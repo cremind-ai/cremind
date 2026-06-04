@@ -1,0 +1,17 @@
+{
+  "name": "cremind-whatsapp-sidecar",
+  "version": "0.1.0",
+  "description": "Baileys-based sidecar that bridges WhatsApp Web to the Cremind WhatsApp channel adapter over a localhost WebSocket.",
+  "private": true,
+  "license": "MIT",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.0",
+    "minimist": "^1.2.8",
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.0"
+  }
+}

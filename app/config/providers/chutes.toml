@@ -1,0 +1,50 @@
+[provider]
+name = "chutes"
+display_name = "Chutes"
+base_url = "https://llm.chutes.ai/v1"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "Chutes API key"
+hint = "Open-source models including Llama, DeepSeek, and more"
+instructions = "Chutes provides access to leading open-source models including Llama, DeepSeek, and more. Get your API key at: https://chutes.ai/settings/api-keys"
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "Chutes API Key", type = "string", secret = true, required = true }
+
+[[models]]
+id = "deepseek-ai/DeepSeek-V3-0324"
+display_name = "DeepSeek V3"
+group_hint = "high"
+input_price_per_1m = 0.50
+output_price_per_1m = 1.50
+
+[[models]]
+id = "deepseek-ai/DeepSeek-R1-0528"
+display_name = "DeepSeek R1"
+group_hint = "high"
+input_price_per_1m = 1.00
+output_price_per_1m = 4.00
+
+[[models]]
+id = "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+display_name = "Llama 4 Maverick"
+group_hint = "high"
+input_price_per_1m = 0.22
+output_price_per_1m = 0.88
+
+[[models]]
+id = "Qwen/Qwen3-235B-A22B"
+display_name = "Qwen 3 235B"
+group_hint = "high"
+input_price_per_1m = 0.50
+output_price_per_1m = 1.50
+
+[[models]]
+id = "moonshotai/Kimi-K2.5"
+display_name = "Kimi K2.5"
+group_hint = "high"
+input_price_per_1m = 0.60
+output_price_per_1m = 3.00

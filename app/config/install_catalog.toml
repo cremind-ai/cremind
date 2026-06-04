@@ -1,0 +1,172 @@
+# AUTO-GENERATED copy of install/catalog.toml shipped with the
+# backend. Do not edit by hand — re-run
+# `python install/scripts/build_catalog.py`.
+# Source SHA-256: fc469a7dd26f18ea2f9f52f0301537cb9879ef8e9a8db9ddcd50e684508f6caa
+
+# Cremind install/setup catalog — single source of truth.
+#
+# Defines the user-facing labels, descriptions, and conditional rules
+# shared by every consumer of the install/setup flow:
+#
+#   - install.sh     (POSIX shell, via the generated _catalog.sh include)
+#   - install.ps1    (PowerShell, via the generated _catalog.ps1 include)
+#   - SetupWizard.vue + DeploymentModeRadio.vue (via the
+#                    /api/config/install-catalog endpoint)
+#   - app/api/features.py (mode-rule filtering of service capabilities)
+#
+# When this file changes, regenerate the language-specific includes:
+#
+#   python install/scripts/build_catalog.py
+#
+# CI runs the same script with --check to fail when the master and
+# generated outputs diverge.
+#
+# The setup-wizard environment presets ("local" / "docker" / "server")
+# stay in app/config/setup_profiles.toml — that file is unchanged. This
+# catalog only describes the install/runtime knobs (deployments, modes,
+# rules); the API stitches both together when the wizard mounts.
+
+schema_version = 1
+
+
+# ── Deployments ──────────────────────────────────────────────────────────
+# How Cremind listens for connections and is reached from a browser.
+# Asked once during install (and shown in the Electron installer stage).
+# Each entry maps to a ENV / HOST / APP_URL / CORS shape in the rendered
+# .env file. Order keys are integers so the install scripts can render
+# numbered prompts deterministically.
+
+[deployments.local]
+label       = "Local"
+short       = "this machine only"
+description = "bind to 127.0.0.1, only this machine can reach it"
+env_value   = "local"
+host        = "127.0.0.1"
+requires_host = false
+order       = 10
+
+[deployments.server]
+label       = "Server"
+short       = "reachable from other devices"
+description = "bind to all interfaces, reachable from other devices"
+env_value   = "production"
+host        = "0.0.0.0"
+requires_host = true
+order       = 20
+
+[deployments.custom]
+label       = "Custom (advanced)"
+short       = "I'll configure host, URL, and CORS myself"
+description = "advanced setup — choose where Cremind listens and how it's reached"
+env_value   = "custom"
+order       = 30
+
+# Advanced fields shown only when the user picks `custom`. Each one
+# carries a plain-English prompt and hint; the installer reads the
+# answers and writes them into the rendered .env (the comment after
+# `key` notes which env var receives the value). Order matters: the
+# install scripts iterate this array in order.
+
+[[deployments.custom.advanced_fields]]
+key        = "listen_host"                # → HOST
+prompt     = "Where should Cremind listen for connections?"
+hint       = "Use 127.0.0.1 to only allow this machine, or 0.0.0.0 to allow other devices / containers on the network."
+default    = "0.0.0.0"
+
+[[deployments.custom.advanced_fields]]
+key        = "public_url"                 # → APP_URL
+prompt     = "What URL will you use to open Cremind in a browser?"
+hint       = "This is the address users type into their browser. Inside a container it's usually http://localhost:1112. On a server it might be http://my-box.lan:1112 or https://cremind.example.com."
+default    = "http://localhost:1112"
+
+[[deployments.custom.advanced_fields]]
+key        = "allowed_origins"            # → CORS_ALLOWED_ORIGINS
+prompt     = "Which web origins should be allowed to talk to the API?"
+hint       = "A comma-separated list of URLs the browser UI will be served from. Usually the same as the public URL above. Leave blank to use the public URL plus localhost variants."
+default    = ""
+
+[[deployments.custom.advanced_fields]]
+key        = "wizard_preset"              # → SETUP_WIZARD_ENV
+prompt     = "Which preset should pre-fill the Setup Wizard?"
+hint       = "Presets fill in sensible defaults for the next setup screens — you can always edit any field afterwards. Pick `local` for a single-machine setup, `docker` for a docker-compose stack, or `server` for an external Postgres/Qdrant."
+choices    = ["local", "docker", "server"]
+default    = "local"
+
+
+# ── Install modes ────────────────────────────────────────────────────────
+# How Cremind itself is installed. Asked once during install. Maps to
+# `INSTALL_MODE` in the rendered .env so the backend can apply the
+# service-mode rules below without re-deriving it from `ENV`.
+#
+# Recommendation algorithm (shared by install.sh, install.ps1, and the
+# Setup Wizard): walk modes in `order` ascending, pick the first whose
+# `requires` capabilities are all satisfied in the current environment.
+# This makes recommendation purely catalog-driven — there is no
+# hardcoded "Docker by default" or "Native for dev channel" anywhere
+# in code.
+
+[modes.docker]
+label       = "Docker"
+description = "sandboxed VNC desktop with a bundled storage stack"
+hint        = "The agent runs inside a container with its own GUI. Observe at http://<host>:6080/vnc.html."
+badge       = "recommended"
+requires    = ["docker"]
+order       = 10
+
+[modes.native]
+label       = "Native"
+description = "Python venv at ~/.cremind/venv with embedded storage"
+hint        = "Simpler, but the agent shares your desktop and home directory."
+requires    = []
+order       = 20
+
+
+# ── Mode rules ───────────────────────────────────────────────────────────
+# Per-install-mode visibility rules for each backing service's
+# deployment_mode picker (Postgres / Qdrant / Chroma). The Setup Wizard's
+# DeploymentModeRadio filters its options against
+# `allowed_service_modes[INSTALL_MODE]`; the backend's
+# /api/services/capabilities applies the same filter server-side so
+# advanced users can't submit a hidden combination.
+#
+#   Docker  install: services may run via Docker (compose sidecar) or
+#                    Native (in-process); External is hidden because the
+#                    target audience doesn't see questions about
+#                    pg_hba.conf, firewalls, or remote-host networking.
+#   Native  install: services may run via Native (in-process) or External
+#                    (user-supplied endpoint); Docker is hidden because
+#                    there's no compose project to start a sidecar in.
+#   Custom  install: all three modes visible — the user is in advanced
+#                    mode and knows what they're doing.
+
+[mode_rules.docker]
+allowed_service_modes = ["docker", "native"]
+default_service_mode  = "docker"
+
+[mode_rules.native]
+allowed_service_modes = ["native", "external"]
+default_service_mode  = "external"
+
+[mode_rules.custom]
+allowed_service_modes = ["docker", "native", "external"]
+default_service_mode  = "external"
+
+
+# ── Service modes ────────────────────────────────────────────────────────
+# Labels and description templates for the per-service deployment_mode
+# radio used by the Server and Embedding wizard steps. The
+# `description_template` uses `{service}` as a placeholder; the
+# DeploymentModeRadio component interpolates it with the service's
+# display name (e.g. "Postgres", "Qdrant", "ChromaDB").
+
+[service_modes.docker]
+label                = "Docker"
+description_template = "Cremind starts a {service} container alongside itself."
+
+[service_modes.native]
+label                = "Native"
+description_template = "Cremind runs {service} locally (no extra container)."
+
+[service_modes.external]
+label                = "External"
+description_template = "Connect to an existing {service} instance."

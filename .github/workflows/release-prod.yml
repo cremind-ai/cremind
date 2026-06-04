@@ -1,0 +1,495 @@
+# Production release workflow.
+#
+# Trigger: push a tag matching ``v*`` (e.g., ``v0.2.1``), excluding
+# ``v*rc*`` (those are handled by release-rc.yml). The workflow
+# produces a single GitHub Release with:
+#   - cremind-X.Y.Z-py3-none-any.whl + cremind-X.Y.Z.tar.gz (PyPI + GH)
+#   - Windows NSIS installer + latest.yml
+#   - macOS DMG + latest-mac.yml
+#   - Linux AppImage + latest-linux.yml
+# Plus, pushed to Docker Hub:
+#   - cremind/cremind-desktop:X.Y.Z and cremind/cremind-desktop:latest
+#
+# Flow:
+#   1. ``prepare-draft`` creates a draft GitHub Release with auto-generated
+#      notes from PR titles since the previous tag.
+#   2. ``wheel`` (one Linux job) builds the SPA via scripts/build_ui.sh,
+#      then ``hatch build``. Smoke-tests the wheel. Publishes to PyPI.
+#      Uploads wheel + sdist to the draft.
+#   3. ``electron`` (matrix: ubuntu, macos, windows) runs ``npm run build``
+#      in ui/. electron-builder with ``releaseType: "draft"`` uploads each
+#      platform's installer + update manifest to the same draft.
+#   4. ``docker`` waits for ``wheel`` (PyPI must serve the new wheel),
+#      then builds Dockerfile.desktop with CREMIND_PIP_SPEC=cremind==X.Y.Z
+#      and pushes cremind/cremind-desktop:X.Y.Z + :latest to Docker Hub.
+#      BuildKit GHA cache keeps the heavy base layers warm across releases.
+#   5. ``publish`` promotes the draft only after wheel AND every electron
+#      matrix job AND docker succeed. Half-finished releases never reach
+#      users.
+#
+# Required repo secrets:
+#   PYPI_API_TOKEN       — for PyPI publish.
+#   DOCKERHUB_USERNAME   — Docker Hub account with push rights to
+#                          cremind/cremind-desktop.
+#   DOCKERHUB_TOKEN      — Docker Hub PAT (Read+Write scope).
+#   GITHUB_TOKEN         — auto-provided; used by electron-builder + gh CLI.
+# Optional (for code signing):
+#   CSC_LINK + CSC_KEY_PASSWORD                     — Windows + macOS certs.
+#   APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD
+#     + APPLE_TEAM_ID                               — macOS notarization.
+# Missing optional secrets produce unsigned builds, not job failures.
+
+name: release-prod
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "!v*rc*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.2.1)"
+        required: true
+        type: string
+
+jobs:
+  # The validate-before-merge gate. All four mechanical checks must pass
+  # before any PyPI upload, Electron build, or Docker push happens:
+  #
+  #   1. Tag matches the production pattern ``vX.Y.Z[.hotfix]``.
+  #   2. ``app/__version__.py`` agrees with the tag. Under the
+  #      Core/Component Maintainer split this is the gate that catches
+  #      a prod tag pushed without the Core Maintainer's version-bump
+  #      commit on main.
+  #   3. The tag points at a commit that is on ``main`` — no shipping
+  #      from feature branches, no shipping commits that were never merged.
+  #   4. **At least one** ``v<X.Y.Z>rc*.dev*`` tag exists in the repo
+  #      whose release-rc.yml workflow concluded with ``success`` AND
+  #      whose commit is reachable from origin/main. This proves the
+  #      version had at least one validated dev release that actually
+  #      got merged. It does NOT require the dev tag to live at the
+  #      same commit as the prod tag (the prod commit is the
+  #      version-bump commit on main, which by design has no dev tag
+  #      of its own).
+  #
+  # Human validation ("I installed this dev release and it works") is
+  # enforced by the ``approve`` job below, which uses a GitHub Actions
+  # environment with required reviewers. Approval there is the signal
+  # that previously came from manually publishing the RC's draft
+  # prerelease.
+  #
+  # Failing any of the four checks here — or rejecting the approval —
+  # means no draft, no PyPI upload, no Electron build. See RELEASING.md.
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.name }}
+      version: ${{ steps.tag.outputs.version }}
+      rc_tag: ${{ steps.rc.outputs.tag }}
+    steps:
+      - name: Resolve tag and bare version
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "name=$tag" >> "$GITHUB_OUTPUT"
+          version=$(echo "$tag" | sed -E 's/^v([0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?)$/\1/')
+          if [ "$version" = "$tag" ]; then
+            echo "::error::Tag $tag does not match v<major>.<minor>.<patch>[.<hotfix>]. Production releases use that pattern; release candidates use release-rc.yml."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check out at tag (full history for tag/ancestry lookups)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.name }}
+          fetch-depth: 0
+
+      - name: Verify tag matches app/__version__.py
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+          EXPECTED: ${{ steps.tag.outputs.version }}
+        run: |
+          src=$(grep -oE '^__version__[[:space:]]*=[[:space:]]*"[^"]+"' app/__version__.py | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$EXPECTED" != "$src" ]; then
+            echo "::error::Tag $TAG implies version $EXPECTED but app/__version__.py is $src."
+            echo "::error::Bump app/__version__.py to $EXPECTED on main and retag."
+            exit 1
+          fi
+          echo "OK: tag $TAG matches app/__version__.py = $src"
+
+      # The tag must be reachable from origin/main — i.e. on the trunk,
+      # not on an abandoned feature branch. Without this, a maintainer
+      # could push a vX.Y.Z tag pointing at a commit that was never
+      # merged and ship code that has no PR history.
+      - name: Verify tag commit is on main
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          commit=$(git rev-parse HEAD)
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "::error::Tag $TAG points at commit $commit, which is not reachable from origin/main."
+            echo "::error::Production releases must ship from main. Merge the PR first, then tag the merged commit."
+            exit 1
+          fi
+          echo "OK: $commit is on main"
+
+      # Some ``v<VERSION>rc*.dev*`` tag in the repo must satisfy BOTH:
+      #   - its release-rc.yml run concluded with ``success``
+      #   - its commit is reachable from origin/main (i.e. the PR
+      #     that shipped that dev release got merged)
+      #
+      # Under the Core/Component Maintainer flow the prod tag points at
+      # the version-bump commit on main, which has no dev tag of its
+      # own — so we do NOT require the dev tag's commit to equal the
+      # prod tag's commit. The check is "did at least one validated dev
+      # release for this version actually land on main?" rather than
+      # "is this exact commit the RC commit?".
+      #
+      # Enumerates tags newest-first (sort -V then reversed) so the most
+      # recent dev release is preferred when reporting which tag
+      # vouched for the prod release.
+      - name: Verify at least one validated v<version>rc*.dev* tag is on main
+        id: rc
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          candidate_tags=$(git tag --list "v${VERSION}rc*.dev*" | sort -V -r)
+          if [ -z "$candidate_tags" ]; then
+            echo "::error::No v${VERSION}rc*.dev* tag exists in the repo."
+            echo "::error::Production releases must promote at least one validated dev release."
+            echo "::error::Ship a per-PR dev release first:"
+            echo "::error::  git tag v${VERSION}rc1.dev1 origin/<feature-branch>"
+            echo "::error::  git push origin v${VERSION}rc1.dev1"
+            echo "::error::Iterate dev<M> until release-rc.yml succeeds, validate the build, merge the PR, then tag v${VERSION}."
+            exit 1
+          fi
+
+          chosen=""
+          chosen_reasons=""
+          for t in $candidate_tags; do
+            t_commit=$(git rev-list -n1 "$t" 2>/dev/null || true)
+            if [ -z "$t_commit" ]; then
+              chosen_reasons="${chosen_reasons}  - ${t}: tag could not be resolved to a commit"$'\n'
+              continue
+            fi
+            if ! git merge-base --is-ancestor "$t_commit" origin/main 2>/dev/null; then
+              chosen_reasons="${chosen_reasons}  - ${t} (${t_commit}): commit not reachable from origin/main"$'\n'
+              continue
+            fi
+            conclusion=$(gh run list \
+              --repo "${{ github.repository }}" \
+              --workflow=release-rc.yml \
+              --commit="$t_commit" \
+              --limit=1 \
+              --json conclusion \
+              --jq '.[0].conclusion // empty')
+            if [ "$conclusion" != "success" ]; then
+              chosen_reasons="${chosen_reasons}  - ${t} (${t_commit}): release-rc.yml conclusion '${conclusion}' (not success)"$'\n'
+              continue
+            fi
+            chosen="$t"
+            chosen_commit="$t_commit"
+            break
+          done
+
+          if [ -z "$chosen" ]; then
+            echo "::error::No v${VERSION}rc*.dev* tag has both a successful release-rc.yml run AND a commit reachable from origin/main."
+            echo "::error::Candidates inspected:"
+            printf '%s' "$chosen_reasons" | while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error::$line"
+            done
+            echo "::error::Cut and validate a v${VERSION}rc<N>.dev<M> tag (or merge the PR whose dev release already succeeded) before retrying."
+            exit 1
+          fi
+          echo "Found validated dev release: $chosen at $chosen_commit"
+          echo "tag=$chosen" >> "$GITHUB_OUTPUT"
+          echo "OK: $chosen has release-rc.yml=success and its commit is on origin/main"
+
+  # Human-validation gate. Pauses the run until a required reviewer
+  # approves it in the Actions UI. The ``prod-release`` environment is
+  # configured in repo Settings → Environments with the reviewer list;
+  # rejecting the approval cancels the run before any artifact is built
+  # or published. See RELEASING.md for the reviewer roster and the
+  # checklist they apply.
+  approve:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: prod-release
+    outputs:
+      tag: ${{ needs.verify.outputs.tag }}
+      version: ${{ needs.verify.outputs.version }}
+      rc_tag: ${{ needs.verify.outputs.rc_tag }}
+    steps:
+      - run: |
+          echo "Reviewer approved release of ${{ needs.verify.outputs.tag }}"
+          echo "  Validated dev release: ${{ needs.verify.outputs.rc_tag }}"
+
+  prepare-draft:
+    needs: approve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ needs.approve.outputs.tag }}
+    steps:
+      - name: Check out cremind
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.approve.outputs.tag }}
+
+      # Creates the draft release that wheel + electron jobs upload into.
+      # generate_release_notes: true fills the body from PR titles since
+      # the previous tag — runs once here so we don't re-generate on every
+      # upload step.
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.approve.outputs.tag }}
+          name: ${{ needs.approve.outputs.tag }}
+          draft: true
+          generate_release_notes: true
+
+  wheel:
+    needs: prepare-draft
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out cremind
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-draft.outputs.tag }}
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Builds the SPA from the in-tree ui/ source into app/static/ui/
+      # so the wheel ``hatch build`` produces ships with the UI bundled.
+      - name: Build SPA
+        run: bash scripts/build_ui.sh
+
+      - name: Install hatch
+        run: pip install --upgrade hatch
+
+      - name: Build wheel + sdist
+        run: hatch build
+
+      # Catch the class of bug where a Python subpackage is accidentally
+      # gitignored out of the wheel: install the freshly built wheel into
+      # a throwaway venv and import the modules the CLI actually loads.
+      - name: Smoke-test built wheel
+        run: |
+          python -m venv /tmp/smoke
+          . /tmp/smoke/bin/activate
+          pip install --upgrade pip
+          pip install dist/*.whl
+          python -c "import app, app.storage, app.storage.migrations"
+          cremind --help >/dev/null
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: Upload wheel + sdist to draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.prepare-draft.outputs.tag }}" \
+            dist/*.whl dist/*.tar.gz \
+            --repo "${{ github.repository }}"
+
+  electron:
+    needs: prepare-draft
+    strategy:
+      # ``fail-fast: false`` keeps a Linux build from being discarded
+      # because (say) macOS notarization hit a transient hiccup. We want
+      # every successful platform's artifacts on the Release.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - name: Check out cremind
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-draft.outputs.tag }}
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+
+      # ui/package.json's ``prebuild`` hook runs
+      # ``python ../scripts/sync_ui_version.py`` before vite/electron-builder,
+      # so each matrix runner needs Python on PATH.
+      - name: Set up Python 3.13 (for prebuild version sync)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Workaround for npm bug #4828: optionalDependencies (the
+      # platform-specific @rollup/rollup-* binaries) are not recorded in a
+      # package-lock.json generated on a single OS. The lockfile here was
+      # created on Windows, so Linux/macOS runners must install their binary
+      # explicitly. --no-save / --no-package-lock keep both files untouched.
+      - name: Install platform Rollup binary (workaround npm#4828)
+        shell: bash
+        run: |
+          case "${{ matrix.os }}" in
+            ubuntu-latest)  pkg="@rollup/rollup-linux-x64-gnu" ;;
+            macos-latest)   pkg="@rollup/rollup-darwin-arm64" ;;
+            windows-latest) exit 0 ;;
+          esac
+          npm install --no-save --no-package-lock "$pkg"
+
+      # Export signing env vars only when the corresponding secret is
+      # non-empty. GitHub passes "" for missing secrets, and electron-builder
+      # treats CSC_LINK="" as "resolve as relative path", which fails. Gating
+      # per-job also lets us add per-platform certs later (e.g. macOS-only)
+      # without touching the Windows job.
+      - name: Configure code-signing env (only if secrets present)
+        shell: bash
+        env:
+          CSC_LINK_SECRET: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD_SECRET: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID_SECRET: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD_SECRET: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID_SECRET: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          [ -n "$CSC_LINK_SECRET" ]                    && echo "CSC_LINK=$CSC_LINK_SECRET"                                       >> "$GITHUB_ENV" || true
+          [ -n "$CSC_KEY_PASSWORD_SECRET" ]            && echo "CSC_KEY_PASSWORD=$CSC_KEY_PASSWORD_SECRET"                       >> "$GITHUB_ENV" || true
+          [ -n "$APPLE_ID_SECRET" ]                    && echo "APPLE_ID=$APPLE_ID_SECRET"                                       >> "$GITHUB_ENV" || true
+          [ -n "$APPLE_APP_SPECIFIC_PASSWORD_SECRET" ] && echo "APPLE_APP_SPECIFIC_PASSWORD=$APPLE_APP_SPECIFIC_PASSWORD_SECRET" >> "$GITHUB_ENV" || true
+          [ -n "$APPLE_TEAM_ID_SECRET" ]               && echo "APPLE_TEAM_ID=$APPLE_TEAM_ID_SECRET"                             >> "$GITHUB_ENV" || true
+
+      # ``--publish always`` tells electron-builder to upload artifacts to
+      # the GitHub provider configured in electron-builder.json5. Because
+      # that file declares ``releaseType: "draft"`` and the draft already
+      # exists (created by prepare-draft), each matrix job uploads to it
+      # rather than creating a new release.
+      - name: Build & publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run build -- --publish always
+
+  # Builds cremind/cremind-desktop and pushes it to Docker Hub. Runs in
+  # parallel with ``electron`` (no shared artifacts) but depends on
+  # ``wheel`` because the image's ``RUN pip install cremind==X.Y.Z`` must
+  # resolve against PyPI — see Dockerfile.desktop's CREMIND_PIP_SPEC arg.
+  #
+  # The expensive base layers (Ubuntu + XFCE + Chrome + Python 3.13 +
+  # Docker CLI) are cached via BuildKit's GHA cache (scope=desktop),
+  # shared with release-rc.yml so an RC build right before a prod
+  # build can be a near-instant rebuild of only the final pip layer.
+  # Docker Hub deduplicates layer blobs by digest, so re-pushing the
+  # cached base layers under a new tag is a no-op for storage and
+  # uploads only the small (~50MB) per-version pip layer.
+  docker:
+    needs: [verify, prepare-draft, wheel]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out cremind
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-draft.outputs.tag }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # PyPI serves the JSON API (``/pypi/<pkg>/<ver>/json``) and the
+      # simple index (``/simple/<pkg>/``) from separate cache paths on
+      # Fastly; the JSON API can refresh ahead of the simple index. The
+      # build's ``pip install cremind==X.Y.Z`` reads from the simple
+      # index, so polling the JSON API previously gave false-positive
+      # readiness signals (v0.2.7 hit exactly this — wheel published,
+      # JSON API ready, pip 404'd because the simple index didn't list
+      # it yet). Poll the simple index directly so its readiness is the
+      # same readiness the next step needs. Mirrors release-rc.yml's
+      # docker job.
+      - name: Wait for PyPI simple index to list cremind==${{ needs.verify.outputs.version }}
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsSL https://pypi.org/simple/cremind/ \
+                | grep -qE "cremind-${VERSION}-py3-none-any\.whl"; then
+              echo "PyPI simple index lists cremind-${VERSION}"
+              exit 0
+            fi
+            echo "Not yet ($i/60); sleeping 5s"
+            sleep 5
+          done
+          echo "::error::PyPI simple index never listed cremind-${VERSION} after 300s"
+          exit 1
+
+      # ``provenance: false`` keeps the published manifest a plain
+      # single-arch image. With provenance on, BuildKit pushes a manifest
+      # list with an attestation entry, which older Docker daemons
+      # (24.x without containerd-snapshotter) flag with cosmetic
+      # "unknown platform" warnings on pull.
+      - name: Build & push cremind/cremind-desktop
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.desktop
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            cremind/cremind-desktop:${{ needs.verify.outputs.version }}
+            cremind/cremind-desktop:latest
+          build-args: |
+            CREMIND_PIP_SPEC=cremind==${{ needs.verify.outputs.version }}
+          cache-from: type=gha,scope=desktop
+          cache-to: type=gha,scope=desktop,mode=max
+
+  publish:
+    needs: [prepare-draft, wheel, electron, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Promote draft release to published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ needs.prepare-draft.outputs.tag }}" \
+            --draft=false \
+            --repo "${{ github.repository }}"

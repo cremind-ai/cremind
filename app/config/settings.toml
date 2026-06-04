@@ -1,0 +1,66 @@
+[general]
+service_name = "cremind-agent"
+agent_id = "cremind_agent"
+agent_name = "Cremind Agent"
+jwt_expiration_hours = 720
+session_token_default_ttl = 3600
+mcp_tool_call_timeout = 300
+sqlite_db_path = "cremind.db"
+profile = ""
+
+[embedding]
+enabled = false       # opt-in; setup wizard flips to true if user opts in
+provider = "me5"      # "me5" | "gemma"
+hf_token = ""         # required when provider = "gemma"
+
+[vectorstore]
+provider = "chroma"  # "qdrant" | "chroma"
+
+[qdrant]
+host = "localhost"
+port = 6333
+api_key = ""
+https = false
+
+[chroma]
+mode = "persistent"       # "http" | "persistent"
+host = "localhost"
+port = 8000
+ssl = false
+api_key = ""
+persist_path = ""         # mode = "persistent" only; defaults to <system_dir>/storage/chroma when blank
+
+[llm]
+# Provider and model groups are configured via the setup wizard (stored in SQLite).
+# No defaults — setup must be completed first.
+
+# ── Settings → Config defaults (per-profile, overridable in the UI) ──
+
+[agent]
+max_steps = 40
+max_llm_retries = 2
+reasoning_temperature = 1.0
+reasoning_max_tokens = 32768
+reasoning_retry = 3
+steps_length = 20
+
+[history]
+max_tokens_total = 5000
+max_tokens_per_message = 500
+
+[tool_result]
+enabled = true
+max_tokens = 1000
+preserve_recent = 1
+head_tokens = 200
+tail_tokens = 200
+
+[skill_classifier]
+temperature = 0.0
+max_tokens = 64
+retry = 2
+
+[summarizer]
+temperature = 0.3
+max_tokens = 1024
+retry = 2

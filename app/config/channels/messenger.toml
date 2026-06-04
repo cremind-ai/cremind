@@ -1,0 +1,41 @@
+[channel]
+type = "messenger"
+display_name = "Messenger"
+icon = "mdi:facebook-messenger"
+supports_bot = true
+supports_userbot = true
+auth_modes = ["none", "otp", "password"]
+default_response_mode = "normal"
+implemented = false
+
+[[channel.modes]]
+id = "bot"
+label = "Page Bot"
+implemented = false
+instructions = """**Coming soon — adapter implementation pending.**
+
+1. Create a Facebook Page (or use an existing one).
+2. Visit https://developers.facebook.com → My Apps → Create App → Business.
+3. Add the Messenger product, generate a Page Access Token, and copy it.
+4. Set the webhook callback URL to <your-cremind-host>/api/channels/webhook/messenger
+   and choose the messages, messaging_postbacks subscriptions.
+5. Paste the page access token and the verify token you set on the webhook below."""
+[channel.modes.fields]
+page_access_token = { description = "Page Access Token", type = "string", secret = true, required = true }
+verify_token = { description = "Webhook Verify Token", type = "string", secret = true, required = true }
+
+[[channel.modes]]
+id = "userbot"
+label = "Userbot (your account)"
+implemented = false
+instructions = """**Coming soon — and use at your own risk.**
+
+User-account automation **violates Facebook's Terms of Service** and may
+result in your account being locked or disabled. The community libraries
+that drove this (e.g. ``fbchat``) are largely unmaintained because Meta
+keeps tightening client-side detection.
+
+Configuration would require pasting Facebook session cookies, which
+gives the agent full access to your account — sensitive."""
+[channel.modes.fields]
+session_cookies = { description = "Session cookies (JSON or string)", type = "string", secret = true, required = true }

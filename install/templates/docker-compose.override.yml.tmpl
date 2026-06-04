@@ -1,0 +1,30 @@
+# Dev-channel override. The installer emits this next to
+# docker-compose.yml only when --channel=dev && --mode=docker; compose
+# merges files in the same directory automatically, so production and
+# test installs never see these overrides.
+#
+# The main ``docker-compose.yml`` template has no ``build:`` section —
+# production and test channels pull a pre-built image from Docker Hub.
+# This override re-introduces the ``build:`` block so dev installs
+# compile the image from the local checkout instead of pulling.
+#
+# - ``build.context`` points at the local checkout (the main compose
+#   template's ``../..`` would resolve to ~/.cremind/.. and miss the
+#   Dockerfile entirely).
+# - ``CREMIND_PIP_SPEC=-e /src`` switches the image build from a PyPI
+#   install to an editable install rooted at the bind-mounted checkout
+#   (see Dockerfile.desktop's --mount=type=bind). Like production, this
+#   is a thin-core install — the Setup Wizard adds optional feature
+#   groups at runtime; they persist in the ``cremind-venv`` volume.
+# - The ``__REPO_ROOT__:/src`` runtime volume keeps the editable install
+#   resolvable after the build step's bind mount is gone, and lets
+#   host-side edits show up inside the container after a restart.
+services:
+  cremind:
+    build:
+      context: "__REPO_ROOT__"
+      dockerfile: Dockerfile.desktop
+      args:
+        CREMIND_PIP_SPEC: "-e /src"
+    volumes:
+      - "__REPO_ROOT__:/src"

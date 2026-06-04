@@ -1,0 +1,72 @@
+.vscode/
+dump.rdb
+**/__pycache__
+
+# local env files
+.env.*
+.env
+env
+
+# Log files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Lockfiles. We track ui/package-lock.json only — every other lockfile
+# (e.g. app/channels/sidecars/whatsapp/) is build-machine state, not
+# something we want creeping into PRs.
+package-lock.json
+!ui/package-lock.json
+yarn.lock
+
+# Editor directories and files
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Logs
+logs
+*.log
+
+# OSX
+**/.DS_Store
+
+**/ai_models
+
+.venv
+
+output.txt
+.client_storage
+.auth_client_storage*
+.profiles/
+.remote_agents/
+.mcp_servers/
+*.egg-info/
+.claude/
+.playwright-mcp/
+
+cli/cremind
+cli/cremind.exe
+
+# Built SPA — populated by scripts/build_ui.sh, picked up by
+# ``cremind serve`` and bundled into the wheel. The built artifacts are
+# regenerated on every release so we don't track them in git.
+app/static/ui/*
+!app/static/ui/.gitkeep
+
+# UI source build outputs (ui/.gitignore also covers these, but root-level
+# entries help tools that don't traverse nested gitignores).
+ui/node_modules/
+ui/dist/
+ui/dist-electron/
+ui/dist-web/
+ui/dist-server/
+ui/release/
+ui/components.d.ts
+ui/*.tsbuildinfo
+ui/.cache/

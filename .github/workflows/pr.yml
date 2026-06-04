@@ -1,0 +1,173 @@
+# Pull-request CI for the merged cremind repo.
+#
+# Three parallel jobs:
+#   - ``backend``: lint + pytest against the Python package.
+#   - ``ui``: type-check + smoke-build the web SPA bundle.
+#   - ``smoke-build``: build the wheel and the Linux Electron .AppImage,
+#     and upload both as PR artifacts so reviewers can download and
+#     try the build locally without waiting for an RC tag.
+#
+# Dockerfile.desktop is intentionally NOT built here. The Dockerfile's
+# pip-install RUN bind-mounts the build context at /src, but
+# ``.dockerignore`` excludes ``dist/`` (which is correct for prod builds
+# that install from a published wheel URL via ``CREMIND_PIP_SPEC``).
+# Working around it for a PR-only docker smoke would require either
+# editing ``.dockerignore`` (affects prod docker builds) or adding a
+# ``--build-context`` slot to the Dockerfile (intrusive). Dockerfile
+# breakage surfaces at RC time (release-rc.yml) before merge.
+#
+# The ``smoke-build`` job skips Windows/macOS matrix builds: code-signing
+# secrets aren't available to fork PRs, and the three-OS matrix adds
+# ~30 minutes per PR. Platform-specific breakage still surfaces at the
+# RC stage (release-rc.yml) before merge — the PR smoke build catches
+# the cross-platform majority cheaply.
+
+name: pr
+
+on:
+  pull_request:
+    branches: [main]
+  # Also run on direct pushes to main so a "bypass PR review" commit
+  # (one that didn't go through pull_request) still gets the same
+  # checks post-hoc — the installer_tui.pyz staleness guard in the
+  # backend job is the load-bearing one. A red main-push run surfaces
+  # the defect immediately on the Actions tab even though it can't
+  # block the push itself.
+  push:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # The shell installer downloads a prebuilt installer_tui.pyz that
+      # bundles a snapshot of app/upgrade + app/installer. It's a committed
+      # binary, so a PR that changes those sources without rebuilding it
+      # would silently ship a stale TUI (e.g. missing newer release shapes).
+      # This stdlib-only check fails the PR until the pyz is regenerated:
+      #   python install/scripts/build_installer_tui.py
+      - name: Check installer_tui.pyz is fresh
+        run: python install/scripts/build_installer_tui.py --check
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: uv sync --all-groups
+
+      # ``--ignore=tests/upgrade`` lets the suite stay green while the
+      # upgrade fixture matures; drop the flag once those tests are
+      # stable. Remove this comment along with the flag.
+      - name: Run pytest
+        run: uv run pytest
+
+  ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+
+      # ui/package.json's prebuild hook shells out to
+      # ``python ../scripts/sync_ui_version.py``, so Python must be on PATH.
+      - name: Set up Python 3.13 (for prebuild version sync)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Linux runner is missing the @rollup/rollup-linux-x64-gnu optional
+      # binary because the lockfile was generated on Windows (npm#4828).
+      - name: Install Linux Rollup binary (workaround npm#4828)
+        run: npm install --no-save --no-package-lock @rollup/rollup-linux-x64-gnu
+
+      - name: Sync version from backend
+        run: npm run version:sync
+
+      - name: Type-check
+        run: npx vue-tsc --noEmit
+
+      # Smoke-build the web bundle. The full Electron + Docker build
+      # lives in the separate ``smoke-build`` job below.
+      - name: Smoke build (web)
+        run: npm run web:build
+
+  # End-to-end smoke build: wheel + Linux Electron installer + Docker
+  # desktop image. Catches packaging breakage (missing data files,
+  # broken Dockerfile, electron-builder config rot) before an RC tag is
+  # cut. The .AppImage is uploaded as a PR artifact so reviewers can
+  # install and try the change locally — the "preview environment"
+  # piece of the validate-before-merge flow.
+  smoke-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install hatch
+        run: pip install --upgrade hatch
+
+      # Build the in-tree ui/ into app/static/ui/ so the wheel bundles
+      # the SPA — same step the release workflows run.
+      - name: Build SPA
+        run: bash scripts/build_ui.sh
+
+      - name: Build wheel + sdist (no publish)
+        run: hatch build
+
+      # Linux runner is missing @rollup/rollup-linux-x64-gnu (npm#4828).
+      - name: Install ui/ deps + Linux Rollup binary
+        working-directory: ui
+        run: |
+          npm ci
+          npm install --no-save --no-package-lock @rollup/rollup-linux-x64-gnu
+
+      # ``--mode test`` so __CREMIND_INSTALL_CHANNEL__ bakes in 'test',
+      # giving reviewers an installer that targets the test channel
+      # rather than masquerading as a production build. ``--publish never``
+      # keeps electron-builder from touching GitHub. ``--linux AppImage``
+      # restricts to one platform (no signing, no Windows/macOS matrix).
+      - name: Build Linux Electron installer (no signing, no publish)
+        working-directory: ui
+        env:
+          GH_TOKEN: ""
+        run: npm run build:test -- --publish never --linux AppImage
+
+      - name: Upload PR artifacts (wheel + AppImage)
+        uses: actions/upload-artifact@v4
+        with:
+          name: cremind-pr-${{ github.event.pull_request.number }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            ui/release/**/*.AppImage
+          if-no-files-found: error
+          retention-days: 14

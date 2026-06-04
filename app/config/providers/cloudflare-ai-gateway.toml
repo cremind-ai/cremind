@@ -1,0 +1,30 @@
+[provider]
+name = "cloudflare-ai-gateway"
+display_name = "Cloudflare AI Gateway"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "Cloudflare AI Gateway"
+hint = "Account ID + Gateway ID + API key"
+instructions = "Set up AI Gateway at https://dash.cloudflare.com — go to AI > AI Gateway, create a gateway, then use your Cloudflare API Token. You need all three values: Account ID, Gateway ID, and API key."
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+account_id = { description = "Cloudflare Account ID", type = "string", secret = false, required = true }
+gateway_id = { description = "Cloudflare AI Gateway ID", type = "string", secret = false, required = true }
+api_key = { description = "Cloudflare API Token", type = "string", secret = true, required = true }
+
+[[models]]
+id = "gpt-5.4"
+display_name = "GPT-5.4 (via CF Gateway)"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "claude-sonnet-4.6"
+display_name = "Claude Sonnet 4.6 (via CF Gateway)"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00

@@ -1,0 +1,558 @@
+# Backend release-candidate workflow.
+#
+# Trigger: push a tag matching the canonical RC shape
+# ``v<X.Y.Z>[.<W>]rc<N>.dev<M>`` (e.g. ``v0.0.2rc1.dev1``, or
+# ``v0.0.2.1rc1.dev1`` for a hotfix). The Core Maintainer assigns
+# ``rcN`` to a PR; the Component Maintainer tags from the PR branch
+# tip. ``M`` increments per bug-fix iteration. ``app/__version__.py``
+# on the PR branch is NOT bumped — the source of truth is updated on
+# main only by the Core Maintainer at prod time.
+#
+# The ``.devM`` counter is mandatory and the only accepted shape;
+# bare ``v<X.Y.Z>rc<N>`` and the older hyphenated form
+# ``v<X.Y.Z>-rc.<N>[.dev.<M>]`` are both rejected. The ``Compute rc
+# version`` step below ``sys.exit``s on anything that doesn't match,
+# so the wheel/sdist/Docker/Electron jobs never run for a malformed
+# tag.
+#
+# Unlike the prod ``release-prod.yml`` workflow, this one:
+#   1. Rewrites ``app/__version__.py`` in-place to the PEP 440 form
+#      (strip the leading ``v`` — the tag already carries PEP 440
+#      canonical form, e.g. ``v0.0.2rc1.dev1`` → ``0.0.2rc1.dev1``).
+#      The rewrite is in-CI only, never committed.
+#   2. Builds the SPA + the wheel/sdist exactly like prod.
+#   3. Publishes to **Test PyPI** (``test.pypi.org``), not production PyPI.
+#   4. Uploads the dist as workflow artifacts so we can download and
+#      inspect the exact bytes that went to Test PyPI.
+#   5. Creates a GitHub Release marked ``prerelease: true`` as a **draft**
+#      (hidden from the unauthenticated ``/releases`` poll) and uploads
+#      the wheel/sdist. The ``electron`` matrix uploads installers to the
+#      same draft. A final ``publish`` job flips ``draft: false`` only
+#      after wheel + electron + docker all succeed — so a test-channel
+#      install never sees an "Update available" for an RC whose installers
+#      haven't been built yet. Human validation has moved to a
+#      required-reviewer approval on release-prod.yml's ``approve`` job.
+#   6. Builds cremind/cremind-desktop with CREMIND_PIP_SPEC pointing at the
+#      Test PyPI wheel (e.g. ``cremind==0.0.2rc1.dev1``) and pushes it to
+#      Docker Hub. No ``:latest`` tag — release candidates never claim
+#      that role.
+#
+# RC/dev tags are expected to live on a feature branch, not on main.
+# release-prod.yml's verify gate enforces "at least one validated dev
+# release for this version exists with its commit on main" — so the RC
+# must run to completion here, AND the PR must merge to main, before any
+# vX.Y.Z prod tag will release. The "validated by a human" signal is
+# collected by required-reviewer approval on release-prod.yml, not by
+# publishing this prerelease.
+#
+# Required repo secrets:
+#   TEST_PYPI_API_TOKEN  — created at https://test.pypi.org/manage/account/token/.
+#                          Scoped to the cremind project once it exists,
+#                          otherwise account-wide for the very first run.
+#   DOCKERHUB_USERNAME   — Docker Hub account with push rights to
+#                          cremind/cremind-desktop.
+#   DOCKERHUB_TOKEN      — Docker Hub PAT (Read+Write scope).
+
+name: release-rc
+
+on:
+  push:
+    tags:
+      - "v*rc*.dev*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "RC tag to release (e.g. v0.0.2rc1.dev1)"
+        required: true
+        type: string
+
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed for creating the GitHub prerelease
+    outputs:
+      tag: ${{ steps.tag.outputs.name }}
+      version: ${{ steps.version.outputs.value }}
+
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out cremind
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.name }}
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Map RC tag → PEP 440 version, then rewrite app/__version__.py so
+      # hatch picks it up. One canonical shape:
+      #
+      #   ``v<base>rc<N>.dev<M>`` → ``<base>rc<N>.dev<M>``  (strip ``v``)
+      #
+      # The tag already carries the PEP 440 canonical form; the rewrite
+      # is just ``tag[1:]``. The ``.devM`` counter is mandatory and the
+      # only accepted shape — bare ``vX.Y.ZrcN`` and the hyphenated
+      # legacy form ``vX.Y.Z-rc.N[.dev.M]`` are rejected.
+      #
+      # PR-branch dev tags intentionally ship from a branch whose
+      # app/__version__.py still reads the *previously released*
+      # production version — the Core Maintainer doesn't bump the
+      # source until prod time on main. So no source-match check is
+      # performed here; verify-gate-4 on release-prod.yml is what
+      # ensures the version eventually shipped to PyPI/Docker matches
+      # the tag the Core Maintainer cut.
+      - name: Compute rc version
+        id: version
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          python <<'PY'
+          import os
+          import re
+          import sys
+
+          tag = os.environ["TAG"]
+          m = re.match(
+              r"^v(\d+\.\d+\.\d+(?:\.\d+)?)rc(\d+)\.dev(\d+)$",
+              tag,
+          )
+          if not m:
+              sys.exit(
+                  f"Tag {tag!r} does not match the canonical RC shape "
+                  f"v<major>.<minor>.<patch>[.<hotfix>]rc<N>.dev<M> "
+                  f"(e.g. v0.0.2rc1.dev1). The .dev<M> counter is "
+                  f"mandatory and the legacy v<...>-rc.<N>[.dev.<M>] "
+                  f"shape is no longer accepted. Refusing to publish."
+              )
+          version = tag[1:]
+
+          path = "app/__version__.py"
+          src = open(path).read()
+
+          src_m = re.search(r'^__version__\s*=\s*"([^"]+)"', src, re.M)
+          if not src_m:
+              sys.exit(f"Could not find __version__ in {path}")
+          src_version = src_m.group(1)
+          print(
+              f"Dev tag {tag!r}: skipping source-version match "
+              f"(app/__version__.py={src_version!r}, rewriting to {version!r})"
+          )
+
+          new = re.sub(
+              r'^__version__\s*=\s*"[^"]*"',
+              f'__version__ = "{version}"',
+              src,
+              count=1,
+              flags=re.M,
+          )
+          if new == src:
+              sys.exit(f"Failed to rewrite __version__ in {path}")
+          open(path, "w").write(new)
+          print(f"Rewrote __version__ -> {version}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"value={version}\n")
+          PY
+
+      # Same SPA build step as prod: build the in-tree ui/ into
+      # app/static/ui/ so the wheel ships with the UI bundled.
+      - name: Build SPA
+        run: bash scripts/build_ui.sh
+
+      - name: Install hatch
+        run: pip install --upgrade hatch
+
+      - name: Build wheel + sdist
+        run: hatch build
+
+      # Catch the class of bug where a Python subpackage is accidentally
+      # gitignored out of the wheel: install the freshly built wheel into
+      # a throwaway venv and import the modules the CLI actually loads.
+      # If anything is missing this fails the release before publish.
+      - name: Smoke-test built wheel
+        run: |
+          python -m venv /tmp/smoke
+          . /tmp/smoke/bin/activate
+          pip install --upgrade pip
+          pip install dist/*.whl
+          python -c "import app, app.storage, app.storage.migrations"
+          cremind --help >/dev/null
+
+      - name: Publish to Test PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          password: ${{ secrets.TEST_PYPI_API_TOKEN }}
+          skip-existing: true
+
+      # Saves the dist on the workflow run page so testers can download
+      # the exact wheel/sdist that hit Test PyPI without going through pip.
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cremind-${{ steps.version.outputs.value }}-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      # Create the GitHub prerelease at the original
+      # ``v<X.Y.Z>rc<N>.dev<M>`` tag and attach the wheel/sdist.
+      # ``prerelease: true`` keeps these entries out of
+      # ``/releases/latest`` (which production-channel installs poll);
+      # test-channel installs (``CREMIND_UPGRADE_CHANNEL=test``) find
+      # them via the ``/releases`` listing endpoint — see
+      # ``app/upgrade/manifest.py::_fetch_latest_test``.
+      #
+      # ``draft: true`` here is the visibility gate. The unauthenticated
+      # ``/releases`` API hides drafts, so the test-channel upgrader will
+      # NOT see this entry yet. The ``electron`` matrix uploads installers
+      # to this same draft over the next 30-60 min; the final ``publish``
+      # job at the bottom of this workflow then runs
+      # ``gh release edit --draft=false`` only after every upload job
+      # succeeds. That ordering ensures a test-channel install never
+      # surfaces an RC whose installer files don't exist yet.
+      #
+      # Human validation has moved to release-prod.yml's ``approve`` job
+      # (a GitHub Actions environment with required reviewers) — no
+      # maintainer click on this prerelease is required or expected.
+      - name: Create GitHub prerelease (draft — publish job flips after all uploads)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          draft: true
+          prerelease: true
+          generate_release_notes: true
+          body: |
+            **Release Candidate — for validation.**
+
+            Install this build and confirm the change works. If a bug
+            surfaces, push the fix to the PR branch and cut the next
+            `dev.<M+1>` tag. Once every PR slated for the upcoming
+            release has shipped a validated dev release and merged to
+            main, the Core Maintainer bumps `app/__version__.py` on
+            main and tags the production version. `release-prod.yml`
+            pauses on the `approve` job until a required reviewer
+            approves the run in the Actions UI — that approval is the
+            "validated by a human" signal. No action needs to be taken
+            on this prerelease itself.
+
+            - Commit: ${{ github.sha }}
+            - RC workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            - PEP 440 version: `${{ steps.version.outputs.value }}`
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+
+  # Builds the per-platform Electron installers and uploads them to the
+  # GitHub prerelease the ``wheel`` job created. Mirrors release-prod.yml's
+  # ``electron`` job with two RC-specific differences:
+  #
+  #   1. Uses ``npm run build:test`` instead of ``npm run build``. That
+  #      script invokes vite with --mode test (so __CREMIND_INSTALL_CHANNEL__
+  #      is baked in as 'test', which makes setupAutoUpdater point
+  #      electron-updater at latest-test.yml on the installed app) and
+  #      passes ``--config electron-builder.test.json5`` so the publish
+  #      block uploads to a prerelease with ``channel: test`` — keeping
+  #      test artifacts out of the production ``latest.yml`` feed.
+  #
+  #   2. The wheel job's app/__version__.py rewrite happened on a
+  #      different runner. Each matrix runner here has a fresh checkout
+  #      without that mutation, so the rewrite is reapplied locally —
+  #      same shape as the ``docker`` job below. The new version flows
+  #      through scripts/sync_ui_version.py (the ui prebuild hook) into
+  #      ui/package.json so the installer filename and the latest-test.yml
+  #      metadata both carry X.Y.ZrcN.
+  #
+  # Existing prod-channel users won't auto-update onto this stream — their
+  # installer baked INSTALL_CHANNEL=production at build time. They have
+  # to download a test installer from this prerelease once to switch.
+  # After that, electron-updater on their installed app sees every
+  # subsequent RC through latest-test.yml.
+  electron:
+    needs: wheel
+    strategy:
+      # ``fail-fast: false`` keeps a Linux build from being discarded
+      # because (say) macOS notarization hit a transient hiccup. We want
+      # every successful platform's artifacts on the prerelease.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - name: Check out cremind
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.wheel.outputs.tag }}
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Set up Python 3.13 (for prebuild version sync)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Windows runners default Python to cp1252 stdout encoding, which
+      # crashes on the Unicode arrow this script used to print. ASCII-only
+      # is the simplest fix — the message is just diagnostic.
+      - name: Rewrite app/__version__.py to ${{ needs.wheel.outputs.version }}
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          NEW_VERSION: ${{ needs.wheel.outputs.version }}
+        run: |
+          python <<'PY'
+          import os, re
+          new = os.environ["NEW_VERSION"]
+          path = "app/__version__.py"
+          src = open(path).read()
+          out = re.sub(
+              r'^__version__\s*=\s*"[^"]*"',
+              f'__version__ = "{new}"',
+              src,
+              count=1,
+              flags=re.M,
+          )
+          if out == src:
+              raise SystemExit(f"Failed to rewrite __version__ in {path}")
+          open(path, "w").write(out)
+          print(f"Rewrote __version__ -> {new}")
+          PY
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Workaround for npm bug #4828: optionalDependencies (the
+      # platform-specific @rollup/rollup-* binaries) are not recorded in
+      # a package-lock.json generated on a single OS. The lockfile here
+      # was created on Windows, so Linux/macOS runners must install
+      # their binary explicitly. --no-save / --no-package-lock keep both
+      # files untouched.
+      - name: Install platform Rollup binary (workaround npm#4828)
+        shell: bash
+        run: |
+          case "${{ matrix.os }}" in
+            ubuntu-latest)  pkg="@rollup/rollup-linux-x64-gnu" ;;
+            macos-latest)   pkg="@rollup/rollup-darwin-arm64" ;;
+            windows-latest) exit 0 ;;
+          esac
+          npm install --no-save --no-package-lock "$pkg"
+
+      # Build the installer locally — do not let electron-builder publish.
+      # Reason: sync_ui_version.py converts the wheel's PEP 440 ``rcN``
+      # form to semver ``-rc.N`` for ui/package.json (npm refuses the
+      # no-separator form as a prerelease identifier). That makes
+      # electron-builder derive a publish tag of ``v0.2.1-rc.N.dev.M``
+      # — which differs from the original GitHub tag
+      # (``v0.2.1rc<N>.dev<M>``) and historically caused 422s when two
+      # matrix runners raced to create the release. Decoupling the
+      # publish below means electron-builder only builds, and we put
+      # the artifacts where they belong using ``gh release upload``.
+      - name: Build (test channel, no publish)
+        run: npm run build:test -- --publish never
+
+      # Upload the installer + the channel update manifest to the same
+      # prerelease the wheel job already created. electron-updater
+      # resolves asset URLs in ``latest-test*.yml`` relative to the
+      # release the yml itself lives in, so the tag matches the version
+      # baked into the filenames (``0.2.1-rc.N.dev.M`` semver form).
+      #
+      # Globs:
+      #   - ``release/*/Cremind*.*`` catches every installer
+      #     (.AppImage / .dmg / .exe) and the matching .blockmap files
+      #     electron-updater uses for differential downloads.
+      #   - ``release/*/latest*.yml`` catches just the update manifests
+      #     (skips ``builder-effective-config.yaml`` and the like).
+      # ``--clobber`` makes re-runs idempotent.
+      - name: Upload Electron installers to GH prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.wheel.outputs.tag }}
+        run: |
+          shopt -s nullglob
+          files=( release/*/Cremind*.* release/*/latest*.yml )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::No installer artifacts found under release/*/"
+            ls -la release/ || true
+            exit 1
+          fi
+          printf 'uploading: %s\n' "${files[@]}"
+          gh release upload "$TAG" "${files[@]}" \
+            --repo "${{ github.repository }}" \
+            --clobber
+
+  # Builds cremind/cremind-desktop:X.Y.ZrcN.devM against Test PyPI and
+  # pushes it to Docker Hub. Mirrors release-prod.yml's ``docker`` job;
+  # differences:
+  #   - Pulls the wheel from Test PyPI (with prod PyPI as fallback index
+  #     for transitive deps that only exist there).
+  #   - Tag is the PEP 440 form (0.2.1rc3.dev2), i.e. the GH tag
+  #     (v0.2.1rc3.dev2) with the ``v`` stripped.
+  #   - Does NOT emit ``:latest``.
+  #
+  # The wheel job's version rewrite happened on a different runner, so
+  # this job's clean checkout has the un-rewritten app/__version__.py.
+  # We re-apply the rewrite before the build because Dockerfile.desktop's
+  # SPA stage copies app/__version__.py + sync_ui_version.py to bake the
+  # version into the UI bundle. Without the rewrite, the wheel from Test
+  # PyPI (0.2.1rc3.dev2) and the UI (0.2.1) would disagree.
+  #
+  # cache scope=desktop is shared with release-prod.yml, so a prod or
+  # prior RC build's base layers are reused.
+  docker:
+    needs: wheel
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out cremind
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.wheel.outputs.tag }}
+
+      - name: Set up Python 3.13 (for version rewrite)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Rewrite app/__version__.py to ${{ needs.wheel.outputs.version }}
+        env:
+          NEW_VERSION: ${{ needs.wheel.outputs.version }}
+        run: |
+          python <<'PY'
+          import os, re
+          new = os.environ["NEW_VERSION"]
+          path = "app/__version__.py"
+          src = open(path).read()
+          out = re.sub(
+              r'^__version__\s*=\s*"[^"]*"',
+              f'__version__ = "{new}"',
+              src,
+              count=1,
+              flags=re.M,
+          )
+          if out == src:
+              raise SystemExit(f"Failed to rewrite __version__ in {path}")
+          open(path, "w").write(out)
+          print(f"Rewrote __version__ → {new}")
+          PY
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Test PyPI serves the JSON API (``/pypi/<pkg>/<ver>/json``) and the
+      # simple index (``/simple/<pkg>/``) from separate cache paths on
+      # Fastly; the JSON API can refresh ahead of the simple index. The
+      # next step reads the wheel URL from the simple index, so polling
+      # the JSON API previously gave false-positive readiness signals
+      # (an early RC hit exactly this — wheel published, JSON API
+      # ready, but the simple index didn't list it yet, so the resolve
+      # step failed). Poll the simple index directly so its readiness
+      # is the same readiness the next step needs.
+      - name: Wait for Test PyPI simple index to list cremind==${{ needs.wheel.outputs.version }}
+        env:
+          VERSION: ${{ needs.wheel.outputs.version }}
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsSL https://test.pypi.org/simple/cremind/ \
+                | grep -qE "cremind-${VERSION}-py3-none-any\.whl"; then
+              echo "Test PyPI simple index lists cremind-${VERSION}"
+              exit 0
+            fi
+            echo "Not yet ($i/60); sleeping 5s"
+            sleep 5
+          done
+          echo "::error::Test PyPI simple index never listed cremind-${VERSION} after 300s"
+          exit 1
+
+      # Resolve the cremind wheel to a direct URL so pip installs it without
+      # consulting Test PyPI as a resolver. Test PyPI is a public free-for-all
+      # polluted with broken stubs (e.g. ``FASTAPI-1.0.tar.gz``, a 2.5 KB
+      # setup.py with a missing ``DESCRIPTION.txt`` that satisfies
+      # ``fastapi>=0.115.2`` and crashes the setuptools build) and stale
+      # pre-releases (``httpx-1.0.dev3`` outranking prod's stable 0.28 once
+      # ``--pre`` is on). Pinning cremind by URL sidesteps both: pip pulls the
+      # wheel directly and resolves all transitive deps from default PyPI.
+      # Same pattern install/install.sh uses for the native test installer.
+      - name: Resolve Test PyPI wheel URL for cremind==${{ needs.wheel.outputs.version }}
+        id: wheel_url
+        env:
+          VERSION: ${{ needs.wheel.outputs.version }}
+        run: |
+          URL=$(curl -fsSL https://test.pypi.org/simple/cremind/ \
+            | grep -oE "https://[^\"]*cremind-${VERSION}-py3-none-any\.whl" \
+            | head -n 1)
+          if [ -z "$URL" ]; then
+            echo "::error::No wheel for cremind==${VERSION} on Test PyPI"
+            exit 1
+          fi
+          echo "Resolved: $URL"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push cremind/cremind-desktop (rc)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.desktop
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: cremind/cremind-desktop:${{ needs.wheel.outputs.version }}
+          build-args: |
+            CREMIND_PIP_SPEC=${{ steps.wheel_url.outputs.url }}
+          cache-from: type=gha,scope=desktop
+          cache-to: type=gha,scope=desktop,mode=max
+
+  # Flip the prerelease from draft to visible — but only after every
+  # asset-producing job has succeeded. If any of wheel / electron / docker
+  # fails, this job is skipped and the prerelease stays as a draft,
+  # invisible to test-channel installs. The maintainer can then either
+  # publish it manually for forensic install testing, or simply cut
+  # rc.N+1 once the underlying failure is fixed.
+  publish:
+    needs: [wheel, electron, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Promote RC prerelease (draft -> visible)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ needs.wheel.outputs.tag }}" \
+            --draft=false \
+            --repo "${{ github.repository }}"

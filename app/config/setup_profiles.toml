@@ -1,0 +1,143 @@
+# Setup wizard environment profiles.
+#
+# Each table defines a named bundle of defaults for one deployment shape
+# (local desktop, Docker compose, production server). The wizard pre-fills
+# its forms from the preset selected by ``SETUP_WIZARD_ENV`` in ``.env`` —
+# every field remains editable, so the operator can mostly click through
+# the steps and tweak only what they need.
+#
+# Recognised top-level keys per profile:
+#   label              — human-readable name (shown as the active-environment badge)
+#   description        — short subtitle
+#   server_config      — seeds StepServerConfig (DB provider, paths, etc.)
+#   embedding_config   — seeds StepEmbeddingConfig (provider, vector store)
+#
+# This file is the single source of truth for environment defaults and is
+# also consumable by external tooling (e.g. a future install.sh) via
+#   python -m app.config.setup_profiles --json
+
+# ── Local development ──────────────────────────────────────────────────────
+# Embedded storage on this machine. No external services required.
+
+[local]
+label = "Local Development"
+description = "Embedded storage on this machine. No external services required."
+
+[local.server_config]
+db_provider = "sqlite"
+sqlite_db_path = "cremind.db"
+service_name = "cremind-agent"
+agent_name = "Cremind Agent"
+user_working_dir = "~/Documents"
+
+[local.embedding_config]
+enabled = false
+provider = "me5"
+hf_token = ""
+
+[local.embedding_config.vectorstore]
+provider = "chroma"
+
+[local.embedding_config.vectorstore.qdrant]
+host = "localhost"
+port = 6333
+api_key = ""
+https = false
+
+[local.embedding_config.vectorstore.chroma]
+mode = "persistent"
+host = "localhost"
+port = 8000
+ssl = false
+api_key = ""
+persist_path = ""
+
+# ── Docker Compose ─────────────────────────────────────────────────────────
+# Storage services running as docker-compose siblings on the same network.
+# Hostnames assume the conventional service names.
+
+[docker]
+label = "Docker Compose"
+description = "Storage services running as docker-compose siblings. Connects via service hostnames."
+
+[docker.server_config]
+db_provider = "postgres"
+sqlite_db_path = "cremind.db"
+service_name = "cremind-agent"
+agent_name = "Cremind Agent"
+user_working_dir = "~/Documents"
+
+[docker.server_config.postgres]
+host = "postgres"
+port = 5432
+database = "cremind"
+user = "cremind"
+password = ""
+sslmode = "disable"
+
+[docker.embedding_config]
+enabled = true
+provider = "me5"
+hf_token = ""
+
+[docker.embedding_config.vectorstore]
+provider = "chroma"
+
+[docker.embedding_config.vectorstore.qdrant]
+host = "qdrant"
+port = 6333
+api_key = ""
+https = false
+
+[docker.embedding_config.vectorstore.chroma]
+mode = "http"
+host = "chroma"
+port = 8000
+ssl = false
+api_key = ""
+persist_path = ""
+
+# ── Production server ──────────────────────────────────────────────────────
+# External database and vector store. Hosts are blank — the operator
+# fills them in with real endpoints. SSL is on by default for both.
+
+[server]
+label = "Production Server"
+description = "External database and vector store. Provide your own endpoints."
+
+[server.server_config]
+db_provider = "postgres"
+sqlite_db_path = "cremind.db"
+service_name = "cremind-agent"
+agent_name = "Cremind Agent"
+user_working_dir = "~/Documents"
+
+[server.server_config.postgres]
+host = ""
+port = 5432
+database = "cremind"
+user = "cremind"
+password = ""
+sslmode = "require"
+
+[server.embedding_config]
+enabled = true
+provider = "me5"
+hf_token = ""
+
+[server.embedding_config.vectorstore]
+provider = "qdrant"
+
+[server.embedding_config.vectorstore.qdrant]
+host = ""
+port = 6333
+api_key = ""
+https = true
+
+[server.embedding_config.vectorstore.chroma]
+mode = "http"
+host = ""
+port = 8000
+ssl = true
+api_key = ""
+persist_path = ""

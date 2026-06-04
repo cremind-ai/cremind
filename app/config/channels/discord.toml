@@ -1,0 +1,40 @@
+[channel]
+type = "discord"
+display_name = "Discord"
+icon = "mdi:discord"
+supports_bot = true
+supports_userbot = true
+auth_modes = ["none", "otp", "password"]
+default_response_mode = "normal"
+implemented = false
+
+[[channel.modes]]
+id = "bot"
+label = "Bot"
+implemented = false
+instructions = """**Coming soon — adapter implementation pending.**
+
+1. Visit https://discord.com/developers/applications and create a new application.
+2. Open the Bot tab → Add Bot, then click 'Reset Token' and copy the token.
+3. Under Privileged Gateway Intents, enable MESSAGE CONTENT INTENT.
+4. Use OAuth2 → URL Generator to invite the bot (scopes: bot; permissions: Send Messages, Read Message History).
+5. Paste the bot token below."""
+[channel.modes.fields]
+bot_token = { description = "Bot Token", type = "string", secret = true, required = true }
+
+[[channel.modes]]
+id = "userbot"
+label = "Userbot (your account)"
+implemented = false
+instructions = """**Coming soon — and use at your own risk.**
+
+User-account automation ("selfbots") **violates Discord's Terms of
+Service** and can result in your account being banned. Discord enforces
+this — they detect non-official-client traffic. Only enable this if you
+have read https://discord.com/terms and accept the risk to your account.
+
+Configuration would require pasting your user authentication token,
+which is also a security risk: anyone with that token has full access
+to your Discord account."""
+[channel.modes.fields]
+user_token = { description = "User Auth Token (from browser DevTools)", type = "string", secret = true, required = true }

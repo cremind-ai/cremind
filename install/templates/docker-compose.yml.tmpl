@@ -1,0 +1,146 @@
+# Cremind Docker bundle.
+#
+# Four services defined; only ``cremind`` is started unconditionally —
+# the Setup Wizard activates the rest by appending their profile to
+# ``COMPOSE_PROFILES`` in the sibling ``.env`` and running
+# ``docker compose up -d`` from within the cremind container (via the
+# mounted Docker socket).
+#
+#   cremind    XFCE desktop + VNC + the Cremind agent + the SPA static
+#             server. The agent runs under the desktop session so it
+#             can drive a real GUI; observe at http://<host>:6080/vnc.html.
+#             Always started.
+#   postgres  Application database. Gated by ``with-postgres``;
+#             activated when the wizard picks Database = Postgres / Docker.
+#   qdrant    Vector store. Gated by ``with-qdrant``; activated when
+#             the wizard picks Vector Store = Qdrant / Docker.
+#   chroma   Vector store. Gated by ``with-chroma``; activated when the
+#             wizard picks Vector Store = ChromaDB / Docker.
+#
+# Compose project name is pinned via ``COMPOSE_PROJECT_NAME=cremind`` in
+# ``.env`` so the project name stays consistent whether docker compose
+# is invoked from the host or from inside the cremind container — the
+# named volumes (cremind-data, pg-data, …) only line up when the
+# project name matches.
+
+services:
+  cremind:
+    # Pre-built image pulled from Docker Hub. ``release.yml`` pushes
+    # ``cremind/cremind-desktop:<version>`` and ``:latest`` for the
+    # production channel; ``release-test.yml`` pushes
+    # ``cremind/cremind-desktop:<dev-version>`` for the test channel.
+    # ``CREMIND_VERSION`` is resolved at install time by install.sh /
+    # install.ps1 against PyPI (production) or Test PyPI (test). The
+    # dev channel re-adds a ``build:`` section via
+    # docker-compose.override.yml so it can build from a local
+    # checkout instead of pulling.
+    image: cremind/cremind-desktop:${CREMIND_VERSION}
+    ports:
+      - "${API_PORT:-1112}:1112"
+      - "${SPA_PORT:-1515}:1515"
+      - "${NOVNC_PORT:-6080}:80"
+      - "${VNC_PORT:-5900}:5900"
+    environment:
+      ENV: production
+      HOST: 0.0.0.0
+      PORT: 1112
+      APP_URL: ${APP_URL}
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      DISABLE_LOG: "false"
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
+      SETUP_WIZARD_ENV: ${SETUP_WIZARD_ENV:-local}
+      # How Cremind was installed. Read by the backend's service-mode
+      # filter (see install_catalog.toml's [mode_rules]) so the Setup
+      # Wizard only offers per-service modes that match the install.
+      INSTALL_MODE: ${INSTALL_MODE:-docker}
+      # Release channel — the installer writes this into the sibling
+      # ``.env`` (production / test / dev). The container's feature
+      # installer reads it via ``app.upgrade.channel.get_channel()`` and
+      # uses it to pick ``pip_spec()`` behavior (dev skips the
+      # ``==<version>`` pin because the editable install in /src already
+      # satisfies it).
+      CREMIND_UPGRADE_CHANNEL: ${CREMIND_UPGRADE_CHANNEL:-}
+      # Where the in-container Setup Wizard finds the compose file
+      # and ``.env`` to drive ``docker compose up -d`` for sidecar
+      # services. The host directory is bind-mounted as
+      # /opt/cremind-compose below.
+      CREMIND_COMPOSE_FILE: /opt/cremind-compose/docker-compose.yml
+      CREMIND_COMPOSE_ENV_FILE: /opt/cremind-compose/.env
+      VNC_PASSWORD: ${VNC_PASSWORD}
+      RESOLUTION: ${RESOLUTION:-1280x720}
+    volumes:
+      # Cremind System Directory lives in a named Docker volume, isolated
+      # from the host filesystem. Storage, tokens, profile dirs, .env,
+      # bootstrap.toml are all written inside the volume — the host's
+      # ~/.cremind is untouched by Docker installs. Survives ``docker
+      # compose down``; wiped by ``docker compose down -v`` (purge
+      # uninstall) along with the other named volumes. Inspect with:
+      #   docker run --rm -v cremind_cremind-data:/data busybox ls /data
+      - cremind-data:/root/.cremind
+      # The runtime venv lives in a named volume so wizard-installed
+      # extras (sentence-transformers, qdrant-client, anthropic, ...)
+      # persist across ``docker compose down && up``. The entrypoint
+      # seeds this from /opt/cremind-baseline/venv (baked into the
+      # image) on first boot.
+      - cremind-venv:/opt/cremind/venv
+      # The compose project directory itself, mounted read-write so the
+      # provisioner can append to COMPOSE_PROFILES + write per-service
+      # env vars (Postgres credentials, …) in ``.env``.
+      - ./:/opt/cremind-compose
+      # Docker socket: lets the in-container backend run
+      # ``docker compose up -d <service>`` against the host daemon
+      # when the wizard picks Docker mode for a sidecar service. This
+      # is a privileged capability — anyone with shell access to the
+      # cremind container can drive the host's Docker.
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+  postgres:
+    profiles: ["with-postgres"]
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${PG_DATABASE:-cremind}
+      POSTGRES_USER: ${PG_USER:-cremind}
+      # Set by the Setup Wizard's Docker provisioner when the user picks
+      # Database = Postgres / Docker. Empty means the service is defined
+      # but not activated.
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      # ``pg_isready`` returns 0 once Postgres is accepting connections;
+      # the wizard's provisioner polls the TCP port directly (matches
+      # this readiness semantically and doesn't depend on the
+      # ``$$POSTGRES_USER`` env-var escape working under every docker
+      # CLI version).
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  qdrant:
+    profiles: ["with-qdrant"]
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+
+  chroma:
+    profiles: ["with-chroma"]
+    image: chromadb/chroma:latest
+    volumes:
+      - chroma-data:/chroma/chroma
+    restart: unless-stopped
+
+volumes:
+  # cremind-data holds the Cremind System Directory contents (storage/,
+  # tokens/, profile dirs, .env, bootstrap.toml). Sidecar service volumes
+  # and the runtime venv are named volumes too — nothing on the host
+  # needs to inspect any of them directly.
+  cremind-data:
+  cremind-venv:
+  pg-data:
+  qdrant-data:
+  chroma-data:

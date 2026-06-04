@@ -1,0 +1,64 @@
+[provider]
+name = "google-gemini"
+display_name = "Google Gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "Google Gemini API key"
+hint = "AI Studio / Gemini API key"
+instructions = "Enter your Gemini API key. Get one from https://aistudio.google.com/apikey"
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "Gemini API Key", type = "string", secret = true, required = true }
+
+[[models]]
+id = "gemini-3.1-pro-preview"
+display_name = "Gemini 3.1 Pro"
+group_hint = "high"
+input_price_per_1m = 2.00
+output_price_per_1m = 12.00
+
+[[models]]
+id = "gemini-3-flash-preview"
+display_name = "Gemini 3 Flash"
+group_hint = "low"
+input_price_per_1m = 0.50
+output_price_per_1m = 3.00
+
+[[models]]
+id = "gemini-3.1-flash-lite-preview"
+display_name = "Gemini 3.1 Flash Lite"
+group_hint = "low"
+input_price_per_1m = 0.25
+output_price_per_1m = 1.50
+
+[[models]]
+id = "gemini-2.5-pro"
+display_name = "Gemini 2.5 Pro"
+group_hint = "high"
+input_price_per_1m = 1.25
+output_price_per_1m = 10.00
+
+[[models]]
+id = "gemini-2.5-flash"
+display_name = "Gemini 2.5 Flash"
+group_hint = "low"
+input_price_per_1m = 0.30
+output_price_per_1m = 2.50
+
+[[models]]
+id = "gemini-2.5-flash-lite"
+display_name = "Gemini 2.5 Flash Lite"
+group_hint = "low"
+input_price_per_1m = 0.10
+output_price_per_1m = 0.40
+
+[[models]]
+id = "gemini-2.0-flash"
+display_name = "Gemini 2.0 Flash"
+group_hint = "low"
+input_price_per_1m = 0.10
+output_price_per_1m = 0.40

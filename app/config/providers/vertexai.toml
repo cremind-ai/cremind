@@ -1,0 +1,75 @@
+[provider]
+name = "vertexai"
+display_name = "Google Vertex AI"
+requires_api_key = false
+requires_service_account = true
+
+[provider.config_fields]
+service_account = { description = "Service Account JSON", type = "json", secret = true, required = true }
+project_id = { description = "GCP Project ID", type = "string", secret = false, required = true }
+location = { description = "GCP Region", type = "string", secret = false, required = false, default = "global" }
+
+[[provider.auth_methods]]
+id = "service_account"
+label = "Service Account"
+hint = "Use a GCP service account JSON key"
+instructions = "Create a service account at https://console.cloud.google.com/iam-admin/serviceaccounts — create a key in JSON format. The service account needs the 'Vertex AI User' role."
+kind = "service_account"
+is_default = true
+
+[provider.auth_methods.fields]
+service_account = { description = "Service Account JSON", type = "json", secret = true, required = true }
+project_id = { description = "GCP Project ID", type = "string", secret = false, required = true }
+location = { description = "GCP Region", type = "string", secret = false, required = false, default = "global" }
+
+[[models]]
+id = "google/gemini-3.1-pro-preview"
+display_name = "Gemini 3.1 Pro"
+group_hint = "high"
+input_price_per_1m = 2.00
+output_price_per_1m = 12.00
+reasoning_effort = ["low", "medium", "high"]
+
+[[models]]
+id = "google/gemini-3-flash-preview"
+display_name = "Gemini 3 Flash"
+group_hint = "low"
+input_price_per_1m = 0.50
+output_price_per_1m = 3.00
+reasoning_effort = ["low", "medium", "high"]
+
+[[models]]
+id = "google/gemini-3.1-flash-lite-preview"
+display_name = "Gemini 3.1 Flash Lite"
+group_hint = "low"
+input_price_per_1m = 0.25
+output_price_per_1m = 1.50
+reasoning_effort = ["low", "medium", "high"]
+
+[[models]]
+id = "google/gemini-2.5-pro"
+display_name = "Gemini 2.5 Pro"
+group_hint = "high"
+input_price_per_1m = 1.25
+output_price_per_1m = 10.00
+
+[[models]]
+id = "google/gemini-2.5-flash"
+display_name = "Gemini 2.5 Flash"
+group_hint = "low"
+input_price_per_1m = 0.30
+output_price_per_1m = 2.50
+
+[[models]]
+id = "google/gemini-2.5-flash-lite"
+display_name = "Gemini 2.5 Flash Lite"
+group_hint = "low"
+input_price_per_1m = 0.10
+output_price_per_1m = 0.40
+
+[[models]]
+id = "google/gemini-2.0-flash"
+display_name = "Gemini 2.0 Flash"
+group_hint = "low"
+input_price_per_1m = 0.15
+output_price_per_1m = 0.60

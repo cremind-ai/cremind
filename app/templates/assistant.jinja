@@ -1,0 +1,52 @@
+{% if introduce_assistant %}
+<INTRODUCE_ASSISTANT>
+{{ introduce_assistant | indent(2, True) }}
+</INTRODUCE_ASSISTANT>
+{% endif %}
+{% if main_task %}
+<MAIN_TASK>
+{{ main_task | indent(2, True) }}
+</MAIN_TASK>
+{% endif %}
+{% if requirements %}
+<REQUIREMENTS>
+{{ requirements | indent(2, True) }}
+</REQUIREMENTS>
+{% endif %}
+{% if assistant_knowledge %}
+<ASSISTANT_KNOWLEDGE>
+{{ assistant_knowledge | indent(2, True) }}
+</ASSISTANT_KNOWLEDGE>
+{% endif %}
+{% if internet_search_results %}
+<INTERNET_SEARCH_RESULTS>
+{{ internet_search_results | indent(2, True) }}
+</INTERNET_SEARCH_RESULTS>
+{% endif %}
+{% if policy %}
+<POLICY>
+  You must avoid the topics mentioned in these rules. Your answer must comply and avoid violating the rules, your answer must follow the rules below:
+{{ policy | indent(2, True) }}
+</POLICY>
+{% endif %}
+{% if tools %}
+<TOOLS>
+  At the same time, with the same user input command, you will call these tools simultaneously and receive data responses from each tool, based on the results returned from the tools, it will provide complete information and suggestions for you to synthesize and return the final result. Typically, only one tool will have the most appropriate answer to the user's question. You should filter out from these tools to get the most accurate final answer.
+{{ tools | indent(2, True) }}
+</TOOLS>
+{% endif %}
+{% if devices_info %}
+<DEVICES_INFO>
+{{ devices_info | indent(2, True) }}
+</DEVICES_INFO>
+{% endif %}
+{% if response_format %}
+<RESPONSE_FORMAT>
+{{ response_format | indent(2, True) }}
+</RESPONSE_FORMAT>
+{% endif %}
+{% if language %}
+<LANGUAGE>
+{{ language | indent(2, True) }}
+</LANGUAGE>
+{% endif %}

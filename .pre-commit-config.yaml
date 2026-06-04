@@ -1,0 +1,43 @@
+# Pre-commit hooks for Cremind.
+#
+# Install once per checkout:   uv run pre-commit install
+# Run manually on all files:   uv run pre-commit run --all-files
+#
+# CI also runs `ruff check` and `ruff format --check` so this config is the
+# local mirror of what the PR gate enforces.
+
+repos:
+  # Ruff — lint + format. Single binary, cross-platform (works on Windows
+  # without needing WSL/git-bash).
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # Mirror app/__version__.py → ui/package.json so the two never drift.
+  # Same script that runs as npm's prebuild/preweb:build hook — running it
+  # here catches version bumps that touched only the Python side.
+  - repo: local
+    hooks:
+      - id: sync-ui-version
+        name: sync ui version from app/__version__.py
+        entry: python scripts/sync_ui_version.py
+        language: system
+        files: ^(app/__version__\.py|ui/package\.json)$
+        pass_filenames: false
+
+  # Generic hygiene.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(app/static/ui/|ui/dist|ui/dist-web)
+      - id: end-of-file-fixer
+        exclude: ^(app/static/ui/|ui/dist|ui/dist-web)
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: [--fix=no]   # report only; .gitattributes governs the truth

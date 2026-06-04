@@ -1,0 +1,50 @@
+[provider]
+name = "huggingface"
+display_name = "Hugging Face"
+base_url = "https://api-inference.huggingface.co/v1"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "Hugging Face API key"
+hint = "Inference API (HF token)"
+instructions = "Enter your Hugging Face API key. Manage tokens at https://huggingface.co/settings/tokens"
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "Hugging Face Token", type = "string", secret = true, required = true }
+
+[[models]]
+id = "Qwen/Qwen3-235B-A22B"
+display_name = "Qwen 3 235B"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "meta-llama/Llama-3.3-70B-Instruct"
+display_name = "Llama 3.3 70B"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "deepseek-ai/DeepSeek-R1"
+display_name = "DeepSeek R1"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+display_name = "Llama 4 Scout"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "google/gemma-3-27b-it"
+display_name = "Gemma 3 27B"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00

@@ -1,0 +1,348 @@
+"""SQLAlchemy ORM models for Cremind's persistence layer.
+
+All tool-related state is keyed by ``tool_id`` (a slugified, globally-unique
+identifier). Profiles cascade-delete their conversations, messages, configs,
+profile-tool memberships, and per-profile tool configs.
+
+Tables
+------
+- profiles            : tenant identity
+- channels            : per-profile messaging channels; one ``main`` row per
+                        profile is auto-created. UNIQUE(profile, channel_type).
+                        (FK profile, CASCADE)
+- conversations       : chat threads (FK profile CASCADE, FK channel CASCADE)
+- messages            : per-conversation messages (FK conversation, CASCADE)
+- channel_senders     : external sender state per channel — auth + per-sender
+                        conversation pointer (FK channel CASCADE,
+                        FK conversation SET NULL)
+- auth_tokens         : per-profile OAuth tokens for tools (FK profile, CASCADE)
+- tools               : global tool registry (one row per tool_id)
+- profile_tools       : M:N join for A2A and MCP tools per profile
+                        (FK profile CASCADE, FK tool CASCADE)
+- tool_configs        : per-profile per-tool scoped config
+                        (FK profile CASCADE, FK tool CASCADE)
+- server_config       : global server settings (no FK)
+- llm_config          : per-profile LLM settings (FK profile, CASCADE)
+- user_config         : per-profile general application settings (FK profile, CASCADE)
+"""
+
+import uuid
+from typing import Any
+
+from sqlalchemy import JSON, Boolean, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column
+
+from a2a.server.models import Base
+
+
+class ProfileModel(Base):
+    __tablename__ = "profiles"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+    skill_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="manual")
+
+
+class ChannelModel(Base):
+    """Per-profile messaging channel.
+
+    Each profile has exactly one ``main`` channel (auto-created with the
+    profile) representing the built-in web/CLI conversations. External
+    channels (telegram/whatsapp/discord/messenger/slack) are added by the
+    user; ``UNIQUE(profile, channel_type)`` enforces one connection per type
+    per profile.
+
+    Secrets (bot tokens, passwords) are NOT stored in ``config`` — they go
+    into ``dynamic_config_storage`` keyed by ``("channels", f"{id}.{field}")``
+    with ``is_secret=True`` so existing redaction applies.
+    """
+
+    __tablename__ = "channels"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False, index=True
+    )
+    channel_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default="bot")
+    auth_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="none")
+    response_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="normal")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    state: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("profile", "channel_type", name="uq_channels_profile_type"),
+    )
+
+
+class ConversationModel(Base):
+    __tablename__ = "conversations"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True, default=lambda: str(uuid.uuid4()))
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Nullable in the SQLAlchemy model so existing rows pass the additive
+    # ALTER TABLE migration. New rows always populate this (storage layer
+    # resolves the profile's main channel when no channel_id is passed).
+    channel_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("channels.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    context_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    # Wide enough for composite task ids like ``msg:<conv-uuid>:<msg-uuid>``
+    # produced by the A2A executor (~77 chars). 36 was the original sizing
+    # for bare UUIDs, which Postgres VARCHAR strictly enforces.
+    task_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    title: Mapped[str] = mapped_column(String(256), default="Untitled Chat")
+    # Per-conversation override of the agent's working directory. Mirrors the
+    # value held in ContextStorage under ``_working_directory_override`` and
+    # survives server restarts (ContextStorage is in-memory only). Validated
+    # against the filesystem on conversation load — stale entries (path was
+    # deleted) are cleared and the conversation falls back to the user
+    # default. ``NULL`` means "no override, use the user default".
+    working_directory: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class MessageModel(Base):
+    __tablename__ = "messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    conversation_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parts: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    thinking_steps: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    token_usage: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    message_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, name="metadata")
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    ordering: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class ChannelSenderModel(Base):
+    """External sender state for a channel — auth flag + per-sender conversation.
+
+    ``conversation_id`` uses ``ON DELETE SET NULL`` (instead of CASCADE) so
+    deleting a single conversation doesn't drop the sender's auth/OTP state.
+    Channel deletion still cascades both rows away via ``channel_id``.
+    """
+
+    __tablename__ = "channel_senders"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    channel_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    sender_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    authenticated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    pending_otp: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    pending_otp_expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("channel_id", "sender_id", name="uq_channel_senders"),
+    )
+
+
+class AuthTokenModel(Base):
+    __tablename__ = "auth_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    # ``agent_name`` is kept as the lookup key (instead of FK-ing to tools)
+    # because OAuth tokens are sometimes saved before the corresponding tool
+    # row has been created (e.g., during MCP server registration). Profile
+    # cascade still cleans them up on profile deletion.
+    agent_name: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False, index=True
+    )
+    agent_type: Mapped[str] = mapped_column(String(32), nullable=False, default="a2a")
+    token_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="access_token")
+    token: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class ToolModel(Base):
+    """Global tool registry. Intrinsic tools are NOT persisted here (always in-memory)."""
+    __tablename__ = "tools"
+
+    tool_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    tool_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    arguments_schema: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    extra: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    owner_profile: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("tool_type", "source", name="uq_tools_type_source"),
+    )
+
+
+class ProfileToolModel(Base):
+    """M:N visibility/enabled state. Populated only for a2a / mcp tool types."""
+    __tablename__ = "profile_tools"
+
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), primary_key=True
+    )
+    # ON UPDATE CASCADE so a tool can be atomically renamed (used to displace a
+    # dynamic tool when a fixed-name intrinsic/built-in tool claims its slug).
+    tool_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("tools.tool_id", ondelete="CASCADE", onupdate="CASCADE"),
+        primary_key=True,
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    added_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class ToolConfigModel(Base):
+    """Per-profile per-tool configuration scoped by purpose.
+
+    scope ∈ {'arg', 'variable', 'llm', 'meta'}.
+    """
+    __tablename__ = "tool_configs"
+
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), primary_key=True
+    )
+    tool_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("tools.tool_id", ondelete="CASCADE", onupdate="CASCADE"),
+        primary_key=True,
+    )
+    scope: Mapped[str] = mapped_column(String(16), primary_key=True)
+    key: Mapped[str] = mapped_column(String(256), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    is_secret: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class ServerConfigModel(Base):
+    """Global server-wide dynamic configuration."""
+    __tablename__ = "server_config"
+
+    key: Mapped[str] = mapped_column(String(256), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    is_secret: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class LLMConfigModel(Base):
+    """Per-profile LLM provider credentials and model group assignments."""
+    __tablename__ = "llm_config"
+
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), primary_key=True,
+    )
+    key: Mapped[str] = mapped_column(String(256), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    is_secret: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class UserConfigModel(Base):
+    """Per-profile general application configuration (Settings → Config page).
+
+    Distinct from ``llm_config`` (provider credentials) and ``server_config``
+    (global). Drives runtime tunables such as agent ``max_steps``, history
+    token windows, and per-LLM-call retry counts.
+    """
+    __tablename__ = "user_config"
+
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), primary_key=True,
+    )
+    key: Mapped[str] = mapped_column(String(256), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class AutostartProcessModel(Base):
+    """Long-running processes registered to (re)start with the Cremind server."""
+    __tablename__ = "autostart_processes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    profile: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    command: Mapped[str] = mapped_column(Text, nullable=False)
+    working_dir: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    is_pty: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_attempted_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class SkillEventSubscriptionModel(Base):
+    """Conversation-scoped subscription to a skill's filesystem event.
+
+    A row says: when ``<skill_dir>/events/<event_type>/<id>.md`` appears for
+    the skill named ``skill_name``, run ``action`` (a natural-language
+    instruction) in ``conversation_id`` with the file content appended.
+
+    Multiple rows for the same (conversation_id, skill_name, event_type) are
+    allowed — when the event fires they execute sequentially in created_at
+    order via the per-conversation queue worker.
+    """
+    __tablename__ = "skill_event_subscriptions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    conversation_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    profile: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    skill_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class FileWatcherSubscriptionModel(Base):
+    """Conversation-scoped subscription to a filesystem watch.
+
+    A row says: while the Cremind server is running, watch ``root_path`` (with
+    optional recursion) for filesystem events of types listed in
+    ``event_types``; when one fires, build a synthetic trigger payload from
+    the watchdog event and run ``action`` in ``conversation_id``.
+
+    ``event_types`` and ``extensions`` use comma-separated strings to match
+    the existing storage convention (skill_event_subscriptions, channels) —
+    bounded enums/extensions, no JSON1 dependency, easy LIKE queries.
+
+    ``target_kind`` ∈ {"file", "folder", "any"} narrows which watchdog
+    events the handler dispatches.
+    """
+    __tablename__ = "file_watcher_subscriptions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    conversation_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    profile: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    root_path: Mapped[str] = mapped_column(Text, nullable=False)
+    recursive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    target_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="any")
+    event_types: Mapped[str] = mapped_column(String(128), nullable=False)
+    extensions: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)

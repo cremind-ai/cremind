@@ -1,0 +1,46 @@
+[provider]
+name = "minimax"
+display_name = "MiniMax"
+base_url = "https://api.minimax.io/v1"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "MiniMax API key (Global)"
+hint = "Global endpoint - api.minimax.io"
+instructions = "Enter your MiniMax API key (sk-api- or sk-cp- prefix). Manage keys at: https://platform.minimax.io/user-center/basic-information/interface-key"
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "MiniMax API Key", type = "string", secret = true, required = true }
+
+[[provider.auth_methods]]
+id = "api_key_cn"
+label = "MiniMax API key (CN)"
+hint = "CN endpoint - api.minimaxi.com"
+instructions = "Enter your MiniMax CN API key (sk-api- or sk-cp- prefix). Manage keys at: https://platform.minimaxi.com/user-center/basic-information/interface-key"
+kind = "api_key"
+
+[provider.auth_methods.fields]
+api_key = { description = "MiniMax API Key", type = "string", secret = true, required = true }
+
+[[models]]
+id = "MiniMax-M2.7"
+display_name = "MiniMax M2.7"
+group_hint = "high"
+input_price_per_1m = 0.30
+output_price_per_1m = 1.20
+
+[[models]]
+id = "MiniMax-M2.5"
+display_name = "MiniMax M2.5"
+group_hint = "high"
+input_price_per_1m = 0.12
+output_price_per_1m = 0.95
+
+[[models]]
+id = "MiniMax-M1"
+display_name = "MiniMax M1"
+group_hint = "high"
+input_price_per_1m = 0.40
+output_price_per_1m = 1.76

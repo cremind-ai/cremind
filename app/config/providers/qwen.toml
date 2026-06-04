@@ -1,0 +1,67 @@
+[provider]
+name = "qwen"
+display_name = "Qwen Cloud"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "Standard API Key (Global)"
+hint = "Endpoint: dashscope-intl.aliyuncs.com"
+instructions = "Manage API keys: https://home.qwencloud.com/api-keys — Docs: https://docs.qwencloud.com/ — Uses the global endpoint at dashscope-intl.aliyuncs.com/compatible-mode/v1"
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "Qwen Cloud API Key", type = "string", secret = true, required = true }
+
+[[provider.auth_methods]]
+id = "api_key_cn"
+label = "Standard API Key (China)"
+hint = "Endpoint: dashscope.aliyuncs.com"
+instructions = "Manage API keys: https://home.qwencloud.com/api-keys — Docs: https://docs.qwencloud.com/ — Uses the China endpoint at dashscope.aliyuncs.com/compatible-mode/v1"
+kind = "api_key"
+
+[provider.auth_methods.fields]
+api_key = { description = "Qwen Cloud API Key", type = "string", secret = true, required = true }
+
+[[models]]
+id = "qwen-max"
+display_name = "Qwen3 Max"
+group_hint = "high"
+input_price_per_1m = 0.78
+output_price_per_1m = 3.90
+
+[[models]]
+id = "qwen-plus"
+display_name = "Qwen3.5 Plus"
+group_hint = "high"
+input_price_per_1m = 0.26
+output_price_per_1m = 1.56
+
+[[models]]
+id = "qwen-turbo"
+display_name = "Qwen Turbo"
+group_hint = "low"
+input_price_per_1m = 0.05
+output_price_per_1m = 0.20
+
+[[models]]
+id = "qwen3-235b-a22b"
+display_name = "Qwen 3 235B"
+group_hint = "high"
+input_price_per_1m = 0.80
+output_price_per_1m = 2.40
+
+[[models]]
+id = "qwen3-32b"
+display_name = "Qwen 3 32B"
+group_hint = "high"
+input_price_per_1m = 0.20
+output_price_per_1m = 0.60
+
+[[models]]
+id = "qwen3-coder-plus"
+display_name = "Qwen3 Coder Plus"
+group_hint = "high"
+input_price_per_1m = 0.65
+output_price_per_1m = 3.25

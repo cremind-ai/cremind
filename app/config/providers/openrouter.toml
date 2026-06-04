@@ -1,0 +1,57 @@
+[provider]
+name = "openrouter"
+display_name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "OpenRouter API key"
+hint = "API key"
+instructions = "Enter your OpenRouter API key. Manage keys at https://openrouter.ai/settings/keys — OpenRouter provides unified access to 100+ models from multiple providers."
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "OpenRouter API Key", type = "string", secret = true, required = true }
+
+[[models]]
+id = "anthropic/claude-opus-4.7"
+display_name = "Claude Opus 4.7 (via OpenRouter)"
+group_hint = "high"
+input_price_per_1m = 5.00
+output_price_per_1m = 25.00
+
+[[models]]
+id = "anthropic/claude-sonnet-4.6"
+display_name = "Claude Sonnet 4.6 (via OpenRouter)"
+group_hint = "high"
+input_price_per_1m = 3.00
+output_price_per_1m = 15.00
+
+[[models]]
+id = "openai/gpt-5.4"
+display_name = "GPT-5.4 (via OpenRouter)"
+group_hint = "high"
+input_price_per_1m = 2.50
+output_price_per_1m = 15.00
+
+[[models]]
+id = "google/gemini-2.5-pro"
+display_name = "Gemini 2.5 Pro (via OpenRouter)"
+group_hint = "high"
+input_price_per_1m = 1.25
+output_price_per_1m = 10.00
+
+[[models]]
+id = "deepseek/deepseek-chat"
+display_name = "DeepSeek V3.2 (via OpenRouter)"
+group_hint = "high"
+input_price_per_1m = 0.28
+output_price_per_1m = 0.42
+
+[[models]]
+id = "meta-llama/llama-4-maverick"
+display_name = "Llama 4 Maverick (via OpenRouter)"
+group_hint = "high"
+input_price_per_1m = 0.27
+output_price_per_1m = 0.85

@@ -1,0 +1,18 @@
+export const PROFILE_ROUTES = new Set([
+  'chat',
+  'conversation',
+  'settings',
+  'llm-settings',
+  'tools-skills-settings',
+  'user-config-settings',
+  'embedding-settings',
+  'profile-settings',
+  'channels-settings',
+  'updates',
+  'about',
+  'channels-page',
+  'process-list',
+  'process-terminal',
+  'skill-events',
+  'developer',
+]);

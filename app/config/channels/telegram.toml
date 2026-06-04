@@ -1,0 +1,44 @@
+[channel]
+type = "telegram"
+display_name = "Telegram"
+icon = "mdi:telegram"
+supports_bot = true
+supports_userbot = true
+auth_modes = ["none", "otp", "password"]
+default_response_mode = "normal"
+
+[[channel.modes]]
+id = "bot"
+label = "Bot"
+implemented = true
+instructions = """1. Open Telegram and start a chat with @BotFather.
+2. Send /newbot and follow the prompts to choose a name and username.
+3. BotFather will reply with an HTTP API token — paste it below.
+4. Anyone who finds your bot's username can DM it; the Cremind agent will reply."""
+[channel.modes.fields]
+bot_token = { description = "Bot API Token", type = "string", secret = true, required = true }
+
+[[channel.modes]]
+id = "userbot"
+label = "Userbot (your account)"
+implemented = true
+setup_kind = "code"
+instructions = """Runs under your own Telegram account, with the agent auto-replying
+to DMs on your behalf. Telegram's TOS explicitly permits userbots (this
+is what Telethon and Pyrogram are designed for).
+
+Setup:
+1. Visit https://my.telegram.org/auth, sign in with your phone, and
+   create an application to get an API ID and API Hash.
+2. Paste both below plus your phone (international format).
+3. After saving, Cremind will prompt for a verification code — Telegram
+   sends it through the Telegram app itself (or by SMS if no other
+   Telegram session is connected). Enter it in the pairing dialog.
+4. If your account has two-step verification, you'll also be prompted
+   for the cloud password.
+5. Pick an authentication mode (none / OTP / password) so unknown
+   senders are gated before the agent runs for them."""
+[channel.modes.fields]
+api_id = { description = "API ID (from my.telegram.org)", type = "string", required = true }
+api_hash = { description = "API Hash (from my.telegram.org)", type = "string", secret = true, required = true }
+phone = { description = "Phone (international format, e.g. +14155551212)", type = "string", required = true }

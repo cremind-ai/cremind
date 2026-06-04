@@ -1,0 +1,43 @@
+[provider]
+name = "perplexity"
+display_name = "Perplexity"
+base_url = "https://api.perplexity.ai"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "API Key"
+hint = "Use your Perplexity API key"
+instructions = "Get your API key at https://www.perplexity.ai/settings/api — sign in and generate a new API key under Settings > API."
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "Perplexity API Key", type = "string", secret = true, required = true }
+
+[[models]]
+id = "sonar-pro"
+display_name = "Sonar Pro"
+group_hint = "high"
+input_price_per_1m = 3.00
+output_price_per_1m = 15.00
+
+[[models]]
+id = "sonar"
+display_name = "Sonar"
+group_hint = "low"
+input_price_per_1m = 1.00
+output_price_per_1m = 1.00
+
+[[models]]
+id = "sonar-reasoning-pro"
+display_name = "Sonar Reasoning Pro"
+group_hint = "high"
+input_price_per_1m = 2.00
+output_price_per_1m = 8.00
+
+[[models]]
+id = "sonar-deep-research"
+display_name = "Sonar Deep Research"
+group_hint = "high"
+input_price_per_1m = 2.00
+output_price_per_1m = 8.00

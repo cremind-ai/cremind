@@ -1,0 +1,199 @@
+# Periodic cleanup of release-candidate artifacts. Once a production
+# release ``vX.Y.Z`` has been live for at least 30 days, all RC artifacts
+# for that ``X.Y.Z`` are removed:
+#   - Docker Hub tags matching ``cremind/cremind-desktop:<X.Y.Z>rcN.devM``
+#   - GitHub prereleases tagged ``v<X.Y.Z>rcN.devM``
+# (The regexes below are permissive enough to also clean up any
+# pre-migration artifacts in the older hyphenated ``v<...>-rc.N[.dev.M]``
+# shape that may still be on Docker Hub / GitHub.)
+#
+# The corresponding git tags are intentionally NOT deleted. They're tiny,
+# and release-prod.yml's verify gate inspects them retrospectively when
+# shipping future versions ("at least one validated dev release for this
+# version exists on main"). Removing them would break that audit trail.
+#
+# Why "prod release ≥ 30 days old" rather than "RC older than N days":
+#   Test-channel installs (``CREMIND_UPGRADE_CHANNEL=test``) discover their
+#   next upgrade by listing GH prereleases — see ``_fetch_latest_test`` in
+#   app/upgrade/manifest.py and the comment block at release-rc.yml:228.
+#   Deleting a prerelease before a prod artifact for that version exists
+#   would strand any test-channel install that hadn't yet picked it up.
+#   Tying retention to "prod has shipped, and shipped a while ago" gives
+#   every test-channel user a real path forward (upgrade to prod, or move
+#   to a newer X.Y.Z's test channel) before the artifact disappears.
+#   30 days of overlap absorbs slow upgrade re-checks.
+#
+# Required repo secrets:
+#   DOCKERHUB_USERNAME — same secret used by release-{prod,rc}.yml.
+#   DOCKERHUB_TOKEN    — Docker Hub PAT (Read+Write scope). Used both for
+#                        the registry (push) and the management API (tag
+#                        delete). Same token, both jobs.
+#   GITHUB_TOKEN       — auto-provided; used by the gh CLI.
+
+name: cleanup-rc
+
+on:
+  schedule:
+    # 06:00 UTC every Monday — low-traffic window worldwide.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Log what would be deleted without actually deleting"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # gh release delete needs this
+    steps:
+      # Manual invocations default to dry-run for safety; the weekly cron
+      # always runs for real (otherwise nothing would ever get cleaned up).
+      - name: Resolve mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "dry_run=${{ github.event.inputs.dry_run }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Clean up superseded RC artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+        run: |
+          python3 <<'PY'
+          import json, os, re, subprocess, sys
+          import urllib.error, urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          REPO = os.environ["GH_REPO"]
+          DOCKER_REPO = "cremind/cremind-desktop"
+          RETENTION_DAYS = 30
+          DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+          cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+          mode = "DRY-RUN" if DRY_RUN else "LIVE"
+          print(f"[{mode}] retention={RETENTION_DAYS}d  cutoff={cutoff.isoformat()}")
+
+          # Step 1 — enumerate every GH release on the repo.
+          out = subprocess.check_output(
+              ["gh", "release", "list", "--repo", REPO, "--limit", "1000",
+               "--json", "tagName,isDraft,isPrerelease,publishedAt"],
+              text=True,
+          )
+          releases = json.loads(out)
+
+          # Step 2 — pick prod versions whose release is older than the
+          # cutoff. The "prod release exists" check has to be done against
+          # GH releases (not git tags) because that's what proves the
+          # release process actually finished — a stray git tag without a
+          # finalized release means release-prod.yml failed somewhere and
+          # we should keep the RCs around for forensics.
+          prod_re = re.compile(r"^v(\d+\.\d+\.\d+(?:\.\d+)?)$")
+          superseded = set()
+          for r in releases:
+              if r["isDraft"] or r["isPrerelease"] or not r["publishedAt"]:
+                  continue
+              m = prod_re.match(r["tagName"])
+              if not m:
+                  continue
+              published = datetime.fromisoformat(r["publishedAt"].replace("Z", "+00:00"))
+              if published < cutoff:
+                  superseded.add(m.group(1))
+
+          if not superseded:
+              print("No prod releases meet the retention cutoff — nothing to do.")
+              sys.exit(0)
+          print(f"Cleaning RCs for: {sorted(superseded)}")
+
+          # Step 3 — exchange the Docker Hub PAT for a hub.docker.com JWT.
+          # The tag-delete endpoint is a Hub-UI API, not the registry-v2
+          # protocol, so ``docker login`` alone isn't enough.
+          login = urllib.request.Request(
+              "https://hub.docker.com/v2/users/login/",
+              data=json.dumps({
+                  "username": os.environ["DOCKERHUB_USERNAME"],
+                  "password": os.environ["DOCKERHUB_TOKEN"],
+              }).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(login) as resp:
+              jwt = json.load(resp)["token"]
+
+          # Step 4 — paginate through every Docker Hub tag on the image.
+          dh_tags = []
+          url = f"https://hub.docker.com/v2/repositories/{DOCKER_REPO}/tags?page_size=100"
+          while url:
+              req = urllib.request.Request(url, headers={"Authorization": f"JWT {jwt}"})
+              with urllib.request.urlopen(req) as resp:
+                  page = json.load(resp)
+              dh_tags.extend(t["name"] for t in page["results"])
+              url = page.get("next")
+
+          # Step 5 — delete matching RC artifacts.
+          # GH tag (canonical):  v<X.Y.Z>rc<N>.dev<M>
+          # Docker tag (canonical): <X.Y.Z>rc<N>.dev<M>   (PEP 440 — see release-rc.yml)
+          # Both regexes are permissive enough to also match
+          # pre-migration artifacts in the older hyphenated/bare shapes
+          # so they get cleaned up too.
+          gh_deleted = dh_deleted = failed = 0
+          for version in sorted(superseded):
+              print(f"\n── v{version} ──")
+              gh_re = re.compile(
+                  rf"^v{re.escape(version)}(?:-rc\.\d+(?:\.dev\.\d+)?|rc\d+\.dev\d+)$"
+              )
+              dh_re = re.compile(rf"^{re.escape(version)}rc\d+(?:\.dev\d+)?$")
+
+              for r in releases:
+                  tag = r["tagName"]
+                  if not gh_re.match(tag):
+                      continue
+                  if DRY_RUN:
+                      print(f"  [dry] gh release delete {tag}")
+                      continue
+                  result = subprocess.run(
+                      ["gh", "release", "delete", tag, "--repo", REPO, "--yes"],
+                      capture_output=True, text=True,
+                  )
+                  if result.returncode == 0:
+                      print(f"  deleted gh release {tag}")
+                      gh_deleted += 1
+                  elif "not found" in (result.stderr or "").lower():
+                      print(f"  already gone: gh release {tag}")
+                  else:
+                      print(f"  FAILED gh release delete {tag}: {result.stderr.strip()}")
+                      failed += 1
+
+              for tag in dh_tags:
+                  if not dh_re.match(tag):
+                      continue
+                  if DRY_RUN:
+                      print(f"  [dry] docker tag delete {tag}")
+                      continue
+                  req = urllib.request.Request(
+                      f"https://hub.docker.com/v2/repositories/{DOCKER_REPO}/tags/{tag}/",
+                      method="DELETE",
+                      headers={"Authorization": f"JWT {jwt}"},
+                  )
+                  try:
+                      urllib.request.urlopen(req)
+                      print(f"  deleted docker tag {tag}")
+                      dh_deleted += 1
+                  except urllib.error.HTTPError as exc:
+                      if exc.code == 404:
+                          print(f"  already gone: docker tag {tag}")
+                      else:
+                          print(f"  FAILED docker tag delete {tag}: HTTP {exc.code}")
+                          failed += 1
+
+          print(f"\n[{mode}] gh={gh_deleted} docker={dh_deleted} failed={failed}")
+          sys.exit(1 if failed else 0)
+          PY

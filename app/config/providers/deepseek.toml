@@ -1,0 +1,29 @@
+[provider]
+name = "deepseek"
+display_name = "DeepSeek"
+base_url = "https://api.deepseek.com/v1"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "DeepSeek API key"
+hint = "API key"
+instructions = "Enter your DeepSeek API key. Manage keys at https://platform.deepseek.com/api_keys"
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "DeepSeek API Key", type = "string", secret = true, required = true }
+
+[[models]]
+id = "deepseek-chat"
+display_name = "DeepSeek V3.2"
+group_hint = "high"
+input_price_per_1m = 0.28
+output_price_per_1m = 0.42
+
+[[models]]
+id = "deepseek-reasoner"
+display_name = "DeepSeek R1 (V3.2)"
+group_hint = "high"
+input_price_per_1m = 0.28
+output_price_per_1m = 0.42

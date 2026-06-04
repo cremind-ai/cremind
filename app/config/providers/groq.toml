@@ -1,0 +1,66 @@
+[provider]
+name = "groq"
+display_name = "Groq"
+requires_api_key = true
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "API Key"
+hint = "Use your Groq API key"
+instructions = "Get your API key at https://console.groq.com/keys — sign in and generate a new API key."
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "Groq API Key", type = "string", secret = true, required = true }
+
+[[models]]
+id = "llama-3.3-70b-versatile"
+display_name = "Llama 3.3 70B Versatile"
+group_hint = "high"
+input_price_per_1m = 0.59
+output_price_per_1m = 0.79
+
+[[models]]
+id = "llama-3.1-8b-instant"
+display_name = "Llama 3.1 8B Instant"
+group_hint = "low"
+input_price_per_1m = 0.05
+output_price_per_1m = 0.08
+
+[[models]]
+id = "openai/gpt-oss-120b"
+display_name = "GPT OSS 120B (via Groq)"
+group_hint = "high"
+input_price_per_1m = 0.15
+output_price_per_1m = 0.60
+reasoning_effort = ["low", "medium", "high"]
+
+[[models]]
+id = "openai/gpt-oss-20b"
+display_name = "GPT OSS 20B (via Groq)"
+group_hint = "low"
+input_price_per_1m = 0.075
+output_price_per_1m = 0.30
+reasoning_effort = ["low", "medium", "high"]
+
+[[models]]
+id = "meta-llama/llama-4-scout-17b-16e-instruct"
+display_name = "Llama 4 Scout 17B 16E"
+group_hint = "high"
+input_price_per_1m = 0.11
+output_price_per_1m = 0.34
+
+[[models]]
+id = "qwen/qwen3-32b"
+display_name = "Qwen3 32B"
+group_hint = "high"
+input_price_per_1m = 0.29
+output_price_per_1m = 0.59
+
+[[models]]
+id = "moonshotai/kimi-k2-instruct"
+display_name = "Kimi K2"
+group_hint = "high"
+input_price_per_1m = 0.50
+output_price_per_1m = 1.50

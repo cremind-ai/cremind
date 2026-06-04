@@ -1,0 +1,44 @@
+[provider]
+name = "xai"
+display_name = "xAI (Grok)"
+base_url = "https://api.x.ai/v1"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "xAI API key"
+hint = "API key"
+instructions = "Enter your xAI API key. Manage keys at https://console.x.ai"
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "xAI API Key", type = "string", secret = true, required = true }
+
+[[models]]
+id = "grok-4"
+display_name = "Grok 4"
+group_hint = "high"
+input_price_per_1m = 2.00
+output_price_per_1m = 6.00
+
+[[models]]
+id = "grok-4-1-fast"
+display_name = "Grok 4.1 Fast"
+group_hint = "low"
+input_price_per_1m = 0.20
+output_price_per_1m = 0.50
+
+[[models]]
+id = "grok-3"
+display_name = "Grok 3"
+group_hint = "high"
+input_price_per_1m = 3.00
+output_price_per_1m = 15.00
+
+[[models]]
+id = "grok-3-mini"
+display_name = "Grok 3 Mini"
+group_hint = "low"
+input_price_per_1m = 0.30
+output_price_per_1m = 0.50
+reasoning_effort = ["low", "medium", "high"]

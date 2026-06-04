@@ -1,0 +1,72 @@
+// Test-channel build config — used by ``npm run build:test``.
+//
+// Same as electron-builder.json5 except for the publish block:
+//   - ``releaseType: "prerelease"`` so electron-builder uploads to the
+//     prerelease the wheel job created at v<X.Y.Z>rc<N>.dev<M>.
+//     (Production uses ``draft`` and a separate ``publish`` job
+//     promotes it.)
+//   - ``channel: "test"`` so the update manifest is named
+//     ``latest-test.yml`` etc., kept out of the production
+//     ``latest.yml`` electron-updater feed. Apps installed from a test
+//     installer also set ``updater.channel = "test"`` in
+//     ``setupAutoUpdater`` so they only check this feed — no chance of
+//     a test build accidentally auto-updating into a production release.
+{
+  "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
+  "appId": "cremind-ui.client",
+  "asar": true,
+  "productName": "Cremind App",
+  "directories": {
+    "output": "release/${version}"
+  },
+  "files": [
+    "dist",
+    "dist-electron"
+  ],
+  // Bundle the install scripts so the NSIS customUnInstall macro in
+  // build/installer.nsh can invoke ``install.ps1 -Uninstall`` when the
+  // user removes Cremind via Windows Settings → Apps. Mirror of
+  // electron-builder.json5.
+  "extraResources": [
+    { "from": "../install/install.ps1", "to": "install.ps1" },
+    { "from": "../install/install.sh",  "to": "install.sh" }
+  ],
+  "mac": {
+    "target": [
+      "dmg"
+    ],
+    "artifactName": "${productName}-Mac-${version}-Installer.${ext}"
+  },
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": [
+          "x64"
+        ]
+      }
+    ],
+    "artifactName": "${productName}-Windows-${version}-Setup.${ext}"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": true,
+    "allowToChangeInstallationDirectory": true,
+    "deleteAppDataOnUninstall": false
+  },
+  "linux": {
+    "target": [
+      "AppImage"
+    ],
+    "artifactName": "${productName}-Linux-${version}.${ext}"
+  },
+  "publish": [
+    {
+      "provider": "github",
+      "owner": "cremind-ai",
+      "repo": "cremind",
+      "releaseType": "prerelease",
+      "channel": "test"
+    }
+  ]
+}

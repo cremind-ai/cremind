@@ -1,0 +1,50 @@
+[provider]
+name = "nvidia"
+display_name = "NVIDIA"
+base_url = "https://integrate.api.nvidia.com/v1"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "API Key"
+hint = "Use your NVIDIA API key"
+instructions = "Get your API key at https://build.nvidia.com — sign in with your NVIDIA account, navigate to any model, and generate an API key."
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "NVIDIA API Key", type = "string", secret = true, required = true }
+
+[[models]]
+id = "meta/llama-3.3-70b-instruct"
+display_name = "Llama 3.3 70B"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "nvidia/llama-3.1-nemotron-ultra-253b-v1"
+display_name = "Nemotron Ultra 253B"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "deepseek-ai/deepseek-r1"
+display_name = "DeepSeek R1"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "meta/llama-4-scout-17b-16e-instruct"
+display_name = "Llama 4 Scout"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "qwen/qwen3-235b-a22b"
+display_name = "Qwen 3 235B"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00

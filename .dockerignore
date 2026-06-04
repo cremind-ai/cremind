@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+# README.md is referenced by pyproject.toml's ``readme`` field; hatchling
+# reads it during editable installs (--channel dev --mode docker), so
+# keep it in the build context even though we ignore other markdown.
+!README.md
+docs/
+
+# Tests
+tests/
+pytest.ini
+.pytest_cache/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Misc
+.DS_Store
+*.log
+
+.playwright-mcp/
+
+cli/cremind
+cli/cremind.exe

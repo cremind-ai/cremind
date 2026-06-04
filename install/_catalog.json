@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "deployments": {
+    "local": {
+      "label": "Local",
+      "short": "this machine only",
+      "description": "bind to 127.0.0.1, only this machine can reach it",
+      "env_value": "local",
+      "host": "127.0.0.1",
+      "requires_host": false,
+      "order": 10
+    },
+    "server": {
+      "label": "Server",
+      "short": "reachable from other devices",
+      "description": "bind to all interfaces, reachable from other devices",
+      "env_value": "production",
+      "host": "0.0.0.0",
+      "requires_host": true,
+      "order": 20
+    },
+    "custom": {
+      "label": "Custom (advanced)",
+      "short": "I'll configure host, URL, and CORS myself",
+      "description": "advanced setup \u2014 choose where Cremind listens and how it's reached",
+      "env_value": "custom",
+      "order": 30,
+      "advanced_fields": [
+        {
+          "key": "listen_host",
+          "prompt": "Where should Cremind listen for connections?",
+          "hint": "Use 127.0.0.1 to only allow this machine, or 0.0.0.0 to allow other devices / containers on the network.",
+          "default": "0.0.0.0"
+        },
+        {
+          "key": "public_url",
+          "prompt": "What URL will you use to open Cremind in a browser?",
+          "hint": "This is the address users type into their browser. Inside a container it's usually http://localhost:1112. On a server it might be http://my-box.lan:1112 or https://cremind.example.com.",
+          "default": "http://localhost:1112"
+        },
+        {
+          "key": "allowed_origins",
+          "prompt": "Which web origins should be allowed to talk to the API?",
+          "hint": "A comma-separated list of URLs the browser UI will be served from. Usually the same as the public URL above. Leave blank to use the public URL plus localhost variants.",
+          "default": ""
+        },
+        {
+          "key": "wizard_preset",
+          "prompt": "Which preset should pre-fill the Setup Wizard?",
+          "hint": "Presets fill in sensible defaults for the next setup screens \u2014 you can always edit any field afterwards. Pick `local` for a single-machine setup, `docker` for a docker-compose stack, or `server` for an external Postgres/Qdrant.",
+          "choices": [
+            "local",
+            "docker",
+            "server"
+          ],
+          "default": "local"
+        }
+      ]
+    }
+  },
+  "modes": {
+    "docker": {
+      "label": "Docker",
+      "description": "sandboxed VNC desktop with a bundled storage stack",
+      "hint": "The agent runs inside a container with its own GUI. Observe at http://<host>:6080/vnc.html.",
+      "badge": "recommended",
+      "requires": [
+        "docker"
+      ],
+      "order": 10
+    },
+    "native": {
+      "label": "Native",
+      "description": "Python venv at ~/.cremind/venv with embedded storage",
+      "hint": "Simpler, but the agent shares your desktop and home directory.",
+      "requires": [],
+      "order": 20
+    }
+  },
+  "mode_rules": {
+    "docker": {
+      "allowed_service_modes": [
+        "docker",
+        "native"
+      ],
+      "default_service_mode": "docker"
+    },
+    "native": {
+      "allowed_service_modes": [
+        "native",
+        "external"
+      ],
+      "default_service_mode": "external"
+    },
+    "custom": {
+      "allowed_service_modes": [
+        "docker",
+        "native",
+        "external"
+      ],
+      "default_service_mode": "external"
+    }
+  },
+  "service_modes": {
+    "docker": {
+      "label": "Docker",
+      "description_template": "Cremind starts a {service} container alongside itself."
+    },
+    "native": {
+      "label": "Native",
+      "description_template": "Cremind runs {service} locally (no extra container)."
+    },
+    "external": {
+      "label": "External",
+      "description_template": "Connect to an existing {service} instance."
+    }
+  },
+  "_meta": {
+    "sha256": "fc469a7dd26f18ea2f9f52f0301537cb9879ef8e9a8db9ddcd50e684508f6caa",
+    "schema_version": 1
+  }
+}

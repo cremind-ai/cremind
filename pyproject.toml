@@ -1,0 +1,223 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cremind"
+dynamic = ["version"]
+description = "Cremind — open personal assistant server and CLI"
+readme = "README.md"
+requires-python = ">=3.13.9"
+license = { text = "MIT" }
+authors = [{ name = "Cremind contributors" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Communications :: Chat",
+    "Environment :: Console",
+]
+dependencies = [
+    # Core runtime: what `cremind serve` + the Setup Wizard + SQLite need.
+    # Feature-gated deps live in `[project.optional-dependencies]` below and
+    # are installed at runtime by `app/features/installer.py` when the user
+    # opts into the corresponding feature.
+    "typer>=0.12",
+    "httpx[http2]>=0.27",
+    "httpx-sse>=0.4",
+    "websockets>=13.0",
+    "rich>=13",
+    "prompt_toolkit>=3.0.47",
+    "qrcode>=7",
+    "PyJWT>=2.8.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.1.1",
+    "loguru>=0.7.3",
+    "pydantic>=2.12.3",
+    "jsonschema>=4.23.0",
+    "tenacity>=8.2.0",
+    # Starlette 1.0 removed the `on_startup` / `on_shutdown` kwargs in
+    # favor of the lifespan async context manager. app/server.py still
+    # passes on_startup=[_on_startup], which TypeErrors out under 1.x.
+    # Pin <1.0 until server.py migrates to lifespan().
+    "starlette>=0.52.1,<1.0",
+    "uvicorn>=0.41.0",
+    "python-multipart>=0.0.9",
+    # a2a-sdk 1.0 removed `a2a.server.apps` and `A2AStarletteApplication`
+    # along with much of the legacy server-app surface. Pin <1.0 until the
+    # codebase migrates to the 1.x API.
+    "a2a-sdk[http-server,sql]>=0.3.10,<1.0",
+    "fastmcp>=2.12.5",
+    "aiosqlite>=0.21.0",
+    "alembic>=1.13.0",
+    "pywinpty>=2.0 ; sys_platform == 'win32'",
+    "jinja2>=3.1.6",
+    "dynaconf>=3.2.0",
+    "toml>=0.10.2",
+    # Filesystem watching. Used unconditionally by every install path —
+    # documents-folder sync, skills hot-reload, the file-browser SSE
+    # endpoint, the ``register_file_watcher`` built-in tool — so it ships
+    # in core rather than as an opt-in extra.
+    "watchdog>=4.0.0",
+]
+
+[project.optional-dependencies]
+# Vector embedding models. Both share sentence-transformers (pulls torch).
+# pandas is used by the embedding-table cache (app/vectorstores/cache.py)
+# and by build_table_embeddings (app/utils/common.py), so it ships
+# whenever embedding is enabled regardless of the documents feature.
+embeddings-me5 = ["sentence-transformers>=3.0.0", "pandas>=3.0.1"]
+embeddings-gemma = ["sentence-transformers>=3.0.0", "pandas>=3.0.1"]
+
+# Vector store back-ends.
+vectorstore-qdrant = ["qdrant-client>=1.9.0"]
+vectorstore-chroma = ["chromadb>=0.5.0"]
+
+# Browser automation (Chrome via CDP). `playwright install chromium` runs as
+# a post-install step.
+browser = ["playwright>=1.52.0"]
+
+# Document ingestion (markitdown converts office/pdf, pandas for tabular).
+documents = ["markitdown[all]>=0.1.0", "pandas>=3.0.1"]
+
+# OpenAI tokenizer — used for prompt-size accounting by every OpenAI-family
+# LLM provider, plus the system_file built-in tool.
+tokenization = ["tiktoken>=0.12.0"]
+
+# Postgres database back-end. SQLite ships in core.
+postgres = ["asyncpg>=0.29", "psycopg[binary]>=3.1"]
+
+# LLM SDKs.
+llm-anthropic = ["anthropic>=0.52.0"]
+llm-openai = ["openai>=2.6.0", "tiktoken>=0.12.0"]
+llm-groq = ["groq>=0.33.0", "tiktoken>=0.12.0"]
+
+# Google APIs (Places, Calendar, OAuth flow for Vertex AI).
+google = ["google-api-python-client>=2.0.0", "google-auth>=2.0.0"]
+
+# External chat-channel adapters.
+channel-telegram-bot = ["python-telegram-bot>=21.0"]
+channel-telegram-userbot = ["telethon>=1.36.0"]
+
+# Convenience meta-extra. Installs every feature group above — handy for
+# power users who want the old all-in behaviour back via
+# `pip install cremind[all]`, and for CI / dev images that override
+# ``CREMIND_PIP_SPEC`` at build time. Core already includes watchdog
+# (filesystem watching is universal), so ``all`` is just the optional
+# feature groups stacked together.
+all = [
+    "sentence-transformers>=3.0.0",
+    "qdrant-client>=1.9.0",
+    "chromadb>=0.5.0",
+    "playwright>=1.52.0",
+    "markitdown[all]>=0.1.0",
+    "pandas>=3.0.1",
+    "tiktoken>=0.12.0",
+    "asyncpg>=0.29",
+    "psycopg[binary]>=3.1",
+    "anthropic>=0.52.0",
+    "openai>=2.6.0",
+    "groq>=0.33.0",
+    "google-api-python-client>=2.0.0",
+    "google-auth>=2.0.0",
+    "python-telegram-bot>=21.0",
+    "telethon>=1.36.0",
+]
+
+[project.scripts]
+cremind = "app.cli.main:app"
+
+[project.urls]
+Homepage = "https://github.com/cremind-ai/cremind"
+Issues = "https://github.com/cremind-ai/cremind/issues"
+
+[tool.hatch.version]
+path = "app/__version__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+# The bundled SPA at app/static/ui/ (web bundle) and app/static/ui-electron/
+# (Electron-renderer bundle, served at /electron-renderer/) are populated
+# by scripts/build_ui.sh at release time. Those files are .gitignored
+# (they're build output), so hatchling's default VCS-tracked-only filter
+# drops them from the wheel. ``artifacts`` is the documented escape hatch:
+# include matching paths even when ignored. Without this, ``cremind serve``
+# logs "SPA not present" and the 1515 listener never opens.
+artifacts = ["app/static/ui/**", "app/static/ui-electron/**"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "app/",
+    "README.md",
+    "pyproject.toml",
+    "LICENSE",
+]
+exclude = [
+    "/cli/",
+    ".venv/",
+    "logs/",
+    "**/__pycache__",
+    "*.egg-info",
+    "dist/",
+    "build/",
+    ".pytest_cache/",
+    # UI source — wheel ships the built artifact at app/static/ui/ instead,
+    # so sdist consumers (rare path; PyPI installs use the wheel) don't
+    # need the Vue source.
+    "/ui/",
+    "/release/",
+]
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "ruff>=0.8.0",
+    "pre-commit>=3.6.0",
+]
+
+# ── Ruff (lint + format) ─────────────────────────────────────────────────
+# Replaces autopep8. Conservative starting rule set — add more over time as
+# the codebase tolerates them. Line length matches the prior autopep8
+# setting so the first format pass doesn't churn unrelated lines.
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+extend-exclude = [
+    "app/alembic/versions",   # auto-generated migrations
+    "app/static/ui",          # built SPA artifact (web bundle)
+    "app/static/ui-electron", # built SPA artifact (Electron renderer bundle)
+    ".venv",
+    "dist",
+    "logs",
+]
+
+[tool.ruff.lint]
+# Conservative starter set: pyflakes (F) catches unused imports + undefined
+# names — real bugs — and pycodestyle errors (E) catches genuine syntax
+# slips. Add these later once the baseline is clean:
+#   "I"  — isort (reorders imports; large diff, churn-heavy)
+#   "UP" — pyupgrade (modernizes List→list etc; large diff)
+#   "B"  — flake8-bugbear (subtle correctness; worth adding next)
+select = ["E", "F"]
+# E501 is enforced by the formatter via `line-length` above — don't
+# double-flag long lines that the formatter intentionally left alone
+# (URLs, comments, strings).
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Package __init__.py files often re-export names; unused-import noise
+# would dominate the report.
+"__init__.py" = ["F401"]
+# Tests sometimes shadow builtins or do other idiomatic test things.
+"tests/**" = ["F401", "F811"]
+
+# ── pytest ───────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+filterwarnings = ["ignore::DeprecationWarning"]

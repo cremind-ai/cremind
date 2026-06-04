@@ -1,0 +1,43 @@
+[channel]
+type = "slack"
+display_name = "Slack"
+icon = "mdi:slack"
+supports_bot = true
+supports_userbot = true
+auth_modes = ["none", "otp", "password"]
+default_response_mode = "normal"
+implemented = false
+
+[[channel.modes]]
+id = "bot"
+label = "Bot"
+implemented = false
+instructions = """**Coming soon — adapter implementation pending.**
+
+1. Visit https://api.slack.com/apps → Create New App → From scratch.
+2. Under OAuth & Permissions, add scopes: chat:write, im:history, im:read, im:write.
+3. Install the app to your workspace; copy the Bot User OAuth Token (starts with xoxb-).
+4. Under Socket Mode, generate an App-Level Token (xapp-...) and enable Socket Mode.
+5. Subscribe to the message.im event under Event Subscriptions.
+6. Paste both tokens below."""
+[channel.modes.fields]
+bot_token = { description = "Bot User OAuth Token (xoxb-)", type = "string", secret = true, required = true }
+app_token = { description = "App-Level Token (xapp-)", type = "string", secret = true, required = true }
+
+[[channel.modes]]
+id = "userbot"
+label = "Userbot (your account)"
+implemented = false
+instructions = """**Coming soon.**
+
+Runs under your own Slack account so DMs to you are auto-answered by the
+agent. Slack permits user OAuth tokens (``xoxp-…``) for legitimate
+automation, but check your workspace's policy first — admins can also
+restrict user-token use.
+
+Get a User OAuth Token by installing a custom app to your workspace
+with user scopes (``chat:write``, ``im:history``, ``im:read``,
+``im:write``)."""
+[channel.modes.fields]
+user_token = { description = "User OAuth Token (xoxp-)", type = "string", secret = true, required = true }
+app_token = { description = "App-Level Token (xapp-) for socket mode", type = "string", secret = true, required = true }

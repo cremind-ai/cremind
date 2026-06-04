@@ -1,0 +1,57 @@
+[provider]
+name = "mistral"
+display_name = "Mistral AI"
+base_url = "https://api.mistral.ai/v1"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "Mistral API key"
+hint = "API key"
+instructions = "Enter your Mistral API key. Manage keys at https://console.mistral.ai/api-keys"
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "Mistral API Key", type = "string", secret = true, required = true }
+
+[[models]]
+id = "mistral-large-latest"
+display_name = "Mistral Large 3"
+group_hint = "high"
+input_price_per_1m = 0.50
+output_price_per_1m = 1.50
+
+[[models]]
+id = "mistral-medium-latest"
+display_name = "Mistral Medium 3.1"
+group_hint = "high"
+input_price_per_1m = 0.40
+output_price_per_1m = 2.00
+
+[[models]]
+id = "mistral-small-latest"
+display_name = "Mistral Small"
+group_hint = "low"
+input_price_per_1m = 0.10
+output_price_per_1m = 0.30
+
+[[models]]
+id = "codestral-latest"
+display_name = "Codestral"
+group_hint = "high"
+input_price_per_1m = 0.30
+output_price_per_1m = 0.90
+
+[[models]]
+id = "magistral-medium-latest"
+display_name = "Magistral Medium"
+group_hint = "high"
+input_price_per_1m = 2.00
+output_price_per_1m = 5.00
+
+[[models]]
+id = "devstral-latest"
+display_name = "Devstral 2"
+group_hint = "high"
+input_price_per_1m = 0.40
+output_price_per_1m = 0.90

@@ -1,0 +1,117 @@
+[provider]
+name = "openai"
+display_name = "OpenAI"
+requires_api_key = true
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "API Key"
+hint = "Standard OpenAI API key"
+instructions = "Get your API key at https://platform.openai.com/api-keys — sign in and create a new secret key."
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "OpenAI API Key", type = "string", secret = true, required = true }
+
+[[provider.auth_methods]]
+id = "codex_oauth"
+label = "Codex OAuth"
+hint = "Paste OAuth access token from ChatGPT"
+instructions = "Obtain an OAuth token by authenticating with ChatGPT via the Codex CLI or browser OAuth flow. Paste the access token here. Full browser-based OAuth integration is planned for a future release."
+kind = "token"
+
+[provider.auth_methods.fields]
+oauth_token = { description = "OAuth Access Token", type = "string", secret = true, required = true }
+
+# Latest flagship models (GPT-5.4 series)
+[[models]]
+id = "gpt-5.4"
+display_name = "GPT-5.4"
+group_hint = "high"
+input_price_per_1m = 2.50
+output_price_per_1m = 15.00
+
+[[models]]
+id = "gpt-5.4-mini"
+display_name = "GPT-5.4 Mini"
+group_hint = "low"
+input_price_per_1m = 0.75
+output_price_per_1m = 4.50
+
+[[models]]
+id = "gpt-5.4-nano"
+display_name = "GPT-5.4 Nano"
+group_hint = "low"
+input_price_per_1m = 0.20
+output_price_per_1m = 1.25
+
+[[models]]
+id = "gpt-5.4-pro"
+display_name = "GPT-5.4 Pro"
+group_hint = "high"
+input_price_per_1m = 30.00
+output_price_per_1m = 180.00
+
+# GPT-5.3 series
+[[models]]
+id = "gpt-5.3-chat-latest"
+display_name = "GPT-5.3"
+group_hint = "high"
+input_price_per_1m = 1.75
+output_price_per_1m = 14.00
+
+# Previous-generation models still supported in the API
+[[models]]
+id = "gpt-4.1"
+display_name = "GPT-4.1"
+group_hint = "high"
+input_price_per_1m = 2.00
+output_price_per_1m = 8.00
+
+[[models]]
+id = "gpt-4.1-mini"
+display_name = "GPT-4.1 Mini"
+group_hint = "low"
+input_price_per_1m = 0.40
+output_price_per_1m = 1.60
+
+[[models]]
+id = "gpt-4.1-nano"
+display_name = "GPT-4.1 Nano"
+group_hint = "low"
+input_price_per_1m = 0.10
+output_price_per_1m = 0.40
+
+# Reasoning models (o-series)
+[[models]]
+id = "o3-pro"
+display_name = "o3 Pro"
+group_hint = "high"
+input_price_per_1m = 20.00
+output_price_per_1m = 80.00
+reasoning_effort = ["low", "medium", "high"]
+
+[[models]]
+id = "o3"
+display_name = "o3"
+group_hint = "high"
+input_price_per_1m = 2.00
+output_price_per_1m = 8.00
+reasoning_effort = ["low", "medium", "high"]
+
+[[models]]
+id = "o4-mini"
+display_name = "o4 Mini"
+group_hint = "high"
+input_price_per_1m = 0.55
+output_price_per_1m = 2.20
+reasoning_effort = ["low", "medium", "high"]
+
+[[models]]
+id = "o3-mini"
+display_name = "o3 Mini"
+group_hint = "high"
+input_price_per_1m = 1.10
+output_price_per_1m = 4.40
+reasoning_effort = ["low", "medium", "high"]

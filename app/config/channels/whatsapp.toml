@@ -1,0 +1,29 @@
+[channel]
+type = "whatsapp"
+display_name = "WhatsApp"
+icon = "mdi:whatsapp"
+supports_bot = false
+supports_userbot = true
+auth_modes = ["none", "otp", "password"]
+default_response_mode = "normal"
+implemented = true
+
+[[channel.modes]]
+id = "userbot"
+label = "Userbot (your account)"
+setup_kind = "qr"
+implemented = true
+instructions = """Runs under your own WhatsApp account — pairing Cremind as a
+linked device. Inbound DMs are auto-answered by the agent.
+
+Prerequisites (one-time): install Node.js 18+ on PATH, then run
+`npm install` inside `app/channels/sidecars/whatsapp/`.
+
+1. Save the channel here, then open the Channels page (sidebar → Channels).
+2. A QR code will appear; scan it with WhatsApp → Settings → Linked Devices
+   → Link a Device. Pairing completes in a few seconds.
+3. Pick an authentication mode (none / OTP / password) so only trusted
+   senders can chat with your agent — recommended unless your number is
+   only known to you."""
+[channel.modes.fields]
+phone = { description = "Phone (international format, e.g. +14155551212)", type = "string", required = false }

@@ -1,0 +1,57 @@
+[provider]
+name = "fireworks"
+display_name = "Fireworks AI"
+base_url = "https://api.fireworks.ai/inference/v1"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "Fireworks API key"
+hint = "API key"
+instructions = "Enter your Fireworks API key. Manage keys at https://fireworks.ai/account/api-keys"
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "Fireworks API Key", type = "string", secret = true, required = true }
+
+[[models]]
+id = "accounts/fireworks/models/llama4-maverick-instruct-basic"
+display_name = "Llama 4 Maverick"
+group_hint = "high"
+input_price_per_1m = 0.22
+output_price_per_1m = 0.88
+
+[[models]]
+id = "accounts/fireworks/models/llama4-scout-instruct-basic"
+display_name = "Llama 4 Scout"
+group_hint = "high"
+input_price_per_1m = 0.15
+output_price_per_1m = 0.60
+
+[[models]]
+id = "accounts/fireworks/models/deepseek-v3"
+display_name = "DeepSeek V3"
+group_hint = "high"
+input_price_per_1m = 0.56
+output_price_per_1m = 1.68
+
+[[models]]
+id = "accounts/fireworks/models/deepseek-r1"
+display_name = "DeepSeek R1"
+group_hint = "high"
+input_price_per_1m = 3.00
+output_price_per_1m = 8.00
+
+[[models]]
+id = "accounts/fireworks/models/qwen3-235b-a22b"
+display_name = "Qwen 3 235B"
+group_hint = "high"
+input_price_per_1m = 0.50
+output_price_per_1m = 1.50
+
+[[models]]
+id = "accounts/fireworks/models/kimi-k2-5"
+display_name = "Kimi K2.5"
+group_hint = "high"
+input_price_per_1m = 0.60
+output_price_per_1m = 3.00

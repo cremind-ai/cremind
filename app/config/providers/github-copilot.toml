@@ -1,0 +1,64 @@
+[provider]
+name = "github-copilot"
+display_name = "GitHub Copilot"
+base_url = "https://api.githubcopilot.com"
+
+[[provider.auth_methods]]
+id = "device_code"
+label = "GitHub Device Login"
+hint = "Browser device-code flow"
+instructions = "This will open a GitHub device login to authorize Copilot. Requires an active GitHub Copilot subscription."
+kind = "device_code"
+is_default = true
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "GitHub Token"
+hint = "Use an existing GitHub token"
+instructions = "Paste a GitHub personal access token or Copilot token. You can also set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN environment variables."
+kind = "api_key"
+
+[provider.auth_methods.fields]
+api_key = { description = "GitHub Token", type = "string", secret = true, required = true }
+
+[[models]]
+id = "gpt-5.4"
+display_name = "GPT-5.4 (via Copilot)"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "claude-sonnet-4.6"
+display_name = "Claude Sonnet 4.6 (via Copilot)"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "claude-opus-4.7"
+display_name = "Claude Opus 4.7 (via Copilot)"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "gpt-4o"
+display_name = "GPT-4o (via Copilot)"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "gpt-4.1"
+display_name = "GPT-4.1 (via Copilot)"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "gemini-2.5-pro"
+display_name = "Gemini 2.5 Pro (via Copilot)"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00

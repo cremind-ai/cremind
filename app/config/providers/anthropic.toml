@@ -1,0 +1,80 @@
+[provider]
+name = "anthropic"
+display_name = "Anthropic"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "API Key"
+hint = "Use your Anthropic API key"
+instructions = "Get your API key at https://console.anthropic.com/settings/keys — sign in to the Anthropic Console and create a new API key."
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "Anthropic API Key", type = "string", secret = true, required = true }
+
+[[provider.auth_methods]]
+id = "setup_token"
+label = "Setup Token"
+hint = "Use a setup/session token (Authorization: Bearer)"
+instructions = "Paste your Anthropic setup-token. This is a bearer token for API access, distinct from a permanent API key. If you have the Claude CLI installed locally, using the API Key method is recommended instead. Setup tokens may have an expiration."
+kind = "token"
+
+[provider.auth_methods.fields]
+setup_token = { description = "Setup Token", type = "string", secret = true, required = true }
+
+# Claude Opus 4.7
+[[models]]
+id = "claude-opus-4-7"
+display_name = "Claude Opus 4.7"
+group_hint = "high"
+input_price_per_1m = 5.00
+output_price_per_1m = 25.00
+
+# Claude Opus 4.6
+[[models]]
+id = "claude-opus-4-6"
+display_name = "Claude Opus 4.6"
+group_hint = "high"
+input_price_per_1m = 5.00
+output_price_per_1m = 25.00
+
+# Claude Sonnet 4.6
+[[models]]
+id = "claude-sonnet-4-6"
+display_name = "Claude Sonnet 4.6"
+group_hint = "high"
+input_price_per_1m = 3.00
+output_price_per_1m = 15.00
+
+# Claude Sonnet 4.5
+[[models]]
+id = "claude-sonnet-4-5-20250929"
+display_name = "Claude Sonnet 4.5"
+group_hint = "high"
+input_price_per_1m = 3.00
+output_price_per_1m = 15.00
+
+# Claude Opus 4.5
+[[models]]
+id = "claude-opus-4-5-20251101"
+display_name = "Claude Opus 4.5"
+group_hint = "high"
+input_price_per_1m = 5.00
+output_price_per_1m = 25.00
+
+# Claude Haiku 4.5
+[[models]]
+id = "claude-haiku-4-5-20251001"
+display_name = "Claude Haiku 4.5"
+group_hint = "low"
+input_price_per_1m = 1.00
+output_price_per_1m = 5.00
+
+# Claude 3.5 Haiku
+[[models]]
+id = "claude-3-5-haiku-20241022"
+display_name = "Claude 3.5 Haiku"
+group_hint = "low"
+input_price_per_1m = 0.80
+output_price_per_1m = 4.00

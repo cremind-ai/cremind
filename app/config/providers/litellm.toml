@@ -1,0 +1,22 @@
+[provider]
+name = "litellm"
+display_name = "LiteLLM"
+
+[[provider.auth_methods]]
+id = "api_key"
+label = "API Key"
+hint = "Use your LiteLLM proxy API key"
+instructions = "LiteLLM is a self-hosted proxy. Deploy it from https://github.com/BerriAI/litellm and configure your API key. The base URL defaults to http://localhost:4000/v1 unless overridden."
+kind = "api_key"
+is_default = true
+
+[provider.auth_methods.fields]
+api_key = { description = "LiteLLM API Key", type = "string", secret = true, required = true }
+base_url = { description = "LiteLLM Base URL", type = "string", secret = false, required = false, default = "http://localhost:4000/v1" }
+
+[[models]]
+id = "gpt-5.4"
+display_name = "GPT-5.4 (via LiteLLM)"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00

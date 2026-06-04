@@ -1,0 +1,39 @@
+[provider]
+name = "vllm"
+display_name = "vLLM (Self-hosted)"
+requires_api_key = false
+
+[[provider.auth_methods]]
+id = "none"
+label = "No Auth Required"
+hint = "vLLM runs locally, no credentials needed"
+kind = "none"
+is_default = true
+
+[[models]]
+id = "meta-llama/Llama-3.3-70B-Instruct"
+display_name = "Llama 3.3 70B Instruct"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "meta-llama/Llama-3.1-8B-Instruct"
+display_name = "Llama 3.1 8B Instruct"
+group_hint = "low"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "Qwen/Qwen3-32B"
+display_name = "Qwen 3 32B"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+display_name = "Llama 4 Scout"
+group_hint = "high"
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
