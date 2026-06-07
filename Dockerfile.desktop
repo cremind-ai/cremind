@@ -36,6 +36,16 @@
 #                                vncserver). Larger = higher network/CPU
 #                                cost; 1280x720 is the comfort default.
 
+# ── uv binaries (pinned) ──────────────────────────────────────────────────
+# uv is the Python package/project manager that built-in skills use to run
+# their helper scripts (``uv run scripts/<...>.py``). Pull its prebuilt
+# static binaries from Astral's official image. ``UV_VERSION`` sits in the
+# global scope so it can parameterize this stage's FROM (overridable with
+# ``--build-arg UV_VERSION=…``); BuildKit forbids variable expansion in a
+# bare ``COPY --from``, hence the dedicated stage copied from in stage 2.
+ARG UV_VERSION=0.11.19
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
 # ── Stage 1: build the SPA ────────────────────────────────────────────────
 FROM node:20-bookworm-slim AS spa-builder
 
@@ -141,6 +151,15 @@ RUN add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get install -y --no-install-recommends \
            python3.13 python3.13-venv python3.13-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# ── uv (Python package & project manager) ─────────────────────────────────
+# Built-in skills run their helper scripts via ``uv run scripts/<...>.py``
+# (e.g. the gmail / gcalendar event listeners spawned by the autostart
+# runner), so ``uv`` must be on PATH for the agent's exec_shell. Copy the
+# prebuilt static binaries from the pinned ``uv`` stage (defined above) into
+# /usr/local/bin so they're on PATH for root (the only user).
+COPY --from=uv /uv /uvx /usr/local/bin/
+RUN uv --version
 
 # ── Docker CLI + compose plugin (client only — no daemon) ────────────────
 # The Setup Wizard's Docker provisioner shells out to ``docker compose``
