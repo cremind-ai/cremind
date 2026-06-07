@@ -584,7 +584,7 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         command = normalize_command_paths(lra["command"], working_dir)
 
         storage = get_autostart_storage()
-        duplicate = storage.find_duplicate(profile, command)
+        duplicate = storage.find_duplicate(profile, command, working_dir=working_dir)
         if duplicate and not force:
             return JSONResponse(
                 {

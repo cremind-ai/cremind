@@ -87,6 +87,17 @@ def _listener_command(source_dir: str) -> str:
     return f'uv run "{script}"'
 
 
+def _listener_working_dir(source_dir: str) -> str:
+    """Return the working dir a listener registers under (its ``scripts`` dir).
+
+    Both ``handle_listener_start`` (which inserts the autostart row) and
+    ``_build_listener_status`` (which looks the row back up to surface its
+    ``autostart_id``) must agree on this byte-for-byte — ``find_duplicate``
+    now matches on ``working_dir``, so any drift would orphan the lookup.
+    """
+    return str(Path(source_dir) / "scripts")
+
+
 def _build_listener_status(profile: str, skill_name: str) -> Optional[Dict[str, Any]]:
     """Compute the JSON payload returned by ``GET /api/skills/.../listener-status``.
 
@@ -110,7 +121,9 @@ def _build_listener_status(profile: str, skill_name: str) -> Optional[Dict[str, 
 
     command = _listener_command(source_dir)
     autostart_storage = get_autostart_storage()
-    autostart_row = autostart_storage.find_duplicate(profile, command)
+    autostart_row = autostart_storage.find_duplicate(
+        profile, command, working_dir=_listener_working_dir(source_dir)
+    )
     return {
         "skill_name": skill_name,
         "running": running,
@@ -293,9 +306,11 @@ def get_event_routes() -> list[Route]:
         if not source_dir:
             return JSONResponse({"error": "Skill not found"}, status_code=404)
         command = _listener_command(source_dir)
-        scripts_dir = str(Path(source_dir) / "scripts")
+        scripts_dir = _listener_working_dir(source_dir)
         autostart_storage = get_autostart_storage()
-        row = autostart_storage.find_duplicate(profile, command)
+        row = autostart_storage.find_duplicate(
+            profile, command, working_dir=scripts_dir
+        )
         if row is None:
             row = autostart_storage.insert(
                 profile=profile,

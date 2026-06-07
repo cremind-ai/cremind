@@ -344,7 +344,9 @@ def get_process_routes() -> list:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
 
         storage = get_autostart_storage()
-        duplicate = storage.find_duplicate(profile, info.command)
+        duplicate = storage.find_duplicate(
+            profile, info.command, working_dir=info.working_dir
+        )
         if duplicate and not force:
             return JSONResponse(
                 {
