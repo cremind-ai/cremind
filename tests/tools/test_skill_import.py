@@ -246,3 +246,38 @@ def test_is_builtin_skill_dir() -> None:
     assert skill_sync.is_builtin_skill_dir(sorted(builtins)[0]) is True
     assert skill_sync.is_builtin_skill_dir("nope-not-real") is False
     assert skill_sync.is_builtin_skill_dir("") is False
+
+
+# ── robust rmtree (Windows file-lock resilience) ─────────────────────────────
+
+
+def test_robust_rmtree_removes_readonly_files(tmp_path: Path) -> None:
+    import os
+    import stat
+
+    from app.skills.sync import _robust_rmtree
+
+    target = tmp_path / "skilldir"
+    (target / "scripts").mkdir(parents=True)
+    locked = target / "scripts" / ".listener.lock"
+    locked.write_text("pid", encoding="utf-8")
+    # Mark read-only so a naive rmtree would fail on Windows.
+    os.chmod(locked, stat.S_IREAD)
+
+    _robust_rmtree(target)
+    assert not target.exists()
+
+
+# ── process/dir matching used by teardown ────────────────────────────────────
+
+
+def test_is_under_matches_dir_and_descendants(tmp_path: Path) -> None:
+    from app.tools.builtin.exec_shell_autostart import _is_under
+
+    skill = tmp_path / "admin" / "skills" / "gmail"
+    skill.mkdir(parents=True)
+
+    assert _is_under(str(skill), skill.resolve()) is True
+    assert _is_under(str(skill / "scripts"), skill.resolve()) is True
+    assert _is_under(str(tmp_path / "admin" / "skills" / "other"), skill.resolve()) is False
+    assert _is_under("", skill.resolve()) is False

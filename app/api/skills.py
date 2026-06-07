@@ -41,6 +41,7 @@ from app.skills.sync import (
     resync_profile_skills,
 )
 from app.tools import ToolType
+from app.tools.builtin.exec_shell_autostart import teardown_processes_for_dir
 from app.utils.logger import logger
 
 # Cap uploaded archives so a hostile upload can't exhaust disk before extraction.
@@ -63,6 +64,24 @@ def _storage_not_ready() -> JSONResponse:
         {"error": "Setup not complete — storage is not ready yet."},
         status_code=503,
     )
+
+
+def _clear_skill_config(registry, profile: str, tool_id: str) -> None:
+    """Delete every saved config row (all scopes) for a skill's tool_id.
+
+    Best-effort: logs and continues on failure so a config-clear hiccup never
+    blocks the file-level reset. Returns the skill to its unconfigured default.
+    """
+    try:
+        storage = registry.config.storage
+        removed = storage.delete_all_configs(profile=profile, tool_id=tool_id)
+        if removed:
+            logger.info(
+                f"Cleared {removed} config row(s) for reset skill '{tool_id}' "
+                f"(profile '{profile}')"
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception(f"Failed to clear config for reset skill '{tool_id}'")
 
 
 def get_skill_routes(state: BootedState) -> list[Route]:
@@ -99,11 +118,30 @@ def get_skill_routes(state: BootedState) -> list[Route]:
         dir_name = info.dir_path.name
         builtin = is_builtin_skill_dir(dir_name)
 
+        # Stop any long-running process the skill registered (and drop its
+        # autostart row) before touching the directory. On Windows a running
+        # listener holds file handles (e.g. scripts/.listener.lock) that would
+        # otherwise make the delete/reset fail with WinError 32.
+        try:
+            await teardown_processes_for_dir(info.dir_path, profile=profile)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                f"Process teardown failed for skill '{tool_id}'; proceeding anyway"
+            )
+
         try:
             if builtin:
                 await asyncio.to_thread(reset_builtin_skill, profile, dir_name)
+                # Reset means pristine: also wipe the skill's saved config
+                # (Skill Variables, arguments, ...). The files are restored from
+                # the shipped built-in, but the per-profile config lives in the
+                # DB keyed by tool_id — which survives because the directory path
+                # (and thus the tool_id) is unchanged. Clear it explicitly.
+                _clear_skill_config(registry, profile, tool_id)
             else:
                 await asyncio.to_thread(delete_profile_skill, profile, dir_name)
+                # External delete: the directory vanishes, so sync_skills drops
+                # the tool row and ON DELETE CASCADE clears its config rows.
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:  # noqa: BLE001

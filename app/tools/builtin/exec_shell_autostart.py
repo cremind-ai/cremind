@@ -14,12 +14,15 @@ import asyncio
 import os
 import platform
 import re
+import subprocess
 import time
 import uuid as _uuid
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from app.config.settings import BaseConfig
 from app.config.system_vars import build_system_env
+from app.storage import get_autostart_storage
 from app.storage.autostart_storage import AutostartStorage
 from app.tools.builtin.exec_shell import (
     LogWriterState,
@@ -30,7 +33,7 @@ from app.tools.builtin.exec_shell import (
     _spawn_command,
     _write_state,
     publish_process_list_changed,
-    Var,
+    stop_process,
 )
 from app.tools.builtin.exec_shell_input_mode import TerminalState
 from app.tools.builtin.exec_shell_pty import _spawn_command_pty
@@ -67,6 +70,89 @@ def normalize_command_paths(command: str, working_dir: str) -> str:
         return token
 
     return re.sub(r"[^\s\"']+", maybe_rewrite, command)
+
+
+# Windows: don't pop a console window when shelling out to taskkill.
+_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def _kill_process_tree(pid: Optional[int]) -> None:
+    """Forcibly terminate *pid* and all of its descendants.
+
+    ``Process.terminate()`` only signals the spawned shell, not the grandchild
+    it launched (e.g. ``pwsh -> uv run -> python``). That grandchild can hold
+    open file handles inside a skill directory (``scripts/.listener.lock`` on
+    Windows), which then blocks ``shutil.rmtree``. Killing the whole tree
+    releases those handles.
+
+    Windows uses ``taskkill /T /F``; POSIX relies on the caller's
+    ``stop_process`` (terminate/kill of the leader) plus the fact that an open
+    file does not prevent directory removal on Unix.
+    """
+    if not pid:
+        return
+    if os.name != "nt":
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            timeout=15,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.warning(f"taskkill failed for pid {pid}", exc_info=True)
+
+
+def _is_under(candidate: str, root: Path) -> bool:
+    """True if *candidate* path is *root* itself or nested beneath it."""
+    if not candidate:
+        return False
+    try:
+        cp = Path(candidate).resolve()
+    except (OSError, ValueError):
+        return False
+    return cp == root or root in cp.parents
+
+
+async def teardown_processes_for_dir(directory: Path, *, profile: Optional[str]) -> dict:
+    """Stop every long-running process bound to *directory* and drop its autostart row.
+
+    Called before a skill directory is deleted or reset: a running listener
+    holds OS file handles inside the directory (which blocks ``rmtree`` on
+    Windows), and a lingering autostart registration would respawn the process
+    from a directory that is gone or has been reset.
+
+    Returns ``{"stopped": [pid], "removed_autostart": int}``.
+    """
+    root = directory.resolve()
+
+    matched = [
+        (pid, info)
+        for pid, info in list(_process_registry.items())
+        if _is_under(getattr(info, "working_dir", "") or "", root)
+    ]
+    for pid, info in matched:
+        _kill_process_tree(getattr(info.process, "pid", None))
+        try:
+            await stop_process(pid, profile=info.profile or (profile or ""))
+        except Exception:  # noqa: BLE001
+            logger.warning(f"stop_process failed for {pid}", exc_info=True)
+
+    removed = 0
+    try:
+        storage = get_autostart_storage()
+        rows = storage.list(profile) if profile else storage.list_all()
+        for row in rows:
+            if _is_under(row.get("working_dir") or "", root):
+                storage.delete(row["id"], row.get("profile") or profile)
+                removed += 1
+    except Exception:  # noqa: BLE001
+        logger.warning("autostart cleanup failed during skill teardown", exc_info=True)
+
+    if matched or removed:
+        publish_process_list_changed(profile)
+    return {"stopped": [pid for pid, _ in matched], "removed_autostart": removed}
 
 
 async def _sanity_check(proc, delay: float = 2.0) -> Optional[int]:

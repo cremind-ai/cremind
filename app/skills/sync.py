@@ -18,8 +18,11 @@ This module is the single entry point used by both ``server.py`` (boot) and
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import stat
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -32,6 +35,42 @@ from app.tools import ToolRegistry
 from app.utils.logger import logger
 
 BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin"
+
+
+def _force_writable(path: str) -> None:
+    """Clear the read-only bit so a stubborn file can be removed (Windows)."""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except OSError:
+        pass
+
+
+def _robust_rmtree(path: Path, *, attempts: int = 5, delay: float = 0.3) -> None:
+    """``shutil.rmtree`` with retries for transient Windows file locks.
+
+    After a process tree is killed, Windows can take a moment to release the
+    file handles it held (e.g. a skill's ``scripts/.listener.lock``). We retry a
+    few times with a short backoff and clear read-only attributes on failure.
+    The final attempt re-raises so genuine failures still surface.
+
+    Runs synchronously; callers invoke it via ``asyncio.to_thread`` so the brief
+    sleeps never block the event loop.
+    """
+    def _on_error(func, p, _exc):  # rmtree onexc handler (Python 3.12+)
+        _force_writable(p)
+        func(p)
+
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(path, onexc=_on_error)
+            return
+        except OSError as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                time.sleep(delay)
+    if last_exc is not None:
+        raise last_exc
 
 _watchers: dict[str, SkillsWatcher] = {}
 _watchers_lock = threading.Lock()
@@ -88,7 +127,7 @@ def delete_profile_skill(profile: str, dir_name: str) -> bool:
     target = _assert_inside_profile_skills(profile, dir_name)
     if not target.exists():
         return False
-    shutil.rmtree(target)
+    _robust_rmtree(target)
     logger.info(f"Deleted skill '{dir_name}' from profile '{profile}'")
     return True
 
@@ -105,7 +144,7 @@ def reset_builtin_skill(profile: str, dir_name: str) -> None:
         raise ValueError(f"Skill '{dir_name}' is not a built-in")
     target = _assert_inside_profile_skills(profile, dir_name)
     if target.exists():
-        shutil.rmtree(target)
+        _robust_rmtree(target)
     shutil.copytree(src, target, dirs_exist_ok=True)
     logger.info(f"Reset built-in skill '{dir_name}' for profile '{profile}'")
 
