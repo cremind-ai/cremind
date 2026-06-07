@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Callable
 
 from app.config.settings import BaseConfig
+from app.events.settings_state_bus import publish_settings_state_changed
 from app.skills.scanner import SkillInfo, scan_skills
 from app.skills.tool import SkillTool
 from app.skills.watcher import SkillsWatcher
@@ -39,6 +40,91 @@ _watchers_lock = threading.Lock()
 def profile_skills_dir(profile: str) -> Path:
     """Return ``<CREMIND_SYSTEM_DIR>/<profile>/skills``."""
     return Path(BaseConfig.CREMIND_SYSTEM_DIR) / profile / "skills"
+
+
+def builtin_skill_dir_names() -> set[str]:
+    """Return the set of directory names shipped under ``app/skills/builtin``."""
+    if not BUILTIN_SKILLS_DIR.is_dir():
+        return set()
+    return {p.name for p in BUILTIN_SKILLS_DIR.iterdir() if p.is_dir()}
+
+
+def is_builtin_skill_dir(dir_name: str) -> bool:
+    """True if *dir_name* corresponds to a shipped built-in skill directory.
+
+    Built-in skills are detected by directory name (the on-disk dir name equals
+    the SKILL.md ``name`` for every built-in). This is what distinguishes a
+    "Reset to Default" (built-in) from a "Delete" (external) skill.
+    """
+    if not dir_name:
+        return False
+    return (BUILTIN_SKILLS_DIR / dir_name).is_dir()
+
+
+def _assert_inside_profile_skills(profile: str, dir_name: str) -> Path:
+    """Resolve ``<profile skills>/<dir_name>`` and guard against traversal.
+
+    Returns the resolved target path. Raises :class:`ValueError` if *dir_name*
+    escapes the profile's skills directory (e.g. contains ``..`` or separators).
+    """
+    skills_root = profile_skills_dir(profile)
+    target = (skills_root / dir_name)
+    resolved = target.resolve()
+    root_resolved = skills_root.resolve()
+    if resolved != root_resolved and root_resolved not in resolved.parents:
+        raise ValueError(f"Skill path '{dir_name}' escapes the skills directory")
+    if resolved == root_resolved:
+        raise ValueError("Refusing to operate on the skills directory itself")
+    return target
+
+
+def delete_profile_skill(profile: str, dir_name: str) -> bool:
+    """Remove a skill directory from the profile's skills folder.
+
+    Only touches ``<CREMIND_SYSTEM_DIR>/<profile>/skills/<dir_name>`` — never the
+    shipped source under ``app/skills/builtin``. Returns True if a directory was
+    removed, False if it did not exist.
+    """
+    target = _assert_inside_profile_skills(profile, dir_name)
+    if not target.exists():
+        return False
+    shutil.rmtree(target)
+    logger.info(f"Deleted skill '{dir_name}' from profile '{profile}'")
+    return True
+
+
+def reset_builtin_skill(profile: str, dir_name: str) -> None:
+    """Restore a single built-in skill to its shipped default for *profile*.
+
+    Deletes the profile's copy (if any) and re-copies the pristine directory
+    from ``BUILTIN_SKILLS_DIR``. Raises :class:`ValueError` if *dir_name* is not
+    a built-in.
+    """
+    src = BUILTIN_SKILLS_DIR / dir_name
+    if not src.is_dir():
+        raise ValueError(f"Skill '{dir_name}' is not a built-in")
+    target = _assert_inside_profile_skills(profile, dir_name)
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(src, target, dirs_exist_ok=True)
+    logger.info(f"Reset built-in skill '{dir_name}' for profile '{profile}'")
+
+
+async def resync_profile_skills(profile: str, registry: ToolRegistry) -> dict[str, SkillInfo]:
+    """Re-scan the profile's skills dir and reconcile the registry immediately.
+
+    Used after a programmatic add/delete so the UI reflects the change at once
+    rather than after the watcher's debounce window. Also pings the Settings
+    SSE stream. Returns the freshly scanned skill set.
+    """
+    skills = scan_skills(profile_skills_dir(profile))
+    await registry.sync_skills(
+        profile=profile,
+        current=skills,
+        skill_factory=lambda info: SkillTool(info),
+    )
+    publish_settings_state_changed(profile)
+    return skills
 
 
 def sync_builtin_skills_into_profile(profile: str) -> list[str]:

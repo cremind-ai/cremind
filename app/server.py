@@ -52,6 +52,7 @@ from app.api.config import get_config_routes
 from app.api.features import get_features_routes
 from app.api.llm import get_llm_routes
 from app.api.setup_stream import get_setup_stream_routes
+from app.api.skills import get_skill_routes
 from app.api.system import get_system_routes
 from app.api.tools import get_tool_routes
 from app.api.upgrade import get_upgrade_routes
@@ -593,6 +594,7 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
     routes.extend(get_config_routes(state))
     routes.extend(get_llm_routes(state))
     routes.extend(get_tool_routes(state))
+    routes.extend(get_skill_routes(state))
     routes.extend(get_setup_stream_routes())
 
     middleware_stack = [

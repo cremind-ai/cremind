@@ -2,7 +2,7 @@
 import { ElSwitch, ElTag, ElButton, ElPopconfirm } from 'element-plus';
 import { Icon } from '@iconify/vue';
 
-defineProps<{
+withDefaults(defineProps<{
   name: string;
   statusTag: { label: string; type: 'success' | 'warning' | 'info' | 'danger' };
   expanded: boolean;
@@ -12,7 +12,17 @@ defineProps<{
   showReconnect?: boolean;
   showRemove?: boolean;
   removeName?: string;
-}>();
+  /** Optional skinning for the remove button (skills reuse it as
+   *  "Reset to Default" / "Delete"). Defaults preserve the bare red trash
+   *  icon used by the MCP/A2A sections. */
+  removeTitle?: string;
+  removeLabel?: string;
+  removeIcon?: string;
+  removeType?: 'danger' | 'warning' | 'primary' | 'info' | 'success';
+}>(), {
+  removeIcon: 'mdi:delete',
+  removeType: 'danger',
+});
 
 const emit = defineEmits<{
   'toggle-expand': [];
@@ -34,9 +44,15 @@ const emit = defineEmits<{
       <ElButton v-if="showReconnect" size="small" type="warning" @click="emit('reconnect')">Reconnect</ElButton>
       <ElButton v-if="showAuthenticate" size="small" type="primary" @click="emit('authenticate')">Auth</ElButton>
       <ElButton v-if="showUnlink" size="small" @click="emit('unlink')">Unlink</ElButton>
-      <ElPopconfirm v-if="showRemove" :title="`Remove '${removeName || name}'?`" @confirm="emit('remove')">
+      <ElPopconfirm
+        v-if="showRemove"
+        :title="removeTitle || `Remove '${removeName || name}'?`"
+        @confirm="emit('remove')"
+      >
         <template #reference>
-          <ElButton size="small" type="danger"><Icon icon="mdi:delete" /></ElButton>
+          <ElButton size="small" :type="removeType">
+            <Icon :icon="removeIcon" /><span v-if="removeLabel">&nbsp;{{ removeLabel }}</span>
+          </ElButton>
         </template>
       </ElPopconfirm>
       <ElSwitch :model-value="enabled" @update:model-value="emit('update:enabled', $event as boolean)" size="small" />

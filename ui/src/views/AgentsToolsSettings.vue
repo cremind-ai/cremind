@@ -17,6 +17,7 @@ import {
   listLLMProviders, getProviderModels,
   getSkillMode, setSkillMode,
   streamFeaturesInstall, FeatureNotInstalledError,
+  deleteSkill, importSkillArchive, importSkillFromGitHub,
   type RemoteAgentInfo, type ToolStatus, type LLMProvider, type SkillMode,
   type FeatureNotInstalledDetail, type FeatureInstallEvent,
 } from '../services/configApi';
@@ -94,6 +95,9 @@ interface UnifiedItem {
   /** LLM fields whose user override is forbidden. The matching switches/inputs
    *  in the form are rendered disabled. */
   lockedLlmFields: string[];
+  /** Skills only: true when the skill is a shipped built-in. Drives the
+   *  "Reset to Default" vs "Delete" action on the skill card. */
+  isBuiltinSkill: boolean;
   /** Skills only: declared ``long_running_app`` block; null when absent. */
   longRunningApp: { command: string; description?: string } | null;
   /** Transient: true while a Register Long-Running Process click is in flight. */
@@ -126,6 +130,13 @@ const addForm = ref({
 });
 const adding = ref(false);
 const jsonConfigError = ref('');
+
+// Import skill dialog
+const showImportDialog = ref(false);
+const importForm = ref<{ mode: 'archive' | 'github'; url: string }>({ mode: 'archive', url: '' });
+const importFile = ref<File | null>(null);
+const importing = ref(false);
+const archiveInput = ref<HTMLInputElement | null>(null);
 
 // Categorized items -- driven by tool_type, not by agent_type
 const builtinItems = computed(() => items.value.filter(i => i.kind === 'builtin'));
@@ -314,9 +325,11 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       toolConfigValues: initVarValues(tool.required_fields, tool.config?.variables),
       toolConfigured: tool.configured,
       agentName: tool.tool_id,
-      // User override only; code-level defaults are rendered as placeholders
-      // via `llmDefaults` on the form.
-      description: metaCfg.description || '',
+      // Skills have no description override and no LLM form — surface the real
+      // SKILL.md description so the expanded card explains what the skill does.
+      // Built-in/MCP tools use this as the user override (placeholder via
+      // `llmDefaults` on the LLM form).
+      description: isSkill ? (tool.description || '') : (metaCfg.description || ''),
       url: tool.url || '',
       systemPrompt: (metaCfg.system_prompt as string) || '',
       llmProvider: (llmCfg.llm_provider as string) || '',
@@ -339,6 +352,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       llmBound: isSkill ? true : (tool.llm_bound ?? true),
       llmDefaults,
       lockedLlmFields,
+      isBuiltinSkill: isSkill && !!tool.is_builtin,
       longRunningApp: tool.long_running_app ?? null,
       registering: false,
       lastRegisteredProcess: null,
@@ -382,6 +396,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       llmBound: true,
       llmDefaults: {},
       lockedLlmFields: [],
+      isBuiltinSkill: false,
       longRunningApp: null,
       registering: false,
       lastRegisteredProcess: null,
@@ -421,6 +436,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       llmBound: true,
       llmDefaults: {},
       lockedLlmFields: [],
+      isBuiltinSkill: false,
       longRunningApp: null,
       registering: false,
       lastRegisteredProcess: null,
@@ -665,6 +681,80 @@ async function handleRemoveAgent(item: UnifiedItem) {
   }
 }
 
+// ── Skill delete / reset ──
+// Confirmation is handled inline by the ItemCardHeader popconfirm; this just
+// performs the action. Built-in skills are reset to their shipped default
+// (the backend re-installs them); external skills are permanently deleted.
+async function handleDeleteSkill(item: UnifiedItem) {
+  if (!item.toolName) return;
+  try {
+    await deleteSkill(settingsStore.agentUrl, settingsStore.authToken, item.toolName);
+    ElMessage.success(
+      item.isBuiltinSkill ? `Reset ${item.displayName} to default` : `Deleted ${item.displayName}`,
+    );
+    await reloadAll();
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to delete skill');
+  }
+}
+
+// ── Skill import ──
+function openImportDialog() {
+  importForm.value = { mode: 'archive', url: '' };
+  importFile.value = null;
+  if (archiveInput.value) archiveInput.value.value = '';
+  showImportDialog.value = true;
+}
+
+function onArchiveSelected(e: Event) {
+  const input = e.target as HTMLInputElement;
+  importFile.value = input.files && input.files.length > 0 ? input.files[0] : null;
+}
+
+function reportImport(result: { installed: string[]; skipped?: { name: string; reason: string }[] }) {
+  const count = result.installed.length;
+  const names = result.installed.join(', ');
+  ElMessage.success(
+    count === 1 ? `Imported skill: ${names}` : `Imported ${count} skills: ${names}`,
+  );
+  if (result.skipped && result.skipped.length > 0) {
+    const detail = result.skipped.map(s => `${s.name} (${s.reason})`).join('; ');
+    ElMessage.warning(`Skipped: ${detail}`);
+  }
+}
+
+async function handleImportSkill() {
+  importing.value = true;
+  try {
+    if (importForm.value.mode === 'archive') {
+      if (!importFile.value) {
+        ElMessage.error('Choose an archive file to import');
+        return;
+      }
+      const result = await importSkillArchive(
+        settingsStore.agentUrl, settingsStore.authToken, importFile.value,
+      );
+      reportImport(result);
+    } else {
+      const url = importForm.value.url.trim();
+      if (!url) {
+        ElMessage.error('Enter a GitHub repository URL');
+        return;
+      }
+      const result = await importSkillFromGitHub(
+        settingsStore.agentUrl, settingsStore.authToken, url,
+      );
+      reportImport(result);
+    }
+    showImportDialog.value = false;
+    await reloadAll();
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to import skill');
+  } finally {
+    importing.value = false;
+  }
+}
+
 function openAddDialog(type: 'mcp' | 'a2a') {
   addForm.value = {
     url: '', type, inputMode: 'url', jsonConfig: '',
@@ -877,40 +967,49 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
         <ElDivider />
 
         <!-- Section 2: Skills -->
-        <div class="section" v-if="skillItems.length > 0">
+        <div class="section">
           <h2 class="section-title">
             <Icon icon="mdi:creation" class="section-icon" /> Skills
           </h2>
 
           <div class="skill-mode-row">
-            <span class="skill-mode-label">Skill Mode</span>
-            <ElRadioGroup
-              v-model="skillMode"
-              size="small"
-              :disabled="skillModeSaving"
-              @change="onSkillModeChange"
-            >
-              <ElRadioButton value="manual">Manual</ElRadioButton>
-              <ElTooltip
-                :disabled="embeddingEnabled"
-                content="Enable Vector Embedding in setup to use Automatic mode."
-                placement="top"
+            <template v-if="skillItems.length > 0">
+              <span class="skill-mode-label">Skill Mode</span>
+              <ElRadioGroup
+                v-model="skillMode"
+                size="small"
+                :disabled="skillModeSaving"
+                @change="onSkillModeChange"
               >
-                <span>
-                  <ElRadioButton value="automatic" :disabled="!embeddingEnabled">Automatic</ElRadioButton>
-                </span>
-              </ElTooltip>
-            </ElRadioGroup>
-            <span class="skill-mode-hint">
-              {{ !embeddingEnabled
-                  ? 'Vector Embedding is disabled — Automatic mode is unavailable.'
-                  : skillMode === 'manual'
-                    ? 'All enabled skills are exposed to the agent.'
-                    : 'Top 10 skills matching your message are selected via vector search.' }}
-            </span>
+                <ElRadioButton value="manual">Manual</ElRadioButton>
+                <ElTooltip
+                  :disabled="embeddingEnabled"
+                  content="Enable Vector Embedding in setup to use Automatic mode."
+                  placement="top"
+                >
+                  <span>
+                    <ElRadioButton value="automatic" :disabled="!embeddingEnabled">Automatic</ElRadioButton>
+                  </span>
+                </ElTooltip>
+              </ElRadioGroup>
+              <span class="skill-mode-hint">
+                {{ !embeddingEnabled
+                    ? 'Vector Embedding is disabled — Automatic mode is unavailable.'
+                    : skillMode === 'manual'
+                      ? 'All enabled skills are exposed to the agent.'
+                      : 'Top 10 skills matching your message are selected via vector search.' }}
+              </span>
+            </template>
+            <ElButton type="primary" class="skill-import-btn" @click="openImportDialog">
+              <Icon icon="mdi:import" /> Import Skill
+            </ElButton>
           </div>
 
-          <div class="items-list">
+          <div v-if="skillItems.length === 0" class="empty-state">
+            No skills installed. Use “Import Skill” above to add one.
+          </div>
+
+          <div v-else class="items-list">
             <ElCard v-for="item in skillItems" :key="item.name" class="item-card" shadow="hover">
               <ItemCardHeader
                 :name="item.displayName"
@@ -919,14 +1018,25 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
                 :enabled="item.enabled"
                 :show-authenticate="item.showAuthenticate"
                 :show-unlink="item.showUnlink"
+                :show-remove="true"
+                :remove-name="item.displayName"
+                :remove-label="item.isBuiltinSkill ? 'Reset to Default' : 'Delete'"
+                :remove-icon="item.isBuiltinSkill ? 'mdi:restore' : 'mdi:delete'"
+                :remove-type="item.isBuiltinSkill ? 'warning' : 'danger'"
+                :remove-title="item.isBuiltinSkill
+                  ? `Reset '${item.displayName}' to its default? Your local changes will be discarded.`
+                  : `Delete '${item.displayName}'? This cannot be undone.`"
                 @toggle-expand="item.expanded = !item.expanded"
                 @update:enabled="toggleItemEnabled(item, $event)"
                 @authenticate="handleAuthenticate(item)"
                 @unlink="handleUnlink(item)"
+                @remove="handleDeleteSkill(item)"
               />
 
               <div v-if="item.expanded" class="item-config">
                 <p v-if="item.description" class="item-desc skill-description">{{ item.description }}</p>
+
+                <ElDivider v-if="item.description && Object.keys(item.toolConfigFields).length > 0" />
 
                 <div v-if="Object.keys(item.toolConfigFields).length > 0" class="config-section">
                   <ToolVariablesForm
@@ -1169,6 +1279,56 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
       </template>
     </ElDialog>
 
+    <!-- Import Skill dialog -->
+    <ElDialog v-model="showImportDialog" title="Import Skill" width="520px">
+      <ElRadioGroup v-model="importForm.mode" size="small" class="import-mode-row">
+        <ElRadioButton value="archive">Archive file</ElRadioButton>
+        <ElRadioButton value="github">GitHub URL</ElRadioButton>
+      </ElRadioGroup>
+
+      <div v-if="importForm.mode === 'archive'" class="import-section">
+        <p class="import-hint">
+          Upload a skill archive (.zip, .tar.gz, .tgz, .tar, .tar.bz2, .tar.xz).
+          Every folder containing a valid SKILL.md will be installed.
+        </p>
+        <input
+          ref="archiveInput"
+          type="file"
+          accept=".zip,.tar.gz,.tgz,.tar,.tar.bz2,.tar.xz"
+          style="display: none"
+          @change="onArchiveSelected"
+        />
+        <div class="import-file-row">
+          <ElButton @click="archiveInput?.click()">
+            <Icon icon="mdi:file-upload-outline" />&nbsp;Choose file…
+          </ElButton>
+          <span class="import-file-name">{{ importFile ? importFile.name : 'No file selected' }}</span>
+        </div>
+      </div>
+
+      <div v-else class="import-section">
+        <p class="import-hint">
+          Paste a public GitHub repository URL. Cremind clones the repo (or
+          downloads it) and installs every skill it contains.
+        </p>
+        <ElInput
+          v-model="importForm.url"
+          placeholder="https://github.com/owner/repo"
+          clearable
+        />
+      </div>
+
+      <template #footer>
+        <ElButton @click="showImportDialog = false">Cancel</ElButton>
+        <ElButton
+          type="primary"
+          :loading="importing"
+          :disabled="importForm.mode === 'archive' ? !importFile : !importForm.url.trim()"
+          @click="handleImportSkill"
+        >Import</ElButton>
+      </template>
+    </ElDialog>
+
     <ElTour v-model="tourOpen">
       <ElTourStep
         :target="tourTargetSelector"
@@ -1390,6 +1550,14 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
   color: var(--text-tertiary);
   flex: 1 1 auto;
 }
+
+.skill-import-btn { margin-left: auto; flex-shrink: 0; }
+
+.import-mode-row { margin-bottom: 12px; }
+.import-section { display: flex; flex-direction: column; gap: 10px; }
+.import-hint { font-size: 0.78rem; color: var(--text-tertiary); line-height: 1.45; margin: 0; }
+.import-file-row { display: flex; align-items: center; gap: 10px; }
+.import-file-name { font-size: 0.8rem; color: var(--text-secondary, var(--text-tertiary)); word-break: break-all; }
 
 .json-config-input :deep(textarea) { font-family: monospace; font-size: 0.8rem; }
 .json-config-hint {

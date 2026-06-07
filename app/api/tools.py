@@ -20,6 +20,7 @@ from app.config.settings import BaseConfig
 from app.events.settings_state_bus import publish_settings_state_changed
 from app.lib.llm.factory import create_llm_provider
 from app.runtime import BootedState
+from app.skills.sync import is_builtin_skill_dir
 from app.storage import get_autostart_storage
 from app.tools import ToolType
 from app.tools.builtin import (
@@ -128,6 +129,13 @@ def get_tool_routes(state: BootedState) -> list[Route]:
                 row["url"] = tool.url
             if hasattr(tool, "owner_profile"):
                 row["owner_profile"] = tool.owner_profile
+            # Skills carry a built-in flag so the Settings page can offer
+            # "Reset to Default" for shipped skills vs "Delete" for imported ones.
+            if tool.tool_type is ToolType.SKILL:
+                info = getattr(tool, "info", None)
+                row["is_builtin"] = bool(
+                    info is not None and is_builtin_skill_dir(info.dir_path.name)
+                )
             lra = _long_running_app_for_tool(tool)
             if lra is not None:
                 row["long_running_app"] = lra
