@@ -3,6 +3,7 @@ name: gcalendar
 description: List, view, create, update, and delete Google Calendar events via OAuth2, and receive calendar-change events in real time. Authorizes through the Cremind Connect service (no GCP setup); tokens stay on this machine. A persistent listener uses Calendar watch channels (via the relay) and drops changed events as markdown. This is the Google Calendar skill (for CalDAV providers like iCloud/Fastmail, use caldav-calendar instead).
 metadata: {
   environment_variables: ["CREMIND_CONNECT_URL", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "CALENDAR_ID"],
+  optional_environment_variables: ["CREMIND_CONNECT_URL", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "CALENDAR_ID"],
   events: {"event_type":[{"name":"event_changed","description":"A calendar event was created, modified, or cancelled"}]},
   long_running_app: {
     command: "uv run scripts/event_listener.py",
@@ -35,11 +36,15 @@ and the relay never sees them. Runs via `uv` (PEP 723 inline metadata).
 
 ## Setup
 
-`scripts/.env`:
+No configuration is required by default. `CREMIND_CONNECT_URL` defaults to
+`https://connect.cremind.io`, and the OAuth `GOOGLE_CLIENT_ID` /
+`GOOGLE_CLIENT_SECRET` are fetched dynamically from Cremind Connect
+(`GET /credentials/google`) so the org can rotate them without a client update.
+Set any of these in `scripts/.env` (or via the Settings UI) **only to override**:
 ```
 CREMIND_CONNECT_URL=https://connect.cremind.io   # optional; this is the default
-GOOGLE_CLIENT_ID=                                # optional; otherwise taken from discovery
-GOOGLE_CLIENT_SECRET=                            # the org's (non-confidential) Desktop client secret
+GOOGLE_CLIENT_ID=                                # optional; otherwise fetched from cremind-connect
+GOOGLE_CLIENT_SECRET=                            # optional; otherwise fetched from cremind-connect
 CALENDAR_ID=primary                              # optional; default "primary"
 ```
 
@@ -114,7 +119,7 @@ received_at: "2026-06-06T09:00:05+00:00"
 
 ## Troubleshooting
 - `Account not linked` → run `uv run scripts/__main__.py link`.
-- `GOOGLE_CLIENT_SECRET missing` → the org's Desktop client secret must be in `scripts/.env`.
+- `No GOOGLE_CLIENT_SECRET available` → cremind-connect must be reachable (it serves the secret), or set it in `scripts/.env` to override.
 - No events arriving → confirm the listener is running and the relay is reachable (`curl $CREMIND_CONNECT_URL/.well-known/cremind-connect`); the webhook domain must be verified in Google for Calendar push.
 - Calendar webhooks aren't signed by Google; the relay treats a nudge purely as a trigger and the listener re-syncs with your own token, so a spurious nudge only causes a harmless re-sync.
 

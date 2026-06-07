@@ -3,6 +3,7 @@ name: gmail
 description: Read, search, send, reply to, label, and trash Gmail messages via OAuth2, and receive new-email events in real time. Authorizes through the Cremind Connect service (no GCP setup); tokens stay on this machine. A persistent listener uses Gmail watch + Pub/Sub (via the relay) and drops new INBOX messages as markdown.
 metadata: {
   environment_variables: ["CREMIND_CONNECT_URL", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
+  optional_environment_variables: ["CREMIND_CONNECT_URL", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
   events: {"event_type":[{"name":"new_email","description":"A new email arrived in the Gmail INBOX"}]},
   long_running_app: {
     command: "uv run scripts/event_listener.py",
@@ -32,11 +33,15 @@ sees them. Runs via `uv` (PEP 723 inline metadata).
 
 ## Setup
 
-`scripts/.env`:
+No configuration is required by default. `CREMIND_CONNECT_URL` defaults to
+`https://connect.cremind.io`, and the OAuth `GOOGLE_CLIENT_ID` /
+`GOOGLE_CLIENT_SECRET` are fetched dynamically from Cremind Connect
+(`GET /credentials/google`) so the org can rotate them without a client update.
+Set any of these in `scripts/.env` (or via the Settings UI) **only to override**:
 ```
 CREMIND_CONNECT_URL=https://connect.cremind.io   # optional; this is the default
-GOOGLE_CLIENT_ID=                                # optional; otherwise taken from discovery
-GOOGLE_CLIENT_SECRET=                            # the org's (non-confidential) Desktop client secret
+GOOGLE_CLIENT_ID=                                # optional; otherwise fetched from cremind-connect
+GOOGLE_CLIENT_SECRET=                            # optional; otherwise fetched from cremind-connect
 ```
 
 Then link the account (opens a browser for Google consent):
@@ -107,7 +112,7 @@ received_at: "2026-06-06T09:00:05+00:00"
 
 ## Troubleshooting
 - `Account not linked` → run `uv run scripts/__main__.py link`.
-- `GOOGLE_CLIENT_SECRET missing` → the org's Desktop client secret must be in `scripts/.env`.
+- `No GOOGLE_CLIENT_SECRET available` → cremind-connect must be reachable (it serves the secret), or set it in `scripts/.env` to override.
 - `Google did not return a refresh token` → revoke at <https://myaccount.google.com/permissions> and re-link.
 - No events arriving → confirm the listener is running, that `link` used `openid email` scopes, and that the relay is reachable (`curl $CREMIND_CONNECT_URL/.well-known/cremind-connect`).
 - Restricted scopes: while the org's consent screen is in "Testing", only added test users can link.
@@ -118,7 +123,7 @@ gmail/
 ├── SKILL.md
 ├── events/new_email/                 # markdown drop-zone
 └── scripts/
-    ├── .env                          # CREMIND_CONNECT_URL, GOOGLE_CLIENT_ID/SECRET
+    ├── .env                          # optional overrides (creds fetched from cremind-connect by default)
     ├── __main__.py                   # CLI entry
     ├── event_listener.py             # listener entry
     ├── tests/test_account_key.py     # cross-repo routing-key parity test

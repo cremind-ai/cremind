@@ -8,16 +8,22 @@ from typing import Any
 
 from . import config, formatter, gmail_api
 from .google import auth
-from .google.discovery import Discovery
+from .google.discovery import Discovery, DiscoveryError
 
 
 def _resolve_client() -> tuple[str, str, list[str]]:
     disc = Discovery(config.CREMIND_CONNECT_URL)
-    client_id = config.GOOGLE_CLIENT_ID or disc.client_id()
-    client_secret = config.GOOGLE_CLIENT_SECRET
-    scopes = disc.scopes()
+    try:
+        creds = disc.credentials()
+        scopes = disc.scopes()
+    except DiscoveryError as e:
+        raise SystemExit(f"Could not reach cremind-connect at {config.CREMIND_CONNECT_URL}: {e}")
+    # Env (scripts/.env) overrides win; otherwise use the values cremind-connect
+    # serves, so the org can rotate the client id/secret without a client update.
+    client_id = config.GOOGLE_CLIENT_ID or creds.get("clientId", "")
+    client_secret = config.GOOGLE_CLIENT_SECRET or creds.get("clientSecret", "")
     if not client_id:
-        raise SystemExit("No GOOGLE_CLIENT_ID (set it in scripts/.env or ensure discovery is reachable).")
+        raise SystemExit("No GOOGLE_CLIENT_ID (set it in scripts/.env or ensure cremind-connect is reachable).")
     if not scopes:
         scopes = [
             "openid",
@@ -49,8 +55,9 @@ def cmd_link(args) -> Any:
     client_id, client_secret, scopes = _resolve_client()
     if not client_secret:
         raise SystemExit(
-            "GOOGLE_CLIENT_SECRET missing in scripts/.env. The org provides the "
-            "(non-confidential) Desktop client secret used for the loopback PKCE flow."
+            "No GOOGLE_CLIENT_SECRET available. It is normally provided by "
+            "cremind-connect; set it in scripts/.env to override, or ensure "
+            "cremind-connect is reachable at CREMIND_CONNECT_URL."
         )
     data = auth.link(
         token_path=config.TOKEN_PATH,

@@ -65,6 +65,21 @@ class SkillTool(Tool):
             return []
         return [v for v in raw if isinstance(v, str) and v]
 
+    @property
+    def optional_environment_variables(self) -> list[str]:
+        """Names of environment variables that are optional (have a sensible
+        default or are fetched dynamically), declared via
+        ``metadata.optional_environment_variables``.
+
+        Such variables stay editable in the UI but do not mark the skill as
+        "needs config" when left blank. Returns an empty list when none are
+        declared.
+        """
+        raw = self._info.metadata.get("optional_environment_variables") or []
+        if not isinstance(raw, list):
+            return []
+        return [v for v in raw if isinstance(v, str) and v]
+
     def get_card(self) -> AgentCard:
         return AgentCard(
             name=self._info.name,

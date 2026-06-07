@@ -28,10 +28,12 @@ from typing import Callable
 
 from app.config.settings import BaseConfig
 from app.events.settings_state_bus import publish_settings_state_changed
+from app.skills.env_file import write_skill_env_file
 from app.skills.scanner import SkillInfo, scan_skills
 from app.skills.tool import SkillTool
 from app.skills.watcher import SkillsWatcher
 from app.tools import ToolRegistry
+from app.tools.base import ToolType
 from app.utils.logger import logger
 
 BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin"
@@ -162,6 +164,7 @@ async def resync_profile_skills(profile: str, registry: ToolRegistry) -> dict[st
         current=skills,
         skill_factory=lambda info: SkillTool(info),
     )
+    _materialize_skill_env_files(profile, registry)
     publish_settings_state_changed(profile)
     return skills
 
@@ -227,7 +230,38 @@ async def initialize_profile_skills(
     )
     logger.info(f"Synced {len(skills)} skill(s) for profile '{profile}'")
 
+    # The copytree above restores shipped skill files (including any stale
+    # .env); re-apply persisted variables so user overrides survive the boot.
+    _materialize_skill_env_files(profile, registry)
+
     return _start_watcher(profile, skills_dir, registry, loop=loop)
+
+
+def _materialize_skill_env_files(profile: str, registry: ToolRegistry) -> None:
+    """Re-write each profile skill's ``scripts/.env`` from its persisted vars.
+
+    Skills get their config solely through ``scripts/.env`` (the agent has no
+    per-skill env hook for the generic exec_shell tool), and that file is
+    otherwise written only when the user saves variables. The boot-time
+    copytree restores the shipped ``.env``, so without this the user's saved
+    overrides would be lost on every restart. Writing from SQLite also yields an
+    empty ``.env`` when there are no overrides — clearing any credentials that
+    older builds shipped on disk.
+    """
+    for tool in registry.tools_for_profile(profile):
+        if tool.tool_type is not ToolType.SKILL:
+            continue
+        declared = getattr(tool, "environment_variables", []) or []
+        if not declared:
+            continue
+        try:
+            variables = registry.config.get_variables(
+                tool.tool_id, profile, include_secrets=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(f"Failed to read variables for skill '{tool.tool_id}'")
+            variables = {}
+        write_skill_env_file(tool.info.dir_path / "scripts", declared, variables)
 
 
 async def teardown_profile_skills(

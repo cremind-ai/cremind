@@ -1,9 +1,11 @@
-"""Client for the cremind-connect discovery document.
+"""Client for the cremind-connect public endpoints.
 
 A single GET to {base}/.well-known/cremind-connect tells the skill which OAuth
 client id + scopes to use, which Pub/Sub topic to point users.watch() at, which
-Calendar webhook URL to use, and the relay WebSocket URL. This keeps the skill
-self-configuring and the relay the single source of truth.
+Calendar webhook URL to use, and the relay WebSocket URL. A separate GET to
+{base}/credentials/<provider> returns the OAuth client id + secret, served
+dynamically so the org can rotate them without a client update. This keeps the
+skill self-configuring and the relay the single source of truth.
 """
 from __future__ import annotations
 
@@ -27,6 +29,8 @@ class Discovery:
         self.cache_ttl = cache_ttl
         self._doc: dict[str, Any] | None = None
         self._fetched_at = 0.0
+        self._creds: dict[str, dict[str, Any]] = {}
+        self._creds_at: dict[str, float] = {}
 
     def _endpoint(self) -> str:
         return f"{self.base_url}/.well-known/cremind-connect"
@@ -69,6 +73,35 @@ class Discovery:
         if not cid:
             raise DiscoveryError("discovery doc has no authClientId")
         return cid
+
+    def _credentials_endpoint(self, provider_id: str) -> str:
+        return f"{self.base_url}/credentials/{provider_id}"
+
+    def credentials(self, provider_id: str = "google", *, force: bool = False) -> dict[str, Any]:
+        """Fetch (and cache) the OAuth client id + secret for a provider.
+
+        Served by cremind-connect at /credentials/<provider> so the org can
+        rotate the (non-confidential, Desktop) client credentials centrally.
+        """
+        now = time.time()
+        cached = self._creds.get(provider_id)
+        if cached is not None and not force and (now - self._creds_at.get(provider_id, 0.0)) < self.cache_ttl:
+            return cached
+        req = urllib.request.Request(
+            self._credentials_endpoint(provider_id),
+            headers={"accept": "application/json", "user-agent": "cremind-skill/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                doc = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+            raise DiscoveryError(f"failed to fetch credentials from {self._credentials_endpoint(provider_id)}: {e}") from e
+        self._creds[provider_id] = doc
+        self._creds_at[provider_id] = now
+        return doc
+
+    def client_secret(self, provider_id: str = "google") -> str:
+        return self.credentials(provider_id).get("clientSecret", "")
 
     def scopes(self, provider_id: str = "google") -> list[str]:
         return list(self.provider(provider_id).get("scopes", []))
