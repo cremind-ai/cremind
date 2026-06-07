@@ -31,6 +31,9 @@ let term: Terminal | null = null;
 let fitAddon: FitAddon | null = null;
 let ws: WebSocket | null = null;
 let resizeObserver: ResizeObserver | null = null;
+// Set when WE close the socket (unmount / pid change) so onclose can stay
+// quiet — only a close we didn't initiate is worth alerting the user about.
+let intentionalClose = false;
 
 // Client-side cooked-mode line buffer for non-PTY processes (see ProcessTerminal.vue
 // for the full rationale — the same logic applies here).
@@ -147,6 +150,7 @@ async function connect() {
   });
 
   try {
+    intentionalClose = false;
     ws = openProcessSocket(settings.agentUrl, settings.authToken, props.pid);
   } catch (err) {
     status.value = 'disconnected';
@@ -184,11 +188,26 @@ async function connect() {
       ElMessage.warning('Output buffer overflowed — some chunks were dropped.');
     }
   };
-  ws.onclose = () => {
-    status.value = status.value === 'exited' ? 'exited' : 'disconnected';
+  ws.onclose = (ev) => {
+    // We closed it ourselves (unmount / pid change), or the process already
+    // reported 'exited' (normal end-of-stream): stay quiet. Anything else is
+    // a real disconnect the user should see — a silent close otherwise looks
+    // identical to a terminal that's still "connecting".
+    if (intentionalClose || status.value === 'exited') return;
+    status.value = 'disconnected';
+    // 1000 (normal) / 1005 (no status) accompany clean closes; only alert on
+    // abnormal codes (1006 dropped, 1008 rejected, 1011 server error, …).
+    if (ev.code !== 1000 && ev.code !== 1005) {
+      ElMessage.error(
+        `Terminal disconnected (code ${ev.code}${ev.reason ? `: ${ev.reason}` : ''}).`,
+      );
+    }
   };
   ws.onerror = () => {
+    // onerror typically fires just before onclose; don't double-toast.
+    if (intentionalClose || status.value === 'exited' || status.value === 'disconnected') return;
     status.value = 'disconnected';
+    ElMessage.error('Terminal connection failed — is the backend reachable?');
   };
 
   resizeObserver = new ResizeObserver(() => {
@@ -205,6 +224,7 @@ async function connect() {
 function disconnect() {
   try { resizeObserver?.disconnect(); } catch { /* noop */ }
   resizeObserver = null;
+  intentionalClose = true;
   try { ws?.close(); } catch { /* noop */ }
   ws = null;
   try { term?.dispose(); } catch { /* noop */ }

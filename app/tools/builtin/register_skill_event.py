@@ -37,7 +37,7 @@ def _resolve_skill(skill_name: str, profile: str) -> Optional[tuple[str, str]]:
     :mod:`app.tools.registry`). The hint we inject into the system prompt
     asks the LLM to pass that tool_id form directly, but for resilience we
     also accept a bare slug or the original SKILL.md ``name`` value
-    (e.g. ``email-cli``); a leading ``<profile>__`` is stripped before
+    (e.g. ``imap-email``); a leading ``<profile>__`` is stripped before
     re-slugging so a stale prefix on a different profile still resolves.
     """
     raw = (skill_name or "").strip()

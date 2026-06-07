@@ -1994,6 +1994,55 @@ if (!gotSingleInstanceLock) {
     focusMostRecentAppWindow()
   })
 
+  // ── window.open handler ─────────────────────────────────────────────────
+  //
+  // The renderer pops out same-origin SPA routes via ``window.open`` — most
+  // notably the Process Manager terminal (ProcessList.vue's openTerminal).
+  // Without a handler, Electron's default opens those as bare windows with NO
+  // preload, so ``window.cremind`` is absent and the terminal's agentUrl/token
+  // resolution falls back to fragile heuristics — which is why the terminal
+  // streamed nothing. Give same-origin SPA pop-outs the same preload bridge,
+  // titlebar, and (implicitly) session as createAppWindow, so they resolve the
+  // backend exactly like the main window.
+  //
+  // Only same-origin http/https/file URLs are treated as SPA pop-outs. That
+  // protocol filter excludes ``blob:`` file previews (openFile.ts) and
+  // ``about:blank`` print tabs (MessageBubble.vue), and the same-origin check
+  // excludes external links (GitHub / PyPI / OAuth) — all of which keep
+  // Electron's default behaviour, untouched.
+  app.on('web-contents-created', (_e, contents) => {
+    contents.setWindowOpenHandler(({ url }) => {
+      let internalSpa = false
+      try {
+        const target = new URL(url)
+        const opener = new URL(contents.getURL())
+        internalSpa =
+          (target.protocol === 'http:' ||
+            target.protocol === 'https:' ||
+            target.protocol === 'file:') &&
+          target.origin === opener.origin
+      } catch {
+        /* malformed / about:blank — treat as external, keep default */
+      }
+      if (!internalSpa) return { action: 'allow' }
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 1100,
+          height: 750,
+          autoHideMenuBar: true,
+          titleBarStyle: 'hidden',
+          titleBarOverlay: { color: '#242424', symbolColor: '#ffffff', height: 32 },
+          icon: path.join(process.env.VITE_PUBLIC, 'logo.png'),
+          webPreferences: {
+            preload: path.join(__dirname, 'preload.mjs'),
+            devTools: devToolsEnabled(),
+          },
+        },
+      }
+    })
+  })
+
   app.whenReady().then(async () => {
     // Load the persisted config before the window opens so the preload's
     // sync IPC returns a populated value on the very first request.

@@ -40,7 +40,7 @@ from app.tools.builtin.register_skill_event import _resolve_skill_source
 from app.utils.logger import logger
 
 
-# Default IMAP poll interval is 30s (see email-cli config). Heartbeat-based
+# Default IMAP poll interval is 30s (see imap-email config). Heartbeat-based
 # liveness uses a generous 3× window so a single missed beat doesn't flag down.
 _DEFAULT_HEARTBEAT_WINDOW_S = 90.0
 

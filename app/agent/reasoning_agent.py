@@ -360,7 +360,7 @@ class ReasoningAgent:
         items = events.get("event_type") or []
         if not isinstance(items, list) or not items:
             return ""
-        # Use the canonical tool_id (e.g. ``admin__email_cli``) — that's the
+        # Use the canonical tool_id (e.g. ``admin__imap_email``) — that's the
         # same identifier the LLM already sees as this skill's Action label,
         # and the only key that resolves the ``tools`` table row directly.
         skill_name = getattr(tool, "tool_id", None) \

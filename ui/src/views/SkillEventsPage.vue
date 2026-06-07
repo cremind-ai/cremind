@@ -285,7 +285,7 @@ function formatDate(ms: number): string {
           v-model="simulateContent"
           type="textarea"
           :rows="14"
-          placeholder="The exact bytes that will be written to the .md file. Format depends on the skill — e.g. an email-cli event uses YAML frontmatter + markdown body."
+          placeholder="The exact bytes that will be written to the .md file. Format depends on the skill — e.g. an imap-email event uses YAML frontmatter + markdown body."
         />
       </div>
       <template #footer>

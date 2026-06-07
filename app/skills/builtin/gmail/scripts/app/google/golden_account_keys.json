@@ -1,0 +1,13 @@
+{
+  "algorithm": "base32(sha256(\"google:\" + lower(trim(email)))[:16]); rfc4648 lowercase no padding",
+  "provider": "google",
+  "note": "CROSS-REPO CONTRACT. Must be byte-identical to cremind-connect/test/golden/account-keys.json.",
+  "vectors": [
+    { "email": "abc@gmail.com", "accountKey": "lihoigfzisd3533cvaluhfd5zq" },
+    { "email": "Abc@Gmail.com", "accountKey": "lihoigfzisd3533cvaluhfd5zq" },
+    { "email": "  abc@gmail.com  ", "accountKey": "lihoigfzisd3533cvaluhfd5zq" },
+    { "email": "user.name+tag@gmail.com", "accountKey": "sv3hjfqldn2lvbwxubynuwaxpm" },
+    { "email": "person@example.org", "accountKey": "3zvcrrsjrgha7ls3pblmv4xjva" },
+    { "email": "li@olli-ai.com", "accountKey": "uyhn42x3uwoxmpzbzvuod5dc5q" }
+  ]
+}
