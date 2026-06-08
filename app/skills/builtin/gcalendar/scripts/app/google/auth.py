@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,42 @@ def _decode_jwt_payload(token: str) -> dict[str, Any]:
         return {}
 
 
+def _run_local_server_interruptible(flow, **kwargs) -> Any:
+    """Run ``flow.run_local_server`` so that Ctrl+C reliably aborts the wait.
+
+    ``run_local_server`` blocks in ``wsgiref``'s ``handle_request()``. On Windows
+    that wait sits inside a WinSock ``select()`` which SIGINT cannot interrupt:
+    the Ctrl+C is queued but never delivered until a request actually arrives, so
+    ``link`` looks frozen and can't be cancelled. Mirroring the listener's relay
+    loop, run the blocking call on a daemon thread and park the MAIN thread in an
+    interruptible ``join`` loop. The signal then lands within ~0.5s; the daemon
+    thread (and its open socket) is reclaimed when the process exits.
+    """
+    box: dict[str, Any] = {}
+
+    def _target() -> None:
+        try:
+            box["creds"] = flow.run_local_server(**kwargs)
+        except BaseException as exc:  # surfaced on the main thread below
+            box["error"] = exc
+
+    worker = threading.Thread(target=_target, name="oauth-loopback", daemon=True)
+    try:
+        worker.start()
+        while worker.is_alive():
+            worker.join(timeout=0.5)
+        # Surface a worker exception, or the creds, on the main thread. Kept inside
+        # the try so a Ctrl+C landing in this teardown window is also normalized to
+        # AuthError rather than leaking a raw KeyboardInterrupt. (SIGINT is only ever
+        # delivered to the main thread, so box["error"] is never a KeyboardInterrupt
+        # and cannot be double-wrapped here.)
+        if "error" in box:
+            raise box["error"]
+        return box["creds"]
+    except KeyboardInterrupt:
+        raise AuthError("Linking cancelled (Ctrl+C) before consent completed.")
+
+
 def link(
     *,
     token_path: Path,
@@ -98,7 +135,8 @@ def link(
         }
     }
     flow = InstalledAppFlow.from_client_config(client_config, scopes)
-    creds = flow.run_local_server(
+    creds = _run_local_server_interruptible(
+        flow,
         host="localhost",
         bind_addr=bind_addr,
         port=port,
