@@ -9,8 +9,15 @@ import './style.css'
 import App from './App.vue'
 import router from './router'
 import { useSettingsStore } from './stores/settings'
+import { installExternalLinkInterceptor } from './utils/externalLinks'
 
 document.title = __IS_ELECTRON__ ? 'Cremind App' : 'Cremind Web UI'
+
+// Route clicked external links to the OS browser instead of a new Electron
+// window. Installed at module scope (not in a component) so it survives the
+// file:// → backend pivot reload below, which re-executes this module, and so
+// it's active before Vue mounts. No-ops in the web build.
+installExternalLinkInterceptor()
 
 // Electron: leave the asar-bundled SPA snapshot in favor of the
 // wheel-served SPA whenever a backend is reachable. The asar copy is

@@ -27,6 +27,11 @@ contextBridge.exposeInMainWorld('cremind', {
   setConfig: (patch: Record<string, unknown>) =>
     ipcRenderer.invoke('cremind:set-config', patch),
 
+  // Open a URL in the OS default handler (browser / mail client) instead of a
+  // new Electron window. The renderer's external-link interceptor calls this
+  // for clicked external anchors; the main process enforces a scheme allowlist.
+  openExternal: (url: string) => ipcRenderer.invoke('cremind:open-external', url),
+
   // First-run installer bridge — fronts the IPC handlers in
   // electron/main.ts. ``run`` returns a promise that resolves with the
   // installer's exit code; while it's pending, ``onLog`` callbacks
