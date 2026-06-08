@@ -40,6 +40,14 @@ services:
       - "${SPA_PORT:-1515}:1515"
       - "${NOVNC_PORT:-6080}:80"
       - "${VNC_PORT:-5900}:5900"
+      # OAuth loopback callback. ``cremind serve`` runs ONE persistent
+      # loopback listener (app/api/oauth_loopback.py) that receives the
+      # Google consent redirect for the built-in skills. The consenting
+      # browser runs on the host and the redirect is http://127.0.0.1:<port>/,
+      # so this port must be published AND identical on both sides (host
+      # port == container port == advertised redirect port). A single
+      # ${OAUTH_CALLBACK_PORT} drives all three.
+      - "${OAUTH_CALLBACK_PORT:-1516}:${OAUTH_CALLBACK_PORT:-1516}"
     environment:
       ENV: production
       HOST: 0.0.0.0
@@ -69,6 +77,15 @@ services:
       CREMIND_COMPOSE_ENV_FILE: /opt/cremind-compose/.env
       VNC_PASSWORD: ${VNC_PASSWORD}
       RESOLUTION: ${RESOLUTION:-1280x720}
+      # Configure the backend's persistent OAuth loopback listener: bind it
+      # to 0.0.0.0 (so Docker-forwarded traffic from the host browser
+      # reaches it) on the published port above. Read by ``cremind serve``
+      # (BaseConfig) to start the listener, and inherited by the
+      # gmail/gcalendar skill subprocesses (which also have it injected via
+      # system_vars) to build the redirect_uri. Must equal the container
+      # side of the ${OAUTH_CALLBACK_PORT} port mapping.
+      CREMIND_OAUTH_CALLBACK_PORT: "${OAUTH_CALLBACK_PORT:-1516}"
+      CREMIND_OAUTH_BIND_ADDR: "0.0.0.0"
     volumes:
       # Cremind System Directory lives in a named Docker volume, isolated
       # from the host filesystem. Storage, tokens, profile dirs, .env,
