@@ -265,10 +265,11 @@ WORKDIR /root/.cremind
 
 # 1112 backend, 1515 SPA, 5900 raw VNC, 80 noVNC web. The compose file
 # maps 80 → 6080 on the host so it doesn't conflict with the host's
-# real port 80. 1516 is the fixed OAuth loopback-callback port: the
-# built-in Google skills (and the A2A auth handler) bind it to 0.0.0.0
-# so the host browser's consent redirect (http://localhost:1516/) reaches
-# the in-container server. EXPOSE is documentation only — the compose
+# real port 80. 1516 is the fixed OAuth loopback-callback port: ``cremind
+# serve`` runs ONE persistent loopback listener (app/api/oauth_loopback.py)
+# bound to 0.0.0.0 so the host browser's Google consent redirect
+# (http://127.0.0.1:1516/) reaches it; the built-in Google skills point
+# their redirect_uri at it. EXPOSE is documentation only — the compose
 # ``-p`` mapping is what actually forwards the port.
 EXPOSE 1112 1515 5900 80 1516
 

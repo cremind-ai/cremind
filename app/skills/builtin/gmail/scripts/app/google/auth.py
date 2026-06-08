@@ -13,10 +13,12 @@ from __future__ import annotations
 import base64
 import json
 import os
+import socket
 import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 from .account_key import account_key_for
 
@@ -99,6 +101,85 @@ def _run_local_server_interruptible(flow, **kwargs) -> Any:
         raise AuthError("Linking cancelled (Ctrl+C) before consent completed.")
 
 
+def _oauth_inbox_dir() -> Path | None:
+    """Directory where ``cremind serve``'s persistent loopback listener drops
+    captured authorization responses, or None when not running under the backend."""
+    system_dir = os.environ.get("CREMIND_SYSTEM_DIR", "").strip()
+    if not system_dir:
+        return None
+    return Path(system_dir) / "oauth_inbox"
+
+
+def _backend_listener_available(port: int) -> bool:
+    """True if the backend's persistent OAuth loopback listener is reachable.
+
+    Requires the Cremind System Directory (so the skill can read the inbox the
+    backend writes to) and a live TCP listener on the loopback port. When false,
+    ``link`` falls back to an in-subprocess ephemeral loopback server.
+    """
+    if _oauth_inbox_dir() is None:
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+def _await_oauth_callback(state: str, *, timeout: float = 300.0) -> str:
+    """Block until the backend drops the authorization response for ``state``.
+
+    Returns the raw redirect query (``code=...&state=...&scope=...``). Raises
+    AuthError on denial, timeout, or Ctrl+C. The wait is a plain sleep loop on
+    the main thread, so SIGINT interrupts it promptly (no thread wrapper needed).
+    """
+    inbox = _oauth_inbox_dir()
+    if inbox is None:  # pragma: no cover - guarded by _backend_listener_available
+        raise AuthError("CREMIND_SYSTEM_DIR is not set; cannot receive the OAuth callback.")
+    path = inbox / f"{state}.txt"
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            if path.exists():
+                try:
+                    query = path.read_text(encoding="utf-8")
+                finally:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                if "error" in parse_qs(query):
+                    raise AuthError("Google consent was denied or returned an error.")
+                return query
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        raise AuthError("Linking cancelled (Ctrl+C) before consent completed.")
+    raise AuthError(
+        "Timed out waiting for Google consent (no callback received within "
+        f"{int(timeout)}s). Re-run link and complete the browser consent."
+    )
+
+
+def _link_via_backend_callback(flow, port: int) -> Any:
+    """Authorize via ``cremind serve``'s persistent loopback callback listener.
+
+    The skill builds the consent URL (PKCE is handled by ``flow``), prints it
+    for the agent/CLI to surface, then waits for the backend to capture the
+    redirect and performs the token exchange locally. Using 127.0.0.1 (rather
+    than ``localhost``) keeps the redirect a valid Desktop-client loopback while
+    avoiding the Windows ``localhost`` -> ``::1`` mismatch that can refuse an
+    IPv4-only listener.
+    """
+    flow.redirect_uri = f"http://127.0.0.1:{port}/"
+    auth_url, state = flow.authorization_url(access_type="offline", prompt="consent")
+    print(f"Please visit this URL to authorize this application: {auth_url}", flush=True)
+    query = _await_oauth_callback(state)
+    # oauthlib insists OAuth 2.0 happens over https, so present the response as such.
+    authorization_response = f"https://127.0.0.1:{port}/?{query}"
+    flow.fetch_token(authorization_response=authorization_response)
+    return flow.credentials
+
+
 def link(
     *,
     token_path: Path,
@@ -135,15 +216,24 @@ def link(
         }
     }
     flow = InstalledAppFlow.from_client_config(client_config, scopes)
-    creds = _run_local_server_interruptible(
-        flow,
-        host="localhost",
-        bind_addr=bind_addr,
-        port=port,
-        access_type="offline",
-        prompt="consent",
-        open_browser=open_browser,
-    )
+    if port and _backend_listener_available(port):
+        # Preferred path under ``cremind serve``: the backend hosts ONE
+        # persistent loopback callback server (app/api/oauth_loopback.py), so
+        # consent survives the agent turn / subprocess teardown that killed the
+        # old per-link server. The skill still does the PKCE token exchange.
+        creds = _link_via_backend_callback(flow, port)
+    else:
+        # Fallback for a standalone CLI run (no backend listening): spin up an
+        # ephemeral loopback server in this process, as before.
+        creds = _run_local_server_interruptible(
+            flow,
+            host="localhost",
+            bind_addr=bind_addr,
+            port=port,
+            access_type="offline",
+            prompt="consent",
+            open_browser=open_browser,
+        )
     if not creds.refresh_token:
         raise AuthError(
             "Google did not return a refresh token. Revoke prior access at "

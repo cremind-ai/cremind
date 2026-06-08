@@ -293,6 +293,18 @@ class BaseConfig:
     DISABLE_LOG = _bool(os.environ.get("DISABLE_LOG", "false"))
     CORS_ALLOWED_ORIGINS = _csv_list(os.environ.get("CORS_ALLOWED_ORIGINS", "")) or ["*"]
 
+    # ── OAuth loopback callback (built-in Google skills) ──
+    # ``cremind serve`` runs ONE persistent loopback callback listener (see
+    # app/api/oauth_loopback.py) so the gmail/gcalendar ``link`` flow doesn't
+    # depend on a per-link ephemeral server inside a short-lived skill
+    # subprocess. The Google "Desktop" client only allows loopback redirects,
+    # so this is bound to a fixed port at the root path
+    # (http://127.0.0.1:<port>/). In Docker the listener binds 0.0.0.0 and the
+    # port is published so the host browser's redirect can reach it; on bare
+    # metal it binds 127.0.0.1.
+    CREMIND_OAUTH_CALLBACK_PORT = int(os.environ.get("CREMIND_OAUTH_CALLBACK_PORT", 1516))
+    CREMIND_OAUTH_BIND_ADDR = os.environ.get("CREMIND_OAUTH_BIND_ADDR", "").strip() or "127.0.0.1"
+
     # ── Application-level (TOML defaults, overridable via SQLite) ──
     SERVICE_NAME = _dynaconf_get("general.service_name", "cremind-agent")
     AGENT_ID = _dynaconf_get("general.agent_id", "cremind_agent")

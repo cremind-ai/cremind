@@ -419,6 +419,12 @@ SHUTDOWN_TIMEOUT_S = 8.0
 async def _do_shutdown() -> None:
     """The actual cleanup body. Module-level so tests can patch it."""
     try:
+        from app.api.oauth_loopback import stop_oauth_loopback_listener
+
+        stop_oauth_loopback_listener()
+    except Exception:  # noqa: BLE001
+        logger.exception("Error stopping OAuth loopback listener during shutdown")
+    try:
         stop_all_watchers()
     except Exception:  # noqa: BLE001
         logger.exception("Error stopping skill watchers during shutdown")
@@ -806,6 +812,17 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                 asyncio.create_task(run_autostart_on_boot(get_autostart_storage()))
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to schedule autostart run on boot")
+
+            # 7c2. Persistent OAuth loopback callback listener. Receives the
+            # Google consent redirect for the built-in gmail/gcalendar skills so
+            # their ``link`` flow doesn't depend on a per-link ephemeral server
+            # dying with the agent turn. Non-fatal if the port can't be bound.
+            try:
+                from app.api.oauth_loopback import start_oauth_loopback_listener
+
+                start_oauth_loopback_listener()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to start OAuth loopback listener")
 
             # 7d. Skill event manager
             try:

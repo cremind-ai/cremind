@@ -44,11 +44,20 @@ GOOGLE_CLIENT_ID=                                # optional; otherwise fetched f
 GOOGLE_CLIENT_SECRET=                            # optional; otherwise fetched from cremind-connect
 ```
 
-Then link the account (opens a browser for Google consent):
+Then link the account:
 ```bash
 uv run scripts/__main__.py link
 ```
-Use `--no-browser` on headless machines (prints the URL to open manually).
+`link` prints a Google consent URL, then waits (in the background) for consent
+to complete. **Surface that URL to the user and ask them to open it and approve
+access.** The consent redirect is received by the always-running Cremind backend
+(a persistent loopback listener), so linking completes even though the command
+keeps running in the background. Once the user says they've approved, confirm:
+```bash
+uv run scripts/__main__.py status
+```
+(`--no-browser` only affects the standalone fallback used when the Cremind
+backend isn't running; under the app the URL is always printed for the user.)
 
 ## CLI Commands
 Run `uv run scripts/__main__.py <subcommand>`. Output is JSON (human-readable on a TTY; force JSON with `--json`).
