@@ -24,6 +24,13 @@ CREMIND_CONNECT_URL = os.environ.get("CREMIND_CONNECT_URL", "https://connect.cre
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
 
+# Loopback OAuth callback server. In the Docker desktop image the host browser
+# must reach the in-container server through a PUBLISHED port, so the port is
+# fixed and the server binds 0.0.0.0 (not 127.0.0.1). On bare metal both are
+# unset → the library's ephemeral-port loopback (port=0, bind localhost).
+OAUTH_CALLBACK_PORT = int(os.environ.get("CREMIND_OAUTH_CALLBACK_PORT", "0"))
+OAUTH_BIND_ADDR = os.environ.get("CREMIND_OAUTH_BIND_ADDR", "").strip() or None
+
 # Bounded recent sync size when the Gmail historyId is too old (offline > ~7 days).
 CATCHUP_MAX = int(os.environ.get("CATCHUP_MAX", "25"))
 

@@ -65,6 +65,8 @@ def cmd_link(args) -> Any:
         client_secret=client_secret,
         scopes=scopes,
         open_browser=not args.no_browser,
+        port=config.OAUTH_CALLBACK_PORT,
+        bind_addr=config.OAUTH_BIND_ADDR,
     )
     return {"linked": True, "email": data["email"], "account_key": data["account_key"]}
 

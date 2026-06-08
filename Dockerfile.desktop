@@ -265,7 +265,11 @@ WORKDIR /root/.cremind
 
 # 1112 backend, 1515 SPA, 5900 raw VNC, 80 noVNC web. The compose file
 # maps 80 → 6080 on the host so it doesn't conflict with the host's
-# real port 80.
-EXPOSE 1112 1515 5900 80
+# real port 80. 1516 is the fixed OAuth loopback-callback port: the
+# built-in Google skills (and the A2A auth handler) bind it to 0.0.0.0
+# so the host browser's consent redirect (http://localhost:1516/) reaches
+# the in-container server. EXPOSE is documentation only — the compose
+# ``-p`` mapping is what actually forwards the port.
+EXPOSE 1112 1515 5900 80 1516
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -69,8 +69,21 @@ def link(
     client_secret: str,
     scopes: list[str],
     open_browser: bool = True,
+    port: int = 0,
+    bind_addr: str | None = None,
 ) -> dict[str, Any]:
-    """Run the loopback PKCE consent flow and persist tokens locally."""
+    """Run the loopback PKCE consent flow and persist tokens locally.
+
+    ``port``/``bind_addr`` control the ephemeral callback server. They default
+    to the library's behavior (random port bound to localhost), which works
+    when the consenting browser shares this machine's loopback. In the Docker
+    desktop image the browser runs on the host, so the callback must arrive
+    through a PUBLISHED port: pass a fixed ``port`` and ``bind_addr="0.0.0.0"``
+    so Docker-forwarded traffic reaches the server (a 127.0.0.1 bind would
+    refuse it). ``host`` stays "localhost" so the advertised redirect_uri is
+    ``http://localhost:<port>/`` — what the host browser hits, and a valid
+    loopback redirect for the org's Desktop OAuth client.
+    """
     from google_auth_oauthlib.flow import InstalledAppFlow
 
     client_config = {
@@ -79,12 +92,16 @@ def link(
             "client_secret": client_secret,
             "auth_uri": GOOGLE_AUTH_URI,
             "token_uri": GOOGLE_TOKEN_URI,
+            # Ignored: run_local_server overwrites flow.redirect_uri with
+            # http://localhost:<bound-port>/ before building the auth URL.
             "redirect_uris": ["http://localhost"],
         }
     }
     flow = InstalledAppFlow.from_client_config(client_config, scopes)
     creds = flow.run_local_server(
-        port=0,
+        host="localhost",
+        bind_addr=bind_addr,
+        port=port,
         access_type="offline",
         prompt="consent",
         open_browser=open_browser,

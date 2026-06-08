@@ -295,12 +295,22 @@ class OAuthClient:
 
         logger.info(f"Initiating Authentication for {self.agent_name}...")
 
-        # Start local callback server
-        import socket
-        sock = socket.socket()
-        sock.bind(('localhost', 0))
-        port = sock.getsockname()[1]
-        sock.close()
+        # Start local callback server. In the Docker desktop image the
+        # consenting browser runs on the host, so the callback must arrive
+        # through a PUBLISHED, fixed port and the server must bind 0.0.0.0
+        # (127.0.0.1 would refuse Docker-forwarded traffic). On bare metal
+        # both env vars are unset → an ephemeral loopback port, as before.
+        # The advertised callback host stays "localhost" regardless.
+        fixed_port = int(os.environ.get("CREMIND_OAUTH_CALLBACK_PORT", "0"))
+        bind_addr = os.environ.get("CREMIND_OAUTH_BIND_ADDR", "").strip() or "localhost"
+        if fixed_port:
+            port = fixed_port
+        else:
+            import socket
+            sock = socket.socket()
+            sock.bind(('localhost', 0))
+            port = sock.getsockname()[1]
+            sock.close()
 
         callback_uri = f"http://localhost:{port}/callback"
 
@@ -327,7 +337,7 @@ class OAuthClient:
                 except Exception as e:
                     loop.call_soon_threadsafe(future.set_exception, e)
 
-        server = HTTPServer(('localhost', port), Handler)
+        server = HTTPServer((bind_addr, port), Handler)
         server_thread = Thread(target=server.serve_forever)
         server_thread.daemon = True
         server_thread.start()
