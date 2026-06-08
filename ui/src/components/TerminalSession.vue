@@ -119,7 +119,9 @@ async function connect() {
   term = new Terminal({
     cols,
     rows,
-    convertEol: false,
+    // Piped (non-PTY) processes emit bare '\n'; convert to CRLF so output
+    // doesn't "staircase". Idempotent for PTY output (already '\r\n').
+    convertEol: true,
     cursorBlink: true,
     fontFamily: 'Consolas, Monaco, "Courier New", monospace',
     fontSize: 13,
