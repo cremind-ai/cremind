@@ -17,7 +17,7 @@ def _resolve_client() -> tuple[str, str, list[str]]:
     disc = Discovery(config.CREMIND_CONNECT_URL)
     try:
         creds = disc.credentials()
-        scopes = disc.scopes()
+        scopes = disc.scopes("calendar")
     except DiscoveryError as e:
         raise SystemExit(f"Could not reach cremind-connect at {config.CREMIND_CONNECT_URL}: {e}")
     # Env (scripts/.env) overrides win; otherwise use the values cremind-connect

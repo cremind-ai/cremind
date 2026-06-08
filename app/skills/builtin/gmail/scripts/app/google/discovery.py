@@ -103,7 +103,19 @@ class Discovery:
     def client_secret(self, provider_id: str = "google") -> str:
         return self.credentials(provider_id).get("clientSecret", "")
 
-    def scopes(self, provider_id: str = "google") -> list[str]:
+    def scopes(self, resource_id: str | None = None, provider_id: str = "google") -> list[str]:
+        """OAuth scopes to request.
+
+        With ``resource_id`` ("gmail"/"calendar") return only that resource's
+        scopes, so each skill's consent screen asks for just what it needs (least
+        privilege). Without it, fall back to the provider-level list (back-compat).
+
+        Returns [] when the chosen entry carries no ``scopes`` key — e.g. an older
+        cremind-connect that has not split scopes per resource yet — so the caller
+        applies its own per-skill fallback. A missing key never raises here.
+        """
+        if resource_id is not None:
+            return list(self.resource(resource_id, provider_id).get("scopes", []))
         return list(self.provider(provider_id).get("scopes", []))
 
     def resource(self, resource_id: str, provider_id: str = "google") -> dict[str, Any]:
