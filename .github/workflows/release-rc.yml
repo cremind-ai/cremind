@@ -297,6 +297,18 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
+    # electron-builder downloads its bundled toolchain (winCodeSign, NSIS,
+    # nsis-resources, …) from GitHub release assets. The CDN edge between the
+    # GitHub-hosted runners and release-assets.githubusercontent.com
+    # intermittently 504s on individual assets (notably nsis-resources, which
+    # blocked the Windows build across multiple retries while sibling assets
+    # downloaded fine). Route electron-builder's binary downloads through the
+    # npmmirror mirror instead; every download is checksum-verified by
+    # electron-builder, so a mirror cannot substitute tampered binaries.
+    # (The Electron runtime itself uses @electron/get / ELECTRON_MIRROR, a
+    # separate mechanism, and is unaffected by this variable.)
+    env:
+      ELECTRON_BUILDER_BINARIES_MIRROR: https://registry.npmmirror.com/-/binary/electron-builder-binaries/
     defaults:
       run:
         working-directory: ui
