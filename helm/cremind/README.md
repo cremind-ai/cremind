@@ -111,6 +111,8 @@ embeddings.
 | `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http://localhost:8080`. |
 | `persistence.system.*` | `5Gi`, RWO | `bootstrap.toml`, tokens, profiles. |
 | `persistence.venv.*` | `8Gi`, RWO | Wizard-installed Python deps (LLM SDKs, embeddings). |
+| `persistence.work.*` | `10Gi`, RWO | Agent working dir (files it creates); `mountPath` must match the wizard's User Working Directory. |
+| `extraVolumes` / `extraVolumeMounts` | `[]` | Persist any additional paths (raw volume specs). |
 | `postgresql.enabled` | `true` | Bundled Bitnami PostgreSQL. |
 | `qdrant.enabled` / `chromadb.enabled` | `false` | Enable when turning on embeddings. |
 | `proxy.enabled` | `true` | nginx single-entry sidecar (UI + API + noVNC on one port). |
@@ -146,9 +148,14 @@ fighting over the same shared database — not a scaled service. Therefore:
   `helm upgrade` resets it to 1.)
 
 State survives a pod reschedule without scaling: PostgreSQL holds the dynamic
-config (JWT signing secret, LLM keys, tool configs, profiles) and the PVCs hold
-`bootstrap.toml`, OAuth tokens, per-profile files, and the runtime venv — so a
-restarted/rescheduled single pod boots straight through with no re-setup.
+config (JWT signing secret, LLM keys, tool configs, profiles) and three PVCs hold
+the rest — `system` (`/root/.cremind`: `bootstrap.toml`, OAuth tokens, per-profile
+files), `venv` (`/opt/cremind/venv`: installed deps), and `work`
+(`/root/Documents`: the files the agent creates). So a restarted/rescheduled
+single pod boots straight through with no re-setup and no lost files. Only these
+mounted paths persist — data written elsewhere (e.g. `/tmp`, or a manual
+`kubectl exec` into `/root`) is ephemeral; add `extraVolumes`/`extraVolumeMounts`
+to persist additional paths.
 
 To serve more load, give the single pod more resources (`resources`) and a
 bigger node; do not add replicas.

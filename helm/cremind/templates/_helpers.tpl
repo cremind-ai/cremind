@@ -80,6 +80,10 @@ PVC claim names (honour existingClaim when set).
 {{- default (printf "%s-venv" (include "cremind.fullname" .)) .Values.persistence.venv.existingClaim -}}
 {{- end -}}
 
+{{- define "cremind.workClaimName" -}}
+{{- default (printf "%s-work" (include "cremind.fullname" .)) .Values.persistence.work.existingClaim -}}
+{{- end -}}
+
 {{/*
 Guard: CREMIND_DB_PROVIDER must never be set on Kubernetes. Setting it flips
 bootstrap_exists() to true and the server boots fully, SKIPPING the Setup

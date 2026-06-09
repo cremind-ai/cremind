@@ -77,10 +77,22 @@ cremind:
   #    value: "1"
 
 ## @section Persistence
-# system: CREMIND_SYSTEM_DIR — bootstrap.toml, tokens/, per-profile state.
-# venv:   /opt/cremind/venv  — Python deps the Setup Wizard installs at runtime
-#         (LLM SDKs, embeddings). Without this, a pod restart reverts to the
-#         thin-core baseline and the agent loses its LLM SDK until re-setup.
+# Three volumes keep the pod's important data across restarts/reschedules:
+#   system: CREMIND_SYSTEM_DIR (/root/.cremind) — bootstrap.toml, tokens/,
+#           per-profile state (PERSONA.md, skills/, browser-profile/), backups.
+#   venv:   /opt/cremind/venv — Python deps the Setup Wizard installs at runtime
+#           (LLM SDKs, embeddings). Without it a restart reverts to the thin
+#           baseline and the agent loses its LLM SDK until re-setup.
+#   work:   the agent's User Working Directory — the folder it reads/writes
+#           files in (root of the Tree Dir panel, default for every built-in
+#           tool). Files the agent creates live here; without this volume they
+#           vanish on restart. mountPath MUST match the wizard's
+#           "User Working Directory" (the kubernetes profile defaults it to
+#           ~/Documents -> /root/Documents). The database lives in PostgreSQL.
+#
+# NOTE: only these mounted paths persist. Files written elsewhere in the
+# container (e.g. /tmp, or an ad-hoc `kubectl exec` into /root) are ephemeral —
+# use extraVolumes/extraVolumeMounts below to persist additional paths.
 persistence:
   system:
     enabled: true
@@ -96,6 +108,23 @@ persistence:
     size: 8Gi
     existingClaim: ""
     annotations: {}
+  work:
+    enabled: true
+    mountPath: /root/Documents   # must match the wizard's User Working Directory
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 10Gi
+    existingClaim: ""
+    annotations: {}
+
+# Persist any additional paths (raw Kubernetes volume / volumeMount specs).
+extraVolumes: []
+#  - name: extra-data
+#    persistentVolumeClaim:
+#      claimName: my-existing-claim
+extraVolumeMounts: []
+#  - name: extra-data
+#    mountPath: /root/extra
 
 ## @section Reverse proxy (single entry point)
 # An in-pod nginx sidecar presents ONE port for the whole workflow so users

@@ -133,6 +133,15 @@ spec:
             - name: venv
               mountPath: /opt/cremind/venv
             {{- end }}
+            {{- if .Values.persistence.work.enabled }}
+            # Persist the agent's User Working Directory so files it creates
+            # survive restarts. mountPath must match the wizard's working dir.
+            - name: work
+              mountPath: {{ .Values.persistence.work.mountPath }}
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
         {{- if .Values.proxy.enabled }}
         # Single entry point: nginx routes /api + /health -> backend, /vnc/ ->
         # noVNC, everything else -> the SPA, all on one port. Shares the pod
@@ -175,6 +184,14 @@ spec:
         - name: venv
           persistentVolumeClaim:
             claimName: {{ include "cremind.venvClaimName" . }}
+        {{- end }}
+        {{- if .Values.persistence.work.enabled }}
+        - name: work
+          persistentVolumeClaim:
+            claimName: {{ include "cremind.workClaimName" . }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
