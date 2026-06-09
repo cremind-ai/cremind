@@ -1,6 +1,6 @@
 # AUTO-GENERATED from install/catalog.toml. Do not edit by hand.
 # Regenerate with: python install/scripts/build_catalog.py
-# Source SHA-256:  a69551b4dc46210a0aa24a54901fcb1ff5da891cfd41962f59f60f8d7861620d
+# Source SHA-256:  8dcb7efa86aedad0b4e3403c814a34143b99c1fc5b542b19fda824a9d51329d4
 
 CATALOG_SCHEMA=1
 
@@ -45,7 +45,7 @@ CUSTOM_FIELD_DEFAULT_wizard_preset="local"
 CUSTOM_FIELD_CHOICES_wizard_preset="local docker server"
 
 # ── Install modes ──
-MODE_IDS="docker native kubernetes"
+MODE_IDS="docker native"
 MODE_LABEL_docker="Docker"
 MODE_DESC_docker="sandboxed VNC desktop with a bundled storage stack"
 MODE_HINT_docker="The agent runs inside a container with its own GUI. Observe at http://<host>:6080/vnc.html."
@@ -56,11 +56,6 @@ MODE_DESC_native="Python venv at ~/.cremind/venv with embedded storage"
 MODE_HINT_native="Simpler, but the agent shares your desktop and home directory."
 MODE_BADGE_native=""
 MODE_REQUIRES_native=""
-MODE_LABEL_kubernetes="Kubernetes"
-MODE_DESC_kubernetes="Helm-deployed pod; storage and vector DBs are in-cluster services"
-MODE_HINT_kubernetes="Single-replica Deployment with shared external state."
-MODE_BADGE_kubernetes=""
-MODE_REQUIRES_kubernetes="kubernetes"
 
 # ── Mode rules ──
 MODE_RULE_ALLOWED_docker="docker native"

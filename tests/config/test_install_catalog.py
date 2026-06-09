@@ -71,13 +71,17 @@ def test_active_install_mode_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
 # ── Kubernetes mode ──────────────────────────────────────────────────────
 
 
-def test_catalog_defines_kubernetes_mode() -> None:
-    """The chart sets INSTALL_MODE=kubernetes; the catalog must recognise it
-    (and define its mode-rule) or the env var is silently ignored and the
-    wizard re-exposes SQLite / persistent Chroma."""
+def test_kubernetes_is_a_rule_only_mode() -> None:
+    """Kubernetes must define a mode-rule (so the chart's INSTALL_MODE=kubernetes
+    constrains the wizard) but must NOT appear under [modes] — the host
+    installers list every [modes] entry as a selectable option, and offering
+    "Kubernetes" on a laptop would wrongly force Postgres-only on a desktop
+    install."""
     cat = install_catalog.load_install_catalog(force_reload=True)
-    assert "kubernetes" in cat["modes"]
     assert "kubernetes" in cat["mode_rules"]
+    assert "kubernetes" not in cat["modes"], "kubernetes must not be host-selectable"
+    # Host-selectable modes stay exactly docker + native.
+    assert set(cat["modes"]) == {"docker", "native"}
 
 
 def test_active_install_mode_kubernetes(monkeypatch: pytest.MonkeyPatch) -> None:

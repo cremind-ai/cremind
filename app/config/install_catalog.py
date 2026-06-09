@@ -135,6 +135,13 @@ _DEFAULT_CATALOG: dict[str, Any] = {
             "allowed_service_modes": ["docker", "native", "external"],
             "default_service_mode": "external",
         },
+        # Rule-only mode (no matching [modes] entry — set by the Helm chart via
+        # INSTALL_MODE, never user-selectable). External-only so the wizard can't
+        # pick pod-local storage. Mirrors install/catalog.toml.
+        "kubernetes": {
+            "allowed_service_modes": ["external"],
+            "default_service_mode": "external",
+        },
     },
     "service_modes": {
         "docker": {
@@ -186,13 +193,21 @@ def get_active_install_mode() -> str | None:
     doesn't define — in that case service-mode filtering is a no-op.
     Resolved fresh on every call so test setups that mutate the env
     take effect without bouncing the loader cache.
+
+    A value is accepted if it appears under ``[modes]`` (a user-selectable
+    host install method) OR under ``[mode_rules]``. The latter covers
+    "rule-only" modes like ``kubernetes`` that constrain the Setup Wizard
+    but are deliberately absent from ``[modes]`` so the host installers
+    never offer them as a pick (the chart sets ``INSTALL_MODE=kubernetes``
+    on the pod). See install/catalog.toml.
     """
     raw = os.environ.get(_ACTIVE_MODE_ENV, "").strip()
     if not raw:
         return None
     catalog = load_install_catalog()
     modes = catalog.get("modes", {}) or {}
-    if raw not in modes:
+    rules = catalog.get("mode_rules", {}) or {}
+    if raw not in modes and raw not in rules:
         logger.warning(
             f"{_ACTIVE_MODE_ENV}={raw!r} does not match any mode in install_catalog.toml; "
             "ignoring."

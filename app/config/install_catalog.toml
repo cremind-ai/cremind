@@ -1,7 +1,7 @@
 # AUTO-GENERATED copy of install/catalog.toml shipped with the
 # backend. Do not edit by hand — re-run
 # `python install/scripts/build_catalog.py`.
-# Source SHA-256: a69551b4dc46210a0aa24a54901fcb1ff5da891cfd41962f59f60f8d7861620d
+# Source SHA-256: 8dcb7efa86aedad0b4e3403c814a34143b99c1fc5b542b19fda824a9d51329d4
 
 # Cremind install/setup catalog — single source of truth.
 #
@@ -120,21 +120,14 @@ hint        = "Simpler, but the agent shares your desktop and home directory."
 requires    = []
 order       = 20
 
-# Kubernetes is never auto-recommended by the host installers: the
-# recommendation algorithm picks the first mode whose `requires` are
-# satisfied, and no curl/PowerShell install can satisfy the synthetic
-# `kubernetes` capability. This mode is only ever reached when the Helm
-# chart sets INSTALL_MODE=kubernetes on the pod explicitly. It exists in
-# the catalog so get_active_install_mode() recognises the value and the
-# mode_rule below applies; without the [modes.kubernetes] entry the env
-# var would be ignored and the wizard would re-expose SQLite / persistent
-# Chroma (see app/config/install_catalog.py:get_active_install_mode).
-[modes.kubernetes]
-label       = "Kubernetes"
-description = "Helm-deployed pod; storage and vector DBs are in-cluster services"
-hint        = "Single-replica Deployment with shared external state."
-requires    = ["kubernetes"]
-order       = 30
+# NOTE: there is deliberately NO [modes.kubernetes] entry. Kubernetes is not a
+# host install method a user picks via curl/PowerShell (the installers — TUI,
+# install.sh, install.ps1 — list every [modes.*] as a selectable option, so a
+# `kubernetes` mode here would wrongly appear on a laptop and force Postgres-only
+# on a desktop install). Instead it is a *rule-only* install mode: the Helm chart
+# sets INSTALL_MODE=kubernetes on the pod, and get_active_install_mode() accepts
+# any mode defined in [mode_rules] even without a [modes] entry, so the rule below
+# still constrains the Setup Wizard. See app/config/install_catalog.py.
 
 
 # ── Mode rules ───────────────────────────────────────────────────────────
@@ -167,7 +160,8 @@ default_service_mode  = "external"
 allowed_service_modes = ["docker", "native", "external"]
 default_service_mode  = "external"
 
-# Kubernetes: every backing service (Postgres / Qdrant / Chroma) must be a
+# Kubernetes (rule-only mode — see the note above [modes]; no [modes.kubernetes]
+# entry on purpose). Every backing service (Postgres / Qdrant / Chroma) must be a
 # shared in-cluster service reached over its service DNS — never pod-local.
 # Restricting to External-only drops Docker (no docker socket in a pod) and,
 # critically, Chroma's Native mode (an in-process *persistent* local file that
