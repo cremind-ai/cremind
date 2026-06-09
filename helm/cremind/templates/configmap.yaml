@@ -18,6 +18,18 @@ data:
   # on first boot (see _helpers.tpl assertNoDbProvider).
   INSTALL_MODE: {{ .Values.cremind.installMode | quote }}
   SETUP_WIZARD_ENV: {{ .Values.cremind.setupWizardEnv | quote }}
+  {{- /* APP_URL is what the A2A agent card advertises to the browser, so it
+         must be the externally-reachable origin. Auto-derive when unset. */ -}}
+  {{- $appUrl := .Values.cremind.appUrl }}
+  {{- if not $appUrl }}
+  {{- if .Values.ingress.enabled }}
+  {{- $scheme := ternary "https" "http" (gt (len (.Values.ingress.tls | default list)) 0) }}
+  {{- $appUrl = printf "%s://%s" $scheme .Values.ingress.host }}
+  {{- else }}
+  {{- $appUrl = "http://localhost:8080" }}
+  {{- end }}
+  {{- end }}
+  APP_URL: {{ $appUrl | quote }}
   HOST: {{ .Values.cremind.host | quote }}
   PORT: {{ .Values.cremind.apiPort | quote }}
   CREMIND_UI_PORT: {{ .Values.cremind.uiPort | quote }}

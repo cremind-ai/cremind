@@ -47,6 +47,13 @@ cremind:
   apiPort: 1112                  # -> PORT (backend API)
   uiPort: 1515                   # -> CREMIND_UI_PORT (SPA / Setup Wizard)
   systemDir: /root/.cremind      # -> CREMIND_SYSTEM_DIR (PVC mount; image default)
+  # APP_URL — the externally-reachable base URL. The A2A agent card advertises
+  # it as the JSON-RPC endpoint the UI connects to, so it MUST match how you
+  # open Cremind in the browser. Leave blank to auto-derive: the Ingress URL
+  # when ingress.enabled, otherwise http://localhost:8080 (the documented
+  # `port-forward svc/cremind 8080:80`). Override if you port-forward to a
+  # different local port or front it with another URL.
+  appUrl: ""
   # The desktop entrypoint requires these or it exits 1. The image already
   # defaults them, but we set them explicitly so they're configurable.
   resolution: "1280x720"         # -> RESOLUTION (must match WIDTHxHEIGHT)
