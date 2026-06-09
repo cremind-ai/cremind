@@ -88,6 +88,17 @@ embeddings.
 > 3. **Vendor offline:** commit a pinned `postgresql-*.tgz` (with a pullable
 >    image) into `charts/` so resolution and pulls are self-contained.
 
+> **Reinstalling? Delete the Postgres data PVC first.** The bundled PostgreSQL
+> is a StatefulSet, so its data volume (`data-<release>-postgresql-0`) is
+> **retained** across `helm uninstall` — but a fresh `helm install` generates a
+> **new** random password into the Secret. PostgreSQL only applies a password on
+> *first* init, so the reused volume keeps the *old* password and setup fails
+> with `password authentication failed for user "cremind"`. Before reinstalling,
+> either delete the stale PVC for a clean database
+> (`kubectl -n <ns> delete pvc data-<release>-postgresql-0`) or pin a stable
+> password you reuse every time (`--set postgresql.auth.password=…`). The same
+> applies to managed/external PostgreSQL: the wizard password must match the DB.
+
 ## Key values
 
 | Key | Default | Notes |
