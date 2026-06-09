@@ -1,3 +1,9 @@
+{{- /* Hard single-pod guard: the image bundles a VNC desktop, so more than one
+       pod means more than one independent desktop — not allowed. Reject any
+       replicaCount other than 1 at render time. */ -}}
+{{- if ne (int .Values.replicaCount) 1 }}
+{{- fail "Cremind bundles a VNC virtual desktop and must run as exactly ONE pod. replicaCount must be 1 — horizontal scaling is not supported (multiple pods would create multiple divergent desktops)." }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -9,9 +15,11 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  replicas: {{ .Values.replicaCount }}
-  # RWO PVCs cannot multi-attach; Recreate terminates the old pod before the
-  # new one binds the volume. Do not switch to RollingUpdate while replicas=1.
+  # Always exactly one pod — see the single-pod guard above (VNC desktop).
+  replicas: 1
+  # RWO PVCs cannot multi-attach AND the single-VNC-desktop model forbids a
+  # second pod; Recreate terminates the old pod before starting the new one,
+  # so an upgrade never momentarily runs two. Never switch to RollingUpdate.
   strategy:
     {{- toYaml .Values.updateStrategy | nindent 4 }}
   selector:

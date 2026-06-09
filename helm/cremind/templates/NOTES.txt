@@ -54,8 +54,8 @@ and noVNC. You never need to forward more than one port.
    will offer Qdrant at "cremind-qdrant:6333" or ChromaDB at
    "cremind-chromadb:8000".
 
-Scaling: this release runs replicaCount={{ .Values.replicaCount }} with
-ReadWriteOnce volumes. Do not raise the replica count or enable autoscaling
-without an RWX storage class and the changes described in the chart README
-("Scaling"): the first-setup wizard race and per-pod browser state must be
-solved first.
+Single instance: this image bundles a VNC desktop, so Cremind runs as exactly
+ONE pod. replicaCount is fixed at 1 (the chart refuses any other value), there
+is no autoscaler, and `kubectl scale` is unsupported — multiple pods would mean
+multiple divergent desktops. To handle more load, give the pod more resources
+and a bigger node, not more replicas.

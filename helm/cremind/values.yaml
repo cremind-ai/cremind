@@ -27,12 +27,15 @@ imagePullSecrets: []
 # tokens, per-profile files, and the wizard-installed venv. A rescheduled pod
 # re-attaches both and boots straight through — no re-setup.
 #
-# Do NOT raise replicaCount without an RWX storage class AND solving the
-# first-setup wizard race + per-pod browser state. See README "Scaling".
+# FIXED AT 1 — DO NOT CHANGE. The image bundles a VNC virtual desktop, so each
+# pod is its own independent desktop/agent. Running more than one would create
+# multiple divergent desktops and break the single-instance model. The chart
+# REJECTS any other value (see deployment.yaml) and ships no HorizontalPodAutoscaler.
 replicaCount: 1
 
-# RWO volumes can attach to one node at a time; Recreate avoids the rolling-
-# update multi-attach deadlock. Keep this as Recreate while replicaCount=1.
+# RWO volumes can attach to one node at a time, and the single-VNC-desktop model
+# forbids a second pod — Recreate terminates the old pod before starting the new
+# one on upgrade, so there is never more than one pod at a time.
 updateStrategy:
   type: Recreate
 
@@ -160,14 +163,16 @@ livenessProbe:
   timeoutSeconds: 10
   failureThreshold: 30
 
-## @section Resources
-# The cremind-desktop image bundles XFCE + Chrome + Python; size accordingly.
+## @section Resources (cremind container)
+# The cremind-desktop image bundles a VNC desktop (XFCE + Chrome) + Python +
+# the agent, so it needs a real allocation. Minimum guaranteed: 2 CPU + 2Gi.
+# The node must have at least this free or the single pod won't schedule.
 resources:
   requests:
-    cpu: 500m
+    cpu: "2"
     memory: 2Gi
   limits:
-    cpu: "2"
+    cpu: "4"
     memory: 4Gi
 
 ## @section Pod scheduling / security
@@ -183,14 +188,9 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
-## @section Autoscaling
-# MUST stay disabled under the single-replica + RWO model. Enabling it would
-# scale past 1 pod and deadlock on the RWO PVC. Template is a placeholder.
-autoscaling:
-  enabled: false
-  minReplicas: 1
-  maxReplicas: 1
-  targetCPUUtilizationPercentage: 80
+# NOTE: Horizontal scaling is intentionally NOT supported. There is no
+# autoscaling section and no HorizontalPodAutoscaler — the VNC-desktop image
+# must run as exactly one pod. See replicaCount above.
 
 ## @section Bundled PostgreSQL (Bitnami subchart) — LOCKED ON
 # fullnameOverride pins the Service to `cremind-postgresql` regardless of the

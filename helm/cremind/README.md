@@ -103,10 +103,12 @@ embeddings.
 
 | Key | Default | Notes |
 |-----|---------|-------|
-| `replicaCount` | `1` | Do not raise without RWX storage — see Scaling. |
+| `replicaCount` | `1` | **Fixed at 1.** The chart rejects any other value (VNC = single desktop). |
+| `resources.requests` | `2` CPU, `2Gi` | Minimum guaranteed for the cremind container; the node must have it free. |
 | `image.tag` | `""` → `appVersion` | The matching `cremind-desktop` image tag. |
 | `cremind.installMode` | `kubernetes` | Drives external-only service modes. |
 | `cremind.setupWizardEnv` | `kubernetes` | Pre-fills the wizard. |
+| `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http://localhost:8080`. |
 | `persistence.system.*` | `5Gi`, RWO | `bootstrap.toml`, tokens, profiles. |
 | `persistence.venv.*` | `8Gi`, RWO | Wizard-installed Python deps (LLM SDKs, embeddings). |
 | `postgresql.enabled` | `true` | Bundled Bitnami PostgreSQL. |
@@ -114,7 +116,6 @@ embeddings.
 | `proxy.enabled` | `true` | nginx single-entry sidecar (UI + API + noVNC on one port). |
 | `service.port` | `80` | The one Service port (fronts the proxy). |
 | `ingress.enabled` | `false` | One hostname for everything (UI at `/`, noVNC at `/vnc/`). |
-| `autoscaling.enabled` | `false` | Must stay false under the single-replica model. |
 
 ## How the storage constraints are enforced
 
@@ -129,22 +130,25 @@ The chart only sets `INSTALL_MODE=kubernetes`; the backend does the rest
   write path and at the vector-store factory; and refuses the SQLite default in
   `cremind db upgrade`.
 
-## Scaling
+## Single instance — scaling is not supported
 
-This chart targets **single-replica + shared external state**:
+Cremind runs as **exactly one pod, by design**. The image bundles a VNC virtual
+desktop (XFCE + Chrome) that the agent drives, so each pod is its own
+independent desktop. Two pods would mean two divergent desktops and two agents
+fighting over the same shared database — not a scaled service. Therefore:
 
-- PostgreSQL holds dynamic config (JWT signing secret, LLM keys, tool configs,
-  profiles), so a rescheduled pod stays authenticated.
-- The PVCs hold `bootstrap.toml`, OAuth tokens, per-profile files, and the
-  runtime venv, so a rescheduled pod boots straight through without re-setup.
+- `replicaCount` is **fixed at 1** and the chart **fails to render** if you set
+  anything else.
+- There is **no HorizontalPodAutoscaler** and no `autoscaling` values.
+- The Deployment uses the `Recreate` strategy, so even an upgrade never runs two
+  pods at once.
+- Do **not** `kubectl scale` the Deployment — it would break the VNC model. (A
+  `helm upgrade` resets it to 1.)
 
-True multi-replica (active-active) is **not** supported yet. Before raising
-`replicaCount`:
+State survives a pod reschedule without scaling: PostgreSQL holds the dynamic
+config (JWT signing secret, LLM keys, tool configs, profiles) and the PVCs hold
+`bootstrap.toml`, OAuth tokens, per-profile files, and the runtime venv — so a
+restarted/rescheduled single pod boots straight through with no re-setup.
 
-1. Switch the PVCs to a **ReadWriteMany** storage class (NFS/CephFS/EFS).
-   Per-pod `browser-profile/` cannot be shared (Chrome locks its profile) and
-   needs per-pod state.
-2. Add a leader or one-shot Setup Job so two pods don't race first-setup
-   (`bootstrap.toml` write + admin-profile creation).
-3. The JWT secret already lives in shared PostgreSQL — no per-pod secret
-   migration is needed.
+To serve more load, give the single pod more resources (`resources`) and a
+bigger node; do not add replicas.
