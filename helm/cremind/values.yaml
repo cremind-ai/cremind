@@ -1,0 +1,179 @@
+# Default values for the Cremind chart.
+# This is a YAML-formatted file. Keys map to the templates under templates/.
+
+## @section Global
+
+# Override the chart's computed names.
+nameOverride: ""
+fullnameOverride: ""
+# Extra labels applied to every rendered object.
+commonLabels: {}
+commonAnnotations: {}
+
+## @section Cremind image
+# Reuses the published cremind/cremind-desktop image (VNC desktop + agent). The
+# `tag` defaults to the chart's appVersion (the matching image tag CI pushed).
+image:
+  registry: docker.io
+  repository: cremind/cremind-desktop
+  # Leave empty to track .Chart.AppVersion (recommended). Override to pin.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+## @section Deployment
+# LOCKED: single replica + shared external state. PostgreSQL holds dynamic
+# config (JWT secret, LLM keys, profiles); the PVCs hold bootstrap.toml, OAuth
+# tokens, per-profile files, and the wizard-installed venv. A rescheduled pod
+# re-attaches both and boots straight through — no re-setup.
+#
+# Do NOT raise replicaCount without an RWX storage class AND solving the
+# first-setup wizard race + per-pod browser state. See README "Scaling".
+replicaCount: 1
+
+# RWO volumes can attach to one node at a time; Recreate avoids the rolling-
+# update multi-attach deadlock. Keep this as Recreate while replicaCount=1.
+updateStrategy:
+  type: Recreate
+
+# Cremind runtime configuration → rendered into a ConfigMap and injected via
+# envFrom. CRITICAL: CREMIND_DB_PROVIDER is deliberately ABSENT — setting it
+# would make the server boot fully and SKIP the Setup Wizard. _helpers.tpl
+# fails the render if anyone smuggles it in through extraEnv.
+cremind:
+  installMode: kubernetes        # -> INSTALL_MODE (external-only service modes; rejects SQLite)
+  setupWizardEnv: kubernetes     # -> SETUP_WIZARD_ENV (pre-fills the kubernetes profile)
+  host: "0.0.0.0"                # -> HOST
+  apiPort: 1112                  # -> PORT (backend API)
+  uiPort: 1515                   # -> CREMIND_UI_PORT (SPA / Setup Wizard)
+  systemDir: /root/.cremind      # -> CREMIND_SYSTEM_DIR (PVC mount; image default)
+  # The desktop entrypoint requires these or it exits 1. The image already
+  # defaults them, but we set them explicitly so they're configurable.
+  resolution: "1280x720"         # -> RESOLUTION (must match WIDTHxHEIGHT)
+  vncPassword: "changeme"        # -> VNC_PASSWORD
+  oauthCallbackPort: 1516        # -> CREMIND_OAUTH_CALLBACK_PORT
+  # Free-form extra env. Guarded against CREMIND_DB_PROVIDER in _helpers.tpl.
+  extraEnv: []
+  #  - name: SOME_FLAG
+  #    value: "1"
+
+## @section Persistence
+# system: CREMIND_SYSTEM_DIR — bootstrap.toml, tokens/, per-profile state.
+# venv:   /opt/cremind/venv  — Python deps the Setup Wizard installs at runtime
+#         (LLM SDKs, embeddings). Without this, a pod restart reverts to the
+#         thin-core baseline and the agent loses its LLM SDK until re-setup.
+persistence:
+  system:
+    enabled: true
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 5Gi
+    existingClaim: ""
+    annotations: {}
+  venv:
+    enabled: true
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 8Gi
+    existingClaim: ""
+    annotations: {}
+
+## @section Service
+service:
+  type: ClusterIP
+  apiPort: 1112
+  uiPort: 1515
+  annotations: {}
+  # noVNC web access to the agent's desktop. Off by default (server use case).
+  vnc:
+    enabled: false
+    novncPort: 6080   # maps to container port 80 (websockify)
+    vncPort: 5900
+
+## @section Ingress
+# Routes the SPA / Setup Wizard (UI port). Set host + className for your cluster.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: cremind.local
+  path: /
+  pathType: Prefix
+  tls: []
+
+## @section Probes
+# Readiness targets the SPA port: ready == the Setup Wizard is reachable. It is
+# intentionally NOT gated on a configured DB, so the wizard always loads.
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 20
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 6
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 60
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 6
+
+## @section Resources
+# The cremind-desktop image bundles XFCE + Chrome + Python; size accordingly.
+resources:
+  requests:
+    cpu: 500m
+    memory: 2Gi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+
+## @section Pod scheduling / security
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+## @section Autoscaling
+# MUST stay disabled under the single-replica + RWO model. Enabling it would
+# scale past 1 pod and deadlock on the RWO PVC. Template is a placeholder.
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 1
+  targetCPUUtilizationPercentage: 80
+
+## @section Bundled PostgreSQL (Bitnami subchart) — LOCKED ON
+# fullnameOverride pins the Service to `cremind-postgresql` regardless of the
+# Helm release name, so the static `kubernetes` setup profile's pre-filled host
+# is correct. The password is read from the generated secret and pasted into
+# the wizard (NOTES.txt prints the command) — it is NOT injected as pod env.
+#
+# NOTE: Bitnami's free Docker Hub images moved to the frozen `bitnamilegacy`
+# namespace (Aug 2025), so the chart's default PostgreSQL image may fail to
+# pull. See README "Dependency availability" for the three remediations
+# (external Postgres / legacy image / vendored .tgz).
+postgresql:
+  enabled: true
+  fullnameOverride: cremind-postgresql
+  auth:
+    username: cremind
+    database: cremind
+    # password / postgresPassword: leave unset to auto-generate into the secret.
+  architecture: standalone
+
+## @section Bundled Qdrant (subchart) — OFF by default (embeddings off)
+qdrant:
+  enabled: false
+  fullnameOverride: cremind-qdrant
+
+## @section Bundled ChromaDB (subchart) — OFF by default (embeddings off)
+chromadb:
+  enabled: false
+  fullnameOverride: cremind-chromadb

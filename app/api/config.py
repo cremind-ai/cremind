@@ -23,6 +23,7 @@ from app.config.settings import (
 )
 from app.config.install_catalog import (
     get_active_install_mode,
+    is_kubernetes_mode,
     load_install_catalog,
 )
 from app.config.setup_profiles import get_active_setup_profile_id, list_setup_profiles
@@ -244,6 +245,27 @@ def _reject_external_in_docker_install(service_id: str) -> str | None:
         "is provisioned by Cremind — External mode is not offered here. "
         "Pick Docker (or Native if the service supports it) in the wizard."
     )
+
+
+def _kubernetes_sqlite_rejection(requested: str) -> str | None:
+    """Backend-side enforcement of the Kubernetes PostgreSQL-only policy (Seam A).
+
+    On Kubernetes pods scale horizontally and a pod-local SQLite file breaks
+    data consistency across replicas. The wizard's ``kubernetes`` mode-rule
+    already hides SQLite, but ``handle_setup`` is unauthenticated on first
+    setup, so a hand-crafted submission could still ask for it. Returns an
+    error message string (the caller surfaces it as a 400) when the choice is
+    disallowed, or ``None`` when allowed. Extracted to module level so the
+    enforcement is unit-testable without driving the whole setup flow.
+    """
+    if is_kubernetes_mode() and requested != "postgres":
+        return (
+            "This Cremind runs on Kubernetes, where pods scale horizontally "
+            "and pod-local storage breaks consistency. SQLite is not "
+            "supported — choose PostgreSQL (an in-cluster or external "
+            "Postgres service)."
+        )
+    return None
 
 
 async def _resolve_vectorstore(embedding_body: dict) -> dict:
@@ -494,6 +516,14 @@ def get_config_routes(state: BootedState) -> list[Route]:
         requested = (server_config.get("db_provider") or "sqlite").strip().lower()
         if requested not in ("sqlite", "postgres"):
             return f"Unknown db_provider: {requested!r}"
+
+        # Seam A — Kubernetes enforcement. On K8s pods scale horizontally and a
+        # pod-local SQLite file breaks data consistency across replicas. The
+        # wizard's kubernetes mode-rule already hides SQLite, but this endpoint
+        # is unauthenticated on first setup, so reject a hand-crafted choice too.
+        k8s_err = _kubernetes_sqlite_rejection(requested)
+        if k8s_err is not None:
+            return k8s_err
 
         bootstrap_path = Path(BaseConfig.CREMIND_SYSTEM_DIR) / "bootstrap.toml"
         if bootstrap_path.exists():

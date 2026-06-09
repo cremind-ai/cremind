@@ -1,6 +1,6 @@
 # AUTO-GENERATED from install/catalog.toml. Do not edit by hand.
 # Regenerate with: python install/scripts/build_catalog.py
-# Source SHA-256:  fc469a7dd26f18ea2f9f52f0301537cb9879ef8e9a8db9ddcd50e684508f6caa
+# Source SHA-256:  a69551b4dc46210a0aa24a54901fcb1ff5da891cfd41962f59f60f8d7861620d
 
 $script:CatalogSchema = 1
 
@@ -70,7 +70,7 @@ $script:CustomFields = [ordered]@{
 }
 
 # ── Install modes ──
-$script:ModeIds = @('docker', 'native')
+$script:ModeIds = @('docker', 'native', 'kubernetes')
 $script:Modes = [ordered]@{
     'docker' = [ordered]@{
         Label       = 'Docker'
@@ -88,6 +88,14 @@ $script:Modes = [ordered]@{
         Requires    = @()
         Order       = 20
     }
+    'kubernetes' = [ordered]@{
+        Label       = 'Kubernetes'
+        Description = 'Helm-deployed pod; storage and vector DBs are in-cluster services'
+        Hint        = 'Single-replica Deployment with shared external state.'
+        Badge       = ''
+        Requires    = @('kubernetes')
+        Order       = 30
+    }
 }
 
 # ── Mode rules ──
@@ -102,6 +110,10 @@ $script:ModeRules = [ordered]@{
     }
     'custom' = [ordered]@{
         AllowedServiceModes = @('docker', 'native', 'external')
+        DefaultServiceMode  = 'external'
+    }
+    'kubernetes' = [ordered]@{
+        AllowedServiceModes = @('external')
         DefaultServiceMode  = 'external'
     }
 }

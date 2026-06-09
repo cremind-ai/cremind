@@ -115,6 +115,22 @@ hint        = "Simpler, but the agent shares your desktop and home directory."
 requires    = []
 order       = 20
 
+# Kubernetes is never auto-recommended by the host installers: the
+# recommendation algorithm picks the first mode whose `requires` are
+# satisfied, and no curl/PowerShell install can satisfy the synthetic
+# `kubernetes` capability. This mode is only ever reached when the Helm
+# chart sets INSTALL_MODE=kubernetes on the pod explicitly. It exists in
+# the catalog so get_active_install_mode() recognises the value and the
+# mode_rule below applies; without the [modes.kubernetes] entry the env
+# var would be ignored and the wizard would re-expose SQLite / persistent
+# Chroma (see app/config/install_catalog.py:get_active_install_mode).
+[modes.kubernetes]
+label       = "Kubernetes"
+description = "Helm-deployed pod; storage and vector DBs are in-cluster services"
+hint        = "Single-replica Deployment with shared external state."
+requires    = ["kubernetes"]
+order       = 30
+
 
 # ── Mode rules ───────────────────────────────────────────────────────────
 # Per-install-mode visibility rules for each backing service's
@@ -144,6 +160,17 @@ default_service_mode  = "external"
 
 [mode_rules.custom]
 allowed_service_modes = ["docker", "native", "external"]
+default_service_mode  = "external"
+
+# Kubernetes: every backing service (Postgres / Qdrant / Chroma) must be a
+# shared in-cluster service reached over its service DNS — never pod-local.
+# Restricting to External-only drops Docker (no docker socket in a pod) and,
+# critically, Chroma's Native mode (an in-process *persistent* local file that
+# breaks horizontal scaling). The intersection in
+# app/config/install_catalog.py:apply_mode_rule_to_services collapses each
+# service's picker to the single External option.
+[mode_rules.kubernetes]
+allowed_service_modes = ["external"]
 default_service_mode  = "external"
 
 

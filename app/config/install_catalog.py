@@ -201,6 +201,25 @@ def get_active_install_mode() -> str | None:
     return raw
 
 
+def is_kubernetes_mode() -> bool:
+    """True iff the active install mode (``INSTALL_MODE`` env var) is ``kubernetes``.
+
+    The Helm chart sets ``INSTALL_MODE=kubernetes`` on the pod. The wizard's
+    ``[mode_rules.kubernetes]`` already trims every backing service to the
+    External (in-cluster) deployment mode, but that filter is advisory — a
+    hand-crafted POST to the unauthenticated first-setup endpoint could still
+    submit SQLite or a persistent/native vector store. The storage enforcement
+    seams (``app/api/config.py``, ``app/databases/factory.py``,
+    ``app/lib/embedding_lifecycle.py``, ``app/vectorstores/factory.py``,
+    ``app/cli/commands/db.py``) call this to reject pod-local storage choices
+    that would break horizontal scaling.
+
+    Resolved fresh on every call (via :func:`get_active_install_mode`) so test
+    setups that mutate the env take effect without bouncing the loader cache.
+    """
+    return get_active_install_mode() == "kubernetes"
+
+
 def get_mode_rule(install_mode: str | None) -> dict[str, Any]:
     """Return the mode-rule entry for ``install_mode``.
 

@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cremind.fullname" . }}
+  labels:
+    {{- include "cremind.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "cremind.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: ui
+      port: {{ .Values.service.uiPort }}
+      targetPort: ui
+      protocol: TCP
+    - name: api
+      port: {{ .Values.service.apiPort }}
+      targetPort: api
+      protocol: TCP
+    {{- if .Values.service.vnc.enabled }}
+    - name: novnc
+      port: {{ .Values.service.vnc.novncPort }}
+      targetPort: novnc
+      protocol: TCP
+    - name: vnc
+      port: {{ .Values.service.vnc.vncPort }}
+      targetPort: vnc
+      protocol: TCP
+    {{- end }}

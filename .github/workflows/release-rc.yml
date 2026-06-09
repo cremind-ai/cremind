@@ -549,14 +549,85 @@ jobs:
           cache-from: type=gha,scope=desktop
           cache-to: type=gha,scope=desktop,mode=max
 
+  # Packages the Helm chart and pushes it to Docker Hub as an OCI artifact.
+  # ``needs: [wheel, docker]`` because the chart's appVersion == the published
+  # cremind/cremind-desktop image tag — the image must exist before a chart
+  # that references it ships. Reuses the DOCKERHUB_* secrets the docker job
+  # already uses; no new secret.
+  #
+  # Versioning: the chart ``version`` must be strict SemVer2, but RC builds use
+  # the PEP 440 form (0.0.2rc1.dev1). We translate it with the SAME function the
+  # Electron build uses (scripts/sync_ui_version.py:pep440_to_semver →
+  # 0.0.2-rc.1.dev.1) so the rule never drifts. ``appVersion`` keeps the PEP 440
+  # form so it equals the Docker tag. RC charts are SemVer pre-releases, so
+  # ``helm pull``/``upgrade`` ignore them unless ``--devel`` is passed —
+  # production users never accidentally pull an RC chart.
+  helm:
+    needs: [wheel, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out cremind
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.wheel.outputs.tag }}
+
+      - name: Set up Python 3.13 (for version translation)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: Compute chart (SemVer2) + app (PEP 440) versions
+        id: cv
+        env:
+          VERSION: ${{ needs.wheel.outputs.version }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, sys
+          sys.path.insert(0, "scripts")
+          from sync_ui_version import pep440_to_semver
+          v = os.environ["VERSION"]
+          print(f"chart={pep440_to_semver(v)}")
+          print(f"app={v}")
+          PY
+
+      - name: Log in to Docker Hub (OCI registry)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: echo "$DOCKERHUB_TOKEN" | helm registry login registry-1.docker.io --username "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Build chart dependencies
+        run: helm dependency build helm/cremind
+
+      - name: Lint chart
+        run: helm lint helm/cremind
+
+      # --version / --app-version override Chart.yaml in place, so the
+      # committed placeholders never need editing. helm package rejects a
+      # non-SemVer2 --version, which is the guard against a bad translation.
+      - name: Package chart
+        run: |
+          helm package helm/cremind \
+            --version "${{ steps.cv.outputs.chart }}" \
+            --app-version "${{ steps.cv.outputs.app }}" \
+            --destination dist-helm
+
+      - name: Push chart to Docker Hub (OCI)
+        run: helm push "dist-helm/cremind-${{ steps.cv.outputs.chart }}.tgz" oci://registry-1.docker.io/cremind
+
   # Flip the prerelease from draft to visible — but only after every
-  # asset-producing job has succeeded. If any of wheel / electron / docker
-  # fails, this job is skipped and the prerelease stays as a draft,
+  # asset-producing job has succeeded. If any of wheel / electron / docker /
+  # helm fails, this job is skipped and the prerelease stays as a draft,
   # invisible to test-channel installs. The maintainer can then either
   # publish it manually for forensic install testing, or simply cut
   # rc.N+1 once the underlying failure is fixed.
   publish:
-    needs: [wheel, electron, docker]
+    needs: [wheel, electron, docker, helm]
     runs-on: ubuntu-latest
     permissions:
       contents: write

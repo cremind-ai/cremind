@@ -92,6 +92,24 @@ def persist_embedding_config(body: dict, config_storage) -> None:
             f"Unknown deployment_mode: '{deployment_mode}'. "
             "Must be 'docker', 'native', or 'external'."
         )
+
+    # Seam C — Kubernetes enforcement. In a pod the only safe vector store is a
+    # shared in-cluster service reached over HTTP (External). 'native' maps to
+    # an in-process *persistent* local file and 'docker' to a sidecar over the
+    # docker socket — both are pod-local and break horizontal scaling. The
+    # wizard's mode-rule already hides them, but this is reached by the
+    # unauthenticated first-setup endpoint and the Settings page, so reject a
+    # hand-crafted submission too. Only runs when embeddings are enabled (the
+    # function early-returns above when disabled), so the default is unaffected.
+    from app.config.install_catalog import is_kubernetes_mode
+    if is_kubernetes_mode() and deployment_mode != "external":
+        raise ValueError(
+            "In Kubernetes mode only external (in-cluster service) vector "
+            f"stores are supported; got deployment_mode='{deployment_mode}'. "
+            "Persistent local storage and Docker sidecars are not available "
+            "in a pod."
+        )
+
     config_storage.set("server_config", "vectorstore.deployment_mode", deployment_mode)
 
     if vs_provider == "qdrant":

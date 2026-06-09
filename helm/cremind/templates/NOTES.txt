@@ -1,0 +1,56 @@
+Cremind has been deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+This is a single-replica deployment that boots straight into the Setup Wizard
+(no install script). Storage choices are constrained for Kubernetes:
+PostgreSQL only (SQLite is rejected), embeddings off by default, and only
+external/in-cluster vector stores.
+
+1. Open the Setup Wizard
+{{- if .Values.ingress.enabled }}
+
+   http://{{ .Values.ingress.host }}{{ .Values.ingress.path }}#/setup
+{{- else }}
+
+   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "cremind.fullname" . }} {{ .Values.service.uiPort }}:{{ .Values.service.uiPort }}
+
+   then browse to:  http://localhost:{{ .Values.service.uiPort }}/#/setup
+{{- end }}
+
+2. Database step — PostgreSQL connection (pre-filled, editable)
+{{- if .Values.postgresql.enabled }}
+
+   Host:     cremind-postgresql          (Service: {{ .Values.postgresql.fullnameOverride }})
+   Port:     5432
+   Database: {{ .Values.postgresql.auth.database }}
+   User:     {{ .Values.postgresql.auth.username }}
+
+   Read the auto-generated password and paste it into the wizard:
+
+   kubectl --namespace {{ .Release.Namespace }} get secret {{ .Values.postgresql.fullnameOverride }} \
+     -o jsonpath='{.data.password}' | base64 -d ; echo
+
+   (The password is NOT injected into the pod — you supply it once in the
+   wizard, which validates the connection and writes it to bootstrap.toml on
+   the persistent volume.)
+{{- else }}
+
+   Bundled PostgreSQL is disabled. Enter the host/port/credentials of your
+   external PostgreSQL service in the wizard's Database step.
+{{- end }}
+
+3. Embeddings (optional)
+
+   Embeddings are OFF by default. To enable them, install with a vector DB:
+
+     helm upgrade {{ .Release.Name }} <chart> --reuse-values \
+       --set qdrant.enabled=true        # or chromadb.enabled=true
+
+   Only external (in-cluster, HTTP) vector stores are permitted — the wizard
+   will offer Qdrant at "cremind-qdrant:6333" or ChromaDB at
+   "cremind-chromadb:8000".
+
+Scaling: this release runs replicaCount={{ .Values.replicaCount }} with
+ReadWriteOnce volumes. Do not raise the replica count or enable autoscaling
+without an RWX storage class and the changes described in the chart README
+("Scaling"): the first-setup wizard race and per-pod browser state must be
+solved first.

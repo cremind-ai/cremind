@@ -141,3 +141,61 @@ port = 8000
 ssl = true
 api_key = ""
 persist_path = ""
+
+# ── Kubernetes ─────────────────────────────────────────────────────────────
+# Helm-deployed pod (selected by the chart setting SETUP_WIZARD_ENV=kubernetes).
+# Storage and vector DBs are in-cluster Services reached by their service DNS
+# name. PostgreSQL is the only allowed DB backend — SQLite is rejected by the
+# backend in Kubernetes mode (INSTALL_MODE=kubernetes). Embeddings are OFF by
+# default; the vector-DB subcharts ship disabled. If embeddings are enabled the
+# vector store must be External (HTTP) — never a pod-local persistent file.
+#
+# The hostnames below assume the chart's bundled-subchart Service names, pinned
+# release-independent via `postgresql.fullnameOverride: cremind` (and the
+# matching Qdrant/Chroma overrides). They are only pre-fill hints — every field
+# stays editable, and NOTES.txt prints the actual host + the command to read the
+# Postgres password from the chart secret.
+
+[kubernetes]
+label = "Kubernetes"
+description = "In-cluster PostgreSQL and (optional) vector DB over service DNS. Single-replica with shared external state."
+
+[kubernetes.server_config]
+db_provider = "postgres"
+service_name = "cremind-agent"
+agent_name = "Cremind Agent"
+user_working_dir = "~/Documents"
+
+[kubernetes.server_config.postgres]
+deployment_mode = "external"
+host = "cremind-postgresql"
+port = 5432
+database = "cremind"
+user = "cremind"
+password = ""
+sslmode = "disable"
+
+[kubernetes.embedding_config]
+enabled = false
+provider = "me5"
+hf_token = ""
+
+[kubernetes.embedding_config.vectorstore]
+provider = "qdrant"
+deployment_mode = "external"
+
+[kubernetes.embedding_config.vectorstore.qdrant]
+deployment_mode = "external"
+host = "cremind-qdrant"
+port = 6333
+api_key = ""
+https = false
+
+[kubernetes.embedding_config.vectorstore.chroma]
+deployment_mode = "external"
+mode = "http"
+host = "cremind-chromadb"
+port = 8000
+ssl = false
+api_key = ""
+persist_path = ""

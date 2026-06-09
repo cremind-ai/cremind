@@ -70,3 +70,10 @@ ui/release/
 ui/components.d.ts
 ui/*.tsbuildinfo
 ui/.cache/
+
+# Helm: subchart archives fetched by `helm dependency build`. Chart.lock pins
+# the exact versions and IS committed; the .tgz blobs are rebuilt by CI (and
+# the PR helm job is path-gated). To make resolution offline (e.g. if Bitnami's
+# free catalog disappears), vendor a pinned postgresql-*.tgz and un-ignore it.
+helm/*/charts/
+helm/*/dist-helm/
