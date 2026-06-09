@@ -51,9 +51,30 @@ spec:
           envFrom:
             - configMapRef:
                 name: {{ include "cremind.fullname" . }}-env
-          {{- with .Values.cremind.extraEnv }}
+          {{- /* Resolve the Secret that holds the Postgres password: an
+                 explicit override, else the bundled subchart's Secret. */ -}}
+          {{- $pgSecret := .Values.cremind.postgresPasswordSecret.name }}
+          {{- if and (not $pgSecret) .Values.postgresql.enabled }}
+          {{- $pgSecret = (.Values.postgresql.fullnameOverride | default (printf "%s-postgresql" (include "cremind.fullname" .))) }}
+          {{- end }}
+          {{- if or $pgSecret .Values.cremind.extraEnv }}
           env:
+            {{- if $pgSecret }}
+            # Auto-wire the PostgreSQL password from its Secret so the Setup
+            # Wizard needs no manual credential entry — the backend falls back
+            # to CREMIND_POSTGRES_PASSWORD when the wizard's password field is
+            # left blank (the Compose-like "everything is wired" experience).
+            # Server-side only via secretKeyRef — the value never reaches the
+            # browser and never appears in the pod spec.
+            - name: CREMIND_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $pgSecret | quote }}
+                  key: {{ .Values.cremind.postgresPasswordSecret.key | quote }}
+            {{- end }}
+            {{- with .Values.cremind.extraEnv }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           ports:
             - name: api

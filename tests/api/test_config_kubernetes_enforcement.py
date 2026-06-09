@@ -140,3 +140,33 @@ def test_seam_e_factory_rejects_persistent_chroma_in_kubernetes(
     monkeypatch.setattr("app.config.install_catalog.is_kubernetes_mode", lambda: True)
     with pytest.raises(ValueError, match="Persistent .*ChromaDB is not supported"):
         vs_factory.create_vector_store_client()
+
+
+# ── Postgres password auto-wiring (Option B) ──────────────────────────────
+
+
+def test_injected_postgres_password_fills_blank(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.api import config as config_api
+
+    monkeypatch.setenv("CREMIND_POSTGRES_PASSWORD", "from-secret")
+    pg = {"host": "cremind-postgresql", "database": "cremind", "user": "cremind", "password": ""}
+    config_api._apply_injected_postgres_password(pg)
+    assert pg["password"] == "from-secret"
+
+
+def test_injected_postgres_password_does_not_override_supplied(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.api import config as config_api
+
+    monkeypatch.setenv("CREMIND_POSTGRES_PASSWORD", "from-secret")
+    pg = {"password": "typed-by-user"}
+    config_api._apply_injected_postgres_password(pg)
+    assert pg["password"] == "typed-by-user"
+
+
+def test_injected_postgres_password_noop_without_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.api import config as config_api
+
+    monkeypatch.delenv("CREMIND_POSTGRES_PASSWORD", raising=False)
+    pg = {"password": ""}
+    config_api._apply_injected_postgres_password(pg)
+    assert pg["password"] == ""

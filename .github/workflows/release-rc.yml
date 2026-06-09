@@ -601,8 +601,13 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: echo "$DOCKERHUB_TOKEN" | helm registry login registry-1.docker.io --username "$DOCKERHUB_USERNAME" --password-stdin
 
+      # helm dependency build reads the committed Chart.lock and needs the
+      # HTTP chart repos registered first (the OCI bitnami repo does not).
       - name: Build chart dependencies
-        run: helm dependency build helm/cremind
+        run: |
+          helm repo add qdrant https://qdrant.github.io/qdrant-helm
+          helm repo add chromadb https://amikos-tech.github.io/chromadb-chart/
+          helm dependency build helm/cremind
 
       - name: Lint chart
         run: helm lint helm/cremind

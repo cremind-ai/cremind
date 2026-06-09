@@ -30,8 +30,12 @@ helm install cremind oci://registry-1.docker.io/cremind/cremind \
   --version <X.Y.Z> --namespace cremind --create-namespace
 ```
 
-Follow the `NOTES` printed after install: open `/#/setup`, then in the Database
-step paste the PostgreSQL password read from the generated secret.
+Follow the `NOTES` printed after install: open `/#/setup` and click through. With
+the bundled PostgreSQL, the Database step is fully pre-filled — including the
+password, which is auto-wired into the pod from the generated Secret (via
+`secretKeyRef`) and used server-side, so you **leave the password blank and just
+click Next** (the Docker-Compose-like "everything is wired" experience). You only
+type credentials when using an external PostgreSQL without `cremind.postgresPasswordSecret`.
 
 ## Bundled dependencies
 

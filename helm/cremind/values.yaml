@@ -52,6 +52,15 @@ cremind:
   resolution: "1280x720"         # -> RESOLUTION (must match WIDTHxHEIGHT)
   vncPassword: "changeme"        # -> VNC_PASSWORD
   oauthCallbackPort: 1516        # -> CREMIND_OAUTH_CALLBACK_PORT
+  # Auto-wire the PostgreSQL password into the pod (as CREMIND_POSTGRES_PASSWORD,
+  # via secretKeyRef) so the Setup Wizard needs no manual credential entry —
+  # like Docker mode. When postgresql.enabled (bundled), this defaults to the
+  # subchart's generated Secret; leave name blank to use it. For an external
+  # Postgres, set name/key to your own Secret (or leave name blank and type the
+  # password in the wizard).
+  postgresPasswordSecret:
+    name: ""        # default: the bundled <release>-postgresql Secret when postgresql.enabled
+    key: password
   # Free-form extra env. Guarded against CREMIND_DB_PROVIDER in _helpers.tpl.
   extraEnv: []
   #  - name: SOME_FLAG
@@ -152,8 +161,9 @@ autoscaling:
 ## @section Bundled PostgreSQL (Bitnami subchart) — LOCKED ON
 # fullnameOverride pins the Service to `cremind-postgresql` regardless of the
 # Helm release name, so the static `kubernetes` setup profile's pre-filled host
-# is correct. The password is read from the generated secret and pasted into
-# the wizard (NOTES.txt prints the command) — it is NOT injected as pod env.
+# is correct. The generated password is auto-wired into the Cremind pod from
+# this subchart's Secret (see cremind.postgresPasswordSecret above), so the
+# wizard needs no manual credential entry.
 #
 # NOTE: Bitnami's free Docker Hub images moved to the frozen `bitnamilegacy`
 # namespace (Aug 2025), so the chart's default PostgreSQL image may fail to

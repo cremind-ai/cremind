@@ -16,26 +16,26 @@ external/in-cluster vector stores.
    then browse to:  http://localhost:{{ .Values.service.uiPort }}/#/setup
 {{- end }}
 
-2. Database step — PostgreSQL connection (pre-filled, editable)
+2. Database step — PostgreSQL connection (pre-filled)
 {{- if .Values.postgresql.enabled }}
 
    Host:     cremind-postgresql          (Service: {{ .Values.postgresql.fullnameOverride }})
    Port:     5432
    Database: {{ .Values.postgresql.auth.database }}
    User:     {{ .Values.postgresql.auth.username }}
+   Password: auto-wired from the cluster Secret — LEAVE IT BLANK and click through.
 
-   Read the auto-generated password and paste it into the wizard:
+   The password is injected into the pod (as CREMIND_POSTGRES_PASSWORD, via
+   secretKeyRef) and used server-side, so you don't copy/paste anything. To
+   inspect it if needed:
 
    kubectl --namespace {{ .Release.Namespace }} get secret {{ .Values.postgresql.fullnameOverride }} \
      -o jsonpath='{.data.password}' | base64 -d ; echo
-
-   (The password is NOT injected into the pod — you supply it once in the
-   wizard, which validates the connection and writes it to bootstrap.toml on
-   the persistent volume.)
 {{- else }}
 
    Bundled PostgreSQL is disabled. Enter the host/port/credentials of your
-   external PostgreSQL service in the wizard's Database step.
+   external PostgreSQL service in the wizard's Database step (or set
+   cremind.postgresPasswordSecret to auto-wire its password from your Secret).
 {{- end }}
 
 3. Embeddings (optional)

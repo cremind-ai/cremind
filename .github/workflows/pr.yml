@@ -199,6 +199,8 @@ jobs:
       - name: Build deps, lint, and render-guard the chart
         if: steps.changes.outputs.helm == 'true'
         run: |
+          helm repo add qdrant https://qdrant.github.io/qdrant-helm
+          helm repo add chromadb https://amikos-tech.github.io/chromadb-chart/
           helm dependency build helm/cremind
           helm lint helm/cremind
           helm template t helm/cremind > /tmp/cremind-render.yaml

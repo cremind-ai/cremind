@@ -259,7 +259,11 @@ onMounted(() => {
           </ElFormItem>
           <ElFormItem label="Password">
             <ElInput v-model="form.postgres.password" type="password" show-password />
-            <div class="field-hint">
+            <div class="field-hint" v-if="isKubernetes">
+              On Kubernetes you can leave this blank — the cluster injects the
+              bundled PostgreSQL password from its Secret automatically.
+            </div>
+            <div class="field-hint" v-else>
               Stored in <code>~/.cremind/bootstrap.toml</code> in plaintext —
               same trust model as <code>~/.pgpass</code>.
             </div>

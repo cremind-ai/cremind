@@ -268,6 +268,23 @@ def _kubernetes_sqlite_rejection(requested: str) -> str | None:
     return None
 
 
+def _apply_injected_postgres_password(pg_in: dict) -> None:
+    """Fill an empty Postgres password from the injected ``CREMIND_POSTGRES_PASSWORD``.
+
+    On Kubernetes the Helm chart wires the bundled PostgreSQL password into the
+    pod from its generated Secret (``secretKeyRef``), so the operator never has
+    to copy/paste it — the wizard's password field can be left blank and the
+    connection still works (the Compose-like "everything is wired" experience).
+    No-op when a password was supplied in the wizard body or the env is unset,
+    so the desktop/native/external-with-typed-password flows are unaffected.
+    Mutates ``pg_in`` in place.
+    """
+    if not pg_in.get("password"):
+        env_pw = os.environ.get("CREMIND_POSTGRES_PASSWORD")
+        if env_pw:
+            pg_in["password"] = env_pw
+
+
 async def _resolve_vectorstore(embedding_body: dict) -> dict:
     """Run the vectorstore provisioner and return a ready-to-persist body.
 
@@ -554,6 +571,10 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 policy_err = _reject_external_in_docker_install("postgres")
                 if policy_err is not None:
                     return policy_err
+                # K8s auto-wiring: use the password injected from the cluster
+                # Secret when the wizard left it blank, so no manual copy/paste
+                # is needed (see _apply_injected_postgres_password).
+                _apply_injected_postgres_password(pg_in)
                 required = ("host", "database", "user")
                 missing = [k for k in required if not pg_in.get(k)]
                 if missing:
