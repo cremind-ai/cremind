@@ -126,21 +126,32 @@ ingress:
   pathType: Prefix
   tls: []
 
-## @section Probes
-# Readiness targets the SPA port: ready == the Setup Wizard is reachable. It is
-# intentionally NOT gated on a configured DB, so the wizard always loads.
+## @section Probes (cremind container)
+# DISABLED by default — deliberately. The cremind backend is effectively a
+# single process whose event loop is starved during the Setup Wizard's heavy
+# one-off work (e.g. `playwright install --with-deps chromium` for the browser
+# feature downloads Chromium and runs apt-get, taking minutes). With a probe on
+# port 1515, that starvation reads as "dead" and Kubernetes restarts the pod
+# *mid-setup*, before bootstrap.toml is even written — so setup never finishes.
+#
+# Two things already cover what these probes would: the nginx proxy sidecar has
+# its own /healthz probe that gates pod readiness (and stays up regardless of
+# what the backend is doing), and the container entrypoint runs `wait -n` so a
+# genuine `cremind serve` crash exits the container and Kubernetes restarts it.
+# Re-enable these only if you specifically want hang-detection, and then give
+# them a grace window longer than your slowest setup (raise failureThreshold).
 readinessProbe:
-  enabled: true
+  enabled: false
   initialDelaySeconds: 20
   periodSeconds: 10
-  timeoutSeconds: 5
-  failureThreshold: 6
+  timeoutSeconds: 10
+  failureThreshold: 30
 livenessProbe:
-  enabled: true
+  enabled: false
   initialDelaySeconds: 60
-  periodSeconds: 20
-  timeoutSeconds: 5
-  failureThreshold: 6
+  periodSeconds: 30
+  timeoutSeconds: 10
+  failureThreshold: 30
 
 ## @section Resources
 # The cremind-desktop image bundles XFCE + Chrome + Python; size accordingly.
