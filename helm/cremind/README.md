@@ -12,6 +12,15 @@ The pod runs the published `cremind/cremind-desktop` image. The chart sets
 `CREMIND_SYSTEM_DIR` and the runtime venv on PersistentVolumeClaims, and — by
 design — **never sets `CREMIND_DB_PROVIDER`** (which would skip the wizard).
 
+### Single entry point
+
+An in-pod **nginx reverse-proxy sidecar** fronts the whole workflow on **one
+port** so you never forward more than one: it routes `/api` + `/health` to the
+backend, `/vnc/` to the agent's desktop (noVNC, always on), and everything else
+to the SPA. The Service exposes only that port, and an Ingress targets it. The
+SPA calls the backend **same-origin**, so it works behind a single port-forward
+*or* a single Ingress hostname.
+
 ## Install
 
 ```bash
@@ -28,6 +37,14 @@ Or from the published OCI registry:
 ```bash
 helm install cremind oci://registry-1.docker.io/cremind/cremind \
   --version <X.Y.Z> --namespace cremind --create-namespace
+```
+
+Reach it with a single port-forward (or an Ingress hostname):
+
+```bash
+kubectl -n cremind port-forward svc/cremind 8080:80
+# UI / wizard:   http://localhost:8080/#/setup
+# agent desktop: http://localhost:8080/vnc/vnc.html
 ```
 
 Follow the `NOTES` printed after install: open `/#/setup` and click through. With
@@ -83,7 +100,9 @@ embeddings.
 | `persistence.venv.*` | `8Gi`, RWO | Wizard-installed Python deps (LLM SDKs, embeddings). |
 | `postgresql.enabled` | `true` | Bundled Bitnami PostgreSQL. |
 | `qdrant.enabled` / `chromadb.enabled` | `false` | Enable when turning on embeddings. |
-| `ingress.enabled` | `false` | Routes the SPA/wizard (UI port). |
+| `proxy.enabled` | `true` | nginx single-entry sidecar (UI + API + noVNC on one port). |
+| `service.port` | `80` | The one Service port (fronts the proxy). |
+| `ingress.enabled` | `false` | One hostname for everything (UI at `/`, noVNC at `/vnc/`). |
 | `autoscaling.enabled` | `false` | Must stay false under the single-replica model. |
 
 ## How the storage constraints are enforced

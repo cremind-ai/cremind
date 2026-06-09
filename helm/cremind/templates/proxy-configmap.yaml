@@ -1,0 +1,70 @@
+{{- if .Values.proxy.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cremind.fullname" . }}-proxy
+  labels:
+    {{- include "cremind.labels" . | nindent 4 }}
+data:
+  default.conf: |
+    # Single entry point for Cremind. The cremind container and this nginx
+    # sidecar share the pod network namespace, so 127.0.0.1 reaches the
+    # backend (1112), the SPA static listener (1515), and noVNC/websockify (80).
+
+    # Standard WebSocket upgrade map (http context — conf.d is included there).
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    server {
+        listen {{ .Values.proxy.port }};
+        server_name _;
+
+        # Proxy-local health for the sidecar's own probes (doesn't depend on
+        # the backend being up).
+        location = /healthz { return 200 "ok\n"; }
+
+        # API: REST + Server-Sent Events + the one WebSocket
+        # (/api/processes/<pid>/ws). Buffering off so SSE streams flow.
+        location /api/ {
+            proxy_pass http://127.0.0.1:1112;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
+        location = /health {
+            proxy_pass http://127.0.0.1:1112;
+            proxy_set_header Host $host;
+        }
+
+        # noVNC desktop viewer. websockify serves the noVNC web bundle (relative
+        # asset paths, so they resolve under /vnc/) and the VNC WebSocket on :80.
+        location = /vnc { return 302 /vnc/vnc.html; }
+        location /vnc/ {
+            proxy_pass http://127.0.0.1:80/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
+
+        # Everything else: the SPA / Setup Wizard.
+        location / {
+            proxy_pass http://127.0.0.1:1515;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+{{- end }}

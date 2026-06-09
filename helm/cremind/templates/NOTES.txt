@@ -5,15 +5,20 @@ This is a single-replica deployment that boots straight into the Setup Wizard
 PostgreSQL only (SQLite is rejected), embeddings off by default, and only
 external/in-cluster vector stores.
 
+Everything is served on ONE port by the in-pod reverse proxy — the UI, the API,
+and noVNC. You never need to forward more than one port.
+
 1. Open the Setup Wizard
 {{- if .Values.ingress.enabled }}
 
    http://{{ .Values.ingress.host }}{{ .Values.ingress.path }}#/setup
+   (the agent's desktop is at http://{{ .Values.ingress.host }}/vnc/vnc.html)
 {{- else }}
 
-   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "cremind.fullname" . }} {{ .Values.service.uiPort }}:{{ .Values.service.uiPort }}
+   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "cremind.fullname" . }} 8080:{{ .Values.service.port }}
 
-   then browse to:  http://localhost:{{ .Values.service.uiPort }}/#/setup
+   then browse to:  http://localhost:8080/#/setup
+   (the agent's desktop is at http://localhost:8080/vnc/vnc.html)
 {{- end }}
 
 2. Database step — PostgreSQL connection (pre-filled)

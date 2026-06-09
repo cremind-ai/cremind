@@ -13,21 +13,8 @@ spec:
   selector:
     {{- include "cremind.selectorLabels" . | nindent 4 }}
   ports:
-    - name: ui
-      port: {{ .Values.service.uiPort }}
-      targetPort: ui
+    # Single entry point — the nginx proxy fronts UI + API + noVNC.
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: {{ if .Values.proxy.enabled }}http{{ else }}ui{{ end }}
       protocol: TCP
-    - name: api
-      port: {{ .Values.service.apiPort }}
-      targetPort: api
-      protocol: TCP
-    {{- if .Values.service.vnc.enabled }}
-    - name: novnc
-      port: {{ .Values.service.vnc.novncPort }}
-      targetPort: novnc
-      protocol: TCP
-    - name: vnc
-      port: {{ .Values.service.vnc.vncPort }}
-      targetPort: vnc
-      protocol: TCP
-    {{- end }}

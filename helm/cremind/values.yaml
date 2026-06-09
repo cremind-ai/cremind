@@ -87,20 +87,36 @@ persistence:
     existingClaim: ""
     annotations: {}
 
+## @section Reverse proxy (single entry point)
+# An in-pod nginx sidecar presents ONE port for the whole workflow so users
+# never port-forward more than one port. It routes (same origin):
+#   /api, /health  -> the backend API on 1112 (REST + SSE + WebSocket)
+#   /vnc/          -> noVNC (websockify on :80) — the agent's desktop, always on
+#   everything else-> the SPA / Setup Wizard on 1515
+# Containers in a pod share localhost, so the proxy reaches 127.0.0.1:{1112,1515,80}.
+proxy:
+  enabled: true
+  image:
+    registry: docker.io
+    # Unprivileged nginx so the sidecar runs as non-root and listens on 8080.
+    repository: nginxinc/nginx-unprivileged
+    tag: "1.27-alpine"
+    pullPolicy: IfNotPresent
+  port: 8080
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
 ## @section Service
+# Exposes ONLY the reverse-proxy port — one port for UI + API + noVNC.
 service:
   type: ClusterIP
-  apiPort: 1112
-  uiPort: 1515
+  port: 80          # external Service port -> proxy container port
   annotations: {}
-  # noVNC web access to the agent's desktop. Off by default (server use case).
-  vnc:
-    enabled: false
-    novncPort: 6080   # maps to container port 80 (websockify)
-    vncPort: 5900
 
 ## @section Ingress
-# Routes the SPA / Setup Wizard (UI port). Set host + className for your cluster.
+# One hostname for the whole workflow (UI at /, noVNC at /vnc/). Set host +
+# className for your cluster.
 ingress:
   enabled: false
   className: ""

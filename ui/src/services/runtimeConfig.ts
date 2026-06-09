@@ -10,13 +10,19 @@
  * 2. ``import.meta.env.VITE_AGENT_URL`` — build-time default for the
  *    standalone web build and the Vite dev server, where there's no
  *    Electron bridge.
- * 3. Same-origin heuristic for the Docker bundle: when the SPA is served
+ * 3. Port-swap heuristic for the raw Docker bundle: when the SPA is served
  *    on port 1515 by the cremind container, the backend is at the same
  *    host on port 1112. This makes the bundle work both when the user
  *    accesses it locally and when they open it on a remote server, with
  *    no per-deploy build flag.
- * 4. Empty string — the UI treats this as "not configured" and routes
- *    the user to the setup wizard.
+ * 4. Same-origin fallback: when the page is served from any other origin —
+ *    e.g. behind the Kubernetes single-port reverse proxy or an Ingress,
+ *    where a path-router sends ``/api`` and ``/health`` to the backend and
+ *    everything else to the SPA — the backend shares the page's origin.
+ *    Returning ``window.location.origin`` lets one URL serve the whole
+ *    workflow with no port juggling.
+ * 5. Empty string — only when there is no window at all (SSR/tests); the
+ *    UI treats this as "not configured" and routes to the setup wizard.
  *
  * Writes go through ``setAgentUrl`` so the persisted config stays in sync
  * across renderer restarts. Under the web build this is a no-op (the URL
@@ -34,14 +40,17 @@ export function getAgentUrl(): string {
   const fromEnv = import.meta.env.VITE_AGENT_URL as string | undefined
   if (fromEnv) return fromEnv
 
-  // Docker-bundle heuristic: the SPA is served at <host>:1515 by the
-  // cremind container, with the API exposed at <host>:1112 on the same
-  // host. We swap the port to derive the API URL automatically.
   if (typeof window !== 'undefined' && window.location?.hostname) {
+    // Raw Docker bundle: SPA on <host>:1515, API on <host>:1112. Swap the
+    // port to derive the API URL.
     if (window.location.port === SPA_PORT) {
       const protocol = window.location.protocol || 'http:'
       return `${protocol}//${window.location.hostname}:${API_PORT}`
     }
+    // Any other origin (Kubernetes single-port proxy / Ingress, or a custom
+    // reverse proxy): the backend is same-origin. A path-router forwards
+    // /api and /health to the backend; everything else is the SPA.
+    return window.location.origin
   }
 
   return ''
