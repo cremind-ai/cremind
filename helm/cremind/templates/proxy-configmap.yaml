@@ -57,6 +57,19 @@ data:
             proxy_read_timeout 3600s;
             proxy_send_timeout 3600s;
         }
+        # noVNC opens its VNC WebSocket at the ROOT path /websockify (its
+        # built-in default), not under /vnc/, so it needs its own route to
+        # websockify. Without this the upgrade falls through to the SPA and the
+        # viewer reports "Failed to connect to server" (close code 1006).
+        location = /websockify {
+            proxy_pass http://127.0.0.1:80;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
 
         # A2A agent card (and any other .well-known) live on the backend —
         # the UI's agent connection fetches /.well-known/agent-card.json here.
