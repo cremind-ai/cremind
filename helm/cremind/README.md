@@ -98,6 +98,8 @@ embeddings.
 > (`kubectl -n <ns> delete pvc data-<release>-postgresql-0`) or pin a stable
 > password you reuse every time (`--set postgresql.auth.password=…`). The same
 > applies to managed/external PostgreSQL: the wizard password must match the DB.
+> To instead have `helm uninstall` delete this volume automatically (so a
+> reinstall always starts clean), see [Uninstalling and removing data](#uninstalling-and-removing-data).
 
 ## Key values
 
@@ -159,3 +161,44 @@ to persist additional paths.
 
 To serve more load, give the single pod more resources (`resources`) and a
 bigger node; do not add replicas.
+
+## Uninstalling and removing data
+
+`helm uninstall <release> -n <ns>` deletes the Deployment, Service, ConfigMaps,
+the generated Secret, and the chart's own three PVCs (`<release>-system`,
+`-venv`, `-work`). Whether each PVC's underlying **PV and disk** also disappear
+is governed by the StorageClass `reclaimPolicy`: `Delete` (the default on most
+cloud provisioners) destroys the disk; `Retain` leaves a `Released` PV behind.
+
+The bundled **StatefulSet** subcharts are the exception — their data PVCs come
+from `volumeClaimTemplates`, which neither Helm nor Kubernetes garbage-collects
+on uninstall, and they don't carry the release-wide labels. So they **survive**
+by default, and a blanket `kubectl delete pvc -l app.kubernetes.io/instance=<release>`
+would *miss* them. Handle each one:
+
+- **PostgreSQL (on by default)** — opt into automatic deletion by enabling the
+  StatefulSet PVC retention policy at install/upgrade:
+  ```bash
+  helm install cremind ./helm/cremind -n cremind --create-namespace \
+    --set postgresql.primary.persistentVolumeClaimRetentionPolicy.enabled=true \
+    --set postgresql.primary.persistentVolumeClaimRetentionPolicy.whenDeleted=Delete
+  ```
+  (Also documented under `postgresql:` in `values.yaml` — set it there instead
+  if you prefer a values file.) `helm uninstall` then removes
+  `data-<release>-postgresql-0` along with everything else. Requires the
+  `StatefulSetAutoDeletePVC` feature — GA in k8s 1.32, beta on-by-default since
+  1.27.
+- **ChromaDB** (if enabled) — already deletes its PVC on uninstall by default
+  (`chromadb.data.retentionPolicyOnDelete: Delete`); set it to `Retain` to keep.
+- **Qdrant** (if enabled) — its subchart exposes **no** retention-policy value,
+  so its PVC always survives. Delete it by name afterwards (the Service name is
+  pinned to `cremind-qdrant`, single replica):
+  ```bash
+  kubectl -n <ns> delete pvc qdrant-storage-cremind-qdrant-0
+  ```
+
+True deletion is two steps: `whenDeleted: Delete` removes the **PVC**, then the
+bound **PV + disk** follow the StorageClass `reclaimPolicy` — so pair the flag
+with a `Delete`-reclaim StorageClass for a guaranteed full wipe. Finally,
+`helm uninstall` does **not** remove the namespace (or anything
+`--create-namespace` created); delete it separately if you want it gone.

@@ -240,6 +240,24 @@ postgresql:
     database: cremind
     # password / postgresPassword: leave unset to auto-generate into the secret.
   architecture: standalone
+  # Data-volume lifecycle on `helm uninstall`. PostgreSQL is a StatefulSet, so
+  # its data PVC (`data-<release>-postgresql-0`) is created by the controller —
+  # NOT Helm — and by default SURVIVES uninstall. That is the safe default: a
+  # stray `helm uninstall` never destroys the database (see README
+  # "Reinstalling?" and "Uninstalling and removing data"). To make uninstall
+  # delete the data volume automatically, flip whenDeleted to Delete (here or
+  # via --set):
+  #   postgresql.primary.persistentVolumeClaimRetentionPolicy.enabled=true
+  #   postgresql.primary.persistentVolumeClaimRetentionPolicy.whenDeleted=Delete
+  # The PVC is removed when the StatefulSet is torn down; the underlying PV +
+  # disk then follow the StorageClass reclaimPolicy (Delete on most cloud
+  # defaults). Requires the StatefulSetAutoDeletePVC feature (GA k8s 1.32, beta
+  # on-by-default since 1.27).
+  primary:
+    persistentVolumeClaimRetentionPolicy:
+      enabled: false
+      whenScaled: Retain
+      whenDeleted: Retain
 
 ## @section Bundled Qdrant (subchart) — OFF by default (embeddings off)
 qdrant:
