@@ -69,19 +69,6 @@ listener), so linking completes even though the command keeps running. Confirm w
 ```bash
 uv run scripts/__main__.py status
 ```
-
-**If the post-approval page does NOT load** (the browser shows "can't connect" /
-`ERR_CONNECTION_REFUSED`) — this happens on remote/Kubernetes deployments where
-the registered loopback callback can't reach the backend — ask the user to **copy
-the full URL from their browser's address bar** (it contains `code=...&state=...`)
-and finish linking while the original `link` is still running:
-```bash
-uv run scripts/__main__.py complete-link --response "<the full redirect URL>"
-```
-Then confirm with `status`. The exchange still uses the registered
-`http://127.0.0.1:<port>/` callback (the pasted URL only supplies the code), so it
-matches the Atlassian app regardless of how you reached Cremind.
-
 > Note: Atlassian allows only a single, pre-registered callback URL, so linking
 > requires running under `cremind serve` (the fixed-port backend listener). The
 > standalone/ephemeral fallback used by the Google skills is not available here.
@@ -92,7 +79,6 @@ Run `uv run scripts/__main__.py <subcommand>`. Output is JSON (human-readable on
 | Subcommand | Required | Optional |
 |---|---|---|
 | `link` | — | — |
-| `complete-link` | `--response` | — |
 | `status` | — | — |
 | `myself` | — | — |
 | `projects` | — | — |

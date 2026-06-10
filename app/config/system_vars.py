@@ -101,16 +101,6 @@ SYSTEM_VARS: list[SystemVarSpec] = [
             "spawning a per-link ephemeral server that dies with the agent turn."
         ),
     ),
-    SystemVarSpec(
-        name="CREMIND_OAUTH_REDIRECT_URI",
-        resolve=lambda _profile: BaseConfig.CREMIND_OAUTH_REDIRECT_URI or None,
-        description=(
-            "Browser-facing redirect URI for the built-in Google skills when the "
-            "loopback listener is fronted by a single-port reverse proxy (the K8s "
-            "chart). Omitted on Docker/native, where the skills use "
-            "http://127.0.0.1:<callback-port>/ directly."
-        ),
-    ),
 ]
 
 

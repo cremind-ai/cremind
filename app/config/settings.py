@@ -304,16 +304,6 @@ class BaseConfig:
     # metal it binds 127.0.0.1.
     CREMIND_OAUTH_CALLBACK_PORT = int(os.environ.get("CREMIND_OAUTH_CALLBACK_PORT", 1516))
     CREMIND_OAUTH_BIND_ADDR = os.environ.get("CREMIND_OAUTH_BIND_ADDR", "").strip() or "127.0.0.1"
-    # Browser-facing redirect URI the built-in Google skills advertise to
-    # Google, when the loopback listener is fronted by a single-port reverse
-    # proxy instead of being reached on 127.0.0.1:<port> directly. In the K8s
-    # chart an nginx sidecar presents ONE port, so the listener's own
-    # 127.0.0.1:1516 is unreachable from the host browser; the chart sets this
-    # to "<APP_URL>/oauth/google/callback" (only when APP_URL is a loopback
-    # origin) and routes that path back to the listener. Unset on Docker/native
-    # (the browser reaches 127.0.0.1:<port> directly), where the skills fall
-    # back to http://127.0.0.1:<port>/.
-    CREMIND_OAUTH_REDIRECT_URI = os.environ.get("CREMIND_OAUTH_REDIRECT_URI", "").strip()
 
     # ── Application-level (TOML defaults, overridable via SQLite) ──
     SERVICE_NAME = _dynaconf_get("general.service_name", "cremind-agent")
