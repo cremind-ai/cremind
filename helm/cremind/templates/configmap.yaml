@@ -35,6 +35,18 @@ data:
   {{- end }}
   {{- end }}
   APP_URL: {{ $appUrl | quote }}
+  {{- /* Google account-linking (gmail/gcalendar) uses a Desktop OAuth client,
+         which can ONLY redirect to a loopback host. When the browser-facing
+         origin is itself loopback (the default `port-forward svc/cremind
+         8080:80`), advertise the consent redirect through the single proxy
+         port — proxy-configmap.yaml routes /oauth/google/callback back to the
+         in-pod listener, so linking is one-click with no second port-forward.
+         For a real Ingress hostname a Desktop client cannot redirect there at
+         all, so leave this unset: the skills fall back to the manual
+         `complete-link` paste (copy the failed redirect URL back). */ -}}
+  {{- if regexMatch "^https?://(127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/|$)" $appUrl }}
+  CREMIND_OAUTH_REDIRECT_URI: {{ printf "%s/oauth/google/callback" (trimSuffix "/" $appUrl) | quote }}
+  {{- end }}
   HOST: {{ .Values.cremind.host | quote }}
   PORT: {{ .Values.cremind.apiPort | quote }}
   CREMIND_UI_PORT: {{ .Values.cremind.uiPort | quote }}

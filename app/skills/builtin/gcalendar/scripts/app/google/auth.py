@@ -13,12 +13,13 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import socket
 import threading
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 from .account_key import account_key_for
 
@@ -29,6 +30,12 @@ os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 GOOGLE_AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
+
+# The OAuth ``state`` is a URL-safe token minted by oauthlib. It becomes an
+# inbox filename, so accept only this charset/length — the guard against path
+# traversal via a crafted ``state`` in a pasted callback URL. Mirrors
+# app/api/oauth_loopback.py's _STATE_RE.
+_STATE_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
 
 class AuthError(RuntimeError):
@@ -126,7 +133,7 @@ def _backend_listener_available(port: int) -> bool:
         return False
 
 
-def _await_oauth_callback(state: str, *, timeout: float = 300.0) -> str:
+def _await_oauth_callback(state: str, *, timeout: float = 600.0) -> str:
     """Block until the backend drops the authorization response for ``state``.
 
     Returns the raw redirect query (``code=...&state=...&scope=...``). Raises
@@ -160,24 +167,84 @@ def _await_oauth_callback(state: str, *, timeout: float = 300.0) -> str:
     )
 
 
-def _link_via_backend_callback(flow, port: int) -> Any:
+def _link_via_backend_callback(flow, port: int, redirect_uri: str | None = None) -> Any:
     """Authorize via ``cremind serve``'s persistent loopback callback listener.
 
     The skill builds the consent URL (PKCE is handled by ``flow``), prints it
     for the agent/CLI to surface, then waits for the backend to capture the
-    redirect and performs the token exchange locally. Using 127.0.0.1 (rather
-    than ``localhost``) keeps the redirect a valid Desktop-client loopback while
-    avoiding the Windows ``localhost`` -> ``::1`` mismatch that can refuse an
-    IPv4-only listener.
+    redirect and performs the token exchange locally.
+
+    By default the redirect is ``http://127.0.0.1:<port>/`` — a valid
+    Desktop-client loopback the host browser hits directly (Docker publishes
+    the port; native shares the loopback). Using 127.0.0.1 rather than
+    ``localhost`` dodges the Windows ``localhost`` -> ``::1`` mismatch that can
+    refuse an IPv4-only listener.
+
+    When ``redirect_uri`` is supplied (the Kubernetes chart sets
+    ``CREMIND_OAUTH_REDIRECT_URI`` to ``<APP_URL>/oauth/google/callback``), the
+    listener is fronted by the single-port nginx proxy, so the browser-facing
+    redirect differs from the in-pod ``127.0.0.1:<port>``. It must still be a
+    loopback origin (Desktop clients reject real hostnames); the proxy routes
+    that path back to the listener and the same inbox capture applies.
     """
-    flow.redirect_uri = f"http://127.0.0.1:{port}/"
+    flow.redirect_uri = redirect_uri or f"http://127.0.0.1:{port}/"
     auth_url, state = flow.authorization_url(access_type="offline", prompt="consent")
     print(f"Please visit this URL to authorize this application: {auth_url}", flush=True)
     query = _await_oauth_callback(state)
-    # oauthlib insists OAuth 2.0 happens over https, so present the response as such.
-    authorization_response = f"https://127.0.0.1:{port}/?{query}"
+    # oauthlib insists OAuth 2.0 happens over https, so present the response as
+    # such. The path is irrelevant to code extraction; only the query matters.
+    https_base = re.sub(r"^http://", "https://", flow.redirect_uri)
+    sep = "&" if "?" in https_base else "?"
+    authorization_response = f"{https_base}{sep}{query}"
     flow.fetch_token(authorization_response=authorization_response)
     return flow.credentials
+
+
+def submit_callback(response: str) -> dict[str, Any]:
+    """Hand a manually-captured OAuth redirect back to the waiting ``link``.
+
+    On remote/headless deployments (Ingress, SSH, or any topology where the
+    consent redirect to the loopback URL fails to reach the pod) the browser
+    still lands on a URL whose query carries a valid ``code`` + ``state``. The
+    user copies that URL; this writes its query into the same per-state inbox
+    file ``cremind serve``'s loopback listener would have written
+    (``<CREMIND_SYSTEM_DIR>/oauth_inbox/<state>.txt``), so the still-running
+    ``link`` picks it up and performs the local PKCE exchange. The auth ``code``
+    is useless without the ``code_verifier`` that ``link`` holds, so tokens
+    never leave the machine.
+
+    ``response`` may be a full redirect URL or a bare ``code=...&state=...``
+    query string. Raises ``AuthError`` on a missing/invalid state, a consent
+    error, or when the inbox is unavailable.
+    """
+    raw = (response or "").strip()
+    if not raw:
+        raise AuthError("Empty OAuth response; paste the full URL Google redirected you to.")
+    # Accept either a full URL (extract its query) or a bare query string.
+    query = urlparse(raw).query
+    if not query:
+        query = raw[1:] if raw.startswith("?") else raw
+    params = parse_qs(query)
+    if "error" in params:
+        raise AuthError("Google consent was denied or returned an error.")
+    state = (params.get("state") or [""])[0]
+    if not _STATE_RE.match(state):
+        raise AuthError(
+            "Could not find a valid 'state' in the pasted response. Paste the "
+            "entire URL from your browser's address bar (it contains "
+            "state=... and code=...)."
+        )
+    if "code" not in params:
+        raise AuthError("The pasted response has no 'code'; paste the full redirect URL after approving.")
+    inbox = _oauth_inbox_dir()
+    if inbox is None:
+        raise AuthError("CREMIND_SYSTEM_DIR is not set; cannot deliver the OAuth response.")
+    inbox.mkdir(parents=True, exist_ok=True)
+    dst = inbox / f"{state}.txt"
+    tmp = dst.with_name(dst.name + ".tmp")
+    tmp.write_text(query, encoding="utf-8")
+    os.replace(tmp, dst)
+    return {"submitted": True, "state": state}
 
 
 def link(
@@ -189,6 +256,7 @@ def link(
     open_browser: bool = True,
     port: int = 0,
     bind_addr: str | None = None,
+    redirect_uri: str | None = None,
 ) -> dict[str, Any]:
     """Run the loopback PKCE consent flow and persist tokens locally.
 
@@ -201,6 +269,10 @@ def link(
     refuse it). ``host`` stays "localhost" so the advertised redirect_uri is
     ``http://localhost:<port>/`` — what the host browser hits, and a valid
     loopback redirect for the org's Desktop OAuth client.
+
+    ``redirect_uri`` overrides the advertised loopback redirect for the
+    backend-listener path — set by the Kubernetes chart to route the callback
+    through its single nginx proxy port (see ``_link_via_backend_callback``).
     """
     from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -221,7 +293,7 @@ def link(
         # persistent loopback callback server (app/api/oauth_loopback.py), so
         # consent survives the agent turn / subprocess teardown that killed the
         # old per-link server. The skill still does the PKCE token exchange.
-        creds = _link_via_backend_callback(flow, port)
+        creds = _link_via_backend_callback(flow, port, redirect_uri=redirect_uri)
     else:
         # Fallback for a standalone CLI run (no backend listening): spin up an
         # ephemeral loopback server in this process, as before.

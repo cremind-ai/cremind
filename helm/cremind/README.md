@@ -69,6 +69,27 @@ password, which is auto-wired into the pod from the generated Secret (via
 click Next** (the Docker-Compose-like "everything is wired" experience). You only
 type credentials when using an external PostgreSQL without `cremind.postgresPasswordSecret`.
 
+### Linking Google accounts (Gmail / Calendar)
+
+The Gmail/Calendar skills use a Google **Desktop** OAuth client, which may only
+redirect to a loopback address. The chart handles this through the single proxy
+port:
+
+- **With the default `port-forward svc/cremind 8080:80`** (APP_URL is
+  `http://localhost:8080`), linking is **one-click** — after you approve in the
+  browser, the consent redirect is routed back through the proxy
+  (`/oauth/google/callback`) to the in-pod listener and the page shows
+  "Authentication complete". No second port-forward is needed. If you forward to
+  a different local port, set `cremind.appUrl` to match (e.g.
+  `--set cremind.appUrl=http://127.0.0.1:9000`) so the advertised redirect port
+  lines up with your browser.
+- **With Ingress (a real hostname),** a Desktop OAuth client cannot redirect to
+  the pod, so the post-approval page will fail to load (`ERR_CONNECTION_REFUSED`)
+  — this is expected. Copy the **full URL** from your browser's address bar (it
+  contains `code=…&state=…`) and give it back to the agent; it finishes linking
+  with the skill's `complete-link` step while the original `link` is still
+  running. Then ask it to check `status`.
+
 ## Bundled dependencies
 
 | Subchart   | Default  | Service name (pinned) | Purpose                    |
@@ -131,7 +152,7 @@ embeddings.
 | _(release channel)_ | auto from `image.tag` | Not a knob. `test` when the effective tag is an RC (`…rcN.devM`, i.e. the `--devel` chart), else `production`; the in-app **Updates** page reports this. Force it via `cremind.extraEnv` (`CREMIND_UPGRADE_CHANNEL`). |
 | `cremind.installMode` | `kubernetes` | Drives external-only service modes. |
 | `cremind.setupWizardEnv` | `kubernetes` | Pre-fills the wizard. |
-| `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http://localhost:8080`. |
+| `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http://localhost:8080`. A loopback value also enables one-click Google account linking (see above). |
 | `persistence.system.*` | `5Gi`, RWO | `bootstrap.toml`, tokens, profiles. |
 | `persistence.venv.*` | `8Gi`, RWO | Wizard-installed Python deps (LLM SDKs, embeddings). |
 | `persistence.work.*` | `10Gi`, RWO | Agent working dir (files it creates); `mountPath` must match the wizard's User Working Directory. |

@@ -60,6 +60,19 @@ keeps running in the background. Once the user says they've approved, confirm:
 ```bash
 uv run scripts/__main__.py status
 ```
+
+**If the post-approval page does NOT load** (the browser shows "can't connect" /
+`ERR_CONNECTION_REFUSED`) — this happens on remote/Kubernetes-Ingress
+deployments where the loopback redirect can't reach the backend — ask the user
+to **copy the full URL from their browser's address bar** (it contains
+`code=...&state=...`) and hand it back to finish linking, while the original
+`link` is still running:
+```bash
+uv run scripts/__main__.py complete-link --response "<the full redirect URL>"
+```
+Then confirm with `status`. (On a normal Docker/desktop or `port-forward` setup
+the page loads a success message and no paste is needed.)
+
 (`--no-browser` only affects the standalone fallback used when the Cremind
 backend isn't running; under the app the URL is always printed for the user.)
 
@@ -69,6 +82,7 @@ Run `uv run scripts/__main__.py <subcommand>`. Output is JSON.
 | Subcommand | Required | Optional |
 |---|---|---|
 | `link` | — | `--no-browser` |
+| `complete-link` | `--response` | — |
 | `status` | — | — |
 | `list-calendars` | — | — |
 | `list` | — | `--calendar`, `--since YYYY-MM-DD`, `--before YYYY-MM-DD`, `--query`, `--max-results` (50) |

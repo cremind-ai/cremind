@@ -67,8 +67,21 @@ def cmd_link(args) -> Any:
         open_browser=not args.no_browser,
         port=config.OAUTH_CALLBACK_PORT,
         bind_addr=config.OAUTH_BIND_ADDR,
+        redirect_uri=config.OAUTH_REDIRECT_URI,
     )
     return {"linked": True, "email": data["email"], "account_key": data["account_key"]}
+
+
+def cmd_complete_link(args) -> Any:
+    """Finish a link started in another (still-running) `link` by handing it the
+    redirect URL the browser was sent to. For remote/Ingress deployments where
+    the loopback redirect can't reach the backend; run `status` after to confirm.
+    """
+    auth.submit_callback(args.response)
+    return {
+        "submitted": True,
+        "note": "Linking will complete in the running 'link' command; run 'status' to confirm.",
+    }
 
 
 def cmd_status(_args) -> Any:
@@ -158,6 +171,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("link", help="link a Google account (loopback PKCE)")
     sp.add_argument("--no-browser", action="store_true")
     sp.set_defaults(func=cmd_link)
+
+    sp = sub.add_parser(
+        "complete-link",
+        help="finish linking by pasting the URL Google redirected you to (remote/Ingress)",
+    )
+    sp.add_argument("--response", required=True, help="the full redirect URL (or its code=...&state=... query)")
+    sp.set_defaults(func=cmd_complete_link)
 
     sub.add_parser("status", help="show link status").set_defaults(func=cmd_status)
 

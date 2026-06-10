@@ -61,6 +61,16 @@ cremind:
   # when ingress.enabled, otherwise http://localhost:8080 (the documented
   # `port-forward svc/cremind 8080:80`). Override if you port-forward to a
   # different local port or front it with another URL.
+  #
+  # Google account-linking (gmail/gcalendar): when APP_URL is a LOOPBACK origin
+  # (localhost / 127.0.0.1 — the default port-forward case), the consent
+  # redirect is routed through this one proxy port (CREMIND_OAUTH_REDIRECT_URI
+  # is derived as <APP_URL>/oauth/google/callback), so linking is one-click with
+  # no second port-forward. If you port-forward to a non-8080 local port, set
+  # appUrl to match (e.g. http://127.0.0.1:9000) so the advertised redirect
+  # port lines up with your browser. With Ingress (a real hostname) a Desktop
+  # OAuth client cannot redirect to the pod, so linking uses the skill's manual
+  # `complete-link` paste fallback (see the README).
   appUrl: ""
   # The desktop entrypoint requires these or it exits 1. The image already
   # defaults them, but we set them explicitly so they're configurable.
