@@ -7,7 +7,6 @@ from app.api.events import get_event_routes
 from app.api.file_watchers import get_file_watcher_routes
 from app.api.files import get_file_routes
 from app.api.oauth2 import get_oauth2_routes
-from app.api.oauth_loopback import get_oauth_loopback_routes
 from app.api.processes import get_process_routes
 from app.api.profiles import get_profile_routes
 from app.api.embedding_stream import get_embedding_stream_routes
@@ -55,9 +54,6 @@ def get_api_routes(
     routes.extend(get_oauth2_routes(
         registry=registry, pending_return_urls=pending_return_urls,
     ))
-    # Google (gmail/gcalendar) loopback callback, captured via the backend's
-    # /api route when Cremind is fronted by a single reverse-proxy port (K8s).
-    routes.extend(get_oauth_loopback_routes())
     routes.extend(get_profile_routes(
         conversation_storage,
         registry=registry,
