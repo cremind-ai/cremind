@@ -39,6 +39,13 @@ helm install cremind oci://registry-1.docker.io/cremind/cremind \
   --version <X.Y.Z> --namespace cremind --create-namespace
 ```
 
+> While Cremind is pre-1.0, only **release-candidate** charts are published.
+> RC charts are SemVer pre-releases, so `helm install`/`pull` ignore them unless
+> you pass `--devel` and pin the version — e.g.
+> `--version 0.0.1-rc.4.dev.8 --devel`. The chart `version` is the SemVer2
+> translation of the image tag (`v0.0.1rc4.dev8` → `0.0.1-rc.4.dev.8`); find the
+> latest on the GitHub Releases page.
+
 Reach it with a single port-forward (or an Ingress hostname):
 
 ```bash
@@ -79,12 +86,17 @@ embeddings.
 >    PostgreSQL at the legacy namespace. Verified working on k8s 1.32:
 >    ```bash
 >    helm install cremind ./helm/cremind -n cremind --create-namespace \
->      --set global.security.allowInsecureImages=true \
 >      --set postgresql.image.registry=docker.io \
 >      --set postgresql.image.repository=bitnamilegacy/postgresql
 >    ```
->    (`allowInsecureImages=true` is required because the image is no longer the
->    chart's signed default — use it only for evaluation.)
+>    These two `--set` overrides are sufficient. You do **not** need
+>    `--set global.security.allowInsecureImages=true`: the Bitnami image-
+>    verification guard is only invoked from the PostgreSQL subchart's
+>    `NOTES.txt`, which Helm does not render for a dependency, and the
+>    `bitnamilegacy/*` namespace is special-cased to a warning rather than a
+>    hard `fail` regardless. Passing `allowInsecureImages=true` is harmless
+>    (it only silences that substitution warning if it ever surfaces) but is
+>    not required — verified against the bundled `postgresql-16.7.27` subchart.
 > 3. **Vendor offline:** commit a pinned `postgresql-*.tgz` (with a pullable
 >    image) into `charts/` so resolution and pulls are self-contained.
 
