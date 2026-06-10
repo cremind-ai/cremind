@@ -323,6 +323,13 @@ async def _spawn_command(
     )
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
+    # Force the child's stdout/stderr to be unbuffered. When stdout is a pipe
+    # (not a TTY), CPython block-buffers it, so a command that prints a line
+    # then blocks before filling the buffer (e.g. the OAuth `link` flow, which
+    # prints the consent URL then parks on a loopback socket) never flushes —
+    # the URL is captured as neither classification output nor a .log file.
+    # Inherited through `uv run` into the child Python, same as PYTHONIOENCODING.
+    env["PYTHONUNBUFFERED"] = "1"
     if extra_env:
         env.update(extra_env)
     if system == "Windows":

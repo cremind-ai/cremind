@@ -1,0 +1,207 @@
+{{- /* Hard single-pod guard: the image bundles a VNC desktop, so more than one
+       pod means more than one independent desktop — not allowed. Reject any
+       replicaCount other than 1 at render time. */ -}}
+{{- if ne (int .Values.replicaCount) 1 }}
+{{- fail "Cremind bundles a VNC virtual desktop and must run as exactly ONE pod. replicaCount must be 1 — horizontal scaling is not supported (multiple pods would create multiple divergent desktops)." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cremind.fullname" . }}
+  labels:
+    {{- include "cremind.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # Always exactly one pod — see the single-pod guard above (VNC desktop).
+  replicas: 1
+  # RWO PVCs cannot multi-attach AND the single-VNC-desktop model forbids a
+  # second pod; Recreate terminates the old pod before starting the new one,
+  # so an upgrade never momentarily runs two. Never switch to RollingUpdate.
+  strategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "cremind.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Roll the pod when the env ConfigMap changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "cremind.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "cremind.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: cremind
+          image: {{ include "cremind.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "cremind.fullname" . }}-env
+          {{- /* Resolve the Secret that holds the Postgres password: an
+                 explicit override, else the bundled subchart's Secret. */ -}}
+          {{- $pgSecret := .Values.cremind.postgresPasswordSecret.name }}
+          {{- if and (not $pgSecret) .Values.postgresql.enabled }}
+          {{- $pgSecret = (.Values.postgresql.fullnameOverride | default (printf "%s-postgresql" (include "cremind.fullname" .))) }}
+          {{- end }}
+          {{- if or $pgSecret .Values.cremind.extraEnv }}
+          env:
+            {{- if $pgSecret }}
+            # Auto-wire the PostgreSQL password from its Secret so the Setup
+            # Wizard needs no manual credential entry — the backend falls back
+            # to CREMIND_POSTGRES_PASSWORD when the wizard's password field is
+            # left blank (the Compose-like "everything is wired" experience).
+            # Server-side only via secretKeyRef — the value never reaches the
+            # browser and never appears in the pod spec.
+            - name: CREMIND_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $pgSecret | quote }}
+                  key: {{ .Values.cremind.postgresPasswordSecret.key | quote }}
+            {{- end }}
+            {{- with .Values.cremind.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          # Container ports are informational; the proxy sidecar reaches these
+          # over the shared pod loopback. noVNC (80) is always available.
+          ports:
+            - name: api
+              containerPort: {{ .Values.cremind.apiPort }}
+            - name: ui
+              containerPort: {{ .Values.cremind.uiPort }}
+            - name: oauth
+              containerPort: {{ .Values.cremind.oauthCallbackPort }}
+            - name: novnc
+              containerPort: 80
+            - name: vnc
+              containerPort: 5900
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: ui
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /
+              port: ui
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- if .Values.persistence.system.enabled }}
+            - name: system
+              mountPath: {{ .Values.cremind.systemDir }}
+            {{- end }}
+            {{- if .Values.persistence.venv.enabled }}
+            # Persist the wizard-installed Python venv (LLM SDKs, embeddings) so
+            # a rescheduled pod keeps working without re-running setup. The
+            # entrypoint seeds this from the image baseline on first boot.
+            - name: venv
+              mountPath: /opt/cremind/venv
+            {{- end }}
+            {{- if .Values.persistence.work.enabled }}
+            # Persist the agent's User Working Directory so files it creates
+            # survive restarts. mountPath must match the wizard's working dir.
+            - name: work
+              mountPath: {{ .Values.persistence.work.mountPath }}
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- if .Values.proxy.enabled }}
+        # Single entry point: nginx routes /api + /health -> backend, /vnc/ ->
+        # noVNC, everything else -> the SPA, all on one port. Shares the pod
+        # network namespace with the cremind container (reaches it on 127.0.0.1).
+        - name: proxy
+          image: "{{ .Values.proxy.image.registry }}/{{ .Values.proxy.image.repository }}:{{ .Values.proxy.image.tag }}"
+          imagePullPolicy: {{ .Values.proxy.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.proxy.port }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          {{- with .Values.proxy.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: proxy-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+        {{- end }}
+      volumes:
+        {{- if .Values.proxy.enabled }}
+        - name: proxy-config
+          configMap:
+            name: {{ include "cremind.fullname" . }}-proxy
+        {{- end }}
+        {{- if .Values.persistence.system.enabled }}
+        - name: system
+          persistentVolumeClaim:
+            claimName: {{ include "cremind.systemClaimName" . }}
+        {{- end }}
+        {{- if .Values.persistence.venv.enabled }}
+        - name: venv
+          persistentVolumeClaim:
+            claimName: {{ include "cremind.venvClaimName" . }}
+        {{- end }}
+        {{- if .Values.persistence.work.enabled }}
+        - name: work
+          persistentVolumeClaim:
+            claimName: {{ include "cremind.workClaimName" . }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

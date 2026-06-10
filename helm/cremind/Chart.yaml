@@ -1,0 +1,49 @@
+apiVersion: v2
+name: cremind
+description: >-
+  Cremind agent on Kubernetes. Single-replica Deployment that boots into the
+  Setup Wizard (no install script), enforces PostgreSQL for shared state, and
+  optionally connects to in-cluster Qdrant / ChromaDB for embeddings.
+type: application
+# version  = the chart packaging version (strict SemVer2).
+# appVersion = the published cremind/cremind-desktop image tag (PEP 440, e.g.
+#              0.0.2 or 0.0.2rc1.dev1). CI stamps BOTH from app/__version__.py
+#              via `helm package --version <semver2> --app-version <pep440>`
+#              (see .github/workflows/release-*.yml). The placeholders below
+#              are only used for local `helm template`/`lint`.
+version: 0.0.0
+appVersion: "0.0.0"
+kubeVersion: ">=1.23.0-0"
+home: https://github.com/cremind/cremind
+sources:
+  - https://github.com/cremind/cremind
+keywords:
+  - cremind
+  - agent
+  - ai
+maintainers:
+  - name: Cremind
+
+# Bundled storage services. PostgreSQL is required (shared app state) and ships
+# enabled; the vector DBs are optional (embeddings are off by default) and ship
+# disabled. Each is gated by a `condition` flag in values.yaml so a turnkey
+# `helm install` brings up only what's needed.
+#
+# NOTE: confirm these chart versions/repos are reachable at build time —
+# Bitnami is restricting its free Docker Hub catalog. If the PostgreSQL chart
+# becomes unavailable, vendor a pinned .tgz into charts/ (see README) so
+# `helm dependency build` resolves offline. `helm dependency build` MUST run
+# before `helm lint`/`helm template`/`helm package`.
+dependencies:
+  - name: postgresql
+    version: "16.x.x"
+    repository: oci://registry-1.docker.io/bitnamicharts
+    condition: postgresql.enabled
+  - name: qdrant
+    version: "1.x.x"
+    repository: https://qdrant.github.io/qdrant-helm
+    condition: qdrant.enabled
+  - name: chromadb
+    version: "0.1.x"
+    repository: https://amikos-tech.github.io/chromadb-chart/
+    condition: chromadb.enabled

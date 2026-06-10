@@ -480,8 +480,59 @@ jobs:
           cache-from: type=gha,scope=desktop
           cache-to: type=gha,scope=desktop,mode=max
 
+  # Packages the Helm chart and pushes it to Docker Hub as an OCI artifact.
+  # ``needs: [approve, prepare-draft, docker]`` — runs only after the human
+  # approval gate and after the cremind/cremind-desktop:X.Y.Z image the chart
+  # references has been pushed. Production versions are already bare X.Y.Z, so
+  # the chart ``version`` and ``appVersion`` are both X.Y.Z (valid SemVer2 —
+  # no translation needed). Reuses the DOCKERHUB_* secrets; no new secret.
+  helm:
+    needs: [approve, prepare-draft, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out cremind
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-draft.outputs.tag }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: Log in to Docker Hub (OCI registry)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: echo "$DOCKERHUB_TOKEN" | helm registry login registry-1.docker.io --username "$DOCKERHUB_USERNAME" --password-stdin
+
+      # helm dependency build reads the committed Chart.lock and needs the
+      # HTTP chart repos registered first (the OCI bitnami repo does not).
+      - name: Build chart dependencies
+        run: |
+          helm repo add qdrant https://qdrant.github.io/qdrant-helm
+          helm repo add chromadb https://amikos-tech.github.io/chromadb-chart/
+          helm dependency build helm/cremind
+
+      - name: Lint chart
+        run: helm lint helm/cremind
+
+      - name: Package chart (version == appVersion == X.Y.Z)
+        env:
+          VERSION: ${{ needs.approve.outputs.version }}
+        run: |
+          helm package helm/cremind \
+            --version "$VERSION" \
+            --app-version "$VERSION" \
+            --destination dist-helm
+
+      - name: Push chart to Docker Hub (OCI)
+        env:
+          VERSION: ${{ needs.approve.outputs.version }}
+        run: helm push "dist-helm/cremind-${VERSION}.tgz" oci://registry-1.docker.io/cremind
+
   publish:
-    needs: [prepare-draft, wheel, electron, docker]
+    needs: [prepare-draft, wheel, electron, docker, helm]
     runs-on: ubuntu-latest
     permissions:
       contents: write

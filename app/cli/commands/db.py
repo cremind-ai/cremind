@@ -64,6 +64,22 @@ def db_upgrade(
     # re-entering deferred mode and creating a parallel DB via the wizard.
     from app.config.bootstrap import bootstrap_exists, write_bootstrap
     if not bootstrap_exists():
+        # Seam D — Kubernetes enforcement. The default-to-SQLite shortcut below
+        # is correct for desktop/native installs but would silently commit a
+        # pod-local SQLite backend on Kubernetes, where horizontal scaling
+        # requires a shared PostgreSQL. The chart's entrypoint never reaches
+        # here without a bootstrap (it skips ``db upgrade`` until the wizard
+        # writes one), but a manual ``cremind db upgrade`` inside a pod would.
+        from app.config.install_catalog import is_kubernetes_mode
+        if is_kubernetes_mode():
+            typer.echo(
+                "SQLite is not supported in Kubernetes mode "
+                "(INSTALL_MODE=kubernetes); pod-local storage breaks horizontal "
+                "scaling. Complete the Setup Wizard to configure PostgreSQL "
+                "instead of running 'cremind db upgrade' manually.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
         write_bootstrap({"db_provider": "sqlite"})
 
     from app.storage import migrations

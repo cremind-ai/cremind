@@ -92,6 +92,15 @@ SYSTEM_VARS: list[SystemVarSpec] = [
         resolve=_load_cremind_token,
         description="Per-profile Cremind token; omitted when missing.",
     ),
+    SystemVarSpec(
+        name="CREMIND_OAUTH_CALLBACK_PORT",
+        resolve=lambda _profile: str(BaseConfig.CREMIND_OAUTH_CALLBACK_PORT),
+        description=(
+            "Port of the backend's persistent OAuth loopback callback listener. "
+            "Built-in Google skills point their redirect_uri at it instead of "
+            "spawning a per-link ephemeral server that dies with the agent turn."
+        ),
+    ),
 ]
 
 

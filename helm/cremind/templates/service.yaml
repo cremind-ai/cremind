@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cremind.fullname" . }}
+  labels:
+    {{- include "cremind.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "cremind.selectorLabels" . | nindent 4 }}
+  ports:
+    # Single entry point — the nginx proxy fronts UI + API + noVNC.
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: {{ if .Values.proxy.enabled }}http{{ else }}ui{{ end }}
+      protocol: TCP

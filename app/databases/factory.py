@@ -21,6 +21,22 @@ def create_database_provider() -> DatabaseProvider:
     cfg = resolve_bootstrap()
     provider = cfg["db_provider"]
 
+    # Seam B — Kubernetes backstop. resolve_bootstrap() defaults to "sqlite"
+    # when neither bootstrap.toml nor CREMIND_DB_PROVIDER is set, so a stray
+    # sqlite bootstrap (baked into an image layer, or a leftover on the PVC)
+    # would otherwise build a pod-local SQLite engine that breaks horizontal
+    # scaling. The wizard write path (Seam A) and the CLI (Seam D) reject the
+    # choice up front; this is the last line of defence at the point every
+    # storage build funnels through.
+    if provider == "sqlite":
+        from app.config.install_catalog import is_kubernetes_mode
+        if is_kubernetes_mode():
+            raise ValueError(
+                "SQLite is not supported in Kubernetes mode "
+                "(INSTALL_MODE=kubernetes); pod-local storage breaks "
+                "horizontal scaling. Configure PostgreSQL."
+            )
+
     if provider == "sqlite":
         # Imported here so SQLITE_DB_PATH resolution stays lazy — the path
         # depends on CREMIND_SYSTEM_DIR which itself comes from settings.

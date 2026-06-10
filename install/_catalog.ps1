@@ -1,6 +1,6 @@
 # AUTO-GENERATED from install/catalog.toml. Do not edit by hand.
 # Regenerate with: python install/scripts/build_catalog.py
-# Source SHA-256:  fc469a7dd26f18ea2f9f52f0301537cb9879ef8e9a8db9ddcd50e684508f6caa
+# Source SHA-256:  8dcb7efa86aedad0b4e3403c814a34143b99c1fc5b542b19fda824a9d51329d4
 
 $script:CatalogSchema = 1
 
@@ -102,6 +102,10 @@ $script:ModeRules = [ordered]@{
     }
     'custom' = [ordered]@{
         AllowedServiceModes = @('docker', 'native', 'external')
+        DefaultServiceMode  = 'external'
+    }
+    'kubernetes' = [ordered]@{
+        AllowedServiceModes = @('external')
         DefaultServiceMode  = 'external'
     }
 }

@@ -695,6 +695,10 @@ export interface ToolStatus {
    *  the Setup Wizard auto-installs it on submit, and the post-setup
    *  enable handler pre-flights it (HTTP 409 + install dialog). */
   requires_feature?: string | null;
+  /** Skills only: true when the skill's on-disk directory is a shipped
+   *  built-in (under ``app/skills/builtin``). Drives the Settings page
+   *  "Reset to Default" (built-in) vs "Delete" (imported) action. */
+  is_builtin?: boolean;
 }
 
 export async function listTools(
@@ -786,6 +790,76 @@ export async function setToolEnabled(
     }
   }
   if (!res.ok) throw new Error(`Failed to set tool enabled: ${res.statusText}`);
+  return res.json();
+}
+
+// ── Skill lifecycle (delete / reset / import) ──
+
+/** Pull a JSON ``error`` message off a non-OK response, falling back to status. */
+async function readError(res: Response, fallback: string): Promise<string> {
+  const body = await res.json().catch(() => null);
+  if (body && typeof body.error === 'string' && body.error) return body.error;
+  return `${fallback}: ${res.statusText}`;
+}
+
+/** Result shape shared by skill import endpoints. */
+export interface SkillImportResult {
+  success: boolean;
+  installed: string[];
+  skipped?: { name: string; reason: string }[];
+}
+
+/** Delete an external skill, or reset a built-in skill to its shipped default.
+ *  The backend decides which based on whether the skill is a built-in; the
+ *  returned ``reset`` flag echoes that decision. */
+export async function deleteSkill(
+  agentUrl: string,
+  token: string,
+  toolId: string
+): Promise<{ success: boolean; reset: boolean }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/skills/${encodeURIComponent(toolId)}`, {
+    method: 'DELETE',
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(await readError(res, 'Failed to delete skill'));
+  return res.json();
+}
+
+/** Import skills from an uploaded archive (.zip/.tar.gz/...). */
+export async function importSkillArchive(
+  agentUrl: string,
+  token: string,
+  file: File
+): Promise<SkillImportResult> {
+  const base = resolveBaseUrl(agentUrl);
+  const formData = new FormData();
+  formData.append('file', file);
+  // Note: no Content-Type header — the browser sets the multipart boundary.
+  const headers: Record<string, string> = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const res = await fetch(`${base}/api/skills/import/archive`, {
+    method: 'POST',
+    headers,
+    body: formData,
+  });
+  if (!res.ok) throw new Error(await readError(res, 'Failed to import skill'));
+  return res.json();
+}
+
+/** Import skills from a public GitHub repository URL. */
+export async function importSkillFromGitHub(
+  agentUrl: string,
+  token: string,
+  url: string
+): Promise<SkillImportResult> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/skills/import/github`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ url }),
+  });
+  if (!res.ok) throw new Error(await readError(res, 'Failed to import skill'));
   return res.json();
 }
 

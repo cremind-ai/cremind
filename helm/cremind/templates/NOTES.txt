@@ -1,0 +1,61 @@
+Cremind has been deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+This is a single-replica deployment that boots straight into the Setup Wizard
+(no install script). Storage choices are constrained for Kubernetes:
+PostgreSQL only (SQLite is rejected), embeddings off by default, and only
+external/in-cluster vector stores.
+
+Everything is served on ONE port by the in-pod reverse proxy — the UI, the API,
+and noVNC. You never need to forward more than one port.
+
+1. Open the Setup Wizard
+{{- if .Values.ingress.enabled }}
+
+   http://{{ .Values.ingress.host }}{{ .Values.ingress.path }}#/setup
+   (the agent's desktop is at http://{{ .Values.ingress.host }}/vnc/vnc.html)
+{{- else }}
+
+   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "cremind.fullname" . }} 8080:{{ .Values.service.port }}
+
+   then browse to:  http://localhost:8080/#/setup
+   (the agent's desktop is at http://localhost:8080/vnc/vnc.html)
+{{- end }}
+
+2. Database step — PostgreSQL connection (pre-filled)
+{{- if .Values.postgresql.enabled }}
+
+   Host:     cremind-postgresql          (Service: {{ .Values.postgresql.fullnameOverride }})
+   Port:     5432
+   Database: {{ .Values.postgresql.auth.database }}
+   User:     {{ .Values.postgresql.auth.username }}
+   Password: auto-wired from the cluster Secret — LEAVE IT BLANK and click through.
+
+   The password is injected into the pod (as CREMIND_POSTGRES_PASSWORD, via
+   secretKeyRef) and used server-side, so you don't copy/paste anything. To
+   inspect it if needed:
+
+   kubectl --namespace {{ .Release.Namespace }} get secret {{ .Values.postgresql.fullnameOverride }} \
+     -o jsonpath='{.data.password}' | base64 -d ; echo
+{{- else }}
+
+   Bundled PostgreSQL is disabled. Enter the host/port/credentials of your
+   external PostgreSQL service in the wizard's Database step (or set
+   cremind.postgresPasswordSecret to auto-wire its password from your Secret).
+{{- end }}
+
+3. Embeddings (optional)
+
+   Embeddings are OFF by default. To enable them, install with a vector DB:
+
+     helm upgrade {{ .Release.Name }} <chart> --reuse-values \
+       --set qdrant.enabled=true        # or chromadb.enabled=true
+
+   Only external (in-cluster, HTTP) vector stores are permitted — the wizard
+   will offer Qdrant at "cremind-qdrant:6333" or ChromaDB at
+   "cremind-chromadb:8000".
+
+Single instance: this image bundles a VNC desktop, so Cremind runs as exactly
+ONE pod. replicaCount is fixed at 1 (the chart refuses any other value), there
+is no autoscaler, and `kubectl scale` is unsupported — multiple pods would mean
+multiple divergent desktops. To handle more load, give the pod more resources
+and a bigger node, not more replicas.

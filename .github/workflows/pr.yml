@@ -171,3 +171,52 @@ jobs:
             ui/release/**/*.AppImage
           if-no-files-found: error
           retention-days: 14
+
+  # Helm chart validation. Path-gated so backend/UI-only PRs don't take on a
+  # dependency on the external chart repos (Bitnami / Qdrant / Chroma) that
+  # ``helm dependency build`` pulls from. The render asserts the load-bearing
+  # K8s invariants: the mode env vars are present and CREMIND_DB_PROVIDER is
+  # NOT templated (setting it would skip the Setup Wizard).
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect helm/ changes
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            helm:
+              - 'helm/**'
+
+      - name: Set up Helm
+        if: steps.changes.outputs.helm == 'true'
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: Build deps, lint, and render-guard the chart
+        if: steps.changes.outputs.helm == 'true'
+        run: |
+          helm repo add qdrant https://qdrant.github.io/qdrant-helm
+          helm repo add chromadb https://amikos-tech.github.io/chromadb-chart/
+          helm dependency build helm/cremind
+          helm lint helm/cremind
+          helm template t helm/cremind > /tmp/cremind-render.yaml
+          grep -q 'INSTALL_MODE: "kubernetes"' /tmp/cremind-render.yaml \
+            || { echo "::error::INSTALL_MODE=kubernetes missing from rendered ConfigMap"; exit 1; }
+          grep -q 'SETUP_WIZARD_ENV: "kubernetes"' /tmp/cremind-render.yaml \
+            || { echo "::error::SETUP_WIZARD_ENV=kubernetes missing from rendered ConfigMap"; exit 1; }
+          # The release channel auto-derives from the image tag: a stable tag
+          # (default appVersion) → production; an RC tag → test.
+          grep -q 'CREMIND_UPGRADE_CHANNEL: "production"' /tmp/cremind-render.yaml \
+            || { echo "::error::default render must report the production channel"; exit 1; }
+          helm template t helm/cremind --set image.tag=0.0.2rc1.dev1 \
+            | grep -q 'CREMIND_UPGRADE_CHANNEL: "test"' \
+            || { echo "::error::an rc image tag must report the test channel"; exit 1; }
+          if grep -qE '^[[:space:]]*CREMIND_DB_PROVIDER:' /tmp/cremind-render.yaml; then
+            echo "::error::CREMIND_DB_PROVIDER must not be templated — it makes the server skip the Setup Wizard."
+            exit 1
+          fi
+          echo "Helm chart render guards passed."

@@ -99,6 +99,12 @@
         "external"
       ],
       "default_service_mode": "external"
+    },
+    "kubernetes": {
+      "allowed_service_modes": [
+        "external"
+      ],
+      "default_service_mode": "external"
     }
   },
   "service_modes": {
@@ -116,7 +122,7 @@
     }
   },
   "_meta": {
-    "sha256": "fc469a7dd26f18ea2f9f52f0301537cb9879ef8e9a8db9ddcd50e684508f6caa",
+    "sha256": "8dcb7efa86aedad0b4e3403c814a34143b99c1fc5b542b19fda824a9d51329d4",
     "schema_version": 1
   }
 }

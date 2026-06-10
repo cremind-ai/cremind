@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router';
 import { ElButton, ElTag } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
+import type { ProcessStatus } from '../services/processApi';
 import TerminalSession from '../components/TerminalSession.vue';
 
 const props = defineProps<{ profile: string; pid: string }>();
@@ -13,12 +14,19 @@ const settings = useSettingsStore();
 const sessionRef = ref<InstanceType<typeof TerminalSession> | null>(null);
 
 // Reactive proxies that read from the exposed refs on TerminalSession. The
-// component uses defineExpose so we can reach .status, .command, etc. from here.
-const status = computed(() => (sessionRef.value?.status as any)?.value ?? 'connecting');
-const command = computed(() => (sessionRef.value?.command as any)?.value ?? '');
-const workingDir = computed(() => (sessionRef.value?.workingDir as any)?.value ?? '');
-const isPty = computed(() => Boolean((sessionRef.value?.isPty as any)?.value));
-const exitCode = computed(() => (sessionRef.value?.exitCode as any)?.value ?? null);
+// component uses defineExpose so we can reach .status, .command, etc. from
+// here. Vue's expose proxy auto-unwraps the refs at runtime, so we read the
+// value directly (no extra `.value`) — the access still goes through the
+// proxy and tracks the child's underlying ref, so the computed stays
+// reactive. The `as any` neutralises the (misleading) ref-typed surface
+// TypeScript infers for exposed members.
+const status = computed<ProcessStatus | 'connecting' | 'disconnected'>(
+  () => (sessionRef.value?.status as any) ?? 'connecting',
+);
+const command = computed<string>(() => (sessionRef.value?.command as any) ?? '');
+const workingDir = computed<string>(() => (sessionRef.value?.workingDir as any) ?? '');
+const isPty = computed<boolean>(() => Boolean(sessionRef.value?.isPty as any));
+const exitCode = computed<number | null>(() => (sessionRef.value?.exitCode as any) ?? null);
 
 onMounted(() => {
   // Defensive token load — same rationale as ProcessList.vue.

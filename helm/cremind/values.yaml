@@ -1,0 +1,275 @@
+# Default values for the Cremind chart.
+# This is a YAML-formatted file. Keys map to the templates under templates/.
+
+## @section Global
+
+# Override the chart's computed names.
+nameOverride: ""
+fullnameOverride: ""
+# Extra labels applied to every rendered object.
+commonLabels: {}
+commonAnnotations: {}
+
+## @section Cremind image
+# Reuses the published cremind/cremind-desktop image (VNC desktop + agent). The
+# `tag` defaults to the chart's appVersion (the matching image tag CI pushed).
+image:
+  registry: docker.io
+  repository: cremind/cremind-desktop
+  # Leave empty to track .Chart.AppVersion (recommended). Override to pin.
+  tag: ""
+  pullPolicy: IfNotPresent
+# The in-app updater's release channel (CREMIND_UPGRADE_CHANNEL) is NOT a knob —
+# it auto-derives from the effective image tag above (appVersion unless `tag` is
+# set): an RC tag like `0.0.2rc1.dev1` (the RC chart, installable only via
+# `helm install --devel`) reports the `test` channel; a stable tag reports
+# `production`. To force a value, set it through `cremind.extraEnv` below.
+imagePullSecrets: []
+
+## @section Deployment
+# LOCKED: single replica + shared external state. PostgreSQL holds dynamic
+# config (JWT secret, LLM keys, profiles); the PVCs hold bootstrap.toml, OAuth
+# tokens, per-profile files, and the wizard-installed venv. A rescheduled pod
+# re-attaches both and boots straight through — no re-setup.
+#
+# FIXED AT 1 — DO NOT CHANGE. The image bundles a VNC virtual desktop, so each
+# pod is its own independent desktop/agent. Running more than one would create
+# multiple divergent desktops and break the single-instance model. The chart
+# REJECTS any other value (see deployment.yaml) and ships no HorizontalPodAutoscaler.
+replicaCount: 1
+
+# RWO volumes can attach to one node at a time, and the single-VNC-desktop model
+# forbids a second pod — Recreate terminates the old pod before starting the new
+# one on upgrade, so there is never more than one pod at a time.
+updateStrategy:
+  type: Recreate
+
+# Cremind runtime configuration → rendered into a ConfigMap and injected via
+# envFrom. CRITICAL: CREMIND_DB_PROVIDER is deliberately ABSENT — setting it
+# would make the server boot fully and SKIP the Setup Wizard. _helpers.tpl
+# fails the render if anyone smuggles it in through extraEnv.
+cremind:
+  installMode: kubernetes        # -> INSTALL_MODE (external-only service modes; rejects SQLite)
+  setupWizardEnv: kubernetes     # -> SETUP_WIZARD_ENV (pre-fills the kubernetes profile)
+  host: "0.0.0.0"                # -> HOST
+  apiPort: 1112                  # -> PORT (backend API)
+  uiPort: 1515                   # -> CREMIND_UI_PORT (SPA / Setup Wizard)
+  systemDir: /root/.cremind      # -> CREMIND_SYSTEM_DIR (PVC mount; image default)
+  # APP_URL — the externally-reachable base URL. The A2A agent card advertises
+  # it as the JSON-RPC endpoint the UI connects to, so it MUST match how you
+  # open Cremind in the browser. Leave blank to auto-derive: the Ingress URL
+  # when ingress.enabled, otherwise http://localhost:8080 (the documented
+  # `port-forward svc/cremind 8080:80`). Override if you port-forward to a
+  # different local port or front it with another URL.
+  appUrl: ""
+  # The desktop entrypoint requires these or it exits 1. The image already
+  # defaults them, but we set them explicitly so they're configurable.
+  resolution: "1280x720"         # -> RESOLUTION (must match WIDTHxHEIGHT)
+  vncPassword: "changeme"        # -> VNC_PASSWORD
+  oauthCallbackPort: 1516        # -> CREMIND_OAUTH_CALLBACK_PORT
+  # Auto-wire the PostgreSQL password into the pod (as CREMIND_POSTGRES_PASSWORD,
+  # via secretKeyRef) so the Setup Wizard needs no manual credential entry —
+  # like Docker mode. When postgresql.enabled (bundled), this defaults to the
+  # subchart's generated Secret; leave name blank to use it. For an external
+  # Postgres, set name/key to your own Secret (or leave name blank and type the
+  # password in the wizard).
+  postgresPasswordSecret:
+    name: ""        # default: the bundled <release>-postgresql Secret when postgresql.enabled
+    key: password
+  # Free-form extra env. Guarded against CREMIND_DB_PROVIDER in _helpers.tpl.
+  extraEnv: []
+  #  - name: SOME_FLAG
+  #    value: "1"
+
+## @section Persistence
+# Three volumes keep the pod's important data across restarts/reschedules:
+#   system: CREMIND_SYSTEM_DIR (/root/.cremind) — bootstrap.toml, tokens/,
+#           per-profile state (PERSONA.md, skills/, browser-profile/), backups.
+#   venv:   /opt/cremind/venv — Python deps the Setup Wizard installs at runtime
+#           (LLM SDKs, embeddings). Without it a restart reverts to the thin
+#           baseline and the agent loses its LLM SDK until re-setup.
+#   work:   the agent's User Working Directory — the folder it reads/writes
+#           files in (root of the Tree Dir panel, default for every built-in
+#           tool). Files the agent creates live here; without this volume they
+#           vanish on restart. mountPath MUST match the wizard's
+#           "User Working Directory" (the kubernetes profile defaults it to
+#           ~/Documents -> /root/Documents). The database lives in PostgreSQL.
+#
+# NOTE: only these mounted paths persist. Files written elsewhere in the
+# container (e.g. /tmp, or an ad-hoc `kubectl exec` into /root) are ephemeral —
+# use extraVolumes/extraVolumeMounts below to persist additional paths.
+persistence:
+  system:
+    enabled: true
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 5Gi
+    existingClaim: ""
+    annotations: {}
+  venv:
+    enabled: true
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 8Gi
+    existingClaim: ""
+    annotations: {}
+  work:
+    enabled: true
+    mountPath: /root/Documents   # must match the wizard's User Working Directory
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 10Gi
+    existingClaim: ""
+    annotations: {}
+
+# Persist any additional paths (raw Kubernetes volume / volumeMount specs).
+extraVolumes: []
+#  - name: extra-data
+#    persistentVolumeClaim:
+#      claimName: my-existing-claim
+extraVolumeMounts: []
+#  - name: extra-data
+#    mountPath: /root/extra
+
+## @section Reverse proxy (single entry point)
+# An in-pod nginx sidecar presents ONE port for the whole workflow so users
+# never port-forward more than one port. It routes (same origin):
+#   /api, /health  -> the backend API on 1112 (REST + SSE + WebSocket)
+#   /vnc/          -> noVNC (websockify on :80) — the agent's desktop, always on
+#   everything else-> the SPA / Setup Wizard on 1515
+# Containers in a pod share localhost, so the proxy reaches 127.0.0.1:{1112,1515,80}.
+proxy:
+  enabled: true
+  image:
+    registry: docker.io
+    # Unprivileged nginx so the sidecar runs as non-root and listens on 8080.
+    repository: nginxinc/nginx-unprivileged
+    tag: "1.27-alpine"
+    pullPolicy: IfNotPresent
+  port: 8080
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+## @section Service
+# Exposes ONLY the reverse-proxy port — one port for UI + API + noVNC.
+service:
+  type: ClusterIP
+  port: 80          # external Service port -> proxy container port
+  annotations: {}
+
+## @section Ingress
+# One hostname for the whole workflow (UI at /, noVNC at /vnc/). Set host +
+# className for your cluster.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: cremind.local
+  path: /
+  pathType: Prefix
+  tls: []
+
+## @section Probes (cremind container)
+# DISABLED by default — deliberately. The cremind backend is effectively a
+# single process whose event loop is starved during the Setup Wizard's heavy
+# one-off work (e.g. `playwright install --with-deps chromium` for the browser
+# feature downloads Chromium and runs apt-get, taking minutes). With a probe on
+# port 1515, that starvation reads as "dead" and Kubernetes restarts the pod
+# *mid-setup*, before bootstrap.toml is even written — so setup never finishes.
+#
+# Two things already cover what these probes would: the nginx proxy sidecar has
+# its own /healthz probe that gates pod readiness (and stays up regardless of
+# what the backend is doing), and the container entrypoint runs `wait -n` so a
+# genuine `cremind serve` crash exits the container and Kubernetes restarts it.
+# Re-enable these only if you specifically want hang-detection, and then give
+# them a grace window longer than your slowest setup (raise failureThreshold).
+readinessProbe:
+  enabled: false
+  initialDelaySeconds: 20
+  periodSeconds: 10
+  timeoutSeconds: 10
+  failureThreshold: 30
+livenessProbe:
+  enabled: false
+  initialDelaySeconds: 60
+  periodSeconds: 30
+  timeoutSeconds: 10
+  failureThreshold: 30
+
+## @section Resources (cremind container)
+# The cremind-desktop image bundles a VNC desktop (XFCE + Chrome) + Python +
+# the agent, so it needs a real allocation. Minimum guaranteed: 2 CPU + 2Gi.
+# The node must have at least this free or the single pod won't schedule.
+resources:
+  requests:
+    cpu: "2"
+    memory: 2Gi
+  limits:
+    cpu: "4"
+    memory: 4Gi
+
+## @section Pod scheduling / security
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# NOTE: Horizontal scaling is intentionally NOT supported. There is no
+# autoscaling section and no HorizontalPodAutoscaler — the VNC-desktop image
+# must run as exactly one pod. See replicaCount above.
+
+## @section Bundled PostgreSQL (Bitnami subchart) — LOCKED ON
+# fullnameOverride pins the Service to `cremind-postgresql` regardless of the
+# Helm release name, so the static `kubernetes` setup profile's pre-filled host
+# is correct. The generated password is auto-wired into the Cremind pod from
+# this subchart's Secret (see cremind.postgresPasswordSecret above), so the
+# wizard needs no manual credential entry.
+#
+# NOTE: Bitnami's free Docker Hub images moved to the frozen `bitnamilegacy`
+# namespace (Aug 2025), so the chart's default PostgreSQL image may fail to
+# pull. See README "Dependency availability" for the three remediations
+# (external Postgres / legacy image / vendored .tgz).
+postgresql:
+  enabled: true
+  fullnameOverride: cremind-postgresql
+  auth:
+    username: cremind
+    database: cremind
+    # password / postgresPassword: leave unset to auto-generate into the secret.
+  architecture: standalone
+  # Data-volume lifecycle on `helm uninstall`. PostgreSQL is a StatefulSet, so
+  # its data PVC (`data-<release>-postgresql-0`) is created by the controller —
+  # NOT Helm — and by default SURVIVES uninstall. That is the safe default: a
+  # stray `helm uninstall` never destroys the database (see README
+  # "Reinstalling?" and "Uninstalling and removing data"). To make uninstall
+  # delete the data volume automatically, flip whenDeleted to Delete (here or
+  # via --set):
+  #   postgresql.primary.persistentVolumeClaimRetentionPolicy.enabled=true
+  #   postgresql.primary.persistentVolumeClaimRetentionPolicy.whenDeleted=Delete
+  # The PVC is removed when the StatefulSet is torn down; the underlying PV +
+  # disk then follow the StorageClass reclaimPolicy (Delete on most cloud
+  # defaults). Requires the StatefulSetAutoDeletePVC feature (GA k8s 1.32, beta
+  # on-by-default since 1.27).
+  primary:
+    persistentVolumeClaimRetentionPolicy:
+      enabled: false
+      whenScaled: Retain
+      whenDeleted: Retain
+
+## @section Bundled Qdrant (subchart) — OFF by default (embeddings off)
+qdrant:
+  enabled: false
+  fullnameOverride: cremind-qdrant
+
+## @section Bundled ChromaDB (subchart) — OFF by default (embeddings off)
+chromadb:
+  enabled: false
+  fullnameOverride: cremind-chromadb

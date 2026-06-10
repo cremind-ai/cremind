@@ -18,19 +18,61 @@ This module is the single entry point used by both ``server.py`` (boot) and
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import stat
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
 from app.config.settings import BaseConfig
+from app.events.settings_state_bus import publish_settings_state_changed
+from app.skills.env_file import write_skill_env_file
 from app.skills.scanner import SkillInfo, scan_skills
 from app.skills.tool import SkillTool
 from app.skills.watcher import SkillsWatcher
 from app.tools import ToolRegistry
+from app.tools.base import ToolType
 from app.utils.logger import logger
 
 BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin"
+
+
+def _force_writable(path: str) -> None:
+    """Clear the read-only bit so a stubborn file can be removed (Windows)."""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except OSError:
+        pass
+
+
+def _robust_rmtree(path: Path, *, attempts: int = 5, delay: float = 0.3) -> None:
+    """``shutil.rmtree`` with retries for transient Windows file locks.
+
+    After a process tree is killed, Windows can take a moment to release the
+    file handles it held (e.g. a skill's ``scripts/.listener.lock``). We retry a
+    few times with a short backoff and clear read-only attributes on failure.
+    The final attempt re-raises so genuine failures still surface.
+
+    Runs synchronously; callers invoke it via ``asyncio.to_thread`` so the brief
+    sleeps never block the event loop.
+    """
+    def _on_error(func, p, _exc):  # rmtree onexc handler (Python 3.12+)
+        _force_writable(p)
+        func(p)
+
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(path, onexc=_on_error)
+            return
+        except OSError as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                time.sleep(delay)
+    if last_exc is not None:
+        raise last_exc
 
 _watchers: dict[str, SkillsWatcher] = {}
 _watchers_lock = threading.Lock()
@@ -39,6 +81,92 @@ _watchers_lock = threading.Lock()
 def profile_skills_dir(profile: str) -> Path:
     """Return ``<CREMIND_SYSTEM_DIR>/<profile>/skills``."""
     return Path(BaseConfig.CREMIND_SYSTEM_DIR) / profile / "skills"
+
+
+def builtin_skill_dir_names() -> set[str]:
+    """Return the set of directory names shipped under ``app/skills/builtin``."""
+    if not BUILTIN_SKILLS_DIR.is_dir():
+        return set()
+    return {p.name for p in BUILTIN_SKILLS_DIR.iterdir() if p.is_dir()}
+
+
+def is_builtin_skill_dir(dir_name: str) -> bool:
+    """True if *dir_name* corresponds to a shipped built-in skill directory.
+
+    Built-in skills are detected by directory name (the on-disk dir name equals
+    the SKILL.md ``name`` for every built-in). This is what distinguishes a
+    "Reset to Default" (built-in) from a "Delete" (external) skill.
+    """
+    if not dir_name:
+        return False
+    return (BUILTIN_SKILLS_DIR / dir_name).is_dir()
+
+
+def _assert_inside_profile_skills(profile: str, dir_name: str) -> Path:
+    """Resolve ``<profile skills>/<dir_name>`` and guard against traversal.
+
+    Returns the resolved target path. Raises :class:`ValueError` if *dir_name*
+    escapes the profile's skills directory (e.g. contains ``..`` or separators).
+    """
+    skills_root = profile_skills_dir(profile)
+    target = (skills_root / dir_name)
+    resolved = target.resolve()
+    root_resolved = skills_root.resolve()
+    if resolved != root_resolved and root_resolved not in resolved.parents:
+        raise ValueError(f"Skill path '{dir_name}' escapes the skills directory")
+    if resolved == root_resolved:
+        raise ValueError("Refusing to operate on the skills directory itself")
+    return target
+
+
+def delete_profile_skill(profile: str, dir_name: str) -> bool:
+    """Remove a skill directory from the profile's skills folder.
+
+    Only touches ``<CREMIND_SYSTEM_DIR>/<profile>/skills/<dir_name>`` — never the
+    shipped source under ``app/skills/builtin``. Returns True if a directory was
+    removed, False if it did not exist.
+    """
+    target = _assert_inside_profile_skills(profile, dir_name)
+    if not target.exists():
+        return False
+    _robust_rmtree(target)
+    logger.info(f"Deleted skill '{dir_name}' from profile '{profile}'")
+    return True
+
+
+def reset_builtin_skill(profile: str, dir_name: str) -> None:
+    """Restore a single built-in skill to its shipped default for *profile*.
+
+    Deletes the profile's copy (if any) and re-copies the pristine directory
+    from ``BUILTIN_SKILLS_DIR``. Raises :class:`ValueError` if *dir_name* is not
+    a built-in.
+    """
+    src = BUILTIN_SKILLS_DIR / dir_name
+    if not src.is_dir():
+        raise ValueError(f"Skill '{dir_name}' is not a built-in")
+    target = _assert_inside_profile_skills(profile, dir_name)
+    if target.exists():
+        _robust_rmtree(target)
+    shutil.copytree(src, target, dirs_exist_ok=True)
+    logger.info(f"Reset built-in skill '{dir_name}' for profile '{profile}'")
+
+
+async def resync_profile_skills(profile: str, registry: ToolRegistry) -> dict[str, SkillInfo]:
+    """Re-scan the profile's skills dir and reconcile the registry immediately.
+
+    Used after a programmatic add/delete so the UI reflects the change at once
+    rather than after the watcher's debounce window. Also pings the Settings
+    SSE stream. Returns the freshly scanned skill set.
+    """
+    skills = scan_skills(profile_skills_dir(profile))
+    await registry.sync_skills(
+        profile=profile,
+        current=skills,
+        skill_factory=lambda info: SkillTool(info),
+    )
+    _materialize_skill_env_files(profile, registry)
+    publish_settings_state_changed(profile)
+    return skills
 
 
 def sync_builtin_skills_into_profile(profile: str) -> list[str]:
@@ -102,7 +230,38 @@ async def initialize_profile_skills(
     )
     logger.info(f"Synced {len(skills)} skill(s) for profile '{profile}'")
 
+    # The copytree above restores shipped skill files (including any stale
+    # .env); re-apply persisted variables so user overrides survive the boot.
+    _materialize_skill_env_files(profile, registry)
+
     return _start_watcher(profile, skills_dir, registry, loop=loop)
+
+
+def _materialize_skill_env_files(profile: str, registry: ToolRegistry) -> None:
+    """Re-write each profile skill's ``scripts/.env`` from its persisted vars.
+
+    Skills get their config solely through ``scripts/.env`` (the agent has no
+    per-skill env hook for the generic exec_shell tool), and that file is
+    otherwise written only when the user saves variables. The boot-time
+    copytree restores the shipped ``.env``, so without this the user's saved
+    overrides would be lost on every restart. Writing from SQLite also yields an
+    empty ``.env`` when there are no overrides — clearing any credentials that
+    older builds shipped on disk.
+    """
+    for tool in registry.tools_for_profile(profile):
+        if tool.tool_type is not ToolType.SKILL:
+            continue
+        declared = getattr(tool, "environment_variables", []) or []
+        if not declared:
+            continue
+        try:
+            variables = registry.config.get_variables(
+                tool.tool_id, profile, include_secrets=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(f"Failed to read variables for skill '{tool.tool_id}'")
+            variables = {}
+        write_skill_env_file(tool.info.dir_path / "scripts", declared, variables)
 
 
 async def teardown_profile_skills(

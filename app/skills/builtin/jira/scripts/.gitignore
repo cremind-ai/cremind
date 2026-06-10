@@ -1,0 +1,9 @@
+.env
+.atlassian_token.json
+.atlassian_token.json.tmp
+.listener_state.json
+.listener_state.json.tmp
+.listener_heartbeat
+.listener.lock
+__pycache__/
+*.pyc

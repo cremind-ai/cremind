@@ -36,6 +36,16 @@
 #                                vncserver). Larger = higher network/CPU
 #                                cost; 1280x720 is the comfort default.
 
+# ── uv binaries (pinned) ──────────────────────────────────────────────────
+# uv is the Python package/project manager that built-in skills use to run
+# their helper scripts (``uv run scripts/<...>.py``). Pull its prebuilt
+# static binaries from Astral's official image. ``UV_VERSION`` sits in the
+# global scope so it can parameterize this stage's FROM (overridable with
+# ``--build-arg UV_VERSION=…``); BuildKit forbids variable expansion in a
+# bare ``COPY --from``, hence the dedicated stage copied from in stage 2.
+ARG UV_VERSION=0.11.19
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
 # ── Stage 1: build the SPA ────────────────────────────────────────────────
 FROM node:20-bookworm-slim AS spa-builder
 
@@ -142,6 +152,15 @@ RUN add-apt-repository -y ppa:deadsnakes/ppa \
            python3.13 python3.13-venv python3.13-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# ── uv (Python package & project manager) ─────────────────────────────────
+# Built-in skills run their helper scripts via ``uv run scripts/<...>.py``
+# (e.g. the gmail / gcalendar event listeners spawned by the autostart
+# runner), so ``uv`` must be on PATH for the agent's exec_shell. Copy the
+# prebuilt static binaries from the pinned ``uv`` stage (defined above) into
+# /usr/local/bin so they're on PATH for root (the only user).
+COPY --from=uv /uv /uvx /usr/local/bin/
+RUN uv --version
+
 # ── Docker CLI + compose plugin (client only — no daemon) ────────────────
 # The Setup Wizard's Docker provisioner shells out to ``docker compose``
 # to bring up postgres / qdrant / chroma sidecars. The compose file
@@ -246,7 +265,12 @@ WORKDIR /root/.cremind
 
 # 1112 backend, 1515 SPA, 5900 raw VNC, 80 noVNC web. The compose file
 # maps 80 → 6080 on the host so it doesn't conflict with the host's
-# real port 80.
-EXPOSE 1112 1515 5900 80
+# real port 80. 1516 is the fixed OAuth loopback-callback port: ``cremind
+# serve`` runs ONE persistent loopback listener (app/api/oauth_loopback.py)
+# bound to 0.0.0.0 so the host browser's Google consent redirect
+# (http://127.0.0.1:1516/) reaches it; the built-in Google skills point
+# their redirect_uri at it. EXPOSE is documentation only — the compose
+# ``-p`` mapping is what actually forwards the port.
+EXPOSE 1112 1515 5900 80 1516
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

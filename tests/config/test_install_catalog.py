@@ -68,6 +68,38 @@ def test_active_install_mode_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     assert install_catalog.get_active_install_mode() is None
 
 
+# ── Kubernetes mode ──────────────────────────────────────────────────────
+
+
+def test_kubernetes_is_a_rule_only_mode() -> None:
+    """Kubernetes must define a mode-rule (so the chart's INSTALL_MODE=kubernetes
+    constrains the wizard) but must NOT appear under [modes] — the host
+    installers list every [modes] entry as a selectable option, and offering
+    "Kubernetes" on a laptop would wrongly force Postgres-only on a desktop
+    install."""
+    cat = install_catalog.load_install_catalog(force_reload=True)
+    assert "kubernetes" in cat["mode_rules"]
+    assert "kubernetes" not in cat["modes"], "kubernetes must not be host-selectable"
+    # Host-selectable modes stay exactly docker + native.
+    assert set(cat["modes"]) == {"docker", "native"}
+
+
+def test_active_install_mode_kubernetes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
+    assert install_catalog.get_active_install_mode() == "kubernetes"
+    assert install_catalog.is_kubernetes_mode() is True
+
+
+def test_is_kubernetes_mode_false_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("INSTALL_MODE", raising=False)
+    assert install_catalog.is_kubernetes_mode() is False
+
+
+def test_is_kubernetes_mode_false_for_docker(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INSTALL_MODE", "docker")
+    assert install_catalog.is_kubernetes_mode() is False
+
+
 # ── mode rule application ────────────────────────────────────────────────
 
 
@@ -109,3 +141,14 @@ def test_mode_rule_native_postgres_external_only() -> None:
     """Postgres has no native support; under Native install only External survives."""
     services = install_catalog.apply_mode_rule_to_services(_capabilities(), "native")
     assert services["postgres"]["supported_modes"] == ["external"]
+
+
+def test_mode_rule_kubernetes_external_only() -> None:
+    """Kubernetes restricts every backing service to External (in-cluster
+    service DNS). Crucially this drops Chroma's ``native`` mode — an in-process
+    *persistent* local file that breaks horizontal scaling — without any
+    per-service special-casing."""
+    services = install_catalog.apply_mode_rule_to_services(_capabilities(), "kubernetes")
+    assert services["postgres"]["supported_modes"] == ["external"]
+    assert services["qdrant"]["supported_modes"] == ["external"]
+    assert services["chroma"]["supported_modes"] == ["external"]  # 'native' (persistent) dropped

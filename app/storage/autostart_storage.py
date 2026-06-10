@@ -63,14 +63,28 @@ class AutostartStorage(SyncStorageBase):
             ).mappings().fetchone()
             return self._row_to_dict(row) if row else None
 
-    def find_duplicate(self, profile: str, command: str) -> Optional[Dict[str, Any]]:
+    def find_duplicate(
+        self, profile: str, command: str, *, working_dir: str
+    ) -> Optional[Dict[str, Any]]:
+        # Process identity is (profile, command, working_dir) — NOT command
+        # alone. Many skills share the identical command string
+        # (``uv run scripts/event_listener.py``); they are distinct apps
+        # because they run from distinct skill directories. ``working_dir`` is
+        # compared verbatim, exactly like ``command``: each skill is always
+        # registered through one deterministic code path, so the stored string
+        # is stable for a genuine re-registration (see the module's callers).
         with self._engine.connect() as conn:
             row = conn.execute(
                 text(
                     "SELECT * FROM autostart_processes "
-                    "WHERE profile = :profile AND command = :command LIMIT 1"
+                    "WHERE profile = :profile AND command = :command "
+                    "AND working_dir = :working_dir LIMIT 1"
                 ),
-                {"profile": profile, "command": command},
+                {
+                    "profile": profile,
+                    "command": command,
+                    "working_dir": working_dir or "",
+                },
             ).mappings().fetchone()
             return self._row_to_dict(row) if row else None
 

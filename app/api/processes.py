@@ -186,25 +186,38 @@ def get_process_routes() -> list:
         token: Optional[str] = None
         if len(subprotocols) >= 2 and subprotocols[0] == "bearer":
             token = subprotocols[1]
+        pid = websocket.path_params.get("pid") or ""
+
         payload = _decode_ws_token(token or "")
         if payload is None:
+            logger.warning(
+                f"process ws rejected (pid={pid}): missing or invalid auth token"
+            )
             await websocket.close(code=1008)
             return
 
         profile = payload.get("profile") or payload.get("sub") or ""
-        pid = websocket.path_params.get("pid") or ""
 
         info = _process_registry.get(pid)
         if info is None:
+            logger.info(f"process ws rejected: unknown process id {pid!r}")
             await websocket.close(code=1008)
             return
         if profile and info.profile and info.profile != profile:
+            logger.warning(
+                f"process ws rejected (pid={pid}): profile {profile!r} may not "
+                f"access a process owned by {info.profile!r}"
+            )
             await websocket.close(code=1008)
             return
 
         try:
             queue, snapshot = await subscribe(pid)
         except KeyError:
+            logger.info(
+                f"process ws rejected (pid={pid}): process has no live log writer "
+                "(already finished?)"
+            )
             await websocket.close(code=1008)
             return
 
@@ -287,11 +300,11 @@ def get_process_routes() -> list:
             for task in done:
                 exc = task.exception()
                 if exc is not None and not isinstance(exc, WebSocketDisconnect):
-                    logger.debug(f"process ws task ended with {exc!r}")
+                    logger.warning(f"process ws task (pid={pid}) ended with {exc!r}")
         except WebSocketDisconnect:
             pass
         except Exception as exc:
-            logger.debug(f"process ws handler error: {exc!r}")
+            logger.warning(f"process ws handler error (pid={pid}): {exc!r}")
             try:
                 await websocket.close(code=1011)
             except Exception:
@@ -331,7 +344,9 @@ def get_process_routes() -> list:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
 
         storage = get_autostart_storage()
-        duplicate = storage.find_duplicate(profile, info.command)
+        duplicate = storage.find_duplicate(
+            profile, info.command, working_dir=info.working_dir
+        )
         if duplicate and not force:
             return JSONResponse(
                 {

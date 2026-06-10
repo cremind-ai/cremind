@@ -30,6 +30,11 @@ const emit = defineEmits<{
 const isFirstSetup = computed(() => props.firstSetup ?? true);
 const postgresCapability = computed(() => props.serviceCapabilities?.services?.postgres ?? null);
 const dockerAvailable = computed(() => props.serviceCapabilities?.docker_available ?? false);
+// Kubernetes deployments scale horizontally, so a pod-local SQLite file would
+// break data consistency. The backend rejects SQLite in this mode (Seam A);
+// here we hide the SQLite option and force PostgreSQL so the user never hits
+// that error. INSTALL_MODE=kubernetes is reported via service capabilities.
+const isKubernetes = computed(() => props.serviceCapabilities?.install_mode === 'kubernetes');
 
 function pickInitialDeploymentMode(saved: string | undefined): DeploymentMode {
   const cap = postgresCapability.value;
@@ -92,6 +97,15 @@ watch([postgresCapability, dockerAvailable], () => {
     form.value.postgres.deployment_mode = pickInitialDeploymentMode(form.value.postgres.deployment_mode);
   }
 });
+
+// Force PostgreSQL on Kubernetes. ``serviceCapabilities`` (which carries
+// ``install_mode``) can arrive after the form mounts with its ``sqlite``
+// default, so watch immediately and clamp the moment the mode is known.
+watch(isKubernetes, (k) => {
+  if (k && form.value.db_provider !== 'postgres') {
+    form.value.db_provider = 'postgres';
+  }
+}, { immediate: true });
 
 const postgresIsDocker = computed(() => form.value.postgres.deployment_mode === 'docker');
 
@@ -190,17 +204,26 @@ onMounted(() => {
 
       <template v-if="isFirstSetup">
         <ElFormItem label="Database Provider">
-          <ElRadioGroup v-model="form.db_provider">
-            <ElRadio value="sqlite">SQLite (default)</ElRadio>
-            <ElRadio value="postgres">PostgreSQL</ElRadio>
-          </ElRadioGroup>
-          <div class="field-hint">
-            Chosen once during first setup and locked thereafter — adding or migrating
-            data to a different backend later requires manual export/import.
-            <span v-if="form.db_provider === 'sqlite'">
-              SQLite is local-only; no deployment options apply.
-            </span>
-          </div>
+          <template v-if="isKubernetes">
+            <div class="single-mode">
+              <strong>PostgreSQL</strong> — required on Kubernetes. SQLite is
+              disabled because pods scale horizontally and pod-local storage
+              breaks data consistency across replicas.
+            </div>
+          </template>
+          <template v-else>
+            <ElRadioGroup v-model="form.db_provider">
+              <ElRadio value="sqlite">SQLite (default)</ElRadio>
+              <ElRadio value="postgres">PostgreSQL</ElRadio>
+            </ElRadioGroup>
+            <div class="field-hint">
+              Chosen once during first setup and locked thereafter — adding or migrating
+              data to a different backend later requires manual export/import.
+              <span v-if="form.db_provider === 'sqlite'">
+                SQLite is local-only; no deployment options apply.
+              </span>
+            </div>
+          </template>
         </ElFormItem>
       </template>
 
@@ -236,7 +259,11 @@ onMounted(() => {
           </ElFormItem>
           <ElFormItem label="Password">
             <ElInput v-model="form.postgres.password" type="password" show-password />
-            <div class="field-hint">
+            <div class="field-hint" v-if="isKubernetes">
+              On Kubernetes you can leave this blank — the cluster injects the
+              bundled PostgreSQL password from its Secret automatically.
+            </div>
+            <div class="field-hint" v-else>
               Stored in <code>~/.cremind/bootstrap.toml</code> in plaintext —
               same trust model as <code>~/.pgpass</code>.
             </div>
@@ -297,6 +324,19 @@ onMounted(() => {
   font-size: 0.775rem;
   color: var(--text-secondary);
   line-height: 1.4;
+}
+
+.single-mode {
+  padding: 10px 14px;
+  background: var(--hover-bg);
+  border-radius: 6px;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.single-mode strong {
+  color: var(--text-primary);
 }
 
 .info-box {

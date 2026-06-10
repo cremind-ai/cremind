@@ -20,6 +20,8 @@ from app.config.settings import BaseConfig
 from app.events.settings_state_bus import publish_settings_state_changed
 from app.lib.llm.factory import create_llm_provider
 from app.runtime import BootedState
+from app.skills.env_file import write_skill_env_file
+from app.skills.sync import is_builtin_skill_dir
 from app.storage import get_autostart_storage
 from app.tools import ToolType
 from app.tools.builtin import (
@@ -128,6 +130,13 @@ def get_tool_routes(state: BootedState) -> list[Route]:
                 row["url"] = tool.url
             if hasattr(tool, "owner_profile"):
                 row["owner_profile"] = tool.owner_profile
+            # Skills carry a built-in flag so the Settings page can offer
+            # "Reset to Default" for shipped skills vs "Delete" for imported ones.
+            if tool.tool_type is ToolType.SKILL:
+                info = getattr(tool, "info", None)
+                row["is_builtin"] = bool(
+                    info is not None and is_builtin_skill_dir(info.dir_path.name)
+                )
             lra = _long_running_app_for_tool(tool)
             if lra is not None:
                 row["long_running_app"] = lra
@@ -195,12 +204,7 @@ def get_tool_routes(state: BootedState) -> list[Route]:
 
         for key, value in variables.items():
             field_spec = required_config.get(key, {})
-            is_secret = bool(
-                field_spec.get("secret")
-                or "secret" in key.lower()
-                or "key" in key.lower()
-                or "password" in key.lower()
-            )
+            is_secret = bool(field_spec.get("secret") or _is_secret_var_name(key))
             # Normalize native JSON booleans to lowercase strings so
             # downstream consumers (e.g. _coerce_headless) see "true"/"false"
             # instead of Python's str(True) -> "True".
@@ -576,7 +580,7 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         command = normalize_command_paths(lra["command"], working_dir)
 
         storage = get_autostart_storage()
-        duplicate = storage.find_duplicate(profile, command)
+        duplicate = storage.find_duplicate(profile, command, working_dir=working_dir)
         if duplicate and not force:
             return JSONResponse(
                 {
@@ -696,13 +700,24 @@ def _locked_llm_fields_for_tool(tool) -> list[str]:
     return []
 
 
+def _is_secret_var_name(name: str) -> bool:
+    """Heuristic: does this variable name look like a secret to mask in the UI?
+
+    Kept in sync with the secret auto-detection in ``handle_set_variables``.
+    """
+    lowered = name.lower()
+    return "secret" in lowered or "key" in lowered or "password" in lowered
+
+
 def _schema_for_tool(tool) -> dict:
     """Return the static config schema for a built-in tool or skill, or {} for others.
 
     Skills declare their environment variables via ``metadata.environment_variables``
     in ``SKILL.md`` (a list of variable names). They are surfaced through the same
     ``required_config`` shape used by built-in tools so the existing UI/save flow
-    works without further branching.
+    works without further branching. Variables also listed in
+    ``metadata.optional_environment_variables`` get an empty ``default`` so they
+    stay editable but never mark the skill as "needs config" when left blank.
     """
     if tool is None:
         return {}
@@ -712,55 +727,28 @@ def _schema_for_tool(tool) -> dict:
         names = getattr(tool, "environment_variables", []) or []
         if not names:
             return {}
-        required = {
-            name: {"description": name, "type": "string", "secret": False}
-            for name in names
-        }
+        optional = set(getattr(tool, "optional_environment_variables", []) or [])
+        required = {}
+        for name in names:
+            spec = {"description": name, "type": "string", "secret": _is_secret_var_name(name)}
+            if name in optional:
+                spec["default"] = ""
+            required[name] = spec
         return {"tool": {"required_config": required}}
     return {}
-
-
-def _escape_env_value(value: str) -> str:
-    """Quote a value for safe inclusion in a ``.env`` file.
-
-    Wraps in double quotes and escapes embedded ``"`` / ``\\`` if the value
-    contains whitespace, ``#``, or quotes; otherwise returns it as-is.
-    """
-    if value == "":
-        return ""
-    needs_quoting = any(ch in value for ch in (" ", "\t", "\n", "\r", "#", '"', "'", "\\", "$"))
-    if not needs_quoting:
-        return value
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
 
 
 def _write_skill_env_file(tool, config_manager, profile: str) -> None:
     """Mirror persisted skill variables to ``{skill_dir}/scripts/.env``.
 
-    Overwrites the file so deletions in the DB also disappear from disk. Only
-    variables declared in the skill's ``environment_variables`` are written —
-    stray DB rows are ignored.
+    Thin wrapper over :func:`app.skills.env_file.write_skill_env_file` that pulls
+    the declared vars + persisted values for this tool/profile.
     """
-    try:
-        scripts_dir = tool.info.dir_path / "scripts"
-        scripts_dir.mkdir(parents=True, exist_ok=True)
-        env_path = scripts_dir / ".env"
-        all_vars = config_manager.get_variables(
-            tool.tool_id, profile, include_secrets=True,
-        )
-        declared = set(getattr(tool, "environment_variables", []) or [])
-        lines = [
-            f"{k}={_escape_env_value(str(v))}"
-            for k, v in all_vars.items()
-            if k in declared and v != ""
-        ]
-        body = "\n".join(lines) + ("\n" if lines else "")
-        env_path.write_text(body, encoding="utf-8")
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            f"Failed to write .env for skill '{getattr(tool, 'tool_id', '?')}'"
-        )
+    all_vars = config_manager.get_variables(
+        tool.tool_id, profile, include_secrets=True,
+    )
+    declared = getattr(tool, "environment_variables", []) or []
+    write_skill_env_file(tool.info.dir_path / "scripts", declared, all_vars)
 
 
 def _is_tool_configured(tool, snapshot: dict) -> bool:

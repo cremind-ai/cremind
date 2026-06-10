@@ -304,8 +304,8 @@ def create_prepare_tools() -> Callable:
         if not loaded:
             return tools
         # Resolve each loaded skill_id → display name so the inner LLM can
-        # match the user's free-form phrasing ("python app test") against the
-        # skill_id it must emit ("admin__python_app_test").
+        # match the user's free-form phrasing ("gmail") against the
+        # skill_id it must emit ("admin__gmail").
         name_lines: List[str] = []
         for skill_id in loaded:
             row = _get_skill_row(skill_id)

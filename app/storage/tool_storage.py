@@ -399,6 +399,24 @@ class ToolStorage(SyncStorageBase):
             )
             return cur.rowcount > 0
 
+    def delete_all_configs(self, *, profile: str, tool_id: str) -> int:
+        """Delete every config row (all scopes) for one (profile, tool_id).
+
+        Used to wipe a skill's saved Variables/Arguments/LLM/meta on
+        "Reset to Default" -- the on-disk files are restored from the shipped
+        built-in, and this returns the per-profile configuration to its
+        pristine, unconfigured state. Returns the number of rows removed.
+        """
+        with self._engine.begin() as conn:
+            cur = conn.execute(
+                text(
+                    "DELETE FROM tool_configs "
+                    "WHERE profile = :profile AND tool_id = :tool_id"
+                ),
+                {"profile": profile, "tool_id": tool_id},
+            )
+            return cur.rowcount
+
 
 # ── singleton ──────────────────────────────────────────────────────────────
 

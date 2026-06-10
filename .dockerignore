@@ -38,6 +38,12 @@ env/
 # reads it during editable installs (--channel dev --mode docker), so
 # keep it in the build context even though we ignore other markdown.
 !README.md
+# Bundled system docs that ``cremind serve`` seeds into
+# <CREMIND_SYSTEM_DIR>/documents on boot (app/server.py ->
+# DocumentSyncService.seed_shared_from_app). Production images get these
+# via the wheel, but the ``-e /src`` dev image installs from this build
+# context, so they must survive the ``*.md`` exclusion above.
+!app/documents/bundled/**
 docs/
 
 # Tests

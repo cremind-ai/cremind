@@ -1,0 +1,65 @@
+{{- if and .Values.persistence.system.enabled (not .Values.persistence.system.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "cremind.fullname" . }}-system
+  labels:
+    {{- include "cremind.labels" . | nindent 4 }}
+  {{- with .Values.persistence.system.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.system.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.system.size | quote }}
+  {{- if .Values.persistence.system.storageClass }}
+  storageClassName: {{ .Values.persistence.system.storageClass | quote }}
+  {{- end }}
+{{- end }}
+{{- if and .Values.persistence.venv.enabled (not .Values.persistence.venv.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "cremind.fullname" . }}-venv
+  labels:
+    {{- include "cremind.labels" . | nindent 4 }}
+  {{- with .Values.persistence.venv.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.venv.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.venv.size | quote }}
+  {{- if .Values.persistence.venv.storageClass }}
+  storageClassName: {{ .Values.persistence.venv.storageClass | quote }}
+  {{- end }}
+{{- end }}
+{{- if and .Values.persistence.work.enabled (not .Values.persistence.work.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "cremind.fullname" . }}-work
+  labels:
+    {{- include "cremind.labels" . | nindent 4 }}
+  {{- with .Values.persistence.work.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.work.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.work.size | quote }}
+  {{- if .Values.persistence.work.storageClass }}
+  storageClassName: {{ .Values.persistence.work.storageClass | quote }}
+  {{- end }}
+{{- end }}

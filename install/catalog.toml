@@ -115,6 +115,15 @@ hint        = "Simpler, but the agent shares your desktop and home directory."
 requires    = []
 order       = 20
 
+# NOTE: there is deliberately NO [modes.kubernetes] entry. Kubernetes is not a
+# host install method a user picks via curl/PowerShell (the installers — TUI,
+# install.sh, install.ps1 — list every [modes.*] as a selectable option, so a
+# `kubernetes` mode here would wrongly appear on a laptop and force Postgres-only
+# on a desktop install). Instead it is a *rule-only* install mode: the Helm chart
+# sets INSTALL_MODE=kubernetes on the pod, and get_active_install_mode() accepts
+# any mode defined in [mode_rules] even without a [modes] entry, so the rule below
+# still constrains the Setup Wizard. See app/config/install_catalog.py.
+
 
 # ── Mode rules ───────────────────────────────────────────────────────────
 # Per-install-mode visibility rules for each backing service's
@@ -144,6 +153,18 @@ default_service_mode  = "external"
 
 [mode_rules.custom]
 allowed_service_modes = ["docker", "native", "external"]
+default_service_mode  = "external"
+
+# Kubernetes (rule-only mode — see the note above [modes]; no [modes.kubernetes]
+# entry on purpose). Every backing service (Postgres / Qdrant / Chroma) must be a
+# shared in-cluster service reached over its service DNS — never pod-local.
+# Restricting to External-only drops Docker (no docker socket in a pod) and,
+# critically, Chroma's Native mode (an in-process *persistent* local file that
+# breaks horizontal scaling). The intersection in
+# app/config/install_catalog.py:apply_mode_rule_to_services collapses each
+# service's picker to the single External option.
+[mode_rules.kubernetes]
+allowed_service_modes = ["external"]
 default_service_mode  = "external"
 
 

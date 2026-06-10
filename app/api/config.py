@@ -23,6 +23,7 @@ from app.config.settings import (
 )
 from app.config.install_catalog import (
     get_active_install_mode,
+    is_kubernetes_mode,
     load_install_catalog,
 )
 from app.config.setup_profiles import get_active_setup_profile_id, list_setup_profiles
@@ -244,6 +245,44 @@ def _reject_external_in_docker_install(service_id: str) -> str | None:
         "is provisioned by Cremind — External mode is not offered here. "
         "Pick Docker (or Native if the service supports it) in the wizard."
     )
+
+
+def _kubernetes_sqlite_rejection(requested: str) -> str | None:
+    """Backend-side enforcement of the Kubernetes PostgreSQL-only policy (Seam A).
+
+    On Kubernetes pods scale horizontally and a pod-local SQLite file breaks
+    data consistency across replicas. The wizard's ``kubernetes`` mode-rule
+    already hides SQLite, but ``handle_setup`` is unauthenticated on first
+    setup, so a hand-crafted submission could still ask for it. Returns an
+    error message string (the caller surfaces it as a 400) when the choice is
+    disallowed, or ``None`` when allowed. Extracted to module level so the
+    enforcement is unit-testable without driving the whole setup flow.
+    """
+    if is_kubernetes_mode() and requested != "postgres":
+        return (
+            "This Cremind runs on Kubernetes, where pods scale horizontally "
+            "and pod-local storage breaks consistency. SQLite is not "
+            "supported — choose PostgreSQL (an in-cluster or external "
+            "Postgres service)."
+        )
+    return None
+
+
+def _apply_injected_postgres_password(pg_in: dict) -> None:
+    """Fill an empty Postgres password from the injected ``CREMIND_POSTGRES_PASSWORD``.
+
+    On Kubernetes the Helm chart wires the bundled PostgreSQL password into the
+    pod from its generated Secret (``secretKeyRef``), so the operator never has
+    to copy/paste it — the wizard's password field can be left blank and the
+    connection still works (the Compose-like "everything is wired" experience).
+    No-op when a password was supplied in the wizard body or the env is unset,
+    so the desktop/native/external-with-typed-password flows are unaffected.
+    Mutates ``pg_in`` in place.
+    """
+    if not pg_in.get("password"):
+        env_pw = os.environ.get("CREMIND_POSTGRES_PASSWORD")
+        if env_pw:
+            pg_in["password"] = env_pw
 
 
 async def _resolve_vectorstore(embedding_body: dict) -> dict:
@@ -495,6 +534,14 @@ def get_config_routes(state: BootedState) -> list[Route]:
         if requested not in ("sqlite", "postgres"):
             return f"Unknown db_provider: {requested!r}"
 
+        # Seam A — Kubernetes enforcement. On K8s pods scale horizontally and a
+        # pod-local SQLite file breaks data consistency across replicas. The
+        # wizard's kubernetes mode-rule already hides SQLite, but this endpoint
+        # is unauthenticated on first setup, so reject a hand-crafted choice too.
+        k8s_err = _kubernetes_sqlite_rejection(requested)
+        if k8s_err is not None:
+            return k8s_err
+
         bootstrap_path = Path(BaseConfig.CREMIND_SYSTEM_DIR) / "bootstrap.toml"
         if bootstrap_path.exists():
             # Choice is locked; silently ignore any disagreement.
@@ -524,6 +571,10 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 policy_err = _reject_external_in_docker_install("postgres")
                 if policy_err is not None:
                     return policy_err
+                # K8s auto-wiring: use the password injected from the cluster
+                # Secret when the wizard left it blank, so no manual copy/paste
+                # is needed (see _apply_injected_postgres_password).
+                _apply_injected_postgres_password(pg_in)
                 required = ("host", "database", "user")
                 missing = [k for k in required if not pg_in.get(k)]
                 if missing:

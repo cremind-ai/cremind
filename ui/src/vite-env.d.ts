@@ -144,6 +144,8 @@ type CremindBridge = {
   setConfig: (
     patch: Partial<CremindBridge['config']>,
   ) => Promise<CremindBridge['config']>
+  // Open a URL in the OS default handler (browser / mail client / dialer).
+  openExternal: (url: string) => Promise<void>
   installer: CremindInstallerBridge
   server: CremindServerBridge
   updater: CremindUpdaterBridge

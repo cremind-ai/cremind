@@ -378,6 +378,7 @@ async def _spawn_unix_pty(
         env["COLUMNS"] = str(cols)
         env["LINES"] = str(rows)
         env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
         if extra_env:
             env.update(extra_env)
 
@@ -418,6 +419,7 @@ async def _spawn_windows_pty(
     env["COLUMNS"] = str(cols)
     env["LINES"] = str(rows)
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
     if extra_env:
         env.update(extra_env)
     argv = [shell, *flags, command]

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, session } from 'electron'
+import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, session, shell } from 'electron'
 import { fileURLToPath } from 'node:url'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
@@ -246,6 +246,35 @@ ipcMain.handle('cremind:set-config', (_event, patch: Partial<CremindConfig>) => 
     void fetchCapabilities()
   }
   return next
+})
+
+// ── External-link bridge ────────────────────────────────────────────────────
+//
+// Hands a URL to the OS default handler (browser / mail client / dialer) so
+// user-clicked external links open outside Electron rather than spawning a new
+// app window. The renderer's capture-phase anchor interceptor
+// (ui/src/utils/externalLinks.ts) is what routes clicks here; programmatic
+// ``window.open`` (OAuth popups, blob/about previews) deliberately does NOT use
+// this — those stay in-app via setWindowOpenHandler. Any NEW external
+// programmatic open should call ``window.cremind.openExternal`` instead.
+//
+// The scheme allowlist is authoritative: never trust the renderer with an
+// arbitrary URL, or a crafted markdown link could ask us to launch
+// ``file://`` targets or custom protocol handlers.
+const EXTERNAL_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'tel:'])
+ipcMain.handle('cremind:open-external', (_event, rawUrl: unknown) => {
+  if (typeof rawUrl !== 'string') return
+  let u: URL
+  try {
+    u = new URL(rawUrl)
+  } catch {
+    return
+  }
+  if (!EXTERNAL_SCHEMES.has(u.protocol)) {
+    console.warn('[cremind] refused open-external for scheme', u.protocol)
+    return
+  }
+  void shell.openExternal(u.toString())
 })
 
 // ── First-run installer bridge ──────────────────────────────────────────────
@@ -1992,6 +2021,62 @@ if (!gotSingleInstanceLock) {
       }
     }
     focusMostRecentAppWindow()
+  })
+
+  // ── window.open handler ─────────────────────────────────────────────────
+  //
+  // The renderer pops out same-origin SPA routes via ``window.open`` — most
+  // notably the Process Manager terminal (ProcessList.vue's openTerminal).
+  // Without a handler, Electron's default opens those as bare windows with NO
+  // preload, so ``window.cremind`` is absent and the terminal's agentUrl/token
+  // resolution falls back to fragile heuristics — which is why the terminal
+  // streamed nothing. Give same-origin SPA pop-outs the same preload bridge,
+  // titlebar, and (implicitly) session as createAppWindow, so they resolve the
+  // backend exactly like the main window.
+  //
+  // Only same-origin http/https/file URLs are treated as SPA pop-outs. The
+  // ``!internalSpa`` branch (action:'allow' → a new Electron window) now serves
+  // ONLY programmatic ``window.open`` cases that must stay in-app:
+  //   - OAuth/A2A sign-in popups and their provider sub-popups — the redirect
+  //     chain ends back on our origin and posts ``a2a-auth-complete`` to the
+  //     opener, which only works inside the same Electron context.
+  //   - ``blob:`` file previews (openFile.ts) and ``about:blank`` print tabs
+  //     (MessageBubble.vue) — shell.openExternal can't render those.
+  // External user-CLICKED links (GitHub / PyPI / release notes / device-code)
+  // never reach here: the renderer's capture-phase anchor interceptor
+  // (ui/src/utils/externalLinks.ts) catches them first and routes them to the
+  // system browser via the ``cremind:open-external`` IPC.
+  app.on('web-contents-created', (_e, contents) => {
+    contents.setWindowOpenHandler(({ url }) => {
+      let internalSpa = false
+      try {
+        const target = new URL(url)
+        const opener = new URL(contents.getURL())
+        internalSpa =
+          (target.protocol === 'http:' ||
+            target.protocol === 'https:' ||
+            target.protocol === 'file:') &&
+          target.origin === opener.origin
+      } catch {
+        /* malformed / about:blank — treat as external, keep default */
+      }
+      if (!internalSpa) return { action: 'allow' }
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 1100,
+          height: 750,
+          autoHideMenuBar: true,
+          titleBarStyle: 'hidden',
+          titleBarOverlay: { color: '#242424', symbolColor: '#ffffff', height: 32 },
+          icon: path.join(process.env.VITE_PUBLIC, 'logo.png'),
+          webPreferences: {
+            preload: path.join(__dirname, 'preload.mjs'),
+            devTools: devToolsEnabled(),
+          },
+        },
+      }
+    })
   })
 
   app.whenReady().then(async () => {

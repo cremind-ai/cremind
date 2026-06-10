@@ -1,0 +1,5 @@
+.env
+.atlassian_token.json
+.atlassian_token.json.tmp
+__pycache__/
+*.pyc

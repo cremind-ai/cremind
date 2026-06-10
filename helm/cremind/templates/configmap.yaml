@@ -1,0 +1,45 @@
+{{- /* Fail early if CREMIND_DB_PROVIDER was smuggled into extraEnv. */ -}}
+{{- include "cremind.assertNoDbProvider" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cremind.fullname" . }}-env
+  labels:
+    {{- include "cremind.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  # Runtime mode signals. INSTALL_MODE=kubernetes constrains every backing
+  # service to its external (in-cluster) deployment mode and rejects SQLite;
+  # SETUP_WIZARD_ENV=kubernetes pre-fills the Setup Wizard. The durable
+  # DB-provider override is intentionally NOT set here so the wizard appears
+  # on first boot (see _helpers.tpl assertNoDbProvider).
+  INSTALL_MODE: {{ .Values.cremind.installMode | quote }}
+  SETUP_WIZARD_ENV: {{ .Values.cremind.setupWizardEnv | quote }}
+  # Release channel the in-app updater reports and queries. Auto-derived from
+  # the image tag: an RC chart (installed via `helm install --devel`) → test,
+  # a stable chart → production. get_channel() reads this at runtime; there is
+  # no values knob — override via cremind.extraEnv if you must.
+  CREMIND_UPGRADE_CHANNEL: {{ include "cremind.upgradeChannel" . | quote }}
+  {{- /* APP_URL is what the A2A agent card advertises to the browser, so it
+         must be the externally-reachable origin. Auto-derive when unset. */ -}}
+  {{- $appUrl := .Values.cremind.appUrl }}
+  {{- if not $appUrl }}
+  {{- if .Values.ingress.enabled }}
+  {{- $scheme := ternary "https" "http" (gt (len (.Values.ingress.tls | default list)) 0) }}
+  {{- $appUrl = printf "%s://%s" $scheme .Values.ingress.host }}
+  {{- else }}
+  {{- $appUrl = "http://localhost:8080" }}
+  {{- end }}
+  {{- end }}
+  APP_URL: {{ $appUrl | quote }}
+  HOST: {{ .Values.cremind.host | quote }}
+  PORT: {{ .Values.cremind.apiPort | quote }}
+  CREMIND_UI_PORT: {{ .Values.cremind.uiPort | quote }}
+  CREMIND_SYSTEM_DIR: {{ .Values.cremind.systemDir | quote }}
+  CREMIND_OAUTH_CALLBACK_PORT: {{ .Values.cremind.oauthCallbackPort | quote }}
+  # Required by the desktop entrypoint (it exits 1 without a valid RESOLUTION).
+  RESOLUTION: {{ .Values.cremind.resolution | quote }}
+  VNC_PASSWORD: {{ .Values.cremind.vncPassword | quote }}
