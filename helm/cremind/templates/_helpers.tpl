@@ -70,6 +70,19 @@ Resolved image reference (registry/repository:tag), tag defaulting to appVersion
 {{- end -}}
 
 {{/*
+Release channel for the in-app updater (CREMIND_UPGRADE_CHANNEL). Derived from
+the SAME effective image tag cremind.image resolves (appVersion unless
+image.tag overrides it): an RC build (…rcN…, only installable via
+`helm install --devel`) → "test"; a stable build → "production". Mirrors the
+rc/final split in app/upgrade/channel.py matches_channel. There is no values
+knob by design — override via cremind.extraEnv if you must.
+*/}}
+{{- define "cremind.upgradeChannel" -}}
+{{- $tag := default .Chart.AppVersion .Values.image.tag -}}
+{{- if regexMatch "rc[0-9]+" $tag -}}test{{- else -}}production{{- end -}}
+{{- end -}}
+
+{{/*
 PVC claim names (honour existingClaim when set).
 */}}
 {{- define "cremind.systemClaimName" -}}

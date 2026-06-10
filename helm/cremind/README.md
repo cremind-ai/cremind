@@ -39,6 +39,21 @@ helm install cremind oci://registry-1.docker.io/cremind/cremind \
   --version <X.Y.Z> --namespace cremind --create-namespace
 ```
 
+Release candidates are published as pre-release chart versions
+(`X.Y.Z-rc.N.dev.M`), which Helm ignores unless you pass `--devel` (or pin the
+exact `--version`):
+
+```bash
+helm install cremind oci://registry-1.docker.io/cremind/cremind \
+  --devel --namespace cremind --create-namespace
+```
+
+An RC install automatically reports the **test** channel in-app — the Updates
+page offers the latest RC and a picker to switch between specific release
+candidates. A stable install reports **production**. The channel is derived from
+the image tag, so you never set it by hand (override only via
+`cremind.extraEnv`).
+
 Reach it with a single port-forward (or an Ingress hostname):
 
 ```bash
@@ -113,6 +128,7 @@ embeddings.
 | `replicaCount` | `1` | **Fixed at 1.** The chart rejects any other value (VNC = single desktop). |
 | `resources.requests` | `2` CPU, `2Gi` | Minimum guaranteed for the cremind container; the node must have it free. |
 | `image.tag` | `""` → `appVersion` | The matching `cremind-desktop` image tag. |
+| _(release channel)_ | auto from `image.tag` | Not a knob. `test` when the effective tag is an RC (`…rcN.devM`, i.e. the `--devel` chart), else `production`; the in-app **Updates** page reports this. Force it via `cremind.extraEnv` (`CREMIND_UPGRADE_CHANNEL`). |
 | `cremind.installMode` | `kubernetes` | Drives external-only service modes. |
 | `cremind.setupWizardEnv` | `kubernetes` | Pre-fills the wizard. |
 | `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http://localhost:8080`. |

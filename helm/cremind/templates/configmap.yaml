@@ -18,6 +18,11 @@ data:
   # on first boot (see _helpers.tpl assertNoDbProvider).
   INSTALL_MODE: {{ .Values.cremind.installMode | quote }}
   SETUP_WIZARD_ENV: {{ .Values.cremind.setupWizardEnv | quote }}
+  # Release channel the in-app updater reports and queries. Auto-derived from
+  # the image tag: an RC chart (installed via `helm install --devel`) → test,
+  # a stable chart → production. get_channel() reads this at runtime; there is
+  # no values knob — override via cremind.extraEnv if you must.
+  CREMIND_UPGRADE_CHANNEL: {{ include "cremind.upgradeChannel" . | quote }}
   {{- /* APP_URL is what the A2A agent card advertises to the browser, so it
          must be the externally-reachable origin. Auto-derive when unset. */ -}}
   {{- $appUrl := .Values.cremind.appUrl }}

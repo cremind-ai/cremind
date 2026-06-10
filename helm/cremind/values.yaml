@@ -19,6 +19,11 @@ image:
   # Leave empty to track .Chart.AppVersion (recommended). Override to pin.
   tag: ""
   pullPolicy: IfNotPresent
+# The in-app updater's release channel (CREMIND_UPGRADE_CHANNEL) is NOT a knob —
+# it auto-derives from the effective image tag above (appVersion unless `tag` is
+# set): an RC tag like `0.0.2rc1.dev1` (the RC chart, installable only via
+# `helm install --devel`) reports the `test` channel; a stable tag reports
+# `production`. To force a value, set it through `cremind.extraEnv` below.
 imagePullSecrets: []
 
 ## @section Deployment

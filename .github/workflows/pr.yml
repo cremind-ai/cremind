@@ -208,6 +208,13 @@ jobs:
             || { echo "::error::INSTALL_MODE=kubernetes missing from rendered ConfigMap"; exit 1; }
           grep -q 'SETUP_WIZARD_ENV: "kubernetes"' /tmp/cremind-render.yaml \
             || { echo "::error::SETUP_WIZARD_ENV=kubernetes missing from rendered ConfigMap"; exit 1; }
+          # The release channel auto-derives from the image tag: a stable tag
+          # (default appVersion) → production; an RC tag → test.
+          grep -q 'CREMIND_UPGRADE_CHANNEL: "production"' /tmp/cremind-render.yaml \
+            || { echo "::error::default render must report the production channel"; exit 1; }
+          helm template t helm/cremind --set image.tag=0.0.2rc1.dev1 \
+            | grep -q 'CREMIND_UPGRADE_CHANNEL: "test"' \
+            || { echo "::error::an rc image tag must report the test channel"; exit 1; }
           if grep -qE '^[[:space:]]*CREMIND_DB_PROVIDER:' /tmp/cremind-render.yaml; then
             echo "::error::CREMIND_DB_PROVIDER must not be templated — it makes the server skip the Setup Wizard."
             exit 1
