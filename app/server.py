@@ -756,7 +756,7 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                 )
                 set_document_service(document_service)
 
-                bundled_docs = Path(__file__).resolve().parents[1] / "documents"
+                bundled_docs = Path(__file__).resolve().parent / "documents" / "bundled"
                 document_service.seed_shared_from_app(bundled_docs)
 
                 document_service.full_reconcile(SHARED_SCOPE)
