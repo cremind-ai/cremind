@@ -39,13 +39,6 @@ helm install cremind oci://registry-1.docker.io/cremind/cremind \
   --version <X.Y.Z> --namespace cremind --create-namespace
 ```
 
-> While Cremind is pre-1.0, only **release-candidate** charts are published.
-> RC charts are SemVer pre-releases, so `helm install`/`pull` ignore them unless
-> you pass `--devel` and pin the version — e.g.
-> `--version 0.0.1-rc.4.dev.8 --devel`. The chart `version` is the SemVer2
-> translation of the image tag (`v0.0.1rc4.dev8` → `0.0.1-rc.4.dev.8`); find the
-> latest on the GitHub Releases page.
-
 Reach it with a single port-forward (or an Ingress hostname):
 
 ```bash
