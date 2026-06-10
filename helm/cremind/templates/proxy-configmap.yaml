@@ -107,10 +107,22 @@ data:
             proxy_send_timeout 3600s;
         }
 
-        # NOTE: the Google (gmail/gcalendar) OAuth consent redirect is captured
-        # at /api/oauth/google/callback, which rides the /api/ route above to the
-        # backend (app/api/oauth_loopback.py) — no dedicated location is needed.
-        # See CREMIND_OAUTH_REDIRECT_URI in configmap.yaml.
+        # Google OAuth loopback callback for the built-in gmail/gcalendar skills.
+        # Their Desktop OAuth client can only redirect to a loopback host, and
+        # the chart exposes ONE port — so the skill advertises
+        # http://<APP_URL>/oauth/google/callback (CREMIND_OAUTH_REDIRECT_URI,
+        # set only when APP_URL is loopback) and this routes that path to the
+        # in-pod persistent listener (app/api/oauth_loopback.py) over the shared
+        # pod loopback. The trailing "/" on proxy_pass rewrites the upstream URI
+        # to "/?<query>", which the listener serves (it only accepts root). No
+        # second port-forward needed. (Ingress/non-loopback APP_URL leaves the
+        # redirect var unset; the skill's manual `complete-link` paste applies.)
+        location = /oauth/google/callback {
+            proxy_pass http://127.0.0.1:{{ .Values.cremind.oauthCallbackPort }}/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
 
         # Everything else (assets, deep links): the SPA / Setup Wizard.
         location / {

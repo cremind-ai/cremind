@@ -305,19 +305,14 @@ class BaseConfig:
     CREMIND_OAUTH_CALLBACK_PORT = int(os.environ.get("CREMIND_OAUTH_CALLBACK_PORT", 1516))
     CREMIND_OAUTH_BIND_ADDR = os.environ.get("CREMIND_OAUTH_BIND_ADDR", "").strip() or "127.0.0.1"
     # Browser-facing redirect URI the built-in Google skills advertise to
-    # Google, when Cremind is fronted by a single-port reverse proxy instead of
-    # the loopback listener being reached on 127.0.0.1:<port> directly. In the
-    # K8s chart an nginx sidecar presents ONE port, so the in-pod 127.0.0.1:1516
-    # listener is unreachable from the host browser; the chart sets this to
-    # "<APP_URL>/api/oauth/google/callback" (only when APP_URL is a loopback
-    # origin), which rides the proxy's existing /api route to the backend
-    # capture handler (app/api/oauth_loopback.py).
-    #
-    # This is now a FALLBACK: when set (i.e. proxied mode), system_vars prefers
-    # the live loopback origin the backend last saw (app/utils/request_origin.py)
-    # so the redirect tracks whatever local port the user port-forwards to,
-    # without a fixed APP_URL. Unset on Docker/native (the browser reaches
-    # 127.0.0.1:<port> directly), where the skills use http://127.0.0.1:<port>/.
+    # Google, when the loopback listener is fronted by a single-port reverse
+    # proxy instead of being reached on 127.0.0.1:<port> directly. In the K8s
+    # chart an nginx sidecar presents ONE port, so the listener's own
+    # 127.0.0.1:1516 is unreachable from the host browser; the chart sets this
+    # to "<APP_URL>/oauth/google/callback" (only when APP_URL is a loopback
+    # origin) and routes that path back to the listener. Unset on Docker/native
+    # (the browser reaches 127.0.0.1:<port> directly), where the skills fall
+    # back to http://127.0.0.1:<port>/.
     CREMIND_OAUTH_REDIRECT_URI = os.environ.get("CREMIND_OAUTH_REDIRECT_URI", "").strip()
 
     # ── Application-level (TOML defaults, overridable via SQLite) ──

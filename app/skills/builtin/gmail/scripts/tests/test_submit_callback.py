@@ -53,10 +53,10 @@ def test_full_url_writes_inbox():
 
 
 def test_proxied_url_path_writes_inbox():
-    """A proxied redirect (localhost:8080/api/oauth/google/callback) is handled
-    the same — only the query matters."""
+    """A proxied redirect (localhost:8080/oauth/google/callback) is handled the
+    same — only the query matters."""
     def body(tmp):
-        url = f"http://localhost:8080/api/oauth/google/callback?{_QUERY}"
+        url = f"http://localhost:8080/oauth/google/callback?{_QUERY}"
         auth.submit_callback(url)
         assert (Path(tmp) / "oauth_inbox" / f"{_STATE}.txt").read_text(encoding="utf-8") == _QUERY
     _with_system_dir(body)

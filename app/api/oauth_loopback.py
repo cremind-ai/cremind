@@ -35,10 +35,6 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from starlette.requests import Request
-from starlette.responses import HTMLResponse
-from starlette.routing import Route
-
 from app.config.settings import BaseConfig
 from app.utils import logger
 
@@ -138,53 +134,6 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             logger.info(f"[oauth-loopback] captured authorization response for state={state[:6]}…")
             self._respond(200, _SUCCESS_HTML)
-
-
-async def _handle_google_loopback_callback(request: Request) -> HTMLResponse:
-    """Backend twin of ``_Handler.do_GET`` for single-port reverse-proxy setups.
-
-    On bare metal/Docker the consent redirect hits the standalone loopback
-    listener directly (``http://127.0.0.1:<port>/``). Under the Kubernetes
-    chart the browser only ever reaches Cremind through ONE proxied port, and
-    that proxy already routes ``/api/*`` to this backend — so the skill is told
-    (via ``CREMIND_OAUTH_REDIRECT_URI``) to advertise
-    ``<APP_URL>/api/oauth/google/callback`` and the redirect lands HERE instead.
-    We capture it into the very same per-state inbox the standalone listener
-    uses, so the waiting ``link`` completes identically. This rides the existing
-    ``/api`` proxy route, so it needs no dedicated nginx location and no reach
-    into the in-pod ``:1516`` listener.
-    """
-    params = request.query_params
-    state = params.get("state", "")
-    if not _STATE_RE.match(state):
-        logger.warning("[oauth-loopback] /api callback with missing/invalid state; ignoring")
-        return HTMLResponse(_ERROR_HTML, status_code=400)
-    # request.url.query is the raw, still-encoded query string — exactly what
-    # _Handler captures and what the skill replays into fetch_token.
-    try:
-        _write_inbox(state, request.url.query)
-    except OSError as e:  # noqa: BLE001
-        logger.error(f"[oauth-loopback] /api failed to write inbox file: {e}")
-        return HTMLResponse(_ERROR_HTML, status_code=500)
-    if "error" in params:
-        logger.info(f"[oauth-loopback] /api consent returned error for state={state[:6]}…")
-        return HTMLResponse(_ERROR_HTML, status_code=200)
-    logger.info(f"[oauth-loopback] /api captured authorization response for state={state[:6]}…")
-    return HTMLResponse(_SUCCESS_HTML, status_code=200)
-
-
-def get_oauth_loopback_routes() -> list[Route]:
-    """Backend route that captures the Google consent redirect when Cremind is
-    fronted by a single reverse-proxy port (the K8s chart). Mounted under
-    ``/api`` so it rides the proxy's existing ``/api`` route — see
-    ``_handle_google_loopback_callback``."""
-    return [
-        Route(
-            "/api/oauth/google/callback",
-            methods=["GET"],
-            endpoint=_handle_google_loopback_callback,
-        ),
-    ]
 
 
 def start_oauth_loopback_listener() -> bool:

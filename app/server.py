@@ -50,7 +50,6 @@ from app.agent.executor import CremindAgentExecutor
 from app.api import get_api_routes
 from app.api.config import get_config_routes
 from app.api.features import get_features_routes
-from app.api.oauth_loopback import get_oauth_loopback_routes
 from app.api.llm import get_llm_routes
 from app.api.setup_stream import get_setup_stream_routes
 from app.api.skills import get_skill_routes
@@ -603,13 +602,6 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
     routes.extend(get_tool_routes(state))
     routes.extend(get_skill_routes(state))
     routes.extend(get_setup_stream_routes())
-    # Google (gmail/gcalendar) loopback OAuth callback. Registered PRE-storage
-    # because it only writes a per-state file under CREMIND_SYSTEM_DIR/oauth_inbox
-    # (no DB/agent needed) — and because account-linking is driven over the A2A
-    # endpoint, which is itself available pre-storage, the consent redirect can
-    # arrive before/independently of the post-storage boot. Keeping this route
-    # pre-storage guarantees it answers whenever a link is in flight.
-    routes.extend(get_oauth_loopback_routes())
 
     middleware_stack = [
         Middleware(
@@ -624,13 +616,9 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
             backend=JWTAuthBackend(secret_provider=BaseConfig.get_jwt_secret),
         ),
     ]
-    from app.middleware import A2AAuthGuard, RequestOriginRecorder
+    from app.middleware import A2AAuthGuard
 
     middleware_stack.append(Middleware(A2AAuthGuard))
-    # Outermost: record the browser's loopback origin on every request so the
-    # Google OAuth redirect can track whatever local port the user port-forwards
-    # to (no fixed APP_URL needed). See app/utils/request_origin.py.
-    middleware_stack.insert(0, Middleware(RequestOriginRecorder))
 
     app = Starlette(
         routes=routes,

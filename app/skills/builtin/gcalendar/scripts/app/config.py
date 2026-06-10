@@ -29,7 +29,7 @@ OAUTH_BIND_ADDR = os.environ.get("CREMIND_OAUTH_BIND_ADDR", "").strip() or None
 
 # Browser-facing redirect URI to advertise to Google when the loopback listener
 # is fronted by a single-port reverse proxy (the Kubernetes chart). When set,
-# the redirect goes to "<APP_URL>/api/oauth/google/callback" (a loopback origin)
+# the redirect goes to "<APP_URL>/oauth/google/callback" (a loopback origin)
 # instead of "http://127.0.0.1:<port>/", and nginx routes it back to the
 # listener. Unset on Docker/native, where the browser reaches the port directly.
 OAUTH_REDIRECT_URI = os.environ.get("CREMIND_OAUTH_REDIRECT_URI", "").strip() or None
