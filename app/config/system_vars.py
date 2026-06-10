@@ -22,6 +22,33 @@ from typing import Callable, Dict, Optional
 
 from app.config.settings import BaseConfig, get_user_working_directory
 from app.utils.logger import logger
+from app.utils.request_origin import get_loopback_origin
+
+# Canonical path of the backend's Google OAuth loopback capture route
+# (app/api/oauth_loopback.py). The dynamic redirect is "<origin>" + this.
+_OAUTH_CALLBACK_PATH = "/api/oauth/google/callback"
+
+
+def _resolve_oauth_redirect_uri(_profile: Optional[str]) -> Optional[str]:
+    """Browser-facing Google OAuth redirect for the gmail/gcalendar skills.
+
+    Only meaningful in the PROXIED deployment (Kubernetes): the chart sets a
+    static ``CREMIND_OAUTH_REDIRECT_URI`` (from APP_URL) precisely when it has
+    opted into routing the consent redirect through its single proxy port. We
+    use that as the signal/fallback, but PREFER the live loopback origin the
+    backend last saw — so the redirect tracks whatever local port the user
+    port-forwards to, with no fixed APP_URL. When the chart did NOT set it
+    (Docker/native, or an Ingress hostname), return None so the skill uses the
+    direct ``http://127.0.0.1:<port>/`` loopback (Docker/native) or the manual
+    ``complete-link`` paste (Ingress) — both unchanged.
+    """
+    static = BaseConfig.CREMIND_OAUTH_REDIRECT_URI or None
+    if not static:
+        return None
+    origin = get_loopback_origin()
+    if origin:
+        return f"{origin}{_OAUTH_CALLBACK_PATH}"
+    return static
 
 
 def _load_cremind_token(profile: Optional[str]) -> Optional[str]:
@@ -103,12 +130,13 @@ SYSTEM_VARS: list[SystemVarSpec] = [
     ),
     SystemVarSpec(
         name="CREMIND_OAUTH_REDIRECT_URI",
-        resolve=lambda _profile: BaseConfig.CREMIND_OAUTH_REDIRECT_URI or None,
+        resolve=_resolve_oauth_redirect_uri,
         description=(
-            "Browser-facing redirect URI for the built-in Google skills when the "
-            "loopback listener is fronted by a single-port reverse proxy (the K8s "
-            "chart). Omitted on Docker/native, where the skills use "
-            "http://127.0.0.1:<callback-port>/ directly."
+            "Browser-facing redirect URI for the built-in Google skills behind a "
+            "single-port reverse proxy (the K8s chart). Prefers the live loopback "
+            "origin so it tracks the user's port-forward port; falls back to the "
+            "chart's APP_URL-derived value. Omitted on Docker/native (direct "
+            "http://127.0.0.1:<callback-port>/) and on Ingress (manual paste)."
         ),
     ),
 ]

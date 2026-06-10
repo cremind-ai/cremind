@@ -311,9 +311,13 @@ class BaseConfig:
     # listener is unreachable from the host browser; the chart sets this to
     # "<APP_URL>/api/oauth/google/callback" (only when APP_URL is a loopback
     # origin), which rides the proxy's existing /api route to the backend
-    # capture handler (app/api/oauth_loopback.py). Unset on Docker/native (the
-    # browser reaches 127.0.0.1:<port> directly), where the skills fall back to
-    # http://127.0.0.1:<port>/.
+    # capture handler (app/api/oauth_loopback.py).
+    #
+    # This is now a FALLBACK: when set (i.e. proxied mode), system_vars prefers
+    # the live loopback origin the backend last saw (app/utils/request_origin.py)
+    # so the redirect tracks whatever local port the user port-forwards to,
+    # without a fixed APP_URL. Unset on Docker/native (the browser reaches
+    # 127.0.0.1:<port> directly), where the skills use http://127.0.0.1:<port>/.
     CREMIND_OAUTH_REDIRECT_URI = os.environ.get("CREMIND_OAUTH_REDIRECT_URI", "").strip()
 
     # ── Application-level (TOML defaults, overridable via SQLite) ──

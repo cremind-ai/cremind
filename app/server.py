@@ -624,9 +624,13 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
             backend=JWTAuthBackend(secret_provider=BaseConfig.get_jwt_secret),
         ),
     ]
-    from app.middleware import A2AAuthGuard
+    from app.middleware import A2AAuthGuard, RequestOriginRecorder
 
     middleware_stack.append(Middleware(A2AAuthGuard))
+    # Outermost: record the browser's loopback origin on every request so the
+    # Google OAuth redirect can track whatever local port the user port-forwards
+    # to (no fixed APP_URL needed). See app/utils/request_origin.py.
+    middleware_stack.insert(0, Middleware(RequestOriginRecorder))
 
     app = Starlette(
         routes=routes,

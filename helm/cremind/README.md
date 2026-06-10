@@ -75,14 +75,13 @@ The Gmail/Calendar skills use a Google **Desktop** OAuth client, which may only
 redirect to a loopback address. The chart handles this through the single proxy
 port:
 
-- **With the default `port-forward svc/cremind 8080:80`** (APP_URL is
-  `http://localhost:8080`), linking is **one-click** — after you approve in the
-  browser, the consent redirect comes back through the proxy to the backend at
-  `/api/oauth/google/callback` and the page shows "Authentication complete". No
-  second port-forward is needed. If you forward to
-  a different local port, set `cremind.appUrl` to match (e.g.
-  `--set cremind.appUrl=http://127.0.0.1:9000`) so the advertised redirect port
-  lines up with your browser.
+- **With a port-forward (`port-forward svc/cremind <anyport>:80`)** linking is
+  **one-click** — after you approve in the browser, the consent redirect comes
+  back through the proxy to the backend at `/api/oauth/google/callback` and the
+  page shows "Authentication complete". The redirect **auto-tracks whatever local
+  port you used** (the backend reads it from your browser's own requests), so you
+  can change the port-forward port freely and you do **not** need to set
+  `cremind.appUrl` for it. No second port-forward is needed.
 - **With Ingress (a real hostname),** a Desktop OAuth client cannot redirect to
   the pod, so the post-approval page will fail to load (`ERR_CONNECTION_REFUSED`)
   — this is expected. Copy the **full URL** from your browser's address bar (it
