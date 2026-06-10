@@ -77,9 +77,9 @@ port:
 
 - **With the default `port-forward svc/cremind 8080:80`** (APP_URL is
   `http://localhost:8080`), linking is **one-click** — after you approve in the
-  browser, the consent redirect is routed back through the proxy
-  (`/oauth/google/callback`) to the in-pod listener and the page shows
-  "Authentication complete". No second port-forward is needed. If you forward to
+  browser, the consent redirect comes back through the proxy to the backend at
+  `/api/oauth/google/callback` and the page shows "Authentication complete". No
+  second port-forward is needed. If you forward to
   a different local port, set `cremind.appUrl` to match (e.g.
   `--set cremind.appUrl=http://127.0.0.1:9000`) so the advertised redirect port
   lines up with your browser.

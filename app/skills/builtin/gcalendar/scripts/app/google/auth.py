@@ -181,11 +181,11 @@ def _link_via_backend_callback(flow, port: int, redirect_uri: str | None = None)
     refuse an IPv4-only listener.
 
     When ``redirect_uri`` is supplied (the Kubernetes chart sets
-    ``CREMIND_OAUTH_REDIRECT_URI`` to ``<APP_URL>/oauth/google/callback``), the
-    listener is fronted by the single-port nginx proxy, so the browser-facing
+    ``CREMIND_OAUTH_REDIRECT_URI`` to ``<APP_URL>/api/oauth/google/callback``),
+    Cremind is fronted by the single-port nginx proxy, so the browser-facing
     redirect differs from the in-pod ``127.0.0.1:<port>``. It must still be a
     loopback origin (Desktop clients reject real hostnames); the proxy routes
-    that path back to the listener and the same inbox capture applies.
+    that path to the backend capture handler and the same inbox capture applies.
     """
     flow.redirect_uri = redirect_uri or f"http://127.0.0.1:{port}/"
     auth_url, state = flow.authorization_url(access_type="offline", prompt="consent")

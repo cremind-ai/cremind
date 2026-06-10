@@ -64,9 +64,10 @@ cremind:
   #
   # Google account-linking (gmail/gcalendar): when APP_URL is a LOOPBACK origin
   # (localhost / 127.0.0.1 — the default port-forward case), the consent
-  # redirect is routed through this one proxy port (CREMIND_OAUTH_REDIRECT_URI
-  # is derived as <APP_URL>/oauth/google/callback), so linking is one-click with
-  # no second port-forward. If you port-forward to a non-8080 local port, set
+  # redirect is captured via this one proxy port (CREMIND_OAUTH_REDIRECT_URI
+  # is derived as <APP_URL>/api/oauth/google/callback, which rides the existing
+  # /api route to the backend), so linking is one-click with no second
+  # port-forward. If you port-forward to a non-8080 local port, set
   # appUrl to match (e.g. http://127.0.0.1:9000) so the advertised redirect
   # port lines up with your browser. With Ingress (a real hostname) a Desktop
   # OAuth client cannot redirect to the pod, so linking uses the skill's manual

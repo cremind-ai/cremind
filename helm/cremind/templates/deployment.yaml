@@ -30,6 +30,12 @@ spec:
       annotations:
         # Roll the pod when the env ConfigMap changes.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        # Also roll when the proxy (nginx) ConfigMap changes — it's mounted via
+        # subPath, which does NOT receive live ConfigMap updates, so without this
+        # an nginx route change would otherwise need a manual pod restart.
+        {{- if .Values.proxy.enabled }}
+        checksum/proxy-config: {{ include (print $.Template.BasePath "/proxy-configmap.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
