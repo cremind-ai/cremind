@@ -1,6 +1,6 @@
 # AUTO-GENERATED from install/catalog.toml. Do not edit by hand.
 # Regenerate with: python install/scripts/build_catalog.py
-# Source SHA-256:  8dcb7efa86aedad0b4e3403c814a34143b99c1fc5b542b19fda824a9d51329d4
+# Source SHA-256:  b32d2d3547d8f9ae0b3994fc509b57ef046c26b3cf4052b59ac6e296532cc5c5
 
 $script:CatalogSchema = 1
 
@@ -49,8 +49,8 @@ $script:CustomFields = [ordered]@{
     'public_url' = [ordered]@{
         Key     = 'public_url'
         Prompt  = 'What URL will you use to open Cremind in a browser?'
-        Hint    = 'This is the address users type into their browser. Inside a container it''s usually http://localhost:1112. On a server it might be http://my-box.lan:1112 or https://cremind.example.com.'
-        Default = 'http://localhost:1112'
+        Hint    = 'This is the address users type into their browser. Inside a container it''s usually http://localhost:1515. On a server it might be http://my-box.lan:1515 or https://cremind.example.com.'
+        Default = 'http://localhost:1515'
         Choices = @()
     }
     'allowed_origins' = [ordered]@{

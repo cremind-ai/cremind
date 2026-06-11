@@ -30,8 +30,12 @@ share one Atlassian OAuth app, but each links and stores its own token.
 
 No per-skill configuration is required by default — the client id and scopes come
 from the Cremind Connect discovery doc (one-time org setup: an Atlassian 3LO app
-with the Confluence scopes, the secret in cremind-connect, and the loopback
-callback URL registered). Override in `scripts/.env` only if needed:
+with the Confluence scopes, the secret in cremind-connect, and ONE callback URL —
+3LO apps allow a single, exact-match callback — registered in the developer console).
+Cremind advertises a single FIXED redirect, `CREMIND_ATLASSIAN_REDIRECT_URI`, default
+`http://localhost:1515/api/oauth/atlassian/callback`; register that or set the var
+(chart: `cremind.atlassianRedirectUri`) to your own and register it.
+Override in `scripts/.env` only if needed:
 ```
 CREMIND_CONNECT_URL=https://connect.cremind.io       # optional; this is the default
 ATLASSIAN_CLIENT_ID=                                 # optional; otherwise from discovery
@@ -45,8 +49,11 @@ uv run scripts/__main__.py link
 `link` prints an Atlassian consent URL, then waits for consent to complete.
 **Surface that URL to the user and ask them to open it and approve access.**
 Confirm with `uv run scripts/__main__.py status`.
-> Note: Atlassian allows only a single, pre-registered callback URL, so linking
-> requires running under `cremind serve` (the fixed-port backend listener).
+> Note: Atlassian allows a single, exact-match callback per app, so linking requires
+> running under `cremind serve` with `CREMIND_ATLASSIAN_REDIRECT_URI` (default
+> `http://localhost:1515/api/oauth/atlassian/callback`) registered in the developer
+> console. If the redirect can't reach the backend (remote/Ingress/another port),
+> finish with `complete-link --response "<the URL you landed on>"`.
 
 ## CLI Commands
 Run `uv run scripts/__main__.py <subcommand>`. Output is JSON (human-readable on a TTY; force JSON with `--json`).
@@ -75,7 +82,7 @@ uv run scripts/__main__.py search --cql 'text ~ "roadmap" AND type = page ORDER 
 
 ## Troubleshooting
 - `Account not linked` → run `uv run scripts/__main__.py link`.
-- Linking error about the backend listener → Atlassian needs the fixed-port loopback; run under `cremind serve`.
+- Linking error about the backend OAuth callback → run under `cremind serve`; the Atlassian-console callback must exactly equal `CREMIND_ATLASSIAN_REDIRECT_URI` (default `http://localhost:1515/api/oauth/atlassian/callback`). For remote/Ingress/another port, finish with `complete-link --response "<pasted URL>"`.
 - `Atlassian /me returned no email` → the `read:me` scope wasn't granted; re-link.
 - Page `update` requires the current version → handled automatically (fetched before write).
 

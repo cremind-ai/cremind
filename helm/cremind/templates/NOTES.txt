@@ -15,10 +15,10 @@ and noVNC. You never need to forward more than one port.
    (the agent's desktop is at http://{{ .Values.ingress.host }}/vnc/vnc.html)
 {{- else }}
 
-   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "cremind.fullname" . }} 8080:{{ .Values.service.port }}
+   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "cremind.fullname" . }} 1515:{{ .Values.service.port }}
 
-   then browse to:  http://localhost:8080/#/setup
-   (the agent's desktop is at http://localhost:8080/vnc/vnc.html)
+   then browse to:  http://localhost:1515/#/setup
+   (the agent's desktop is at http://localhost:1515/vnc/vnc.html)
 {{- end }}
 
 2. Database step — PostgreSQL connection (pre-filled)

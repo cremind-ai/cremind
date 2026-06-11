@@ -20,20 +20,15 @@
 // browser handles ``target="_blank"`` natively.
 
 // Origins that must stay in-app rather than open externally: the live SPA
-// origin plus the configured backend. The wheel-served SPA lives on a separate
-// listener (default 1515) from the API (default 1112), so we add the 1515
-// variant too — mirrors the 1112→1515 mapping in ui/src/main.ts's pivot logic.
+// origin plus the configured backend. The cremind app is now a single
+// same-origin app (UI + API on one public port), so there's no separate
+// SPA/API port variant to add.
 function internalOrigins(): Set<string> {
   const origins = new Set<string>([window.location.origin]);
   const agentUrl = window.cremind?.config?.agentUrl;
   if (agentUrl) {
     try {
-      const u = new URL(agentUrl);
-      origins.add(u.origin);
-      if (u.port === '1112' || !u.port) {
-        u.port = '1515';
-        origins.add(u.origin);
-      }
+      origins.add(new URL(agentUrl).origin);
     } catch {
       /* malformed agentUrl — ignore */
     }

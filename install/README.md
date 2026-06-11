@@ -44,7 +44,7 @@ shows no radio (it's local-only).
 4. Per-channel image strategy:
    - `production` / `test`: resolve the latest version from PyPI / Test PyPI, then `docker compose pull` + `docker compose up -d` (no local build; a missing tag fails hard).
    - `dev`: `docker compose pull --ignore-pull-failures` for sidecars, then `docker compose up -d --build` against the local checkout via `docker-compose.override.yml`.
-5. Wait for `http://<host>:1112/health` to return 200.
+5. Wait for `http://<host>:1515/health` to return 200.
 6. Open `http://<host>:1515/#/setup` in your browser.
 
 The bundle defines four services. Only `cremind` is started at install
@@ -81,9 +81,9 @@ docker compose down -v             # stop and delete all data
 4. Generate `~/.cremind/.env` from [`templates/local.env`](templates/local.env), [`templates/server.env.tmpl`](templates/server.env.tmpl) (with `__APP_HOST__` substituted), or [`templates/custom.env.tmpl`](templates/custom.env.tmpl) (with the four advanced-field placeholders substituted). The installer also appends `INSTALL_MODE=docker|native` so the backend's Setup Wizard can filter per-service deployment modes.
 5. Generate `~/.cremind/bootstrap.toml` selecting SQLite.
 6. Run `cremind db upgrade` to apply Alembic migrations.
-7. Start `cremind serve` in the background. The same process opens two
-   listeners: the API on `:1112` and the SPA on `:1515`. Wait for
-   `/health`.
+7. Start `cremind serve` in the background. It serves the single public
+   origin on `:1515` (UI + API) plus an internal loopback API on `:1112`.
+   Wait for `/health`.
 8. Open `http://<host>:1515/#/setup` in your browser.
 
 Both modes are idempotent: re-running upgrades in place and keeps your
@@ -97,7 +97,7 @@ Both installers ask **how** Cremind will be reached:
 | Deployment | What it sets | When to pick it |
 |---|---|---|
 | **local**  | `HOST=127.0.0.1`. Only this machine can reach the backend. | Single-user desktop install. |
-| **server** | `HOST=0.0.0.0`, `APP_URL=http://<your-host>:1112`, CORS allows your host. | Multi-machine setup; pass `--host`/`-AppHost` with your public IP or domain. |
+| **server** | `HOST=0.0.0.0`, `APP_URL=http://<your-host>:1515`, CORS allows your host. | Multi-machine setup; pass `--host`/`-AppHost` with your public IP or domain. |
 | **custom** *(advanced)* | You pick `HOST`, `APP_URL`, `CORS_ALLOWED_ORIGINS`, and the Setup Wizard preset yourself. | Inside containers, behind reverse proxies, or anywhere the local/server presets don't fit. |
 
 `container` is accepted as a deprecated alias for `custom` (with
@@ -217,6 +217,12 @@ CI runs [`scripts/build_ui.sh`](../scripts/build_ui.sh) before
 
 ```bash
 ./scripts/build_ui.sh
+```
+
+On Windows (no Bash), use the PowerShell port [`scripts/build_ui.ps1`](../scripts/build_ui.ps1):
+
+```powershell
+.\scripts\build_ui.ps1
 ```
 
 The script builds the in-tree `ui/` source and writes to

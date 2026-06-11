@@ -5,8 +5,6 @@ import os
 import time
 import urllib.parse
 import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from threading import Thread
 
 import httpx
 from a2a.types import AgentCard
@@ -295,60 +293,29 @@ class OAuthClient:
 
         logger.info(f"Initiating Authentication for {self.agent_name}...")
 
-        # Start local callback server. In the Docker desktop image the
-        # consenting browser runs on the host, so the callback must arrive
-        # through a PUBLISHED, fixed port and the server must bind 0.0.0.0
-        # (127.0.0.1 would refuse Docker-forwarded traffic). On bare metal
-        # both env vars are unset → an ephemeral loopback port, as before.
-        # The advertised callback host stays "localhost" regardless.
-        fixed_port = int(os.environ.get("CREMIND_OAUTH_CALLBACK_PORT", "0"))
-        bind_addr = os.environ.get("CREMIND_OAUTH_BIND_ADDR", "").strip() or "localhost"
-        if fixed_port:
-            port = fixed_port
-        else:
-            import socket
-            sock = socket.socket()
-            sock.bind(('localhost', 0))
-            port = sock.getsockname()[1]
-            sock.close()
+        # The consent redirect is captured by the always-running backend at
+        # GET /api/oauth/a2a/callback (app/api/oauth_callback.py), which resolves
+        # the in-process Future we register here keyed by ``state``. The backend
+        # is reachable at localhost:<PORT> from wherever the consent browser runs
+        # (the same host/pod as this process), so no auxiliary published port is
+        # needed. The external provider must have this redirect URL registered.
+        from app.config.settings import BaseConfig
+        from app.tools.a2a.oauth_rendezvous import cancel, register
 
-        callback_uri = f"http://localhost:{port}/callback"
+        callback_uri = f"http://localhost:{BaseConfig.PORT}/api/oauth/a2a/callback"
 
         loop = asyncio.get_running_loop()
-        future = loop.create_future()
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, format, *args): pass
-
-            def do_GET(self):
-                try:
-                    query = urllib.parse.urlparse(self.path).query
-                    params = urllib.parse.parse_qs(query)
-                    code = params.get('code', [None])[0]
-                    if code:
-                        loop.call_soon_threadsafe(future.set_result, code)
-                        self.send_response(200)
-                        self.send_header('Content-type', 'text/html')
-                        self.end_headers()
-                        self.wfile.write(b"<h1>Authentication successful!</h1><p>You can close this window.</p>")
-                    else:
-                        loop.call_soon_threadsafe(future.set_result, None)
-                        self.send_response(400)
-                except Exception as e:
-                    loop.call_soon_threadsafe(future.set_exception, e)
-
-        server = HTTPServer((bind_addr, port), Handler)
-        server_thread = Thread(target=server.serve_forever)
-        server_thread.daemon = True
-        server_thread.start()
+        future: asyncio.Future = loop.create_future()
+        state = base64.urlsafe_b64encode(os.urandom(16)).decode()
+        self.state = state  # for CSRF validation (the route matches by state)
+        register(state, future)
 
         try:
-            state = base64.urlsafe_b64encode(os.urandom(16)).decode()
             params = {
-                "client_id": "cremind-agent-client",  # Changed client_id just in case, but usually depends on provider
+                "client_id": "cremind-agent-client",  # usually provider-dependent
                 "redirect_uri": callback_uri,
                 "response_type": "code",
-                "state": state
+                "state": state,
             }
 
             # Use authorization endpoint from Agent Card
@@ -359,7 +326,7 @@ class OAuthClient:
             webbrowser.open(auth_url)
 
             logger.info(f"Waiting for callback from {self.agent_name}...")
-            # Wait for the future with a timeout (e.g. 5 minutes)
+            # Wait for the backend route to resolve the Future (5 minutes).
             code = await asyncio.wait_for(future, timeout=300)
 
             if not code:
@@ -388,5 +355,4 @@ class OAuthClient:
         except Exception as e:
             logger.error(f"Authentication failed: {e}")
         finally:
-            server.shutdown()
-            server_thread.join()
+            cancel(state)

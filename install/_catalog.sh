@@ -1,6 +1,6 @@
 # AUTO-GENERATED from install/catalog.toml. Do not edit by hand.
 # Regenerate with: python install/scripts/build_catalog.py
-# Source SHA-256:  8dcb7efa86aedad0b4e3403c814a34143b99c1fc5b542b19fda824a9d51329d4
+# Source SHA-256:  b32d2d3547d8f9ae0b3994fc509b57ef046c26b3cf4052b59ac6e296532cc5c5
 
 CATALOG_SCHEMA=1
 
@@ -32,8 +32,8 @@ CUSTOM_FIELD_HINT_listen_host="Use 127.0.0.1 to only allow this machine, or 0.0.
 CUSTOM_FIELD_DEFAULT_listen_host="0.0.0.0"
 CUSTOM_FIELD_CHOICES_listen_host=""
 CUSTOM_FIELD_PROMPT_public_url="What URL will you use to open Cremind in a browser?"
-CUSTOM_FIELD_HINT_public_url="This is the address users type into their browser. Inside a container it's usually http://localhost:1112. On a server it might be http://my-box.lan:1112 or https://cremind.example.com."
-CUSTOM_FIELD_DEFAULT_public_url="http://localhost:1112"
+CUSTOM_FIELD_HINT_public_url="This is the address users type into their browser. Inside a container it's usually http://localhost:1515. On a server it might be http://my-box.lan:1515 or https://cremind.example.com."
+CUSTOM_FIELD_DEFAULT_public_url="http://localhost:1515"
 CUSTOM_FIELD_CHOICES_public_url=""
 CUSTOM_FIELD_PROMPT_allowed_origins="Which web origins should be allowed to talk to the API?"
 CUSTOM_FIELD_HINT_allowed_origins="A comma-separated list of URLs the browser UI will be served from. Usually the same as the public URL above. Leave blank to use the public URL plus localhost variants."

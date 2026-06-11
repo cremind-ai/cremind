@@ -26,20 +26,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
-import socket
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from .account_key import account_key_for
 
 AUTHORIZE_URL = "https://auth.atlassian.com/authorize"
 ACCESSIBLE_RESOURCES_URL = "https://api.atlassian.com/oauth/token/accessible-resources"
 ME_URL = "https://api.atlassian.com/me"
+
+# The OAuth ``state`` becomes an inbox filename; accept only this charset/length
+# (guards against path traversal via a crafted ``state`` in a pasted URL).
+# Mirrors app/api/oauth_callback.py's _STATE_RE.
+_STATE_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
 
 class AuthError(RuntimeError):
@@ -104,19 +109,9 @@ def _oauth_inbox_dir() -> Path | None:
     return Path(system_dir) / "oauth_inbox"
 
 
-def _backend_listener_available(port: int) -> bool:
-    if port <= 0 or _oauth_inbox_dir() is None:
-        return False
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=1.0):
-            return True
-    except OSError:
-        return False
-
-
-def _await_oauth_callback(state: str, *, timeout: float = 300.0) -> str:
+def _await_oauth_callback(state: str, *, timeout: float = 600.0) -> str:
     inbox = _oauth_inbox_dir()
-    if inbox is None:  # pragma: no cover - guarded by _backend_listener_available
+    if inbox is None:  # pragma: no cover - guarded by link()
         raise AuthError("CREMIND_SYSTEM_DIR is not set; cannot receive the OAuth callback.")
     path = inbox / f"{state}.txt"
     deadline = time.monotonic() + timeout
@@ -144,6 +139,53 @@ def _await_oauth_callback(state: str, *, timeout: float = 300.0) -> str:
         "Timed out waiting for Atlassian consent (no callback received within "
         f"{int(timeout)}s). Re-run link and complete the browser consent."
     )
+
+
+def submit_callback(response: str) -> dict[str, Any]:
+    """Hand a manually-captured OAuth redirect back to the waiting ``link``.
+
+    On remote/headless deployments (Kubernetes, SSH, …) the browser is redirected
+    to the registered callback (``<APP_URL>/api/oauth/atlassian/callback``) which
+    it may not be able to reach, but the URL still carries a valid ``code`` +
+    ``state``. The user copies it; this writes the raw query into the same
+    per-state inbox file the backend callback route would have written
+    (``<CREMIND_SYSTEM_DIR>/oauth_inbox/<state>.txt``), so the still-running
+    ``link`` reads the code and completes the backend-mediated exchange.
+
+    Crucially, the ``redirect_uri`` sent at exchange is ``link``'s OWN value (the
+    URL registered in the Atlassian app), never derived from the pasted URL, so
+    the exchange matches the registration regardless of which host the user
+    actually pasted.
+
+    ``response`` may be a full redirect URL or a bare ``code=...&state=...`` query.
+    """
+    raw = (response or "").strip()
+    if not raw:
+        raise AuthError("Empty OAuth response; paste the full URL Atlassian redirected you to.")
+    query = urlparse(raw).query
+    if not query:
+        query = raw[1:] if raw.startswith("?") else raw
+    params = parse_qs(query)
+    if "error" in params:
+        raise AuthError("Atlassian consent was denied or returned an error.")
+    state = (params.get("state") or [""])[0]
+    if not _STATE_RE.match(state):
+        raise AuthError(
+            "Could not find a valid 'state' in the pasted response. Paste the "
+            "entire URL from your browser's address bar (it contains "
+            "state=... and code=...)."
+        )
+    if "code" not in params:
+        raise AuthError("The pasted response has no 'code'; paste the full redirect URL after approving.")
+    inbox = _oauth_inbox_dir()
+    if inbox is None:
+        raise AuthError("CREMIND_SYSTEM_DIR is not set; cannot deliver the OAuth response.")
+    inbox.mkdir(parents=True, exist_ok=True)
+    dst = inbox / f"{state}.txt"
+    tmp = dst.with_name(dst.name + ".tmp")
+    tmp.write_text(query, encoding="utf-8")
+    os.replace(tmp, dst)
+    return {"submitted": True, "state": state}
 
 
 # --- accessible resources / identity ---
@@ -197,23 +239,23 @@ def link(
     connect_url: str,
     client_id: str,
     scopes: list[str],
-    port: int,
+    redirect_uri: str | None = None,
     site_url_hint: str = "",
 ) -> dict[str, Any]:
     """Run the backend-mediated 3LO consent flow and persist tokens locally."""
     if not client_id:
         raise AuthError("No Atlassian client id (discovery doc has none; set ATLASSIAN_CLIENT_ID to override).")
-    if not _backend_listener_available(port):
+    if not redirect_uri or _oauth_inbox_dir() is None:
         raise AuthError(
-            "Atlassian linking requires the Cremind backend loopback listener on a "
-            f"fixed port (CREMIND_OAUTH_CALLBACK_PORT={port or 'unset'}). Atlassian only "
-            "allows a single, pre-registered callback URL, so the standalone/ephemeral "
-            "fallback used by the Google skills is not available here. Run under "
-            "`cremind serve` and register http://127.0.0.1:<port>/ as the app's callback URL."
+            "Atlassian linking requires the Cremind backend OAuth callback "
+            "(CREMIND_ATLASSIAN_REDIRECT_URI). Atlassian allows only a single, "
+            "pre-registered callback URL, so the ephemeral fallback used by the "
+            "Google skills is not available here. Run under `cremind serve` and "
+            "register <APP_URL>/api/oauth/atlassian/callback as the app's callback "
+            "URL in the Atlassian developer console."
         )
 
     state = secrets.token_urlsafe(24)
-    redirect_uri = f"http://127.0.0.1:{port}/"
     params = {
         "audience": "api.atlassian.com",
         "client_id": client_id,

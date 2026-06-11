@@ -452,7 +452,7 @@ if [ "$DEPLOYMENT" = "container" ]; then
     warn "--deployment container is deprecated; using --deployment custom with container defaults."
     DEPLOYMENT="custom"
     : "${CUSTOM_listen_host:=0.0.0.0}"
-    : "${CUSTOM_public_url:=http://localhost:1112}"
+    : "${CUSTOM_public_url:=http://localhost:1515}"
     : "${CUSTOM_wizard_preset:=local}"
 fi
 
@@ -540,7 +540,7 @@ if [ "$UNATTENDED" -eq 1 ] && [ -z "$DEPLOYMENT" ]; then
     if [ "$IN_CONTAINER" -eq 1 ]; then
         DEPLOYMENT="custom"
         : "${CUSTOM_listen_host:=0.0.0.0}"
-        : "${CUSTOM_public_url:=http://localhost:1112}"
+        : "${CUSTOM_public_url:=http://localhost:1515}"
         : "${CUSTOM_wizard_preset:=local}"
     else
         DEPLOYMENT="local"
@@ -1260,12 +1260,12 @@ if [ "$MODE" = "docker" ]; then
 
     case "$DEPLOYMENT" in
         local)
-            DOCKER_APP_URL="http://localhost:1112"
+            DOCKER_APP_URL="http://localhost:1515"
             DOCKER_CORS="http://localhost:1515,http://127.0.0.1:1515"
             DOCKER_WIZARD_ENV="local"
             ;;
         server)
-            DOCKER_APP_URL="http://$APP_HOST:1112"
+            DOCKER_APP_URL="http://$APP_HOST:1515"
             DOCKER_CORS="http://$APP_HOST:1515,http://localhost:1515"
             DOCKER_WIZARD_ENV="server"
             ;;
@@ -1402,12 +1402,13 @@ EOF
     fi
 
     # Health gate: don't open the wizard until the backend is reachable.
-    # Custom installs already picked the public URL — strip the scheme
-    # and trailing path so we can probe :1112/health on its hostname.
+    # Docker publishes only the single public port (1515), so probe
+    # :1515/health on the host. Custom installs already picked the public URL —
+    # strip the scheme and trailing path to get its hostname.
     if [ "$DEPLOYMENT" = "local" ]; then
         HEALTH_HOST="localhost"
     elif [ "$DEPLOYMENT" = "custom" ]; then
-        # http://foo.bar:1112 → foo.bar
+        # http://foo.bar:1515 → foo.bar
         HEALTH_HOST="${CUSTOM_public_url#*://}"
         HEALTH_HOST="${HEALTH_HOST%%/*}"
         HEALTH_HOST="${HEALTH_HOST%%:*}"
@@ -1415,7 +1416,7 @@ EOF
     else
         HEALTH_HOST="$APP_HOST"
     fi
-    HEALTH_URL="http://${HEALTH_HOST}:1112/health"
+    HEALTH_URL="http://${HEALTH_HOST}:1515/health"
     info "Waiting for backend at $HEALTH_URL ..."
     for i in $(seq 1 60); do
         if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
@@ -1443,7 +1444,7 @@ ${BOLD}Open this URL in your browser to continue setup:${RESET}
 
     ${BOLD}$WIZARD_URL${RESET}
 
-  ${BOLD}Backend${RESET}:    http://${HEALTH_HOST}:1112
+  ${BOLD}Cremind${RESET}:    http://${HEALTH_HOST}:1515
   ${BOLD}Desktop${RESET}:    $NOVNC_URL
   ${BOLD}VNC password${RESET} (saved to $DOCKER_DIR/.env):
     $(grep '^VNC_PASSWORD=' "$DOCKER_DIR/.env" | cut -d= -f2-)
@@ -2109,12 +2110,12 @@ fi
 
 # ``custom`` installs honour the public URL the user provided; ``server``
 # uses the host from --host; ``local`` is loopback. Custom URLs may
-# include a path/scheme; swap the port to 1515 (the wizard's SPA port)
-# while preserving the hostname.
+# include a path/scheme; normalise to the single public port (1515) while
+# preserving the hostname.
 if [ "$DEPLOYMENT" = "server" ]; then
     WIZARD_URL="http://$APP_HOST:1515/#/setup"
 elif [ "$DEPLOYMENT" = "custom" ]; then
-    # http://foo.bar:1112 → http://foo.bar:1515/#/setup
+    # http://foo.bar:1515 → http://foo.bar:1515/#/setup
     CUSTOM_HOSTPART="${CUSTOM_public_url#*://}"
     CUSTOM_HOSTPART="${CUSTOM_HOSTPART%%/*}"
     CUSTOM_HOSTPART="${CUSTOM_HOSTPART%%:*}"
@@ -2138,7 +2139,7 @@ ${BOLD}Open this URL in your browser to continue setup:${RESET}
 
     ${BOLD}$WIZARD_URL${RESET}
 
-  Backend:    http://${HOST:-127.0.0.1}:${PORT:-1112}
+  Cremind:    ${WIZARD_URL%/#/setup}
   Stop:       kill \$(cat $SERVER_PID_FILE)
 
 EOF

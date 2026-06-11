@@ -50,6 +50,7 @@ from app.agent.executor import CremindAgentExecutor
 from app.api import get_api_routes
 from app.api.config import get_config_routes
 from app.api.features import get_features_routes
+from app.api.oauth_callback import get_oauth_callback_routes
 from app.api.llm import get_llm_routes
 from app.api.setup_stream import get_setup_stream_routes
 from app.api.skills import get_skill_routes
@@ -419,12 +420,6 @@ SHUTDOWN_TIMEOUT_S = 8.0
 async def _do_shutdown() -> None:
     """The actual cleanup body. Module-level so tests can patch it."""
     try:
-        from app.api.oauth_loopback import stop_oauth_loopback_listener
-
-        stop_oauth_loopback_listener()
-    except Exception:  # noqa: BLE001
-        logger.exception("Error stopping OAuth loopback listener during shutdown")
-    try:
         stop_all_watchers()
     except Exception:  # noqa: BLE001
         logger.exception("Error stopping skill watchers during shutdown")
@@ -602,6 +597,13 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
     routes.extend(get_tool_routes(state))
     routes.extend(get_skill_routes(state))
     routes.extend(get_setup_stream_routes())
+    # OAuth callback routes (Google/Atlassian skills + A2A tool auth). Registered
+    # PRE-storage because they only write a per-state inbox file / resolve an
+    # in-process Future (no DB/agent needed) — and account-linking is driven over
+    # the A2A endpoint, itself available pre-storage, so the consent redirect can
+    # arrive before/independently of the post-storage boot. Keeping these routes
+    # pre-storage guarantees they answer whenever a link is in flight.
+    routes.extend(get_oauth_callback_routes())
 
     middleware_stack = [
         Middleware(
@@ -620,11 +622,36 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
 
     middleware_stack.append(Middleware(A2AAuthGuard))
 
+    # ── Single public origin: serve the SPA from THIS app ──────────────────
+    # The web UI, API, A2A, OAuth callbacks, SSE, and the PTY WebSocket are all
+    # served by one app on the single public port (see the serve section). The
+    # SPA is installed as the router *default* — the catch-all consulted only
+    # after every real route misses, including the post-storage routes appended
+    # to the live app at boot — so it never shadows /api or the A2A root.
+    # /electron-renderer is a prefix mount (matched before the default).
+    _spa_web_static, _spa_electron_mount = _build_spa_components()
+    if _spa_electron_mount is not None:
+        routes.append(_spa_electron_mount)
+    if _spa_web_static is not None:
+        # Explicit GET / → SPA index. The A2A root route is POST-only, so a bare
+        # GET / would otherwise 405 (Starlette partial-matches the POST route and
+        # never reaches the router default). A full-method match here wins over
+        # that partial match; POST / still routes to A2A. HEAD covers probes.
+        async def _serve_spa_index(request: Request):
+            return await _spa_web_static.get_response("index.html", request.scope)
+
+        routes.append(Route("/", _serve_spa_index, methods=["GET", "HEAD"]))
+
     app = Starlette(
         routes=routes,
         middleware=middleware_stack,
         on_shutdown=[_on_shutdown],
     )
+    if _spa_web_static is not None:
+        # Everything not matched by a route (hashed /assets/*, favicon, etc.)
+        # falls here. With hash routing the only SPA path the server sees is `/`
+        # (handled above); this covers static files and any stray deep link.
+        app.router.default = _SpaFallback(_spa_web_static)
 
     # ── Deferred storage + post-storage boot ─────────────────────────────
     #
@@ -813,17 +840,6 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to schedule autostart run on boot")
 
-            # 7c2. Persistent OAuth loopback callback listener. Receives the
-            # Google consent redirect for the built-in gmail/gcalendar skills so
-            # their ``link`` flow doesn't depend on a per-link ephemeral server
-            # dying with the agent turn. Non-fatal if the port can't be bound.
-            try:
-                from app.api.oauth_loopback import start_oauth_loopback_listener
-
-                start_oauth_loopback_listener()
-            except Exception:  # noqa: BLE001
-                logger.exception("Failed to start OAuth loopback listener")
-
             # 7d. Skill event manager
             try:
                 from app.events import get_event_manager
@@ -994,10 +1010,6 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
     # otherwise hold the server alive). It does NOT bound the lifespan
     # shutdown hook — that's handled in _on_shutdown itself via
     # asyncio.wait_for. Keep both.
-    config = uvicorn.Config(
-        app, host=host, port=port, timeout_graceful_shutdown=10
-    )
-
     import os
     import threading
 
@@ -1040,35 +1052,50 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                 ).start()
             super().handle_exit(sig, frame)
 
-    server = _BoundedShutdownServer(config)
+    # ── Single public origin + internal loopback ──────────────────────────
+    #
+    # One app, two binds. The PUBLIC port (CREMIND_UI_PORT, default 1515) on
+    # ``host`` is the single origin the browser uses — UI + API + A2A + OAuth +
+    # SSE + the PTY WebSocket, all same-origin. The INTERNAL port (PORT, default
+    # 1112) binds 127.0.0.1 ONLY (never published) for the local ``cremind`` CLI
+    # (CREMIND_SERVER). ``CREMIND_UI_PORT=0`` opens no public bind — an external
+    # proxy fronts the loopback app instead.
+    #
+    # The public server owns the ASGI lifespan (so ``_on_shutdown`` runs once);
+    # the loopback server is started with ``lifespan="off"`` to avoid a second
+    # shutdown of the same app.
+    raw_ui_port = os.environ.get("CREMIND_UI_PORT", "1515")
+    try:
+        public_port = int(raw_ui_port)
+    except ValueError:
+        logger.warning(f"Invalid CREMIND_UI_PORT={raw_ui_port!r}; defaulting to 1515.")
+        public_port = 1515
 
-    # ── Bundled SPA listener ───────────────────────────────────────────────
-    #
-    # The web UI ships inside the cremind wheel at ``app/static/ui/`` (the
-    # CI step in ``scripts/build_ui.sh`` populates it). When that
-    # directory exists, ``cremind serve`` opens a second uvicorn listener on
-    # ``CREMIND_UI_PORT`` (default 1515) and serves the SPA. The browser
-    # then sees:
-    #
-    #   http://<host>:1112    A2A protocol + REST API (existing)
-    #   http://<host>:1515    SPA (only when bundled)
-    #
-    # ``CREMIND_UI_DIR`` overrides the on-disk location — used by the
-    # Docker image, which builds the SPA in a separate stage and points
-    # the env var at ``/opt/cremind-ui`` so the in-process serve picks
-    # up that build instead of the (possibly stale) wheel-bundled copy.
-    #
-    # ``CREMIND_UI_PORT=0`` disables the listener entirely (e.g., when
-    # running behind a sibling nginx that already serves the SPA).
-    ui_server = _build_ui_server(host=host)
-    if ui_server is None:
-        await server.serve()
+    def _mk_config(bind_host: str, bind_port: int, *, lifespan: str) -> uvicorn.Config:
+        return uvicorn.Config(
+            app, host=bind_host, port=bind_port,
+            timeout_graceful_shutdown=10, lifespan=lifespan,
+        )
+
+    servers: list[uvicorn.Server] = []
+    if public_port != 0:
+        servers.append(_BoundedShutdownServer(_mk_config(host, public_port, lifespan="auto")))
+        servers.append(_BoundedShutdownServer(_mk_config("127.0.0.1", port, lifespan="off")))
+        logger.info(
+            f"Serving on public http://{host}:{public_port} "
+            f"(+ internal loopback http://127.0.0.1:{port})"
+        )
     else:
-        # Run both listeners as tasks. ``asyncio.gather`` propagates the
-        # first exception, which on a clean shutdown is just a
-        # ``CancelledError`` from the API server's signal handler — the
-        # UI server's task gets cancelled too, which is what we want.
-        await asyncio.gather(server.serve(), ui_server.serve())
+        servers.append(_BoundedShutdownServer(_mk_config("127.0.0.1", port, lifespan="auto")))
+        logger.info(f"CREMIND_UI_PORT=0 — serving loopback-only on http://127.0.0.1:{port}")
+
+    if len(servers) == 1:
+        await servers[0].serve()
+    else:
+        # asyncio.gather propagates the first exception; on a clean shutdown
+        # that's a CancelledError from a signal handler and the sibling
+        # server's task is cancelled too, which is what we want.
+        await asyncio.gather(*(s.serve() for s in servers))
 
 
 class _CachingStaticFiles(StaticFiles):
@@ -1111,21 +1138,38 @@ class _CachingStaticFiles(StaticFiles):
         return response
 
 
-def _build_ui_server(*, host: str) -> uvicorn.Server | None:
-    """Return a uvicorn server for the bundled SPA, or None if disabled.
+class _SpaFallback:
+    """Router ``default``: serve the SPA for unmatched HTTP requests (the
+    deep-link / ``index.html`` catch-all) and close any unmatched WebSocket,
+    without tripping ``StaticFiles``' http-only assertion. Installed only when a
+    built SPA is present, so it runs after every real route — including the
+    post-storage routes appended at boot — has missed."""
 
-    Skipped quietly when ``CREMIND_UI_PORT=0`` or when the SPA directory
-    is missing (e.g., a dev install that hasn't run scripts/build_ui.sh).
+    def __init__(self, static: "_CachingStaticFiles"):
+        self._static = static
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            await self._static(scope, receive, send)
+        elif scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1000})
+
+
+def _build_spa_components():
+    """Resolve the bundled SPA into components to attach to the merged app.
+
+    Returns ``(web_static, electron_mount)``:
+    - ``web_static`` — a ``_CachingStaticFiles`` to install as the app's router
+      ``default`` (the catch-all SPA / deep-link ``index.html`` fallback), or
+      ``None`` when no built SPA is present (e.g. a dev install that hasn't run
+      scripts/build_ui.sh — the API still serves; Vite serves the SPA separately).
+    - ``electron_mount`` — a ``Mount`` for ``/electron-renderer`` (the Electron
+      shell bundle), or ``None`` when absent.
+
+    The whole app (API + A2A + OAuth + this SPA) is served on the single public
+    port, so the browser is same-origin and there is no separate SPA listener;
+    see ``main()`` for the public/loopback bind split.
     """
-    raw_port = os.environ.get("CREMIND_UI_PORT", "1515")
-    try:
-        ui_port = int(raw_port)
-    except ValueError:
-        logger.warning(f"Invalid CREMIND_UI_PORT={raw_port!r}; SPA listener disabled.")
-        return None
-    if ui_port == 0:
-        return None
-
     # Resolution order:
     #   1. Wheel-bundled SPA at app/static/ui/   ← ALWAYS preferred when
     #                                              present, because that
@@ -1170,20 +1214,20 @@ def _build_ui_server(*, host: str) -> uvicorn.Server | None:
         ui_dir = Path(override)
         if not (ui_dir.is_dir() and (ui_dir / "index.html").is_file()):
             logger.info(
-                f"SPA not present at CREMIND_UI_DIR={ui_dir}; UI listener disabled "
+                f"SPA not present at CREMIND_UI_DIR={ui_dir}; SPA serving disabled "
                 "(run scripts/build_ui.sh or fix the CREMIND_UI_DIR path)."
             )
-            return None
+            return None, None
         logger.info(
             f"SPA: serving CREMIND_UI_DIR fallback at {ui_dir} "
             "(no wheel-bundled SPA found — dev install?)"
         )
     else:
         logger.info(
-            f"SPA not present at {wheel_ui_dir}; UI listener disabled "
+            f"SPA not present at {wheel_ui_dir}; SPA serving disabled "
             "(run scripts/build_ui.sh or set CREMIND_UI_DIR=/path/to/built/ui)."
         )
-        return None
+        return None, None
 
     # ``html=True`` makes StaticFiles fall back to index.html for any
     # missing path — required for client-side routing under hash mode
@@ -1220,24 +1264,19 @@ def _build_ui_server(*, host: str) -> uvicorn.Server | None:
     else:
         ui_electron_dir = None
 
-    routes: list = []
+    electron_mount = None
     if ui_electron_dir is not None:
-        routes.append(
-            Mount(
-                "/electron-renderer",
-                app=_CachingStaticFiles(directory=str(ui_electron_dir), html=True),
-                name="ui-electron",
-            )
+        electron_mount = Mount(
+            "/electron-renderer",
+            app=_CachingStaticFiles(directory=str(ui_electron_dir), html=True),
+            name="ui-electron",
         )
-        logger.info(f"SPA listener: /electron-renderer → {ui_electron_dir}")
+        logger.info(f"SPA: /electron-renderer → {ui_electron_dir}")
     else:
         logger.info(
-            "Electron-renderer bundle not present; "
-            "/electron-renderer mount disabled (Electron shell will fall "
-            "back to the asar copy)."
+            "Electron-renderer bundle not present; /electron-renderer disabled "
+            "(Electron shell falls back to the asar copy)."
         )
-    routes.append(Mount("/", app=_CachingStaticFiles(directory=str(ui_dir), html=True), name="ui"))
-    spa_app = Starlette(routes=routes)
-    cfg = uvicorn.Config(spa_app, host=host, port=ui_port, log_level="warning")
-    logger.info(f"SPA listener: http://{host}:{ui_port} (serving {ui_dir})")
-    return uvicorn.Server(cfg)
+    web_static = _CachingStaticFiles(directory=str(ui_dir), html=True)
+    logger.info(f"SPA: serving {ui_dir} as the single-origin catch-all (router default)")
+    return web_static, electron_mount

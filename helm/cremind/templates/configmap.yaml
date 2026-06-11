@@ -31,15 +31,19 @@ data:
   {{- $scheme := ternary "https" "http" (gt (len (.Values.ingress.tls | default list)) 0) }}
   {{- $appUrl = printf "%s://%s" $scheme .Values.ingress.host }}
   {{- else }}
-  {{- $appUrl = "http://localhost:8080" }}
+  {{- $appUrl = "http://localhost:1515" }}
   {{- end }}
   {{- end }}
   APP_URL: {{ $appUrl | quote }}
+  {{- /* Atlassian 3LO single fixed callback. Blank → the image default
+         (http://localhost:1515/api/oauth/atlassian/callback) applies. */ -}}
+  {{- if .Values.cremind.atlassianRedirectUri }}
+  CREMIND_ATLASSIAN_REDIRECT_URI: {{ .Values.cremind.atlassianRedirectUri | quote }}
+  {{- end }}
   HOST: {{ .Values.cremind.host | quote }}
   PORT: {{ .Values.cremind.apiPort | quote }}
   CREMIND_UI_PORT: {{ .Values.cremind.uiPort | quote }}
   CREMIND_SYSTEM_DIR: {{ .Values.cremind.systemDir | quote }}
-  CREMIND_OAUTH_CALLBACK_PORT: {{ .Values.cremind.oauthCallbackPort | quote }}
   # Required by the desktop entrypoint (it exits 1 without a valid RESOLUTION).
   RESOLUTION: {{ .Values.cremind.resolution | quote }}
   VNC_PASSWORD: {{ .Values.cremind.vncPassword | quote }}

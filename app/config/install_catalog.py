@@ -80,9 +80,9 @@ _DEFAULT_CATALOG: dict[str, Any] = {
                     "prompt": "What URL will you use to open Cremind in a browser?",
                     "hint": (
                         "This is the address users type into their browser. Inside a "
-                        "container it's usually http://localhost:1112."
+                        "container it's usually http://localhost:1515."
                     ),
-                    "default": "http://localhost:1112",
+                    "default": "http://localhost:1515",
                 },
                 {
                     "key": "allowed_origins",

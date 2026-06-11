@@ -255,7 +255,7 @@ async function continueToSetupWizard() {
     // the preload bridge), so the value survives the cross-origin
     // pivot below.
     if (!settingsStore.agentUrl) {
-      await settingsStore.setAgentUrl('http://localhost:1112');
+      await settingsStore.setAgentUrl('http://localhost:1515');
     }
     // Pivot off ``file://`` onto the wheel-served SPA origin before
     // the user touches any setup form. The auth token created in
@@ -608,7 +608,7 @@ async function loadInstallCatalog() {
   // to ``install_catalog.toml`` without rebuilding the SPA. Failures
   // are silent — the bundled copy is identical for the same release.
   try {
-    const url = settingsStore.agentUrl || 'http://localhost:1112';
+    const url = settingsStore.agentUrl || 'http://localhost:1515';
     const resp = await fetchInstallCatalog(url);
     installCatalog.value = resp.catalog;
     // Re-seed any custom field that the user hasn't touched yet so a

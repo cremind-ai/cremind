@@ -91,6 +91,15 @@ yarn web:dev
 
 Access the app at `http://localhost:1515` (or the port shown in console).
 
+The SPA needs the backend running. The backend now serves one merged app on the single public port (`:1515`), so for dev start it on loopback only — `CREMIND_UI_PORT=0` frees `:1515` for Vite — and point the SPA at the backend's internal API with `VITE_AGENT_URL`:
+
+```bash
+# backend (separate terminal): internal API on :1112 only, no public :1515
+CREMIND_UI_PORT=0 uv run cremind serve
+# Vite on :1515, talking to the backend on :1112
+VITE_AGENT_URL=http://localhost:1112 npm run web:dev   # or put it in ui/.env.local
+```
+
 ### Building
 
 #### Build Desktop App
@@ -115,14 +124,14 @@ npm run web:dev
 yarn web:dev
 ```
 
-This starts the Vite dev server at `http://localhost:1515` with proxy support for `/a2a` requests.
+This starts the Vite dev server at `http://localhost:1515`. The SPA talks to the backend at `VITE_AGENT_URL` (default `http://localhost:1515`); for local dev set `VITE_AGENT_URL=http://localhost:1112` and run the backend with `CREMIND_UI_PORT=0` so Vite owns `:1515` (see Web Mode above).
 
 ## Configuration
 
 ### Environment Variables
 
 - `PORT`: Port for web server (default: 1515 for web mode, 0/random for Electron mode)
-- `VITE_AGENT_URL`: Default A2A agent URL, injected at build time as `__AGENT_URL__`. Used when the user has not stored a custom URL in localStorage (`agent_url`). (default: http://localhost:1112)
+- `VITE_AGENT_URL`: Default A2A agent URL, injected at build time as `__AGENT_URL__`. Used when the user has not stored a custom URL in localStorage (`agent_url`). (default: http://localhost:1515)
 
 ### Agent Configuration
 
@@ -135,7 +144,7 @@ In the app settings, you can configure:
 ## Usage
 
 1. Launch the application (desktop or web)
-2. Configure your agent URL in settings (default: `http://localhost:1112`)
+2. Configure your agent URL in settings (default: `http://localhost:1515`)
 3. Connect to the agent to view agent card information
 4. Start chatting with the agent
 5. View real-time thinking process, token usage, and latency metrics
@@ -144,7 +153,7 @@ In the app settings, you can configure:
 ## Development Tips
 
 - The app detects whether it's running in Electron or web mode automatically
-- In web dev mode, `/a2a` requests are proxied to the agent URL
+- In web dev mode the SPA calls the backend **directly** at `VITE_AGENT_URL` (there is no Vite proxy); set `VITE_AGENT_URL=http://localhost:1112` for local dev
 - Chat history is stored in localStorage
 - The SDK client is initialized dynamically based on the runtime mode
 

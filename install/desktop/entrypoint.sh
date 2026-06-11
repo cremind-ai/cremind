@@ -13,9 +13,10 @@
 #   2. Start the X server (TigerVNC display :0) and websockify (noVNC web).
 #   3. Run ``cremind db upgrade`` so a fresh DB gets the schema and an
 #      existing one picks up new migrations on every restart.
-#   4. Start ``cremind serve`` on :1112, inheriting DISPLAY=:0 so the agent
-#      can drive the desktop. The same process opens a second listener
-#      on :1515 for the SPA (CREMIND_UI_DIR points at the stage-1 build).
+#   4. Start ``cremind serve`` (DISPLAY=:0 so the agent can drive the desktop).
+#      One app serves the single public origin on :1515 (SPA + API + A2A +
+#      OAuth) plus an internal loopback API on :1112 (CREMIND_UI_DIR points at
+#      the stage-1 SPA build).
 #   5. ``wait -n`` exits as soon as any background job dies; Docker
 #      then restarts the whole container.
 #
@@ -135,7 +136,7 @@ fi
 # /opt/cremind-ui from the spa-builder stage). Hash routing means
 # StaticFiles' ``html=True`` fallback to index.html covers every
 # client-side route — no rewrite rules needed.
-echo "[entrypoint] starting cremind serve (API :$PORT, SPA :${CREMIND_UI_PORT:-1515})..."
+echo "[entrypoint] starting cremind serve (public :${CREMIND_UI_PORT:-1515}, internal API :$PORT)..."
 # tee to both the container's stdout (so ``docker logs`` surfaces
 # startup crashes — without this, an import error or missing-dep
 # failure would die into /var/log/cremind.log and the container would
@@ -149,8 +150,7 @@ cremind serve --host "$HOST" --port "$PORT" 2>&1 \
 cat <<EOF
 ================================================================
  Cremind-Desktop ready.
-   Backend      : http://<host>:1112  (mapped from this container)
-   Web UI       : http://<host>:1515  (served by cremind serve)
+   Cremind      : http://<host>:1515  (UI + API — single public port)
    noVNC        : http://<host>:6080/vnc.html  (VNC password set)
    Resolution   : $RESOLUTION
 ================================================================

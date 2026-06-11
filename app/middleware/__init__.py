@@ -4,7 +4,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 
 class A2AAuthGuard:
-    """Middleware that requires authentication for A2A protocol endpoints."""
+    """Middleware that requires authentication for the A2A protocol endpoint."""
 
     # The A2A JSON-RPC endpoint
     PROTECTED_PATHS = {"/"}
@@ -15,8 +15,10 @@ class A2AAuthGuard:
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
         if scope["type"] == "http" and scope["path"] in self.PROTECTED_PATHS:
             request = Request(scope)
-            # Skip OPTIONS (CORS preflight)
-            if request.method != "OPTIONS" and not request.user.is_authenticated:
+            # Only the A2A JSON-RPC endpoint (POST /) is protected. The single
+            # public origin also serves the SPA index at GET / (and OPTIONS is a
+            # CORS preflight), so guard POST only and let everything else pass.
+            if request.method == "POST" and not request.user.is_authenticated:
                 response = JSONResponse(
                     {
                         "jsonrpc": "2.0",
