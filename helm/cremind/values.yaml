@@ -58,15 +58,23 @@ cremind:
   # APP_URL — the externally-reachable base URL. The A2A agent card advertises
   # it as the JSON-RPC endpoint the UI connects to, so it MUST match how you
   # open Cremind in the browser. Leave blank to auto-derive: the Ingress URL
-  # when ingress.enabled, otherwise http://localhost:8080 (the documented
-  # `port-forward svc/cremind 8080:80`). Override if you port-forward to a
+  # when ingress.enabled, otherwise http://localhost:1515 (the documented
+  # `port-forward svc/cremind 1515:80`). Override if you port-forward to a
   # different local port or front it with another URL.
   appUrl: ""
+  # Atlassian 3LO callback URL (jira/confluence skills). Atlassian allows only ONE
+  # registered callback per app (exact match), so unlike Google this is a single
+  # FIXED URL — register it once in the Atlassian developer console and set this to
+  # match. Leave blank to use the image default
+  # (http://localhost:1515/api/oauth/atlassian/callback), which suits the documented
+  # `port-forward svc/cremind 1515:80`. Set to https://<host>/api/oauth/atlassian/callback
+  # when fronting Cremind with an Ingress domain. Where the browser can't reach it,
+  # linking falls back to the `complete-link` paste.
+  atlassianRedirectUri: ""        # -> CREMIND_ATLASSIAN_REDIRECT_URI (blank = image default)
   # The desktop entrypoint requires these or it exits 1. The image already
   # defaults them, but we set them explicitly so they're configurable.
   resolution: "1280x720"         # -> RESOLUTION (must match WIDTHxHEIGHT)
   vncPassword: "changeme"        # -> VNC_PASSWORD
-  oauthCallbackPort: 1516        # -> CREMIND_OAUTH_CALLBACK_PORT
   # Auto-wire the PostgreSQL password into the pod (as CREMIND_POSTGRES_PASSWORD,
   # via secretKeyRef) so the Setup Wizard needs no manual credential entry —
   # like Docker mode. When postgresql.enabled (bundled), this defaults to the
@@ -133,11 +141,13 @@ extraVolumeMounts: []
 
 ## @section Reverse proxy (single entry point)
 # An in-pod nginx sidecar presents ONE port for the whole workflow so users
-# never port-forward more than one port. It routes (same origin):
-#   /api, /health  -> the backend API on 1112 (REST + SSE + WebSocket)
-#   /vnc/          -> noVNC (websockify on :80) — the agent's desktop, always on
-#   everything else-> the SPA / Setup Wizard on 1515
-# Containers in a pod share localhost, so the proxy reaches 127.0.0.1:{1112,1515,80}.
+# never port-forward more than one port. The cremind app is now a single
+# same-origin app (SPA + API + A2A + OAuth) on 1515, so the proxy only routes:
+#   /vnc/, /websockify -> noVNC (websockify on :80) — the agent's desktop
+#   everything else     -> the cremind app on 1515 (SPA + /api + /health +
+#                          /.well-known + A2A POST / — incl. SSE + WebSocket)
+# Containers in a pod share localhost, so the proxy reaches 127.0.0.1:{1515,80}.
+# The internal API bind (1112) is loopback-only and is not proxied.
 proxy:
   enabled: true
   image:

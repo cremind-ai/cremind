@@ -177,7 +177,7 @@ function reconcileInstallStateWithDisk(): void {
     // and we lost track of it. Adopt the default local agent URL — the
     // user can correct it later via settings if they actually pointed
     // cremind at a remote host.
-    updateConfig({ agentUrl: 'http://localhost:1112', deploymentType: 'local' })
+    updateConfig({ agentUrl: 'http://localhost:1515', deploymentType: 'local' })
   }
 }
 
@@ -369,11 +369,10 @@ function venvPythonPath(): string {
 }
 
 function backendHealthUrl(): string {
-  // The install script writes ``.env`` with HOST/PORT, but
-  // ``http://127.0.0.1:1112`` is the documented default and matches
-  // the agent URL we persist in runtimeConfig. We don't parse .env
+  // The merged app serves /health on the single public origin (default 1515),
+  // which is reachable on the same machine as the backend. We don't parse .env
   // here — keep this simple.
-  return 'http://127.0.0.1:1112/health'
+  return 'http://127.0.0.1:1515/health'
 }
 
 function isBackendHealthy(): Promise<boolean> {
@@ -396,23 +395,12 @@ async function waitForBackendHealthy(timeoutMs = 30000): Promise<boolean> {
   return false
 }
 
-// Origin of the backend's bundled SPA. The backend runs TWO listeners
-// (see ``app/server.py:_build_ui_server``):
-//
-//   http://<host>:1112    A2A protocol + REST API + /health + /version
-//   http://<host>:1515    StaticFiles(app/static/ui/, html=True)
-//
-// The SPA only lives on the second one. Test20's pivot logic
-// accidentally pointed at ``backendHealthUrl().replace(/\/health$/,'')``
-// — i.e. port 1112 — so reloads landed on the API server's root, which
-// 405s the GET request and never serves a SPA. The renderer kept
-// whatever was already loaded (the asar snapshot) and the wheel's new
-// UI never reached the Electron shell.
-//
-// Mapping the API port to the UI port matches the backend's own default
-// (1112 → 1515). When CREMIND_UI_PORT is overridden on the backend, the
-// Electron shell would need a matching override here; today we just
-// hardcode the default, same as backendHealthUrl().
+// Origin of the backend's bundled SPA. The backend now serves the SPA, API,
+// A2A, and OAuth as ONE same-origin app on the single public port (default
+// 1515 — see ``app/server.py``); the internal API bind (1112) is loopback-only.
+// The Electron shell pivots here once the backend is healthy. When
+// CREMIND_UI_PORT is overridden on the backend, the shell would need a matching
+// override here; today we hardcode the default, same as backendHealthUrl().
 function backendSpaUrl(): string {
   return 'http://127.0.0.1:1515'
 }
@@ -1097,23 +1085,23 @@ async function runInstaller(
         //   - custom: the public URL the user gave (or localhost if blank)
         let resolvedAgentUrl: string
         if (payload.deployment === 'local') {
-          resolvedAgentUrl = 'http://localhost:1112'
+          resolvedAgentUrl = 'http://localhost:1515'
         } else if (payload.deployment === 'custom') {
           const pub = payload.customFields?.public_url ?? ''
           // Drop the path component, keep the scheme+host+port. Falls back
-          // to localhost:1112 when the operator left public_url empty.
+          // to localhost:1515 when the operator left public_url empty.
           if (pub) {
             try {
               const u = new URL(pub)
               resolvedAgentUrl = `${u.protocol}//${u.host}`
             } catch {
-              resolvedAgentUrl = 'http://localhost:1112'
+              resolvedAgentUrl = 'http://localhost:1515'
             }
           } else {
-            resolvedAgentUrl = 'http://localhost:1112'
+            resolvedAgentUrl = 'http://localhost:1515'
           }
         } else {
-          resolvedAgentUrl = `http://${payload.appHost!}:1112`
+          resolvedAgentUrl = `http://${payload.appHost!}:1515`
         }
         updateConfig({
           agentUrl: resolvedAgentUrl,

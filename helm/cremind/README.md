@@ -57,9 +57,9 @@ the image tag, so you never set it by hand (override only via
 Reach it with a single port-forward (or an Ingress hostname):
 
 ```bash
-kubectl -n cremind port-forward svc/cremind 8080:80
-# UI / wizard:   http://localhost:8080/#/setup
-# agent desktop: http://localhost:8080/vnc/vnc.html
+kubectl -n cremind port-forward svc/cremind 1515:80
+# UI / wizard:   http://localhost:1515/#/setup
+# agent desktop: http://localhost:1515/vnc/vnc.html
 ```
 
 Follow the `NOTES` printed after install: open `/#/setup` and click through. With
@@ -131,7 +131,7 @@ embeddings.
 | _(release channel)_ | auto from `image.tag` | Not a knob. `test` when the effective tag is an RC (`…rcN.devM`, i.e. the `--devel` chart), else `production`; the in-app **Updates** page reports this. Force it via `cremind.extraEnv` (`CREMIND_UPGRADE_CHANNEL`). |
 | `cremind.installMode` | `kubernetes` | Drives external-only service modes. |
 | `cremind.setupWizardEnv` | `kubernetes` | Pre-fills the wizard. |
-| `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http://localhost:8080`. |
+| `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http://localhost:1515`. |
 | `persistence.system.*` | `5Gi`, RWO | `bootstrap.toml`, tokens, profiles. |
 | `persistence.venv.*` | `8Gi`, RWO | Wizard-installed Python deps (LLM SDKs, embeddings). |
 | `persistence.work.*` | `10Gi`, RWO | Agent working dir (files it creates); `mountPath` must match the wizard's User Working Directory. |

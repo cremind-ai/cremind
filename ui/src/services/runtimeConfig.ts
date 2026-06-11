@@ -10,18 +10,12 @@
  * 2. ``import.meta.env.VITE_AGENT_URL`` — build-time default for the
  *    standalone web build and the Vite dev server, where there's no
  *    Electron bridge.
- * 3. Port-swap heuristic for the raw Docker bundle: when the SPA is served
- *    on port 1515 by the cremind container, the backend is at the same
- *    host on port 1112. This makes the bundle work both when the user
- *    accesses it locally and when they open it on a remote server, with
- *    no per-deploy build flag.
- * 4. Same-origin fallback: when the page is served from any other origin —
- *    e.g. behind the Kubernetes single-port reverse proxy or an Ingress,
- *    where a path-router sends ``/api`` and ``/health`` to the backend and
- *    everything else to the SPA — the backend shares the page's origin.
- *    Returning ``window.location.origin`` lets one URL serve the whole
- *    workflow with no port juggling.
- * 5. Empty string — only when there is no window at all (SSR/tests); the
+ * 3. Same-origin: the cremind app is a single same-origin app — the SPA, API,
+ *    A2A, and OAuth are all served from the page's own origin (the one public
+ *    port, 1515, in native/Docker; the single-port proxy / Ingress origin in
+ *    Kubernetes). Returning ``window.location.origin`` lets one URL serve the
+ *    whole workflow with no port juggling.
+ * 4. Empty string — only when there is no window at all (SSR/tests); the
  *    UI treats this as "not configured" and routes to the setup wizard.
  *
  * Writes go through ``setAgentUrl`` so the persisted config stays in sync
@@ -30,9 +24,6 @@
  * that mode.
  */
 
-const SPA_PORT = '1515'
-const API_PORT = '1112'
-
 export function getAgentUrl(): string {
   const fromBridge = window.cremind?.config?.agentUrl
   if (fromBridge) return fromBridge
@@ -40,16 +31,10 @@ export function getAgentUrl(): string {
   const fromEnv = import.meta.env.VITE_AGENT_URL as string | undefined
   if (fromEnv) return fromEnv
 
-  if (typeof window !== 'undefined' && window.location?.hostname) {
-    // Raw Docker bundle: SPA on <host>:1515, API on <host>:1112. Swap the
-    // port to derive the API URL.
-    if (window.location.port === SPA_PORT) {
-      const protocol = window.location.protocol || 'http:'
-      return `${protocol}//${window.location.hostname}:${API_PORT}`
-    }
-    // Any other origin (Kubernetes single-port proxy / Ingress, or a custom
-    // reverse proxy): the backend is same-origin. A path-router forwards
-    // /api and /health to the backend; everything else is the SPA.
+  // Single same-origin app: the SPA, API, A2A, and OAuth are all served from
+  // the page's own origin (the one public port in native/Docker; the proxy /
+  // Ingress origin in Kubernetes). No port juggling.
+  if (typeof window !== 'undefined' && window.location?.origin) {
     return window.location.origin
   }
 

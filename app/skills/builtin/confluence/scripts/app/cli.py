@@ -68,10 +68,21 @@ def cmd_link(_args) -> Any:
         connect_url=config.CREMIND_CONNECT_URL,
         client_id=client_id,
         scopes=scopes,
-        port=config.OAUTH_CALLBACK_PORT,
+        redirect_uri=config.OAUTH_REDIRECT_URI,
         site_url_hint=config.CONFLUENCE_SITE_URL,
     )
     return {"linked": True, "email": data["email"], "site_url": data.get("site_url"), "account_key": data["account_key"]}
+
+
+def cmd_complete_link(args) -> Any:
+    """Finish a link started in another (still-running) `link` by handing it the
+    redirect URL the browser was sent to. For remote/Kubernetes deployments where
+    the registered loopback callback can't reach the backend; run `status` after."""
+    auth.submit_callback(args.response)
+    return {
+        "submitted": True,
+        "note": "Linking will complete in the running 'link' command; run 'status' to confirm.",
+    }
 
 
 def cmd_status(_args) -> Any:
@@ -142,6 +153,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("link", help="link an Atlassian account (backend-mediated 3LO)").set_defaults(func=cmd_link, _kind="")
+    sp = sub.add_parser(
+        "complete-link",
+        help="finish linking by pasting the URL Atlassian redirected you to (remote/Kubernetes)",
+    )
+    sp.add_argument("--response", required=True, help="the full redirect URL (or its code=...&state=... query)")
+    sp.set_defaults(func=cmd_complete_link, _kind="")
     sub.add_parser("status", help="show link status").set_defaults(func=cmd_status, _kind="")
 
     sp = sub.add_parser("spaces", help="list spaces")

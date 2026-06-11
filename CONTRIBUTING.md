@@ -15,7 +15,7 @@ see [RELEASING.md](RELEASING.md).
 | `ui/` | Vue 3 + Vite + Electron source. |
 | `ui/src/` | Vue components, stores, services. |
 | `ui/electron/` | Electron main process + preload. |
-| `scripts/build_ui.sh` | Builds the SPA into `app/static/ui/` so the wheel ships with it. |
+| `scripts/build_ui.sh` (Windows: `scripts/build_ui.ps1`) | Builds the SPA into `app/static/ui/` so the wheel ships with it. |
 | `scripts/sync_ui_version.py` | Mirrors `app/__version__.py` → `ui/package.json` (also runs as the `prebuild`/`preweb:build` npm hook). |
 | `.github/workflows/` | `pr.yml`, `release.yml`, `release-test.yml`. |
 | `pyproject.toml` | Python deps + hatch config. |
@@ -47,52 +47,48 @@ hot-reloads its own half.
 
 ### Prereq: free port `:1515` for Vite
 
-`uv run cremind serve` opens a second listener on `:1515` to serve the
-bundled SPA at `app/static/ui/` — but **only if that directory contains
-an `index.html`** (see [app/server.py](app/server.py)'s `_build_ui_server`).
-In a fresh checkout it's empty and the listener stays silent. If you've
-ever run `bash scripts/build_ui.sh` (e.g. for a release smoke test), it
-isn't — and the backend will fight Vite for the port, leaving you
-looking at a stale build with no HMR.
-
-Pick **one** before starting Terminal A:
+`uv run cremind serve` now serves one merged app on the single public port
+(`CREMIND_UI_PORT`, default `:1515`) — the SPA, API, A2A, and OAuth together —
+plus an internal loopback API on `:1112`. So it binds `:1515` regardless of
+whether `app/static/ui/` is built, and would fight Vite for the port. Free it
+by running the backend on loopback only:
 
 ```powershell
-# Option A (simplest): wipe the build artifact. It's gitignored; rebuild
-# anytime with bash scripts/build_ui.sh.
-Remove-Item -Recurse -Force app\static\ui
-
-# Option B: keep the build, but disable the SPA listener for this session.
+# Bind only the internal API (loopback :1112); open no public :1515 bind.
 $env:CREMIND_UI_PORT = "0"
-
-# Option C: keep the build, point the listener at a nonexistent path.
-$env:CREMIND_UI_DIR = "C:\nonexistent"
 ```
 
-If you skip this step you'll see `SPA listener: http://127.0.0.1:1515
-(serving …\app\static\ui)` in Terminal A's log — that's the warning sign.
-Apply one of the options above, then restart Terminal A.
+If you skip this you'll see the backend bind `:1515` in Terminal A's log —
+that's the warning sign. Set `CREMIND_UI_PORT=0` and restart Terminal A.
 
 ### Terminal A — backend
 
 ```powershell
+$env:CREMIND_UI_PORT = "0"               # bind the internal API on :1112 only; free :1515 for Vite
+$env:APP_URL = "http://localhost:1112"   # agent card + OAuth redirects target the backend, not Vite
 uv run cremind serve
 ```
 
-The API listens on `:1112`. With the prereq applied, Terminal A logs
-`SPA not present at …\app\static\ui; UI listener disabled` and leaves
-`:1515` for Vite.
+With `CREMIND_UI_PORT=0` Terminal A logs `serving loopback-only on
+http://127.0.0.1:1112` — the backend binds only the internal API and
+leaves `:1515` for Vite. **`APP_URL=http://localhost:1112` is required to
+test account-linking (Gmail/Atlassian) in dev**: the OAuth redirect derives
+from `APP_URL`, so the production default (`:1515`) would send the consent
+redirect to Vite's SPA ("Select a profile…") instead of the backend's
+`/api/oauth/.../callback`. Pointing it at `:1112` lets linking complete.
 
 ### Terminal B — Vite dev server
 
 ```powershell
 cd ui
+$env:VITE_AGENT_URL = "http://localhost:1112"   # point the SPA at the backend's internal API
 npm run web:dev
 ```
 
-Open <http://localhost:1515>. `ui/src/services/runtimeConfig.ts`'s
-port-swap heuristic detects the `:1515` host and auto-resolves the
-backend at `:1112` — you don't need to set `VITE_AGENT_URL`.
+Open <http://localhost:1515> (Vite). Set `VITE_AGENT_URL=http://localhost:1112`
+so the dev SPA reaches the backend's internal API — the merged app is
+same-origin in production, so without this override `runtimeConfig.ts`
+resolves the API at Vite's own `:1515`, which doesn't serve it.
 
 To confirm you're hitting Vite (not a stale backend bundle), open
 browser DevTools → Sources. You should see `/@vite/client` —
@@ -125,9 +121,9 @@ uvicorn's in-process reload (~2 s for a cold restart) but it always works.
 
 | You want… | Run |
 |---|---|
-| Backend only, no UI | `uv run cremind serve`. UI listener on `:1515` is silent. |
+| Backend only (API on loopback) | `$env:CREMIND_UI_PORT=0; uv run cremind serve` — binds `:1112` only, no public `:1515`. |
 | UI pointed at a remote backend | `cd ui ; npm run web:dev`. Configure the agent URL via the setup wizard, or `$env:VITE_AGENT_URL = "https://..."` before `npm run web:dev`. |
-| Single-port end-to-end smoke (no HMR) | `bash scripts/build_ui.sh ; uv run cremind serve`. The SPA gets bundled into `app/static/ui/`, served on `:1515` by the backend. Use for pre-release verification, not active dev. |
+| Single-port end-to-end smoke (no HMR) | `bash scripts/build_ui.sh ; uv run cremind serve` (Windows: `.\scripts\build_ui.ps1 ; uv run cremind serve`). The SPA gets bundled into `app/static/ui/`, served on `:1515` by the backend. Use for pre-release verification, not active dev. |
 | Electron desktop dev | `cd ui ; npm run dev`. Wraps the SPA in an Electron window. Talks to the backend URL from `~/.cremind-ui/cremind-config.json`. |
 
 ## Installing your checkout via the installer scripts
@@ -167,8 +163,8 @@ fails when the committed includes diverge from the master.
 Caveats:
 
 - The wizard at `http://localhost:1515` needs `app/static/ui/`
-  populated. Run `bash scripts/build_ui.sh` once before `--channel dev`
-  so the SPA listener comes up.
+  populated. Run `bash scripts/build_ui.sh` (Windows: `.\scripts\build_ui.ps1`)
+  once before `--channel dev` so the backend serves the SPA.
 - `--channel dev` requires running the script *from* a checkout —
   piping it via `curl | bash` (no file on disk) is rejected.
 - `--channel dev --mode docker` works: the installer emits a
@@ -190,9 +186,10 @@ Caveats:
   setup wizard until the agent URL is configured. After that it sticks.
 - **Backend not picking up code changes**: kill + restart Terminal A.
   Don't restart Vite — it's stateful for HMR.
-- **The port-swap heuristic only kicks in when the SPA is served at
-  `:1515`**. Running Vite on a different port (e.g. via `$env:PORT`)
-  skips it; you need `VITE_AGENT_URL`.
+- **The dev SPA needs `VITE_AGENT_URL`**. The old `:1515`→`:1112`
+  port-swap was removed (the SPA is same-origin in production), so in
+  dev point it at the backend with `VITE_AGENT_URL=http://localhost:1112`
+  (or `ui/.env.local`).
 - **`ui/node_modules` is large** — ~600 MB. Stay patient on first
   install.
 - **Don't edit `ui/package.json`'s `version` field** — it's regenerated

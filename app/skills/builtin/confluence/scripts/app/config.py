@@ -21,10 +21,11 @@ ATLASSIAN_CLIENT_ID = os.environ.get("ATLASSIAN_CLIENT_ID", "").strip()
 # when the account can access more than one. Defaults to the first accessible site.
 CONFLUENCE_SITE_URL = os.environ.get("CONFLUENCE_SITE_URL", "").strip()
 
-# Loopback OAuth callback (the persistent backend listener under `cremind serve`).
-# Atlassian requires a FIXED, pre-registered callback URL, so the port must be set
-# and must equal http://127.0.0.1:<port>/ registered in the Atlassian console.
-OAUTH_CALLBACK_PORT = int(os.environ.get("CREMIND_OAUTH_CALLBACK_PORT", "0"))
+# Browser-facing OAuth redirect, injected by ``cremind serve`` (system_vars) as
+# <APP_URL>/api/oauth/atlassian/callback. Atlassian 3LO requires a FIXED,
+# pre-registered callback URL, so this MUST be registered (exact match) in the
+# Atlassian developer console. Unset → use the manual ``complete-link`` paste.
+OAUTH_REDIRECT_URI = os.environ.get("CREMIND_ATLASSIAN_REDIRECT_URI", "").strip() or None
 
 
 def setup_logging(level: str | int = "INFO") -> logging.Logger:

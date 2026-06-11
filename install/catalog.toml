@@ -71,8 +71,8 @@ default    = "0.0.0.0"
 [[deployments.custom.advanced_fields]]
 key        = "public_url"                 # → APP_URL
 prompt     = "What URL will you use to open Cremind in a browser?"
-hint       = "This is the address users type into their browser. Inside a container it's usually http://localhost:1112. On a server it might be http://my-box.lan:1112 or https://cremind.example.com."
-default    = "http://localhost:1112"
+hint       = "This is the address users type into their browser. Inside a container it's usually http://localhost:1515. On a server it might be http://my-box.lan:1515 or https://cremind.example.com."
+default    = "http://localhost:1515"
 
 [[deployments.custom.advanced_fields]]
 key        = "allowed_origins"            # → CORS_ALLOWED_ORIGINS

@@ -787,7 +787,7 @@ if ($Deployment -eq 'container') {
     Write-Warn2 "-Deployment container is deprecated; using -Deployment custom with container defaults."
     $Deployment = 'custom'
     if (-not $ListenHost)   { $ListenHost   = '0.0.0.0' }
-    if (-not $PublicUrl)    { $PublicUrl    = 'http://localhost:1112' }
+    if (-not $PublicUrl)    { $PublicUrl    = 'http://localhost:1515' }
     if (-not $WizardPreset) { $WizardPreset = 'local' }
 }
 
@@ -1298,12 +1298,12 @@ if ($Mode -eq 'docker') {
 
     switch ($Deployment) {
         'local' {
-            $DockerAppUrl    = 'http://localhost:1112'
+            $DockerAppUrl    = 'http://localhost:1515'
             $DockerCors      = 'http://localhost:1515,http://127.0.0.1:1515'
             $DockerWizardEnv = 'local'
         }
         'server' {
-            $DockerAppUrl    = "http://${AppHost}:1112"
+            $DockerAppUrl    = "http://${AppHost}:1515"
             $DockerCors      = "http://${AppHost}:1515,http://localhost:1515"
             $DockerWizardEnv = 'server'
         }
@@ -1457,14 +1457,15 @@ not a missing image. Things that help:
     if ($Deployment -eq 'local') {
         $HealthHost = 'localhost'
     } elseif ($Deployment -eq 'custom') {
-        # http://foo.bar:1112 → foo.bar
+        # http://foo.bar:1515 → foo.bar
         $HealthHost = $CustomValues['public_url']
         if ($HealthHost -match '^https?://([^:/]+)') { $HealthHost = $Matches[1] }
         if (-not $HealthHost) { $HealthHost = 'localhost' }
     } else {
         $HealthHost = $AppHost
     }
-    $HealthUrl = "http://${HealthHost}:1112/health"
+    # Docker publishes only the single public port (1515); probe it on the host.
+    $HealthUrl = "http://${HealthHost}:1515/health"
     Write-Info "Waiting for backend at $HealthUrl ..."
     for ($i = 0; $i -lt 60; $i++) {
         try {
@@ -1494,7 +1495,7 @@ Open this URL in your browser to continue setup:
 
     $WizardUrl
 
-  Backend     : http://${HealthHost}:1112
+  Cremind     : http://${HealthHost}:1515
   Desktop     : $NoVncUrl
   VNC password (saved to $EnvDocker):
     $StoredVnc
@@ -2120,7 +2121,7 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
 
 # 'custom' installs honour the public URL the user provided; 'server'
 # uses the host from -AppHost; 'local' is loopback. Custom URLs may
-# include a path/scheme; we swap the port to 1515 (the wizard SPA port)
+# include a path/scheme; we normalise to the single public port (1515)
 # while preserving the hostname.
 if ($Deployment -eq 'server') {
     $WizardUrl = "http://${AppHost}:1515/#/setup"
@@ -2146,7 +2147,7 @@ Open this URL in your browser to continue setup:
 
     $WizardUrl
 
-  Backend:    http://${ServerHost}:${ServerPort}
+  Cremind:    $($WizardUrl -replace '/#/setup$', '')
   Stop:       Stop-Process -Id (Get-Content $PidFile)
   Re-open:    cremind serve   (or: & "$VenvCremind" serve)
 

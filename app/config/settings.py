@@ -285,25 +285,34 @@ class BaseConfig:
 
     # ── Server-level (from .env only) ──
     HOST = os.environ.get("HOST", "0.0.0.0")
+    # Internal API bind port (loopback). The public single origin is PORT 1515
+    # (CREMIND_UI_PORT); 1112 is bound on 127.0.0.1 only and is never published.
     PORT = int(os.environ.get("PORT", 1112))
-    APP_URL = os.environ.get("APP_URL", f"http://{HOST}:{PORT}")
+    # Public single-origin base URL (port 1515): the A2A agent card advertises it
+    # and the Google OAuth redirect derives from it. Deliberately decoupled from
+    # the internal HOST:PORT (1112) bind. Set explicitly (env / installer / chart)
+    # for server/Ingress deployments; the default suits local + the K8s
+    # ``kubectl port-forward svc/cremind 1515:80``.
+    APP_URL = os.environ.get("APP_URL", "http://localhost:1515")
     ENV = os.environ.get("ENV", "production")
     DEBUG = _bool(os.environ.get("DEBUG", "false"))
     LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
     DISABLE_LOG = _bool(os.environ.get("DISABLE_LOG", "false"))
     CORS_ALLOWED_ORIGINS = _csv_list(os.environ.get("CORS_ALLOWED_ORIGINS", "")) or ["*"]
 
-    # ── OAuth loopback callback (built-in Google skills) ──
-    # ``cremind serve`` runs ONE persistent loopback callback listener (see
-    # app/api/oauth_loopback.py) so the gmail/gcalendar ``link`` flow doesn't
-    # depend on a per-link ephemeral server inside a short-lived skill
-    # subprocess. The Google "Desktop" client only allows loopback redirects,
-    # so this is bound to a fixed port at the root path
-    # (http://127.0.0.1:<port>/). In Docker the listener binds 0.0.0.0 and the
-    # port is published so the host browser's redirect can reach it; on bare
-    # metal it binds 127.0.0.1.
-    CREMIND_OAUTH_CALLBACK_PORT = int(os.environ.get("CREMIND_OAUTH_CALLBACK_PORT", 1516))
-    CREMIND_OAUTH_BIND_ADDR = os.environ.get("CREMIND_OAUTH_BIND_ADDR", "").strip() or "127.0.0.1"
+    # ── Atlassian 3LO callback (built-in jira/confluence skills) ──
+    # Atlassian is a confidential Web client whose callback URL is registered in
+    # the developer console with EXACT match and only ONE URL per app. Unlike the
+    # Google Desktop client (loopback, any port — derived per-deployment from
+    # APP_URL), this is a SINGLE FIXED URL shared by every deployment: register it
+    # once and set this to match. The default suits local + the documented
+    # Kubernetes ``kubectl port-forward svc/cremind 1515:80``. Where the browser
+    # can't reach it (Ingress, or a non-default port), linking falls back to the
+    # manual ``complete-link`` paste — the exchange still uses THIS value, so it
+    # always matches the registration regardless of how the user reached Cremind.
+    CREMIND_ATLASSIAN_REDIRECT_URI = os.environ.get(
+        "CREMIND_ATLASSIAN_REDIRECT_URI", "http://localhost:1515/api/oauth/atlassian/callback"
+    ).strip()
 
     # ── Application-level (TOML defaults, overridable via SQLite) ──
     SERVICE_NAME = _dynaconf_get("general.service_name", "cremind-agent")

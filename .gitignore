@@ -58,6 +58,9 @@ cli/cremind.exe
 # regenerated on every release so we don't track them in git.
 app/static/ui/*
 !app/static/ui/.gitkeep
+# Electron-renderer build artifact (staged by scripts/build_ui.{sh,ps1});
+# regenerated on every release, same as app/static/ui/.
+app/static/ui-electron/
 
 # UI source build outputs (ui/.gitignore also covers these, but root-level
 # entries help tools that don't traverse nested gitignores).

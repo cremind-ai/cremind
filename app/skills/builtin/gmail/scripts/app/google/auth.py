@@ -13,12 +13,12 @@ from __future__ import annotations
 import base64
 import json
 import os
-import socket
+import re
 import threading
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 from .account_key import account_key_for
 
@@ -29,6 +29,11 @@ os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 GOOGLE_AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
+
+# The OAuth ``state`` is a URL-safe token minted by oauthlib. It becomes an inbox
+# filename, so accept only this charset/length — the guard against path traversal
+# via a crafted ``state`` in a pasted callback URL. Mirrors oauth_callback._STATE_RE.
+_STATE_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
 
 class AuthError(RuntimeError):
@@ -110,23 +115,7 @@ def _oauth_inbox_dir() -> Path | None:
     return Path(system_dir) / "oauth_inbox"
 
 
-def _backend_listener_available(port: int) -> bool:
-    """True if the backend's persistent OAuth loopback listener is reachable.
-
-    Requires the Cremind System Directory (so the skill can read the inbox the
-    backend writes to) and a live TCP listener on the loopback port. When false,
-    ``link`` falls back to an in-subprocess ephemeral loopback server.
-    """
-    if _oauth_inbox_dir() is None:
-        return False
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=1.0):
-            return True
-    except OSError:
-        return False
-
-
-def _await_oauth_callback(state: str, *, timeout: float = 300.0) -> str:
+def _await_oauth_callback(state: str, *, timeout: float = 600.0) -> str:
     """Block until the backend drops the authorization response for ``state``.
 
     Returns the raw redirect query (``code=...&state=...&scope=...``). Raises
@@ -134,7 +123,7 @@ def _await_oauth_callback(state: str, *, timeout: float = 300.0) -> str:
     the main thread, so SIGINT interrupts it promptly (no thread wrapper needed).
     """
     inbox = _oauth_inbox_dir()
-    if inbox is None:  # pragma: no cover - guarded by _backend_listener_available
+    if inbox is None:  # pragma: no cover - guarded by link()
         raise AuthError("CREMIND_SYSTEM_DIR is not set; cannot receive the OAuth callback.")
     path = inbox / f"{state}.txt"
     deadline = time.monotonic() + timeout
@@ -160,24 +149,74 @@ def _await_oauth_callback(state: str, *, timeout: float = 300.0) -> str:
     )
 
 
-def _link_via_backend_callback(flow, port: int) -> Any:
-    """Authorize via ``cremind serve``'s persistent loopback callback listener.
+def _link_via_backend_route(flow, redirect_uri: str) -> Any:
+    """Authorize via the backend's OAuth callback route.
 
-    The skill builds the consent URL (PKCE is handled by ``flow``), prints it
-    for the agent/CLI to surface, then waits for the backend to capture the
-    redirect and performs the token exchange locally. Using 127.0.0.1 (rather
-    than ``localhost``) keeps the redirect a valid Desktop-client loopback while
-    avoiding the Windows ``localhost`` -> ``::1`` mismatch that can refuse an
-    IPv4-only listener.
+    ``cremind serve`` hosts ``GET /api/oauth/google/callback`` and injects the
+    browser-facing redirect (``<APP_URL>/api/oauth/google/callback``) as
+    ``CREMIND_OAUTH_REDIRECT_URI``. The skill advertises it, waits for the backend
+    to capture the consent redirect into ``oauth_inbox/<state>.txt``, then performs
+    the PKCE token exchange locally. The redirect must be a loopback origin —
+    Google Desktop clients reject real hostnames (the chart leaves it unset for
+    non-loopback ``APP_URL`` so we never get here in that case).
     """
-    flow.redirect_uri = f"http://127.0.0.1:{port}/"
+    flow.redirect_uri = redirect_uri
     auth_url, state = flow.authorization_url(access_type="offline", prompt="consent")
     print(f"Please visit this URL to authorize this application: {auth_url}", flush=True)
     query = _await_oauth_callback(state)
-    # oauthlib insists OAuth 2.0 happens over https, so present the response as such.
-    authorization_response = f"https://127.0.0.1:{port}/?{query}"
-    flow.fetch_token(authorization_response=authorization_response)
+    # oauthlib insists OAuth 2.0 happens over https, so present the response as
+    # such. The path is irrelevant to code extraction — only the query matters.
+    https_base = re.sub(r"^http://", "https://", flow.redirect_uri)
+    sep = "&" if "?" in https_base else "?"
+    flow.fetch_token(authorization_response=f"{https_base}{sep}{query}")
     return flow.credentials
+
+
+def submit_callback(response: str) -> dict[str, Any]:
+    """Hand a manually-captured OAuth redirect back to the waiting ``link``.
+
+    On remote/headless deployments (Ingress, SSH, or any topology where the
+    consent redirect to the loopback/proxy URL fails to reach the backend) the
+    browser still lands on a URL whose query carries a valid ``code`` + ``state``.
+    The user copies that URL; this writes its query into the same per-state inbox
+    file the backend callback route would have written
+    (``<CREMIND_SYSTEM_DIR>/oauth_inbox/<state>.txt``), so the still-running
+    ``link`` picks it up and performs the local PKCE exchange. The auth ``code``
+    is useless without the ``code_verifier`` that ``link`` holds, so tokens never
+    leave the machine.
+
+    ``response`` may be a full redirect URL or a bare ``code=...&state=...`` query
+    string. Raises ``AuthError`` on a missing/invalid state, a consent error, or
+    when the inbox is unavailable.
+    """
+    raw = (response or "").strip()
+    if not raw:
+        raise AuthError("Empty OAuth response; paste the full URL Google redirected you to.")
+    # Accept either a full URL (extract its query) or a bare query string.
+    query = urlparse(raw).query
+    if not query:
+        query = raw[1:] if raw.startswith("?") else raw
+    params = parse_qs(query)
+    if "error" in params:
+        raise AuthError("Google consent was denied or returned an error.")
+    state = (params.get("state") or [""])[0]
+    if not _STATE_RE.match(state):
+        raise AuthError(
+            "Could not find a valid 'state' in the pasted response. Paste the "
+            "entire URL from your browser's address bar (it contains "
+            "state=... and code=...)."
+        )
+    if "code" not in params:
+        raise AuthError("The pasted response has no 'code'; paste the full redirect URL after approving.")
+    inbox = _oauth_inbox_dir()
+    if inbox is None:
+        raise AuthError("CREMIND_SYSTEM_DIR is not set; cannot deliver the OAuth response.")
+    inbox.mkdir(parents=True, exist_ok=True)
+    dst = inbox / f"{state}.txt"
+    tmp = dst.with_name(dst.name + ".tmp")
+    tmp.write_text(query, encoding="utf-8")
+    os.replace(tmp, dst)
+    return {"submitted": True, "state": state}
 
 
 def link(
@@ -187,20 +226,19 @@ def link(
     client_secret: str,
     scopes: list[str],
     open_browser: bool = True,
-    port: int = 0,
-    bind_addr: str | None = None,
+    redirect_uri: str | None = None,
 ) -> dict[str, Any]:
     """Run the loopback PKCE consent flow and persist tokens locally.
 
-    ``port``/``bind_addr`` control the ephemeral callback server. They default
-    to the library's behavior (random port bound to localhost), which works
-    when the consenting browser shares this machine's loopback. In the Docker
-    desktop image the browser runs on the host, so the callback must arrive
-    through a PUBLISHED port: pass a fixed ``port`` and ``bind_addr="0.0.0.0"``
-    so Docker-forwarded traffic reaches the server (a 127.0.0.1 bind would
-    refuse it). ``host`` stays "localhost" so the advertised redirect_uri is
-    ``http://localhost:<port>/`` — what the host browser hits, and a valid
-    loopback redirect for the org's Desktop OAuth client.
+    Under ``cremind serve`` the backend hosts the persistent OAuth callback route
+    and injects ``redirect_uri`` (``CREMIND_OAUTH_REDIRECT_URI`` =
+    ``<APP_URL>/api/oauth/google/callback``). The skill advertises it and waits for
+    the backend to capture the consent redirect, so linking survives the agent
+    turn / subprocess teardown that killed the old per-link server. When
+    ``redirect_uri`` is unset — a standalone CLI run, or a non-loopback ``APP_URL``
+    where a Desktop client can't redirect to the backend — fall back to an
+    ephemeral in-process loopback server (and, for non-loopback deployments, the
+    manual ``complete-link`` paste once the consent URL has been opened).
     """
     from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -216,20 +254,19 @@ def link(
         }
     }
     flow = InstalledAppFlow.from_client_config(client_config, scopes)
-    if port and _backend_listener_available(port):
-        # Preferred path under ``cremind serve``: the backend hosts ONE
-        # persistent loopback callback server (app/api/oauth_loopback.py), so
-        # consent survives the agent turn / subprocess teardown that killed the
-        # old per-link server. The skill still does the PKCE token exchange.
-        creds = _link_via_backend_callback(flow, port)
+    if redirect_uri and _oauth_inbox_dir() is not None:
+        # Preferred path under ``cremind serve``: the backend hosts the OAuth
+        # callback route and we wait for it to drop the per-state inbox file, so
+        # consent survives the agent turn / subprocess teardown. The skill still
+        # does the PKCE token exchange.
+        creds = _link_via_backend_route(flow, redirect_uri)
     else:
-        # Fallback for a standalone CLI run (no backend listening): spin up an
-        # ephemeral loopback server in this process, as before.
+        # Fallback for a standalone CLI run (no backend): spin up an ephemeral
+        # loopback server in this process on a random localhost port.
         creds = _run_local_server_interruptible(
             flow,
             host="localhost",
-            bind_addr=bind_addr,
-            port=port,
+            port=0,
             access_type="offline",
             prompt="consent",
             open_browser=open_browser,

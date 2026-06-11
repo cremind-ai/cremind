@@ -40,8 +40,14 @@ them. Runs via `uv` (PEP 723 inline metadata).
 No per-skill configuration is required by default — the client id and scopes come
 from the Cremind Connect discovery doc. One-time org setup (already done centrally):
 an Atlassian OAuth 2.0 (3LO) app with the Jira scopes, the client secret stored in
-cremind-connect (`ATLASSIAN_CLIENT_SECRET`), and the callback URL registered as
-`http://127.0.0.1:<port>/` matching `CREMIND_OAUTH_CALLBACK_PORT`.
+cremind-connect (`ATLASSIAN_CLIENT_SECRET`), and ONE callback URL registered in the
+Atlassian developer console (3LO apps allow only a single, exact-match callback per
+app). Cremind advertises a single FIXED redirect, `CREMIND_ATLASSIAN_REDIRECT_URI`,
+which defaults to `http://localhost:1515/api/oauth/atlassian/callback` (the documented
+K8s `port-forward svc/cremind 1515:80`). Register that exact URL — or set
+`CREMIND_ATLASSIAN_REDIRECT_URI` (chart: `cremind.atlassianRedirectUri`) to your own
+single URL and register that. Where the browser can't reach it, finish with
+`complete-link` (below).
 
 Override defaults in `scripts/.env` only if needed:
 ```
@@ -135,7 +141,7 @@ received_at: "2026-06-08T10:20:35+00:00"
 
 ## Troubleshooting
 - `Account not linked` → run `uv run scripts/__main__.py link`.
-- Linking error about the backend listener → Atlassian needs the fixed-port loopback; run under `cremind serve` and ensure `CREMIND_OAUTH_CALLBACK_PORT` matches the registered callback URL.
+- Linking error about the backend OAuth callback → run under `cremind serve`; the callback registered in the Atlassian console must exactly equal `CREMIND_ATLASSIAN_REDIRECT_URI` (default `http://localhost:1515/api/oauth/atlassian/callback`). If the consent redirect can't reach the backend (remote/Ingress/another port), finish with `uv run scripts/__main__.py complete-link --response "<the URL the browser landed on>"`.
 - `Atlassian /me returned no email` → the `read:me` scope wasn't granted; re-link.
 - No events arriving → confirm the listener is running, the webhook registered (`uv run scripts/__main__.py watch`), and the relay is reachable (`curl $CREMIND_CONNECT_URL/.well-known/cremind-connect`).
 - Webhook registers but **no events ever arrive** (and `GET /rest/api/3/webhook/failed` is empty) → the OAuth app is **private**, so Atlassian only delivers when the app owner == the registering user. Enable **Distribution → Sharing** (make the app public) in the developer console — no Marketplace approval needed.
