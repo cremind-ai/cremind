@@ -46,6 +46,21 @@ def get_profile_routes(
             logger.error(f"Error listing profiles: {e}")
             return JSONResponse({"error": f"Internal server error: {e}"}, status_code=500)
 
+    async def handle_list_profile_names(request: Request) -> JSONResponse:
+        """Public (no auth): the login screen's profile dropdown.
+
+        Deliberately exposes ONLY the visible profile names — no ids,
+        timestamps, personas, or any other per-profile data. Anything
+        richer must stay on the authenticated ``GET /api/profiles``.
+        """
+        try:
+            profiles = await conversation_storage.list_profiles()
+            visible = [p["name"] for p in profiles if not p["name"].startswith("__")]
+            return JSONResponse({"profiles": visible}, status_code=200)
+        except Exception as e:
+            logger.error(f"Error listing profile names: {e}")
+            return JSONResponse({"error": "Internal server error"}, status_code=500)
+
     async def handle_add_profile(request: Request) -> JSONResponse:
         unauth = _require_auth(request)
         if unauth is not None:
@@ -247,6 +262,8 @@ def get_profile_routes(
     return [
         Route(path="/api/profiles", methods=["GET"], endpoint=handle_list_profiles),
         Route(path="/api/profiles", methods=["POST"], endpoint=handle_add_profile),
+        # Public (pre-auth): names only, for the login screen's dropdown.
+        Route(path="/api/profiles/names", methods=["GET"], endpoint=handle_list_profile_names),
         Route(
             path="/api/profiles/{profile_name}/persona",
             methods=["GET"], endpoint=handle_get_persona,

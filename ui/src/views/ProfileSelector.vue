@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
-import { ElButton, ElInput, ElDivider } from 'element-plus';
+import { ElButton, ElInput, ElSelect, ElOption, ElDivider } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
-import { checkSetupStatus, resetOrphanedSetup } from '../services/configApi';
+import { checkSetupStatus, listPublicProfileNames, resetOrphanedSetup } from '../services/configApi';
 import { fetchMe } from '../services/agentApi';
 
 // During a backend restart (typical immediately post-upgrade) the
@@ -47,7 +47,25 @@ const loginToken = ref('');
 const loginLoading = ref(false);
 const loginError = ref('');
 
+// Names served by the public /api/profiles/names endpoint, feeding the
+// login dropdown. Best-effort: on any failure the dropdown stays empty
+// and `allow-create` lets the user type the name by hand, which is the
+// pre-dropdown behavior.
+const availableProfiles = ref<string[]>([]);
+
+async function loadAvailableProfiles() {
+  try {
+    const { profiles } = await listPublicProfileNames(settingsStore.agentUrl);
+    availableProfiles.value = profiles;
+  } catch {
+    availableProfiles.value = [];
+  }
+}
+
 onMounted(async () => {
+  // Fire-and-forget: don't gate the setup-status flow on this.
+  void loadAvailableProfiles();
+
   const status = await readStableSetupStatus();
 
   if (!status) {
@@ -206,12 +224,22 @@ async function handleLogin() {
       <div class="login-section">
         <div class="login-field">
           <label class="field-label">Profile name</label>
-          <ElInput
+          <ElSelect
             v-model="loginProfileName"
-            placeholder="e.g. admin, lee"
-            size="default"
+            filterable
+            allow-create
+            default-first-option
+            :placeholder="availableProfiles.length > 0 ? 'Select a profile' : 'e.g. admin, lee'"
+            class="profile-select"
             @keyup.enter="handleLogin"
-          />
+          >
+            <ElOption
+              v-for="profile in availableProfiles"
+              :key="profile"
+              :label="profile"
+              :value="profile"
+            />
+          </ElSelect>
         </div>
 
         <div class="login-field">
@@ -344,6 +372,10 @@ async function handleLogin() {
   font-size: 0.8rem;
   font-weight: 500;
   color: var(--text-secondary);
+}
+
+.profile-select {
+  width: 100%;
 }
 
 .token-input :deep(textarea) {
