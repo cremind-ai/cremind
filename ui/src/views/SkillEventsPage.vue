@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
+import { goBackToChat } from '../utils/backToChat';
 import {
   ElButton,
   ElDialog,
@@ -99,7 +100,7 @@ onBeforeUnmount(() => {
 });
 
 function goBack() {
-  router.push(`/${props.profile}`);
+  goBackToChat(router, props.profile);
 }
 
 function openConversation(id: string) {

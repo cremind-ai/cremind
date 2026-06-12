@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onBeforeUnmount, watch } from 'vue';
 import { useRouter } from 'vue-router';
+import { goBackToChat } from '../utils/backToChat';
 import { ElTable, ElTableColumn, ElButton, ElTag, ElAlert, ElMessage, ElMessageBox, ElTooltip } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useProcessManagerStore } from '../stores/processManager';
@@ -52,7 +53,7 @@ const exitedCount = computed(
 );
 
 function goBack() {
-  router.push(`/${props.profile}`);
+  goBackToChat(router, props.profile);
 }
 
 function openTerminal(pid: string) {

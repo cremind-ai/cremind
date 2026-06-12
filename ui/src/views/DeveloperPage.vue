@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onBeforeUpdate, onMounted, ref, watch } from 'vue';
 import type { ComponentPublicInstance } from 'vue';
 import { useRouter } from 'vue-router';
+import { goBackToChat } from '../utils/backToChat';
 import { ElButton, ElCard, ElCheckTag, ElEmpty, ElInput, ElMessage, ElMessageBox, ElSwitch, ElTag } from 'element-plus';
 import { Icon } from '@iconify/vue';
 
@@ -331,7 +332,7 @@ function handleScrollToBottom() {
 }
 
 function goBack() {
-  router.push(`/${props.profile}`);
+  goBackToChat(router, props.profile);
 }
 
 function levelTagType(level: string): 'success' | 'info' | 'warning' | 'danger' | 'primary' {

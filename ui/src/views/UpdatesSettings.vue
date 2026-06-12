@@ -11,6 +11,7 @@
 
 import { computed, onMounted, onBeforeUnmount, ref } from 'vue';
 import { useRouter } from 'vue-router';
+import { goBackToChat } from '../utils/backToChat';
 import {
   ElButton, ElCard, ElDialog, ElEmpty, ElMessageBox, ElSwitch, ElTag, ElRadio, ElRadioGroup,
   ElSelect, ElOption,
@@ -291,7 +292,7 @@ onBeforeUnmount(() => {
 });
 
 function goBack() {
-  router.push(`/${props.profile}`);
+  goBackToChat(router, props.profile);
 }
 </script>
 
