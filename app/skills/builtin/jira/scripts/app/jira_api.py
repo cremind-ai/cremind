@@ -132,9 +132,25 @@ class JiraClient:
             body["nextPageToken"] = next_page_token
         return self._req("POST", "/search/jql", body=body)
 
-    def get_issue(self, key: str, *, fields: list[str] | None = None) -> dict[str, Any]:
-        params = {"fields": ",".join(fields)} if fields else None
-        return self._req("GET", f"/issue/{urllib.parse.quote(key)}", params=params)
+    def get_issue(self, key: str, *, fields: list[str] | None = None, expand: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if fields:
+            params["fields"] = ",".join(fields)
+        if expand:
+            # e.g. expand="changelog" → response carries changelog.histories[], each with
+            # created + items[] (field/fieldId/fromString/toString). The /search/jql search
+            # endpoint can't reliably expand changelog, so per-issue fetch is the only path.
+            params["expand"] = expand
+        return self._req("GET", f"/issue/{urllib.parse.quote(key)}", params=params or None)
+
+    def get_comments(self, key: str, *, order_by: str = "-created", max_results: int = 20, start_at: int = 0) -> dict[str, Any]:
+        """Return the issue's comments: {startAt, maxResults, total, comments: [...]}.
+
+        Comments are NOT part of the changelog, so detecting a new comment needs this
+        separate fetch. Each comment carries id/author/body(ADF)/created/updated.
+        """
+        params = {"orderBy": order_by, "maxResults": max_results, "startAt": start_at}
+        return self._req("GET", f"/issue/{urllib.parse.quote(key)}/comment", params=params)
 
     def create_issue(self, *, project_key: str, summary: str, issue_type: str = "Task", description: str | None = None) -> dict[str, Any]:
         fields: dict[str, Any] = {

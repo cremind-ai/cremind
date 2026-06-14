@@ -6,15 +6,17 @@ id_token, so — unlike the Google relay client — the bootstrap credential is 
 relay-session minted by the backend (from the user's access token via /me). A
 fresh session is fetched on every (re)connect.
 
-The relay replies with a `hello` and thereafter pushes content-free `resync`
-nudges; each nudge triggers a local incremental pull (the relay sends no Jira data).
+The relay replies with a `hello` and thereafter pushes `resync` nudges; each nudge
+triggers a local incremental pull. A nudge may additively carry the triggering Jira
+webhook event type (`event`) and issue `key` for classification — but never issue
+*content* (the relay still sees no Jira data).
 """
 from __future__ import annotations
 
 import json
 import logging
 import threading
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import quote
 
 PING_INTERVAL = 240  # seconds; keep NAT open without spamming
@@ -29,7 +31,7 @@ class RelayClient:
         account_key: str,
         resources: list[str],
         session_provider: Callable[[], str],
-        on_resync: Callable[[str], None],
+        on_resync: Callable[[dict[str, Any]], None],
         logger: Optional[logging.Logger] = None,
     ):
         self.ws_url = ws_url
@@ -63,10 +65,13 @@ class RelayClient:
         if mtype == "hello":
             self.log.info("relay session established")
         elif mtype == "resync":
-            source = msg.get("source", "")
-            self.log.info("resync nudge received (source=%s)", source)
+            # The backend may additively carry the triggering Jira webhook event type
+            # and issue key; absent (older backend) → None, and the listener falls back
+            # to a plain cursor pull.
+            meta = {"source": msg.get("source", ""), "event": msg.get("event"), "key": msg.get("key")}
+            self.log.info("resync nudge received (source=%s event=%s key=%s)", meta["source"], meta["event"], meta["key"])
             try:
-                self.on_resync(source)
+                self.on_resync(meta)
             except Exception:
                 self.log.exception("on_resync handler failed")
         elif mtype == "error":

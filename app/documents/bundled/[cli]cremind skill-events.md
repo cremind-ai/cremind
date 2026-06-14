@@ -375,7 +375,11 @@ common causes: (1) the listener is down (`listener-status`), (2) the
 subscription is bound to a conversation that has been deleted (the
 event is dropped), (3) the `event_type` declared by the skill changed
 and the existing subscription no longer matches — re-create it from
-the UI.
+the UI. (Note: when the **jira** skill split its old `issue_changed`
+event into `issue_created`/`issue_updated`/`issue_transitioned`/
+`issue_commented`, a boot-time migration auto-maps existing
+`issue_changed` subscriptions, so re-subscribing is only needed if a
+row was somehow missed.)
 
 **`--since` returns nothing** — Notifications are not retained
 indefinitely. If `--since` reaches further back than the server's

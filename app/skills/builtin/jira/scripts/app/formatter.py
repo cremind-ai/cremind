@@ -70,7 +70,20 @@ def issue_url(site_url: str, key: str) -> str:
     return f"{site_url.rstrip('/')}/browse/{key}"
 
 
-def format_issue_markdown(issue: dict[str, Any], *, event_type: str = "issue_changed", site_url: str = "") -> str:
+def format_issue_markdown(
+    issue: dict[str, Any],
+    *,
+    event_type: str,
+    site_url: str = "",
+    transition: dict[str, Any] | None = None,
+    comment: dict[str, Any] | None = None,
+) -> str:
+    """Render a changed issue as event markdown.
+
+    ``transition`` (for issue_transitioned) is ``{"from": <name>, "to": <name>}``.
+    ``comment`` (for issue_commented) is ``{"author": <name>, "body": <plain text>}``;
+    when present, the comment becomes the body and the description moves under "## Issue".
+    """
     m = parse_issue(issue)
     lines = [
         "---",
@@ -84,10 +97,39 @@ def format_issue_markdown(issue: dict[str, Any], *, event_type: str = "issue_cha
         f"updated: {_yaml_quote(m['updated'])}",
         f"url: {_yaml_quote(issue_url(site_url, m['key']))}",
         f"event_type: {_yaml_quote(event_type)}",
+    ]
+    if transition:
+        lines.append(f"from_status: {_yaml_quote(transition.get('from', ''))}")
+        lines.append(f"to_status: {_yaml_quote(transition.get('to', ''))}")
+    if comment:
+        lines.append(f"comment_author: {_yaml_quote(comment.get('author', ''))}")
+    lines.append(f"received_at: {_yaml_quote(received_at_iso())}")
+    lines.append("---")
+    lines.append("")
+    if comment:
+        lines.append((comment.get("body") or "").rstrip())
+        if m["description"]:
+            lines.append("")
+            lines.append("## Issue")
+            lines.append("")
+            lines.append(m["description"])
+    else:
+        lines.append(m["description"])
+    lines.append("")
+    return "\n".join(lines)
+
+
+def format_deleted_markdown(key: str, *, site_url: str = "") -> str:
+    """Render an issue_deleted event. The issue is gone, so only key/url are available."""
+    lines = [
+        "---",
+        f"key: {_yaml_quote(key)}",
+        f"url: {_yaml_quote(issue_url(site_url, key))}",
+        "event_type: issue_deleted",
         f"received_at: {_yaml_quote(received_at_iso())}",
         "---",
         "",
-        m["description"],
+        f"Issue {key} was deleted.",
         "",
     ]
     return "\n".join(lines)

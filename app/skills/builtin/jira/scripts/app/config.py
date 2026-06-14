@@ -8,7 +8,14 @@ SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 PROJECT_DIR = SCRIPTS_DIR.parent
 ENV_PATH = SCRIPTS_DIR / ".env"
 EVENTS_DIR = PROJECT_DIR / "events"
-ISSUE_CHANGED_DIR = EVENTS_DIR / "issue_changed"
+
+# Skill events (one markdown drop-zone folder per name). These are the SKILL.md
+# event_type names — distinct from the raw Jira webhook events the listener subscribes to.
+EVENT_NAMES = ["issue_created", "issue_updated", "issue_transitioned", "issue_commented", "issue_deleted"]
+
+
+def event_dir(name: str) -> Path:
+    return EVENTS_DIR / name
 TOKEN_PATH = SCRIPTS_DIR / ".atlassian_token.json"
 STATE_FILE = SCRIPTS_DIR / ".listener_state.json"
 HEARTBEAT_FILE = SCRIPTS_DIR / ".listener_heartbeat"

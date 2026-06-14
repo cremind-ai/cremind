@@ -1,10 +1,10 @@
 ---
 name: jira
-description: Search, view, create, comment on, and transition Jira Cloud issues via OAuth2 (Atlassian 3LO), and receive issue-change events in real time. Authorizes through the Cremind Connect service (no Atlassian app setup on the client); tokens stay on this machine. A persistent listener registers a Jira webhook and (via the relay) drops changed issues as markdown.
+description: Search, view, create, comment on, and transition Jira Cloud issues via OAuth2 (Atlassian 3LO), and receive issue-change events in real time. Authorizes through the Cremind Connect service (no Atlassian app setup on the client); tokens stay on this machine. A persistent listener registers a Jira webhook and (via the relay) drops changed issues as markdown, classified into per-lifecycle events (created/updated/transitioned/commented/deleted).
 metadata: {
   environment_variables: ["CREMIND_CONNECT_URL", "ATLASSIAN_CLIENT_ID", "JIRA_SITE_URL"],
   optional_environment_variables: ["CREMIND_CONNECT_URL", "ATLASSIAN_CLIENT_ID", "JIRA_SITE_URL", "JIRA_WEBHOOK_JQL"],
-  events: {"event_type":[{"name":"issue_changed","description":"A Jira issue was created, updated, transitioned, or commented on"}]},
+  events: {"event_type":[{"name":"issue_created","description":"A Jira issue was created"},{"name":"issue_updated","description":"A Jira issue's fields were edited (other than a status transition)"},{"name":"issue_transitioned","description":"A Jira issue moved to a new status"},{"name":"issue_commented","description":"A comment was added to a Jira issue"},{"name":"issue_deleted","description":"A Jira issue was deleted (live only; a deletion while the listener is offline is missed)"}]},
   long_running_app: {
     command: "uv run scripts/event_listener.py",
     description: "Persistent Jira listener. Registers + refreshes a Jira dynamic webhook, subscribes to the Cremind Connect relay, and drops changed issues as markdown.",
@@ -30,8 +30,9 @@ them. Runs via `uv` (PEP 723 inline metadata).
   org ingress (`.../ingress/atlassian/jira?rk=<accountKey>`), then connects a
   WebSocket to the relay using a short-lived **relay-session** (Atlassian issues no
   id_token, so the backend mints the session from your access token via `/me`).
-  When an issue changes, the relay sends a content-free `resync` nudge; the listener
-  then pulls changed issues with JQL and writes them to `events/issue_changed/`.
+  When an issue changes, the relay sends a `resync` nudge (carrying the Jira webhook
+  event type + issue key, but never issue content); the listener pulls changed issues
+  with JQL, classifies each change, and writes it to `events/<event_type>/`.
 - Jira dynamic webhooks **expire after 30 days**; the listener refreshes them well
   inside that window.
 
@@ -114,13 +115,15 @@ uv run scripts/event_listener.py
 ```
 Behavior:
 - **Baseline on first run**: records the current time as the cursor; emits nothing for existing issues.
-- **Live**: on each relay `resync` nudge, runs an incremental JQL pull (`updated >= <cursor>`) and writes changed issues to `events/issue_changed/<YYYY-MM-DDTHH-MM-SS> <KEY> <summary>.md`.
-- **Catch-up**: on startup it also syncs anything changed while offline (bounded by `CATCHUP_MAX`).
+- **Live**: on each relay `resync` nudge, runs an incremental JQL pull (`updated >= <cursor>`), classifies each changed issue, and writes it to `events/<event_type>/<YYYY-MM-DDTHH-MM-SS> <KEY> <summary>.md`. Classification: `issue_created` (created since the cursor), `issue_transitioned` (a `status` changelog item — captures from/to), `issue_commented` (a new comment, fetched separately since comments aren't in the changelog), else `issue_updated`. One event per issue per change, by that priority order.
+- **Deletions**: `issue_deleted` is emitted from the nudge's event type + key (a deleted issue can't be fetched via JQL). It is **live only** — a deletion while the listener is offline is **not** caught up.
+- **Catch-up**: on startup it also syncs created/updated/transitioned/commented changes that happened while offline (bounded by `CATCHUP_MAX`); deletions are not caught up.
 - **Webhook renewal**: refreshes the Jira dynamic webhook well inside the 30-day expiry; re-registers if a refresh fails.
-- **De-dup**: Jira JQL `updated` is minute-precision, so a small emitted-set suppresses duplicate event files.
+- **De-dup**: Jira JQL `updated` is minute-precision, so a small emitted-set (keyed by `<key>:<updated>:<event_type>`) suppresses duplicate event files.
 - **State**: `scripts/.listener_state.json` (gitignored). Shutdown on SIGINT/SIGTERM; single-instance lock.
 
 ### Event markdown schema
+Common frontmatter (one of the five `event_type` values per the event folder):
 ```markdown
 ---
 key: "ABC-123"
@@ -132,11 +135,24 @@ reporter: "Bob"
 priority: "High"
 updated: "2026-06-08T10:20:30.000-0700"
 url: "https://your-site.atlassian.net/browse/ABC-123"
-event_type: "issue_changed"
+event_type: "issue_updated"
 received_at: "2026-06-08T10:20:35+00:00"
 ---
 
 <issue description as plain text>
+```
+- `issue_transitioned` adds `from_status` / `to_status`.
+- `issue_commented` adds `comment_author`; the body is the comment text, with the issue description under a `## Issue` heading.
+- `issue_deleted` is minimal — only `key`, `url`, `event_type`, `received_at` (the issue is gone, so no fields):
+```markdown
+---
+key: "ABC-123"
+url: "https://your-site.atlassian.net/browse/ABC-123"
+event_type: "issue_deleted"
+received_at: "2026-06-08T10:20:35+00:00"
+---
+
+Issue ABC-123 was deleted.
 ```
 
 ## Troubleshooting
@@ -147,12 +163,15 @@ received_at: "2026-06-08T10:20:35+00:00"
 - Webhook registers but **no events ever arrive** (and `GET /rest/api/3/webhook/failed` is empty) → the OAuth app is **private**, so Atlassian only delivers when the app owner == the registering user. Enable **Distribution → Sharing** (make the app public) in the developer console — no Marketplace approval needed.
 - `Clause ... is unsupported` / `Operator is not is unsupported` on registration → `JIRA_WEBHOOK_JQL` used a clause/operator outside the webhook subset (no dates, no `IS [NOT] EMPTY`, no functions); use `=`/`!=`/`IN`/`NOT IN` on assignee/issuetype/status/project/etc.
 - 5-webhook limit / no delivery → OAuth apps are capped at 5 dynamic webhooks per user per tenant; `unwatch` to clear stale ones.
+- No `issue_deleted` event for an issue you deleted → deletions are **live only** (a deleted issue can't be pulled via JQL), so a deletion while the listener was offline is missed; only deletions seen while connected are emitted. (Requires a Cremind Connect backend that forwards the webhook event type + key on the nudge.)
 
 ## Module layout
 ```
 jira/
 ├── SKILL.md
-├── events/issue_changed/             # markdown drop-zone
+├── events/                           # one markdown drop-zone per event_type:
+│   ├── issue_created/  issue_updated/  issue_transitioned/
+│   └── issue_commented/  issue_deleted/
 └── scripts/
     ├── .env                          # optional overrides
     ├── __main__.py                   # CLI entry

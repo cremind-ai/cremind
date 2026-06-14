@@ -8,7 +8,9 @@ Architecture (token-less relay):
      with a short-lived relay-session (Atlassian issues no id_token; the backend
      mints the session from the access token via /me).
   3. On each `resync` nudge (and once on startup), pull issues updated since the
-     cursor via JQL and drop changed issues as markdown into events/issue_changed/.
+     cursor via JQL, classify each change (created/updated/transitioned/commented),
+     and drop markdown into the matching events/<event_type>/ folder. Deletions can't
+     be pulled, so they come from the nudge's event type + key (live only).
 """
 from __future__ import annotations
 
@@ -33,6 +35,10 @@ log = config.setup_logging()
 _shutdown = threading.Event()
 _sync_lock = threading.Lock()
 
+# Raw JIRA WEBHOOK events we subscribe to (the event plane). NOTE: this is a different
+# namespace from the SKILL.md *skill events* (issue_created/updated/transitioned/...).
+# Jira has no distinct "transitioned" webhook — a transition is a jira:issue_updated with
+# a status changelog item — so the skill derives the lifecycle events client-side.
 DEFAULT_EVENTS = ["jira:issue_created", "jira:issue_updated", "jira:issue_deleted", "comment_created"]
 PULL_FIELDS = ["summary", "status", "issuetype", "assignee", "reporter", "priority", "updated", "created", "description"]
 _EMITTED_CAP = 500
@@ -127,16 +133,12 @@ def _sanitize(part: str) -> str:
     return cleaned
 
 
-def _write_event(issue: dict[str, Any], site_url: str) -> Path:
-    config.ISSUE_CHANGED_DIR.mkdir(parents=True, exist_ok=True)
-    content = formatter.format_issue_markdown(issue, event_type="issue_changed", site_url=site_url)
-    key = issue.get("key", "")
-    summary = (issue.get("fields", {}) or {}).get("summary", "")
-    base = f"{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')} {key} {_sanitize(summary)}"
+def _atomic_write(target: Path, base: str, content: str) -> Path:
+    target.mkdir(parents=True, exist_ok=True)
     attempt = 0
     while True:
         name = f"{base}.md" if attempt == 0 else f"{base} ({attempt + 1}).md"
-        path = config.ISSUE_CHANGED_DIR / name
+        path = target / name
         try:
             fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         except OSError as e:
@@ -149,6 +151,27 @@ def _write_event(issue: dict[str, Any], site_url: str) -> Path:
         return path
 
 
+def _write_event(issue: dict[str, Any], site_url: str, event_type: str, ctx: dict[str, Any] | None = None) -> Path:
+    ctx = ctx or {}
+    content = formatter.format_issue_markdown(
+        issue,
+        event_type=event_type,
+        site_url=site_url,
+        transition=ctx.get("transition"),
+        comment=ctx.get("comment"),
+    )
+    key = issue.get("key", "")
+    summary = (issue.get("fields", {}) or {}).get("summary", "")
+    base = f"{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')} {key} {_sanitize(summary)}"
+    return _atomic_write(config.event_dir(event_type), base, content)
+
+
+def _write_deleted_event(key: str, site_url: str) -> Path:
+    content = formatter.format_deleted_markdown(key, site_url=site_url)
+    base = f"{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')} {_sanitize(key)}"
+    return _atomic_write(config.event_dir("issue_deleted"), base, content)
+
+
 # --- jira client ---
 
 def _svc() -> jira_api.JiraClient:
@@ -156,12 +179,75 @@ def _svc() -> jira_api.JiraClient:
     return jira_api.JiraClient(access_token, data["cloud_id"])
 
 
+# --- classification ---
+
+def _latest_comment_since(svc: jira_api.JiraClient, key: str, cursor_ms: int) -> dict[str, Any] | None:
+    """Return {author, body} for the newest comment created at/after the cursor, else None."""
+    try:
+        data = svc.get_comments(key, order_by="-created", max_results=20)
+    except Exception as e:
+        log.debug("comment fetch failed for %s: %s", key, e)
+        return None
+    for c in data.get("comments", []) or []:
+        c_ms = _parse_jira_dt_ms(c.get("created", ""))
+        if c_ms is not None and c_ms >= cursor_ms:
+            author = c.get("author") or {}
+            return {
+                "author": author.get("displayName", "") if isinstance(author, dict) else "",
+                "body": formatter.adf_to_text(c.get("body")).rstrip(),
+            }
+    return None
+
+
+def _classify(
+    issue: dict[str, Any], cursor_ms: int, *, svc: jira_api.JiraClient, nudge_event: str | None = None
+) -> list[tuple[str, dict[str, Any]]]:
+    """Map a pulled issue to lifecycle event(s) (v1 returns 0 or 1).
+
+    Priority: created > transitioned > commented > updated. (Deletes are handled
+    separately from the nudge — a deleted issue can't be pulled.)
+    """
+    key = issue.get("key", "")
+    f = issue.get("fields", {}) or {}
+
+    created_ms = _parse_jira_dt_ms(f.get("created", ""))
+    if created_ms is not None and created_ms >= cursor_ms:
+        return [("issue_created", {})]
+
+    # /search/jql can't reliably expand changelog, so fetch it per issue.
+    histories: list[dict[str, Any]] = []
+    try:
+        detail = svc.get_issue(key, fields=["created"], expand="changelog")
+        histories = (detail.get("changelog") or {}).get("histories", []) or []
+    except Exception as e:
+        log.debug("changelog fetch failed for %s: %s", key, e)
+
+    kept = [h for h in histories if (_parse_jira_dt_ms(h.get("created", "")) or 0) >= cursor_ms]
+
+    for h in kept:
+        for item in h.get("items", []) or []:
+            if item.get("fieldId") == "status" or item.get("field") == "status":
+                return [("issue_transitioned", {"transition": {"from": item.get("fromString", ""), "to": item.get("toString", "")}})]
+
+    # No tracked field change. A comment leaves no changelog item, so when the nudge
+    # says "comment" or the bump is otherwise unexplained, check for a new comment.
+    if nudge_event == "comment_created" or not kept:
+        comment = _latest_comment_since(svc, key, cursor_ms)
+        if comment is not None:
+            return [("issue_commented", {"comment": comment})]
+
+    # Surfaced by the pull (updated >= cursor) but nothing matched — emit a generic
+    # update rather than silently dropping a real change.
+    return [("issue_updated", {})]
+
+
 # --- sync ---
 
-def _sync(state: dict[str, Any], site_url: str) -> int:
+def _sync(state: dict[str, Any], site_url: str, *, nudge_event: str | None = None, nudge_key: str | None = None) -> int:
     with _sync_lock:
         svc = _svc()
         since_ms = int(state.get("since_ms") or _now_ms())
+        cursor_ms = since_ms  # real watermark for classification (pre-floor)
         # Jira JQL date comparisons are minute-precision; floor to the minute and
         # rely on the emitted-set to suppress duplicates.
         floor_ms = (since_ms // 60000) * 60000
@@ -178,20 +264,35 @@ def _sync(state: dict[str, Any], site_url: str) -> int:
         emitted_set = set(emitted)
         max_ms = since_ms
         count = 0
+
+        # Deletes can't be pulled (the issue is gone), so they arrive ONLY via the live
+        # nudge — a delete during an offline gap is missed (no catch-up for deletions).
+        if nudge_event == "jira:issue_deleted" and nudge_key:
+            marker = f"{nudge_key}:deleted"
+            if marker not in emitted_set:
+                try:
+                    _write_deleted_event(nudge_key, site_url)
+                    count += 1
+                    emitted.append(marker)
+                    emitted_set.add(marker)
+                except OSError as e:
+                    log.warning("failed to write deleted event %s: %s", nudge_key, e)
+
         for issue in issues:
             key = issue.get("key", "")
             updated = (issue.get("fields", {}) or {}).get("updated", "")
-            marker = f"{key}:{updated}"
-            if marker in emitted_set:
-                continue
-            try:
-                _write_event(issue, site_url)
-                count += 1
-            except OSError as e:
-                log.warning("failed to write issue %s: %s", key, e)
-                continue
-            emitted.append(marker)
-            emitted_set.add(marker)
+            for event_type, ctx in _classify(issue, cursor_ms, svc=svc, nudge_event=nudge_event):
+                marker = f"{key}:{updated}:{event_type}"
+                if marker in emitted_set:
+                    continue
+                try:
+                    _write_event(issue, site_url, event_type, ctx)
+                    count += 1
+                except OSError as e:
+                    log.warning("failed to write issue %s: %s", key, e)
+                    continue
+                emitted.append(marker)
+                emitted_set.add(marker)
             ms = _parse_jira_dt_ms(updated)
             if ms and ms > max_ms:
                 max_ms = ms
@@ -200,13 +301,13 @@ def _sync(state: dict[str, Any], site_url: str) -> int:
         state["emitted"] = emitted[-_EMITTED_CAP:]
         _save_state(state)
         if count:
-            log.info("emitted %d changed issue(s)", count)
+            log.info("emitted %d event(s)", count)
         return count
 
 
-def _safe_sync(state: dict[str, Any], site_url: str) -> None:
+def _safe_sync(state: dict[str, Any], site_url: str, *, nudge_event: str | None = None, nudge_key: str | None = None) -> None:
     try:
-        _sync(state, site_url)
+        _sync(state, site_url, nudge_event=nudge_event, nudge_key=nudge_key)
     except Exception as e:
         log.warning("sync failed: %s", e)
 
@@ -284,7 +385,8 @@ def run() -> None:
             "exiting to avoid duplicate event files", config.LOCK_FILE
         )
         raise SystemExit(1)
-    config.ISSUE_CHANGED_DIR.mkdir(parents=True, exist_ok=True)
+    for _name in config.EVENT_NAMES:
+        config.event_dir(_name).mkdir(parents=True, exist_ok=True)
 
     # Wait for the account to be linked instead of exiting (starts automatically once linked).
     data = None
@@ -328,12 +430,15 @@ def run() -> None:
         account_key=account_key,
         resources=["jira"],
         session_provider=lambda: auth.fresh_relay_session(config.TOKEN_PATH, config.CREMIND_CONNECT_URL),
-        on_resync=lambda _source: _safe_sync(state, site_url),
+        on_resync=lambda nudge: _safe_sync(
+            state, site_url, nudge_event=nudge.get("event"), nudge_key=nudge.get("key")
+        ),
         logger=log,
     )
     relay_thread = threading.Thread(target=relay.run_forever, name="relay", daemon=True)
     relay_thread.start()
     log.info("listening for jira issue events (account_key=%s)", account_key)
+    log.info("note: issue_deleted is live-only — deletions during an offline gap are not caught up")
     try:
         while relay_thread.is_alive() and not _shutdown.is_set():
             relay_thread.join(timeout=0.5)
