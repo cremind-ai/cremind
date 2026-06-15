@@ -2,8 +2,12 @@
 name: gcalendar
 description: List, view, create, update, and delete Google Calendar events via OAuth2, and receive calendar-change events in real time. Authorizes through the Cremind Connect service (no GCP setup); tokens stay on this machine. A persistent listener uses Calendar watch channels (via the relay) and drops changed events as markdown. This is the Google Calendar skill (for CalDAV providers like iCloud/Fastmail, use caldav-calendar instead).
 metadata: {
-  environment_variables: ["CREMIND_CONNECT_URL", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "CALENDAR_ID"],
-  optional_environment_variables: ["CREMIND_CONNECT_URL", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "CALENDAR_ID"],
+  environment_variables: [
+    {"name": "CREMIND_CONNECT_URL", "description": "Cremind Connect base URL (OAuth broker)", "required": false, "type": "string", "default": "https://connect.cremind.io"},
+    {"name": "GOOGLE_CLIENT_ID", "description": "Google OAuth Client ID (auto-fetched from Cremind Connect when blank)", "required": false, "type": "string", "default": ""},
+    {"name": "GOOGLE_CLIENT_SECRET", "description": "Google OAuth Client Secret (auto-fetched from Cremind Connect when blank)", "required": false, "secret": true, "type": "string", "default": ""},
+    {"name": "CALENDAR_ID", "description": "Calendar ID to operate on", "required": false, "type": "string", "default": "primary"}
+  ],
   events: {"event_type":[{"name":"event_changed","description":"A calendar event was created, modified, or cancelled"}]},
   long_running_app: {
     command: "uv run scripts/event_listener.py",

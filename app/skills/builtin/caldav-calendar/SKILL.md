@@ -2,7 +2,12 @@
 name: caldav-calendar
 description: List, view, create, update, and delete calendar events via CalDAV. Works with Apple iCloud, Fastmail, Nextcloud, Posteo, Radicale, and generic CalDAV servers using username + password. A persistent event listener drops new and updated events as markdown. Does NOT support Google Calendar (requires OAuth2) or Microsoft (does not implement CalDAV).
 metadata: {
-  environment_variables: ["CALDAV_URL", "CALDAV_USERNAME", "CALDAV_PASSWORD", "CALDAV_CALENDAR"],
+  environment_variables: [
+    {"name": "CALDAV_URL", "description": "CalDAV server URL (e.g. https://caldav.icloud.com)", "required": true, "type": "string"},
+    {"name": "CALDAV_USERNAME", "description": "CalDAV account username", "required": true, "type": "string"},
+    {"name": "CALDAV_PASSWORD", "description": "CalDAV password or app-specific password", "required": true, "secret": true, "type": "string"},
+    {"name": "CALDAV_CALENDAR", "description": "Calendar name (default: first writable calendar)", "required": false, "type": "string", "default": ""}
+  ],
   events: {"event_type":[
     {"name":"new_event","description":"A new calendar event was added on the server"},
     {"name":"updated_event","description":"An existing calendar event was modified on the server"}

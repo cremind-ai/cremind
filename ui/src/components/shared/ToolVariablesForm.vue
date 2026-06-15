@@ -2,7 +2,7 @@
 import { ElForm, ElFormItem, ElInput, ElInputNumber, ElSelect, ElOption, ElSwitch, ElTag } from 'element-plus';
 
 const props = withDefaults(defineProps<{
-  fields: Record<string, { description: string; type: string; secret: boolean; configured: boolean; enum?: string[]; default?: unknown }>;
+  fields: Record<string, { description: string; type: string; secret: boolean; configured: boolean; required?: boolean; enum?: string[]; default?: unknown }>;
   values: Record<string, string>;
   title?: string;
 }>(), {
@@ -25,6 +25,9 @@ function updateValue(key: string, value: string) {
       <ElFormItem v-for="(field, key) in fields" :key="key">
         <template #label>
           {{ field.description || key }}
+          <ElTag v-if="field.required" type="danger" size="small" class="field-tag">Required</ElTag>
+          <ElTag v-else type="info" size="small" effect="plain" class="field-tag">Optional</ElTag>
+          <ElTag v-if="field.secret" type="warning" size="small" effect="plain" class="field-tag">Secret</ElTag>
           <ElTag v-if="field.configured" type="success" size="small" class="field-tag">Set</ElTag>
         </template>
         <ElSwitch

@@ -1,0 +1,5 @@
+.env
+.listener_state.json
+.ha_token.json
+__pycache__/
+*.pyc
