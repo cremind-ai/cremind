@@ -100,6 +100,20 @@ class LogWriterState:
     ring_buffer_bytes: int = 0
     ring_buffer_max: int = _RING_BUFFER_DEFAULT_MAX_BYTES
     subscribers: Set["asyncio.Queue[Dict[str, Any]]"] = field(default_factory=set)
+    # Long-poll signal for ExecShellOutputTool.  The writer sets this (always
+    # under rotate_lock) whenever it appends a chunk or the process ends; a
+    # blocked reader clears it under the same lock right before draining the
+    # .log files, then awaits it.  Same-lock ordering rules out lost wakeups
+    # (see ExecShellOutputTool.run).  Teardown paths (stop/cancel/cleanup)
+    # also set it via _wake_readers so a waiting reader unblocks promptly.
+    output_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Last input-mode classification produced by a read that returned output.
+    # The reader deletes .log files after each read, so on an empty re-call the
+    # output tail is gone and tail-based signals (e.g. a trailing ": " prompt)
+    # can't be recomputed.  Caching the prior classification lets the heartbeat
+    # path keep telling the agent "process is waiting for text/selection input"
+    # instead of degrading to "unknown".
+    last_input_mode: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -132,6 +146,12 @@ _DEFAULT_SILENCE_TIMEOUT = 3.0
 _DEFAULT_LONG_RUNNING_TIMEOUT = 10.0
 _MAX_CLASSIFICATION_TIME = 30.0
 _DEFAULT_CLEANUP_TTL_HOURS = 24
+# How long a single exec_shell_output call long-polls before returning a
+# "still running" heartbeat the agent can immediately re-issue (no sleep).
+_DEFAULT_OUTPUT_WAIT_TIMEOUT = 120.0
+# Safety margin kept below MCP_TOOL_CALL_TIMEOUT so a heartbeat always returns
+# before the adapter's hard tool-call timeout turns it into a generic error.
+_OUTPUT_WAIT_MARGIN = 15.0
 _STATE_FILENAME = "state.json"
 
 
@@ -168,6 +188,18 @@ def _read_state(log_dir: str) -> Optional[Dict[str, Any]]:
         logger.error(f"_read_state({log_dir}): {exc}")
         return None
 
+
+def _wake_readers(state: Optional[LogWriterState]) -> None:
+    """Unblock any ExecShellOutputTool long-poll waiting on *state*.
+
+    Safe to call from anywhere (it only sets an asyncio.Event, never awaits).
+    Invoked by the writer on new output / exit and by every teardown path
+    (stop / task-cancel / TTL cleanup) so a blocked reader wakes, re-checks,
+    and returns instead of hanging until its heartbeat deadline.
+    """
+    if state is not None:
+        state.output_event.set()
+
 # ---------------------------------------------------------------------------
 # Tool definitions
 # ---------------------------------------------------------------------------
@@ -181,6 +213,7 @@ class Var:
     LARGE_OUTPUT_TOKEN_THRESHOLD = "LARGE_OUTPUT_TOKEN_THRESHOLD"
     LOG_SILENCE_THRESHOLD = "LOG_SILENCE_THRESHOLD"
     LONG_RUNNING_TIMEOUT = "LONG_RUNNING_TIMEOUT"
+    OUTPUT_WAIT_TIMEOUT = "OUTPUT_WAIT_TIMEOUT"
     CLEANUP_TTL_HOURS = "CLEANUP_TTL_HOURS"
     # UI-only defaults used by the Process Manager terminal view.  The
     # agent's per-invocation ``cols`` / ``rows`` arguments on ExecShellTool
@@ -247,6 +280,18 @@ TOOL_CONFIG: ToolConfig = {
             ),
             "type": "number",
             "default": _DEFAULT_LONG_RUNNING_TIMEOUT,
+        },
+        Var.OUTPUT_WAIT_TIMEOUT: {
+            "description": (
+                "Seconds a single exec_shell_output call blocks (long-polls) "
+                "waiting for new output before returning a 'still running' "
+                "heartbeat the agent can re-issue immediately. Returns the "
+                "instant output appears or the process exits, so this only "
+                "bounds dead-air waits. Automatically clamped below "
+                "MCP_TOOL_CALL_TIMEOUT. Default: 120."
+            ),
+            "type": "number",
+            "default": _DEFAULT_OUTPUT_WAIT_TIMEOUT,
         },
         Var.TERMINAL_DEFAULT_COLS: {
             "description": (
@@ -593,6 +638,10 @@ async def _log_writer_loop(
                     # put_nowait so a stuck WebSocket cannot block the log
                     # writer; overflowed queues are evicted next cycle.
                     _broadcast_chunks(state, chunks)
+                    # Wake a long-polling reader: new output is on disk.  Set
+                    # inside rotate_lock so it is ordered after a reader's
+                    # clear() (also under the lock) — no lost wakeup.
+                    _wake_readers(state)
     except asyncio.CancelledError:
         pass
     except Exception as exc:
@@ -627,9 +676,16 @@ async def _log_writer_loop(
                     "exited_at": time.time(),
                 })
                 _write_state(state.log_dir, existing)
+                # Wake a long-polling reader: the process has exited, so the
+                # next drain will see completed=True even with no new output.
+                # Set under rotate_lock for the same no-lost-wakeup ordering.
+                _wake_readers(state)
         except Exception as exc:
             logger.error(f"log_writer_loop({state.process_id}): state.json update failed: {exc}")
 
+        # Belt-and-suspenders: ensure the event is set even if the state.json
+        # update above raised before reaching _wake_readers.
+        _wake_readers(state)
         state.stopped = True
         # Tell the Process Manager UI that this row's status flipped to
         # ``exited`` — registry entry is still present (it is only popped
@@ -1030,6 +1086,13 @@ async def write_stdin_to_process(
             "process_id": process_id,
         }
 
+    # Input was just sent, so the cached "process is waiting for input"
+    # classification is now stale.  Clearing it lets the next exec_shell_output
+    # call block for the process's *response* instead of immediately returning a
+    # heartbeat that assumes the process is still sitting at a prompt.
+    if info.log_writer_state is not None:
+        info.log_writer_state.last_input_mode = None
+
     return {
         "process_id": process_id,
         "input_sent": True,
@@ -1094,12 +1157,18 @@ async def stop_process(process_id: str, *, profile: str) -> Dict[str, Any]:
     stopped_profile = info.profile
 
     process = info.process
+    state = info.log_writer_state
 
-    if info.log_writer_state and info.log_writer_state.task:
-        info.log_writer_state.stopped = True
-        info.log_writer_state.task.cancel()
+    # Wake any reader currently long-polling this process so it re-checks the
+    # (now popped) registry and returns promptly instead of blocking until its
+    # heartbeat deadline.  Done before cancelling the writer while state lives.
+    _wake_readers(state)
+
+    if state and state.task:
+        state.stopped = True
+        state.task.cancel()
         try:
-            await info.log_writer_state.task
+            await state.task
         except (asyncio.CancelledError, Exception):
             pass
 
@@ -1141,20 +1210,28 @@ async def stop_process(process_id: str, *, profile: str) -> Dict[str, Any]:
         except Exception:
             pass
 
+    # Read remaining logs + delete the dir under rotate_lock so this can't race
+    # an in-flight ExecShellOutputTool drain (which lists/reads/removes the same
+    # files); without the lock its os.listdir could hit a half-removed tree.
     final_output = ""
-    if info.log_dir and os.path.isdir(info.log_dir):
-        log_files = sorted(
-            [f for f in os.listdir(info.log_dir) if f.endswith(".log")],
-            key=lambda f: int(f.split(".")[0]),
-        )
-        for fname in log_files:
+    read_lock = state.rotate_lock if state is not None else _noop_async_cm()
+    async with read_lock:
+        if info.log_dir and os.path.isdir(info.log_dir):
             try:
-                with open(os.path.join(info.log_dir, fname), "r",
-                          encoding="utf-8") as fh:
-                    final_output += fh.read()
-            except Exception:
-                pass
-        shutil.rmtree(info.log_dir, ignore_errors=True)
+                log_files = sorted(
+                    [f for f in os.listdir(info.log_dir) if f.endswith(".log")],
+                    key=lambda f: int(f.split(".")[0]),
+                )
+            except FileNotFoundError:
+                log_files = []
+            for fname in log_files:
+                try:
+                    with open(os.path.join(info.log_dir, fname), "r",
+                              encoding="utf-8") as fh:
+                        final_output += fh.read()
+                except Exception:
+                    pass
+            shutil.rmtree(info.log_dir, ignore_errors=True)
 
     publish_process_list_changed(stopped_profile)
 
@@ -1180,6 +1257,7 @@ async def cancel_processes_by_task(task_id: str) -> int:
         if info.task_id != task_id:
             continue
         try:
+            _wake_readers(info.log_writer_state)
             if info.log_writer_state and info.log_writer_state.task:
                 info.log_writer_state.stopped = True
                 info.log_writer_state.task.cancel()
@@ -1240,6 +1318,7 @@ async def _cleanup_stale_processes() -> int:
         if not info:
             continue
         affected_profiles.add(info.profile)
+        _wake_readers(info.log_writer_state)
         if info.log_writer_state and info.log_writer_state.task:
             info.log_writer_state.stopped = True
             info.log_writer_state.task.cancel()
@@ -1276,7 +1355,11 @@ class ExecShellTool(BuiltInTool):
         "fails with a TTY-required error (e.g. 'the input device is not a TTY'), "
         "it is automatically respawned under a pseudo-terminal. For commands "
         "that hang without a TTY instead of erroring (notably ssh), pass "
-        "`pty: true` explicitly. In PTY mode stdout and stderr are merged into `stdout`."
+        "`pty: true` explicitly. In PTY mode stdout and stderr are merged into `stdout`.\n"
+        "One important note: before deciding to stop reading **stdout**, check the "
+        "**`completed`** flag. If it is **`False`**, you must **sleep for a few seconds** "
+        "and then read **stdout** again to ensure that there is no remaining output "
+        "still buffered."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -1878,22 +1961,35 @@ def _build_output_instruction(
         return (
             "Process is running but the input mode is unclear. If input is "
             "expected, try plain text with exec shell input or special keys "
-            "for selection menus otherwise use the sleep tool and call exec "
-            "shell output again."
+            "for selection menus. Otherwise call exec_shell_output again to "
+            "keep waiting — it blocks until output arrives or the process "
+            "exits."
         )
     return (
-        "Process is still running. Use the sleep tool and call "
-        "exec shell output again to read more output."
+        "Process is still running with no new output yet. Call "
+        "exec_shell_output again to keep waiting — it blocks until new output "
+        "arrives or the process exits."
     )
+
+
+def _refresh_expire(info: ProcessInfo, variables: Dict[str, Any]) -> None:
+    """Re-arm a process's TTL cleanup window on agent interaction.
+
+    Autostart-linked processes opt out — they're meant to live indefinitely
+    while registered, and an agent read must not silently start a 24h timer.
+    """
+    if info.autostart_id is None:
+        cleanup_ttl_hours = float(
+            variables.get(Var.CLEANUP_TTL_HOURS) or _DEFAULT_CLEANUP_TTL_HOURS
+        )
+        info.expire_time = time.monotonic() + (cleanup_ttl_hours * 3600)
 
 
 class ExecShellOutputTool(BuiltInTool):
     name: str = "exec_shell_output"
     description: str = (
         "Read stdout from a long-running process.\n"
-        "Note that some applications do not produce stdout immediately, "
-        "so you should combine it with a **Sleep Tool** to wait for stdout.\n"
-        "E.g., read stdout for process '708e9873'\n"
+        "E.g. [process_id: 708e9873]\nmode: 'exec shell output'\n"
         "Required: process_id"
     )
     parameters: Dict[str, Any] = {
@@ -1922,98 +2018,151 @@ class ExecShellOutputTool(BuiltInTool):
                 }
             )
 
-        info = _process_registry.get(process_id)
-        if not info:
-            return BuiltInToolResult(
-                structured_content={
-                    "error": "Process not found",
-                    "message": (
-                        f"No process with id '{process_id}'. "
-                        "It may have been cleaned up."
-                    ),
-                    "instruction": (
-                        "The process no longer exists. Start a new command "
-                        "with exec_shell."
-                    ),
-                }
+        # Long-poll window: block until new output is written or the process
+        # exits, returning the instant either happens.  On a long silence,
+        # return a "still running" heartbeat the agent can re-issue immediately
+        # (no sleep).  Clamp below MCP_TOOL_CALL_TIMEOUT so the heartbeat always
+        # beats the adapter's hard tool-call timeout (which would otherwise turn
+        # it into a generic, guidance-free error).
+        max_wait = float(
+            variables.get(Var.OUTPUT_WAIT_TIMEOUT) or _DEFAULT_OUTPUT_WAIT_TIMEOUT
+        )
+        tool_cap = BaseConfig.MCP_TOOL_CALL_TIMEOUT
+        if tool_cap:
+            max_wait = min(max_wait, max(1.0, float(tool_cap) - _OUTPUT_WAIT_MARGIN))
+        deadline = time.monotonic() + max_wait
+
+        while True:
+            # Re-fetch each iteration: a teardown (stop / cancel / TTL cleanup)
+            # can pop the entry while we're blocked, and we must notice.
+            info = _process_registry.get(process_id)
+            if not info:
+                return BuiltInToolResult(
+                    structured_content={
+                        "error": "Process not found",
+                        "message": (
+                            f"No process with id '{process_id}'. "
+                            "It may have exited and been cleaned up."
+                        ),
+                        "instruction": (
+                            "The process no longer exists. Start a new command "
+                            "with exec_shell."
+                        ),
+                    }
+                )
+
+            state = info.log_writer_state
+
+            # Drain whatever output is currently on disk.  Hold rotate_lock
+            # across clear + flush + list + read + delete so the writer cannot
+            # open a new .log file (or resume appending) while we iterate, and
+            # so the event clear is ordered against the writer's set.
+            merged_output = ""
+            if info.log_dir and os.path.isdir(info.log_dir):
+                lock_ctx = state.rotate_lock if state is not None else _noop_async_cm()
+                async with lock_ctx:
+                    # Clear the wake signal BEFORE draining, inside the lock, so
+                    # any subsequent writer set() (also under the lock) is seen
+                    # by the wait() below — no lost wakeup.
+                    if state is not None:
+                        state.output_event.clear()
+                    if state is not None and state.current_file is not None:
+                        try:
+                            state.current_file.close()
+                        except Exception:
+                            pass
+                        state.current_file = None
+                        state.current_file_number += 1
+
+                    try:
+                        log_files: List[str] = [
+                            f for f in os.listdir(info.log_dir) if f.endswith(".log")
+                        ]
+                    except FileNotFoundError:
+                        # Dir vanished mid-wait (stop / cleanup).  Treat as no
+                        # output; the next iteration re-checks the registry.
+                        log_files = []
+                    log_files.sort(key=lambda f: int(f.split(".")[0]))
+
+                    read_paths: List[str] = []
+                    for fname in log_files:
+                        fpath = os.path.join(info.log_dir, fname)
+                        try:
+                            with open(fpath, "r", encoding="utf-8") as fh:
+                                merged_output += fh.read()
+                        except Exception:
+                            continue
+                        read_paths.append(fpath)
+
+                    for fpath in read_paths:
+                        try:
+                            os.remove(fpath)
+                        except Exception:
+                            pass
+
+            # Completion is authoritative from the registry / state.json, and is
+            # checked BEFORE waiting so an exit can never be missed even if its
+            # event set() happened to race our clear() above.
+            state_data = (_read_state(info.log_dir) if info.log_dir else None) or {}
+            completed = state_data.get("status") == "completed"
+            exit_code: Optional[int] = state_data.get("return_code")
+            if not completed and info.process.returncode is not None:
+                completed = True
+                exit_code = info.process.returncode
+
+            # Something to report — return it immediately.
+            if merged_output or completed:
+                _refresh_expire(info, variables)
+                return self._build_output_result(
+                    process_id=process_id,
+                    info=info,
+                    state=state,
+                    merged_output=merged_output,
+                    completed=completed,
+                    exit_code=exit_code,
+                    large_output_mode=large_output_mode,
+                    token_threshold=token_threshold,
+                )
+
+            # Nothing yet and the process is still running.  Decide: wait or
+            # heartbeat.  Early-heartbeat when we last saw the process sitting
+            # at a prompt (no new output can come until input is sent — and
+            # write_stdin_to_process clears last_input_mode, so this won't fire
+            # after input was sent while we await a response).
+            remaining = deadline - time.monotonic()
+            pending_input = (
+                isinstance(getattr(state, "last_input_mode", None), dict)
+                and state.last_input_mode.get("input_mode") in ("text", "selection")
             )
+            if state is None or remaining <= 0 or pending_input:
+                _refresh_expire(info, variables)
+                return self._build_heartbeat(process_id, info, state)
 
-        if not info.log_dir or not os.path.isdir(info.log_dir):
-            completed_no_log = info.process.returncode is not None
-            return BuiltInToolResult(
-                structured_content={
-                    "process_id": process_id,
-                    "stdout": "",
-                    "completed": completed_no_log,
-                    "return_code": info.process.returncode,
-                    "command": info.command,
-                    "message": "No log output available yet.",
-                    "instruction": _build_output_instruction(
-                        completed=completed_no_log,
-                        return_code=info.process.returncode,
-                        input_mode=None,
-                        is_pty=info.is_pty,
-                        truncated=False,
-                    ),
-                }
-            )
+            try:
+                await asyncio.wait_for(state.output_event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                _refresh_expire(info, variables)
+                return self._build_heartbeat(process_id, info, state)
+            # Woke on new output / exit / teardown — loop and re-drain.
 
-        # Hold rotate_lock across flush + list + read + delete so the writer
-        # cannot open a new .log file (or resume appending to the current
-        # one) while we're iterating the directory.
-        state = info.log_writer_state
-        lock_ctx = state.rotate_lock if state is not None else _noop_async_cm()
-
-        merged_output = ""
-        async with lock_ctx:
-            if state is not None and state.current_file is not None:
-                try:
-                    state.current_file.close()
-                except Exception:
-                    pass
-                state.current_file = None
-                state.current_file_number += 1
-
-            log_files: List[str] = [
-                f for f in os.listdir(info.log_dir) if f.endswith(".log")
-            ]
-            log_files.sort(key=lambda f: int(f.split(".")[0]))
-
-            read_paths: List[str] = []
-            for fname in log_files:
-                fpath = os.path.join(info.log_dir, fname)
-                try:
-                    with open(fpath, "r", encoding="utf-8") as fh:
-                        merged_output += fh.read()
-                except Exception:
-                    continue
-                read_paths.append(fpath)
-
-            for fpath in read_paths:
-                try:
-                    os.remove(fpath)
-                except Exception:
-                    pass
-
-        # Autostart-linked processes opt out of TTL refresh — they're meant to
-        # live indefinitely while registered, and an agent interaction must not
-        # silently re-arm a 24h cleanup window.
-        if info.autostart_id is None:
-            cleanup_ttl_hours = float(
-                variables.get(Var.CLEANUP_TTL_HOURS) or _DEFAULT_CLEANUP_TTL_HOURS
-            )
-            info.expire_time = time.monotonic() + (cleanup_ttl_hours * 3600)
-
-        state_data = _read_state(info.log_dir) or {}
-        completed = state_data.get("status") == "completed"
-        exit_code: Optional[int] = state_data.get("return_code")
-        if not completed and info.process.returncode is not None:
-            completed = True
-            exit_code = info.process.returncode
-
+    def _build_output_result(
+        self,
+        *,
+        process_id: str,
+        info: ProcessInfo,
+        state: Optional[LogWriterState],
+        merged_output: str,
+        completed: bool,
+        exit_code: Optional[int],
+        large_output_mode: str,
+        token_threshold: int,
+    ) -> BuiltInToolResult:
+        """Assemble the structured result for a read that produced output or
+        observed completion (the original post-processing path)."""
         # Classify the current input mode from the tail of stdout + persistent
-        # terminal-state flags.  Only meaningful while the process is still
-        # running; once it's exited the agent has no reason to send input.
+        # terminal-state flags.  Only meaningful while still running.  Cache it
+        # on the writer state so a later empty heartbeat — whose tail is gone
+        # because we delete .log files after reading — can still guide the agent.
         mode_info: Optional[dict] = None
         if not completed and state is not None:
             mode_info = detect_input_mode(
@@ -2021,6 +2170,7 @@ class ExecShellOutputTool(BuiltInTool):
                 merged_output[-4096:],
                 info.is_pty,
             )
+            state.last_input_mode = mode_info
 
         total_tokens = 0
         truncated = False
@@ -2062,6 +2212,44 @@ class ExecShellOutputTool(BuiltInTool):
             input_mode=mode_info["input_mode"] if mode_info is not None else None,
             is_pty=info.is_pty,
             truncated=truncated,
+        )
+        return BuiltInToolResult(structured_content=structured)
+
+    def _build_heartbeat(
+        self,
+        process_id: str,
+        info: ProcessInfo,
+        state: Optional[LogWriterState],
+    ) -> BuiltInToolResult:
+        """No new output after the long-poll window; process is still running.
+
+        Reuse the last cached input-mode classification (the live tail is gone
+        after deletion) so the agent keeps "waiting for input" guidance instead
+        of degrading to "unknown".
+        """
+        last_mode = state.last_input_mode if state is not None else None
+        input_mode = last_mode.get("input_mode") if isinstance(last_mode, dict) else None
+        structured: Dict[str, Any] = {
+            "process_id": process_id,
+            "stdout": "",
+            "completed": False,
+            "return_code": None,
+            "truncated": False,
+            "total_tokens": 0,
+            "command": info.command,
+            "waiting": True,
+            "message": "No new output yet; the process is still running.",
+        }
+        if isinstance(last_mode, dict):
+            structured["input_mode"] = last_mode["input_mode"]
+            structured["input_mode_confidence"] = last_mode["confidence"]
+            structured["input_signals"] = last_mode["signals"]
+        structured["instruction"] = _build_output_instruction(
+            completed=False,
+            return_code=None,
+            input_mode=input_mode,
+            is_pty=info.is_pty,
+            truncated=False,
         )
         return BuiltInToolResult(structured_content=structured)
 
