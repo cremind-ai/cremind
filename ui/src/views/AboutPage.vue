@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
+import { goBackToChat } from '../utils/backToChat';
 import { ElCard, ElTag } from 'element-plus';
 import { Icon } from '@iconify/vue';
 
@@ -101,7 +102,7 @@ onMounted(() => {
 });
 
 function goBack() {
-  router.push(`/${props.profile}`);
+  goBackToChat(router, props.profile);
 }
 </script>
 

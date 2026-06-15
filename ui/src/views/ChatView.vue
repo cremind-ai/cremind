@@ -96,16 +96,25 @@ onMounted(async () => {
   }
 
   // Deep-link: if URL contains a conversationId, load it
-  if (props.conversationId && chatStore.activeConversationId !== props.conversationId) {
-    try {
-      await chatStore.switchConversation(props.conversationId);
-    } catch (e) {
-      router.replace({ name: 'chat', params: { profile: props.profile } });
+  if (props.conversationId) {
+    if (chatStore.activeConversationId !== props.conversationId) {
+      try {
+        await chatStore.switchConversation(props.conversationId);
+      } catch (e) {
+        router.replace({ name: 'chat', params: { profile: props.profile } });
+      }
+    } else {
+      // Re-attach the 'active' tracker after a previous unmount (e.g. user
+      // came back from Settings to the same conversation). Idempotent.
+      chatStore.trackConversation(props.conversationId, 'active');
     }
   } else if (chatStore.activeConversationId) {
-    // Re-attach the 'active' tracker after a previous unmount (e.g. user
-    // came back from Settings to the same conversation). Idempotent.
-    chatStore.trackConversation(chatStore.activeConversationId, 'active');
+    // Bare chat route (no conversationId) but a conversation is still active
+    // from before we navigated away (e.g. returned from Settings to the
+    // landing page, not the conversation). Clear it so the active highlight
+    // and "New Chat" state stay consistent with the URL — the route watcher
+    // below only fires on prop *changes*, not on this fresh mount.
+    chatStore.switchToNewChat();
   }
 });
 

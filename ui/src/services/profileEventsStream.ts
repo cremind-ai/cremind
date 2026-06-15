@@ -50,7 +50,12 @@ type ProfileEventsFrame = NotifFrame | ConvsFrame | ConvEventFrame | ReadyFrame;
  * Per-conversation rolling buffer so a late `subscribeConversation`
  * caller catches recent events for an in-progress run. Mirrors the
  * backend ring-buffer replay that the legacy per-conversation SSE
- * provided on connect.
+ * provided on connect — including its lifecycle: the buffer is scoped
+ * to the *current* run (reset on `user_message`/`event_trigger_message`,
+ * dropped on `complete`, matching stream_bus.start_run/end_run). A
+ * completed run's messages are already persisted, so replaying its
+ * events to a late subscriber would render duplicate bubbles on top of
+ * the fetched history.
  */
 const CONV_BUFFER_CAP = 256;
 
@@ -65,6 +70,9 @@ interface Connection {
   lastSnapshot: ConversationsListSnapshot | null;
   notifCursor: number;
   convBuffers: Map<string, ConversationStreamEvent[]>;
+  // Conversations that produced at least one event since the last `ready`
+  // frame. Used to sweep stale buffers on (re)connect — see dispatchFrame.
+  convSeenSinceReady: Set<string>;
 }
 
 const connections = new Map<string, Connection>();
@@ -192,15 +200,25 @@ function dispatchFrame(conn: Connection, frame: ProfileEventsFrame) {
       type: rest.type,
       data: rest.data,
     };
-    // Buffer for late subscribers within this tab.
-    let buf = conn.convBuffers.get(convId);
-    if (!buf) {
-      buf = [];
-      conn.convBuffers.set(convId, buf);
-    }
-    buf.push(event);
-    if (buf.length > CONV_BUFFER_CAP) {
-      buf.splice(0, buf.length - CONV_BUFFER_CAP);
+    conn.convSeenSinceReady.add(convId);
+    // Buffer for late subscribers within this tab, mirroring the backend
+    // ring's lifecycle (stream_bus.start_run/end_run): a run-start marker
+    // resets the buffer, the terminal `complete` drops it. `error` is NOT
+    // terminal — stream_runner always publishes `complete` after it.
+    if (event.type === 'user_message' || event.type === 'event_trigger_message') {
+      conn.convBuffers.set(convId, [event]);
+    } else if (event.type === 'complete') {
+      conn.convBuffers.delete(convId);
+    } else {
+      let buf = conn.convBuffers.get(convId);
+      if (!buf) {
+        buf = [];
+        conn.convBuffers.set(convId, buf);
+      }
+      buf.push(event);
+      if (buf.length > CONV_BUFFER_CAP) {
+        buf.splice(0, buf.length - CONV_BUFFER_CAP);
+      }
     }
     // Live dispatch
     const subs = conn.convSubs.get(convId);
@@ -209,6 +227,17 @@ function dispatchFrame(conn: Connection, frame: ProfileEventsFrame) {
         try { cb(event); } catch (e) { console.warn('[profileEventsStream] conv sub threw', e); }
       }
     }
+  } else if (frame.event === 'ready') {
+    // The replay phase of a (re)connect just ended. The backend replays the
+    // full ring of every *active* conversation before emitting `ready`, so
+    // any buffered conversation that produced no frame since the previous
+    // `ready` was not replayed as active — its run ended while we were
+    // disconnected and its `complete` was lost. Drop those buffers so a
+    // later subscriber doesn't re-render a run already in persisted history.
+    for (const convId of Array.from(conn.convBuffers.keys())) {
+      if (!conn.convSeenSinceReady.has(convId)) conn.convBuffers.delete(convId);
+    }
+    conn.convSeenSinceReady.clear();
   }
 }
 
@@ -242,6 +271,7 @@ function ensureConnection(
       lastSnapshot: null,
       notifCursor: sinceMs,
       convBuffers: new Map(),
+      convSeenSinceReady: new Set(),
     };
     connections.set(key, conn);
     startShared(conn);
@@ -326,8 +356,10 @@ export function subscribeConversation(
   subs.add(onEvent);
   // Replay this tab's buffered events for the conversation so the new
   // subscriber catches an in-progress run that started before it
-  // registered. The chat store's per-conversation seqSeen dedupe absorbs
-  // any overlap if the same events arrive again live.
+  // registered. dispatchFrame keeps the buffer scoped to the current run
+  // (reset on run-start, dropped on `complete`), so replay never
+  // re-renders a finished run; the chat store's per-conversation seqSeen
+  // dedupe absorbs any overlap if the same events arrive again live.
   const buf = conn.convBuffers.get(conversationId);
   if (buf) {
     for (const event of buf) {
