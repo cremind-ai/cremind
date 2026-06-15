@@ -157,6 +157,11 @@ class ToolRegistry:
             if tool.hidden:
                 out.append(tool)
                 continue
+            # ``locked`` built-ins are visible in the UI but can't be disabled;
+            # always expose them so a stale disabled row can't suppress them.
+            if tool.locked:
+                out.append(tool)
+                continue
             if tool.tool_type is ToolType.SKILL:
                 if self._skill_belongs_to_profile(tool, profile):
                     out.append(tool)
@@ -183,6 +188,10 @@ class ToolRegistry:
                 continue
             explicit = enabled_per_profile.get(tool.tool_id)
             enabled = explicit if explicit is not None else self._default_enabled(tool.tool_type)
+            # ``locked`` tools can't be disabled, so always report them on —
+            # a stale ``profile_tools`` row must not show them as off.
+            if tool.locked:
+                enabled = True
             rows.append({
                 "tool_id": tool.tool_id,
                 "name": tool.name,
@@ -588,8 +597,10 @@ class ToolRegistry:
         and any built-in marked ``hidden`` via ``TOOL_CONFIG`` — those are
         system tools whose lifecycle is controlled by the runtime, and
         disabling them would break internal flows (e.g. skill-event routing).
-        Every other type accepts the toggle; the row in ``profile_tools``
-        overrides the per-type default returned by :meth:`_default_enabled`.
+        Built-ins marked ``locked`` are visible but can't be turned off, so a
+        disable is refused while an (idempotent) re-enable is allowed. Every
+        other type accepts the toggle; the row in ``profile_tools`` overrides
+        the per-type default returned by :meth:`_default_enabled`.
         """
         tool = self._tools.get(tool_id)
         if tool is None:
@@ -602,6 +613,12 @@ class ToolRegistry:
             raise ValueError(
                 f"Tool '{tool_id}' is a hidden system tool and cannot be "
                 f"toggled from the Settings UI."
+            )
+        # ``locked`` tools are visible but always-on: a re-enable is a no-op,
+        # but a disable must be refused.
+        if tool.locked and not enabled:
+            raise ValueError(
+                f"Tool '{tool_id}' is locked and cannot be disabled."
             )
         self._storage.set_profile_tool(profile, tool_id, enabled)
 

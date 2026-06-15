@@ -964,7 +964,9 @@ TOOL_CONFIG: ToolConfig = {
     "name": "system_file",
     "display_name": "System File",
     "default_model_group": "low",
-    "hidden": True,
+    # Visible in Settings (so its token/size limits can be configured) but
+    # locked on — a core capability the user must not disable.
+    "locked": True,
     "llm_parameters": {
         "tool_instructions": (
             "A file management assistant. Operates inside the conversation's "

@@ -59,6 +59,10 @@ interface SetupToolItem {
    *  ``"google"``). Surfaced as a hint next to the toggle so the user
    *  knows their selection will trigger a pip install on submit. */
   requiresFeature: string | null;
+
+  /** Built-in tools only: when true the enable toggle is locked on — the
+   *  tool can't be opted out of during setup. Sourced from TOOL_CONFIG.locked. */
+  toggleLocked: boolean;
 }
 
 const items = ref<SetupToolItem[]>([]);
@@ -172,9 +176,12 @@ onMounted(async () => {
         reasoningEffort: (llmCfg.reasoning_effort as string) || '',
         fullReasoning: !!tool.full_reasoning,
         llmDefaults: tool.llm_defaults ?? {},
-        enabled: tool.enabled,
+        // Locked tools can't be opted out of — force them on so the submitted
+        // _enabled payload never disables them.
+        enabled: tool.toggle_locked ? true : tool.enabled,
         expanded: false,
         requiresFeature: tool.requires_feature ?? null,
+        toggleLocked: !!tool.toggle_locked,
       };
     });
   } catch {
@@ -253,6 +260,7 @@ watch(items, emitConfigs, { deep: true });
               :status-tag="getStatusTag(item)"
               :expanded="item.expanded"
               :enabled="item.enabled"
+              :toggle-locked="item.toggleLocked"
               @toggle-expand="item.expanded = !item.expanded"
               @update:enabled="item.enabled = $event"
             />
@@ -329,6 +337,7 @@ watch(items, emitConfigs, { deep: true });
                 :status-tag="getStatusTag(item)"
                 :expanded="item.expanded"
                 :enabled="item.enabled"
+                :toggle-locked="item.toggleLocked"
                 @toggle-expand="item.expanded = !item.expanded"
                 @update:enabled="item.enabled = $event"
               />

@@ -158,6 +158,9 @@ def list_builtin_tool_catalog() -> list[dict]:
             # "Installs: cremind[…]" hint; the post-setup enable handler
             # uses it to drive the missing-dep pre-flight (HTTP 409).
             "requires_feature": tool_info.get("requires_feature"),
+            # ``locked`` tools render with a disabled (locked-on) toggle in
+            # the wizard so the user can't opt out — see ToolConfig.locked.
+            "toggle_locked": bool(tool_info.get("locked", False)),
         })
     return rows
 
@@ -513,6 +516,11 @@ async def register_builtin_tools(
         # reasoning agent — see ToolConfig.hidden.
         if tool_info.get("hidden", False):
             group.hidden = True
+        # ``locked`` leaves the tool visible in the Settings UI but locks its
+        # enable/disable toggle on — the registry refuses to disable it and
+        # always exposes it to the reasoning agent — see ToolConfig.locked.
+        if tool_info.get("locked", False):
+            group.locked = True
         registry.register_builtin(group, source=module_name)
 
 

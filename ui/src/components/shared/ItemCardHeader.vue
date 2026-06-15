@@ -7,6 +7,9 @@ withDefaults(defineProps<{
   statusTag: { label: string; type: 'success' | 'warning' | 'info' | 'danger' };
   expanded: boolean;
   enabled: boolean;
+  /** When true, the enable/disable switch is disabled (locked on) and a
+   *  lock icon is shown — the tool can't be turned off. */
+  toggleLocked?: boolean;
   showAuthenticate?: boolean;
   showUnlink?: boolean;
   showReconnect?: boolean;
@@ -22,6 +25,7 @@ withDefaults(defineProps<{
 }>(), {
   removeIcon: 'mdi:delete',
   removeType: 'danger',
+  toggleLocked: false,
 });
 
 const emit = defineEmits<{
@@ -55,7 +59,13 @@ const emit = defineEmits<{
           </ElButton>
         </template>
       </ElPopconfirm>
-      <ElSwitch :model-value="enabled" @update:model-value="emit('update:enabled', $event as boolean)" size="small" />
+      <ElSwitch
+        :model-value="enabled"
+        :disabled="toggleLocked"
+        @update:model-value="emit('update:enabled', $event as boolean)"
+        size="small"
+      />
+      <Icon v-if="toggleLocked" icon="mdi:lock" class="lock-icon" />
       <Icon :icon="expanded ? 'mdi:chevron-up' : 'mdi:chevron-down'" class="expand-icon" />
     </div>
   </div>
@@ -72,5 +82,6 @@ const emit = defineEmits<{
 .item-info { display: flex; align-items: center; gap: 8px; }
 .item-name { font-weight: 600; font-size: 0.9rem; }
 .item-actions { display: flex; align-items: center; gap: 6px; }
+.lock-icon { font-size: 14px; color: var(--text-tertiary); }
 .expand-icon { font-size: 18px; color: var(--text-tertiary); cursor: pointer; }
 </style>

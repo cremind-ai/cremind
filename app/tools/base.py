@@ -121,6 +121,11 @@ class Tool(ABC):
     # available to the reasoning agent (intrinsic tools).
     hidden: bool = False
 
+    # locked tools stay in the UI listing (unlike hidden) but their
+    # enable/disable toggle is locked on — they cannot be disabled.
+    # See ToolConfig.locked.
+    locked: bool = False
+
     def __init__(self) -> None:
         # Populated by ToolRegistry.register_*; safe defaults until then.
         self._tool_id: str = ""

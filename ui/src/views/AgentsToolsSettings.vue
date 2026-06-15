@@ -95,6 +95,9 @@ interface UnifiedItem {
   /** LLM fields whose user override is forbidden. The matching switches/inputs
    *  in the form are rendered disabled. */
   lockedLlmFields: string[];
+  /** Built-in tools only: true when the enable/disable toggle is locked on
+   *  (the tool can't be disabled). Renders the switch disabled + a lock icon. */
+  toggleLocked: boolean;
   /** Skills only: true when the skill is a shipped built-in. Drives the
    *  "Reset to Default" vs "Delete" action on the skill card. */
   isBuiltinSkill: boolean;
@@ -139,7 +142,13 @@ const importing = ref(false);
 const archiveInput = ref<HTMLInputElement | null>(null);
 
 // Categorized items -- driven by tool_type, not by agent_type
-const builtinItems = computed(() => items.value.filter(i => i.kind === 'builtin'));
+// Built-in tools list locked (non-disableable) tools first; the sort is
+// stable so tools keep their original relative order within each group.
+const builtinItems = computed(() =>
+  items.value
+    .filter(i => i.kind === 'builtin')
+    .sort((a, b) => Number(b.toggleLocked) - Number(a.toggleLocked)),
+);
 const skillItems = computed(() => items.value.filter(i => i.kind === 'skill'));
 const mcpRemoteItems = computed(() => items.value.filter(i => i.kind === 'mcp-remote'));
 const a2aRemoteItems = computed(() => items.value.filter(i => i.kind === 'a2a-remote'));
@@ -352,6 +361,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       llmBound: isSkill ? true : (tool.llm_bound ?? true),
       llmDefaults,
       lockedLlmFields,
+      toggleLocked: !!tool.toggle_locked,
       isBuiltinSkill: isSkill && !!tool.is_builtin,
       longRunningApp: tool.long_running_app ?? null,
       registering: false,
@@ -396,6 +406,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       llmBound: true,
       llmDefaults: {},
       lockedLlmFields: [],
+      toggleLocked: false,
       isBuiltinSkill: false,
       longRunningApp: null,
       registering: false,
@@ -436,6 +447,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       llmBound: true,
       llmDefaults: {},
       lockedLlmFields: [],
+      toggleLocked: false,
       isBuiltinSkill: false,
       longRunningApp: null,
       registering: false,
@@ -907,6 +919,7 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
                 :status-tag="getBuiltinStatusTag(item)"
                 :expanded="item.expanded"
                 :enabled="item.enabled"
+                :toggle-locked="item.toggleLocked"
                 :show-authenticate="item.showAuthenticate"
                 :show-unlink="item.showUnlink"
                 @toggle-expand="item.expanded = !item.expanded"
@@ -1016,6 +1029,7 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
                 :status-tag="getBuiltinStatusTag(item)"
                 :expanded="item.expanded"
                 :enabled="item.enabled"
+                :toggle-locked="item.toggleLocked"
                 :show-authenticate="item.showAuthenticate"
                 :show-unlink="item.showUnlink"
                 :show-remove="true"
@@ -1105,6 +1119,7 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
                 :status-tag="getRemoteStatusTag(item)"
                 :expanded="item.expanded"
                 :enabled="item.enabled"
+                :toggle-locked="item.toggleLocked"
                 :show-authenticate="item.showAuthenticate && !item.connectionError"
                 :show-unlink="item.showUnlink && !item.connectionError"
                 :show-reconnect="!!item.connectionError"
@@ -1174,6 +1189,7 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
                 :status-tag="getRemoteStatusTag(item)"
                 :expanded="item.expanded"
                 :enabled="item.enabled"
+                :toggle-locked="item.toggleLocked"
                 :show-authenticate="item.showAuthenticate && !item.connectionError"
                 :show-unlink="item.showUnlink && !item.connectionError"
                 :show-reconnect="!!item.connectionError"

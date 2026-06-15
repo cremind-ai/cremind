@@ -201,7 +201,9 @@ TOOL_CONFIG: ToolConfig = {
     "name": "exec_shell",
     "display_name": "Shell Executor",
     "default_model_group": "low",
-    "hidden": True,
+    # Visible in Settings (so its output-handling options can be configured)
+    # but locked on — a core capability the user must not disable.
+    "locked": True,
     "llm_parameters": {
         "tool_instructions": (
             "Execute command-line instructions on the terminal. Supports Linux, Windows, and macOS.\n"

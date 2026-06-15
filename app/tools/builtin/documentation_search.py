@@ -101,7 +101,9 @@ TOOL_CONFIG: ToolConfig = {
     "name": "documentation_search",
     "display_name": SERVER_NAME,
     "default_model_group": "low",
-    "hidden": True,
+    # Visible in Settings (so its top-k can be configured) but locked on —
+    # the agent must always be able to search its own documentation.
+    "locked": True,
     "llm_parameters": {
         "tool_instructions": _DOC_TOOL_INSTRUCTIONS,
         # Locked off: the relevance ranking happens INSIDE run() via the
