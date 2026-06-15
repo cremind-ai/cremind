@@ -1023,6 +1023,16 @@ export async function fetchSystemVars(
 
 // ── Profiles ──
 
+/** Public (no auth): profile names only, for the login screen's dropdown. */
+export async function listPublicProfileNames(
+  agentUrl: string
+): Promise<{ profiles: string[] }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/profiles/names`);
+  if (!res.ok) throw new Error(`Failed to list profile names: ${res.statusText}`);
+  return res.json();
+}
+
 export async function listProfiles(
   agentUrl: string,
   token: string
