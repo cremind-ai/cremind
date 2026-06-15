@@ -60,7 +60,7 @@ interface UnifiedItem {
   kind: 'builtin' | 'skill' | 'mcp-remote' | 'a2a-remote';
 
   toolName: string | null;  // tool_id used by /api/tools/{tool_id} endpoints
-  toolConfigFields: Record<string, { description: string; type: string; secret: boolean; configured: boolean }>;
+  toolConfigFields: Record<string, { description: string; type: string; secret: boolean; configured: boolean; required?: boolean; enum?: string[]; default?: unknown }>;
   toolConfigValues: Record<string, string>;
   toolConfigured: boolean;
 

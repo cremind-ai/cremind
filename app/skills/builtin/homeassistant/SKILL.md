@@ -2,8 +2,13 @@
 name: homeassistant
 description: Read entity states, call services (turn lights/switches on/off, set values, run scripts), and receive granular real-time events (motion detected, door opened, light turned on, person arrived home, ...) from a self-hosted or HA Cloud Home Assistant instance. Connects directly — no add-on, no cloud relay. Authenticate with a pasted Long-Lived Access Token, or leave it blank and authorize via the OAuth 2.0 browser flow.
 metadata: {
-  environment_variables: ["HA_URL"],
-  optional_environment_variables: ["HA_TOKEN", "HA_ENTITY_FILTER", "HA_VERIFY_SSL", "LOG_LEVEL"],
+  environment_variables: [
+    {"name": "HA_URL", "description": "Home Assistant base URL, e.g. http://homeassistant.local:8123", "required": true, "type": "string"},
+    {"name": "HA_TOKEN", "description": "Long-Lived Access Token (leave blank to authorize via the OAuth browser flow)", "required": false, "secret": true, "type": "string"},
+    {"name": "HA_ENTITY_FILTER", "description": "Comma-separated entity globs (fnmatch); empty = all entities", "required": false, "type": "string", "default": ""},
+    {"name": "HA_VERIFY_SSL", "description": "Verify TLS certificates (turn off for self-signed/local certs)", "required": false, "type": "boolean", "default": "true"},
+    {"name": "LOG_LEVEL", "description": "Logging verbosity", "required": false, "type": "enum", "enum": ["DEBUG", "INFO", "WARNING", "ERROR"], "default": "INFO"}
+  ],
   events: {"event_type": [
     {"name": "became_unavailable", "description": "An entity went offline / its state became unavailable or unknown"},
     {"name": "became_available", "description": "An entity came back online from an unavailable/unknown state"},

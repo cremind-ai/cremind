@@ -2,8 +2,11 @@
 name: gmail
 description: Read, search, send, reply to, label, and trash Gmail messages via OAuth2, and receive new-email events in real time. Authorizes through the Cremind Connect service (no GCP setup); tokens stay on this machine. A persistent listener uses Gmail watch + Pub/Sub (via the relay) and drops new INBOX messages as markdown.
 metadata: {
-  environment_variables: ["CREMIND_CONNECT_URL", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
-  optional_environment_variables: ["CREMIND_CONNECT_URL", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
+  environment_variables: [
+    {"name": "CREMIND_CONNECT_URL", "description": "Cremind Connect base URL (OAuth broker)", "required": false, "type": "string", "default": "https://connect.cremind.io"},
+    {"name": "GOOGLE_CLIENT_ID", "description": "Google OAuth Client ID (auto-fetched from Cremind Connect when blank)", "required": false, "type": "string", "default": ""},
+    {"name": "GOOGLE_CLIENT_SECRET", "description": "Google OAuth Client Secret (auto-fetched from Cremind Connect when blank)", "required": false, "secret": true, "type": "string", "default": ""}
+  ],
   events: {"event_type":[{"name":"new_email","description":"A new email arrived in the Gmail INBOX"}]},
   long_running_app: {
     command: "uv run scripts/event_listener.py",

@@ -251,7 +251,7 @@ def _materialize_skill_env_files(profile: str, registry: ToolRegistry) -> None:
     for tool in registry.tools_for_profile(profile):
         if tool.tool_type is not ToolType.SKILL:
             continue
-        declared = getattr(tool, "environment_variables", []) or []
+        declared = getattr(tool, "environment_variable_names", []) or []
         if not declared:
             continue
         try:

@@ -634,6 +634,9 @@ export interface ToolConfigField {
   type: string;
   secret: boolean;
   configured: boolean;
+  /** Whether the variable must be set. Skills declare this per-variable; when
+   *  false (or with a default) the field is editable but never blocks config. */
+  required?: boolean;
   enum?: string[];
   default?: unknown;
 }

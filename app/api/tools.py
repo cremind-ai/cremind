@@ -713,28 +713,50 @@ def _schema_for_tool(tool) -> dict:
     """Return the static config schema for a built-in tool or skill, or {} for others.
 
     Skills declare their environment variables via ``metadata.environment_variables``
-    in ``SKILL.md`` (a list of variable names). They are surfaced through the same
-    ``required_config`` shape used by built-in tools so the existing UI/save flow
-    works without further branching. Variables also listed in
-    ``metadata.optional_environment_variables`` get an empty ``default`` so they
-    stay editable but never mark the skill as "needs config" when left blank.
+    in ``SKILL.md`` — a list of per-variable objects (see
+    :attr:`app.skills.tool.SkillTool.environment_variables`). Each object's
+    ``required`` / ``secret`` / ``type`` / ``enum`` / ``default`` / ``description``
+    metadata is mapped onto the same ``required_config`` field shape used by
+    built-in tools so the existing UI/save flow renders it without branching.
+
+    Gating: a variable marked ``required: true`` blocks "needs config" until set;
+    optional variables carry a ``default`` (the author's value, or ``""``) so they
+    stay editable but never block — the skill's own code supplies the real runtime
+    fallback (``os.environ.get(name, default)``).
     """
     if tool is None:
         return {}
     if tool.tool_type is ToolType.BUILTIN and isinstance(tool, BuiltInToolGroup):
         return get_builtin_tool_config(tool.config_name)
     if tool.tool_type is ToolType.SKILL:
-        names = getattr(tool, "environment_variables", []) or []
-        if not names:
+        specs = getattr(tool, "environment_variables", []) or []
+        if not specs:
             return {}
-        optional = set(getattr(tool, "optional_environment_variables", []) or [])
-        required = {}
-        for name in names:
-            spec = {"description": name, "type": "string", "secret": _is_secret_var_name(name)}
-            if name in optional:
-                spec["default"] = ""
-            required[name] = spec
-        return {"tool": {"required_config": required}}
+        required_config: dict[str, dict] = {}
+        for spec in specs:
+            name = spec["name"]
+            is_required = bool(spec.get("required"))
+            secret = spec.get("secret")
+            field: dict = {
+                "description": spec.get("description") or name,
+                "type": spec.get("type") or "string",
+                "secret": secret if secret is not None else _is_secret_var_name(name),
+                "required": is_required,
+            }
+            if spec.get("enum"):
+                field["enum"] = spec["enum"]
+            default = spec.get("default")
+            if is_required:
+                # Gating keys off ``required``; only surface a default the
+                # author explicitly provided (purely a UI hint/placeholder).
+                if default is not None:
+                    field["default"] = default
+            else:
+                # Optional: always carry a default (real value or "") so the
+                # field is pre-fillable and clearly non-blocking.
+                field["default"] = default if default is not None else ""
+            required_config[name] = field
+        return {"tool": {"required_config": required_config}}
     return {}
 
 
@@ -747,22 +769,31 @@ def _write_skill_env_file(tool, config_manager, profile: str) -> None:
     all_vars = config_manager.get_variables(
         tool.tool_id, profile, include_secrets=True,
     )
-    declared = getattr(tool, "environment_variables", []) or []
+    declared = getattr(tool, "environment_variable_names", []) or []
     write_skill_env_file(tool.info.dir_path / "scripts", declared, all_vars)
 
 
 def _is_tool_configured(tool, snapshot: dict) -> bool:
     """Return True if all required variables are populated for this tool.
 
-    Fields that declare a ``default`` value are considered satisfied even
-    when the user has not explicitly set them.
+    A field is satisfied when the user has set a value, OR the field is
+    explicitly optional (``required: False`` — skill env vars), OR it declares
+    a ``default`` (built-in tools, whose field specs carry no ``required`` flag).
     """
     schema = _schema_for_tool(tool)
     required = schema.get("tool", {}).get("required_config", {})
     if not required:
         return True
     have = snapshot.get("variables", {})
-    return all(
-        have.get(k) or field_spec.get("default") is not None
-        for k, field_spec in required.items()
-    )
+
+    def _satisfied(key: str, field_spec: dict) -> bool:
+        if have.get(key):
+            return True
+        required_flag = field_spec.get("required")
+        if required_flag is True:
+            return False
+        if required_flag is False:
+            return True
+        return field_spec.get("default") is not None
+
+    return all(_satisfied(k, spec) for k, spec in required.items())
