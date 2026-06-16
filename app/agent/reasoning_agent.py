@@ -218,12 +218,15 @@ class ReasoningAgent:
             ]
         # Event-triggered runs must not register new watchers/events — that
         # path leads to recursive event storms (event → reasoning → register →
-        # event → …). Drop both tools so the LLM can't see or select them.
+        # event → …). ``register_skill_event`` is a standalone tool, so drop it
+        # outright. ``register_file_watcher`` is now a *subtool* of the
+        # ``system_file`` group (which we must keep for its file ops), so it is
+        # suppressed deeper down: ``_dispatch`` injects ``_triggered_by_event``
+        # into the System File call and ``system_file.get_prepare_tools`` hides
+        # the register subtool from the child LLM.
+        self._triggered_by_event = triggered_by_event
         if triggered_by_event:
-            tools = [
-                t for t in tools
-                if t.tool_id not in ("register_file_watcher", "register_skill_event")
-            ]
+            tools = [t for t in tools if t.tool_id != "register_skill_event"]
         self._tools = tools
         self._tools_by_id = {t.tool_id: t for t in self._tools}
         self._action_names = list(self._tools_by_id.keys())
@@ -861,6 +864,13 @@ class ReasoningAgent:
                     yield r
                 return
             arguments = {**arguments, **(pinned or {})}
+
+        # Event-triggered runs must not register new watchers. ``system_file``
+        # owns the ``register_file_watcher`` subtool now, so signal the run kind
+        # via a dispatch argument; ``system_file.get_prepare_tools`` reads it and
+        # hides that one subtool from the group's child LLM (file ops stay).
+        if tool.tool_id == "system_file" and self._triggered_by_event:
+            arguments = {**arguments, "_triggered_by_event": True}
 
         variables = self._load_variables(tool.tool_id) if tool.tool_type in (
             ToolType.A2A, ToolType.MCP, ToolType.BUILTIN,
