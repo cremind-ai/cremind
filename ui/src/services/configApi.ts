@@ -702,6 +702,10 @@ export interface ToolStatus {
    *  built-in (under ``app/skills/builtin``). Drives the Settings page
    *  "Reset to Default" (built-in) vs "Delete" (imported) action. */
   is_builtin?: boolean;
+  /** Built-in tools only: when true, the tool is visible but its enable/disable
+   *  toggle is locked ON (the API rejects disable). The UI renders the switch
+   *  disabled with a lock icon. Sourced from TOOL_CONFIG.locked. */
+  toggle_locked?: boolean;
 }
 
 export async function listTools(

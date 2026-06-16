@@ -214,6 +214,14 @@ class ToolConfig(TypedDict, total=False):
     # auto-installer and the post-setup enable pre-flight to pip-install
     # the right extras (e.g. ``"browser"`` -> ``cremind[browser]``).
     requires_feature: str
+    # When True, the tool stays VISIBLE in the Settings UI but its
+    # enable/disable toggle is locked ON: the user cannot turn it off.
+    # Unlike ``hidden`` (which removes the tool from the UI entirely),
+    # ``locked`` keeps it listed and configurable while guaranteeing it is
+    # always exposed to the reasoning agent. The API rejects disable writes;
+    # the UI renders the toggle disabled with a lock icon (surfaced to the
+    # frontend as the row field ``toggle_locked``).
+    locked: bool
 
 
 class ChatCompletionStreamResponseType(TypedDict):

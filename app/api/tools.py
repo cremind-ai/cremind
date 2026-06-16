@@ -118,6 +118,9 @@ def get_tool_routes(state: BootedState) -> list[Route]:
                 # Drives the Setup Wizard "Installs: cremind[…]" hint and
                 # the post-setup enable-toggle install dialog.
                 "requires_feature": schema.get("tool", {}).get("requires_feature"),
+                # Built-in tools only: when True the Settings toggle is locked
+                # on (the API rejects disable) — see ToolConfig.locked.
+                "toggle_locked": bool(schema.get("tool", {}).get("locked", False)),
             })
             if hasattr(tool, "connection_error") and getattr(tool, "connection_error"):
                 row["connection_error"] = tool.connection_error
