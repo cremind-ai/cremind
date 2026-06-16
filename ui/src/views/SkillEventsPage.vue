@@ -25,9 +25,9 @@ import {
   type SkillEventSubscription,
 } from '../services/skillEventsApi';
 import {
-  openSkillEventsAdminStream,
-  type SkillEventsAdminStreamHandle,
-} from '../services/skillEventsAdminStream';
+  subscribeSkillEventsAdmin,
+  type AdminEventsSubHandle,
+} from '../services/adminEventsStream';
 import FileWatcherSection from '../components/FileWatcherSection.vue';
 
 const props = defineProps<{ profile: string }>();
@@ -49,14 +49,14 @@ const sortedSubs = computed(() =>
   [...subscriptions.value].sort((a, b) => b.created_at - a.created_at),
 );
 
-let streamHandle: SkillEventsAdminStreamHandle | null = null;
+let streamHandle: AdminEventsSubHandle | null = null;
 
 function streamStart() {
   streamStop();
   if (!settings.agentUrl || !settings.authToken) return;
   loading.value = true;
   errorMessage.value = '';
-  streamHandle = openSkillEventsAdminStream(
+  streamHandle = subscribeSkillEventsAdmin(
     settings.agentUrl,
     settings.authToken,
     (snap) => {
@@ -64,10 +64,6 @@ function streamStart() {
       listenerByName.value = snap.listeners;
       loading.value = false;
       errorMessage.value = '';
-    },
-    (err) => {
-      errorMessage.value = err instanceof Error ? err.message : String(err);
-      loading.value = false;
     },
   );
 }

@@ -18,9 +18,9 @@ import {
   type FileWatcherSubscription,
 } from '../services/fileWatchersApi';
 import {
-  openFileWatchersAdminStream,
-  type FileWatchersAdminStreamHandle,
-} from '../services/fileWatchersAdminStream';
+  subscribeFileWatchersAdmin,
+  type AdminEventsSubHandle,
+} from '../services/adminEventsStream';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -34,24 +34,20 @@ const sortedSubs = computed(() =>
   [...subscriptions.value].sort((a, b) => b.created_at - a.created_at),
 );
 
-let streamHandle: FileWatchersAdminStreamHandle | null = null;
+let streamHandle: AdminEventsSubHandle | null = null;
 
 function streamStart() {
   streamStop();
   if (!settings.agentUrl || !settings.authToken) return;
   loading.value = true;
   errorMessage.value = '';
-  streamHandle = openFileWatchersAdminStream(
+  streamHandle = subscribeFileWatchersAdmin(
     settings.agentUrl,
     settings.authToken,
     (snap) => {
       subscriptions.value = snap.subscriptions;
       loading.value = false;
       errorMessage.value = '';
-    },
-    (err) => {
-      errorMessage.value = err instanceof Error ? err.message : String(err);
-      loading.value = false;
     },
   );
 }
