@@ -25,7 +25,7 @@ from app.tools.builtin import system_file
 _WATCHER_NAMES = {"register_file_watcher", "list_file_watchers", "delete_file_watcher"}
 
 _ALL_SYSTEM_FILE_FUNCS = [
-    "search_files", "list_files", "get_file_info", "read_file",
+    "search_files", "grep_files", "list_files", "get_file_info", "read_file",
     "write_file", "write_file_from_reference",
     "register_file_watcher", "list_file_watchers", "delete_file_watcher",
 ]
@@ -61,7 +61,8 @@ def test_get_tools_includes_watcher_subtools() -> None:
     tools = system_file.get_tools({})
     names = {t.name for t in tools}
     assert _WATCHER_NAMES.issubset(names)
-    assert len(tools) == 9  # 6 file ops + 3 watcher functions
+    assert "grep_files" in names
+    assert len(tools) == 10  # 7 file ops + 3 watcher functions
 
 
 def test_watcher_subtools_are_self_describing() -> None:
@@ -80,7 +81,7 @@ def test_prepare_tools_passthrough_on_normal_run() -> None:
     assert [t["function"]["name"] for t in result] == _ALL_SYSTEM_FILE_FUNCS
     # Explicit falsy flag -> nothing filtered.
     result = prepare("q", list(tools), arguments={"_triggered_by_event": False})
-    assert len(result) == 9
+    assert len(result) == 10
 
 
 def test_prepare_tools_suppresses_only_register_on_event_run() -> None:
@@ -90,4 +91,5 @@ def test_prepare_tools_suppresses_only_register_on_event_run() -> None:
     assert "register_file_watcher" not in names  # the storm risk: suppressed
     assert "list_file_watchers" in names          # harmless: stays
     assert "delete_file_watcher" in names          # harmless: stays
-    assert len(result) == 8
+    assert "grep_files" in names                   # read-only: stays
+    assert len(result) == 9

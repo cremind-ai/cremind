@@ -6,13 +6,15 @@ content handling via markitdown conversion and token-based limits. Write
 operations are restricted to human-readable text files.
 """
 
+import asyncio
 import fnmatch
 import mimetypes
 import os
 import platform
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.tools.builtin.base import (
     BuiltInTool,
@@ -31,6 +33,15 @@ MAX_MARKITDOWN_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 MAX_LIST_ENTRIES = 100
 MAX_SEARCH_RESULTS = 100
 
+# grep_files defaults (the first three are user-configurable; the rest are
+# internal safety rails that bound a single grep call regardless of profile).
+MAX_GREP_RESULTS = 100                  # hard cap on returned entries
+MAX_GREP_FILE_SIZE = 5 * 1024 * 1024    # 5 MB; larger files are skipped
+MAX_GREP_MATCH_LINE_LENGTH = 1000       # clip a single matched/context line
+DEFAULT_GREP_RESULTS = 50               # per-call max_results default
+MAX_GREP_FILES_SCANNED = 5000           # traversal budget (files actually read)
+MAX_GREP_CONTEXT_LINES = 50             # clamp for context / -A / -B / -C
+
 
 class Var:
     """Variable keys for the System File tool's per-profile overrides."""
@@ -38,6 +49,9 @@ class Var:
     MAX_MARKITDOWN_FILE_SIZE = "MAX_MARKITDOWN_FILE_SIZE"
     MAX_LIST_ENTRIES = "MAX_LIST_ENTRIES"
     MAX_SEARCH_RESULTS = "MAX_SEARCH_RESULTS"
+    MAX_GREP_RESULTS = "MAX_GREP_RESULTS"
+    MAX_GREP_FILE_SIZE = "MAX_GREP_FILE_SIZE"
+    MAX_GREP_MATCH_LINE_LENGTH = "MAX_GREP_MATCH_LINE_LENGTH"
 
 
 def _resolve_limits(arguments: Dict[str, Any]) -> Dict[str, int]:
@@ -60,6 +74,10 @@ def _resolve_limits(arguments: Dict[str, Any]) -> Dict[str, int]:
         "max_markitdown_file_size": _as_int(Var.MAX_MARKITDOWN_FILE_SIZE, MAX_MARKITDOWN_FILE_SIZE),
         "max_list_entries": _as_int(Var.MAX_LIST_ENTRIES, MAX_LIST_ENTRIES),
         "max_search_results": _as_int(Var.MAX_SEARCH_RESULTS, MAX_SEARCH_RESULTS),
+        "max_grep_results": _as_int(Var.MAX_GREP_RESULTS, MAX_GREP_RESULTS),
+        "max_grep_file_size": _as_int(Var.MAX_GREP_FILE_SIZE, MAX_GREP_FILE_SIZE),
+        "max_grep_match_line_length": _as_int(
+            Var.MAX_GREP_MATCH_LINE_LENGTH, MAX_GREP_MATCH_LINE_LENGTH),
     }
 
 # Lazy-loaded encoder (created once on first use)
@@ -205,6 +223,111 @@ def _file_description(name: str, mime: str, uri: str) -> str:
     if mime.startswith("image/"):
         return f'![{name}]({uri} "{name}")'
     return f'[{name}]({uri} "{name}")'
+
+
+# ---------------------------------------------------------------------------
+# Grep helpers
+# ---------------------------------------------------------------------------
+
+# Curated file-type aliases (ripgrep-style ``--type``). Maps a short language
+# name the LLM reliably knows to the file extensions it covers, so the agent
+# can write ``type='py'`` instead of an error-prone glob. Extensions are
+# compared case-insensitively against ``os.path.splitext(name)[1].lower()``.
+_TYPE_EXTENSIONS: Dict[str, Tuple[str, ...]] = {
+    "py":     (".py", ".pyi"),
+    "js":     (".js", ".jsx", ".mjs", ".cjs"),
+    "ts":     (".ts", ".tsx"),
+    "web":    (".html", ".htm", ".css", ".scss", ".js", ".jsx", ".ts", ".tsx",
+               ".vue", ".svelte"),
+    "c":      (".c", ".h"),
+    "cpp":    (".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"),
+    "rust":   (".rs",),
+    "go":     (".go",),
+    "java":   (".java",),
+    "json":   (".json", ".jsonl", ".ndjson"),
+    "yaml":   (".yaml", ".yml"),
+    "toml":   (".toml",),
+    "xml":    (".xml",),
+    "html":   (".html", ".htm"),
+    "css":    (".css", ".scss", ".sass", ".less"),
+    "md":     (".md", ".markdown", ".mdx"),
+    "txt":    (".txt", ".text", ".log"),
+    "sh":     (".sh", ".bash", ".zsh"),
+    "sql":    (".sql",),
+    "csv":    (".csv", ".tsv"),
+    "config": (".ini", ".cfg", ".conf", ".env", ".properties", ".toml",
+               ".yaml", ".yml"),
+}
+
+
+def _compile_grep_pattern(
+    pattern: str,
+    *,
+    fixed_strings: bool,
+    whole_word: bool,
+    case_insensitive: bool,
+    multiline: bool,
+) -> "re.Pattern[str]":
+    """Build the compiled regex for a grep call. Raises ``re.error`` on bad input.
+
+    ``fixed_strings`` escapes the pattern (grep -F); ``whole_word`` brackets it
+    in word boundaries (grep -w) -- grouped with ``(?:...)`` so alternations
+    bind correctly. ``multiline`` sets ``re.DOTALL`` so ``.`` spans newlines;
+    we drive line boundaries ourselves (see ``_grep_search_multiline``) so
+    ``re.MULTILINE`` is intentionally *not* set.
+    """
+    body = re.escape(pattern) if fixed_strings else pattern
+    if whole_word:
+        body = r"\b(?:" + body + r")\b"
+    flags = 0
+    if case_insensitive:
+        flags |= re.IGNORECASE
+    if multiline:
+        flags |= re.DOTALL
+    return re.compile(body, flags)
+
+
+def _expand_braces(glob_pat: str) -> List[str]:
+    """Expand a single ``{a,b,c}`` group into multiple fnmatch patterns.
+
+    stdlib ``fnmatch`` does not understand brace sets, so ``*.{ts,tsx}`` is
+    pre-expanded to ``['*.ts', '*.tsx']``. Only the first brace group is
+    expanded (enough for the common ``*.{ext1,ext2}`` case); patterns without
+    a brace group are returned unchanged.
+    """
+    start = glob_pat.find("{")
+    end = glob_pat.find("}", start + 1)
+    if start == -1 or end == -1:
+        return [glob_pat]
+    prefix, inner, suffix = glob_pat[:start], glob_pat[start + 1:end], glob_pat[end + 1:]
+    return [f"{prefix}{opt}{suffix}" for opt in inner.split(",")]
+
+
+def _grep_name_matches(
+    name: str,
+    glob_variants: Optional[List[str]],
+    type_exts: Optional[Tuple[str, ...]],
+) -> bool:
+    """Return True if a file base name passes the glob AND type filters.
+
+    ``glob`` matching uses ``fnmatch.fnmatch`` (same call as search_files /
+    list_files -- case-insensitive on Windows, case-sensitive on POSIX); the
+    type filter compares the lower-cased extension against the alias set.
+    """
+    if glob_variants is not None:
+        if not any(fnmatch.fnmatch(name, g) for g in glob_variants):
+            return False
+    if type_exts is not None:
+        if os.path.splitext(name)[1].lower() not in type_exts:
+            return False
+    return True
+
+
+def _truncate_line(text: str, max_len: int) -> Tuple[str, bool]:
+    """Clip *text* to *max_len* chars; return (clipped, was_truncated)."""
+    if len(text) > max_len:
+        return text[:max_len], True
+    return text, False
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +481,544 @@ class SearchFilesTool(BuiltInTool):
             "max_results": max_results,
             "results": results,
         })
+
+
+class GrepFilesTool(BuiltInTool):
+    name: str = "grep_files"
+    description: str = (
+        "Search the CONTENTS of text files for a regular-expression (or "
+        "fixed-string) pattern, recursively within the current working "
+        "directory. This is the content counterpart to search_files, which "
+        "matches file NAMES — use grep_files to find WHICH files contain a "
+        "string/regex and on WHAT line. Supports case-insensitivity, glob and "
+        "file-type filters, before/after context lines, whole-word, "
+        "fixed-string, invert and multiline matching, plus count and "
+        "files-with-matches summary modes. Returns relative paths you can pass "
+        "straight to read_file. Binary and oversized files are skipped "
+        "automatically. E.g. 'find TODO in the python files' -> pattern='TODO', "
+        "type='py'."
+    )
+    parameters: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": (
+                    "The search pattern. Interpreted as a regular expression "
+                    "by default (e.g. 'def\\s+\\w+', 'TODO|FIXME'). Set "
+                    "fixed_strings=true to match it literally instead. Required."
+                ),
+            },
+            "path": {
+                "type": "string",
+                "description": (
+                    "Optional sub-path **relative to the current working "
+                    "directory** to search. May be a directory (searched "
+                    "recursively) or a single file. Defaults to '.' (the "
+                    "current working directory). Do not repeat the working "
+                    "directory's own name here."
+                ),
+            },
+            "glob": {
+                "type": "string",
+                "description": (
+                    "Optional glob to limit which files are searched, matched "
+                    "against the file name only, e.g. '*.py' or '*.{ts,tsx}' "
+                    "(one brace set is supported). Combine with `type` for "
+                    "broader categories; a file must satisfy both when both "
+                    "are given."
+                ),
+            },
+            "type": {
+                "type": "string",
+                "enum": list(_TYPE_EXTENSIONS.keys()),
+                "description": (
+                    "Optional file-type alias that expands to a set of "
+                    "extensions, e.g. type='py' searches *.py/*.pyi, "
+                    "type='web' searches html/css/js/ts/etc. More reliable "
+                    "than hand-writing a multi-extension glob."
+                ),
+            },
+            "output_mode": {
+                "type": "string",
+                "enum": ["files_with_matches", "content", "count"],
+                "description": (
+                    "What to return. 'files_with_matches' (default): just the "
+                    "list of files containing a match — cheapest; follow up "
+                    "with read_file. 'content': matching lines with line "
+                    "numbers and optional context (grep -n). 'count': number "
+                    "of matching lines per file (grep -c)."
+                ),
+            },
+            "case_insensitive": {
+                "type": "boolean",
+                "description": "Ignore case when matching (grep -i). Default false.",
+            },
+            "fixed_strings": {
+                "type": "boolean",
+                "description": (
+                    "Treat `pattern` as a literal string instead of a regex "
+                    "(grep -F). Use when the pattern contains regex "
+                    "metacharacters to match literally. Default false."
+                ),
+            },
+            "whole_word": {
+                "type": "boolean",
+                "description": (
+                    "Match only whole words — the pattern must be bounded by "
+                    "word boundaries (grep -w). 'log' will not match 'login'. "
+                    "Default false."
+                ),
+            },
+            "invert_match": {
+                "type": "boolean",
+                "description": (
+                    "Select lines that do NOT match the pattern (grep -v). "
+                    "Not supported together with multiline. Default false."
+                ),
+            },
+            "multiline": {
+                "type": "boolean",
+                "description": (
+                    "Let the pattern span multiple lines: '.' matches newlines "
+                    "and each file is searched as one string. Use for patterns "
+                    "like 'class\\s+\\w+.*?:'. Disables invert_match and "
+                    "context. Default false."
+                ),
+            },
+            "only_matching": {
+                "type": "boolean",
+                "description": (
+                    "Return only the matched substring(s) rather than the whole "
+                    "line (grep -o); emits one entry per occurrence. "
+                    "output_mode='content' only. Default false."
+                ),
+            },
+            "show_line_numbers": {
+                "type": "boolean",
+                "description": (
+                    "Include 1-based line numbers in 'content' results "
+                    "(grep -n). Default true."
+                ),
+            },
+            "before_context": {
+                "type": "integer",
+                "description": (
+                    "Lines of context to show BEFORE each match (grep -B). "
+                    "output_mode='content' only. Default 0, capped at 50."
+                ),
+            },
+            "after_context": {
+                "type": "integer",
+                "description": (
+                    "Lines of context to show AFTER each match (grep -A). "
+                    "output_mode='content' only. Default 0, capped at 50."
+                ),
+            },
+            "context": {
+                "type": "integer",
+                "description": (
+                    "Lines of context to show both before AND after each match "
+                    "(grep -C); overrides before_context/after_context when "
+                    "set. Default 0, capped at 50."
+                ),
+            },
+            "max_results": {
+                "type": "integer",
+                "description": (
+                    "Maximum entries to return: matching lines for "
+                    "output_mode='content', files for 'files_with_matches', or "
+                    "per-file counts for 'count'. Defaults to 50, capped at the "
+                    "server limit. When the cap is hit the response sets "
+                    "truncated=true so you know more matches exist."
+                ),
+            },
+        },
+        "required": ["pattern"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self, data_dir: str):
+        self._data_dir = data_dir
+
+    async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
+        data_dir = arguments.pop("_working_directory", None) or self._data_dir
+        limits = _resolve_limits(arguments)
+
+        pattern = arguments.get("pattern", "")
+        if not isinstance(pattern, str) or pattern == "":
+            return BuiltInToolResult(structured_content={
+                "error": "Missing parameter",
+                "message": "pattern is required.",
+            })
+
+        rel_path = arguments.get("path") or "."
+        glob_pat = arguments.get("glob")
+        type_filter = arguments.get("type")
+        output_mode = arguments.get("output_mode", "files_with_matches")
+        if output_mode not in ("files_with_matches", "content", "count"):
+            output_mode = "files_with_matches"
+        case_insensitive = bool(arguments.get("case_insensitive", False))
+        fixed_strings = bool(arguments.get("fixed_strings", False))
+        whole_word = bool(arguments.get("whole_word", False))
+        invert_match = bool(arguments.get("invert_match", False))
+        multiline = bool(arguments.get("multiline", False))
+        only_matching = bool(arguments.get("only_matching", False))
+        show_line_numbers = bool(arguments.get("show_line_numbers", True))
+
+        if multiline and invert_match:
+            return BuiltInToolResult(structured_content={
+                "error": "Invalid combination",
+                "message": "invert_match is not supported in multiline mode.",
+            })
+
+        def _as_nonneg_int(value: Any, fallback: int = 0) -> int:
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                return fallback
+
+        if arguments.get("context") is not None:
+            before = after = min(_as_nonneg_int(arguments.get("context")),
+                                 MAX_GREP_CONTEXT_LINES)
+        else:
+            before = min(_as_nonneg_int(arguments.get("before_context")),
+                         MAX_GREP_CONTEXT_LINES)
+            after = min(_as_nonneg_int(arguments.get("after_context")),
+                        MAX_GREP_CONTEXT_LINES)
+
+        max_results = _as_nonneg_int(arguments.get("max_results"), DEFAULT_GREP_RESULTS)
+        if max_results <= 0:
+            max_results = DEFAULT_GREP_RESULTS
+        max_results = min(max_results, limits["max_grep_results"])
+
+        # Compile up front so a bad pattern is reported regardless of path.
+        try:
+            regex = _compile_grep_pattern(
+                pattern,
+                fixed_strings=fixed_strings,
+                whole_word=whole_word,
+                case_insensitive=case_insensitive,
+                multiline=multiline,
+            )
+        except re.error as e:
+            return BuiltInToolResult(structured_content={
+                "error": "Invalid regex",
+                "message": str(e),
+                "pattern": pattern,
+            })
+
+        try:
+            target = _safe_resolve(data_dir, rel_path)
+        except ValueError as e:
+            return BuiltInToolResult(structured_content={
+                "error": "Access denied",
+                "message": str(e),
+            })
+
+        if not os.path.exists(target):
+            return BuiltInToolResult(structured_content={
+                "error": "Not found",
+                "message": f"'{rel_path}' does not exist.",
+            })
+
+        glob_variants = _expand_braces(glob_pat) if glob_pat else None
+        type_exts = _TYPE_EXTENSIONS.get(type_filter) if type_filter else None
+
+        # The scan is CPU/IO-bound and synchronous; offload it so it doesn't
+        # block the event loop serving other concurrent agent requests.
+        payload = await asyncio.to_thread(
+            self._run_search,
+            data_dir=data_dir,
+            target=target,
+            rel_path=rel_path,
+            regex=regex,
+            pattern=pattern,
+            glob_variants=glob_variants,
+            type_exts=type_exts,
+            output_mode=output_mode,
+            invert_match=invert_match,
+            multiline=multiline,
+            only_matching=only_matching,
+            before=before,
+            after=after,
+            show_line_numbers=show_line_numbers,
+            max_results=max_results,
+            limits=limits,
+        )
+        return BuiltInToolResult(structured_content=payload)
+
+    def _walk_files(self, root, glob_variants, type_exts):
+        """Yield candidate file paths under *root*, applying name filters.
+
+        ``followlinks=False`` (the os.walk default) prevents directory-symlink
+        loops from causing infinite recursion on any OS.
+        """
+        for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+            for name in filenames:
+                if _grep_name_matches(name, glob_variants, type_exts):
+                    yield os.path.join(dirpath, name)
+
+    def _search_one_file(
+        self,
+        path: str,
+        regex: "re.Pattern[str]",
+        *,
+        output_mode: str,
+        invert_match: bool,
+        multiline: bool,
+        only_matching: bool,
+        before: int,
+        after: int,
+        show_line_numbers: bool,
+        max_line_len: int,
+        entry_limit: int,
+    ) -> Tuple[int, List[Dict[str, Any]], bool]:
+        """Search one file. Returns ``(match_count, content_entries, more_in_file)``.
+
+        For 'files_with_matches' the read short-circuits on the first hit; for
+        'count' it streams and counts matching lines; for 'content' it reads the
+        file (already size-capped) and builds up to ``entry_limit`` entries.
+        ``more_in_file`` is True when 'content' stopped early with more to show.
+        Raises OSError/UnicodeError to the caller, which counts it as unreadable.
+        """
+        if multiline:
+            with open(path, "r", encoding="utf-8", errors="replace", newline=None) as f:
+                text = f.read()
+            if output_mode == "files_with_matches":
+                return (1 if regex.search(text) else 0), [], False
+            if output_mode == "count":
+                return sum(1 for _ in regex.finditer(text)), [], False
+            entries: List[Dict[str, Any]] = []
+            more = False
+            for m in regex.finditer(text):
+                if len(entries) >= entry_limit:
+                    more = True
+                    break
+                line_no = text.count("\n", 0, m.start()) + 1
+                snippet, was_trunc = _truncate_line(m.group(0), max_line_len)
+                entry: Dict[str, Any] = {}
+                if show_line_numbers:
+                    entry["line_number"] = line_no
+                entry["line"] = snippet
+                if was_trunc:
+                    entry["line_truncated"] = True
+                entries.append(entry)
+            return len(entries), entries, more
+
+        # --- Line-by-line modes (universal newlines unify CRLF/LF) ---
+        if output_mode == "files_with_matches":
+            with open(path, "r", encoding="utf-8", errors="replace", newline=None) as f:
+                for line in f:
+                    hit = bool(regex.search(line.rstrip("\n")))
+                    if hit != invert_match:  # hit XOR invert
+                        return 1, [], False
+            return 0, [], False
+
+        if output_mode == "count":
+            count = 0
+            with open(path, "r", encoding="utf-8", errors="replace", newline=None) as f:
+                for line in f:
+                    hit = bool(regex.search(line.rstrip("\n")))
+                    if hit != invert_match:
+                        count += 1
+            return count, [], False
+
+        # --- content mode ---
+        with open(path, "r", encoding="utf-8", errors="replace", newline=None) as f:
+            text = f.read()
+        file_lines = text.split("\n")
+        if file_lines and file_lines[-1] == "":
+            file_lines.pop()  # drop the phantom trailing element from a final \n
+        n = len(file_lines)
+        content_entries: List[Dict[str, Any]] = []
+        more = False
+
+        # grep -o: one entry per matched substring, no context (only when not
+        # inverted — there are no substrings to show for non-matching lines).
+        if only_matching and not invert_match:
+            for i, line in enumerate(file_lines):
+                stop = False
+                for m in regex.finditer(line):
+                    if len(content_entries) >= entry_limit:
+                        more = True
+                        stop = True
+                        break
+                    seg, was_trunc = _truncate_line(m.group(0), max_line_len)
+                    e: Dict[str, Any] = {}
+                    if show_line_numbers:
+                        e["line_number"] = i + 1
+                    e["line"] = seg
+                    if was_trunc:
+                        e["line_truncated"] = True
+                    content_entries.append(e)
+                if stop:
+                    break
+            return len(content_entries), content_entries, more
+
+        for i, line in enumerate(file_lines):
+            hit = bool(regex.search(line))
+            if hit == invert_match:  # not a match for this mode
+                continue
+            if len(content_entries) >= entry_limit:
+                more = True
+                break
+            line_text, was_trunc = _truncate_line(line, max_line_len)
+            e = {}
+            if show_line_numbers:
+                e["line_number"] = i + 1
+            e["line"] = line_text
+            if was_trunc:
+                e["line_truncated"] = True
+            if before:
+                e["before"] = [
+                    {"line_number": j + 1, "line": _truncate_line(file_lines[j], max_line_len)[0]}
+                    for j in range(max(0, i - before), i)
+                ]
+            if after:
+                e["after"] = [
+                    {"line_number": j + 1, "line": _truncate_line(file_lines[j], max_line_len)[0]}
+                    for j in range(i + 1, min(n, i + 1 + after))
+                ]
+            content_entries.append(e)
+        return len(content_entries), content_entries, more
+
+    def _run_search(
+        self,
+        *,
+        data_dir: str,
+        target: str,
+        rel_path: str,
+        regex: "re.Pattern[str]",
+        pattern: str,
+        glob_variants: Optional[List[str]],
+        type_exts: Optional[Tuple[str, ...]],
+        output_mode: str,
+        invert_match: bool,
+        multiline: bool,
+        only_matching: bool,
+        before: int,
+        after: int,
+        show_line_numbers: bool,
+        max_results: int,
+        limits: Dict[str, int],
+    ) -> Dict[str, Any]:
+        """Synchronous traversal + matching; builds the full structured payload."""
+        base = os.path.realpath(data_dir)
+        max_file_size = limits["max_grep_file_size"]
+        max_line_len = limits["max_grep_match_line_length"]
+
+        files_searched = 0
+        files_skipped_binary = 0
+        files_skipped_too_large = 0
+        files_unreadable = 0
+        truncated = False
+
+        matches: List[Dict[str, Any]] = []
+        files_list: List[str] = []
+        counts: List[Dict[str, Any]] = []
+        total_matches = 0
+
+        # A single named file is searched directly (name filters don't apply
+        # when the user points at one file); a directory is walked recursively.
+        if os.path.isfile(target):
+            candidates: Any = [target]
+        else:
+            candidates = self._walk_files(target, glob_variants, type_exts)
+
+        def _rel(p: str) -> str:
+            return os.path.relpath(p, base).replace(os.sep, "/")
+
+        for file_path in candidates:
+            if files_searched >= MAX_GREP_FILES_SCANNED:
+                truncated = True
+                break
+
+            try:
+                size = os.path.getsize(file_path)
+            except OSError:
+                files_unreadable += 1
+                continue
+            if size > max_file_size:
+                files_skipped_too_large += 1
+                continue
+            try:
+                if _is_binary(file_path):
+                    files_skipped_binary += 1
+                    continue
+            except OSError:
+                files_unreadable += 1
+                continue
+
+            entry_limit = (max_results - len(matches)) if output_mode == "content" else 0
+            try:
+                count, entries, more = self._search_one_file(
+                    file_path, regex,
+                    output_mode=output_mode,
+                    invert_match=invert_match,
+                    multiline=multiline,
+                    only_matching=only_matching,
+                    before=before,
+                    after=after,
+                    show_line_numbers=show_line_numbers,
+                    max_line_len=max_line_len,
+                    entry_limit=entry_limit,
+                )
+            except (OSError, UnicodeError):
+                files_unreadable += 1
+                continue
+
+            files_searched += 1
+            if count == 0:
+                continue
+
+            rel = _rel(file_path)
+            if output_mode == "files_with_matches":
+                files_list.append(rel)
+                total_matches += 1
+                if len(files_list) >= max_results:
+                    truncated = True
+                    break
+            elif output_mode == "count":
+                counts.append({"path": rel, "count": count})
+                total_matches += count
+                if len(counts) >= max_results:
+                    truncated = True
+                    break
+            else:  # content
+                for entry in entries:
+                    matches.append({"path": rel, **entry})
+                total_matches += len(entries)
+                if more or len(matches) >= max_results:
+                    truncated = True
+                    break
+
+        payload: Dict[str, Any] = {
+            "output_mode": output_mode,
+            "pattern": pattern,
+            "search_root": rel_path,
+            "truncated": truncated,
+            "total_matches": total_matches,
+            "max_results": max_results,
+            "files_searched": files_searched,
+            "files_skipped_binary": files_skipped_binary,
+            "files_skipped_too_large": files_skipped_too_large,
+            "files_unreadable": files_unreadable,
+        }
+        if output_mode == "files_with_matches":
+            payload["total_files"] = len(files_list)
+            payload["files"] = files_list
+        elif output_mode == "count":
+            payload["total_files"] = len(counts)
+            payload["counts"] = counts
+        else:
+            payload["matches"] = matches
+        payload["truncation_note"] = (
+            f"Result limit ({max_results}) reached; more matches exist. Narrow "
+            "the pattern, add a glob/type filter, or raise max_results."
+            if truncated else None
+        )
+        return payload
 
 
 class ListFilesTool(BuiltInTool):
@@ -756,8 +1417,8 @@ class WriteFileFromReferenceTool(BuiltInTool):
         "Extract a region from an existing human-readable text file and write "
         "it to a new file. The region is specified with 1-based line and column "
         "coordinates. Both the reference file and the output file must be "
-        "human-readable text types. "
-        "E.g. 'extract lines 10-20 from ./data.csv into ./snippet.csv'"
+        "human-readable text types.\n"
+        "E.g. 'extract lines 10-20 from <absolute_path>/data.csv into <absolute_path>/snippet.csv'"
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -773,17 +1434,9 @@ class WriteFileFromReferenceTool(BuiltInTool):
                 "type": "integer",
                 "description": "1-based start line number (inclusive).",
             },
-            "start_column": {
-                "type": "integer",
-                "description": "1-based start column number (inclusive).",
-            },
             "end_line": {
                 "type": "integer",
                 "description": "1-based end line number (inclusive).",
-            },
-            "end_column": {
-                "type": "integer",
-                "description": "1-based end column number (exclusive).",
             },
             "path": {
                 "type": "string",
@@ -794,8 +1447,7 @@ class WriteFileFromReferenceTool(BuiltInTool):
             },
         },
         "required": [
-            "reference_path", "start_line", "start_column",
-            "end_line", "end_column", "path",
+            "reference_path", "start_line", "end_line", "path",
         ],
         "additionalProperties": False,
     }
@@ -963,6 +1615,7 @@ def get_tools(config: dict) -> list[BuiltInTool]:
     data_dir = config.get("CREMIND_SYSTEM_DIR", os.path.join(os.path.expanduser("~"), ".cremind"))
     return [
         SearchFilesTool(data_dir=data_dir),
+        GrepFilesTool(data_dir=data_dir),
         ListFilesTool(data_dir=data_dir),
         GetFileInfoTool(data_dir=data_dir),
         ReadFileTool(data_dir=data_dir),
@@ -993,6 +1646,8 @@ TOOL_CONFIG: ToolConfig = {
             "pass '.'). Never repeat the working directory's own name as a "
             "`path` value: if the user says 'list files in the Lee folder' "
             "and the cwd is already '.../Lee', call list_files with no path. "
+            "Use search_files to find files by NAME and grep_files to search "
+            "file CONTENTS by regular expression. "
             "Also registers file/folder watchers that notify you or re-run an "
             "action whenever files are created, modified, deleted, or moved on "
             "disk — use this when the user asks to be notified or to act on "
@@ -1032,6 +1687,32 @@ TOOL_CONFIG: ToolConfig = {
             "type": "number",
             "default": MAX_SEARCH_RESULTS,
         },
+        Var.MAX_GREP_RESULTS: {
+            "description": (
+                "Hard cap on the number of match entries returned by grep_files "
+                "(the per-call max_results argument is clamped to this). "
+                "Default: 100."
+            ),
+            "type": "number",
+            "default": MAX_GREP_RESULTS,
+        },
+        Var.MAX_GREP_FILE_SIZE: {
+            "description": (
+                "Maximum file size in bytes that grep_files will read; larger "
+                "files are skipped. Default: 5242880 (5 MB)."
+            ),
+            "type": "number",
+            "default": MAX_GREP_FILE_SIZE,
+        },
+        Var.MAX_GREP_MATCH_LINE_LENGTH: {
+            "description": (
+                "Maximum characters of a single matched or context line "
+                "returned by grep_files; longer lines are truncated. "
+                "Default: 1000."
+            ),
+            "type": "number",
+            "default": MAX_GREP_MATCH_LINE_LENGTH,
+        },
     },
 }
 
@@ -1040,7 +1721,9 @@ def _make_server_instructions(_data_dir: str) -> str:
     return (
         "A file management assistant. Operates inside the conversation's "
         "current working directory; all `path` arguments are relative to "
-        "that directory and default to '.' when omitted. Also registers "
+        "that directory and default to '.' when omitted. Find files by name "
+        "with search_files and search file contents by regex with grep_files. "
+        "Also registers "
         "file/folder watchers that notify you or re-run an action whenever "
         "files are created, modified, deleted, or moved on disk."
     )
