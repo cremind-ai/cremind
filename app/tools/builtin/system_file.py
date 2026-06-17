@@ -1415,8 +1415,8 @@ class WriteFileFromReferenceTool(BuiltInTool):
     name: str = "write_file_from_reference"
     description: str = (
         "Extract a region from an existing human-readable text file and write "
-        "it to a new file. The region is specified with 1-based line and column "
-        "coordinates. Both the reference file and the output file must be "
+        "it to a new file. The region is specified with 1-based line numbers "
+        "(inclusive). Both the reference file and the output file must be "
         "human-readable text types.\n"
         "E.g. 'extract lines 10-20 from <absolute_path>/data.csv into <absolute_path>/snippet.csv'"
     )
@@ -1459,9 +1459,7 @@ class WriteFileFromReferenceTool(BuiltInTool):
         data_dir = arguments.pop("_working_directory", None) or self._data_dir
         ref_path = arguments.get("reference_path", "")
         start_line = arguments.get("start_line", 0)
-        start_col = arguments.get("start_column", 0)
         end_line = arguments.get("end_line", 0)
-        end_col = arguments.get("end_column", 0)
         out_path = arguments.get("path", "")
 
         # --- Validate required params ---
@@ -1471,13 +1469,13 @@ class WriteFileFromReferenceTool(BuiltInTool):
                 "message": "reference_path and path are both required.",
             })
 
-        if start_line < 1 or start_col < 1 or end_line < 1 or end_col < 1:
+        if start_line < 1 or end_line < 1:
             return BuiltInToolResult(structured_content={
                 "error": "Invalid coordinates",
-                "message": "All line/column values must be >= 1 (1-based).",
+                "message": "All line values must be >= 1 (1-based).",
             })
 
-        if (end_line, end_col) < (start_line, start_col):
+        if end_line < start_line:
             return BuiltInToolResult(structured_content={
                 "error": "Invalid range",
                 "message": "End position must be at or after start position.",
@@ -1543,17 +1541,9 @@ class WriteFileFromReferenceTool(BuiltInTool):
         # Clamp end_line to file length
         end_line = min(end_line, len(lines))
 
-        # --- Extract region (1-based coords) ---
+        # --- Extract region (1-based line numbers, inclusive) ---
         selected = lines[start_line - 1 : end_line]
-
-        if not selected:
-            extracted = ""
-        elif len(selected) == 1:
-            extracted = selected[0][start_col - 1 : end_col - 1]
-        else:
-            selected[0] = selected[0][start_col - 1 :]
-            selected[-1] = selected[-1][: end_col - 1]
-            extracted = "".join(selected)
+        extracted = "".join(selected)
 
         # --- Write output ---
         os.makedirs(os.path.dirname(out_target), exist_ok=True)
@@ -1581,7 +1571,7 @@ class WriteFileFromReferenceTool(BuiltInTool):
 
         payload: ToolResultWithFiles = {
             "text": (
-                f"Extracted lines {start_line}:{start_col} to {end_line}:{end_col} "
+                f"Extracted lines {start_line} to {end_line} "
                 f"from '{os.path.basename(ref_target)}' ({len(extracted)} characters).\n"
                 f"Output: {rel_output}"
             ),
@@ -1590,7 +1580,7 @@ class WriteFileFromReferenceTool(BuiltInTool):
 
         logger.info(
             f"[WriteFileFromReferenceTool] extracted "
-            f"{start_line}:{start_col}-{end_line}:{end_col} from "
+            f"lines {start_line}-{end_line} from "
             f"{ref_path} -> {rel_output} ({len(extracted)} chars)"
         )
 
@@ -1619,7 +1609,7 @@ def get_tools(config: dict) -> list[BuiltInTool]:
         ListFilesTool(data_dir=data_dir),
         GetFileInfoTool(data_dir=data_dir),
         ReadFileTool(data_dir=data_dir),
-        WriteFileTool(data_dir=data_dir),
+        # WriteFileTool(data_dir=data_dir),
         WriteFileFromReferenceTool(data_dir=data_dir),
         RegisterFileWatcherTool(),
         ListFileWatchersTool(),

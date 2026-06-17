@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import shutil
+import stat
 
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, StreamingResponse
@@ -139,6 +140,29 @@ async def _serve_file_by_path(request: Request):
 _DIRECTORY_LIST_CAP = 2000
 
 
+def _entry_hidden(name: str, attrs: int, show_hidden: bool) -> bool:
+    """Whether a ``scandir`` entry should be omitted from a listing.
+
+    ``attrs`` is ``stat_result.st_file_attributes`` — the Windows attribute
+    bitmask, or ``0`` on POSIX (where the field is absent).
+
+    * SYSTEM-flagged entries are *always* omitted. These are protected-OS
+      items such as the legacy ``My Music``/``My Pictures``/``My Videos``
+      junctions in the user profile, which reparse to directories *outside*
+      the working tree and only 403 when opened — Explorer keeps them hidden
+      by default too.
+    * Hidden entries — dotfiles (POSIX convention) or the Windows HIDDEN
+      attribute — are omitted unless ``show_hidden`` is set.
+    """
+    if attrs & stat.FILE_ATTRIBUTE_SYSTEM:
+        return True
+    if not show_hidden and (
+        name.startswith(".") or bool(attrs & stat.FILE_ATTRIBUTE_HIDDEN)
+    ):
+        return True
+    return False
+
+
 async def _list_directory(request: Request):
     """List entries in a directory.
 
@@ -166,13 +190,14 @@ async def _list_directory(request: Request):
     try:
         with os.scandir(target) as it:
             for de in it:
-                if not show_hidden and de.name.startswith("."):
-                    continue
                 try:
                     is_dir = de.is_dir(follow_symlinks=False)
                     is_file = de.is_file(follow_symlinks=False)
                     st = de.stat(follow_symlinks=False)
                 except OSError:
+                    continue
+                attrs = getattr(st, "st_file_attributes", 0)
+                if _entry_hidden(de.name, attrs, show_hidden):
                     continue
                 entries.append({
                     "name": de.name,
