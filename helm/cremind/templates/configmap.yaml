@@ -36,7 +36,7 @@ data:
   {{- end }}
   APP_URL: {{ $appUrl | quote }}
   {{- /* Atlassian 3LO single fixed callback. Blank → the image default
-         (http://localhost:1515/api/oauth/atlassian/callback) applies. */ -}}
+         (http://localhost:1515/api/oauth/callback) applies. */ -}}
   {{- if .Values.cremind.atlassianRedirectUri }}
   CREMIND_ATLASSIAN_REDIRECT_URI: {{ .Values.cremind.atlassianRedirectUri | quote }}
   {{- end }}

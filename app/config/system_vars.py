@@ -24,12 +24,13 @@ from typing import Callable, Dict, Optional
 from app.config.settings import BaseConfig, get_user_working_directory
 from app.utils.logger import logger
 
-# Backend OAuth callback path for the Google skills (served by
-# app/api/oauth_callback.py). The browser-facing redirect they advertise is
-# APP_URL + this. (Atlassian uses a single FIXED URL — see settings.py — not an
-# APP_URL-derived one, because its 3LO Web client allows only one registered,
-# exact-match callback per app.)
-_GOOGLE_CALLBACK_PATH = "/api/oauth/google/callback"
+# Shared backend OAuth callback path for the built-in skills (served by
+# app/api/oauth_callback.py). The Google skills advertise APP_URL + this; the
+# Atlassian skills advertise a single FIXED URL ending in the same path (defaulted
+# in the jira/confluence skill), because its 3LO Web client allows only one
+# registered, exact-match callback per app. One route suffices because the
+# per-flow ``state`` (not the path) disambiguates the provider/flow.
+_OAUTH_CALLBACK_PATH = "/api/oauth/callback"
 
 # APP_URL origins a Google "Desktop" client will accept as a redirect: loopback
 # only (localhost / 127.0.0.1, any port). A real hostname (Ingress/domain/LAN
@@ -45,17 +46,6 @@ def _app_url_base() -> Optional[str]:
     if not url or "://0.0.0.0" in url:
         return None
     return url
-
-
-def _resolve_google_redirect_uri(_profile: Optional[str]) -> Optional[str]:
-    """Browser-facing Google OAuth redirect for the gmail/gcalendar skills:
-    ``<APP_URL>/api/oauth/google/callback``. Emitted only for a loopback APP_URL
-    (Desktop client constraint); otherwise omitted so the skill uses the manual
-    ``complete-link`` paste."""
-    base = _app_url_base()
-    if not base or not _LOOPBACK_APP_URL_RE.match(base):
-        return None
-    return base + _GOOGLE_CALLBACK_PATH
 
 
 def _load_cremind_token(profile: Optional[str]) -> Optional[str]:
@@ -125,27 +115,6 @@ SYSTEM_VARS: list[SystemVarSpec] = [
         name="CREMIND_TOKEN",
         resolve=_load_cremind_token,
         description="Per-profile Cremind token; omitted when missing.",
-    ),
-    SystemVarSpec(
-        name="CREMIND_OAUTH_REDIRECT_URI",
-        resolve=_resolve_google_redirect_uri,
-        description=(
-            "Browser-facing Google OAuth redirect for the gmail/gcalendar skills "
-            "(<APP_URL>/api/oauth/google/callback). The skill advertises it and the "
-            "backend captures the consent redirect; omitted for non-loopback APP_URL "
-            "(Desktop clients only accept loopback) so the skill uses manual paste."
-        ),
-    ),
-    SystemVarSpec(
-        name="CREMIND_ATLASSIAN_REDIRECT_URI",
-        resolve=lambda _profile: BaseConfig.CREMIND_ATLASSIAN_REDIRECT_URI or None,
-        description=(
-            "Atlassian 3LO redirect for the jira/confluence skills — a SINGLE FIXED "
-            "URL (not APP_URL-derived) registered exact-match in the Atlassian "
-            "developer console (one callback per app). Set via the same env var or "
-            "the chart's cremind.atlassianRedirectUri; defaults to the single "
-            "public origin (http://localhost:1515/api/oauth/atlassian/callback)."
-        ),
     ),
 ]
 

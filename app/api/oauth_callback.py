@@ -6,12 +6,11 @@ their OAuth consent redirect can't be received by a server inside the subprocess
 routes on the always-running backend — fronted by the nginx proxy under the K8s
 chart, published directly in Docker/native:
 
-  GET /api/oauth/google/callback      gmail, gcalendar  (Google Desktop/loopback client)
-  GET /api/oauth/atlassian/callback   jira, confluence  (Atlassian 3LO confidential client)
+  GET /api/oauth/callback             gmail, gcalendar, jira, confluence (built-in skills)
   GET /api/oauth/a2a/callback         A2A tool auth     (external OAuth providers)
 
 The browser-facing redirect URL is derived from ``APP_URL`` (see
-app/config/system_vars.py) — e.g. ``http://localhost:1515/api/oauth/google/callback``
+app/config/system_vars.py) — e.g. ``http://localhost:1515/api/oauth/callback``
 behind a Kubernetes ``port-forward``. For the skills, the handler writes the raw
 authorization response (``code`` + ``state`` + ``scope``) to a per-state file
 under ``<CREMIND_SYSTEM_DIR>/oauth_inbox/<state>.txt``; the skill subprocess polls
@@ -95,9 +94,10 @@ async def _handle_inbox_callback(request: Request) -> HTMLResponse:
     """Capture a subprocess-skill consent redirect into the per-state inbox.
 
     Shared by the gmail/gcalendar (Google Desktop) and jira/confluence (Atlassian
-    3LO) skills — the path differs only so each provider can register its own
-    redirect URL; this handler reads only the query. The waiting ``link`` in the
-    skill subprocess polls ``oauth_inbox/<state>.txt`` and finishes the exchange.
+    3LO) skills via a single ``/api/oauth/callback`` route; the per-flow ``state``
+    (not the path) disambiguates flows, and this handler reads only the query. The
+    waiting ``link`` in the skill subprocess polls ``oauth_inbox/<state>.txt`` and
+    finishes the exchange.
     """
     params = request.query_params
     state = params.get("state", "")
@@ -150,7 +150,6 @@ def get_oauth_callback_routes() -> list[Route]:
     A2A endpoint) is in flight. Mounted under ``/api`` so they ride the K8s
     proxy's existing ``/api`` route to the backend."""
     return [
-        Route("/api/oauth/google/callback", methods=["GET"], endpoint=_handle_inbox_callback),
-        Route("/api/oauth/atlassian/callback", methods=["GET"], endpoint=_handle_inbox_callback),
+        Route("/api/oauth/callback", methods=["GET"], endpoint=_handle_inbox_callback),
         Route("/api/oauth/a2a/callback", methods=["GET"], endpoint=_handle_a2a_callback),
     ]

@@ -145,7 +145,7 @@ def submit_callback(response: str) -> dict[str, Any]:
     """Hand a manually-captured OAuth redirect back to the waiting ``link``.
 
     On remote/headless deployments (Kubernetes, SSH, …) the browser is redirected
-    to the registered callback (``<APP_URL>/api/oauth/atlassian/callback``) which
+    to the registered callback (``<APP_URL>/api/oauth/callback``) which
     it may not be able to reach, but the URL still carries a valid ``code`` +
     ``state``. The user copies it; this writes the raw query into the same
     per-state inbox file the backend callback route would have written
@@ -251,7 +251,7 @@ def link(
             "(CREMIND_ATLASSIAN_REDIRECT_URI). Atlassian allows only a single, "
             "pre-registered callback URL, so the ephemeral fallback used by the "
             "Google skills is not available here. Run under `cremind serve` and "
-            "register <APP_URL>/api/oauth/atlassian/callback as the app's callback "
+            "register <APP_URL>/api/oauth/callback as the app's callback "
             "URL in the Atlassian developer console."
         )
 

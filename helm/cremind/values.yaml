@@ -66,8 +66,8 @@ cremind:
   # registered callback per app (exact match), so unlike Google this is a single
   # FIXED URL — register it once in the Atlassian developer console and set this to
   # match. Leave blank to use the image default
-  # (http://localhost:1515/api/oauth/atlassian/callback), which suits the documented
-  # `port-forward svc/cremind 1515:80`. Set to https://<host>/api/oauth/atlassian/callback
+  # (http://localhost:1515/api/oauth/callback), which suits the documented
+  # `port-forward svc/cremind 1515:80`. Set to https://<host>/api/oauth/callback
   # when fronting Cremind with an Ingress domain. Where the browser can't reach it,
   # linking falls back to the `complete-link` paste.
   atlassianRedirectUri: ""        # -> CREMIND_ATLASSIAN_REDIRECT_URI (blank = image default)
