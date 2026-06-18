@@ -106,6 +106,12 @@ class ConversationModel(Base):
     # deleted) are cleared and the conversation falls back to the user
     # default. ``NULL`` means "no override, use the user default".
     working_directory: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # Memory-feature watermark: the ``MessageModel.ordering`` of the last message
+    # already folded into short-term memory. Auto-extraction counts message-content
+    # tokens with ``ordering > memory_watermark`` and re-triggers once they pass the
+    # configured threshold, then advances this. Defaults to 0 (extract from the start).
+    memory_watermark: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    memory_last_extracted_at: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)
 
@@ -345,4 +351,51 @@ class FileWatcherSubscriptionModel(Base):
     event_types: Mapped[str] = mapped_column(String(128), nullable=False)
     extensions: Mapped[str | None] = mapped_column(String(256), nullable=True)
     action: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class ShortTermMemoryModel(Base):
+    """Per-conversation short-term memory entry (FIFO queue).
+
+    Each row is one distilled summary of a conversation window — past mistakes,
+    repeated commands, user habits — produced by the background memory extractor.
+    The queue is bounded by ``memory.short_term_queue_size`` (default 10); the
+    storage layer FIFO-evicts the oldest rows (lowest ``ordering``) on overflow.
+    """
+    __tablename__ = "short_term_memories"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    conversation_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Denormalized profile for cheap filtering / parity with other tables; not an FK
+    # because conversation cascade already governs lifecycle.
+    profile: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Monotonic per-conversation insertion order; FIFO eviction drops the lowest.
+    ordering: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class LongTermMemoryModel(Base):
+    """Per-profile long-term memory entry (FIFO queue).
+
+    Each row is one durable, session-independent user fact (name, age, stable
+    preferences). Bounded by ``memory.long_term_queue_size`` (default 20); the
+    storage layer FIFO-evicts the oldest rows on overflow. Optional per
+    extraction — many extractions add nothing here.
+    """
+    __tablename__ = "long_term_memories"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False, index=True
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # The conversation this fact was learned from (informational; not an FK so a
+    # conversation delete doesn't drop durable profile facts).
+    source_conversation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    ordering: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)

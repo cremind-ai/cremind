@@ -193,11 +193,16 @@ class ReasoningAgent:
         reasoning: bool = True,
         allowed_skill_ids: Optional[set[str]] = None,
         triggered_by_event: bool = False,
+        memory_context: str = "",
     ):
         self.llm = llm
         self.registry = registry
         self.profile = profile
         self.reasoning = reasoning
+        # Pre-rendered MEMORY block (short/long-term) fetched by the caller and
+        # appended to the system instruction so it is never truncated by the
+        # history window. Empty when the memory feature is off / has no entries.
+        self._memory_context = memory_context or ""
         self.current_skills_directory = os.path.join(BaseConfig.CREMIND_SYSTEM_DIR, self.profile, "skills")
 
         cfg = resolve_agent_config(profile)
@@ -420,7 +425,7 @@ class ReasoningAgent:
             if self.context_id else None
         )
         current_user_working_directory = override or get_user_working_directory()
-        return template_instruction.format(
+        instruction = template_instruction.format(
             persona_description=persona,
             current_time=f"{datetime.now().isoformat()}",
             current_os=platform.system(),
@@ -431,6 +436,9 @@ class ReasoningAgent:
             OBSERVATION_START_MARKER=OBSERVATION_START_MARKER,
             OBSERVATION_END_MARKER=OBSERVATION_END_MARKER,
         )
+        if self._memory_context:
+            instruction = f"{instruction}\n\n{self._memory_context}"
+        return instruction
 
     # ── config lookups ────────────────────────────────────────────────
 
