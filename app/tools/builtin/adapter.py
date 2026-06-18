@@ -51,11 +51,44 @@ from app.utils.context_storage import get_context
 from app.utils.logger import logger
 
 BUILTIN_AGENT_SYSTEM_PROMPT = (
-    "You are an AI Agent returning results from tool calls. "
-    "Use the available tools to answer the user's query. "
-    "Don't answer any questions or provide explanations. "
-    "Always call the appropriate tool(s) to get the data needed to answer."
+    "You fulfill a request by calling the available tools. The request often "
+    "begins with the exact name of the tool to call (e.g. 'overwrite_file ...'); "
+    "when it does, call THAT tool and pass the given arguments faithfully. Never "
+    "substitute a different tool - do not read, search or list when asked to "
+    "write, edit or delete. Don't answer questions or add explanations; always "
+    "call the appropriate tool(s) to get the data needed to answer."
 )
+
+# Word-boundary chars that may follow a leading tool name in an Action_Input
+# (e.g. 'overwrite_file path=...', 'read_file:', 'grep_files(').
+_NAME_BOUNDARY = " \t\r\n:=(,\"'"
+
+
+def _leading_tool_name(query: str, tool_names: List[str]) -> Optional[str]:
+    """Return the subtool the query explicitly starts with, else None.
+
+    The reasoning agent prefixes its Action_Input with the intended subtool
+    name; honoring that verbatim removes the routing LLM's chance to mis-pick
+    (e.g. running ``read_file`` when ``overwrite_file`` was requested). Matches
+    the longest name at a word boundary so prose like 'search files ...' (a
+    space, not the 'search_files' token) never matches.
+    """
+    head = query.lstrip()
+    for name in sorted(tool_names, key=len, reverse=True):
+        if head.startswith(name):
+            rest = head[len(name):]
+            if rest == "" or rest[0] in _NAME_BOUNDARY:
+                return name
+    return None
+
+
+def _looks_like_diff(query: str) -> bool:
+    """True if the query is a bare unified-diff hunk (starts with an '@@' header).
+
+    The reasoning agent occasionally dumps a diff with no leading sub-tool name;
+    this lets the dispatcher route it to overwrite_file instead of mis-guessing.
+    """
+    return query.lstrip().startswith("@@")
 
 
 class BuiltInToolAdapter:
@@ -225,8 +258,14 @@ class BuiltInToolAdapter:
             except Exception as e:
                 logger.warning(f"prepare_tools callback failed for '{self.name}': {e}")
 
+        # Inject the group's own tool_instructions so the routing LLM sees the
+        # per-group steering (e.g. "edit with overwrite_file") -- it otherwise
+        # only reaches the parent reasoning agent, not this dispatcher.
+        system_content = self._system_prompt or BUILTIN_AGENT_SYSTEM_PROMPT
+        if self._server_instructions:
+            system_content = f"{system_content}\n\n{self._server_instructions}"
         messages: List[ChatCompletionMessageParam] = [
-            {"role": "system", "content": self._system_prompt or BUILTIN_AGENT_SYSTEM_PROMPT},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": query},
         ]
 
@@ -269,12 +308,28 @@ class BuiltInToolAdapter:
                 f"full_reasoning={self._full_reasoning}"
             )
             # logger.debug(f"Available tools for LLM: {available_tools}")
+            # When the query explicitly names a subtool, force that function so
+            # the routing LLM can't mis-pick; otherwise fall back to "auto".
+            names = [t["function"]["name"] for t in available_tools] if available_tools else []
+            forced = _leading_tool_name(query, names) if names else None
+            # Safety net: the reasoning agent sometimes dumps a bare unified diff
+            # with no leading subtool name. Route it to the editor instead of
+            # letting the LLM mis-guess (it tends to pick grep_files); the editor
+            # then returns an actionable "path required" error if needed.
+            if not forced and "overwrite_file" in names and _looks_like_diff(query):
+                forced = "overwrite_file"
+                logger.info(f"[Built-in '{self.name}'] bare diff -> forcing overwrite_file")
+            if forced:
+                tool_choice: Any = {"type": "function", "function": {"name": forced}}
+                logger.info(f"[Built-in '{self.name}'] forcing subtool -> {forced}")
+            else:
+                tool_choice = "auto" if available_tools else None
             try:
                 async for response in self._llm.chat_completion(
                     messages=messages,
                     tools=available_tools if available_tools else None,
-                    tool_choice="auto" if available_tools else None,
-                    temperature=1,
+                    tool_choice=tool_choice,
+                    temperature=0,
                 ):
                     logger.debug(response)
                     if response["type"] == ChatCompletionTypeEnum.CONTENT:

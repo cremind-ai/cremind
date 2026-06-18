@@ -26,7 +26,7 @@ _WATCHER_NAMES = {"register_file_watcher", "list_file_watchers", "delete_file_wa
 
 _ALL_SYSTEM_FILE_FUNCS = [
     "search_files", "grep_files", "list_files", "get_file_info", "read_file",
-    "write_file", "write_file_from_reference",
+    "write_file", "overwrite_file",
     "register_file_watcher", "list_file_watchers", "delete_file_watcher",
 ]
 

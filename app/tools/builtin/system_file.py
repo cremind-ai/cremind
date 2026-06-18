@@ -218,6 +218,164 @@ def _is_text_mime(mime: str) -> bool:
     return mime in _TEXT_APP_MIMES
 
 
+# ---------------------------------------------------------------------------
+# Unified-diff helpers (used by OverwriteFileTool)
+# ---------------------------------------------------------------------------
+
+# '@@ -a[,b] +c[,d] @@' with optional counts and optional trailing section text.
+_HUNK_HEADER_RE = re.compile(r"^@@+\s*-(\d+)(?:,\d+)?\s+\+\d+(?:,\d+)?\s*@@+")
+
+
+class _Hunk:
+    """One parsed hunk: 1-based old-start hint + old/new line blocks.
+
+    ``has_header`` records whether an ``@@`` header was present, so a
+    pure-insertion hunk (empty ``old_block``) can be positioned from the header
+    but rejected when no header gives us anywhere to anchor it.
+    """
+    __slots__ = ("old_start", "old_block", "new_block", "has_header")
+
+    def __init__(self, old_start: int, old_block: List[str],
+                 new_block: List[str], has_header: bool):
+        self.old_start = old_start
+        self.old_block = old_block   # context + removed lines, marker stripped
+        self.new_block = new_block   # context + added lines, marker stripped
+        self.has_header = has_header
+
+
+def _parse_unified_diff(diff: str) -> List["_Hunk"]:
+    """Parse *diff* into hunks (terminator-free lines). Raises ValueError('Invalid diff').
+
+    Tolerant of LLM-authored diffs: optional hunk-header counts and trailing
+    section text, an optional leading ``---``/``+++`` file header, ``\\ No
+    newline`` markers, and a bare body with no ``@@`` header (treated as a
+    single content-matched hunk).
+    """
+    raw = diff.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if raw and raw[-1] == "":
+        raw.pop()  # drop the phantom element from a trailing newline on the diff string
+
+    hunks: List[_Hunk] = []
+    old_start = 0
+    has_header = False
+    old_block: Optional[List[str]] = None
+    new_block: Optional[List[str]] = None
+
+    def _flush() -> None:
+        nonlocal old_block, new_block, old_start, has_header
+        if old_block is not None and (old_block or new_block):
+            hunks.append(_Hunk(old_start, old_block, new_block or [], has_header))
+        old_block, new_block, old_start, has_header = None, None, 0, False
+
+    for line in raw:
+        m = _HUNK_HEADER_RE.match(line)
+        if m:
+            _flush()
+            old_start = int(m.group(1))
+            has_header = True
+            old_block, new_block = [], []
+            continue
+        if line.startswith("--- ") or line.startswith("+++ ") or line.startswith("\\"):
+            continue  # file headers a model may prepend / "\ No newline at end of file"
+        if old_block is None:  # headerless diff: open an implicit hunk on first body line
+            if line[:1] not in (" ", "+", "-"):
+                continue       # skip leading prose/blank lines before any hunk content
+            old_block, new_block = [], []
+        marker = line[:1]
+        if marker == "-":
+            old_block.append(line[1:])
+        elif marker == "+":
+            new_block.append(line[1:])
+        elif marker == " ":
+            old_block.append(line[1:])   # space-marked context: drop the one marker space
+            new_block.append(line[1:])
+        else:
+            # No diff marker: the model dropped the leading space on a context
+            # line (or it's a bare blank line). Treat the WHOLE line as unchanged
+            # context -- do NOT strip the first character.
+            old_block.append(line)
+            new_block.append(line)
+
+    _flush()
+    if not hunks:
+        raise ValueError("Invalid diff")
+    return hunks
+
+
+def _find_block(lines: List[str], block: List[str], hint_start: int) -> int:
+    """0-based index where *block* matches contiguously; -1 none, -2 ambiguous.
+
+    With several matches, the header's 1-based ``hint_start`` breaks the tie by
+    nearest position; a perfect tie (or no usable hint) stays ambiguous.
+    """
+    n, b = len(lines), len(block)
+    if b == 0:
+        return -1
+    matches = [i for i in range(0, n - b + 1) if lines[i:i + b] == block]
+    if not matches:
+        return -1
+    if len(matches) == 1:
+        return matches[0]
+    if hint_start <= 0:
+        return -2
+    target = hint_start - 1
+    nearest = sorted(matches, key=lambda i: (abs(i - target), i))
+    if abs(nearest[0] - target) == abs(nearest[1] - target):
+        return -2  # equally near on both sides -> still ambiguous
+    return nearest[0]
+
+
+def _deescape_quotes(line: str) -> str:
+    r"""Undo backslash-escaped quotes (\' and \") in a diff line.
+
+    A model that wraps the diff in a quoted Action_Input string often escapes
+    the quotes inside it (e.g. ``don\'t``), and those backslashes leak into the
+    diff argument. Used only as a fallback when the verbatim match fails, so a
+    file that genuinely contains ``\'`` keeps matching exactly.
+    """
+    return line.replace("\\'", "'").replace('\\"', '"')
+
+
+def _apply_hunks(file_lines: List[str], hunks: List["_Hunk"]) -> Tuple[List[str], int]:
+    """Apply hunks sequentially, re-matching by content. Returns (new_lines, lines_changed).
+
+    Re-matching against the running result (rather than trusting header line
+    numbers) keeps later hunks correct even when an earlier hunk changed the
+    line count. Raises ValueError('Diff did not apply:<n>') or
+    ValueError('Ambiguous diff:<n>') naming the 1-based hunk that failed.
+    """
+    lines = list(file_lines)
+    changed = 0
+    for n, h in enumerate(hunks, start=1):
+        if not h.old_block:  # pure insertion: position from the header (after old_start lines)
+            if not h.has_header:
+                raise ValueError(f"Diff did not apply:{n}")
+            pos = min(max(h.old_start, 0), len(lines))
+            lines[pos:pos] = h.new_block
+            changed += len(h.new_block)
+            continue
+        new_block = h.new_block
+        at = _find_block(lines, h.old_block, h.old_start)
+        if at == -1:
+            # Fallback for the common quoting artifact: the model backslash-
+            # escaped quotes inside the diff (don\'t). Retry with those escapes
+            # stripped from BOTH sides so the match lands and clean text is
+            # written. Only runs after the verbatim match failed, so a file that
+            # really contains \' is still matched exactly above.
+            deesc_old = [_deescape_quotes(line) for line in h.old_block]
+            if deesc_old != h.old_block:
+                at = _find_block(lines, deesc_old, h.old_start)
+                if at >= 0:
+                    new_block = [_deescape_quotes(line) for line in h.new_block]
+        if at == -1:
+            raise ValueError(f"Diff did not apply:{n}")
+        if at == -2:
+            raise ValueError(f"Ambiguous diff:{n}")
+        lines[at:at + len(h.old_block)] = new_block
+        changed += max(len(h.old_block), len(new_block))
+    return lines, changed
+
+
 def _file_description(name: str, mime: str, uri: str) -> str:
     """Return a Markdown description of a file for the LLM observation."""
     if mime.startswith("image/"):
@@ -1411,44 +1569,47 @@ class WriteFileTool(BuiltInTool):
         return BuiltInToolResult(structured_content=payload)
 
 
-class WriteFileFromReferenceTool(BuiltInTool):
-    name: str = "write_file_from_reference"
+class OverwriteFileTool(BuiltInTool):
+    name: str = "overwrite_file"
     description: str = (
-        "Extract a region from an existing human-readable text file and write "
-        "it to a new file. The region is specified with 1-based line numbers "
-        "(inclusive). Both the reference file and the output file must be "
-        "human-readable text types.\n"
-        "E.g. 'extract lines 10-20 from <absolute_path>/data.csv into <absolute_path>/snippet.csv'"
+        "Edit part of an EXISTING human-readable text file in place by applying a "
+        "unified diff. Use this to change a few lines without rewriting the whole "
+        "file; to create a new file or replace it entirely use write_file. First "
+        "read the file with read_file (or locate lines with grep_files) so the "
+        "diff's context and removed ('-') lines EXACTLY match the current text, "
+        "whitespace included. The '@@ -a,b +c,d @@' header line numbers are only a "
+        "hint - lines are matched by content. Provide both `path` and `diff`.\n"
+        "E.g. path='conversation.txt', diff='@@ -2,1 +2,1 @@\\n"
+        "-Steve: see you at 3pm\\n+James: see you at 3pm'"
     )
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
-            "reference_path": {
-                "type": "string",
-                "description": (
-                    "Relative path to the source text file to extract from. "
-                    "Must be a human-readable text file."
-                ),
-            },
-            "start_line": {
-                "type": "integer",
-                "description": "1-based start line number (inclusive).",
-            },
-            "end_line": {
-                "type": "integer",
-                "description": "1-based end line number (inclusive).",
-            },
             "path": {
                 "type": "string",
                 "description": (
-                    "Relative path within the data directory for the output file. "
-                    "Must have a text file extension."
+                    "Relative path to the existing text file to edit in place. "
+                    "Must be a human-readable text file that already exists. To "
+                    "create or fully replace a file, use write_file instead."
+                ),
+            },
+            "diff": {
+                "type": "string",
+                "description": (
+                    "A unified diff to apply. Each hunk may start with an "
+                    "'@@ -a,b +c,d @@' header; body lines are prefixed with ' ' "
+                    "(unchanged context), '-' (removed) or '+' (added). The "
+                    "context and '-' lines must match the current file exactly; "
+                    "the header line numbers are only a hint since lines are "
+                    "matched by content. Copy the file's text verbatim - do not "
+                    "add backslash escapes to quotes or other characters. A bare "
+                    "body with no '@@' header is accepted as a single "
+                    "content-matched hunk. E.g. "
+                    "'@@ -2,1 +2,1 @@\\n-old line\\n+new line'."
                 ),
             },
         },
-        "required": [
-            "reference_path", "start_line", "end_line", "path",
-        ],
+        "required": ["path", "diff"],
         "additionalProperties": False,
     }
 
@@ -1457,131 +1618,145 @@ class WriteFileFromReferenceTool(BuiltInTool):
 
     async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
         data_dir = arguments.pop("_working_directory", None) or self._data_dir
-        ref_path = arguments.get("reference_path", "")
-        start_line = arguments.get("start_line", 0)
-        end_line = arguments.get("end_line", 0)
-        out_path = arguments.get("path", "")
+        rel_path = arguments.get("path", "")
+        diff = arguments.get("diff", "")
 
-        # --- Validate required params ---
-        if not ref_path or not out_path:
+        # --- Validate required params (before touching the filesystem) ---
+        if not rel_path:
             return BuiltInToolResult(structured_content={
                 "error": "Missing parameter",
-                "message": "reference_path and path are both required.",
+                "message": (
+                    "path is required. Call as: "
+                    'overwrite_file path="<file>" diff="<unified diff>".'
+                ),
             })
 
-        if start_line < 1 or end_line < 1:
+        if not diff:
             return BuiltInToolResult(structured_content={
-                "error": "Invalid coordinates",
-                "message": "All line values must be >= 1 (1-based).",
+                "error": "Missing parameter",
+                "message": "diff is required.",
             })
 
-        if end_line < start_line:
-            return BuiltInToolResult(structured_content={
-                "error": "Invalid range",
-                "message": "End position must be at or after start position.",
-            })
-
-        # --- Resolve paths ---
+        # --- Resolve path ---
         try:
-            ref_target = _safe_resolve(data_dir, ref_path)
-            out_target = _safe_resolve(data_dir, out_path)
+            target = _safe_resolve(data_dir, rel_path)
         except ValueError as e:
             return BuiltInToolResult(structured_content={
                 "error": "Access denied",
                 "message": str(e),
             })
 
-        # --- Validate reference file ---
-        if not os.path.isfile(ref_target):
+        # --- File must already exist (edit-in-place, never create) ---
+        if not os.path.isfile(target):
             return BuiltInToolResult(structured_content={
                 "error": "Not found",
-                "message": f"Reference file '{ref_path}' does not exist or is not a file.",
-            })
-
-        ref_mime = _guess_mime(ref_target)
-        if not _is_text_mime(ref_mime) or _is_binary(ref_target):
-            return BuiltInToolResult(structured_content={
-                "error": "Unsupported file type",
                 "message": (
-                    f"Reference file '{os.path.basename(ref_target)}' is not a "
-                    "human-readable text file."
+                    f"File '{rel_path}' does not exist or is not a file. "
+                    "To create a new file, use write_file instead."
                 ),
             })
 
-        # --- Validate output MIME ---
-        out_mime = _guess_mime(out_target)
-        if not _is_text_mime(out_mime):
+        mime = _guess_mime(target)
+        if not _is_text_mime(mime) or _is_binary(target):
             return BuiltInToolResult(structured_content={
                 "error": "Unsupported file type",
                 "message": (
-                    f"Output file '{os.path.basename(out_target)}' has MIME type "
-                    f"'{out_mime}' which is not a human-readable text format."
+                    f"'{os.path.basename(target)}' is not a human-readable text "
+                    "file. Only text files can be edited with a diff."
                 ),
             })
 
-        # --- Read reference file ---
+        # --- Parse the diff up front so a malformed diff fails clearly ---
         try:
-            with open(ref_target, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+            hunks = _parse_unified_diff(diff)
+        except ValueError:
+            return BuiltInToolResult(structured_content={
+                "error": "Invalid diff",
+                "message": (
+                    "No applicable hunks found. Provide a unified diff: an "
+                    "'@@ -a,b +c,d @@' header followed by ' ' context, '-' removed "
+                    "and '+' added lines (a bare '-'/'+' body is also accepted)."
+                ),
+            })
+
+        # --- Read existing file (universal newlines unify CRLF/LF) ---
+        try:
+            with open(target, "r", encoding="utf-8", errors="replace", newline=None) as f:
+                text = f.read()
         except OSError as e:
             return BuiltInToolResult(structured_content={
                 "error": "Read error",
-                "message": f"Failed to read reference file: {e}",
+                "message": f"Failed to read file: {e}",
             })
 
-        if start_line > len(lines):
-            return BuiltInToolResult(structured_content={
-                "error": "Out of range",
-                "message": (
-                    f"start_line ({start_line}) exceeds file length "
-                    f"({len(lines)} lines)."
-                ),
-            })
+        # Split to terminator-free lines, remembering the trailing-newline state
+        # so it can be restored on write (mirrors GrepFilesTool's content read).
+        file_lines = text.split("\n")
+        had_trailing_newline = bool(file_lines) and file_lines[-1] == ""
+        if had_trailing_newline:
+            file_lines.pop()
 
-        # Clamp end_line to file length
-        end_line = min(end_line, len(lines))
-
-        # --- Extract region (1-based line numbers, inclusive) ---
-        selected = lines[start_line - 1 : end_line]
-        extracted = "".join(selected)
-
-        # --- Write output ---
-        os.makedirs(os.path.dirname(out_target), exist_ok=True)
-
+        # --- Apply the hunks (matched by content; header numbers are a hint) ---
         try:
-            with open(out_target, "w", encoding="utf-8") as f:
-                f.write(extracted)
+            new_lines, lines_changed = _apply_hunks(file_lines, hunks)
+        except ValueError as e:
+            code, _, which = str(e).partition(":")
+            if code == "Ambiguous diff":
+                message = (
+                    f"Hunk {which} matches more than one place in the file. Add "
+                    "more surrounding context lines to the diff so the target is "
+                    "unique."
+                )
+            else:
+                message = (
+                    f"Hunk {which} did not apply: its context/removed lines do not "
+                    "match the current file. Re-read the file with read_file and "
+                    "copy the exact lines (including whitespace) into the diff."
+                )
+            return BuiltInToolResult(structured_content={
+                "error": code,
+                "message": message,
+            })
+
+        new_text = "\n".join(new_lines)
+        if had_trailing_newline:
+            new_text += "\n"
+
+        # --- Write back ---
+        try:
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(new_text)
         except OSError as e:
-            logger.error(f"[WriteFileFromReferenceTool] write failed: {e}")
+            logger.error(f"[OverwriteFileTool] write failed: {e}")
             return BuiltInToolResult(structured_content={
                 "error": "Write error",
-                "message": f"Failed to write output file: {e}",
+                "message": f"Failed to write file: {e}",
             })
 
-        out_name = os.path.basename(out_target)
-        file_uri = out_target.replace(os.sep, "/")
+        file_name = os.path.basename(target)
+        file_uri = target.replace(os.sep, "/")
         base = os.path.realpath(data_dir)
-        rel_output = os.path.relpath(out_target, base).replace(os.sep, "/")
+        rel_output = os.path.relpath(target, base).replace(os.sep, "/")
 
         file_entry: ToolResultFile = {
             "uri": file_uri,
-            "name": out_name,
-            "mime_type": out_mime,
+            "name": file_name,
+            "mime_type": mime,
         }
 
         payload: ToolResultWithFiles = {
             "text": (
-                f"Extracted lines {start_line} to {end_line} "
-                f"from '{os.path.basename(ref_target)}' ({len(extracted)} characters).\n"
+                f"Applied {len(hunks)} hunk(s) to '{file_name}' "
+                f"({lines_changed} line(s) changed, file now "
+                f"{len(new_lines)} lines).\n"
                 f"Output: {rel_output}"
             ),
             "_files": [file_entry],
         }
 
         logger.info(
-            f"[WriteFileFromReferenceTool] extracted "
-            f"lines {start_line}-{end_line} from "
-            f"{ref_path} -> {rel_output} ({len(extracted)} chars)"
+            f"[OverwriteFileTool] {rel_output}: applied {len(hunks)} hunk(s), "
+            f"{lines_changed} line(s) changed"
         )
 
         return BuiltInToolResult(structured_content=payload)
@@ -1609,8 +1784,8 @@ def get_tools(config: dict) -> list[BuiltInTool]:
         ListFilesTool(data_dir=data_dir),
         GetFileInfoTool(data_dir=data_dir),
         ReadFileTool(data_dir=data_dir),
-        # WriteFileTool(data_dir=data_dir),
-        WriteFileFromReferenceTool(data_dir=data_dir),
+        WriteFileTool(data_dir=data_dir),
+        OverwriteFileTool(data_dir=data_dir),
         RegisterFileWatcherTool(),
         ListFileWatchersTool(),
         DeleteFileWatcherTool(),
@@ -1638,6 +1813,8 @@ TOOL_CONFIG: ToolConfig = {
             "and the cwd is already '.../Lee', call list_files with no path. "
             "Use search_files to find files by NAME and grep_files to search "
             "file CONTENTS by regular expression. "
+            "Edit part of an existing file with overwrite_file (apply a unified "
+            "diff); create or replace a whole file with write_file. "
             "Also registers file/folder watchers that notify you or re-run an "
             "action whenever files are created, modified, deleted, or moved on "
             "disk — use this when the user asks to be notified or to act on "
@@ -1713,6 +1890,8 @@ def _make_server_instructions(_data_dir: str) -> str:
         "current working directory; all `path` arguments are relative to "
         "that directory and default to '.' when omitted. Find files by name "
         "with search_files and search file contents by regex with grep_files. "
+        "Edit part of an existing file with overwrite_file (a unified diff); "
+        "create or replace a whole file with write_file. "
         "Also registers "
         "file/folder watchers that notify you or re-run an action whenever "
         "files are created, modified, deleted, or moved on disk."

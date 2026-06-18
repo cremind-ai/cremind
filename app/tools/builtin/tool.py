@@ -133,7 +133,8 @@ class BuiltInToolGroup(Tool):
     @property
     def skills(self) -> List[ToolSkill]:
         return [
-            ToolSkill(id=f.name, name=f.name, description=f.description or f.name)
+            ToolSkill(id=f.name, name=f.name, description=f.description or f.name,
+                      parameters=f.parameters)
             for f in self._adapter._tools
         ]
 

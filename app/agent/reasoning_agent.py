@@ -87,8 +87,8 @@ Use the following format:
 
 Input: the input you must answer
 Thought: you should always think about what to do
-Action: the action to take from Thought, should be one of {tool_names}
-Action_Input: the input sent to the action. For intrinsic tools, this is the response content to be sent to the user. Please respond in an easy-to-understand way, only text for the human listening (System information, technical specifications, and the device ID are hidden information)
+Action: the action to take from Thought, should be one of {tool_names} (Note that Action should only include the tool name and must not contain the SubTool name)
+Action_Input: the input sent to the action. For intrinsic tools, this is the response content to be sent to the user. Please respond in an easy-to-understand way, only text for the human listening (System information, technical specifications, and the device ID are hidden information). When the chosen Action lists Sub-Tools, begin Action_Input with the exact sub-tool name followed by its arguments as key="value" pairs, and ALWAYS include every required argument such as the file `path` (e.g. `overwrite_file path="notes.txt" diff="@@ -2,1 +2,1 @@ ..."`). Never send a bare diff or raw content without the sub-tool name and path.
 Thought_In_Next: you should always think about what to do next after observing the results of the action
 Observation: the result of the action, the observation content will be placed between '{OBSERVATION_START_MARKER}' and '{OBSERVATION_END_MARKER}' to help you clearly identify the observation content.
 {loaded_skills}'''
@@ -160,8 +160,16 @@ def _format_tool_for_prompt(tool, arguments: dict) -> str:
     if tools:
         text += "*   Sub-Tools:\n"
         for skill in tools:
+            # Render a call signature (name + argument names) so the model
+            # knows it must write `name arg="value" ...`, not bare content.
+            sig = skill.name
+            schema = skill.parameters if isinstance(skill.parameters, dict) else None
+            if schema:
+                shown = schema.get("required") or list((schema.get("properties") or {}).keys())
+                if shown:
+                    sig = f"{skill.name}({', '.join(shown)})"
             examples_str = ", ".join([f"'{ex}'" for ex in skill.examples]) if skill.examples else ""
-            text += f"    *   {skill.description}"
+            text += f"    *   {sig}: {skill.description}"
             if examples_str:
                 text += f", examples: {examples_str}"
             text += "\n"
