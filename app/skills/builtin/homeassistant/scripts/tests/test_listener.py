@@ -40,17 +40,24 @@ def _run_handle(data, state, *, entity_filter=None):
     orig_write = listener._write_event
     orig_save = listener._save_state
     orig_filter = config.HA_ENTITY_FILTER
+    orig_upsert = listener._update_inventory
+    orig_remove = listener._remove_from_inventory
     config.HA_ENTITY_FILTER = entity_filter or []
     listener._write_event = lambda events_dir, entity, et: (
         writes.append((entity["entity_id"], et)) or Path("x.md")
     )
     listener._save_state = lambda s: None
+    # Keep these tests hermetic — don't touch the real references/devices.md.
+    listener._update_inventory = lambda entity_id, new_state: None
+    listener._remove_from_inventory = lambda entity_id: None
     try:
         wrote = listener._handle_state_changed(data, state)
     finally:
         listener._write_event = orig_write
         listener._save_state = orig_save
         config.HA_ENTITY_FILTER = orig_filter
+        listener._update_inventory = orig_upsert
+        listener._remove_from_inventory = orig_remove
     return wrote, writes
 
 
@@ -105,6 +112,40 @@ def test_emits_on_newer_timestamp():
     _run_handle(_evt(last_updated="2026-06-14T10:00:00+00:00"), state)
     wrote, _ = _run_handle(_evt(new="off", last_updated="2026-06-14T10:05:00+00:00"), state)
     assert wrote == "light_turned_off"
+
+
+# --- devices.md inventory wiring ---
+
+def test_inventory_upsert_on_change():
+    """A fresh classified change updates the device's inventory line (before classify)."""
+    state = listener._empty_state()
+    calls = []
+    orig_upsert = listener._update_inventory
+    orig_write = listener._write_event
+    orig_save = listener._save_state
+    listener._update_inventory = lambda entity_id, new_state: calls.append(entity_id)
+    listener._write_event = lambda *a: Path("x.md")
+    listener._save_state = lambda s: None
+    try:
+        listener._handle_state_changed(_evt(), state)
+    finally:
+        listener._update_inventory = orig_upsert
+        listener._write_event = orig_write
+        listener._save_state = orig_save
+    assert calls == ["light.kitchen"]
+
+
+def test_inventory_remove_on_removed_entity():
+    """A removed entity (new_state=None) is dropped from the inventory."""
+    state = listener._empty_state()
+    calls = []
+    orig_remove = listener._remove_from_inventory
+    listener._remove_from_inventory = lambda entity_id: calls.append(entity_id)
+    try:
+        listener._handle_state_changed(_evt(new_state_none=True), state)
+    finally:
+        listener._remove_from_inventory = orig_remove
+    assert calls == ["light.kitchen"]
 
 
 # --- filename sanitize ---

@@ -21,7 +21,7 @@ from typing import Any, Optional
 
 import websocket  # websocket-client
 
-from . import classify, config, formatter
+from . import classify, config, devices, formatter
 from .homeassistant_api import HaError, HaRestClient, HaWebSocketClient
 
 
@@ -149,6 +149,37 @@ def _record_emitted(state: dict[str, Any], marker: str) -> None:
         del emitted[: len(emitted) - _EMITTED_CAP]
 
 
+def _update_inventory(entity_id: str, new_state: dict[str, Any]) -> None:
+    """Best-effort: keep this entity's line in references/devices.md current."""
+    attrs = new_state.get("attributes") or {}
+    try:
+        devices.upsert(
+            entity_id,
+            attrs.get("friendly_name") or entity_id,
+            devices.device_type(entity_id, attrs),
+            new_state.get("state", ""),
+        )
+    except OSError as e:
+        log.debug("devices.md upsert failed for %s: %s", entity_id, e)
+
+
+def _remove_from_inventory(entity_id: str) -> None:
+    """Best-effort: drop this entity's line from references/devices.md."""
+    try:
+        devices.remove(entity_id)
+    except OSError as e:
+        log.debug("devices.md remove failed for %s: %s", entity_id, e)
+
+
+def _device_rows(states: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Filtered device rows for a full devices.md snapshot (mirrors HA_ENTITY_FILTER)."""
+    return [
+        devices.row_from_state(s)
+        for s in states
+        if _entity_matches(s.get("entity_id") or "", config.HA_ENTITY_FILTER)
+    ]
+
+
 def _handle_state_changed(data: dict[str, Any], state: dict[str, Any]) -> Optional[str]:
     """Process one `state_changed` payload. Returns the emitted event type, or None."""
     entity_id = data.get("entity_id") or ""
@@ -158,7 +189,8 @@ def _handle_state_changed(data: dict[str, Any], state: dict[str, Any]) -> Option
         return None
     new_state = data.get("new_state")
     if not new_state:
-        # Entity was removed; nothing to emit.
+        # Entity was removed; drop it from the inventory and emit nothing.
+        _remove_from_inventory(entity_id)
         return None
 
     last_updated = new_state.get("last_updated") or ""
@@ -174,6 +206,10 @@ def _handle_state_changed(data: dict[str, Any], state: dict[str, Any]) -> Option
     previous = old_state.get("state", "") if isinstance(old_state, dict) else ""
     attrs = new_state.get("attributes") or {}
     new_str = new_state.get("state", "")
+
+    # Keep the inventory current for every fresh change, even ones that classify to no
+    # notable event type (the `event_type is None` path below returns early).
+    _update_inventory(entity_id, new_state)
 
     event_type = classify.classify(entity_id, attrs, previous, new_str)
     if event_type is None:
@@ -213,6 +249,10 @@ def _baseline(state: dict[str, Any]) -> None:
     state["entities"] = entities
     state["emitted"] = []
     _save_state(state)
+    try:
+        devices.full_sync(_device_rows(states))
+    except OSError as e:
+        log.debug("devices.md full_sync failed during baseline: %s", e)
     log.info("baseline complete: tracking %d entit%s",
              len(entities), "y" if len(entities) == 1 else "ies")
 
@@ -228,6 +268,15 @@ def _connect_cycle(state: dict[str, Any]) -> None:
             f" (filter: {', '.join(config.HA_ENTITY_FILTER)})"
             if config.HA_ENTITY_FILTER else " (ALL entities)",
         )
+        # Re-snapshot references/devices.md to current truth on every (re)connect. This
+        # runs even when the startup event-baseline is skipped (state intact across a
+        # restart) and heals any drift from a disconnected window (HA does not replay
+        # changes missed while offline). Best-effort: never abort the cycle on failure.
+        try:
+            with HaRestClient() as c:
+                devices.full_sync(_device_rows(c.get_states()))
+        except (HaError, OSError, socket.error) as e:
+            log.debug("devices.md refresh on connect failed: %s", e)
         connected_at = time.monotonic()
         while not _shutdown:
             if time.monotonic() - connected_at > config.RECONNECT_MAX_SECONDS:

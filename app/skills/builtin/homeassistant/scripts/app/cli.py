@@ -78,6 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--domain", default=None)
     sp.add_argument("--query", default=None)
 
+    sub.add_parser(
+        "sync-devices",
+        help="rebuild references/devices.md from current states (one line per device)",
+    )
+
     sp = sub.add_parser("call-service", help="call a service to control devices, e.g. light.turn_on")
     sp.add_argument("--domain", required=True, help="service domain, e.g. light")
     sp.add_argument("--service", required=True, help="service name, e.g. turn_on")
@@ -117,6 +122,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         elif args.command == "states":
             rows = operations.states(domain=args.domain, query=args.query)
             _emit(rows, as_json=as_json)
+
+        elif args.command == "sync-devices":
+            _emit(operations.sync_devices(), as_json=True)
 
         elif args.command == "call-service":
             data = None
