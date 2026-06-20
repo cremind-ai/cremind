@@ -76,6 +76,8 @@ _BUILTIN_MODULE_NAMES: tuple[str, ...] = (
     "change_working_directory",
     "web_search",
     "web_fetch",
+    "datetime_parser",
+    "schedule_parser",
 )
 
 

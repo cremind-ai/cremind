@@ -71,16 +71,17 @@ LOADED_SKILLS_KEY = "_loaded_skill_ids"
 
 template_instruction = '''(***[VERY IMPORTANT] You MUST always call the "personal_assistant_react" function tool to return your reasoning step. DO NOT return any plain text. Always use the function call with the fields: Thought, Action, Action_Input, Thought_In_Next.***)
 {persona_description}
-You will have these tools to support you. Your task is to respond to user commands by determining the next step you need to take by querying the relevant tool(s) until the goal is achieved, at which point you will return the Final Answer.
-Please carefully consider the user's needs and construct a thoughtful plan to address them in the most intelligent way possible. You have access to the following tools below; only use the necessary tools in the reasoning steps.
-You must be cautious and think carefully about which tool to use and whether to use it at all.
-Reasoning steps should avoid repeating previous reasoning to prevent redundant information and conserve resources. If you have sufficient information, proceed to the next step. Please detect if the Thought content across the steps is repeating itself. If it is, immediately modify the Thought content to avoid entering a loop.
-When a user request targets a skill, just call the skill's tool with the user's request as **Action_Input** — the system decides whether to load the skill for immediate execution or register a recurring event subscription.
 
 Current time: {current_time}
 Current OS: {current_os}
 Current User Working Directory: `{current_user_working_directory}`
 
+You will have these tools to support you. Your task is to respond to user commands by determining the next step you need to take by querying the relevant tool(s) until the goal is achieved, at which point you will return the Final Answer.
+Please carefully consider the user's needs and construct a thoughtful plan to address them in the most intelligent way possible. You have access to the following tools below; only use the necessary tools in the reasoning steps.
+You must be cautious and think carefully about which tool to use and whether to use it at all.
+Reasoning steps should avoid repeating previous reasoning to prevent redundant information and conserve resources. If you have sufficient information, proceed to the next step. Please detect if the Thought content across the steps is repeating itself. If it is, immediately modify the Thought content to avoid entering a loop.
+When a user request targets a skill, just call the skill's tool with the user's request as **Action_Input** — the system decides whether to load the skill for immediate execution or register a recurring event subscription.
+For all user commands that contain a time structure within them, you must call the `datetime_parser` tool, and if they contain a time structure combined with a schedule, you must call the `schedule_parser` tool before calling any other tools, in order to analyze and normalize the time structure or the time + schedule structure for other tools to use. Please choose the tool type very carefully and do not confuse them — if the command belongs to a schedule structure, you must choose the `schedule_parser` tool and must not use `datetime_parser`.
 Tools:
 {tools}
 Use the following format:

@@ -1,0 +1,509 @@
+"""Schedule Parser built-in tool.
+
+Sibling of the ``datetime_parser`` tool. Where that tool normalizes a single
+time expression into concrete datetime(s), this tool classifies a *schedule*
+expression into one of six core data types and normalizes it into a structured,
+machine-usable result for downstream schedule services (Google Calendar,
+iCloud/CalDAV, Reminders):
+
+* **instant**      — a single point ("at 9 AM")
+* **interval**     — a bounded span, start+end or start+duration ("2-4 PM")
+* **recurrence**   — a generator rule ("every weekday at 9")
+* **explicit_set** — a hand-listed union ("July 3 and July 5 at 2pm")
+* **window**       — a query region, not a booking ("this week")
+* **constraint**   — a predicate qualifying any of the above ("weekday
+  afternoons only")
+
+Like ``datetime_parser``, the LLM never computes dates: it decomposes each time
+anchor into atomic offsets (the reused ``time_elements`` schema below) and the
+concrete datetimes are computed in pure Python — here via
+:mod:`app.utils.schedule`, which composes :mod:`app.utils.datetime`. For
+recurrences the tool also emits an RFC 5545 RRULE string. Returned datetimes are
+naive local wall-clock (``YYYY-MM-DDTHH:MM:SS``); the consuming tool owns
+timezone localization (signalled by ``timezone: "pending"`` in the output).
+"""
+
+from datetime import datetime
+from typing import Any, Dict
+
+from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
+from app.types import ToolConfig
+from app.utils.logger import logger
+from app.utils.schedule import compute_schedule
+
+
+SERVER_NAME = "Schedule Parser"
+
+
+# Atomic time-element item schema — copied verbatim from datetime_parser so the
+# LLM's time-decomposition contract is identical everywhere a time appears.
+_TIME_ELEMENT_ITEM_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "mode": {
+            "type": "string",
+            "enum": ["absolute", "relative"],
+        },
+        "time_range": {
+            "type": "string",
+            "description": (
+                "Whether this element is the start or end of a span. For an "
+                "explicit interval ('from 2pm to 4pm') tag start units 'start' "
+                "and end units 'end'. For a single point use 'start'."
+            ),
+            "enum": ["start", "end"],
+        },
+        "offset_unit": {
+            "type": "string",
+            "enum": [
+                "year", "month", "day", "hour", "minute", "second",
+                "sunday", "monday", "tuesday", "wednesday",
+                "thursday", "friday", "saturday",
+            ],
+        },
+        "offset_value": {
+            "type": "integer",
+            "description": (
+                "For relative times, the integer offset (day=0 today, day=1 "
+                "tomorrow, day=-1 yesterday, month=1 next month, year=-1 last "
+                "year, hour=-1 last hour). For absolute times, the concrete "
+                "value (month=4 for April, hour=15 for 3pm). For weekdays, "
+                "offset_unit is the weekday and offset_value is the occurrence "
+                "(0='this', 1='next', -1='last')."
+            ),
+        },
+    },
+    "required": ["mode", "time_range", "offset_unit", "offset_value"],
+    "additionalProperties": False,
+}
+
+_DURATION_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "A length of time, for an interval given as start + duration ('for 2 "
+        "hours', '90-minute meeting'). Set only the fields mentioned. Omit "
+        "entirely when an explicit end clock time is spoken (use an 'end' "
+        "time_elements entry instead). No months/years — express those via end "
+        "time_elements."
+    ),
+    "properties": {
+        "days": {"type": "integer"},
+        "hours": {"type": "integer"},
+        "minutes": {"type": "integer"},
+        "seconds": {"type": "integer"},
+    },
+    "additionalProperties": False,
+}
+
+
+TOOL_CONFIG: ToolConfig = {
+    "name": "schedule_parser",
+    "display_name": "Schedule Parser",
+    # Lightweight structured extraction, like datetime_parser and the other
+    # extraction tools.
+    "default_model_group": "low",
+    "hidden": True,
+    # NOT direct_dispatch: this tool's contract is that the LLM fills the
+    # structured schema below.
+    "llm_parameters": {
+        "tool_instructions": (
+            "Classify and normalize a schedule expression (a single time, an "
+            "interval, a recurring rule, a hand-listed set, a query window, or "
+            "a filtering constraint) into machine-usable datetimes and, for "
+            "recurrences, an RFC 5545 RRULE."
+        ),
+        "system_prompt": (
+            "You decompose a natural-language schedule expression and call the "
+            "schedule_parser tool with the result. You have exactly one task.\n"
+            "NEVER use your own knowledge of the current date or time — emit "
+            "only atomic offsets and let the system compute the actual "
+            "datetimes. Decompose each time anchor left-to-right into "
+            "time_elements exactly as for datetime_parser ('tomorrow' = "
+            "relative day offset 1; '3pm' = absolute hour 15; 'next Monday' = "
+            "offset_unit='monday', offset_value=1).\n"
+            "Pick exactly one schedule_kind and fill the matching carrier:\n"
+            "- instant: a single point -> time_elements (single_time_mode=true).\n"
+            "- interval: a bounded span -> start in time_elements plus either "
+            "'end'-tagged elements (explicit end time) or a duration (a length).\n"
+            "- recurrence: a repeat rule ('every', 'each', 'weekly') -> the "
+            "recurrence object; put the time-of-day in time_elements; express a "
+            "'until <date>' via until_elements and a fixed count via "
+            "recurrence.count.\n"
+            "- explicit_set: a finite hand-listed union of distinct dates -> "
+            "members; a time stated once for all may go in the top-level "
+            "time_elements.\n"
+            "- window: a region to QUERY rather than book ('this week', "
+            "'availability') -> time_elements with single_time_mode=false.\n"
+            "- constraint: a standalone filtering predicate -> constraints.\n"
+            "A predicate that merely qualifies another kind ('every day in the "
+            "afternoon') stays in the constraints array on the real kind; do not "
+            "set schedule_kind='constraint' for it. Prefer recurrence over "
+            "explicit_set when the same weekday repeats weekly.\n"
+            "Always respond by calling schedule_parser."
+        ),
+    },
+}
+
+
+class ScheduleParserTool(BuiltInTool):
+    name: str = "schedule_parser"
+    description: str = (
+        "Classify a schedule expression (instant, interval, recurrence, "
+        "explicit set, query window, or constraint) and normalize it into "
+        "concrete datetimes and an RFC 5545 RRULE for calendar/reminder services."
+    )
+    parameters: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "reasoning": {
+                "type": "string",
+                "description": (
+                    "Think step by step. State which schedule_kind the phrase is "
+                    "and why, then how you decomposed the time(s) into atomic "
+                    "offsets. Resolve any instant-vs-interval, interval-vs-window, "
+                    "or recurrence-vs-explicit_set ambiguity here first."
+                ),
+            },
+            "parsable": {
+                "type": "boolean",
+                "description": (
+                    "True if a schedule structure could be extracted; false if "
+                    "the text contains no usable schedule/time information."
+                ),
+            },
+            "schedule_kind": {
+                "type": "string",
+                "enum": [
+                    "instant", "interval", "recurrence",
+                    "explicit_set", "window", "constraint",
+                ],
+                "description": (
+                    "The PRIMARY schedule structure. Pick exactly one:\n"
+                    "- 'instant': a single point used as a start ('at 9 AM', "
+                    "'tomorrow at noon').\n"
+                    "- 'interval': one bounded span with start+end or "
+                    "start+duration, intent to BOOK ('2-4 PM', 'meet for 2 "
+                    "hours at 1').\n"
+                    "- 'recurrence': a rule-based repeat ('every weekday at 9', "
+                    "'weekly on Tuesdays', 'first Monday of each month'). Use "
+                    "this whenever the phrase implies an open-ended/rule-based "
+                    "repeat.\n"
+                    "- 'explicit_set': a finite hand-listed union of distinct "
+                    "non-periodic points/spans ('July 3 and July 5 at 2pm', "
+                    "'9am and 5pm'). If the listed items are the same weekday "
+                    "repeating weekly, prefer 'recurrence' with by_weekday.\n"
+                    "- 'window': a region to QUERY/search, not book ('this "
+                    "week', 'my availability this afternoon', 'between today and "
+                    "Friday').\n"
+                    "- 'constraint': the phrase is PRIMARILY a standalone "
+                    "filtering predicate ('weekday afternoons only', 'business "
+                    "hours'). A predicate that qualifies another kind goes in "
+                    "the 'constraints' array instead."
+                ),
+            },
+            "time_elements": {
+                "type": "array",
+                "description": (
+                    "Atomic time components for the ANCHOR / base time of this "
+                    "schedule, decomposed left-to-right as in datetime_parser. "
+                    "Role by kind: instant=the point; interval=the start (plus "
+                    "'end' elements if an explicit end time is spoken); "
+                    "recurrence=the time-of-day of each occurrence; window=the "
+                    "queried region (usually single_time_mode=false); "
+                    "explicit_set=a time shared by all members (or empty); "
+                    "constraint=optional base being qualified (often empty). May "
+                    "be empty for a pure recurrence or constraint."
+                ),
+                "items": _TIME_ELEMENT_ITEM_SCHEMA,
+            },
+            "components_count": {
+                "type": "integer",
+                "description": "Exact length of the top-level time_elements array.",
+            },
+            "single_time_mode": {
+                "type": "boolean",
+                "description": (
+                    "Governs only the top-level time_elements anchor. True = a "
+                    "single precise instant (instant kind, recurrence "
+                    "time-of-day, interval start). False = expand the anchor to "
+                    "a start/end pair covering the whole unit ('this week', "
+                    "'today' -> full day) — typical for 'window'. Ignored when "
+                    "time_elements already has explicit 'end' tags. Prefer true "
+                    "in general; prefer false for 'window'."
+                ),
+            },
+            "duration": _DURATION_SCHEMA,
+            "recurrence": {
+                "type": "object",
+                "description": (
+                    "For schedule_kind='recurrence'. A flat RFC 5545-aligned "
+                    "rule. The time-of-day lives in time_elements, not here. "
+                    "Set frequency and interval; fill by_* only for the units "
+                    "the phrase constrains; set at most one of count / "
+                    "until_elements."
+                ),
+                "properties": {
+                    "frequency": {
+                        "type": "string",
+                        "enum": [
+                            "secondly", "minutely", "hourly",
+                            "daily", "weekly", "monthly", "yearly",
+                        ],
+                        "description": (
+                            "Base repeat unit. 'every weekday'/'daily'->daily; "
+                            "'weekly'/'every Monday'->weekly; 'monthly'/'first "
+                            "Monday of the month'->monthly; 'every year'->yearly."
+                        ),
+                    },
+                    "interval": {
+                        "type": "integer",
+                        "description": (
+                            "Step between occurrences. 1 for 'every'/'each'; 2 "
+                            "for 'every other week'/'biweekly'. Default 1."
+                        ),
+                    },
+                    "by_weekday": {
+                        "type": "array",
+                        "description": (
+                            "Weekdays the rule fires on (BYDAY), two-letter "
+                            "codes. 'every weekday'->Mon-Fri; 'Mondays and "
+                            "Thursdays' (recurring)->['MO','TH']."
+                        ),
+                        "items": {
+                            "type": "string",
+                            "enum": ["MO", "TU", "WE", "TH", "FR", "SA", "SU"],
+                        },
+                    },
+                    "by_monthday": {
+                        "type": "array",
+                        "description": (
+                            "Days of the month (BYMONTHDAY), 1..31 or negative "
+                            "from end (-1=last day). 'on the 1st and 15th'->"
+                            "[1,15]."
+                        ),
+                        "items": {"type": "integer"},
+                    },
+                    "by_month": {
+                        "type": "array",
+                        "description": "Months (BYMONTH), 1..12. 'every Jan and Jul'->[1,7].",
+                        "items": {"type": "integer"},
+                    },
+                    "by_setpos": {
+                        "type": "array",
+                        "description": (
+                            "Nth-occurrence selector (BYSETPOS) used with "
+                            "by_weekday for ordinals: 'first Monday of each "
+                            "month'->by_weekday=['MO'], by_setpos=[1]; 'last "
+                            "Friday'->[-1]."
+                        ),
+                        "items": {"type": "integer"},
+                    },
+                    "by_hour": {
+                        "type": "array",
+                        "description": (
+                            "Hours (BYHOUR), 0..23. Use ONLY for several fixed "
+                            "times per period ('at 9 and 17'->[9,17]); for a "
+                            "single time-of-day use time_elements instead."
+                        ),
+                        "items": {"type": "integer"},
+                    },
+                    "by_minute": {
+                        "type": "array",
+                        "description": "Minutes (BYMINUTE), 0..59. Rarely needed; pair with by_hour.",
+                        "items": {"type": "integer"},
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": (
+                            "Total occurrences if the phrase caps it ('the next "
+                            "5 Mondays'->5). Omit if open-ended or bounded by a "
+                            "date (use until_elements)."
+                        ),
+                    },
+                    "until_elements": {
+                        "type": "array",
+                        "description": (
+                            "End-of-series date bound as atomic offsets (same "
+                            "format as time_elements). 'every day until Friday' "
+                            "-> one weekday element friday/1. Omit when count is "
+                            "set or the series is open-ended."
+                        ),
+                        "items": _TIME_ELEMENT_ITEM_SCHEMA,
+                    },
+                },
+                "required": ["frequency"],
+                "additionalProperties": False,
+            },
+            "members": {
+                "type": "array",
+                "description": (
+                    "For schedule_kind='explicit_set'. A flat, one-level list of "
+                    "the hand-listed items (no nested schedules). Each member "
+                    "carries its own atomic decomposition; a time shared by all "
+                    "members may instead be placed in the top-level "
+                    "time_elements and inherited."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "member_kind": {
+                            "type": "string",
+                            "enum": ["instant", "interval"],
+                            "description": (
+                                "'instant' for a single point ('9am'); "
+                                "'interval' for a span ('2-3pm on Friday')."
+                            ),
+                        },
+                        "time_elements": {
+                            "type": "array",
+                            "description": (
+                                "This member's atomic time, same format as the "
+                                "top-level field. For an interval member tag "
+                                "start/end units; omit units inherited from the "
+                                "top-level shared time."
+                            ),
+                            "items": _TIME_ELEMENT_ITEM_SCHEMA,
+                        },
+                        "duration": _DURATION_SCHEMA,
+                    },
+                    "required": ["member_kind", "time_elements"],
+                    "additionalProperties": False,
+                },
+            },
+            "constraints": {
+                "type": "array",
+                "description": (
+                    "Predicate filters that qualify the schedule. May co-occur "
+                    "with ANY schedule_kind and is the main payload when "
+                    "schedule_kind='constraint'. Each entry is one predicate "
+                    "(combined as logical AND); fill only the sub-fields "
+                    "relevant to its 'type'."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": [
+                                "weekday_membership", "time_of_day_band",
+                                "date_range", "excluded_dates",
+                            ],
+                            "description": (
+                                "'weekday_membership': restrict to weekdays "
+                                "(use 'weekdays'). 'time_of_day_band': restrict "
+                                "to a part of the day (use 'band' or "
+                                "start_hour/end_hour). 'date_range': restrict to "
+                                "a date span (use range_*_elements). "
+                                "'excluded_dates': drop specific dates/days (use "
+                                "excluded_elements and/or 'weekdays')."
+                            ),
+                        },
+                        "weekdays": {
+                            "type": "array",
+                            "description": (
+                                "Two-letter weekday codes — the ALLOWED days for "
+                                "'weekday_membership' or the BLOCKED days for "
+                                "'excluded_dates'. 'weekdays only'->"
+                                "['MO','TU','WE','TH','FR']."
+                            ),
+                            "items": {
+                                "type": "string",
+                                "enum": ["MO", "TU", "WE", "TH", "FR", "SA", "SU"],
+                            },
+                        },
+                        "band": {
+                            "type": "string",
+                            "enum": [
+                                "morning", "afternoon", "evening",
+                                "night", "business_hours", "custom",
+                            ],
+                            "description": (
+                                "Named time-of-day band for 'time_of_day_band'. "
+                                "Use 'custom' with start_hour/end_hour for "
+                                "explicit hours ('9-5')."
+                            ),
+                        },
+                        "start_hour": {
+                            "type": "integer",
+                            "description": "Band lower bound 0..23 for band='custom' ('9-5'->9).",
+                        },
+                        "end_hour": {
+                            "type": "integer",
+                            "description": "Band upper bound 0..23 for band='custom' ('9-5'->17).",
+                        },
+                        "range_start_elements": {
+                            "type": "array",
+                            "description": (
+                                "For 'date_range': the lower date bound as atomic "
+                                "offsets (same format as time_elements)."
+                            ),
+                            "items": _TIME_ELEMENT_ITEM_SCHEMA,
+                        },
+                        "range_end_elements": {
+                            "type": "array",
+                            "description": (
+                                "For 'date_range': the upper date bound as atomic "
+                                "offsets."
+                            ),
+                            "items": _TIME_ELEMENT_ITEM_SCHEMA,
+                        },
+                        "excluded_elements": {
+                            "type": "array",
+                            "description": (
+                                "For 'excluded_dates': a specific date to drop, "
+                                "as atomic offsets. For excluded WEEKDAYS use "
+                                "'weekdays' instead."
+                            ),
+                            "items": _TIME_ELEMENT_ITEM_SCHEMA,
+                        },
+                    },
+                    "required": ["type"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["reasoning", "parsable", "schedule_kind"],
+    }
+
+    async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
+        logger.info(f"[schedule_parser] Received arguments: {arguments}")
+
+        parsable = arguments.get("parsable", False)
+        schedule_kind = arguments.get("schedule_kind")
+
+        # Early exit if not parsable or no kind. Uniform structured shape.
+        if not parsable or not schedule_kind:
+            return BuiltInToolResult(
+                structured_content={
+                    "parsable": False,
+                    "reason": arguments.get("reasoning") or "Could not parse a schedule from input",
+                }
+            )
+
+        # Current datetime as ISO string. ``_now`` is a test/caller override
+        # (matches the ``_``-prefixed injected-key convention); otherwise use the
+        # naive local wall-clock, as the source library expects.
+        current_date_str = arguments.get("_now") or datetime.now().isoformat()
+
+        try:
+            result = compute_schedule(arguments, current_date_str)
+        except Exception as e:
+            # The date library can raise (e.g. Jan 31 + 1 month) and bad
+            # recurrence/constraint fields raise ValueError; surface as a
+            # structured observation, never a crash.
+            logger.warning(f"[schedule_parser] conversion failed: {e}")
+            return BuiltInToolResult(
+                structured_content={
+                    "error": "ConversionError",
+                    "parsable": False,
+                    "message": f"Failed to compute schedule: {e}",
+                }
+            )
+
+        logger.info(f"[schedule_parser] Converted result: {result}")
+        return BuiltInToolResult(structured_content=result)
+
+
+def get_tools(config: dict) -> list[BuiltInTool]:
+    """Return tool instances for this server."""
+    return [ScheduleParserTool()]
