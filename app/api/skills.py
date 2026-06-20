@@ -33,6 +33,7 @@ from app.skills.importer import (
     SkillImportError,
     install_archive,
     install_github,
+    install_hub,
 )
 from app.skills.sync import (
     delete_profile_skill,
@@ -246,8 +247,40 @@ def get_skill_routes(state: BootedState) -> list[Route]:
         await resync_profile_skills(profile, registry)
         return JSONResponse({"success": True, **result})
 
+    async def handle_import_hub(request: Request) -> JSONResponse:
+        """Install skills from a Cremind Hub link (skill page URL or bare name)."""
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        registry = state.registry
+        if registry is None:
+            return _storage_not_ready()
+        profile = _profile_from_request(request)
+        if not profile:
+            return JSONResponse({"error": "Profile is required"}, status_code=400)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        link = body.get("link") or body.get("url")
+        if not isinstance(link, str) or not link.strip():
+            return JSONResponse({"error": "'link' is required"}, status_code=400)
+
+        try:
+            result = await asyncio.to_thread(install_hub, link, profile)
+        except SkillImportError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Skill Hub import failed")
+            return JSONResponse({"error": f"Import failed: {exc}"}, status_code=500)
+
+        await resync_profile_skills(profile, registry)
+        return JSONResponse({"success": True, **result})
+
     return [
         Route("/api/skills/import/archive", handle_import_archive, methods=["POST"]),
         Route("/api/skills/import/github", handle_import_github, methods=["POST"]),
+        Route("/api/skills/import/hub", handle_import_hub, methods=["POST"]),
         Route("/api/skills/{tool_id}", handle_delete_skill, methods=["DELETE"]),
     ]
