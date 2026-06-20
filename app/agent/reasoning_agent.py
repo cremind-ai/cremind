@@ -57,6 +57,7 @@ from app.utils.common import limit_messages, truncate_messages, truncate_old_obs
 from app.utils.context_storage import clear_context, get_context, set_context
 from app.utils.logger import logger
 from app.utils.persona import read_persona_file
+from app.utils.working_directory import set_in_memory_override
 
 
 OBSERVATION_START_MARKER = "------------OBS-START------------"
@@ -1008,6 +1009,9 @@ class ReasoningAgent:
                 # Reset the dynamic enum mirror so change_working_directory's
                 # ``target`` falls back to the default values on the next turn.
                 clear_context(self.context_id, LOADED_SKILLS_KEY)
+                # Evict any stale per-call shell-dir override left by pre-fix
+                # conversations so it can never shadow the unified working dir.
+                clear_context(self.context_id, "current_shell_directory")
             done_chunk: Dict[str, Any] = {
                 "type": ChatCompletionTypeEnum.DONE,
                 "data": observation_text,
@@ -1033,6 +1037,9 @@ class ReasoningAgent:
             if self.context_id:
                 self._save_context(self.context_id)
                 clear_context(self.context_id, LOADED_SKILLS_KEY)
+                # Evict any stale per-call shell-dir override left by pre-fix
+                # conversations so it can never shadow the unified working dir.
+                clear_context(self.context_id, "current_shell_directory")
             yield {
                 "type": ChatCompletionTypeEnum.CLARIFY,
                 "data": observation_text,
@@ -1136,11 +1143,16 @@ class ReasoningAgent:
                 skill_text = f"{skill_text}\n\n{events_hint}"
             self._loaded_skill_sections[tool.tool_id] = skill_text
             self._loaded_skill_ids.add(tool.tool_id)
-            # Pin exec_shell's working directory to the loaded skill's dir so
-            # subsequent shell commands run inside the skill folder without
-            # the LLM having to re-supply current_shell_directory.
+            # Anchor the ONE conversation working directory to the loaded
+            # skill's own dir, using the canonical override key that
+            # system_file, exec_shell, and the "Current User Working Directory"
+            # prompt line all read. Persist + broadcast so it survives a reopen
+            # and refreshes any subscribed UI, exactly like the
+            # change_working_directory tool. Subsequent relative paths
+            # ("scripts/__main__.py", "references/devices.md") then resolve for
+            # both tools without the LLM having to navigate.
             if self.context_id:
-                set_context(self.context_id, "current_shell_directory", str(dir_path))
+                set_in_memory_override(self.context_id, str(dir_path))
                 # Mirror loaded skills into ContextStorage so per-request
                 # callbacks (change_working_directory.prepare_tools) can
                 # extend the ``target`` enum with the active skill IDs.
@@ -1149,6 +1161,25 @@ class ReasoningAgent:
                     LOADED_SKILLS_KEY,
                     sorted(self._loaded_skill_ids),
                 )
+                try:
+                    from app.events.runner import get_conversation_storage
+                    from app.utils.working_directory import persist_working_directory
+                    await persist_working_directory(
+                        self.context_id, str(dir_path), get_conversation_storage(),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to persist skill cwd anchor for %s", self.context_id,
+                    )
+                try:
+                    from app.events import get_event_stream_bus
+                    await get_event_stream_bus().publish(
+                        self.context_id, "cwd", {"working_directory": str(dir_path)},
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to publish skill cwd anchor for %s", self.context_id,
+                    )
             # The full SKILL.md content is shown to the user in the frontend's
             # Thinking Process via RESULT_ARTIFACT, but the recorded step in
             # self.steps only carries a short pointer — the actual content
@@ -1422,6 +1453,9 @@ class ReasoningAgent:
         if self.context_id:
             self._clear_context(self.context_id)
             clear_context(self.context_id, LOADED_SKILLS_KEY)
+            # Evict any stale per-call shell-dir override left by pre-fix
+            # conversations so it can never shadow the unified working dir.
+            clear_context(self.context_id, "current_shell_directory")
 
         yield {
             "type": ChatCompletionTypeEnum.DONE,

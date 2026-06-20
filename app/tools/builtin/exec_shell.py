@@ -30,7 +30,6 @@ from app.config.settings import BaseConfig
 from app.config.system_vars import build_system_env
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
 from app.types import ToolConfig
-from app.utils.context_storage import get_context, set_context
 from app.utils.task_context import current_task_id_var
 from app.tools.builtin.exec_shell_classifier import detect_tui_sequences
 from app.tools.builtin.exec_shell_input_mode import (
@@ -1372,7 +1371,17 @@ class ExecShellTool(BuiltInTool):
             },
             "current_shell_directory": {
                 "type": "string",
-                "description": "Require absolute path"
+                "description": (
+                    "OPTIONAL one-off override for THIS command's working "
+                    "directory (absolute path only). Leave EMPTY in almost all "
+                    "cases: the command already runs in the conversation's "
+                    "current working directory (shown as 'Current User Working "
+                    "Directory' in the system prompt). Set this only to run a "
+                    "single command somewhere else; it does NOT change the "
+                    "conversation's working directory and is not remembered for "
+                    "later commands. To switch persistently, use "
+                    "change_working_directory."
+                ),
             },
             "timeout": {
                 "type": "integer",
@@ -1419,25 +1428,24 @@ class ExecShellTool(BuiltInTool):
 
     async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
         command = arguments.get("command", "").strip()
-        context_id = arguments.get("_context_id") or ""
         logger.debug(f"exec_shell called with command={command!r}")
-        user_working_directory = (
+        # The ONE conversation working directory, shared with system_file and
+        # the reasoning-agent prompt line. It is the _working_directory_override
+        # (set by change_working_directory or skill-load) injected by the
+        # adapter as `_working_directory`, else CREMIND_SYSTEM_DIR.
+        conversation_working_directory = (
             arguments.get("_working_directory", None)
             or BaseConfig.CREMIND_SYSTEM_DIR
         )
 
-        # current_shell_directory: explicit arg wins and is persisted to the
-        # conversation-scoped store; otherwise fall back to the previously
-        # set sticky value, then to the User Working Directory.
+        # current_shell_directory is an OPTIONAL one-off override for THIS
+        # command only — it is never persisted, so it can no longer silently
+        # shadow the conversation cwd on later calls. To move the conversation
+        # persistently, change_working_directory writes
+        # _working_directory_override, which arrives here as _working_directory.
         current_dir_arg = (arguments.get("current_shell_directory") or "").strip() or None
-        if current_dir_arg and context_id:
-            set_context(context_id, "current_shell_directory", current_dir_arg)
-        shell_working_directory = (
-            current_dir_arg
-            or (get_context(context_id, "current_shell_directory") if context_id else None)
-            or user_working_directory
-        )
-        logger.debug(f"User working directory: {user_working_directory!r}")
+        shell_working_directory = current_dir_arg or conversation_working_directory
+        logger.debug(f"Conversation working directory: {conversation_working_directory!r}")
         logger.debug(f"Determined shell working directory: {shell_working_directory!r}")
         timeout = arguments.get("timeout", 120)
         silence_timeout = arguments.get("silence_timeout", _DEFAULT_SILENCE_TIMEOUT)
