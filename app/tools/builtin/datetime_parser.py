@@ -148,7 +148,7 @@ class DatetimeParserTool(BuiltInTool):
 
         # ── Build the time payload from the atomic elements ──
         # Partitioning by time_range, date inheritance and component building
-        # all live in app.utils.datetime so schedule_parser reuses the exact
+        # all live in app.utils.datetime so the scheduler reuses the exact
         # same logic per anchor.
         payload = build_payload_from_elements(time_elements)
 

@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 
 from app.events import runner as event_runner
 from app.events import file_watcher_runner
+from app.events import schedule_event_runner
 from app.utils.logger import logger
 
 
@@ -57,6 +58,15 @@ async def _worker(conversation_id: str) -> None:
                     profile=item["profile"],
                     subscription_id=item["subscription_id"],
                     watch_name=item["watch_name"],
+                    action=item["action"],
+                    payload=item["payload"],
+                )
+            elif kind == "schedule_event":
+                await schedule_event_runner.run_event(
+                    conversation_id=conversation_id,
+                    profile=item["profile"],
+                    subscription_id=item["subscription_id"],
+                    title=item["title"],
                     action=item["action"],
                     payload=item["payload"],
                 )
@@ -153,6 +163,27 @@ async def enqueue_file_watcher_event(
         "profile": profile,
         "subscription_id": subscription_id,
         "watch_name": watch_name,
+        "action": action,
+        "payload": payload,
+    })
+
+
+async def enqueue_schedule_event(
+    *,
+    conversation_id: str,
+    profile: str,
+    subscription_id: str,
+    title: str,
+    action: str,
+    payload: Dict[str, Any],
+) -> None:
+    """Add a schedule (time-based) event to the conversation's queue."""
+    queue = _ensure_worker(conversation_id)
+    await queue.put({
+        "kind": "schedule_event",
+        "profile": profile,
+        "subscription_id": subscription_id,
+        "title": title,
         "action": action,
         "payload": payload,
     })

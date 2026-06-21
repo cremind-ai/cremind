@@ -1,10 +1,10 @@
-"""Schedule Parser built-in tool.
+"""Scheduler built-in tool.
 
 Sibling of the ``datetime_parser`` tool. Where that tool normalizes a single
 time expression into concrete datetime(s), this tool classifies a *schedule*
 expression into one of six core data types and normalizes it into a structured,
-machine-usable result for downstream schedule services (Google Calendar,
-iCloud/CalDAV, Reminders):
+machine-usable result for downstream schedule services (the Cremind internal
+calendar, Google Calendar, iCloud/CalDAV, Reminders):
 
 * **instant**      — a single point ("at 9 AM")
 * **interval**     — a bounded span, start+end or start+duration ("2-4 PM")
@@ -21,6 +21,12 @@ concrete datetimes are computed in pure Python — here via
 recurrences the tool also emits an RFC 5545 RRULE string. Returned datetimes are
 naive local wall-clock (``YYYY-MM-DDTHH:MM:SS``); the consuming tool owns
 timezone localization (signalled by ``timezone: "pending"`` in the output).
+
+This module is the home of the **scheduler** tool group. The single ``scheduler``
+function below (the schedule parser / normalizer) is always exposed. When the
+per-profile *Calendar & Schedule* feature is enabled, this group additionally
+exposes action subtools (create / list / update / cancel schedule events) — see
+:mod:`app.tools.builtin.scheduler_actions` and the ``get_prepare_tools`` gate.
 """
 
 from datetime import datetime
@@ -32,7 +38,7 @@ from app.utils.logger import logger
 from app.utils.schedule import compute_schedule
 
 
-SERVER_NAME = "Schedule Parser"
+SERVER_NAME = "Scheduler"
 
 
 # Atomic time-element item schema — copied verbatim from datetime_parser so the
@@ -97,8 +103,8 @@ _DURATION_SCHEMA: Dict[str, Any] = {
 
 
 TOOL_CONFIG: ToolConfig = {
-    "name": "schedule_parser",
-    "display_name": "Schedule Parser",
+    "name": "scheduler",
+    "display_name": "Scheduler",
     # Lightweight structured extraction, like datetime_parser and the other
     # extraction tools.
     "default_model_group": "low",
@@ -114,7 +120,7 @@ TOOL_CONFIG: ToolConfig = {
         ),
         "system_prompt": (
             "You decompose a natural-language schedule expression and call the "
-            "schedule_parser tool with the result. You have exactly one task.\n"
+            "scheduler tool with the result. You have exactly one task.\n"
             "NEVER use your own knowledge of the current date or time — emit "
             "only atomic offsets and let the system compute the actual "
             "datetimes. Decompose each time anchor left-to-right into "
@@ -139,14 +145,22 @@ TOOL_CONFIG: ToolConfig = {
             "afternoon') stays in the constraints array on the real kind; do not "
             "set schedule_kind='constraint' for it. Prefer recurrence over "
             "explicit_set when the same weekday repeats weekly.\n"
-            "Always respond by calling schedule_parser."
+            "To ANALYZE/normalize a schedule expression, call `scheduler` with "
+            "the decomposition above.\n"
+            "If the request is to CREATE a scheduled task or reminder and the "
+            "time has already been normalized, call `schedule_create`, copying "
+            "dtstart and any rrule / recurrence_end_type / recurrence_end_value "
+            "VERBATIM from the normalized data — never invent datetimes. To "
+            "review or cancel existing scheduled events, call `schedule_list` / "
+            "`schedule_cancel`. If only the `scheduler` function is available, "
+            "always call `scheduler`."
         ),
     },
 }
 
 
-class ScheduleParserTool(BuiltInTool):
-    name: str = "schedule_parser"
+class SchedulerTool(BuiltInTool):
+    name: str = "scheduler"
     description: str = (
         "Classify a schedule expression (instant, interval, recurrence, "
         "explicit set, query window, or constraint) and normalize it into "
@@ -466,7 +480,7 @@ class ScheduleParserTool(BuiltInTool):
     }
 
     async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
-        logger.info(f"[schedule_parser] Received arguments: {arguments}")
+        logger.info(f"[scheduler] Received arguments: {arguments}")
 
         parsable = arguments.get("parsable", False)
         schedule_kind = arguments.get("schedule_kind")
@@ -491,7 +505,7 @@ class ScheduleParserTool(BuiltInTool):
             # The date library can raise (e.g. Jan 31 + 1 month) and bad
             # recurrence/constraint fields raise ValueError; surface as a
             # structured observation, never a crash.
-            logger.warning(f"[schedule_parser] conversion failed: {e}")
+            logger.warning(f"[scheduler] conversion failed: {e}")
             return BuiltInToolResult(
                 structured_content={
                     "error": "ConversionError",
@@ -500,10 +514,60 @@ class ScheduleParserTool(BuiltInTool):
                 }
             )
 
-        logger.info(f"[schedule_parser] Converted result: {result}")
+        logger.info(f"[scheduler] Converted result: {result}")
         return BuiltInToolResult(structured_content=result)
 
 
 def get_tools(config: dict) -> list[BuiltInTool]:
-    """Return tool instances for this server."""
-    return [ScheduleParserTool()]
+    """Return tool instances for this server.
+
+    Always includes the ``scheduler`` parser. The Calendar & Schedule action
+    subtools (create/list/update/cancel schedule events) are appended here and
+    gated per-request by :func:`get_prepare_tools` against the profile's
+    ``calendar_schedule_enabled`` flag, so when the feature is OFF the agent
+    only ever sees the parser (today's behavior).
+    """
+    tools: list[BuiltInTool] = [SchedulerTool()]
+    try:
+        from app.tools.builtin.scheduler_actions import get_action_tools
+        tools.extend(get_action_tools(config))
+    except Exception as exc:  # noqa: BLE001
+        # Never let the action subtools break the always-on parser.
+        logger.warning(f"[scheduler] action subtools unavailable: {exc}")
+    return tools
+
+
+def get_prepare_tools():
+    """Per-request gate: hide the Calendar & Schedule action subtools unless the
+    active profile has the feature enabled.
+
+    The Reasoning Agent passes the active ``profile`` into every ``prepare_tools``
+    callback (same plumbing ``change_working_directory`` relies on). We read the
+    per-profile ``calendar_schedule_enabled`` flag; when OFF (the default), every
+    action subtool is stripped from the tool list so the LLM only ever sees the
+    always-on ``scheduler`` parser — i.e. today's behavior.
+
+    Boot-safe: if the action-subtool module is not importable yet, there is
+    nothing to gate and the tool list passes through unchanged.
+    """
+
+    def prepare_tools(query, tools, *, arguments=None, context_id=None, profile=None, **_):
+        try:
+            from app.tools.builtin.scheduler_actions import ACTION_TOOL_NAMES
+        except Exception:  # noqa: BLE001
+            return tools
+        enabled = False
+        if profile:
+            try:
+                from app.calendar.feature import is_enabled
+                enabled = is_enabled(profile)
+            except Exception:  # noqa: BLE001
+                enabled = False
+        if enabled:
+            return tools
+        return [
+            t for t in tools
+            if (t.get("function") or {}).get("name") not in ACTION_TOOL_NAMES
+        ]
+
+    return prepare_tools

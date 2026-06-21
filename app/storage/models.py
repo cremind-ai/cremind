@@ -354,6 +354,58 @@ class FileWatcherSubscriptionModel(Base):
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
 
 
+class ScheduleEventSubscriptionModel(Base):
+    """Conversation-scoped, time-based event subscription (the Calendar &
+    Schedule engine).
+
+    A row is ONE schedule rule, not one occurrence. It says: at ``next_fire_at``
+    (and, for a recurrence, at every following occurrence the ``rrule`` yields),
+    fire ``action`` in ``conversation_id`` — or, for a reminder-only row, just
+    raise a notification. After each fire the ``ScheduleManager`` advances
+    ``next_fire_at`` to the following occurrence (a rolling pointer), so an
+    open-ended recurrence stays a single row forever; bounded series (COUNT /
+    UNTIL) stop and flip ``status`` to ``completed``.
+
+    The calendar UI expands occurrences on demand for the visible window only;
+    they are never persisted here.
+    """
+    __tablename__ = "schedule_event_subscriptions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    conversation_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    profile: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    # Natural-language command run when the event fires. Empty for reminder-only.
+    action: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    is_reminder_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # All-day event (no time-of-day). Multi-day spans are carried by dtstart +
+    # duration_minutes (days × 1440); all_day just changes display + Google body.
+    all_day: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # One of: instant | interval | recurrence | explicit_set (from the scheduler
+    # parser's schedule_kind). explicit_set is stored as one row per occurrence.
+    schedule_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="instant")
+    # First/next occurrence as naive local wall-clock ISO (YYYY-MM-DDTHH:MM:SS).
+    dtstart: Mapped[str] = mapped_column(String(32), nullable=False)
+    duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    # RFC 5545 RRULE value (no "RRULE:" prefix). NULL for a one-shot event.
+    rrule: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recurrence_end_type: Mapped[str | None] = mapped_column(String(16), nullable=True)  # never|count|until
+    recurrence_end_value: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Rolling pointer: epoch seconds of the next fire. NULL once completed/cancelled.
+    next_fire_at: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
+    occurrences_fired: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")  # active|completed|cancelled|paused
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="agent")  # agent|manual
+    # Set when mirrored to an external provider (e.g. "google"); reserved for Phase 2.
+    external_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    external_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
 class ShortTermMemoryModel(Base):
     """Per-conversation short-term memory entry (FIFO queue).
 

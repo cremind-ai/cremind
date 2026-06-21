@@ -1,4 +1,4 @@
-"""Unit tests for the ``schedule_parser`` built-in tool.
+"""Unit tests for the ``scheduler`` built-in tool (schedule parser).
 
 Simulate the structured arguments the routing LLM would emit (the tool's
 ``parameters`` schema) and assert the ``structured_content`` observation. Time
@@ -14,8 +14,8 @@ NOW = "2026-06-20T14:30:00"  # Saturday
 
 
 def _run(arguments):
-    from app.tools.builtin.schedule_parser import ScheduleParserTool
-    tool = ScheduleParserTool()
+    from app.tools.builtin.scheduler import SchedulerTool
+    tool = SchedulerTool()
     return asyncio.run(tool.run(arguments)).structured_content
 
 

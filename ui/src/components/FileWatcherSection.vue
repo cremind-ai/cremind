@@ -21,6 +21,7 @@ import {
   subscribeFileWatchersAdmin,
   type AdminEventsSubHandle,
 } from '../services/adminEventsStream';
+import CollapsibleSection from './CollapsibleSection.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -126,11 +127,7 @@ function formatDate(seconds: number): string {
 
 <template>
   <section class="fw-section">
-    <header class="section-header">
-      <Icon icon="mdi:folder-eye-outline" class="section-icon" />
-      <h2>File Watcher Events</h2>
-    </header>
-
+    <CollapsibleSection title="File Watcher Events" icon="mdi:folder-eye-outline" :count="sortedSubs.length">
     <p class="section-blurb">
       Watch a directory for filesystem changes and run an action whenever a
       matching event fires (created, modified, deleted, moved). Subscriptions
@@ -220,6 +217,7 @@ function formatDate(seconds: number): string {
         </template>
       </ElTableColumn>
     </ElTable>
+    </CollapsibleSection>
   </section>
 </template>
 

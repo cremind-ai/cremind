@@ -61,6 +61,10 @@ dependencies = [
     # endpoint, the ``register_file_watcher`` built-in tool — so it ships
     # in core rather than as an opt-in extra.
     "watchdog>=4.0.0",
+    # RFC 5545 recurrence expansion for the Calendar & Schedule engine
+    # (app/calendar/recurrence.py + app/events/schedule_manager.py). Used
+    # unconditionally whenever the feature is on, so it ships in core.
+    "python-dateutil>=2.8.0",
 ]
 
 [project.optional-dependencies]

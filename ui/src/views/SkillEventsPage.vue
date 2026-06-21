@@ -29,6 +29,8 @@ import {
   type AdminEventsSubHandle,
 } from '../services/adminEventsStream';
 import FileWatcherSection from '../components/FileWatcherSection.vue';
+import ScheduleEventsSection from '../components/ScheduleEventsSection.vue';
+import CollapsibleSection from '../components/CollapsibleSection.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -195,19 +197,15 @@ function formatDate(ms: number): string {
       <h2>Events</h2>
     </header>
 
-    <section class="section-header">
-      <Icon icon="mdi:lightning-bolt-outline" class="section-icon" />
-      <h2 class="section-title">Skill Events</h2>
-    </section>
+    <p v-if="errorMessage" class="error-banner">{{ errorMessage }}</p>
 
+    <CollapsibleSection title="Skill Events" icon="mdi:lightning-bolt-outline" :count="sortedSubs.length">
     <p class="page-blurb">
       Each subscription re-runs its conversation with the saved <em>action</em> whenever a new
       event file appears in the skill's <code>events/&lt;event_type&gt;/</code> folder.
       Subscriptions are made by the assistant when you ask for an automation
       (e.g. "when a new email arrives, summarize it").
     </p>
-
-    <p v-if="errorMessage" class="error-banner">{{ errorMessage }}</p>
 
     <ElEmpty v-if="!loading && sortedSubs.length === 0" description="No active subscriptions." />
 
@@ -258,6 +256,7 @@ function formatDate(ms: number): string {
         </template>
       </ElTableColumn>
     </ElTable>
+    </CollapsibleSection>
 
     <ElDialog v-model="simulateOpen" title="Simulate event" width="640px">
       <p class="dialog-info" v-if="simulateTarget">
@@ -292,6 +291,8 @@ function formatDate(ms: number): string {
     </ElDialog>
 
     <FileWatcherSection :profile="profile" />
+
+    <ScheduleEventsSection :profile="profile" />
   </div>
 </template>
 
