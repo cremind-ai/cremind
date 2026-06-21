@@ -133,10 +133,11 @@ force JSON with `--json`).
   removes the stored OAuth tokens.
 - `list-entities` / `states` filter client-side by `--domain` (the part before the dot in an
   `entity_id`) and `--query` (case-insensitive substring over `entity_id` + friendly name).
-- `sync-devices` (re)builds `references/devices.md` — a concise, one-line-per-device inventory
-  (see below) — from the current states, filtered by `HA_ENTITY_FILTER`. The listener maintains
-  this file automatically; run this verb to populate it before the listener's first run, or to
-  force a fresh snapshot.
+- `sync-devices` (re)builds `references/devices.md` (a concise, one-line-per-device inventory)
+  **and** `references/device_names.md` (a low-churn `entity_id | name` index) — see below — from
+  the current states, filtered by `HA_ENTITY_FILTER`. The listener maintains both files
+  automatically; run this verb to populate them before the listener's first run, or to force a
+  fresh snapshot.
 - `call-service` controls devices. `--entity` is sugar for `--data '{"entity_id": "..."}'`.
   Calling a service with **no** `--entity` and **no** `--data` can affect every matching device
   (e.g. every light) — the CLI warns when both are absent.
@@ -157,7 +158,7 @@ uv run scripts/__main__.py list-entities --query temperature
 # Read one entity (state + attributes)
 uv run scripts/__main__.py get-state --entity light.kitchen
 
-# Build the concise device inventory at references/devices.md (one line per device)
+# Build the device inventory + name index (references/devices.md, references/device_names.md)
 uv run scripts/__main__.py sync-devices
 
 # Turn a light on / off
@@ -191,7 +192,28 @@ The format is `entity_id | name | type | state`, where **type** is the entity's 
 
 Read this file when you need the current name / type / state of devices at a glance.
 
-Before interacting with any device, always load the `references/devices.md` file to check all device information and status.
+
+## Device name index (`references/device_names.md`)
+
+`references/device_names.md` is a leaner companion to `devices.md`: **only** `entity_id | name`,
+one device per line —
+
+```
+light.kitchen | Kitchen Light
+binary_sensor.front_door | Front Door
+sensor.living_room | Living Room Temp
+```
+
+It is the stable name↔`entity_id` map. Unlike `devices.md` (rewritten on every state tick), this
+file is **low-churn**: the listener rewrites a single line only when a device is **added,
+removed, or renamed**, never on a plain state change — so it stays quiet and cache-friendly.
+
+- It mirrors `HA_ENTITY_FILTER`, is sorted by `entity_id`, and is **auto-maintained — do not
+  hand-edit** (`sync-devices` and the listener overwrite it).
+- Use it to resolve a friendly name to its `entity_id` (or vice-versa) without the state noise of
+  `devices.md`; read `devices.md` when you also need each device's type or current state.
+
+Before interacting with any device, always load the `references/device_names.md` file to load the current friendly names and `entity_id`s.
 
 ## Entity filtering (important)
 
@@ -224,7 +246,10 @@ Behavior:
   to `events/<event_type>/<YYYY-MM-DDTHH-MM-SS> <friendly name>.md`.
 - **Device inventory**: maintains `references/devices.md` (one line per tracked device,
   `entity_id | name | type | state`) — a full snapshot on each (re)connect, and a single-line
-  in-place update on each change. See [Device inventory](#device-inventory-referencesdevicesmd).
+  in-place update on each change — plus `references/device_names.md` (`entity_id | name`), which
+  is only rewritten when a device is added, removed, or renamed. See
+  [Device inventory](#device-inventory-referencesdevicesmd) and
+  [Device name index](#device-name-index-referencesdevice_namesmd).
 - **State**: persisted to `scripts/.listener_state.json` (gitignored). Delete it to force a
   re-baseline. Auto-wipes if `HA_URL` changes.
 - **Reconnect**: on dropped sockets or HA restarts, the listener reconnects, re-authenticates
@@ -297,7 +322,8 @@ homeassistant/
 ├── events/
 │   └── <event_type>/              # one markdown drop-zone per classified event type
 ├── references/
-│   └── devices.md                 # auto-maintained current device inventory (untracked at runtime)
+│   ├── devices.md                 # auto-maintained current device inventory (untracked at runtime)
+│   └── device_names.md            # auto-maintained entity_id|name index (untracked at runtime)
 └── scripts/
     ├── .env                       # HA_URL (+ optional HA_TOKEN and other vars)
     ├── __main__.py                # CLI entry (uv run scripts/__main__.py ...)
@@ -310,6 +336,7 @@ homeassistant/
         ├── classify.py            # state_changed -> granular event type
         ├── operations.py          # verbs: check / list-entities / get-state / states / sync-devices / call-service
         ├── devices.py             # references/devices.md inventory (full_sync + single-line upsert/remove)
+        ├── device_names.py        # references/device_names.md name index (entity_id|name; rename/add/remove only)
         ├── formatter.py           # entity rows + event markdown
         ├── listener.py            # WebSocket loop, classify, atomic event writes, reconnect
         └── cli.py                 # argparse builder + dispatch

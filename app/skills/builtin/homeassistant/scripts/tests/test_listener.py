@@ -42,14 +42,18 @@ def _run_handle(data, state, *, entity_filter=None):
     orig_filter = config.HA_ENTITY_FILTER
     orig_upsert = listener._update_inventory
     orig_remove = listener._remove_from_inventory
+    orig_names_upsert = listener._update_names_inventory
+    orig_names_remove = listener._remove_from_names_inventory
     config.HA_ENTITY_FILTER = entity_filter or []
     listener._write_event = lambda events_dir, entity, et: (
         writes.append((entity["entity_id"], et)) or Path("x.md")
     )
     listener._save_state = lambda s: None
-    # Keep these tests hermetic — don't touch the real references/devices.md.
+    # Keep these tests hermetic — don't touch the real references/*.md inventories.
     listener._update_inventory = lambda entity_id, new_state: None
     listener._remove_from_inventory = lambda entity_id: None
+    listener._update_names_inventory = lambda entity_id, old_state, new_state: None
+    listener._remove_from_names_inventory = lambda entity_id: None
     try:
         wrote = listener._handle_state_changed(data, state)
     finally:
@@ -58,6 +62,8 @@ def _run_handle(data, state, *, entity_filter=None):
         config.HA_ENTITY_FILTER = orig_filter
         listener._update_inventory = orig_upsert
         listener._remove_from_inventory = orig_remove
+        listener._update_names_inventory = orig_names_upsert
+        listener._remove_from_names_inventory = orig_names_remove
     return wrote, writes
 
 
@@ -123,15 +129,18 @@ def test_inventory_upsert_on_change():
     orig_upsert = listener._update_inventory
     orig_write = listener._write_event
     orig_save = listener._save_state
+    orig_names = listener._update_names_inventory
     listener._update_inventory = lambda entity_id, new_state: calls.append(entity_id)
     listener._write_event = lambda *a: Path("x.md")
     listener._save_state = lambda s: None
+    listener._update_names_inventory = lambda entity_id, old_state, new_state: None
     try:
         listener._handle_state_changed(_evt(), state)
     finally:
         listener._update_inventory = orig_upsert
         listener._write_event = orig_write
         listener._save_state = orig_save
+        listener._update_names_inventory = orig_names
     assert calls == ["light.kitchen"]
 
 
@@ -140,11 +149,87 @@ def test_inventory_remove_on_removed_entity():
     state = listener._empty_state()
     calls = []
     orig_remove = listener._remove_from_inventory
+    orig_names_remove = listener._remove_from_names_inventory
     listener._remove_from_inventory = lambda entity_id: calls.append(entity_id)
+    listener._remove_from_names_inventory = lambda entity_id: None
     try:
         listener._handle_state_changed(_evt(new_state_none=True), state)
     finally:
         listener._remove_from_inventory = orig_remove
+        listener._remove_from_names_inventory = orig_names_remove
+    assert calls == ["light.kitchen"]
+
+
+# --- device_names.md name-index wiring ---
+
+def test_names_inventory_rename_upserts():
+    """A friendly-name change upserts the entity's line in device_names.md."""
+    calls = []
+    orig = listener.device_names.upsert
+    listener.device_names.upsert = lambda eid, name: calls.append((eid, name))
+    try:
+        old = {"state": "on", "attributes": {"friendly_name": "Old Name"}}
+        new = {"state": "on", "attributes": {"friendly_name": "New Name"}}
+        listener._update_names_inventory("light.kitchen", old, new)
+    finally:
+        listener.device_names.upsert = orig
+    assert calls == [("light.kitchen", "New Name")]
+
+
+def test_names_inventory_state_only_change_is_untouched():
+    """A plain state change (same name) writes nothing to device_names.md — the low-churn guarantee."""
+    calls = []
+    orig = listener.device_names.upsert
+    listener.device_names.upsert = lambda eid, name: calls.append((eid, name))
+    try:
+        old = {"state": "off", "attributes": {"friendly_name": "Kitchen Light"}}
+        new = {"state": "on", "attributes": {"friendly_name": "Kitchen Light"}}
+        listener._update_names_inventory("light.kitchen", old, new)
+    finally:
+        listener.device_names.upsert = orig
+    assert calls == [], "state-only change must not touch device_names.md"
+
+
+def test_names_inventory_new_entity_upserts():
+    """A brand-new entity (no old_state) is added to device_names.md."""
+    calls = []
+    orig = listener.device_names.upsert
+    listener.device_names.upsert = lambda eid, name: calls.append((eid, name))
+    try:
+        new = {"state": "on", "attributes": {"friendly_name": "Kitchen Light"}}
+        listener._update_names_inventory("light.kitchen", None, new)
+    finally:
+        listener.device_names.upsert = orig
+    assert calls == [("light.kitchen", "Kitchen Light")]
+
+
+def test_names_inventory_no_friendly_name_is_untouched():
+    """With no friendly_name on either side both names fall back to entity_id => no rewrite."""
+    calls = []
+    orig = listener.device_names.upsert
+    listener.device_names.upsert = lambda eid, name: calls.append((eid, name))
+    try:
+        old = {"state": "off", "attributes": {}}
+        new = {"state": "on", "attributes": {}}
+        listener._update_names_inventory("light.kitchen", old, new)
+    finally:
+        listener.device_names.upsert = orig
+    assert calls == [], "no friendly_name on either side => name unchanged (entity_id)"
+
+
+def test_names_inventory_remove_on_removed_entity():
+    """A removed entity (new_state=None) is dropped from device_names.md."""
+    state = listener._empty_state()
+    calls = []
+    orig_names_remove = listener._remove_from_names_inventory
+    orig_dev_remove = listener._remove_from_inventory
+    listener._remove_from_names_inventory = lambda eid: calls.append(eid)
+    listener._remove_from_inventory = lambda eid: None
+    try:
+        listener._handle_state_changed(_evt(new_state_none=True), state)
+    finally:
+        listener._remove_from_names_inventory = orig_names_remove
+        listener._remove_from_inventory = orig_dev_remove
     assert calls == ["light.kitchen"]
 
 
@@ -168,4 +253,4 @@ if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn()
-    print("OK: entity filter, classification, dedup, sanitize.")
+    print("OK: entity filter, classification, dedup, devices/device_names wiring, sanitize.")

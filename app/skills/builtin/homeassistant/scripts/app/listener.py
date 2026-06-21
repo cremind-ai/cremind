@@ -21,7 +21,7 @@ from typing import Any, Optional
 
 import websocket  # websocket-client
 
-from . import classify, config, devices, formatter
+from . import classify, config, device_names, devices, formatter
 from .homeassistant_api import HaError, HaRestClient, HaWebSocketClient
 
 
@@ -171,6 +171,31 @@ def _remove_from_inventory(entity_id: str) -> None:
         log.debug("devices.md remove failed for %s: %s", entity_id, e)
 
 
+def _update_names_inventory(entity_id: str, old_state, new_state: dict[str, Any]) -> None:
+    """Best-effort: keep this entity's line in references/device_names.md current — but only
+    when its friendly name actually changed (or it is a brand-new entity). A plain state
+    change leaves the old and new names equal, so the common path touches nothing here and the
+    name index stays low-churn. ``old_state`` is the event's prior state (None for a new entity)."""
+    new_name = (new_state.get("attributes") or {}).get("friendly_name") or entity_id
+    old_name = None
+    if isinstance(old_state, dict):
+        old_name = (old_state.get("attributes") or {}).get("friendly_name") or entity_id
+    if old_name == new_name:
+        return  # name unchanged (state-only change) -> device_names.md untouched, no I/O
+    try:
+        device_names.upsert(entity_id, new_name)
+    except OSError as e:
+        log.debug("device_names.md upsert failed for %s: %s", entity_id, e)
+
+
+def _remove_from_names_inventory(entity_id: str) -> None:
+    """Best-effort: drop this entity's line from references/device_names.md."""
+    try:
+        device_names.remove(entity_id)
+    except OSError as e:
+        log.debug("device_names.md remove failed for %s: %s", entity_id, e)
+
+
 def _device_rows(states: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filtered device rows for a full devices.md snapshot (mirrors HA_ENTITY_FILTER)."""
     return [
@@ -189,8 +214,9 @@ def _handle_state_changed(data: dict[str, Any], state: dict[str, Any]) -> Option
         return None
     new_state = data.get("new_state")
     if not new_state:
-        # Entity was removed; drop it from the inventory and emit nothing.
+        # Entity was removed; drop it from both inventories and emit nothing.
         _remove_from_inventory(entity_id)
+        _remove_from_names_inventory(entity_id)
         return None
 
     last_updated = new_state.get("last_updated") or ""
@@ -207,9 +233,11 @@ def _handle_state_changed(data: dict[str, Any], state: dict[str, Any]) -> Option
     attrs = new_state.get("attributes") or {}
     new_str = new_state.get("state", "")
 
-    # Keep the inventory current for every fresh change, even ones that classify to no
-    # notable event type (the `event_type is None` path below returns early).
+    # Keep the inventories current for every fresh change, even ones that classify to no
+    # notable event type (the `event_type is None` path below returns early). devices.md
+    # tracks state on every tick; device_names.md only rewrites when the name actually changed.
     _update_inventory(entity_id, new_state)
+    _update_names_inventory(entity_id, old_state, new_state)
 
     event_type = classify.classify(entity_id, attrs, previous, new_str)
     if event_type is None:
@@ -249,10 +277,15 @@ def _baseline(state: dict[str, Any]) -> None:
     state["entities"] = entities
     state["emitted"] = []
     _save_state(state)
+    rows = _device_rows(states)
     try:
-        devices.full_sync(_device_rows(states))
+        devices.full_sync(rows)
     except OSError as e:
         log.debug("devices.md full_sync failed during baseline: %s", e)
+    try:
+        device_names.full_sync(rows)
+    except OSError as e:
+        log.debug("device_names.md full_sync failed during baseline: %s", e)
     log.info("baseline complete: tracking %d entit%s",
              len(entities), "y" if len(entities) == 1 else "ies")
 
@@ -274,9 +307,11 @@ def _connect_cycle(state: dict[str, Any]) -> None:
         # changes missed while offline). Best-effort: never abort the cycle on failure.
         try:
             with HaRestClient() as c:
-                devices.full_sync(_device_rows(c.get_states()))
+                rows = _device_rows(c.get_states())
+            devices.full_sync(rows)
+            device_names.full_sync(rows)
         except (HaError, OSError, socket.error) as e:
-            log.debug("devices.md refresh on connect failed: %s", e)
+            log.debug("inventory refresh on connect failed: %s", e)
         connected_at = time.monotonic()
         while not _shutdown:
             if time.monotonic() - connected_at > config.RECONNECT_MAX_SECONDS:
