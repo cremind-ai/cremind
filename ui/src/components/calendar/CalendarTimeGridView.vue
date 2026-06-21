@@ -78,7 +78,7 @@ onMounted(() => { if (bodyRef.value) bodyRef.value.scrollTop = 7 * HOUR_H; }); /
           v-for="seg in allDaySegments"
           :key="seg.ev.subscription_id + seg.ev.start + seg.lane"
           class="tg-allday-bar"
-          :class="{ reminder: seg.ev.is_reminder_only, done: seg.ev.status !== 'active' }"
+          :class="{ done: seg.ev.status !== 'active' }"
           :style="segStyle(seg)"
           @click.stop="emit('select', seg.ev)"
         >{{ seg.ev.title }}</button>
@@ -109,7 +109,7 @@ onMounted(() => { if (bodyRef.value) bodyRef.value.scrollTop = 7 * HOUR_H; }); /
           v-for="p in timedFor(day)"
           :key="p.ev.subscription_id + p.ev.start"
           class="tg-block"
-          :class="{ reminder: p.ev.is_reminder_only, done: p.ev.status !== 'active' }"
+          :class="{ done: p.ev.status !== 'active' }"
           :style="blockStyle(p)"
           @click.stop="emit('select', p.ev)"
         >
@@ -143,7 +143,6 @@ onMounted(() => { if (bodyRef.value) bodyRef.value.scrollTop = 7 * HOUR_H; }); /
   border-radius: 4px; padding: 0 8px; font-size: .72rem; font-weight: 500;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.tg-allday-bar.reminder { background: var(--warning-color); }
 .tg-allday-bar.done { opacity: .55; }
 
 .tg-body { display: grid; grid-template-columns: 64px repeat(var(--cols), 1fr); overflow-y: auto; max-height: 62vh; position: relative; }
@@ -163,7 +162,6 @@ onMounted(() => { if (bodyRef.value) bodyRef.value.scrollTop = 7 * HOUR_H; }); /
   border-radius: 5px; padding: 2px 6px; text-align: left; cursor: pointer;
   display: flex; flex-direction: column; gap: 1px;
 }
-.tg-block.reminder { background: var(--warning-color); border-left-color: color-mix(in srgb, var(--warning-color) 60%, #000); }
 .tg-block.done { opacity: .55; }
 .tg-block .b-time { font-size: .64rem; opacity: .9; }
 .tg-block .b-title { font-size: .74rem; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

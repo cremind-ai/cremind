@@ -45,7 +45,6 @@ function barStyle(seg: DaySegment) {
 }
 function barClass(seg: DaySegment) {
   return {
-    reminder: seg.ev.is_reminder_only,
     'continues-left': seg.continuesLeft,
     'continues-right': seg.continuesRight,
     done: seg.ev.status === 'completed' || seg.ev.status === 'cancelled',
@@ -79,7 +78,7 @@ function barClass(seg: DaySegment) {
               v-for="ev in timedFor(day).slice(0, MAX_CHIPS)"
               :key="ev.subscription_id + ev.start"
               class="cal-chip"
-              :class="{ reminder: ev.is_reminder_only, done: ev.status !== 'active' }"
+              :class="{ done: ev.status !== 'active' }"
               @click.stop="emit('select', ev)"
             >
               <span class="dot" />
@@ -151,7 +150,6 @@ function barClass(seg: DaySegment) {
 }
 .cal-chip:hover { background: var(--hover-bg); }
 .cal-chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--primary-color); flex: none; }
-.cal-chip.reminder .dot { background: var(--warning-color); }
 .cal-chip.done { opacity: .5; }
 .cal-chip .t { color: var(--text-tertiary); font-variant-numeric: tabular-nums; flex: none; }
 .cal-chip .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -167,7 +165,6 @@ function barClass(seg: DaySegment) {
   font-size: .72rem; font-weight: 500; line-height: 18px;
   display: flex; align-items: center; overflow: hidden;
 }
-.cal-mbar.reminder { background: var(--warning-color); }
 .cal-mbar.done { opacity: .55; }
 .cal-mbar.continues-left { border-top-left-radius: 0; border-bottom-left-radius: 0; }
 .cal-mbar.continues-right { border-top-right-radius: 0; border-bottom-right-radius: 0; }

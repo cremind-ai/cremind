@@ -71,7 +71,7 @@ def test_manager_fires_and_advances_recurrence(tmp_path, monkeypatch):
     dtstart = R.format_local(R.from_epoch(fire_at))
     row = store.insert(
         conversation_id="c1", profile="admin", title="daily job", action="do the thing",
-        is_reminder_only=False, schedule_kind="recurrence", dtstart=dtstart,
+        schedule_kind="recurrence", dtstart=dtstart,
         duration_minutes=30, next_fire_at=fire_at, rrule="FREQ=DAILY",
         recurrence_end_type="never",
     )
@@ -106,7 +106,7 @@ def test_manager_completes_one_shot(tmp_path, monkeypatch):
     dtstart = R.format_local(R.from_epoch(fire_at))
     row = store.insert(
         conversation_id="c1", profile="admin", title="one shot", action="ping once",
-        is_reminder_only=False, schedule_kind="instant", dtstart=dtstart,
+        schedule_kind="instant", dtstart=dtstart,
         duration_minutes=30, next_fire_at=fire_at, rrule=None,
     )
 
@@ -126,6 +126,38 @@ def test_manager_completes_one_shot(tmp_path, monkeypatch):
     assert updated["occurrences_fired"] == 1
 
 
+def test_manager_runs_action_falling_back_to_title(tmp_path, monkeypatch):
+    # Reminder mode removed: an event with NO explicit action still RUNS — the
+    # title is used as the command (so a bare "tắt đèn hiên" executes).
+    store = _make_store(tmp_path)
+    _seed(store)
+    recorded = _wire(monkeypatch, store)
+
+    now = time.time()
+    fire_at = now + 0.3
+    dtstart = R.format_local(R.from_epoch(fire_at))
+    row = store.insert(
+        conversation_id="c1", profile="admin", title="tắt đèn hiên", action="",
+        schedule_kind="instant", dtstart=dtstart,
+        duration_minutes=30, next_fire_at=fire_at, rrule=None,
+    )
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        mgr = sm.ScheduleManager()
+        mgr.start(loop)
+        await asyncio.sleep(0.9)
+        mgr.stop()
+
+    asyncio.run(run())
+
+    # Enqueued an agent run in the bound conversation, with action == title.
+    assert len(recorded) == 1
+    assert recorded[0]["conversation_id"] == "c1"
+    assert recorded[0]["subscription_id"] == row["id"]
+    assert recorded[0]["action"] == "tắt đèn hiên"
+
+
 def test_manager_skips_disabled_profile(tmp_path, monkeypatch):
     store = _make_store(tmp_path)
     _seed(store)
@@ -142,7 +174,7 @@ def test_manager_skips_disabled_profile(tmp_path, monkeypatch):
     fire_at = time.time() + 0.2
     store.insert(
         conversation_id="c1", profile="admin", title="should not fire", action="nope",
-        is_reminder_only=False, schedule_kind="instant",
+        schedule_kind="instant",
         dtstart=R.format_local(R.from_epoch(fire_at)), duration_minutes=30,
         next_fire_at=fire_at, rrule=None,
     )

@@ -17,8 +17,8 @@ from typing import Any, Dict
 from app.utils.logger import logger
 
 
-def _format_trigger_message(*, action: str, payload: Dict[str, Any]) -> str:
-    """Build the synthetic user-message body the agent receives."""
+def _format_content(payload: Dict[str, Any]) -> str:
+    """Build the trigger's content block (the detail lines shown in the UI bubble)."""
     lines = [
         f"title: {payload.get('title', '')}",
         f"fired_at: {payload.get('fired_at', '')}",
@@ -28,12 +28,19 @@ def _format_trigger_message(*, action: str, payload: Dict[str, Any]) -> str:
         lines.append(f"rrule: {payload['rrule']}")
     if payload.get("next_fire_at_iso"):
         lines.append(f"next_occurrence: {payload['next_fire_at_iso']}")
-    block = "\n".join(lines)
-    return (
-        f"Trigger: schedule\n"
-        f"Action: {action.strip()}\n"
-        f"Content:\n---\n{block}\n---"
-    )
+    return "\n".join(lines)
+
+
+def build_trigger_messages(action: str, payload: Dict[str, Any]) -> tuple[str, str]:
+    """Return ``(reasoning_query, bubble_content)`` for a fired schedule event.
+
+    The reasoning ``Input:`` is just the action (the user's command, e.g.
+    "tắt đèn hiên") — the schedule metadata is noise for execution. The UI
+    bubble keeps the fenced detail block (rendered by stream_runner's
+    ``_format_trigger_content``), so it is unchanged.
+    """
+    block = _format_content(payload)
+    return action.strip(), f"---\n{block}\n---"
 
 
 async def run_event(
@@ -89,7 +96,9 @@ async def run_event(
     except Exception:  # noqa: BLE001
         logger.exception("[schedule_event] channel forwarder setup failed")
 
-    query = _format_trigger_message(action=action, payload=payload)
+    # query = the bare command (reasoning Input); bubble_content = the fenced
+    # detail block (UI bubble, unchanged).
+    query, bubble_content = build_trigger_messages(action, payload)
     metadata: Dict[str, Any] = {
         "source": "schedule_event",
         "subscription_id": subscription_id,
@@ -100,7 +109,7 @@ async def run_event(
     trigger_event: Dict[str, Any] = {
         "event_type": "schedule",
         "action": action.strip(),
-        "content": query.split("Content:\n", 1)[-1] if "Content:\n" in query else "",
+        "content": bubble_content,
         "title": title,
         "schedule_kind": payload.get("schedule_kind"),
         "rrule": payload.get("rrule"),

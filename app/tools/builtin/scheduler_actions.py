@@ -59,17 +59,21 @@ class ScheduleCreateTool(BuiltInTool):
     description: str = (
         "Create a Calendar & Schedule event (a time-based Cremind event). Use "
         "AFTER calling `scheduler` to normalize the time: copy the parser's "
-        "dtstart and (for recurrences) rrule verbatim. The event fires at its "
-        "time(s): a reminder-only event raises a notification; otherwise the "
-        "given action runs in this conversation. Open-ended recurrences are "
-        "stored as a single advancing rule, never an infinite set."
+        "dtstart and (for recurrences) rrule verbatim. When the event fires, its "
+        "action RUNS in this conversation (the agent executes it). Open-ended "
+        "recurrences are stored as a single advancing rule, never an infinite set."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
             "title": {
                 "type": "string",
-                "description": "Short human-readable name for the event/reminder.",
+                "description": (
+                    "Short human-readable name for the event/reminder, in the "
+                    "USER'S ORIGINAL LANGUAGE — use the user's own wording and "
+                    "never translate it (e.g. keep 'tắt đèn hiên'; do not render "
+                    "'Turn off porch light')."
+                ),
             },
             "dtstart": {
                 "type": "string",
@@ -82,15 +86,10 @@ class ScheduleCreateTool(BuiltInTool):
             "action": {
                 "type": "string",
                 "description": (
-                    "The command to run when the event fires (e.g. 'summarize my "
-                    "unread email'). Leave empty for a pure reminder."
-                ),
-            },
-            "is_reminder_only": {
-                "type": "boolean",
-                "description": (
-                    "True for a plain reminder (notification, no agent run). "
-                    "Defaults to true when no action is given."
+                    "The command to run when the event fires (e.g. 'turn off the "
+                    "porch light', 'summarize my unread email'), in the user's "
+                    "ORIGINAL language. If omitted, the title is used as the "
+                    "command — so a bare command like 'tắt đèn hiên' still runs."
                 ),
             },
             "duration_minutes": {
@@ -152,8 +151,9 @@ class ScheduleCreateTool(BuiltInTool):
                 "message": "dtstart is required (copy it from the scheduler result).",
             })
         title = (arguments.get("title") or "").strip() or "Scheduled event"
-        action = (arguments.get("action") or "").strip()
-        is_reminder_only = bool(arguments.get("is_reminder_only", not action))
+        # Every scheduled event runs an action; default it to the title so a
+        # bare command (no explicit action) still executes when it fires.
+        action = (arguments.get("action") or "").strip() or title
         rrule = (arguments.get("rrule") or "").strip() or None
         all_day = bool(arguments.get("all_day", False))
 
@@ -192,7 +192,6 @@ class ScheduleCreateTool(BuiltInTool):
                 conversation_id=conversation_id,
                 title=title,
                 action=action,
-                is_reminder_only=is_reminder_only,
                 source="agent",
                 schedule_kind=("recurrence" if rrule else ("interval" if duration_minutes > 30 else "instant")),
                 dtstart=dtstart,
@@ -213,7 +212,6 @@ class ScheduleCreateTool(BuiltInTool):
             })
 
         _publish_changed(profile)
-        kind = "reminder" if is_reminder_only else "scheduled action"
         when = "recurring" if rrule else "one-time"
         return BuiltInToolResult(structured_content={
             "ok": True,
@@ -224,7 +222,7 @@ class ScheduleCreateTool(BuiltInTool):
             "rrule": rrule,
             "next_fire_at": row.get("next_fire_at"),
             "status": row.get("status"),
-            "message": f"Created a {when} {kind} '{title}' starting {dtstart}.",
+            "message": f"Created a {when} scheduled action '{title}' starting {dtstart}.",
         })
 
 
@@ -261,7 +259,6 @@ class ScheduleListTool(BuiltInTool):
                 "id": r["id"],
                 "title": r.get("title"),
                 "action": r.get("action"),
-                "is_reminder_only": r.get("is_reminder_only"),
                 "schedule_kind": r.get("schedule_kind"),
                 "dtstart": r.get("dtstart"),
                 "rrule": r.get("rrule"),

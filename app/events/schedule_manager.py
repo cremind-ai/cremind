@@ -225,28 +225,28 @@ class ScheduleManager:
             store.set_status(sub_id, "completed", next_fire_at=None)
             store.update_next_fire(sub_id, next_fire_at=None, occurrences_fired=occurrences_fired)
 
-        # Deliver the trigger.
-        if sub.get("is_reminder_only") or not (sub.get("action") or "").strip():
-            self._notify_reminder(sub, fired_iso)
-        else:
-            payload = {
-                "title": sub.get("title", ""),
-                "fired_at": fired_iso,
-                "schedule_kind": sub.get("schedule_kind"),
-                "rrule": sub.get("rrule"),
-                "next_fire_at_iso": R.format_local(nxt) if nxt is not None else None,
-            }
-            try:
-                await event_queue.enqueue_schedule_event(
-                    conversation_id=sub["conversation_id"],
-                    profile=sub["profile"],
-                    subscription_id=sub_id,
-                    title=sub.get("title", ""),
-                    action=sub["action"],
-                    payload=payload,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception(f"ScheduleManager: enqueue failed for {sub_id}")
+        # Deliver the trigger: ALWAYS run the action in the registering
+        # conversation. When no explicit action was set, the title is the
+        # command (e.g. "tắt đèn hiên"), so the agent still executes it.
+        action = (sub.get("action") or "").strip() or (sub.get("title") or "").strip()
+        payload = {
+            "title": sub.get("title", ""),
+            "fired_at": fired_iso,
+            "schedule_kind": sub.get("schedule_kind"),
+            "rrule": sub.get("rrule"),
+            "next_fire_at_iso": R.format_local(nxt) if nxt is not None else None,
+        }
+        try:
+            await event_queue.enqueue_schedule_event(
+                conversation_id=sub["conversation_id"],
+                profile=sub["profile"],
+                subscription_id=sub_id,
+                title=sub.get("title", ""),
+                action=action,
+                payload=payload,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(f"ScheduleManager: enqueue failed for {sub_id}")
 
         # Nudge any open Events-page / calendar SSE subscribers.
         self._publish_admin_changed(sub["profile"])
@@ -254,23 +254,6 @@ class ScheduleManager:
             f"ScheduleManager: fired {sub_id} ({sub.get('title')!r}) at {fired_iso}; "
             f"next={R.format_local(nxt) if nxt else 'none (completed)'}"
         )
-
-    @staticmethod
-    def _notify_reminder(sub: Dict[str, Any], fired_iso: str) -> None:
-        try:
-            from app.events.notifications_buffer import get_event_notifications
-            title = sub.get("title") or "Reminder"
-            get_event_notifications().push(
-                profile=sub["profile"],
-                conversation_id=sub.get("conversation_id", ""),
-                conversation_title=title,
-                message_preview=f"⏰ {title}",
-                kind="reminder",
-                priority="high",
-                extra={"subscription_id": sub["id"], "fired_at": fired_iso},
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("ScheduleManager: reminder notification failed")
 
     @staticmethod
     def _publish_admin_changed(profile: str) -> None:

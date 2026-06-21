@@ -69,7 +69,7 @@ def test_open_ended_recurrence_is_one_row_with_advancing_pointer(tmp_path: Path)
     _seed(store)
     row = store.insert(
         conversation_id="c1", profile="admin", title="standup", action="check email",
-        is_reminder_only=False, schedule_kind="recurrence", dtstart="2026-06-22T09:00:00",
+        schedule_kind="recurrence", dtstart="2026-06-22T09:00:00",
         duration_minutes=30, next_fire_at=R.to_epoch(R.parse_local("2026-06-22T09:00:00")),
         rrule="FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR", recurrence_end_type="never",
     )
@@ -97,7 +97,7 @@ def test_count_bounded_recurrence_completes(tmp_path: Path) -> None:
     _seed(store)
     row = store.insert(
         conversation_id="c1", profile="admin", title="3-day reminder", action="ping",
-        is_reminder_only=False, schedule_kind="recurrence", dtstart="2026-06-22T09:00:00",
+        schedule_kind="recurrence", dtstart="2026-06-22T09:00:00",
         duration_minutes=30, next_fire_at=R.to_epoch(R.parse_local("2026-06-22T09:00:00")),
         rrule="FREQ=DAILY;COUNT=3", recurrence_end_type="count", recurrence_end_value="3",
     )
@@ -119,7 +119,7 @@ def test_until_bounded_recurrence_completes(tmp_path: Path) -> None:
     _seed(store)
     row = store.insert(
         conversation_id="c1", profile="admin", title="until-fri", action="ping",
-        is_reminder_only=False, schedule_kind="recurrence", dtstart="2026-06-22T09:00:00",
+        schedule_kind="recurrence", dtstart="2026-06-22T09:00:00",
         duration_minutes=30, next_fire_at=R.to_epoch(R.parse_local("2026-06-22T09:00:00")),
         rrule="FREQ=DAILY", recurrence_end_type="until", recurrence_end_value="2026-06-24T09:00:00",
     )
@@ -141,7 +141,7 @@ def test_one_shot_does_not_advance(tmp_path: Path) -> None:
     _seed(store)
     row = store.insert(
         conversation_id="c1", profile="admin", title="dentist", action="",
-        is_reminder_only=True, schedule_kind="instant", dtstart="2026-06-22T09:00:00",
+        schedule_kind="instant", dtstart="2026-06-22T09:00:00",
         duration_minutes=30, next_fire_at=R.to_epoch(R.parse_local("2026-06-22T09:00:00")),
         rrule=None,
     )
@@ -158,7 +158,7 @@ def test_all_day_multiday_round_trips(tmp_path: Path) -> None:
     _seed(store)
     row = store.insert(
         conversation_id="c1", profile="admin", title="trip", action="",
-        is_reminder_only=True, all_day=True, schedule_kind="interval",
+        all_day=True, schedule_kind="interval",
         dtstart="2026-06-22T00:00:00", duration_minutes=3 * 1440,
         next_fire_at=R.to_epoch(R.parse_local("2026-06-22T00:00:00")),
     )
@@ -176,7 +176,7 @@ def test_crud_update_and_delete(tmp_path: Path) -> None:
     _seed(store)
     row = store.insert(
         conversation_id="c1", profile="admin", title="t", action="a",
-        is_reminder_only=False, schedule_kind="instant", dtstart="2026-06-22T09:00:00",
+        schedule_kind="instant", dtstart="2026-06-22T09:00:00",
         duration_minutes=30, next_fire_at=R.to_epoch(R.parse_local("2026-06-22T09:00:00")),
     )
     updated = store.update_fields(row["id"], title="renamed", duration_minutes=60)

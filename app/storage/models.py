@@ -377,9 +377,9 @@ class ScheduleEventSubscriptionModel(Base):
     )
     profile: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(512), nullable=False, default="")
-    # Natural-language command run when the event fires. Empty for reminder-only.
+    # Natural-language command run in the conversation when the event fires.
+    # Defaults to the title at creation time, so a bare command still executes.
     action: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    is_reminder_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # All-day event (no time-of-day). Multi-day spans are carried by dtstart +
     # duration_minutes (days × 1440); all_day just changes display + Google body.
     all_day: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

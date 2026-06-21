@@ -33,10 +33,9 @@ const groups = computed(() => {
         @click="emit('select', ev)"
       >
         <Icon
-          :icon="ev.status === 'completed' ? 'mdi:check-circle'
-            : ev.is_reminder_only ? 'mdi:bell-outline' : 'mdi:lightning-bolt-outline'"
+          :icon="ev.status === 'completed' ? 'mdi:check-circle' : 'mdi:lightning-bolt-outline'"
           class="agenda-icon"
-          :class="{ done: ev.status === 'completed', reminder: ev.is_reminder_only }"
+          :class="{ done: ev.status === 'completed' }"
         />
         <span class="agenda-time">{{ isMultiDayOrAllDay(ev) ? 'All day' : timeLabel(ev.start) }}</span>
         <span class="agenda-title">{{ ev.title }}</span>
@@ -59,7 +58,6 @@ const groups = computed(() => {
 }
 .agenda-row:hover { background: var(--surface-hover); border-color: var(--border-hover); }
 .agenda-icon { font-size: 1.15rem; color: var(--primary-color); flex: none; }
-.agenda-icon.reminder { color: var(--warning-color); }
 .agenda-icon.done { color: var(--success-color); }
 .agenda-time { font-variant-numeric: tabular-nums; color: var(--text-secondary); font-size: .82rem; min-width: 58px; }
 .agenda-title { flex: 1; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

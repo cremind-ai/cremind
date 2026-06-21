@@ -37,7 +37,6 @@ class ScheduleEventSubscriptionStorage(SyncStorageBase):
             "profile": row["profile"],
             "title": row["title"] or "",
             "action": row["action"] or "",
-            "is_reminder_only": bool(row["is_reminder_only"]),
             "all_day": bool(row["all_day"]),
             "schedule_kind": row["schedule_kind"],
             "dtstart": row["dtstart"],
@@ -115,7 +114,6 @@ class ScheduleEventSubscriptionStorage(SyncStorageBase):
         profile: str,
         title: str,
         action: str,
-        is_reminder_only: bool,
         schedule_kind: str,
         dtstart: str,
         duration_minutes: int,
@@ -138,7 +136,6 @@ class ScheduleEventSubscriptionStorage(SyncStorageBase):
             "profile": profile,
             "title": title or "",
             "action": action or "",
-            "is_reminder_only": bool(is_reminder_only),
             "all_day": bool(all_day),
             "schedule_kind": schedule_kind,
             "dtstart": dtstart,
@@ -160,11 +157,11 @@ class ScheduleEventSubscriptionStorage(SyncStorageBase):
             conn.execute(
                 text(
                     "INSERT INTO schedule_event_subscriptions "
-                    "(id, conversation_id, profile, title, action, is_reminder_only, all_day, "
+                    "(id, conversation_id, profile, title, action, all_day, "
                     "schedule_kind, dtstart, duration_minutes, rrule, recurrence_end_type, "
                     "recurrence_end_value, timezone, next_fire_at, occurrences_fired, "
                     "status, source, external_provider, external_event_id, created_at, updated_at) "
-                    "VALUES (:id, :conversation_id, :profile, :title, :action, :is_reminder_only, :all_day, "
+                    "VALUES (:id, :conversation_id, :profile, :title, :action, :all_day, "
                     ":schedule_kind, :dtstart, :duration_minutes, :rrule, :recurrence_end_type, "
                     ":recurrence_end_value, :timezone, :next_fire_at, :occurrences_fired, "
                     ":status, :source, :external_provider, :external_event_id, :created_at, :updated_at)"
@@ -202,7 +199,7 @@ class ScheduleEventSubscriptionStorage(SyncStorageBase):
     # Columns a caller may edit (manual calendar edits / agent updates). Excludes
     # identity/bookkeeping columns.
     _EDITABLE = {
-        "title", "action", "is_reminder_only", "all_day", "schedule_kind", "dtstart",
+        "title", "action", "all_day", "schedule_kind", "dtstart",
         "duration_minutes", "rrule", "recurrence_end_type", "recurrence_end_value",
         "timezone", "next_fire_at", "status", "external_provider", "external_event_id",
     }

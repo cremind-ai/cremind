@@ -26,7 +26,6 @@ export interface ScheduleEventSubscription {
   profile: string;
   title: string;
   action: string;
-  is_reminder_only: boolean;
   schedule_kind: string;
   dtstart: string;
   duration_minutes: number;
@@ -45,7 +44,6 @@ export interface CalendarOccurrence {
   subscription_id: string | null;
   title: string;
   action: string;
-  is_reminder_only: boolean;
   all_day: boolean;
   schedule_kind: string;
   is_recurring: boolean;
@@ -70,7 +68,6 @@ export interface CreateEventPayload {
   title: string;
   dtstart: string;
   action?: string;
-  is_reminder_only?: boolean;
   all_day?: boolean;
   duration_minutes?: number;
   schedule_kind?: string;

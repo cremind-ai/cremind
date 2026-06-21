@@ -190,7 +190,6 @@ class InternalCalendarProvider(CalendarProvider):
         conversation_id: str,
         title: str,
         action: str = "",
-        is_reminder_only: bool = False,
         source: str = "agent",
         schedule_kind: str = "instant",
         dtstart: str,
@@ -207,12 +206,14 @@ class InternalCalendarProvider(CalendarProvider):
         )
         # A past one-shot is stored as a completed calendar record (never fires).
         status = "active" if next_fire_at is not None else "completed"
+        # Every schedule event runs an action; when none is given, the title is
+        # the command (so a bare "tắt đèn hiên" still executes).
+        action = (action or "").strip() or (title or "").strip()
         row = self._store.insert(
             conversation_id=conversation_id,
             profile=profile,
             title=title or "",
-            action=action or "",
-            is_reminder_only=bool(is_reminder_only),
+            action=action,
             all_day=bool(all_day),
             schedule_kind=schedule_kind,
             dtstart=dtstart,
@@ -240,7 +241,6 @@ class InternalCalendarProvider(CalendarProvider):
         conversation_id: str,
         title: str,
         action: str = "",
-        is_reminder_only: bool = False,
         source: str = "agent",
         result: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
@@ -250,7 +250,7 @@ class InternalCalendarProvider(CalendarProvider):
         for spec in specs:
             rows.append(self.create_event(
                 profile=profile, conversation_id=conversation_id, title=title,
-                action=action, is_reminder_only=is_reminder_only, source=source,
+                action=action, source=source,
                 schedule_kind=spec["schedule_kind"], dtstart=spec["dtstart"],
                 duration_minutes=spec.get("duration_minutes", DEFAULT_DURATION_MINUTES),
                 all_day=spec.get("all_day", False),
@@ -347,7 +347,6 @@ class InternalCalendarProvider(CalendarProvider):
                     "subscription_id": sub["id"],
                     "title": sub.get("title", ""),
                     "action": sub.get("action", ""),
-                    "is_reminder_only": sub.get("is_reminder_only", False),
                     "all_day": sub.get("all_day", False),
                     "schedule_kind": sub.get("schedule_kind"),
                     "is_recurring": bool(sub.get("rrule")),
@@ -393,7 +392,7 @@ def _google_dt_to_local_iso(g: Optional[Dict[str, Any]]) -> Optional[str]:
 
 def _google_event_body(
     *, title: str, dtstart: str, duration_minutes: int, rrule: Optional[str],
-    is_reminder_only: bool, action: str, all_day: bool = False,
+    action: str, all_day: bool = False,
 ) -> Dict[str, Any]:
     """Build a Google Calendar event body for a Cremind schedule event mirror."""
     start_dt = R.parse_local(dtstart)
@@ -417,7 +416,7 @@ def _google_event_body(
         }
     if rrule:
         body["recurrence"] = [f"RRULE:{rrule}"]
-    note = "Cremind reminder" if is_reminder_only else (f"Cremind action: {action}" if action else "Cremind event")
+    note = f"Cremind action: {action}" if action else "Cremind event"
     body["description"] = f"{note}\n(managed by Cremind)"
     return body
 
@@ -439,7 +438,6 @@ def _google_event_to_occurrence(ev: Dict[str, Any], match_row: Optional[Dict[str
             "subscription_id": match_row["id"],
             "title": match_row.get("title") or ev.get("summary", ""),
             "action": match_row.get("action", ""),
-            "is_reminder_only": match_row.get("is_reminder_only", False),
             "all_day": match_row.get("all_day", g_all_day),
             "schedule_kind": match_row.get("schedule_kind"),
             "is_recurring": bool(match_row.get("rrule")) or g_recurring,
@@ -455,7 +453,6 @@ def _google_event_to_occurrence(ev: Dict[str, Any], match_row: Optional[Dict[str
         "subscription_id": None,
         "title": ev.get("summary", "(busy)"),
         "action": "",
-        "is_reminder_only": False,
         "all_day": g_all_day,
         "schedule_kind": "instant",
         "is_recurring": g_recurring,
@@ -511,7 +508,7 @@ class GoogleCalendarProvider(CalendarProvider):
         return _google_event_body(
             title=row.get("title", ""), dtstart=row["dtstart"],
             duration_minutes=row.get("duration_minutes", DEFAULT_DURATION_MINUTES),
-            rrule=row.get("rrule"), is_reminder_only=row.get("is_reminder_only", False),
+            rrule=row.get("rrule"),
             action=row.get("action", ""), all_day=row.get("all_day", False),
         )
 

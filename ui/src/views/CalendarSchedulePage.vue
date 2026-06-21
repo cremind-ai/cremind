@@ -151,7 +151,7 @@ const form = ref({
   title: '', all_day: false, date: isoDate(new Date()), time: '09:00',
   end_date: isoDate(new Date()), duration_minutes: 30,
   repeat: 'none' as Repeat, end_type: 'never' as 'never' | 'count' | 'until',
-  end_count: 5, end_until: '', is_reminder_only: true, action: '',
+  end_count: 5, end_until: '', action: '',
 });
 
 function resetForm(date?: string, time?: string) {
@@ -159,7 +159,7 @@ function resetForm(date?: string, time?: string) {
   form.value = {
     title: '', all_day: false, date: d, time: time || '09:00',
     end_date: d, duration_minutes: 30, repeat: 'none', end_type: 'never',
-    end_count: 5, end_until: '', is_reminder_only: true, action: '',
+    end_count: 5, end_until: '', action: '',
   };
 }
 
@@ -184,7 +184,6 @@ function openEdit(ev: CalendarOccurrence) {
   resetForm(ev.start.slice(0, 10), ev.start.slice(11, 16));
   form.value.title = ev.title;
   form.value.all_day = ev.all_day;
-  form.value.is_reminder_only = ev.is_reminder_only;
   form.value.action = ev.action || '';
   // inclusive end date for an all-day event (end is stored exclusive-ish)
   const endD = parseLocal(ev.end);
@@ -228,8 +227,7 @@ async function submitForm() {
   const payload = {
     title: form.value.title.trim(),
     dtstart,
-    action: form.value.is_reminder_only ? '' : form.value.action.trim(),
-    is_reminder_only: form.value.is_reminder_only,
+    action: form.value.action.trim(),
     all_day: allDay,
     duration_minutes: duration,
     rrule,
@@ -403,15 +401,13 @@ async function deleteCurrent() {
             <ElDatePicker v-if="form.end_type === 'until'" v-model="form.end_until" type="date" value-format="YYYY-MM-DD" style="margin-top:8px;width:100%" />
           </template>
 
-          <label class="f-label">Type</label>
-          <ElRadioGroup v-model="form.is_reminder_only">
-            <ElRadioButton :value="true">Reminder</ElRadioButton>
-            <ElRadioButton :value="false">Run an action</ElRadioButton>
-          </ElRadioGroup>
-          <template v-if="!form.is_reminder_only">
-            <label class="f-label">Action (runs in the Schedule conversation)</label>
-            <ElInput v-model="form.action" type="textarea" :rows="3" placeholder="e.g. Summarize my unread email" />
-          </template>
+          <label class="f-label">Command to run when it fires</label>
+          <ElInput
+            v-model="form.action"
+            type="textarea"
+            :rows="3"
+            placeholder="Runs in the Schedule conversation. Leave empty to run the title as the command (e.g. 'tắt đèn hiên')."
+          />
         </template>
       </div>
       <template #footer>

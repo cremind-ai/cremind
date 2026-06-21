@@ -132,8 +132,8 @@ async function confirmDelete(row: ScheduleEventSubscription) {
     <p class="section-blurb">
       Time-based events from the <strong>Calendar &amp; Schedule</strong> feature.
       Each fires at its time (and, for a recurrence, at every following
-      occurrence) — running its action in the conversation that created it, or
-      raising a reminder. Create them from the calendar, or ask the assistant
+      occurrence) — running its action in the conversation that created it.
+      Create them from the calendar, or ask the assistant
       (e.g. "every weekday at 9am, summarize my unread email").
     </p>
 
@@ -162,8 +162,7 @@ async function confirmDelete(row: ScheduleEventSubscription) {
       </ElTableColumn>
       <ElTableColumn label="Action" min-width="220">
         <template #default="{ row }">
-          <span v-if="row.is_reminder_only" class="muted">⏰ Reminder</span>
-          <ElTooltip v-else :content="row.action" placement="top">
+          <ElTooltip :content="row.action" placement="top">
             <span class="action-cell">{{ row.action }}</span>
           </ElTooltip>
         </template>

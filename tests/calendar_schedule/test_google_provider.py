@@ -13,7 +13,7 @@ import app.calendar.provider as P
 def test_event_body_recurring():
     body = P._google_event_body(
         title="Standup", dtstart="2026-06-22T09:00:00", duration_minutes=30,
-        rrule="FREQ=DAILY", is_reminder_only=False, action="check email",
+        rrule="FREQ=DAILY", action="check email",
     )
     assert body["summary"] == "Standup"
     assert body["recurrence"] == ["RRULE:FREQ=DAILY"]
@@ -21,13 +21,21 @@ def test_event_body_recurring():
     assert "Cremind action: check email" in body["description"]
 
 
-def test_event_body_reminder_no_recurrence():
+def test_event_body_no_action_no_recurrence():
     body = P._google_event_body(
         title="Dentist", dtstart="2026-06-22T15:00:00", duration_minutes=60,
-        rrule=None, is_reminder_only=True, action="",
+        rrule=None, action="",
     )
     assert "recurrence" not in body
-    assert "Cremind reminder" in body["description"]
+    assert "Cremind event" in body["description"]
+
+
+def test_event_body_with_action_notes_command():
+    body = P._google_event_body(
+        title="Standup", dtstart="2026-06-22T09:00:00", duration_minutes=30,
+        rrule=None, action="join the call",
+    )
+    assert "Cremind action: join the call" in body["description"]
 
 
 def test_google_dt_to_local_iso_allday():
@@ -38,7 +46,7 @@ def test_event_body_all_day_uses_date_range():
     # 3-day trip = 3*1440 minutes, midnight start -> Google date-only, end EXCLUSIVE.
     body = P._google_event_body(
         title="Trip", dtstart="2026-06-22T00:00:00", duration_minutes=3 * 1440,
-        rrule=None, is_reminder_only=True, action="", all_day=True,
+        rrule=None, action="", all_day=True,
     )
     assert body["start"] == {"date": "2026-06-22"}
     assert body["end"] == {"date": "2026-06-25"}  # start + 3 days, exclusive
@@ -67,7 +75,7 @@ def test_occurrence_match_surfaces_cremind_fields():
           "start": {"dateTime": "2026-06-22T09:00:00+00:00"},
           "end": {"dateTime": "2026-06-22T09:30:00+00:00"}}
     row = {"id": "row1", "title": "Cremind Standup", "action": "do x",
-           "is_reminder_only": False, "schedule_kind": "recurrence", "rrule": "FREQ=DAILY",
+           "schedule_kind": "recurrence", "rrule": "FREQ=DAILY",
            "status": "active", "source": "agent", "conversation_id": "c1"}
     occ = P._google_event_to_occurrence(ev, row)
     assert occ["subscription_id"] == "row1"
@@ -108,7 +116,7 @@ def _provider_with(rows):
 def test_list_occurrences_reconciles_mirrored_and_pure(monkeypatch):
     rows = [{
         "id": "row1", "external_event_id": "gbase", "title": "Cremind Mtg", "action": "ping",
-        "is_reminder_only": False, "schedule_kind": "recurrence", "rrule": "FREQ=DAILY",
+        "schedule_kind": "recurrence", "rrule": "FREQ=DAILY",
         "status": "active", "source": "agent", "conversation_id": "c1",
     }]
     gp = _provider_with(rows)

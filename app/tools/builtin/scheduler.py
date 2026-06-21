@@ -150,10 +150,11 @@ TOOL_CONFIG: ToolConfig = {
             "If the request is to CREATE a scheduled task or reminder and the "
             "time has already been normalized, call `schedule_create`, copying "
             "dtstart and any rrule / recurrence_end_type / recurrence_end_value "
-            "VERBATIM from the normalized data — never invent datetimes. To "
-            "review or cancel existing scheduled events, call `schedule_list` / "
-            "`schedule_cancel`. If only the `scheduler` function is available, "
-            "always call `scheduler`."
+            "VERBATIM from the normalized data — never invent datetimes. Set the "
+            "title from the user's request in their ORIGINAL language; never "
+            "translate it. To review or cancel existing scheduled events, call "
+            "`schedule_list` / `schedule_cancel`. If only the `scheduler` "
+            "function is available, always call `scheduler`."
         ),
     },
 }

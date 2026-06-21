@@ -201,9 +201,9 @@ def get_calendar_routes(conversation_storage=None) -> list[Route]:
                 status_code=400,
             )
         title = (body.get("title") or "").strip() or "Untitled event"
-        action = (body.get("action") or "").strip()
-        # Reminder-only by default unless an explicit agent action is given.
-        is_reminder_only = bool(body.get("is_reminder_only", not action))
+        # Every scheduled event runs an action; default it to the title so an
+        # event created with just a title still executes when it fires.
+        action = (body.get("action") or "").strip() or title
 
         # Resolve the dedicated per-profile schedule conversation for manual events.
         conv_storage = conversation_storage or get_conversation_storage()
@@ -223,7 +223,6 @@ def get_calendar_routes(conversation_storage=None) -> list[Route]:
                 conversation_id=conversation_id,
                 title=title,
                 action=action,
-                is_reminder_only=is_reminder_only,
                 source="manual",
                 schedule_kind=(body.get("schedule_kind") or ("recurrence" if body.get("rrule") else "instant")),
                 dtstart=_norm_range(dtstart, dtstart),
@@ -256,7 +255,7 @@ def get_calendar_routes(conversation_storage=None) -> list[Route]:
         except Exception:
             return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
         allowed = {
-            "title", "action", "is_reminder_only", "all_day", "schedule_kind", "dtstart",
+            "title", "action", "all_day", "schedule_kind", "dtstart",
             "duration_minutes", "rrule", "recurrence_end_type", "recurrence_end_value",
         }
         fields = {k: v for k, v in body.items() if k in allowed}

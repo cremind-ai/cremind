@@ -13,13 +13,10 @@ from typing import Any, Dict, Optional
 from app.utils.logger import logger
 
 
-def _format_trigger_message(*, action: str, payload: Dict[str, Any]) -> str:
-    """Build the synthetic user-message body the agent receives.
-
-    Format matches the spec: a short header followed by a YAML-ish block
-    describing the watchdog event (event_type, target_kind, path, watch_name,
-    extension, detected_at, plus src_path/dest_path on ``moved`` events).
-    """
+def _format_content(payload: Dict[str, Any]) -> str:
+    """Build the content block describing the watchdog event (event_type,
+    target_kind, path, watch_name, extension, detected_at, plus src/dest on
+    ``moved`` events)."""
     lines = [
         f"event_type: {payload.get('event_type', '')}",
         f"target_kind: {payload.get('target_kind', '')}",
@@ -36,12 +33,19 @@ def _format_trigger_message(*, action: str, payload: Dict[str, Any]) -> str:
         f"extension: {payload.get('extension', '')}",
         f"detected_at: {payload.get('detected_at', '')}",
     ])
-    block = "\n".join(lines)
-    return (
-        f"Trigger: {payload.get('event_type', '')}\n"
-        f"Action: {action.strip()}\n"
-        f"Content:\n---\n{block}\n---"
-    )
+    return "\n".join(lines)
+
+
+def build_trigger_messages(action: str, payload: Dict[str, Any]) -> tuple[str, str]:
+    """Return ``(reasoning_query, bubble_content)`` for a file-watcher event.
+
+    The reasoning ``Input:`` is the action command followed by the event
+    details (so the agent can act on what changed). The UI bubble keeps the
+    fenced detail block (rendered by stream_runner), so it is unchanged.
+    """
+    block = _format_content(payload)
+    query = f"{action.strip()}\n\n{block}".strip()
+    return query, f"---\n{block}\n---"
 
 
 async def run_event(
@@ -101,7 +105,9 @@ async def run_event(
     except Exception:  # noqa: BLE001
         logger.exception("[file_watcher_event] channel forwarder setup failed")
 
-    query = _format_trigger_message(action=action, payload=payload)
+    # query = action command + event details (reasoning Input); bubble_content =
+    # the fenced detail block (UI bubble, unchanged).
+    query, bubble_content = build_trigger_messages(action, payload)
     metadata: Dict[str, Any] = {
         "source": "file_watcher_event",
         "subscription_id": subscription_id,
@@ -117,7 +123,7 @@ async def run_event(
     trigger_event: Dict[str, Any] = {
         "event_type": payload.get("event_type"),
         "action": action.strip(),
-        "content": query.split("Content:\n", 1)[-1] if "Content:\n" in query else "",
+        "content": bubble_content,
         "watch_name": watch_name,
         "target_kind": payload.get("target_kind"),
         "path": payload.get("path"),
