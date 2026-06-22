@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue';
-import { useRouter } from 'vue-router';
+import { ref, onMounted, computed, nextTick, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import { ElButton, ElMessage, ElMessageBox } from 'element-plus';
 import { Icon } from '@iconify/vue';
 
@@ -16,7 +16,31 @@ import ConfigGroupCard from '../components/config/ConfigGroupCard.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
+const route = useRoute();
 const settingsStore = useSettingsStore();
+
+// Deep-link target: callers can navigate here with ``?section=<group>`` (e.g.
+// the conversation memory panel's settings icon → ``?section=memory``) to
+// scroll the matching group into view and briefly highlight it.
+const groupEls = new Map<string, HTMLElement>();
+const highlightedSection = ref<string | null>(null);
+let highlightTimer: ReturnType<typeof setTimeout> | null = null;
+
+function setGroupRef(key: string, el: Element | null) {
+  if (el instanceof HTMLElement) groupEls.set(key, el);
+  else groupEls.delete(key);
+}
+
+async function scrollToSection(section: string | null) {
+  if (!section) return;
+  await nextTick();
+  const el = groupEls.get(section);
+  if (!el) return;
+  el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  highlightedSection.value = section;
+  if (highlightTimer) clearTimeout(highlightTimer);
+  highlightTimer = setTimeout(() => { highlightedSection.value = null; }, 2000);
+}
 
 const schema = ref<UserConfigSchema | null>(null);
 const values = ref<Record<string, unknown>>({});
@@ -102,7 +126,20 @@ function goBack() {
   router.push(`/${props.profile}/settings`);
 }
 
-onMounted(loadAll);
+function currentSection(): string | null {
+  const s = route.query.section;
+  return typeof s === 'string' && s ? s : null;
+}
+
+onMounted(async () => {
+  await loadAll();
+  await scrollToSection(currentSection());
+});
+
+// Re-scroll if the section query changes while the page stays mounted.
+watch(() => route.query.section, (s) => {
+  if (typeof s === 'string' && s) scrollToSection(s);
+});
 </script>
 
 <template>
@@ -135,16 +172,22 @@ onMounted(loadAll);
 
       <div v-if="loading" class="loading">Loading…</div>
       <div v-else-if="schema">
-        <ConfigGroupCard
+        <div
           v-for="(group, groupKey) in schema.groups"
           :key="groupKey"
-          :group-key="groupKey"
-          :group="group"
-          :values="values"
-          :defaults="defaults"
-          @update:value="handleUpdate"
-          @reset="handleReset"
-        />
+          :ref="(el) => setGroupRef(String(groupKey), el as Element | null)"
+          class="config-group-anchor"
+          :class="{ 'config-group-highlight': highlightedSection === groupKey }"
+        >
+          <ConfigGroupCard
+            :group-key="groupKey"
+            :group="group"
+            :values="values"
+            :defaults="defaults"
+            @update:value="handleUpdate"
+            @reset="handleReset"
+          />
+        </div>
       </div>
     </div>
   </div>
@@ -173,5 +216,14 @@ onMounted(loadAll);
 .loading {
   display: flex; align-items: center; justify-content: center;
   padding: 60px 0; color: var(--text-secondary);
+}
+.config-group-anchor {
+  /* Keep a little breathing room when scrolled to via ?section=. */
+  scroll-margin-top: 16px;
+  border-radius: 8px;
+  transition: box-shadow 0.3s ease, background-color 0.3s ease;
+}
+.config-group-highlight {
+  box-shadow: 0 0 0 2px var(--primary-color);
 }
 </style>

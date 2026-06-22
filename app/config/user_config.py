@@ -161,3 +161,38 @@ def resolve_summarizer_config(profile: str) -> SummarizerConfig:
         max_tokens=int(values["max_tokens"]),
         retry=int(values["retry"]),
     )
+
+
+@dataclass(frozen=True)
+class MemoryConfig:
+    """Snapshot of the conversation-memory tunables for one profile."""
+
+    enabled: bool
+    trigger_token_threshold: int
+    short_term_queue_size: int
+    long_term_queue_size: int
+    short_term_max_tokens: int
+    long_term_max_tokens: int
+    temperature: float
+    max_tokens: int
+    retry: int
+
+
+def resolve_memory_config(profile: str) -> MemoryConfig:
+    """Build a :class:`MemoryConfig` for ``profile``.
+
+    Re-read at extraction/consumption time (not cached) so toggling the feature
+    or its thresholds in Settings takes effect on the next turn.
+    """
+    values = resolve_group("memory", profile)
+    return MemoryConfig(
+        enabled=bool(values["enabled"]),
+        trigger_token_threshold=int(values["trigger_token_threshold"]),
+        short_term_queue_size=int(values["short_term_queue_size"]),
+        long_term_queue_size=int(values["long_term_queue_size"]),
+        short_term_max_tokens=int(values["short_term_max_tokens"]),
+        long_term_max_tokens=int(values["long_term_max_tokens"]),
+        temperature=float(values["temperature"]),
+        max_tokens=int(values["max_tokens"]),
+        retry=int(values["retry"]),
+    )

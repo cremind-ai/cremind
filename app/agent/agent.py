@@ -299,6 +299,7 @@ class CremindAgent:
         profile: str,
         reasoning: bool = True,
         triggered_by_event: bool = False,
+        memory_context: str = "",
     ) -> AsyncGenerator[ReasoningStreamResponseType, None]:
         logger.debug(f"Running CremindAgent with query: {query} and profile: {profile}")
 
@@ -346,6 +347,7 @@ class CremindAgent:
             reasoning=reasoning,
             allowed_skill_ids=allowed_skill_ids,
             triggered_by_event=triggered_by_event,
+            memory_context=memory_context,
         )
 
         async for result in reasoning_agent.run(query, task_history):

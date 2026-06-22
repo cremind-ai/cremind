@@ -13,6 +13,7 @@ import StepServerConfig from '../components/setup/StepServerConfig.vue';
 import StepEmbeddingConfig, { type EmbeddingConfigPayload } from '../components/setup/StepEmbeddingConfig.vue';
 import StepLLMConfig from '../components/setup/StepLLMConfig.vue';
 import StepToolConfig from '../components/setup/StepToolConfig.vue';
+import StepMemoryConfig from '../components/setup/StepMemoryConfig.vue';
 import StepChannelsConfig from '../components/setup/StepChannelsConfig.vue';
 import StepProfileCreate from '../components/setup/StepProfileCreate.vue';
 import ChannelPairingDialog from '../components/channels/ChannelPairingDialog.vue';
@@ -395,6 +396,9 @@ const llmConfig = ref<Record<string, string>>({});
 const toolConfigs = ref<Record<string, Record<string, string>>>({});
 const agentConfigs = ref<Record<string, Record<string, string>>>({});
 const channelConfigs = ref<CreateChannelPayload[]>([]);
+// Memory opt-in (per-profile). Off by default; persisted as the
+// ``memory.enabled`` user_config key in the setup payload.
+const memoryEnabled = ref(false);
 
 // Catalog of supported channel types — fetched pre-auth so the post-token
 // pairing rows can look up ``setup_kind`` on each created channel.
@@ -539,6 +543,7 @@ const setupSteps = computed(() => {
       { key: 'embedding', title: 'Vector Embedding', description: 'Optional — semantic search' },
       { key: 'llm', title: 'LLM Providers', description: 'Configure AI models' },
       { key: 'tools', title: 'Tools', description: 'Configure built-in tools' },
+      { key: 'memory', title: 'Memory', description: 'Optional — learns habits & facts' },
       { key: 'channels', title: 'Channels', description: 'Connect messaging apps (optional)' },
       { key: 'complete', title: 'Complete', description: 'Generate token' },
     ];
@@ -546,6 +551,7 @@ const setupSteps = computed(() => {
   return [
     { key: 'llm', title: 'LLM Providers', description: 'Configure AI models' },
     { key: 'tools', title: 'Tools', description: 'Configure built-in tools' },
+    { key: 'memory', title: 'Memory', description: 'Optional — learns habits & facts' },
     { key: 'channels', title: 'Channels', description: 'Connect messaging apps (optional)' },
     { key: 'complete', title: 'Complete', description: 'Create profile' },
   ];
@@ -884,6 +890,9 @@ async function handleCompleteSetup() {
     // Always send LLM and tool configs (both first setup and profile setup)
     config.llm_config = llmConfig.value;
     config.tool_configs = toolConfigs.value;
+    // Per-profile general settings; the Memory opt-in is the only one collected
+    // in the wizard today. Backend validates against CONFIG_SCHEMA.
+    config.user_config = { 'memory.enabled': String(memoryEnabled.value) };
     if (Object.keys(agentConfigs.value).length > 0) {
       config.agent_configs = agentConfigs.value;
     }
@@ -1530,6 +1539,11 @@ async function downloadConfigFile(format: ExportFormat) {
           :is-first-setup="isFirstSetup"
           @update="handleToolConfigsUpdate"
           @update:agent-configs="handleAgentConfigsUpdate"
+        />
+        <StepMemoryConfig
+          v-else-if="currentStepKey === 'memory'"
+          :enabled="memoryEnabled"
+          @update="memoryEnabled = $event"
         />
         <StepChannelsConfig
           v-else-if="currentStepKey === 'channels'"
