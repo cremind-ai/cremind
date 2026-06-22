@@ -20,6 +20,7 @@ from app.config.settings import BaseConfig, get_user_working_directory
 from app.events import get_event_stream_bus
 from app.utils.context_storage import get_context
 from app.utils.logger import logger
+from app.utils.uploads_tmp import conversation_tmp_dir, max_upload_bytes
 from app.utils.working_directory import (
     WORKING_DIR_OVERRIDE_KEY as _WORKING_DIR_OVERRIDE_KEY,
     persist_working_directory,
@@ -395,6 +396,47 @@ def _unique_dest(target_dir: str, basename: str) -> str:
 _UPLOAD_CHUNK = 1 << 20  # 1 MiB
 
 
+async def _write_upload(value, target_dir: str, max_bytes: int | None = None) -> dict:
+    """Chunk-write one uploaded file part into ``target_dir``.
+
+    Shared by ``_upload_files`` and ``_upload_temp_files``. Strips any path
+    components from the client filename, picks a collision-free destination,
+    and (when ``max_bytes`` is set) aborts + removes the partial file if the
+    upload exceeds the ceiling. Returns a per-file result dict.
+    """
+    basename = os.path.basename(getattr(value, "filename", "") or "")
+    if not basename or basename in (".", ".."):
+        return {"name": getattr(value, "filename", ""), "saved_as": "",
+                "status": "error", "error": "Invalid filename"}
+    dest = _unique_dest(target_dir, basename)
+    written = 0
+    try:
+        with open(dest, "wb") as out:
+            while True:
+                chunk = await value.read(_UPLOAD_CHUNK)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if max_bytes is not None and written > max_bytes:
+                    out.close()
+                    try:
+                        os.remove(dest)
+                    except OSError:
+                        pass
+                    return {"name": basename, "saved_as": "", "status": "error",
+                            "error": f"File exceeds the {max_bytes}-byte upload limit"}
+                out.write(chunk)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Upload failed for %s", basename)
+        return {"name": basename, "saved_as": "", "status": "error", "error": str(exc)}
+    return {
+        "name": basename,
+        "saved_as": os.path.basename(dest),
+        "status": "renamed" if os.path.basename(dest) != basename else "ok",
+        "path": dest,
+    }
+
+
 async def _upload_files(request: Request):
     """Multipart upload of one or more files into a target directory.
 
@@ -432,35 +474,65 @@ async def _upload_files(request: Request):
     for field, value in form.multi_items():
         if not hasattr(value, "filename") or not getattr(value, "filename", None):
             continue
-        # Strip any path components from the client-supplied filename — we
-        # only ever write into the validated target dir.
-        basename = os.path.basename(value.filename)
-        if not basename or basename in (".", ".."):
-            results.append(
-                {"name": value.filename, "saved_as": "", "status": "error",
-                 "error": "Invalid filename"}
-            )
+        results.append(await _write_upload(value, resolved))
+
+    return JSONResponse({"results": results})
+
+
+async def _upload_temp_files(request: Request):
+    """Multipart upload into a conversation's temporary upload folder.
+
+    Unlike ``/upload`` the client never supplies a server path: the temp dir
+    is computed server-side from the authenticated profile + ``conversation_id``
+    (``<CREMIND_SYSTEM_DIR>/<profile>/uploads_tmp/<conversation_id>/``), which
+    already lives inside the ``system_file`` tool's allowed roots. Returns each
+    file's absolute ``path`` so the client can attach it to the next message.
+
+    Form fields:
+      - ``conversation_id`` (required): the owning conversation.
+      - Files: any number of file parts (any field name).
+    """
+    unauth = _require_auth(request)
+    if unauth is not None:
+        return unauth
+    profile = getattr(request.user, "username", "") or ""
+    if not profile:
+        return JSONResponse({"error": "Profile is required"}, status_code=400)
+
+    try:
+        form = await request.form()
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(
+            {"error": f"Failed to parse multipart form: {exc}"}, status_code=400
+        )
+
+    conversation_id = form.get("conversation_id")
+    if not isinstance(conversation_id, str) or not conversation_id:
+        return JSONResponse({"error": "conversation_id is required"}, status_code=400)
+
+    # Ownership: only the conversation's owner may drop files into its slice.
+    try:
+        from app.events.runner import get_conversation_storage
+        conv = await get_conversation_storage().get_conversation(conversation_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("upload-temp: failed to load conversation %s", conversation_id)
+        conv = None
+    if conv is None:
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
+    if conv.get("profile") != profile:
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+    try:
+        target_dir = conversation_tmp_dir(profile, conversation_id)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    max_bytes = max_upload_bytes()
+    results: list[dict] = []
+    for field, value in form.multi_items():
+        if not hasattr(value, "filename") or not getattr(value, "filename", None):
             continue
-        dest = _unique_dest(resolved, basename)
-        try:
-            with open(dest, "wb") as out:
-                while True:
-                    chunk = await value.read(_UPLOAD_CHUNK)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Upload failed for %s", basename)
-            results.append(
-                {"name": basename, "saved_as": "", "status": "error",
-                 "error": str(exc)}
-            )
-            continue
-        results.append({
-            "name": basename,
-            "saved_as": os.path.basename(dest),
-            "status": "renamed" if os.path.basename(dest) != basename else "ok",
-        })
+        results.append(await _write_upload(value, target_dir, max_bytes=max_bytes))
 
     return JSONResponse({"results": results})
 
@@ -677,6 +749,7 @@ def get_file_routes() -> list[Route]:
         Route("/api/files/watch", endpoint=_watch_directory, methods=["GET"]),
         Route("/api/files/open", endpoint=_serve_file_by_path, methods=["GET"]),
         Route("/api/files/upload", endpoint=_upload_files, methods=["POST"]),
+        Route("/api/files/upload-temp", endpoint=_upload_temp_files, methods=["POST"]),
         Route("/api/files/delete", endpoint=_delete_entry, methods=["DELETE"]),
         Route("/api/files/move", endpoint=_move_entry, methods=["POST"]),
         Route("/api/files/mkdir", endpoint=_mkdir, methods=["POST"]),

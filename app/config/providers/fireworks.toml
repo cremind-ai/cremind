@@ -18,6 +18,7 @@ api_key = { description = "Fireworks API Key", type = "string", secret = true, r
 id = "accounts/fireworks/models/llama4-maverick-instruct-basic"
 display_name = "Llama 4 Maverick"
 group_hint = "high"
+vision = true
 input_price_per_1m = 0.22
 output_price_per_1m = 0.88
 
@@ -25,6 +26,7 @@ output_price_per_1m = 0.88
 id = "accounts/fireworks/models/llama4-scout-instruct-basic"
 display_name = "Llama 4 Scout"
 group_hint = "high"
+vision = true
 input_price_per_1m = 0.15
 output_price_per_1m = 0.60
 

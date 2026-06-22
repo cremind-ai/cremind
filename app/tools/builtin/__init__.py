@@ -64,6 +64,7 @@ __all__ = [
 _BUILTIN_MODULE_NAMES: tuple[str, ...] = (
     "exec_shell",
     "markdown_converter",
+    "image_understanding",
     "message_detail",
     "system_file",
     "weather",

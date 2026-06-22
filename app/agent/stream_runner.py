@@ -52,6 +52,29 @@ from app.utils.task_context import current_task_id_var
 _running_runs: Dict[str, asyncio.Task] = {}
 
 
+def _append_attachments_note(
+    agent_query: str, attachments: Optional[List[Dict[str, Any]]],
+) -> str:
+    """Append a note listing uploaded-file absolute paths to the agent's input.
+
+    Returns ``agent_query`` unchanged when there are no valid attachments.
+    """
+    if not attachments:
+        return agent_query
+    paths = [a.get("path") for a in attachments if isinstance(a, dict) and a.get("path")]
+    if not paths:
+        return agent_query
+    lines = ["[Attached files — saved to a temporary folder; absolute paths:]"]
+    lines += [f"- {p}" for p in paths]
+    lines.append(
+        "(Read or convert these with the system_file tools — or, to understand "
+        "the visual content of an image, the image_understanding tool. If the "
+        "user asks to keep or save a file, move it into their working directory.)"
+    )
+    note = "\n".join(lines)
+    return f"{agent_query}\n\n{note}" if agent_query else note
+
+
 def cancel_run(run_id: str) -> bool:
     """Cancel the running asyncio task for ``run_id``. Idempotent."""
     task = _running_runs.get(run_id)
@@ -164,6 +187,7 @@ async def run_agent_to_bus(
     user_parts: List[Any] | None = None,
     user_message_metadata: Dict[str, Any] | None = None,
     agent_message_metadata: Dict[str, Any] | None = None,
+    attachments: List[Dict[str, Any]] | None = None,
     push_user_message: bool = True,
     publish_notification: bool = False,
     update_title_from_query: bool = True,
@@ -339,6 +363,12 @@ async def run_agent_to_bus(
         agent_query = await resolve_message_tokens(
             query, profile=profile, conversation_storage=conversation_storage,
         )
+
+        # Append uploaded-attachment paths to what the agent sees (NOT to the
+        # persisted/published user message — that stays exactly what the user
+        # typed). The temp paths live inside the system_file tool's allowed
+        # roots, so the agent can read / convert / move them by absolute path.
+        agent_query = _append_attachments_note(agent_query, attachments)
 
         # Consumption: read current memory (short-term for this conversation +
         # long-term for this profile) and pass it to the agent as a system block.

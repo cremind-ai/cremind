@@ -420,6 +420,12 @@ SHUTDOWN_TIMEOUT_S = 8.0
 async def _do_shutdown() -> None:
     """The actual cleanup body. Module-level so tests can patch it."""
     try:
+        from app.events import get_uploads_cleanup_manager
+
+        get_uploads_cleanup_manager().stop()
+    except Exception:  # noqa: BLE001
+        logger.exception("Error stopping uploads cleanup manager during shutdown")
+    try:
         stop_all_watchers()
     except Exception:  # noqa: BLE001
         logger.exception("Error stopping skill watchers during shutdown")
@@ -455,6 +461,17 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
 
     # 0. Purge stale exec_shell stdout directories from previous runs.
     cleanup_stdout_on_startup()
+
+    # 0'. Wipe temporary chat-upload folders left behind by the previous run.
+    #     They are ephemeral by design (a file the user asked to keep has
+    #     already been moved into their working dir). Best-effort — a locked
+    #     file must never block boot.
+    try:
+        from app.utils.uploads_tmp import wipe_all_on_startup
+
+        wipe_all_on_startup()
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[boot] uploads_tmp wipe best-effort failed: {e}")
 
     # 0a. Clear the in-app upgrade status file if the previous run
     #     terminated (done/failed). Leaves an in-flight upgrade alone
@@ -721,7 +738,13 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                         profile=profile,
                         default_reasoning_effort=_llm_params.get("reasoning_effort"),
                     )
-                return model_group_mgr.create_llm_for_group("low", profile=profile)
+                # No per-tool override: fall back to the tool's declared default
+                # model group (e.g. image_understanding → "vision"), defaulting
+                # to "low" for the bulk of tools.
+                from app.tools.builtin import get_builtin_tool_config
+                _schema = get_builtin_tool_config(tool_id)
+                _default_group = (_schema.get("tool") or {}).get("default_model_group") or "low"
+                return model_group_mgr.create_llm_for_group(_default_group, profile=profile)
 
             try:
                 await register_builtin_tools(
@@ -878,6 +901,16 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                 get_schedule_manager().start(loop)
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to start schedule manager")
+
+            # 7g. Temporary chat-upload pruner — periodically removes idle
+            # per-conversation upload folders so the temp tree never grows
+            # unbounded during a long-lived process.
+            try:
+                from app.events import get_uploads_cleanup_manager
+
+                get_uploads_cleanup_manager().start(loop)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to start uploads cleanup manager")
 
             # 8. Build the real agent executor and the post-setup callback.
             agent_executor = CremindAgentExecutor(

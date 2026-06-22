@@ -180,9 +180,14 @@ const handleConnect = async () => {
   }
 };
 
-const handleSendMessage = async (text: string) => {
+const handleSendMessage = async (
+  payload: { text: string; attachments: { name: string; path: string }[] },
+) => {
   try {
-    await chatStore.sendMessage(text, { reasoning: settingsStore.reasoningEnabled });
+    await chatStore.sendMessage(payload.text, {
+      reasoning: settingsStore.reasoningEnabled,
+      attachments: payload.attachments,
+    });
   } catch (error: any) {
     ElNotification({
       title: 'Error',

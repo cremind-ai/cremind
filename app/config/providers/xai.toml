@@ -18,6 +18,7 @@ api_key = { description = "xAI API Key", type = "string", secret = true, require
 id = "grok-4"
 display_name = "Grok 4"
 group_hint = "high"
+vision = true
 input_price_per_1m = 2.00
 output_price_per_1m = 6.00
 
@@ -25,6 +26,7 @@ output_price_per_1m = 6.00
 id = "grok-4-1-fast"
 display_name = "Grok 4.1 Fast"
 group_hint = "low"
+vision = true
 input_price_per_1m = 0.20
 output_price_per_1m = 0.50
 
