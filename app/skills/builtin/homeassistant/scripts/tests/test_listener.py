@@ -49,7 +49,7 @@ def _run_handle(data, state, *, entity_filter=None):
         writes.append((entity["entity_id"], et)) or Path("x.md")
     )
     listener._save_state = lambda s: None
-    # Keep these tests hermetic — don't touch the real references/*.md inventories.
+    # Keep these tests hermetic — don't touch the real devices.md / SKILL.md inventories.
     listener._update_inventory = lambda entity_id, new_state: None
     listener._remove_from_inventory = lambda entity_id: None
     listener._update_names_inventory = lambda entity_id, old_state, new_state: None
@@ -160,10 +160,10 @@ def test_inventory_remove_on_removed_entity():
     assert calls == ["light.kitchen"]
 
 
-# --- device_names.md name-index wiring ---
+# --- Device list (SKILL.md) name-index wiring ---
 
 def test_names_inventory_rename_upserts():
-    """A friendly-name change upserts the entity's line in device_names.md."""
+    """A friendly-name change upserts the entity's line in the SKILL.md Device list."""
     calls = []
     orig = listener.device_names.upsert
     listener.device_names.upsert = lambda eid, name: calls.append((eid, name))
@@ -177,7 +177,7 @@ def test_names_inventory_rename_upserts():
 
 
 def test_names_inventory_state_only_change_is_untouched():
-    """A plain state change (same name) writes nothing to device_names.md — the low-churn guarantee."""
+    """A plain state change (same name) writes nothing to the Device list — the low-churn guarantee."""
     calls = []
     orig = listener.device_names.upsert
     listener.device_names.upsert = lambda eid, name: calls.append((eid, name))
@@ -187,11 +187,11 @@ def test_names_inventory_state_only_change_is_untouched():
         listener._update_names_inventory("light.kitchen", old, new)
     finally:
         listener.device_names.upsert = orig
-    assert calls == [], "state-only change must not touch device_names.md"
+    assert calls == [], "state-only change must not touch the Device list"
 
 
 def test_names_inventory_new_entity_upserts():
-    """A brand-new entity (no old_state) is added to device_names.md."""
+    """A brand-new entity (no old_state) is added to the SKILL.md Device list."""
     calls = []
     orig = listener.device_names.upsert
     listener.device_names.upsert = lambda eid, name: calls.append((eid, name))
@@ -218,7 +218,7 @@ def test_names_inventory_no_friendly_name_is_untouched():
 
 
 def test_names_inventory_remove_on_removed_entity():
-    """A removed entity (new_state=None) is dropped from device_names.md."""
+    """A removed entity (new_state=None) is dropped from the SKILL.md Device list."""
     state = listener._empty_state()
     calls = []
     orig_names_remove = listener._remove_from_names_inventory

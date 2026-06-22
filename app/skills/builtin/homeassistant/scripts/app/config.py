@@ -16,9 +16,10 @@ HEARTBEAT_FILE = SCRIPTS_DIR / ".listener_heartbeat"
 # runtime by the listener (and the `sync-devices` CLI verb); see app.devices.
 REFERENCES_DIR = PROJECT_DIR / "references"
 DEVICES_FILE = REFERENCES_DIR / "devices.md"
-# Low-churn name<->entity_id index (one line per entity). Maintained at runtime by the
-# listener (only on add/remove/rename) and the `sync-devices` CLI verb; see app.device_names.
-DEVICE_NAMES_FILE = REFERENCES_DIR / "device_names.md"
+# Low-churn name<->entity_id index, kept as the trailing `## Device list` section of
+# SKILL.md (runtime-populated; reset to the shipped empty section on each boot). Maintained
+# by the listener (only on add/remove/rename) and the `sync-devices` CLI verb; see app.device_names.
+SKILL_FILE = PROJECT_DIR / "SKILL.md"
 # OAuth token store (used only when HA_TOKEN is not set). Gitignored.
 TOKEN_PATH = SCRIPTS_DIR / ".ha_token.json"
 
