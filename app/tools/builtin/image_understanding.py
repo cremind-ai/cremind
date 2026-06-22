@@ -54,10 +54,11 @@ _IMAGE_TOOL_INSTRUCTIONS = (
     "describe what it depicts, or answer a question about what is pictured. The "
     "image is sent to a vision model. Do NOT use it for operations that do not "
     "require seeing the picture: file dimensions / size / format / metadata (use "
-    "the System File 'get_file_info' sub-tool), moving / copying / renaming / "
-    "deleting (use System File), or converting an image to another format such as "
-    "markdown (use Convert To Markdown). If the request is about the file rather "
-    "than the picture, do not use this tool."
+    "the System File 'get_file_info' sub-tool), moving / copying / renaming a "
+    "file (use the System File 'move_file' or 'copy_file' sub-tool), or "
+    "converting an image to another format such as markdown (use Convert To "
+    "Markdown). If the request is about the file rather than the picture, do not "
+    "use this tool."
 )
 
 
@@ -195,8 +196,8 @@ class AnalyzeImageTool(BuiltInTool):
         "Look at an image and answer a question about its visual content — "
         "extract/OCR text shown in it, describe what it depicts, or read a chart. "
         "Sends the image to a vision model. Do NOT use for file metadata "
-        "(dimensions/size/format → get_file_info), moving/renaming (→ system_file), "
-        "or converting to markdown (→ convert_to_markdown)."
+        "(dimensions/size/format → get_file_info), moving/copying/renaming "
+        "(→ move_file / copy_file), or converting to markdown (→ convert_to_markdown)."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
