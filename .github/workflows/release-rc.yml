@@ -67,7 +67,47 @@ on:
         type: string
 
 jobs:
+  # Backend test gate. pr.yml only runs pytest on pull_requests whose base is
+  # ``main``; a stacked PR based on another feature branch therefore gets no
+  # pytest coverage until it merges. That is exactly how the 0.0.6 stack landed
+  # three pytest failures on main (a token-extra import, a platform-dependent
+  # path test, and a brittle tool-count assertion) — none of which this
+  # workflow's wheel smoke-test (``import app`` + ``cremind --help``) can
+  # catch. Every per-PR dev release runs through this workflow, so gating it on
+  # pytest exercises the suite on the exact commit being validated: failures
+  # surface here, before merge, instead of on main afterward. Mirrors pr.yml's
+  # ``backend`` job. The wheel/electron/docker/helm/publish jobs all chain off
+  # ``wheel``, so making ``wheel`` need ``test`` gates the whole RC.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out cremind
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Same load-bearing staleness guard pr.yml runs: a PR that changes
+      # app/upgrade or app/installer without rebuilding the committed
+      # installer_tui.pyz would silently ship a stale TUI.
+      - name: Check installer_tui.pyz is fresh
+        run: python install/scripts/build_installer_tui.py --check
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: uv sync --all-groups
+
+      - name: Run pytest
+        run: uv run pytest
+
   wheel:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: write   # needed for creating the GitHub prerelease
