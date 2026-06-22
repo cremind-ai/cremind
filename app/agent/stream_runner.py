@@ -67,9 +67,13 @@ def _append_attachments_note(
     lines = ["[Attached files — saved to a temporary folder; absolute paths:]"]
     lines += [f"- {p}" for p in paths]
     lines.append(
-        "(Read or convert these with the system_file tools — or, to understand "
-        "the visual content of an image, the image_understanding tool. If the "
-        "user asks to keep or save a file, move it into their working directory.)"
+        "(Pass these paths to the tools EXACTLY as written above — they are "
+        "absolute paths; do not shorten them, strip the home/drive prefix, or "
+        "convert them to relative paths. Read or convert a file with the "
+        "system_file tools, or understand an image's visual content with the "
+        "image_understanding tool. If the user asks to keep or save a file, use "
+        "the system_file move_file tool to move it into their working directory "
+        "(or copy_file to keep a copy).)"
     )
     note = "\n".join(lines)
     return f"{agent_query}\n\n{note}" if agent_query else note
