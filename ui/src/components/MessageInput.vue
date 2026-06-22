@@ -52,16 +52,19 @@ const onFilesPicked = async (event: Event) => {
   input.value = '';
   if (!files.length) return;
 
-  // Files must land in a real conversation's temp dir, so ensure one exists
-  // (created upfront for a brand-new chat) before uploading.
-  const cid = await chatStore.ensureConversation();
-  if (!cid) {
-    ElNotification({ title: 'Upload failed', message: 'No active conversation', type: 'error' });
-    return;
-  }
-
+  // Gate send for the WHOLE provision+upload window. Set before awaiting
+  // ensureConversation so a quick Enter can't (a) send a message before the
+  // attachment is pushed (dropping it), or (b) create a second conversation
+  // while the first is still being provisioned for the upload.
   uploading.value = true;
   try {
+    // Files must land in a real conversation's temp dir, so ensure one exists
+    // (created upfront for a brand-new chat) before uploading.
+    const cid = await chatStore.ensureConversation();
+    if (!cid) {
+      ElNotification({ title: 'Upload failed', message: 'No active conversation', type: 'error' });
+      return;
+    }
     const results = await uploadTempFiles(
       settingsStore.agentUrl, settingsStore.authToken, cid, files,
     );
@@ -381,6 +384,9 @@ const handleClick = () => {
     emit('stop');
     return;
   }
+  // Don't send while an attachment is still provisioning/uploading — its path
+  // isn't in `attachments` yet, so the message would go without it.
+  if (uploading.value) return;
   if (inputText.value.trim() && !props.disabled) {
     emit('send', { text: inputText.value, attachments: [...attachments.value] });
     inputText.value = '';
@@ -539,10 +545,10 @@ const handleReasoningToggle = (value: boolean | string | number) => {
       </button>
       <button
         @click="handleClick"
-        :disabled="!isProcessing && (disabled || !inputText.trim())"
+        :disabled="!isProcessing && (disabled || uploading || !inputText.trim())"
         class="send-button"
         :class="{
-          'disabled': !isProcessing && (disabled || !inputText.trim()),
+          'disabled': !isProcessing && (disabled || uploading || !inputText.trim()),
           'stop': isProcessing,
         }"
         :title="isProcessing ? 'Stop' : 'Send'"

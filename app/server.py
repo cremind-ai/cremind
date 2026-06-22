@@ -740,10 +740,11 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                     )
                 # No per-tool override: fall back to the tool's declared default
                 # model group (e.g. image_understanding → "vision"), defaulting
-                # to "low" for the bulk of tools.
-                from app.tools.builtin import get_builtin_tool_config
-                _schema = get_builtin_tool_config(tool_id)
-                _default_group = (_schema.get("tool") or {}).get("default_model_group") or "low"
+                # to "low" for the bulk of tools. ``tool_id`` may be a module
+                # name (boot) or a slug (runtime refresh); the resolver handles
+                # both.
+                from app.tools.builtin import default_model_group_for
+                _default_group = default_model_group_for(tool_id)
                 return model_group_mgr.create_llm_for_group(_default_group, profile=profile)
 
             try:

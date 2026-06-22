@@ -125,8 +125,12 @@ def _prepare_image_data_url(
             "error": "OS error", "message": str(e)})
 
     if size <= max_bytes and mime in _SAFE_IMAGE_MIMES:
-        with open(path, "rb") as f:
-            data = f.read()
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            return None, BuiltInToolResult(structured_content={
+                "error": "OS error", "message": str(e)})
         return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}", None
 
     try:
