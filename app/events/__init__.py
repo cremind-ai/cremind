@@ -17,6 +17,7 @@ from app.events.file_watcher_manager import (
     get_file_watcher_manager,
 )
 from app.events.manager import EventManager, get_event_manager
+from app.events.schedule_manager import ScheduleManager, get_schedule_manager
 from app.events.notifications_buffer import EventNotificationsBuffer, get_event_notifications
 from app.events.notifications_bus import NotificationsStreamBus, get_notifications_stream_bus
 from app.events.stream_bus import ConversationStreamBus, get_event_stream_bus
@@ -26,10 +27,12 @@ __all__ = [
     "EventManager",
     "EventNotificationsBuffer",
     "FileWatcherManager",
+    "ScheduleManager",
     "NotificationsStreamBus",
     "get_event_manager",
     "get_event_notifications",
     "get_event_stream_bus",
     "get_file_watcher_manager",
+    "get_schedule_manager",
     "get_notifications_stream_bus",
 ]

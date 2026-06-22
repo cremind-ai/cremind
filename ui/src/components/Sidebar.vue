@@ -265,6 +265,12 @@ const handleOpenEvents = () => {
   router.push({ name: 'skill-events', params: { profile } });
 };
 
+const handleOpenCalendar = () => {
+  const profile = route.params.profile as string;
+  if (!profile) return;
+  router.push({ name: 'calendar-schedule', params: { profile } });
+};
+
 // Developer page is admin-only — backend's require_admin would 403
 // non-admin profiles, and the route guard already redirects them.
 // Hiding the sidebar row keeps them from ever seeing the entry point.
@@ -623,6 +629,13 @@ const toggleThemeFromIcon = () => {
         <div class="settings-row" @click="handleOpenEvents">
           <Icon icon="mdi:lightning-bolt-outline" class="settings-icon" />
           <span class="settings-label" v-if="!isCollapsed">Events</span>
+          <Icon icon="mdi:chevron-right" class="chevron-icon" v-if="!isCollapsed" />
+        </div>
+      </ElTooltip>
+      <ElTooltip content="Calendar & Schedule" placement="right" :show-after="300" :disabled="!isCollapsed">
+        <div class="settings-row" @click="handleOpenCalendar">
+          <Icon icon="mdi:calendar-month" class="settings-icon" />
+          <span class="settings-label" v-if="!isCollapsed">Calendar &amp; Schedule</span>
           <Icon icon="mdi:chevron-right" class="chevron-icon" v-if="!isCollapsed" />
         </div>
       </ElTooltip>

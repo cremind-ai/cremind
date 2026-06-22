@@ -17,6 +17,7 @@
 
 import type { FileWatcherSubscription } from './fileWatchersApi';
 import type { ListenerStatus, SkillEventSubscription } from './skillEventsApi';
+import type { ScheduleEventSubscription } from './calendarApi';
 import {
   createSharedStream,
   type SharedStreamHandle,
@@ -32,13 +33,20 @@ export interface FileWatchersAdminSnapshot {
   subscriptions: FileWatcherSubscription[];
 }
 
+export interface ScheduleEventsAdminSnapshot {
+  subscriptions: ScheduleEventSubscription[];
+  enabled: boolean;
+}
+
 type SkillEventsCallback = (snap: SkillEventsAdminSnapshot) => void;
 type FileWatchersCallback = (snap: FileWatchersAdminSnapshot) => void;
+type ScheduleEventsCallback = (snap: ScheduleEventsAdminSnapshot) => void;
 
 interface SkillEventsFrame { event: 'skill-events'; data: SkillEventsAdminSnapshot; }
 interface FileWatchersFrame { event: 'file-watchers'; data: FileWatchersAdminSnapshot; }
+interface ScheduleEventsFrame { event: 'schedule-events'; data: ScheduleEventsAdminSnapshot; }
 interface ReadyFrame { event: 'ready'; data: Record<string, never>; }
-type AdminFrame = SkillEventsFrame | FileWatchersFrame | ReadyFrame;
+type AdminFrame = SkillEventsFrame | FileWatchersFrame | ScheduleEventsFrame | ReadyFrame;
 
 interface Connection {
   shared: SharedStreamHandle | null;
@@ -46,11 +54,13 @@ interface Connection {
   authToken: string;
   skillEventsSubs: Set<SkillEventsCallback>;
   fileWatchersSubs: Set<FileWatchersCallback>;
+  scheduleEventsSubs: Set<ScheduleEventsCallback>;
   // Last snapshot of each kind, replayed to a subscriber that joins after
   // the shared stream's initial frames have already arrived (e.g. the two
   // Events-page consumers register one tick apart).
   lastSkillEvents: SkillEventsAdminSnapshot | null;
   lastFileWatchers: FileWatchersAdminSnapshot | null;
+  lastScheduleEvents: ScheduleEventsAdminSnapshot | null;
 }
 
 let connection: Connection | null = null;
@@ -124,6 +134,8 @@ function openAdminEventsRaw(
                 onEvent({ event: 'skill-events', data: data as SkillEventsAdminSnapshot });
               } else if (eventName === 'file-watchers') {
                 onEvent({ event: 'file-watchers', data: data as FileWatchersAdminSnapshot });
+              } else if (eventName === 'schedule-events') {
+                onEvent({ event: 'schedule-events', data: data as ScheduleEventsAdminSnapshot });
               } else if (eventName === 'ready') {
                 onEvent({ event: 'ready', data: {} });
               }
@@ -165,6 +177,11 @@ function dispatchFrame(conn: Connection, frame: AdminFrame) {
     for (const cb of conn.fileWatchersSubs) {
       try { cb(frame.data); } catch (e) { console.warn('[adminEventsStream] file-watchers sub threw', e); }
     }
+  } else if (frame.event === 'schedule-events') {
+    conn.lastScheduleEvents = frame.data;
+    for (const cb of conn.scheduleEventsSubs) {
+      try { cb(frame.data); } catch (e) { console.warn('[adminEventsStream] schedule-events sub threw', e); }
+    }
   }
   // 'ready' is a no-op marker; consumers act on snapshot frames.
 }
@@ -192,8 +209,10 @@ function ensureConnection(agentUrl: string, authToken: string): Connection {
       authToken,
       skillEventsSubs: new Set(),
       fileWatchersSubs: new Set(),
+      scheduleEventsSubs: new Set(),
       lastSkillEvents: null,
       lastFileWatchers: null,
+      lastScheduleEvents: null,
     };
     startShared(connection);
   }
@@ -201,7 +220,11 @@ function ensureConnection(agentUrl: string, authToken: string): Connection {
 }
 
 function maybeClose(conn: Connection) {
-  if (conn.skillEventsSubs.size > 0 || conn.fileWatchersSubs.size > 0) return;
+  if (
+    conn.skillEventsSubs.size > 0 ||
+    conn.fileWatchersSubs.size > 0 ||
+    conn.scheduleEventsSubs.size > 0
+  ) return;
   if (conn.shared) conn.shared.close();
   if (connection === conn) connection = null;
 }
@@ -245,6 +268,26 @@ export function subscribeFileWatchersAdmin(
   return {
     close() {
       conn.fileWatchersSubs.delete(onSnapshot);
+      maybeClose(conn);
+    },
+  };
+}
+
+export function subscribeScheduleEventsAdmin(
+  agentUrl: string,
+  authToken: string,
+  onSnapshot: ScheduleEventsCallback,
+): AdminEventsSubHandle {
+  const conn = ensureConnection(agentUrl, authToken);
+  conn.scheduleEventsSubs.add(onSnapshot);
+  if (conn.lastScheduleEvents) {
+    try { onSnapshot(conn.lastScheduleEvents); } catch (e) {
+      console.warn('[adminEventsStream] schedule-events late-replay threw', e);
+    }
+  }
+  return {
+    close() {
+      conn.scheduleEventsSubs.delete(onSnapshot);
       maybeClose(conn);
     },
   };

@@ -93,6 +93,15 @@ class _FakeTool(BuiltInTool):
         return BuiltInToolResult(structured_content={"text": "ok"})
 
 
+class _FakeReadTool(BuiltInTool):
+    name = "read_file"
+    description = "fake read"
+    parameters: Dict[str, Any] = {"type": "object", "properties": {}}
+
+    async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
+        return BuiltInToolResult(structured_content={"text": "ok"})
+
+
 class _RecordingLLM:
     """Minimal LLMProvider stand-in that records the routing call kwargs."""
     provider_name = "fake"
@@ -149,6 +158,28 @@ def test_request_bare_diff_forces_overwrite_file() -> None:
     _drive(adapter, "@@ -2,7 +2,7 @@\n-James: hi\n+Steve: hi")
     assert llm.recorded["tool_choice"] == {
         "type": "function", "function": {"name": "overwrite_file"}}
+
+
+def test_request_forcing_sends_only_the_forced_tool() -> None:
+    # A forced subtool must send ONLY that tool's schema — providers that
+    # validate schemas (Groq) otherwise choke on sibling schemas, and Groq
+    # rejects disable_tool_validation alongside a named tool_choice.
+    llm = _RecordingLLM()
+    adapter = BuiltInToolAdapter(tools=[_FakeTool(), _FakeReadTool()], llm=llm, name="system_file")
+    _drive(adapter, 'overwrite_file path="x" diff="d"')
+    sent = [t["function"]["name"] for t in (llm.recorded["tools"] or [])]
+    assert sent == ["overwrite_file"]
+    assert llm.recorded["tool_choice"] == {
+        "type": "function", "function": {"name": "overwrite_file"}}
+
+
+def test_request_auto_sends_all_tools() -> None:
+    llm = _RecordingLLM()
+    adapter = BuiltInToolAdapter(tools=[_FakeTool(), _FakeReadTool()], llm=llm, name="system_file")
+    _drive(adapter, "please change the file somehow")
+    sent = sorted(t["function"]["name"] for t in (llm.recorded["tools"] or []))
+    assert sent == ["overwrite_file", "read_file"]
+    assert llm.recorded["tool_choice"] == "auto"
 
 
 def test_request_injects_group_instructions_into_system_prompt() -> None:

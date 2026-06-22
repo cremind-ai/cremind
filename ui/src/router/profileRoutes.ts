@@ -14,6 +14,7 @@ export const PROFILE_ROUTES = new Set([
   'process-list',
   'process-terminal',
   'skill-events',
+  'calendar-schedule',
   'developer',
 ]);
 

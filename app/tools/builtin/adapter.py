@@ -321,13 +321,22 @@ class BuiltInToolAdapter:
                 logger.info(f"[Built-in '{self.name}'] bare diff -> forcing overwrite_file")
             if forced:
                 tool_choice: Any = {"type": "function", "function": {"name": forced}}
+                # Send ONLY the forced tool's schema: the child LLM can't pick
+                # anything else anyway, and this keeps providers that validate tool
+                # schemas (Groq) from choking on the group's other, complex schemas
+                # (e.g. the scheduler parser) on a forced call. Defensive ``or``:
+                # ``forced`` always comes from ``names``, so the filter can't empty.
+                call_tools = [
+                    t for t in available_tools if t["function"]["name"] == forced
+                ] or available_tools
                 logger.info(f"[Built-in '{self.name}'] forcing subtool -> {forced}")
             else:
                 tool_choice = "auto" if available_tools else None
+                call_tools = available_tools
             try:
                 async for response in self._llm.chat_completion(
                     messages=messages,
-                    tools=available_tools if available_tools else None,
+                    tools=call_tools if call_tools else None,
                     tool_choice=tool_choice,
                     temperature=0,
                 ):

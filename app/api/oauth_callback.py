@@ -118,6 +118,36 @@ async def _handle_inbox_callback(request: Request) -> HTMLResponse:
     return HTMLResponse(_SUCCESS_HTML, status_code=200)
 
 
+async def _handle_google_calendar_callback(request: Request) -> HTMLResponse:
+    """Complete the backend-native Google Calendar OAuth exchange.
+
+    Unlike the subprocess skills (which poll the file inbox), the Calendar
+    connect flow runs in THIS process: this handler hands ``state`` + ``code``
+    to ``app.calendar.google_auth.complete_callback``, which exchanges the code
+    and stores per-profile tokens in ``auth_tokens``. The popup then closes and
+    the Calendar page polls ``GET /api/calendar/settings`` to see "connected".
+    """
+    params = request.query_params
+    state = params.get("state", "")
+    if not _STATE_RE.match(state):
+        logger.warning("[oauth-callback] google-calendar callback with missing/invalid state")
+        return HTMLResponse(_ERROR_HTML, status_code=400)
+    if "error" in params:
+        logger.info(f"[oauth-callback] google-calendar consent error for state={state[:6]}…")
+        return HTMLResponse(_ERROR_HTML, status_code=200)
+    code = params.get("code", "")
+    if not code:
+        return HTMLResponse(_ERROR_HTML, status_code=400)
+    try:
+        from app.calendar.google_auth import complete_callback
+        complete_callback(state, code)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"[oauth-callback] google-calendar exchange failed: {exc}")
+        return HTMLResponse(_ERROR_HTML, status_code=200)
+    logger.info(f"[oauth-callback] google-calendar connected for state={state[:6]}…")
+    return HTMLResponse(_SUCCESS_HTML, status_code=200)
+
+
 async def _handle_a2a_callback(request: Request) -> HTMLResponse:
     """Resolve the in-process Future for an A2A OAuth consent redirect.
 
@@ -152,4 +182,8 @@ def get_oauth_callback_routes() -> list[Route]:
     return [
         Route("/api/oauth/callback", methods=["GET"], endpoint=_handle_inbox_callback),
         Route("/api/oauth/a2a/callback", methods=["GET"], endpoint=_handle_a2a_callback),
+        Route(
+            "/api/oauth/google-calendar/callback",
+            methods=["GET"], endpoint=_handle_google_calendar_callback,
+        ),
     ]

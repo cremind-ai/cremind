@@ -3,7 +3,7 @@
 The companion of :mod:`app.utils.datetime`. Where that module turns a single
 natural-language *time* expression into concrete datetimes, this module turns a
 *schedule* expression — already decomposed by the parsing LLM into the
-``schedule_parser`` tool-call schema — into a normalized, machine-usable result
+``scheduler`` tool-call schema — into a normalized, machine-usable result
 for downstream calendar/reminder services (Google Calendar, iCloud/CalDAV,
 Reminders).
 
@@ -541,7 +541,7 @@ def _compute_explicit_set(arguments: dict, now_str: str) -> dict:
 def compute_schedule(arguments: dict, now_str: str) -> dict:
     """Compute a normalized schedule result from the LLM's tool-call arguments.
 
-    ``arguments`` is the ``schedule_parser`` tool-call payload; ``now_str`` is
+    ``arguments`` is the ``scheduler`` tool-call payload; ``now_str`` is
     the current naive-local datetime as an ISO string. Returns a dict suitable
     for ``BuiltInToolResult.structured_content``. On any per-kind failure
     returns ``{"parsable": False, "reason": ...}`` (no envelope). Raising is the
