@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from typing import Any, Dict
 
 from starlette.requests import Request
@@ -21,6 +22,7 @@ from app.storage import get_memory_storage
 from app.storage.conversation_storage import ConversationStorage, is_valid_conversation_id
 from app.utils import logger
 from app.utils.common import convert_db_messages_to_history
+from app.utils.uploads_tmp import is_inside_conversation_tmp
 
 
 def _profile_from_request(request: Request) -> str:
@@ -247,6 +249,30 @@ def get_conversation_routes(
             )
         reasoning = bool(body.get("reasoning", True))
 
+        # Files attached from the composer were uploaded to this conversation's
+        # temp dir via /api/files/upload-temp. Keep only entries whose path
+        # still resolves inside that dir and exists — anything else is dropped
+        # (never injected into what the agent sees).
+        attachments: list[dict] = []
+        raw_attachments = body.get("attachments")
+        if isinstance(raw_attachments, list):
+            for item in raw_attachments:
+                if not isinstance(item, dict):
+                    continue
+                path = item.get("path")
+                name = item.get("name") or (os.path.basename(path) if path else "")
+                if not path or not isinstance(path, str):
+                    continue
+                if not is_inside_conversation_tmp(profile, conversation_id, path):
+                    logger.warning(
+                        "POST message: dropping attachment outside temp dir: %r", path,
+                    )
+                    continue
+                if not os.path.isfile(path):
+                    logger.warning("POST message: dropping missing attachment: %r", path)
+                    continue
+                attachments.append({"name": name, "path": path})
+
         conv = await conversation_storage.get_conversation(conversation_id)
         if conv is None:
             return JSONResponse({"error": "Conversation not found"}, status_code=404)
@@ -295,6 +321,11 @@ def get_conversation_routes(
             query=text,
             history_messages=history_messages,
             reasoning=reasoning,
+            attachments=attachments or None,
+            user_message_metadata=(
+                {"attachments": [{"name": a["name"]} for a in attachments]}
+                if attachments else None
+            ),
             push_user_message=True,
             update_title_from_query=True,
         )

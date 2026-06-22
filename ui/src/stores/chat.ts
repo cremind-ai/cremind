@@ -282,7 +282,50 @@ export const useChatStore = defineStore('chat', {
      * actual streaming happens through the SSE handler below — this method
      * returns once the POST succeeds, NOT when the run finishes.
      */
-    async sendMessage(text: string, options?: { reasoning?: boolean; conversationId?: string }) {
+    /**
+     * Ensure there is an active conversation, creating one upfront if needed,
+     * and return its id (or null on failure). Used by the composer so files
+     * can be uploaded to a real conversation temp dir before the first send.
+     */
+    async ensureConversation(): Promise<string | null> {
+      if (this.activeConversationId) return this.activeConversationId;
+      const settings = useSettingsStore();
+      const agentUrl = settings.agentUrl;
+      const authToken = settings.authToken;
+      try {
+        const conv = await apiCreateConversation(agentUrl, authToken);
+        this.conversations = [
+          {
+            id: conv.id,
+            title: conv.title,
+            channelId: conv.channel_id ?? null,
+            contextId: conv.context_id ?? undefined,
+            taskId: conv.task_id ?? undefined,
+            createdAt: conv.created_at,
+            updatedAt: conv.updated_at,
+            messageCount: 0,
+          },
+          ...this.conversations,
+        ];
+        this.channelIdsByConversation[conv.id] = conv.channel_id ?? null;
+        this.activeConversationId = conv.id;
+        this.trackConversation(conv.id, 'active');
+        return conv.id;
+      } catch (e: any) {
+        this.error = e?.message || 'Failed to create conversation';
+        console.error('Failed to create conversation:', e);
+        return null;
+      }
+    },
+
+    async sendMessage(
+      text: string,
+      options?: {
+        reasoning?: boolean;
+        conversationId?: string;
+        attachments?: { name: string; path: string }[];
+      },
+    ) {
       if (!text.trim()) return;
 
       this.error = null;
@@ -376,6 +419,7 @@ export const useChatStore = defineStore('chat', {
           cid,
           text,
           options?.reasoning !== false,
+          options?.attachments,
         );
         runtime.currentTaskId = resp.run_id;
       } catch (e: any) {

@@ -29,6 +29,7 @@ oauth_token = { description = "OAuth Access Token", type = "string", secret = tr
 id = "gpt-5.4"
 display_name = "GPT-5.4"
 group_hint = "high"
+vision = true
 input_price_per_1m = 2.50
 output_price_per_1m = 15.00
 
@@ -36,6 +37,7 @@ output_price_per_1m = 15.00
 id = "gpt-5.4-mini"
 display_name = "GPT-5.4 Mini"
 group_hint = "low"
+vision = true
 input_price_per_1m = 0.75
 output_price_per_1m = 4.50
 
@@ -43,6 +45,7 @@ output_price_per_1m = 4.50
 id = "gpt-5.4-nano"
 display_name = "GPT-5.4 Nano"
 group_hint = "low"
+vision = true
 input_price_per_1m = 0.20
 output_price_per_1m = 1.25
 
@@ -50,6 +53,7 @@ output_price_per_1m = 1.25
 id = "gpt-5.4-pro"
 display_name = "GPT-5.4 Pro"
 group_hint = "high"
+vision = true
 input_price_per_1m = 30.00
 output_price_per_1m = 180.00
 
@@ -58,6 +62,7 @@ output_price_per_1m = 180.00
 id = "gpt-5.3-chat-latest"
 display_name = "GPT-5.3"
 group_hint = "high"
+vision = true
 input_price_per_1m = 1.75
 output_price_per_1m = 14.00
 
@@ -66,6 +71,7 @@ output_price_per_1m = 14.00
 id = "gpt-4.1"
 display_name = "GPT-4.1"
 group_hint = "high"
+vision = true
 input_price_per_1m = 2.00
 output_price_per_1m = 8.00
 
@@ -73,6 +79,7 @@ output_price_per_1m = 8.00
 id = "gpt-4.1-mini"
 display_name = "GPT-4.1 Mini"
 group_hint = "low"
+vision = true
 input_price_per_1m = 0.40
 output_price_per_1m = 1.60
 
@@ -80,6 +87,7 @@ output_price_per_1m = 1.60
 id = "gpt-4.1-nano"
 display_name = "GPT-4.1 Nano"
 group_hint = "low"
+vision = true
 input_price_per_1m = 0.10
 output_price_per_1m = 0.40
 
@@ -88,6 +96,7 @@ output_price_per_1m = 0.40
 id = "o3-pro"
 display_name = "o3 Pro"
 group_hint = "high"
+vision = true
 input_price_per_1m = 20.00
 output_price_per_1m = 80.00
 reasoning_effort = ["low", "medium", "high"]
@@ -96,6 +105,7 @@ reasoning_effort = ["low", "medium", "high"]
 id = "o3"
 display_name = "o3"
 group_hint = "high"
+vision = true
 input_price_per_1m = 2.00
 output_price_per_1m = 8.00
 reasoning_effort = ["low", "medium", "high"]
@@ -104,6 +114,7 @@ reasoning_effort = ["low", "medium", "high"]
 id = "o4-mini"
 display_name = "o4 Mini"
 group_hint = "high"
+vision = true
 input_price_per_1m = 0.55
 output_price_per_1m = 2.20
 reasoning_effort = ["low", "medium", "high"]

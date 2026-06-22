@@ -222,6 +222,26 @@ def _guess_mime(file_path: str) -> str:
     return mime or "application/octet-stream"
 
 
+def _image_dimensions(file_path: str, mime: str) -> Tuple[Optional[int], Optional[int]]:
+    """Return ``(width, height)`` in pixels for an image, or ``(None, None)``.
+
+    Lazily imports Pillow; if it is not installed (an optional dependency) the
+    dimensions are simply omitted rather than failing — ``get_file_info`` still
+    returns the rest of the metadata.
+    """
+    if not mime.startswith("image/"):
+        return None, None
+    try:
+        from PIL import Image  # lazy; optional
+    except ImportError:
+        return None, None
+    try:
+        with Image.open(file_path) as im:
+            return int(im.width), int(im.height)
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
 def _format_size(size: int) -> str:
     """Human-readable file size."""
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -1331,8 +1351,9 @@ class GetFileInfoTool(BuiltInTool):
     name: str = "get_file_info"
     description: str = (
         "Get detailed metadata about a single file: name, size, MIME type, "
-        "modification date, whether it is binary, and its extension. "
-        "E.g. 'get info about ./report.pdf'"
+        "modification date, whether it is binary, its extension, and — for "
+        "image files — its pixel width and height (when available). "
+        "E.g. 'get info about ./report.pdf' or 'what are the dimensions of ./photo.png'"
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -1372,7 +1393,7 @@ class GetFileInfoTool(BuiltInTool):
         binary = _is_binary(target) if os.path.isfile(target) else False
         ext = os.path.splitext(target)[1]
 
-        return BuiltInToolResult(structured_content={
+        info: Dict[str, Any] = {
             "name": os.path.basename(target),
             "path": rel_path,
             "size": stat.st_size,
@@ -1383,7 +1404,16 @@ class GetFileInfoTool(BuiltInTool):
             "extension": ext,
             "modified": _format_timestamp(stat.st_mtime),
             "os": platform.system(),
-        })
+        }
+
+        if os.path.isfile(target):
+            width, height = _image_dimensions(target, mime)
+            if width is not None and height is not None:
+                info["width"] = width
+                info["height"] = height
+                info["dimensions"] = f"{width}x{height}"
+
+        return BuiltInToolResult(structured_content=info)
 
 
 class ReadFileTool(BuiltInTool):
