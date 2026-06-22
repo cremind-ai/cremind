@@ -159,6 +159,14 @@ const routes = [
     props: true,
     meta: { title: 'Events' },
   },
+  // Calendar & Schedule — system calendar + time-based schedule events
+  {
+    path: '/:profile/calendar',
+    name: 'calendar-schedule',
+    component: () => import('../views/CalendarSchedulePage.vue'),
+    props: true,
+    meta: { title: 'Calendar & Schedule' },
+  },
   // Developer — debug tools (live log stream, etc.). Admin-only; mirrors
   // the embedding-settings guard pattern above so non-admin profiles
   // never see a 403'd page.

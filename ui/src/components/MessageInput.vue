@@ -191,7 +191,12 @@ onMounted(async () => {
       fetchSystemVars(settingsStore.agentUrl, settingsStore.authToken),
       listProfiles(settingsStore.agentUrl, settingsStore.authToken),
     ]);
-    sysVars.value = sv.map(v => ({ name: v.name, description: v.description }));
+    sysVars.value = sv.map(v => ({
+      name: v.name,
+      description: v.description,
+      value: v.value,
+      secret: v.secret,
+    }));
     profiles.value = pr.profiles.map(name => ({ name }));
   } catch {
     // leave lists empty; listsLoaded stays false so no chip flashes red.
@@ -404,6 +409,7 @@ const handleReasoningToggle = (value: boolean | string | number) => {
         :active-index="activeIndex"
         :prefix="triggerKind ?? '$'"
         @select="insertSelection"
+        @update:active-index="activeIndex = $event"
       />
       <ElPopover
         :visible="popoverVisible"

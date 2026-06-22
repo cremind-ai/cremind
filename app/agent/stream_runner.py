@@ -32,7 +32,9 @@ from typing import Any, Dict, List, Optional
 
 from a2a.types import DataPart, FilePart, Part
 
+from app.agent import memory_runner
 from app.agent.summary import summarize_reasoning
+from app.config.user_config import resolve_memory_config
 from app.constants import ChatCompletionTypeEnum
 from app.events.notifications_buffer import get_event_notifications
 from app.events.stream_bus import get_event_stream_bus
@@ -264,6 +266,15 @@ async def run_agent_to_bus(
     errored = False
     cancelled = False
 
+    # Memory feature (independent background session). Read the per-profile
+    # config once for this turn: used both to inject stored memory into the
+    # prompt (consumption) and to decide whether to schedule a post-turn
+    # extraction. Any failure simply disables memory for this turn.
+    try:
+        memory_cfg = resolve_memory_config(profile)
+    except Exception:  # noqa: BLE001
+        memory_cfg = None
+
     try:
         # 1. Persist the trigger / user message and announce it on the bus.
         #    For skill events we render the trigger as an *agent* bubble with
@@ -328,6 +339,17 @@ async def run_agent_to_bus(
         agent_query = await resolve_message_tokens(
             query, profile=profile, conversation_storage=conversation_storage,
         )
+
+        # Consumption: read current memory (short-term for this conversation +
+        # long-term for this profile) and pass it to the agent as a system block.
+        # Fully decoupled from extraction — the agent never triggers or waits on
+        # the background memory session.
+        memory_context = ""
+        if memory_cfg is not None and memory_cfg.enabled:
+            memory_context = await memory_runner.load_memory_context(
+                conversation_id, profile,
+            )
+
         try:
             async for chunk in cremind_agent.run(
                 query=agent_query,
@@ -336,6 +358,7 @@ async def run_agent_to_bus(
                 profile=profile,
                 reasoning=reasoning,
                 triggered_by_event=trigger_event is not None,
+                memory_context=memory_context,
             ):
                 ctype = chunk.get("type")
 
@@ -505,6 +528,21 @@ async def run_agent_to_bus(
             logger.exception(
                 f"stream_runner: failed to persist assistant message for {conversation_id}"
             )
+
+        # 5b. Memory trigger: if enough NEW message-content tokens (reasoning
+        #     excluded) have accrued since the last extraction, kick off a
+        #     background "memory session". Non-blocking and single-flight — it
+        #     never interleaves with the next turn. Skipped on cancel/error so
+        #     partial turns don't pollute memory.
+        if memory_cfg is not None and memory_cfg.enabled and not errored and not cancelled:
+            try:
+                pending = await memory_runner.pending_token_count(conversation_id)
+                if pending >= memory_cfg.trigger_token_threshold:
+                    memory_runner.schedule_extraction(conversation_id, profile)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    f"stream_runner: memory trigger check failed for {conversation_id}"
+                )
 
         # 6. Update the conversation row (title from first query, task_id).
         try:

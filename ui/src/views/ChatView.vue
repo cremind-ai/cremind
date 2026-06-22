@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, computed, watch } from 'vue';
+import { onMounted, onBeforeUnmount, computed, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { ElNotification } from 'element-plus';
 import { Icon } from '@iconify/vue';
@@ -11,6 +11,7 @@ import ChatWindow from '../components/ChatWindow.vue';
 import MessageInput from '../components/MessageInput.vue';
 import RightPanel from '../components/RightPanel.vue';
 import ResizableDivider from '../components/ResizableDivider.vue';
+import ConversationMemoryPanel from '../components/ConversationMemoryPanel.vue';
 
 const props = defineProps<{
   profile?: string;
@@ -85,6 +86,13 @@ const rightPanelWidth = computed(() =>
 const isElectron = computed(() => {
   return typeof __IS_ELECTRON__ !== 'undefined' && __IS_ELECTRON__;
 });
+
+// Per-conversation memory panel (short-term for this chat + long-term for the
+// profile). Only meaningful for a saved conversation, so the button is hidden
+// on the empty new-chat slot.
+const memoryPanelOpen = ref(false);
+const showMemoryButton = computed(() => !!chatStore.activeConversationId);
+const openMemoryPanel = () => { memoryPanelOpen.value = true; };
 
 onMounted(async () => {
   // Right panel (file tree) is visible by default on entering Conversations.
@@ -188,6 +196,15 @@ const handleSendMessage = async (text: string) => {
 <template>
   <div class="chat-view" :class="{ 'has-titlebar': isElectron, split: showRightPanel }">
     <div class="chat-section">
+      <button
+        v-if="showMemoryButton"
+        class="memory-button"
+        :title="'View conversation memory'"
+        @click="openMemoryPanel"
+      >
+        <Icon icon="mdi:brain" />
+      </button>
+
       <ChatWindow
         :messages="chatStore.messages"
         :isStreaming="chatStore.isStreaming"
@@ -239,6 +256,11 @@ const handleSendMessage = async (text: string) => {
         :style="{ width: rightPanelWidth + 'px' }"
       />
     </template>
+
+    <ConversationMemoryPanel
+      v-model="memoryPanelOpen"
+      :conversation-id="chatStore.activeConversationId"
+    />
   </div>
 </template>
 
@@ -304,4 +326,28 @@ const handleSendMessage = async (text: string) => {
   color: var(--text-secondary);
 }
 .readonly-banner :deep(svg) { font-size: 16px; }
+
+/* Floating memory toggle, top-right of the chat area. */
+.memory-button {
+  position: absolute;
+  top: 12px;
+  left: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  background: var(--surface-color);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  cursor: pointer;
+  z-index: 6;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+.memory-button:hover {
+  border-color: var(--primary-color);
+  color: var(--primary-color);
+}
+.memory-button :deep(svg) { font-size: 18px; }
 </style>

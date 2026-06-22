@@ -1008,6 +1008,27 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 is_secret = False
             config_storage.set("llm_config", key, str(value), is_secret=is_secret, profile=profile_name)
 
+        # Per-profile general settings from the wizard (Settings → Config keys),
+        # e.g. the Memory opt-in (``{"memory.enabled": "true"}``). Validated
+        # against CONFIG_SCHEMA and coerced/stringified the same way the
+        # /api/config/user PUT endpoint does, so an invalid key is ignored
+        # rather than corrupting the user_config table.
+        user_config = body.get("user_config") or {}
+        if isinstance(user_config, dict) and user_config:
+            from app.config.config_schema import lookup as _lookup_config
+
+            _emit_setup("user_config", "Saving profile preferences…")
+            for key, raw in user_config.items():
+                try:
+                    _, _, field = _lookup_config(key)
+                    value = field.coerce(raw)
+                    field.validate(value)
+                except (KeyError, ValueError) as exc:
+                    logger.warning(f"setup: skipping invalid user_config {key!r}: {exc}")
+                    continue
+                stored = "true" if value is True else ("false" if value is False else str(value))
+                config_storage.set("user_config", key, stored, profile=profile_name)
+
         # Tool config payload from the wizard. The frontend bundles four
         # different settings into a single ``tool_configs[tool_id]`` dict using
         # reserved key prefixes:

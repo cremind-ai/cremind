@@ -56,6 +56,13 @@ interface State {
   // chat slot before the user sends their first message). Seeded once from
   // ``GET /api/files/cwd``.
   userDefaultCwd: string;
+  // The user working directory the panel was seeded with — an allowed read
+  // base on the backend. Unlike ``userDefaultCwd`` (which follows no-
+  // conversation navigation), this stays fixed so the breadcrumb knows the
+  // floor below which it must not navigate while no conversation is active:
+  // without a conversation there's no cwd override to widen the backend's
+  // read allowlist, so leaving this subtree would 403 and strand the tree.
+  userWorkingRoot: string;
   splitRatio: number;
   showHiddenFiles: boolean;
   viewMode: FileViewMode;
@@ -75,6 +82,7 @@ export const useTerminalPanelStore = defineStore('terminalPanel', {
     panelWidth: loadInitialWidth(),
     cwdByConversation: {},
     userDefaultCwd: '',
+    userWorkingRoot: '',
     splitRatio: loadInitialSplitRatio(),
     showHiddenFiles: loadInitialShowHidden(),
     viewMode: loadInitialViewMode(),
@@ -177,6 +185,15 @@ export const useTerminalPanelStore = defineStore('terminalPanel', {
     setUserDefaultCwd(path: string) {
       if (!path || this.userDefaultCwd === path) return;
       this.userDefaultCwd = path;
+    },
+
+    // Record the immutable working-dir root (the no-conversation navigation
+    // floor — see the state field). Seeded from the same
+    // ``GET /api/files/cwd`` value as the default cwd, but never moved by
+    // navigation.
+    setUserWorkingRoot(path: string) {
+      if (!path || this.userWorkingRoot === path) return;
+      this.userWorkingRoot = path;
     },
 
     // Drop a conversation's cached cwd (e.g. when it gets deleted).

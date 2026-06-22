@@ -861,6 +861,15 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to start file watcher manager")
 
+            # 7f. Schedule (time-based) event manager — the Calendar & Schedule
+            # trigger engine. Reuses the skill-event runner globals set in 7d.
+            try:
+                from app.events import get_schedule_manager
+
+                get_schedule_manager().start(loop)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to start schedule manager")
+
             # 8. Build the real agent executor and the post-setup callback.
             agent_executor = CremindAgentExecutor(
                 cremind_agent,

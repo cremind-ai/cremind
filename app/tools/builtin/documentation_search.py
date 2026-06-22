@@ -56,6 +56,7 @@ from app.documents import get_service
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
 from app.types import ToolConfig
 from app.utils.logger import logger
+from app.utils.message_tokens import resolve_system_var_tokens
 
 
 SERVER_NAME = "Documentation Search"
@@ -101,7 +102,9 @@ TOOL_CONFIG: ToolConfig = {
     "name": "documentation_search",
     "display_name": SERVER_NAME,
     "default_model_group": "low",
-    "hidden": True,
+    # Visible in Settings (so its top-k can be configured) but locked on —
+    # the agent must always be able to search its own documentation.
+    "locked": True,
     "llm_parameters": {
         "tool_instructions": _DOC_TOOL_INSTRUCTIONS,
         # Locked off: the relevance ranking happens INSIDE run() via the
@@ -244,7 +247,14 @@ class DocumentationSearchTool(BuiltInTool):
             )
             return _no_result()
 
-        # Return the body of the chosen document verbatim. The adapter's
+        # Resolve $VAR system-variable tokens in the body for the active
+        # profile (e.g. $CREMIND_SERVER, $CREMIND_PROFILE) — same syntax as
+        # chat; `$$NAME` escapes to a literal `$NAME`. Done here at serving
+        # time only, never during indexing, so resolved values never enter
+        # the vector store or content hash.
+        body = resolve_system_var_tokens(body, profile)
+
+        # Return the body of the chosen document. The adapter's
         # _extract_tool_result unwraps a single text content item to a
         # plain string, which is what the Reasoning Agent should see.
         return BuiltInToolResult(

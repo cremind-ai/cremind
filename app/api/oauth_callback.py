@@ -6,12 +6,11 @@ their OAuth consent redirect can't be received by a server inside the subprocess
 routes on the always-running backend — fronted by the nginx proxy under the K8s
 chart, published directly in Docker/native:
 
-  GET /api/oauth/google/callback      gmail, gcalendar  (Google Desktop/loopback client)
-  GET /api/oauth/atlassian/callback   jira, confluence  (Atlassian 3LO confidential client)
+  GET /api/oauth/callback             gmail, gcalendar, jira, confluence (built-in skills)
   GET /api/oauth/a2a/callback         A2A tool auth     (external OAuth providers)
 
 The browser-facing redirect URL is derived from ``APP_URL`` (see
-app/config/system_vars.py) — e.g. ``http://localhost:1515/api/oauth/google/callback``
+app/config/system_vars.py) — e.g. ``http://localhost:1515/api/oauth/callback``
 behind a Kubernetes ``port-forward``. For the skills, the handler writes the raw
 authorization response (``code`` + ``state`` + ``scope``) to a per-state file
 under ``<CREMIND_SYSTEM_DIR>/oauth_inbox/<state>.txt``; the skill subprocess polls
@@ -95,9 +94,10 @@ async def _handle_inbox_callback(request: Request) -> HTMLResponse:
     """Capture a subprocess-skill consent redirect into the per-state inbox.
 
     Shared by the gmail/gcalendar (Google Desktop) and jira/confluence (Atlassian
-    3LO) skills — the path differs only so each provider can register its own
-    redirect URL; this handler reads only the query. The waiting ``link`` in the
-    skill subprocess polls ``oauth_inbox/<state>.txt`` and finishes the exchange.
+    3LO) skills via a single ``/api/oauth/callback`` route; the per-flow ``state``
+    (not the path) disambiguates flows, and this handler reads only the query. The
+    waiting ``link`` in the skill subprocess polls ``oauth_inbox/<state>.txt`` and
+    finishes the exchange.
     """
     params = request.query_params
     state = params.get("state", "")
@@ -115,6 +115,36 @@ async def _handle_inbox_callback(request: Request) -> HTMLResponse:
         logger.info(f"[oauth-callback] consent returned error for state={state[:6]}…")
         return HTMLResponse(_ERROR_HTML, status_code=200)
     logger.info(f"[oauth-callback] captured authorization response for state={state[:6]}…")
+    return HTMLResponse(_SUCCESS_HTML, status_code=200)
+
+
+async def _handle_google_calendar_callback(request: Request) -> HTMLResponse:
+    """Complete the backend-native Google Calendar OAuth exchange.
+
+    Unlike the subprocess skills (which poll the file inbox), the Calendar
+    connect flow runs in THIS process: this handler hands ``state`` + ``code``
+    to ``app.calendar.google_auth.complete_callback``, which exchanges the code
+    and stores per-profile tokens in ``auth_tokens``. The popup then closes and
+    the Calendar page polls ``GET /api/calendar/settings`` to see "connected".
+    """
+    params = request.query_params
+    state = params.get("state", "")
+    if not _STATE_RE.match(state):
+        logger.warning("[oauth-callback] google-calendar callback with missing/invalid state")
+        return HTMLResponse(_ERROR_HTML, status_code=400)
+    if "error" in params:
+        logger.info(f"[oauth-callback] google-calendar consent error for state={state[:6]}…")
+        return HTMLResponse(_ERROR_HTML, status_code=200)
+    code = params.get("code", "")
+    if not code:
+        return HTMLResponse(_ERROR_HTML, status_code=400)
+    try:
+        from app.calendar.google_auth import complete_callback
+        complete_callback(state, code)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"[oauth-callback] google-calendar exchange failed: {exc}")
+        return HTMLResponse(_ERROR_HTML, status_code=200)
+    logger.info(f"[oauth-callback] google-calendar connected for state={state[:6]}…")
     return HTMLResponse(_SUCCESS_HTML, status_code=200)
 
 
@@ -150,7 +180,10 @@ def get_oauth_callback_routes() -> list[Route]:
     A2A endpoint) is in flight. Mounted under ``/api`` so they ride the K8s
     proxy's existing ``/api`` route to the backend."""
     return [
-        Route("/api/oauth/google/callback", methods=["GET"], endpoint=_handle_inbox_callback),
-        Route("/api/oauth/atlassian/callback", methods=["GET"], endpoint=_handle_inbox_callback),
+        Route("/api/oauth/callback", methods=["GET"], endpoint=_handle_inbox_callback),
         Route("/api/oauth/a2a/callback", methods=["GET"], endpoint=_handle_a2a_callback),
+        Route(
+            "/api/oauth/google-calendar/callback",
+            methods=["GET"], endpoint=_handle_google_calendar_callback,
+        ),
     ]

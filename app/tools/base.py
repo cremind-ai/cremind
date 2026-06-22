@@ -56,6 +56,10 @@ class ToolSkill:
     name: str
     description: str
     examples: List[str] = field(default_factory=list)
+    # Optional JSON-schema for the sub-tool's arguments. When present, the
+    # reasoning prompt renders a call signature (e.g. ``overwrite_file(path,
+    # diff)``) so the model knows how to format its Action_Input.
+    parameters: Optional[Dict[str, Any]] = None
 
 
 # ── Event stream emitted by Tool.execute() ─────────────────────────────────
@@ -120,6 +124,11 @@ class Tool(ABC):
     # Hidden tools are excluded from the UI listing but still
     # available to the reasoning agent (intrinsic tools).
     hidden: bool = False
+
+    # locked tools stay in the UI listing (unlike hidden) but their
+    # enable/disable toggle is locked on — they cannot be disabled.
+    # See ToolConfig.locked.
+    locked: bool = False
 
     def __init__(self) -> None:
         # Populated by ToolRegistry.register_*; safe defaults until then.

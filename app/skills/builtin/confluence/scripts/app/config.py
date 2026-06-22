@@ -21,11 +21,14 @@ ATLASSIAN_CLIENT_ID = os.environ.get("ATLASSIAN_CLIENT_ID", "").strip()
 # when the account can access more than one. Defaults to the first accessible site.
 CONFLUENCE_SITE_URL = os.environ.get("CONFLUENCE_SITE_URL", "").strip()
 
-# Browser-facing OAuth redirect, injected by ``cremind serve`` (system_vars) as
-# <APP_URL>/api/oauth/atlassian/callback. Atlassian 3LO requires a FIXED,
-# pre-registered callback URL, so this MUST be registered (exact match) in the
-# Atlassian developer console. Unset → use the manual ``complete-link`` paste.
-OAUTH_REDIRECT_URI = os.environ.get("CREMIND_ATLASSIAN_REDIRECT_URI", "").strip() or None
+# Browser-facing OAuth redirect for the Atlassian 3LO flow. Atlassian requires a
+# FIXED, pre-registered callback URL (exact match in the developer console), so —
+# unlike Google — this is a single fixed value independent of APP_URL. Defaults to
+# the documented localhost (suits native + the K8s ``port-forward svc/cremind 1515:80``);
+# override via CREMIND_ATLASSIAN_REDIRECT_URI (e.g. Helm cremind.atlassianRedirectUri).
+OAUTH_REDIRECT_URI = os.environ.get(
+    "CREMIND_ATLASSIAN_REDIRECT_URI", "http://localhost:1515/api/oauth/callback"
+).strip() or None
 
 
 def setup_logging(level: str | int = "INFO") -> logging.Logger:

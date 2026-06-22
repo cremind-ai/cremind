@@ -41,7 +41,7 @@ def _with_system_dir(fn):
 
 def test_full_url_writes_inbox():
     def body(tmp):
-        url = f"http://localhost:1112/api/oauth/google/callback?{_QUERY}"
+        url = f"http://localhost:1112/api/oauth/callback?{_QUERY}"
         result = auth.submit_callback(url)
         assert result == {"submitted": True, "state": _STATE}
         dst = Path(tmp) / "oauth_inbox" / f"{_STATE}.txt"
@@ -53,10 +53,10 @@ def test_full_url_writes_inbox():
 
 
 def test_proxied_url_path_writes_inbox():
-    """A proxied redirect (localhost:1515/api/oauth/google/callback, the K8s
+    """A proxied redirect (localhost:1515/api/oauth/callback, the K8s
     port-forward origin) is handled the same — only the query matters."""
     def body(tmp):
-        url = f"http://localhost:1515/api/oauth/google/callback?{_QUERY}"
+        url = f"http://localhost:1515/api/oauth/callback?{_QUERY}"
         auth.submit_callback(url)
         assert (Path(tmp) / "oauth_inbox" / f"{_STATE}.txt").read_text(encoding="utf-8") == _QUERY
     _with_system_dir(body)

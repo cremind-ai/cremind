@@ -64,3 +64,14 @@ retry = 2
 temperature = 0.3
 max_tokens = 1024
 retry = 2
+
+[memory]
+enabled = false              # opt-in; setup wizard offers to flip this to true
+trigger_token_threshold = 100000
+short_term_queue_size = 10
+long_term_queue_size = 20
+short_term_max_tokens = 300
+long_term_max_tokens = 50
+temperature = 0.3
+max_tokens = 1024
+retry = 2

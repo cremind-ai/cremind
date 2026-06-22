@@ -54,31 +54,66 @@ class SkillTool(Tool):
         return self._info.description
 
     @property
-    def environment_variables(self) -> list[str]:
-        """Names of environment variables declared in the SKILL.md frontmatter.
+    def environment_variables(self) -> list[dict[str, Any]]:
+        """Environment-variable specs declared in the SKILL.md frontmatter.
 
-        Declared via ``metadata.environment_variables`` as a list of strings.
-        Returns an empty list when none are declared.
+        Declared via ``metadata.environment_variables`` as a list of objects,
+        each describing one variable's config/UI metadata so the frontend can
+        render it accurately::
+
+            environment_variables: [
+              {"name": "HA_URL", "required": true, "description": "..."},
+              {"name": "HA_TOKEN", "required": false, "secret": true, ...},
+            ]
+
+        Each entry is normalized to a dict with keys: ``name`` (str),
+        ``description`` (str), ``required`` (bool), ``secret`` (bool | None —
+        ``None`` lets the API layer fall back to its name-based heuristic),
+        ``type`` (str), ``default`` (str | None) and ``enum`` (list[str]).
+
+        A plain string entry is still accepted and treated as an optional
+        string variable, so legacy manifests keep working. Entries without a
+        usable ``name`` are dropped. Returns an empty list when none declared.
         """
         raw = self._info.metadata.get("environment_variables") or []
         if not isinstance(raw, list):
             return []
-        return [v for v in raw if isinstance(v, str) and v]
+        specs: list[dict[str, Any]] = []
+        for entry in raw:
+            if isinstance(entry, str) and entry:
+                specs.append(self._normalize_env_spec({"name": entry}))
+            elif isinstance(entry, dict):
+                name = entry.get("name")
+                if isinstance(name, str) and name:
+                    specs.append(self._normalize_env_spec(entry))
+        return specs
+
+    @staticmethod
+    def _normalize_env_spec(entry: dict[str, Any]) -> dict[str, Any]:
+        """Coerce one raw frontmatter entry into a normalized env-var spec."""
+        name = entry["name"]
+        desc = entry.get("description")
+        default = entry.get("default")
+        enum_raw = entry.get("enum")
+        return {
+            "name": name,
+            "description": str(desc) if desc else name,
+            "required": bool(entry.get("required", False)),
+            # None => caller applies the secret-name heuristic.
+            "secret": bool(entry["secret"]) if "secret" in entry else None,
+            "type": str(entry.get("type") or "string"),
+            "default": str(default) if default is not None else None,
+            "enum": [str(v) for v in enum_raw] if isinstance(enum_raw, list) else [],
+        }
 
     @property
-    def optional_environment_variables(self) -> list[str]:
-        """Names of environment variables that are optional (have a sensible
-        default or are fetched dynamically), declared via
-        ``metadata.optional_environment_variables``.
+    def environment_variable_names(self) -> list[str]:
+        """Declared variable names only (order-preserving).
 
-        Such variables stay editable in the UI but do not mark the skill as
-        "needs config" when left blank. Returns an empty list when none are
-        declared.
+        Convenience for callers that just need the names — e.g. writing the
+        skill's ``.env`` file — without the per-variable UI metadata.
         """
-        raw = self._info.metadata.get("optional_environment_variables") or []
-        if not isinstance(raw, list):
-            return []
-        return [v for v in raw if isinstance(v, str) and v]
+        return [spec["name"] for spec in self.environment_variables]
 
     def get_card(self) -> AgentCard:
         return AgentCard(

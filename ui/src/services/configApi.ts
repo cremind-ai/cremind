@@ -634,6 +634,9 @@ export interface ToolConfigField {
   type: string;
   secret: boolean;
   configured: boolean;
+  /** Whether the variable must be set. Skills declare this per-variable; when
+   *  false (or with a default) the field is editable but never blocks config. */
+  required?: boolean;
   enum?: string[];
   default?: unknown;
 }
@@ -699,6 +702,10 @@ export interface ToolStatus {
    *  built-in (under ``app/skills/builtin``). Drives the Settings page
    *  "Reset to Default" (built-in) vs "Delete" (imported) action. */
   is_builtin?: boolean;
+  /** Built-in tools only: when true, the tool is visible but its enable/disable
+   *  toggle is locked ON (the API rejects disable). The UI renders the switch
+   *  disabled with a lock icon. Sourced from TOOL_CONFIG.locked. */
+  toggle_locked?: boolean;
 }
 
 export async function listTools(
@@ -863,6 +870,22 @@ export async function importSkillFromGitHub(
   return res.json();
 }
 
+/** Import skills from a Cremind Hub link (skill page URL or bare skill name). */
+export async function importSkillFromHub(
+  agentUrl: string,
+  token: string,
+  link: string
+): Promise<SkillImportResult> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/skills/import/hub`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ link }),
+  });
+  if (!res.ok) throw new Error(await readError(res, 'Failed to import skill'));
+  return res.json();
+}
+
 /** One SSE frame emitted by ``POST /api/features/install``. */
 export interface FeatureInstallEvent {
   event: 'start' | 'log' | 'post_install' | 'done' | 'error';
@@ -1007,6 +1030,7 @@ export interface SystemVar {
   name: string;
   description: string;
   value: string | null;
+  secret: boolean;
 }
 
 export async function fetchSystemVars(
@@ -1022,6 +1046,16 @@ export async function fetchSystemVars(
 }
 
 // ── Profiles ──
+
+/** Public (no auth): profile names only, for the login screen's dropdown. */
+export async function listPublicProfileNames(
+  agentUrl: string
+): Promise<{ profiles: string[] }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/profiles/names`);
+  if (!res.ok) throw new Error(`Failed to list profile names: ${res.statusText}`);
+  return res.json();
+}
 
 export async function listProfiles(
   agentUrl: string,

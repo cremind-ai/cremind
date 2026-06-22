@@ -39,6 +39,7 @@ async def list_system_vars(request: Request) -> JSONResponse:
             "name": spec.name,
             "description": spec.description,
             "value": spec.resolve(profile),
+            "secret": spec.secret,
         }
         for spec in SYSTEM_VARS
     ])

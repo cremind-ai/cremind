@@ -360,7 +360,7 @@ the watched path:
 
 ```bash
 # Linux/macOS
-$ touch "$CREMIND_USER_WORKING_DIR/Lee/test.py"
+$ touch "$$CREMIND_USER_WORKING_DIR/Lee/test.py"
 
 # Windows PowerShell
 > ni $env:USERPROFILE\Documents\Lee\test.py -Force | Out-Null

@@ -215,6 +215,48 @@ def convert_db_messages_to_history(
     return messages
 
 
+_CONTENT_TOKEN_ENCODER = None
+
+
+def count_content_tokens(text: str, model: str = "gpt-4o") -> int:
+    """Count tokens in a single piece of message *content*.
+
+    Used by the memory feature to size extraction windows and decide when to
+    trigger extraction. Counts only the text it is given (callers pass
+    ``MessageModel.content``, never reasoning ``thinking_steps``). The encoder
+    is cached process-wide; tiktoken lives in the ``tokenization`` extra and is
+    imported lazily, so importing this module stays cheap on the thin core.
+    """
+    if not text:
+        return 0
+    global _CONTENT_TOKEN_ENCODER
+    if _CONTENT_TOKEN_ENCODER is None:
+        from tiktoken import encoding_for_model
+        _CONTENT_TOKEN_ENCODER = encoding_for_model(model)
+    return len(_CONTENT_TOKEN_ENCODER.encode(text))
+
+
+def truncate_to_tokens(text: str, max_tokens: int, model: str = "gpt-4o") -> str:
+    """Return ``text`` clipped to at most ``max_tokens`` tokens (best-effort).
+
+    Used to enforce the memory entry size caps (≤300 short-term, ≤50 long-term).
+    Falls back to the original text if tiktoken is unavailable for any reason.
+    """
+    if not text or max_tokens <= 0:
+        return text or ""
+    try:
+        global _CONTENT_TOKEN_ENCODER
+        if _CONTENT_TOKEN_ENCODER is None:
+            from tiktoken import encoding_for_model
+            _CONTENT_TOKEN_ENCODER = encoding_for_model(model)
+        tokens = _CONTENT_TOKEN_ENCODER.encode(text)
+        if len(tokens) <= max_tokens:
+            return text
+        return _CONTENT_TOKEN_ENCODER.decode(tokens[:max_tokens]).rstrip()
+    except Exception:  # noqa: BLE001
+        return text
+
+
 def limit_messages(messages: list[ChatCompletionMessageParam], max_length: int,
                    model: str = "gpt-4o") -> list[ChatCompletionMessageParam]:
     """Limit messages by token length, keeping the most recent messages.

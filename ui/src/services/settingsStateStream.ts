@@ -7,7 +7,7 @@
  * config, setup completion, skill mode, skill add/remove on disk. The
  * ping carries no payload; consumers refetch the resources they render.
  *
- * Mirrors {@link openSkillEventsAdminStream}: EventSource cannot send
+ * Mirrors {@link openProcessesStream}: EventSource cannot send
  * Authorization headers, so we use fetch + ReadableStream and parse SSE
  * frames manually. Reconnects with exponential backoff are transparent.
  *

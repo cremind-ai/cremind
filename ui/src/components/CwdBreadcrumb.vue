@@ -6,6 +6,7 @@ import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
 import {
   listDirectory,
+  DirectoryAccessError,
   type DirectoryEntry,
 } from '../services/filesApi';
 import { useCwdNavigation } from '../composables/useCwdNavigation';
@@ -18,7 +19,7 @@ interface Segment {
 const panel = useTerminalPanelStore();
 const settings = useSettingsStore();
 const chat = useChatStore();
-const { navigate } = useCwdNavigation();
+const { navigate, canNavigateTo } = useCwdNavigation();
 
 function detectSep(p: string): string {
   return p && p.includes('\\') ? '\\' : '/';
@@ -58,6 +59,13 @@ const upPath = computed<string | null>(() => {
   return segs[segs.length - 2].path;
 });
 
+// Go-Up is allowed only when there is a parent and that parent is reachable
+// (always so with an active conversation; bounded by the working root when
+// there isn't one).
+const canGoUp = computed<boolean>(
+  () => !!upPath.value && canNavigateTo(upPath.value),
+);
+
 // ── Edit mode ─────────────────────────────────────────────────────
 
 const editing = ref(false);
@@ -66,7 +74,15 @@ const editInputRef = ref<HTMLInputElement | null>(null);
 
 async function startEdit() {
   if (editing.value) return;
-  editValue.value = panel.cwd || '';
+  const cwd = panel.cwd || '';
+  // Seed with a trailing separator so the initial autocomplete lists the
+  // children of the *current* directory rather than its parent. Without it,
+  // ``editParentAndFragment`` parses the cwd as <parent>/<leaf> and lists the
+  // parent — which, when the cwd is the user working dir, sits outside the
+  // read allowlist and 403s with a spurious "Access denied". A trailing sep
+  // makes the cwd itself the parent; typing a leaf then narrows as before.
+  const sep = detectSep(cwd);
+  editValue.value = cwd && !cwd.endsWith(sep) ? cwd + sep : cwd;
   editing.value = true;
   await refreshSuggestions();
   await nextTick();
@@ -80,10 +96,14 @@ function cancelEdit() {
 }
 
 async function commitEdit() {
-  const target = editValue.value.trim();
+  let target = editValue.value.trim();
   editing.value = false;
   closeDropdown();
   if (!target) return;
+  // Drop the trailing separator we seed in startEdit so we navigate to the
+  // directory itself, not "…/dir/". Preserve bare roots ("C:\\" / "/").
+  const stripped = target.replace(/[\\/]+$/, '');
+  if (stripped && !/^[A-Za-z]:$/.test(stripped)) target = stripped;
   const r = await navigate(target);
   if (!r.ok) showError(r.error || 'Failed to change directory');
 }
@@ -148,7 +168,10 @@ async function refreshSuggestions() {
   } catch (e: unknown) {
     if ((e as Error)?.name === 'AbortError') return;
     dropdownEntries.value = [];
-    dropdownError.value = (e as Error)?.message || 'Failed to load';
+    dropdownError.value =
+      e instanceof DirectoryAccessError && e.status === 403
+        ? 'Outside accessible folders'
+        : (e as Error)?.message || 'Failed to load';
   } finally {
     dropdownLoading.value = false;
   }
@@ -182,6 +205,7 @@ watch(editValue, () => {
 // ── Picking entries ──────────────────────────────────────────────
 
 async function pickSegment(seg: Segment) {
+  if (!canNavigateTo(seg.path)) return;
   closeDropdown();
   const r = await navigate(seg.path);
   if (!r.ok) showError(r.error || 'Failed to change directory');
@@ -202,7 +226,7 @@ async function pickEntry(entry: DirectoryEntry) {
 }
 
 async function goUp() {
-  if (!upPath.value) return;
+  if (!canGoUp.value || !upPath.value) return;
   closeDropdown();
   const r = await navigate(upPath.value);
   if (!r.ok) showError(r.error || 'Failed to change directory');
@@ -287,8 +311,8 @@ onBeforeUnmount(() => {
   <div class="cwd-breadcrumb-root">
     <button
       class="bc-icon-btn"
-      title="Go up"
-      :disabled="!upPath"
+      :title="canGoUp || !upPath ? 'Go up' : 'Start a conversation to browse outside the working folder'"
+      :disabled="!canGoUp"
       @click="goUp"
     >
       <Icon icon="mdi:arrow-up" />
@@ -313,8 +337,16 @@ onBeforeUnmount(() => {
           <template v-for="(seg, idx) in segments" :key="seg.path">
             <button
               class="bc-segment"
-              :class="{ last: idx === segments.length - 1 }"
-              :title="seg.path"
+              :class="{
+                last: idx === segments.length - 1,
+                locked: !canNavigateTo(seg.path),
+              }"
+              :aria-disabled="!canNavigateTo(seg.path)"
+              :title="
+                canNavigateTo(seg.path)
+                  ? seg.path
+                  : 'Start a conversation to browse outside the working folder'
+              "
               @click.stop="pickSegment(seg)"
             >{{ seg.label }}</button>
             <span v-if="idx < segments.length - 1" class="bc-sep">›</span>
@@ -475,6 +507,15 @@ onBeforeUnmount(() => {
 .bc-segment.last {
   color: var(--text-primary);
   font-weight: 500;
+}
+.bc-segment.locked {
+  color: var(--text-tertiary);
+  cursor: default;
+  opacity: 0.55;
+}
+.bc-segment.locked:hover {
+  background: transparent;
+  color: var(--text-tertiary);
 }
 .bc-sep {
   color: var(--text-tertiary);

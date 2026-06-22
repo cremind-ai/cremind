@@ -53,7 +53,6 @@ class GroqLLMProvider(LLMProvider):
                     "model": self.model_name,
                     "messages": messages,
                     "stream": True,
-                    "disable_tool_validation": True,
                 }
                 if temperature:
                     params["temperature"] = temperature
@@ -72,6 +71,16 @@ class GroqLLMProvider(LLMProvider):
                 if tools:
                     params["tool_choice"] = tool_choice or "auto"
                     params["tools"] = tools
+                # Groq rejects `disable_tool_validation` together with a *specified*
+                # tool_choice (a named function or "required"). Keep the validation
+                # bypass only for the open auto/none/no-tools cases — it's what lets
+                # complex schemas (e.g. the scheduler parser) through. For a forced
+                # subtool we omit it and let Groq validate that single simple schema.
+                _specifying_tool = bool(tools) and (
+                    isinstance(tool_choice, dict) or tool_choice == "required"
+                )
+                if not _specifying_tool:
+                    params["disable_tool_validation"] = True
                 if parallel_tool_calls is not None:
                     params["parallel_tool_calls"] = parallel_tool_calls
 
@@ -165,7 +174,6 @@ class GroqLLMProvider(LLMProvider):
                     "model": self.model_name,
                     "messages": messages,
                     "stream": False,
-                    "disable_tool_validation": True,
                 }
                 if temperature:
                     params["temperature"] = temperature
@@ -184,6 +192,16 @@ class GroqLLMProvider(LLMProvider):
                 if tools:
                     params["tool_choice"] = tool_choice or "auto"
                     params["tools"] = tools
+                # Groq rejects `disable_tool_validation` together with a *specified*
+                # tool_choice (a named function or "required"). Keep the validation
+                # bypass only for the open auto/none/no-tools cases — it's what lets
+                # complex schemas (e.g. the scheduler parser) through. For a forced
+                # subtool we omit it and let Groq validate that single simple schema.
+                _specifying_tool = bool(tools) and (
+                    isinstance(tool_choice, dict) or tool_choice == "required"
+                )
+                if not _specifying_tool:
+                    params["disable_tool_validation"] = True
                 if parallel_tool_calls is not None:
                     params["parallel_tool_calls"] = parallel_tool_calls
 

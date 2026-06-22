@@ -40,7 +40,7 @@ def _with_system_dir(fn):
 
 def test_full_url_writes_inbox():
     def body(tmp):
-        url = f"http://localhost:1515/api/oauth/atlassian/callback?{_QUERY}"
+        url = f"http://localhost:1515/api/oauth/callback?{_QUERY}"
         result = auth.submit_callback(url)
         assert result == {"submitted": True, "state": _STATE}
         dst = Path(tmp) / "oauth_inbox" / f"{_STATE}.txt"

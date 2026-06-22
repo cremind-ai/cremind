@@ -18,9 +18,10 @@ import {
   type FileWatcherSubscription,
 } from '../services/fileWatchersApi';
 import {
-  openFileWatchersAdminStream,
-  type FileWatchersAdminStreamHandle,
-} from '../services/fileWatchersAdminStream';
+  subscribeFileWatchersAdmin,
+  type AdminEventsSubHandle,
+} from '../services/adminEventsStream';
+import CollapsibleSection from './CollapsibleSection.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -34,24 +35,20 @@ const sortedSubs = computed(() =>
   [...subscriptions.value].sort((a, b) => b.created_at - a.created_at),
 );
 
-let streamHandle: FileWatchersAdminStreamHandle | null = null;
+let streamHandle: AdminEventsSubHandle | null = null;
 
 function streamStart() {
   streamStop();
   if (!settings.agentUrl || !settings.authToken) return;
   loading.value = true;
   errorMessage.value = '';
-  streamHandle = openFileWatchersAdminStream(
+  streamHandle = subscribeFileWatchersAdmin(
     settings.agentUrl,
     settings.authToken,
     (snap) => {
       subscriptions.value = snap.subscriptions;
       loading.value = false;
       errorMessage.value = '';
-    },
-    (err) => {
-      errorMessage.value = err instanceof Error ? err.message : String(err);
-      loading.value = false;
     },
   );
 }
@@ -130,11 +127,7 @@ function formatDate(seconds: number): string {
 
 <template>
   <section class="fw-section">
-    <header class="section-header">
-      <Icon icon="mdi:folder-eye-outline" class="section-icon" />
-      <h2>File Watcher Events</h2>
-    </header>
-
+    <CollapsibleSection title="File Watcher Events" icon="mdi:folder-eye-outline" :count="sortedSubs.length">
     <p class="section-blurb">
       Watch a directory for filesystem changes and run an action whenever a
       matching event fires (created, modified, deleted, moved). Subscriptions
@@ -224,6 +217,7 @@ function formatDate(seconds: number): string {
         </template>
       </ElTableColumn>
     </ElTable>
+    </CollapsibleSection>
   </section>
 </template>
 

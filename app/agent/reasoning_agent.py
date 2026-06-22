@@ -57,6 +57,7 @@ from app.utils.common import limit_messages, truncate_messages, truncate_old_obs
 from app.utils.context_storage import clear_context, get_context, set_context
 from app.utils.logger import logger
 from app.utils.persona import read_persona_file
+from app.utils.working_directory import set_in_memory_override
 
 
 OBSERVATION_START_MARKER = "------------OBS-START------------"
@@ -71,24 +72,26 @@ LOADED_SKILLS_KEY = "_loaded_skill_ids"
 
 template_instruction = '''(***[VERY IMPORTANT] You MUST always call the "personal_assistant_react" function tool to return your reasoning step. DO NOT return any plain text. Always use the function call with the fields: Thought, Action, Action_Input, Thought_In_Next.***)
 {persona_description}
-You will have these tools to support you. Your task is to respond to user commands by determining the next step you need to take by querying the relevant tool(s) until the goal is achieved, at which point you will return the Final Answer.
-Please carefully consider the user's needs and construct a thoughtful plan to address them in the most intelligent way possible. You have access to the following tools below; only use the necessary tools in the reasoning steps.
-You must be cautious and think carefully about which tool to use and whether to use it at all.
-Reasoning steps should avoid repeating previous reasoning to prevent redundant information and conserve resources. If you have sufficient information, proceed to the next step. Please detect if the Thought content across the steps is repeating itself. If it is, immediately modify the Thought content to avoid entering a loop.
-When a user request targets a skill, just call the skill's tool with the user's request as **Action_Input** — the system decides whether to load the skill for immediate execution or register a recurring event subscription.
 
 Current time: {current_time}
 Current OS: {current_os}
 Current User Working Directory: `{current_user_working_directory}`
 
+You will have these tools to support you. Your task is to respond to user commands by determining the next step you need to take by querying the relevant tool(s) until the goal is achieved, at which point you will return the Final Answer.
+Please carefully consider the user's needs and construct a thoughtful plan to address them in the most intelligent way possible. You have access to the following tools below; only use the necessary tools in the reasoning steps.
+You must be cautious and think carefully about which tool to use and whether to use it at all.
+Reasoning steps should avoid repeating previous reasoning to prevent redundant information and conserve resources. If you have sufficient information, proceed to the next step. Please detect if the Thought content across the steps is repeating itself. If it is, immediately modify the Thought content to avoid entering a loop.
+When a user request targets a skill, just call the skill's tool with the user's request as **Action_Input** — the system decides whether to load the skill for immediate execution or register a recurring event subscription.
+For all user commands that contain a time structure within them, you must call the `datetime_parser` tool, and if they contain a time structure combined with a schedule, you must call the `scheduler` tool before calling any other tools, in order to analyze and normalize the time structure or the time + schedule structure for other tools to use. Please choose the tool type very carefully and do not confuse them — if the command belongs to a schedule structure, you must choose the `scheduler` tool and must not use `datetime_parser`.
+PRESERVE THE USER'S LANGUAGE: any human-facing value you put in a tool argument — especially the title/name of something you create on the user's behalf (a schedule event, reminder, note, or task) and any message shown to the user — MUST be written in the SAME language the user used. Do NOT translate it. Your internal Thought may be in any language, and tool/sub-tool names plus structured values (ISO datetimes, RRULE strings, enums, file paths, keys) stay exactly as specified.
 Tools:
 {tools}
 Use the following format:
 
 Input: the input you must answer
 Thought: you should always think about what to do
-Action: the action to take from Thought, should be one of {tool_names}
-Action_Input: the input sent to the action. For intrinsic tools, this is the response content to be sent to the user. Please respond in an easy-to-understand way, only text for the human listening (System information, technical specifications, and the device ID are hidden information)
+Action: the action to take from Thought, should be one of {tool_names} (Note that Action should only include the tool name and must not contain the SubTool name)
+Action_Input: the input sent to the action. For intrinsic tools, this is the response content to be sent to the user. Please respond in an easy-to-understand way, only text for the human listening (System information, technical specifications, and the device ID are hidden information). When the chosen Action lists Sub-Tools, begin Action_Input with the exact sub-tool name followed by its arguments as key="value" pairs, and ALWAYS include every required argument such as the file `path` (e.g. `overwrite_file path="notes.txt" diff="@@ -2,1 +2,1 @@ ..."`). Never send a bare diff or raw content without the sub-tool name and path.
 Thought_In_Next: you should always think about what to do next after observing the results of the action
 Observation: the result of the action, the observation content will be placed between '{OBSERVATION_START_MARKER}' and '{OBSERVATION_END_MARKER}' to help you clearly identify the observation content.
 {loaded_skills}'''
@@ -160,8 +163,16 @@ def _format_tool_for_prompt(tool, arguments: dict) -> str:
     if tools:
         text += "*   Sub-Tools:\n"
         for skill in tools:
+            # Render a call signature (name + argument names) so the model
+            # knows it must write `name arg="value" ...`, not bare content.
+            sig = skill.name
+            schema = skill.parameters if isinstance(skill.parameters, dict) else None
+            if schema:
+                shown = schema.get("required") or list((schema.get("properties") or {}).keys())
+                if shown:
+                    sig = f"{skill.name}({', '.join(shown)})"
             examples_str = ", ".join([f"'{ex}'" for ex in skill.examples]) if skill.examples else ""
-            text += f"    *   {skill.description}"
+            text += f"    *   {sig}: {skill.description}"
             if examples_str:
                 text += f", examples: {examples_str}"
             text += "\n"
@@ -185,11 +196,16 @@ class ReasoningAgent:
         reasoning: bool = True,
         allowed_skill_ids: Optional[set[str]] = None,
         triggered_by_event: bool = False,
+        memory_context: str = "",
     ):
         self.llm = llm
         self.registry = registry
         self.profile = profile
         self.reasoning = reasoning
+        # Pre-rendered MEMORY block (short/long-term) fetched by the caller and
+        # appended to the system instruction so it is never truncated by the
+        # history window. Empty when the memory feature is off / has no entries.
+        self._memory_context = memory_context or ""
         self.current_skills_directory = os.path.join(BaseConfig.CREMIND_SYSTEM_DIR, self.profile, "skills")
 
         cfg = resolve_agent_config(profile)
@@ -218,12 +234,15 @@ class ReasoningAgent:
             ]
         # Event-triggered runs must not register new watchers/events — that
         # path leads to recursive event storms (event → reasoning → register →
-        # event → …). Drop both tools so the LLM can't see or select them.
+        # event → …). ``register_skill_event`` is a standalone tool, so drop it
+        # outright. ``register_file_watcher`` is now a *subtool* of the
+        # ``system_file`` group (which we must keep for its file ops), so it is
+        # suppressed deeper down: ``_dispatch`` injects ``_triggered_by_event``
+        # into the System File call and ``system_file.get_prepare_tools`` hides
+        # the register subtool from the child LLM.
+        self._triggered_by_event = triggered_by_event
         if triggered_by_event:
-            tools = [
-                t for t in tools
-                if t.tool_id not in ("register_file_watcher", "register_skill_event")
-            ]
+            tools = [t for t in tools if t.tool_id != "register_skill_event"]
         self._tools = tools
         self._tools_by_id = {t.tool_id: t for t in self._tools}
         self._action_names = list(self._tools_by_id.keys())
@@ -409,7 +428,7 @@ class ReasoningAgent:
             if self.context_id else None
         )
         current_user_working_directory = override or get_user_working_directory()
-        return template_instruction.format(
+        instruction = template_instruction.format(
             persona_description=persona,
             current_time=f"{datetime.now().isoformat()}",
             current_os=platform.system(),
@@ -420,6 +439,9 @@ class ReasoningAgent:
             OBSERVATION_START_MARKER=OBSERVATION_START_MARKER,
             OBSERVATION_END_MARKER=OBSERVATION_END_MARKER,
         )
+        if self._memory_context:
+            instruction = f"{instruction}\n\n{self._memory_context}"
+        return instruction
 
     # ── config lookups ────────────────────────────────────────────────
 
@@ -862,6 +884,13 @@ class ReasoningAgent:
                 return
             arguments = {**arguments, **(pinned or {})}
 
+        # Event-triggered runs must not register new watchers. ``system_file``
+        # owns the ``register_file_watcher`` subtool now, so signal the run kind
+        # via a dispatch argument; ``system_file.get_prepare_tools`` reads it and
+        # hides that one subtool from the group's child LLM (file ops stay).
+        if tool.tool_id == "system_file" and self._triggered_by_event:
+            arguments = {**arguments, "_triggered_by_event": True}
+
         variables = self._load_variables(tool.tool_id) if tool.tool_type in (
             ToolType.A2A, ToolType.MCP, ToolType.BUILTIN,
         ) else {}
@@ -981,6 +1010,9 @@ class ReasoningAgent:
                 # Reset the dynamic enum mirror so change_working_directory's
                 # ``target`` falls back to the default values on the next turn.
                 clear_context(self.context_id, LOADED_SKILLS_KEY)
+                # Evict any stale per-call shell-dir override left by pre-fix
+                # conversations so it can never shadow the unified working dir.
+                clear_context(self.context_id, "current_shell_directory")
             done_chunk: Dict[str, Any] = {
                 "type": ChatCompletionTypeEnum.DONE,
                 "data": observation_text,
@@ -1006,6 +1038,9 @@ class ReasoningAgent:
             if self.context_id:
                 self._save_context(self.context_id)
                 clear_context(self.context_id, LOADED_SKILLS_KEY)
+                # Evict any stale per-call shell-dir override left by pre-fix
+                # conversations so it can never shadow the unified working dir.
+                clear_context(self.context_id, "current_shell_directory")
             yield {
                 "type": ChatCompletionTypeEnum.CLARIFY,
                 "data": observation_text,
@@ -1109,11 +1144,16 @@ class ReasoningAgent:
                 skill_text = f"{skill_text}\n\n{events_hint}"
             self._loaded_skill_sections[tool.tool_id] = skill_text
             self._loaded_skill_ids.add(tool.tool_id)
-            # Pin exec_shell's working directory to the loaded skill's dir so
-            # subsequent shell commands run inside the skill folder without
-            # the LLM having to re-supply current_shell_directory.
+            # Anchor the ONE conversation working directory to the loaded
+            # skill's own dir, using the canonical override key that
+            # system_file, exec_shell, and the "Current User Working Directory"
+            # prompt line all read. Persist + broadcast so it survives a reopen
+            # and refreshes any subscribed UI, exactly like the
+            # change_working_directory tool. Subsequent relative paths
+            # ("scripts/__main__.py", "references/devices.md") then resolve for
+            # both tools without the LLM having to navigate.
             if self.context_id:
-                set_context(self.context_id, "current_shell_directory", str(dir_path))
+                set_in_memory_override(self.context_id, str(dir_path))
                 # Mirror loaded skills into ContextStorage so per-request
                 # callbacks (change_working_directory.prepare_tools) can
                 # extend the ``target`` enum with the active skill IDs.
@@ -1122,6 +1162,25 @@ class ReasoningAgent:
                     LOADED_SKILLS_KEY,
                     sorted(self._loaded_skill_ids),
                 )
+                try:
+                    from app.events.runner import get_conversation_storage
+                    from app.utils.working_directory import persist_working_directory
+                    await persist_working_directory(
+                        self.context_id, str(dir_path), get_conversation_storage(),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to persist skill cwd anchor for %s", self.context_id,
+                    )
+                try:
+                    from app.events import get_event_stream_bus
+                    await get_event_stream_bus().publish(
+                        self.context_id, "cwd", {"working_directory": str(dir_path)},
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to publish skill cwd anchor for %s", self.context_id,
+                    )
             # The full SKILL.md content is shown to the user in the frontend's
             # Thinking Process via RESULT_ARTIFACT, but the recorded step in
             # self.steps only carries a short pointer — the actual content
@@ -1395,6 +1454,9 @@ class ReasoningAgent:
         if self.context_id:
             self._clear_context(self.context_id)
             clear_context(self.context_id, LOADED_SKILLS_KEY)
+            # Evict any stale per-call shell-dir override left by pre-fix
+            # conversations so it can never shadow the unified working dir.
+            clear_context(self.context_id, "current_shell_directory")
 
         yield {
             "type": ChatCompletionTypeEnum.DONE,

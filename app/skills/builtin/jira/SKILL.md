@@ -2,8 +2,12 @@
 name: jira
 description: Search, view, create, comment on, and transition Jira Cloud issues via OAuth2 (Atlassian 3LO), and receive issue-change events in real time. Authorizes through the Cremind Connect service (no Atlassian app setup on the client); tokens stay on this machine. A persistent listener registers a Jira webhook and (via the relay) drops changed issues as markdown, classified into per-lifecycle events (created/updated/transitioned/commented/deleted).
 metadata: {
-  environment_variables: ["CREMIND_CONNECT_URL", "ATLASSIAN_CLIENT_ID", "JIRA_SITE_URL"],
-  optional_environment_variables: ["CREMIND_CONNECT_URL", "ATLASSIAN_CLIENT_ID", "JIRA_SITE_URL", "JIRA_WEBHOOK_JQL"],
+  environment_variables: [
+    {"name": "CREMIND_CONNECT_URL", "description": "Cremind Connect base URL (OAuth broker)", "required": false, "type": "string", "default": "https://connect.cremind.io"},
+    {"name": "ATLASSIAN_CLIENT_ID", "description": "Atlassian OAuth Client ID (auto-fetched from Cremind Connect when blank)", "required": false, "type": "string", "default": ""},
+    {"name": "JIRA_SITE_URL", "description": "Jira site URL (default: first accessible site)", "required": false, "type": "string", "default": ""},
+    {"name": "JIRA_WEBHOOK_JQL", "description": "JQL filter selecting which issues raise events", "required": false, "type": "string", "default": "assignee = currentUser()"}
+  ],
   events: {"event_type":[{"name":"issue_created","description":"A Jira issue was created"},{"name":"issue_updated","description":"A Jira issue's fields were edited (other than a status transition)"},{"name":"issue_transitioned","description":"A Jira issue moved to a new status"},{"name":"issue_commented","description":"A comment was added to a Jira issue"},{"name":"issue_deleted","description":"A Jira issue was deleted (live only; a deletion while the listener is offline is missed)"}]},
   long_running_app: {
     command: "uv run scripts/event_listener.py",
@@ -44,7 +48,7 @@ an Atlassian OAuth 2.0 (3LO) app with the Jira scopes, the client secret stored 
 cremind-connect (`ATLASSIAN_CLIENT_SECRET`), and ONE callback URL registered in the
 Atlassian developer console (3LO apps allow only a single, exact-match callback per
 app). Cremind advertises a single FIXED redirect, `CREMIND_ATLASSIAN_REDIRECT_URI`,
-which defaults to `http://localhost:1515/api/oauth/atlassian/callback` (the documented
+which defaults to `http://localhost:1515/api/oauth/callback` (the documented
 K8s `port-forward svc/cremind 1515:80`). Register that exact URL — or set
 `CREMIND_ATLASSIAN_REDIRECT_URI` (chart: `cremind.atlassianRedirectUri`) to your own
 single URL and register that. Where the browser can't reach it, finish with
@@ -157,7 +161,7 @@ Issue ABC-123 was deleted.
 
 ## Troubleshooting
 - `Account not linked` → run `uv run scripts/__main__.py link`.
-- Linking error about the backend OAuth callback → run under `cremind serve`; the callback registered in the Atlassian console must exactly equal `CREMIND_ATLASSIAN_REDIRECT_URI` (default `http://localhost:1515/api/oauth/atlassian/callback`). If the consent redirect can't reach the backend (remote/Ingress/another port), finish with `uv run scripts/__main__.py complete-link --response "<the URL the browser landed on>"`.
+- Linking error about the backend OAuth callback → run under `cremind serve`; the callback registered in the Atlassian console must exactly equal `CREMIND_ATLASSIAN_REDIRECT_URI` (default `http://localhost:1515/api/oauth/callback`). If the consent redirect can't reach the backend (remote/Ingress/another port), finish with `uv run scripts/__main__.py complete-link --response "<the URL the browser landed on>"`.
 - `Atlassian /me returned no email` → the `read:me` scope wasn't granted; re-link.
 - No events arriving → confirm the listener is running, the webhook registered (`uv run scripts/__main__.py watch`), and the relay is reachable (`curl $CREMIND_CONNECT_URL/.well-known/cremind-connect`).
 - Webhook registers but **no events ever arrive** (and `GET /rest/api/3/webhook/failed` is empty) → the OAuth app is **private**, so Atlassian only delivers when the app owner == the registering user. Enable **Distribution → Sharing** (make the app public) in the developer console — no Marketplace approval needed.

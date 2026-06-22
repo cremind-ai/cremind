@@ -17,7 +17,7 @@ import {
   listLLMProviders, getProviderModels,
   getSkillMode, setSkillMode,
   streamFeaturesInstall, FeatureNotInstalledError,
-  deleteSkill, importSkillArchive, importSkillFromGitHub,
+  deleteSkill, importSkillArchive, importSkillFromGitHub, importSkillFromHub,
   type RemoteAgentInfo, type ToolStatus, type LLMProvider, type SkillMode,
   type FeatureNotInstalledDetail, type FeatureInstallEvent,
 } from '../services/configApi';
@@ -60,7 +60,7 @@ interface UnifiedItem {
   kind: 'builtin' | 'skill' | 'mcp-remote' | 'a2a-remote';
 
   toolName: string | null;  // tool_id used by /api/tools/{tool_id} endpoints
-  toolConfigFields: Record<string, { description: string; type: string; secret: boolean; configured: boolean }>;
+  toolConfigFields: Record<string, { description: string; type: string; secret: boolean; configured: boolean; required?: boolean; enum?: string[]; default?: unknown }>;
   toolConfigValues: Record<string, string>;
   toolConfigured: boolean;
 
@@ -95,6 +95,9 @@ interface UnifiedItem {
   /** LLM fields whose user override is forbidden. The matching switches/inputs
    *  in the form are rendered disabled. */
   lockedLlmFields: string[];
+  /** Built-in tools only: true when the enable/disable toggle is locked on
+   *  (the tool can't be disabled). Renders the switch disabled + a lock icon. */
+  toggleLocked: boolean;
   /** Skills only: true when the skill is a shipped built-in. Drives the
    *  "Reset to Default" vs "Delete" action on the skill card. */
   isBuiltinSkill: boolean;
@@ -133,13 +136,19 @@ const jsonConfigError = ref('');
 
 // Import skill dialog
 const showImportDialog = ref(false);
-const importForm = ref<{ mode: 'archive' | 'github'; url: string }>({ mode: 'archive', url: '' });
+const importForm = ref<{ mode: 'archive' | 'github' | 'hub'; url: string }>({ mode: 'archive', url: '' });
 const importFile = ref<File | null>(null);
 const importing = ref(false);
 const archiveInput = ref<HTMLInputElement | null>(null);
 
 // Categorized items -- driven by tool_type, not by agent_type
-const builtinItems = computed(() => items.value.filter(i => i.kind === 'builtin'));
+// Built-in tools list locked (non-disableable) tools first; the sort is
+// stable so tools keep their original relative order within each group.
+const builtinItems = computed(() =>
+  items.value
+    .filter(i => i.kind === 'builtin')
+    .sort((a, b) => Number(b.toggleLocked) - Number(a.toggleLocked)),
+);
 const skillItems = computed(() => items.value.filter(i => i.kind === 'skill'));
 const mcpRemoteItems = computed(() => items.value.filter(i => i.kind === 'mcp-remote'));
 const a2aRemoteItems = computed(() => items.value.filter(i => i.kind === 'a2a-remote'));
@@ -352,6 +361,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       llmBound: isSkill ? true : (tool.llm_bound ?? true),
       llmDefaults,
       lockedLlmFields,
+      toggleLocked: !!tool.toggle_locked,
       isBuiltinSkill: isSkill && !!tool.is_builtin,
       longRunningApp: tool.long_running_app ?? null,
       registering: false,
@@ -396,6 +406,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       llmBound: true,
       llmDefaults: {},
       lockedLlmFields: [],
+      toggleLocked: false,
       isBuiltinSkill: false,
       longRunningApp: null,
       registering: false,
@@ -436,6 +447,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       llmBound: true,
       llmDefaults: {},
       lockedLlmFields: [],
+      toggleLocked: false,
       isBuiltinSkill: false,
       longRunningApp: null,
       registering: false,
@@ -700,7 +712,7 @@ async function handleDeleteSkill(item: UnifiedItem) {
 
 // ── Skill import ──
 function openImportDialog() {
-  importForm.value = { mode: 'archive', url: '' };
+  importForm.value = { mode: 'hub', url: '' };
   importFile.value = null;
   if (archiveInput.value) archiveInput.value.value = '';
   showImportDialog.value = true;
@@ -735,7 +747,7 @@ async function handleImportSkill() {
         settingsStore.agentUrl, settingsStore.authToken, importFile.value,
       );
       reportImport(result);
-    } else {
+    } else if (importForm.value.mode === 'github') {
       const url = importForm.value.url.trim();
       if (!url) {
         ElMessage.error('Enter a GitHub repository URL');
@@ -743,6 +755,16 @@ async function handleImportSkill() {
       }
       const result = await importSkillFromGitHub(
         settingsStore.agentUrl, settingsStore.authToken, url,
+      );
+      reportImport(result);
+    } else {
+      const link = importForm.value.url.trim();
+      if (!link) {
+        ElMessage.error('Enter a Cremind Hub link or skill name');
+        return;
+      }
+      const result = await importSkillFromHub(
+        settingsStore.agentUrl, settingsStore.authToken, link,
       );
       reportImport(result);
     }
@@ -907,6 +929,7 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
                 :status-tag="getBuiltinStatusTag(item)"
                 :expanded="item.expanded"
                 :enabled="item.enabled"
+                :toggle-locked="item.toggleLocked"
                 :show-authenticate="item.showAuthenticate"
                 :show-unlink="item.showUnlink"
                 @toggle-expand="item.expanded = !item.expanded"
@@ -1016,6 +1039,7 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
                 :status-tag="getBuiltinStatusTag(item)"
                 :expanded="item.expanded"
                 :enabled="item.enabled"
+                :toggle-locked="item.toggleLocked"
                 :show-authenticate="item.showAuthenticate"
                 :show-unlink="item.showUnlink"
                 :show-remove="true"
@@ -1105,6 +1129,7 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
                 :status-tag="getRemoteStatusTag(item)"
                 :expanded="item.expanded"
                 :enabled="item.enabled"
+                :toggle-locked="item.toggleLocked"
                 :show-authenticate="item.showAuthenticate && !item.connectionError"
                 :show-unlink="item.showUnlink && !item.connectionError"
                 :show-reconnect="!!item.connectionError"
@@ -1174,6 +1199,7 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
                 :status-tag="getRemoteStatusTag(item)"
                 :expanded="item.expanded"
                 :enabled="item.enabled"
+                :toggle-locked="item.toggleLocked"
                 :show-authenticate="item.showAuthenticate && !item.connectionError"
                 :show-unlink="item.showUnlink && !item.connectionError"
                 :show-reconnect="!!item.connectionError"
@@ -1282,11 +1308,24 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
     <!-- Import Skill dialog -->
     <ElDialog v-model="showImportDialog" title="Import Skill" width="520px">
       <ElRadioGroup v-model="importForm.mode" size="small" class="import-mode-row">
+        <ElRadioButton value="hub">Cremind Hub</ElRadioButton>
         <ElRadioButton value="archive">Archive file</ElRadioButton>
         <ElRadioButton value="github">GitHub URL</ElRadioButton>
       </ElRadioGroup>
 
-      <div v-if="importForm.mode === 'archive'" class="import-section">
+      <div v-if="importForm.mode === 'hub'" class="import-section">
+        <p class="import-hint">
+          Paste a Cremind Hub skill link (or just the skill name). Cremind
+          downloads it from hub.cremind.io and installs it.
+        </p>
+        <ElInput
+          v-model="importForm.url"
+          placeholder="https://hub.cremind.io/skills/my-skill"
+          clearable
+        />
+      </div>
+
+      <div v-else-if="importForm.mode === 'archive'" class="import-section">
         <p class="import-hint">
           Upload a skill archive (.zip, .tar.gz, .tgz, .tar, .tar.bz2, .tar.xz).
           Every folder containing a valid SKILL.md will be installed.

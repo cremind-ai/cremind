@@ -13,6 +13,8 @@ from app.storage.conversation_storage import ConversationStorage
 from app.storage.dynamic_config_storage import DynamicConfigStorage
 from app.storage.event_subscription_storage import EventSubscriptionStorage
 from app.storage.file_watcher_storage import FileWatcherSubscriptionStorage
+from app.storage.schedule_event_storage import ScheduleEventSubscriptionStorage
+from app.storage.memory_storage import MemoryStorage
 from app.storage.tool_storage import ToolStorage, get_tool_storage
 
 _instance: ConversationStorage | None = None
@@ -20,6 +22,8 @@ _dynamic_config_instance: DynamicConfigStorage | None = None
 _autostart_instance: AutostartStorage | None = None
 _event_subscription_instance: EventSubscriptionStorage | None = None
 _file_watcher_instance: FileWatcherSubscriptionStorage | None = None
+_schedule_event_instance: ScheduleEventSubscriptionStorage | None = None
+_memory_instance: MemoryStorage | None = None
 
 
 def get_conversation_storage(provider: DatabaseProvider | None = None) -> ConversationStorage:
@@ -27,6 +31,13 @@ def get_conversation_storage(provider: DatabaseProvider | None = None) -> Conver
     if _instance is None:
         _instance = ConversationStorage(provider)
     return _instance
+
+
+def get_memory_storage(provider: DatabaseProvider | None = None) -> MemoryStorage:
+    global _memory_instance
+    if _memory_instance is None:
+        _memory_instance = MemoryStorage(provider)
+    return _memory_instance
 
 
 def get_dynamic_config_storage(provider: DatabaseProvider | None = None) -> DynamicConfigStorage:
@@ -57,6 +68,13 @@ def get_file_watcher_storage(provider: DatabaseProvider | None = None) -> FileWa
     return _file_watcher_instance
 
 
+def get_schedule_event_storage(provider: DatabaseProvider | None = None) -> ScheduleEventSubscriptionStorage:
+    global _schedule_event_instance
+    if _schedule_event_instance is None:
+        _schedule_event_instance = ScheduleEventSubscriptionStorage(provider)
+    return _schedule_event_instance
+
+
 def invalidate_storage_singletons() -> None:
     """Drop every cached storage instance.
 
@@ -65,12 +83,15 @@ def invalidate_storage_singletons() -> None:
     provider. Safe to call any time — re-resolution is lazy.
     """
     global _instance, _dynamic_config_instance, _autostart_instance
-    global _event_subscription_instance, _file_watcher_instance
+    global _event_subscription_instance, _file_watcher_instance, _memory_instance
+    global _schedule_event_instance
     _instance = None
     _dynamic_config_instance = None
     _autostart_instance = None
     _event_subscription_instance = None
     _file_watcher_instance = None
+    _schedule_event_instance = None
+    _memory_instance = None
 
     # Reach into the storage modules that hold their own singletons to drop
     # them too — otherwise they'd hold engines pointing at the old DB.
@@ -89,12 +110,16 @@ __all__ = [
     "DynamicConfigStorage",
     "EventSubscriptionStorage",
     "FileWatcherSubscriptionStorage",
+    "ScheduleEventSubscriptionStorage",
+    "MemoryStorage",
     "ToolStorage",
     "get_autostart_storage",
     "get_conversation_storage",
     "get_dynamic_config_storage",
     "get_event_subscription_storage",
     "get_file_watcher_storage",
+    "get_schedule_event_storage",
+    "get_memory_storage",
     "get_tool_storage",
     "invalidate_storage_singletons",
 ]

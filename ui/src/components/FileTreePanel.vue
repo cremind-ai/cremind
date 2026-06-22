@@ -28,6 +28,24 @@ const errorMessage = ref<string | null>(null);
 const truncated = ref(false);
 let abortCtl: AbortController | null = null;
 
+// The last directory that listed cleanly with no active conversation — the
+// fallback we roll back to when a subsequent no-conversation navigation lands
+// on an unlistable path (see loadRoot's catch).
+const lastGoodCwd = ref('');
+
+// Transient toast shown when we recover from a failed navigation, so the user
+// learns why the cwd didn't change without a persistent error screen.
+const treeToast = ref<string | null>(null);
+let treeToastTimer: ReturnType<typeof setTimeout> | null = null;
+function showTreeToast(msg: string) {
+  treeToast.value = msg;
+  if (treeToastTimer) clearTimeout(treeToastTimer);
+  treeToastTimer = setTimeout(() => {
+    treeToast.value = null;
+    treeToastTimer = null;
+  }, 4000);
+}
+
 async function loadRoot() {
   if (!panel.cwd) return;
   abortCtl?.abort();
@@ -45,8 +63,29 @@ async function loadRoot() {
     );
     rootEntries.value = data.entries;
     truncated.value = data.truncated;
+    // Only no-conversation cwds are safe rollback targets — conversation cwds
+    // are widened server-side via the override and may sit outside the static
+    // allowlist.
+    if (!chat.activeConversationId) lastGoodCwd.value = panel.cwd;
   } catch (e: unknown) {
     if ((e as Error)?.name === 'AbortError') return;
+    // Without a conversation, a 403/404 means the target resolves outside the
+    // allowlist (e.g. a symlink/junction pointing out of the working tree) or
+    // has vanished — there's no override to widen the allowlist and no async
+    // race. Roll the cwd back to the last good directory and toast, instead of
+    // stranding the tree on an error screen. (With a conversation, a transient
+    // 403 is the override-not-yet-set race, so we must NOT roll back.)
+    if (
+      e instanceof DirectoryAccessError &&
+      (e.status === 403 || e.status === 404) &&
+      !chat.activeConversationId &&
+      lastGoodCwd.value &&
+      lastGoodCwd.value !== panel.cwd
+    ) {
+      panel.setUserDefaultCwd(lastGoodCwd.value);
+      showTreeToast("That folder isn't accessible");
+      return; // the cwd change re-triggers loadRoot for the restored directory
+    }
     if (e instanceof DirectoryAccessError) {
       if (e.status === 403) {
         errorMessage.value = 'Path is outside accessible bases';
@@ -157,6 +196,9 @@ onMounted(async () => {
     try {
       const cwd = await getInitialCwd(settings.agentUrl, settings.authToken);
       panel.setUserDefaultCwd(cwd);
+      // Pin the working-dir root too — it's an allowed read base and the
+      // floor for no-conversation breadcrumb navigation.
+      panel.setUserWorkingRoot(cwd);
     } catch {
       /* fall through — a ready event will populate eventually */
     }
@@ -173,7 +215,10 @@ watch(
 );
 watch(() => panel.showHiddenFiles, loadRoot);
 
-onBeforeUnmount(closeWatch);
+onBeforeUnmount(() => {
+  closeWatch();
+  if (treeToastTimer) clearTimeout(treeToastTimer);
+});
 </script>
 
 <template>
@@ -228,6 +273,7 @@ onBeforeUnmount(closeWatch);
         </li>
       </ul>
     </div>
+    <div v-if="treeToast" class="tree-toast">{{ treeToast }}</div>
   </div>
 </template>
 
@@ -327,5 +373,22 @@ onBeforeUnmount(closeWatch);
 @keyframes spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
+}
+.tree-toast {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  z-index: 10;
+  padding: 6px 12px;
+  max-width: 90%;
+  background: var(--danger-color);
+  color: #fff;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  font-family: system-ui, sans-serif;
+  text-align: center;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  pointer-events: none;
 }
 </style>

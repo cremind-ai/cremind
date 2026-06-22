@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import shutil
 import sys
 import tempfile
@@ -86,6 +87,23 @@ def _zip_contents(path: Path) -> dict[str, bytes]:
     return out
 
 
+# ``app/__version__.py``'s ``__version__`` string is bumped on every release
+# (release-prod.yml's verify gate requires the bump on main), but the bundled
+# installer only uses that value for an HTTP User-Agent header and a synthetic
+# dev-forced label — never for an install decision. Comparing it verbatim would
+# mark the committed pyz "stale" on every version bump, failing CI on each prod
+# deploy. Neutralise just that one line so the freshness guard still catches
+# real source drift, including the load-bearing ``MIN_SUPPORTED_UPGRADE_FROM``
+# line in the same file.
+_VERSION_LINE_RE = re.compile(rb"^(__version__\s*=\s*).*$", re.MULTILINE)
+
+
+def _normalize(name: str, data: bytes) -> bytes:
+    if name == "app/__version__.py":
+        return _VERSION_LINE_RE.sub(rb'\g<1>"0.0.0"', data)
+    return data
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -98,7 +116,8 @@ def main() -> int:
     if args.check:
         # zipapp embeds the current timestamp in each zip entry, so two
         # consecutive builds never produce byte-identical archives. Compare
-        # the zip's *contents* (member name → file bytes) instead.
+        # the zip's *contents* (member name → file bytes) instead, with the
+        # per-release ``__version__`` string normalised out (see _normalize).
         if not OUT_PYZ.is_file():
             print(f"installer_tui.pyz is missing: {OUT_PYZ}", file=sys.stderr)
             return 1
@@ -106,8 +125,12 @@ def main() -> int:
             tmp_path = Path(tmp.name)
         try:
             _build_pyz(tmp_path)
-            existing = _zip_contents(OUT_PYZ)
-            fresh = _zip_contents(tmp_path)
+            existing = {
+                k: _normalize(k, v) for k, v in _zip_contents(OUT_PYZ).items()
+            }
+            fresh = {
+                k: _normalize(k, v) for k, v in _zip_contents(tmp_path).items()
+            }
         finally:
             tmp_path.unlink(missing_ok=True)
         if existing != fresh:
