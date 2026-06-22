@@ -36,7 +36,7 @@ from the Cremind Connect discovery doc (one-time org setup: an Atlassian 3LO app
 with the Confluence scopes, the secret in cremind-connect, and ONE callback URL —
 3LO apps allow a single, exact-match callback — registered in the developer console).
 Cremind advertises a single FIXED redirect, `CREMIND_ATLASSIAN_REDIRECT_URI`, default
-`http://localhost:1515/api/oauth/atlassian/callback`; register that or set the var
+`http://localhost:1515/api/oauth/callback`; register that or set the var
 (chart: `cremind.atlassianRedirectUri`) to your own and register it.
 Override in `scripts/.env` only if needed:
 ```
@@ -54,7 +54,7 @@ uv run scripts/__main__.py link
 Confirm with `uv run scripts/__main__.py status`.
 > Note: Atlassian allows a single, exact-match callback per app, so linking requires
 > running under `cremind serve` with `CREMIND_ATLASSIAN_REDIRECT_URI` (default
-> `http://localhost:1515/api/oauth/atlassian/callback`) registered in the developer
+> `http://localhost:1515/api/oauth/callback`) registered in the developer
 > console. If the redirect can't reach the backend (remote/Ingress/another port),
 > finish with `complete-link --response "<the URL you landed on>"`.
 
@@ -85,7 +85,7 @@ uv run scripts/__main__.py search --cql 'text ~ "roadmap" AND type = page ORDER 
 
 ## Troubleshooting
 - `Account not linked` → run `uv run scripts/__main__.py link`.
-- Linking error about the backend OAuth callback → run under `cremind serve`; the Atlassian-console callback must exactly equal `CREMIND_ATLASSIAN_REDIRECT_URI` (default `http://localhost:1515/api/oauth/atlassian/callback`). For remote/Ingress/another port, finish with `complete-link --response "<pasted URL>"`.
+- Linking error about the backend OAuth callback → run under `cremind serve`; the Atlassian-console callback must exactly equal `CREMIND_ATLASSIAN_REDIRECT_URI` (default `http://localhost:1515/api/oauth/callback`). For remote/Ingress/another port, finish with `complete-link --response "<pasted URL>"`.
 - `Atlassian /me returned no email` → the `read:me` scope wasn't granted; re-link.
 - Page `update` requires the current version → handled automatically (fetched before write).
 

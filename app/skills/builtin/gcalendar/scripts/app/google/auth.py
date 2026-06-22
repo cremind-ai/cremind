@@ -152,8 +152,8 @@ def _await_oauth_callback(state: str, *, timeout: float = 600.0) -> str:
 def _link_via_backend_route(flow, redirect_uri: str) -> Any:
     """Authorize via the backend's OAuth callback route.
 
-    ``cremind serve`` hosts ``GET /api/oauth/google/callback`` and injects the
-    browser-facing redirect (``<APP_URL>/api/oauth/google/callback``) as
+    ``cremind serve`` hosts ``GET /api/oauth/callback`` and injects the
+    browser-facing redirect (``<APP_URL>/api/oauth/callback``) as
     ``CREMIND_OAUTH_REDIRECT_URI``. The skill advertises it, waits for the backend
     to capture the consent redirect into ``oauth_inbox/<state>.txt``, then performs
     the PKCE token exchange locally. The redirect must be a loopback origin —
@@ -232,7 +232,7 @@ def link(
 
     Under ``cremind serve`` the backend hosts the persistent OAuth callback route
     and injects ``redirect_uri`` (``CREMIND_OAUTH_REDIRECT_URI`` =
-    ``<APP_URL>/api/oauth/google/callback``). The skill advertises it and waits for
+    ``<APP_URL>/api/oauth/callback``). The skill advertises it and waits for
     the backend to capture the consent redirect, so linking survives the agent
     turn / subprocess teardown that killed the old per-link server. When
     ``redirect_uri`` is unset — a standalone CLI run, or a non-loopback ``APP_URL``

@@ -59,7 +59,7 @@ uv run scripts/__main__.py link
 `link` prints a Google consent URL, then waits (in the background) for consent
 to complete. **Surface that URL to the user and ask them to open it and approve
 access.** The consent redirect is received by the always-running Cremind backend
-(its `/api/oauth/google/callback` route), so linking completes even though the command
+(its `/api/oauth/callback` route), so linking completes even though the command
 keeps running in the background. Once the user says they've approved, confirm:
 ```bash
 uv run scripts/__main__.py status

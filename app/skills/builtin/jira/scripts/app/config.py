@@ -39,11 +39,14 @@ JIRA_SITE_URL = os.environ.get("JIRA_SITE_URL", "").strip()
 # 'project = ABC', 'assignee = currentUser() AND issuetype = Task', '' (all issues).
 JIRA_WEBHOOK_JQL = os.environ.get("JIRA_WEBHOOK_JQL", "assignee = currentUser()").strip()
 
-# Browser-facing OAuth redirect, injected by ``cremind serve`` (system_vars) as
-# <APP_URL>/api/oauth/atlassian/callback. Atlassian 3LO requires a FIXED,
-# pre-registered callback URL, so this MUST be registered (exact match) in the
-# Atlassian developer console. Unset → use the manual ``complete-link`` paste.
-OAUTH_REDIRECT_URI = os.environ.get("CREMIND_ATLASSIAN_REDIRECT_URI", "").strip() or None
+# Browser-facing OAuth redirect for the Atlassian 3LO flow. Atlassian requires a
+# FIXED, pre-registered callback URL (exact match in the developer console), so —
+# unlike Google — this is a single fixed value independent of APP_URL. Defaults to
+# the documented localhost (suits native + the K8s ``port-forward svc/cremind 1515:80``);
+# override via CREMIND_ATLASSIAN_REDIRECT_URI (e.g. Helm cremind.atlassianRedirectUri).
+OAUTH_REDIRECT_URI = os.environ.get(
+    "CREMIND_ATLASSIAN_REDIRECT_URI", "http://localhost:1515/api/oauth/callback"
+).strip() or None
 
 # Re-register/refresh the Jira dynamic webhook this often. Jira expires dynamic
 # webhooks after 30 days; refresh well inside that window (default ~20 days).

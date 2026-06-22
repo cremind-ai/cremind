@@ -25,7 +25,7 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
 
 # Browser-facing OAuth redirect, injected by ``cremind serve`` (system_vars) as
-# <APP_URL>/api/oauth/google/callback when APP_URL is a loopback origin. The
+# <APP_URL>/api/oauth/callback when APP_URL is a loopback origin. The
 # backend captures the consent redirect there; the skill polls oauth_inbox and
 # does the local PKCE exchange. Unset → fall back to an ephemeral loopback server
 # (standalone CLI) or the manual ``complete-link`` paste (non-loopback APP_URL).

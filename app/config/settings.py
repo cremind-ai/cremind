@@ -300,20 +300,6 @@ class BaseConfig:
     DISABLE_LOG = _bool(os.environ.get("DISABLE_LOG", "false"))
     CORS_ALLOWED_ORIGINS = _csv_list(os.environ.get("CORS_ALLOWED_ORIGINS", "")) or ["*"]
 
-    # ── Atlassian 3LO callback (built-in jira/confluence skills) ──
-    # Atlassian is a confidential Web client whose callback URL is registered in
-    # the developer console with EXACT match and only ONE URL per app. Unlike the
-    # Google Desktop client (loopback, any port — derived per-deployment from
-    # APP_URL), this is a SINGLE FIXED URL shared by every deployment: register it
-    # once and set this to match. The default suits local + the documented
-    # Kubernetes ``kubectl port-forward svc/cremind 1515:80``. Where the browser
-    # can't reach it (Ingress, or a non-default port), linking falls back to the
-    # manual ``complete-link`` paste — the exchange still uses THIS value, so it
-    # always matches the registration regardless of how the user reached Cremind.
-    CREMIND_ATLASSIAN_REDIRECT_URI = os.environ.get(
-        "CREMIND_ATLASSIAN_REDIRECT_URI", "http://localhost:1515/api/oauth/atlassian/callback"
-    ).strip()
-
     # ── Application-level (TOML defaults, overridable via SQLite) ──
     SERVICE_NAME = _dynaconf_get("general.service_name", "cremind-agent")
     AGENT_ID = _dynaconf_get("general.agent_id", "cremind_agent")
