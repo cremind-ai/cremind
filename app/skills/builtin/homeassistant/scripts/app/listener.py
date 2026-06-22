@@ -172,7 +172,7 @@ def _remove_from_inventory(entity_id: str) -> None:
 
 
 def _update_names_inventory(entity_id: str, old_state, new_state: dict[str, Any]) -> None:
-    """Best-effort: keep this entity's line in references/device_names.md current — but only
+    """Best-effort: keep this entity's line in the SKILL.md Device list current — but only
     when its friendly name actually changed (or it is a brand-new entity). A plain state
     change leaves the old and new names equal, so the common path touches nothing here and the
     name index stays low-churn. ``old_state`` is the event's prior state (None for a new entity)."""
@@ -181,19 +181,19 @@ def _update_names_inventory(entity_id: str, old_state, new_state: dict[str, Any]
     if isinstance(old_state, dict):
         old_name = (old_state.get("attributes") or {}).get("friendly_name") or entity_id
     if old_name == new_name:
-        return  # name unchanged (state-only change) -> device_names.md untouched, no I/O
+        return  # name unchanged (state-only change) -> Device list untouched, no I/O
     try:
         device_names.upsert(entity_id, new_name)
     except OSError as e:
-        log.debug("device_names.md upsert failed for %s: %s", entity_id, e)
+        log.debug("Device list upsert failed for %s: %s", entity_id, e)
 
 
 def _remove_from_names_inventory(entity_id: str) -> None:
-    """Best-effort: drop this entity's line from references/device_names.md."""
+    """Best-effort: drop this entity's line from the SKILL.md Device list."""
     try:
         device_names.remove(entity_id)
     except OSError as e:
-        log.debug("device_names.md remove failed for %s: %s", entity_id, e)
+        log.debug("Device list remove failed for %s: %s", entity_id, e)
 
 
 def _device_rows(states: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -235,7 +235,7 @@ def _handle_state_changed(data: dict[str, Any], state: dict[str, Any]) -> Option
 
     # Keep the inventories current for every fresh change, even ones that classify to no
     # notable event type (the `event_type is None` path below returns early). devices.md
-    # tracks state on every tick; device_names.md only rewrites when the name actually changed.
+    # tracks state on every tick; the Device list only rewrites when the name actually changed.
     _update_inventory(entity_id, new_state)
     _update_names_inventory(entity_id, old_state, new_state)
 
@@ -285,7 +285,7 @@ def _baseline(state: dict[str, Any]) -> None:
     try:
         device_names.full_sync(rows)
     except OSError as e:
-        log.debug("device_names.md full_sync failed during baseline: %s", e)
+        log.debug("Device list full_sync failed during baseline: %s", e)
     log.info("baseline complete: tracking %d entit%s",
              len(entities), "y" if len(entities) == 1 else "ies")
 

@@ -80,7 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser(
         "sync-devices",
-        help="rebuild references/devices.md + references/device_names.md from current states "
+        help="rebuild references/devices.md + this SKILL.md's Device list from current states "
         "(one line per device)",
     )
 

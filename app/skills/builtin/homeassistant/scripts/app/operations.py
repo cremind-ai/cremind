@@ -98,8 +98,8 @@ def states(domain: Optional[str] = None, query: Optional[str] = None) -> list[di
 
 
 def sync_devices() -> dict:
-    """Rebuild references/devices.md and references/device_names.md from current states
-    (filtered by HA_ENTITY_FILTER), in a single REST round trip.
+    """Rebuild references/devices.md and the SKILL.md "## Device list" section from current
+    states (filtered by HA_ENTITY_FILTER), in a single REST round trip.
 
     Lets the inventories be populated/repaired on demand, without the listener running."""
     with HaRestClient() as c:
@@ -111,7 +111,7 @@ def sync_devices() -> dict:
         "ok": True,
         "count": len(rows),
         "path": str(config.DEVICES_FILE),
-        "device_names_path": str(config.DEVICE_NAMES_FILE),
+        "device_list_path": str(config.SKILL_FILE),
     }
 
 
