@@ -56,6 +56,10 @@ class ToolSkill:
     name: str
     description: str
     examples: List[str] = field(default_factory=list)
+    # Optional JSON-schema for the sub-tool's arguments. When present, the
+    # reasoning prompt renders a call signature (e.g. ``overwrite_file(path,
+    # diff)``) so the model knows how to format its Action_Input.
+    parameters: Optional[Dict[str, Any]] = None
 
 
 # ── Event stream emitted by Tool.execute() ─────────────────────────────────
