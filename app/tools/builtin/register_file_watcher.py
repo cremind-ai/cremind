@@ -1,14 +1,22 @@
-"""Register File Watcher built-in tool.
+"""File-watcher subtools for the System File built-in tool.
 
-Records a (conversation, root_path, event_types, filters, action) tuple so
-that whenever the watchdog ``Observer`` mounted at ``root_path`` reports a
-matching filesystem event, the reasoning agent re-runs ``action`` with a
-synthetic trigger payload describing the event — and streams the result
-into the conversation.
+Defines the three file-watcher functions — :class:`RegisterFileWatcherTool`,
+:class:`ListFileWatchersTool`, :class:`DeleteFileWatcherTool` — that are folded
+into the ``system_file`` tool group's ``get_tools()`` factory. This module is
+no longer a standalone built-in tool (it has no ``TOOL_CONFIG`` / ``SERVER_NAME``
+/ ``get_tools`` and is not listed in ``_BUILTIN_MODULE_NAMES``); it is a pure
+implementation home for those subtools.
 
-Mirrors :mod:`register_skill_event` structurally; the divergence is that
-the trigger payload comes from the watchdog event itself rather than from
-a ``.md`` file appearing under ``events/<event_type>/``.
+``RegisterFileWatcherTool`` records a (conversation, root_path, event_types,
+filters, action) tuple so that whenever the watchdog ``Observer`` mounted at
+``root_path`` reports a matching filesystem event, the reasoning agent re-runs
+``action`` with a synthetic trigger payload describing the event — and streams
+the result into the conversation.
+
+The routing guidance that used to live in the standalone tool's
+``system_prompt`` now lives in each class's ``description`` (the System File
+group has no group-level ``system_prompt``, so per-function descriptions drive
+both the child-LLM routing and the parent agent's Sub-Tools listing).
 """
 
 from __future__ import annotations
@@ -20,55 +28,11 @@ from app.config.settings import get_user_working_directory
 from app.events import get_file_watcher_manager
 from app.storage import get_file_watcher_storage
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
-from app.types import ToolConfig
 from app.utils.logger import logger
 
 
-SERVER_NAME = "Register File Watcher"
-
 _VALID_EVENT_TYPES: tuple[str, ...] = ("created", "modified", "deleted", "moved")
 _VALID_TARGET_KINDS: tuple[str, ...] = ("file", "folder", "any")
-
-
-TOOL_CONFIG: ToolConfig = {
-    "name": "register_file_watcher",
-    "display_name": "Register File Watcher",
-    "default_model_group": "low",
-    "hidden": True,
-    "llm_parameters": {
-        "tool_instructions": (
-            "Use 'Register File Watcher' when the user asks to be notified or "
-            "to take action whenever something happens to a file or folder "
-            "on disk. Please pass the full user request into this tool so it "
-            "can analyze and process it, including both the **trigger** and "
-            "the **action** of the command."
-        ),
-        "system_prompt": (
-            "You convert a file-watch registration request into a structured "
-            "tool call.\n"
-            "Always call register_file_watcher with at minimum `path` and "
-            "`action`. Decide sensible defaults for `triggers` (created, "
-            "modified, deleted, moved), `target_kind` (file / folder / any), "
-            "`extensions`, and `recursive` (default true) based on what the "
-            "user said.\n"
-            "`action` is a natural-language instruction the assistant will "
-            "execute when the watcher fires; do not embed event metadata "
-            "into it — the runtime appends a structured Content block "
-            "automatically.\n"
-            "Examples:\n"
-            "  user: \"when a python file changes in the 'MyDocs' directory, "
-            "notify me\"\n"
-            "  → path=\"MyDocs\", triggers=[\"modified\",\"created\"], "
-            "target_kind=\"file\", extensions=[\".py\"], "
-            "action=\"notify the user about the change\"\n"
-            "Use list_file_watchers when the user asks what watchers exist "
-            "(default scope=\"profile\"; use scope=\"conversation\" if they "
-            "scope the question to the current chat).\n"
-            "Use delete_file_watcher with the `id` returned by a prior "
-            "register/list call when they ask to remove or stop one.\n"
-        ),
-    },
-}
 
 
 def _normalize_string_list(raw: Any, *, lower: bool = False) -> List[str]:
@@ -158,6 +122,22 @@ def _auto_name(root_path: str, extensions: List[str], target_kind: str) -> str:
 
 class RegisterFileWatcherTool(BuiltInTool):
     name: str = "register_file_watcher"
+    description: str = (
+        "Register a watcher on a directory that re-runs an action (or notifies "
+        "the user) whenever files or folders inside it are created, modified, "
+        "deleted, or moved. Use this when the user asks to be notified or to "
+        "take action whenever something happens to a file or folder on disk. "
+        "Requires at minimum `path` and `action`. Defaults: `triggers` = all "
+        "four events (created, modified, deleted, moved); `target_kind` = any "
+        "(file / folder / any); `recursive` = true; `extensions` = none "
+        "(match all). `action` is a natural-language instruction the assistant "
+        "executes when the watcher fires — do not embed event metadata into it; "
+        "the runtime appends a structured Content block describing the event "
+        "automatically. Example: 'when a python file changes in MyDocs, notify "
+        "me' → path='MyDocs', triggers=['modified','created'], "
+        "target_kind='file', extensions=['.py'], action='notify the user about "
+        "the change'."
+    )
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -418,6 +398,11 @@ def _format_subscription_line(idx: int, sub: Dict[str, Any]) -> str:
 
 class ListFileWatchersTool(BuiltInTool):
     name: str = "list_file_watchers"
+    description: str = (
+        "List the registered file watchers. Use scope='profile' (default) for "
+        "every watcher owned by the user, or scope='conversation' to narrow to "
+        "watchers registered in the current chat."
+    )
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -530,6 +515,10 @@ class ListFileWatchersTool(BuiltInTool):
 
 class DeleteFileWatcherTool(BuiltInTool):
     name: str = "delete_file_watcher"
+    description: str = (
+        "Stop and remove a file watcher by the `id` returned from a prior "
+        "register_file_watcher or list_file_watchers call."
+    )
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -607,11 +596,3 @@ class DeleteFileWatcherTool(BuiltInTool):
                 "path": existing["root_path"],
             },
         )
-
-
-def get_tools(config: dict) -> list[BuiltInTool]:
-    return [
-        RegisterFileWatcherTool(),
-        ListFileWatchersTool(),
-        DeleteFileWatcherTool(),
-    ]

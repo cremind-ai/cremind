@@ -12,7 +12,7 @@ import os
 import platform
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict, List, Optional
 
 from app.tools.builtin.base import (
     BuiltInTool,
@@ -946,7 +946,20 @@ class WriteFileFromReferenceTool(BuiltInTool):
 
 
 def get_tools(config: dict) -> list[BuiltInTool]:
-    """Return tool instances for this server."""
+    """Return tool instances for this server.
+
+    The three file-watcher subtools (register/list/delete) used to be a
+    standalone "Register File Watcher" tool; they are folded in here so file
+    watching lives under the same always-on System File tool. The watcher
+    classes resolve their own context (``_profile``/``_context_id`` injected by
+    the adapter) and need no ``data_dir``.
+    """
+    from app.tools.builtin.register_file_watcher import (
+        DeleteFileWatcherTool,
+        ListFileWatchersTool,
+        RegisterFileWatcherTool,
+    )
+
     data_dir = config.get("CREMIND_SYSTEM_DIR", os.path.join(os.path.expanduser("~"), ".cremind"))
     return [
         SearchFilesTool(data_dir=data_dir),
@@ -955,6 +968,9 @@ def get_tools(config: dict) -> list[BuiltInTool]:
         ReadFileTool(data_dir=data_dir),
         WriteFileTool(data_dir=data_dir),
         WriteFileFromReferenceTool(data_dir=data_dir),
+        RegisterFileWatcherTool(),
+        ListFileWatchersTool(),
+        DeleteFileWatcherTool(),
     ]
 
 
@@ -976,7 +992,11 @@ TOOL_CONFIG: ToolConfig = {
             "root. To act on the current directory itself, omit `path` (or "
             "pass '.'). Never repeat the working directory's own name as a "
             "`path` value: if the user says 'list files in the Lee folder' "
-            "and the cwd is already '.../Lee', call list_files with no path."
+            "and the cwd is already '.../Lee', call list_files with no path. "
+            "Also registers file/folder watchers that notify you or re-run an "
+            "action whenever files are created, modified, deleted, or moved on "
+            "disk — use this when the user asks to be notified or to act on "
+            "changes to a file or folder."
         ),
     },
     "required_config": {
@@ -1020,5 +1040,38 @@ def _make_server_instructions(_data_dir: str) -> str:
     return (
         "A file management assistant. Operates inside the conversation's "
         "current working directory; all `path` arguments are relative to "
-        "that directory and default to '.' when omitted."
+        "that directory and default to '.' when omitted. Also registers "
+        "file/folder watchers that notify you or re-run an action whenever "
+        "files are created, modified, deleted, or moved on disk."
     )
+
+
+def get_prepare_tools() -> Optional[Callable]:
+    """Module hook auto-detected by ``register_builtin_tools``.
+
+    Returns a ``prepare_tools`` callback that suppresses the
+    ``register_file_watcher`` subtool on event-triggered runs. Registering a
+    new watcher while *reacting* to a watcher/skill event risks recursive
+    event storms (event → reasoning → register → event → …), so the reasoning
+    agent injects ``_triggered_by_event=True`` into the System File dispatch
+    arguments for those runs (see ``reasoning_agent._dispatch``). ``list`` and
+    ``delete`` stay available — they pose no storm risk.
+    """
+
+    def prepare_tools(
+        query: str,  # noqa: ARG001
+        tools: List[Dict[str, Any]],
+        *,
+        arguments: Optional[Dict[str, Any]] = None,
+        context_id: Optional[str] = None,  # noqa: ARG001
+        profile: Optional[str] = None,  # noqa: ARG001
+        **_: Any,
+    ) -> List[Dict[str, Any]]:
+        if not (arguments or {}).get("_triggered_by_event"):
+            return tools
+        return [
+            t for t in tools
+            if (t.get("function") or {}).get("name") != "register_file_watcher"
+        ]
+
+    return prepare_tools
