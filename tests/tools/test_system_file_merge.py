@@ -62,7 +62,8 @@ def test_get_tools_includes_watcher_subtools() -> None:
     names = {t.name for t in tools}
     assert _WATCHER_NAMES.issubset(names)
     assert "grep_files" in names
-    assert len(tools) == 10  # 7 file ops + 3 watcher functions
+    assert {"move_file", "copy_file"}.issubset(names)
+    assert len(tools) == 12  # 9 file ops (incl. move/copy) + 3 watcher functions
 
 
 def test_watcher_subtools_are_self_describing() -> None:
