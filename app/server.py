@@ -814,7 +814,16 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
             if config_storage.is_setup_complete():
                 try:
                     runner = model_group_mgr.create_llm_for_group("high", profile="admin")
-                except ValueError as e:
+                except (ValueError, ImportError) as e:
+                    # ValueError: the provider is misconfigured or its
+                    # credentials are missing. ImportError (incl.
+                    # ModuleNotFoundError): the provider's optional SDK isn't
+                    # installed — e.g. the `openai` extra that backs
+                    # github-copilot and every OpenAI-compatible provider.
+                    # Either way, degrade gracefully: leave runner=None so the
+                    # server still boots and the user can fix the model-group
+                    # config from the UI, rather than hard-crashing the whole
+                    # process the way an uncaught ModuleNotFoundError would.
                     logger.warning(f"Failed to create 'high' group LLM: {e}")
 
             cremind_agent = CremindAgent(
