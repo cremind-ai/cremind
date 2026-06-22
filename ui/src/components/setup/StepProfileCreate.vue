@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref } from 'vue';
-import { ElButton, ElAlert, ElSelect, ElOption } from 'element-plus';
+import { ElButton, ElAlert, ElSelect, ElOption, ElMessage } from 'element-plus';
 import { Icon } from '@iconify/vue';
+import { useCopyToClipboard } from '../../composables/useCopyToClipboard';
 
 defineProps<{
   token: string;
@@ -16,6 +17,11 @@ const emit = defineEmits<{
 }>();
 
 const exportFormat = ref<'md' | 'json' | 'env'>('md');
+
+const { copy, isCopied } = useCopyToClipboard();
+async function copyValue(text: string, key: string) {
+  if (!(await copy(text, key))) ElMessage.error('Failed to copy');
+}
 </script>
 
 <template>
@@ -43,7 +49,13 @@ const exportFormat = ref<'md' | 'json' | 'env'>('md');
       <ElAlert type="success" :closable="false" show-icon class="token-alert">
         <template #title>Setup Complete!</template>
         Download your configuration below. The token inside is also saved at
-        <code>~/.cremind/tokens/{{ profileName }}.token</code> on the server.
+        <code>~/.cremind/tokens/{{ profileName }}.token</code><button
+          type="button"
+          class="copy-icon-btn"
+          :class="{ copied: isCopied('path-alert') }"
+          :title="isCopied('path-alert') ? 'Copied!' : 'Copy path'"
+          @click="copyValue(`~/.cremind/tokens/${profileName}.token`, 'path-alert')"
+        ><Icon :icon="isCopied('path-alert') ? 'mdi:check' : 'mdi:content-copy'" /></button> on the server.
       </ElAlert>
 
       <ElAlert
@@ -93,7 +105,13 @@ const exportFormat = ref<'md' | 'json' | 'env'>('md');
         The export bundles your token, project paths, database and vector-store
         parameters, embedding settings, channels, and the VNC password when
         running under Docker. If you lose the token later, recover it from
-        <code>~/.cremind/tokens/{{ profileName }}.token</code> on the server.
+        <code>~/.cremind/tokens/{{ profileName }}.token</code><button
+          type="button"
+          class="copy-icon-btn"
+          :class="{ copied: isCopied('path-infobox') }"
+          :title="isCopied('path-infobox') ? 'Copied!' : 'Copy path'"
+          @click="copyValue(`~/.cremind/tokens/${profileName}.token`, 'path-infobox')"
+        ><Icon :icon="isCopied('path-infobox') ? 'mdi:check' : 'mdi:content-copy'" /></button> on the server.
       </div>
     </div>
   </div>
@@ -109,6 +127,23 @@ const exportFormat = ref<'md' | 'json' | 'env'>('md');
 .info-value { font-family: monospace; font-size: 0.95rem; color: var(--primary-color); font-weight: 600; }
 .token-alert { margin-bottom: 16px; }
 .token-alert code { background: var(--surface-color); padding: 1px 4px; border-radius: 3px; font-size: 0.75rem; }
+.copy-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 1px;
+  margin-left: 4px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  transition: color 0.15s ease;
+}
+.copy-icon-btn:hover { color: var(--primary-color); }
+.copy-icon-btn.copied { color: var(--success-color); }
 .save-required-alert { margin-bottom: 16px; }
 .download-controls {
   display: flex; align-items: flex-end; gap: 12px;
