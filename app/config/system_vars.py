@@ -83,6 +83,7 @@ class SystemVarSpec:
     name: str
     resolve: Callable[[Optional[str]], Optional[str]]
     description: str = ""
+    secret: bool = False
 
 
 SYSTEM_VARS: list[SystemVarSpec] = [
@@ -112,9 +113,15 @@ SYSTEM_VARS: list[SystemVarSpec] = [
         description="Loopback URL of this server for the `cremind` CLI.",
     ),
     SystemVarSpec(
+        name="CREMIND_PROFILE",
+        resolve=lambda profile: profile or None,
+        description="Active profile name; omitted when no profile is set.",
+    ),
+    SystemVarSpec(
         name="CREMIND_TOKEN",
         resolve=_load_cremind_token,
         description="Per-profile Cremind token; omitted when missing.",
+        secret=True,
     ),
 ]
 

@@ -1014,6 +1014,7 @@ export interface SystemVar {
   name: string;
   description: string;
   value: string | null;
+  secret: boolean;
 }
 
 export async function fetchSystemVars(
