@@ -80,7 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser(
         "sync-devices",
-        help="rebuild references/devices.md from current states (one line per device)",
+        help="rebuild references/devices.md + references/device_names.md from current states "
+        "(one line per device)",
     )
 
     sp = sub.add_parser("call-service", help="call a service to control devices, e.g. light.turn_on")
