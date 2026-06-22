@@ -1372,6 +1372,7 @@ class ExecShellTool(BuiltInTool):
             },
             "current_shell_directory": {
                 "type": "string",
+                "description": "Require absolute path"
             },
             "timeout": {
                 "type": "integer",
