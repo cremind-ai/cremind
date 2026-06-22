@@ -24,11 +24,20 @@ def test_relative_path_resolves_under_base(tmp_path):
     assert target == os.path.realpath(os.path.join(base, "sub", "file.txt"))
 
 
-def test_leading_slash_is_treated_as_relative(tmp_path):
-    # "/foo" (no drive on Windows) must stay relative to base, not escape.
-    base = str(tmp_path)
-    target = _safe_resolve(base, "/foo.txt")
-    assert target == os.path.realpath(os.path.join(base, "foo.txt"))
+def test_leading_slash_never_escapes_base(tmp_path):
+    # "/foo.txt" has no drive letter, so os.path.isabs classifies it differently
+    # per platform: absolute on POSIX (→ rejected as outside the allowed roots)
+    # but drive-relative on Windows/py3.13+ (→ resolved under base). Either way
+    # it must NOT escape the base directory — that no-escape property is what
+    # this guards, regardless of which branch the platform takes.
+    base = os.path.realpath(str(tmp_path))
+    try:
+        target = _safe_resolve(base, "/foo.txt")
+    except ValueError as exc:
+        assert "Access denied" in str(exc)  # POSIX: absolute path, outside roots
+    else:
+        # Windows: treated as drive-relative, stays under base.
+        assert target == base or target.startswith(base + os.sep)
 
 
 def test_absolute_path_inside_base_is_accepted(tmp_path):

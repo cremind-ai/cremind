@@ -695,6 +695,7 @@ dev = [
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "tiktoken" },
 ]
 
 [package.metadata]
@@ -771,6 +772,7 @@ dev = [
     { name = "pre-commit", specifier = ">=3.6.0" },
     { name = "pytest", specifier = ">=9.0.2" },
     { name = "ruff", specifier = ">=0.8.0" },
+    { name = "tiktoken", specifier = ">=0.12.0" },
 ]
 
 [[package]]
