@@ -124,6 +124,7 @@ force JSON with `--json`).
 | `list-entities` | — | `--domain light`, `--query STR`, `--max-results N` (200) |
 | `get-state` | `--entity light.kitchen` | — |
 | `states` | — | `--domain`, `--query` |
+| `sync-devices` | — | — |
 | `call-service` | `--domain`, `--service` | `--entity light.kitchen`, `--data '<json>'` |
 
 - `check` validates auth + connectivity and reports the auth mode (`llat`/`oauth`), HA version,
@@ -132,6 +133,10 @@ force JSON with `--json`).
   removes the stored OAuth tokens.
 - `list-entities` / `states` filter client-side by `--domain` (the part before the dot in an
   `entity_id`) and `--query` (case-insensitive substring over `entity_id` + friendly name).
+- `sync-devices` (re)builds `references/devices.md` — a concise, one-line-per-device inventory
+  (see below) — from the current states, filtered by `HA_ENTITY_FILTER`. The listener maintains
+  this file automatically; run this verb to populate it before the listener's first run, or to
+  force a fresh snapshot.
 - `call-service` controls devices. `--entity` is sugar for `--data '{"entity_id": "..."}'`.
   Calling a service with **no** `--entity` and **no** `--data` can affect every matching device
   (e.g. every light) — the CLI warns when both are absent.
@@ -152,6 +157,9 @@ uv run scripts/__main__.py list-entities --query temperature
 # Read one entity (state + attributes)
 uv run scripts/__main__.py get-state --entity light.kitchen
 
+# Build the concise device inventory at references/devices.md (one line per device)
+uv run scripts/__main__.py sync-devices
+
 # Turn a light on / off
 uv run scripts/__main__.py call-service --domain light --service turn_on --entity light.kitchen
 uv run scripts/__main__.py call-service --domain light --service turn_off --entity light.kitchen
@@ -160,6 +168,30 @@ uv run scripts/__main__.py call-service --domain light --service turn_off --enti
 uv run scripts/__main__.py call-service --domain light --service turn_on \
     --data '{"entity_id": "light.kitchen", "brightness": 200, "color_name": "tomato"}'
 ```
+
+## Device inventory (`references/devices.md`)
+
+`references/devices.md` is a concise, **always-current snapshot of every tracked device** — one
+line per entity, so the whole picture loads cheaply without an API round trip:
+
+```
+light.kitchen | Kitchen Light | light | on
+binary_sensor.front_door | Front Door | binary_sensor/door | off
+sensor.living_room | Living Room Temp | sensor/temperature | 21.5
+```
+
+The format is `entity_id | name | type | state`, where **type** is the entity's domain, or
+`domain/device_class` when it has one (e.g. `binary_sensor/motion`, `sensor/temperature`).
+
+- It mirrors `HA_ENTITY_FILTER` — exactly the entities the listener watches.
+- **Auto-maintained — do not hand-edit.** The listener full-syncs the whole file on every
+  (re)connect and rewrites only the **single changed line** on each state change; `sync-devices`
+  rebuilds it on demand. Manual edits are overwritten.
+- It exists only after the listener has run once (or after `sync-devices`).
+
+Read this file when you need the current name / type / state of devices at a glance.
+
+Before interacting with any device, always load the `references/devices.md` file to check all device information and status.
 
 ## Entity filtering (important)
 
@@ -190,6 +222,9 @@ Behavior:
   access token), and subscribes to `state_changed`.
 - **Classification**: each change is mapped to a **granular event type** (see below) and written
   to `events/<event_type>/<YYYY-MM-DDTHH-MM-SS> <friendly name>.md`.
+- **Device inventory**: maintains `references/devices.md` (one line per tracked device,
+  `entity_id | name | type | state`) — a full snapshot on each (re)connect, and a single-line
+  in-place update on each change. See [Device inventory](#device-inventory-referencesdevicesmd).
 - **State**: persisted to `scripts/.listener_state.json` (gitignored). Delete it to force a
   re-baseline. Auto-wipes if `HA_URL` changes.
 - **Reconnect**: on dropped sockets or HA restarts, the listener reconnects, re-authenticates
@@ -261,6 +296,8 @@ homeassistant/
 ├── SKILL.md
 ├── events/
 │   └── <event_type>/              # one markdown drop-zone per classified event type
+├── references/
+│   └── devices.md                 # auto-maintained current device inventory (untracked at runtime)
 └── scripts/
     ├── .env                       # HA_URL (+ optional HA_TOKEN and other vars)
     ├── __main__.py                # CLI entry (uv run scripts/__main__.py ...)
@@ -271,7 +308,8 @@ homeassistant/
         ├── auth.py                # LLAT + OAuth (IndieAuth loopback) token management
         ├── homeassistant_api.py   # HaRestClient (requests) + HaWebSocketClient (websocket-client)
         ├── classify.py            # state_changed -> granular event type
-        ├── operations.py          # verbs: check / list-entities / get-state / states / call-service
+        ├── operations.py          # verbs: check / list-entities / get-state / states / sync-devices / call-service
+        ├── devices.py             # references/devices.md inventory (full_sync + single-line upsert/remove)
         ├── formatter.py           # entity rows + event markdown
         ├── listener.py            # WebSocket loop, classify, atomic event writes, reconnect
         └── cli.py                 # argparse builder + dispatch

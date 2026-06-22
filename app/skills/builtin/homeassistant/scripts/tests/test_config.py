@@ -19,6 +19,11 @@ if str(_SCRIPTS) not in sys.path:
 from app import config  # noqa: E402
 
 
+def test_devices_file_path():
+    assert config.DEVICES_FILE == config.PROJECT_DIR / "references" / "devices.md"
+    assert config.REFERENCES_DIR == config.PROJECT_DIR / "references"
+
+
 def test_ws_url_http():
     assert config.ws_url("http://homeassistant.local:8123") == "ws://homeassistant.local:8123/api/websocket"
 

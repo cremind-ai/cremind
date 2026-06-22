@@ -31,6 +31,7 @@ uv run scripts/__main__.py link          # OAuth (only if HA_TOKEN unset)
 uv run scripts/__main__.py unlink
 uv run scripts/__main__.py list-entities --domain light
 uv run scripts/__main__.py get-state --entity light.kitchen
+uv run scripts/__main__.py sync-devices    # (re)build references/devices.md inventory
 uv run scripts/__main__.py call-service --domain light --service turn_on --entity light.kitchen
 ```
 
@@ -44,6 +45,10 @@ Baselines on startup (emits nothing for existing state), then classifies each li
 into a granular event type and drops it to `events/<event_type>/`. Reconnects automatically and
 refreshes the OAuth token as needed. Stop with Ctrl-C.
 
+It also maintains `references/devices.md` — a concise one-line-per-device inventory
+(`entity_id | name | type | state`): a full snapshot on each (re)connect, and a single-line
+in-place update per change. Use `sync-devices` to (re)build it without the listener.
+
 ## Tests
 
 ```bash
@@ -51,6 +56,7 @@ uv run scripts/tests/test_config.py
 uv run scripts/tests/test_classify.py
 uv run scripts/tests/test_listener.py
 uv run scripts/tests/test_formatter.py
+uv run scripts/tests/test_devices.py
 # or: pytest scripts/tests/
 ```
 

@@ -1,14 +1,22 @@
 """CLI verb implementations over the Home Assistant REST API."""
 from __future__ import annotations
 
+import fnmatch
 from typing import Any, Optional
 
-from . import auth, config
+from . import auth, config, devices
 from .homeassistant_api import HaRestClient
 
 
 def _domain(entity_id: str) -> str:
     return entity_id.split(".", 1)[0] if "." in entity_id else ""
+
+
+def _matches_filter(entity_id: str) -> bool:
+    """True if the entity matches HA_ENTITY_FILTER (empty filter = all entities)."""
+    if not config.HA_ENTITY_FILTER:
+        return True
+    return any(fnmatch.fnmatch(entity_id, p) for p in config.HA_ENTITY_FILTER)
 
 
 def _friendly_name(state: dict) -> str:
@@ -87,6 +95,17 @@ def states(domain: Optional[str] = None, query: Optional[str] = None) -> list[di
     ]
     rows.sort(key=lambda r: r["entity_id"])
     return rows
+
+
+def sync_devices() -> dict:
+    """Rebuild references/devices.md from current states (filtered by HA_ENTITY_FILTER).
+
+    Lets the inventory be populated/repaired on demand, without the listener running."""
+    with HaRestClient() as c:
+        raw = c.get_states()
+    rows = [devices.row_from_state(s) for s in raw if _matches_filter(s.get("entity_id") or "")]
+    devices.full_sync(rows)
+    return {"ok": True, "count": len(rows), "path": str(config.DEVICES_FILE)}
 
 
 def call_service(domain: str, service: str, data: Optional[dict] = None, entity: Optional[str] = None) -> dict:
