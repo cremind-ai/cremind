@@ -8,7 +8,14 @@ branch). ``cremind db upgrade`` and boot-time ``ensure_at_head`` both target
 """
 from __future__ import annotations
 
+from alembic.script import ScriptDirectory
+
 from app.storage import migrations
+
+# alembic_version.version_num is VARCHAR(32). Postgres enforces it; SQLite does
+# not — so an over-long id passes the SQLite CI gate then truncates on a real
+# Postgres upgrade. This test catches it at the gate.
+ALEMBIC_VERSION_NUM_LEN = 32
 
 
 def test_single_alembic_head():
@@ -17,4 +24,18 @@ def test_single_alembic_head():
         "Alembic migration tree must have exactly one head; found "
         f"{len(heads)}: {heads}. Re-parent the divergent migration's "
         "down_revision onto the current tip (or add a merge revision)."
+    )
+
+
+def test_revision_ids_fit_version_column():
+    script = ScriptDirectory.from_config(migrations.build_alembic_config())
+    offenders = {
+        rev.revision: len(rev.revision)
+        for rev in script.walk_revisions()
+        if len(rev.revision) > ALEMBIC_VERSION_NUM_LEN
+    }
+    assert not offenders, (
+        f"Alembic revision ids must be <= {ALEMBIC_VERSION_NUM_LEN} chars "
+        f"(alembic_version.version_num is VARCHAR({ALEMBIC_VERSION_NUM_LEN}), "
+        f"enforced on Postgres). Too long: {offenders}"
     )
