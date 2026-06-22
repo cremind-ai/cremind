@@ -5,7 +5,7 @@ import { useChatStore } from './stores/chat';
 import { useSettingsStore } from './stores/settings';
 import { useEmbeddingStatusStore } from './stores/embeddingStatus';
 import { checkSetupStatus } from './services/configApi';
-import { PROFILE_ROUTES } from './router/profileRoutes';
+import { PROFILE_ROUTES, CHAT_ROUTES } from './router/profileRoutes';
 import Sidebar from './components/Sidebar.vue';
 import UpdateBanner from './components/UpdateBanner.vue';
 
@@ -73,7 +73,11 @@ watch(() => settingsStore.theme, applyTheme);
 // reset/connect. Synchronous token activation and login redirect for missing
 // tokens are handled by the router beforeEach guard, so views always see a
 // valid token by the time their onMounted fires.
-async function handleProfileNavigation(profileName: string, previousProfile: string) {
+async function handleProfileNavigation(
+  profileName: string,
+  previousProfile: string,
+  routeName: string,
+) {
   if (!profileName) return;
 
   // Verify profile still exists on server
@@ -87,10 +91,24 @@ async function handleProfileNavigation(profileName: string, previousProfile: str
     // Server unreachable — proceed with cached token
   }
 
-  // Reset chat state when switching to a different profile
+  // Only chat-rendering routes need the long-lived ``profile-events`` SSE.
+  // Opening it on every profile route (Events, Settings, Processes, …) piled
+  // onto each page's own admin streams and saturated the browser's per-origin
+  // HTTP/1.1 connection cap, stalling later REST requests. Gate the chat
+  // connection lifecycle to CHAT_ROUTES; non-chat pages that read the chat
+  // store (e.g. SkillEventsPage's "Simulate") open their per-conversation
+  // stream on demand via trackConversation, independent of connect().
+  const onChatRoute = CHAT_ROUTES.has(routeName);
   if (previousProfile && previousProfile !== profileName) {
-    await chatStore.resetForProfileSwitch();
-  } else if (!chatStore.isConnected) {
+    // Reset chat state when switching to a different profile.
+    if (onChatRoute) {
+      await chatStore.resetForProfileSwitch();
+    } else if (chatStore.isConnected) {
+      // Leaving a chat page's profile for a non-chat page of another
+      // profile: drop the stale connection rather than reopening it.
+      chatStore.disconnect();
+    }
+  } else if (onChatRoute && !chatStore.isConnected) {
     try {
       await chatStore.connect();
     } catch (e) {
@@ -103,7 +121,7 @@ watch(
   () => [route.name, route.params.profile],
   ([routeName, profile], [, oldProfile]) => {
     if (routeName && PROFILE_ROUTES.has(routeName as string) && profile) {
-      handleProfileNavigation(profile as string, (oldProfile as string) || '');
+      handleProfileNavigation(profile as string, (oldProfile as string) || '', routeName as string);
     }
   },
 );
@@ -138,7 +156,7 @@ onMounted(async () => {
   const routeName = route.name as string;
   const profile = route.params.profile as string;
   if (routeName && PROFILE_ROUTES.has(routeName) && profile) {
-    await handleProfileNavigation(profile, '');
+    await handleProfileNavigation(profile, '', routeName);
   }
 });
 
