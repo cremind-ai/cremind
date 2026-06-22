@@ -6,6 +6,7 @@ import { markedHighlight } from 'marked-highlight';
 import hljs from 'highlight.js';
 import vLinkBlank from '../directives/v-link-blank';
 import { Icon } from '@iconify/vue';
+import { copyTextToClipboard } from '../utils/clipboard';
 import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
 
@@ -67,7 +68,7 @@ const hasThinking = computed(() => props.message.thinkingSteps && props.message.
 const copied = ref(false);
 const copyToClipboard = async () => {
   if (!props.message.content) return;
-  await navigator.clipboard.writeText(props.message.content);
+  if (!(await copyTextToClipboard(props.message.content))) return;
   copied.value = true;
   setTimeout(() => { copied.value = false; }, 2000);
 };
@@ -236,7 +237,7 @@ const copyFileContent = async (url: string, fileName: string) => {
   try {
     const resp = await fetch(url, { headers: authHeaders() });
     const text = await resp.text();
-    await navigator.clipboard.writeText(text);
+    if (!(await copyTextToClipboard(text))) return;
     fileCopied.value = fileName;
     setTimeout(() => { fileCopied.value = null; }, 2000);
   } catch {

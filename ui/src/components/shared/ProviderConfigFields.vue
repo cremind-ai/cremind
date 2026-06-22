@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue';
 import { ElForm, ElFormItem, ElInput, ElTag, ElButton, ElRadioGroup, ElRadio, ElMessage } from 'element-plus';
+import { Icon } from '@iconify/vue';
 import type { LLMProvider, LLMModel, ProviderConfigField, AuthMethod } from '../../services/configApi';
 import { startDeviceCodeFlow, pollDeviceCode } from '../../services/configApi';
 import { useSettingsStore } from '../../stores/settings';
+import { useCopyToClipboard } from '../../composables/useCopyToClipboard';
 
 export interface ProviderWithState extends LLMProvider {
   apiKey: string;
@@ -32,6 +34,11 @@ const emit = defineEmits<{
 }>();
 
 const settingsStore = useSettingsStore();
+
+const { copy, isCopied } = useCopyToClipboard();
+async function copyValue(text: string, key: string) {
+  if (!(await copy(text, key))) ElMessage.error('Failed to copy');
+}
 
 // Device code flow state
 const deviceCodeLoading = ref(false);
@@ -186,10 +193,28 @@ async function pollForToken(deviceCode: string, interval: number) {
             <a :href="deviceCodeData.verification_uri" target="_blank" rel="noopener" class="device-code-link">
               {{ deviceCodeData.verification_uri }}
             </a>
+            <button
+              type="button"
+              class="copy-icon-btn"
+              :class="{ copied: isCopied('uri') }"
+              :title="isCopied('uri') ? 'Copied!' : 'Copy'"
+              @click="copyValue(deviceCodeData.verification_uri, 'uri')"
+            >
+              <Icon :icon="isCopied('uri') ? 'mdi:check' : 'mdi:content-copy'" />
+            </button>
           </div>
           <div class="device-code-step">
             <span class="device-code-label">Code:</span>
             <code class="device-code-value">{{ deviceCodeData.user_code }}</code>
+            <button
+              type="button"
+              class="copy-icon-btn"
+              :class="{ copied: isCopied('code') }"
+              :title="isCopied('code') ? 'Copied!' : 'Copy'"
+              @click="copyValue(deviceCodeData.user_code, 'code')"
+            >
+              <Icon :icon="isCopied('code') ? 'mdi:check' : 'mdi:content-copy'" />
+            </button>
           </div>
           <div class="device-code-status">
             <span v-if="deviceCodePolling" class="polling-indicator">Waiting for authorization...</span>
@@ -375,6 +400,22 @@ async function pollForToken(deviceCode: string, interval: number) {
   font-size: 0.85rem;
 }
 .device-code-link:hover { text-decoration: underline; }
+
+.copy-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+  font-size: 0.95rem;
+  color: var(--text-secondary);
+  transition: color 0.15s ease;
+}
+.copy-icon-btn:hover { color: var(--primary-color); }
+.copy-icon-btn.copied { color: var(--success-color); }
 
 .device-code-value {
   font-size: 1.1rem;
