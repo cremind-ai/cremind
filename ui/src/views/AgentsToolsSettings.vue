@@ -17,7 +17,7 @@ import {
   listLLMProviders, getProviderModels,
   getSkillMode, setSkillMode,
   streamFeaturesInstall, FeatureNotInstalledError,
-  deleteSkill, importSkillArchive, importSkillFromGitHub,
+  deleteSkill, importSkillArchive, importSkillFromGitHub, importSkillFromHub,
   type RemoteAgentInfo, type ToolStatus, type LLMProvider, type SkillMode,
   type FeatureNotInstalledDetail, type FeatureInstallEvent,
 } from '../services/configApi';
@@ -136,7 +136,7 @@ const jsonConfigError = ref('');
 
 // Import skill dialog
 const showImportDialog = ref(false);
-const importForm = ref<{ mode: 'archive' | 'github'; url: string }>({ mode: 'archive', url: '' });
+const importForm = ref<{ mode: 'archive' | 'github' | 'hub'; url: string }>({ mode: 'archive', url: '' });
 const importFile = ref<File | null>(null);
 const importing = ref(false);
 const archiveInput = ref<HTMLInputElement | null>(null);
@@ -712,7 +712,7 @@ async function handleDeleteSkill(item: UnifiedItem) {
 
 // ── Skill import ──
 function openImportDialog() {
-  importForm.value = { mode: 'archive', url: '' };
+  importForm.value = { mode: 'hub', url: '' };
   importFile.value = null;
   if (archiveInput.value) archiveInput.value.value = '';
   showImportDialog.value = true;
@@ -747,7 +747,7 @@ async function handleImportSkill() {
         settingsStore.agentUrl, settingsStore.authToken, importFile.value,
       );
       reportImport(result);
-    } else {
+    } else if (importForm.value.mode === 'github') {
       const url = importForm.value.url.trim();
       if (!url) {
         ElMessage.error('Enter a GitHub repository URL');
@@ -755,6 +755,16 @@ async function handleImportSkill() {
       }
       const result = await importSkillFromGitHub(
         settingsStore.agentUrl, settingsStore.authToken, url,
+      );
+      reportImport(result);
+    } else {
+      const link = importForm.value.url.trim();
+      if (!link) {
+        ElMessage.error('Enter a Cremind Hub link or skill name');
+        return;
+      }
+      const result = await importSkillFromHub(
+        settingsStore.agentUrl, settingsStore.authToken, link,
       );
       reportImport(result);
     }
@@ -1298,11 +1308,24 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
     <!-- Import Skill dialog -->
     <ElDialog v-model="showImportDialog" title="Import Skill" width="520px">
       <ElRadioGroup v-model="importForm.mode" size="small" class="import-mode-row">
+        <ElRadioButton value="hub">Cremind Hub</ElRadioButton>
         <ElRadioButton value="archive">Archive file</ElRadioButton>
         <ElRadioButton value="github">GitHub URL</ElRadioButton>
       </ElRadioGroup>
 
-      <div v-if="importForm.mode === 'archive'" class="import-section">
+      <div v-if="importForm.mode === 'hub'" class="import-section">
+        <p class="import-hint">
+          Paste a Cremind Hub skill link (or just the skill name). Cremind
+          downloads it from hub.cremind.io and installs it.
+        </p>
+        <ElInput
+          v-model="importForm.url"
+          placeholder="https://hub.cremind.io/skills/my-skill"
+          clearable
+        />
+      </div>
+
+      <div v-else-if="importForm.mode === 'archive'" class="import-section">
         <p class="import-hint">
           Upload a skill archive (.zip, .tar.gz, .tgz, .tar, .tar.bz2, .tar.xz).
           Every folder containing a valid SKILL.md will be installed.

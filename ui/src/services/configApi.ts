@@ -870,6 +870,22 @@ export async function importSkillFromGitHub(
   return res.json();
 }
 
+/** Import skills from a Cremind Hub link (skill page URL or bare skill name). */
+export async function importSkillFromHub(
+  agentUrl: string,
+  token: string,
+  link: string
+): Promise<SkillImportResult> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/skills/import/hub`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ link }),
+  });
+  if (!res.ok) throw new Error(await readError(res, 'Failed to import skill'));
+  return res.json();
+}
+
 /** One SSE frame emitted by ``POST /api/features/install``. */
 export interface FeatureInstallEvent {
   event: 'start' | 'log' | 'post_install' | 'done' | 'error';

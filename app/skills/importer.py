@@ -47,6 +47,16 @@ _GITHUB_URL_RE = re.compile(
 )
 _OWNER_REPO_RE = re.compile(r"^(?P<owner>[^/\s]+)/(?P<repo>[^/\s#?]+)$")
 
+# Cremind Hub: the public marketplace at hub.cremind.io. Override the base URL with
+# CREMIND_HUB_URL (e.g. http://localhost:3000) for local development.
+_HUB_DEFAULT_URL = "https://hub.cremind.io"
+# A hub link is the skill's page URL (what users copy) or a bare canonical name.
+_HUB_SKILL_PATH_RE = re.compile(
+    r"^(?:https?://[^/\s]+)?/skills/(?P<name>[a-z0-9][a-z0-9._-]{0,63})/?$",
+    re.IGNORECASE,
+)
+_HUB_BARE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$", re.IGNORECASE)
+
 
 class SkillImportError(Exception):
     """Raised when an import cannot be completed (bad input, no skills, etc.)."""
@@ -250,3 +260,74 @@ def install_github(url: str, profile: str) -> dict:
         repo_dir = Path(tmp) / "repo"
         fetch_github_repo(url, repo_dir)
         return install_skills_from_dir(repo_dir, profile)
+
+
+# ── Cremind Hub import ────────────────────────────────────────────────────────
+
+
+def parse_hub_link(link: str) -> str:
+    """Resolve a Cremind Hub link to a canonical skill name.
+
+    Accepts the skill page URL (``https://hub.cremind.io/skills/<name>`` or
+    ``/skills/<name>``) or a bare ``<name>``. Returns the lowercased name. Raises
+    :class:`SkillImportError` for anything unrecognizable.
+    """
+    raw = (link or "").strip()
+    if not raw:
+        raise SkillImportError("A Cremind Hub link or skill name is required")
+    match = _HUB_SKILL_PATH_RE.match(raw)
+    if match:
+        return match.group("name").lower()
+    if _HUB_BARE_NAME_RE.match(raw):
+        return raw.lower()
+    raise SkillImportError(
+        "Not a recognizable Cremind Hub link "
+        "(expected https://hub.cremind.io/skills/<name> or a skill name)"
+    )
+
+
+def _download_hub_tarball(name: str, dest: Path) -> None:
+    """Download + extract a skill's canonical tar.gz from Cremind Hub into *dest*."""
+    base = os.environ.get("CREMIND_HUB_URL", _HUB_DEFAULT_URL).rstrip("/")
+    url = f"{base}/api/skills/{name}/download"
+    dest.mkdir(parents=True, exist_ok=True)
+    tar_path: Path | None = None
+    try:
+        with httpx.stream("GET", url, follow_redirects=True, timeout=60) as resp:
+            if resp.status_code == 404:
+                raise SkillImportError(f"Skill '{name}' was not found on Cremind Hub")
+            if resp.status_code != 200:
+                raise SkillImportError(
+                    f"Cremind Hub returned {resp.status_code} for '{name}'"
+                )
+            with tempfile.NamedTemporaryFile(
+                prefix="cremind-hub-", suffix=".tar.gz", delete=False
+            ) as fh:
+                tar_path = Path(fh.name)
+                total = 0
+                for chunk in resp.iter_bytes(1 << 20):
+                    total += len(chunk)
+                    if total > _MAX_TARBALL_BYTES:
+                        fh.close()
+                        tar_path.unlink(missing_ok=True)
+                        raise SkillImportError("Skill archive is too large")
+                    fh.write(chunk)
+    except httpx.HTTPError as exc:
+        logger.warning(f"Hub download failed for '{name}': {exc}")
+        raise SkillImportError(
+            f"Could not reach Cremind Hub for '{name}'. Check the link and your connection."
+        ) from exc
+    try:
+        extract_archive(tar_path, dest)
+    finally:
+        if tar_path is not None:
+            tar_path.unlink(missing_ok=True)
+
+
+def install_hub(link: str, profile: str) -> dict:
+    """Resolve a Cremind Hub link/name, download its tar.gz, install its skills."""
+    name = parse_hub_link(link)
+    with tempfile.TemporaryDirectory(prefix="cremind-skill-hub-") as tmp:
+        out_dir = Path(tmp) / "hub"
+        _download_hub_tarball(name, out_dir)
+        return install_skills_from_dir(out_dir, profile)
