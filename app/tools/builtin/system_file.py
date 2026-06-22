@@ -125,16 +125,82 @@ def _get_markitdown():
 # Security helpers
 # ---------------------------------------------------------------------------
 
-def _safe_resolve(data_dir: str, relative_path: str) -> str:
-    """Resolve *relative_path* inside data_dir.  Raises ValueError on traversal."""
+def _allowed_roots(arguments: Dict[str, Any], data_dir: str) -> List[str]:
+    """Roots an *absolute* path argument may fall under, beyond ``data_dir``.
+
+    Mirrors the trust boundary already enforced by ``app/api/files.py``: the
+    per-profile skills tree (``CREMIND_SKILL_DIR`` — its parent, so every skill
+    is covered by one entry), the user working dir, and the per-profile slice of
+    ``CREMIND_SYSTEM_DIR`` (NOT the bare root, so another profile's
+    ``tokens/*.token`` stays unreachable). ``data_dir`` itself is always allowed
+    by ``_safe_resolve`` so it is not repeated here.
+    """
+    roots: List[str] = []
+    profile = arguments.get("_profile")
+    try:
+        from app.config.system_vars import build_system_env
+        env = build_system_env(profile)
+    except Exception:  # noqa: BLE001
+        logger.debug("system_file: build_system_env failed for allowed roots", exc_info=True)
+        return roots
+    if env.get("CREMIND_SKILL_DIR"):
+        roots.append(env["CREMIND_SKILL_DIR"])
+    if env.get("CREMIND_USER_WORKING_DIR"):
+        roots.append(env["CREMIND_USER_WORKING_DIR"])
+    sys_dir = env.get("CREMIND_SYSTEM_DIR")
+    if sys_dir and profile:
+        roots.append(os.path.join(sys_dir, profile))
+    return roots
+
+
+def _report_path(full_path: str, base: str) -> str:
+    """Display path for a result: relative to ``base`` when inside it, else the
+    absolute path. Avoids ``../..`` strings for hits that live outside the
+    active working directory (e.g. results under an absolute skill path)."""
+    if full_path == base or full_path.startswith(base + os.sep):
+        return os.path.relpath(full_path, base).replace(os.sep, "/")
+    return full_path.replace(os.sep, "/")
+
+
+def _safe_resolve(
+    data_dir: str,
+    relative_path: str,
+    allowed_roots: Optional[List[str]] = None,
+) -> str:
+    """Resolve *relative_path* and confirm it stays inside an allowed root.
+
+    Relative paths resolve under ``data_dir`` (the active working directory).
+    Absolute paths (and ``~``-prefixed paths) are accepted only when they fall
+    within ``data_dir`` or one of ``allowed_roots`` (e.g. a loaded skill's own
+    directory) — matching the paths ``exec_shell`` already accepts. Raises
+    ValueError with actionable guidance on a true escape.
+    """
     base = os.path.realpath(data_dir)
     os.makedirs(base, exist_ok=True)
-    # Strip leading slashes so "/" or "/foo" are treated as relative to data_dir
-    relative_path = relative_path.lstrip("/\\")
-    target = os.path.realpath(os.path.join(base, relative_path))
-    if target != base and not target.startswith(base + os.sep):
-        raise ValueError(f"Path traversal detected: {relative_path}")
-    return target
+
+    roots = [base]
+    for r in (allowed_roots or []):
+        if r:
+            roots.append(os.path.realpath(r))
+
+    raw = os.path.expanduser(relative_path)
+    # Treat a Windows drive-qualified path ("C:..." / "C:\\...") as absolute too.
+    is_abs = os.path.isabs(raw) or (len(raw) >= 2 and raw[1] == ":")
+    if is_abs:
+        target = os.path.realpath(raw)
+    else:
+        target = os.path.realpath(os.path.join(base, raw.lstrip("/\\")))
+
+    for root in roots:
+        if target == root or target.startswith(root + os.sep):
+            return target
+
+    raise ValueError(
+        f"Access denied: '{relative_path}' resolves outside the allowed "
+        f"directories. Allowed roots: {roots}. Absolute paths are accepted only "
+        f"under one of these (e.g. a loaded skill's own directory). Use a path "
+        f"inside the current working directory, or call change_working_directory first."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +633,7 @@ class SearchFilesTool(BuiltInTool):
             })
 
         try:
-            search_root = _safe_resolve(data_dir, rel_path)
+            search_root = _safe_resolve(data_dir, rel_path, _allowed_roots(arguments, data_dir))
         except ValueError as e:
             return BuiltInToolResult(structured_content={
                 "error": "Access denied",
@@ -601,7 +667,7 @@ class SearchFilesTool(BuiltInTool):
                     continue
 
                 full_path = os.path.join(dirpath, name)
-                entry_rel = os.path.relpath(full_path, base)
+                entry_rel = _report_path(full_path, base)
 
                 entry: Dict[str, Any] = {
                     "name": name,
@@ -867,7 +933,7 @@ class GrepFilesTool(BuiltInTool):
             })
 
         try:
-            target = _safe_resolve(data_dir, rel_path)
+            target = _safe_resolve(data_dir, rel_path, _allowed_roots(arguments, data_dir))
         except ValueError as e:
             return BuiltInToolResult(structured_content={
                 "error": "Access denied",
@@ -1085,7 +1151,7 @@ class GrepFilesTool(BuiltInTool):
             candidates = self._walk_files(target, glob_variants, type_exts)
 
         def _rel(p: str) -> str:
-            return os.path.relpath(p, base).replace(os.sep, "/")
+            return _report_path(p, base)
 
         for file_path in candidates:
             if files_searched >= MAX_GREP_FILES_SCANNED:
@@ -1217,7 +1283,7 @@ class ListFilesTool(BuiltInTool):
         pattern = arguments.get("pattern")
 
         try:
-            target = _safe_resolve(data_dir, rel_path)
+            target = _safe_resolve(data_dir, rel_path, _allowed_roots(arguments, data_dir))
         except ValueError as e:
             return BuiltInToolResult(structured_content={"error": "Access denied", "message": str(e)})
 
@@ -1290,7 +1356,7 @@ class GetFileInfoTool(BuiltInTool):
             return BuiltInToolResult(structured_content={"error": "Missing parameter", "message": "path is required."})
 
         try:
-            target = _safe_resolve(data_dir, rel_path)
+            target = _safe_resolve(data_dir, rel_path, _allowed_roots(arguments, data_dir))
         except ValueError as e:
             return BuiltInToolResult(structured_content={"error": "Access denied", "message": str(e)})
 
@@ -1360,7 +1426,7 @@ class ReadFileTool(BuiltInTool):
             return BuiltInToolResult(structured_content={"error": "Missing parameter", "message": "path is required."})
 
         try:
-            target = _safe_resolve(data_dir, rel_path)
+            target = _safe_resolve(data_dir, rel_path, _allowed_roots(arguments, data_dir))
         except ValueError as e:
             return BuiltInToolResult(structured_content={"error": "Access denied", "message": str(e)})
 
@@ -1503,7 +1569,7 @@ class WriteFileTool(BuiltInTool):
             })
 
         try:
-            target = _safe_resolve(data_dir, rel_path)
+            target = _safe_resolve(data_dir, rel_path, _allowed_roots(arguments, data_dir))
         except ValueError as e:
             return BuiltInToolResult(structured_content={
                 "error": "Access denied",
@@ -1546,7 +1612,7 @@ class WriteFileTool(BuiltInTool):
         file_name = os.path.basename(target)
         file_uri = target.replace(os.sep, "/")
         base = os.path.realpath(data_dir)
-        rel_output = os.path.relpath(target, base).replace(os.sep, "/")
+        rel_output = _report_path(target, base)
 
         file_entry: ToolResultFile = {
             "uri": file_uri,
@@ -1639,7 +1705,7 @@ class OverwriteFileTool(BuiltInTool):
 
         # --- Resolve path ---
         try:
-            target = _safe_resolve(data_dir, rel_path)
+            target = _safe_resolve(data_dir, rel_path, _allowed_roots(arguments, data_dir))
         except ValueError as e:
             return BuiltInToolResult(structured_content={
                 "error": "Access denied",
@@ -1736,7 +1802,7 @@ class OverwriteFileTool(BuiltInTool):
         file_name = os.path.basename(target)
         file_uri = target.replace(os.sep, "/")
         base = os.path.realpath(data_dir)
-        rel_output = os.path.relpath(target, base).replace(os.sep, "/")
+        rel_output = _report_path(target, base)
 
         file_entry: ToolResultFile = {
             "uri": file_uri,
