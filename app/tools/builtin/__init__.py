@@ -55,6 +55,7 @@ __all__ = [
     "register_builtin_tools",
     "refresh_builtin_tool_oauth",
     "get_builtin_tool_config",
+    "default_model_group_for",
     "list_builtin_tool_catalog",
     "feature_keys_for_tool_ids",
     "required_feature_for_tool_id",
@@ -249,6 +250,33 @@ def get_builtin_tool_config(config_name: str) -> dict:
     if not isinstance(tool_config, dict):
         return {}
     return {"tool": tool_config}
+
+
+def default_model_group_for(tool_key: str) -> str:
+    """Resolve a built-in tool's default model group from EITHER its module
+    name (``config_name``) or its slugified ``tool_id``.
+
+    ``get_builtin_tool_config`` keys off the module name, but the runtime LLM
+    refresh path (``BuiltInToolGroup.refresh_llm``) hands the factory the
+    slugified ``tool_id``. For most tools ``slugify(SERVER_NAME) == module``,
+    but for a few (e.g. weather → ``accuweather_weather``) they differ — so a
+    bare module lookup would silently fall back to ``"low"``. This maps a slug
+    back to its module before reading ``default_model_group`` so a tool's
+    declared group (e.g. ``image_understanding`` → ``"vision"``) is honored on
+    every path, not just at boot. Defaults to ``"low"``.
+    """
+    schema = get_builtin_tool_config(tool_key)
+    if not schema:
+        for module_name in _BUILTIN_MODULE_NAMES:
+            try:
+                module = importlib.import_module(f"app.tools.builtin.{module_name}")
+            except ImportError:
+                continue
+            server_name = getattr(module, "SERVER_NAME", module_name)
+            if module_name == tool_key or slugify(server_name) == tool_key:
+                schema = get_builtin_tool_config(module_name)
+                break
+    return (schema.get("tool") or {}).get("default_model_group") or "low"
 
 
 def _build_oauth_provider(*, oauth_config: Optional[dict], server_name: str):

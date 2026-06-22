@@ -312,10 +312,9 @@ def get_tool_routes(state: BootedState) -> list[Route]:
                 # server.py. The "vision" group itself falls back to "high"
                 # when unset.
                 if not model_name:
-                    from app.tools.builtin import get_builtin_tool_config
-                    _cfg_name = getattr(tool, "config_name", None)
-                    _schema = get_builtin_tool_config(_cfg_name) if _cfg_name else {}
-                    _group = (_schema.get("tool") or {}).get("default_model_group") or "low"
+                    from app.tools.builtin import default_model_group_for
+                    _key = getattr(tool, "config_name", None) or tool_id
+                    _group = default_model_group_for(_key)
                     group_value = BaseConfig.get_model_group(_group, profile=profile)
                     if not group_value and _group == "vision":
                         group_value = BaseConfig.get_model_group("high", profile=profile)
