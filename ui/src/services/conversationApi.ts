@@ -158,20 +158,28 @@ export interface SendMessageResponse {
   conversation_id: string;
 }
 
+export interface MessageAttachment {
+  name: string;
+  path: string;
+}
+
 export async function sendMessageRequest(
   agentUrl: string,
   authToken: string,
   conversationId: string,
   text: string,
   reasoning: boolean = true,
+  attachments?: MessageAttachment[],
 ): Promise<SendMessageResponse> {
   const base = resolveBaseUrl(agentUrl);
+  const body: Record<string, unknown> = { text, reasoning };
+  if (attachments && attachments.length) body.attachments = attachments;
   const res = await fetch(
     `${base}/api/conversations/${encodeURIComponent(conversationId)}/messages`,
     {
       method: 'POST',
       headers: authHeaders(authToken),
-      body: JSON.stringify({ text, reasoning }),
+      body: JSON.stringify(body),
     },
   );
   if (!res.ok) throw new Error(`Failed to send message: ${res.statusText}`);

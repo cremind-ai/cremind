@@ -39,6 +39,13 @@ class ModelGroupManager:
             except Exception:
                 pass
 
+        # The dedicated "vision" group is optional: when the user hasn't picked
+        # a vision model it transparently falls back to the "high" group, so
+        # image understanding works out of the box on a vision-capable high
+        # model. A non-vision model still surfaces a clear error at use time.
+        if not group_value and group == "vision":
+            return self.get_provider_and_model("high", profile=profile)
+
         if not group_value:
             raise SetupRequiredError(
                 (

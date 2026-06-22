@@ -1,10 +1,17 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue';
-import { ElPopover, ElSwitch } from 'element-plus';
+import { ElPopover, ElSwitch, ElNotification } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
+import { useChatStore } from '../stores/chat';
 import { fetchSystemVars, listProfiles } from '../services/configApi';
+import { uploadTempFiles } from '../services/filesApi';
 import MentionMenu, { type MentionItem } from './MentionMenu.vue';
+
+export interface Attachment {
+  name: string;
+  path: string;
+}
 
 const props = withDefaults(defineProps<{
   disabled?: boolean;
@@ -15,17 +22,77 @@ const props = withDefaults(defineProps<{
 });
 
 const emit = defineEmits<{
-  send: [text: string];
+  send: [payload: { text: string; attachments: Attachment[] }];
   stop: [];
   'update:reasoningEnabled': [enabled: boolean];
 }>();
 
 const settingsStore = useSettingsStore();
+const chatStore = useChatStore();
 
 const inputText = ref('');
 const popoverVisible = ref(false);
 const taRef = ref<HTMLTextAreaElement | null>(null);
 const layerRef = ref<HTMLDivElement | null>(null);
+
+// ── file upload (composer attachments) ──
+const fileInputRef = ref<HTMLInputElement | null>(null);
+const attachments = ref<Attachment[]>([]);
+const uploading = ref(false);
+
+const triggerUpload = () => {
+  if (props.disabled || props.isProcessing || uploading.value) return;
+  fileInputRef.value?.click();
+};
+
+const onFilesPicked = async (event: Event) => {
+  const input = event.target as HTMLInputElement;
+  const files = input.files ? Array.from(input.files) : [];
+  // Reset the input value so picking the same file again re-fires `change`.
+  input.value = '';
+  if (!files.length) return;
+
+  // Gate send for the WHOLE provision+upload window. Set before awaiting
+  // ensureConversation so a quick Enter can't (a) send a message before the
+  // attachment is pushed (dropping it), or (b) create a second conversation
+  // while the first is still being provisioned for the upload.
+  uploading.value = true;
+  try {
+    // Files must land in a real conversation's temp dir, so ensure one exists
+    // (created upfront for a brand-new chat) before uploading.
+    const cid = await chatStore.ensureConversation();
+    if (!cid) {
+      ElNotification({ title: 'Upload failed', message: 'No active conversation', type: 'error' });
+      return;
+    }
+    const results = await uploadTempFiles(
+      settingsStore.agentUrl, settingsStore.authToken, cid, files,
+    );
+    for (const r of results) {
+      if (r.status === 'error' || !r.path) {
+        ElNotification({
+          title: 'Upload failed',
+          message: r.error ? `${r.name}: ${r.error}` : `Failed to upload ${r.name}`,
+          type: 'error',
+        });
+        continue;
+      }
+      attachments.value.push({ name: r.saved_as || r.name, path: r.path });
+    }
+  } catch (e: any) {
+    ElNotification({
+      title: 'Upload failed',
+      message: e?.message || 'Failed to upload files',
+      type: 'error',
+    });
+  } finally {
+    uploading.value = false;
+  }
+};
+
+const removeAttachment = (index: number) => {
+  attachments.value.splice(index, 1);
+};
 
 const MIN_HEIGHT_PX = 72;   // ≈ 3 rows at 1.6 line-height, 0.95em font
 const MAX_HEIGHT_PX = 192;  // ≈ 8 rows
@@ -317,9 +384,13 @@ const handleClick = () => {
     emit('stop');
     return;
   }
+  // Don't send while an attachment is still provisioning/uploading — its path
+  // isn't in `attachments` yet, so the message would go without it.
+  if (uploading.value) return;
   if (inputText.value.trim() && !props.disabled) {
-    emit('send', inputText.value);
+    emit('send', { text: inputText.value, attachments: [...attachments.value] });
     inputText.value = '';
+    attachments.value = [];
     closeMenu();
     nextTick(adjustHeight);
   }
@@ -370,6 +441,32 @@ const handleReasoningToggle = (value: boolean | string | number) => {
 <template>
   <div class="message-input-container">
     <div class="input-wrapper">
+      <input
+        ref="fileInputRef"
+        type="file"
+        multiple
+        class="hidden-file-input"
+        @change="onFilesPicked"
+      />
+      <div v-if="attachments.length" class="attachment-chips">
+        <span
+          v-for="(att, i) in attachments"
+          :key="i"
+          class="attachment-chip"
+          :title="att.name"
+        >
+          <Icon icon="mdi:paperclip" class="chip-icon" />
+          <span class="chip-name">{{ att.name }}</span>
+          <button
+            type="button"
+            class="chip-remove"
+            title="Remove"
+            @click="removeAttachment(i)"
+          >
+            <Icon icon="mdi:close" />
+          </button>
+        </span>
+      </div>
       <div class="composer" :class="{ disabled }">
         <div class="hl-layer" ref="layerRef" aria-hidden="true">
           <template v-for="(seg, i) in segments" :key="i">
@@ -437,11 +534,21 @@ const handleReasoningToggle = (value: boolean | string | number) => {
         </div>
       </ElPopover>
       <button
+        @click="triggerUpload"
+        :disabled="disabled || isProcessing || uploading"
+        class="upload-button"
+        :class="{ disabled: disabled || isProcessing || uploading }"
+        type="button"
+        :title="uploading ? 'Uploading…' : 'Attach files'"
+      >
+        <Icon :icon="uploading ? 'mdi:loading' : 'mdi:paperclip'" :class="{ spin: uploading }" />
+      </button>
+      <button
         @click="handleClick"
-        :disabled="!isProcessing && (disabled || !inputText.trim())"
+        :disabled="!isProcessing && (disabled || uploading || !inputText.trim())"
         class="send-button"
         :class="{
-          'disabled': !isProcessing && (disabled || !inputText.trim()),
+          'disabled': !isProcessing && (disabled || uploading || !inputText.trim()),
           'stop': isProcessing,
         }"
         :title="isProcessing ? 'Stop' : 'Send'"
@@ -487,7 +594,9 @@ const handleReasoningToggle = (value: boolean | string | number) => {
   font-family: inherit;
   font-size: 0.95em;
   line-height: 1.6;
-  padding: 10px 44px 10px 14px;
+  /* Right room for the reasoning/send buttons; left room for the upload
+     button. Layer + textarea share this rule so the caret never drifts. */
+  padding: 10px 44px 10px 44px;
   border: 1px solid var(--border-color);
   border-radius: 8px;
   white-space: pre-wrap;
@@ -660,5 +769,101 @@ const handleReasoningToggle = (value: boolean | string | number) => {
 
 .send-button.stop:hover {
   background: #dc2626;
+}
+
+/* Upload button — mirrors the send button but anchored bottom-left. */
+.hidden-file-input {
+  display: none;
+}
+
+.upload-button {
+  position: absolute;
+  bottom: 10px;
+  left: 10px;
+  width: 28px;
+  height: 28px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  transition: all 0.2s ease;
+  padding: 0;
+  z-index: 3;
+}
+
+.upload-button:hover:not(:disabled) {
+  border-color: var(--primary-color);
+  color: var(--primary-color);
+}
+
+.upload-button.disabled,
+.upload-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.spin {
+  animation: upload-spin 0.8s linear infinite;
+}
+
+@keyframes upload-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Attachment chips above the composer. */
+.attachment-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 220px;
+  padding: 3px 6px 3px 8px;
+  background: var(--surface-hover);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.chip-icon {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+}
+
+.chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chip-remove {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+
+.chip-remove:hover {
+  color: var(--text-primary);
+  background: var(--border-color);
 }
 </style>

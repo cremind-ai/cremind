@@ -18,13 +18,14 @@ import ProviderConfigFields, { type ProviderWithState } from '../components/shar
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
 const settingsStore = useSettingsStore();
-const { rebuildModelList, getFilteredModels, getReasoningOptions } = useLLMModels();
+const { rebuildModelList, getFilteredModels, getVisionModels, getReasoningOptions } = useLLMModels();
 
 const providers = ref<ProviderWithState[]>([]);
-const modelGroups = ref<Record<string, string>>({ high: '', low: '' });
+const modelGroups = ref<Record<string, string>>({ high: '', low: '', vision: '' });
 const reasoningEfforts = ref<Record<string, string | null>>({ high: null, low: null });
 const highProvider = ref('');
 const lowProvider = ref('');
+const visionProvider = ref('');
 const apiKeyProvider = ref('');
 const loading = ref(false);
 const saving = ref(false);
@@ -62,6 +63,7 @@ const selectedApiKeyProvider = computed(() =>
 
 const highFilteredModels = computed(() => getFilteredModels(highProvider.value));
 const lowFilteredModels = computed(() => getFilteredModels(lowProvider.value));
+const visionFilteredModels = computed(() => getVisionModels(visionProvider.value));
 const highModelReasoningOptions = computed(() => getReasoningOptions(modelGroups.value.high));
 const lowModelReasoningOptions = computed(() => getReasoningOptions(modelGroups.value.low));
 
@@ -81,6 +83,14 @@ watch(lowProvider, (newProvider, oldProvider) => {
     if (currentProvider !== newProvider) {
       modelGroups.value.low = '';
       reasoningEfforts.value.low = null;
+    }
+  }
+});
+watch(visionProvider, (newProvider, oldProvider) => {
+  if (oldProvider && newProvider !== oldProvider) {
+    const currentProvider = extractProvider(modelGroups.value.vision);
+    if (currentProvider !== newProvider) {
+      modelGroups.value.vision = '';
     }
   }
 });
@@ -108,6 +118,7 @@ onMounted(async () => {
     // Initialize per-group providers from stored model group values
     highProvider.value = extractProvider(groupRes.model_groups.high) || groupRes.default_provider || '';
     lowProvider.value = extractProvider(groupRes.model_groups.low) || groupRes.default_provider || '';
+    visionProvider.value = extractProvider(groupRes.model_groups.vision || '') || '';
 
     for (const p of providers.value) {
       try {
@@ -366,6 +377,29 @@ function goBack() {
             <ElFormItem v-if="lowModelReasoningOptions.length > 0" label="Reasoning Effort">
               <ElSelect v-model="reasoningEfforts.low" placeholder="Select reasoning effort" clearable>
                 <ElOption v-for="opt in lowModelReasoningOptions" :key="opt" :label="opt" :value="opt" />
+              </ElSelect>
+            </ElFormItem>
+          </ElForm>
+        </div>
+
+        <!-- Vision Group -->
+        <div class="section">
+          <h2 class="section-title">Vision Group (Image Understanding)</h2>
+          <p class="section-description">
+            Select the model used to analyze images (e.g. "extract the text in this image").
+            Only vision-capable models are listed. Leave empty to use the High Group model.
+          </p>
+
+          <ElForm label-position="top" class="groups-form">
+            <ElFormItem label="Provider">
+              <ElSelect v-model="visionProvider" placeholder="Select provider" clearable>
+                <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
+              </ElSelect>
+            </ElFormItem>
+
+            <ElFormItem label="Model">
+              <ElSelect v-model="modelGroups.vision" filterable clearable placeholder="Select vision model (defaults to High)">
+                <ElOption v-for="m in visionFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
               </ElSelect>
             </ElFormItem>
           </ElForm>

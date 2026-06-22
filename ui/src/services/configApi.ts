@@ -500,6 +500,7 @@ export interface LLMModel {
   input_price_per_1m: number;
   output_price_per_1m: number;
   reasoning_effort?: string[];
+  vision?: boolean;
 }
 
 export async function listLLMProviders(

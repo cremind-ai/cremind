@@ -42,6 +42,7 @@ output_price_per_1m = 0.00
 id = "gemma3:27b"
 display_name = "Gemma 3 27B"
 group_hint = "high"
+vision = true
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 

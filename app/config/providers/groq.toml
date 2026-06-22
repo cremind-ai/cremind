@@ -48,6 +48,7 @@ reasoning_effort = ["low", "medium", "high"]
 id = "meta-llama/llama-4-scout-17b-16e-instruct"
 display_name = "Llama 4 Scout 17B 16E"
 group_hint = "high"
+vision = true
 input_price_per_1m = 0.11
 output_price_per_1m = 0.34
 

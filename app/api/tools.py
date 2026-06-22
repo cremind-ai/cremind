@@ -306,10 +306,18 @@ def get_tool_routes(state: BootedState) -> list[Route]:
                 provider_name = merged.get("llm_provider") or None
                 model_name = merged.get("llm_model") or None
 
-                # When no per-tool model override, fall back to the "low"
-                # model group (same source as startup in server.py).
+                # When no per-tool model override, fall back to the tool's
+                # declared default model group (e.g. image_understanding →
+                # "vision"), defaulting to "low" — same source as startup in
+                # server.py. The "vision" group itself falls back to "high"
+                # when unset.
                 if not model_name:
-                    group_value = BaseConfig.get_model_group("low", profile=profile)
+                    from app.tools.builtin import default_model_group_for
+                    _key = getattr(tool, "config_name", None) or tool_id
+                    _group = default_model_group_for(_key)
+                    group_value = BaseConfig.get_model_group(_group, profile=profile)
+                    if not group_value and _group == "vision":
+                        group_value = BaseConfig.get_model_group("high", profile=profile)
                     if group_value:
                         parts = group_value.split("/", 1)
                         if not provider_name:
