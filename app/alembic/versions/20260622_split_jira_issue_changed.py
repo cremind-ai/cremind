@@ -1,8 +1,8 @@
 """Split the jira skill's ``issue_changed`` subscriptions into lifecycle events.
 
-Revision ID: 20260614_split_jira_issue_changed
-Revises: 20260509_baseline
-Create Date: 2026-06-14
+Revision ID: 20260622_split_jira_issue_changed
+Revises: 20260621c_drop_reminder
+Create Date: 2026-06-22
 
 The jira skill replaced its single generic ``issue_changed`` event with five
 lifecycle events (``issue_created``, ``issue_updated``, ``issue_transitioned``,
@@ -29,8 +29,8 @@ from alembic import op
 from sqlalchemy import bindparam, text
 
 # revision identifiers, used by Alembic.
-revision: str = "20260614_split_jira_issue_changed"
-down_revision: Union[str, Sequence[str], None] = "20260509_baseline"
+revision: str = "20260622_split_jira_issue_changed"
+down_revision: Union[str, Sequence[str], None] = "20260621c_drop_reminder"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
