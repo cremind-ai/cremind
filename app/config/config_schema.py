@@ -136,21 +136,56 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
             ),
         },
     ),
-    "history": ConfigGroup(
-        label="Conversation History",
-        description="Token-budget limits applied when assembling the message window for each LLM call.",
+    "compaction": ConfigGroup(
+        label="Conversation Compaction",
+        description=(
+            "Keeps long conversations within budget by folding the oldest turns "
+            "into a running summary (via the low model group) while recent turns "
+            "stay verbatim. Replaces fixed token-window truncation and is "
+            "prompt-cache friendly — the summary at the front stays byte-stable "
+            "between compactions."
+        ),
         fields={
-            "max_tokens_total": Field(
-                type="number", default_toml="history.max_tokens_total",
-                label="Total history tokens",
-                description="Maximum total tokens of past messages included in each prompt.",
-                min=500, max=200000,
+            "enabled": Field(
+                type="boolean", default_toml="compaction.enabled",
+                label="Enabled",
+                description="When off, full history is sent (bounded only by the model's context window).",
             ),
-            "max_tokens_per_message": Field(
-                type="number", default_toml="history.max_tokens_per_message",
-                label="Per-message tokens",
-                description="Each message is truncated to at most this many tokens before assembly.",
-                min=50, max=20000,
+            "compact_threshold_tokens": Field(
+                type="number", default_toml="compaction.compact_threshold_tokens",
+                label="Compaction threshold (tokens)",
+                description="Fold the oldest turns into the summary once the verbatim tail's token count crosses this.",
+                min=1000, max=1000000,
+            ),
+            "keep_recent_tokens": Field(
+                type="number", default_toml="compaction.keep_recent_tokens",
+                label="Keep-recent target (tokens)",
+                description="After a compaction, keep about this many tokens of recent turns verbatim. The gap below the threshold is the hysteresis band that keeps the cached summary stable across turns.",
+                min=500, max=500000,
+            ),
+            "keep_recent_messages": Field(
+                type="number", default_toml="compaction.keep_recent_messages",
+                label="Keep-recent messages (floor)",
+                description="Never fold below this many of the most recent messages, even if the tail is over the keep-recent target.",
+                min=0, max=50,
+            ),
+            "temperature": Field(
+                type="number", default_toml="compaction.temperature",
+                label="Temperature",
+                description="Sampling temperature for the summarization call; keep low for consistency.",
+                min=0, max=2, step=0.1,
+            ),
+            "max_tokens": Field(
+                type="number", default_toml="compaction.max_tokens",
+                label="Max tokens",
+                description="Output token cap for the running summary (also its hard size bound).",
+                min=128, max=8192,
+            ),
+            "retry": Field(
+                type="number", default_toml="compaction.retry",
+                label="Retry count",
+                description="Retries on transient summarization LLM errors.",
+                min=0, max=10,
             ),
         },
     ),

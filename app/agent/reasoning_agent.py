@@ -54,7 +54,7 @@ from app.tools import (
 from app.tools.ids import slugify
 from app.skills.scanner import generate_dir_tree
 from app.types import ReasoningStreamResponseType
-from app.utils.common import limit_messages, truncate_messages, truncate_old_observations
+from app.utils.common import truncate_old_observations
 from app.utils.context_storage import clear_context, get_context, set_context
 from app.utils.logger import logger
 from app.utils.persona import read_persona_file
@@ -215,8 +215,6 @@ class ReasoningAgent:
         self._reasoning_temperature = cfg.reasoning_temperature
         self._reasoning_max_tokens = cfg.reasoning_max_tokens
         self._reasoning_retry = cfg.reasoning_retry
-        self._history_max_tokens_total = cfg.history_max_tokens_total
-        self._history_max_tokens_per_message = cfg.history_max_tokens_per_message
         self._tool_result_enabled = cfg.tool_result_enabled
         self._tool_result_max_tokens = cfg.tool_result_max_tokens
         self._tool_result_preserve_recent = cfg.tool_result_preserve_recent
@@ -656,11 +654,13 @@ class ReasoningAgent:
         func_def = cast(dict, self.reasoning_tool["function"])
         func_def["parameters"]["properties"]["Action"]["enum"] = [""] + self._active_action_names()
 
-        truncated = truncate_messages(self.history_messages, max_tokens_per_message=self._history_max_tokens_per_message)
-        limited = limit_messages(truncated, max_length=self._history_max_tokens_total)
+        # History is already compacted upstream (running summary + verbatim tail)
+        # and sent as-is — no per-step windowing. The summary block stays
+        # byte-stable between compactions, so the [tools + system + history] cache
+        # prefix is reused across turns.
         messages: List[ChatCompletionMessageParam] = [
             {"role": "system", "content": self.instruction},
-            *limited,
+            *self.history_messages,
             {"role": "user", "content": input_section},
         ]
 

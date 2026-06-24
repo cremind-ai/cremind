@@ -686,6 +686,72 @@ class ConversationStorage:
             messages = result.scalars().all()
             return [self._msg_to_dict(msg) for msg in messages]
 
+    async def get_messages_after(
+        self, conversation_id: str, after_ordering: int, limit: int = 5000,
+    ) -> list[dict]:
+        """Full message dicts with ``ordering > after_ordering``, oldest → newest.
+
+        Unlike :meth:`get_messages` (which caps at the *oldest* 100), this returns
+        the un-compacted tail regardless of total length, so compaction sees every
+        message past the watermark. Pass ``-1`` to get the whole conversation.
+        """
+        await self._ensure_initialized()
+        async with self.async_session_maker() as session:
+            result = await session.execute(
+                select(MessageModel)
+                .where(
+                    MessageModel.conversation_id == conversation_id,
+                    MessageModel.ordering > after_ordering,
+                )
+                .order_by(MessageModel.ordering.asc())
+                .limit(limit)
+            )
+            return [self._msg_to_dict(msg) for msg in result.scalars().all()]
+
+    # ── Compaction state ──
+
+    async def get_compaction_state(
+        self, conversation_id: str,
+    ) -> tuple[str | None, int, float | None]:
+        """Return ``(compaction_summary, compaction_watermark, compaction_last_compacted_at)``.
+
+        Returns ``(None, -1, None)`` when the row is missing or nothing has been
+        compacted yet (``-1`` so a ``> watermark`` tail query includes message 0).
+        """
+        await self._ensure_initialized()
+        async with self.async_session_maker() as session:
+            row = (await session.execute(
+                select(
+                    ConversationModel.compaction_summary,
+                    ConversationModel.compaction_watermark,
+                    ConversationModel.compaction_last_compacted_at,
+                ).where(ConversationModel.id == conversation_id)
+            )).first()
+            if row is None:
+                return None, -1, None
+            return row[0], int(row[1]) if row[1] is not None else -1, row[2]
+
+    async def set_compaction_state(
+        self, conversation_id: str, summary: str | None, watermark: int,
+        ts: float | None = None,
+    ) -> None:
+        """Persist the running summary + watermark. Deliberately does NOT touch
+        ``updated_at`` — compaction is background bookkeeping and must not reorder
+        the conversation list."""
+        await self._ensure_initialized()
+        async with self.async_session_maker.begin() as session:
+            await session.execute(
+                update(ConversationModel)
+                .where(ConversationModel.id == conversation_id)
+                .values(
+                    compaction_summary=summary,
+                    compaction_watermark=int(watermark),
+                    compaction_last_compacted_at=(
+                        ts if ts is not None else time.time() * 1000
+                    ),
+                )
+            )
+
     # ── Helpers ──
 
     @staticmethod
