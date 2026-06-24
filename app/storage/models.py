@@ -29,7 +29,7 @@ Tables
 import uuid
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from a2a.server.models import Base
@@ -132,6 +132,73 @@ class MessageModel(Base):
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     ordering: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class UsageRecordModel(Base):
+    """One LLM invocation (smallest logical unit) within an agent turn.
+
+    A turn (one assistant ``MessageModel``) fans out to N usage_records: one per
+    reasoning step plus one per tool/sub-agent child-LLM call. Raw token counts
+    are always stored; the ``*_usd`` cost columns are frozen at write time from
+    the rate snapshot in effect, so historical estimates never move when catalog
+    prices change. Costs are nullable — left null when the model is unknown
+    (e.g. backfilled rows, or remote A2A sub-agents that don't report a model).
+    Everything the dashboard groups by (conversation, profile, provider, model,
+    source, tool, time) is an indexed column on this one fact table.
+    """
+
+    __tablename__ = "usage_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+
+    # ── scope / grouping keys ──
+    conversation_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # The assistant turn this rolled up into. SET NULL (not CASCADE) so a turn
+    # re-write / message delete doesn't drop usage history; the conversation
+    # CASCADE still governs lifecycle. Nullable so a record can be inserted
+    # before the turn's message id is known, and so backfilled rows can attach.
+    message_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Denormalized for cheap filtering (mirrors ShortTermMemoryModel.profile).
+    profile: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    # Catalog group_hint (high|low|...) so the dashboard can group by tier.
+    model_group: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # reasoning | tool | subagent | intrinsic | aggregate
+    source_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="reasoning", index=True)
+    tool_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    label: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # 0-based step ordinal within the turn (drill-down / ordering).
+    step_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # ── raw token counts (always present, never recomputed) ──
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cache_read_input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cache_creation_input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # ── frozen cost (USD), computed at write time; nullable when rates unknown ──
+    uncached_input_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cache_read_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cache_write_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    output_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_usd: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
+    # Rate snapshot the cost was computed from (rates, multipliers, source,
+    # pricing_version) — makes each row a self-describing, auditable receipt.
+    rate_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)  # epoch ms
+
+    __table_args__ = (
+        Index("ix_usage_records_conv_msg", "conversation_id", "message_id"),
+        Index("ix_usage_records_profile_created", "profile", "created_at"),
+    )
 
 
 class ChannelSenderModel(Base):

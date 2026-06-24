@@ -34,6 +34,7 @@ from a2a.types import DataPart, FilePart, Part
 
 from app.agent import memory_runner
 from app.agent.summary import summarize_reasoning
+from app.agent.usage import reconcile
 from app.config.user_config import resolve_memory_config
 from app.constants import ChatCompletionTypeEnum
 from app.events.notifications_buffer import get_event_notifications
@@ -292,6 +293,10 @@ async def run_agent_to_bus(
     total_cache_read_input_tokens = 0
     total_cache_creation_input_tokens = 0
     total_output_tokens = 0
+    # Per-source attribution for the turn (one entry per LLM invocation),
+    # carried on terminal chunks. Overwritten each terminal chunk so the final
+    # one holds the complete list (mirrors how the token totals are captured).
+    collected_usage_records: list[dict] = []
     reasoning_input_section: str | None = None
     errored = False
     cancelled = False
@@ -451,6 +456,8 @@ async def run_agent_to_bus(
                     total_cache_read_input_tokens = chunk.get("cache_read_input_tokens") or total_cache_read_input_tokens
                     total_cache_creation_input_tokens = chunk.get("cache_creation_input_tokens") or total_cache_creation_input_tokens
                     total_output_tokens = chunk.get("output_tokens") or total_output_tokens
+                    if chunk.get("usage_records"):
+                        collected_usage_records = chunk["usage_records"]
                     if (
                         ctype == ChatCompletionTypeEnum.DONE
                         and chunk.get("input_section")
@@ -551,6 +558,20 @@ async def run_agent_to_bus(
             }
         persist_parts = collected_file_parts if collected_file_parts else None
 
+        # Stamp the turn's reasoning provider/model onto the message metadata so
+        # the aggregate ``token_usage`` blob is attributable even without the
+        # per-source rows (and so any future backfill can recover it).
+        reasoning_rec = next(
+            (r for r in collected_usage_records if r.get("source_kind") == "reasoning"),
+            None,
+        )
+        if reasoning_rec and (reasoning_rec.get("provider") or reasoning_rec.get("model")):
+            agent_message_metadata = {
+                **(agent_message_metadata or {}),
+                "provider": reasoning_rec.get("provider"),
+                "model": reasoning_rec.get("model"),
+            }
+
         assistant_msg_id: Optional[str] = None
         try:
             assistant_msg = await conversation_storage.add_message(
@@ -570,6 +591,29 @@ async def run_agent_to_bus(
             logger.exception(
                 f"stream_runner: failed to persist assistant message for {conversation_id}"
             )
+
+        # 5a. Persist the per-source usage breakdown (one row per LLM invocation:
+        #     reasoning step vs. each tool/sub-agent), with frozen estimated cost.
+        #     Keyed to the assistant turn just persisted. Best-effort — never
+        #     break the stream over usage accounting.
+        if collected_usage_records:
+            try:
+                if token_usage_data and not reconcile(collected_usage_records, token_usage_data):
+                    logger.warning(
+                        f"stream_runner: usage records don't reconcile with turn totals "
+                        f"for {conversation_id} (records sum != aggregate)"
+                    )
+                from app.storage import get_usage_storage
+                await get_usage_storage().add_usage_records(
+                    conversation_id=conversation_id,
+                    profile=profile,
+                    records=collected_usage_records,
+                    message_id=assistant_msg_id,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    f"stream_runner: failed to persist usage records for {conversation_id}"
+                )
 
         # 5b. Memory trigger: if enough NEW message-content tokens (reasoning
         #     excluded) have accrued since the last extraction, kick off a
