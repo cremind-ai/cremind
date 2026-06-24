@@ -106,6 +106,8 @@ class CremindAgentExecutor(AgentExecutor):
         has_sent_first_chunk = False
         final_response_text_parts = []
         total_input_tokens = 0
+        total_cache_read_input_tokens = 0
+        total_cache_creation_input_tokens = 0
         total_output_tokens = 0
         collected_thinking_steps: list[dict] = []
         collected_file_parts: list[Part] = []
@@ -288,6 +290,8 @@ class CremindAgentExecutor(AgentExecutor):
                             await asyncio.sleep(0.001)  # 1ms delay per token
                     # Capture token usage from the final chunk
                     total_input_tokens = chunk.get("input_tokens") or 0
+                    total_cache_read_input_tokens = chunk.get("cache_read_input_tokens") or 0
+                    total_cache_creation_input_tokens = chunk.get("cache_creation_input_tokens") or 0
                     total_output_tokens = chunk.get("output_tokens") or 0
                     # DONE carries input_section only when the turn was
                     # multi-step (i.e. worth summarizing); presence of this
@@ -373,11 +377,18 @@ class CremindAgentExecutor(AgentExecutor):
 
         # Emit token_usage artifact if we have any token data
         if total_input_tokens > 0 or total_output_tokens > 0:
-            logger.debug(f"Total token usage - input: {total_input_tokens}, output: {total_output_tokens}")
+            logger.debug(
+                f"Total token usage - input: {total_input_tokens}, "
+                f"cache_read: {total_cache_read_input_tokens}, "
+                f"cache_creation: {total_cache_creation_input_tokens}, "
+                f"output: {total_output_tokens}"
+            )
             await updater.add_artifact(
                 [Part(root=DataPart(data={
                     "token_usage": {
                         "input_tokens": total_input_tokens,
+                        "cache_read_input_tokens": total_cache_read_input_tokens,
+                        "cache_creation_input_tokens": total_cache_creation_input_tokens,
                         "output_tokens": total_output_tokens,
                     }
                 }, kind="data", metadata=None))],
@@ -420,6 +431,8 @@ class CremindAgentExecutor(AgentExecutor):
                 if total_input_tokens > 0 or total_output_tokens > 0:
                     token_usage_data = {
                         "input_tokens": total_input_tokens,
+                        "cache_read_input_tokens": total_cache_read_input_tokens,
+                        "cache_creation_input_tokens": total_cache_creation_input_tokens,
                         "output_tokens": total_output_tokens,
                     }
 

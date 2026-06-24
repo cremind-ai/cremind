@@ -228,7 +228,13 @@ class ChatCompletionStreamResponseType(TypedDict):
     type: ChatCompletionTypeEnum
     data: Required[Optional[Any]]
     last_token: NotRequired[bool]
+    # ``input_tokens`` is the UNCACHED input only. Cached prompt tokens are
+    # reported separately so cost can be attributed accurately:
+    #   cache_read_input_tokens     -- served from cache (heavily discounted)
+    #   cache_creation_input_tokens -- written to cache (Anthropic only; premium)
     input_tokens: NotRequired[Optional[int]]
+    cache_read_input_tokens: NotRequired[Optional[int]]
+    cache_creation_input_tokens: NotRequired[Optional[int]]
     output_tokens: NotRequired[Optional[int]]
     finish_reason: NotRequired[Optional[str]]
 
@@ -248,5 +254,9 @@ class VectorEmbeddingType(Enum):
 class ReasoningStreamResponseType(TypedDict):
     type: ChatCompletionTypeEnum
     data: Required[Any]
+    # ``input_tokens`` is uncached input only; cached tokens are reported
+    # separately (see ``ChatCompletionStreamResponseType``).
     input_tokens: NotRequired[Optional[int]]
+    cache_read_input_tokens: NotRequired[Optional[int]]
+    cache_creation_input_tokens: NotRequired[Optional[int]]
     output_tokens: NotRequired[Optional[int]]

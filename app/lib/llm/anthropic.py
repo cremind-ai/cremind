@@ -246,6 +246,8 @@ class AnthropicLLMProvider(LLMProvider):
             tool_use_blocks: List[dict] = []
             current_tool: Optional[dict] = None
             input_tokens = 0
+            cache_read_input_tokens = 0
+            cache_creation_input_tokens = 0
             output_tokens = 0
             finish_reason = None
 
@@ -288,15 +290,15 @@ class AnthropicLLMProvider(LLMProvider):
                             if hasattr(event, "message") and event.message.usage:
                                 usage = event.message.usage
                                 # Anthropic reports cached tokens separately from
-                                # ``input_tokens``; fold them in so the total
-                                # reflects the full prompt size, and log hits.
-                                cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-                                cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
-                                input_tokens = usage.input_tokens + cache_read + cache_creation
+                                # ``input_tokens`` (which is the uncached remainder).
+                                # Keep them distinct so cost is attributable.
+                                cache_read_input_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+                                cache_creation_input_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                                input_tokens = usage.input_tokens
                                 if cache_enabled:
                                     logger.debug(
-                                        f"[llm:anthropic] prompt cache: read={cache_read} "
-                                        f"creation={cache_creation} uncached={usage.input_tokens}"
+                                        f"[llm:anthropic] prompt cache: read={cache_read_input_tokens} "
+                                        f"creation={cache_creation_input_tokens} uncached={input_tokens}"
                                     )
 
                         elif event.type == "content_block_start":
@@ -366,6 +368,8 @@ class AnthropicLLMProvider(LLMProvider):
                 res: dict = {
                     "type": ChatCompletionTypeEnum.DONE,
                     "input_tokens": input_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens,
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
                     "output_tokens": output_tokens,
                     "finish_reason": finish_reason,
                 }
@@ -502,22 +506,27 @@ class AnthropicLLMProvider(LLMProvider):
                     finish_reason = "length"
 
                 input_tokens = None
+                cache_read_input_tokens = None
+                cache_creation_input_tokens = None
                 output_tokens = None
                 if response.usage:
-                    # Fold cached tokens into the input total (Anthropic reports
-                    # them separately) and log cache activity.
-                    cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
-                    cache_creation = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
-                    input_tokens = response.usage.input_tokens + cache_read + cache_creation
+                    # Anthropic reports cached tokens separately from
+                    # ``input_tokens`` (the uncached remainder). Keep them
+                    # distinct so cost is attributable, and log cache activity.
+                    cache_read_input_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+                    cache_creation_input_tokens = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+                    input_tokens = response.usage.input_tokens
                     output_tokens = response.usage.output_tokens
                     if cache_enabled:
                         logger.debug(
-                            f"[llm:anthropic] prompt cache: read={cache_read} "
-                            f"creation={cache_creation} uncached={response.usage.input_tokens}"
+                            f"[llm:anthropic] prompt cache: read={cache_read_input_tokens} "
+                            f"creation={cache_creation_input_tokens} uncached={input_tokens}"
                         )
                 yield {
                     "type": ChatCompletionTypeEnum.DONE,
                     "input_tokens": input_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens,
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
                     "output_tokens": output_tokens,
                     "finish_reason": finish_reason,
                     "data": text_content or None,
