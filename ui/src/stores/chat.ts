@@ -130,6 +130,8 @@ export interface ArtifactInfo {
 export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
   totalTokens: number;
 }
 
@@ -1002,10 +1004,14 @@ export const useChatStore = defineStore('chat', {
         case 'token_usage': {
           const message = ensureAssistant();
           const usage = data.token_usage ?? data;
+          const cacheRead = usage.cache_read_input_tokens || 0;
+          const cacheCreation = usage.cache_creation_input_tokens || 0;
           message.tokenUsage = {
             inputTokens: usage.input_tokens || 0,
             outputTokens: usage.output_tokens || 0,
-            totalTokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
+            cacheReadTokens: cacheRead,
+            cacheCreationTokens: cacheCreation,
+            totalTokens: (usage.input_tokens || 0) + cacheRead + cacheCreation + (usage.output_tokens || 0),
           };
           return;
         }
@@ -1041,6 +1047,12 @@ export const useChatStore = defineStore('chat', {
           runtime.isSummarizing = false;
           runtime.streamingAssistantId = undefined;
           scratch.currentTextPart = '';
+          // Drop this turn's usage rollup so the usage panel / chips re-fetch
+          // the freshly-persisted per-source records (lazy import: the usage
+          // store must not be a load-time dependency of the chat store).
+          import('./usage')
+            .then(m => m.useUsageStore().invalidateConversation(conversationId))
+            .catch(() => {});
           // Drop the 'streaming' tracker so the SSE can close when the
           // user navigates away (it stays open as long as 'active' is set).
           this.untrackConversation(conversationId, 'streaming');
@@ -1179,7 +1191,13 @@ export const useChatStore = defineStore('chat', {
         ? {
             inputTokens: msg.token_usage.input_tokens,
             outputTokens: msg.token_usage.output_tokens,
-            totalTokens: (msg.token_usage.input_tokens || 0) + (msg.token_usage.output_tokens || 0),
+            cacheReadTokens: msg.token_usage.cache_read_input_tokens || 0,
+            cacheCreationTokens: msg.token_usage.cache_creation_input_tokens || 0,
+            totalTokens:
+              (msg.token_usage.input_tokens || 0) +
+              (msg.token_usage.cache_read_input_tokens || 0) +
+              (msg.token_usage.cache_creation_input_tokens || 0) +
+              (msg.token_usage.output_tokens || 0),
           }
         : undefined;
 

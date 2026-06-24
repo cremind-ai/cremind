@@ -260,3 +260,8 @@ class ReasoningStreamResponseType(TypedDict):
     cache_read_input_tokens: NotRequired[Optional[int]]
     cache_creation_input_tokens: NotRequired[Optional[int]]
     output_tokens: NotRequired[Optional[int]]
+    # Per-source token attribution for this turn (one entry per LLM invocation:
+    # reasoning step vs. specific tool/sub-agent). Carried on terminal chunks so
+    # the runner can freeze cost and persist to ``usage_records``. The aggregate
+    # token fields above remain authoritative for backward compatibility.
+    usage_records: NotRequired[list[dict]]

@@ -18,7 +18,7 @@ from app.events.conversations_list_bus import (
     publish_conversations_changed,
 )
 from app.events.stream_bus import get_event_stream_bus
-from app.storage import get_memory_storage
+from app.storage import get_memory_storage, get_usage_storage
 from app.storage.conversation_storage import ConversationStorage, is_valid_conversation_id
 from app.utils import logger
 from app.utils.common import convert_db_messages_to_history
@@ -33,6 +33,53 @@ def _require_auth(request: Request):
     if not getattr(request.user, "is_authenticated", False):
         return JSONResponse({"error": "Unauthenticated"}, status_code=401)
     return None
+
+
+def _usage_sum(rows: list[dict]) -> dict:
+    """Sum a set of usage rows into a TokenBreakdown (cost skips null estimates)."""
+    it = sum(r["input_tokens"] for r in rows)
+    cr = sum(r["cache_read_input_tokens"] for r in rows)
+    cc = sum(r["cache_creation_input_tokens"] for r in rows)
+    ot = sum(r["output_tokens"] for r in rows)
+    cost = sum((r["estimated_cost_usd"] or 0.0) for r in rows)
+    return {
+        "input_tokens": it,
+        "cache_read_input_tokens": cr,
+        "cache_creation_input_tokens": cc,
+        "output_tokens": ot,
+        "total_tokens": it + cr + cc + ot,
+        "estimated_cost_usd": cost,
+    }
+
+
+def _usage_by_source(rows: list[dict]) -> list[dict]:
+    """Group rows by (source_kind, tool_id) — reasoning agent + each tool/sub-agent."""
+    groups: dict[tuple, list[dict]] = {}
+    order: list[tuple] = []
+    for r in rows:
+        key = (r["source_kind"], r.get("tool_id"))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+    out = []
+    for sk, tid in order:
+        grp = groups[(sk, tid)]
+        out.append({
+            "source": tid or sk,
+            "display_name": grp[0].get("label") or tid or sk,
+            "source_type": sk,
+            "tool_id": tid,
+            "request_count": len(grp),
+            **_usage_sum(grp),
+        })
+    out.sort(key=lambda e: e["estimated_cost_usd"], reverse=True)
+    return out
+
+
+def _cache_hit_rate(totals: dict) -> float:
+    denom = totals["input_tokens"] + totals["cache_read_input_tokens"]
+    return (totals["cache_read_input_tokens"] / denom) if denom else 0.0
 
 
 def get_conversation_routes(
@@ -582,6 +629,61 @@ def get_conversation_routes(
             cancelled = agent_executor.cancel_by_task_id(task_id)
         return JSONResponse({"cancelled": cancelled})
 
+    async def handle_get_conversation_usage(request: Request) -> JSONResponse:
+        """Per-request + cumulative token usage & estimated cost for a conversation.
+
+        Returns one entry per assistant turn (request), each broken down by
+        source (reasoning agent vs. each sub-agent/tool), plus conversation-wide
+        totals and a per-source rollup. Built from a single ``usage_records``
+        query; all grouping happens in Python over the (few dozen) rows.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile_from_request(request)
+        conversation_id = request.path_params["conversation_id"]
+        conv = await conversation_storage.get_conversation(conversation_id)
+        if not conv:
+            return JSONResponse({"error": "Conversation not found"}, status_code=404)
+        if conv.get("profile") != profile and profile != "admin":
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+        rows = await get_usage_storage().per_request_breakdown(conversation_id)
+
+        # Group rows into requests (one assistant turn = one message_id),
+        # preserving first-seen order (rows arrive ordered by message/step).
+        req_groups: dict = {}
+        req_order: list = []
+        for r in rows:
+            mid = r["message_id"]
+            if mid not in req_groups:
+                req_groups[mid] = []
+                req_order.append(mid)
+            req_groups[mid].append(r)
+
+        requests = []
+        for mid in req_order:
+            grp = req_groups[mid]
+            reasoning = next((x for x in grp if x["source_kind"] == "reasoning"), grp[0])
+            requests.append({
+                "message_id": mid,
+                "created_at": min(x["created_at"] for x in grp),
+                "model": reasoning.get("model"),
+                "provider": reasoning.get("provider"),
+                **_usage_sum(grp),
+                "by_source": _usage_by_source(grp),
+            })
+
+        totals = _usage_sum(rows) if rows else _usage_sum([])
+        return JSONResponse({
+            "conversation_id": conversation_id,
+            "totals": totals,
+            "cache_hit_rate": _cache_hit_rate(totals),
+            "request_count": len(requests),
+            "by_source": _usage_by_source(rows),
+            "requests": requests,
+        })
+
     return [
         Route(
             "/api/conversations",
@@ -609,6 +711,11 @@ def get_conversation_routes(
         Route(
             "/api/conversations/{conversation_id}/memory",
             endpoint=handle_get_memory,
+            methods=["GET"],
+        ),
+        Route(
+            "/api/conversations/{conversation_id}/usage",
+            endpoint=handle_get_conversation_usage,
             methods=["GET"],
         ),
         Route(
