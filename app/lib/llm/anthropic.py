@@ -139,6 +139,32 @@ def _convert_tools(tools: Optional[List[ChatCompletionToolUnionParam]]) -> list[
     return anthropic_tools
 
 
+_CACHE_CONTROL = {"type": "ephemeral"}
+
+
+def _system_param(system_text: str, cache_enabled: bool):
+    """Return the Anthropic ``system`` param, adding a cache breakpoint when enabled.
+
+    A plain string when caching is off; a single text block carrying
+    ``cache_control`` when on, so Anthropic caches the system prefix.
+    """
+    if not cache_enabled:
+        return system_text
+    return [{"type": "text", "text": system_text, "cache_control": _CACHE_CONTROL}]
+
+
+def _cache_last_tool(anthropic_tools: list[dict], cache_enabled: bool) -> list[dict]:
+    """Mark the last tool with ``cache_control`` so the whole tools block is cached.
+
+    Tools precede ``system`` in Anthropic's cache prefix, so a breakpoint on the
+    final tool caches every tool definition. Returns the list unchanged when
+    caching is off or there are no tools.
+    """
+    if not cache_enabled or not anthropic_tools:
+        return anthropic_tools
+    return anthropic_tools[:-1] + [{**anthropic_tools[-1], "cache_control": _CACHE_CONTROL}]
+
+
 class AnthropicLLMProvider(LLMProvider):
     def __init__(
         self,
@@ -186,6 +212,7 @@ class AnthropicLLMProvider(LLMProvider):
     ) -> AsyncGenerator[ChatCompletionStreamResponseType, None]:
         last_error: Any = None
         logger.debug(f"[llm:anthropic] chat_completion_stream model={self.model_name}")
+        cache_enabled = bool((args or {}).get("prompt_cache"))
 
         for attempt in range((retry or 0) + 1):
             content_total = ""
@@ -206,7 +233,7 @@ class AnthropicLLMProvider(LLMProvider):
                     "stream": True,
                 }
                 if system_text:
-                    params["system"] = system_text
+                    params["system"] = _system_param(system_text, cache_enabled)
                 if temperature is not None:
                     params["temperature"] = temperature
                 if top_p is not None:
@@ -214,7 +241,7 @@ class AnthropicLLMProvider(LLMProvider):
                 if stop:
                     params["stop_sequences"] = [stop]
                 if anthropic_tools:
-                    params["tools"] = anthropic_tools
+                    params["tools"] = _cache_last_tool(anthropic_tools, cache_enabled)
                     # Map OpenAI tool_choice to Anthropic
                     if tool_choice == "auto" or tool_choice is None:
                         params["tool_choice"] = {"type": "auto"}
@@ -232,7 +259,18 @@ class AnthropicLLMProvider(LLMProvider):
                     async for event in stream:
                         if event.type == "message_start":
                             if hasattr(event, "message") and event.message.usage:
-                                input_tokens = event.message.usage.input_tokens
+                                usage = event.message.usage
+                                # Anthropic reports cached tokens separately from
+                                # ``input_tokens``; fold them in so the total
+                                # reflects the full prompt size, and log hits.
+                                cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+                                cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                                input_tokens = usage.input_tokens + cache_read + cache_creation
+                                if cache_enabled:
+                                    logger.debug(
+                                        f"[llm:anthropic] prompt cache: read={cache_read} "
+                                        f"creation={cache_creation} uncached={usage.input_tokens}"
+                                    )
 
                         elif event.type == "content_block_start":
                             block = event.content_block
@@ -332,6 +370,7 @@ class AnthropicLLMProvider(LLMProvider):
     ) -> AsyncGenerator[ChatCompletionStreamResponseType, None]:
         last_error: Any = None
         logger.debug(f"[llm:anthropic] chat_completion model={self.model_name}")
+        cache_enabled = bool((args or {}).get("prompt_cache"))
 
         for attempt in range((retry or 0) + 1):
             try:
@@ -344,7 +383,7 @@ class AnthropicLLMProvider(LLMProvider):
                     "max_tokens": self._resolve_max_tokens(max_tokens),
                 }
                 if system_text:
-                    params["system"] = system_text
+                    params["system"] = _system_param(system_text, cache_enabled)
                 if temperature is not None:
                     params["temperature"] = temperature
                 if top_p is not None:
@@ -352,7 +391,7 @@ class AnthropicLLMProvider(LLMProvider):
                 if stop:
                     params["stop_sequences"] = [stop]
                 if anthropic_tools:
-                    params["tools"] = anthropic_tools
+                    params["tools"] = _cache_last_tool(anthropic_tools, cache_enabled)
                     if tool_choice == "auto" or tool_choice is None:
                         params["tool_choice"] = {"type": "auto"}
                     elif tool_choice == "required":
@@ -435,10 +474,24 @@ class AnthropicLLMProvider(LLMProvider):
                 elif response.stop_reason == "max_tokens":
                     finish_reason = "length"
 
+                input_tokens = None
+                output_tokens = None
+                if response.usage:
+                    # Fold cached tokens into the input total (Anthropic reports
+                    # them separately) and log cache activity.
+                    cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+                    cache_creation = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+                    input_tokens = response.usage.input_tokens + cache_read + cache_creation
+                    output_tokens = response.usage.output_tokens
+                    if cache_enabled:
+                        logger.debug(
+                            f"[llm:anthropic] prompt cache: read={cache_read} "
+                            f"creation={cache_creation} uncached={response.usage.input_tokens}"
+                        )
                 yield {
                     "type": ChatCompletionTypeEnum.DONE,
-                    "input_tokens": response.usage.input_tokens if response.usage else None,
-                    "output_tokens": response.usage.output_tokens if response.usage else None,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
                     "finish_reason": finish_reason,
                     "data": text_content or None,
                 }
