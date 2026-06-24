@@ -24,6 +24,9 @@ kind = "token"
 [provider.auth_methods.fields]
 oauth_token = { description = "OAuth Access Token", type = "string", secret = true, required = true }
 
+# Cache pricing: OpenAI discounts cached input tokens to 0.25x the input rate and
+# does not charge separately for cache creation.
+
 # Latest flagship models (GPT-5.4 series)
 [[models]]
 id = "gpt-5.4"
@@ -33,6 +36,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 2.50
 output_price_per_1m = 15.00
+cache_read_price_per_1m = 0.625   # 0.25x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gpt-5.4-mini"
@@ -42,6 +47,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.75
 output_price_per_1m = 4.50
+cache_read_price_per_1m = 0.1875  # 0.25x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gpt-5.4-nano"
@@ -51,6 +58,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.20
 output_price_per_1m = 1.25
+cache_read_price_per_1m = 0.05    # 0.25x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gpt-5.4-pro"
@@ -60,6 +69,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 30.00
 output_price_per_1m = 180.00
+cache_read_price_per_1m = 7.50    # 0.25x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 # GPT-5.3 series
 [[models]]
@@ -70,6 +81,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 1.75
 output_price_per_1m = 14.00
+cache_read_price_per_1m = 0.4375  # 0.25x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 # Previous-generation models still supported in the API
 [[models]]
@@ -80,6 +93,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 2.00
 output_price_per_1m = 8.00
+cache_read_price_per_1m = 0.50    # 0.25x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gpt-4.1-mini"
@@ -89,6 +104,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.40
 output_price_per_1m = 1.60
+cache_read_price_per_1m = 0.10    # 0.25x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gpt-4.1-nano"
@@ -98,6 +115,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.10
 output_price_per_1m = 0.40
+cache_read_price_per_1m = 0.025   # 0.25x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 # Reasoning models (o-series)
 [[models]]
@@ -109,6 +128,8 @@ vision = true
 input_price_per_1m = 20.00
 output_price_per_1m = 80.00
 reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 5.00    # 0.25x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "o3"
@@ -119,6 +140,8 @@ vision = true
 input_price_per_1m = 2.00
 output_price_per_1m = 8.00
 reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.50    # 0.25x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "o4-mini"
@@ -129,6 +152,8 @@ vision = true
 input_price_per_1m = 0.55
 output_price_per_1m = 2.20
 reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.1375  # 0.25x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "o3-mini"
@@ -138,3 +163,5 @@ prompt_cache = true
 input_price_per_1m = 1.10
 output_price_per_1m = 4.40
 reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.275   # 0.25x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee

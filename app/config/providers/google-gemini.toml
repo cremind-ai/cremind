@@ -14,6 +14,9 @@ is_default = true
 [provider.auth_methods.fields]
 api_key = { description = "Gemini API Key", type = "string", secret = true, required = true }
 
+# Cache pricing: Gemini implicit caching (2.5+) bills cached input at 0.10x the
+# input rate (90% discount) with no separate cache-write fee.
+
 [[models]]
 id = "gemini-3.1-pro-preview"
 display_name = "Gemini 3.1 Pro"
@@ -22,6 +25,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 2.00
 output_price_per_1m = 12.00
+cache_read_price_per_1m = 0.20    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gemini-3-flash-preview"
@@ -31,6 +36,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.50
 output_price_per_1m = 3.00
+cache_read_price_per_1m = 0.05    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gemini-3.1-flash-lite-preview"
@@ -40,6 +47,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.25
 output_price_per_1m = 1.50
+cache_read_price_per_1m = 0.025   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gemini-2.5-pro"
@@ -49,6 +58,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 1.25
 output_price_per_1m = 10.00
+cache_read_price_per_1m = 0.125   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gemini-2.5-flash"
@@ -58,6 +69,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.30
 output_price_per_1m = 2.50
+cache_read_price_per_1m = 0.03    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gemini-2.5-flash-lite"
@@ -67,6 +80,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.10
 output_price_per_1m = 0.40
+cache_read_price_per_1m = 0.01    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gemini-2.0-flash"
@@ -76,3 +91,5 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.10
 output_price_per_1m = 0.40
+cache_read_price_per_1m = 0.01    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee

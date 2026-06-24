@@ -14,6 +14,9 @@ is_default = true
 [provider.auth_methods.fields]
 api_key = { description = "Fireworks API Key", type = "string", secret = true, required = true }
 
+# Cache pricing: Fireworks serverless prompt caching applies a flat 50% cached-
+# input discount (0.50x input) with no separate cache-write fee.
+
 [[models]]
 id = "accounts/fireworks/models/llama4-maverick-instruct-basic"
 display_name = "Llama 4 Maverick"
@@ -22,6 +25,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.22
 output_price_per_1m = 0.88
+cache_read_price_per_1m = 0.11    # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "accounts/fireworks/models/llama4-scout-instruct-basic"
@@ -31,6 +36,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.15
 output_price_per_1m = 0.60
+cache_read_price_per_1m = 0.075   # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "accounts/fireworks/models/deepseek-v3"
@@ -39,6 +46,8 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.56
 output_price_per_1m = 1.68
+cache_read_price_per_1m = 0.28    # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "accounts/fireworks/models/deepseek-r1"
@@ -47,6 +56,8 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 3.00
 output_price_per_1m = 8.00
+cache_read_price_per_1m = 1.50    # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "accounts/fireworks/models/qwen3-235b-a22b"
@@ -55,6 +66,8 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.50
 output_price_per_1m = 1.50
+cache_read_price_per_1m = 0.25    # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "accounts/fireworks/models/kimi-k2-5"
@@ -63,3 +76,5 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.60
 output_price_per_1m = 3.00
+cache_read_price_per_1m = 0.30    # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee

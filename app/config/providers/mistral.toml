@@ -14,6 +14,9 @@ is_default = true
 [provider.auth_methods.fields]
 api_key = { description = "Mistral API Key", type = "string", secret = true, required = true }
 
+# Cache pricing: Mistral bills cached tokens at 0.10x the input rate (90%
+# discount) with no separate cache-write fee.
+
 [[models]]
 id = "mistral-large-latest"
 display_name = "Mistral Large 3"
@@ -22,6 +25,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.50
 output_price_per_1m = 1.50
+cache_read_price_per_1m = 0.05    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "mistral-medium-latest"
@@ -31,6 +36,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.40
 output_price_per_1m = 2.00
+cache_read_price_per_1m = 0.04    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "mistral-small-latest"
@@ -40,6 +47,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.10
 output_price_per_1m = 0.30
+cache_read_price_per_1m = 0.01    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "codestral-latest"
@@ -48,6 +57,8 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.30
 output_price_per_1m = 0.90
+cache_read_price_per_1m = 0.03    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "magistral-medium-latest"
@@ -56,6 +67,8 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 2.00
 output_price_per_1m = 5.00
+cache_read_price_per_1m = 0.20    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "devstral-latest"
@@ -64,3 +77,5 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.40
 output_price_per_1m = 0.90
+cache_read_price_per_1m = 0.04    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
