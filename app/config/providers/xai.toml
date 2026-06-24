@@ -14,6 +14,10 @@ is_default = true
 [provider.auth_methods.fields]
 api_key = { description = "xAI API Key", type = "string", secret = true, required = true }
 
+# Cache pricing: xAI publishes a flat cached-input rate per model (no separate
+# cache-write fee). Grok 4-class models cache at $0.20/M; Grok 4.1 Fast at
+# $0.05/M; Grok 3 / 3 Mini at 0.25x the input rate.
+
 [[models]]
 id = "grok-4"
 display_name = "Grok 4"
@@ -22,6 +26,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 2.00
 output_price_per_1m = 6.00
+cache_read_price_per_1m = 0.20    # published flat cached-input rate
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "grok-4-1-fast"
@@ -31,6 +37,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.20
 output_price_per_1m = 0.50
+cache_read_price_per_1m = 0.05    # published flat cached-input rate
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "grok-3"
@@ -39,6 +47,8 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 3.00
 output_price_per_1m = 15.00
+cache_read_price_per_1m = 0.75    # 0.25x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "grok-3-mini"
@@ -48,3 +58,5 @@ prompt_cache = true
 input_price_per_1m = 0.30
 output_price_per_1m = 0.50
 reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.075   # 0.25x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
