@@ -165,6 +165,33 @@ def _cache_last_tool(anthropic_tools: list[dict], cache_enabled: bool) -> list[d
     return anthropic_tools[:-1] + [{**anthropic_tools[-1], "cache_control": _CACHE_CONTROL}]
 
 
+def _cache_history(anthropic_messages: list[dict], cache_enabled: bool) -> list[dict]:
+    """Mark the last *history* message so ``[tools + system + history]`` is cached.
+
+    The reasoning loop appends the volatile turn last, so ``messages[-1]`` is the
+    per-step input and ``messages[-2]`` is the last (byte-stable) history message.
+    A breakpoint on its last content block caches the whole history prefix. No-op
+    when caching is off or there is no history (< 2 messages). Only the reasoning
+    loop sets ``prompt_cache``, so the "last message is volatile" assumption holds.
+    """
+    if not cache_enabled or len(anthropic_messages) < 2:
+        return anthropic_messages
+    idx = len(anthropic_messages) - 2
+    msg = anthropic_messages[idx]
+    content = msg.get("content")
+    if isinstance(content, list) and content:
+        new_content = content[:-1] + [{**content[-1], "cache_control": _CACHE_CONTROL}]
+    elif isinstance(content, str) and content:
+        new_content = [{"type": "text", "text": content, "cache_control": _CACHE_CONTROL}]
+    else:
+        return anthropic_messages
+    return (
+        anthropic_messages[:idx]
+        + [{**msg, "content": new_content}]
+        + anthropic_messages[idx + 1:]
+    )
+
+
 class AnthropicLLMProvider(LLMProvider):
     def __init__(
         self,
@@ -228,7 +255,7 @@ class AnthropicLLMProvider(LLMProvider):
 
                 params: Dict[str, Any] = {
                     "model": self.model_name,
-                    "messages": anthropic_messages,
+                    "messages": _cache_history(anthropic_messages, cache_enabled),
                     "max_tokens": self._resolve_max_tokens(max_tokens),
                     "stream": True,
                 }
@@ -379,7 +406,7 @@ class AnthropicLLMProvider(LLMProvider):
 
                 params: Dict[str, Any] = {
                     "model": self.model_name,
-                    "messages": anthropic_messages,
+                    "messages": _cache_history(anthropic_messages, cache_enabled),
                     "max_tokens": self._resolve_max_tokens(max_tokens),
                 }
                 if system_text:
