@@ -129,6 +129,11 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
                 description="Maximum number of recent ReAct step entries kept in the prompt context. Older entries are dropped once this is exceeded.",
                 min=5, max=500,
             ),
+            "enable_prompt_cache": Field(
+                type="boolean", default_toml="agent.enable_prompt_cache",
+                label="Prompt caching",
+                description="Reuse the cached system+tools prefix across reasoning steps to cut input tokens. Anthropic uses explicit cache markers; OpenAI-family providers cache automatically. Harmless on providers without cache support.",
+            ),
         },
     ),
     "history": ConfigGroup(
