@@ -300,6 +300,10 @@ async def run_agent_to_bus(
     reasoning_input_section: str | None = None
     errored = False
     cancelled = False
+    # The id of this turn's just-persisted user/trigger message, captured below.
+    # Passed to compaction so the current turn (sent separately as the volatile
+    # input) is excluded from the rebuilt history tail.
+    current_turn_msg_id: Optional[str] = None
 
     # Memory feature (independent background session). Read the per-profile
     # config once for this turn: used both to inject stored memory into the
@@ -339,6 +343,7 @@ async def run_agent_to_bus(
                     f"stream_runner: failed to persist trigger message for {conversation_id}"
                 )
 
+            current_turn_msg_id = trigger_msg_id
             await bus.publish(conversation_id, "event_trigger_message", {
                 "id": trigger_msg_id,
                 "content": trigger_content,
@@ -360,6 +365,7 @@ async def run_agent_to_bus(
                     f"stream_runner: failed to persist user message for {conversation_id}"
                 )
 
+            current_turn_msg_id = user_msg_id
             await bus.publish(conversation_id, "user_message", {
                 "id": user_msg_id,
                 "content": query,
@@ -390,6 +396,22 @@ async def run_agent_to_bus(
             memory_context = await memory_runner.load_memory_context(
                 conversation_id, profile,
             )
+
+        # Compaction: replace the raw history with [running summary + verbatim tail],
+        # folding the oldest turns into the summary first when the tail is over
+        # threshold. Synchronous (before the prompt is assembled) so the threshold is
+        # never exceeded — notably on the first turn after upgrade, when a long
+        # pre-existing conversation would otherwise be sent whole. No-op / falls back
+        # to the raw history when disabled or on error.
+        from app.agent import compaction
+        history_messages = await compaction.build_compacted_history(
+            conversation_id=conversation_id,
+            profile=profile,
+            conversation_storage=conversation_storage,
+            cremind_agent=cremind_agent,
+            fallback_history=history_messages,
+            exclude_message_id=current_turn_msg_id,
+        )
 
         try:
             async for chunk in cremind_agent.run(
