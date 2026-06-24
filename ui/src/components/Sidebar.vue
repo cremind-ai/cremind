@@ -271,6 +271,12 @@ const handleOpenCalendar = () => {
   router.push({ name: 'calendar-schedule', params: { profile } });
 };
 
+const handleOpenUsage = () => {
+  const profile = route.params.profile as string;
+  if (!profile) return;
+  router.push({ name: 'usage', params: { profile } });
+};
+
 // Developer page is admin-only — backend's require_admin would 403
 // non-admin profiles, and the route guard already redirects them.
 // Hiding the sidebar row keeps them from ever seeing the entry point.
@@ -611,6 +617,13 @@ const toggleThemeFromIcon = () => {
           @dismiss="handleDismissNotification"
         />
       </ElPopover>
+      <ElTooltip content="Usage &amp; Cost" placement="right" :show-after="300" :disabled="!isCollapsed">
+        <div class="settings-row" @click="handleOpenUsage">
+          <Icon icon="mdi:chart-box-outline" class="settings-icon" />
+          <span class="settings-label" v-if="!isCollapsed">Usage &amp; Cost</span>
+          <Icon icon="mdi:chevron-right" class="chevron-icon" v-if="!isCollapsed" />
+        </div>
+      </ElTooltip>
       <ElTooltip content="Process Manager" placement="right" :show-after="300" :disabled="!isCollapsed">
         <div class="settings-row" @click="handleOpenProcessManager">
           <Icon icon="mdi:console" class="settings-icon" />

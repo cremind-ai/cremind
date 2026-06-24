@@ -36,6 +36,7 @@ from a2a.types import Part, TextPart
 
 from app.agent.context_store import ReasoningContextStore
 from app.agent.skill_classifier import classify_skill_request
+from app.agent.usage import UsageRecord
 from app.config.settings import BaseConfig, get_user_working_directory
 from app.config.user_config import resolve_agent_config
 from app.constants import ChatCompletionTypeEnum
@@ -265,6 +266,10 @@ class ReasoningAgent:
         self._total_cache_read_input_tokens = 0
         self._total_cache_creation_input_tokens = 0
         self._total_output_tokens = 0
+        # Per-invocation attribution for this turn. Appended at the same sites
+        # that bump the running totals above, so ``sum(records) == totals`` by
+        # construction (the runner reconciles before persisting to usage_records).
+        self._usage_records: list[UsageRecord] = []
         # Skills whose SKILL.md content has been folded into self.instruction.
         # Such skills are removed from the rendered Tools block and from the
         # Action enum so the LLM cannot re-invoke them. Cleared when the loop
@@ -468,7 +473,71 @@ class ReasoningAgent:
             "cache_read_input_tokens": self._total_cache_read_input_tokens,
             "cache_creation_input_tokens": self._total_cache_creation_input_tokens,
             "output_tokens": self._total_output_tokens,
+            # Per-source attribution riding the chunk to the runner, which freezes
+            # cost and persists to usage_records. Serialized to plain dicts so the
+            # existing TypedDict consumers (which ignore the key) stay unaffected.
+            "usage_records": [r.to_dict() for r in self._usage_records],
         }
+
+    # ── per-invocation usage attribution ──────────────────────────────────
+
+    # Maps a tool's ``tool_type`` to a usage ``source_kind``. The main ReAct loop
+    # records source_kind="reasoning" directly; this only covers tool dispatch.
+    _SOURCE_KIND_BY_TOOL_TYPE = {
+        ToolType.INTRINSIC: "intrinsic",
+        ToolType.SKILL: "intrinsic",
+        ToolType.BUILTIN: "tool",
+        ToolType.MCP: "tool",
+        ToolType.A2A: "subagent",
+    }
+
+    def _provider_model_for(self, tool) -> tuple[str | None, str | None]:
+        """Provider+model that produced a tool's LLM usage (mirrors _model_label_for)."""
+        if tool.tool_type in (ToolType.INTRINSIC, ToolType.SKILL):
+            return self.llm.provider_name, getattr(self.llm, "model_name", None)
+        adapter = getattr(tool, "adapter", None)
+        inner = getattr(adapter, "_llm", None)
+        if inner is not None:
+            return getattr(inner, "provider_name", None), getattr(inner, "model_name", None)
+        return None, None  # A2A and tools with no local child LLM
+
+    def _record_reasoning_usage(self, response: dict) -> None:
+        """Attribute one reasoning-step LLM call to source_kind='reasoning'.
+
+        Called from the same blocks that bump ``self._total_*`` so the records
+        sum to the aggregate. Skips all-zero calls (they add nothing).
+        """
+        it = response.get("input_tokens") or 0
+        cr = response.get("cache_read_input_tokens") or 0
+        cc = response.get("cache_creation_input_tokens") or 0
+        ot = response.get("output_tokens") or 0
+        if not (it or cr or cc or ot):
+            return
+        self._usage_records.append(UsageRecord(
+            source_kind="reasoning", tool_id=None, label=self.llm.model_label,
+            provider=self.llm.provider_name, model=getattr(self.llm, "model_name", None),
+            model_group=None, step_index=self.current_step_count,
+            input_tokens=it, cache_read_input_tokens=cr,
+            cache_creation_input_tokens=cc, output_tokens=ot,
+        ))
+
+    def _record_tool_usage(self, tool, token_usage: dict) -> None:
+        """Attribute one tool/sub-agent invocation's reported usage to that tool."""
+        it = token_usage.get("input_tokens", 0) or 0
+        cr = token_usage.get("cache_read_input_tokens", 0) or 0
+        cc = token_usage.get("cache_creation_input_tokens", 0) or 0
+        ot = token_usage.get("output_tokens", 0) or 0
+        if not (it or cr or cc or ot):
+            return
+        provider, model = self._provider_model_for(tool)
+        self._usage_records.append(UsageRecord(
+            source_kind=self._SOURCE_KIND_BY_TOOL_TYPE.get(tool.tool_type, "tool"),
+            tool_id=tool.tool_id, label=getattr(tool, "name", None) or tool.tool_id,
+            provider=provider, model=model, model_group=None,
+            step_index=self.current_step_count,
+            input_tokens=it, cache_read_input_tokens=cr,
+            cache_creation_input_tokens=cc, output_tokens=ot,
+        ))
 
     # ── config lookups ────────────────────────────────────────────────
 
@@ -510,6 +579,7 @@ class ReasoningAgent:
     ) -> AsyncGenerator[ReasoningStreamResponseType, None]:
         self.history_messages = history_messages
         self._agent_call_history = []
+        self._usage_records = []
         # Stamp the prompt time once for the whole turn so every step's system
         # prompt is byte-identical (enables provider prompt caching of the
         # [tools + system] prefix). Re-stamped on each new ``run``/turn.
@@ -632,6 +702,7 @@ class ReasoningAgent:
                 self._total_cache_read_input_tokens += response.get("cache_read_input_tokens") or 0
                 self._total_cache_creation_input_tokens += response.get("cache_creation_input_tokens") or 0
                 self._total_output_tokens += response.get("output_tokens") or 0
+                self._record_reasoning_usage(response)
                 finish_reason = response.get("finish_reason")
                 break
 
@@ -1023,6 +1094,7 @@ class ReasoningAgent:
             self._total_cache_read_input_tokens += result_event.token_usage.get("cache_read_input_tokens", 0) or 0
             self._total_cache_creation_input_tokens += result_event.token_usage.get("cache_creation_input_tokens", 0) or 0
             self._total_output_tokens += result_event.token_usage.get("output_tokens", 0) or 0
+            self._record_tool_usage(tool, result_event.token_usage)
 
         behavior = result_event.behavior
         observation_text = result_event.observation_text
@@ -1385,6 +1457,7 @@ class ReasoningAgent:
                 self._total_cache_read_input_tokens += result_event.token_usage.get("cache_read_input_tokens", 0) or 0
                 self._total_cache_creation_input_tokens += result_event.token_usage.get("cache_creation_input_tokens", 0) or 0
                 self._total_output_tokens += result_event.token_usage.get("output_tokens", 0) or 0
+                self._record_tool_usage(rse_tool, result_event.token_usage)
             obs_text = result_event.observation_text or ""
             obs_parts = result_event.observation_parts
             rse_step.observation = obs_parts
@@ -1466,6 +1539,7 @@ class ReasoningAgent:
                     self._total_cache_read_input_tokens += response.get("cache_read_input_tokens") or 0
                     self._total_cache_creation_input_tokens += response.get("cache_creation_input_tokens") or 0
                     self._total_output_tokens += response.get("output_tokens") or 0
+                    self._record_reasoning_usage(response)
                     break
         except AgentException as err:
             logger.error(f"Final LLM call failed in single-step mode: {err}")

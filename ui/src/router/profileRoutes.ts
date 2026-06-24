@@ -16,6 +16,7 @@ export const PROFILE_ROUTES = new Set([
   'skill-events',
   'calendar-schedule',
   'developer',
+  'usage',
 ]);
 
 // Routes that actually render chat (sidebar conversation list + per-conversation
