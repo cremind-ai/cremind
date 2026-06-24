@@ -16,7 +16,7 @@ from app.utils import logger
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolUnionParam, ChatCompletionNamedToolChoiceParam
 from openai.types import ResponseFormatJSONObject, ResponseFormatJSONSchema, ResponseFormatText
 
-from .base import LLMProvider
+from .base import LLMProvider, openai_usage_breakdown
 
 
 class VllmLLMProvider(LLMProvider):
@@ -125,8 +125,7 @@ class VllmLLMProvider(LLMProvider):
 
                 res = {
                     "type": ChatCompletionTypeEnum.DONE,
-                    "input_tokens": usage.prompt_tokens if usage else None,
-                    "output_tokens": usage.completion_tokens if usage else None,
+                    **openai_usage_breakdown(usage),
                     "finish_reason": finish_reason,
                 }
                 if len(content_total) > 0:
@@ -235,8 +234,7 @@ class VllmLLMProvider(LLMProvider):
 
                 yield {
                     "type": ChatCompletionTypeEnum.DONE,
-                    "input_tokens": response.usage.prompt_tokens if response.usage else None,
-                    "output_tokens": response.usage.completion_tokens if response.usage else None,
+                    **openai_usage_breakdown(response.usage),
                     "finish_reason": response.choices[0].finish_reason if len(response.choices) > 0 else None,
                     "data": response.choices[0].message.content,
                 }

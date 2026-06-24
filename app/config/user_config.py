@@ -100,6 +100,7 @@ class AgentRuntimeConfig:
     reasoning_max_tokens: int
     reasoning_retry: int
     steps_length: int
+    enable_prompt_cache: bool
     history_max_tokens_total: int
     history_max_tokens_per_message: int
     tool_result_enabled: bool
@@ -121,6 +122,7 @@ def resolve_agent_config(profile: str) -> AgentRuntimeConfig:
         reasoning_max_tokens=int(agent["reasoning_max_tokens"]),
         reasoning_retry=int(agent["reasoning_retry"]),
         steps_length=int(agent["steps_length"]),
+        enable_prompt_cache=bool(agent["enable_prompt_cache"]),
         history_max_tokens_total=int(history["max_tokens_total"]),
         history_max_tokens_per_message=int(history["max_tokens_per_message"]),
         tool_result_enabled=bool(tool_result["enabled"]),

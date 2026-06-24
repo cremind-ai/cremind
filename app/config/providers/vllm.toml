@@ -14,6 +14,7 @@ is_default = true
 id = "meta-llama/Llama-3.3-70B-Instruct"
 display_name = "Llama 3.3 70B Instruct"
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
@@ -21,6 +22,7 @@ output_price_per_1m = 0.00
 id = "meta-llama/Llama-3.1-8B-Instruct"
 display_name = "Llama 3.1 8B Instruct"
 group_hint = "low"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
@@ -28,6 +30,7 @@ output_price_per_1m = 0.00
 id = "Qwen/Qwen3-32B"
 display_name = "Qwen 3 32B"
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
@@ -35,6 +38,7 @@ output_price_per_1m = 0.00
 id = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
 display_name = "Llama 4 Scout"
 group_hint = "high"
+prompt_cache = false
 vision = true
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00

@@ -18,6 +18,7 @@ api_key = { description = "Fireworks API Key", type = "string", secret = true, r
 id = "accounts/fireworks/models/llama4-maverick-instruct-basic"
 display_name = "Llama 4 Maverick"
 group_hint = "high"
+prompt_cache = true
 vision = true
 input_price_per_1m = 0.22
 output_price_per_1m = 0.88
@@ -26,6 +27,7 @@ output_price_per_1m = 0.88
 id = "accounts/fireworks/models/llama4-scout-instruct-basic"
 display_name = "Llama 4 Scout"
 group_hint = "high"
+prompt_cache = true
 vision = true
 input_price_per_1m = 0.15
 output_price_per_1m = 0.60
@@ -34,6 +36,7 @@ output_price_per_1m = 0.60
 id = "accounts/fireworks/models/deepseek-v3"
 display_name = "DeepSeek V3"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.56
 output_price_per_1m = 1.68
 
@@ -41,6 +44,7 @@ output_price_per_1m = 1.68
 id = "accounts/fireworks/models/deepseek-r1"
 display_name = "DeepSeek R1"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 3.00
 output_price_per_1m = 8.00
 
@@ -48,6 +52,7 @@ output_price_per_1m = 8.00
 id = "accounts/fireworks/models/qwen3-235b-a22b"
 display_name = "Qwen 3 235B"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.50
 output_price_per_1m = 1.50
 
@@ -55,5 +60,6 @@ output_price_per_1m = 1.50
 id = "accounts/fireworks/models/kimi-k2-5"
 display_name = "Kimi K2.5"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.60
 output_price_per_1m = 3.00

@@ -28,6 +28,7 @@ api_key = { description = "MiniMax API Key", type = "string", secret = true, req
 id = "MiniMax-M2.7"
 display_name = "MiniMax M2.7"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.30
 output_price_per_1m = 1.20
 
@@ -35,6 +36,7 @@ output_price_per_1m = 1.20
 id = "MiniMax-M2.5"
 display_name = "MiniMax M2.5"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.12
 output_price_per_1m = 0.95
 
@@ -42,5 +44,6 @@ output_price_per_1m = 0.95
 id = "MiniMax-M1"
 display_name = "MiniMax M1"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.40
 output_price_per_1m = 1.76

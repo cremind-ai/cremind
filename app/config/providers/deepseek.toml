@@ -18,6 +18,7 @@ api_key = { description = "DeepSeek API Key", type = "string", secret = true, re
 id = "deepseek-chat"
 display_name = "DeepSeek V3.2"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.28
 output_price_per_1m = 0.42
 
@@ -25,5 +26,6 @@ output_price_per_1m = 0.42
 id = "deepseek-reasoner"
 display_name = "DeepSeek R1 (V3.2)"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.28
 output_price_per_1m = 0.42
