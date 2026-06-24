@@ -94,7 +94,7 @@ const removeAttachment = (index: number) => {
   attachments.value.splice(index, 1);
 };
 
-const MIN_HEIGHT_PX = 72;   // ≈ 3 rows at 1.6 line-height, 0.95em font
+const MIN_HEIGHT_PX = 112;  // tall enough for the reasoning/upload/send button column
 const MAX_HEIGHT_PX = 192;  // ≈ 8 rows
 
 // Mention/system-var autocomplete state
@@ -594,9 +594,9 @@ const handleReasoningToggle = (value: boolean | string | number) => {
   font-family: inherit;
   font-size: 0.95em;
   line-height: 1.6;
-  /* Right room for the reasoning/send buttons; left room for the upload
-     button. Layer + textarea share this rule so the caret never drifts. */
-  padding: 10px 44px 10px 44px;
+  /* Right room for the reasoning/upload/send button stack. Layer + textarea
+     share this rule so the caret never drifts. */
+  padding: 10px 44px 10px 14px;
   border: 1px solid var(--border-color);
   border-radius: 8px;
   white-space: pre-wrap;
@@ -622,7 +622,7 @@ const handleReasoningToggle = (value: boolean | string | number) => {
   position: relative;
   display: block;
   width: 100%;
-  min-height: 72px;
+  min-height: 112px;
   max-height: 192px;
   background: transparent;
   color: transparent;
@@ -689,7 +689,7 @@ const handleReasoningToggle = (value: boolean | string | number) => {
 
 .reasoning-toggle-button {
   position: absolute;
-  bottom: 42px;
+  bottom: 74px;
   right: 10px;
   width: 28px;
   height: 28px;
@@ -771,15 +771,16 @@ const handleReasoningToggle = (value: boolean | string | number) => {
   background: #dc2626;
 }
 
-/* Upload button — mirrors the send button but anchored bottom-left. */
+/* Upload button — sits in the right-side stack between the reasoning toggle
+   (above) and the send button (below). */
 .hidden-file-input {
   display: none;
 }
 
 .upload-button {
   position: absolute;
-  bottom: 10px;
-  left: 10px;
+  bottom: 42px;
+  right: 10px;
   width: 28px;
   height: 28px;
   background: transparent;
