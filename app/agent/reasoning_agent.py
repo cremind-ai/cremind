@@ -259,6 +259,11 @@ class ReasoningAgent:
         self.instruction = ""
         self._agent_call_history: List[Tuple[str, str]] = []
         self._total_input_tokens = 0
+        # Cached prompt tokens are tracked separately from full-price input so
+        # cost is attributable: reads are heavily discounted; creation (Anthropic
+        # cache writes) carries a premium.
+        self._total_cache_read_input_tokens = 0
+        self._total_cache_creation_input_tokens = 0
         self._total_output_tokens = 0
         # Skills whose SKILL.md content has been folded into self.instruction.
         # Such skills are removed from the rendered Tools block and from the
@@ -451,6 +456,20 @@ class ReasoningAgent:
             instruction = f"{instruction}\n\n{self._memory_context}"
         return instruction
 
+    def _token_fields(self) -> dict:
+        """Running token totals for this turn, as chunk fields.
+
+        Cached input (``cache_read_input_tokens`` / ``cache_creation_input_tokens``)
+        is reported separately from full-price ``input_tokens`` so downstream
+        consumers can attribute cost accurately.
+        """
+        return {
+            "input_tokens": self._total_input_tokens,
+            "cache_read_input_tokens": self._total_cache_read_input_tokens,
+            "cache_creation_input_tokens": self._total_cache_creation_input_tokens,
+            "output_tokens": self._total_output_tokens,
+        }
+
     # ── config lookups ────────────────────────────────────────────────
 
     def _load_arguments(self, tool_id: str) -> dict:
@@ -536,8 +555,7 @@ class ReasoningAgent:
             done_chunk: Dict[str, Any] = {
                 "type": ChatCompletionTypeEnum.DONE,
                 "data": final_answer,
-                "input_tokens": self._total_input_tokens,
-                "output_tokens": self._total_output_tokens,
+                **self._token_fields(),
             }
             if self.current_step_count > 1:
                 done_chunk["input_section"] = template_input.format(steps="\n".join(self.steps))
@@ -602,8 +620,7 @@ class ReasoningAgent:
             yield {
                 "type": ChatCompletionTypeEnum.CLARIFY,
                 "data": step.thought or "I encountered an error processing your request. Please try again.",
-                "input_tokens": self._total_input_tokens,
-                "output_tokens": self._total_output_tokens,
+                **self._token_fields(),
             }
             return
 
@@ -612,6 +629,8 @@ class ReasoningAgent:
         for response in llm_responses:
             if response["type"] == ChatCompletionTypeEnum.DONE:
                 self._total_input_tokens += response.get("input_tokens") or 0
+                self._total_cache_read_input_tokens += response.get("cache_read_input_tokens") or 0
+                self._total_cache_creation_input_tokens += response.get("cache_creation_input_tokens") or 0
                 self._total_output_tokens += response.get("output_tokens") or 0
                 finish_reason = response.get("finish_reason")
                 break
@@ -638,8 +657,7 @@ class ReasoningAgent:
                     yield {
                         "type": ChatCompletionTypeEnum.CLARIFY,
                         "data": content,
-                        "input_tokens": self._total_input_tokens,
-                        "output_tokens": self._total_output_tokens,
+                        **self._token_fields(),
                     }
                     return
 
@@ -676,8 +694,7 @@ class ReasoningAgent:
                     yield {
                         "type": ChatCompletionTypeEnum.CLARIFY,
                         "data": chat_response,
-                        "input_tokens": self._total_input_tokens,
-                        "output_tokens": self._total_output_tokens,
+                        **self._token_fields(),
                     }
                     return
 
@@ -702,8 +719,7 @@ class ReasoningAgent:
         yield {
             "type": ChatCompletionTypeEnum.CLARIFY,
             "data": fallback,
-            "input_tokens": self._total_input_tokens,
-            "output_tokens": self._total_output_tokens,
+            **self._token_fields(),
         }
 
     # ── tool-stream helper ────────────────────────────────────────────
@@ -862,8 +878,7 @@ class ReasoningAgent:
                         yield {
                             "type": ChatCompletionTypeEnum.CLARIFY,
                             "data": obs,
-                            "input_tokens": self._total_input_tokens,
-                            "output_tokens": self._total_output_tokens,
+                            **self._token_fields(),
                         }
                         return
                     async for r in self._loop(step):
@@ -892,8 +907,7 @@ class ReasoningAgent:
                     yield {
                         "type": ChatCompletionTypeEnum.CLARIFY,
                         "data": err_msg,
-                        "input_tokens": self._total_input_tokens,
-                        "output_tokens": self._total_output_tokens,
+                        **self._token_fields(),
                     }
                     return
                 async for r in self._loop(step):
@@ -975,8 +989,7 @@ class ReasoningAgent:
                 yield {
                     "type": ChatCompletionTypeEnum.CLARIFY,
                     "data": error_event.message,
-                    "input_tokens": self._total_input_tokens,
-                    "output_tokens": self._total_output_tokens,
+                    **self._token_fields(),
                 }
                 return
             obs = error_event.message
@@ -989,8 +1002,7 @@ class ReasoningAgent:
                 yield {
                     "type": ChatCompletionTypeEnum.CLARIFY,
                     "data": obs,
-                    "input_tokens": self._total_input_tokens,
-                    "output_tokens": self._total_output_tokens,
+                    **self._token_fields(),
                 }
                 return
             async for r in self._loop(step):
@@ -1001,14 +1013,15 @@ class ReasoningAgent:
             yield {
                 "type": ChatCompletionTypeEnum.CLARIFY,
                 "data": step.thought or "I was unable to complete the reasoning process.",
-                "input_tokens": self._total_input_tokens,
-                "output_tokens": self._total_output_tokens,
+                **self._token_fields(),
             }
             return
 
         # Accumulate token usage
         if result_event.token_usage:
             self._total_input_tokens += result_event.token_usage.get("input_tokens", 0) or 0
+            self._total_cache_read_input_tokens += result_event.token_usage.get("cache_read_input_tokens", 0) or 0
+            self._total_cache_creation_input_tokens += result_event.token_usage.get("cache_creation_input_tokens", 0) or 0
             self._total_output_tokens += result_event.token_usage.get("output_tokens", 0) or 0
 
         behavior = result_event.behavior
@@ -1033,8 +1046,7 @@ class ReasoningAgent:
             done_chunk: Dict[str, Any] = {
                 "type": ChatCompletionTypeEnum.DONE,
                 "data": observation_text,
-                "input_tokens": self._total_input_tokens,
-                "output_tokens": self._total_output_tokens,
+                **self._token_fields(),
             }
             # Only attach input_section when the turn was multi-step — its
             # presence is the signal to callers that the trace is worth
@@ -1061,8 +1073,7 @@ class ReasoningAgent:
             yield {
                 "type": ChatCompletionTypeEnum.CLARIFY,
                 "data": observation_text,
-                "input_tokens": self._total_input_tokens,
-                "output_tokens": self._total_output_tokens,
+                **self._token_fields(),
             }
             return
 
@@ -1079,8 +1090,7 @@ class ReasoningAgent:
                 yield {
                     "type": ChatCompletionTypeEnum.DONE,
                     "data": "",
-                    "input_tokens": self._total_input_tokens,
-                    "output_tokens": self._total_output_tokens,
+                    **self._token_fields(),
                 }
                 return
             async for r in self._loop(step):
@@ -1372,6 +1382,8 @@ class ReasoningAgent:
         elif result_event is not None:
             if result_event.token_usage:
                 self._total_input_tokens += result_event.token_usage.get("input_tokens", 0) or 0
+                self._total_cache_read_input_tokens += result_event.token_usage.get("cache_read_input_tokens", 0) or 0
+                self._total_cache_creation_input_tokens += result_event.token_usage.get("cache_creation_input_tokens", 0) or 0
                 self._total_output_tokens += result_event.token_usage.get("output_tokens", 0) or 0
             obs_text = result_event.observation_text or ""
             obs_parts = result_event.observation_parts
@@ -1451,6 +1463,8 @@ class ReasoningAgent:
                         content_parts.append(content)
                 elif response["type"] == ChatCompletionTypeEnum.DONE:
                     self._total_input_tokens += response.get("input_tokens") or 0
+                    self._total_cache_read_input_tokens += response.get("cache_read_input_tokens") or 0
+                    self._total_cache_creation_input_tokens += response.get("cache_creation_input_tokens") or 0
                     self._total_output_tokens += response.get("output_tokens") or 0
                     break
         except AgentException as err:
@@ -1458,8 +1472,7 @@ class ReasoningAgent:
             yield {
                 "type": ChatCompletionTypeEnum.CLARIFY,
                 "data": observation_text or "I encountered an error generating a response.",
-                "input_tokens": self._total_input_tokens,
-                "output_tokens": self._total_output_tokens,
+                **self._token_fields(),
             }
             return
 
@@ -1478,8 +1491,7 @@ class ReasoningAgent:
         yield {
             "type": ChatCompletionTypeEnum.DONE,
             "data": final_text,
-            "input_tokens": self._total_input_tokens,
-            "output_tokens": self._total_output_tokens,
+            **self._token_fields(),
         }
 
     # ── step bookkeeping ──────────────────────────────────────────────

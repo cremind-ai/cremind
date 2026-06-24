@@ -72,6 +72,28 @@ def model_supports_vision(provider_name: str, model_name: str) -> bool:
     return False
 
 
+def model_supports_prompt_cache(provider_name: str, model_name: str) -> bool:
+    """Return True if ``model_name`` is flagged prompt-cache-capable for its provider.
+
+    Looks up the ``prompt_cache`` flag on the matching ``[[models]]`` entry in the
+    provider catalog. Unknown / unlisted models default to False. This is
+    informational metadata (surfaced via the model catalog API); cached-token
+    *accounting* happens at runtime in the provider classes regardless of this flag.
+    """
+    if not provider_name or not model_name:
+        return False
+    model = model_name
+    prefix = f"{provider_name}/"
+    if model.startswith(prefix):
+        model = model[len(prefix):]
+
+    catalog = load_provider_catalog(provider_name)
+    for entry in catalog.get("models", []) or []:
+        if isinstance(entry, dict) and entry.get("id") == model:
+            return bool(entry.get("prompt_cache", False))
+    return False
+
+
 def load_all_provider_catalogs() -> dict[str, dict]:
     """Load all provider catalogs from app/config/providers/*.toml.
 
