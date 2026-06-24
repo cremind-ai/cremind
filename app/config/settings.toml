@@ -43,6 +43,7 @@ reasoning_temperature = 1.0
 reasoning_max_tokens = 32768
 reasoning_retry = 3
 steps_length = 20
+enable_prompt_cache = true
 
 [history]
 max_tokens_total = 5000
