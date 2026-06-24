@@ -22,6 +22,9 @@ service_account = { description = "Service Account JSON", type = "json", secret 
 project_id = { description = "GCP Project ID", type = "string", secret = false, required = true }
 location = { description = "GCP Region", type = "string", secret = false, required = false, default = "global" }
 
+# Cache pricing: Gemini implicit caching (2.5+) bills cached input at 0.10x the
+# input rate (90% discount) with no separate cache-write fee.
+
 [[models]]
 id = "google/gemini-3.1-pro-preview"
 display_name = "Gemini 3.1 Pro"
@@ -31,6 +34,8 @@ vision = true
 input_price_per_1m = 2.00
 output_price_per_1m = 12.00
 reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.20    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "google/gemini-3-flash-preview"
@@ -41,6 +46,8 @@ vision = true
 input_price_per_1m = 0.50
 output_price_per_1m = 3.00
 reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.05    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "google/gemini-3.1-flash-lite-preview"
@@ -51,6 +58,8 @@ vision = true
 input_price_per_1m = 0.25
 output_price_per_1m = 1.50
 reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.025   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "google/gemini-2.5-pro"
@@ -60,6 +69,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 1.25
 output_price_per_1m = 10.00
+cache_read_price_per_1m = 0.125   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "google/gemini-2.5-flash"
@@ -69,6 +80,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.30
 output_price_per_1m = 2.50
+cache_read_price_per_1m = 0.03    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "google/gemini-2.5-flash-lite"
@@ -78,6 +91,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.10
 output_price_per_1m = 0.40
+cache_read_price_per_1m = 0.01    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "google/gemini-2.0-flash"
@@ -87,3 +102,5 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.15
 output_price_per_1m = 0.60
+cache_read_price_per_1m = 0.015   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee

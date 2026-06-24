@@ -24,6 +24,11 @@ kind = "api_key"
 [provider.auth_methods.fields]
 api_key = { description = "MiniMax API Key", type = "string", secret = true, required = true }
 
+# Cache pricing: MiniMax bills cache reads at 0.20x the input rate and (unlike
+# most OpenAI-compatible APIs) charges 1.25x for cache writes. The write rate is
+# recorded for accuracy; it is currently not exercised because the OpenAI-style
+# usage breakdown reports cache-creation tokens as 0.
+
 [[models]]
 id = "MiniMax-M2.7"
 display_name = "MiniMax M2.7"
@@ -31,6 +36,8 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.30
 output_price_per_1m = 1.20
+cache_read_price_per_1m = 0.06    # 0.20x input
+cache_write_price_per_1m = 0.375  # 1.25x input
 
 [[models]]
 id = "MiniMax-M2.5"
@@ -39,6 +46,8 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.12
 output_price_per_1m = 0.95
+cache_read_price_per_1m = 0.024   # 0.20x input
+cache_write_price_per_1m = 0.15   # 1.25x input
 
 [[models]]
 id = "MiniMax-M1"
@@ -47,3 +56,5 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.40
 output_price_per_1m = 1.76
+cache_read_price_per_1m = 0.08    # 0.20x input
+cache_write_price_per_1m = 0.50   # 1.25x input

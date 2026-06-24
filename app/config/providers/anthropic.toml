@@ -23,6 +23,9 @@ kind = "token"
 [provider.auth_methods.fields]
 setup_token = { description = "Setup Token", type = "string", secret = true, required = true }
 
+# Cache pricing: Anthropic bills cache reads at 0.10x the input rate and 5-minute
+# ephemeral cache writes at 1.25x the input rate.
+
 # Claude Opus 4.7
 [[models]]
 id = "claude-opus-4-7"
@@ -32,6 +35,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 5.00
 output_price_per_1m = 25.00
+cache_read_price_per_1m = 0.50    # 0.10x input
+cache_write_price_per_1m = 6.25   # 1.25x input (5-min ephemeral)
 
 # Claude Opus 4.6
 [[models]]
@@ -42,6 +47,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 5.00
 output_price_per_1m = 25.00
+cache_read_price_per_1m = 0.50    # 0.10x input
+cache_write_price_per_1m = 6.25   # 1.25x input (5-min ephemeral)
 
 # Claude Sonnet 4.6
 [[models]]
@@ -52,6 +59,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 3.00
 output_price_per_1m = 15.00
+cache_read_price_per_1m = 0.30    # 0.10x input
+cache_write_price_per_1m = 3.75   # 1.25x input (5-min ephemeral)
 
 # Claude Sonnet 4.5
 [[models]]
@@ -62,6 +71,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 3.00
 output_price_per_1m = 15.00
+cache_read_price_per_1m = 0.30    # 0.10x input
+cache_write_price_per_1m = 3.75   # 1.25x input (5-min ephemeral)
 
 # Claude Opus 4.5
 [[models]]
@@ -72,6 +83,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 5.00
 output_price_per_1m = 25.00
+cache_read_price_per_1m = 0.50    # 0.10x input
+cache_write_price_per_1m = 6.25   # 1.25x input (5-min ephemeral)
 
 # Claude Haiku 4.5
 [[models]]
@@ -82,6 +95,8 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 1.00
 output_price_per_1m = 5.00
+cache_read_price_per_1m = 0.10    # 0.10x input
+cache_write_price_per_1m = 1.25   # 1.25x input (5-min ephemeral)
 
 # Claude 3.5 Haiku
 [[models]]
@@ -92,3 +107,5 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 0.80
 output_price_per_1m = 4.00
+cache_read_price_per_1m = 0.08    # 0.10x input
+cache_write_price_per_1m = 1.00   # 1.25x input (5-min ephemeral)
