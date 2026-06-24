@@ -136,6 +136,14 @@ const routes = [
     props: true,
     meta: { title: 'About' },
   },
+  // Usage & Cost — token-usage + estimated-pricing dashboard
+  {
+    path: '/:profile/usage',
+    name: 'usage',
+    component: () => import('../views/UsagePage.vue'),
+    props: true,
+    meta: { title: 'Usage & Cost' },
+  },
   // Process Manager — long-running exec_shell processes
   {
     path: '/:profile/processes',

@@ -9,6 +9,7 @@ import { Icon } from '@iconify/vue';
 import { copyTextToClipboard } from '../utils/clipboard';
 import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
+import MessageUsageChip from './MessageUsageChip.vue';
 
 const props = defineProps<{
   message: ChatMessage;
@@ -413,11 +414,8 @@ const handleThinkingClick = (event: MouseEvent) => {
       <!-- Streaming cursor -->
       <span v-if="message.isStreaming" class="streaming-cursor">▊</span>
 
-      <!-- Token usage footer -->
-      <div v-if="message.tokenUsage" class="token-usage">
-        {{ message.tokenUsage.totalTokens }} tokens
-        ({{ message.tokenUsage.inputTokens }} in + {{ message.tokenUsage.outputTokens }} out)
-      </div>
+      <!-- Token usage + estimated cost (expandable per sub-agent/tool) -->
+      <MessageUsageChip v-if="message.tokenUsage" :message="message" />
 
       <!-- Latency information -->
       <div v-if="latencyDisplay && !isUser" class="latency-info">
