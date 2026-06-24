@@ -14,6 +14,62 @@ if TYPE_CHECKING:
     from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolUnionParam
 
 
+def _openai_cached_tokens(usage: Any, prompt: int) -> int:
+    """Extract the cached-prompt-token count from an OpenAI-style ``usage`` object.
+
+    The standard location is ``prompt_tokens_details.cached_tokens`` (OpenAI, Groq,
+    xAI, Mistral, Qwen, MiniMax, Fireworks, OpenRouter, LiteLLM, …). A few
+    OpenAI-compatible providers report the same number under a different name, so we
+    fall back to those when the standard field is absent/zero:
+
+    - Together / Moonshot(Kimi): top-level ``usage.cached_tokens``
+    - DeepSeek: top-level ``usage.prompt_cache_hit_tokens`` (with
+      ``prompt_cache_miss_tokens`` being the uncached remainder)
+
+    (Gemini's ``cached_content_token_count`` lives in ``usageMetadata``, not the
+    OpenAI usage object, so it isn't captured here — see provider notes.)
+    """
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached = (getattr(details, "cached_tokens", 0) or 0) if details else 0
+    if not cached:
+        cached = (
+            (getattr(usage, "cached_tokens", 0) or 0)
+            or (getattr(usage, "prompt_cache_hit_tokens", 0) or 0)
+        )
+    return min(cached, prompt)  # guard against a malformed cached > prompt
+
+
+def openai_usage_breakdown(usage: Any) -> Dict[str, Optional[int]]:
+    """Normalize an OpenAI-style ``usage`` object into Cremind's token breakdown.
+
+    OpenAI-compatible APIs report ``prompt_tokens`` as the *total* prompt size with
+    the cached subset reported separately (see ``_openai_cached_tokens``). We split
+    those apart so cost can be attributed accurately:
+
+    - ``input_tokens``                -- uncached input (full price)
+    - ``cache_read_input_tokens``     -- served from cache (discounted)
+    - ``cache_creation_input_tokens`` -- always 0 (no separate cache-write on these APIs)
+    - ``output_tokens``               -- completion tokens
+
+    Returns all-``None`` when ``usage`` is missing.
+    """
+    if not usage:
+        return {
+            "input_tokens": None,
+            "cache_read_input_tokens": None,
+            "cache_creation_input_tokens": None,
+            "output_tokens": None,
+        }
+    prompt = getattr(usage, "prompt_tokens", 0) or 0
+    cached = _openai_cached_tokens(usage, prompt)
+    return {
+        "input_tokens": prompt - cached,
+        "cache_read_input_tokens": cached,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+    }
+
+
 class LLMProvider(ABC):
     provider_name: str = ""
 

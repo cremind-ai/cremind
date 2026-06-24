@@ -289,6 +289,8 @@ async def run_agent_to_bus(
     collected_thinking_steps: List[dict] = []
     collected_file_parts: List[Part] = []
     total_input_tokens = 0
+    total_cache_read_input_tokens = 0
+    total_cache_creation_input_tokens = 0
     total_output_tokens = 0
     reasoning_input_section: str | None = None
     errored = False
@@ -446,6 +448,8 @@ async def run_agent_to_bus(
                         final_text_parts.append(data)
                         await bus.publish(conversation_id, "text", {"token": data})
                     total_input_tokens = chunk.get("input_tokens") or total_input_tokens
+                    total_cache_read_input_tokens = chunk.get("cache_read_input_tokens") or total_cache_read_input_tokens
+                    total_cache_creation_input_tokens = chunk.get("cache_creation_input_tokens") or total_cache_creation_input_tokens
                     total_output_tokens = chunk.get("output_tokens") or total_output_tokens
                     if (
                         ctype == ChatCompletionTypeEnum.DONE
@@ -524,6 +528,8 @@ async def run_agent_to_bus(
             await bus.publish(conversation_id, "token_usage", {
                 "token_usage": {
                     "input_tokens": total_input_tokens,
+                    "cache_read_input_tokens": total_cache_read_input_tokens,
+                    "cache_creation_input_tokens": total_cache_creation_input_tokens,
                     "output_tokens": total_output_tokens,
                 },
             })
@@ -539,6 +545,8 @@ async def run_agent_to_bus(
         if total_input_tokens or total_output_tokens:
             token_usage_data = {
                 "input_tokens": total_input_tokens,
+                "cache_read_input_tokens": total_cache_read_input_tokens,
+                "cache_creation_input_tokens": total_cache_creation_input_tokens,
                 "output_tokens": total_output_tokens,
             }
         persist_parts = collected_file_parts if collected_file_parts else None

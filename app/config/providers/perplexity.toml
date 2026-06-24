@@ -18,6 +18,7 @@ api_key = { description = "Perplexity API Key", type = "string", secret = true, 
 id = "sonar-pro"
 display_name = "Sonar Pro"
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 3.00
 output_price_per_1m = 15.00
 
@@ -25,6 +26,7 @@ output_price_per_1m = 15.00
 id = "sonar"
 display_name = "Sonar"
 group_hint = "low"
+prompt_cache = false
 input_price_per_1m = 1.00
 output_price_per_1m = 1.00
 
@@ -32,6 +34,7 @@ output_price_per_1m = 1.00
 id = "sonar-reasoning-pro"
 display_name = "Sonar Reasoning Pro"
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 2.00
 output_price_per_1m = 8.00
 
@@ -39,5 +42,6 @@ output_price_per_1m = 8.00
 id = "sonar-deep-research"
 display_name = "Sonar Deep Research"
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 2.00
 output_price_per_1m = 8.00

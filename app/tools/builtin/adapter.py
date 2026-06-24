@@ -281,6 +281,8 @@ class BuiltInToolAdapter:
 
         # Collect LLM response
         total_input_tokens = 0
+        total_cache_read_input_tokens = 0
+        total_cache_creation_input_tokens = 0
         total_output_tokens = 0
         content_parts: List[str] = []
         function_calls: List[Dict] = []
@@ -351,6 +353,8 @@ class BuiltInToolAdapter:
                             function_calls = response["data"]["function"]
                     elif response["type"] == ChatCompletionTypeEnum.DONE:
                         total_input_tokens += response.get("input_tokens") or 0
+                        total_cache_read_input_tokens += response.get("cache_read_input_tokens") or 0
+                        total_cache_creation_input_tokens += response.get("cache_creation_input_tokens") or 0
                         total_output_tokens += response.get("output_tokens") or 0
                         break
 
@@ -541,6 +545,8 @@ class BuiltInToolAdapter:
                                 reasoning_content_parts.append(content)
                         elif response["type"] == ChatCompletionTypeEnum.DONE:
                             total_input_tokens += response.get("input_tokens") or 0
+                            total_cache_read_input_tokens += response.get("cache_read_input_tokens") or 0
+                            total_cache_creation_input_tokens += response.get("cache_creation_input_tokens") or 0
                             total_output_tokens += response.get("output_tokens") or 0
                             break
 
@@ -638,6 +644,8 @@ class BuiltInToolAdapter:
                 parts=[Part(root=DataPart(data={
                     "token_usage": {
                         "input_tokens": total_input_tokens,
+                        "cache_read_input_tokens": total_cache_read_input_tokens,
+                        "cache_creation_input_tokens": total_cache_creation_input_tokens,
                         "output_tokens": total_output_tokens,
                     }
                 }))],

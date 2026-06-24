@@ -18,6 +18,7 @@ base_url = { description = "LiteLLM Base URL", type = "string", secret = false, 
 id = "gpt-5.4"
 display_name = "GPT-5.4 (via LiteLLM)"
 group_hint = "high"
+prompt_cache = true
 vision = true
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
