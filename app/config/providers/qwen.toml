@@ -24,6 +24,9 @@ kind = "api_key"
 [provider.auth_methods.fields]
 api_key = { description = "Qwen Cloud API Key", type = "string", secret = true, required = true }
 
+# Cache pricing: DashScope context caching discounts cached input by up to 90%
+# (0.10x input) with no separate cache-write fee.
+
 [[models]]
 id = "qwen-max"
 display_name = "Qwen3 Max"
@@ -31,6 +34,8 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.78
 output_price_per_1m = 3.90
+cache_read_price_per_1m = 0.078   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "qwen-plus"
@@ -39,6 +44,8 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.26
 output_price_per_1m = 1.56
+cache_read_price_per_1m = 0.026   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "qwen-turbo"
@@ -47,6 +54,8 @@ group_hint = "low"
 prompt_cache = true
 input_price_per_1m = 0.05
 output_price_per_1m = 0.20
+cache_read_price_per_1m = 0.005   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "qwen3-235b-a22b"
@@ -55,6 +64,8 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.80
 output_price_per_1m = 2.40
+cache_read_price_per_1m = 0.08    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "qwen3-32b"
@@ -63,6 +74,8 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.20
 output_price_per_1m = 0.60
+cache_read_price_per_1m = 0.02    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "qwen3-coder-plus"
@@ -71,3 +84,5 @@ group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.65
 output_price_per_1m = 3.25
+cache_read_price_per_1m = 0.065   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
