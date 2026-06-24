@@ -229,18 +229,25 @@ page).
 | `agent.reasoning_retry`        | Per-call retry count  | number | `3`     | 0 – 10         | How many times an individual reasoning LLM call retries on transient errors.        |
 | `agent.steps_length`           | Steps history length  | number | `80`    | 5 – 500        | Maximum number of recent ReAct step entries kept in the prompt context. Older entries are dropped once this is exceeded. |
 
-### Group `history` — Conversation History
+### Group `compaction` — Conversation Compaction
 
-Token-budget limits applied when assembling the message window for each
-LLM call.
+Keeps long conversations within budget by folding the oldest turns into a
+running summary (via the low model group) while recent turns stay verbatim.
+Replaces fixed token-window truncation and is prompt-cache friendly — the
+summary at the front stays byte-stable between compactions.
 
-**Settings → Config card:** **Conversation History** (the second card on
+**Settings → Config card:** **Conversation Compaction** (the second card on
 the page).
 
-| Key                              | UI label              | Type   | Default | Range          | Meaning                                                                |
-|----------------------------------|-----------------------|--------|---------|----------------|------------------------------------------------------------------------|
-| `history.max_tokens_total`       | Total history tokens  | number | `5000`  | 500 – 200000   | Maximum total tokens of past messages included in each prompt.         |
-| `history.max_tokens_per_message` | Per-message tokens    | number | `500`   | 50 – 20000     | Each message is truncated to at most this many tokens before assembly. |
+| Key                                   | UI label                    | Type    | Default  | Range           | Meaning                                                                                  |
+|---------------------------------------|-----------------------------|---------|----------|-----------------|------------------------------------------------------------------------------------------|
+| `compaction.enabled`                  | Enabled                     | boolean | `true`   | —               | When off, full history is sent (bounded only by the model's context window).             |
+| `compaction.compact_threshold_tokens` | Compaction threshold        | number  | `100000` | 1000 – 1000000  | Fold the oldest turns into the summary once the verbatim tail's token count crosses this. |
+| `compaction.keep_recent_tokens`       | Keep-recent target          | number  | `40000`  | 500 – 500000    | After a compaction, keep about this many tokens of recent turns verbatim (hysteresis band). |
+| `compaction.keep_recent_messages`     | Keep-recent messages floor  | number  | `4`      | 0 – 50          | Never fold below this many of the most recent messages.                                  |
+| `compaction.temperature`              | Temperature                 | number  | `0.3`    | 0 – 2 (±0.1)    | Sampling temperature for the summarization call.                                         |
+| `compaction.max_tokens`               | Max tokens                  | number  | `2048`   | 128 – 8192      | Output token cap for the running summary (also its hard size bound).                     |
+| `compaction.retry`                    | Retry count                 | number  | `2`      | 0 – 10          | Retries on transient summarization LLM errors.                                           |
 
 ### Group `skill_classifier` — Skill Classifier
 
@@ -294,11 +301,11 @@ $ cremind config get agent.max_steps
 40
 ```
 
-### Tighten the history budget for a short-context model
+### Compact sooner for a short-context model
 
 ```bash
-$ cremind config set history.max_tokens_total 2000
-$ cremind config set history.max_tokens_per_message 250
+$ cremind config set compaction.compact_threshold_tokens 40000
+$ cremind config set compaction.keep_recent_tokens 15000
 ```
 
 ### Pipe the schema into `jq`

@@ -112,6 +112,21 @@ class ConversationModel(Base):
     # configured threshold, then advances this. Defaults to 0 (extract from the start).
     memory_watermark: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     memory_last_extracted_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # History-compaction state (mirrors the memory_* pair above). ``compaction_summary``
+    # is the running summary of every message with ``ordering <= compaction_watermark``;
+    # the verbatim tail (``ordering > compaction_watermark``) is sent to the LLM as-is.
+    # Oldest turns are folded into the summary once the tail's tokens cross the
+    # configured threshold, then the watermark advances. Defaults to -1 (nothing
+    # folded — message ``ordering`` starts at 0, so the sentinel must be < 0 or the
+    # first message would be excluded from the tail).
+    # ``server_default`` (not just the ORM-side ``default``) so tables created
+    # straight from this metadata — fresh-install baseline and tests that raw-INSERT
+    # a conversation row — carry the -1 default at the DB level too.
+    compaction_watermark: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=-1, server_default="-1"
+    )
+    compaction_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    compaction_last_compacted_at: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)
 

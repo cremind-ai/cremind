@@ -92,7 +92,7 @@ def resolve_group(group_name: str, profile: str) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class AgentRuntimeConfig:
-    """Snapshot of agent + history config for one ReAct run."""
+    """Snapshot of agent config for one ReAct run."""
 
     max_steps: int
     max_llm_retries: int
@@ -101,8 +101,6 @@ class AgentRuntimeConfig:
     reasoning_retry: int
     steps_length: int
     enable_prompt_cache: bool
-    history_max_tokens_total: int
-    history_max_tokens_per_message: int
     tool_result_enabled: bool
     tool_result_max_tokens: int
     tool_result_preserve_recent: int
@@ -113,7 +111,6 @@ class AgentRuntimeConfig:
 def resolve_agent_config(profile: str) -> AgentRuntimeConfig:
     """Build an :class:`AgentRuntimeConfig` for ``profile``."""
     agent = resolve_group("agent", profile)
-    history = resolve_group("history", profile)
     tool_result = resolve_group("tool_result", profile)
     return AgentRuntimeConfig(
         max_steps=int(agent["max_steps"]),
@@ -123,13 +120,42 @@ def resolve_agent_config(profile: str) -> AgentRuntimeConfig:
         reasoning_retry=int(agent["reasoning_retry"]),
         steps_length=int(agent["steps_length"]),
         enable_prompt_cache=bool(agent["enable_prompt_cache"]),
-        history_max_tokens_total=int(history["max_tokens_total"]),
-        history_max_tokens_per_message=int(history["max_tokens_per_message"]),
         tool_result_enabled=bool(tool_result["enabled"]),
         tool_result_max_tokens=int(tool_result["max_tokens"]),
         tool_result_preserve_recent=int(tool_result["preserve_recent"]),
         tool_result_head_tokens=int(tool_result["head_tokens"]),
         tool_result_tail_tokens=int(tool_result["tail_tokens"]),
+    )
+
+
+@dataclass(frozen=True)
+class CompactionConfig:
+    """Snapshot of the conversation-compaction tunables for one profile."""
+
+    enabled: bool
+    compact_threshold_tokens: int
+    keep_recent_tokens: int
+    keep_recent_messages: int
+    temperature: float
+    max_tokens: int
+    retry: int
+
+
+def resolve_compaction_config(profile: str) -> CompactionConfig:
+    """Build a :class:`CompactionConfig` for ``profile``.
+
+    Re-read at consumption time (not cached) so toggling the feature or its
+    thresholds in Settings takes effect on the next turn.
+    """
+    values = resolve_group("compaction", profile)
+    return CompactionConfig(
+        enabled=bool(values["enabled"]),
+        compact_threshold_tokens=int(values["compact_threshold_tokens"]),
+        keep_recent_tokens=int(values["keep_recent_tokens"]),
+        keep_recent_messages=int(values["keep_recent_messages"]),
+        temperature=float(values["temperature"]),
+        max_tokens=int(values["max_tokens"]),
+        retry=int(values["retry"]),
     )
 
 

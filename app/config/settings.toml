@@ -45,9 +45,14 @@ reasoning_retry = 3
 steps_length = 20
 enable_prompt_cache = true
 
-[history]
-max_tokens_total = 5000
-max_tokens_per_message = 500
+[compaction]
+enabled = true                    # summarization-based history compaction (replaces token windowing)
+compact_threshold_tokens = 100000 # fold oldest turns into the running summary once the verbatim tail crosses this
+keep_recent_tokens = 40000        # after folding, keep ~this many tokens of recent turns verbatim (hysteresis band)
+keep_recent_messages = 4          # never fold below this many of the most recent messages
+temperature = 0.3
+max_tokens = 2048                 # hard cap on the running summary's size
+retry = 2
 
 [tool_result]
 enabled = true
