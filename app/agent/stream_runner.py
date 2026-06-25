@@ -387,22 +387,13 @@ async def run_agent_to_bus(
         # roots, so the agent can read / convert / move them by absolute path.
         agent_query = _append_attachments_note(agent_query, attachments)
 
-        # Consumption: read current memory (short-term for this conversation +
-        # long-term for this profile) and pass it to the agent as a system block.
-        # Fully decoupled from extraction — the agent never triggers or waits on
-        # the background memory session.
-        memory_context = ""
-        if memory_cfg is not None and memory_cfg.enabled:
-            memory_context = await memory_runner.load_memory_context(
-                conversation_id, profile,
-            )
-
-        # Compaction: replace the raw history with [running summary + verbatim tail],
-        # folding the oldest turns into the summary first when the tail is over
-        # threshold. Synchronous (before the prompt is assembled) so the threshold is
-        # never exceeded — notably on the first turn after upgrade, when a long
-        # pre-existing conversation would otherwise be sent whole. No-op / falls back
-        # to the raw history when disabled or on error.
+        # Compaction (also memory generation): replace the raw history with
+        # [running summary + verbatim tail], folding the oldest turns into the
+        # summary when the tail is over threshold — and, when memory is enabled,
+        # extracting long-term facts in the same fold pass. Synchronous (before the
+        # prompt is assembled) so the threshold is never exceeded — notably on the
+        # first turn after upgrade, when a long pre-existing conversation would
+        # otherwise be sent whole. No-op / falls back to the raw history on error.
         from app.agent import compaction
         history_messages = await compaction.build_compacted_history(
             conversation_id=conversation_id,
@@ -412,6 +403,17 @@ async def run_agent_to_bus(
             fallback_history=history_messages,
             exclude_message_id=current_turn_msg_id,
         )
+
+        # Consumption: load long-term memory as the ## Memory block — retrieved by
+        # similarity to the latest user message (embedding on) or read from the DB
+        # queue (embedding off). After compaction, so long-term facts a fold wrote
+        # this turn are visible immediately. The agent places this block in its
+        # volatile per-step input, never in the cached system prompt.
+        memory_context = ""
+        if memory_cfg is not None and memory_cfg.enabled:
+            memory_context = await memory_runner.load_memory_context(
+                profile, query_text=agent_query,
+            )
 
         try:
             async for chunk in cremind_agent.run(
@@ -637,20 +639,8 @@ async def run_agent_to_bus(
                     f"stream_runner: failed to persist usage records for {conversation_id}"
                 )
 
-        # 5b. Memory trigger: if enough NEW message-content tokens (reasoning
-        #     excluded) have accrued since the last extraction, kick off a
-        #     background "memory session". Non-blocking and single-flight — it
-        #     never interleaves with the next turn. Skipped on cancel/error so
-        #     partial turns don't pollute memory.
-        if memory_cfg is not None and memory_cfg.enabled and not errored and not cancelled:
-            try:
-                pending = await memory_runner.pending_token_count(conversation_id)
-                if pending >= memory_cfg.trigger_token_threshold:
-                    memory_runner.schedule_extraction(conversation_id, profile)
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    f"stream_runner: memory trigger check failed for {conversation_id}"
-                )
+        # Memory generation now happens inline at the compaction fold (above), so
+        # there is no separate post-turn extraction trigger.
 
         # 6. Update the conversation row (title from first query, task_id).
         try:

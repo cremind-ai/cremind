@@ -275,41 +275,24 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
     "memory": ConfigGroup(
         label="Memory",
         description=(
-            "Distills conversations into short-term (per-conversation) and "
-            "long-term (per-profile) memory so the agent recalls habits, past "
-            "mistakes, and durable facts. Runs as a background \"memory session\" "
-            "using the low model group — it consumes extra tokens, so it is off "
-            "by default."
+            "Lets the agent recall durable, long-term facts about the user across "
+            "conversations. Long-term memory is extracted together with the "
+            "conversation summary at the compaction fold (requires Compaction "
+            "enabled). When Vector Embedding is on, facts are stored in the vector "
+            "store and retrieved by relevance; otherwise they live in a small "
+            "size-capped queue. Off by default."
         ),
         fields={
             "enabled": Field(
                 type="boolean", default_toml="memory.enabled",
                 label="Enabled",
-                description="Master switch. When off, no extraction runs and the agent reads no memory.",
-            ),
-            "trigger_token_threshold": Field(
-                type="number", default_toml="memory.trigger_token_threshold",
-                label="Trigger threshold (tokens)",
-                description="Auto-extract once this many NEW message-content tokens (reasoning excluded) accumulate since the last extraction.",
-                min=1000, max=1000000,
-            ),
-            "short_term_queue_size": Field(
-                type="number", default_toml="memory.short_term_queue_size",
-                label="Short-term queue size",
-                description="Max short-term entries kept per conversation. Oldest is dropped on overflow.",
-                min=1, max=50,
+                description="Master switch for long-term memory. Requires Compaction enabled (memory is generated at the compaction fold). When off, the agent reads and writes no long-term memory.",
             ),
             "long_term_queue_size": Field(
                 type="number", default_toml="memory.long_term_queue_size",
                 label="Long-term queue size",
-                description="Max long-term entries kept per profile. Oldest is dropped on overflow.",
+                description="Max long-term facts kept per profile in the DB queue (Vector-Embedding-OFF mode). Oldest is dropped on overflow. Ignored in vector mode (unlimited).",
                 min=1, max=100,
-            ),
-            "short_term_max_tokens": Field(
-                type="number", default_toml="memory.short_term_max_tokens",
-                label="Short-term entry max tokens",
-                description="Each short-term summary is clipped to at most this many tokens.",
-                min=50, max=2000,
             ),
             "long_term_max_tokens": Field(
                 type="number", default_toml="memory.long_term_max_tokens",
@@ -317,23 +300,11 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
                 description="Each long-term fact is clipped to at most this many tokens.",
                 min=10, max=500,
             ),
-            "temperature": Field(
-                type="number", default_toml="memory.temperature",
-                label="Temperature",
-                description="Sampling temperature for the extraction call; keep low for consistency.",
-                min=0, max=2, step=0.1,
-            ),
-            "max_tokens": Field(
-                type="number", default_toml="memory.max_tokens",
-                label="Max tokens",
-                description="Output token cap for the extraction LLM call.",
-                min=256, max=8192,
-            ),
-            "retry": Field(
-                type="number", default_toml="memory.retry",
-                label="Retry count",
-                description="Retries on transient extraction LLM errors.",
-                min=0, max=10,
+            "long_term_retrieve_limit": Field(
+                type="number", default_toml="memory.long_term_retrieve_limit",
+                label="Long-term retrieval limit",
+                description="Top-K long-term facts retrieved from the vector store for the prompt (Vector-Embedding-ON mode).",
+                min=1, max=50,
             ),
         },
     ),

@@ -67,6 +67,10 @@ export const useSettingsStore = defineStore('settings', () => {
   // Sidebar collapsed state
   const sidebarCollapsed = ref(localStorage.getItem('sidebar_collapsed') === 'true');
 
+  // Usage chip: open its explanation popover on hover (default) vs. on click.
+  // Default true unless explicitly turned off.
+  const usageChipHover = ref(localStorage.getItem('usage_chip_hover') !== 'false');
+
   // Active profile ID (the currently-used profile for this tab session)
   const profileId = ref(localStorage.getItem('profile_id') || '');
 
@@ -176,6 +180,11 @@ export const useSettingsStore = defineStore('settings', () => {
     localStorage.setItem('sidebar_collapsed', String(value));
   }
 
+  function setUsageChipHover(value: boolean) {
+    usageChipHover.value = value;
+    localStorage.setItem('usage_chip_hover', String(value));
+  }
+
   function setProfileId(id: string) {
     profileId.value = id;
   }
@@ -208,6 +217,7 @@ export const useSettingsStore = defineStore('settings', () => {
     setAgentUrl: setAgentUrlAction,
     theme,
     sidebarCollapsed,
+    usageChipHover,
     profileId,
     authToken,
     workingDir,
@@ -215,6 +225,7 @@ export const useSettingsStore = defineStore('settings', () => {
     setAutoConnect,
     setTheme,
     setSidebarCollapsed,
+    setUsageChipHover,
     setProfileId,
     setAuthToken,
     // Per-profile token management

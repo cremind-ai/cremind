@@ -7,9 +7,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
-from app.agent import memory_runner
 from app.agent.stream_runner import cancel_run, make_run_id
-from app.config.user_config import resolve_memory_config
+from app.config.embedding_state import embedding_state
+from app.config.settings import BaseConfig
+from app.config.user_config import resolve_compaction_config, resolve_memory_config
 from app.events import queue as event_queue
 from app.api.events import publish_skill_events_admin_changed
 from app.api.file_watchers import publish_file_watchers_admin_changed
@@ -21,7 +22,7 @@ from app.events.stream_bus import get_event_stream_bus
 from app.storage import get_memory_storage, get_usage_storage
 from app.storage.conversation_storage import ConversationStorage, is_valid_conversation_id
 from app.utils import logger
-from app.utils.common import convert_db_messages_to_history
+from app.utils.common import convert_db_messages_to_history, count_content_tokens
 from app.utils.uploads_tmp import is_inside_conversation_tmp
 
 
@@ -206,11 +207,12 @@ def get_conversation_routes(
         return JSONResponse({"messages": messages})
 
     async def handle_get_memory(request: Request) -> JSONResponse:
-        """Return this conversation's short-term + the profile's long-term memory.
+        """Return this conversation's running summary (short-term) + long-term memory.
 
-        Also reports progress toward the next auto-extraction (un-extracted
-        message-content tokens vs. the configured threshold) and whether an
-        extraction is currently running, so the UI panel can poll for updates.
+        Short-term memory is now the conversation's running compaction summary;
+        long-term comes from the vector store (embedding on) or the DB queue
+        (embedding off). Also reports progress toward the next fold (verbatim-tail
+        tokens vs. the compaction threshold) so the UI panel can poll for updates.
         """
         unauth = _require_auth(request)
         if unauth is not None:
@@ -223,33 +225,43 @@ def get_conversation_routes(
         if conv.get("profile") != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
 
-        storage = get_memory_storage()
         cfg = resolve_memory_config(profile)
-        short_term = await storage.get_short_term(conversation_id)
-        long_term = await storage.get_long_term(profile)
-        _, last_extracted_at = await storage.get_watermark(conversation_id)
-        try:
-            current_tokens = await memory_runner.pending_token_count(conversation_id)
-        except Exception:  # noqa: BLE001
-            current_tokens = 0
+        comp_cfg = resolve_compaction_config(profile)
+        summary, watermark, last_compacted_at = await conversation_storage.get_compaction_state(
+            conversation_id
+        )
+
+        if BaseConfig.is_embedding_enabled() and embedding_state.is_ready():
+            from app.agent import memory_vectorstore
+            from app.events.runner import get_cremind_agent
+            long_term = await asyncio.to_thread(
+                memory_vectorstore.list_long_term,
+                agent=get_cremind_agent(), profile=profile, limit=50,
+            )
+        else:
+            long_term = await get_memory_storage().get_long_term(profile)
+
+        tail = await conversation_storage.get_messages_after(conversation_id, watermark)
+        current_tokens = count_content_tokens(summary or "") + sum(
+            count_content_tokens(m.get("content") or "") for m in tail
+        )
         return JSONResponse({
-            "short_term": short_term,
+            "summary": summary or "",
             "long_term": long_term,
             "token_progress": {
                 "current": current_tokens,
-                "threshold": cfg.trigger_token_threshold,
+                "threshold": comp_cfg.compact_threshold_tokens,
             },
             "enabled": cfg.enabled,
-            "extracting": memory_runner.is_extracting(conversation_id),
-            "last_extracted_at": last_extracted_at,
+            "last_compacted_at": last_compacted_at,
         })
 
     async def handle_trigger_memory(request: Request) -> JSONResponse:
-        """Manually kick off a background memory extraction for this conversation.
+        """Manually fold this conversation now (running summary + long-term memory).
 
-        User-initiated, so it runs even when auto-extraction is disabled in
-        settings (``force=True``). Returns ``202`` immediately; the extraction
-        runs in the background and the panel polls ``GET …/memory`` for results.
+        User-initiated: folds the current tail regardless of the compaction
+        threshold so a short conversation can have its memory extracted on demand.
+        Runs synchronously; returns the result so the panel can refresh.
         """
         unauth = _require_auth(request)
         if unauth is not None:
@@ -262,8 +274,15 @@ def get_conversation_routes(
         if conv.get("profile") != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
 
-        memory_runner.schedule_extraction(conversation_id, profile, force=True)
-        return JSONResponse({"scheduled": True}, status_code=202)
+        from app.agent import compaction
+        from app.events.runner import get_cremind_agent
+        folded = await compaction.force_fold(
+            conversation_id=conversation_id,
+            profile=profile,
+            conversation_storage=conversation_storage,
+            cremind_agent=get_cremind_agent(),
+        )
+        return JSONResponse({"folded": folded}, status_code=200)
 
     async def handle_post_message(request: Request) -> JSONResponse:
         """Enqueue a user message for streaming agent processing.

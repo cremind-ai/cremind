@@ -1,4 +1,4 @@
-"""Summarization-based conversation-history compaction.
+"""Unified conversation compaction + memory generation.
 
 Replaces the old token-window truncation (``limit_messages`` / ``truncate_messages``).
 That windowing dropped the oldest turns off the *front* of history every turn, which
@@ -6,7 +6,18 @@ broke prompt caching: the cached prefix is a strict prefix match, so mutating th
 front invalidates everything after it. Instead this keeps a byte-stable running
 *summary* at the front of history and the recent turns verbatim.
 
-State lives on the conversation row (mirrors the memory watermark):
+The running summary IS the conversation's "short-term memory" — the two were
+unified (they both summarized the conversation per-conversation). One LLM pass at
+the fold point produces it:
+
+- **memory disabled** → a plain chat completion (:func:`_summarize_plain`) yields
+  the running summary only. This is the conversation compact.
+- **memory enabled** → a forced ``save_memory`` tool call
+  (:func:`app.agent.memory_extractor.extract_fold_memory`) yields the running
+  summary AND long-term facts in one call. Long-term is routed to the vector store
+  (embedding on, FLEXIBLE prompt) or the DB queue (embedding off, STRICT prompt).
+
+State lives on the conversation row:
 
 - ``compaction_summary``   — running summary of every message ``ordering <= watermark``
 - ``compaction_watermark`` — ordering of the newest message folded into the summary
@@ -20,11 +31,12 @@ assembled. The fold target ``keep_recent_tokens`` sits well below the trigger so
 summary stays byte-identical for many turns and the cached prefix is reused; a
 compaction event is a deliberate one-time cache write.
 
-This runs **synchronously** in the consumption path (not as a background task like
-memory extraction) so the threshold is never exceeded — important because, on the
-first turn after this feature ships, a long pre-existing conversation would otherwise
-be sent whole. Per-conversation turns are serialized by ``app.events.queue``, so the
-inline read-modify-write never races on a conversation's watermark.
+This runs **synchronously** in the consumption path so the threshold is never
+exceeded — important because, on the first turn after this feature ships, a long
+pre-existing conversation would otherwise be sent whole. Per-conversation turns are
+serialized by ``app.events.queue``, so the inline read-modify-write never races on a
+conversation's watermark. The manual-trigger path (:func:`force_fold`) runs off that
+queue, so it takes a per-conversation lock.
 
 The summary is injected as a **user**-role message (not ``system``): the Anthropic
 provider folds every ``system`` message into the cached system block (see
@@ -34,16 +46,30 @@ instruction; a user message stays a distinct, byte-stable history block.
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass, field
 from typing import Any, cast
 
-from app.config.user_config import CompactionConfig, resolve_compaction_config
+from app.config.settings import BaseConfig
+from app.config.user_config import (
+    CompactionConfig,
+    MemoryConfig,
+    resolve_compaction_config,
+    resolve_memory_config,
+)
 from app.constants import ChatCompletionTypeEnum
+from app.storage import get_memory_storage
 from app.utils.common import (
     convert_db_messages_to_history,
     count_content_tokens,
     truncate_to_tokens,
 )
 from app.utils.logger import logger
+
+# Headroom (tokens) added to the LLM-call budget on the memory-enabled path so the
+# forced tool call can emit the long-term facts alongside the running summary
+# (which alone may approach ``compaction.max_tokens``).
+_LONG_TERM_OUTPUT_BUDGET = 512
 
 # Frames the running summary for the model. Kept stable so the cached prefix only
 # changes when the summary text itself changes (i.e. on a compaction event).
@@ -52,6 +78,8 @@ _SUMMARY_HEADER = (
     "factual background of what was already said and done.]\n\n"
 )
 
+# Plain-completion system prompt (memory-disabled path). The memory-enabled path
+# uses the merged save_memory prompt in app.agent.memory_extractor instead.
 _SUMMARY_SYSTEM = (
     "You maintain a running summary of a long conversation between a user and an AI "
     "agent so the agent keeps full continuity after older turns are dropped from its "
@@ -69,6 +97,15 @@ _SUMMARY_SYSTEM = (
     "with no preamble."
 )
 
+# Per-conversation locks for the off-queue manual-trigger path (force_fold).
+_force_locks: dict[str, asyncio.Lock] = {}
+
+
+@dataclass
+class _FoldResult:
+    summary: str
+    long_term: list[str] = field(default_factory=list)
+
 
 def _render_fold_input(old_summary: str | None, folded: list[dict]) -> str:
     """Render the prior summary + the messages being folded, as the summarizer input."""
@@ -85,15 +122,11 @@ def _render_fold_input(old_summary: str | None, folded: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-async def _summarize(
-    cremind_agent: Any, old_summary: str | None, folded: list[dict],
-    profile: str, cfg: CompactionConfig,
-) -> str:
-    """One-shot summary via the low model group (mirrors summary.summarize_reasoning)."""
-    llm = cremind_agent.low_group_llm(profile)
+async def _summarize_plain(llm: Any, fold_input: str, cfg: CompactionConfig) -> str:
+    """One-shot running summary via the low model group (memory-disabled path)."""
     messages = [
         {"role": "system", "content": _SUMMARY_SYSTEM},
-        {"role": "user", "content": _render_fold_input(old_summary, folded)},
+        {"role": "user", "content": fold_input},
     ]
     collected: list[str] = []
     async for resp in llm.chat_completion(
@@ -107,6 +140,92 @@ async def _summarize(
             if data:
                 collected.append(data)
     return "".join(collected).strip()
+
+
+async def _fold(
+    cremind_agent: Any,
+    old_summary: str | None,
+    folded: list[dict],
+    profile: str,
+    comp_cfg: CompactionConfig,
+    memory_cfg: MemoryConfig | None,
+) -> _FoldResult | None:
+    """Produce the merged running summary (+ long-term facts when memory is on).
+
+    Returns ``None`` when the LLM produced nothing usable — the caller leaves the
+    summary + watermark unchanged and sends the full tail this turn.
+    """
+    llm = cremind_agent.low_group_llm(profile)
+    fold_input = _render_fold_input(old_summary, folded)
+
+    if memory_cfg is None or not memory_cfg.enabled:
+        summary = await _summarize_plain(llm, fold_input, comp_cfg)
+        return _FoldResult(summary=summary) if summary else None
+
+    # Memory enabled: forced save_memory tool call → summary + long-term in one call.
+    flexible = BaseConfig.is_embedding_enabled()
+    if flexible:
+        # Vector store dedups at write time; no need to feed the full set back.
+        current_long_term: list[str] = []
+    else:
+        storage = get_memory_storage()
+        current_long_term = [m["content"] for m in await storage.get_long_term(profile)]
+
+    from app.agent.memory_extractor import extract_fold_memory
+
+    parsed = await extract_fold_memory(
+        llm=llm,
+        fold_input=fold_input,
+        long_term_flexible=flexible,
+        current_long_term=current_long_term,
+        summary_max_tokens=comp_cfg.max_tokens,
+        long_max_tokens=memory_cfg.long_term_max_tokens,
+        temperature=comp_cfg.temperature,
+        max_tokens=comp_cfg.max_tokens + _LONG_TERM_OUTPUT_BUDGET,
+        retry=comp_cfg.retry,
+    )
+    if parsed is None or not parsed.get("short_term_memory"):
+        return None
+    return _FoldResult(
+        summary=parsed["short_term_memory"],
+        long_term=parsed.get("long_term_memories") or [],
+    )
+
+
+async def _store_long_term(
+    cremind_agent: Any,
+    profile: str,
+    conversation_id: str,
+    facts: list[str],
+    memory_cfg: MemoryConfig,
+) -> None:
+    """Route extracted long-term facts to the vector store or the DB queue."""
+    if not facts:
+        return
+    from app.agent import memory_vectorstore
+
+    if memory_vectorstore.vector_long_term_available(cremind_agent):
+        await asyncio.to_thread(
+            memory_vectorstore.store_long_term,
+            agent=cremind_agent,
+            profile=profile,
+            conversation_id=conversation_id,
+            facts=facts,
+        )
+        return
+
+    storage = get_memory_storage()
+    for fact in facts:
+        clipped = truncate_to_tokens(fact, memory_cfg.long_term_max_tokens).strip()
+        if not clipped:
+            continue
+        await storage.add_long_term(
+            profile=profile,
+            content=clipped,
+            token_count=count_content_tokens(clipped),
+            source_conversation_id=conversation_id,
+            queue_size=memory_cfg.long_term_queue_size,
+        )
 
 
 def _select_fold_count(tail: list[dict], cfg: CompactionConfig) -> int:
@@ -164,6 +283,11 @@ async def build_compacted_history(
         return fallback_history
 
     try:
+        memory_cfg = resolve_memory_config(profile)
+    except Exception:  # noqa: BLE001
+        memory_cfg = None
+
+    try:
         summary, watermark, _ = await conversation_storage.get_compaction_state(conversation_id)
         tail = await conversation_storage.get_messages_after(conversation_id, watermark)
         if exclude_message_id:
@@ -177,17 +301,22 @@ async def build_compacted_history(
             cut = _select_fold_count(tail, cfg)
             if cut > 0:
                 folded, kept = tail[:cut], tail[cut:]
-                new_summary = await _summarize(cremind_agent, summary, folded, profile, cfg)
-                if new_summary:
-                    new_summary = truncate_to_tokens(new_summary, cfg.max_tokens)
+                result = await _fold(cremind_agent, summary, folded, profile, cfg, memory_cfg)
+                if result and result.summary:
+                    new_summary = truncate_to_tokens(result.summary, cfg.max_tokens)
                     new_watermark = int(folded[-1]["ordering"])
                     await conversation_storage.set_compaction_state(
                         conversation_id, new_summary, new_watermark,
                     )
                     summary, tail = new_summary, kept
+                    if memory_cfg is not None and memory_cfg.enabled and result.long_term:
+                        await _store_long_term(
+                            cremind_agent, profile, conversation_id, result.long_term, memory_cfg,
+                        )
                     logger.info(
                         f"[compaction] conv={conversation_id} folded {len(folded)} msg(s), "
-                        f"watermark->{new_watermark}, eff_tokens={eff_tokens}"
+                        f"watermark->{new_watermark}, eff_tokens={eff_tokens}, "
+                        f"long_term+={len(result.long_term)}"
                     )
                 else:
                     # Summarization failed/empty — leave summary + watermark
@@ -203,3 +332,58 @@ async def build_compacted_history(
             f"[compaction] failed for conv={conversation_id}; falling back to raw history"
         )
         return fallback_history
+
+
+async def force_fold(
+    *,
+    conversation_id: str,
+    profile: str,
+    conversation_storage: Any,
+    cremind_agent: Any,
+) -> bool:
+    """Manually fold the current tail regardless of threshold (manual trigger).
+
+    Folds everything except the most recent ``keep_recent_messages`` so a short
+    conversation that never crosses ``compact_threshold_tokens`` can still have its
+    memory extracted on demand. Returns ``True`` when a fold happened.
+
+    Runs off the per-conversation run queue, so it takes a per-conversation lock to
+    avoid racing the inline path on the watermark.
+    """
+    cfg = resolve_compaction_config(profile)
+    if not cfg.enabled:
+        return False
+    try:
+        memory_cfg = resolve_memory_config(profile)
+    except Exception:  # noqa: BLE001
+        memory_cfg = None
+
+    lock = _force_locks.setdefault(conversation_id, asyncio.Lock())
+    async with lock:
+        try:
+            summary, watermark, _ = await conversation_storage.get_compaction_state(conversation_id)
+            tail = await conversation_storage.get_messages_after(conversation_id, watermark)
+            cut = max(0, len(tail) - cfg.keep_recent_messages)
+            if cut <= 0:
+                return False
+            folded = tail[:cut]
+            result = await _fold(cremind_agent, summary, folded, profile, cfg, memory_cfg)
+            if not (result and result.summary):
+                return False
+            new_summary = truncate_to_tokens(result.summary, cfg.max_tokens)
+            new_watermark = int(folded[-1]["ordering"])
+            await conversation_storage.set_compaction_state(
+                conversation_id, new_summary, new_watermark,
+            )
+            if memory_cfg is not None and memory_cfg.enabled and result.long_term:
+                await _store_long_term(
+                    cremind_agent, profile, conversation_id, result.long_term, memory_cfg,
+                )
+            logger.info(
+                f"[compaction] force_fold conv={conversation_id} folded {len(folded)} msg(s), "
+                f"watermark->{new_watermark}, long_term+={len(result.long_term)}"
+            )
+            return True
+        except Exception:  # noqa: BLE001
+            logger.exception(f"[compaction] force_fold failed for conv={conversation_id}")
+            return False
