@@ -1,17 +1,23 @@
-"""LLM-driven extraction of short/long-term memory from a conversation window.
+"""LLM-driven extraction of the running summary + long-term memory at fold time.
 
-Runs as part of the background "memory session" (see
-:mod:`app.agent.memory_runner`), entirely decoupled from the reasoning loop.
-It mirrors the auxiliary-LLM-call shape of :mod:`app.agent.summary` /
-:mod:`app.agent.skill_classifier`, but uses a **forced tool call**: the model
-must call ``save_memory`` with a required short-term summary and an optional
-list of long-term facts. Tool-call results stream back as a
-``FUNCTION_CALLING`` event whose ``data.function[0].arguments`` the provider
-has already parsed (we still defend against a JSON-string fallback, matching
-:mod:`app.tools.builtin.adapter`).
+This is the **memory-enabled** branch of the unified compaction/memory pass (see
+:mod:`app.agent.compaction`). When memory is enabled, the fold is a single
+**forced tool call**: the model must call ``save_memory`` with
 
-Current memory is passed into the prompt so the model dedups — it should not
-re-summarize facts already captured.
+- ``short_term_memory`` — the merged RUNNING SUMMARY (prior summary + the older
+  messages being folded out of context). This *is* the conversation compact;
+  compaction stores it as the conversation's running summary.
+- ``long_term_memories`` — 0+ durable, session-independent facts. The extraction
+  instruction is STRICT when long-term lives in the size-limited DB queue
+  (embedding off) and FLEXIBLE when it lives in the effectively-unlimited vector
+  store (embedding on).
+
+When memory is *disabled*, compaction skips this module entirely and produces the
+summary with a plain chat completion (``compaction._summarize_plain``).
+
+Tool-call results stream back as a ``FUNCTION_CALLING`` event whose
+``data.function[0].arguments`` the provider has already parsed (we still defend
+against a JSON-string fallback, matching :mod:`app.tools.builtin.adapter`).
 """
 
 from __future__ import annotations
@@ -19,7 +25,6 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
-from app.config.user_config import MemoryConfig
 from app.constants import ChatCompletionTypeEnum
 from app.lib.llm.base import LLMProvider
 from app.utils.logger import logger
@@ -28,23 +33,56 @@ if TYPE_CHECKING:
     from openai.types.chat import ChatCompletionMessageParam
 
 
-_SYSTEM_PROMPT = (
-    "You maintain an AI agent's MEMORY by distilling a slice of a conversation "
-    "into two kinds of memory. You MUST call the `save_memory` tool exactly once.\n\n"
-    "SHORT-TERM memory (REQUIRED): a concise summary of THIS working session that "
-    "will help the agent optimize the requests that follow — mistakes it made and "
-    "should avoid repeating, commands/tools it ran repeatedly, and the user's "
-    "commanding habits and preferences within this session. Write it as dense, "
-    "actionable notes. Keep it under {short_max} tokens.\n\n"
+# The short-term field is the running summary; its instruction merges the
+# continuity-summary guidance that used to live in ``compaction._SUMMARY_SYSTEM``.
+_SHORT_TERM_INSTRUCTION = (
+    "SHORT-TERM memory (REQUIRED) — the RUNNING SUMMARY: you maintain a running "
+    "summary of a long conversation so the agent keeps full continuity after older "
+    "turns are dropped from its context window. You are given the PRIOR SUMMARY "
+    "(already covering the earliest part of the conversation) and a batch of OLDER "
+    "MESSAGES that now need to be folded in. Produce ONE merged summary that "
+    "supersedes the prior summary and absorbs the new messages. Preserve, densely "
+    "and specifically: facts and decisions; identifiers (IDs, file paths, URLs, "
+    "ticket/PR numbers, command names, config keys, exact values); unresolved "
+    "questions and pending TODOs; the user's stated goals, constraints, and "
+    "preferences; and any state the agent must not re-derive. Carry forward "
+    "everything still relevant from the prior summary — do not drop it just because "
+    "it is old. Do not invent anything not present in the inputs. Output "
+    "GitHub-flavored Markdown, with no preamble. Keep it under {summary_max} tokens."
+)
+
+# STRICT: long-term lives in a size-capped DB queue, so only the most durable facts.
+_LONG_TERM_STRICT = (
     "LONG-TERM memory (OPTIONAL — usually empty): only EXTREMELY important, durable "
     "facts about the user that persist far beyond this session and rarely change — "
     "e.g. their name, age, role, stable preferences. Each entry must be a single "
     "short fact under {long_max} tokens. DO NOT store transient or session-bound "
-    "information here: no reminders, schedules, calendar events, to-dos, or "
-    "anything tied to the current task. If nothing qualifies, return an empty list.\n\n"
-    "DEDUPLICATION: the agent's CURRENT memory is given below. Do NOT repeat facts "
-    "that are already stored; only add genuinely new information. For short-term, "
-    "summarize what is new in this slice rather than restating prior summaries."
+    "information here: no reminders, schedules, calendar events, to-dos, or anything "
+    "tied to the current task. If nothing qualifies, return an empty list."
+)
+
+# FLEXIBLE: long-term lives in the vector store (effectively unlimited), so capture
+# any globally reusable knowledge, not just rare biographical facts.
+_LONG_TERM_FLEXIBLE = (
+    "LONG-TERM memory (OPTIONAL): capture any GLOBALLY useful, reusable knowledge "
+    "that would help in FUTURE, unrelated conversations — not just rare biographical "
+    "facts. Include durable user facts and preferences; stable project/environment "
+    "details (repositories, paths, services, conventions, where credentials live — "
+    "never the secret values themselves); recurring workflows and how the user likes "
+    "them done; and decisions plus their rationale that outlive the current task. "
+    "Each entry must be a single, self-contained fact (it will be retrieved out of "
+    "context) under {long_max} tokens. Exclude only truly ephemeral state (one-off "
+    "reminders, the current to-do). Storage is effectively unlimited — err toward "
+    "capturing reusable knowledge. If nothing qualifies, return an empty list."
+)
+
+_SYSTEM_PROMPT_TEMPLATE = (
+    "You maintain an AI agent's MEMORY by distilling a slice of a long conversation "
+    "into two kinds of memory. You MUST call the `save_memory` tool exactly once.\n\n"
+    "{short_term}\n\n"
+    "{long_term}\n\n"
+    "DEDUPLICATION: the agent's CURRENT long-term memory is given below. Do NOT "
+    "repeat facts that are already stored; only add genuinely new information."
 )
 
 _SAVE_MEMORY_TOOL: dict[str, Any] = {
@@ -52,8 +90,9 @@ _SAVE_MEMORY_TOOL: dict[str, Any] = {
     "function": {
         "name": "save_memory",
         "description": (
-            "Persist memory extracted from the conversation slice. Always provide "
-            "short_term_memory; provide long_term_memories only for durable user facts."
+            "Persist the running summary and any durable long-term facts extracted "
+            "from this fold. Always provide short_term_memory (the merged running "
+            "summary); provide long_term_memories only for durable, reusable facts."
         ),
         "parameters": {
             "type": "object",
@@ -61,16 +100,17 @@ _SAVE_MEMORY_TOOL: dict[str, Any] = {
                 "short_term_memory": {
                     "type": "string",
                     "description": (
-                        "REQUIRED. Concise, actionable session notes: mistakes to "
-                        "avoid, repeated commands, user habits/preferences this session."
+                        "REQUIRED. The merged RUNNING SUMMARY: the prior summary "
+                        "updated to absorb the folded older messages, preserving "
+                        "facts, identifiers, TODOs, goals and constraints."
                     ),
                 },
                 "long_term_memories": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "0+ durable, session-independent user facts (name, age, "
-                        "stable preferences), each a single short fact. Empty if none."
+                        "0+ durable, session-independent facts, each a single "
+                        "self-contained fact. Empty if none qualify."
                     ),
                 },
             },
@@ -80,28 +120,9 @@ _SAVE_MEMORY_TOOL: dict[str, Any] = {
 }
 
 
-def _format_current_memory(short_term: list[str], long_term: list[str]) -> str:
-    def _bullets(items: list[str]) -> str:
-        items = [i for i in (s.strip() for s in items) if i]
-        return "\n".join(f"- {i}" for i in items) if items else "(none)"
-
-    return (
-        "CURRENT short-term memory (this conversation):\n"
-        f"{_bullets(short_term)}\n\n"
-        "CURRENT long-term memory (this profile):\n"
-        f"{_bullets(long_term)}"
-    )
-
-
-def _format_window(window_messages: list[dict[str, Any]]) -> str:
-    lines: list[str] = []
-    for m in window_messages:
-        role = m.get("role", "")
-        speaker = "User" if role == "user" else "Agent"
-        content = (m.get("content") or "").strip()
-        if content:
-            lines.append(f"{speaker}: {content}")
-    return "\n\n".join(lines)
+def _bullets(items: list[str]) -> str:
+    items = [i for i in (s.strip() for s in items) if i]
+    return "\n".join(f"- {i}" for i in items) if items else "(none)"
 
 
 def _parse_save_memory(arguments: Any) -> dict[str, Any] | None:
@@ -127,33 +148,42 @@ def _parse_save_memory(arguments: Any) -> dict[str, Any] | None:
     return {"short_term_memory": short_term, "long_term_memories": long_term}
 
 
-async def extract_memory(
+async def extract_fold_memory(
     *,
     llm: LLMProvider,
-    window_messages: list[dict[str, Any]],
-    current_short_term: list[str],
+    fold_input: str,
+    long_term_flexible: bool,
     current_long_term: list[str],
-    cfg: MemoryConfig,
+    summary_max_tokens: int,
+    long_max_tokens: int,
+    temperature: float,
+    max_tokens: int,
+    retry: int,
 ) -> dict[str, Any] | None:
-    """Run the extraction LLM call. Returns the parsed memory dict or ``None``.
+    """Run the unified fold extraction (forced ``save_memory`` tool call).
 
-    The returned dict has ``short_term_memory`` (str, possibly empty) and
-    ``long_term_memories`` (list[str]). ``None`` means the call failed or the
-    model produced nothing usable — the caller treats that as a no-op.
+    ``fold_input`` is the rendered "PRIOR SUMMARY + OLDER MESSAGES" block (built by
+    :func:`app.agent.compaction._render_fold_input`). ``long_term_flexible``
+    selects the FLEXIBLE (vector-store) vs STRICT (DB-queue) long-term prompt.
+
+    Returns ``{short_term_memory, long_term_memories}`` or ``None`` when the call
+    failed or produced nothing usable — the caller treats ``None`` as a no-op and
+    leaves the running summary/watermark unchanged.
     """
-    window_text = _format_window(window_messages)
-    if not window_text:
+    if not fold_input.strip():
         return None
 
-    system = _SYSTEM_PROMPT.format(
-        short_max=cfg.short_term_max_tokens, long_max=cfg.long_term_max_tokens
+    long_term_block = (_LONG_TERM_FLEXIBLE if long_term_flexible else _LONG_TERM_STRICT).format(
+        long_max=long_max_tokens
+    )
+    system = _SYSTEM_PROMPT_TEMPLATE.format(
+        short_term=_SHORT_TERM_INSTRUCTION.format(summary_max=summary_max_tokens),
+        long_term=long_term_block,
     )
     user_content = (
-        f"{_format_current_memory(current_short_term, current_long_term)}\n\n"
-        "NEW conversation slice to extract memory from:\n"
-        "----------------------------------------\n"
-        f"{window_text}\n"
-        "----------------------------------------\n\n"
+        "CURRENT long-term memory (this profile):\n"
+        f"{_bullets(current_long_term)}\n\n"
+        f"{fold_input}\n\n"
         "Call save_memory now."
     )
     messages: list[ChatCompletionMessageParam] = [
@@ -167,9 +197,9 @@ async def extract_memory(
             messages=messages,  # type: ignore[arg-type]
             tools=[_SAVE_MEMORY_TOOL],  # type: ignore[list-item]
             tool_choice={"type": "function", "function": {"name": "save_memory"}},
-            temperature=cfg.temperature,
-            max_tokens=cfg.max_tokens,
-            retry=cfg.retry,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            retry=retry,
         ):
             rtype = response.get("type")
             if rtype == ChatCompletionTypeEnum.FUNCTION_CALLING:
@@ -179,7 +209,7 @@ async def extract_memory(
             elif rtype == ChatCompletionTypeEnum.DONE:
                 break
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"[memory] extraction LLM call failed: {exc}")
+        logger.warning(f"[memory] fold extraction LLM call failed: {exc}")
         return None
 
     for call in function_calls:
@@ -187,5 +217,5 @@ async def extract_memory(
             parsed = _parse_save_memory(call.get("arguments"))
             if parsed is not None:
                 return parsed
-    logger.debug("[memory] extraction produced no usable save_memory call")
+    logger.debug("[memory] fold extraction produced no usable save_memory call")
     return None
