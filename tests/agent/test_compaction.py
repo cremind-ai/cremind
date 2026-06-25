@@ -30,7 +30,7 @@ pytest.importorskip("tiktoken")  # count_content_tokens / convert need the encod
 from a2a.server.models import Base  # noqa: E402
 import app.storage.models  # noqa: F401,E402 — registers tables on Base.metadata
 from app.agent import compaction  # noqa: E402
-from app.config.user_config import CompactionConfig  # noqa: E402
+from app.config.user_config import CompactionConfig, MemoryConfig  # noqa: E402
 from app.constants import ChatCompletionTypeEnum  # noqa: E402
 from app.databases.sqlite import SqliteDatabaseProvider  # noqa: E402
 from app.storage.conversation_storage import ConversationStorage  # noqa: E402
@@ -62,11 +62,11 @@ def _seed(store: ConversationStorage, *, profile="admin", conv="c1", n_messages=
             "VALUES ('p', :profile, :now, :now, 'manual')"
         ), {"profile": profile, "now": now})
         # compaction_watermark column has no DDL default (ORM-side default=-1), so
-        # the raw INSERT must supply it — same as memory_watermark.
+        # the raw INSERT must supply it.
         conn.execute(text(
             "INSERT INTO conversations "
-            "(id, profile, title, created_at, updated_at, memory_watermark, compaction_watermark) "
-            "VALUES (:conv, :profile, 't', :now, :now, 0, -1)"
+            "(id, profile, title, created_at, updated_at, compaction_watermark) "
+            "VALUES (:conv, :profile, 't', :now, :now, -1)"
         ), {"conv": conv, "profile": profile, "now": now})
         for i in range(n_messages):
             conn.execute(text(
@@ -136,12 +136,22 @@ class _FakeStore:
 
 
 class _FakeLLM:
-    def __init__(self, output="RUNNING SUMMARY"):
+    def __init__(self, output="RUNNING SUMMARY", tool_args=None):
         self.output = output
+        # When set, emit a FUNCTION_CALLING save_memory event (memory-enabled
+        # fold path) instead of a plain CONTENT chunk.
+        self.tool_args = tool_args
         self.calls = 0
 
     async def chat_completion(self, **kwargs):
         self.calls += 1
+        if self.tool_args is not None:
+            yield {
+                "type": ChatCompletionTypeEnum.FUNCTION_CALLING,
+                "data": {"function": [{"name": "save_memory", "arguments": self.tool_args}]},
+            }
+            yield {"type": ChatCompletionTypeEnum.DONE}
+            return
         if self.output:
             yield {"type": ChatCompletionTypeEnum.CONTENT, "data": self.output}
 
@@ -167,8 +177,19 @@ def _cfg(*, enabled=True, threshold=25, keep_recent_tokens=5, keep_recent_messag
     )
 
 
-def _patch_cfg(monkeypatch, cfg):
+def _mem_cfg(*, enabled=False) -> MemoryConfig:
+    return MemoryConfig(
+        enabled=enabled, long_term_queue_size=20, long_term_max_tokens=50,
+        long_term_retrieve_limit=10,
+    )
+
+
+def _patch_cfg(monkeypatch, cfg, memory_cfg=None):
     monkeypatch.setattr(compaction, "resolve_compaction_config", lambda profile: cfg)
+    monkeypatch.setattr(
+        compaction, "resolve_memory_config",
+        lambda profile: memory_cfg if memory_cfg is not None else _mem_cfg(enabled=False),
+    )
 
 
 async def _build(store, agent, fallback):
@@ -245,6 +266,45 @@ def test_over_threshold_folds_and_advances_watermark(monkeypatch) -> None:
     assert "RUNNING SUMMARY" in out[0]["content"]
     assert out[0]["content"].startswith("[Summary of earlier conversation")
     assert len(out) == 2                  # summary + the one kept message (ordering 3)
+
+
+def test_memory_enabled_fold_extracts_long_term_to_db(monkeypatch) -> None:
+    # Memory on + embedding off: the fold is a forced save_memory tool call that
+    # yields the running summary AND long-term facts; facts route to the DB queue.
+    _patch_cfg(
+        monkeypatch,
+        _cfg(threshold=25, keep_recent_tokens=5, keep_recent_messages=1),
+        memory_cfg=_mem_cfg(enabled=True),
+    )
+    monkeypatch.setattr(
+        compaction.BaseConfig, "is_embedding_enabled", classmethod(lambda cls: False)
+    )
+
+    class _FakeMemStore:
+        def __init__(self):
+            self.added: list[str] = []
+
+        async def get_long_term(self, profile):
+            return []
+
+        async def add_long_term(self, *, profile, content, token_count,
+                                source_conversation_id, queue_size):
+            self.added.append(content)
+            return {"content": content}
+
+    fake_mem = _FakeMemStore()
+    monkeypatch.setattr(compaction, "get_memory_storage", lambda: fake_mem)
+
+    store = _FakeStore([_msg(i, _TEN) for i in range(4)])
+    tool_args = {"short_term_memory": "RUNNING SUMMARY", "long_term_memories": ["User is Lee"]}
+    agent = _FakeAgent(_FakeLLM(tool_args=tool_args))
+    out = asyncio.run(_build(store, agent, fallback=[]))
+
+    assert agent._llm.calls == 1
+    new_summary, new_watermark = store.set_calls[0]
+    assert new_summary == "RUNNING SUMMARY"
+    assert "RUNNING SUMMARY" in out[0]["content"]
+    assert fake_mem.added == ["User is Lee"]   # long-term routed to the DB queue
 
 
 def test_hysteresis_no_recompaction_next_turn(monkeypatch) -> None:

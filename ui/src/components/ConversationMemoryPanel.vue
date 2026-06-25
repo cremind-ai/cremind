@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch, onBeforeUnmount } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElDialog, ElButton, ElProgress, ElEmpty, ElTooltip } from 'element-plus';
 import { Icon } from '@iconify/vue';
@@ -44,8 +44,6 @@ const memory = ref<ConversationMemory | null>(null);
 const loading = ref(false);
 const triggering = ref(false);
 const error = ref<string | null>(null);
-let pollTimer: ReturnType<typeof setTimeout> | null = null;
-let pollsLeft = 0;
 
 const progressPercent = computed(() => {
   const p = memory.value?.token_progress;
@@ -59,22 +57,10 @@ const tokensRemaining = computed(() => {
   return Math.max(0, p.threshold - p.current);
 });
 
-const isExtracting = computed(() => triggering.value || memory.value?.extracting === true);
-
-function stopPolling() {
-  if (pollTimer) {
-    clearTimeout(pollTimer);
-    pollTimer = null;
-  }
-  pollsLeft = 0;
-}
-
-async function load(silent = false): Promise<void> {
+async function load(): Promise<void> {
   if (!props.conversationId) return;
-  if (!silent) {
-    loading.value = true;
-    error.value = null;
-  }
+  loading.value = true;
+  error.value = null;
   try {
     memory.value = await fetchConversationMemory(
       settings.agentUrl, settings.authToken, props.conversationId,
@@ -86,23 +72,7 @@ async function load(silent = false): Promise<void> {
   }
 }
 
-// Poll a handful of times after a trigger so the panel reflects the
-// background extraction result without requiring a manual reopen.
-function schedulePoll() {
-  stopPolling();
-  pollsLeft = 12; // ~18s at 1.5s spacing
-  const tick = async () => {
-    await load(true);
-    pollsLeft -= 1;
-    if (pollsLeft > 0 && memory.value?.extracting) {
-      pollTimer = setTimeout(tick, 1500);
-    } else {
-      pollTimer = null;
-    }
-  };
-  pollTimer = setTimeout(tick, 1500);
-}
-
+// Fold now (synchronous server-side), then refresh to show the result.
 async function handleTrigger(): Promise<void> {
   if (!props.conversationId || triggering.value) return;
   triggering.value = true;
@@ -111,9 +81,9 @@ async function handleTrigger(): Promise<void> {
     await triggerConversationMemory(
       settings.agentUrl, settings.authToken, props.conversationId,
     );
-    schedulePoll();
+    await load();
   } catch (e: any) {
-    error.value = e?.message || 'Failed to start extraction';
+    error.value = e?.message || 'Failed to update memory';
   } finally {
     triggering.value = false;
   }
@@ -128,19 +98,12 @@ function formatTime(ts: number): string {
   }
 }
 
-// Load when the dialog opens; stop polling when it closes.
 watch(
   () => props.modelValue,
   (open) => {
-    if (open) {
-      load();
-    } else {
-      stopPolling();
-    }
+    if (open) load();
   },
 );
-
-onBeforeUnmount(stopPolling);
 </script>
 
 <template>
@@ -179,15 +142,16 @@ onBeforeUnmount(stopPolling);
       <div v-if="!memory.enabled" class="memory-notice">
         <Icon icon="mdi:information-outline" />
         <span>
-          Automatic memory is <strong>off</strong> for this profile. Enable it in
-          <em>Settings → Memory</em>, or use “Extract now” below to build memory once.
+          Long-term memory is <strong>off</strong> for this profile. Enable it in
+          <em>Settings → Memory</em> (requires Compaction). The running summary
+          below is still kept for context. Use “Update now” to fold immediately.
         </span>
       </div>
 
-      <!-- Token progress toward next auto-extraction -->
+      <!-- Token progress toward the next compaction fold -->
       <div class="memory-progress">
         <div class="memory-progress-head">
-          <span class="memory-progress-label">Next auto-extraction</span>
+          <span class="memory-progress-label">Next compaction</span>
           <span class="memory-progress-value">
             {{ memory.token_progress.current.toLocaleString() }} /
             {{ memory.token_progress.threshold.toLocaleString() }} tokens
@@ -199,28 +163,27 @@ onBeforeUnmount(stopPolling);
           :status="progressPercent >= 100 ? 'success' : ''"
         />
         <div class="memory-progress-foot">
-          <span v-if="progressPercent >= 100">Threshold reached — extraction will run after the next turn.</span>
-          <span v-else>≈ {{ tokensRemaining.toLocaleString() }} more message tokens until the next extraction.</span>
+          <span v-if="progressPercent >= 100">Threshold reached — the oldest turns will fold into the summary on the next turn.</span>
+          <span v-else>≈ {{ tokensRemaining.toLocaleString() }} more message tokens until the next fold.</span>
         </div>
       </div>
 
-      <!-- Short-term: this conversation -->
+      <!-- Short-term: this conversation's running summary -->
       <section class="memory-section">
         <h4>
           <Icon icon="mdi:lightning-bolt-outline" />
           Short-term memory
-          <ElTooltip content="Session notes for this conversation — habits, repeated commands, mistakes to avoid.">
+          <ElTooltip content="The running summary of this conversation — older turns folded into a compact summary the agent keeps for continuity.">
             <Icon icon="mdi:help-circle-outline" class="hint-icon" />
           </ElTooltip>
-          <span class="count">{{ memory.short_term.length }}</span>
         </h4>
-        <ul v-if="memory.short_term.length" class="memory-list">
-          <li v-for="item in memory.short_term" :key="item.id" class="memory-item">
-            <div class="memory-item-content">{{ item.content }}</div>
-            <div class="memory-item-meta">{{ formatTime(item.created_at) }} · {{ item.token_count }} tok</div>
-          </li>
-        </ul>
-        <ElEmpty v-else description="No short-term memory yet" :image-size="60" />
+        <div v-if="memory.summary" class="memory-item">
+          <div class="memory-item-content">{{ memory.summary }}</div>
+          <div v-if="memory.last_compacted_at" class="memory-item-meta">
+            Last folded {{ formatTime(memory.last_compacted_at) }}
+          </div>
+        </div>
+        <ElEmpty v-else description="No summary yet — the conversation is still short" :image-size="60" />
       </section>
 
       <!-- Long-term: this profile -->
@@ -245,13 +208,13 @@ onBeforeUnmount(stopPolling);
 
     <template #footer>
       <div class="memory-footer">
-        <span v-if="isExtracting" class="extracting">
-          <Icon icon="mdi:loading" class="spin" /> Extracting…
+        <span v-if="triggering" class="extracting">
+          <Icon icon="mdi:loading" class="spin" /> Folding…
         </span>
-        <ElButton @click="load()" :disabled="loading || isExtracting">
+        <ElButton @click="load()" :disabled="loading || triggering">
           <Icon icon="mdi:refresh" /> Refresh
         </ElButton>
-        <ElButton type="primary" @click="handleTrigger" :disabled="isExtracting || !conversationId">
+        <ElButton type="primary" @click="handleTrigger" :disabled="triggering || !conversationId">
           <Icon icon="mdi:cog-sync-outline" /> Update now
         </ElButton>
       </div>

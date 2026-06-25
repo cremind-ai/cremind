@@ -79,6 +79,7 @@ _BUILTIN_MODULE_NAMES: tuple[str, ...] = (
     "web_search",
     "web_fetch",
     "datetime_parser",
+    "current_time",
     "scheduler",
 )
 

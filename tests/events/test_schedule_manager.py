@@ -42,8 +42,8 @@ def _seed(store: ScheduleEventSubscriptionStorage, *, profile="admin", conv="c1"
             "VALUES ('p', :profile, :now, :now, 'manual')"
         ), {"profile": profile, "now": now})
         conn.execute(text(
-            "INSERT INTO conversations (id, profile, title, created_at, updated_at, memory_watermark) "
-            "VALUES (:conv, :profile, 't', :now, :now, 0)"
+            "INSERT INTO conversations (id, profile, title, created_at, updated_at) "
+            "VALUES (:conv, :profile, 't', :now, :now)"
         ), {"conv": conv, "profile": profile, "now": now})
 
 

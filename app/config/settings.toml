@@ -47,8 +47,12 @@ enable_prompt_cache = true
 
 [compaction]
 enabled = true                    # summarization-based history compaction (replaces token windowing)
-compact_threshold_tokens = 100000 # fold oldest turns into the running summary once the verbatim tail crosses this
-keep_recent_tokens = 40000        # after folding, keep ~this many tokens of recent turns verbatim (hysteresis band)
+# Hysteresis: fold is triggered at the UPPER bound and trims the tail back to the
+# LOWER bound, so keep_recent_tokens MUST be well below compact_threshold_tokens.
+# The gap (~28k here) is how much conversation accrues between folds — a bigger gap
+# means folds are rarer, so the cached prompt prefix stays warm across more turns.
+compact_threshold_tokens = 40000  # fold oldest turns into the running summary once summary+tail crosses this (upper bound)
+keep_recent_tokens = 12000        # after folding, trim the verbatim tail back to ~this (lower bound)
 keep_recent_messages = 4          # never fold below this many of the most recent messages
 temperature = 0.3
 max_tokens = 2048                 # hard cap on the running summary's size
@@ -72,12 +76,7 @@ max_tokens = 1024
 retry = 2
 
 [memory]
-enabled = false              # opt-in; setup wizard offers to flip this to true
-trigger_token_threshold = 100000
-short_term_queue_size = 10
-long_term_queue_size = 20
-short_term_max_tokens = 300
-long_term_max_tokens = 50
-temperature = 0.3
-max_tokens = 1024
-retry = 2
+enabled = false                # opt-in; setup wizard offers to flip this to true. Requires [compaction] enabled — long-term memory is generated at the compaction fold.
+long_term_queue_size = 20      # max long-term facts kept in the DB queue (embedding-off mode; vector mode is unlimited)
+long_term_max_tokens = 50      # clip each long-term fact to this many tokens (both modes)
+long_term_retrieve_limit = 10  # top-K long-term facts retrieved from the vector store for the ## Memory block (embedding-on mode)

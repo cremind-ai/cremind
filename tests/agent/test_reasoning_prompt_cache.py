@@ -1,11 +1,11 @@
-"""The system prompt must be byte-identical across the steps of a single turn,
-or the [tools + system] prompt-cache prefix silently misses every step.
+"""The system prompt must be byte-identical across turns (not just steps), or the
+[tools + system] prompt-cache prefix silently misses.
 
-``ReasoningAgent`` stamps ``current_time`` once per turn (in ``run``) instead of
-per step precisely so the prefix stays stable. These tests guard that fix:
-``_build_instruction`` is deterministic given a fixed ``_prompt_time``, and the
-timestamp is genuinely part of the rendered prefix (so per-turn stamping is what
-stabilizes it).
+Two things now keep it stable: ``current_time`` was removed from the prompt (it
+used to mutate the prefix every turn), and the ``## Memory`` block was moved out of
+the system prompt into the volatile per-step input (``template_input``, before
+``Begin!``) so per-turn memory retrieval never busts the cached prefix. These tests
+guard both.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ def _make_agent(monkeypatch):
     """Build a ReasoningAgent skeleton with only what ``_build_instruction`` reads.
 
     ``__new__`` bypasses the heavy DI ``__init__``; module-level helpers are
-    monkeypatched to fixed values so the only variable is ``_prompt_time``.
+    monkeypatched to fixed values.
     """
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
     monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
@@ -30,31 +30,39 @@ def _make_agent(monkeypatch):
     agent.profile = "default"
     agent.context_id = None  # skips the working-directory-override / get_context branch
     agent._memory_context = ""
-    agent._prompt_time = "2026-06-24T10:00:00"
     agent._build_tools_block = lambda: "TOOLS_BLOCK"
     agent._build_loaded_skills_block = lambda: ""
     agent._active_action_names = lambda: ["a", "b"]
     return agent
 
 
-def test_system_prompt_stable_within_turn(monkeypatch):
+def test_system_prompt_stable_and_clock_free(monkeypatch):
     agent = _make_agent(monkeypatch)
 
     first = agent._build_instruction()
     second = agent._build_instruction()
 
-    assert first == second  # byte-identical across steps of the same turn
-    assert agent._prompt_time in first  # the stamp is embedded in the cached prefix
+    assert first == second  # byte-identical across steps/turns
+    # The wall clock was removed from the cached prefix — it now lives in the
+    # on-demand get_current_time tool, not the system prompt.
+    assert "Current time" not in first
 
 
-def test_system_prompt_varies_when_prompt_time_changes(monkeypatch):
+def test_memory_block_lives_in_input_not_system_prompt(monkeypatch):
     agent = _make_agent(monkeypatch)
+    agent._memory_context = "## Memory\nUser name is Lee."
 
-    agent._prompt_time = "2026-06-24T10:00:00"
-    first = agent._build_instruction()
-    agent._prompt_time = "2026-06-24T10:05:00"
-    second = agent._build_instruction()
+    instruction = agent._build_instruction()
+    # Memory must NOT be in the cached system prompt (it changes per turn).
+    assert "## Memory" not in instruction
 
-    # current_time lives inside the prefix, so re-stamping changes it — which is
-    # exactly why stamping once per turn (not per step) is what keeps it stable.
-    assert first != second
+    rendered = agent._render_input("Thought: hello")
+    # It lives in the volatile per-step input, before ``Begin!``.
+    assert "## Memory" in rendered
+    assert rendered.index("## Memory") < rendered.index("Begin!")
+
+    # With no memory, the input has no stray block and still contains Begin!.
+    agent._memory_context = ""
+    empty = agent._render_input("Thought: hello")
+    assert "## Memory" not in empty
+    assert "Begin!" in empty

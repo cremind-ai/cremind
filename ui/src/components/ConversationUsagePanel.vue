@@ -10,7 +10,7 @@ import {
 import { Icon } from '@iconify/vue';
 import { useUsageStore } from '../stores/usage';
 import { formatTokens, formatUsd, formatPercent, formatTimestamp } from '../utils/usageFormat';
-import type { ConversationUsage } from '../services/usageApi';
+import type { ConversationUsage, RequestUsage } from '../services/usageApi';
 
 const props = defineProps<{
   modelValue: boolean;
@@ -44,6 +44,13 @@ watch(() => props.modelValue, (open) => { if (open) load(); });
 
 const tagType = (t: string) =>
   t === 'reasoning' ? 'primary' : t === 'subagent' ? 'danger' : t === 'intrinsic' ? 'success' : 'warning';
+
+// Requests are sortable from the column headers (When / Model / Tokens / Est.
+// cost), defaulting to newest-first — which also fixes the unordered rows the
+// backend returns (it groups by message_id, i.e. UUID order). ``model`` can be
+// null, so it needs an explicit comparator; the numeric columns sort natively.
+const modelSort = (a: RequestUsage, b: RequestUsage) =>
+  (a.model || '').localeCompare(b.model || '');
 </script>
 
 <template>
@@ -98,10 +105,16 @@ const tagType = (t: string) =>
         </ElTable>
       </section>
 
-      <!-- Per-request table; each row expands to its per-source breakdown -->
+      <!-- Per-request table; sort from the column headers, newest-first by
+           default. Each row expands to its per-source breakdown. -->
       <section class="usage-section">
-        <h4><Icon icon="mdi:format-list-numbered" /> Requests</h4>
-        <ElTable :data="data.requests" size="small" row-key="message_id">
+        <h4><Icon icon="mdi:format-list-numbered" /> Requests <span class="hint">click a column header to sort</span></h4>
+        <ElTable
+          :data="data.requests"
+          size="small"
+          row-key="message_id"
+          :default-sort="{ prop: 'created_at', order: 'descending' }"
+        >
           <ElTableColumn type="expand">
             <template #default="{ row }">
               <div class="req-detail">
@@ -115,16 +128,16 @@ const tagType = (t: string) =>
               </div>
             </template>
           </ElTableColumn>
-          <ElTableColumn label="When" width="170">
+          <ElTableColumn label="When" width="170" prop="created_at" sortable>
             <template #default="{ row }">{{ formatTimestamp(row.created_at) }}</template>
           </ElTableColumn>
-          <ElTableColumn label="Model" min-width="140" show-overflow-tooltip>
+          <ElTableColumn label="Model" min-width="140" prop="model" sortable :sort-method="modelSort" show-overflow-tooltip>
             <template #default="{ row }">{{ row.model || '—' }}</template>
           </ElTableColumn>
-          <ElTableColumn label="Tokens" width="100" align="right">
+          <ElTableColumn label="Tokens" width="110" prop="total_tokens" sortable align="right">
             <template #default="{ row }">{{ formatTokens(row.total_tokens) }}</template>
           </ElTableColumn>
-          <ElTableColumn label="Est. cost" width="100" align="right">
+          <ElTableColumn label="Est. cost" width="110" prop="estimated_cost_usd" sortable align="right">
             <template #default="{ row }">{{ formatUsd(row.estimated_cost_usd) }}</template>
           </ElTableColumn>
         </ElTable>
