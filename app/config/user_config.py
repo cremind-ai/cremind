@@ -193,34 +193,32 @@ def resolve_summarizer_config(profile: str) -> SummarizerConfig:
 
 @dataclass(frozen=True)
 class MemoryConfig:
-    """Snapshot of the conversation-memory tunables for one profile."""
+    """Snapshot of the conversation-memory tunables for one profile.
+
+    Memory generation is unified with conversation compaction (see
+    :mod:`app.agent.compaction`): the fold's auxiliary LLM call uses the
+    ``[compaction]`` tunables (temperature/max_tokens/retry/threshold), so those
+    are intentionally absent here. ``enabled`` requires ``[compaction]`` enabled.
+    ``long_term_queue_size`` bounds only the DB path (embedding off); the vector
+    path (embedding on) is effectively unlimited.
+    """
 
     enabled: bool
-    trigger_token_threshold: int
-    short_term_queue_size: int
     long_term_queue_size: int
-    short_term_max_tokens: int
     long_term_max_tokens: int
-    temperature: float
-    max_tokens: int
-    retry: int
+    long_term_retrieve_limit: int
 
 
 def resolve_memory_config(profile: str) -> MemoryConfig:
     """Build a :class:`MemoryConfig` for ``profile``.
 
-    Re-read at extraction/consumption time (not cached) so toggling the feature
-    or its thresholds in Settings takes effect on the next turn.
+    Re-read at consumption time (not cached) so toggling the feature or its
+    limits in Settings takes effect on the next turn.
     """
     values = resolve_group("memory", profile)
     return MemoryConfig(
         enabled=bool(values["enabled"]),
-        trigger_token_threshold=int(values["trigger_token_threshold"]),
-        short_term_queue_size=int(values["short_term_queue_size"]),
         long_term_queue_size=int(values["long_term_queue_size"]),
-        short_term_max_tokens=int(values["short_term_max_tokens"]),
         long_term_max_tokens=int(values["long_term_max_tokens"]),
-        temperature=float(values["temperature"]),
-        max_tokens=int(values["max_tokens"]),
-        retry=int(values["retry"]),
+        long_term_retrieve_limit=int(values["long_term_retrieve_limit"]),
     )

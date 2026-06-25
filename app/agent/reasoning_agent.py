@@ -20,7 +20,6 @@ import json
 import os
 import platform
 import uuid
-from datetime import datetime
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Tuple, cast
 
 import jsonschema
@@ -74,7 +73,6 @@ LOADED_SKILLS_KEY = "_loaded_skill_ids"
 template_instruction = '''(***[VERY IMPORTANT] You MUST always call the "personal_assistant_react" function tool to return your reasoning step. DO NOT return any plain text. Always use the function call with the fields: Thought, Action, Action_Input, Thought_In_Next.***)
 {persona_description}
 
-Current time: {current_time}
 Current OS: {current_os}
 Current User Working Directory: `{current_user_working_directory}`
 
@@ -98,7 +96,7 @@ Observation: the result of the action, the observation content will be placed be
 {loaded_skills}'''
 
 template_input = '''
-Begin!
+{memory}Begin!
 {steps}
 Thought:
 '''
@@ -221,9 +219,6 @@ class ReasoningAgent:
         self._tool_result_head_tokens = cfg.tool_result_head_tokens
         self._tool_result_tail_tokens = cfg.tool_result_tail_tokens
         self._enable_prompt_cache = cfg.enable_prompt_cache
-        # Wall-clock stamp for the system prompt, fixed once per turn in ``run``
-        # so the cacheable prefix stays byte-identical across the turn's steps.
-        self._prompt_time: Optional[str] = None
 
         # Snapshot the tool list available to this profile for this run.
         # When ``allowed_skill_ids`` is provided (automatic skill mode), skills
@@ -442,11 +437,6 @@ class ReasoningAgent:
         current_user_working_directory = override or get_user_working_directory()
         instruction = template_instruction.format(
             persona_description=persona,
-            # Stamped once per turn (in ``run``) rather than per step, so the
-            # system prompt is byte-stable across the steps of a turn and the
-            # provider can prompt-cache the [tools + system] prefix. Falls back
-            # to "now" if a caller reaches this before ``run`` set it.
-            current_time=self._prompt_time or datetime.now().isoformat(),
             current_os=platform.system(),
             current_user_working_directory=current_user_working_directory,
             tools=self._build_tools_block(),
@@ -455,9 +445,18 @@ class ReasoningAgent:
             OBSERVATION_START_MARKER=OBSERVATION_START_MARKER,
             OBSERVATION_END_MARKER=OBSERVATION_END_MARKER,
         )
-        if self._memory_context:
-            instruction = f"{instruction}\n\n{self._memory_context}"
         return instruction
+
+    def _render_input(self, steps_text: str) -> str:
+        """Render the volatile per-step input message (``messages[-1]``).
+
+        The ``## Memory`` block (long-term facts, retrieved per turn by the
+        latest user message) lives here, before ``Begin!`` — NOT in the system
+        prompt. ``messages[-1]`` is never part of the cached prefix, so a
+        per-turn-changing memory block costs nothing in prompt-cache terms.
+        """
+        memory = f"{self._memory_context}\n\n" if self._memory_context else ""
+        return template_input.format(memory=memory, steps=steps_text)
 
     def _token_fields(self) -> dict:
         """Running token totals for this turn, as chunk fields.
@@ -578,10 +577,6 @@ class ReasoningAgent:
         self.history_messages = history_messages
         self._agent_call_history = []
         self._usage_records = []
-        # Stamp the prompt time once for the whole turn so every step's system
-        # prompt is byte-identical (enables provider prompt caching of the
-        # [tools + system] prefix). Re-stamped on each new ``run``/turn.
-        self._prompt_time = datetime.now().isoformat()
 
         context = self.context_store.get_context(self.context_id)
         if context:
@@ -626,7 +621,7 @@ class ReasoningAgent:
                 **self._token_fields(),
             }
             if self.current_step_count > 1:
-                done_chunk["input_section"] = template_input.format(steps="\n".join(self.steps))
+                done_chunk["input_section"] = template_input.format(memory="", steps="\n".join(self.steps))
             yield done_chunk
             return
 
@@ -640,7 +635,7 @@ class ReasoningAgent:
                 head_tokens=self._tool_result_head_tokens,
                 tail_tokens=self._tool_result_tail_tokens,
             )
-        input_section = template_input.format(steps="\n".join(steps_for_prompt))
+        input_section = self._render_input("\n".join(steps_for_prompt))
 
         # Rebuild the system prompt every iteration so newly loaded skills are
         # appended (and re-invoked skills are filtered out of the Tools block).
@@ -1124,7 +1119,7 @@ class ReasoningAgent:
             # presence is the signal to callers that the trace is worth
             # summarizing.
             if self.current_step_count > 1:
-                done_chunk["input_section"] = template_input.format(steps="\n".join(self.steps))
+                done_chunk["input_section"] = template_input.format(memory="", steps="\n".join(self.steps))
             yield done_chunk
             return
 
