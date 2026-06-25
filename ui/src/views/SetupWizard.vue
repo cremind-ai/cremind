@@ -1099,17 +1099,38 @@ function buildConfigSnapshot(): ConfigExportSnapshot {
       const m = secrets.app_url.match(/^[a-z]+:\/\/([^/:]+)/i);
       if (m && m[1]) host = m[1];
     }
-    const novncPort = secrets.novnc_port ?? 6080;
-    const vncPort = secrets.vnc_port ?? 5900;
-    vnc = {
-      password: secrets.vnc_password as string,
-      host,
-      novnc_port: novncPort,
-      vnc_port: vncPort,
-      novnc_url: `http://${host}:${novncPort}/vnc.html`,
-      vnc_endpoint: `${host}:${vncPort}`,
-      resolution: secrets.resolution || undefined,
-    };
+    // Kubernetes runs a single pod behind an nginx proxy that fronts the
+    // SPA, API and noVNC on ONE port — there are no separately-exposed
+    // 6080/5900 ports. The agent desktop lives at the app origin under
+    // /vnc/vnc.html (e.g. http://localhost:1515/vnc/vnc.html for the
+    // documented `port-forward svc/cremind 1515:80`, or https://<host>/...
+    // behind an Ingress). See helm/cremind/templates/proxy-configmap.yaml.
+    if (secrets.install_mode === 'kubernetes') {
+      let origin = 'http://localhost:1515';
+      if (secrets.app_url) {
+        try { origin = new URL(secrets.app_url).origin; } catch { /* keep default */ }
+      }
+      vnc = {
+        password: secrets.vnc_password as string,
+        host,
+        novnc_url: `${origin}/vnc/vnc.html`,
+        resolution: secrets.resolution || undefined,
+        environment: 'kubernetes',
+      };
+    } else {
+      const novncPort = secrets.novnc_port ?? 6080;
+      const vncPort = secrets.vnc_port ?? 5900;
+      vnc = {
+        password: secrets.vnc_password as string,
+        host,
+        novnc_port: novncPort,
+        vnc_port: vncPort,
+        novnc_url: `http://${host}:${novncPort}/vnc.html`,
+        vnc_endpoint: `${host}:${vncPort}`,
+        resolution: secrets.resolution || undefined,
+        environment: 'docker',
+      };
+    }
   }
 
   const customFields = installDeployment.value === 'custom'
