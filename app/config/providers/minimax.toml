@@ -32,6 +32,7 @@ api_key = { description = "MiniMax API Key", type = "string", secret = true, req
 [[models]]
 id = "MiniMax-M2.7"
 display_name = "MiniMax M2.7"
+supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.30
@@ -42,6 +43,7 @@ cache_write_price_per_1m = 0.375  # 1.25x input
 [[models]]
 id = "MiniMax-M2.5"
 display_name = "MiniMax M2.5"
+supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.12
@@ -52,6 +54,7 @@ cache_write_price_per_1m = 0.15   # 1.25x input
 [[models]]
 id = "MiniMax-M1"
 display_name = "MiniMax M1"
+supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 0.40

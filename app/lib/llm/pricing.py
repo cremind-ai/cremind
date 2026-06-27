@@ -15,10 +15,14 @@ Design notes
     - **Anthropic** keeps cache tokens distinct from input. Cache *reads* cost
       ~0.10x the input rate; 5-minute ephemeral cache *writes* cost ~1.25x the
       input rate (per Anthropic's published prompt-caching economics).
-    - **OpenAI-family** runtimes fold cached tokens into the prompt and discount
-      them (~0.5x), and never charge separately for cache creation — Cremind's
+    - **OpenAI-family** runtimes fold cached tokens into the prompt and never
+      charge separately for cache creation — Cremind's
       ``openai_usage_breakdown()`` always reports ``cache_creation`` as 0, so the
-      write multiplier is moot for those providers.
+      write multiplier is moot for those providers. The actual cached-read
+      discount varies by model (e.g. the GPT-5 family is 0.10x, GPT-4.1 is 0.25x),
+      so models carry explicit ``cache_read_price_per_1m`` fields; the 0.50x
+      family default below is only a conservative fallback for entries that omit
+      one — it over-estimates rather than treats cached tokens as free.
 * A model entry may carry optional ``cache_read_price_per_1m`` /
   ``cache_write_price_per_1m`` fields; when present they override the
   family-default multipliers. Absent those, rates are derived as
@@ -43,14 +47,16 @@ PRICING_VERSION = 1
 # provider-family -> (cache_read_multiplier, cache_write_multiplier) relative to
 # the input rate, used when a model has no explicit cache_*_price_per_1m fields.
 #   anthropic     : read 0.10x, 5-min write 1.25x (cache tokens are distinct)
-#   openai-family : read 0.50x, write 0 (creation tokens are always 0 here)
-#   google/gemini : read 0.25x, write 0 (implicit context-cache discount)
+#   openai-family : read 0.50x, write 0 — conservative fallback only; real OpenAI
+#                   models set explicit cache_read_price_per_1m (GPT-5 0.10x,
+#                   GPT-4.1 0.25x). Creation tokens are always 0 here.
+#   google/gemini : read 0.10x, write 0 (implicit context-cache discount)
 #   fallback      : 1.0 / 1.0 — unknown cache economics over-estimate rather
 #                   than silently treat cached tokens as free.
 _CACHE_MULTIPLIERS: dict[str, tuple[float, float]] = {
     "anthropic": (0.10, 1.25),
     "openai": (0.50, 0.0),
-    "google": (0.25, 0.0),
+    "google": (0.10, 0.0),
     "fallback": (1.0, 1.0),
 }
 

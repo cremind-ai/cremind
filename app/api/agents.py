@@ -1,15 +1,14 @@
-"""Agent / MCP-server registration API.
+"""MCP-server registration API.
 
 Endpoints (kept compatible with the existing frontend; tool_id replaces
 agent_name in path params):
 
-- ``GET    /api/agents?profile=...``                     list a2a + mcp tools
-- ``POST   /api/agents``                                 register a new A2A or MCP server
+- ``GET    /api/agents?profile=...``                     list mcp tools
+- ``POST   /api/agents``                                 register a new MCP server
 - ``DELETE /api/agents/{tool_id}``                       unregister a tool
 - ``PUT    /api/agents/{tool_id}/enabled``               toggle visibility for a profile
 - ``POST   /api/agents/{tool_id}/reconnect``             retry a failed connection
 - ``GET    /api/agents/{tool_id}/auth-url``              OAuth: get authorization URL
-- ``GET    /api/agents/{tool_id}/callback``              OAuth: per-agent callback (legacy)
 - ``POST   /api/agents/{tool_id}/unlink``                drop the OAuth token for this profile
 - ``GET    /api/agents/{tool_id}/config``                MCP-server LLM/system_prompt config
 - ``PUT    /api/agents/{tool_id}/config``                update LLM/system_prompt
@@ -18,13 +17,12 @@ agent_name in path params):
 from __future__ import annotations
 
 import asyncio
-import base64
 import inspect
 import json
 import urllib.parse
 
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from app.api._auth import require_auth_or_setup_mode
@@ -32,7 +30,6 @@ from app.config.settings import BaseConfig
 from app.events.settings_state_bus import publish_settings_state_changed
 from app.lib.llm.factory import create_llm_provider
 from app.tools import ToolRegistry, ToolType
-from app.tools.a2a import A2ATool, build_a2a_stub, build_a2a_tool
 from app.tools.mcp import (
     MCPServerTool,
     build_http_mcp_tool,
@@ -135,31 +132,6 @@ def _serialize_tool(tool, profile: str) -> dict:
     badge_class = "badge-secondary"
     status_text = "Agent does not support authentication"
 
-    if isinstance(tool, A2ATool) and tool.connection is not None:
-        oauth_client = tool.connection.get_oauth_client_for_profile(profile)
-        try:
-            auth_status = oauth_client.get_auth_status(profile)
-        except Exception:  # noqa: BLE001
-            auth_status = "not_supported"
-        status_map = {
-            "not_supported": ("badge-secondary", "Agent does not support authentication"),
-            "authenticated": ("badge-success", "Agent has been successfully authenticated"),
-            "not_authenticated": ("badge-danger", "Agent has not been authenticated yet"),
-            "expired": ("badge-warning", "Agent's token has expired"),
-        }
-        badge_class, status_text = status_map.get(
-            auth_status, ("badge-secondary", "Unknown")
-        )
-        if auth_status == "authenticated":
-            try:
-                expiration_info = oauth_client.get_expiration_info(profile)
-            except Exception:
-                expiration_info = None
-        show_authenticate = auth_status in ("not_authenticated", "expired")
-        show_unlink = auth_status == "authenticated" or (
-            auth_status == "expired" and oauth_client.get_token(profile)
-        )
-
     if getattr(tool, "connection_error", None):
         badge_class = "badge-danger"
         status_text = f"Connection error: {tool.connection_error}"
@@ -195,13 +167,7 @@ def _persist_llm_scope(config_manager, tool_id: str, profile: str, body: dict) -
 
 def _get_oauth_client(tool, profile: str):
     """Return the OAuth client used by ``tool`` for ``profile``, or None."""
-    if isinstance(tool, A2ATool):
-        if tool.connection is None:
-            return None
-        return tool.connection.get_oauth_client_for_profile(profile)
-    if isinstance(tool, MCPServerTool):
-        return getattr(tool.adapter, "_mcp_auth", None)
-    # Built-in tools (with OAuth)
+    # MCP servers and built-in tools both carry their OAuth client on the adapter.
     adapter = getattr(tool, "adapter", None)
     if adapter is not None:
         return getattr(adapter, "_mcp_auth", None)
@@ -251,7 +217,7 @@ def get_agent_routes(
         )
         agents = []
         for tool in registry.all_tools():
-            if tool.tool_type not in (ToolType.A2A, ToolType.MCP):
+            if tool.tool_type is not ToolType.MCP:
                 continue
             row = _serialize_tool(tool, profile)
             row["enabled"] = enabled_per_profile.get(tool.tool_id, False)
@@ -268,34 +234,19 @@ def get_agent_routes(
             return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
         url = body.get("url")
-        agent_type = body.get("type", "a2a")
+        agent_type = body.get("type", "mcp")
         profile = _profile_from_request(request)
         json_config = body.get("json_config")
 
-        if agent_type not in ("a2a", "mcp"):
+        if agent_type != "mcp":
             return JSONResponse(
-                {"error": f"Unsupported type: {agent_type}"}, status_code=400,
+                {"error": f"Unsupported type: {agent_type}. Only 'mcp' is supported."},
+                status_code=400,
             )
-        if not url and not (agent_type == "mcp" and json_config):
+        if not url and not json_config:
             return JSONResponse({"error": "URL is required"}, status_code=400)
         if not profile:
             return JSONResponse({"error": "Profile is required"}, status_code=400)
-
-        if agent_type == "a2a":
-            try:
-                tool = await build_a2a_tool(url=url, owner_profile=profile)
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"Failed to add A2A agent at {url}: {e}")
-                return JSONResponse(
-                    {"error": f"Failed to connect to agent at {url}: {e}"},
-                    status_code=400,
-                )
-            await registry.register_a2a(tool, source=url, owner_profile=profile)
-            publish_settings_state_changed(profile)
-            return JSONResponse(
-                {"success": True, "agent": _serialize_tool(tool, profile)},
-                status_code=201,
-            )
 
         # MCP path
         llm = _resolve_mcp_llm(profile)
@@ -390,9 +341,9 @@ def get_agent_routes(
         tool = registry.get(tool_id)
         if tool is None:
             return JSONResponse({"error": f"Tool '{tool_id}' not found"}, status_code=404)
-        if tool.tool_type not in (ToolType.A2A, ToolType.MCP):
+        if tool.tool_type is not ToolType.MCP:
             return JSONResponse(
-                {"error": "Only A2A and MCP tools can be removed via this endpoint"},
+                {"error": "Only MCP tools can be removed via this endpoint"},
                 status_code=400,
             )
         if isinstance(tool, MCPServerTool):
@@ -460,9 +411,9 @@ def get_agent_routes(
         tool = registry.get(tool_id)
         if tool is None:
             return JSONResponse({"error": f"Tool '{tool_id}' not found"}, status_code=404)
-        if tool.tool_type not in (ToolType.A2A, ToolType.MCP):
+        if tool.tool_type is not ToolType.MCP:
             return JSONResponse(
-                {"error": f"Tool '{tool_id}' is not an A2A/MCP tool"}, status_code=400,
+                {"error": f"Tool '{tool_id}' is not an MCP tool"}, status_code=400,
             )
         if not getattr(tool, "is_stub", False):
             return JSONResponse(
@@ -496,11 +447,7 @@ def get_agent_routes(
             return JSONResponse(
                 {"error": f"Tool '{tool_id}' does not support OAuth"}, status_code=400,
             )
-        if tool.tool_type is ToolType.A2A:
-            encoded_id = urllib.parse.quote(tool_id)
-            redirect_uri = f"{BaseConfig.APP_URL}/api/agents/{encoded_id}/callback"
-        else:
-            redirect_uri = f"{BaseConfig.APP_URL}/oauth2/callback"
+        redirect_uri = f"{BaseConfig.APP_URL}/oauth2/callback"
         auth_url = oauth_client.get_auth_url(redirect_uri, profile, source="api")
         if inspect.isawaitable(auth_url):
             auth_url = await auth_url
@@ -512,57 +459,6 @@ def get_agent_routes(
         if return_url:
             pending_return_urls[(tool_id, profile)] = return_url
         return JSONResponse({"auth_url": auth_url, "tool_id": tool_id})
-
-    async def handle_a2a_callback(request: Request) -> HTMLResponse:
-        tool_id = request.path_params["tool_id"]
-        state = request.query_params.get("state")
-        profile = None
-        if state:
-            try:
-                decoded = base64.urlsafe_b64decode(state).decode()
-                parts = decoded.split(":")
-                if len(parts) >= 2:
-                    profile = parts[1]
-            except Exception:  # noqa: BLE001
-                pass
-        if not profile:
-            return HTMLResponse(
-                "<h1>Error: Profile could not be determined from callback state</h1>",
-                status_code=400,
-            )
-        tool = registry.get(tool_id)
-        if tool is None:
-            return HTMLResponse(
-                f"<h1>Error: Tool '{tool_id}' not found</h1>", status_code=404,
-            )
-        code = request.query_params.get("code")
-        if not code:
-            error = request.query_params.get("error", "Unknown error")
-            return HTMLResponse(
-                f"<h1>Authentication Failed</h1><p>Error: {error}</p>", status_code=400,
-            )
-        encoded_id = urllib.parse.quote(tool_id)
-        redirect_uri = f"{BaseConfig.APP_URL}/api/agents/{encoded_id}/callback"
-        oauth_client = _get_oauth_client(tool, profile)
-        if oauth_client is None:
-            return HTMLResponse("<h1>Error: OAuth not supported</h1>", status_code=400)
-        success = await oauth_client.handle_oauth_callback(code, redirect_uri, state, profile)
-        if success and isinstance(tool, A2ATool) and tool.connection is not None:
-            tool.connection.update_auth_header_for_profile(profile)
-        if success:
-            publish_settings_state_changed(profile)
-            return_url = pending_return_urls.pop((tool_id, profile), None)
-            if return_url:
-                sep = "&" if "?" in return_url else "?"
-                return RedirectResponse(url=f"{return_url}{sep}agents=open")
-            return HTMLResponse(
-                "<h1>Authentication Successful</h1><p>You can close this window.</p>"
-                "<script>setTimeout(function(){window.close()},3000);</script>"
-            )
-        return HTMLResponse(
-            f"<h1>Authentication Failed</h1><p>Tool '{tool_id}' (profile {profile}).</p>",
-            status_code=500,
-        )
 
     async def handle_unlink(request: Request) -> JSONResponse:
         unauth = _require_auth(request)
@@ -581,8 +477,6 @@ def get_agent_routes(
                 {"error": f"Tool '{tool_id}' does not support OAuth"}, status_code=400,
             )
         success = oauth_client.unlink_token(profile)
-        if success and isinstance(tool, A2ATool) and tool.connection is not None:
-            tool.connection.update_auth_header_for_profile(profile)
         if success:
             publish_settings_state_changed(profile)
         return JSONResponse({"success": bool(success)})
@@ -653,10 +547,10 @@ def get_agent_routes(
                 model = llm_model if llm_model is not _MISSING else None
                 effort = reasoning_effort if reasoning_effort is not _MISSING else None
 
-                # When no per-tool override, fall back to the "low" model group
-                # (same source as startup in server.py _builtin_llm_factory).
+                # When no per-tool override, fall back to the single configured
+                # model (same source as startup in server.py _builtin_llm_factory).
                 if not model:
-                    group_value = BaseConfig.get_model_group("low", profile=profile)
+                    group_value = BaseConfig.get_model_group("high", profile=profile)
                     if group_value:
                         parts = group_value.split("/", 1)
                         if not prov:
@@ -713,7 +607,6 @@ def get_agent_routes(
         Route("/api/agents/{tool_id}/enabled", handle_toggle_enabled, methods=["PUT"]),
         Route("/api/agents/{tool_id}/reconnect", handle_reconnect, methods=["POST"]),
         Route("/api/agents/{tool_id}/auth-url", handle_get_auth_url, methods=["GET"]),
-        Route("/api/agents/{tool_id}/callback", handle_a2a_callback, methods=["GET"]),
         Route("/api/agents/{tool_id}/unlink", handle_unlink, methods=["POST"]),
         Route("/api/agents/{tool_id}/config", handle_get_agent_config, methods=["GET"]),
         Route("/api/agents/{tool_id}/config", handle_update_agent_config, methods=["PUT"]),

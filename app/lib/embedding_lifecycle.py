@@ -28,7 +28,10 @@ from app.utils.logger import logger
 
 # Collections we own and may rebuild. Other collections (created by
 # user-installed tools) are left untouched on principle.
-_OWNED_COLLECTION_PREFIXES = ("tool_embeddings_",)
+# Collections that a model re-sync drops and rebuilds from their source. Memory
+# (``long_term_memory_*``) and now-removed tool-card embeddings are NOT owned:
+# memory has no rebuild source, and tool-card embeddings no longer exist.
+_OWNED_COLLECTION_PREFIXES: tuple[str, ...] = ()
 _OWNED_COLLECTIONS_EXACT = ("gg_places_types", "documentation_search")
 
 
@@ -244,10 +247,11 @@ def _rebuild_caches(*, agent, embedding, vector_store, profiles: list[str]) -> N
 
     - ``gg_places._build_embedding_table`` rebuilds the place-type cache
       eagerly so the first place search isn't slow.
-    - ``CremindAgent.embedding_table_for(profile)`` lazy-builds each
-      profile's tool embedding collection (cache was cleared on rewire).
     - ``DocumentSyncService.full_reconcile`` re-emits doc embeddings for
       the shared scope and each profile.
+
+    Long-term memory collections are intentionally NOT rebuilt here — they have
+    no source to rebuild from and must survive re-syncs.
     """
     embedding_state.set_phase("rebuilding_places")
     try:
@@ -255,13 +259,6 @@ def _rebuild_caches(*, agent, embedding, vector_store, profiles: list[str]) -> N
         gg_places._build_embedding_table(vector_store=vector_store)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[embedding] gg_places rebuild failed; continuing: {e}")
-
-    embedding_state.set_phase("rebuilding_tools")
-    for profile in profiles:
-        try:
-            agent.embedding_table_for(profile)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"[embedding] tool embeddings rebuild failed for profile '{profile}'; continuing: {e}")
 
     embedding_state.set_phase("rebuilding_docs")
     try:
@@ -288,11 +285,6 @@ def _rewire_agent(agent, embedding, vector_store) -> None:
         return
     agent.embedding = embedding
     agent.vector_store = vector_store
-    # Drop any cached empty tables built when embedding was disabled.
-    try:
-        agent._embedding_tables.clear()
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def apply_embedding_config(

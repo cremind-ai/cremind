@@ -234,7 +234,7 @@ class AnalyzeImageTool(BuiltInTool):
         if llm is None:
             return BuiltInToolResult(structured_content={
                 "error": "No LLM configured",
-                "message": "No vision model is configured. Choose a Vision model in Settings → LLM Providers.",
+                "message": "No vision model is configured. Choose a Specialized Vision Model in Settings → LLM Providers.",
             })
 
         # Resolve the image path within the same trust boundary as system_file.
@@ -268,9 +268,9 @@ class AnalyzeImageTool(BuiltInTool):
                 "error": "VisionNotSupported",
                 "model": getattr(llm, "model_label", model),
                 "message": (
-                    f"The configured Vision model '{getattr(llm, 'model_label', model)}' "
+                    f"The configured vision model '{getattr(llm, 'model_label', model)}' "
                     "does not support image input. Choose a vision-capable model for "
-                    "the Vision group in Settings → LLM Providers, or set the "
+                    "the Specialized Vision Model in Settings → LLM Providers, or set the "
                     "CREMIND_VISION_MODELS env var if this model does in fact support vision."
                 ),
             })

@@ -37,23 +37,23 @@ persist_path = ""         # mode = "persistent" only; defaults to <system_dir>/s
 # ── Settings → Config defaults (per-profile, overridable in the UI) ──
 
 [agent]
-max_steps = 40
+max_steps = 200
 max_llm_retries = 2
 reasoning_temperature = 1.0
 reasoning_max_tokens = 32768
 reasoning_retry = 3
 steps_length = 20
 enable_prompt_cache = true
+replay_reasoning_steps = true     # replay each turn's tool-call/tool-result trace into later-turn history (keeps the reasoning context cache-warm)
 
 [compaction]
-enabled = true                    # summarization-based history compaction (replaces token windowing)
-# Hysteresis: fold is triggered at the UPPER bound and trims the tail back to the
-# LOWER bound, so keep_recent_tokens MUST be well below compact_threshold_tokens.
-# The gap (~28k here) is how much conversation accrues between folds — a bigger gap
-# means folds are rarer, so the cached prompt prefix stays warm across more turns.
-compact_threshold_tokens = 40000  # fold oldest turns into the running summary once summary+tail crosses this (upper bound)
-keep_recent_tokens = 12000        # after folding, trim the verbatim tail back to ~this (lower bound)
-keep_recent_messages = 4          # never fold below this many of the most recent messages
+enabled = true                    # summarization-based history compaction (model-driven compact_conversation tool)
+# With prompt caching, a large threshold keeps the cached prefix warm for many turns.
+# Compaction is now suggest-only: once summary+tail crosses this, the UI proposes
+# compacting (the user clicks to run it); it is never forced automatically.
+compact_threshold_tokens = 500000 # suggest compaction once summary+tail crosses this
+keep_recent_tokens = 12000        # after compaction, the verbatim tail kept alongside the summary
+keep_recent_messages = 4          # keep at least this many recent messages out of the summary
 temperature = 0.3
 max_tokens = 2048                 # hard cap on the running summary's size
 retry = 2
@@ -68,11 +68,6 @@ tail_tokens = 200
 [skill_classifier]
 temperature = 0.0
 max_tokens = 64
-retry = 2
-
-[summarizer]
-temperature = 0.3
-max_tokens = 1024
 retry = 2
 
 [memory]

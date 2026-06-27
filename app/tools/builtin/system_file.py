@@ -460,8 +460,8 @@ def _find_block(lines: List[str], block: List[str], hint_start: int) -> int:
 def _deescape_quotes(line: str) -> str:
     r"""Undo backslash-escaped quotes (\' and \") in a diff line.
 
-    A model that wraps the diff in a quoted Action_Input string often escapes
-    the quotes inside it (e.g. ``don\'t``), and those backslashes leak into the
+    A model that passes the diff as a quoted JSON string often escapes the
+    quotes inside it (e.g. ``don\'t``), and those backslashes leak into the
     diff argument. Used only as a fallback when the verbatim match fails, so a
     file that genuinely contains ``\'`` keeps matching exactly.
     """
@@ -2207,7 +2207,7 @@ TOOL_CONFIG: ToolConfig = {
     "locked": True,
     "llm_parameters": {
         "tool_instructions": (
-            "A file management assistant. Operates inside the conversation's "
+            "File management inside the conversation's "
             "*current* working directory — which may have just been changed by "
             "the `change_working_directory` tool. A relative `path` argument is "
             "interpreted relative to that current directory, never to a fixed "
@@ -2298,7 +2298,7 @@ TOOL_CONFIG: ToolConfig = {
 
 def _make_server_instructions(_data_dir: str) -> str:
     return (
-        "A file management assistant. Operates inside the conversation's "
+        "File management inside the conversation's "
         "current working directory; a relative `path` is relative to that "
         "directory and defaults to '.' when omitted, while an absolute path is "
         "used as-is — pass an absolute path (e.g. an attached/uploaded file) "

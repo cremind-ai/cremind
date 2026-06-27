@@ -30,7 +30,9 @@ from a2a.types import (
 from app.config.settings import BaseConfig
 from app.lib.llm.base import LLMProvider
 from app.tools.base import (
+    FunctionSpec,
     Tool,
+    make_leaf_name,
     ToolEvent,
     ToolErrorEvent,
     ToolResultEvent,
@@ -137,6 +139,83 @@ class BuiltInToolGroup(Tool):
                       parameters=f.parameters)
             for f in self._adapter._tools
         ]
+
+    # ── native function calling ─────────────────────────────────────────
+
+    def leaf_function_specs(
+        self,
+        *,
+        context_id: str,
+        profile: str,
+        query: str = "",
+        arguments=None,
+    ) -> List[FunctionSpec]:
+        """Expose each sub-tool as a native function, namespaced ``<tool_id>__<leaf>``.
+
+        Runs the adapter's ``prepare_tools`` so dynamic enums / suppression are
+        reflected in the schemas the model sees.
+        """
+        specs = self._adapter.build_specs(
+            query=query, arguments=arguments, context_id=context_id, profile=profile,
+        )
+        out: List[FunctionSpec] = []
+        for s in specs:
+            fn = s.get("function") or {}
+            leaf = fn.get("name") or ""
+            if not leaf:
+                continue
+            exposed = make_leaf_name(self.tool_id, leaf)
+            schema = {"type": "function", "function": {**fn, "name": exposed}}
+            out.append(FunctionSpec(name=exposed, leaf_name=leaf, schema=schema))
+        return out
+
+    async def execute_leaf(
+        self,
+        *,
+        leaf_name: str,
+        args: Dict[str, Any],
+        context_id: str,
+        profile: str,
+        arguments: Dict[str, Any],
+        variables: Dict[str, str],
+        llm_params: Dict[str, Any],
+    ) -> AsyncGenerator[ToolEvent, None]:
+        # Refresh the child LLM (used by tools with an internal LLM step, e.g.
+        # image_understanding / documentation_search) so config changes apply.
+        self.refresh_llm(profile)
+        if "full_reasoning" in llm_params:
+            self._adapter.update_config(full_reasoning=bool(llm_params["full_reasoning"]))
+
+        yield ToolThinkingEvent(
+            text=f"[{self._display_name}] {leaf_name}",
+            model_label=getattr(self._adapter._llm, "model_label", None) if self._adapter._llm else None,
+        )
+
+        events: list = []
+        metadata: dict = {}
+        if arguments:
+            metadata["arguments"] = arguments
+        if variables:
+            metadata["variables"] = variables
+
+        try:
+            async for ev in self._adapter.request(
+                query=leaf_name, context_id=context_id, metadata=metadata, profile=profile,
+                decided_calls=[{"name": leaf_name, "arguments": args}],
+            ):
+                events.append(ev)
+                yield ToolStatusEvent(raw=ev)
+        except Exception as e:  # noqa: BLE001
+            logger.exception(f"Built-in tool '{self._display_name}' failed")
+            yield ToolErrorEvent(message=str(e))
+            return
+
+        observation_text, token_usage, observation_parts = parse_agent_events(events)
+        yield ToolResultEvent(
+            observation_text=observation_text,
+            observation_parts=observation_parts,
+            token_usage=token_usage or {},
+        )
 
     def get_card(self) -> AgentCard:
         return self._adapter.create_synthetic_card()

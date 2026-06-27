@@ -447,5 +447,6 @@ class UsageStorage:
             "cache_write_usd": r.cache_write_usd,
             "output_usd": r.output_usd,
             "estimated_cost_usd": r.total_usd,
+            "rate_snapshot": r.rate_snapshot,
             "created_at": r.created_at,
         }

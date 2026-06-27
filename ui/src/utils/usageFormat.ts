@@ -34,6 +34,19 @@ export function formatPercent(frac: number | null | undefined): string {
   return `${Math.round((frac ?? 0) * 100)}%`;
 }
 
+/**
+ * Per-million-token price, as stored in the provider catalogs:
+ * 2 → "$2.00/M", 0.5 → "$0.50/M", 0.125 → "$0.125/M", 0 → "$0.00/M".
+ */
+export function formatRatePerM(n: number | null | undefined): string {
+  const v = n ?? 0;
+  const s = v.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 4,
+  });
+  return `$${s}/M`;
+}
+
 /** Epoch-ms → locale date+time, blank on falsy. */
 export function formatTimestamp(ms: number | null | undefined): string {
   if (!ms) return '';

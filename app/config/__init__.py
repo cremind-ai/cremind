@@ -72,6 +72,23 @@ def model_supports_vision(provider_name: str, model_name: str) -> bool:
     return False
 
 
+def vision_feature_enabled(profile: str | None = None) -> bool:
+    """Whether the Specialized Vision Model feature is enabled for ``profile``.
+
+    The feature is opt-in: when on, image understanding is routed through the
+    dedicated ``vision`` model group and the ``image_understanding`` tool is
+    exposed to the agent (and listed in Settings → Tools). When off (the
+    default — an unset flag reads as False), the tool is withheld entirely.
+
+    Reads the ``model_group.vision.enabled`` flag from ``llm_config`` (written
+    via the model-groups API). Stored as ``"true"``/``"false"``; coerced with an
+    explicit truthy set so the string ``"false"`` is correctly falsy.
+    """
+    from app.config.settings import get_dynamic
+    raw = get_dynamic("llm_config", "model_group.vision.enabled", profile=profile)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def model_supports_prompt_cache(provider_name: str, model_name: str) -> bool:
     """Return True if ``model_name`` is flagged prompt-cache-capable for its provider.
 
@@ -91,6 +108,50 @@ def model_supports_prompt_cache(provider_name: str, model_name: str) -> bool:
     for entry in catalog.get("models", []) or []:
         if isinstance(entry, dict) and entry.get("id") == model:
             return bool(entry.get("prompt_cache", False))
+    return False
+
+
+def _reasoning_overrides() -> set[str]:
+    """Models force-flagged native-reasoning-capable via the
+    ``CREMIND_REASONING_MODELS`` env var (comma-separated ``provider/model`` or
+    bare ``model`` ids).
+
+    Escape hatch for custom / dynamic / proxy models (ollama, vllm, litellm,
+    OpenAI-compatible gateways) whose catalog entries are illustrative. Marking
+    a model here means it HAS native reasoning, so the agent's ``reasoning``
+    think-tool is *disabled* for it (the inverse of the vision override, which
+    enables a feature).
+    """
+    raw = os.environ.get("CREMIND_REASONING_MODELS", "")
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def model_supports_reasoning(provider_name: str, model_name: str) -> bool:
+    """Return True if ``model_name`` has native step-by-step reasoning.
+
+    Looks up the ``supports_reasoning`` flag on the matching ``[[models]]``
+    entry in the provider catalog. Unknown / unlisted models (e.g. a custom or
+    dynamic model) default to ``False`` — i.e. treated as *non*-reasoning — so
+    the agent's ``reasoning`` think-tool is enabled for them by default (the
+    safe, beneficial default: a local/unknown model almost certainly lacks
+    native reasoning). The ``CREMIND_REASONING_MODELS`` env var can force-mark a
+    specific model as reasoning-capable.
+    """
+    if not provider_name or not model_name:
+        return False
+    model = model_name
+    prefix = f"{provider_name}/"
+    if model.startswith(prefix):
+        model = model[len(prefix):]
+
+    overrides = _reasoning_overrides()
+    if f"{provider_name}/{model}" in overrides or model in overrides:
+        return True
+
+    catalog = load_provider_catalog(provider_name)
+    for entry in catalog.get("models", []) or []:
+        if isinstance(entry, dict) and entry.get("id") == model:
+            return bool(entry.get("supports_reasoning", False))
     return False
 
 

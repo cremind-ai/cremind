@@ -621,15 +621,16 @@ class BrowserTool(BuiltInTool):
 
     name: str = "browser"
     description: str = (
-        "Control a Chrome browser. Supported actions:\n"
-        "- navigate: go to a URL, E.g. 'open https://www.example.com'\n"
-        "- snapshot: read current page as accessibility tree (use this to understand page content), E.g. 'snapshot target_id=abc123'\n"
-        "- screenshot: capture page as PNG image, E.g. 'screenshot selector=\"#main\" full_page=true target_id=abc123'\n"
-        "- click: click an element by selector, text, or ARIA role, E.g. 'click selector=\"button.submit\" target_id=abc123'\n"
-        "- type: type text into an input or press keyboard keys, E.g. 'type selector=\"input[name=email]\" text=\"user@example.com\" target_id=abc123'\n"
+        "Control a Chrome browser via the `action` parameter. Supported actions:\n"
+        "- navigate: open a URL (set `url`)\n"
+        "- snapshot: read the current page as an accessibility tree — use this to understand page content before interacting\n"
+        "- screenshot: capture the page as a PNG image (optionally a `selector` region or `full_page`)\n"
+        "- click: click an element by `selector`, visible text, or ARIA role\n"
+        "- type: type `text` into an input identified by `selector`, or press keyboard keys\n"
         "- tabs: manage browser tabs (list/switch/close/new)\n"
-        "- evaluate: run JavaScript on the page and return the result, E.g. 'evaluate expression=\"document.title\" target_id=abc123'\n\n"
-        "Always use 'snapshot' first to understand page structure before 'click' or 'type'."
+        "- evaluate: run JavaScript (`expression`) on the page and return the result\n\n"
+        "Always run 'snapshot' first to understand the page structure before 'click' or 'type'. "
+        "Pass `target_id` to act on a specific tab."
     )
     parameters: Dict[str, Any] = {
         "type": "object",

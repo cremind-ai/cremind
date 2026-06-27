@@ -25,12 +25,11 @@ Token-frugal contract
 - Only AFTER the judge picks does the tool open and read the chosen
   ``.md`` file's body from disk.
 
-Why the adapter's routing LLM is bypassed
------------------------------------------
-``TOOL_CONFIG.direct_dispatch = True`` makes :class:`BuiltInToolAdapter`
-skip its routing pass and invoke ``run()`` directly with the user's
-Action_Input as ``{"query": ...}``. Routing has nothing to decide -- there
-is exactly one sub-tool and the input is the query verbatim.
+Invocation
+----------
+The reasoning model calls ``search_documentation`` directly via native
+function calling, filling the ``query`` argument; there is no per-group
+routing LLM. The tool's INTERNAL judge LLM (below) is the only LLM call it makes.
 
 Why ``full_reasoning`` is locked OFF
 ------------------------------------
@@ -39,9 +38,9 @@ would only add a second round whose job is to paraphrase the body we
 already produced. ``locked_llm_fields = ["full_reasoning"]`` keeps the
 toggle disabled in the Settings UI and rejected by the API.
 
-Template_instruction (visible to the Reasoning Agent) describes this as a
-*document search tool*. The tool's INTERNAL LLM, by contrast, is told its
-sole job is to pick the most accurate candidate -- not to reason about
+The leaf ``description`` (what the reasoning model sees) frames this as a
+*document search tool*. The tool's INTERNAL judge LLM, by contrast, is told
+its sole job is to pick the most accurate candidate -- not to reason about
 the user's request more broadly.
 """
 
@@ -67,11 +66,9 @@ NO_RESULT_MESSAGE = "no relevant result found"
 
 
 _DOC_TOOL_INSTRUCTIONS = (
-    "When a user submits a request (not a casual chat), if you cannot "
-    "find a relevant tool to handle it, you can search for it using the "
-    "**“Documentation Search”** tool. This tool is used to look up "
-    "documentation and guides, and can be considered a **knowledge base "
-    "for documents**."
+    "Look up Cremind's documentation and guides — a semantic knowledge base "
+    "over the user's Markdown documents. Returns the body of the single "
+    "best-matching document."
 )
 
 _JUDGE_SYSTEM_PROMPT = (
@@ -126,10 +123,9 @@ TOOL_CONFIG: ToolConfig = {
     # and the Settings UI. ``full_reasoning`` is required to stay False
     # because the tool already runs its own LLM judgement step.
     "locked_llm_fields": ["full_reasoning"],
-    # Skip the BuiltInToolAdapter's routing LLM round. The Action_Input
-    # IS the query for vector search; there is nothing for an LLM to
-    # decide at that stage. The tool's own LLM judge inside run() is the
-    # only LLM call this tool needs.
+    # Single sub-tool: the model fills ``query`` directly via native function
+    # calling. The tool's own LLM judge inside run() is the only LLM call this
+    # tool needs.
     "direct_dispatch": True,
 }
 

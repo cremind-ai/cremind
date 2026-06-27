@@ -9,7 +9,6 @@ from a2a.types import (
 
 if TYPE_CHECKING:
     import pandas as pd
-    from app.tools.a2a import RemoteAgentConnections
 
 from app.constants import ChatCompletionTypeEnum
 
@@ -78,7 +77,7 @@ class MCPServerConfig(TypedDict):
 
 
 class AgentInfo(TypedDict):
-    remote_agent_connections: "RemoteAgentConnections"
+    remote_agent_connections: Any
     context_storage: Dict[str, str]
     card: AgentCard
     url: str
@@ -202,12 +201,10 @@ class ToolConfig(TypedDict, total=False):
     # ``full_reasoning=False`` because relevance ranking already runs
     # inside the tool).
     locked_llm_fields: list[str]
-    # When True, ``BuiltInToolAdapter`` skips its routing LLM call and
-    # invokes the group's single sub-tool directly with
-    # ``{"query": <Action_Input>}``. Use this for tool groups whose
-    # contract is "take the user's input verbatim and do the work" --
-    # the routing LLM otherwise just paraphrases the input into a
-    # one-tool-call no-op (token waste with no decision to make).
+    # Legacy single-sub-tool marker from the pre-native-function-calling
+    # design (when a per-group routing LLM chose the sub-tool). The reasoning
+    # model now calls each leaf directly with its typed arguments, so there is
+    # no routing call to skip; the flag is retained for backward compatibility.
     direct_dispatch: bool
     # Optional Python deps group needed for this tool to run. Maps to a
     # key in ``app.features.manifest.FEATURES``. Used by the Setup Wizard

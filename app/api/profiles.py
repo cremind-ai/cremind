@@ -201,63 +201,6 @@ def get_profile_routes(
             logger.error(f"Error writing persona for '{profile_name}': {e}")
             return JSONResponse({"error": str(e)}, status_code=500)
 
-    async def handle_get_skill_mode(request: Request) -> JSONResponse:
-        unauth = _require_auth(request)
-        if unauth is not None:
-            return unauth
-        profile_name = urllib.parse.unquote(request.path_params.get("profile_name", ""))
-        if not profile_name:
-            return JSONResponse({"error": "Profile name is required"}, status_code=400)
-        if profile_name != _profile_from_request(request):
-            return JSONResponse({"error": "Forbidden"}, status_code=403)
-        try:
-            if not await conversation_storage.profile_exists(profile_name):
-                return JSONResponse({"error": f"Profile '{profile_name}' not found"}, status_code=404)
-            mode = await conversation_storage.get_skill_mode(profile_name)
-            from app.config.settings import BaseConfig
-            return JSONResponse({
-                "mode": mode,
-                "embedding_enabled": BaseConfig.is_embedding_enabled(),
-            })
-        except Exception as e:
-            logger.error(f"Error reading skill_mode for '{profile_name}': {e}")
-            return JSONResponse({"error": str(e)}, status_code=500)
-
-    async def handle_update_skill_mode(request: Request) -> JSONResponse:
-        unauth = _require_auth(request)
-        if unauth is not None:
-            return unauth
-        profile_name = urllib.parse.unquote(request.path_params.get("profile_name", ""))
-        if not profile_name:
-            return JSONResponse({"error": "Profile name is required"}, status_code=400)
-        if profile_name != _profile_from_request(request):
-            return JSONResponse({"error": "Forbidden"}, status_code=403)
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        mode = body.get("mode")
-        if mode not in ("manual", "automatic"):
-            return JSONResponse(
-                {"error": "'mode' must be 'manual' or 'automatic'"}, status_code=400,
-            )
-        if mode == "automatic":
-            from app.config.settings import BaseConfig
-            if not BaseConfig.is_embedding_enabled():
-                return JSONResponse(
-                    {"error": "Automatic skill mode requires Vector Embedding to be enabled."},
-                    status_code=400,
-                )
-        try:
-            updated = await conversation_storage.set_skill_mode(profile_name, mode)
-            if not updated:
-                return JSONResponse({"error": f"Profile '{profile_name}' not found"}, status_code=404)
-            from app.events.settings_state_bus import publish_settings_state_changed
-            publish_settings_state_changed(profile_name)
-            return JSONResponse({"success": True, "mode": mode})
-        except Exception as e:
-            logger.error(f"Error updating skill_mode for '{profile_name}': {e}")
-            return JSONResponse({"error": str(e)}, status_code=500)
 
     return [
         Route(path="/api/profiles", methods=["GET"], endpoint=handle_list_profiles),
@@ -271,14 +214,6 @@ def get_profile_routes(
         Route(
             path="/api/profiles/{profile_name}/persona",
             methods=["PUT"], endpoint=handle_update_persona,
-        ),
-        Route(
-            path="/api/profiles/{profile_name}/skill-mode",
-            methods=["GET"], endpoint=handle_get_skill_mode,
-        ),
-        Route(
-            path="/api/profiles/{profile_name}/skill-mode",
-            methods=["PUT"], endpoint=handle_update_skill_mode,
         ),
         Route(
             path="/api/profiles/{profile_name}",
