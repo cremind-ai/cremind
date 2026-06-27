@@ -33,7 +33,6 @@ from app.skills.scanner import SkillInfo, scan_skills
 from app.skills.tool import SkillTool
 from app.skills.watcher import SkillsWatcher
 from app.tools import ToolRegistry
-from app.tools.base import ToolType
 from app.utils.logger import logger
 
 BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin"
@@ -248,9 +247,11 @@ def _materialize_skill_env_files(profile: str, registry: ToolRegistry) -> None:
     empty ``.env`` when there are no overrides — clearing any credentials that
     older builds shipped on disk.
     """
-    for tool in registry.tools_for_profile(profile):
-        if tool.tool_type is not ToolType.SKILL:
-            continue
+    # Use ``owned_skills`` (not ``tools_for_profile``) so a skill that's
+    # disabled in Settings still gets its ``.env`` rewritten/cleared — env
+    # materialization is credential hygiene over on-disk assets, independent of
+    # whether the skill is currently exposed to the agent.
+    for tool in registry.owned_skills(profile):
         declared = getattr(tool, "environment_variable_names", []) or []
         if not declared:
             continue
