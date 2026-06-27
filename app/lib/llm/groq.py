@@ -106,8 +106,13 @@ class GroqLLMProvider(LLMProvider):
                             function_calling[tool_call.index]["arguments"] += tool_call.function.arguments
                     if len(chunk.choices) > 0 and chunk.choices[0].finish_reason:
                         finish_reason = chunk.choices[0].finish_reason
+                    # Groq reports streaming token usage under `x_groq.usage`
+                    # (the final chunk), not the top-level `usage` field. Prefer
+                    # whichever is present so cost tracking stays accurate.
                     if chunk.usage:
                         usage = chunk.usage
+                    elif getattr(chunk, "x_groq", None) and chunk.x_groq.usage:
+                        usage = chunk.x_groq.usage
 
                 parsed_function_calling = [
                     {

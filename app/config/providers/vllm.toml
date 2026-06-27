@@ -29,6 +29,7 @@ output_price_per_1m = 0.00
 [[models]]
 id = "Qwen/Qwen3-32B"
 display_name = "Qwen 3 32B"
+supports_reasoning = true
 group_hint = "high"
 prompt_cache = false
 input_price_per_1m = 0.00

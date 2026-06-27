@@ -88,6 +88,11 @@ export interface TerminalAttachment {
 
 export interface ChatMessage {
   id: string;
+  // Persisted (server) id of the assistant turn, captured on `complete` without
+  // overwriting the optimistic `id` (changing `id` would remount the bubble and
+  // flicker). Usage records are keyed by this server id, so the usage chip
+  // matches on `backendId ?? id` to show cost live, not only after a reload.
+  backendId?: string;
   role: 'user' | 'assistant';
   content: string;
   parts: Part[];
@@ -112,10 +117,13 @@ export interface ObservationPart {
 }
 
 export interface ThinkingStep {
-  thought: string;
-  action: string;
-  actionInput: string;
-  observation?: ObservationPart[];
+  // One tool call within a step. ``step`` groups parallel tool calls made in the
+  // same model turn; ``callId`` pairs a tool call with its result.
+  step?: number | null;
+  callId?: string | null;
+  tool: string;
+  toolInput: string;
+  result?: ObservationPart[];
   receivedAt?: number;
   modelLabel?: string | null;
 }
@@ -154,9 +162,17 @@ export interface ConversationRuntime {
   streamingAssistantId?: string;
 }
 
+export interface CompactionSuggestion {
+  currentTokens: number;
+  threshold: number;
+  estimatedSavings: number;
+}
+
 interface ChatState {
   messagesByConversation: Record<string, ChatMessage[]>;
   runtimes: Record<string, ConversationRuntime>;
+  /** Pending "compaction suggested" popup per conversation (null when none). */
+  compactionByConversation: Record<string, CompactionSuggestion | null>;
   agentCard: AgentCard | null;
   agentName: string;
   isConnected: boolean;
@@ -189,6 +205,7 @@ export const useChatStore = defineStore('chat', {
   state: (): ChatState => ({
     messagesByConversation: {},
     runtimes: {},
+    compactionByConversation: {},
     agentCard: null,
     agentName: 'Agent',
     isConnected: false,
@@ -225,6 +242,11 @@ export const useChatStore = defineStore('chat', {
     isSummarizing(state): boolean {
       const key = state.activeConversationId ?? NEW_CHAT_KEY;
       return !!state.runtimes[key]?.isSummarizing;
+    },
+    /** Pending compaction suggestion for the active conversation, or null. */
+    compactionSuggestion(state): CompactionSuggestion | null {
+      if (!state.activeConversationId) return null;
+      return state.compactionByConversation[state.activeConversationId] ?? null;
     },
     /**
      * Map of conversationId -> isStreaming, used by the sidebar to show
@@ -482,6 +504,27 @@ export const useChatStore = defineStore('chat', {
         } catch {
           // already logged
         }
+      }
+    },
+
+    // ── compaction suggestion popup ───────────────────────────────────
+
+    /** Dismiss the popup; it re-appears after the next over-threshold turn. */
+    dismissCompaction(conversationId: string) {
+      this.compactionByConversation[conversationId] = null;
+    },
+
+    /** Run model-driven compaction now, then clear the suggestion. */
+    async compactConversation(conversationId: string) {
+      this.compactionByConversation[conversationId] = null;
+      try {
+        const settings = useSettingsStore();
+        const { triggerConversationMemory } = await import('../services/conversationMemory');
+        await triggerConversationMemory(
+          settings.agentUrl, settings.authToken, conversationId,
+        );
+      } catch (e) {
+        console.warn('Compaction failed:', e);
       }
     },
 
@@ -917,18 +960,17 @@ export const useChatStore = defineStore('chat', {
         case 'thinking': {
           const message = ensureAssistant();
           const stepReceivedAt = Date.now();
+          // One tool call. Several may share the same ``Step`` (parallel tools).
           const thinkingStep: ThinkingStep = {
-            thought: data.Thought || '',
-            action: data.Action || '',
-            actionInput: data.Action_Input || '',
+            step: data.Step ?? null,
+            callId: data.Call_Id ?? null,
+            tool: data.Tool || '',
+            toolInput: data.Tool_Input || '',
             receivedAt: stepReceivedAt,
             modelLabel: data.Model_Label || null,
           };
           message.thinkingSteps = message.thinkingSteps || [];
           message.thinkingSteps.push(thinkingStep);
-          if (!message.reasoningModelLabel && data.Reasoning_Model_Label) {
-            message.reasoningModelLabel = data.Reasoning_Model_Label;
-          }
           if (message.latency && !message.latency.firstStepAt) {
             message.latency.firstStepAt = stepReceivedAt;
           }
@@ -937,20 +979,23 @@ export const useChatStore = defineStore('chat', {
 
         case 'result': {
           const message = ensureAssistant();
-          const observationParts: ObservationPart[] = Array.isArray(data.Observation)
-            ? data.Observation
+          const resultRaw = data.Result ?? data.Observation;
+          const resultParts: ObservationPart[] = Array.isArray(resultRaw)
+            ? resultRaw
             : [{
                 kind: 'text',
-                text: typeof data.Observation === 'string'
-                  ? data.Observation
-                  : JSON.stringify(data.Observation),
+                text: typeof resultRaw === 'string' ? resultRaw : JSON.stringify(resultRaw),
               }];
-          if (message.thinkingSteps && message.thinkingSteps.length > 0) {
-            const unresolvedStep = [...message.thinkingSteps]
-              .reverse()
-              .find(s => !s.observation);
-            if (unresolvedStep) {
-              unresolvedStep.observation = observationParts;
+          const steps = message.thinkingSteps;
+          if (steps && steps.length > 0) {
+            // Pair the result with its call (parallel-safe); fall back to the
+            // most recent step still missing a result.
+            const target = (data.call_id
+              ? steps.find(s => s.callId === data.call_id && !s.result)
+              : undefined)
+              || [...steps].reverse().find(s => !s.result);
+            if (target) {
+              target.result = resultParts;
             }
           }
           return;
@@ -1016,18 +1061,21 @@ export const useChatStore = defineStore('chat', {
           return;
         }
 
-        case 'phase':
-          runtime.isSummarizing = data.phase === 'summarizing';
-          return;
-
-        case 'summary': {
-          const message = ensureAssistant();
-          if (typeof data.summary === 'string') {
-            message.summary = data.summary;
-          }
-          runtime.isSummarizing = false;
+        case 'compaction_suggested': {
+          // The conversation crossed the compaction threshold. Surface a subtle
+          // popup (suggest-only; never forced).
+          this.compactionByConversation[conversationId] = {
+            currentTokens: data.current_tokens ?? 0,
+            threshold: data.threshold ?? 0,
+            estimatedSavings: data.estimated_savings ?? 0,
+          };
           return;
         }
+
+        case 'compacted':
+          // Compaction ran — clear any pending suggestion.
+          this.compactionByConversation[conversationId] = null;
+          return;
 
         case 'complete': {
           const message = findAssistant();
@@ -1042,6 +1090,13 @@ export const useChatStore = defineStore('chat', {
             // id is fine to keep for the lifetime of the session; the
             // persisted DB id is only relevant on reload (where
             // mapBackendMessage assigns it freshly).
+            //
+            // We DO record it separately as `backendId` so the usage chip can
+            // match this turn's freshly-persisted usage records (keyed by the
+            // server id) and show estimated cost live, not just after reload.
+            if (typeof data.assistant_id === 'string' && data.assistant_id) {
+              message.backendId = data.assistant_id;
+            }
           }
           runtime.isStreaming = false;
           runtime.isSummarizing = false;
@@ -1176,16 +1231,16 @@ export const useChatStore = defineStore('chat', {
     mapBackendMessage(msg: MessageRecord): ChatMessage {
       const thinkingSteps: ThinkingStep[] | undefined = msg.thinking_steps
         ? msg.thinking_steps.map(s => ({
-            thought: s.thought,
-            action: s.action,
-            actionInput: s.action_input,
-            observation: s.observation as ObservationPart[] | undefined,
+            step: (s as any).step ?? null,
+            callId: (s as any).call_id ?? null,
+            tool: (s as any).tool ?? '',
+            toolInput: (s as any).tool_input ?? '',
+            result: ((s as any).result ?? s.observation) as ObservationPart[] | undefined,
             modelLabel: s.model_label || null,
           }))
         : undefined;
 
-      const reasoningModelLabel = msg.thinking_steps
-        ?.find(s => s.reasoning_model_label)?.reasoning_model_label ?? undefined;
+      const reasoningModelLabel = undefined;
 
       const tokenUsage: TokenUsage | undefined = msg.token_usage
         ? {

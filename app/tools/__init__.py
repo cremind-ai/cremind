@@ -1,8 +1,8 @@
 """Unified tool framework.
 
 Public exports:
-- :class:`Tool`                    -- common interface for all 5 capability types
-- :class:`ToolType`                -- enum of {intrinsic, builtin, a2a, mcp, skill}
+- :class:`Tool`                    -- common interface for all capability types
+- :class:`ToolType`                -- enum of {builtin, mcp, skill}
 - :class:`ToolBehavior`            -- post-execution behavior signal
 - :class:`ToolRegistry`            -- single source of truth for tool_ids
 - :class:`ToolConfigManager`       -- per-profile per-tool scoped config

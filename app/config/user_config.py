@@ -106,6 +106,7 @@ class AgentRuntimeConfig:
     tool_result_preserve_recent: int
     tool_result_head_tokens: int
     tool_result_tail_tokens: int
+    replay_reasoning_steps: bool
 
 
 def resolve_agent_config(profile: str) -> AgentRuntimeConfig:
@@ -125,7 +126,20 @@ def resolve_agent_config(profile: str) -> AgentRuntimeConfig:
         tool_result_preserve_recent=int(tool_result["preserve_recent"]),
         tool_result_head_tokens=int(tool_result["head_tokens"]),
         tool_result_tail_tokens=int(tool_result["tail_tokens"]),
+        replay_reasoning_steps=bool(agent["replay_reasoning_steps"]),
     )
+
+
+def replay_reasoning_enabled(profile: str) -> bool:
+    """Whether each turn's native reasoning trace is replayed into history.
+
+    Safe accessor for the history builders — never raises (a config-resolution
+    failure must not break loading conversation history); falls back to ``False``.
+    """
+    try:
+        return bool(resolve_agent_config(profile).replay_reasoning_steps)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 @dataclass(frozen=True)
@@ -169,22 +183,6 @@ class SkillClassifierConfig:
 def resolve_skill_classifier_config(profile: str) -> SkillClassifierConfig:
     values = resolve_group("skill_classifier", profile)
     return SkillClassifierConfig(
-        temperature=float(values["temperature"]),
-        max_tokens=int(values["max_tokens"]),
-        retry=int(values["retry"]),
-    )
-
-
-@dataclass(frozen=True)
-class SummarizerConfig:
-    temperature: float
-    max_tokens: int
-    retry: int
-
-
-def resolve_summarizer_config(profile: str) -> SummarizerConfig:
-    values = resolve_group("summarizer", profile)
-    return SummarizerConfig(
         temperature=float(values["temperature"]),
         max_tokens=int(values["max_tokens"]),
         retry=int(values["retry"]),

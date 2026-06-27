@@ -26,7 +26,7 @@ def test_anthropic_explicit_cache_prices_from_catalog():
     [
         # Anthropic: read 0.10x, 5-min write 1.25x.
         ("anthropic", "claude-sonnet-4-6", 0.30, 3.75),
-        # OpenAI: read 0.25x, no cache-write fee.
+        # OpenAI GPT-4.1: read 0.25x, no cache-write fee (the GPT-5 family is 0.10x).
         ("openai", "gpt-4.1", 0.50, 0.0),
         # Gemini implicit caching: read 0.10x, no cache-write fee.
         ("google-gemini", "gemini-2.5-pro", 0.125, 0.0),

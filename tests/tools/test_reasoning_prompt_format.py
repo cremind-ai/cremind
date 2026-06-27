@@ -1,49 +1,251 @@
-"""Tests for sub-tool rendering in the reasoning prompt.
+"""Native function-calling loop: the reasoning agent calls leaf tools directly,
+feeds results back as role:"tool" messages, and ends the turn on plain text.
 
-The reasoning prompt must show each sub-tool's NAME and argument signature (e.g.
-``overwrite_file(path, diff)``) so the model knows to format its Action_Input as
-``overwrite_file path="..." diff="..."`` instead of dumping a bare diff. The
-renderer previously printed only the description, omitting the name entirely.
+A scripted fake LLM emits a tool call on the first step and a final text answer
+on the second; a fake one-leaf tool records its invocation. We assert: the leaf
+ran with the model's typed args, the final answer streamed as CONTENT, the turn
+ended with a DONE, and per-call THINKING/RESULT artifacts were emitted.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import asyncio
+from typing import Any, AsyncGenerator, Dict, List
 
-from app.agent.reasoning_agent import _format_tool_for_prompt
-from app.tools.base import ToolSkill
+import pytest
+
+pytest.importorskip("a2a")
+
+from app.constants import ChatCompletionTypeEnum  # noqa: E402
+from app.tools.base import (  # noqa: E402
+    FunctionSpec,
+    Tool,
+    ToolResultEvent,
+    ToolType,
+)
+import app.agent.reasoning_agent as ra  # noqa: E402
 
 
-def test_subtool_signature_rendered_with_params() -> None:
-    skills = [
-        ToolSkill(
-            id="overwrite_file", name="overwrite_file", description="Edit a file.",
-            parameters={
-                "type": "object",
-                "properties": {"path": {}, "diff": {}},
-                "required": ["path", "diff"],
+class _FakeLeafTool(Tool):
+    tool_type = ToolType.BUILTIN
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._tool_id = "calc"
+        self.calls: List[Dict[str, Any]] = []
+
+    @property
+    def name(self) -> str:
+        return "Calculator"
+
+    @property
+    def description(self) -> str:
+        return "Adds numbers."
+
+    def leaf_function_specs(self, *, context_id, profile, query="", arguments=None):
+        return [FunctionSpec(
+            name="calc__add",
+            leaf_name="add",
+            schema={
+                "type": "function",
+                "function": {
+                    "name": "calc__add",
+                    "description": "Add a and b.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+                        "required": ["a", "b"],
+                    },
+                },
             },
-        ),
-        # No parameters -> render just the name (no parentheses).
-        ToolSkill(id="list_files", name="list_files", description="List files."),
-    ]
-    tool = SimpleNamespace(
-        tool_id="system_file", description="File assistant.", skills=skills)
-    text = _format_tool_for_prompt(tool, {})
+        )]
 
-    # The name + signature must appear, not just the description.
-    assert "overwrite_file(path, diff): Edit a file." in text
-    assert "list_files: List files." in text
+    async def execute(self, *, query, context_id, profile, arguments,
+                      variables, llm_params):  # pragma: no cover - unused
+        if False:
+            yield None  # type: ignore[unreachable]
+
+    async def execute_leaf(self, *, leaf_name, args, context_id, profile,
+                           arguments, variables, llm_params):
+        self.calls.append({"leaf": leaf_name, "args": args})
+        total = (args.get("a") or 0) + (args.get("b") or 0)
+        yield ToolResultEvent(observation_text=f"result={total}")
 
 
-def test_signature_falls_back_to_properties_when_no_required() -> None:
-    skills = [
-        ToolSkill(
-            id="grep_files", name="grep_files", description="Search contents.",
-            parameters={"type": "object", "properties": {"pattern": {}, "path": {}}},
-        ),
-    ]
-    tool = SimpleNamespace(
-        tool_id="system_file", description="File assistant.", skills=skills)
-    text = _format_tool_for_prompt(tool, {})
-    assert "grep_files(pattern, path): Search contents." in text
+class _ScriptedLLM:
+    """Yields a tool call on step 1, then streams a final text answer on step 2."""
+    provider_name = "fake"
+    model_name = "fake-model"
+    model_label = "Fake fake-model"
+
+    def __init__(self) -> None:
+        self._step = 0
+
+    async def chat_completion_stream(self, *, messages, tools=None, tool_choice=None,
+                                     **kwargs) -> AsyncGenerator[dict, None]:
+        self._step += 1
+        if self._step == 1:
+            # The model picks the namespaced leaf with typed args.
+            yield {
+                "type": ChatCompletionTypeEnum.FUNCTION_CALLING,
+                "data": {"function": [
+                    {"index": 0, "id": "call_1", "name": "calc__add",
+                     "arguments": {"a": 2, "b": 3}},
+                ]},
+            }
+            yield {"type": ChatCompletionTypeEnum.DONE, "input_tokens": 5,
+                   "output_tokens": 2, "finish_reason": "tool_calls"}
+        else:
+            # No tool calls -> the streamed text is the final answer.
+            for tok in ("The ", "answer ", "is 5."):
+                yield {"type": ChatCompletionTypeEnum.CONTENT, "data": tok}
+            yield {"type": ChatCompletionTypeEnum.DONE, "input_tokens": 7,
+                   "output_tokens": 3, "finish_reason": "stop"}
+
+
+def _build_agent(monkeypatch) -> tuple[ra.ReasoningAgent, _FakeLeafTool]:
+    monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+
+    tool = _FakeLeafTool()
+    agent = ra.ReasoningAgent.__new__(ra.ReasoningAgent)
+    agent.llm = _ScriptedLLM()
+    agent.profile = "default"
+    agent.context_id = None
+    agent.reasoning = True
+    agent._memory_context = ""
+    agent._triggered_by_event = False
+    agent._inject_reasoning_guidance = False
+    agent._tools = [tool]
+    agent._tools_by_id = {"calc": tool}
+    agent.max_steps = 6
+    agent._loaded_skill_ids = set()
+    agent._loaded_skill_sections = {}
+    agent._total_input_tokens = 0
+    agent._total_cache_read_input_tokens = 0
+    agent._total_cache_creation_input_tokens = 0
+    agent._total_output_tokens = 0
+    agent._usage_records = []
+    agent._reasoning_temperature = 1.0
+    agent._reasoning_max_tokens = 1024
+    agent._reasoning_retry = 0
+    agent._max_llm_retries = 0
+    agent._tool_result_enabled = False
+    agent._tool_result_max_tokens = 4096
+    agent._enable_prompt_cache = False
+    return agent, tool
+
+
+def test_native_fc_loop_runs_leaf_then_streams_final_answer(monkeypatch) -> None:
+    agent, tool = _build_agent(monkeypatch)
+
+    async def _run() -> List[dict]:
+        return [c async for c in agent.run("add 2 and 3", history_messages=[])]
+
+    chunks = asyncio.run(_run())
+    types = [c["type"] for c in chunks]
+
+    # The leaf executed with the model's typed args.
+    assert tool.calls == [{"leaf": "add", "args": {"a": 2, "b": 3}}]
+
+    # UI artifacts were emitted for the tool call.
+    assert ChatCompletionTypeEnum.THINKING_ARTIFACT in types
+    assert ChatCompletionTypeEnum.RESULT_ARTIFACT in types
+
+    # The final answer streamed as CONTENT deltas (real streaming).
+    streamed = "".join(
+        c["data"] for c in chunks if c["type"] == ChatCompletionTypeEnum.CONTENT
+    )
+    assert streamed == "The answer is 5."
+
+    # The turn ended with a DONE; the streamed answer is not duplicated in data.
+    done = [c for c in chunks if c["type"] == ChatCompletionTypeEnum.DONE]
+    assert len(done) == 1
+    assert done[0]["data"] == ""
+
+
+def test_tool_result_fed_back_as_tool_message(monkeypatch) -> None:
+    agent, _tool = _build_agent(monkeypatch)
+
+    async def _run() -> None:
+        async for _ in agent.run("add 2 and 3", history_messages=[]):
+            pass
+
+    asyncio.run(_run())
+    # After the run, the in-turn trace holds the assistant tool_call + a tool result.
+    roles = [m["role"] for m in agent._turn_messages]
+    assert roles == ["assistant", "tool"]
+    assert agent._turn_messages[0]["tool_calls"][0]["function"]["name"] == "calc__add"
+    assert "result=5" in agent._turn_messages[1]["content"]
+
+
+class _TwoLeafTool(_FakeLeafTool):
+    """A group exposing two leaves so a step can call both in parallel."""
+
+    def leaf_function_specs(self, *, context_id, profile, query="", arguments=None):
+        out = []
+        for leaf in ("add", "mul"):
+            out.append(FunctionSpec(
+                name=f"calc__{leaf}", leaf_name=leaf,
+                schema={"type": "function", "function": {
+                    "name": f"calc__{leaf}",
+                    "parameters": {"type": "object",
+                                   "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+                                   "required": ["a", "b"]},
+                }},
+            ))
+        return out
+
+    async def execute_leaf(self, *, leaf_name, args, context_id, profile,
+                           arguments, variables, llm_params):
+        self.calls.append({"leaf": leaf_name, "args": args})
+        a, b = (args.get("a") or 0), (args.get("b") or 0)
+        total = a + b if leaf_name == "add" else a * b
+        yield ToolResultEvent(observation_text=f"{leaf_name}={total}")
+
+
+class _TwoCallLLM(_ScriptedLLM):
+    async def chat_completion_stream(self, *, messages, tools=None, tool_choice=None, **kwargs):
+        self._step += 1
+        if self._step == 1:
+            yield {
+                "type": ChatCompletionTypeEnum.FUNCTION_CALLING,
+                "data": {"function": [
+                    {"index": 0, "id": "c1", "name": "calc__add", "arguments": {"a": 2, "b": 3}},
+                    {"index": 1, "id": "c2", "name": "calc__mul", "arguments": {"a": 4, "b": 5}},
+                ]},
+            }
+            yield {"type": ChatCompletionTypeEnum.DONE, "input_tokens": 5,
+                   "output_tokens": 4, "finish_reason": "tool_calls"}
+        else:
+            yield {"type": ChatCompletionTypeEnum.CONTENT, "data": "done"}
+            yield {"type": ChatCompletionTypeEnum.DONE, "input_tokens": 6,
+                   "output_tokens": 1, "finish_reason": "stop"}
+
+
+def test_parallel_tool_calls_run_and_group_in_one_step(monkeypatch) -> None:
+    agent, _ = _build_agent(monkeypatch)
+    tool = _TwoLeafTool()
+    agent.llm = _TwoCallLLM()
+    agent._tools = [tool]
+    agent._tools_by_id = {"calc": tool}
+
+    async def _run():
+        return [c async for c in agent.run("add 2+3 and multiply 4*5", history_messages=[])]
+
+    chunks = asyncio.run(_run())
+
+    # Both leaves ran (in one step).
+    assert {c["leaf"] for c in tool.calls} == {"add", "mul"}
+
+    # Two THINKING artifacts, sharing the same Step number.
+    thinks = [c["data"] for c in chunks if c["type"] == ChatCompletionTypeEnum.THINKING_ARTIFACT]
+    assert len(thinks) == 2
+    assert thinks[0]["Step"] == thinks[1]["Step"]
+    assert {t["Tool"] for t in thinks} == {"calc__add", "calc__mul"}
+
+    # Assistant message carried both tool_calls; both tool results were appended.
+    roles = [m["role"] for m in agent._turn_messages]
+    assert roles == ["assistant", "tool", "tool"]
+    tool_texts = " ".join(m["content"] for m in agent._turn_messages if m["role"] == "tool")
+    assert "add=5" in tool_texts and "mul=20" in tool_texts

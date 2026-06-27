@@ -29,6 +29,7 @@ from typing import Any
 from app.events import queue as event_queue
 from app.events.notifications_buffer import get_event_notifications
 from app.events.stream_bus import get_event_stream_bus
+from app.config.user_config import replay_reasoning_enabled
 from app.utils.common import convert_db_messages_to_history
 from app.utils.logger import logger
 
@@ -458,7 +459,7 @@ class BaseChannelAdapter(ABC):
             db_msgs = await self.storage.get_messages(conversation_id)
             if db_msgs:
                 history_messages = convert_db_messages_to_history(
-                    db_msgs, inject_ids=True,
+                    db_msgs, include_reasoning=replay_reasoning_enabled(self.profile),
                 )
         except Exception:  # noqa: BLE001
             logger.exception(

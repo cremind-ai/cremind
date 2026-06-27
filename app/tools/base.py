@@ -26,11 +26,42 @@ from a2a.types import AgentCard, Part
 
 
 class ToolType(str, Enum):
-    INTRINSIC = "intrinsic"
     BUILTIN = "builtin"
-    A2A = "a2a"
     MCP = "mcp"
     SKILL = "skill"
+
+
+# Separator used to namespace a group's sub-tool ("leaf") into a globally-unique
+# native-function name exposed to the model, e.g. ``system_file__overwrite_file``.
+LEAF_SEP = "__"
+
+
+def make_leaf_name(tool_id: str, leaf_name: str) -> str:
+    """Build the native-function name the model sees for a group's leaf.
+
+    For single-leaf groups whose leaf is named like the group (e.g.
+    ``exec_shell``/``web_search``) the doubled ``exec_shell__exec_shell`` form is
+    noise, so collapse it to just the leaf/group name. Multi-leaf groups keep the
+    ``<tool_id>__<leaf>`` namespacing (e.g. ``system_file__read_file``). Group
+    ``tool_id``s are unique, so single-leaf names can't collide.
+    """
+    if leaf_name == tool_id:
+        return leaf_name
+    return f"{tool_id}{LEAF_SEP}{leaf_name}"
+
+
+@dataclass
+class FunctionSpec:
+    """One native-function-callable leaf exposed to the reasoning model.
+
+    ``name`` is the namespaced function name the model calls; ``leaf_name`` is
+    the original sub-tool name within the owning :class:`Tool`; ``schema`` is the
+    full OpenAI tool spec (``{"type": "function", "function": {...}}``) carrying
+    the leaf's real JSON-Schema parameters.
+    """
+    name: str
+    leaf_name: str
+    schema: Dict[str, Any]
 
 
 class ToolBehavior(str, Enum):
@@ -56,9 +87,10 @@ class ToolSkill:
     name: str
     description: str
     examples: List[str] = field(default_factory=list)
-    # Optional JSON-schema for the sub-tool's arguments. When present, the
-    # reasoning prompt renders a call signature (e.g. ``overwrite_file(path,
-    # diff)``) so the model knows how to format its Action_Input.
+    # Optional JSON-schema for the sub-tool's arguments. Native function
+    # calling exposes the leaf's real JSON-Schema directly (see
+    # ``leaf_function_specs``); this field is retained for the few callers
+    # that still introspect a tool's sub-skills.
     parameters: Optional[Dict[str, Any]] = None
 
 
@@ -163,6 +195,49 @@ class Tool(ABC):
     def skills(self) -> List[ToolSkill]:
         """Sub-skills exposed in the prompt (default: none)."""
         return []
+
+    # ── native function calling ─────────────────────────────────────────
+
+    def leaf_function_specs(
+        self,
+        *,
+        context_id: str,
+        profile: str,
+        query: str = "",
+        arguments: Optional[Dict[str, Any]] = None,
+    ) -> List["FunctionSpec"]:
+        """Return the native-function specs for this tool's callable leaves.
+
+        The reasoning agent flattens these across all enabled tools into one
+        ``tools=`` list for the model and keeps a ``name -> (tool, leaf_name)``
+        dispatch map. Default: none. Built-in / MCP groups override to expose
+        each sub-tool (with its full JSON-Schema). ``query``/``arguments`` let a
+        group run per-request customization (dynamic enums, suppression).
+        """
+        return []
+
+    async def execute_leaf(
+        self,
+        *,
+        leaf_name: str,
+        args: Dict[str, Any],
+        context_id: str,
+        profile: str,
+        arguments: Dict[str, Any],
+        variables: Dict[str, str],
+        llm_params: Dict[str, Any],
+    ) -> AsyncGenerator["ToolEvent", None]:
+        """Execute one named leaf with model-chosen ``args`` and yield events.
+
+        Default delegates to :meth:`execute` passing ``leaf_name`` as the query
+        (sufficient for single-leaf tools); built-in / MCP groups override to
+        dispatch the exact ``(leaf_name, args)`` to their executor.
+        """
+        async for ev in self.execute(
+            query=leaf_name, context_id=context_id, profile=profile,
+            arguments={**arguments, **args}, variables=variables, llm_params=llm_params,
+        ):
+            yield ev
 
     # ── prompt & UI helpers ─────────────────────────────────────────────
 

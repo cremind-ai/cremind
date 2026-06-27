@@ -17,12 +17,10 @@ const emit = defineEmits<{
 const { rebuildModelList, getFilteredModels, getReasoningOptions } = useLLMModels();
 
 const providers = ref<ProviderWithState[]>([]);
+// Single model. Stored under the historical ``model_group.high`` key.
 const highProvider = ref(extractProvider(props.config['model_group.high']) || props.config.default_provider || 'groq');
-const lowProvider = ref(extractProvider(props.config['model_group.low']) || props.config.default_provider || 'groq');
 const modelGroupHigh = ref(props.config['model_group.high'] || '');
-const modelGroupLow = ref(props.config['model_group.low'] || '');
 const reasoningEffortHigh = ref(props.config['model_group.high.reasoning_effort'] || '');
-const reasoningEffortLow = ref(props.config['model_group.low.reasoning_effort'] || '');
 const apiKeyProvider = ref('');
 const loading = ref(false);
 
@@ -38,10 +36,8 @@ function extractProvider(groupValue: string | undefined): string {
 }
 
 const highFilteredModels = computed(() => getFilteredModels(highProvider.value));
-const lowFilteredModels = computed(() => getFilteredModels(lowProvider.value));
 
 const highModelReasoningOptions = computed(() => getReasoningOptions(modelGroupHigh.value));
-const lowModelReasoningOptions = computed(() => getReasoningOptions(modelGroupLow.value));
 
 // When provider changes, clear model selection if current model doesn't belong to new provider
 watch(highProvider, (newProvider, oldProvider) => {
@@ -53,22 +49,10 @@ watch(highProvider, (newProvider, oldProvider) => {
     }
   }
 });
-watch(lowProvider, (newProvider, oldProvider) => {
-  if (oldProvider && newProvider !== oldProvider) {
-    const currentProvider = extractProvider(modelGroupLow.value);
-    if (currentProvider !== newProvider) {
-      modelGroupLow.value = '';
-      reasoningEffortLow.value = '';
-    }
-  }
-});
 
 // Clear reasoning_effort when model changes and new model doesn't support it
 watch(modelGroupHigh, () => {
   if (highModelReasoningOptions.value.length === 0) reasoningEffortHigh.value = '';
-});
-watch(modelGroupLow, () => {
-  if (lowModelReasoningOptions.value.length === 0) reasoningEffortLow.value = '';
 });
 
 onMounted(async () => {
@@ -120,13 +104,11 @@ onMounted(async () => {
 
 function emitConfig() {
   const config: Record<string, string> = {
-    // Derive default_provider from the high group's provider
-    default_provider: highProvider.value || lowProvider.value || 'groq',
+    // Derive default_provider from the single model's provider
+    default_provider: highProvider.value || 'groq',
   };
   if (modelGroupHigh.value) config['model_group.high'] = modelGroupHigh.value;
-  if (modelGroupLow.value) config['model_group.low'] = modelGroupLow.value;
   if (reasoningEffortHigh.value) config['model_group.high.reasoning_effort'] = reasoningEffortHigh.value;
-  if (reasoningEffortLow.value) config['model_group.low.reasoning_effort'] = reasoningEffortLow.value;
 
   for (const p of providers.value) {
     // Emit auth_method selection
@@ -153,7 +135,7 @@ function emitConfig() {
   emit('update', config);
 }
 
-watch([highProvider, lowProvider, modelGroupHigh, modelGroupLow, reasoningEffortHigh, reasoningEffortLow], emitConfig);
+watch([highProvider, modelGroupHigh, reasoningEffortHigh], emitConfig);
 watch(providers, emitConfig, { deep: true });
 </script>
 
@@ -161,8 +143,8 @@ watch(providers, emitConfig, { deep: true });
   <div class="step-llm-config">
     <h3 class="step-title">LLM Provider Configuration</h3>
     <p class="step-description">
-      Configure at least one LLM provider with an API key, then assign models to the
-      <strong>High</strong> (reasoning) and <strong>Low</strong> (tools) groups.
+      Configure at least one LLM provider with an API key, then choose the
+      <strong>model</strong> the assistant runs on.
     </p>
 
     <div v-if="loading" class="loading-state">Loading providers...</div>
@@ -187,12 +169,11 @@ watch(providers, emitConfig, { deep: true });
       </div>
 
       <div class="model-groups-section">
-        <h4 class="section-subtitle">Model Groups</h4>
+        <h4 class="section-subtitle">Model</h4>
 
-      <!-- High Group -->
       <div class="group-block">
         <p class="step-description">
-          <strong>High Group</strong> — used for reasoning.
+          The single model the assistant uses for reasoning, tool calls, and replies.
         </p>
         <ElForm label-position="top" class="groups-form">
           <ElFormItem label="Provider">
@@ -202,7 +183,7 @@ watch(providers, emitConfig, { deep: true });
           </ElFormItem>
 
           <ElFormItem label="Model">
-            <ElSelect v-model="modelGroupHigh" placeholder="Select reasoning model" filterable>
+            <ElSelect v-model="modelGroupHigh" placeholder="Select model" filterable>
               <ElOption v-for="m in highFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
             </ElSelect>
           </ElFormItem>
@@ -210,32 +191,6 @@ watch(providers, emitConfig, { deep: true });
           <ElFormItem v-if="highModelReasoningOptions.length > 0" label="Reasoning Effort">
             <ElSelect v-model="reasoningEffortHigh" placeholder="Select reasoning effort" clearable>
               <ElOption v-for="opt in highModelReasoningOptions" :key="opt" :label="opt" :value="opt" />
-            </ElSelect>
-          </ElFormItem>
-        </ElForm>
-      </div>
-
-      <!-- Low Group -->
-      <div class="group-block">
-        <p class="step-description">
-          <strong>Low Group</strong> — used for tool calls.
-        </p>
-        <ElForm label-position="top" class="groups-form">
-          <ElFormItem label="Provider">
-            <ElSelect v-model="lowProvider" placeholder="Select provider">
-              <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
-            </ElSelect>
-          </ElFormItem>
-
-          <ElFormItem label="Model">
-            <ElSelect v-model="modelGroupLow" placeholder="Select tools model" filterable>
-              <ElOption v-for="m in lowFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
-            </ElSelect>
-          </ElFormItem>
-
-          <ElFormItem v-if="lowModelReasoningOptions.length > 0" label="Reasoning Effort">
-            <ElSelect v-model="reasoningEffortLow" placeholder="Select reasoning effort" clearable>
-              <ElOption v-for="opt in lowModelReasoningOptions" :key="opt" :label="opt" :value="opt" />
             </ElSelect>
           </ElFormItem>
         </ElForm>

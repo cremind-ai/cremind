@@ -8,7 +8,7 @@ Error contract
 Every built-in tool must surface runtime errors to the Reasoning Agent as
 structured observations — never swallow them with ``logger.warning`` and a
 silent ``return []``/``None``. The agent reads ``BuiltInToolResult.structured_content``
-as part of its ReAct loop and decides the next action (retry, ask the user,
+as the tool-call result and decides the next action (retry, ask the user,
 suggest installing a missing feature, etc.). Two shapes:
 
 1. Generic errors: ``{"error": "<code>", "message": "<human text>", ...}``.

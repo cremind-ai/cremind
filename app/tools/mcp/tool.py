@@ -19,7 +19,9 @@ from a2a.types import AgentCard
 from app.config.settings import BaseConfig
 from app.lib.llm.base import LLMProvider
 from app.tools.base import (
+    FunctionSpec,
     Tool,
+    make_leaf_name,
     ToolErrorEvent,
     ToolEvent,
     ToolResultEvent,
@@ -107,6 +109,82 @@ class MCPServerTool(Tool):
 
     def get_card(self) -> AgentCard:
         return self._adapter.create_synthetic_card()
+
+    # ── native function calling ─────────────────────────────────────────
+
+    def leaf_function_specs(
+        self,
+        *,
+        context_id: str,
+        profile: str,
+        query: str = "",
+        arguments=None,
+    ) -> List[FunctionSpec]:
+        """Expose each MCP tool as a native function, namespaced ``<tool_id>__<leaf>``."""
+        if self._connection_error:
+            return []
+        specs = self._adapter.build_specs(
+            query=query, arguments=arguments, context_id=context_id, profile=profile,
+        )
+        out: List[FunctionSpec] = []
+        for s in specs:
+            fn = s.get("function") or {}
+            leaf = fn.get("name") or ""
+            if not leaf:
+                continue
+            exposed = make_leaf_name(self.tool_id, leaf)
+            schema = {"type": "function", "function": {**fn, "name": exposed}}
+            out.append(FunctionSpec(name=exposed, leaf_name=leaf, schema=schema))
+        return out
+
+    async def execute_leaf(
+        self,
+        *,
+        leaf_name: str,
+        args: Dict[str, Any],
+        context_id: str,
+        profile: str,
+        arguments: Dict[str, Any],
+        variables: Dict[str, str],
+        llm_params: Dict[str, Any],
+    ) -> AsyncGenerator[ToolEvent, None]:
+        if self._connection_error:
+            yield ToolErrorEvent(
+                message=(
+                    f"MCP server '{self.name}' is unavailable: {self._connection_error}. "
+                    "Please reconnect or disable this tool."
+                )
+            )
+            return
+        self.refresh_llm(profile)
+        if "full_reasoning" in llm_params:
+            self._adapter.update_config(full_reasoning=bool(llm_params["full_reasoning"]))
+
+        yield ToolThinkingEvent(
+            text=f"[{self.name}] {leaf_name}",
+            model_label=getattr(self._adapter._llm, "model_label", None) if self._adapter._llm else None,
+        )
+
+        events: list = []
+        metadata = {"arguments": arguments} if arguments else None
+        try:
+            async for ev in self._adapter.request(
+                query=leaf_name, context_id=context_id, metadata=metadata, profile=profile,
+                decided_calls=[{"name": leaf_name, "arguments": args}],
+            ):
+                events.append(ev)
+                yield ToolStatusEvent(raw=ev)
+        except Exception as e:  # noqa: BLE001
+            logger.exception(f"MCP tool '{self.name}' failed")
+            yield ToolErrorEvent(message=str(e))
+            return
+
+        observation_text, token_usage, observation_parts = parse_agent_events(events)
+        yield ToolResultEvent(
+            observation_text=observation_text,
+            observation_parts=observation_parts,
+            token_usage=token_usage or {},
+        )
 
     # ── runtime LLM refresh ────────────────────────────────────────────
 

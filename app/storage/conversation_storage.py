@@ -208,27 +208,6 @@ class ConversationStorage:
             )
             return result.scalar() > 0
 
-    async def get_skill_mode(self, name: str) -> str:
-        await self._ensure_initialized()
-        async with self.async_session_maker() as session:
-            result = await session.execute(
-                select(ProfileModel.skill_mode).where(ProfileModel.name == name)
-            )
-            mode = result.scalar_one_or_none()
-            return mode or "manual"
-
-    async def set_skill_mode(self, name: str, mode: str) -> bool:
-        if mode not in ("manual", "automatic"):
-            raise ValueError(f"Invalid skill_mode: {mode!r}")
-        await self._ensure_initialized()
-        async with self.async_session_maker.begin() as session:
-            result = await session.execute(
-                update(ProfileModel)
-                .where(ProfileModel.name == name)
-                .values(skill_mode=mode, updated_at=time.time() * 1000)
-            )
-            return result.rowcount > 0
-
     # ── Conversation CRUD ──
 
     async def create_conversation(
@@ -629,7 +608,7 @@ class ConversationStorage:
         self, conversation_id: str, role: str, content: str | None = None,
         parts: list | None = None, thinking_steps: list | None = None,
         token_usage: dict | None = None, metadata: dict | None = None,
-        summary: str | None = None,
+        summary: str | None = None, llm_messages: list | None = None,
     ) -> dict:
         await self._ensure_initialized()
         now = time.time() * 1000
@@ -663,6 +642,7 @@ class ConversationStorage:
                 content=content,
                 parts=serialized_parts,
                 thinking_steps=thinking_steps,
+                llm_messages=llm_messages,
                 token_usage=token_usage,
                 message_metadata=metadata,
                 summary=summary,
@@ -818,6 +798,7 @@ class ConversationStorage:
             "content": msg.content,
             "parts": msg.parts,
             "thinking_steps": msg.thinking_steps,
+            "llm_messages": msg.llm_messages,
             "token_usage": msg.token_usage,
             "metadata": msg.message_metadata,
             "summary": msg.summary,

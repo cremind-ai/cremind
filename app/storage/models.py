@@ -42,7 +42,6 @@ class ProfileModel(Base):
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)
-    skill_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="manual")
 
 
 class ChannelModel(Base):
@@ -136,6 +135,11 @@ class MessageModel(Base):
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     parts: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     thinking_steps: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # Native LLM reasoning trace (assistant tool_calls + role:"tool" results + the
+    # final-answer assistant message) for this turn, in OpenAI chat format. Replayed
+    # into conversation history on later turns so the prompt-cache prefix covers the
+    # reasoning context. NULL for turns with no tool calls (replays content-only).
+    llm_messages: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     token_usage: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     message_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, name="metadata")
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)

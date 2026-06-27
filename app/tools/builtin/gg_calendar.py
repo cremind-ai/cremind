@@ -31,7 +31,7 @@ TOOL_CONFIG: ToolConfig = {
     # app.features.manifest.FEATURES.
     "requires_feature": "google",
     "llm_parameters": {
-        "tool_instructions": "A Google Calendar assistant that can list upcoming events and create new events.",
+        "tool_instructions": "List upcoming events and create new events on the user's Google Calendar.",
     },
     "required_config": {
         Var.CLIENT_ID: {

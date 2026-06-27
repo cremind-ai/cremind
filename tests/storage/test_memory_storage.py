@@ -52,8 +52,8 @@ def _seed_profile(store: MemoryStorage, *, profile="admin") -> None:
     now = time.time()
     with store.provider.sync_engine().begin() as conn:
         conn.execute(text(
-            "INSERT INTO profiles (id, name, created_at, updated_at, skill_mode) "
-            "VALUES ('p', :profile, :now, :now, 'manual')"
+            "INSERT INTO profiles (id, name, created_at, updated_at) "
+            "VALUES ('p', :profile, :now, :now)"
         ), {"profile": profile, "now": now})
 
 
