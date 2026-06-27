@@ -599,7 +599,7 @@ export async function pollDeviceCode(
 export async function getModelGroups(
   agentUrl: string,
   token: string
-): Promise<{ model_groups: Record<string, string>; default_provider: string; reasoning_efforts: Record<string, string | null> }> {
+): Promise<{ model_groups: Record<string, string>; default_provider: string; reasoning_efforts: Record<string, string | null>; vision_enabled: boolean }> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/llm/model-groups`, {
     headers: authHeaders(token),
@@ -614,11 +614,13 @@ export async function updateModelGroups(
   modelGroups: Record<string, string>,
   defaultProvider?: string,
   reasoningEfforts?: Record<string, string | null>,
+  visionEnabled?: boolean,
 ): Promise<{ success: boolean }> {
   const base = resolveBaseUrl(agentUrl);
   const body: Record<string, unknown> = { model_groups: modelGroups };
   if (defaultProvider) body.default_provider = defaultProvider;
   if (reasoningEfforts) body.reasoning_efforts = reasoningEfforts;
+  if (visionEnabled !== undefined) body.vision_enabled = visionEnabled;
   const res = await fetch(`${base}/api/llm/model-groups`, {
     method: 'PUT',
     headers: authHeaders(token),

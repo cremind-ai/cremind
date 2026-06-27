@@ -79,16 +79,6 @@ TOOL_CONFIG: ToolConfig = {
         "tool_instructions": (
             "This tool is for subscribing the current conversation to events emitted by a loaded skill."
         ),
-        "system_prompt": (
-            "You convert a registration request into a structured tool call.\n"
-            "Always call register_skill_event with trigger and action.\n"
-            "trigger is an array of one or more event names declared by the skill.\n"
-            "action is the string command to run when any of those events fire. "
-            "The action must only contain executable commands and must not include "
-            "any event-related information.\n"
-            "E.g. 'When a new email is received, please summarize it for me' -> "
-            "trigger: new email, action: 'summarize latest email'."
-        ),
     },
 }
 
@@ -160,6 +150,15 @@ def _read_events_metadata(source_dir: Path) -> List[Dict[str, Any]]:
 
 class RegisterSkillEventTool(BuiltInTool):
     name: str = "register_skill_event"
+    description: str = (
+        "Subscribe the current conversation to one or more events declared by a "
+        "loaded skill, so a chosen action runs automatically whenever any of "
+        "those events fire. `trigger` is an array of event names the skill "
+        "declares; `action` is a short imperative describing only WHAT to do "
+        "when an event fires — do not embed event details, the runtime supplies "
+        "them. E.g. 'when a new email arrives, summarize it' -> "
+        "trigger=['new_email'], action='summarize the latest email'."
+    )
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {

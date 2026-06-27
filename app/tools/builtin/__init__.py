@@ -31,8 +31,6 @@ import inspect
 from typing import Iterable, Optional
 
 from app.config.settings import BaseConfig
-from app.lib.llm.base import LLMProvider
-from app.lib.llm.factory import create_llm_provider
 from app.tools.builtin.adapter import BuiltInToolAdapter
 from app.tools.builtin.base import (
     BuiltInTool,
@@ -55,7 +53,6 @@ __all__ = [
     "register_builtin_tools",
     "refresh_builtin_tool_oauth",
     "get_builtin_tool_config",
-    "default_model_group_for",
     "list_builtin_tool_catalog",
     "feature_keys_for_tool_ids",
     "required_feature_for_tool_id",
@@ -66,7 +63,6 @@ _BUILTIN_MODULE_NAMES: tuple[str, ...] = (
     "exec_shell",
     "markdown_converter",
     "image_understanding",
-    "message_detail",
     "system_file",
     "weather",
     "gg_calendar",
@@ -81,6 +77,9 @@ _BUILTIN_MODULE_NAMES: tuple[str, ...] = (
     "datetime_parser",
     "current_time",
     "scheduler",
+    "search_memory",
+    "compact_conversation",
+    "reasoning",
 )
 
 
@@ -253,33 +252,6 @@ def get_builtin_tool_config(config_name: str) -> dict:
     return {"tool": tool_config}
 
 
-def default_model_group_for(tool_key: str) -> str:
-    """Resolve a built-in tool's default model group from EITHER its module
-    name (``config_name``) or its slugified ``tool_id``.
-
-    ``get_builtin_tool_config`` keys off the module name, but the runtime LLM
-    refresh path (``BuiltInToolGroup.refresh_llm``) hands the factory the
-    slugified ``tool_id``. For most tools ``slugify(SERVER_NAME) == module``,
-    but for a few (e.g. weather → ``accuweather_weather``) they differ — so a
-    bare module lookup would silently fall back to ``"low"``. This maps a slug
-    back to its module before reading ``default_model_group`` so a tool's
-    declared group (e.g. ``image_understanding`` → ``"vision"``) is honored on
-    every path, not just at boot. Defaults to ``"low"``.
-    """
-    schema = get_builtin_tool_config(tool_key)
-    if not schema:
-        for module_name in _BUILTIN_MODULE_NAMES:
-            try:
-                module = importlib.import_module(f"app.tools.builtin.{module_name}")
-            except ImportError:
-                continue
-            server_name = getattr(module, "SERVER_NAME", module_name)
-            if module_name == tool_key or slugify(server_name) == tool_key:
-                schema = get_builtin_tool_config(module_name)
-                break
-    return (schema.get("tool") or {}).get("default_model_group") or "low"
-
-
 def _build_oauth_provider(*, oauth_config: Optional[dict], server_name: str):
     """Return a callable ``adapter -> MCPOAuthClient`` if OAuth is configured."""
     if not oauth_config:
@@ -444,8 +416,14 @@ async def register_builtin_tools(
             continue
 
         server_name = getattr(module, "SERVER_NAME", module_name)
-        llm_defaults: dict = dict(tool_info.get("llm_parameters") or {})
-        instructions = llm_defaults.get("tool_instructions", "") or ""
+        # Group description text only (no inner-LLM steering — there is no inner
+        # routing LLM). ``description`` (top-level) wins; legacy
+        # ``llm_parameters.tool_instructions`` is read purely as fallback text.
+        instructions = (
+            tool_info.get("description")
+            or (tool_info.get("llm_parameters") or {}).get("tool_instructions", "")
+            or ""
+        )
         if hasattr(module, "_make_server_instructions"):
             instructions = module._make_server_instructions(config["CREMIND_SYSTEM_DIR"])
 
@@ -479,68 +457,28 @@ async def register_builtin_tools(
                 oauth_config=populated, server_name=server_name,
             )
 
-        # Read persisted LLM params from DB (mirrors MCP hydration in server.py).
-        # Per-key precedence: DB override > TOOL_CONFIG["llm_parameters"] default.
-        tool_id_for_config = slugify(server_name)
+        # The group's child LLM (used only by tools with an internal LLM step,
+        # e.g. image_understanding / documentation_search) is the single
+        # configured model resolved by the factory (image_understanding → the
+        # optional vision model). There are no per-tool LLM overrides anymore.
         try:
-            _llm_params = config_manager.get_llm_params(tool_id_for_config, setup_profile)
-        except Exception:  # noqa: BLE001
-            _llm_params = {}
-
-        try:
-            _meta = config_manager.get_meta(tool_id_for_config, setup_profile)
-        except Exception:  # noqa: BLE001
-            _meta = {}
-
-        effective_llm: dict = {**llm_defaults, **(_llm_params or {})}
-        effective_meta: dict = {
-            k: llm_defaults[k]
-            for k in ("system_prompt", "description")
-            if k in llm_defaults
-        }
-        effective_meta.update(_meta or {})
-
-        llm: Optional[LLMProvider] = None
-        if effective_llm.get("llm_provider") or effective_llm.get("llm_model"):
-            try:
-                llm = create_llm_provider(
-                    provider_name=effective_llm.get("llm_provider")
-                        or BaseConfig.get_default_provider(),
-                    model_name=effective_llm.get("llm_model") or None,
-                    config_storage=config_storage,
-                    profile=setup_profile,
-                    default_reasoning_effort=effective_llm.get("reasoning_effort"),
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    f"Per-tool LLM hydrate failed for '{server_name}': {e}. "
-                    "Falling back to default model-group LLM."
-                )
-
-        if llm is None:
-            try:
-                llm = llm_factory(module_name, setup_profile)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    f"No LLM available for built-in tool '{server_name}': {e}. "
-                    "Registering as unbound -- will be rebound after setup completes."
-                )
-                llm = None
+            llm = llm_factory(module_name, setup_profile)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"No LLM available for built-in tool '{server_name}': {e}. "
+                "Registering as unbound -- will be rebound after setup completes."
+            )
+            llm = None
 
         group = BuiltInToolGroup(
             config_name=module_name,
             display_name=server_name,
-            description=effective_meta.get("description") or instructions or server_name,
+            description=instructions or server_name,
             functions=functions,
             llm=llm,
-            arguments_schema=tool_info.get("arguments") or None,
             oauth_provider=oauth_provider,
             prepare_tools=prepare_tools_fn,
-            full_reasoning=bool(effective_llm.get("full_reasoning", False)),
-            system_prompt=effective_meta.get("system_prompt") or None,
-            tool_instructions=instructions or None,
             llm_factory=llm_factory,
-            direct_dispatch=bool(tool_info.get("direct_dispatch", False)),
         )
         # ``hidden`` keeps the tool out of ``visible_for_profile`` (Settings UI
         # / GET /api/tools) while ``tools_for_profile`` still exposes it to the

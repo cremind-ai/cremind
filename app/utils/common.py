@@ -190,24 +190,34 @@ def convert_task_history_to_messages(task_history: list[Message]) -> list[ChatCo
 
 def convert_db_messages_to_history(
     db_messages: list[dict],
-    inject_ids: bool = True,
+    *,
+    include_reasoning: bool = False,
 ) -> list[ChatCompletionMessageParam]:
     """Convert database message dicts to ChatCompletionMessageParam format.
 
-    When inject_ids is True, each message's content is suffixed with
-    ``\\nid: <uuid>`` so the LLM can reference it via the message_detail tool.
+    The model receives each message's ORIGINAL content verbatim — no injected
+    ``message_id``/``conversation_id``/``summary`` suffixes (those were ReAct-era
+    aids for the now-removed ``message_detail`` tool and trace summarizer, and
+    they would also bust the prompt cache).
+
+    When ``include_reasoning`` is set and a message carries a stored ``llm_messages``
+    trace (assistant ``tool_calls`` + ``role:"tool"`` results + the final-answer
+    assistant message), that native trace is spliced in verbatim **in place of** the
+    single content message — so later turns resume the real tool-use transcript and
+    the prompt-cache prefix covers the prior reasoning. The trace already ends with
+    the final answer, so it is not duplicated. Messages without a trace (older rows,
+    or turns with no tool calls) fall back to the content-only form.
     """
     messages: list[ChatCompletionMessageParam] = []
     for m in db_messages:
+        trace = m.get("llm_messages") if include_reasoning else None
+        if trace:
+            messages.extend(trace)
+            continue
         role = "assistant" if m["role"] == "agent" else m["role"]
         content = m.get("content") or ""
         if not content.strip():
             continue
-        if inject_ids:
-            content += f"\nmessage_id: {m['id']}"
-        summary = m.get("summary")
-        if summary:
-            content += f"\nsummary: {summary}"
         messages.append({
             "role": role,
             "content": content,

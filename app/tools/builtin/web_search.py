@@ -6,13 +6,11 @@ is available as an opt-in, experimental fallback. See
 ``app.tools.builtin.web_search_providers`` for the providers and
 ``WEB_SEARCH_PROVIDER`` selection.
 
-Dispatch contract
------------------
-``TOOL_CONFIG["direct_dispatch"] = True`` makes :class:`BuiltInToolAdapter`
-skip its routing LLM round and call ``run({"query": <Action_Input>})``
-directly -- the agent's Action_Input IS the search query (same contract as
-``documentation_search``). Requires exactly one sub-tool, which ``get_tools``
-guarantees.
+Invocation
+----------
+The reasoning model calls ``search_web`` directly via native function
+calling, filling the ``query`` argument from the tool's JSON-Schema. There
+is no per-group routing LLM. ``get_tools`` exposes exactly one sub-tool.
 
 Zero-config
 -----------
@@ -63,10 +61,10 @@ TOOL_CONFIG: ToolConfig = {
     "visible": True,
     "llm_parameters": {
         "tool_instructions": (
-            "A web search assistant. Use it to find current information on the "
-            "public web (news, facts, documentation, products). Returns a "
-            "ranked list of results, each with a title, URL and snippet. Pair "
-            "it with the Web Fetch tool to read a result's full page."
+            "Search the public web for current information (news, facts, "
+            "documentation, products). Returns a ranked list of results, each "
+            "with a title, URL and snippet; pair it with the Web Fetch tool to "
+            "read a result's full page."
         ),
         # Results are returned as structured_content; a second LLM pass would
         # only paraphrase the list. Keep it off (and locked).
@@ -110,7 +108,7 @@ TOOL_CONFIG: ToolConfig = {
         },
     },
     "locked_llm_fields": ["full_reasoning"],
-    # Action_Input is the query verbatim -> skip the routing LLM round.
+    # Single sub-tool; the model fills ``query`` directly.
     "direct_dispatch": True,
 }
 
@@ -261,7 +259,7 @@ class WebSearchTool(BuiltInTool):
 def get_tools(config: dict) -> list[BuiltInTool]:
     """Return tool instances for this server.
 
-    Exactly one tool -- required for ``direct_dispatch`` to take the fast path
-    in :class:`BuiltInToolAdapter`.
+    Exactly one tool -- the reasoning model fills its ``query`` argument
+    directly via native function calling.
     """
     return [WebSearchTool()]

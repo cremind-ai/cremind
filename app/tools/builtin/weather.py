@@ -30,7 +30,7 @@ TOOL_CONFIG: ToolConfig = {
     "default_model_group": "low",
     "visible": True,
     "llm_parameters": {
-        "tool_instructions": "A weather assistant that retrieves weather forecasts and current conditions.",
+        "tool_instructions": "Retrieve weather forecasts and current conditions for a location.",
     },
     "required_config": {
         Var.API_KEY: {

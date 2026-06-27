@@ -40,12 +40,26 @@ export interface ToolUsage extends TokenBreakdown {
   request_count: number;
 }
 
+/**
+ * The four per-1M token rates the turn's cost was computed from. Present only
+ * when every priced record in the turn shared one identical rate card (so the
+ * worked formula `tokens × rate` reproduces the frozen total exactly); null for
+ * multi-model or partially-unpriced turns.
+ */
+export interface RequestRates {
+  input_per_1m: number | null;
+  output_per_1m: number | null;
+  cache_read_per_1m: number | null;
+  cache_write_per_1m: number | null;
+}
+
 /** One assistant turn (request) with its per-source breakdown. */
 export interface RequestUsage extends TokenBreakdown {
   message_id: string | null;
   created_at: number;
   model: string | null;
   provider: string | null;
+  rates: RequestRates | null;
   by_source: ToolUsage[];
 }
 

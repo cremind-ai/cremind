@@ -63,6 +63,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 [[models]]
 id = "magistral-medium-latest"
 display_name = "Magistral Medium"
+supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 input_price_per_1m = 2.00

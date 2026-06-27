@@ -25,6 +25,7 @@ output_price_per_1m = 1.50
 [[models]]
 id = "deepseek-ai/DeepSeek-R1-0528"
 display_name = "DeepSeek R1"
+supports_reasoning = true
 group_hint = "high"
 prompt_cache = false
 input_price_per_1m = 1.00
@@ -42,6 +43,7 @@ output_price_per_1m = 0.88
 [[models]]
 id = "Qwen/Qwen3-235B-A22B"
 display_name = "Qwen 3 235B"
+supports_reasoning = true
 group_hint = "high"
 prompt_cache = false
 input_price_per_1m = 0.50

@@ -10,7 +10,11 @@ from starlette.routing import Route
 from app.agent.stream_runner import cancel_run, make_run_id
 from app.config.embedding_state import embedding_state
 from app.config.settings import BaseConfig
-from app.config.user_config import resolve_compaction_config, resolve_memory_config
+from app.config.user_config import (
+    replay_reasoning_enabled,
+    resolve_compaction_config,
+    resolve_memory_config,
+)
 from app.events import queue as event_queue
 from app.api.events import publish_skill_events_admin_changed
 from app.api.file_watchers import publish_file_watchers_admin_changed
@@ -81,6 +85,46 @@ def _usage_by_source(rows: list[dict]) -> list[dict]:
 def _cache_hit_rate(totals: dict) -> float:
     denom = totals["input_tokens"] + totals["cache_read_input_tokens"]
     return (totals["cache_read_input_tokens"] / denom) if denom else 0.0
+
+
+def _uniform_rates(rows: list[dict]) -> dict | None:
+    """Per-1M rate card for the turn, only when it explains the cost exactly.
+
+    Returns the four per-1M rates iff **every** row shares one identical rate
+    snapshot. If any row is unpriced (no snapshot) or uses a different rate set
+    (e.g. a sub-agent on another model), returns ``None`` — then the aggregate
+    ``tokens × rate`` would not equal the frozen total, so the UI shows the
+    symbolic formula instead of a worked, plugged-in one.
+    """
+    seen: tuple | None = None
+    for r in rows:
+        # Zero-token rows (bookkeeping / intrinsic) add nothing to the token sum
+        # or the cost, so they can't break the `tokens × rate == total` identity
+        # — skip them rather than let a missing snapshot veto the rate card.
+        if not (r["input_tokens"] + r["cache_read_input_tokens"]
+                + r["cache_creation_input_tokens"] + r["output_tokens"]):
+            continue
+        snap = r.get("rate_snapshot")
+        if not snap:
+            return None
+        rates = (
+            snap.get("input_per_1m"),
+            snap.get("output_per_1m"),
+            snap.get("cache_read_per_1m"),
+            snap.get("cache_write_per_1m"),
+        )
+        if seen is None:
+            seen = rates
+        elif rates != seen:
+            return None
+    if seen is None:
+        return None
+    return {
+        "input_per_1m": seen[0],
+        "output_per_1m": seen[1],
+        "cache_read_per_1m": seen[2],
+        "cache_write_per_1m": seen[3],
+    }
 
 
 def get_conversation_routes(
@@ -257,11 +301,13 @@ def get_conversation_routes(
         })
 
     async def handle_trigger_memory(request: Request) -> JSONResponse:
-        """Manually fold this conversation now (running summary + long-term memory).
+        """Compact this conversation now (model-driven).
 
-        User-initiated: folds the current tail regardless of the compaction
-        threshold so a short conversation can have its memory extracted on demand.
-        Runs synchronously; returns the result so the panel can refresh.
+        Runs a synthetic "please compact" turn through the agent so the MAIN
+        model — with the conversation already in its cached prefix — writes the
+        running summary (and any long-term facts) by calling the
+        ``compact_conversation`` tool. The synthetic message and the model's
+        reply are NOT persisted and never shown to the user.
         """
         unauth = _require_auth(request)
         if unauth is not None:
@@ -276,13 +322,54 @@ def get_conversation_routes(
 
         from app.agent import compaction
         from app.events.runner import get_cremind_agent
-        folded = await compaction.force_fold(
+
+        agent = get_cremind_agent()
+        if agent is None:
+            return JSONResponse({"error": "Agent not available"}, status_code=503)
+
+        context_id = conv.get("context_id") or conversation_id
+        # Effective history (current summary + verbatim tail) = the cached prefix.
+        history = await compaction.build_compacted_history(
             conversation_id=conversation_id,
             profile=profile,
             conversation_storage=conversation_storage,
-            cremind_agent=get_cremind_agent(),
+            fallback_history=[],
         )
-        return JSONResponse({"folded": folded}, status_code=200)
+        synthetic = (
+            "Please compact our conversation now to free up context. Summarize "
+            "EVERYTHING discussed so far into a single dense, self-contained "
+            "running summary that preserves all facts, decisions, identifiers "
+            "(IDs, file paths, URLs, commands, config keys, exact values), "
+            "unresolved questions and pending TODOs, and my goals, constraints "
+            "and preferences. Then call the compact_conversation tool with that "
+            "summary (and any durable long_term_memories). Do not do anything "
+            "else."
+        )
+        # NOTE: this is a technique — the synthetic message is never persisted to
+        # the conversation and the user never sees it. We drain the stream; the
+        # compact_conversation tool does the persistence.
+        before, _, _ = await conversation_storage.get_compaction_state(conversation_id)
+        try:
+            async for _chunk in agent.run(
+                query=synthetic,
+                task_history=history,
+                context_id=context_id,
+                profile=profile,
+                reasoning=True,
+            ):
+                pass
+        except Exception as e:  # noqa: BLE001
+            logger.exception(f"compaction run failed for {conversation_id}")
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+        after, _, _ = await conversation_storage.get_compaction_state(conversation_id)
+        compacted = after != before
+        try:
+            from app.events.stream_bus import get_event_stream_bus
+            await get_event_stream_bus().publish(conversation_id, "compacted", {})
+        except Exception:  # noqa: BLE001
+            logger.debug("failed to publish compacted event", exc_info=True)
+        return JSONResponse({"compacted": compacted}, status_code=200)
 
     async def handle_post_message(request: Request) -> JSONResponse:
         """Enqueue a user message for streaming agent processing.
@@ -372,7 +459,9 @@ def get_conversation_routes(
         try:
             db_msgs = await conversation_storage.get_messages(conversation_id)
             if db_msgs:
-                history_messages = convert_db_messages_to_history(db_msgs, inject_ids=True)
+                history_messages = convert_db_messages_to_history(
+                    db_msgs, include_reasoning=replay_reasoning_enabled(profile),
+                )
         except Exception:  # noqa: BLE001
             logger.exception(
                 f"POST message: failed to load history for {conversation_id}"
@@ -690,6 +779,7 @@ def get_conversation_routes(
                 "model": reasoning.get("model"),
                 "provider": reasoning.get("provider"),
                 **_usage_sum(grp),
+                "rates": _uniform_rates(grp),
                 "by_source": _usage_by_source(grp),
             })
 

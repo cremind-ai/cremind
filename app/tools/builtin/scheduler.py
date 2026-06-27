@@ -109,52 +109,14 @@ TOOL_CONFIG: ToolConfig = {
     # extraction tools.
     "default_model_group": "low",
     "hidden": True,
-    # NOT direct_dispatch: this tool's contract is that the LLM fills the
-    # structured schema below.
+    # This tool's contract is that the reasoning model fills the structured
+    # schema below directly via native function calling.
     "llm_parameters": {
         "tool_instructions": (
             "Classify and normalize a schedule expression (a single time, an "
             "interval, a recurring rule, a hand-listed set, a query window, or "
             "a filtering constraint) into machine-usable datetimes and, for "
             "recurrences, an RFC 5545 RRULE."
-        ),
-        "system_prompt": (
-            "You decompose a natural-language schedule expression and call the "
-            "scheduler tool with the result. You have exactly one task.\n"
-            "NEVER use your own knowledge of the current date or time — emit "
-            "only atomic offsets and let the system compute the actual "
-            "datetimes. Decompose each time anchor left-to-right into "
-            "time_elements exactly as for datetime_parser ('tomorrow' = "
-            "relative day offset 1; '3pm' = absolute hour 15; 'next Monday' = "
-            "offset_unit='monday', offset_value=1).\n"
-            "Pick exactly one schedule_kind and fill the matching carrier:\n"
-            "- instant: a single point -> time_elements (single_time_mode=true).\n"
-            "- interval: a bounded span -> start in time_elements plus either "
-            "'end'-tagged elements (explicit end time) or a duration (a length).\n"
-            "- recurrence: a repeat rule ('every', 'each', 'weekly') -> the "
-            "recurrence object; put the time-of-day in time_elements; express a "
-            "'until <date>' via until_elements and a fixed count via "
-            "recurrence.count.\n"
-            "- explicit_set: a finite hand-listed union of distinct dates -> "
-            "members; a time stated once for all may go in the top-level "
-            "time_elements.\n"
-            "- window: a region to QUERY rather than book ('this week', "
-            "'availability') -> time_elements with single_time_mode=false.\n"
-            "- constraint: a standalone filtering predicate -> constraints.\n"
-            "A predicate that merely qualifies another kind ('every day in the "
-            "afternoon') stays in the constraints array on the real kind; do not "
-            "set schedule_kind='constraint' for it. Prefer recurrence over "
-            "explicit_set when the same weekday repeats weekly.\n"
-            "To ANALYZE/normalize a schedule expression, call `scheduler` with "
-            "the decomposition above.\n"
-            "If the request is to CREATE a scheduled task or reminder and the "
-            "time has already been normalized, call `schedule_create`, copying "
-            "dtstart and any rrule / recurrence_end_type / recurrence_end_value "
-            "VERBATIM from the normalized data — never invent datetimes. Set the "
-            "title from the user's request in their ORIGINAL language; never "
-            "translate it. To review or cancel existing scheduled events, call "
-            "`schedule_list` / `schedule_cancel`. If only the `scheduler` "
-            "function is available, always call `scheduler`."
         ),
     },
 }
@@ -165,7 +127,11 @@ class SchedulerTool(BuiltInTool):
     description: str = (
         "Classify a schedule expression (instant, interval, recurrence, "
         "explicit set, query window, or constraint) and normalize it into "
-        "concrete datetimes and an RFC 5545 RRULE for calendar/reminder services."
+        "concrete datetimes and an RFC 5545 RRULE for calendar/reminder services. "
+        "Decompose each time anchor into atomic relative offsets — do NOT compute "
+        "absolute datetimes from your own knowledge of the current time; the "
+        "server resolves the offsets against the real clock. To then create the "
+        "scheduled task, pass the normalized output to schedule_create."
     )
     parameters: Dict[str, Any] = {
         "type": "object",

@@ -33,8 +33,8 @@ def _seed_profile(store: ToolStorage, name: str) -> None:
     with store._engine.begin() as conn:  # noqa: SLF001 — test seeding
         conn.execute(
             text(
-                "INSERT INTO profiles (id, name, created_at, updated_at, skill_mode) "
-                "VALUES (:id, :name, :c, :u, 'manual')"
+                "INSERT INTO profiles (id, name, created_at, updated_at) "
+                "VALUES (:id, :name, :c, :u)"
             ),
             {"id": name, "name": name, "c": now, "u": now},
         )

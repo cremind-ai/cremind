@@ -58,8 +58,8 @@ def _seed(store: ConversationStorage, *, profile="admin", conv="c1", n_messages=
     now = time.time()
     with store.provider.sync_engine().begin() as conn:
         conn.execute(text(
-            "INSERT INTO profiles (id, name, created_at, updated_at, skill_mode) "
-            "VALUES ('p', :profile, :now, :now, 'manual')"
+            "INSERT INTO profiles (id, name, created_at, updated_at) "
+            "VALUES ('p', :profile, :now, :now)"
         ), {"profile": profile, "now": now})
         # compaction_watermark column has no DDL default (ORM-side default=-1), so
         # the raw INSERT must supply it.
@@ -160,8 +160,14 @@ class _FakeAgent:
     def __init__(self, llm):
         self._llm = llm
 
-    def low_group_llm(self, profile):
+    def auxiliary_llm(self, profile):
         return self._llm
+
+
+def _async_return(value):
+    async def _fn(*args, **kwargs):
+        return value
+    return _fn
 
 
 def _cfg(*, enabled=True, threshold=25, keep_recent_tokens=5, keep_recent_messages=1,
@@ -204,15 +210,6 @@ async def _build(store, agent, fallback):
 
 # ── pure helpers ───────────────────────────────────────────────────────────────
 
-def test_select_fold_count_respects_target_and_floor() -> None:
-    tail = [_msg(i, _TEN) for i in range(4)]  # ~10 tokens each, ~40 total
-    # keep_recent_messages floor caps the cut at n - floor.
-    assert compaction._select_fold_count(tail, _cfg(keep_recent_messages=1)) == 3
-    assert compaction._select_fold_count(tail, _cfg(keep_recent_messages=2)) == 2
-    # A generous target means nothing needs folding.
-    assert compaction._select_fold_count(tail, _cfg(keep_recent_tokens=10_000)) == 0
-
-
 def test_build_effective_shapes() -> None:
     tail = [_msg(5, "hello"), _msg(6, "world", role="agent")]
     # With a summary: first message is the user-role summary block, then the tail.
@@ -250,88 +247,115 @@ def test_below_threshold_no_fold(monkeypatch) -> None:
     assert not out[0]["content"].startswith("[Summary")
 
 
-def test_over_threshold_folds_and_advances_watermark(monkeypatch) -> None:
+def test_over_threshold_does_not_auto_fold(monkeypatch) -> None:
+    # Compaction is now model-driven (suggest-only): even over threshold the read
+    # path NEVER folds automatically — it just returns summary + verbatim tail.
     _patch_cfg(monkeypatch, _cfg(threshold=25, keep_recent_tokens=5, keep_recent_messages=1))
     store = _FakeStore([_msg(i, _TEN) for i in range(4)])
     agent = _FakeAgent(_FakeLLM(output="RUNNING SUMMARY"))
     out = asyncio.run(_build(store, agent, fallback=[]))
 
-    assert agent._llm.calls == 1
-    assert len(store.set_calls) == 1
-    new_summary, new_watermark = store.set_calls[0]
-    assert new_summary == "RUNNING SUMMARY"
-    assert new_watermark == 2             # folded msgs 0,1,2 → watermark = last folded ordering
-    # summary is the FIRST history message (user role), kept tail follows
-    assert out[0]["role"] == "user"
-    assert "RUNNING SUMMARY" in out[0]["content"]
-    assert out[0]["content"].startswith("[Summary of earlier conversation")
-    assert len(out) == 2                  # summary + the one kept message (ordering 3)
-
-
-def test_memory_enabled_fold_extracts_long_term_to_db(monkeypatch) -> None:
-    # Memory on + embedding off: the fold is a forced save_memory tool call that
-    # yields the running summary AND long-term facts; facts route to the DB queue.
-    _patch_cfg(
-        monkeypatch,
-        _cfg(threshold=25, keep_recent_tokens=5, keep_recent_messages=1),
-        memory_cfg=_mem_cfg(enabled=True),
-    )
-    monkeypatch.setattr(
-        compaction.BaseConfig, "is_embedding_enabled", classmethod(lambda cls: False)
-    )
-
-    class _FakeMemStore:
-        def __init__(self):
-            self.added: list[str] = []
-
-        async def get_long_term(self, profile):
-            return []
-
-        async def add_long_term(self, *, profile, content, token_count,
-                                source_conversation_id, queue_size):
-            self.added.append(content)
-            return {"content": content}
-
-    fake_mem = _FakeMemStore()
-    monkeypatch.setattr(compaction, "get_memory_storage", lambda: fake_mem)
-
-    store = _FakeStore([_msg(i, _TEN) for i in range(4)])
-    tool_args = {"short_term_memory": "RUNNING SUMMARY", "long_term_memories": ["User is Lee"]}
-    agent = _FakeAgent(_FakeLLM(tool_args=tool_args))
-    out = asyncio.run(_build(store, agent, fallback=[]))
-
-    assert agent._llm.calls == 1
-    new_summary, new_watermark = store.set_calls[0]
-    assert new_summary == "RUNNING SUMMARY"
-    assert "RUNNING SUMMARY" in out[0]["content"]
-    assert fake_mem.added == ["User is Lee"]   # long-term routed to the DB queue
-
-
-def test_hysteresis_no_recompaction_next_turn(monkeypatch) -> None:
-    _patch_cfg(monkeypatch, _cfg(threshold=25, keep_recent_tokens=5, keep_recent_messages=1))
-    store = _FakeStore([_msg(i, _TEN) for i in range(4)])
-    agent = _FakeAgent(_FakeLLM(output="RUNNING SUMMARY"))
-
-    out1 = asyncio.run(_build(store, agent, fallback=[]))
-    # Second turn: tail is now just message 3 (+ the small summary) → under threshold.
-    out2 = asyncio.run(_build(store, agent, fallback=[]))
-
-    assert agent._llm.calls == 1          # NOT called again
-    assert len(store.set_calls) == 1      # watermark/summary unchanged
-    # The cached summary block is byte-identical across the two turns.
-    assert out1[0]["content"] == out2[0]["content"]
-
-
-def test_summarizer_failure_keeps_state_and_sends_full_tail(monkeypatch) -> None:
-    _patch_cfg(monkeypatch, _cfg(threshold=25, keep_recent_tokens=5, keep_recent_messages=1))
-    store = _FakeStore([_msg(i, _TEN) for i in range(4)])
-    agent = _FakeAgent(_FakeLLM(output=""))   # empty → no CONTENT chunk → empty summary
-    out = asyncio.run(_build(store, agent, fallback=[]))
-
-    assert agent._llm.calls == 1          # attempted
-    assert store.set_calls == []          # NOT persisted (no data lost)
+    assert agent._llm.calls == 0          # no summarizer call
+    assert store.set_calls == []          # state untouched
     assert len(out) == 4                  # full verbatim tail, no summary block
     assert not out[0]["content"].startswith("[Summary")
+
+
+def test_compaction_suggestion_over_and_under_threshold(monkeypatch) -> None:
+    _patch_cfg(monkeypatch, _cfg(threshold=25, keep_recent_tokens=5, max_tokens=5))
+    over = _FakeStore([_msg(i, _TEN) for i in range(4)])  # ~40 tokens > 25
+    s = asyncio.run(compaction.compaction_suggestion(
+        conversation_id="c1", profile="admin", conversation_storage=over,
+    ))
+    assert s is not None
+    assert s["current_tokens"] >= s["threshold"] == 25
+    assert s["estimated_savings"] >= 0
+
+    _patch_cfg(monkeypatch, _cfg(threshold=1_000_000))
+    under = _FakeStore([_msg(0, _TEN)])
+    assert asyncio.run(compaction.compaction_suggestion(
+        conversation_id="c1", profile="admin", conversation_storage=under,
+    )) is None
+
+
+def test_compaction_suggestion_counts_reasoning_trace(monkeypatch) -> None:
+    # Tiny final-answer content, but a big replayed reasoning trace. With replay ON
+    # the trace tokens must count toward the threshold (else the prompt grows large
+    # without ever suggesting a compaction); with replay OFF only content counts.
+    _patch_cfg(monkeypatch, _cfg(threshold=25, keep_recent_tokens=5, max_tokens=5))
+    big_trace = [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "search", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1",
+         "content": " ".join([_TEN] * 4)},  # ~40 tokens of tool output
+        {"role": "assistant", "content": "ok"},
+    ]
+    msgs = [{"id": "m0", "role": "agent", "content": "ok",
+             "ordering": 0, "llm_messages": big_trace}]
+
+    monkeypatch.setattr(compaction, "replay_reasoning_enabled", lambda profile: True)
+    s_on = asyncio.run(compaction.compaction_suggestion(
+        conversation_id="c1", profile="admin", conversation_storage=_FakeStore(msgs),
+    ))
+    assert s_on is not None and s_on["current_tokens"] >= 25  # trace counted
+
+    monkeypatch.setattr(compaction, "replay_reasoning_enabled", lambda profile: False)
+    s_off = asyncio.run(compaction.compaction_suggestion(
+        conversation_id="c1", profile="admin", conversation_storage=_FakeStore(msgs),
+    ))
+    assert s_off is None  # only the tiny "ok" content counts → under threshold
+
+
+def test_build_effective_replays_trace_when_enabled() -> None:
+    trace = [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "t", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "res"},
+        {"role": "assistant", "content": "final"},
+    ]
+    tail = [{"id": "m5", "role": "agent", "content": "final",
+             "ordering": 5, "llm_messages": trace}]
+    # include_reasoning splices the trace; without it, content-only.
+    assert compaction._build_effective(None, tail, include_reasoning=True) == trace
+    out_off = compaction._build_effective(None, tail, include_reasoning=False)
+    assert out_off == [{"role": "assistant", "content": "final"}]
+
+
+def test_apply_compaction_persists_summary_and_advances_watermark(monkeypatch) -> None:
+    _patch_cfg(monkeypatch, _cfg(max_tokens=2048))
+    monkeypatch.setattr(
+        compaction, "_store_long_term_facts",
+        _async_return(0),
+    )
+    store = _FakeStore([_msg(i, _TEN) for i in range(4)])  # orderings 0..3
+    result = asyncio.run(compaction.apply_compaction(
+        conversation_id="c1", profile="admin",
+        summary="THE RUNNING SUMMARY", long_term=[], conversation_storage=store,
+    ))
+    assert result["watermark"] == 3          # newest message ordering
+    assert store.set_calls == [("THE RUNNING SUMMARY", 3)]
+
+
+def test_apply_compaction_routes_long_term_facts(monkeypatch) -> None:
+    _patch_cfg(monkeypatch, _cfg())
+    captured: dict = {}
+
+    async def _fake_store_facts(profile, conversation_id, facts):
+        captured["facts"] = facts
+        return len(facts)
+
+    monkeypatch.setattr(compaction, "_store_long_term_facts", _fake_store_facts)
+    store = _FakeStore([_msg(0, _TEN), _msg(1, _TEN)])
+    result = asyncio.run(compaction.apply_compaction(
+        conversation_id="c1", profile="admin",
+        summary="S", long_term=["User is Lee", "Repo at /x"], conversation_storage=store,
+    ))
+    assert captured["facts"] == ["User is Lee", "Repo at /x"]
+    assert result["long_term_stored"] == 2
 
 
 def test_excludes_current_turn_message(monkeypatch) -> None:

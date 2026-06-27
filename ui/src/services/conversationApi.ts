@@ -31,7 +31,16 @@ export interface MessageRecord {
   role: 'user' | 'agent';
   content: string | null;
   parts: any[] | null;
-  thinking_steps: { thought: string; action: string; action_input: string; observation?: { kind: string; text?: string; data?: Record<string, any>; file?: any }[]; model_label?: string | null; reasoning_model_label?: string | null }[] | null;
+  thinking_steps: {
+    step?: number | null;
+    call_id?: string | null;
+    tool?: string;
+    tool_input?: string;
+    result?: { kind: string; text?: string; data?: Record<string, any>; file?: any }[];
+    // Legacy fields (older persisted messages) read for back-compat.
+    observation?: { kind: string; text?: string; data?: Record<string, any>; file?: any }[];
+    model_label?: string | null;
+  }[] | null;
   token_usage: {
     input_tokens: number;
     output_tokens: number;

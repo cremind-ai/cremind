@@ -32,10 +32,7 @@ from typing import Any, Dict, List, Optional
 
 from a2a.types import DataPart, FilePart, Part
 
-from app.agent import memory_runner
-from app.agent.summary import summarize_reasoning
 from app.agent.usage import reconcile
-from app.config.user_config import resolve_memory_config
 from app.constants import ChatCompletionTypeEnum
 from app.events.notifications_buffer import get_event_notifications
 from app.events.stream_bus import get_event_stream_bus
@@ -297,22 +294,16 @@ async def run_agent_to_bus(
     # carried on terminal chunks. Overwritten each terminal chunk so the final
     # one holds the complete list (mirrors how the token totals are captured).
     collected_usage_records: list[dict] = []
-    reasoning_input_section: str | None = None
+    # The turn's native reasoning trace (assistant tool_calls + tool results + final
+    # answer), carried on the terminal DONE chunk. Persisted so later turns can replay
+    # it into history. ``None`` for turns with no tool calls (those replay content-only).
+    collected_llm_messages: list | None = None
     errored = False
     cancelled = False
     # The id of this turn's just-persisted user/trigger message, captured below.
     # Passed to compaction so the current turn (sent separately as the volatile
     # input) is excluded from the rebuilt history tail.
     current_turn_msg_id: Optional[str] = None
-
-    # Memory feature (independent background session). Read the per-profile
-    # config once for this turn: used both to inject stored memory into the
-    # prompt (consumption) and to decide whether to schedule a post-turn
-    # extraction. Any failure simply disables memory for this turn.
-    try:
-        memory_cfg = resolve_memory_config(profile)
-    except Exception:  # noqa: BLE001
-        memory_cfg = None
 
     try:
         # 1. Persist the trigger / user message and announce it on the bus.
@@ -404,17 +395,9 @@ async def run_agent_to_bus(
             exclude_message_id=current_turn_msg_id,
         )
 
-        # Consumption: load long-term memory as the ## Memory block — retrieved by
-        # similarity to the latest user message (embedding on) or read from the DB
-        # queue (embedding off). After compaction, so long-term facts a fold wrote
-        # this turn are visible immediately. The agent places this block in its
-        # volatile per-step input, never in the cached system prompt.
-        memory_context = ""
-        if memory_cfg is not None and memory_cfg.enabled:
-            memory_context = await memory_runner.load_memory_context(
-                profile, query_text=agent_query,
-            )
-
+        # Long-term memory is NOT injected into the prompt (that would bust the
+        # cache every turn). The model retrieves it on demand via the
+        # ``search_memory`` tool.
         try:
             async for chunk in cremind_agent.run(
                 query=agent_query,
@@ -423,7 +406,6 @@ async def run_agent_to_bus(
                 profile=profile,
                 reasoning=reasoning,
                 triggered_by_event=trigger_event is not None,
-                memory_context=memory_context,
             ):
                 ctype = chunk.get("type")
 
@@ -437,35 +419,48 @@ async def run_agent_to_bus(
                     thinking_data = chunk.get("data", {}) or {}
                     await bus.publish(conversation_id, "thinking", thinking_data)
                     collected_thinking_steps.append({
-                        "thought": thinking_data.get("Thought", ""),
-                        "action": thinking_data.get("Action", ""),
-                        "action_input": thinking_data.get("Action_Input", ""),
+                        "step": thinking_data.get("Step"),
+                        "call_id": thinking_data.get("Call_Id"),
+                        "tool": thinking_data.get("Tool", ""),
+                        "tool_input": thinking_data.get("Tool_Input", ""),
                         "model_label": thinking_data.get("Model_Label"),
-                        "reasoning_model_label": thinking_data.get("Reasoning_Model_Label"),
                     })
 
                 elif ctype == ChatCompletionTypeEnum.RESULT_ARTIFACT:
                     result_data = chunk.get("data", {}) or {}
-                    observation_parts = result_data.get("Observation", []) or []
-                    serialized_observation = _serialize_observation(observation_parts)
+                    call_id = result_data.get("Call_Id")
+                    # ``Result`` is the new key; fall back to ``Observation``.
+                    result_parts = (
+                        result_data.get("Result") or result_data.get("Observation") or []
+                    )
+                    serialized_result = _serialize_observation(result_parts)
 
                     await bus.publish(conversation_id, "result", {
-                        "Observation": serialized_observation,
+                        "step": result_data.get("Step"),
+                        "call_id": call_id,
+                        "Result": serialized_result,
                     })
 
-                    for obs_part in observation_parts:
+                    for obs_part in result_parts:
                         if hasattr(obs_part, "root") and isinstance(obs_part.root, FilePart):
                             collected_file_parts.append(obs_part)
                             file_payload = obs_part.root.model_dump(mode="json")
                             await bus.publish(conversation_id, "file", file_payload)
 
-                    for terminal in _terminal_payloads(observation_parts):
+                    for terminal in _terminal_payloads(result_parts):
                         await bus.publish(conversation_id, "terminal", terminal)
 
-                    if collected_thinking_steps:
+                    # Attach the result to its originating step (match by call_id,
+                    # so parallel tools in one step pair up correctly).
+                    if call_id:
+                        for step in collected_thinking_steps:
+                            if step.get("call_id") == call_id and "result" not in step:
+                                step["result"] = serialized_result
+                                break
+                    else:
                         for step in reversed(collected_thinking_steps):
-                            if "observation" not in step:
-                                step["observation"] = serialized_observation
+                            if "result" not in step:
+                                step["result"] = serialized_result
                                 break
 
                 elif ctype in (
@@ -482,11 +477,8 @@ async def run_agent_to_bus(
                     total_output_tokens = chunk.get("output_tokens") or total_output_tokens
                     if chunk.get("usage_records"):
                         collected_usage_records = chunk["usage_records"]
-                    if (
-                        ctype == ChatCompletionTypeEnum.DONE
-                        and chunk.get("input_section")
-                    ):
-                        reasoning_input_section = chunk["input_section"]
+                    if chunk.get("llm_messages"):
+                        collected_llm_messages = chunk["llm_messages"]
         except asyncio.CancelledError:
             cancelled = True
             logger.info(f"stream_runner: run {run_id} cancelled")
@@ -538,23 +530,7 @@ async def run_agent_to_bus(
             except Exception:  # noqa: BLE001
                 logger.exception("stream_runner: failed to publish error event")
 
-        # 3. Optional reasoning summary (skip on cancel/error to keep the UI
-        #    state consistent with the partial response).
-        summary_text: str | None = None
-        if reasoning_input_section and not errored and not cancelled:
-            try:
-                await bus.publish(conversation_id, "phase", {"phase": "summarizing"})
-                summary_text = await summarize_reasoning(
-                    cremind_agent, reasoning_input_section, profile,
-                )
-                if summary_text:
-                    await bus.publish(conversation_id, "summary", {"summary": summary_text})
-            except Exception:  # noqa: BLE001
-                logger.exception("stream_runner: failed to produce reasoning summary")
-                summary_text = None
-
-        # 4. Token usage (after summary so any summary tokens are included
-        #    upstream; here we only report what the agent loop reported).
+        # 4. Token usage — what the agent loop reported this turn.
         if total_input_tokens or total_output_tokens:
             await bus.publish(conversation_id, "token_usage", {
                 "token_usage": {
@@ -604,8 +580,8 @@ async def run_agent_to_bus(
                 content=final_text,
                 parts=persist_parts,
                 thinking_steps=collected_thinking_steps or None,
+                llm_messages=collected_llm_messages,
                 token_usage=token_usage_data,
-                summary=summary_text,
                 metadata=agent_message_metadata,
             )
             assistant_msg_id = (
@@ -668,6 +644,21 @@ async def run_agent_to_bus(
             publish_conversations_changed(profile)
         except Exception:  # noqa: BLE001
             logger.debug("conversations-list publish failed", exc_info=True)
+
+        # 6b. Suggest compaction (popup) when the conversation crosses the
+        #     threshold. Suggest-only — never forced; the user clicks to compact.
+        if not errored and not cancelled:
+            try:
+                from app.agent import compaction
+                suggestion = await compaction.compaction_suggestion(
+                    conversation_id=conversation_id,
+                    profile=profile,
+                    conversation_storage=conversation_storage,
+                )
+                if suggestion:
+                    await bus.publish(conversation_id, "compaction_suggested", suggestion)
+            except Exception:  # noqa: BLE001
+                logger.debug("compaction suggestion check failed", exc_info=True)
 
         # 7. Terminal event so subscribers can flip isStreaming=false.
         await bus.publish(conversation_id, "complete", {

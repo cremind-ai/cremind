@@ -33,6 +33,7 @@ output_price_per_1m = 1.00
 [[models]]
 id = "sonar-reasoning-pro"
 display_name = "Sonar Reasoning Pro"
+supports_reasoning = true
 group_hint = "high"
 prompt_cache = false
 input_price_per_1m = 2.00
@@ -41,6 +42,7 @@ output_price_per_1m = 8.00
 [[models]]
 id = "sonar-deep-research"
 display_name = "Sonar Deep Research"
+supports_reasoning = true
 group_hint = "high"
 prompt_cache = false
 input_price_per_1m = 2.00

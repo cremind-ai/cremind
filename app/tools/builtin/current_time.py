@@ -34,22 +34,11 @@ TOOL_CONFIG: ToolConfig = {
     # Lightweight, structured extraction — matches every other extraction tool.
     "default_model_group": "low",
     # NOT hidden: the reasoning agent must see this tool to answer time
-    # questions. NOT direct_dispatch: the child LLM fills the structured
-    # ``timezone`` argument (resolving a named location to its IANA zone).
+    # questions. The reasoning model fills the structured ``timezone``
+    # argument directly (resolving a named location to its IANA zone).
     "llm_parameters": {
         "tool_instructions": (
             "Get the current date and time, optionally in a specific timezone."
-        ),
-        "system_prompt": (
-            "You report the current time by calling the get_current_time tool. "
-            "You have exactly one task.\n"
-            "If the request names a place (city, region, or country), set "
-            "`timezone` to its IANA timezone name — e.g. Tokyo -> 'Asia/Tokyo', "
-            "New York -> 'America/New_York', London -> 'Europe/London', UTC -> "
-            "'UTC'. If no place is named (e.g. 'what time is it'), leave "
-            "`timezone` empty to get the server's local time.\n"
-            "Do not answer questions or perform any other task. Always respond "
-            "by calling get_current_time."
         ),
     },
 }
