@@ -57,6 +57,13 @@ const tokensRemaining = computed(() => {
   return Math.max(0, p.threshold - p.current);
 });
 
+// The threshold as a percentage of the model's context window (e.g. 85%).
+const thresholdPercentOfWindow = computed(() => {
+  const p = memory.value?.token_progress;
+  if (!p || !p.context_window) return 0;
+  return Math.round((p.threshold / p.context_window) * 100);
+});
+
 async function load(): Promise<void> {
   if (!props.conversationId) return;
   loading.value = true;
@@ -151,7 +158,14 @@ watch(
       <!-- Token progress toward the next compaction fold -->
       <div class="memory-progress">
         <div class="memory-progress-head">
-          <span class="memory-progress-label">Next compaction</span>
+          <span class="memory-progress-label">
+            Next compaction
+            <ElTooltip
+              content="How much of the model's context window the latest turn used. Once it reaches the threshold, the oldest turns fold into a running summary so the prompt stays within the window."
+            >
+              <Icon icon="mdi:help-circle-outline" class="hint-icon" />
+            </ElTooltip>
+          </span>
           <span class="memory-progress-value">
             {{ memory.token_progress.current.toLocaleString() }} /
             {{ memory.token_progress.threshold.toLocaleString() }} tokens
@@ -164,8 +178,19 @@ watch(
         />
         <div class="memory-progress-foot">
           <span v-if="progressPercent >= 100">Threshold reached — the oldest turns will fold into the summary on the next turn.</span>
-          <span v-else>≈ {{ tokensRemaining.toLocaleString() }} more message tokens until the next fold.</span>
+          <span v-else>≈ {{ tokensRemaining.toLocaleString() }} more tokens until the next fold.</span>
         </div>
+        <!-- How the number is computed, so the mechanism is transparent. -->
+        <p class="memory-progress-formula">
+          <strong>How it's measured:</strong> the model's actual reported context size
+          for the latest turn — the real prompt it processed (system prompt + tools +
+          history + this turn's reasoning and tool results). Compaction is suggested
+          once that reaches
+          <strong>{{ thresholdPercentOfWindow }}%</strong> of this model's
+          <strong>{{ memory.token_progress.context_window.toLocaleString() }}</strong>-token
+          context window, leaving headroom for the response. It tracks the current
+          turn, so it can rise or fall between turns.
+        </p>
       </div>
 
       <!-- Short-term: this conversation's running summary -->
@@ -285,9 +310,20 @@ watch(
   align-items: baseline;
   margin-bottom: 4px;
 }
-.memory-progress-label { font-weight: 600; color: var(--text-primary); }
+.memory-progress-label { font-weight: 600; color: var(--text-primary); display: inline-flex; align-items: center; gap: 4px; }
 .memory-progress-value { font-size: 0.8rem; color: var(--text-secondary); }
 .memory-progress-foot { margin-top: 4px; font-size: 0.78rem; color: var(--text-tertiary, var(--text-secondary)); }
+.memory-progress-formula {
+  margin: 8px 0 0 0;
+  padding: 8px 10px;
+  background: var(--hover-bg);
+  border-radius: 8px;
+  font-size: 0.76rem;
+  line-height: 1.5;
+  color: var(--text-tertiary, var(--text-secondary));
+}
+.memory-progress-formula strong { color: var(--text-secondary); font-weight: 600; }
+.memory-progress-formula em { font-style: italic; }
 
 .memory-section h4 {
   display: flex;

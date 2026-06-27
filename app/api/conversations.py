@@ -12,7 +12,6 @@ from app.config.embedding_state import embedding_state
 from app.config.settings import BaseConfig
 from app.config.user_config import (
     replay_reasoning_enabled,
-    resolve_compaction_config,
     resolve_memory_config,
 )
 from app.events import queue as event_queue
@@ -26,7 +25,7 @@ from app.events.stream_bus import get_event_stream_bus
 from app.storage import get_memory_storage, get_usage_storage
 from app.storage.conversation_storage import ConversationStorage, is_valid_conversation_id
 from app.utils import logger
-from app.utils.common import convert_db_messages_to_history, count_content_tokens
+from app.utils.common import convert_db_messages_to_history
 from app.utils.uploads_tmp import is_inside_conversation_tmp
 
 
@@ -255,8 +254,10 @@ def get_conversation_routes(
 
         Short-term memory is now the conversation's running compaction summary;
         long-term comes from the vector store (embedding on) or the DB queue
-        (embedding off). Also reports progress toward the next fold (verbatim-tail
-        tokens vs. the compaction threshold) so the UI panel can poll for updates.
+        (embedding off). Also reports progress toward the next fold — the model's
+        reported context size for the latest turn vs. the threshold
+        (``compact_threshold_percent`` of the active model's context window; see
+        :func:`app.agent.compaction.context_usage`) — so the UI panel can poll.
         """
         unauth = _require_auth(request)
         if unauth is not None:
@@ -270,7 +271,6 @@ def get_conversation_routes(
             return JSONResponse({"error": "Forbidden"}, status_code=403)
 
         cfg = resolve_memory_config(profile)
-        comp_cfg = resolve_compaction_config(profile)
         summary, watermark, last_compacted_at = await conversation_storage.get_compaction_state(
             conversation_id
         )
@@ -285,16 +285,19 @@ def get_conversation_routes(
         else:
             long_term = await get_memory_storage().get_long_term(profile)
 
-        tail = await conversation_storage.get_messages_after(conversation_id, watermark)
-        current_tokens = count_content_tokens(summary or "") + sum(
-            count_content_tokens(m.get("content") or "") for m in tail
+        from app.agent import compaction
+        usage = await compaction.context_usage(
+            conversation_id=conversation_id,
+            profile=profile,
+            conversation_storage=conversation_storage,
         )
         return JSONResponse({
             "summary": summary or "",
             "long_term": long_term,
             "token_progress": {
-                "current": current_tokens,
-                "threshold": comp_cfg.compact_threshold_tokens,
+                "current": usage["current_tokens"],
+                "threshold": usage["threshold"],
+                "context_window": usage["context_window"],
             },
             "enabled": cfg.enabled,
             "last_compacted_at": last_compacted_at,

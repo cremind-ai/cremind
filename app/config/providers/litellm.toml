@@ -16,6 +16,7 @@ base_url = { description = "LiteLLM Base URL", type = "string", secret = false, 
 
 [[models]]
 id = "gpt-5.4"
+context_window = 1050000
 display_name = "GPT-5.4 (via LiteLLM)"
 supports_reasoning = true
 group_hint = "high"

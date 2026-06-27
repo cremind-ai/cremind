@@ -116,11 +116,21 @@ def _msg(ordering: int, content: str, role: str = "user") -> dict:
     return {"id": f"m{ordering}", "role": role, "content": content, "ordering": ordering}
 
 
+def _agent_msg(context_tokens, *, provider="p", model="m", ordering=99) -> dict:
+    """Latest agent message carrying the model-reported context size + stamped model."""
+    return {
+        "id": "a", "role": "agent", "content": "ok", "ordering": ordering,
+        "token_usage": {"context_tokens": context_tokens},
+        "metadata": {"provider": provider, "model": model},
+    }
+
+
 class _FakeStore:
-    def __init__(self, messages, summary=None, watermark=-1):
+    def __init__(self, messages, summary=None, watermark=-1, latest_agent=None):
         self._messages = messages
         self._summary = summary
         self._watermark = watermark
+        self._latest_agent = latest_agent
         self.set_calls: list[tuple] = []
 
     async def get_compaction_state(self, cid):
@@ -128,6 +138,9 @@ class _FakeStore:
 
     async def get_messages_after(self, cid, after, limit=5000):
         return [m for m in self._messages if m["ordering"] > after][:limit]
+
+    async def get_latest_agent_message(self, cid):
+        return self._latest_agent
 
     async def set_compaction_state(self, cid, summary, watermark, ts=None):
         self.set_calls.append((summary, watermark))
@@ -170,11 +183,11 @@ def _async_return(value):
     return _fn
 
 
-def _cfg(*, enabled=True, threshold=25, keep_recent_tokens=5, keep_recent_messages=1,
+def _cfg(*, enabled=True, percent=85.0, keep_recent_tokens=5, keep_recent_messages=1,
          max_tokens=2048) -> CompactionConfig:
     return CompactionConfig(
         enabled=enabled,
-        compact_threshold_tokens=threshold,
+        compact_threshold_percent=percent,
         keep_recent_tokens=keep_recent_tokens,
         keep_recent_messages=keep_recent_messages,
         temperature=0.3,
@@ -237,7 +250,7 @@ def test_disabled_returns_fallback(monkeypatch) -> None:
 
 
 def test_below_threshold_no_fold(monkeypatch) -> None:
-    _patch_cfg(monkeypatch, _cfg(threshold=1_000_000))
+    _patch_cfg(monkeypatch, _cfg())
     store = _FakeStore([_msg(0, "hello"), _msg(1, "there", role="agent")])
     agent = _FakeAgent(_FakeLLM())
     out = asyncio.run(_build(store, agent, fallback=[{"role": "user", "content": "FB"}]))
@@ -250,7 +263,7 @@ def test_below_threshold_no_fold(monkeypatch) -> None:
 def test_over_threshold_does_not_auto_fold(monkeypatch) -> None:
     # Compaction is now model-driven (suggest-only): even over threshold the read
     # path NEVER folds automatically — it just returns summary + verbatim tail.
-    _patch_cfg(monkeypatch, _cfg(threshold=25, keep_recent_tokens=5, keep_recent_messages=1))
+    _patch_cfg(monkeypatch, _cfg(keep_recent_tokens=5, keep_recent_messages=1))
     store = _FakeStore([_msg(i, _TEN) for i in range(4)])
     agent = _FakeAgent(_FakeLLM(output="RUNNING SUMMARY"))
     out = asyncio.run(_build(store, agent, fallback=[]))
@@ -261,51 +274,68 @@ def test_over_threshold_does_not_auto_fold(monkeypatch) -> None:
     assert not out[0]["content"].startswith("[Summary")
 
 
+def test_context_tokens_from_records_picks_final_step() -> None:
+    # The final reasoning step (max step_index) is the largest prompt; tool/subagent
+    # rows are ignored; full prompt = input + cache_read + cache_creation.
+    recs = [
+        {"source_kind": "reasoning", "step_index": 1,
+         "input_tokens": 10, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+        {"source_kind": "reasoning", "step_index": 3,
+         "input_tokens": 5, "cache_read_input_tokens": 200, "cache_creation_input_tokens": 2},
+        {"source_kind": "reasoning", "step_index": 2,
+         "input_tokens": 99, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+        {"source_kind": "tool", "step_index": 9,
+         "input_tokens": 9999, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+    ]
+    assert compaction.context_tokens_from_records(recs) == 207  # step 3: 5 + 200 + 2
+    assert compaction.context_tokens_from_records([]) is None
+    assert compaction.context_tokens_from_records(
+        [{"source_kind": "tool", "step_index": 1, "input_tokens": 5}]) is None
+
+
+def test_context_usage_threshold_from_window(monkeypatch) -> None:
+    # current = the latest agent message's reported context size; threshold =
+    # percent/100 * the active model's context window.
+    _patch_cfg(monkeypatch, _cfg(percent=85))
+    monkeypatch.setattr(compaction, "context_window_for", lambda p, m: 1000)
+    store = _FakeStore([], latest_agent=_agent_msg(900))
+    usage = asyncio.run(compaction.context_usage(
+        conversation_id="c1", profile="admin", conversation_storage=store,
+    ))
+    assert usage == {"current_tokens": 900, "context_window": 1000, "threshold": 850}
+
+
+def test_context_usage_defaults_when_no_turn(monkeypatch) -> None:
+    # No agent turn yet → current 0; unknown window → DEFAULT_CONTEXT_WINDOW.
+    from app.lib.llm.pricing import DEFAULT_CONTEXT_WINDOW
+    _patch_cfg(monkeypatch, _cfg(percent=50))
+    monkeypatch.setattr(compaction, "context_window_for", lambda p, m: None)
+    usage = asyncio.run(compaction.context_usage(
+        conversation_id="c1", profile="admin", conversation_storage=_FakeStore([], latest_agent=None),
+    ))
+    assert usage["current_tokens"] == 0
+    assert usage["context_window"] == DEFAULT_CONTEXT_WINDOW
+    assert usage["threshold"] == round(50 / 100 * DEFAULT_CONTEXT_WINDOW)
+
+
 def test_compaction_suggestion_over_and_under_threshold(monkeypatch) -> None:
-    _patch_cfg(monkeypatch, _cfg(threshold=25, keep_recent_tokens=5, max_tokens=5))
-    over = _FakeStore([_msg(i, _TEN) for i in range(4)])  # ~40 tokens > 25
+    _patch_cfg(monkeypatch, _cfg(percent=85, keep_recent_tokens=5, max_tokens=5))
+    monkeypatch.setattr(compaction, "context_window_for", lambda p, m: 1000)  # threshold 850
+
+    over = _FakeStore([], latest_agent=_agent_msg(900))
     s = asyncio.run(compaction.compaction_suggestion(
         conversation_id="c1", profile="admin", conversation_storage=over,
     ))
     assert s is not None
-    assert s["current_tokens"] >= s["threshold"] == 25
+    assert s["current_tokens"] == 900
+    assert s["threshold"] == 850
+    assert s["context_window"] == 1000
     assert s["estimated_savings"] >= 0
 
-    _patch_cfg(monkeypatch, _cfg(threshold=1_000_000))
-    under = _FakeStore([_msg(0, _TEN)])
+    under = _FakeStore([], latest_agent=_agent_msg(100))
     assert asyncio.run(compaction.compaction_suggestion(
         conversation_id="c1", profile="admin", conversation_storage=under,
     )) is None
-
-
-def test_compaction_suggestion_counts_reasoning_trace(monkeypatch) -> None:
-    # Tiny final-answer content, but a big replayed reasoning trace. With replay ON
-    # the trace tokens must count toward the threshold (else the prompt grows large
-    # without ever suggesting a compaction); with replay OFF only content counts.
-    _patch_cfg(monkeypatch, _cfg(threshold=25, keep_recent_tokens=5, max_tokens=5))
-    big_trace = [
-        {"role": "assistant", "content": None, "tool_calls": [
-            {"id": "c1", "type": "function",
-             "function": {"name": "search", "arguments": "{}"}},
-        ]},
-        {"role": "tool", "tool_call_id": "c1",
-         "content": " ".join([_TEN] * 4)},  # ~40 tokens of tool output
-        {"role": "assistant", "content": "ok"},
-    ]
-    msgs = [{"id": "m0", "role": "agent", "content": "ok",
-             "ordering": 0, "llm_messages": big_trace}]
-
-    monkeypatch.setattr(compaction, "replay_reasoning_enabled", lambda profile: True)
-    s_on = asyncio.run(compaction.compaction_suggestion(
-        conversation_id="c1", profile="admin", conversation_storage=_FakeStore(msgs),
-    ))
-    assert s_on is not None and s_on["current_tokens"] >= 25  # trace counted
-
-    monkeypatch.setattr(compaction, "replay_reasoning_enabled", lambda profile: False)
-    s_off = asyncio.run(compaction.compaction_suggestion(
-        conversation_id="c1", profile="admin", conversation_storage=_FakeStore(msgs),
-    ))
-    assert s_off is None  # only the tiny "ok" content counts → under threshold
 
 
 def test_build_effective_replays_trace_when_enabled() -> None:
@@ -361,7 +391,7 @@ def test_apply_compaction_routes_long_term_facts(monkeypatch) -> None:
 def test_excludes_current_turn_message(monkeypatch) -> None:
     # The just-persisted current turn (sent separately as the volatile input) must
     # not reappear in the rebuilt history tail.
-    _patch_cfg(monkeypatch, _cfg(threshold=1_000_000))  # no fold
+    _patch_cfg(monkeypatch, _cfg())  # no fold
     store = _FakeStore([_msg(0, "older message"), _msg(1, "current turn")])
     agent = _FakeAgent(_FakeLLM())
     out = asyncio.run(compaction.build_compacted_history(
@@ -376,6 +406,6 @@ def test_excludes_current_turn_message(monkeypatch) -> None:
 def test_compaction_config_is_frozen_snapshot() -> None:
     cfg = _cfg()
     assert cfg.enabled is True
-    assert cfg.compact_threshold_tokens == 25
+    assert cfg.compact_threshold_percent == 85.0
     with pytest.raises(Exception):
         cfg.enabled = False  # frozen dataclass
