@@ -137,9 +137,10 @@ class ToolRegistry:
     def tools_for_profile(self, profile: str) -> List[Tool]:
         """Return tools the reasoning agent should expose to ``profile``.
 
-        Skills owned by other profiles are excluded. Every other type honors a
-        per-profile ``profile_tools`` row when present, falling back to the
-        type's default (built-in = on; mcp = off).
+        Skills owned by other profiles are excluded. Every type — skills
+        included — honors a per-profile ``profile_tools`` row when present,
+        falling back to the type's default (built-in = on; skill = on;
+        mcp = off), so a skill disabled in Settings is no longer exposed.
         """
         enabled_per_profile = self._storage.list_profile_tools(profile)
         out: List[Tool] = []
@@ -156,14 +157,31 @@ class ToolRegistry:
                 out.append(tool)
                 continue
             if tool.tool_type is ToolType.SKILL:
-                if self._skill_belongs_to_profile(tool, profile):
-                    out.append(tool)
-                continue
+                if not self._skill_belongs_to_profile(tool, profile):
+                    continue
+                # owned skill — fall through to the shared enabled check so a
+                # ``profile_tools`` row with enabled=0 (set via Settings)
+                # suppresses it just like any other tool. Absent a row, the
+                # SKILL default (on) keeps it exposed.
             explicit = enabled_per_profile.get(tool.tool_id)
             enabled = explicit if explicit is not None else self._default_enabled(tool.tool_type)
             if enabled:
                 out.append(tool)
         return out
+
+    def owned_skills(self, profile: str) -> List[Tool]:
+        """Return every skill owned by ``profile`` regardless of enabled state.
+
+        Unlike :meth:`tools_for_profile`, this ignores the per-profile
+        ``enabled`` flag — callers that operate on a profile's skills as
+        on-disk assets (e.g. re-materializing ``scripts/.env``) need the full
+        set, not just the ones currently exposed to the agent.
+        """
+        return [
+            tool
+            for tool in self._tools.values()
+            if self._skill_belongs_to_profile(tool, profile)
+        ]
 
     def visible_for_profile(self, profile: str) -> List[dict]:
         """Return UI rows for ``profile`` -- includes disabled stubs.
