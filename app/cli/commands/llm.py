@@ -27,7 +27,7 @@ providers_app = typer.Typer(
 )
 model_groups_app = typer.Typer(
     name="model-groups",
-    help="Read or write the high/low model group assignments.",
+    help="Read or write the configured model (and optional vision model).",
     no_args_is_help=True,
 )
 device_code_app = typer.Typer(
@@ -229,13 +229,23 @@ def model_groups_get(ctx: typer.Context) -> None:
 @graceful_errors
 def model_groups_set(
     ctx: typer.Context,
-    high: Optional[str] = typer.Option(None, "--high", help="Model id for the 'high' group."),
-    low: Optional[str] = typer.Option(None, "--low", help="Model id for the 'low' group."),
+    model: Optional[str] = typer.Option(
+        None, "--model", "--high",
+        help="Provider/model id for the single configured model (e.g. groq/openai/gpt-oss-120b).",
+    ),
+    vision: Optional[str] = typer.Option(
+        None, "--vision",
+        help="Optional provider/model id for image understanding (defaults to --model).",
+    ),
+    vision_enabled: Optional[bool] = typer.Option(
+        None, "--vision-enabled/--no-vision-enabled",
+        help="Enable/disable the Specialized Vision Model feature (the image_understanding tool).",
+    ),
     default_provider: Optional[str] = typer.Option(
         None, "--default-provider", help="Default provider name."
     ),
 ) -> None:
-    """Update model group assignments."""
+    """Update the configured model (and optional vision model)."""
     import asyncio
 
     from app.cli.client._base import Client
@@ -244,18 +254,21 @@ def model_groups_set(
 
     body: dict[str, Any] = {}
     groups: dict[str, Any] = {}
-    if high:
-        groups["high"] = high
-    if low:
-        groups["low"] = low
+    # The single model is stored under the historical ``high`` key.
+    if model:
+        groups["high"] = model
+    if vision:
+        groups["vision"] = vision
     if groups:
         body["model_groups"] = groups
     if default_provider:
         body["default_provider"] = default_provider
+    if vision_enabled is not None:
+        body["vision_enabled"] = vision_enabled
 
     if not body:
         typer.echo(
-            "at least one of --high, --low, --default-provider is required",
+            "at least one of --model, --vision, --vision-enabled, --default-provider is required",
             err=True,
         )
         raise typer.Exit(code=1)

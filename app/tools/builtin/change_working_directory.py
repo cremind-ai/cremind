@@ -97,22 +97,9 @@ TOOL_CONFIG: ToolConfig = {
     "hidden": True,
     "llm_parameters": {
         "tool_instructions": (
-            "Always switch the active working directory before executing any "
-            "commands relevant to the user's files or skills. This ensures "
-            "the agent is operating in the correct context.\n"
-            "Supported targets are user working (the profile default), "
-            "documents and skills, it can be skills or skill name "
-            "strings (e.g. 'my weather skill' to switch to a "
-            "specific skill's source dir). \n"
-            "If the user names an arbitrary directory (e.g. 'switch to "
-            "C:\\\\Code\\\\foo' or '~/projects/acme'), call with "
-            "target='custom' and path=<absolute path>. The path must already "
-            "exist; it will not be auto-created.\n"
-            "E.g. 'change to user working directory', 'switch to documents folder', 'change to my weather skill' (if 'my weather skill' is a loaded skill), 'change to C:\\\\Users\\\\me\\\\projects\\\\acme'."
-        ),
-        "system_prompt": (
-            "Don't answer any questions or provide any information. "
-            "Always call the 'change_working_directory' tool with the requested target."
+            "Switch the conversation's active working directory — to the profile "
+            "default (user working), the documents or skills folder, a loaded "
+            "skill's source directory, or a custom absolute path."
         ),
     },
 }
@@ -120,6 +107,15 @@ TOOL_CONFIG: ToolConfig = {
 
 class ChangeWorkingDirectoryTool(BuiltInTool):
     name: str = "change_working_directory"
+    description: str = (
+        "Switch the conversation's active working directory so subsequent "
+        "exec_shell and system_file calls operate in the right place. Use "
+        "target='user_working' (the profile default; also clears any override), "
+        "'documents', 'skills', or the name of a loaded skill to use that "
+        "skill's source directory. For an arbitrary directory the user names, "
+        "use target='custom' with `path` set to an existing absolute path "
+        "(it is not auto-created)."
+    )
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {

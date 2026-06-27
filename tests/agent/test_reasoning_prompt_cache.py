@@ -1,11 +1,12 @@
 """The system prompt must be byte-identical across turns (not just steps), or the
 [tools + system] prompt-cache prefix silently misses.
 
-Two things now keep it stable: ``current_time`` was removed from the prompt (it
-used to mutate the prefix every turn), and the ``## Memory`` block was moved out of
-the system prompt into the volatile per-step input (``template_input``, before
-``Begin!``) so per-turn memory retrieval never busts the cached prefix. These tests
-guard both.
+Under native function calling the tool list is passed via the ``tools=`` param
+(not rendered into the prompt text), so the system prompt is just persona / OS /
+cwd / loaded-skill instructions. Two things keep it stable: there is no wall
+clock in it (that lives in the on-demand ``get_current_time`` tool), and the
+``## Memory`` block lives in the volatile per-turn user input, not the cached
+system prompt. These tests guard both.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import app.agent.reasoning_agent as ra  # noqa: E402
 
 
 def _make_agent(monkeypatch):
-    """Build a ReasoningAgent skeleton with only what ``_build_instruction`` reads.
+    """Build a ReasoningAgent skeleton with only what the prompt builders read.
 
     ``__new__`` bypasses the heavy DI ``__init__``; module-level helpers are
     monkeypatched to fixed values.
@@ -29,10 +30,8 @@ def _make_agent(monkeypatch):
     agent = ra.ReasoningAgent.__new__(ra.ReasoningAgent)
     agent.profile = "default"
     agent.context_id = None  # skips the working-directory-override / get_context branch
-    agent._memory_context = ""
-    agent._build_tools_block = lambda: "TOOLS_BLOCK"
-    agent._build_loaded_skills_block = lambda: ""
-    agent._active_action_names = lambda: ["a", "b"]
+    agent._loaded_skill_sections = {}
+    agent._inject_reasoning_guidance = False
     return agent
 
 
@@ -48,21 +47,16 @@ def test_system_prompt_stable_and_clock_free(monkeypatch):
     assert "Current time" not in first
 
 
-def test_memory_block_lives_in_input_not_system_prompt(monkeypatch):
+def test_input_is_query_only_no_memory_injection(monkeypatch):
+    """Long-term memory is no longer injected into the prompt (it would bust the
+    cache every turn); the model retrieves it via the search_memory tool. So the
+    volatile per-turn input is exactly the user's query."""
     agent = _make_agent(monkeypatch)
-    agent._memory_context = "## Memory\nUser name is Lee."
+    agent._current_query = "hello there"
 
-    instruction = agent._build_instruction()
-    # Memory must NOT be in the cached system prompt (it changes per turn).
-    assert "## Memory" not in instruction
+    # Memory is never in the cached system prompt.
+    assert "## Memory" not in agent._build_instruction()
 
-    rendered = agent._render_input("Thought: hello")
-    # It lives in the volatile per-step input, before ``Begin!``.
-    assert "## Memory" in rendered
-    assert rendered.index("## Memory") < rendered.index("Begin!")
-
-    # With no memory, the input has no stray block and still contains Begin!.
-    agent._memory_context = ""
-    empty = agent._render_input("Thought: hello")
-    assert "## Memory" not in empty
-    assert "Begin!" in empty
+    # The volatile input is just the query — no injected memory block.
+    rendered = agent._render_input()
+    assert rendered == "hello there"

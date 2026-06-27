@@ -38,6 +38,7 @@ output_price_per_1m = 0.08
 id = "openai/gpt-oss-120b"
 display_name = "GPT OSS 120B (via Groq)"
 prompt_cache = true
+supports_reasoning = true
 group_hint = "high"
 input_price_per_1m = 0.15
 output_price_per_1m = 0.60
@@ -49,6 +50,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 id = "openai/gpt-oss-20b"
 display_name = "GPT OSS 20B (via Groq)"
 prompt_cache = true
+supports_reasoning = true
 group_hint = "low"
 input_price_per_1m = 0.075
 output_price_per_1m = 0.30
@@ -69,14 +71,10 @@ output_price_per_1m = 0.34
 id = "qwen/qwen3-32b"
 display_name = "Qwen3 32B"
 prompt_cache = false
+supports_reasoning = true
 group_hint = "high"
 input_price_per_1m = 0.29
 output_price_per_1m = 0.59
 
-[[models]]
-id = "moonshotai/kimi-k2-instruct"
-display_name = "Kimi K2"
-prompt_cache = false
-group_hint = "high"
-input_price_per_1m = 0.50
-output_price_per_1m = 1.50
+# Removed moonshotai/kimi-k2-instruct: deprecated by Groq on 2025-10-10
+# (replacement: openai/gpt-oss-120b). See console.groq.com/docs/deprecations.

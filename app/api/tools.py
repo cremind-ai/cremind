@@ -101,6 +101,14 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         if not profile and config_storage is not None and config_storage.is_setup_complete():
             return JSONResponse({"error": "Profile is required"}, status_code=400)
         rows = registry.visible_for_profile(profile)
+        # Keep this view consistent with what the reasoning agent is actually
+        # given: the ``image_understanding`` tool is available iff the model that
+        # would run it can see images (the dedicated vision model when the
+        # Specialized Vision Model feature is on, otherwise the main model). Hidden
+        # only when the feature is off AND the main model is text-only.
+        mgr = getattr(state, "model_group_mgr", None)
+        if mgr is not None and not mgr.image_understanding_available(profile):
+            rows = [r for r in rows if r["tool_id"] != "image_understanding"]
         enriched: list[dict] = []
         for row in rows:
             tool = registry.get(row["tool_id"])
@@ -111,9 +119,6 @@ def get_tool_routes(state: BootedState) -> list[Route]:
                 "configured": _is_tool_configured(tool, snapshot),
                 "config": snapshot,
                 "required_fields": required_fields,
-                "llm_defaults": _llm_defaults_for_tool(tool),
-                "locked_llm_fields": _locked_llm_fields_for_tool(tool),
-                "full_reasoning": bool(snapshot.get("llm", {}).get("full_reasoning", False)),
                 # Optional pip-extras feature key (built-in tools only).
                 # Drives the Setup Wizard "Installs: cremind[…]" hint and
                 # the post-setup enable-toggle install dialog.
@@ -171,8 +176,6 @@ def get_tool_routes(state: BootedState) -> list[Route]:
             "arguments_schema": tool.arguments_schema,
             "schema": schema,
             "config": snapshot,
-            "llm_defaults": _llm_defaults_for_tool(tool),
-            "locked_llm_fields": _locked_llm_fields_for_tool(tool),
             "configured": _is_tool_configured(tool, snapshot),
         }
         lra = _long_running_app_for_tool(tool)
@@ -226,238 +229,6 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         # to prepare the environment for the generic exec_shell tool.
         if tool and tool.tool_type is ToolType.SKILL:
             _write_skill_env_file(tool, config_manager, profile)
-
-        publish_settings_state_changed(profile)
-        return JSONResponse({"success": True})
-
-    async def handle_set_arguments(request: Request) -> JSONResponse:
-        """Update Tool Arguments (JSON-Schema parameter values)."""
-        unauth = _require_auth(request)
-        if unauth is not None:
-            return unauth
-        registry = state.registry
-        if registry is None:
-            return _storage_not_ready()
-        config_manager = registry.config
-        profile = _profile_from_request(request)
-        if not profile:
-            return JSONResponse({"error": "Profile is required"}, status_code=400)
-        tool_id = request.path_params["tool_id"]
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        arguments = body.get("arguments", {})
-        if not isinstance(arguments, dict):
-            return JSONResponse({"error": "'arguments' must be an object"}, status_code=400)
-        config_manager.set_arguments(tool_id, profile, arguments)
-        publish_settings_state_changed(profile)
-        return JSONResponse({"success": True})
-
-    async def handle_set_llm_params(request: Request) -> JSONResponse:
-        """Update LLM Parameters (provider, model, full_reasoning, reasoning_effort)."""
-        unauth = _require_auth(request)
-        if unauth is not None:
-            return unauth
-        registry = state.registry
-        if registry is None:
-            return _storage_not_ready()
-        config_manager = registry.config
-        config_storage = state.config_storage
-        profile = _profile_from_request(request)
-        if not profile:
-            return JSONResponse({"error": "Profile is required"}, status_code=400)
-        tool_id = request.path_params["tool_id"]
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        llm_params = body.get("llm", {})
-        if not isinstance(llm_params, dict):
-            return JSONResponse({"error": "'llm' must be an object"}, status_code=400)
-
-        tool = registry.get(tool_id)
-        locked = set(_locked_llm_fields_for_tool(tool))
-        if locked:
-            llm_defaults = _llm_defaults_for_tool(tool)
-            for key in locked:
-                if key in llm_params and llm_params[key] != llm_defaults.get(key):
-                    return JSONResponse(
-                        {
-                            "error": (
-                                f"LLM parameter '{key}' is locked for tool "
-                                f"'{tool_id}' and cannot be modified."
-                            )
-                        },
-                        status_code=400,
-                    )
-
-        for key, value in llm_params.items():
-            config_manager.set_llm_param(tool_id, profile, key, value)
-
-        # If provider/model/reasoning_effort changed, rebuild the adapter's LLM.
-        # Read the *post-write* DB values so partial updates (e.g. only
-        # reasoning_effort in the body) are merged with the existing settings.
-        if tool and hasattr(tool, "update_runtime_config") and any(
-            k in llm_params for k in ("llm_provider", "llm_model", "reasoning_effort")
-        ):
-            try:
-                merged = config_manager.get_llm_params(tool_id, profile)
-                provider_name = merged.get("llm_provider") or None
-                model_name = merged.get("llm_model") or None
-
-                # When no per-tool model override, fall back to the tool's
-                # declared default model group (e.g. image_understanding →
-                # "vision"), defaulting to "low" — same source as startup in
-                # server.py. The "vision" group itself falls back to "high"
-                # when unset.
-                if not model_name:
-                    from app.tools.builtin import default_model_group_for
-                    _key = getattr(tool, "config_name", None) or tool_id
-                    _group = default_model_group_for(_key)
-                    group_value = BaseConfig.get_model_group(_group, profile=profile)
-                    if not group_value and _group == "vision":
-                        group_value = BaseConfig.get_model_group("high", profile=profile)
-                    if group_value:
-                        parts = group_value.split("/", 1)
-                        if not provider_name:
-                            provider_name = parts[0]
-                        model_name = parts[1] if len(parts) > 1 else parts[0]
-
-                if not provider_name:
-                    provider_name = BaseConfig.get_default_provider(profile=profile)
-
-                if model_name:
-                    new_llm = create_llm_provider(
-                        provider_name=provider_name,
-                        model_name=model_name,
-                        config_storage=config_storage,
-                        profile=profile,
-                        default_reasoning_effort=merged.get("reasoning_effort"),
-                    )
-                    tool.update_runtime_config(llm=new_llm)
-                else:
-                    logger.warning(
-                        f"No model resolved for tool '{tool_id}'; skipping LLM rebuild"
-                    )
-            except ValueError as e:
-                return JSONResponse({"error": f"Invalid LLM: {e}"}, status_code=400)
-            except Exception as e:  # noqa: BLE001
-                logger.exception(
-                    f"Failed to apply LLM change to running tool '{tool_id}'"
-                )
-                return JSONResponse(
-                    {"error": f"Failed to apply LLM change: {e}"}, status_code=500,
-                )
-
-        # If full_reasoning changed, propagate to the running adapter
-        if tool and "full_reasoning" in llm_params and hasattr(tool, "update_runtime_config"):
-            tool.update_runtime_config(full_reasoning=bool(llm_params["full_reasoning"]))
-
-        publish_settings_state_changed(profile)
-        return JSONResponse({"success": True})
-
-    async def handle_reset_llm_params(request: Request) -> JSONResponse:
-        """Delete selected LLM-parameter overrides so code defaults apply again.
-
-        Body: ``{"keys": ["system_prompt", "llm_provider", ...]}``.
-
-        Keys in ``{system_prompt, description}`` are removed from the ``meta``
-        scope; all other keys are removed from the ``llm`` scope. When any
-        provider-shaping key is reset, the adapter's child LLM is rebuilt so
-        the change takes effect without a restart.
-        """
-        unauth = _require_auth(request)
-        if unauth is not None:
-            return unauth
-        registry = state.registry
-        if registry is None:
-            return _storage_not_ready()
-        config_manager = registry.config
-        config_storage = state.config_storage
-        profile = _profile_from_request(request)
-        if not profile:
-            return JSONResponse({"error": "Profile is required"}, status_code=400)
-        tool_id = request.path_params["tool_id"]
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        keys = body.get("keys", [])
-        if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
-            return JSONResponse(
-                {"error": "'keys' must be an array of strings"}, status_code=400,
-            )
-
-        tool = registry.get(tool_id)
-        if tool is None:
-            return JSONResponse({"error": f"Tool '{tool_id}' not found"}, status_code=404)
-
-        locked = set(_locked_llm_fields_for_tool(tool))
-        if locked:
-            blocked = [k for k in keys if k in locked]
-            if blocked:
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"Cannot reset locked LLM parameter(s) "
-                            f"{blocked} for tool '{tool_id}'."
-                        )
-                    },
-                    status_code=400,
-                )
-
-        storage = config_manager.storage
-        from app.storage.tool_storage import SCOPE_LLM, SCOPE_META
-        for key in keys:
-            scope = SCOPE_META if key in _META_KEYS else SCOPE_LLM
-            try:
-                storage.delete_config(
-                    profile=profile, tool_id=tool_id, scope=scope, key=key,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    f"Failed to delete {scope}.{key} for tool '{tool_id}'"
-                )
-
-        # If a provider-shaping key was reset, rebuild the child LLM using
-        # the remaining DB values (falling back to the profile's model group).
-        if any(k in ("llm_provider", "llm_model", "reasoning_effort") for k in keys) \
-                and hasattr(tool, "update_runtime_config"):
-            try:
-                merged = config_manager.get_llm_params(tool_id, profile)
-                provider_name = merged.get("llm_provider") or None
-                model_name = merged.get("llm_model") or None
-                if not model_name:
-                    group_value = BaseConfig.get_model_group("low", profile=profile)
-                    if group_value:
-                        parts = group_value.split("/", 1)
-                        if not provider_name:
-                            provider_name = parts[0]
-                        model_name = parts[1] if len(parts) > 1 else parts[0]
-                if not provider_name:
-                    provider_name = BaseConfig.get_default_provider(profile=profile)
-                if model_name:
-                    new_llm = create_llm_provider(
-                        provider_name=provider_name,
-                        model_name=model_name,
-                        config_storage=config_storage,
-                        profile=profile,
-                        default_reasoning_effort=merged.get("reasoning_effort"),
-                    )
-                    tool.update_runtime_config(llm=new_llm)
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    f"Failed to rebuild LLM for tool '{tool_id}' after reset"
-                )
-
-        # Push cleared system_prompt / description straight to the running
-        # adapter so in-flight changes take effect immediately.
-        if hasattr(tool, "update_runtime_config"):
-            if "system_prompt" in keys:
-                tool.update_runtime_config(system_prompt="")
-            if "description" in keys:
-                tool.update_runtime_config(description="")
 
         publish_settings_state_changed(profile)
         return JSONResponse({"success": True})
@@ -637,9 +408,6 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         Route("/api/tools", handle_list_tools, methods=["GET"]),
         Route("/api/tools/{tool_id}", handle_get_tool, methods=["GET"]),
         Route("/api/tools/{tool_id}/variables", handle_set_variables, methods=["PUT"]),
-        Route("/api/tools/{tool_id}/arguments", handle_set_arguments, methods=["PUT"]),
-        Route("/api/tools/{tool_id}/llm", handle_set_llm_params, methods=["PUT"]),
-        Route("/api/tools/{tool_id}/llm", handle_reset_llm_params, methods=["DELETE"]),
         Route("/api/tools/{tool_id}/enabled", handle_set_enabled, methods=["PUT"]),
         Route(
             "/api/tools/{tool_id}/long-running-app/register",

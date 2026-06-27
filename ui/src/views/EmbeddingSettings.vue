@@ -417,7 +417,7 @@ async function restartFromInstallDialog() {
             <div class="field-hint">
               {{ form.enabled
                   ? 'Configure the model and vector store below. Applying changes will reload + rebuild caches.'
-                  : 'Embedding-dependent features (Automatic Skill Mode, semantic Google Places filtering, doc search) are disabled.' }}
+                  : 'Embedding-dependent features (long-term memory search, semantic Google Places filtering, document search) are disabled.' }}
             </div>
           </ElFormItem>
 

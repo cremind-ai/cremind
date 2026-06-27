@@ -104,16 +104,13 @@ class ToolRegistry:
     def _default_enabled(tool_type: ToolType) -> bool:
         """Default enabled state when no ``profile_tools`` row exists.
 
-        - intrinsic / builtin : on by default (always available, opt-out per
-                                profile)
-        - skill               : on by default *for its owner profile*; invisible
-                                to other profiles (filtered in
-                                :meth:`tools_for_profile`).
-        - a2a / mcp           : off by default (opt-in per profile, except for
-                                the owner profile which gets enabled=1 at
-                                registration)
+        - builtin : on by default (always available, opt-out per profile)
+        - skill   : on by default *for its owner profile*; invisible to other
+                    profiles (filtered in :meth:`tools_for_profile`).
+        - mcp     : off by default (opt-in per profile, except for the owner
+                    profile which gets enabled=1 at registration)
         """
-        return tool_type in (ToolType.INTRINSIC, ToolType.BUILTIN, ToolType.SKILL)
+        return tool_type in (ToolType.BUILTIN, ToolType.SKILL)
 
     @staticmethod
     def _skill_belongs_to_profile(tool: Tool, profile: str) -> bool:
@@ -140,17 +137,13 @@ class ToolRegistry:
     def tools_for_profile(self, profile: str) -> List[Tool]:
         """Return tools the reasoning agent should expose to ``profile``.
 
-        Intrinsic tools are always included. Skills owned by other profiles
-        are excluded. Every other type honors a per-profile ``profile_tools``
-        row when present, falling back to the type's default (built-in = on;
-        a2a / mcp = off).
+        Skills owned by other profiles are excluded. Every other type honors a
+        per-profile ``profile_tools`` row when present, falling back to the
+        type's default (built-in = on; mcp = off).
         """
         enabled_per_profile = self._storage.list_profile_tools(profile)
         out: List[Tool] = []
         for tool in self._tools.values():
-            if tool.tool_type is ToolType.INTRINSIC:
-                out.append(tool)
-                continue
             # Hidden system built-ins are always-on for every profile —
             # their lifecycle is the runtime's, not the user's, so a stale
             # ``profile_tools`` row must not be able to suppress them.
@@ -206,17 +199,6 @@ class ToolRegistry:
 
     def _taken(self) -> set[str]:
         return set(self._tools.keys())
-
-    # ── intrinsic registration (in-memory only) ────────────────────────
-
-    def register_intrinsic(self, tool: Tool) -> str:
-        if tool.tool_type is not ToolType.INTRINSIC:
-            raise ValueError("register_intrinsic requires a Tool with tool_type=INTRINSIC")
-        tool_id = allocate_fixed_tool_id(tool.name, self._taken())
-        tool.tool_id = tool_id
-        self._tools[tool_id] = tool
-        logger.info(f"Registered intrinsic tool '{tool.name}' (tool_id={tool_id})")
-        return tool_id
 
     def repersist_builtin_tools(self) -> int:
         """Re-write rows for every in-memory built-in tool to the storage backend.
@@ -312,18 +294,7 @@ class ToolRegistry:
             f"Renamed displaced tool to '{new_id}' (per-profile state preserved)."
         )
 
-    # ── a2a / mcp registration (persisted, profile_tools backfilled) ──
-
-    async def register_a2a(self, tool: Tool, *, source: str, owner_profile: str | None) -> str:
-        if tool.tool_type is not ToolType.A2A:
-            raise ValueError("register_a2a requires a Tool with tool_type=A2A")
-        async with self._lock:
-            tool_id = self._register_dynamic(
-                tool, source=source, owner_profile=owner_profile,
-                tool_type_value=ToolType.A2A.value,
-            )
-        self._fire_change()
-        return tool_id
+    # ── mcp registration (persisted, profile_tools backfilled) ──
 
     async def register_mcp(
         self, tool: Tool, *, source: str, owner_profile: str | None, extra: dict | None = None,
@@ -423,7 +394,7 @@ class ToolRegistry:
             owner_is_other_fixed = (
                 owner is not None
                 and owner is not tool
-                and owner.tool_type in (ToolType.INTRINSIC, ToolType.BUILTIN)
+                and owner.tool_type is ToolType.BUILTIN
             )
             if owner_is_other_fixed:
                 fresh = self._unique_skill_id(preferred)
@@ -605,10 +576,6 @@ class ToolRegistry:
         tool = self._tools.get(tool_id)
         if tool is None:
             raise KeyError(f"Tool '{tool_id}' is not registered")
-        if tool.tool_type is ToolType.INTRINSIC:
-            raise ValueError(
-                f"Tool '{tool_id}' is intrinsic and cannot be disabled."
-            )
         if tool.hidden:
             raise ValueError(
                 f"Tool '{tool_id}' is a hidden system tool and cannot be "

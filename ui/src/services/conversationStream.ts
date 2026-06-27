@@ -24,6 +24,8 @@ export interface ConversationStreamEvent {
     | 'token_usage'
     | 'phase'
     | 'summary'
+    | 'compaction_suggested'
+    | 'compacted'
     | 'complete'
     | 'error'
     | 'cwd';

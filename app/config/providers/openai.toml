@@ -24,52 +24,57 @@ kind = "token"
 [provider.auth_methods.fields]
 oauth_token = { description = "OAuth Access Token", type = "string", secret = true, required = true }
 
-# Cache pricing: OpenAI discounts cached input tokens to 0.25x the input rate and
-# does not charge separately for cache creation.
+# Cache pricing: the GPT-5 family discounts cached input to 0.10x the input rate;
+# GPT-4.1 and the o-series cache at 0.25x. OpenAI does not charge separately for
+# cache creation.
 
 # Latest flagship models (GPT-5.4 series)
 [[models]]
 id = "gpt-5.4"
 display_name = "GPT-5.4"
 group_hint = "high"
+supports_reasoning = true
 prompt_cache = true
 vision = true
 input_price_per_1m = 2.50
 output_price_per_1m = 15.00
-cache_read_price_per_1m = 0.625   # 0.25x input
+cache_read_price_per_1m = 0.25    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gpt-5.4-mini"
 display_name = "GPT-5.4 Mini"
 group_hint = "low"
+supports_reasoning = true
 prompt_cache = true
 vision = true
 input_price_per_1m = 0.75
 output_price_per_1m = 4.50
-cache_read_price_per_1m = 0.1875  # 0.25x input
+cache_read_price_per_1m = 0.075   # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gpt-5.4-nano"
 display_name = "GPT-5.4 Nano"
 group_hint = "low"
+supports_reasoning = true
 prompt_cache = true
 vision = true
 input_price_per_1m = 0.20
 output_price_per_1m = 1.25
-cache_read_price_per_1m = 0.05    # 0.25x input
+cache_read_price_per_1m = 0.02    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gpt-5.4-pro"
 display_name = "GPT-5.4 Pro"
 group_hint = "high"
+supports_reasoning = true
 prompt_cache = true
 vision = true
 input_price_per_1m = 30.00
 output_price_per_1m = 180.00
-cache_read_price_per_1m = 7.50    # 0.25x input
+cache_read_price_per_1m = 3.00    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 # GPT-5.3 series
@@ -81,7 +86,7 @@ prompt_cache = true
 vision = true
 input_price_per_1m = 1.75
 output_price_per_1m = 14.00
-cache_read_price_per_1m = 0.4375  # 0.25x input
+cache_read_price_per_1m = 0.175   # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 # Previous-generation models still supported in the API
@@ -123,6 +128,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 id = "o3-pro"
 display_name = "o3 Pro"
 group_hint = "high"
+supports_reasoning = true
 prompt_cache = true
 vision = true
 input_price_per_1m = 20.00
@@ -135,6 +141,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 id = "o3"
 display_name = "o3"
 group_hint = "high"
+supports_reasoning = true
 prompt_cache = true
 vision = true
 input_price_per_1m = 2.00
@@ -147,6 +154,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 id = "o4-mini"
 display_name = "o4 Mini"
 group_hint = "high"
+supports_reasoning = true
 prompt_cache = true
 vision = true
 input_price_per_1m = 0.55
@@ -159,6 +167,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 id = "o3-mini"
 display_name = "o3 Mini"
 group_hint = "high"
+supports_reasoning = true
 prompt_cache = true
 input_price_per_1m = 1.10
 output_price_per_1m = 4.40

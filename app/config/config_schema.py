@@ -91,13 +91,13 @@ class ConfigGroup:
 CONFIG_SCHEMA: dict[str, ConfigGroup] = {
     "agent": ConfigGroup(
         label="Reasoning Agent",
-        description="Controls the ReAct loop's iteration limits and per-call LLM parameters.",
+        description="Controls the agent loop's iteration limits and per-call LLM parameters.",
         fields={
             "max_steps": Field(
                 type="number", default_toml="agent.max_steps",
                 label="Max steps",
-                description="Maximum ReAct iterations before the agent stops a turn.",
-                min=1, max=200,
+                description="Maximum tool-calling iterations before the agent stops a turn.",
+                min=1, max=500,
             ),
             "max_llm_retries": Field(
                 type="number", default_toml="agent.max_llm_retries",
@@ -133,6 +133,11 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
                 type="boolean", default_toml="agent.enable_prompt_cache",
                 label="Prompt caching",
                 description="Reuse the cached system+tools prefix across reasoning steps to cut input tokens. Anthropic uses explicit cache markers; OpenAI-family providers cache automatically. Harmless on providers without cache support.",
+            ),
+            "replay_reasoning_steps": Field(
+                type="boolean", default_toml="agent.replay_reasoning_steps",
+                label="Replay reasoning steps",
+                description="Send each prior turn's full tool-call/tool-result trace back into history (not just the final answer), so the model resumes the real transcript and the cached prefix covers the reasoning. Larger prompts — cheap on Anthropic (cached), but extra input tokens on providers without caching.",
             ),
         },
     ),
@@ -244,30 +249,6 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
                 type="number", default_toml="skill_classifier.retry",
                 label="Retry count",
                 description="Retries on transient classifier LLM errors.",
-                min=0, max=10,
-            ),
-        },
-    ),
-    "summarizer": ConfigGroup(
-        label="Trace Summarizer",
-        description="LLM that compresses long reasoning traces back into the conversation history.",
-        fields={
-            "temperature": Field(
-                type="number", default_toml="summarizer.temperature",
-                label="Temperature",
-                description="Sampling temperature for the summarization call.",
-                min=0, max=2, step=0.1,
-            ),
-            "max_tokens": Field(
-                type="number", default_toml="summarizer.max_tokens",
-                label="Max tokens",
-                description="Output token cap for the summary.",
-                min=128, max=8192,
-            ),
-            "retry": Field(
-                type="number", default_toml="summarizer.retry",
-                label="Retry count",
-                description="Retries on transient summarizer LLM errors.",
                 min=0, max=10,
             ),
         },
