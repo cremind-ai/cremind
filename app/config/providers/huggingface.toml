@@ -16,6 +16,7 @@ api_key = { description = "Hugging Face Token", type = "string", secret = true, 
 
 [[models]]
 id = "Qwen/Qwen3-235B-A22B"
+context_window = 262144
 display_name = "Qwen 3 235B"
 supports_reasoning = true
 group_hint = "high"
@@ -25,6 +26,7 @@ output_price_per_1m = 0.00
 
 [[models]]
 id = "meta-llama/Llama-3.3-70B-Instruct"
+context_window = 131072
 display_name = "Llama 3.3 70B"
 group_hint = "high"
 prompt_cache = false
@@ -33,6 +35,7 @@ output_price_per_1m = 0.00
 
 [[models]]
 id = "deepseek-ai/DeepSeek-R1"
+context_window = 131072
 display_name = "DeepSeek R1"
 supports_reasoning = true
 group_hint = "high"
@@ -42,6 +45,7 @@ output_price_per_1m = 0.00
 
 [[models]]
 id = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+context_window = 1048576
 display_name = "Llama 4 Scout"
 group_hint = "high"
 prompt_cache = false
@@ -51,6 +55,7 @@ output_price_per_1m = 0.00
 
 [[models]]
 id = "google/gemma-3-27b-it"
+context_window = 131072
 display_name = "Gemma 3 27B"
 group_hint = "high"
 prompt_cache = false

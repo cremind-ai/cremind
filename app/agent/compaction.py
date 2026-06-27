@@ -39,6 +39,7 @@ from app.config.user_config import (
     resolve_compaction_config,
     resolve_memory_config,
 )
+from app.lib.llm.pricing import DEFAULT_CONTEXT_WINDOW, context_window_for
 from app.storage import get_memory_storage
 from app.utils.common import (
     convert_db_messages_to_history,
@@ -70,28 +71,26 @@ def _build_effective(
     return history
 
 
-def _llm_messages_tokens(trace: list | None) -> int:
-    """Approximate token cost of a stored native reasoning trace.
+def context_tokens_from_records(records: list[dict] | None) -> int | None:
+    """Model-reported prompt size of a turn's FINAL reasoning call.
 
-    Counts each message's text plus tool-call name/argument JSON, so the compaction
-    threshold reflects the replayed reasoning (not just the final-answer ``content``).
+    A turn fans out to several LLM calls; the last one (highest ``step_index``) has
+    the largest prompt and is what the model just processed. Return its full prompt
+    size = ``input + cache_read + cache_creation`` (the per-turn ``token_usage`` blob
+    is summed across calls and over-counts, so it can't be used). ``None`` when there
+    are no reasoning records.
     """
-    if not trace:
-        return 0
-    total = 0
-    for msg in trace:
-        content = msg.get("content")
-        if isinstance(content, str) and content:
-            total += count_content_tokens(content)
-        for tc in msg.get("tool_calls") or []:
-            fn = tc.get("function") or {}
-            name = fn.get("name") or ""
-            args = fn.get("arguments") or ""
-            if name:
-                total += count_content_tokens(name)
-            if isinstance(args, str) and args:
-                total += count_content_tokens(args)
-    return total
+    if not records:
+        return None
+    reasoning = [r for r in records if (r.get("source_kind") or "reasoning") == "reasoning"]
+    if not reasoning:
+        return None
+    last = max(reasoning, key=lambda r: int(r.get("step_index") or 0))
+    return (
+        int(last.get("input_tokens") or 0)
+        + int(last.get("cache_read_input_tokens") or 0)
+        + int(last.get("cache_creation_input_tokens") or 0)
+    )
 
 
 async def build_compacted_history(
@@ -134,17 +133,64 @@ async def build_compacted_history(
         return fallback_history
 
 
+async def context_usage(
+    *,
+    conversation_id: str,
+    profile: str,
+    conversation_storage: Any,
+) -> dict:
+    """Return ``{current_tokens, context_window, threshold}`` for the conversation.
+
+    - ``current_tokens``: the model's actually-reported prompt size for the latest
+      turn (``context_tokens`` persisted on the newest agent message — the final
+      reasoning call's ``input + cache_read + cache_creation``). This is exactly the
+      context the model processed, so the ratio against the window is accurate. ``0``
+      when no turn has run yet (or a message predates this metric — self-heals next turn).
+    - ``context_window``: the active model's context window, looked up from the
+      provider catalog using the latest agent message's stamped ``provider``/``model``;
+      falls back to :data:`DEFAULT_CONTEXT_WINDOW`.
+    - ``threshold``: ``round(compact_threshold_percent / 100 * context_window)`` —
+      compaction is suggested once ``current_tokens`` reaches it. The percentage
+      (default 85) keeps the prompt clear of the window and leaves headroom for the
+      response.
+
+    Single source of truth shared by the chat banner (:func:`compaction_suggestion`)
+    and the ``/memory`` endpoint. Defensive — never raises; falls back to safe defaults.
+    """
+    try:
+        cfg = resolve_compaction_config(profile)
+        percent = cfg.compact_threshold_percent
+    except Exception:  # noqa: BLE001
+        percent = 85.0
+
+    current = 0
+    provider = model = None
+    try:
+        latest = await conversation_storage.get_latest_agent_message(conversation_id)
+        if latest:
+            tu = latest.get("token_usage") or {}
+            current = int(tu.get("context_tokens") or 0)
+            meta = latest.get("metadata") or {}
+            provider, model = meta.get("provider"), meta.get("model")
+    except Exception:  # noqa: BLE001
+        logger.debug(f"[compaction] could not read latest message for conv={conversation_id}",
+                     exc_info=True)
+
+    window = context_window_for(provider, model) or DEFAULT_CONTEXT_WINDOW
+    threshold = max(1, round(percent / 100 * window))
+    return {"current_tokens": current, "context_window": window, "threshold": threshold}
+
+
 async def compaction_suggestion(
     *,
     conversation_id: str,
     profile: str,
     conversation_storage: Any,
-    exclude_message_id: str | None = None,
 ) -> dict | None:
-    """Return a suggestion payload when ``summary + tail`` crosses the threshold.
+    """Return a suggestion payload when the model's context crosses the threshold.
 
-    ``{current_tokens, threshold, estimated_savings}`` when compaction is worth
-    proposing, else ``None``. Never folds — purely advisory for the UI popup.
+    ``{current_tokens, threshold, estimated_savings, context_window}`` when compaction
+    is worth proposing, else ``None``. Never folds — purely advisory for the UI popup.
     """
     try:
         cfg = resolve_compaction_config(profile)
@@ -153,27 +199,21 @@ async def compaction_suggestion(
     if not cfg.enabled:
         return None
     try:
-        include_reasoning = replay_reasoning_enabled(profile)
-        summary, watermark, _ = await conversation_storage.get_compaction_state(conversation_id)
-        tail = await conversation_storage.get_messages_after(conversation_id, watermark)
-        if exclude_message_id:
-            tail = [m for m in tail if m.get("id") != exclude_message_id]
-        # Size the tail exactly as it will be sent: a turn's native reasoning trace
-        # (when present and replay is on) replaces its content-only form.
-        eff = count_content_tokens(summary or "")
-        for m in tail:
-            if include_reasoning and m.get("llm_messages"):
-                eff += _llm_messages_tokens(m.get("llm_messages"))
-            else:
-                eff += count_content_tokens(m.get("content") or "")
-        if eff < cfg.compact_threshold_tokens:
+        usage = await context_usage(
+            conversation_id=conversation_id,
+            profile=profile,
+            conversation_storage=conversation_storage,
+        )
+        current, threshold = usage["current_tokens"], usage["threshold"]
+        if current < threshold:
             return None
         # Roughly the tokens that compaction would fold into the summary.
-        savings = max(0, eff - cfg.keep_recent_tokens - cfg.max_tokens)
+        savings = max(0, current - cfg.keep_recent_tokens - cfg.max_tokens)
         return {
-            "current_tokens": eff,
-            "threshold": cfg.compact_threshold_tokens,
+            "current_tokens": current,
+            "threshold": threshold,
             "estimated_savings": savings,
+            "context_window": usage["context_window"],
         }
     except Exception:  # noqa: BLE001
         logger.exception(f"[compaction] suggestion check failed for conv={conversation_id}")

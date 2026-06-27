@@ -19,6 +19,7 @@ api_key = { description = "Mistral API Key", type = "string", secret = true, req
 
 [[models]]
 id = "mistral-large-latest"
+context_window = 131072
 display_name = "Mistral Large 3"
 group_hint = "high"
 prompt_cache = true
@@ -30,6 +31,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "mistral-medium-latest"
+context_window = 131072
 display_name = "Mistral Medium 3.1"
 group_hint = "high"
 prompt_cache = true
@@ -41,6 +43,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "mistral-small-latest"
+context_window = 131072
 display_name = "Mistral Small"
 group_hint = "low"
 prompt_cache = true
@@ -52,6 +55,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "codestral-latest"
+context_window = 262144
 display_name = "Codestral"
 group_hint = "high"
 prompt_cache = true
@@ -62,6 +66,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "magistral-medium-latest"
+context_window = 40960
 display_name = "Magistral Medium"
 supports_reasoning = true
 group_hint = "high"
@@ -73,6 +78,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "devstral-latest"
+context_window = 131072
 display_name = "Devstral 2"
 group_hint = "high"
 prompt_cache = true
