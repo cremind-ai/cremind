@@ -166,6 +166,7 @@ export interface CompactionSuggestion {
   currentTokens: number;
   threshold: number;
   estimatedSavings: number;
+  contextWindow?: number;
 }
 
 interface ChatState {
@@ -1068,6 +1069,7 @@ export const useChatStore = defineStore('chat', {
             currentTokens: data.current_tokens ?? 0,
             threshold: data.threshold ?? 0,
             estimatedSavings: data.estimated_savings ?? 0,
+            contextWindow: data.context_window ?? undefined,
           };
           return;
         }

@@ -156,11 +156,11 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
                 label="Enabled",
                 description="When off, full history is sent (bounded only by the model's context window).",
             ),
-            "compact_threshold_tokens": Field(
-                type="number", default_toml="compaction.compact_threshold_tokens",
-                label="Compaction threshold (tokens)",
-                description="Fold the oldest turns into the summary once the verbatim tail's token count crosses this.",
-                min=1000, max=1000000,
+            "compact_threshold_percent": Field(
+                type="number", default_toml="compaction.compact_threshold_percent",
+                label="Compaction threshold (% of context window)",
+                description="Suggest folding the oldest turns once the model's reported context reaches this percentage of its context window. Lower it to compact earlier.",
+                min=10, max=100, step=5,
             ),
             "keep_recent_tokens": Field(
                 type="number", default_toml="compaction.keep_recent_tokens",

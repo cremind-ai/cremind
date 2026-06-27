@@ -48,10 +48,11 @@ replay_reasoning_steps = true     # replay each turn's tool-call/tool-result tra
 
 [compaction]
 enabled = true                    # summarization-based history compaction (model-driven compact_conversation tool)
-# With prompt caching, a large threshold keeps the cached prefix warm for many turns.
-# Compaction is now suggest-only: once summary+tail crosses this, the UI proposes
-# compacting (the user clicks to run it); it is never forced automatically.
-compact_threshold_tokens = 500000 # suggest compaction once summary+tail crosses this
+# The threshold is a FRACTION of the active model's context window (from the provider
+# catalog), so it auto-scales across models and leaves headroom for the response.
+# Compaction is suggest-only: once the model's reported context reaches the threshold,
+# the UI proposes compacting (the user clicks to run it); it is never forced.
+compact_threshold_percent = 85    # suggest compaction once context reaches this % of the window
 keep_recent_tokens = 12000        # after compaction, the verbatim tail kept alongside the summary
 keep_recent_messages = 4          # keep at least this many recent messages out of the summary
 temperature = 0.3

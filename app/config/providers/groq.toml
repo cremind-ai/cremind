@@ -20,6 +20,7 @@ api_key = { description = "Groq API Key", type = "string", secret = true, requir
 
 [[models]]
 id = "llama-3.3-70b-versatile"
+context_window = 131072
 display_name = "Llama 3.3 70B Versatile"
 prompt_cache = false
 group_hint = "high"
@@ -28,6 +29,7 @@ output_price_per_1m = 0.79
 
 [[models]]
 id = "llama-3.1-8b-instant"
+context_window = 131072
 display_name = "Llama 3.1 8B Instant"
 prompt_cache = false
 group_hint = "low"
@@ -36,6 +38,7 @@ output_price_per_1m = 0.08
 
 [[models]]
 id = "openai/gpt-oss-120b"
+context_window = 131072
 display_name = "GPT OSS 120B (via Groq)"
 prompt_cache = true
 supports_reasoning = true
@@ -48,6 +51,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "openai/gpt-oss-20b"
+context_window = 131072
 display_name = "GPT OSS 20B (via Groq)"
 prompt_cache = true
 supports_reasoning = true
@@ -60,6 +64,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "meta-llama/llama-4-scout-17b-16e-instruct"
+context_window = 131072
 display_name = "Llama 4 Scout 17B 16E"
 prompt_cache = false
 group_hint = "high"
@@ -69,6 +74,7 @@ output_price_per_1m = 0.34
 
 [[models]]
 id = "qwen/qwen3-32b"
+context_window = 131072
 display_name = "Qwen3 32B"
 prompt_cache = false
 supports_reasoning = true

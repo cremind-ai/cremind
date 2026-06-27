@@ -688,6 +688,25 @@ class ConversationStorage:
             )
             return [self._msg_to_dict(msg) for msg in result.scalars().all()]
 
+    async def get_latest_agent_message(self, conversation_id: str) -> dict | None:
+        """Most recent ``agent`` message dict (highest ``ordering``), or ``None``.
+
+        Used by compaction to read the turn's model-reported context size
+        (``token_usage.context_tokens``) and stamped ``provider``/``model``.
+        """
+        await self._ensure_initialized()
+        async with self.async_session_maker() as session:
+            row = (await session.execute(
+                select(MessageModel)
+                .where(
+                    MessageModel.conversation_id == conversation_id,
+                    MessageModel.role == "agent",
+                )
+                .order_by(MessageModel.ordering.desc())
+                .limit(1)
+            )).scalars().first()
+            return self._msg_to_dict(row) if row is not None else None
+
     # ── Compaction state ──
 
     async def get_compaction_state(
