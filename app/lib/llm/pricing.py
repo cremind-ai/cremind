@@ -44,6 +44,10 @@ from app.config import load_provider_catalog
 # ``rate_snapshot`` records which generation of the estimator produced it.
 PRICING_VERSION = 1
 
+# Conservative fallback context window (tokens) when a model declares none in its
+# catalog entry — used by compaction to size the threshold (0.85 * window).
+DEFAULT_CONTEXT_WINDOW = 128_000
+
 # provider-family -> (cache_read_multiplier, cache_write_multiplier) relative to
 # the input rate, used when a model has no explicit cache_*_price_per_1m fields.
 #   anthropic     : read 0.10x, 5-min write 1.25x (cache tokens are distinct)
@@ -92,6 +96,7 @@ class ModelRates:
     cache_read_multiplier: float
     cache_write_multiplier: float
     source: str  # "catalog" | "unknown"
+    context_window: Optional[int] = None  # max context tokens, from the catalog entry
 
 
 @dataclass(frozen=True)
@@ -172,8 +177,17 @@ def get_model_rates(provider: Optional[str], model: Optional[str]) -> ModelRates
         input_per_1m=input_per_1m, output_per_1m=output_per_1m,
         cache_read_per_1m=cache_read_per_1m, cache_write_per_1m=cache_write_per_1m,
         cache_read_multiplier=read_mult, cache_write_multiplier=write_mult,
-        source=source,
+        source=source, context_window=_as_int(entry.get("context_window")),
     )
+
+
+def context_window_for(provider: Optional[str], model: Optional[str]) -> Optional[int]:
+    """Max context window (tokens) for ``(provider, model)`` from the catalog.
+
+    ``None`` when the provider/model is unknown or the catalog entry omits
+    ``context_window`` — callers fall back to :data:`DEFAULT_CONTEXT_WINDOW`.
+    """
+    return get_model_rates(provider, model).context_window
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -181,6 +195,15 @@ def _as_float(value: Any) -> Optional[float]:
         return None
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 

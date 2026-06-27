@@ -19,6 +19,7 @@ api_key = { description = "Gemini API Key", type = "string", secret = true, requ
 
 [[models]]
 id = "gemini-3.1-pro-preview"
+context_window = 1048576
 display_name = "Gemini 3.1 Pro"
 group_hint = "high"
 supports_reasoning = true
@@ -31,6 +32,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gemini-3-flash-preview"
+context_window = 1048576
 display_name = "Gemini 3 Flash"
 group_hint = "low"
 supports_reasoning = true
@@ -43,6 +45,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gemini-3.1-flash-lite-preview"
+context_window = 1048576
 display_name = "Gemini 3.1 Flash Lite"
 group_hint = "low"
 supports_reasoning = true
@@ -55,6 +58,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gemini-2.5-pro"
+context_window = 1048576
 display_name = "Gemini 2.5 Pro"
 group_hint = "high"
 supports_reasoning = true
@@ -67,6 +71,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gemini-2.5-flash"
+context_window = 1048576
 display_name = "Gemini 2.5 Flash"
 group_hint = "low"
 supports_reasoning = true
@@ -79,6 +84,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gemini-2.5-flash-lite"
+context_window = 1048576
 display_name = "Gemini 2.5 Flash Lite"
 group_hint = "low"
 supports_reasoning = true
@@ -91,6 +97,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "gemini-2.0-flash"
+context_window = 1048576
 display_name = "Gemini 2.0 Flash"
 group_hint = "low"
 prompt_cache = true

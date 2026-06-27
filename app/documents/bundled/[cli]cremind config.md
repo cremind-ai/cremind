@@ -242,7 +242,7 @@ the page).
 | Key                                   | UI label                    | Type    | Default  | Range           | Meaning                                                                                  |
 |---------------------------------------|-----------------------------|---------|----------|-----------------|------------------------------------------------------------------------------------------|
 | `compaction.enabled`                  | Enabled                     | boolean | `true`   | —               | When off, full history is sent (bounded only by the model's context window).             |
-| `compaction.compact_threshold_tokens` | Compaction threshold        | number  | `40000`  | 1000 – 1000000  | Fold the oldest turns into the summary once the verbatim tail's token count crosses this. Must stay above `keep_recent_tokens`. |
+| `compaction.compact_threshold_percent` | Compaction threshold (% of context window) | number | `85` | 10 – 100 (±5) | Suggest folding the oldest turns once the model's reported context reaches this percentage of its context window. Lower it to compact earlier. |
 | `compaction.keep_recent_tokens`       | Keep-recent target          | number  | `40000`  | 500 – 500000    | After a compaction, keep about this many tokens of recent turns verbatim (hysteresis band). |
 | `compaction.keep_recent_messages`     | Keep-recent messages floor  | number  | `4`      | 0 – 50          | Never fold below this many of the most recent messages.                                  |
 | `compaction.temperature`              | Temperature                 | number  | `0.3`    | 0 – 2 (±0.1)    | Sampling temperature for the summarization call.                                         |
@@ -301,10 +301,10 @@ $ cremind config get agent.max_steps
 40
 ```
 
-### Compact sooner for a short-context model
+### Compact sooner (fold before the context window fills)
 
 ```bash
-$ cremind config set compaction.compact_threshold_tokens 40000
+$ cremind config set compaction.compact_threshold_percent 70
 $ cremind config set compaction.keep_recent_tokens 15000
 ```
 

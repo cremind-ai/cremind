@@ -28,7 +28,9 @@ export interface ConversationMemory {
   // Short-term memory is the conversation's running compaction summary.
   summary: string;
   long_term: MemoryEntry[];
-  token_progress: { current: number; threshold: number };
+  // current = the model's reported context size for the latest turn; threshold =
+  // compact_threshold_percent / 100 * context_window (when to suggest compacting).
+  token_progress: { current: number; threshold: number; context_window: number };
   enabled: boolean;
   last_compacted_at: number | null;
 }

@@ -17,6 +17,7 @@ api_key = { description = "Cloudflare API Token", type = "string", secret = true
 
 [[models]]
 id = "gpt-5.4"
+context_window = 1050000
 display_name = "GPT-5.4 (via CF Gateway)"
 supports_reasoning = true
 group_hint = "high"
@@ -27,6 +28,7 @@ output_price_per_1m = 0.00
 
 [[models]]
 id = "claude-sonnet-4.6"
+context_window = 1000000
 display_name = "Claude Sonnet 4.6 (via CF Gateway)"
 supports_reasoning = true
 group_hint = "high"

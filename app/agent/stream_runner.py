@@ -556,6 +556,14 @@ async def run_agent_to_bus(
                 "cache_creation_input_tokens": total_cache_creation_input_tokens,
                 "output_tokens": total_output_tokens,
             }
+            # The single largest prompt the model processed this turn (final reasoning
+            # call) = the real context size, used by compaction to gauge the window.
+            # The four totals above are summed across calls and over-count, so this is
+            # stored separately.
+            from app.agent.compaction import context_tokens_from_records
+            ctx = context_tokens_from_records(collected_usage_records)
+            if ctx is not None:
+                token_usage_data["context_tokens"] = ctx
         persist_parts = collected_file_parts if collected_file_parts else None
 
         # Stamp the turn's reasoning provider/model onto the message metadata so
