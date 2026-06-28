@@ -4,11 +4,6 @@ Prompt-injection defense for ``web_search`` / ``web_fetch``: text fetched from
 the public web is NEVER trusted as instructions. We delimit it with a
 unique-id marker so the Reasoning Agent can tell data from directives, and
 (for fetched pages) prepend a short security notice.
-
-Reduced port of OpenClaw's ``security/external-content.ts`` -- the full
-upstream module adds homoglyph folding and special-token scrubbing; this is a
-deliberately small first pass covering the load-bearing parts (boundary
-markers + marker-spoof neutralisation + the warning banner).
 """
 
 from __future__ import annotations

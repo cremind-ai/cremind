@@ -7,14 +7,6 @@ via Cremind's existing MCP client stack
 Parallel API key as a Bearer token unlocks the higher-limit ``mcp-oauth``
 endpoint (supported here via the optional ``PARALLEL_API_KEY`` config var).
 
-Why this is the default
------------------------
-Unlike DuckDuckGo HTML scraping, this is a *documented, sanctioned* free API
-that returns structured JSON (no fragile HTML parsing). It is what OpenClaw
-prefers as its top keyless provider. Risks (no SLA, undocumented anonymous
-rate limits, "light use" positioning) are handled by failing gracefully so the
-tool can fall through (under ``auto``) or surface a clear error.
-
 Robustness
 ----------
 Parallel's docs name the tool (``web_search``) but do not pin its input/output

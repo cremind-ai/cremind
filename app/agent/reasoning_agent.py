@@ -396,6 +396,8 @@ class ReasoningAgent:
         specs: List[dict] = []
         dispatch: Dict[str, tuple] = {}
         skill_events_available = self._has_loaded_skill_with_events()
+        # Per-profile disabled sub-tools ("leaves"), resolved in one read.
+        disabled_by_tool = self.registry.disabled_leaves_by_tool(self.profile)
 
         for tool in self._tools:
             if tool.tool_id in self._loaded_skill_ids:
@@ -438,7 +440,10 @@ class ReasoningAgent:
             except Exception:  # noqa: BLE001
                 logger.exception(f"leaf_function_specs failed for '{tool.tool_id}'")
                 continue
+            disabled = disabled_by_tool.get(tool.tool_id, ())
             for fs in leaf_specs:
+                if fs.leaf_name in disabled:
+                    continue  # sub-tool disabled for this profile
                 specs.append(fs.schema)
                 dispatch[fs.name] = ("leaf", tool, fs.leaf_name)
 

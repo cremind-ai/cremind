@@ -14,7 +14,6 @@ from app.lib.llm.factory import SUPPORTED_LLM_PROVIDERS
 from app.runtime import BootedState
 from app.utils.logger import logger
 
-# GitHub Copilot device code flow constants (from OpenClaw)
 _GH_CLIENT_ID = "Iv1.b507a08c87ecfe98"
 _GH_DEVICE_CODE_URL = "https://github.com/login/device/code"
 _GH_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"

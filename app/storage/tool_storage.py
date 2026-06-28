@@ -29,7 +29,11 @@ SCOPE_ARG = "arg"
 SCOPE_VARIABLE = "variable"
 SCOPE_LLM = "llm"
 SCOPE_META = "meta"
-VALID_SCOPES = {SCOPE_ARG, SCOPE_VARIABLE, SCOPE_LLM, SCOPE_META}
+# ``leaf`` stores per-profile enable/disable for a built-in/MCP group's
+# individual sub-tools ("leaves"). Opt-out model: a row exists only for a
+# DISABLED leaf (key=leaf_name, value="false"); absence == enabled.
+SCOPE_LEAF = "leaf"
+VALID_SCOPES = {SCOPE_ARG, SCOPE_VARIABLE, SCOPE_LLM, SCOPE_META, SCOPE_LEAF}
 
 
 class ToolStorage(SyncStorageBase):
@@ -398,6 +402,28 @@ class ToolStorage(SyncStorageBase):
                 {"profile": profile, "tool_id": tool_id, "scope": scope, "key": key},
             )
             return cur.rowcount > 0
+
+    def list_disabled_leaves(self, profile: str) -> dict[str, set[str]]:
+        """Return ``{tool_id: {leaf_name, ...}}`` of disabled leaves for ``profile``.
+
+        Single grouped query over the ``leaf`` config scope -- mirrors
+        :meth:`list_profile_tools` so the reasoning agent can resolve every
+        tool's disabled sub-tools in one read per turn rather than one per tool.
+        Only DISABLED leaves are persisted (value ``"false"``); enabled leaves
+        have no row and fall through to the default (on).
+        """
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT tool_id, key FROM tool_configs "
+                    "WHERE profile = :profile AND scope = :scope AND value = :value"
+                ),
+                {"profile": profile, "scope": SCOPE_LEAF, "value": "false"},
+            ).fetchall()
+            out: dict[str, set[str]] = {}
+            for tool_id, key in rows:
+                out.setdefault(tool_id, set()).add(key)
+            return out
 
     def delete_all_configs(self, *, profile: str, tool_id: str) -> int:
         """Delete every config row (all scopes) for one (profile, tool_id).

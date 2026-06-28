@@ -10,6 +10,7 @@ ended with a DONE, and per-call THINKING/RESULT artifacts were emitted.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any, AsyncGenerator, Dict, List
 
 import pytest
@@ -118,6 +119,9 @@ def _build_agent(monkeypatch) -> tuple[ra.ReasoningAgent, _FakeLeafTool]:
     agent._inject_reasoning_guidance = False
     agent._tools = [tool]
     agent._tools_by_id = {"calc": tool}
+    # No sub-tools disabled for this profile (real agents resolve this via the
+    # registry; here _tools is set directly so a minimal stub suffices).
+    agent.registry = SimpleNamespace(disabled_leaves_by_tool=lambda profile: {})
     agent.max_steps = 6
     agent._loaded_skill_ids = set()
     agent._loaded_skill_sections = {}
