@@ -13,10 +13,11 @@ import { useSettingsStore, type ProfileValue } from '../stores/settings';
 import {
   listAgents, addAgent, removeAgent, updateAgentConfig,
   listTools, updateToolConfig, setToolEnabled,
+  listToolLeaves, setToolLeaves,
   listLLMProviders, getProviderModels,
   streamFeaturesInstall, FeatureNotInstalledError,
   deleteSkill, importSkillArchive, importSkillFromGitHub, importSkillFromHub,
-  type RemoteAgentInfo, type ToolStatus, type LLMProvider,
+  type RemoteAgentInfo, type ToolStatus, type LLMProvider, type ToolLeaf,
   type FeatureNotInstalledDetail, type FeatureInstallEvent,
 } from '../services/configApi';
 import {
@@ -31,6 +32,7 @@ import ItemCardHeader from '../components/shared/ItemCardHeader.vue';
 import ToolVariablesForm from '../components/shared/ToolVariablesForm.vue';
 import ToolArgumentsForm from '../components/shared/ToolArgumentsForm.vue';
 import LLMParametersForm from '../components/shared/LLMParametersForm.vue';
+import LeafToggleSection from '../components/shared/LeafToggleSection.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -99,6 +101,20 @@ interface UnifiedItem {
   /** Transient: most recent successful registration result, used to render
    *  the inline confirmation card with a link to the process detail page. */
   lastRegisteredProcess: { process_id: string; command: string } | null;
+
+  // ── Per-sub-tool ("leaf") enable/disable (built-in groups + MCP servers) ──
+  /** True when the tool exposes more than one sub-tool, so the expanded card
+   *  shows a "Sub-tools" section. For built-ins this comes from the list row;
+   *  for MCP servers it's resolved from the lazy-loaded leaf list. */
+  supportsLeafToggle: boolean;
+  /** Lazily-loaded sub-tools with their enabled state. */
+  leaves: ToolLeaf[];
+  /** Transient: true while the leaf list is being fetched. */
+  leavesLoading: boolean;
+  /** Whether the leaf list has been fetched yet (lazy-load guard). */
+  leavesLoaded: boolean;
+  /** True when an MCP server is disconnected and its sub-tools can't be listed. */
+  leavesDisconnected: boolean;
 }
 
 // ── Data ──
@@ -349,6 +365,11 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       longRunningApp: tool.long_running_app ?? null,
       registering: false,
       lastRegisteredProcess: null,
+      supportsLeafToggle: !!tool.supports_leaf_toggle,
+      leaves: [],
+      leavesLoading: false,
+      leavesLoaded: false,
+      leavesDisconnected: false,
     });
   }
 
@@ -394,6 +415,12 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       longRunningApp: null,
       registering: false,
       lastRegisteredProcess: null,
+      // MCP servers can expose many tools; resolved on expand via listToolLeaves.
+      supportsLeafToggle: false,
+      leaves: [],
+      leavesLoading: false,
+      leavesLoaded: false,
+      leavesDisconnected: false,
     });
   }
 
@@ -435,6 +462,12 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       longRunningApp: null,
       registering: false,
       lastRegisteredProcess: null,
+      // A2A remote agents have no per-leaf controls.
+      supportsLeafToggle: false,
+      leaves: [],
+      leavesLoading: false,
+      leavesLoaded: false,
+      leavesDisconnected: false,
     });
   }
 
@@ -521,6 +554,65 @@ async function toggleItemEnabled(item: UnifiedItem, value: boolean) {
     }
     item.enabled = !item.enabled;
     ElMessage.error(e instanceof Error ? e.message : 'Failed to toggle');
+  }
+}
+
+// ── Sub-tool ("leaf") enable/disable ──
+
+/** Expand/collapse a card; lazy-load the sub-tool list the first time a
+ *  built-in group or MCP server card is opened. */
+function toggleExpand(item: UnifiedItem) {
+  item.expanded = !item.expanded;
+  if (item.expanded && !item.leavesLoaded && (item.kind === 'builtin' || item.kind === 'mcp-remote')) {
+    void loadLeaves(item);
+  }
+}
+
+async function loadLeaves(item: UnifiedItem) {
+  const toolId = item.toolName ?? item.name;
+  item.leavesLoading = true;
+  try {
+    const res = await listToolLeaves(settingsStore.agentUrl, settingsStore.authToken, toolId);
+    item.leaves = res.leaves;
+    item.supportsLeafToggle = res.supports_leaf_toggle;
+    item.leavesDisconnected = res.disconnected;
+    item.leavesLoaded = true;
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to load sub-tools');
+  } finally {
+    item.leavesLoading = false;
+  }
+}
+
+/** Optimistically toggle one sub-tool, rolling back on failure. */
+async function toggleLeaf(item: UnifiedItem, leafName: string, value: boolean) {
+  const leaf = item.leaves.find(l => l.leaf_name === leafName);
+  if (!leaf) return;
+  const prev = leaf.enabled;
+  leaf.enabled = value;
+  try {
+    await setToolLeaves(settingsStore.agentUrl, settingsStore.authToken,
+      item.toolName ?? item.name, { [leafName]: value });
+  } catch (e) {
+    leaf.enabled = prev;
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to update sub-tool');
+  }
+}
+
+/** Optimistically enable/disable every sub-tool at once, rolling back on failure. */
+async function setAllLeaves(item: UnifiedItem, enabled: boolean) {
+  const prev = item.leaves.map(l => l.enabled);
+  const payload: Record<string, boolean> = {};
+  for (const leaf of item.leaves) {
+    payload[leaf.leaf_name] = enabled;
+    leaf.enabled = enabled;
+  }
+  try {
+    await setToolLeaves(settingsStore.agentUrl, settingsStore.authToken,
+      item.toolName ?? item.name, payload);
+  } catch (e) {
+    item.leaves.forEach((l, i) => { l.enabled = prev[i]; });
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to update sub-tools');
   }
 }
 
@@ -868,7 +960,7 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
                 :toggle-locked="item.toggleLocked"
                 :show-authenticate="item.showAuthenticate"
                 :show-unlink="item.showUnlink"
-                @toggle-expand="item.expanded = !item.expanded"
+                @toggle-expand="toggleExpand(item)"
                 @update:enabled="toggleItemEnabled(item, $event)"
                 @authenticate="handleAuthenticate(item)"
                 @unlink="handleUnlink(item)"
@@ -887,7 +979,21 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
                      style="display: flex; align-items: center; gap: 8px;">
                   <ElButton type="primary" size="small" :loading="item.saving" @click="saveItemConfig(item)">Save</ElButton>
                 </div>
-                <div v-else class="empty-args">No configuration required for this tool.</div>
+
+                <LeafToggleSection
+                  v-if="item.supportsLeafToggle || item.leavesLoading"
+                  :leaves="item.leaves"
+                  :loading="item.leavesLoading"
+                  :disconnected="item.leavesDisconnected"
+                  :parent-enabled="item.enabled"
+                  @toggle="(leaf, val) => toggleLeaf(item, leaf, val)"
+                  @set-all="(val) => setAllLeaves(item, val)"
+                />
+
+                <div
+                  v-if="Object.keys(item.toolConfigFields).length === 0 && !item.supportsLeafToggle && !item.leavesLoading"
+                  class="empty-args"
+                >No configuration required for this tool.</div>
               </div>
             </ElCard>
           </div>
@@ -1014,7 +1120,7 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
                 :show-reconnect="!!item.connectionError"
                 :show-remove="true"
                 :remove-name="item.name"
-                @toggle-expand="item.expanded = !item.expanded"
+                @toggle-expand="toggleExpand(item)"
                 @update:enabled="toggleItemEnabled(item, $event)"
                 @authenticate="handleAuthenticate(item)"
                 @unlink="handleUnlink(item)"
@@ -1052,6 +1158,16 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
                   <ElButton type="primary" size="small" :loading="item.saving" @click="saveItemConfig(item)">Save</ElButton>
                   <ElButton size="small" @click="resetLLMDefaults(item)">Reset All to Default</ElButton>
                 </div>
+
+                <LeafToggleSection
+                  v-if="item.leavesLoading || item.supportsLeafToggle || item.leavesDisconnected"
+                  :leaves="item.leaves"
+                  :loading="item.leavesLoading"
+                  :disconnected="item.leavesDisconnected"
+                  :parent-enabled="item.enabled"
+                  @toggle="(leaf, val) => toggleLeaf(item, leaf, val)"
+                  @set-all="(val) => setAllLeaves(item, val)"
+                />
               </div>
             </ElCard>
           </div>

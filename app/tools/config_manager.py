@@ -17,7 +17,7 @@ import json
 from typing import Any
 
 from app.storage.tool_storage import (
-    SCOPE_ARG, SCOPE_LLM, SCOPE_META, SCOPE_VARIABLE,
+    SCOPE_ARG, SCOPE_LEAF, SCOPE_LLM, SCOPE_META, SCOPE_VARIABLE,
     ToolStorage,
 )
 
@@ -111,6 +111,34 @@ class ToolConfigManager:
             return
         self._storage.set_config(
             profile=profile, tool_id=tool_id, scope=SCOPE_META, key=key, value=value,
+        )
+
+    # ── leaf enable/disable (sub-tools of a built-in/MCP group) ─────────
+
+    def get_disabled_leaves(self, tool_id: str, profile: str) -> set[str]:
+        """Return the set of leaf names explicitly disabled for this tool.
+
+        Opt-out model: only disabled leaves are stored (value ``"false"``);
+        an absent leaf is enabled by default. Note this scope is intentionally
+        excluded from :meth:`snapshot` so it doesn't leak into the generic
+        per-tool config UI.
+        """
+        raw = self._storage.get_scope(profile=profile, tool_id=tool_id, scope=SCOPE_LEAF)
+        return {key for key, value in raw.items() if value == "false"}
+
+    def set_leaf_enabled(self, tool_id: str, profile: str, leaf: str, enabled: bool) -> None:
+        """Enable or disable a single leaf for ``profile``.
+
+        Re-enabling deletes the opt-out row (back to the default); disabling
+        writes ``value="false"``.
+        """
+        if enabled:
+            self._storage.delete_config(
+                profile=profile, tool_id=tool_id, scope=SCOPE_LEAF, key=leaf,
+            )
+            return
+        self._storage.set_config(
+            profile=profile, tool_id=tool_id, scope=SCOPE_LEAF, key=leaf, value="false",
         )
 
     # ── snapshot for the UI ────────────────────────────────────────────

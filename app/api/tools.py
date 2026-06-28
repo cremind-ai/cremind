@@ -132,6 +132,12 @@ def get_tool_routes(state: BootedState) -> list[Route]:
                 row["is_stub"] = True
             else:
                 row["is_stub"] = bool(getattr(tool, "is_stub", False))
+            # Multi-leaf tools (built-in groups, MCP servers) expose a per-
+            # sub-tool toggle section; the UI lazy-loads leaves only for these.
+            try:
+                row["supports_leaf_toggle"] = len(tool.skills) > 1
+            except Exception:  # noqa: BLE001
+                row["supports_leaf_toggle"] = False
             if hasattr(tool, "is_llm_bound"):
                 row["llm_bound"] = bool(tool.is_llm_bound)
             if hasattr(tool, "url"):
@@ -404,11 +410,98 @@ def get_tool_routes(state: BootedState) -> list[Route]:
             "working_dir": working_dir,
         })
 
+    async def handle_list_leaves(request: Request) -> JSONResponse:
+        """List a tool's sub-tools ("leaves") with their per-profile enabled state.
+
+        Returns ``{supports_leaf_toggle, disconnected, leaves: [{leaf_name,
+        name, description, enabled}]}``. Built-in groups list statically; MCP
+        servers list live and return an empty list (``disconnected=true``) when
+        the connection is down.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        registry = state.registry
+        if registry is None:
+            return _storage_not_ready()
+        profile = _profile_from_request(request)
+        if not profile:
+            return JSONResponse({"error": "Profile is required"}, status_code=400)
+        tool_id = request.path_params["tool_id"]
+        try:
+            return JSONResponse(registry.leaves_for_profile(profile, tool_id))
+        except KeyError:
+            return JSONResponse({"error": f"Tool '{tool_id}' not found"}, status_code=404)
+
+    async def handle_set_leaves(request: Request) -> JSONResponse:
+        """Enable/disable one or more sub-tools ("leaves") of a tool.
+
+        Body: ``{"leaves": {"<leaf_name>": <bool>, ...}}``. A single key is a
+        per-row toggle; many keys drive "Enable all" / "Disable all". Unknown
+        leaf names are rejected when the tool exposes a live sub-tool list;
+        when that list is empty (e.g. a disconnected MCP server) the write is
+        accepted so a persisted choice survives a reconnect.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        registry = state.registry
+        if registry is None:
+            return _storage_not_ready()
+        profile = _profile_from_request(request)
+        if not profile:
+            return JSONResponse({"error": "Profile is required"}, status_code=400)
+        tool_id = request.path_params["tool_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        leaves = body.get("leaves")
+        if not isinstance(leaves, dict) or not leaves:
+            return JSONResponse(
+                {"error": "'leaves' must be a non-empty object of {leaf_name: bool}"},
+                status_code=400,
+            )
+
+        tool = registry.get(tool_id)
+        if tool is None:
+            return JSONResponse({"error": f"Tool '{tool_id}' not found"}, status_code=404)
+        # Validate against the live sub-tool list when available.
+        try:
+            known = {s.id for s in tool.skills}
+        except Exception:  # noqa: BLE001
+            known = set()
+        if known:
+            unknown = [name for name in leaves if name not in known]
+            if unknown:
+                return JSONResponse(
+                    {"error": f"Unknown sub-tool(s): {', '.join(sorted(unknown))}"},
+                    status_code=400,
+                )
+
+        try:
+            for leaf, enabled in leaves.items():
+                registry.set_profile_tool_leaf_enabled(
+                    profile, tool_id, str(leaf), bool(enabled),
+                )
+        except KeyError:
+            return JSONResponse({"error": f"Tool '{tool_id}' not found"}, status_code=404)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+        # Deliberately NOT publishing a settings-state change: the reasoning
+        # agent re-reads disabled leaves from the DB every step (no in-memory
+        # cache to invalidate), and an SSE refresh would collapse the expanded
+        # Settings card the user is toggling sub-tools in.
+        return JSONResponse({"success": True})
+
     return [
         Route("/api/tools", handle_list_tools, methods=["GET"]),
         Route("/api/tools/{tool_id}", handle_get_tool, methods=["GET"]),
         Route("/api/tools/{tool_id}/variables", handle_set_variables, methods=["PUT"]),
         Route("/api/tools/{tool_id}/enabled", handle_set_enabled, methods=["PUT"]),
+        Route("/api/tools/{tool_id}/leaves", handle_list_leaves, methods=["GET"]),
+        Route("/api/tools/{tool_id}/leaves", handle_set_leaves, methods=["PUT"]),
         Route(
             "/api/tools/{tool_id}/long-running-app/register",
             handle_register_long_running_app,
