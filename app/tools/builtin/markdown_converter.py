@@ -118,7 +118,7 @@ class ConvertToMarkdownTool(BuiltInTool):
         "to Markdown format. The converted file is saved with a timestamped "
         "filename. If an output path is specified, the file is saved there; "
         "otherwise it defaults to <profile>/markdown_files/. "
-        "E.g. 'Convert openclaw.pdf to markdown'"
+        "E.g. 'Convert cremind.pdf to markdown'"
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -127,7 +127,7 @@ class ConvertToMarkdownTool(BuiltInTool):
                 "type": "string",
                 "description": (
                     "Relative path to the source file within the data directory. "
-                    "E.g. 'documents/report.pdf' or 'default/uploads/openclaw.pdf'."
+                    "E.g. 'documents/report.pdf' or 'default/uploads/cremind.pdf'."
                 ),
             },
             "profile": {

@@ -630,7 +630,7 @@ class SearchFilesTool(BuiltInTool):
         "Recursively search for files or directories by name within the user's "
         "data directory. Supports deep searching through nested folders using "
         "case-insensitive keyword matching. All query words must appear in the "
-        "file name. E.g. 'find the file open claw' will match 'OpenClaw.pdf'."
+        "file name. E.g. 'find the file cremind' will match 'cremind.pdf'."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -640,7 +640,7 @@ class SearchFilesTool(BuiltInTool):
                 "description": (
                     "Search query. Split into keywords; a file matches if ALL "
                     "keywords appear in its name (case-insensitive). "
-                    "E.g. 'open claw' matches 'OpenClaw.pdf'."
+                    "E.g. 'cremind' matches 'cremind.pdf'."
                 ),
             },
             "path": {

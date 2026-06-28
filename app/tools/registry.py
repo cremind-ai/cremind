@@ -607,6 +607,71 @@ class ToolRegistry:
             )
         self._storage.set_profile_tool(profile, tool_id, enabled)
 
+    # ── per-leaf enable/disable (sub-tools of a built-in/MCP group) ─────
+
+    def disabled_leaves_by_tool(self, profile: str) -> Dict[str, set[str]]:
+        """Return ``{tool_id: {leaf_name, ...}}`` of disabled leaves for ``profile``.
+
+        Used by the reasoning agent's per-step tool build to suppress disabled
+        sub-tools in one read, mirroring :meth:`tools_for_profile`'s use of
+        ``list_profile_tools``.
+        """
+        return self._storage.list_disabled_leaves(profile)
+
+    def leaves_for_profile(self, profile: str, tool_id: str) -> dict:
+        """Return the UI payload describing a tool's sub-tools for ``profile``.
+
+        Built from the tool's ``skills`` (static for built-in groups, live for
+        MCP servers, empty for a disconnected MCP stub) merged with the
+        per-profile disabled set. ``supports_leaf_toggle`` is False for
+        single-leaf groups (toggling the one leaf is redundant with the tool's
+        own enable switch) so the UI can hide the section.
+        """
+        tool = self._tools.get(tool_id)
+        if tool is None:
+            raise KeyError(f"Tool '{tool_id}' is not registered")
+        try:
+            skills = tool.skills
+        except Exception:  # noqa: BLE001
+            logger.exception(f"leaves_for_profile: skills failed for '{tool_id}'")
+            skills = []
+        disabled = self._config.get_disabled_leaves(tool_id, profile)
+        leaves = [
+            {
+                "leaf_name": s.id,
+                "name": s.name,
+                "description": s.description,
+                "enabled": s.id not in disabled,
+            }
+            for s in skills
+        ]
+        return {
+            "supports_leaf_toggle": len(leaves) > 1,
+            "disconnected": bool(getattr(tool, "connection_error", None)),
+            "leaves": leaves,
+        }
+
+    def set_profile_tool_leaf_enabled(
+        self, profile: str, tool_id: str, leaf: str, enabled: bool,
+    ) -> None:
+        """Enable/disable a single sub-tool ("leaf") of a tool for ``profile``.
+
+        Refuses ``hidden`` system tools (never user-facing). Unlike
+        :meth:`set_profile_tool_enabled`, ``locked`` tools ARE allowed: the lock
+        protects the group's presence, while per-leaf control is the whole point
+        (e.g. make a locked ``system_file`` read-only). The leaf row is
+        independent of the parent ``profile_tools`` flag, so the choice persists
+        across a parent disable/re-enable.
+        """
+        tool = self._tools.get(tool_id)
+        if tool is None:
+            raise KeyError(f"Tool '{tool_id}' is not registered")
+        if tool.hidden:
+            raise ValueError(
+                f"Tool '{tool_id}' is a hidden system tool and has no per-leaf controls."
+            )
+        self._config.set_leaf_enabled(tool_id, profile, leaf, enabled)
+
 
 # ── singleton ──────────────────────────────────────────────────────────────
 

@@ -1,10 +1,5 @@
 """DuckDuckGo HTML-scraping web-search provider (EXPERIMENTAL / UNOFFICIAL).
 
-Ported from OpenClaw's ``extensions/duckduckgo/src/ddg-client.ts``. Scrapes the
-no-JavaScript SERP page at ``https://html.duckduckgo.com/html`` with the
-standard library only (``re`` + ``html.unescape`` + ``urllib.parse``) -- no
-HTML-parser dependency.
-
 Why this is OPT-IN and off by default
 --------------------------------------
 ``html.duckduckgo.com`` is NOT an official API. Its ``robots.txt`` is
