@@ -2,7 +2,6 @@
 
 Fetches an HTTP(S) URL and extracts readable markdown/text using the standard
 library only (regex HTML->markdown, no renderer, no HTML-parser dependency).
-Ported from OpenClaw's ``web_fetch`` + its SSRF guard.
 
 Invocation
 ----------

@@ -108,7 +108,7 @@ _TEXT_PROMPT_TAIL_RE = re.compile(
 
 # Clack active-prompt header: a line starting with `◆` (active) or `◇`
 # (complete) followed by the prompt question.  @clack/prompts and every
-# CLI built on it (create-astro, sv, openclaw, shadcn-ui, …) emit this.
+# CLI built on it (create-astro, sv, Cremind, shadcn-ui, …) emit this.
 _CLACK_HEADER_RE = re.compile(r"(?m)^[ \t]{0,8}[◆◇][ \t]+\S")
 
 
