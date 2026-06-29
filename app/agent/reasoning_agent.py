@@ -38,7 +38,6 @@ if TYPE_CHECKING:
 
 from a2a.types import DataPart, Part, TextPart
 
-from app.agent.skill_classifier import classify_skill_request
 from app.agent.usage import UsageRecord
 from app.utils.formatting import dict_to_text
 from app.config import model_supports_reasoning, model_supports_vision, vision_feature_enabled
@@ -72,8 +71,13 @@ from app.utils.working_directory import set_in_memory_override
 LOADED_SKILLS_KEY = "_loaded_skill_ids"
 
 # Parameter name a skill function exposes so the model can pass the user's
-# intent (used to classify load-vs-event and to seed register_skill_event).
+# intent. On first use it is overwritten to a fixed marker and the SKILL.md
+# content is returned as the tool result (see ``_handle_skill_call``).
 SKILL_REQUEST_ARG = "request"
+
+# What we overwrite a skill load call's ``request`` arg with so the persisted /
+# replayed trace is deterministic and byte-stable (better prompt-cache reuse).
+SKILL_LOAD_REQUEST = "You need to load the SKILL.md file for skill {name}"
 
 
 SYSTEM_TEMPLATE = '''{persona_description}
@@ -98,8 +102,7 @@ PRESERVE THE USER'S LANGUAGE: any human-facing value you put in a tool argument
 schedule event, reminder, note, or task) and any message shown to the user --
 MUST be written in the SAME language the user used. Do NOT translate it.
 Structured values (ISO datetimes, RRULE strings, enums, file paths, keys) stay
-exactly as specified.
-{loaded_skills}'''
+exactly as specified.'''
 
 
 # Injected into the system prompt ONLY for models that lack native step-by-step
@@ -174,12 +177,11 @@ class ReasoningAgent:
         # Snapshot the tool list available to this profile for this run.
         tools = registry.tools_for_profile(profile)
         # Event-triggered runs must not register new watchers/events (recursive
-        # event storms). ``register_skill_event`` is dropped outright;
-        # ``register_file_watcher`` is a system_file subtool suppressed via
-        # ``_triggered_by_event`` injected into spec-building below.
+        # event storms). The skill tool's ``subscribe`` block is omitted from the
+        # spec when ``_triggered_by_event`` is set (see _build_tools_and_dispatch),
+        # and ``register_file_watcher`` (a system_file subtool) is suppressed the
+        # same way via ``_triggered_by_event`` injected into spec-building below.
         self._triggered_by_event = triggered_by_event
-        if triggered_by_event:
-            tools = [t for t in tools if t.tool_id != "register_skill_event"]
         # The ``reasoning`` think-tool exists only to give models WITHOUT native
         # step-by-step reasoning a place to think before acting. Drop it (and
         # skip its system-prompt guidance) for models that reason natively.
@@ -209,9 +211,12 @@ class ReasoningAgent:
         self.max_steps = max_steps if max_steps is not None else cfg.max_steps
         self.current_step_count = 0
 
-        # Skills whose SKILL.md has been folded into the system prompt this turn.
+        # Skill tool_ids whose SKILL.md is present in this conversation's context.
+        # Seeded at run() start from the replayed history (a skill stays "loaded"
+        # only while its load tool call is still in the tail; it drops out once
+        # compaction folds that call into the summary), then extended as new skills
+        # load this turn. Used to skip re-loading an already-loaded skill.
         self._loaded_skill_ids: set[str] = set()
-        self._loaded_skill_sections: Dict[str, str] = {}
 
         # Per-turn token accounting (cached reads/writes split for cost attribution).
         self._total_input_tokens = 0
@@ -334,24 +339,6 @@ class ReasoningAgent:
 
     # ── prompt building ───────────────────────────────────────────────
 
-    def _build_loaded_skills_block(self) -> str:
-        if not self._loaded_skill_sections:
-            return ""
-        parts = [
-            "\n==========Start Skills Instructions==========\n"
-            "You should only follow the instructions provided in the content loaded below.\n"
-            "Do not use the **System File** tool to read the directory structure of "
-            "`<skill_directory>` for security reasons."
-        ]
-        for tool_id, content in self._loaded_skill_sections.items():
-            parts.append(
-                f"\n----- Skill: {tool_id} -----\n\nPlease use this name `{tool_id}` "
-                f"to provide <skill-name> for **Exec Shell** tool\n{content}\n"
-                f"-------------------------\n"
-            )
-        parts.append("==========End Skills Instructions==========\n")
-        return "".join(parts)
-
     def _build_instruction(self) -> str:
         persona = read_persona_file(self.profile)
         override = (
@@ -364,7 +351,6 @@ class ReasoningAgent:
             current_os=platform.system(),
             current_user_working_directory=cwd,
             reasoning_guidance=REASONING_GUIDANCE if self._inject_reasoning_guidance else "",
-            loaded_skills=self._build_loaded_skills_block(),
         )
 
     def _render_input(self) -> str:
@@ -378,56 +364,93 @@ class ReasoningAgent:
 
     # ── tool spec assembly ─────────────────────────────────────────────
 
-    def _has_loaded_skill_with_events(self) -> bool:
-        for tool_id in self._loaded_skill_ids:
-            if self._skill_has_events(self._tools_by_id.get(tool_id)):
-                return True
-        return False
+    def _skill_function_spec(self, tool) -> dict:
+        """Build the native function spec for one skill tool.
+
+        The spec is derived purely from static skill metadata (description +
+        declared events), so it is byte-stable across steps and turns — loaded
+        skills are NOT removed and no per-request mutation happens, which keeps
+        the cached ``tools=`` prefix intact. Event-bearing skills additionally
+        expose a ``subscribe`` object carrying that skill's own event enum, so a
+        subscription is unambiguously tied to the skill whose tool was called
+        (no active-skill state). ``subscribe`` is omitted on event-triggered runs
+        to prevent recursive event storms.
+        """
+        properties: Dict[str, Any] = {
+            SKILL_REQUEST_ARG: {
+                "type": "string",
+                "description": (
+                    "What you want this skill to do right now (one-shot use). "
+                    "Provide this to load and use the skill."
+                ),
+            },
+        }
+        items = self._skill_event_items(tool)
+        if items and not self._triggered_by_event:
+            names = [i["name"] for i in items]
+            desc_lines = [
+                f"- {i['name']}: {i.get('description', '')}".rstrip(": ").rstrip()
+                for i in items
+            ]
+            properties["subscribe"] = {
+                "type": "object",
+                "description": (
+                    "Provide INSTEAD of `request` to subscribe this conversation "
+                    "to one or more of this skill's events so an action runs "
+                    "automatically whenever an event fires."
+                ),
+                "properties": {
+                    "trigger": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": names},
+                        "minItems": 1,
+                        "uniqueItems": True,
+                        "description": (
+                            "One or more event names declared by this skill. "
+                            "Available events:\n" + "\n".join(desc_lines)
+                        ),
+                    },
+                    "action": {
+                        "type": "string",
+                        "description": (
+                            "Short imperative of WHAT to do when an event fires "
+                            "(no trigger phrasing)."
+                        ),
+                    },
+                },
+                "required": ["trigger", "action"],
+                "additionalProperties": False,
+            }
+        return {
+            "type": "function",
+            "function": {
+                "name": tool.tool_id,
+                "description": (
+                    f"{tool.description} Call this to use the skill; pass the "
+                    "user's request. The skill's instructions load on first use."
+                ),
+                "parameters": {"type": "object", "properties": properties},
+            },
+        }
 
     def _build_tools_and_dispatch(self) -> Tuple[List[dict], Dict[str, tuple]]:
         """Flatten enabled tools' leaves into native function specs + a dispatch map.
 
         Returns ``(specs, dispatch)`` where ``dispatch[name]`` is
         ``("leaf", tool, leaf_name)`` for built-in/MCP sub-tools or
-        ``("skill", tool, None)`` for skill load/route functions. Re-run every
-        step so newly loaded skills disappear and per-request prepare_tools
-        customisation (dynamic enums, suppression) is reflected.
+        ``("skill", tool, None)`` for skill functions. Skill specs are static
+        (all skills always present, derived from metadata) so the tools block is
+        byte-stable for prompt caching.
         """
         specs: List[dict] = []
         dispatch: Dict[str, tuple] = {}
-        skill_events_available = self._has_loaded_skill_with_events()
         # Per-profile disabled sub-tools ("leaves"), resolved in one read.
         disabled_by_tool = self.registry.disabled_leaves_by_tool(self.profile)
 
         for tool in self._tools:
-            if tool.tool_id in self._loaded_skill_ids:
-                continue  # already folded into the system prompt
-            if tool.tool_id == "register_skill_event" and not skill_events_available:
-                continue
-
             if tool.tool_type is ToolType.SKILL:
-                name = tool.tool_id
-                specs.append({
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": (
-                            f"{tool.description} "
-                            "Call this to use the skill; pass the user's request."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                SKILL_REQUEST_ARG: {
-                                    "type": "string",
-                                    "description": "What the user wants this skill to do.",
-                                },
-                            },
-                            "required": [SKILL_REQUEST_ARG],
-                        },
-                    },
-                })
-                dispatch[name] = ("skill", tool, None)
+                specs.append(self._skill_function_spec(tool))
+                dispatch[tool.tool_id] = ("skill", tool, None)
                 continue
 
             try:
@@ -462,8 +485,12 @@ class ReasoningAgent:
         self._turn_messages = []
         self._final_answer_text = ""
         self.current_step_count = 0
-        self._loaded_skill_ids = set()
-        self._loaded_skill_sections = {}
+        # A skill is "loaded" iff its SKILL.md load call is still in the replayed
+        # history (it drops out once compaction folds it past the watermark). Mirror
+        # the derived set into ContextStorage for change_working_directory.
+        self._loaded_skill_ids = self._derive_loaded_skills_from_history()
+        if self.context_id:
+            set_context(self.context_id, LOADED_SKILLS_KEY, sorted(self._loaded_skill_ids))
         async for item in self._loop():
             yield item
 
@@ -575,7 +602,14 @@ class ReasoningAgent:
                 entry = dispatch.get(name)
                 resolved.append((call_id, name, args, entry))
                 tool = entry[1] if entry else None
-                yield self._thinking_artifact(step_no, call_id, name, args, tool)
+                # For a skill *load* call the recorded request is overwritten to a
+                # fixed marker (see _handle_skill_call); show that same marker in
+                # the UI Thinking Process so it matches the trace the model sees.
+                display_args = (
+                    self._skill_call_display_args(tool, args)
+                    if entry and entry[0] == "skill" else args
+                )
+                yield self._thinking_artifact(step_no, call_id, name, display_args, tool)
 
             leaf_calls = [(c, n, a, e) for (c, n, a, e) in resolved if e and e[0] == "leaf"]
             outcomes: Dict[str, "_LeafOutcome"] = {}
@@ -608,13 +642,14 @@ class ReasoningAgent:
     def _final_chunk(self, data: str) -> Dict[str, Any]:
         """Terminal DONE chunk. ``data`` is empty when the answer was streamed.
 
-        Carries the turn's native reasoning trace (``llm_messages``) for persistence
-        and clears per-turn skill state.
+        Carries the turn's native reasoning trace (``llm_messages``) for persistence.
+        The loaded-skill set is NOT cleared here: it is re-derived from history at
+        the next run() and the ContextStorage mirror must survive across turns (so
+        change_working_directory still resolves loaded skills). It resets naturally
+        once compaction folds a skill's load call out of the replayed tail.
         """
-        self._loaded_skill_ids.clear()
-        self._loaded_skill_sections.clear()
+        self._loaded_skill_ids = set()
         if self.context_id:
-            clear_context(self.context_id, LOADED_SKILLS_KEY)
             clear_context(self.context_id, "current_shell_directory")
         final_answer = data or self._final_answer_text
         return {
@@ -717,15 +752,6 @@ class ReasoningAgent:
         """
         status_chunks: list[dict] = []
 
-        # register_skill_event needs the active event-bearing skill pinned.
-        extra_args: Dict[str, Any] = {}
-        if tool.tool_id == "register_skill_event":
-            pinned, err_msg = self._pin_skill_for_register_event(json.dumps(args))
-            if err_msg is not None:
-                return _LeafOutcome(call_id, status_chunks, err_msg,
-                                    [Part(root=TextPart(text=err_msg))])
-            extra_args = pinned or {}
-
         client_args = self._tool_arguments(tool.tool_id)
         variables = self._load_variables(tool.tool_id)
         llm_params = self._load_llm_params(tool.tool_id)
@@ -735,7 +761,7 @@ class ReasoningAgent:
         try:
             async for ev in tool.execute_leaf(
                 leaf_name=leaf_name,
-                args={**args, **extra_args},
+                args=dict(args),
                 context_id=self.context_id,
                 profile=self.profile,
                 arguments=client_args,
@@ -777,10 +803,16 @@ class ReasoningAgent:
 
     def _append_tool_result(
         self, call_id: str, observation_text: str, fn_name: str | None = None,
+        *, truncate: bool = True,
     ) -> None:
-        """Append the native ``role:"tool"`` message for the model's context."""
+        """Append the native ``role:"tool"`` message for the model's context.
+
+        ``truncate=False`` skips the per-tool token clamp — used for a skill load
+        result so the full SKILL.md content reaches (and stays in) the model's
+        context.
+        """
         text = observation_text or "No result"
-        if self._tool_result_enabled:
+        if truncate and self._tool_result_enabled:
             text = truncate_to_tokens(text, self._tool_result_max_tokens)
         self._turn_messages.append({
             "role": "tool",
@@ -790,141 +822,181 @@ class ReasoningAgent:
 
     # ── skills ─────────────────────────────────────────────────────────
 
-    def _skill_has_events(self, tool) -> bool:
+    @staticmethod
+    def _skill_event_items(tool) -> List[Dict[str, Any]]:
+        """The skill's declared events (``metadata.events.event_type``).
+
+        Returns a list of ``{name, description?}`` dicts (entries without a
+        ``name`` are dropped); empty when the skill declares no events.
+        """
         info = getattr(tool, "info", None)
         metadata = getattr(info, "metadata", None) if info is not None else None
         if not isinstance(metadata, dict):
-            return False
+            return []
         events = metadata.get("events") or {}
         if not isinstance(events, dict):
-            return False
+            return []
         items = events.get("event_type") or []
-        return isinstance(items, list) and any(
-            isinstance(i, dict) and i.get("name") for i in items
-        )
+        if not isinstance(items, list):
+            return []
+        return [i for i in items if isinstance(i, dict) and i.get("name")]
 
     def _render_events_hint(self, tool) -> str:
-        info = getattr(tool, "info", None)
-        metadata = getattr(info, "metadata", None) if info is not None else None
-        if not isinstance(metadata, dict):
+        """Note appended to a skill's load result describing its events + how to
+        subscribe (via this same skill tool's ``subscribe`` field)."""
+        items = self._skill_event_items(tool)
+        if not items:
             return ""
-        events = metadata.get("events") or {}
-        if not isinstance(events, dict):
-            return ""
-        items = events.get("event_type") or []
-        if not isinstance(items, list) or not items:
-            return ""
-        skill_name = getattr(tool, "tool_id", None) or getattr(tool, "name", "")
-        bullets: List[str] = []
-        for item in items:
-            if not isinstance(item, dict) or not item.get("name"):
-                continue
-            desc = item.get("description") or ""
-            bullets.append(f"- {item['name']}: {desc}" if desc else f"- {item['name']}")
-        if not bullets:
-            return ""
-        names_csv = ", ".join(
-            i["name"] for i in items if isinstance(i, dict) and i.get("name")
-        )
+        bullets = [
+            f"- {i['name']}: {i['description']}" if i.get("description") else f"- {i['name']}"
+            for i in items
+        ]
         return (
-            "## Available events for this skill\n"
+            "## Automatic actions on events\n"
+            "This skill can run an action automatically whenever one of these "
+            "events fires:\n"
             + "\n".join(bullets)
-            + "\n\nIf the user wants something to happen automatically whenever one "
-            "of these events fires, call the `register_skill_event` tool with:\n"
-            f"- skill_name: \"{skill_name}\"\n"
-            f"- trigger: an array of one or more from [{names_csv}].\n"
-            "- action: only WHAT to do, as a short imperative (no trigger phrasing)."
+            + "\n\nIf the user wants that, call this same skill again with a "
+            "`subscribe` object: `trigger` = one or more of the event names above, "
+            "`action` = a short imperative of what to do when an event fires."
         )
 
-    def _pin_skill_for_register_event(
-        self, action_input: str,
-    ) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
-        requested: Optional[str] = None
-        try:
-            parsed = json.loads(action_input) if action_input else None
-        except (json.JSONDecodeError, TypeError):
-            parsed = None
-        if isinstance(parsed, dict):
-            sn = parsed.get("skill_name")
-            if isinstance(sn, str) and sn.strip():
-                requested = sn.strip()
+    @staticmethod
+    def _is_skill_subscribe_args(args: Dict[str, Any]) -> bool:
+        """True when a skill call carries a ``subscribe`` payload (event mode).
 
-        candidates: List[Tuple[str, str]] = []
-        for tid in self._loaded_skill_ids:
-            t = self._tools_by_id.get(tid)
-            if t is None or not self._skill_has_events(t):
-                continue
-            dir_path = getattr(getattr(t, "info", None), "dir_path", None)
-            if dir_path is None:
-                continue
-            candidates.append((tid, str(dir_path)))
+        A load call has no ``subscribe``; this distinguishes the two modes both
+        when dispatching a live call and when deriving loaded skills from history.
+        """
+        sub = args.get("subscribe") if isinstance(args, dict) else None
+        return isinstance(sub, dict) and bool(sub.get("trigger"))
 
-        if not candidates:
-            return None, (
-                "register_skill_event was invoked but no event-bearing skill is "
-                "loaded in this conversation. Load a skill that declares "
-                "metadata.events first."
-            )
-        if requested:
-            prefix = f"{self.profile}__"
-            bare = requested[len(prefix):] if requested.startswith(prefix) else requested
-            wanted = {requested, f"{self.profile}__{bare}", bare}
-            for tid, src in candidates:
-                if tid in wanted:
-                    return {"_skill_id": tid, "_skill_source": src}, None
-            return None, (
-                f"register_skill_event named skill '{requested}', but it is not "
-                f"currently loaded. Loaded event-bearing skills: "
-                f"{', '.join(t for t, _ in candidates)}."
-            )
-        if len(candidates) == 1:
-            tid, src = candidates[0]
-            return {"_skill_id": tid, "_skill_source": src}, None
-        return None, (
-            "register_skill_event needs a skill_name because more than one "
-            "event-bearing skill is loaded: "
-            f"{', '.join(t for t, _ in candidates)}."
-        )
+    def _derive_loaded_skills_from_history(self) -> set[str]:
+        """Skill tool_ids whose SKILL.md load call is still in the replayed history.
+
+        Scans assistant ``tool_calls`` for skill functions whose args are *load*
+        args (not a ``subscribe`` payload). Because SKILL.md now rides the load
+        call's tool result, a skill counts as loaded only while that call remains
+        in the tail — it drops out for free once compaction folds it away.
+        """
+        skill_ids = {t.tool_id for t in self._tools if t.tool_type is ToolType.SKILL}
+        if not skill_ids:
+            return set()
+        loaded: set[str] = set()
+        for msg in self.history_messages:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tc in (msg.get("tool_calls") or []):
+                fn = tc.get("function") or {}
+                name = fn.get("name")
+                if name not in skill_ids or name in loaded:
+                    continue
+                if not self._is_skill_subscribe_args(_coerce_args(fn.get("arguments"))):
+                    loaded.add(name)
+        return loaded
+
+    def _skill_call_display_args(self, tool, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Args to SHOW for a skill call in the UI Thinking Process.
+
+        Mirrors ``_handle_skill_call``'s branch: a subscribe call shows its
+        ``subscribe`` payload verbatim; any other (load) call shows the same
+        fixed marker the recorded ``request`` is overwritten to, so the UI step
+        matches the trace the model actually sees.
+        """
+        if self._is_skill_subscribe_args(args) and not self._triggered_by_event:
+            return args
+        return {SKILL_REQUEST_ARG: SKILL_LOAD_REQUEST.format(name=tool.name)}
+
+    def _set_skill_call_request(self, call_id: str, text: str) -> None:
+        """Overwrite the recorded skill tool-call's args to ``{request: text}``.
+
+        Keeps the persisted/replayed trace deterministic regardless of what the
+        model typed, so the cached history prefix stays byte-stable.
+        """
+        payload = json.dumps({SKILL_REQUEST_ARG: text})
+        for msg in reversed(self._turn_messages):
+            if msg.get("role") != "assistant":
+                continue
+            for tc in (msg.get("tool_calls") or []):
+                if tc.get("id") == call_id:
+                    tc.setdefault("function", {})["arguments"] = payload
+                    return
 
     async def _handle_skill_call(
         self, tool, args: Dict[str, Any], call_id: str, step_no: int,
     ) -> AsyncGenerator[ReasoningStreamResponseType, None]:
-        """Handle a model call to a skill function: load SKILL.md or route to event."""
-        user_input = (args.get(SKILL_REQUEST_ARG) or "").strip() or self._current_query
+        """Handle a model call to a skill function.
+
+        Two modes, distinguished by the args shape:
+
+        - ``subscribe`` present -> register an event subscription for THIS skill
+          (pinned by its own tool_id/source dir — no active-skill state).
+        - otherwise -> load: on first call, overwrite the recorded ``request`` to
+          a fixed marker and return the full SKILL.md as the tool result so later
+          steps (and replayed turns) carry the instructions. A repeat call (the
+          content is already in context) short-circuits.
+        """
         dir_path = tool.info.dir_path  # type: ignore[attr-defined]
-        skill_source = str(dir_path)
-        has_events = self._skill_has_events(tool)
+        skill_md_path = dir_path / "SKILL.md"
 
-        routing = {"response_type": "load"}
-        if has_events and user_input:
-            try:
-                routing = await classify_skill_request(
-                    action_input=user_input,
-                    skill_id=tool.tool_id,
-                    skill_name=tool.name,
-                    source=skill_source,
-                    llm=self.llm,
-                    profile=self.profile,
-                    skill_content=getattr(tool.info, "full_content", "") or "",  # type: ignore[attr-defined]
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"skill_classifier raised: {exc}. Defaulting to 'load'.")
-                routing = {"response_type": "load"}
-
-        if routing.get("response_type") == "event":
-            async for item in self._route_skill_to_event(tool, user_input, call_id, step_no):
-                yield item
+        # ── subscribe path: register an event for this exact skill ──────────
+        if self._is_skill_subscribe_args(args) and not self._triggered_by_event:
+            from app.tools.builtin.register_skill_event import (
+                register_skill_events,
+                _normalize_triggers,
+            )
+            sub = args.get("subscribe") or {}
+            obs = await register_skill_events(
+                profile=self.profile,
+                context_id=self.context_id or "",
+                skill_id=tool.tool_id,
+                skill_source=str(dir_path),
+                triggers=_normalize_triggers(sub.get("trigger")),
+                action=(sub.get("action") or "").strip(),
+            )
+            self._append_tool_result(call_id, obs, fn_name=tool.tool_id)
+            yield self._result_artifact(step_no, call_id, [Part(root=TextPart(text=obs))])
             return
 
-        # ── load path: fold SKILL.md into the system prompt ──────────────
-        skill_text = getattr(tool.info, "full_content", "") or ""  # type: ignore[attr-defined]
+        # ── load path ───────────────────────────────────────────────────────
+        canonical = SKILL_LOAD_REQUEST.format(name=tool.name)
+        self._set_skill_call_request(call_id, canonical)
+
+        if tool.tool_id in self._loaded_skill_ids:
+            obs = (
+                f"Skill '{tool.name}' is already loaded in this conversation; its "
+                "instructions are available above. Follow them directly — no need "
+                "to load it again."
+            )
+            self._append_tool_result(call_id, obs, fn_name=tool.tool_id, truncate=False)
+            yield self._result_artifact(
+                step_no, call_id,
+                [Part(root=TextPart(text=f"[Skill already loaded: {skill_md_path}]"))],
+            )
+            return
+
+        # Build the full SKILL.md result. The guidance that used to live in the
+        # system prompt now rides this tool result, so the system prompt stays
+        # byte-stable across skill loads (cache-friendly).
+        content = getattr(tool.info, "full_content", "") or ""  # type: ignore[attr-defined]
+        header = (
+            f"[Skill '{tool.name}' loaded from {skill_md_path}.]\n"
+            f"Only follow the instructions in the content below. Use the name "
+            f"`{tool.tool_id}` as the <skill-name> argument for the Exec Shell "
+            f"tool. Do not use the System File tool to read the <skill_directory> "
+            f"structure for security reasons."
+        )
+        sections = [header]
         tree_text = generate_dir_tree(dir_path)
         if tree_text:
-            skill_text = f"Skill Directory Structure:\n```\n{tree_text}\n```\n\n{skill_text}"
-        events_hint = self._render_events_hint(tool)
-        if events_hint:
-            skill_text = f"{skill_text}\n\n{events_hint}"
-        self._loaded_skill_sections[tool.tool_id] = skill_text
+            sections.append(f"Skill Directory Structure:\n```\n{tree_text}\n```")
+        if content:
+            sections.append(content)
+        events_note = self._render_events_hint(tool)
+        if events_note:
+            sections.append(events_note)
+        obs = "\n\n".join(sections)
+
         self._loaded_skill_ids.add(tool.tool_id)
 
         # Anchor the conversation working directory to the skill's own dir.
@@ -947,72 +1019,7 @@ class ReasoningAgent:
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to publish skill cwd anchor for %s", self.context_id)
 
-        skill_md_path = tool.info.dir_path / "SKILL.md"  # type: ignore[attr-defined]
-        obs = (
-            f"Skill '{tool.name}' loaded (from {skill_md_path}). Follow its "
-            "instructions, which are now in the system prompt."
-        )
-        self._append_tool_result(call_id, obs, fn_name=tool.tool_id)
+        self._append_tool_result(call_id, obs, fn_name=tool.tool_id, truncate=False)
         yield self._result_artifact(
             step_no, call_id, [Part(root=TextPart(text=f"[Skill loaded: {skill_md_path}]"))],
         )
-
-    async def _route_skill_to_event(
-        self, skill_tool, user_input: str, call_id: str, step_no: int,
-    ) -> AsyncGenerator[ReasoningStreamResponseType, None]:
-        """Auto-invoke register_skill_event for a skill the user wants subscribed."""
-        skill_id = skill_tool.tool_id
-        skill_source = str(skill_tool.info.dir_path)  # type: ignore[attr-defined]
-
-        rse_tool = self._tools_by_id.get("register_skill_event")
-        if rse_tool is None:
-            obs = (
-                "register_skill_event tool is not available in this profile. "
-                "Cannot register an event subscription."
-            )
-            self._append_tool_result(call_id, obs, fn_name=skill_id)
-            yield self._result_artifact(step_no, call_id, [Part(root=TextPart(text=obs))])
-            return
-
-        # register_skill_event is a single-subtool builtin group.
-        leaf_name = rse_tool.skills[0].name if rse_tool.skills else "register_skill_event"
-        extra_args = {"_skill_id": skill_id, "_skill_source": skill_source}
-        client_args = self._tool_arguments(rse_tool.tool_id)
-        variables = self._load_variables(rse_tool.tool_id)
-        llm_params = self._load_llm_params(rse_tool.tool_id)
-
-        result_event: Optional[ToolResultEvent] = None
-        error_event: Optional[ToolErrorEvent] = None
-        try:
-            async for ev in rse_tool.execute_leaf(
-                leaf_name=leaf_name,
-                args={"query": user_input, **extra_args},
-                context_id=self.context_id,
-                profile=self.profile,
-                arguments=client_args,
-                variables=variables,
-                llm_params=llm_params,
-            ):
-                if isinstance(ev, ToolStatusEvent):
-                    yield {"type": ChatCompletionTypeEnum.STATUS_UPDATE, "data": ev.raw}
-                elif isinstance(ev, ToolResultEvent):
-                    result_event = ev
-                elif isinstance(ev, ToolErrorEvent):
-                    error_event = ev
-                    break
-        except Exception as e:  # noqa: BLE001
-            logger.exception("register_skill_event auto-route failed")
-            error_event = ToolErrorEvent(message=str(e))
-
-        if error_event is not None:
-            obs = error_event.message or "register_skill_event failed."
-        elif result_event is not None:
-            if result_event.token_usage:
-                self._accumulate_tokens(result_event.token_usage)
-                self._record_tool_usage(rse_tool, result_event.token_usage)
-            obs = result_event.observation_text or "Event registered."
-        else:
-            obs = "register_skill_event returned no result."
-
-        self._append_tool_result(call_id, obs, fn_name=skill_id)
-        yield self._result_artifact(step_no, call_id, [Part(root=TextPart(text=obs))])

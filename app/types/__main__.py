@@ -187,7 +187,7 @@ class ToolConfig(TypedDict, total=False):
     # When True, the tool is still registered with the agent (and remains
     # available at runtime) but is suppressed from the Settings UI and the
     # Setup Wizard catalog. Use for "system" built-ins whose lifecycle is
-    # controlled by the runtime, not the user (e.g. ``register_skill_event``):
+    # controlled by the runtime, not the user (e.g. ``change_working_directory``):
     # disabling them would break internal flows.
     hidden: bool
     required_config: dict[str, RequiredConfigField]
