@@ -69,7 +69,6 @@ _BUILTIN_MODULE_NAMES: tuple[str, ...] = (
     "gg_places",
     "browser",
     "sleep",
-    "register_skill_event",
     "documentation_search",
     "change_working_directory",
     "web_search",

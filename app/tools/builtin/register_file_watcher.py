@@ -281,7 +281,7 @@ class RegisterFileWatcherTool(BuiltInTool):
             name = _auto_name(resolved_path, extensions, target_kind)
 
         # Resolve (or create) the conversation row eagerly so the FK target
-        # exists. Same idea as register_skill_event.
+        # exists. Same idea as the skill-event subscription path.
         from app.storage import get_conversation_storage
 
         conv_storage = get_conversation_storage()
