@@ -21,7 +21,6 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-from app.events.manager import get_event_manager
 from app.storage import get_event_subscription_storage
 from app.utils.skill_source import lookup_skill_source
 from app.tools.ids import slugify
@@ -234,20 +233,11 @@ async def register_skill_events(
             return f"Failed to save subscription for trigger '{trigger}': {exc}"
         rows.append(row)
 
-    watcher_failures: List[str] = []
-    for trigger in triggers:
-        try:
-            get_event_manager().ensure_watcher(
-                profile=profile,
-                skill_name=canonical_skill_id,
-                source_dir=source_dir_str,
-                event_type=trigger,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                f"register_skill_events: ensure_watcher failed for '{trigger}'"
-            )
-            watcher_failures.append(f"'{trigger}': {exc}")
+    # No per-subscription watcher arming: Cremind already monitors every
+    # event-listener skill's events/ tree continuously (see app.events.manager),
+    # so persisting the subscription row is all that's needed — the blanket
+    # watch resolves it on fan-out. Arming a second watcher here would race the
+    # blanket one to unlink/enqueue the same file.
 
     # Push the new subscriptions to any open events-page SSE subscribers so the
     # admin UI lights them up without a manual refresh. Imported locally to avoid
@@ -271,11 +261,6 @@ async def register_skill_events(
             f"Subscribed this conversation to {len(triggers)} events of skill "
             f"'{canonical_skill_id}': {trig_list}. Whenever any of these events "
             f"fires (under {source_dir / 'events'}/<event_type>/), I'll run: {action}."
-        )
-    if watcher_failures:
-        confirmation += (
-            "\n\nNote: subscriptions were saved, but some watchers failed to "
-            f"start: {'; '.join(watcher_failures)}. Check server logs."
         )
 
     logger.info(

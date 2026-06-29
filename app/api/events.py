@@ -23,7 +23,6 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from app.events import (
-    get_event_manager,
     get_event_notifications,
     get_event_stream_bus,
     get_notifications_stream_bus,
@@ -195,14 +194,10 @@ def get_event_routes() -> list[Route]:
         if profile and existing["profile"] != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
         store.delete(sub_id)
-        try:
-            get_event_manager().release_watcher(
-                profile=existing["profile"],
-                skill_name=existing["skill_name"],
-                event_type=existing["event_type"],
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to release watcher after delete")
+        # No watcher teardown: the blanket per-profile watch (app.events.manager)
+        # stays armed independent of subscriptions, so deleting the last
+        # subscription for a folder just stops fan-out — incoming events keep
+        # being deleted as junk rather than accumulating.
         publish_skill_events_admin_changed(profile)
         return JSONResponse({"ok": True})
 

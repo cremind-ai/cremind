@@ -82,6 +82,22 @@ def profile_skills_dir(profile: str) -> Path:
     return Path(BaseConfig.CREMIND_SYSTEM_DIR) / profile / "skills"
 
 
+def _refresh_event_watch(profile: str, registry: ToolRegistry) -> None:
+    """Refresh the EventManager's skill index for *profile* (and arm its watch).
+
+    The blanket per-profile event watch never needs re-arming on skill changes,
+    but its path→tool_id index must track skills added/edited/removed so
+    fan-out keeps resolving the canonical subscription key. ``watch_profile`` is
+    idempotent and no-ops the schedule if the loop isn't running yet (boot).
+    """
+    try:
+        from app.events import get_event_manager
+
+        get_event_manager().watch_profile(profile, registry)
+    except Exception:  # noqa: BLE001
+        logger.exception(f"Failed to refresh event watch for profile '{profile}'")
+
+
 def builtin_skill_dir_names() -> set[str]:
     """Return the set of directory names shipped under ``app/skills/builtin``."""
     if not BUILTIN_SKILLS_DIR.is_dir():
@@ -164,6 +180,7 @@ async def resync_profile_skills(profile: str, registry: ToolRegistry) -> dict[st
         skill_factory=lambda info: SkillTool(info),
     )
     _materialize_skill_env_files(profile, registry)
+    _refresh_event_watch(profile, registry)
     publish_settings_state_changed(profile)
     return skills
 
@@ -232,6 +249,12 @@ async def initialize_profile_skills(
     # The copytree above restores shipped skill files (including any stale
     # .env); re-apply persisted variables so user overrides survive the boot.
     _materialize_skill_env_files(profile, registry)
+
+    # Keep the EventManager's skill index in sync. At boot this runs before
+    # EventManager.start(), so it only refreshes the index; the watch itself is
+    # armed by server boot (block 7d). On runtime profile creation the loop is
+    # already running, so this also arms the watch.
+    _refresh_event_watch(profile, registry)
 
     return _start_watcher(profile, skills_dir, registry, loop=loop)
 
@@ -324,6 +347,9 @@ def _start_watcher(
             future.result(timeout=30)
         except Exception:  # noqa: BLE001
             logger.exception(f"Skill re-sync failed for profile '{profile}'")
+        # Track skills added/edited/removed on disk in the EventManager index so
+        # fan-out keeps resolving the canonical skill key after a hot-reload.
+        _refresh_event_watch(profile, registry)
         # Notify the Settings page that the skills list / config schema may
         # have changed (a SKILL.md was added, edited, or removed on disk).
         try:
