@@ -21,6 +21,7 @@ import json
 import os
 import platform
 import shutil
+import subprocess
 import time
 import uuid as _uuid
 from dataclasses import dataclass, field
@@ -58,6 +59,39 @@ def _shell_for(system: str) -> tuple[str, str]:
     if system == "Windows":
         return "powershell.exe", "-Command"
     return "/bin/bash", "-c"
+
+
+# Windows: don't pop a console window when shelling out to taskkill.
+_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def _kill_process_tree(pid: Optional[int]) -> None:
+    """Forcibly terminate *pid* and all of its descendants.
+
+    ``Process.terminate()`` only signals the spawned shell, not the grandchild
+    it launched (e.g. ``pwsh -> uv run -> python``). That grandchild can hold
+    open file handles inside a skill directory (``scripts/.listener.lock`` on
+    Windows), which then blocks ``shutil.rmtree`` and keeps a single-instance
+    listener's lock held so it can't be re-registered. Killing the whole tree
+    releases those handles.
+
+    Windows uses ``taskkill /T /F``; POSIX relies on the caller's
+    ``stop_process`` (terminate/kill of the leader) plus the fact that an open
+    file does not prevent directory removal on Unix.
+    """
+    if not pid:
+        return
+    if os.name != "nt":
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            timeout=15,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.warning(f"taskkill failed for pid {pid}", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1156,6 +1190,7 @@ async def stop_process(process_id: str, *, profile: str) -> Dict[str, Any]:
 
     process = info.process
     state = info.log_writer_state
+    tracked_pid = getattr(process, "pid", None)
 
     # Wake any reader currently long-polling this process so it re-checks the
     # (now popped) registry and returns promptly instead of blocking until its
@@ -1187,6 +1222,13 @@ async def stop_process(process_id: str, *, profile: str) -> Dict[str, Any]:
             process.stdin.close()
         except Exception:
             pass
+
+    # Windows: terminate()/kill() below only signals the tracked leader (the
+    # powershell wrapper); its ``uv run -> python`` descendants survive and a
+    # skill listener child keeps holding ``scripts/.listener.lock``, blocking
+    # re-registration. taskkill /T kills the whole tree so handles release.
+    if os.name == "nt" and process.returncode is None:
+        _kill_process_tree(tracked_pid)
 
     if process.returncode is None:
         try:
@@ -1326,6 +1368,11 @@ async def _cleanup_stale_processes() -> int:
                 pass
         if info.process.returncode is None:
             try:
+                # Windows: kill() hits only the tracked leader; tear down the
+                # whole tree so a TTL-evicted listener doesn't orphan its
+                # ``uv -> python`` children (which would keep its lock held).
+                if os.name == "nt":
+                    _kill_process_tree(getattr(info.process, "pid", None))
                 info.process.kill()
                 await asyncio.wait_for(info.process.wait(), timeout=5.0)
             except (asyncio.TimeoutError, Exception):
