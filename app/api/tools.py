@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import urllib.parse
+from pathlib import Path
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -34,6 +35,7 @@ from app.tools.builtin.exec_shell import publish_process_list_changed
 from app.tools.builtin.exec_shell_autostart import (
     normalize_command_paths,
     spawn_from_autostart,
+    teardown_processes_for_dir,
 )
 from app.utils.logger import logger
 
@@ -366,6 +368,16 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         # Normalize forward-slash relative paths in the command to the OS's
         # native separator so the same SKILL.md works on POSIX and Windows.
         command = normalize_command_paths(lra["command"], working_dir)
+
+        # Self-heal: tear down any listener already running for this skill dir
+        # (and drop its stale autostart rows) before spawning a fresh one. A
+        # single-instance listener takes an exclusive lock on
+        # ``scripts/.listener.lock``; if a prior one is still alive — including
+        # an orphan left behind on Windows after Stop/Unregister killed only the
+        # shell leader — the new process would exit immediately ("another
+        # listener is already running"). Killing the tree first makes Register
+        # idempotent: it always restarts cleanly.
+        await teardown_processes_for_dir(Path(working_dir), profile=profile)
 
         storage = get_autostart_storage()
         duplicate = storage.find_duplicate(profile, command, working_dir=working_dir)
