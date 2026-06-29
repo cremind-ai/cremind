@@ -42,8 +42,7 @@ this order:
 
 1. **Reasoning Agent** — the `agent.*` keys.
 2. **Conversation History** — the `history.*` keys.
-3. **Skill Classifier** — the `skill_classifier.*` keys.
-4. **Trace Summarizer** — the `summarizer.*` keys.
+3. **Trace Summarizer** — the `summarizer.*` keys.
 
 Inside each card, every row shows the field's label, a one-line
 description, the current default, and a type-appropriate input — a
@@ -249,26 +248,12 @@ the page).
 | `compaction.max_tokens`               | Max tokens                  | number  | `2048`   | 128 – 8192      | Output token cap for the running summary (also its hard size bound).                     |
 | `compaction.retry`                    | Retry count                 | number  | `2`      | 0 – 10          | Retries on transient summarization LLM errors.                                           |
 
-### Group `skill_classifier` — Skill Classifier
-
-Lightweight LLM that decides whether a request maps to a registered
-skill.
-
-**Settings → Config card:** **Skill Classifier** (the third card on the
-page).
-
-| Key                            | UI label    | Type   | Default | Range          | Meaning                                                            |
-|--------------------------------|-------------|--------|---------|----------------|--------------------------------------------------------------------|
-| `skill_classifier.temperature` | Temperature | number | `0.0`   | 0 – 2 (±0.1)   | Sampling temperature; keep low for deterministic classification.   |
-| `skill_classifier.max_tokens`  | Max tokens  | number | `64`    | 8 – 2048       | Output token cap for the classifier call.                          |
-| `skill_classifier.retry`       | Retry count | number | `2`     | 0 – 10         | Retries on transient classifier LLM errors.                        |
-
 ### Group `summarizer` — Trace Summarizer
 
 LLM that compresses long reasoning traces back into the conversation
 history.
 
-**Settings → Config card:** **Trace Summarizer** (the fourth card on
+**Settings → Config card:** **Trace Summarizer** (the third card on
 the page).
 
 | Key                       | UI label    | Type   | Default | Range          | Meaning                                                  |

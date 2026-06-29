@@ -124,7 +124,6 @@ def _build_agent(monkeypatch) -> tuple[ra.ReasoningAgent, _FakeLeafTool]:
     agent.registry = SimpleNamespace(disabled_leaves_by_tool=lambda profile: {})
     agent.max_steps = 6
     agent._loaded_skill_ids = set()
-    agent._loaded_skill_sections = {}
     agent._total_input_tokens = 0
     agent._total_cache_read_input_tokens = 0
     agent._total_cache_creation_input_tokens = 0

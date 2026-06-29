@@ -33,7 +33,7 @@ TOOL_CONFIG: ToolConfig = {
     "name": "datetime_parser",
     "display_name": "Datetime Parser",
     # Lightweight, structured extraction — matches every other extraction tool
-    # (register_skill_event, documentation_search, weather all use "low").
+    # (documentation_search, weather all use "low").
     "default_model_group": "low",
     "hidden": True,
     # The reasoning model fills the structured schema below directly via

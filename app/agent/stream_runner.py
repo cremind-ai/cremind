@@ -235,7 +235,7 @@ async def run_agent_to_bus(
 
     # Back-fill context_id on the conv row when it was created via the web
     # POST /api/conversations path (which leaves context_id=NULL). Without
-    # this, tools like register_skill_event do get_conversation_by_context
+    # this, flows like skill-event subscription do get_conversation_by_context
     # and miss → they spawn a stray "Untitled Chat" sibling instead of
     # attaching to the active conversation.
     if conv and not conv.get("context_id"):
