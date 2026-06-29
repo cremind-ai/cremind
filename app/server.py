@@ -390,6 +390,12 @@ async def _do_shutdown() -> None:
     except Exception:  # noqa: BLE001
         logger.exception("Error stopping uploads cleanup manager during shutdown")
     try:
+        from app.events import get_event_manager
+
+        get_event_manager().stop()
+    except Exception:  # noqa: BLE001
+        logger.exception("Error stopping skill event manager during shutdown")
+    try:
         stop_all_watchers()
     except Exception:  # noqa: BLE001
         logger.exception("Error stopping skill watchers during shutdown")
@@ -741,6 +747,17 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                 except Exception:  # noqa: BLE001
                     logger.exception(f"Skill init failed for profile '{profile_name}'")
 
+            # 6a. Clean slate: wipe any stale skill event files left over from a
+            # previous run *before* listeners spawn (7c) and the watch arms
+            # (7d), so operation begins with no junk. The blanket per-profile
+            # watch keeps the folders clean from then on.
+            try:
+                from app.events import wipe_event_folders_on_startup
+
+                wipe_event_folders_on_startup(known_profiles)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to wipe skill event folders on startup")
+
             # 6b. Documentation Search
             #
             # The reconcile step embeds existing ``.md`` files; the watcher
@@ -823,7 +840,18 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                     cremind_agent=cremind_agent,
                     conversation_storage=conversation_storage,
                 )
-                get_event_manager().start(loop)
+                event_manager = get_event_manager()
+                event_manager.start(loop)
+                # Arm one recursive watch per profile over its skills tree so
+                # every event-listener skill's events/ folder is always
+                # monitored (junk deleted, subscribed events fanned out).
+                for profile_name in known_profiles:
+                    try:
+                        event_manager.watch_profile(profile_name, registry)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            f"Failed to arm event watch for profile '{profile_name}'"
+                        )
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to start skill event manager")
 
