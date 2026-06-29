@@ -174,22 +174,6 @@ def resolve_compaction_config(profile: str) -> CompactionConfig:
 
 
 @dataclass(frozen=True)
-class SkillClassifierConfig:
-    temperature: float
-    max_tokens: int
-    retry: int
-
-
-def resolve_skill_classifier_config(profile: str) -> SkillClassifierConfig:
-    values = resolve_group("skill_classifier", profile)
-    return SkillClassifierConfig(
-        temperature=float(values["temperature"]),
-        max_tokens=int(values["max_tokens"]),
-        retry=int(values["retry"]),
-    )
-
-
-@dataclass(frozen=True)
 class MemoryConfig:
     """Snapshot of the conversation-memory tunables for one profile.
 

@@ -2,8 +2,8 @@
 
 Resolves a skill row's on-disk ``source`` directory from its ``tool_id``,
 scoped to a profile.  Shared by the exec_shell tool (sticky working
-directory on skill load) and the register_skill_event tool (resolving an
-event subscription target).
+directory on skill load) and the skill-event subscription helper (resolving
+an event subscription target).
 """
 
 from typing import Optional

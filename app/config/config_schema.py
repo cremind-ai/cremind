@@ -229,30 +229,6 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
             ),
         },
     ),
-    "skill_classifier": ConfigGroup(
-        label="Skill Classifier",
-        description="Lightweight LLM that decides whether a request maps to a registered skill.",
-        fields={
-            "temperature": Field(
-                type="number", default_toml="skill_classifier.temperature",
-                label="Temperature",
-                description="Sampling temperature; keep low for deterministic classification.",
-                min=0, max=2, step=0.1,
-            ),
-            "max_tokens": Field(
-                type="number", default_toml="skill_classifier.max_tokens",
-                label="Max tokens",
-                description="Output token cap for the classifier call.",
-                min=8, max=2048,
-            ),
-            "retry": Field(
-                type="number", default_toml="skill_classifier.retry",
-                label="Retry count",
-                description="Retries on transient classifier LLM errors.",
-                min=0, max=10,
-            ),
-        },
-    ),
     "memory": ConfigGroup(
         label="Memory",
         description=(
