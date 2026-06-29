@@ -1,10 +1,11 @@
 """Long-term memory in the vector store (embedding-enabled mode).
 
 When ``embedding.enabled`` is on, long-term memory lives in the vector store
-instead of the size-capped DB queue. Storage is effectively unlimited, so the
-extraction prompt is FLEXIBLE (see :mod:`app.agent.memory_extractor`) and
-retrieval is a top-K similarity query against the latest user message rather
-than a FIFO read.
+instead of the size-capped DB queue. Storage is effectively unlimited, so dedup
+is by vector similarity (not FIFO eviction) and retrieval is a top-K similarity
+query rather than a FIFO read. Facts are written here by the
+``compact_conversation`` tool (see :mod:`app.agent.compaction`) and read back by
+the ``search_memory`` tool.
 
 Collection ``long_term_memory_{profile}`` (per-profile, mirroring
 ``tool_embeddings_{profile}``). It is deliberately NOT registered under
@@ -120,8 +121,7 @@ def retrieve_long_term(
 ) -> list[dict[str, Any]]:
     """Top-``limit`` long-term facts most similar to ``query_text``.
 
-    Returns ``[{content, created_at}, ...]`` sorted oldest-first (deterministic),
-    matching the shape :func:`app.agent.memory_runner.build_memory_block` expects.
+    Returns ``[{content, created_at}, ...]`` sorted oldest-first (deterministic).
     Empty on any failure, empty query, or missing collection.
     """
     query_text = (query_text or "").strip()
