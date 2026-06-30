@@ -292,12 +292,59 @@ def test_skill_spec_is_stable_and_carries_event_enum(monkeypatch):
     assert props["subscribe"]["properties"]["trigger"]["items"]["enum"] == ["new_email"]
 
 
-def test_event_triggered_run_omits_subscribe(monkeypatch):
-    gmail = _FakeSkillTool("default__gmail", "gmail",
-                           events=[{"name": "new_email", "description": "new mail"}])
-    agent = _spec_agent(monkeypatch, [gmail], triggered_by_event=True)
+def test_event_triggered_run_keeps_subscribe_in_spec(monkeypatch):
+    # The tools= block must be BYTE-IDENTICAL between event-triggered and normal
+    # runs — it is the front of the prompt-cache prefix, so a schema divergence
+    # here busts the cache on every event run. Storm prevention now happens at
+    # dispatch time (see test_event_triggered_subscribe_is_refused), not by
+    # dropping `subscribe` from the spec.
+    gmail_evt = _FakeSkillTool("default__gmail", "gmail",
+                               events=[{"name": "new_email", "description": "new mail"}])
+    evt_specs, _ = _spec_agent(
+        monkeypatch, [gmail_evt], triggered_by_event=True
+    )._build_tools_and_dispatch()
 
-    specs, _ = agent._build_tools_and_dispatch()
-    props = specs[0]["function"]["parameters"]["properties"]
+    props = evt_specs[0]["function"]["parameters"]["properties"]
     assert "request" in props
-    assert "subscribe" not in props  # no new subscriptions during event-triggered runs
+    assert "subscribe" in props  # always exposed; refused at dispatch on event runs
+
+    gmail_chat = _FakeSkillTool("default__gmail", "gmail",
+                                events=[{"name": "new_email", "description": "new mail"}])
+    chat_specs, _ = _spec_agent(
+        monkeypatch, [gmail_chat], triggered_by_event=False
+    )._build_tools_and_dispatch()
+    assert evt_specs == chat_specs  # identical tools block → cache prefix reused
+
+
+def test_event_triggered_subscribe_is_refused(monkeypatch):
+    # On an event run the model may still emit a subscribe call (the schema is
+    # identical), but it must be refused at runtime WITHOUT registering anything —
+    # and the tool_call must still get a paired role:"tool" result so the replayed
+    # trace has no dangling tool_use.
+    called = {"n": 0}
+
+    async def fake_register(**kwargs):  # pragma: no cover - must NOT be called
+        called["n"] += 1
+        return "SUBSCRIBED OK"
+
+    monkeypatch.setattr(rse, "register_skill_events", fake_register)
+
+    jira = _FakeSkillTool("default__jira", "jira",
+                          events=[{"name": "issue_created", "description": "new issue"}])
+    llm = _SkillCallLLM(
+        "default__jira",
+        {"subscribe": {"trigger": ["issue_created"], "action": "summarize the issue"}},
+    )
+    agent = _build_agent(monkeypatch, llm, [jira])
+    agent._triggered_by_event = True
+
+    chunks = _run(agent, "subscribe to jira issues", history=[])
+    trace = _done(chunks)["llm_messages"]
+
+    assert called["n"] == 0  # no subscription registered while handling an event
+    assert trace[0]["role"] == "assistant"
+    assert trace[0]["tool_calls"][0]["function"]["name"] == "default__jira"
+    assert trace[1]["role"] == "tool"
+    # Leading phrase only: _build_agent caps tool results at a tiny token budget
+    # (proving results are truncated); the full refusal survives the real 1000-tok cap.
+    assert "Subscriptions cannot be created" in trace[1]["content"]

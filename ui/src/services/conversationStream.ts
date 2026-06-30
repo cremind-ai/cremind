@@ -16,6 +16,7 @@ export interface ConversationStreamEvent {
     | 'ready'
     | 'user_message'
     | 'event_trigger_message'
+    | 'event_trigger_rejected'
     | 'thinking'
     | 'result'
     | 'text'

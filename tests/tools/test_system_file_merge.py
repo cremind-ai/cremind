@@ -7,9 +7,10 @@ The three file-watcher functions (``register_file_watcher`` /
 
 - the standalone tool is gone from registration and the catalog,
 - the watcher functions ship inside ``system_file`` and are self-describing,
-- the ``register_file_watcher`` subtool is suppressed on event-triggered runs
-  (via ``system_file.get_prepare_tools``) to prevent recursive event storms,
-  while ``list``/``delete`` and the six file ops stay available.
+- ``register_file_watcher`` stays in the schema on EVERY run (no
+  ``get_prepare_tools`` hook), so the ``tools=`` block is byte-identical for
+  prompt-cache reuse; recursive-event-storm prevention moved to the reasoning
+  agent's dispatch (it refuses the call while reacting to an event).
 """
 
 from __future__ import annotations
@@ -23,18 +24,6 @@ from app.tools.builtin import system_file
 
 
 _WATCHER_NAMES = {"register_file_watcher", "list_file_watchers", "delete_file_watcher"}
-
-_ALL_SYSTEM_FILE_FUNCS = [
-    "search_files", "grep_files", "list_files", "get_file_info", "read_file",
-    "write_file", "overwrite_file",
-    "register_file_watcher", "list_file_watchers", "delete_file_watcher",
-]
-
-
-def _fake_openai_tools() -> list[dict]:
-    """The OpenAI-format tool list the adapter hands ``prepare_tools``."""
-    return [{"type": "function", "function": {"name": n}} for n in _ALL_SYSTEM_FILE_FUNCS]
-
 
 def test_register_file_watcher_not_a_standalone_module() -> None:
     assert "register_file_watcher" not in _BUILTIN_MODULE_NAMES
@@ -74,23 +63,10 @@ def test_watcher_subtools_are_self_describing() -> None:
         assert tools[name].description.strip(), f"{name} needs a non-empty description"
 
 
-def test_prepare_tools_passthrough_on_normal_run() -> None:
-    prepare = system_file.get_prepare_tools()
-    tools = _fake_openai_tools()
-    # No arguments at all -> nothing filtered (the non-event-run case).
-    result = prepare("q", list(tools), arguments=None, context_id="c", profile="p")
-    assert [t["function"]["name"] for t in result] == _ALL_SYSTEM_FILE_FUNCS
-    # Explicit falsy flag -> nothing filtered.
-    result = prepare("q", list(tools), arguments={"_triggered_by_event": False})
-    assert len(result) == 10
-
-
-def test_prepare_tools_suppresses_only_register_on_event_run() -> None:
-    prepare = system_file.get_prepare_tools()
-    result = prepare("q", _fake_openai_tools(), arguments={"_triggered_by_event": True})
-    names = {t["function"]["name"] for t in result}
-    assert "register_file_watcher" not in names  # the storm risk: suppressed
-    assert "list_file_watchers" in names          # harmless: stays
-    assert "delete_file_watcher" in names          # harmless: stays
-    assert "grep_files" in names                   # read-only: stays
-    assert len(result) == 9
+def test_no_prepare_tools_hook_keeps_schema_byte_stable() -> None:
+    # The event-run schema filter was removed: register_file_watcher now stays in
+    # the tools= block on every run (byte-stable prompt-cache prefix). Storm
+    # prevention is enforced at dispatch in the reasoning agent instead. The module
+    # must expose NO prepare_tools hook — otherwise the tools list would mutate
+    # per run and bust the cache (the bug this fix addresses).
+    assert not hasattr(system_file, "get_prepare_tools")

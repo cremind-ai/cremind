@@ -15,7 +15,7 @@ import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.tools.builtin.base import (
     BuiltInTool,
@@ -2312,34 +2312,3 @@ def _make_server_instructions(_data_dir: str) -> str:
         "file/folder watchers that notify you or re-run an action whenever "
         "files are created, modified, deleted, or moved on disk."
     )
-
-
-def get_prepare_tools() -> Optional[Callable]:
-    """Module hook auto-detected by ``register_builtin_tools``.
-
-    Returns a ``prepare_tools`` callback that suppresses the
-    ``register_file_watcher`` subtool on event-triggered runs. Registering a
-    new watcher while *reacting* to a watcher/skill event risks recursive
-    event storms (event → reasoning → register → event → …), so the reasoning
-    agent injects ``_triggered_by_event=True`` into the System File dispatch
-    arguments for those runs (see ``reasoning_agent._dispatch``). ``list`` and
-    ``delete`` stay available — they pose no storm risk.
-    """
-
-    def prepare_tools(
-        query: str,  # noqa: ARG001
-        tools: List[Dict[str, Any]],
-        *,
-        arguments: Optional[Dict[str, Any]] = None,
-        context_id: Optional[str] = None,  # noqa: ARG001
-        profile: Optional[str] = None,  # noqa: ARG001
-        **_: Any,
-    ) -> List[Dict[str, Any]]:
-        if not (arguments or {}).get("_triggered_by_event"):
-            return tools
-        return [
-            t for t in tools
-            if (t.get("function") or {}).get("name") != "register_file_watcher"
-        ]
-
-    return prepare_tools

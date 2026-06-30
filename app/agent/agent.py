@@ -70,13 +70,26 @@ class CremindAgent:
     def auxiliary_llm(self, profile: str) -> LLMProvider:
         """Return the profile's LLM for auxiliary calls (compaction, etc.).
 
-        With the high/low split removed this is the same single configured model
-        as the main reasoning runner; kept as a separate accessor so auxiliary
-        call sites read clearly.
+        This is the same single configured model as the main reasoning runner;
+        kept as a separate accessor so auxiliary call sites read clearly. Use
+        :meth:`low_performance_llm` instead for cheap, throw-away classification.
         """
         if self._model_group_mgr is None:
             self._model_group_mgr = ModelGroupManager(get_dynamic_config_storage())
         return self._model_group_mgr.create_llm_for_model(profile=profile)
+
+    def low_performance_llm(self, profile: str) -> LLMProvider:
+        """Return the profile's low-performance (cheap) LLM.
+
+        Resolves the optional ``low`` model group, transparently falling back to
+        the single configured model when the user hasn't picked a cheaper one.
+        The reusable entry point for lightweight auxiliary work — e.g. the
+        skill-event matching gate — where a small/economical model is preferred
+        and no system prompt, tools, or chat history are involved.
+        """
+        if self._model_group_mgr is None:
+            self._model_group_mgr = ModelGroupManager(get_dynamic_config_storage())
+        return self._model_group_mgr.create_llm_for_group("low", profile=profile)
 
     # ── profile lifecycle ───────────────────────────────────────────────
 
