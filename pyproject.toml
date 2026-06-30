@@ -65,6 +65,10 @@ dependencies = [
     # (app/calendar/recurrence.py + app/events/schedule_manager.py). Used
     # unconditionally whenever the feature is on, so it ships in core.
     "python-dateutil>=2.8.0",
+    # IANA timezone database for stdlib ``zoneinfo`` (app/tools/builtin/current_time.py).
+    # Windows ships no system tz database, and minimal Linux containers may omit
+    # /usr/share/zoneinfo, so bundle it unconditionally.
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

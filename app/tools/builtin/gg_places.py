@@ -38,9 +38,8 @@ TOOL_CONFIG: ToolConfig = {
     "requires_feature": "google",
     "llm_parameters": {
         "tool_instructions": (
-            "A places assistant that searches for nearby places using Google Maps "
-            "and generates direction links. Use search_places to find nearby locations "
-            "and map_direction_link to create navigation URLs."
+            "Search for nearby places with Google Maps (search_places) and "
+            "generate Google Maps directions links (map_direction_link)."
         ),
     },
     "required_config": {
@@ -640,7 +639,7 @@ class SearchPlacesTool(BuiltInTool):
 class MapDirectionLinkTool(BuiltInTool):
     name: str = "map_direction_link"
     description: str = (
-        "This tool generates a Google Maps directions link from an origin to a destination. "
+        "Generate a Google Maps directions link from an origin to a destination. "
         "Each endpoint (origin and destination) can be specified as either a place name/address "
         "(string) or as latitude/longitude coordinates. You can mix both styles freely."
     )

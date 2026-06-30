@@ -32,9 +32,7 @@ from typing import Any, Dict, List, Optional
 
 from a2a.types import DataPart, FilePart, Part
 
-from app.agent import memory_runner
-from app.agent.summary import summarize_reasoning
-from app.config.user_config import resolve_memory_config
+from app.agent.usage import reconcile
 from app.constants import ChatCompletionTypeEnum
 from app.events.notifications_buffer import get_event_notifications
 from app.events.stream_bus import get_event_stream_bus
@@ -50,6 +48,33 @@ from app.utils.task_context import current_task_id_var
 # run starts; cleared when it ends. Both the A2A executor and the user-message
 # POST handler register here so a single cancel endpoint targets either.
 _running_runs: Dict[str, asyncio.Task] = {}
+
+
+def _append_attachments_note(
+    agent_query: str, attachments: Optional[List[Dict[str, Any]]],
+) -> str:
+    """Append a note listing uploaded-file absolute paths to the agent's input.
+
+    Returns ``agent_query`` unchanged when there are no valid attachments.
+    """
+    if not attachments:
+        return agent_query
+    paths = [a.get("path") for a in attachments if isinstance(a, dict) and a.get("path")]
+    if not paths:
+        return agent_query
+    lines = ["[Attached files — saved to a temporary folder; absolute paths:]"]
+    lines += [f"- {p}" for p in paths]
+    lines.append(
+        "(Pass these paths to the tools EXACTLY as written above — they are "
+        "absolute paths; do not shorten them, strip the home/drive prefix, or "
+        "convert them to relative paths. Read or convert a file with the "
+        "system_file tools, or understand an image's visual content with the "
+        "image_understanding tool. If the user asks to keep or save a file, use "
+        "the system_file move_file tool to move it into their working directory "
+        "(or copy_file to keep a copy).)"
+    )
+    note = "\n".join(lines)
+    return f"{agent_query}\n\n{note}" if agent_query else note
 
 
 def cancel_run(run_id: str) -> bool:
@@ -164,6 +189,7 @@ async def run_agent_to_bus(
     user_parts: List[Any] | None = None,
     user_message_metadata: Dict[str, Any] | None = None,
     agent_message_metadata: Dict[str, Any] | None = None,
+    attachments: List[Dict[str, Any]] | None = None,
     push_user_message: bool = True,
     publish_notification: bool = False,
     update_title_from_query: bool = True,
@@ -209,7 +235,7 @@ async def run_agent_to_bus(
 
     # Back-fill context_id on the conv row when it was created via the web
     # POST /api/conversations path (which leaves context_id=NULL). Without
-    # this, tools like register_skill_event do get_conversation_by_context
+    # this, flows like skill-event subscription do get_conversation_by_context
     # and miss → they spawn a stray "Untitled Chat" sibling instead of
     # attaching to the active conversation.
     if conv and not conv.get("context_id"):
@@ -261,19 +287,23 @@ async def run_agent_to_bus(
     collected_thinking_steps: List[dict] = []
     collected_file_parts: List[Part] = []
     total_input_tokens = 0
+    total_cache_read_input_tokens = 0
+    total_cache_creation_input_tokens = 0
     total_output_tokens = 0
-    reasoning_input_section: str | None = None
+    # Per-source attribution for the turn (one entry per LLM invocation),
+    # carried on terminal chunks. Overwritten each terminal chunk so the final
+    # one holds the complete list (mirrors how the token totals are captured).
+    collected_usage_records: list[dict] = []
+    # The turn's native reasoning trace (assistant tool_calls + tool results + final
+    # answer), carried on the terminal DONE chunk. Persisted so later turns can replay
+    # it into history. ``None`` for turns with no tool calls (those replay content-only).
+    collected_llm_messages: list | None = None
     errored = False
     cancelled = False
-
-    # Memory feature (independent background session). Read the per-profile
-    # config once for this turn: used both to inject stored memory into the
-    # prompt (consumption) and to decide whether to schedule a post-turn
-    # extraction. Any failure simply disables memory for this turn.
-    try:
-        memory_cfg = resolve_memory_config(profile)
-    except Exception:  # noqa: BLE001
-        memory_cfg = None
+    # The id of this turn's just-persisted user/trigger message, captured below.
+    # Passed to compaction so the current turn (sent separately as the volatile
+    # input) is excluded from the rebuilt history tail.
+    current_turn_msg_id: Optional[str] = None
 
     try:
         # 1. Persist the trigger / user message and announce it on the bus.
@@ -304,6 +334,7 @@ async def run_agent_to_bus(
                     f"stream_runner: failed to persist trigger message for {conversation_id}"
                 )
 
+            current_turn_msg_id = trigger_msg_id
             await bus.publish(conversation_id, "event_trigger_message", {
                 "id": trigger_msg_id,
                 "content": trigger_content,
@@ -325,6 +356,7 @@ async def run_agent_to_bus(
                     f"stream_runner: failed to persist user message for {conversation_id}"
                 )
 
+            current_turn_msg_id = user_msg_id
             await bus.publish(conversation_id, "user_message", {
                 "id": user_msg_id,
                 "content": query,
@@ -340,16 +372,32 @@ async def run_agent_to_bus(
             query, profile=profile, conversation_storage=conversation_storage,
         )
 
-        # Consumption: read current memory (short-term for this conversation +
-        # long-term for this profile) and pass it to the agent as a system block.
-        # Fully decoupled from extraction — the agent never triggers or waits on
-        # the background memory session.
-        memory_context = ""
-        if memory_cfg is not None and memory_cfg.enabled:
-            memory_context = await memory_runner.load_memory_context(
-                conversation_id, profile,
-            )
+        # Append uploaded-attachment paths to what the agent sees (NOT to the
+        # persisted/published user message — that stays exactly what the user
+        # typed). The temp paths live inside the system_file tool's allowed
+        # roots, so the agent can read / convert / move them by absolute path.
+        agent_query = _append_attachments_note(agent_query, attachments)
 
+        # Compaction (also memory generation): replace the raw history with
+        # [running summary + verbatim tail], folding the oldest turns into the
+        # summary when the tail is over threshold — and, when memory is enabled,
+        # extracting long-term facts in the same fold pass. Synchronous (before the
+        # prompt is assembled) so the threshold is never exceeded — notably on the
+        # first turn after upgrade, when a long pre-existing conversation would
+        # otherwise be sent whole. No-op / falls back to the raw history on error.
+        from app.agent import compaction
+        history_messages = await compaction.build_compacted_history(
+            conversation_id=conversation_id,
+            profile=profile,
+            conversation_storage=conversation_storage,
+            cremind_agent=cremind_agent,
+            fallback_history=history_messages,
+            exclude_message_id=current_turn_msg_id,
+        )
+
+        # Long-term memory is NOT injected into the prompt (that would bust the
+        # cache every turn). The model retrieves it on demand via the
+        # ``search_memory`` tool.
         try:
             async for chunk in cremind_agent.run(
                 query=agent_query,
@@ -358,7 +406,6 @@ async def run_agent_to_bus(
                 profile=profile,
                 reasoning=reasoning,
                 triggered_by_event=trigger_event is not None,
-                memory_context=memory_context,
             ):
                 ctype = chunk.get("type")
 
@@ -372,35 +419,48 @@ async def run_agent_to_bus(
                     thinking_data = chunk.get("data", {}) or {}
                     await bus.publish(conversation_id, "thinking", thinking_data)
                     collected_thinking_steps.append({
-                        "thought": thinking_data.get("Thought", ""),
-                        "action": thinking_data.get("Action", ""),
-                        "action_input": thinking_data.get("Action_Input", ""),
+                        "step": thinking_data.get("Step"),
+                        "call_id": thinking_data.get("Call_Id"),
+                        "tool": thinking_data.get("Tool", ""),
+                        "tool_input": thinking_data.get("Tool_Input", ""),
                         "model_label": thinking_data.get("Model_Label"),
-                        "reasoning_model_label": thinking_data.get("Reasoning_Model_Label"),
                     })
 
                 elif ctype == ChatCompletionTypeEnum.RESULT_ARTIFACT:
                     result_data = chunk.get("data", {}) or {}
-                    observation_parts = result_data.get("Observation", []) or []
-                    serialized_observation = _serialize_observation(observation_parts)
+                    call_id = result_data.get("Call_Id")
+                    # ``Result`` is the new key; fall back to ``Observation``.
+                    result_parts = (
+                        result_data.get("Result") or result_data.get("Observation") or []
+                    )
+                    serialized_result = _serialize_observation(result_parts)
 
                     await bus.publish(conversation_id, "result", {
-                        "Observation": serialized_observation,
+                        "step": result_data.get("Step"),
+                        "call_id": call_id,
+                        "Result": serialized_result,
                     })
 
-                    for obs_part in observation_parts:
+                    for obs_part in result_parts:
                         if hasattr(obs_part, "root") and isinstance(obs_part.root, FilePart):
                             collected_file_parts.append(obs_part)
                             file_payload = obs_part.root.model_dump(mode="json")
                             await bus.publish(conversation_id, "file", file_payload)
 
-                    for terminal in _terminal_payloads(observation_parts):
+                    for terminal in _terminal_payloads(result_parts):
                         await bus.publish(conversation_id, "terminal", terminal)
 
-                    if collected_thinking_steps:
+                    # Attach the result to its originating step (match by call_id,
+                    # so parallel tools in one step pair up correctly).
+                    if call_id:
+                        for step in collected_thinking_steps:
+                            if step.get("call_id") == call_id and "result" not in step:
+                                step["result"] = serialized_result
+                                break
+                    else:
                         for step in reversed(collected_thinking_steps):
-                            if "observation" not in step:
-                                step["observation"] = serialized_observation
+                            if "result" not in step:
+                                step["result"] = serialized_result
                                 break
 
                 elif ctype in (
@@ -412,12 +472,13 @@ async def run_agent_to_bus(
                         final_text_parts.append(data)
                         await bus.publish(conversation_id, "text", {"token": data})
                     total_input_tokens = chunk.get("input_tokens") or total_input_tokens
+                    total_cache_read_input_tokens = chunk.get("cache_read_input_tokens") or total_cache_read_input_tokens
+                    total_cache_creation_input_tokens = chunk.get("cache_creation_input_tokens") or total_cache_creation_input_tokens
                     total_output_tokens = chunk.get("output_tokens") or total_output_tokens
-                    if (
-                        ctype == ChatCompletionTypeEnum.DONE
-                        and chunk.get("input_section")
-                    ):
-                        reasoning_input_section = chunk["input_section"]
+                    if chunk.get("usage_records"):
+                        collected_usage_records = chunk["usage_records"]
+                    if chunk.get("llm_messages"):
+                        collected_llm_messages = chunk["llm_messages"]
         except asyncio.CancelledError:
             cancelled = True
             logger.info(f"stream_runner: run {run_id} cancelled")
@@ -469,27 +530,13 @@ async def run_agent_to_bus(
             except Exception:  # noqa: BLE001
                 logger.exception("stream_runner: failed to publish error event")
 
-        # 3. Optional reasoning summary (skip on cancel/error to keep the UI
-        #    state consistent with the partial response).
-        summary_text: str | None = None
-        if reasoning_input_section and not errored and not cancelled:
-            try:
-                await bus.publish(conversation_id, "phase", {"phase": "summarizing"})
-                summary_text = await summarize_reasoning(
-                    cremind_agent, reasoning_input_section, profile,
-                )
-                if summary_text:
-                    await bus.publish(conversation_id, "summary", {"summary": summary_text})
-            except Exception:  # noqa: BLE001
-                logger.exception("stream_runner: failed to produce reasoning summary")
-                summary_text = None
-
-        # 4. Token usage (after summary so any summary tokens are included
-        #    upstream; here we only report what the agent loop reported).
+        # 4. Token usage — what the agent loop reported this turn.
         if total_input_tokens or total_output_tokens:
             await bus.publish(conversation_id, "token_usage", {
                 "token_usage": {
                     "input_tokens": total_input_tokens,
+                    "cache_read_input_tokens": total_cache_read_input_tokens,
+                    "cache_creation_input_tokens": total_cache_creation_input_tokens,
                     "output_tokens": total_output_tokens,
                 },
             })
@@ -505,9 +552,33 @@ async def run_agent_to_bus(
         if total_input_tokens or total_output_tokens:
             token_usage_data = {
                 "input_tokens": total_input_tokens,
+                "cache_read_input_tokens": total_cache_read_input_tokens,
+                "cache_creation_input_tokens": total_cache_creation_input_tokens,
                 "output_tokens": total_output_tokens,
             }
+            # The single largest prompt the model processed this turn (final reasoning
+            # call) = the real context size, used by compaction to gauge the window.
+            # The four totals above are summed across calls and over-count, so this is
+            # stored separately.
+            from app.agent.compaction import context_tokens_from_records
+            ctx = context_tokens_from_records(collected_usage_records)
+            if ctx is not None:
+                token_usage_data["context_tokens"] = ctx
         persist_parts = collected_file_parts if collected_file_parts else None
+
+        # Stamp the turn's reasoning provider/model onto the message metadata so
+        # the aggregate ``token_usage`` blob is attributable even without the
+        # per-source rows (and so any future backfill can recover it).
+        reasoning_rec = next(
+            (r for r in collected_usage_records if r.get("source_kind") == "reasoning"),
+            None,
+        )
+        if reasoning_rec and (reasoning_rec.get("provider") or reasoning_rec.get("model")):
+            agent_message_metadata = {
+                **(agent_message_metadata or {}),
+                "provider": reasoning_rec.get("provider"),
+                "model": reasoning_rec.get("model"),
+            }
 
         assistant_msg_id: Optional[str] = None
         try:
@@ -517,8 +588,8 @@ async def run_agent_to_bus(
                 content=final_text,
                 parts=persist_parts,
                 thinking_steps=collected_thinking_steps or None,
+                llm_messages=collected_llm_messages,
                 token_usage=token_usage_data,
-                summary=summary_text,
                 metadata=agent_message_metadata,
             )
             assistant_msg_id = (
@@ -529,20 +600,31 @@ async def run_agent_to_bus(
                 f"stream_runner: failed to persist assistant message for {conversation_id}"
             )
 
-        # 5b. Memory trigger: if enough NEW message-content tokens (reasoning
-        #     excluded) have accrued since the last extraction, kick off a
-        #     background "memory session". Non-blocking and single-flight — it
-        #     never interleaves with the next turn. Skipped on cancel/error so
-        #     partial turns don't pollute memory.
-        if memory_cfg is not None and memory_cfg.enabled and not errored and not cancelled:
+        # 5a. Persist the per-source usage breakdown (one row per LLM invocation:
+        #     reasoning step vs. each tool/sub-agent), with frozen estimated cost.
+        #     Keyed to the assistant turn just persisted. Best-effort — never
+        #     break the stream over usage accounting.
+        if collected_usage_records:
             try:
-                pending = await memory_runner.pending_token_count(conversation_id)
-                if pending >= memory_cfg.trigger_token_threshold:
-                    memory_runner.schedule_extraction(conversation_id, profile)
+                if token_usage_data and not reconcile(collected_usage_records, token_usage_data):
+                    logger.warning(
+                        f"stream_runner: usage records don't reconcile with turn totals "
+                        f"for {conversation_id} (records sum != aggregate)"
+                    )
+                from app.storage import get_usage_storage
+                await get_usage_storage().add_usage_records(
+                    conversation_id=conversation_id,
+                    profile=profile,
+                    records=collected_usage_records,
+                    message_id=assistant_msg_id,
+                )
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    f"stream_runner: memory trigger check failed for {conversation_id}"
+                    f"stream_runner: failed to persist usage records for {conversation_id}"
                 )
+
+        # Memory generation now happens inline at the compaction fold (above), so
+        # there is no separate post-turn extraction trigger.
 
         # 6. Update the conversation row (title from first query, task_id).
         try:
@@ -570,6 +652,21 @@ async def run_agent_to_bus(
             publish_conversations_changed(profile)
         except Exception:  # noqa: BLE001
             logger.debug("conversations-list publish failed", exc_info=True)
+
+        # 6b. Suggest compaction (popup) when the conversation crosses the
+        #     threshold. Suggest-only — never forced; the user clicks to compact.
+        if not errored and not cancelled:
+            try:
+                from app.agent import compaction
+                suggestion = await compaction.compaction_suggestion(
+                    conversation_id=conversation_id,
+                    profile=profile,
+                    conversation_storage=conversation_storage,
+                )
+                if suggestion:
+                    await bus.publish(conversation_id, "compaction_suggested", suggestion)
+            except Exception:  # noqa: BLE001
+                logger.debug("compaction suggestion check failed", exc_info=True)
 
         # 7. Terminal event so subscribers can flip isStreaming=false.
         await bus.publish(conversation_id, "complete", {

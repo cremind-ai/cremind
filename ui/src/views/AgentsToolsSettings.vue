@@ -4,7 +4,7 @@ import { useRouter, useRoute } from 'vue-router';
 import {
   ElCard, ElForm, ElFormItem, ElInput,
   ElButton, ElMessage, ElMessageBox, ElDialog, ElDivider,
-  ElRadioGroup, ElRadioButton, ElTooltip,
+  ElRadioGroup, ElRadioButton,
   ElTour, ElTourStep,
 } from 'element-plus';
 import { Icon } from '@iconify/vue';
@@ -12,13 +12,12 @@ import { RouterLink } from 'vue-router';
 import { useSettingsStore, type ProfileValue } from '../stores/settings';
 import {
   listAgents, addAgent, removeAgent, updateAgentConfig,
-  listTools, updateToolConfig, setToolEnabled, setToolFullReasoning,
-  updateToolArguments, resetToolLLMKeys,
+  listTools, updateToolConfig, setToolEnabled,
+  listToolLeaves, setToolLeaves,
   listLLMProviders, getProviderModels,
-  getSkillMode, setSkillMode,
   streamFeaturesInstall, FeatureNotInstalledError,
   deleteSkill, importSkillArchive, importSkillFromGitHub, importSkillFromHub,
-  type RemoteAgentInfo, type ToolStatus, type LLMProvider, type SkillMode,
+  type RemoteAgentInfo, type ToolStatus, type LLMProvider, type ToolLeaf,
   type FeatureNotInstalledDetail, type FeatureInstallEvent,
 } from '../services/configApi';
 import {
@@ -26,13 +25,6 @@ import {
 } from '../services/processApi';
 import { openSettingsStateStream, type SettingsStateStreamHandle } from '../services/settingsStateStream';
 
-type LLMDefaultField =
-  | 'description'
-  | 'system_prompt'
-  | 'llm_provider'
-  | 'llm_model'
-  | 'reasoning_effort'
-  | 'full_reasoning';
 import type { JsonSchema } from '../services/agentApi';
 import { getAuthUrl, unlinkAgent, reconnectAgent } from '../services/agentApi';
 import { useLLMModels } from '../composables/useLLMModels';
@@ -40,6 +32,7 @@ import ItemCardHeader from '../components/shared/ItemCardHeader.vue';
 import ToolVariablesForm from '../components/shared/ToolVariablesForm.vue';
 import ToolArgumentsForm from '../components/shared/ToolArgumentsForm.vue';
 import LLMParametersForm from '../components/shared/LLMParametersForm.vue';
+import LeafToggleSection from '../components/shared/LeafToggleSection.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -108,15 +101,26 @@ interface UnifiedItem {
   /** Transient: most recent successful registration result, used to render
    *  the inline confirmation card with a link to the process detail page. */
   lastRegisteredProcess: { process_id: string; command: string } | null;
+
+  // ── Per-sub-tool ("leaf") enable/disable (built-in groups + MCP servers) ──
+  /** True when the tool exposes more than one sub-tool, so the expanded card
+   *  shows a "Sub-tools" section. For built-ins this comes from the list row;
+   *  for MCP servers it's resolved from the lazy-loaded leaf list. */
+  supportsLeafToggle: boolean;
+  /** Lazily-loaded sub-tools with their enabled state. */
+  leaves: ToolLeaf[];
+  /** Transient: true while the leaf list is being fetched. */
+  leavesLoading: boolean;
+  /** Whether the leaf list has been fetched yet (lazy-load guard). */
+  leavesLoaded: boolean;
+  /** True when an MCP server is disconnected and its sub-tools can't be listed. */
+  leavesDisconnected: boolean;
 }
 
 // ── Data ──
 const items = ref<UnifiedItem[]>([]);
 const llmProviders = ref<LLMProvider[]>([]);
 const loading = ref(false);
-const skillMode = ref<SkillMode>('manual');
-const skillModeSaving = ref(false);
-const embeddingEnabled = ref(true);
 
 // Add agent dialog
 const showAddDialog = ref(false);
@@ -151,7 +155,6 @@ const builtinItems = computed(() =>
 );
 const skillItems = computed(() => items.value.filter(i => i.kind === 'skill'));
 const mcpRemoteItems = computed(() => items.value.filter(i => i.kind === 'mcp-remote'));
-const a2aRemoteItems = computed(() => items.value.filter(i => i.kind === 'a2a-remote'));
 
 // ── Feature install dialog ──
 // Shown when toggling on a built-in tool whose optional pip extras are
@@ -207,17 +210,13 @@ onMounted(async () => {
   openLiveSettingsStream();
   loading.value = true;
   try {
-    const [agentRes, toolRes, provRes, skillModeRes] = await Promise.all([
+    const [agentRes, toolRes, provRes] = await Promise.all([
       listAgents(settingsStore.agentUrl, settingsStore.authToken),
       listTools(settingsStore.agentUrl, settingsStore.authToken),
       listLLMProviders(settingsStore.agentUrl, settingsStore.authToken),
-      getSkillMode(settingsStore.agentUrl, settingsStore.authToken, props.profile)
-        .catch(() => ({ mode: 'manual' as SkillMode, embedding_enabled: false })),
     ]);
 
     llmProviders.value = provRes.providers;
-    skillMode.value = skillModeRes.mode;
-    embeddingEnabled.value = skillModeRes.embedding_enabled !== false;
 
     // Load models for all providers using composable
     const providersWithModels: { name: string; display_name: string; models: any[] }[] = [];
@@ -366,6 +365,11 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       longRunningApp: tool.long_running_app ?? null,
       registering: false,
       lastRegisteredProcess: null,
+      supportsLeafToggle: !!tool.supports_leaf_toggle,
+      leaves: [],
+      leavesLoading: false,
+      leavesLoaded: false,
+      leavesDisconnected: false,
     });
   }
 
@@ -411,6 +415,12 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       longRunningApp: null,
       registering: false,
       lastRegisteredProcess: null,
+      // MCP servers can expose many tools; resolved on expand via listToolLeaves.
+      supportsLeafToggle: false,
+      leaves: [],
+      leavesLoading: false,
+      leavesLoaded: false,
+      leavesDisconnected: false,
     });
   }
 
@@ -452,6 +462,12 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       longRunningApp: null,
       registering: false,
       lastRegisteredProcess: null,
+      // A2A remote agents have no per-leaf controls.
+      supportsLeafToggle: false,
+      leaves: [],
+      leavesLoading: false,
+      leavesLoaded: false,
+      leavesDisconnected: false,
     });
   }
 
@@ -478,28 +494,21 @@ function getRemoteStatusTag(item: UnifiedItem) {
 async function saveItemConfig(item: UnifiedItem) {
   item.saving = true;
   try {
+    // Built-in / skill tools only persist their variables (secrets / required
+    // config) now — the per-tool LLM/arguments options were removed.
     if (item.toolName && Object.keys(item.toolConfigValues).length > 0) {
       await updateToolConfig(settingsStore.agentUrl, settingsStore.authToken, item.toolName, item.toolConfigValues);
     }
 
-    if (item.toolName && item.agentType !== 'skill') {
-      await setToolFullReasoning(settingsStore.agentUrl, settingsStore.authToken, item.toolName, item.fullReasoning);
-    }
-
-    if (item.kind !== 'a2a-remote' && item.hasAgent && item.agentType !== 'skill') {
+    // MCP remote servers keep their own LLM/system-prompt config endpoint.
+    if (item.kind === 'mcp-remote' && item.hasAgent) {
       await updateAgentConfig(settingsStore.agentUrl, settingsStore.authToken, item.agentName, {
         description: item.description || null,
         system_prompt: item.systemPrompt || null,
         llm_provider: item.llmProvider || null,
         llm_model: item.llmModel || null,
         reasoning_effort: getReasoningOptions(item.llmModel).length > 0 ? (item.reasoningEffort || null) : null,
-        full_reasoning: item.kind === 'mcp-remote' ? item.fullReasoning : undefined,
       });
-    }
-
-    if (item.argumentsSchema && Object.keys(item.argValues).length > 0) {
-      const configName = item.toolName || item.agentName;
-      await updateToolArguments(settingsStore.agentUrl, settingsStore.authToken, configName, { ...item.argValues });
     }
 
     ElMessage.success(`${item.displayName} configuration saved`);
@@ -511,37 +520,13 @@ async function saveItemConfig(item: UnifiedItem) {
   }
 }
 
+/** Client-side "Reset All to Default" for the MCP config form. */
 function resetLLMDefaults(item: UnifiedItem) {
   item.description = '';
   item.systemPrompt = '';
   item.llmProvider = '';
   item.llmModel = '';
   item.reasoningEffort = '';
-  // Locked fields stay at their code default; clearing them would force a
-  // forbidden value (e.g. documentation_search must keep full_reasoning=true).
-  if (!item.lockedLlmFields.includes('full_reasoning')) {
-    item.fullReasoning = false;
-  }
-}
-
-/** Per-field "Reset to default" from LLMParametersForm.
- *
- *  Clears the DB override via DELETE /api/tools/{id}/llm and refreshes the
- *  list so the placeholder/default re-appears. Only wired for built-in tools
- *  today — MCP/A2A agents persist LLM overrides through a different endpoint. */
-async function handleResetField(item: UnifiedItem, field: LLMDefaultField) {
-  if (!item.toolName || item.kind !== 'builtin') return;
-  try {
-    await resetToolLLMKeys(
-      settingsStore.agentUrl,
-      settingsStore.authToken,
-      item.toolName,
-      [field],
-    );
-    await reloadAll();
-  } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : 'Failed to reset field');
-  }
 }
 
 async function toggleItemEnabled(item: UnifiedItem, value: boolean) {
@@ -569,6 +554,65 @@ async function toggleItemEnabled(item: UnifiedItem, value: boolean) {
     }
     item.enabled = !item.enabled;
     ElMessage.error(e instanceof Error ? e.message : 'Failed to toggle');
+  }
+}
+
+// ── Sub-tool ("leaf") enable/disable ──
+
+/** Expand/collapse a card; lazy-load the sub-tool list the first time a
+ *  built-in group or MCP server card is opened. */
+function toggleExpand(item: UnifiedItem) {
+  item.expanded = !item.expanded;
+  if (item.expanded && !item.leavesLoaded && (item.kind === 'builtin' || item.kind === 'mcp-remote')) {
+    void loadLeaves(item);
+  }
+}
+
+async function loadLeaves(item: UnifiedItem) {
+  const toolId = item.toolName ?? item.name;
+  item.leavesLoading = true;
+  try {
+    const res = await listToolLeaves(settingsStore.agentUrl, settingsStore.authToken, toolId);
+    item.leaves = res.leaves;
+    item.supportsLeafToggle = res.supports_leaf_toggle;
+    item.leavesDisconnected = res.disconnected;
+    item.leavesLoaded = true;
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to load sub-tools');
+  } finally {
+    item.leavesLoading = false;
+  }
+}
+
+/** Optimistically toggle one sub-tool, rolling back on failure. */
+async function toggleLeaf(item: UnifiedItem, leafName: string, value: boolean) {
+  const leaf = item.leaves.find(l => l.leaf_name === leafName);
+  if (!leaf) return;
+  const prev = leaf.enabled;
+  leaf.enabled = value;
+  try {
+    await setToolLeaves(settingsStore.agentUrl, settingsStore.authToken,
+      item.toolName ?? item.name, { [leafName]: value });
+  } catch (e) {
+    leaf.enabled = prev;
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to update sub-tool');
+  }
+}
+
+/** Optimistically enable/disable every sub-tool at once, rolling back on failure. */
+async function setAllLeaves(item: UnifiedItem, enabled: boolean) {
+  const prev = item.leaves.map(l => l.enabled);
+  const payload: Record<string, boolean> = {};
+  for (const leaf of item.leaves) {
+    payload[leaf.leaf_name] = enabled;
+    leaf.enabled = enabled;
+  }
+  try {
+    await setToolLeaves(settingsStore.agentUrl, settingsStore.authToken,
+      item.toolName ?? item.name, payload);
+  } catch (e) {
+    item.leaves.forEach((l, i) => { l.enabled = prev[i]; });
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to update sub-tools');
   }
 }
 
@@ -885,22 +929,6 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
   };
   ElMessage.success('Process registered and started');
 }
-
-async function onSkillModeChange(value: string | number | boolean | undefined) {
-  const next = value as SkillMode;
-  const previous: SkillMode = next === 'manual' ? 'automatic' : 'manual';
-  skillMode.value = next;
-  skillModeSaving.value = true;
-  try {
-    await setSkillMode(settingsStore.agentUrl, settingsStore.authToken, props.profile, next);
-    ElMessage.success(`Skill mode set to ${next}`);
-  } catch (e) {
-    skillMode.value = previous;
-    ElMessage.error(e instanceof Error ? e.message : 'Failed to update skill mode');
-  } finally {
-    skillModeSaving.value = false;
-  }
-}
 </script>
 
 <template>
@@ -932,7 +960,7 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
                 :toggle-locked="item.toggleLocked"
                 :show-authenticate="item.showAuthenticate"
                 :show-unlink="item.showUnlink"
-                @toggle-expand="item.expanded = !item.expanded"
+                @toggle-expand="toggleExpand(item)"
                 @update:enabled="toggleItemEnabled(item, $event)"
                 @authenticate="handleAuthenticate(item)"
                 @unlink="handleUnlink(item)"
@@ -947,41 +975,25 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
                   />
                 </div>
 
-                <div v-if="item.agentType !== 'skill'" class="config-section">
-                  <h4 class="config-section-title">LLM Parameters</h4>
-                  <LLMParametersForm
-                    v-model:description="item.description"
-                    v-model:system-prompt="item.systemPrompt"
-                    v-model:llm-provider="item.llmProvider"
-                    v-model:llm-model="item.llmModel"
-                    v-model:reasoning-effort="item.reasoningEffort"
-                    v-model:full-reasoning="item.fullReasoning"
-                    :providers="llmProviders"
-                    :get-filtered-models="getFilteredModels"
-                    :get-reasoning-options="getReasoningOptions"
-                    :default-description="item.llmDefaults.description || item.llmDefaults.server_instructions || ''"
-                    :default-system-prompt="item.llmDefaults.system_prompt || ''"
-                    :default-llm-provider="item.llmDefaults.llm_provider || ''"
-                    :default-llm-model="item.llmDefaults.llm_model || ''"
-                    :default-reasoning-effort="item.llmDefaults.reasoning_effort || ''"
-                    :default-full-reasoning="item.llmDefaults.full_reasoning"
-                    :locked-full-reasoning="item.lockedLlmFields.includes('full_reasoning')"
-                    @reset-field="handleResetField(item, $event)"
-                  />
-                </div>
-
-                <div v-if="item.argumentsSchema && Object.keys(item.argumentsSchema.properties).length > 0" class="config-section">
-                  <ToolArgumentsForm
-                    :schema="item.argumentsSchema"
-                    :arg-values="item.argValues"
-                    @update:arg-values="item.argValues = $event"
-                  />
-                </div>
-
-                <div style="display: flex; align-items: center; gap: 8px;">
+                <div v-if="Object.keys(item.toolConfigFields).length > 0"
+                     style="display: flex; align-items: center; gap: 8px;">
                   <ElButton type="primary" size="small" :loading="item.saving" @click="saveItemConfig(item)">Save</ElButton>
-                  <ElButton size="small" @click="resetLLMDefaults(item)">Reset All to Default</ElButton>
                 </div>
+
+                <LeafToggleSection
+                  v-if="item.supportsLeafToggle || item.leavesLoading"
+                  :leaves="item.leaves"
+                  :loading="item.leavesLoading"
+                  :disconnected="item.leavesDisconnected"
+                  :parent-enabled="item.enabled"
+                  @toggle="(leaf, val) => toggleLeaf(item, leaf, val)"
+                  @set-all="(val) => setAllLeaves(item, val)"
+                />
+
+                <div
+                  v-if="Object.keys(item.toolConfigFields).length === 0 && !item.supportsLeafToggle && !item.leavesLoading"
+                  class="empty-args"
+                >No configuration required for this tool.</div>
               </div>
             </ElCard>
           </div>
@@ -996,33 +1008,6 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
           </h2>
 
           <div class="skill-mode-row">
-            <template v-if="skillItems.length > 0">
-              <span class="skill-mode-label">Skill Mode</span>
-              <ElRadioGroup
-                v-model="skillMode"
-                size="small"
-                :disabled="skillModeSaving"
-                @change="onSkillModeChange"
-              >
-                <ElRadioButton value="manual">Manual</ElRadioButton>
-                <ElTooltip
-                  :disabled="embeddingEnabled"
-                  content="Enable Vector Embedding in setup to use Automatic mode."
-                  placement="top"
-                >
-                  <span>
-                    <ElRadioButton value="automatic" :disabled="!embeddingEnabled">Automatic</ElRadioButton>
-                  </span>
-                </ElTooltip>
-              </ElRadioGroup>
-              <span class="skill-mode-hint">
-                {{ !embeddingEnabled
-                    ? 'Vector Embedding is disabled — Automatic mode is unavailable.'
-                    : skillMode === 'manual'
-                      ? 'All enabled skills are exposed to the agent.'
-                      : 'Top 10 skills matching your message are selected via vector search.' }}
-              </span>
-            </template>
             <ElButton type="primary" class="skill-import-btn" @click="openImportDialog">
               <Icon icon="mdi:import" /> Import Skill
             </ElButton>
@@ -1135,7 +1120,7 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
                 :show-reconnect="!!item.connectionError"
                 :show-remove="true"
                 :remove-name="item.name"
-                @toggle-expand="item.expanded = !item.expanded"
+                @toggle-expand="toggleExpand(item)"
                 @update:enabled="toggleItemEnabled(item, $event)"
                 @authenticate="handleAuthenticate(item)"
                 @unlink="handleUnlink(item)"
@@ -1173,6 +1158,16 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
                   <ElButton type="primary" size="small" :loading="item.saving" @click="saveItemConfig(item)">Save</ElButton>
                   <ElButton size="small" @click="resetLLMDefaults(item)">Reset All to Default</ElButton>
                 </div>
+
+                <LeafToggleSection
+                  v-if="item.leavesLoading || item.supportsLeafToggle || item.leavesDisconnected"
+                  :leaves="item.leaves"
+                  :loading="item.leavesLoading"
+                  :disconnected="item.leavesDisconnected"
+                  :parent-enabled="item.enabled"
+                  @toggle="(leaf, val) => toggleLeaf(item, leaf, val)"
+                  @set-all="(val) => setAllLeaves(item, val)"
+                />
               </div>
             </ElCard>
           </div>
@@ -1181,66 +1176,11 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
             <Icon icon="mdi:plus" /> Add MCP Server
           </ElButton>
         </div>
-
-        <ElDivider />
-
-        <!-- Section 4: A2A Agent Remote -->
-        <div class="section">
-          <h2 class="section-title">
-            <Icon icon="mdi:robot" class="section-icon" /> A2A Agent Remote
-          </h2>
-
-          <div v-if="a2aRemoteItems.length === 0" class="empty-state">No A2A agents configured.</div>
-
-          <div v-else class="items-list">
-            <ElCard v-for="item in a2aRemoteItems" :key="item.name" class="item-card" :class="{ 'item-card-error': !!item.connectionError }" shadow="hover">
-              <ItemCardHeader
-                :name="item.name"
-                :status-tag="getRemoteStatusTag(item)"
-                :expanded="item.expanded"
-                :enabled="item.enabled"
-                :toggle-locked="item.toggleLocked"
-                :show-authenticate="item.showAuthenticate && !item.connectionError"
-                :show-unlink="item.showUnlink && !item.connectionError"
-                :show-reconnect="!!item.connectionError"
-                :show-remove="true"
-                :remove-name="item.name"
-                @toggle-expand="item.expanded = !item.expanded"
-                @update:enabled="toggleItemEnabled(item, $event)"
-                @authenticate="handleAuthenticate(item)"
-                @unlink="handleUnlink(item)"
-                @reconnect="handleReconnect(item)"
-                @remove="handleRemoveAgent(item)"
-              />
-              <p class="item-url">{{ item.url }}</p>
-              <p v-if="item.connectionError" class="item-error-msg"><Icon icon="mdi:alert-circle-outline" /> {{ item.connectionError }}</p>
-              <p v-else class="item-desc">{{ item.description }}</p>
-
-              <div v-if="item.expanded" class="item-config">
-                <div v-if="item.argumentsSchema && Object.keys(item.argumentsSchema.properties).length > 0" class="config-section">
-                  <ToolArgumentsForm
-                    :schema="item.argumentsSchema"
-                    :arg-values="item.argValues"
-                    @update:arg-values="item.argValues = $event"
-                  />
-                </div>
-
-                <div v-else class="empty-args">No arguments required for this agent.</div>
-
-                <ElButton type="primary" size="small" :loading="item.saving" @click="saveItemConfig(item)">Save</ElButton>
-              </div>
-            </ElCard>
-          </div>
-
-          <ElButton type="primary" class="add-btn" @click="openAddDialog('a2a')">
-            <Icon icon="mdi:plus" /> Add A2A Agent
-          </ElButton>
-        </div>
       </template>
     </div>
 
-    <!-- Add Agent Dialog -->
-    <ElDialog v-model="showAddDialog" :title="addForm.type === 'mcp' ? 'Add MCP Server' : 'Add A2A Agent'" width="520px">
+    <!-- Add Agent Dialog (MCP only) -->
+    <ElDialog v-model="showAddDialog" title="Add MCP Server" width="520px">
       <ElForm label-position="top">
         <!-- Input mode toggle (MCP only) -->
         <template v-if="addForm.type === 'mcp'">

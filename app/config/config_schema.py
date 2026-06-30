@@ -91,13 +91,13 @@ class ConfigGroup:
 CONFIG_SCHEMA: dict[str, ConfigGroup] = {
     "agent": ConfigGroup(
         label="Reasoning Agent",
-        description="Controls the ReAct loop's iteration limits and per-call LLM parameters.",
+        description="Controls the agent loop's iteration limits and per-call LLM parameters.",
         fields={
             "max_steps": Field(
                 type="number", default_toml="agent.max_steps",
                 label="Max steps",
-                description="Maximum ReAct iterations before the agent stops a turn.",
-                min=1, max=200,
+                description="Maximum tool-calling iterations before the agent stops a turn.",
+                min=1, max=500,
             ),
             "max_llm_retries": Field(
                 type="number", default_toml="agent.max_llm_retries",
@@ -129,23 +129,68 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
                 description="Maximum number of recent ReAct step entries kept in the prompt context. Older entries are dropped once this is exceeded.",
                 min=5, max=500,
             ),
+            "enable_prompt_cache": Field(
+                type="boolean", default_toml="agent.enable_prompt_cache",
+                label="Prompt caching",
+                description="Reuse the cached system+tools prefix across reasoning steps to cut input tokens. Anthropic uses explicit cache markers; OpenAI-family providers cache automatically. Harmless on providers without cache support.",
+            ),
+            "replay_reasoning_steps": Field(
+                type="boolean", default_toml="agent.replay_reasoning_steps",
+                label="Replay reasoning steps",
+                description="Send each prior turn's full tool-call/tool-result trace back into history (not just the final answer), so the model resumes the real transcript and the cached prefix covers the reasoning. Larger prompts — cheap on Anthropic (cached), but extra input tokens on providers without caching.",
+            ),
         },
     ),
-    "history": ConfigGroup(
-        label="Conversation History",
-        description="Token-budget limits applied when assembling the message window for each LLM call.",
+    "compaction": ConfigGroup(
+        label="Conversation Compaction",
+        description=(
+            "Keeps long conversations within budget by folding the oldest turns "
+            "into a running summary (via the low model group) while recent turns "
+            "stay verbatim. Replaces fixed token-window truncation and is "
+            "prompt-cache friendly — the summary at the front stays byte-stable "
+            "between compactions."
+        ),
         fields={
-            "max_tokens_total": Field(
-                type="number", default_toml="history.max_tokens_total",
-                label="Total history tokens",
-                description="Maximum total tokens of past messages included in each prompt.",
-                min=500, max=200000,
+            "enabled": Field(
+                type="boolean", default_toml="compaction.enabled",
+                label="Enabled",
+                description="When off, full history is sent (bounded only by the model's context window).",
             ),
-            "max_tokens_per_message": Field(
-                type="number", default_toml="history.max_tokens_per_message",
-                label="Per-message tokens",
-                description="Each message is truncated to at most this many tokens before assembly.",
-                min=50, max=20000,
+            "compact_threshold_percent": Field(
+                type="number", default_toml="compaction.compact_threshold_percent",
+                label="Compaction threshold (% of context window)",
+                description="Suggest folding the oldest turns once the model's reported context reaches this percentage of its context window. Lower it to compact earlier.",
+                min=10, max=100, step=5,
+            ),
+            "keep_recent_tokens": Field(
+                type="number", default_toml="compaction.keep_recent_tokens",
+                label="Keep-recent target (tokens)",
+                description="After a compaction, keep about this many tokens of recent turns verbatim. The gap below the threshold is the hysteresis band that keeps the cached summary stable across turns.",
+                min=500, max=500000,
+            ),
+            "keep_recent_messages": Field(
+                type="number", default_toml="compaction.keep_recent_messages",
+                label="Keep-recent messages (floor)",
+                description="Never fold below this many of the most recent messages, even if the tail is over the keep-recent target.",
+                min=0, max=50,
+            ),
+            "temperature": Field(
+                type="number", default_toml="compaction.temperature",
+                label="Temperature",
+                description="Sampling temperature for the summarization call; keep low for consistency.",
+                min=0, max=2, step=0.1,
+            ),
+            "max_tokens": Field(
+                type="number", default_toml="compaction.max_tokens",
+                label="Max tokens",
+                description="Output token cap for the running summary (also its hard size bound).",
+                min=128, max=8192,
+            ),
+            "retry": Field(
+                type="number", default_toml="compaction.retry",
+                label="Retry count",
+                description="Retries on transient summarization LLM errors.",
+                min=0, max=10,
             ),
         },
     ),
@@ -184,92 +229,27 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
             ),
         },
     ),
-    "skill_classifier": ConfigGroup(
-        label="Skill Classifier",
-        description="Lightweight LLM that decides whether a request maps to a registered skill.",
-        fields={
-            "temperature": Field(
-                type="number", default_toml="skill_classifier.temperature",
-                label="Temperature",
-                description="Sampling temperature; keep low for deterministic classification.",
-                min=0, max=2, step=0.1,
-            ),
-            "max_tokens": Field(
-                type="number", default_toml="skill_classifier.max_tokens",
-                label="Max tokens",
-                description="Output token cap for the classifier call.",
-                min=8, max=2048,
-            ),
-            "retry": Field(
-                type="number", default_toml="skill_classifier.retry",
-                label="Retry count",
-                description="Retries on transient classifier LLM errors.",
-                min=0, max=10,
-            ),
-        },
-    ),
-    "summarizer": ConfigGroup(
-        label="Trace Summarizer",
-        description="LLM that compresses long reasoning traces back into the conversation history.",
-        fields={
-            "temperature": Field(
-                type="number", default_toml="summarizer.temperature",
-                label="Temperature",
-                description="Sampling temperature for the summarization call.",
-                min=0, max=2, step=0.1,
-            ),
-            "max_tokens": Field(
-                type="number", default_toml="summarizer.max_tokens",
-                label="Max tokens",
-                description="Output token cap for the summary.",
-                min=128, max=8192,
-            ),
-            "retry": Field(
-                type="number", default_toml="summarizer.retry",
-                label="Retry count",
-                description="Retries on transient summarizer LLM errors.",
-                min=0, max=10,
-            ),
-        },
-    ),
     "memory": ConfigGroup(
         label="Memory",
         description=(
-            "Distills conversations into short-term (per-conversation) and "
-            "long-term (per-profile) memory so the agent recalls habits, past "
-            "mistakes, and durable facts. Runs as a background \"memory session\" "
-            "using the low model group — it consumes extra tokens, so it is off "
-            "by default."
+            "Lets the agent recall durable, long-term facts about the user across "
+            "conversations. Long-term memory is extracted together with the "
+            "conversation summary at the compaction fold (requires Compaction "
+            "enabled). When Vector Embedding is on, facts are stored in the vector "
+            "store and retrieved by relevance; otherwise they live in a small "
+            "size-capped queue. Off by default."
         ),
         fields={
             "enabled": Field(
                 type="boolean", default_toml="memory.enabled",
                 label="Enabled",
-                description="Master switch. When off, no extraction runs and the agent reads no memory.",
-            ),
-            "trigger_token_threshold": Field(
-                type="number", default_toml="memory.trigger_token_threshold",
-                label="Trigger threshold (tokens)",
-                description="Auto-extract once this many NEW message-content tokens (reasoning excluded) accumulate since the last extraction.",
-                min=1000, max=1000000,
-            ),
-            "short_term_queue_size": Field(
-                type="number", default_toml="memory.short_term_queue_size",
-                label="Short-term queue size",
-                description="Max short-term entries kept per conversation. Oldest is dropped on overflow.",
-                min=1, max=50,
+                description="Master switch for long-term memory. Requires Compaction enabled (memory is generated at the compaction fold). When off, the agent reads and writes no long-term memory.",
             ),
             "long_term_queue_size": Field(
                 type="number", default_toml="memory.long_term_queue_size",
                 label="Long-term queue size",
-                description="Max long-term entries kept per profile. Oldest is dropped on overflow.",
+                description="Max long-term facts kept per profile in the DB queue (Vector-Embedding-OFF mode). Oldest is dropped on overflow. Ignored in vector mode (unlimited).",
                 min=1, max=100,
-            ),
-            "short_term_max_tokens": Field(
-                type="number", default_toml="memory.short_term_max_tokens",
-                label="Short-term entry max tokens",
-                description="Each short-term summary is clipped to at most this many tokens.",
-                min=50, max=2000,
             ),
             "long_term_max_tokens": Field(
                 type="number", default_toml="memory.long_term_max_tokens",
@@ -277,23 +257,11 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
                 description="Each long-term fact is clipped to at most this many tokens.",
                 min=10, max=500,
             ),
-            "temperature": Field(
-                type="number", default_toml="memory.temperature",
-                label="Temperature",
-                description="Sampling temperature for the extraction call; keep low for consistency.",
-                min=0, max=2, step=0.1,
-            ),
-            "max_tokens": Field(
-                type="number", default_toml="memory.max_tokens",
-                label="Max tokens",
-                description="Output token cap for the extraction LLM call.",
-                min=256, max=8192,
-            ),
-            "retry": Field(
-                type="number", default_toml="memory.retry",
-                label="Retry count",
-                description="Retries on transient extraction LLM errors.",
-                min=0, max=10,
+            "long_term_retrieve_limit": Field(
+                type="number", default_toml="memory.long_term_retrieve_limit",
+                label="Long-term retrieval limit",
+                description="Top-K long-term facts retrieved from the vector store for the prompt (Vector-Embedding-ON mode).",
+                min=1, max=50,
             ),
         },
     ),

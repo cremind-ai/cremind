@@ -16,6 +16,7 @@ export interface ConversationStreamEvent {
     | 'ready'
     | 'user_message'
     | 'event_trigger_message'
+    | 'event_trigger_rejected'
     | 'thinking'
     | 'result'
     | 'text'
@@ -24,6 +25,8 @@ export interface ConversationStreamEvent {
     | 'token_usage'
     | 'phase'
     | 'summary'
+    | 'compaction_suggested'
+    | 'compacted'
     | 'complete'
     | 'error'
     | 'cwd';

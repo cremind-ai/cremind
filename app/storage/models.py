@@ -29,7 +29,7 @@ Tables
 import uuid
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from a2a.server.models import Base
@@ -42,7 +42,6 @@ class ProfileModel(Base):
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)
-    skill_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="manual")
 
 
 class ChannelModel(Base):
@@ -106,12 +105,21 @@ class ConversationModel(Base):
     # deleted) are cleared and the conversation falls back to the user
     # default. ``NULL`` means "no override, use the user default".
     working_directory: Mapped[str | None] = mapped_column(String(1024), nullable=True)
-    # Memory-feature watermark: the ``MessageModel.ordering`` of the last message
-    # already folded into short-term memory. Auto-extraction counts message-content
-    # tokens with ``ordering > memory_watermark`` and re-triggers once they pass the
-    # configured threshold, then advances this. Defaults to 0 (extract from the start).
-    memory_watermark: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    memory_last_extracted_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # History-compaction state. ``compaction_summary``
+    # is the running summary of every message with ``ordering <= compaction_watermark``;
+    # the verbatim tail (``ordering > compaction_watermark``) is sent to the LLM as-is.
+    # Oldest turns are folded into the summary once the tail's tokens cross the
+    # configured threshold, then the watermark advances. Defaults to -1 (nothing
+    # folded — message ``ordering`` starts at 0, so the sentinel must be < 0 or the
+    # first message would be excluded from the tail).
+    # ``server_default`` (not just the ORM-side ``default``) so tables created
+    # straight from this metadata — fresh-install baseline and tests that raw-INSERT
+    # a conversation row — carry the -1 default at the DB level too.
+    compaction_watermark: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=-1, server_default="-1"
+    )
+    compaction_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    compaction_last_compacted_at: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)
 
@@ -127,11 +135,83 @@ class MessageModel(Base):
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     parts: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     thinking_steps: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # Native LLM reasoning trace (assistant tool_calls + role:"tool" results + the
+    # final-answer assistant message) for this turn, in OpenAI chat format. Replayed
+    # into conversation history on later turns so the prompt-cache prefix covers the
+    # reasoning context. NULL for turns with no tool calls (replays content-only).
+    llm_messages: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     token_usage: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     message_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, name="metadata")
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     ordering: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class UsageRecordModel(Base):
+    """One LLM invocation (smallest logical unit) within an agent turn.
+
+    A turn (one assistant ``MessageModel``) fans out to N usage_records: one per
+    reasoning step plus one per tool/sub-agent child-LLM call. Raw token counts
+    are always stored; the ``*_usd`` cost columns are frozen at write time from
+    the rate snapshot in effect, so historical estimates never move when catalog
+    prices change. Costs are nullable — left null when the model is unknown
+    (e.g. backfilled rows, or remote A2A sub-agents that don't report a model).
+    Everything the dashboard groups by (conversation, profile, provider, model,
+    source, tool, time) is an indexed column on this one fact table.
+    """
+
+    __tablename__ = "usage_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+
+    # ── scope / grouping keys ──
+    conversation_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # The assistant turn this rolled up into. SET NULL (not CASCADE) so a turn
+    # re-write / message delete doesn't drop usage history; the conversation
+    # CASCADE still governs lifecycle. Nullable so a record can be inserted
+    # before the turn's message id is known, and so backfilled rows can attach.
+    message_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Denormalized for cheap filtering / parity with other per-profile tables.
+    profile: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    # Catalog group_hint (high|low|...) so the dashboard can group by tier.
+    model_group: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # reasoning | tool | subagent | intrinsic | aggregate
+    source_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="reasoning", index=True)
+    tool_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    label: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # 0-based step ordinal within the turn (drill-down / ordering).
+    step_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # ── raw token counts (always present, never recomputed) ──
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cache_read_input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cache_creation_input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # ── frozen cost (USD), computed at write time; nullable when rates unknown ──
+    uncached_input_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cache_read_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cache_write_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    output_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_usd: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
+    # Rate snapshot the cost was computed from (rates, multipliers, source,
+    # pricing_version) — makes each row a self-describing, auditable receipt.
+    rate_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)  # epoch ms
+
+    __table_args__ = (
+        Index("ix_usage_records_conv_msg", "conversation_id", "message_id"),
+        Index("ix_usage_records_profile_created", "profile", "created_at"),
+    )
 
 
 class ChannelSenderModel(Base):
@@ -404,30 +484,6 @@ class ScheduleEventSubscriptionModel(Base):
     external_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)
-
-
-class ShortTermMemoryModel(Base):
-    """Per-conversation short-term memory entry (FIFO queue).
-
-    Each row is one distilled summary of a conversation window — past mistakes,
-    repeated commands, user habits — produced by the background memory extractor.
-    The queue is bounded by ``memory.short_term_queue_size`` (default 10); the
-    storage layer FIFO-evicts the oldest rows (lowest ``ordering``) on overflow.
-    """
-    __tablename__ = "short_term_memories"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    conversation_id: Mapped[str] = mapped_column(
-        String(128), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    # Denormalized profile for cheap filtering / parity with other tables; not an FK
-    # because conversation cascade already governs lifecycle.
-    profile: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    token_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    # Monotonic per-conversation insertion order; FIFO eviction drops the lowest.
-    ordering: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    created_at: Mapped[float] = mapped_column(Float, nullable=False)
 
 
 class LongTermMemoryModel(Base):

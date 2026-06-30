@@ -31,8 +31,22 @@ export interface MessageRecord {
   role: 'user' | 'agent';
   content: string | null;
   parts: any[] | null;
-  thinking_steps: { thought: string; action: string; action_input: string; observation?: { kind: string; text?: string; data?: Record<string, any>; file?: any }[]; model_label?: string | null; reasoning_model_label?: string | null }[] | null;
-  token_usage: { input_tokens: number; output_tokens: number } | null;
+  thinking_steps: {
+    step?: number | null;
+    call_id?: string | null;
+    tool?: string;
+    tool_input?: string;
+    result?: { kind: string; text?: string; data?: Record<string, any>; file?: any }[];
+    // Legacy fields (older persisted messages) read for back-compat.
+    observation?: { kind: string; text?: string; data?: Record<string, any>; file?: any }[];
+    model_label?: string | null;
+  }[] | null;
+  token_usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  } | null;
   metadata: Record<string, any> | null;
   summary: string | null;
   created_at: number;
@@ -158,20 +172,28 @@ export interface SendMessageResponse {
   conversation_id: string;
 }
 
+export interface MessageAttachment {
+  name: string;
+  path: string;
+}
+
 export async function sendMessageRequest(
   agentUrl: string,
   authToken: string,
   conversationId: string,
   text: string,
   reasoning: boolean = true,
+  attachments?: MessageAttachment[],
 ): Promise<SendMessageResponse> {
   const base = resolveBaseUrl(agentUrl);
+  const body: Record<string, unknown> = { text, reasoning };
+  if (attachments && attachments.length) body.attachments = attachments;
   const res = await fetch(
     `${base}/api/conversations/${encodeURIComponent(conversationId)}/messages`,
     {
       method: 'POST',
       headers: authHeaders(authToken),
-      body: JSON.stringify({ text, reasoning }),
+      body: JSON.stringify(body),
     },
   );
   if (!res.ok) throw new Error(`Failed to send message: ${res.statusText}`);

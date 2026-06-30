@@ -22,12 +22,12 @@ from a2a.utils import new_agent_text_message, new_task
 from a2a.utils.errors import ServerError
 
 from app.agent.agent import CremindAgent
-from app.agent.summary import summarize_reasoning
 from app.config.settings import BaseConfig
 from app.constants import ChatCompletionTypeEnum
 from app.lib.llm import LLMProvider
 from app.storage.conversation_storage import ConversationStorage
 
+from app.config.user_config import replay_reasoning_enabled
 from app.utils import logger, build_table_embeddings, find_similar_items
 from app.utils.common import convert_db_messages_to_history, convert_task_history_to_messages
 from app.utils.context_storage import get_context
@@ -106,18 +106,16 @@ class CremindAgentExecutor(AgentExecutor):
         has_sent_first_chunk = False
         final_response_text_parts = []
         total_input_tokens = 0
+        total_cache_read_input_tokens = 0
+        total_cache_creation_input_tokens = 0
         total_output_tokens = 0
         collected_thinking_steps: list[dict] = []
         collected_file_parts: list[Part] = []
-        reasoning_input_section: str | None = None
+        # The turn's native reasoning trace (carried on the terminal DONE chunk),
+        # persisted so later turns can replay it into history. None when no tools ran.
+        collected_llm_messages: list | None = None
 
-        # Initialize tiktoken encoder for token-by-token streaming. Lazy
-        # import: tiktoken lives in the ``tokenization`` extras group and
-        # may not be present on a thin-core install.
-        from tiktoken import encoding_for_model
-        encoder = encoding_for_model("gpt-4o")
-
-        # Load history from DB (includes message IDs for the message_detail tool).
+        # Load history from DB.
         # Fall back to task.history when no DB conversation exists yet.
         history_messages = []
         if self.conversation_storage and profile and context_id:
@@ -128,7 +126,10 @@ class CremindAgentExecutor(AgentExecutor):
                 if conv:
                     db_msgs = await self.conversation_storage.get_messages(conv["id"])
                     if db_msgs:
-                        history_messages = convert_db_messages_to_history(db_msgs, inject_ids=True)
+                        history_messages = convert_db_messages_to_history(
+                            db_msgs,
+                            include_reasoning=replay_reasoning_enabled(profile),
+                        )
             except Exception:
                 logger.debug("Failed to load history from DB, falling back to task.history", exc_info=True)
 
@@ -153,21 +154,15 @@ class CremindAgentExecutor(AgentExecutor):
                     content = chunk.get("data")
                     if content:
                         final_response_text_parts.append(content)
-
-                        # Tokenize content and stream token by token
-                        tokens = encoder.encode(content)
-                        for token in tokens:
-                            token_text = encoder.decode([token])
-                            await updater.add_artifact(
-                                [Part(root=TextPart(text=token_text))],
-                                artifact_id,
-                                name="Text Response",
-                                append=has_sent_first_chunk,
-                                last_chunk=False
-                            )
-                            has_sent_first_chunk = True
-                            # Add delay to simulate token latency
-                            await asyncio.sleep(0.001)  # 1ms delay per token
+                        # Forward the native streaming delta as-is (real streaming).
+                        await updater.add_artifact(
+                            [Part(root=TextPart(text=content))],
+                            artifact_id,
+                            name="Text Response",
+                            append=has_sent_first_chunk,
+                            last_chunk=False,
+                        )
+                        has_sent_first_chunk = True
                 elif chunk["type"] == ChatCompletionTypeEnum.THINKING_ARTIFACT:
                     # Emit thinking artifact as a separate DataPart
                     thinking_data = chunk.get("data", {})
@@ -179,16 +174,18 @@ class CremindAgentExecutor(AgentExecutor):
                     )
                     # Collect for persistence
                     collected_thinking_steps.append({
-                        "thought": thinking_data.get("Thought", ""),
-                        "action": thinking_data.get("Action", ""),
-                        "action_input": thinking_data.get("Action_Input", ""),
+                        "step": thinking_data.get("Step"),
+                        "call_id": thinking_data.get("Call_Id"),
+                        "tool": thinking_data.get("Tool", ""),
+                        "tool_input": thinking_data.get("Tool_Input", ""),
                         "model_label": thinking_data.get("Model_Label"),
-                        "reasoning_model_label": thinking_data.get("Reasoning_Model_Label"),
                     })
                 elif chunk["type"] == ChatCompletionTypeEnum.RESULT_ARTIFACT:
-                    # Observation is now list[Part] from the reasoning agent
+                    # Result is list[Part] from the reasoning agent.
                     result_data = chunk.get("data", {})
-                    observation_parts = result_data.get("Observation", [])
+                    observation_parts = (
+                        result_data.get("Result") or result_data.get("Observation") or []
+                    )
 
                     # Serialize Part objects to dicts for the frontend DataPart
                     serialized_observation = []
@@ -201,7 +198,11 @@ class CremindAgentExecutor(AgentExecutor):
                             serialized_observation.append(obs_part)
 
                     await updater.add_artifact(
-                        [Part(root=DataPart(data={"Observation": serialized_observation}, kind="data", metadata=None))],
+                        [Part(root=DataPart(data={
+                            "step": result_data.get("Step"),
+                            "call_id": result_data.get("Call_Id"),
+                            "Result": serialized_observation,
+                        }, kind="data", metadata=None))],
                         name="result",
                         append=False,
                         last_chunk=True
@@ -261,39 +262,39 @@ class CremindAgentExecutor(AgentExecutor):
                                     last_chunk=True,
                                 )
 
-                    # Attach observation parts to the latest thinking step for storage
-                    if collected_thinking_steps:
+                    # Attach the result to its originating step (match by call_id).
+                    _rcid = result_data.get("Call_Id")
+                    if _rcid:
+                        for step in collected_thinking_steps:
+                            if step.get("call_id") == _rcid and "result" not in step:
+                                step["result"] = serialized_observation
+                                break
+                    elif collected_thinking_steps:
                         for step in reversed(collected_thinking_steps):
-                            if "observation" not in step:
-                                step["observation"] = serialized_observation
+                            if "result" not in step:
+                                step["result"] = serialized_observation
                                 break
                 elif chunk["type"] in [ChatCompletionTypeEnum.DONE, ChatCompletionTypeEnum.CLARIFY]:
+                    # The answer streamed via CONTENT; DONE.data is normally empty.
+                    # Non-empty only for terminal fallbacks (max-steps / errors).
                     content = chunk.get("data")
                     if content:
                         final_response_text_parts.append(content)
-
-                        # Tokenize content and stream token by token
-                        tokens = encoder.encode(content)
-                        for token in tokens:
-                            token_text = encoder.decode([token])
-                            await updater.add_artifact(
-                                [Part(root=TextPart(text=token_text))],
-                                artifact_id,
-                                name="Text Response",
-                                append=has_sent_first_chunk,
-                                last_chunk=False
-                            )
-                            has_sent_first_chunk = True
-                            # Add delay to simulate token latency
-                            await asyncio.sleep(0.001)  # 1ms delay per token
+                        await updater.add_artifact(
+                            [Part(root=TextPart(text=content))],
+                            artifact_id,
+                            name="Text Response",
+                            append=has_sent_first_chunk,
+                            last_chunk=False,
+                        )
+                        has_sent_first_chunk = True
                     # Capture token usage from the final chunk
                     total_input_tokens = chunk.get("input_tokens") or 0
+                    total_cache_read_input_tokens = chunk.get("cache_read_input_tokens") or 0
+                    total_cache_creation_input_tokens = chunk.get("cache_creation_input_tokens") or 0
                     total_output_tokens = chunk.get("output_tokens") or 0
-                    # DONE carries input_section only when the turn was
-                    # multi-step (i.e. worth summarizing); presence of this
-                    # field is the signal to invoke the summarizer.
-                    if chunk["type"] == ChatCompletionTypeEnum.DONE and chunk.get("input_section"):
-                        reasoning_input_section = chunk["input_section"]
+                    if chunk.get("llm_messages"):
+                        collected_llm_messages = chunk["llm_messages"]
         except asyncio.CancelledError:
             logger.info(f"Task {task_key} cancelled by user")
             from app.tools.builtin.exec_shell import cancel_processes_by_task
@@ -339,45 +340,20 @@ class CremindAgentExecutor(AgentExecutor):
             last_chunk=True,
         )
 
-        # Summarize the reasoning chain when the turn was multi-step.
-        # Uses the low model group; failures must not break the user-visible answer.
-        summary_text: str | None = None
-        if reasoning_input_section:
-            try:
-                # Signal to the UI that the indicator should say "summarizing".
-                await updater.add_artifact(
-                    [Part(root=DataPart(
-                        data={"phase": "summarizing"},
-                        kind="data", metadata=None,
-                    ))],
-                    name="phase",
-                    append=False,
-                    last_chunk=True,
-                )
-                summary_text = await summarize_reasoning(
-                    self.cremind_agent, reasoning_input_section, profile,
-                )
-                if summary_text:
-                    await updater.add_artifact(
-                        [Part(root=DataPart(
-                            data={"summary": summary_text},
-                            kind="data", metadata=None,
-                        ))],
-                        name="summary",
-                        append=False,
-                        last_chunk=True,
-                    )
-            except Exception:
-                logger.exception("Failed to produce reasoning summary")
-                summary_text = None
-
         # Emit token_usage artifact if we have any token data
         if total_input_tokens > 0 or total_output_tokens > 0:
-            logger.debug(f"Total token usage - input: {total_input_tokens}, output: {total_output_tokens}")
+            logger.debug(
+                f"Total token usage - input: {total_input_tokens}, "
+                f"cache_read: {total_cache_read_input_tokens}, "
+                f"cache_creation: {total_cache_creation_input_tokens}, "
+                f"output: {total_output_tokens}"
+            )
             await updater.add_artifact(
                 [Part(root=DataPart(data={
                     "token_usage": {
                         "input_tokens": total_input_tokens,
+                        "cache_read_input_tokens": total_cache_read_input_tokens,
+                        "cache_creation_input_tokens": total_cache_creation_input_tokens,
                         "output_tokens": total_output_tokens,
                     }
                 }, kind="data", metadata=None))],
@@ -420,6 +396,8 @@ class CremindAgentExecutor(AgentExecutor):
                 if total_input_tokens > 0 or total_output_tokens > 0:
                     token_usage_data = {
                         "input_tokens": total_input_tokens,
+                        "cache_read_input_tokens": total_cache_read_input_tokens,
+                        "cache_creation_input_tokens": total_cache_creation_input_tokens,
                         "output_tokens": total_output_tokens,
                     }
 
@@ -432,8 +410,8 @@ class CremindAgentExecutor(AgentExecutor):
                     content=final_response_text,
                     parts=persist_parts,
                     thinking_steps=collected_thinking_steps if collected_thinking_steps else None,
+                    llm_messages=collected_llm_messages,
                     token_usage=token_usage_data,
-                    summary=summary_text,
                 )
 
                 # Update conversation title from first user message if still default

@@ -21,6 +21,7 @@ import json
 import os
 import platform
 import shutil
+import subprocess
 import time
 import uuid as _uuid
 from dataclasses import dataclass, field
@@ -58,6 +59,39 @@ def _shell_for(system: str) -> tuple[str, str]:
     if system == "Windows":
         return "powershell.exe", "-Command"
     return "/bin/bash", "-c"
+
+
+# Windows: don't pop a console window when shelling out to taskkill.
+_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def _kill_process_tree(pid: Optional[int]) -> None:
+    """Forcibly terminate *pid* and all of its descendants.
+
+    ``Process.terminate()`` only signals the spawned shell, not the grandchild
+    it launched (e.g. ``pwsh -> uv run -> python``). That grandchild can hold
+    open file handles inside a skill directory (``scripts/.listener.lock`` on
+    Windows), which then blocks ``shutil.rmtree`` and keeps a single-instance
+    listener's lock held so it can't be re-registered. Killing the whole tree
+    releases those handles.
+
+    Windows uses ``taskkill /T /F``; POSIX relies on the caller's
+    ``stop_process`` (terminate/kill of the leader) plus the fact that an open
+    file does not prevent directory removal on Unix.
+    """
+    if not pid:
+        return
+    if os.name != "nt":
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            timeout=15,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.warning(f"taskkill failed for pid {pid}", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -238,12 +272,9 @@ TOOL_CONFIG: ToolConfig = {
     "locked": True,
     "llm_parameters": {
         "tool_instructions": (
-            "Execute command-line instructions on the terminal. Supports Linux, Windows, and macOS.\n"
+            "Run command-line instructions on the terminal, including "
+            "interactive/long-running processes. Works on Linux, Windows, and macOS."
         ),
-        "system_prompt": (
-            "You are a helpful assistant that can execute shell commands and provide their output.\n"
-            "Don't answer any questions or provide explanations. Only execute the command and return the output."
-        )
     },
     "required_config": {
         Var.LARGE_OUTPUT_MODE: {
@@ -1159,6 +1190,7 @@ async def stop_process(process_id: str, *, profile: str) -> Dict[str, Any]:
 
     process = info.process
     state = info.log_writer_state
+    tracked_pid = getattr(process, "pid", None)
 
     # Wake any reader currently long-polling this process so it re-checks the
     # (now popped) registry and returns promptly instead of blocking until its
@@ -1190,6 +1222,13 @@ async def stop_process(process_id: str, *, profile: str) -> Dict[str, Any]:
             process.stdin.close()
         except Exception:
             pass
+
+    # Windows: terminate()/kill() below only signals the tracked leader (the
+    # powershell wrapper); its ``uv run -> python`` descendants survive and a
+    # skill listener child keeps holding ``scripts/.listener.lock``, blocking
+    # re-registration. taskkill /T kills the whole tree so handles release.
+    if os.name == "nt" and process.returncode is None:
+        _kill_process_tree(tracked_pid)
 
     if process.returncode is None:
         try:
@@ -1329,6 +1368,11 @@ async def _cleanup_stale_processes() -> int:
                 pass
         if info.process.returncode is None:
             try:
+                # Windows: kill() hits only the tracked leader; tear down the
+                # whole tree so a TTL-evicted listener doesn't orphan its
+                # ``uv -> python`` children (which would keep its lock held).
+                if os.name == "nt":
+                    _kill_process_tree(getattr(info.process, "pid", None))
                 info.process.kill()
                 await asyncio.wait_for(info.process.wait(), timeout=5.0)
             except (asyncio.TimeoutError, Exception):
@@ -1349,18 +1393,18 @@ async def _cleanup_stale_processes() -> int:
 class ExecShellTool(BuiltInTool):
     name: str = "exec_shell"
     description: str = (
-        "Executes a shell command on the terminal and returns its output. "
-        "Automatically detects the operating system and uses the appropriate shell.\n"
+        "Execute a shell command and return its output. Detects the operating "
+        "system and uses the appropriate shell (Linux, Windows, macOS).\n"
         "Supports interactive commands that require a TTY (ssh, docker exec -it, "
         "kubectl exec -it, REPLs like python -i / mysql / psql). If a command "
         "fails with a TTY-required error (e.g. 'the input device is not a TTY'), "
         "it is automatically respawned under a pseudo-terminal. For commands "
         "that hang without a TTY instead of erroring (notably ssh), pass "
         "`pty: true` explicitly. In PTY mode stdout and stderr are merged into `stdout`.\n"
-        "One important note: before deciding to stop reading **stdout**, check the "
-        "**`completed`** flag. If it is **`False`**, you must **sleep for a few seconds** "
-        "and then read **stdout** again to ensure that there is no remaining output "
-        "still buffered."
+        "A long-running command returns a `process_id` with `completed` set to "
+        "false. While `completed` is false there may still be buffered output: "
+        "call `exec_shell_output` with that `process_id` to read the remainder "
+        "until `completed` becomes true."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -1792,46 +1836,24 @@ _KEYSTROKE_DELAY_SEC = 0.1
 class ExecShellInputTool(BuiltInTool):
     name: str = "exec_shell_input"
     description: str = (
-        "Send input to a running process. Use this after exec_shell returns "
-        "a process_id. Writes to the process's stdin; use exec shell output "
-        "to read the response.\n"
-        'Format input: [process_id: <id>]\n<mode and payload here>\n'
+        "Send input to a running process started by exec_shell, identified by "
+        "its process_id. Writes to the process's stdin; read the response with "
+        "exec_shell_output.\n"
         "Pick exactly one 'mode' per call:\n"
-        "  - input_text: send the 'input_text' field as text/raw bytes. "
-        "You don't need to append a line terminator; the right one is "
-        "added automatically ('\\r' on Windows PTY processes, '\\n' "
-        "elsewhere). Override with 'line_ending' if needed.\n"
+        "  - input_text: send the 'input_text' field as text/raw bytes. A line "
+        "terminator is appended automatically ('\\r' on Windows PTY processes, "
+        "'\\n' elsewhere); override with 'line_ending' if needed.\n"
         "  - navigation: send the 'keys' field as cursor/focus movement "
-        "keystrokes. Allowed names: up, down, left, right, tab, space, "
-        "backspace. Use this to position the cursor or selection. No "
-        "side effects — nothing is committed.\n"
-        "  - action: send the 'keys' field as a single execution / "
-        "confirmation keystroke. Allowed names: enter, escape, ctrl+c. "
-        "These ARE side-effecting — enter submits, escape dismisses, "
-        "ctrl+c aborts.\n"
-        "Required flow: navigation and action are NEVER combined in one "
-        "call. The correct sequence is:\n"
-        "  1) call with mode='navigation' to position the cursor (you "
-        "can batch many keys in one call),\n"
-        "  2) call exec_shell output to verify the cursor/selection "
-        "actually landed where you expect,\n"
-        "  3) call again with mode='action' to commit (e.g. press enter).\n"
-        "Skipping step 2 risks committing in the wrong place.\n"
-        "Navigation example:\n"
-        '  [process_id: 708e9873]\n'
-        '  mode: "navigation"\n'
-        '  keys: ["down","down"]\n'
-        "Action example (after observing stdout):\n"
-        '  [process_id: 708e9873]\n'
-        '  mode: "action"\n'
-        '  keys: ["enter"]\n'
-        "Text example:\n"
-        '  [process_id: 708e9873]\n'
-        '  mode: "input_text"\n'
-        '  input_text: "my input"\n'
-        "Required: process_id, mode, and the field that mode selects "
-        "(input_text for mode='input_text', keys for mode='navigation' "
-        "or mode='action')."
+        "keystrokes (up, down, left, right, tab, space, backspace). Positions "
+        "the cursor or selection with no side effects — nothing is committed.\n"
+        "  - action: send the 'keys' field as a single execution / confirmation "
+        "keystroke (enter, escape, ctrl+c). These ARE side-effecting — enter "
+        "submits, escape dismisses, ctrl+c aborts.\n"
+        "navigation and action are never combined in one call. To drive a TUI "
+        "safely, position with mode='navigation' (batching keys is fine), then "
+        "read exec_shell_output to confirm the cursor/selection landed where you "
+        "expect, then commit with mode='action'. Skipping that confirmation read "
+        "risks committing in the wrong place."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -1970,11 +1992,7 @@ def _build_output_instruction(
         return base
     if input_mode == "unknown":
         return (
-            "Process is running but the input mode is unclear. If input is "
-            "expected, try plain text with exec shell input or special keys "
-            "for selection menus. Otherwise call exec_shell_output again to "
-            "keep waiting — it blocks until output arrives or the process "
-            "exits."
+            ""
         )
     return (
         "Process is still running with no new output yet. Call "
@@ -1999,9 +2017,11 @@ def _refresh_expire(info: ProcessInfo, variables: Dict[str, Any]) -> None:
 class ExecShellOutputTool(BuiltInTool):
     name: str = "exec_shell_output"
     description: str = (
-        "Read stdout from a long-running process.\n"
-        "E.g. [process_id: 708e9873]\nmode: 'exec shell output'\n"
-        "Required: process_id"
+        "Read newly available stdout from a long-running process started by "
+        "exec_shell, identified by its process_id. Blocks briefly until new "
+        "output arrives or the process exits, then returns what is available "
+        "with a `completed` flag; call again while `completed` is false to "
+        "collect the rest of the output."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -2268,10 +2288,9 @@ class ExecShellOutputTool(BuiltInTool):
 class ExecShellStopTool(BuiltInTool):
     name: str = "exec_shell_stop"
     description: str = (
-        "Stop a running process by process_id. "
-        "Sends SIGTERM, waits briefly, then SIGKILL if needed.\n"
-        "E.g., stop process '708e9873'\n"
-        "Required: process_id"
+        "Stop a running process started by exec_shell, identified by its "
+        "process_id. Sends SIGTERM, waits briefly, then SIGKILL if the process "
+        "has not exited."
     )
     parameters: Dict[str, Any] = {
         "type": "object",

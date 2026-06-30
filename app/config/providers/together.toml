@@ -14,51 +14,87 @@ is_default = true
 [provider.auth_methods.fields]
 api_key = { description = "Together AI API Key", type = "string", secret = true, required = true }
 
+# Cache pricing: Together AI prompt caching applies a ~50% cached-input discount
+# (0.50x input) on repeated prefixes, with no separate cache-write fee.
+
 [[models]]
 id = "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+context_window = 1048576
 display_name = "Llama 4 Maverick 17B 128E"
 group_hint = "high"
+prompt_cache = true
+vision = true
 input_price_per_1m = 0.27
 output_price_per_1m = 0.85
+cache_read_price_per_1m = 0.135   # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+context_window = 1048576
 display_name = "Llama 4 Scout 17B 16E"
 group_hint = "high"
+prompt_cache = true
+vision = true
 input_price_per_1m = 0.18
 output_price_per_1m = 0.59
+cache_read_price_per_1m = 0.09    # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "deepseek-ai/DeepSeek-V3-0324"
+context_window = 131072
 display_name = "DeepSeek V3"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.60
 output_price_per_1m = 1.70
+cache_read_price_per_1m = 0.30    # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "deepseek-ai/DeepSeek-R1"
+context_window = 131072
 display_name = "DeepSeek R1"
+supports_reasoning = true
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 3.00
 output_price_per_1m = 7.00
+cache_read_price_per_1m = 1.50    # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "Qwen/Qwen3-235B-A22B-FP8"
+context_window = 262144
 display_name = "Qwen 3 235B"
+supports_reasoning = true
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.50
 output_price_per_1m = 1.50
+cache_read_price_per_1m = 0.25    # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "openai/gpt-oss-120b"
+context_window = 131072
 display_name = "GPT-OSS 120B"
+supports_reasoning = true
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.15
 output_price_per_1m = 0.60
+cache_read_price_per_1m = 0.075   # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "moonshotai/Kimi-K2.5"
+context_window = 262144
 display_name = "Kimi K2.5"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.50
 output_price_per_1m = 2.80
+cache_read_price_per_1m = 0.25    # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee

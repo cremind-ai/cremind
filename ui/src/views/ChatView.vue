@@ -12,6 +12,7 @@ import MessageInput from '../components/MessageInput.vue';
 import RightPanel from '../components/RightPanel.vue';
 import ResizableDivider from '../components/ResizableDivider.vue';
 import ConversationMemoryPanel from '../components/ConversationMemoryPanel.vue';
+import ConversationUsagePanel from '../components/ConversationUsagePanel.vue';
 
 const props = defineProps<{
   profile?: string;
@@ -93,6 +94,9 @@ const isElectron = computed(() => {
 const memoryPanelOpen = ref(false);
 const showMemoryButton = computed(() => !!chatStore.activeConversationId);
 const openMemoryPanel = () => { memoryPanelOpen.value = true; };
+
+const usagePanelOpen = ref(false);
+const openUsagePanel = () => { usagePanelOpen.value = true; };
 
 onMounted(async () => {
   // Right panel (file tree) is visible by default on entering Conversations.
@@ -180,9 +184,14 @@ const handleConnect = async () => {
   }
 };
 
-const handleSendMessage = async (text: string) => {
+const handleSendMessage = async (
+  payload: { text: string; attachments: { name: string; path: string }[] },
+) => {
   try {
-    await chatStore.sendMessage(text, { reasoning: settingsStore.reasoningEnabled });
+    await chatStore.sendMessage(payload.text, {
+      reasoning: settingsStore.reasoningEnabled,
+      attachments: payload.attachments,
+    });
   } catch (error: any) {
     ElNotification({
       title: 'Error',
@@ -203,6 +212,15 @@ const handleSendMessage = async (text: string) => {
         @click="openMemoryPanel"
       >
         <Icon icon="mdi:brain" />
+      </button>
+
+      <button
+        v-if="showMemoryButton"
+        class="memory-button usage-button"
+        :title="'View token usage & cost'"
+        @click="openUsagePanel"
+      >
+        <Icon icon="mdi:chart-box-outline" />
       </button>
 
       <ChatWindow
@@ -259,6 +277,11 @@ const handleSendMessage = async (text: string) => {
 
     <ConversationMemoryPanel
       v-model="memoryPanelOpen"
+      :conversation-id="chatStore.activeConversationId"
+    />
+
+    <ConversationUsagePanel
+      v-model="usagePanelOpen"
       :conversation-id="chatStore.activeConversationId"
     />
   </div>
@@ -350,4 +373,5 @@ const handleSendMessage = async (text: string) => {
   color: var(--primary-color);
 }
 .memory-button :deep(svg) { font-size: 18px; }
+.usage-button { left: 58px; }
 </style>

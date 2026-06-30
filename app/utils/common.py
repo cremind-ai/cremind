@@ -190,24 +190,40 @@ def convert_task_history_to_messages(task_history: list[Message]) -> list[ChatCo
 
 def convert_db_messages_to_history(
     db_messages: list[dict],
-    inject_ids: bool = True,
+    *,
+    include_reasoning: bool = False,
 ) -> list[ChatCompletionMessageParam]:
     """Convert database message dicts to ChatCompletionMessageParam format.
 
-    When inject_ids is True, each message's content is suffixed with
-    ``\\nid: <uuid>`` so the LLM can reference it via the message_detail tool.
+    The model receives each message's ORIGINAL content verbatim — no injected
+    ``message_id``/``conversation_id``/``summary`` suffixes (those were ReAct-era
+    aids for the now-removed ``message_detail`` tool and trace summarizer, and
+    they would also bust the prompt cache).
+
+    When ``include_reasoning`` is set and a message carries a stored ``llm_messages``
+    trace (assistant ``tool_calls`` + ``role:"tool"`` results + the final-answer
+    assistant message), that native trace is spliced in verbatim **in place of** the
+    single content message — so later turns resume the real tool-use transcript and
+    the prompt-cache prefix covers the prior reasoning. The trace already ends with
+    the final answer, so it is not duplicated. Messages without a trace (older rows,
+    or turns with no tool calls) fall back to the content-only form.
     """
     messages: list[ChatCompletionMessageParam] = []
     for m in db_messages:
+        # UI-only messages (e.g. rejected skill-event triggers the matching gate
+        # filtered out) are shown in the conversation but must never enter the
+        # model's context — the agent has no knowledge of them. This is the single
+        # chokepoint every history-building path routes through.
+        if (m.get("metadata") or {}).get("ui_only"):
+            continue
+        trace = m.get("llm_messages") if include_reasoning else None
+        if trace:
+            messages.extend(trace)
+            continue
         role = "assistant" if m["role"] == "agent" else m["role"]
         content = m.get("content") or ""
         if not content.strip():
             continue
-        if inject_ids:
-            content += f"\nmessage_id: {m['id']}"
-        summary = m.get("summary")
-        if summary:
-            content += f"\nsummary: {summary}"
         messages.append({
             "role": role,
             "content": content,
@@ -255,96 +271,6 @@ def truncate_to_tokens(text: str, max_tokens: int, model: str = "gpt-4o") -> str
         return _CONTENT_TOKEN_ENCODER.decode(tokens[:max_tokens]).rstrip()
     except Exception:  # noqa: BLE001
         return text
-
-
-def limit_messages(messages: list[ChatCompletionMessageParam], max_length: int,
-                   model: str = "gpt-4o") -> list[ChatCompletionMessageParam]:
-    """Limit messages by token length, keeping the most recent messages.
-
-    This function iterates from the end of the messages list (most recent) and
-    keeps including messages until the total token length exceeds max_length.
-
-    Args:
-        messages: List of chat completion messages to limit
-        max_length: Maximum number of tokens allowed
-        model: Model name for tiktoken encoder (default: "gpt-4o")
-
-    Returns:
-        List of messages within the token limit, preserving order
-    """
-    from tiktoken import encoding_for_model
-    encoder = encoding_for_model(model)
-    llm_messages: list[ChatCompletionMessageParam] = []
-
-    for i in range(len(messages) - 1, -1, -1):
-        # Get messages from index i to end
-        slice_messages = messages[i:len(messages)]
-
-        # Join all content into a single string
-        total_messages = " ".join(
-            str(msg.get("content", "")) for msg in slice_messages
-        )
-
-        # Calculate token length
-        token_length = len(encoder.encode(total_messages))
-
-        # Stop if we exceed max_length
-        if token_length > max_length:
-            break
-
-        # Add message to the beginning of the result list
-        llm_messages.insert(0, messages[i])
-
-    return llm_messages
-
-
-def truncate_messages(
-    messages: list[ChatCompletionMessageParam],
-    max_tokens_per_message: int,
-    preserve_recent: int = 2,
-    model: str = "gpt-4o",
-) -> list[ChatCompletionMessageParam]:
-    """Truncate older messages to a maximum token length per message.
-
-    The most recent `preserve_recent` messages are kept at full length.
-    All older messages that exceed `max_tokens_per_message` tokens are
-    truncated and suffixed with '...' to indicate omitted content.
-
-    Args:
-        messages: List of chat completion messages
-        max_tokens_per_message: Maximum tokens allowed per older message
-        preserve_recent: Number of most recent messages to preserve in full (default: 2)
-        model: Model name for tiktoken encoder (default: "gpt-4o")
-
-    Returns:
-        A new list of messages with older ones truncated as needed
-    """
-    if not messages:
-        return []
-
-    from tiktoken import encoding_for_model
-    encoder = encoding_for_model(model)
-    result: list[ChatCompletionMessageParam] = []
-    protected_start = max(len(messages) - preserve_recent, 0)
-
-    for i, msg in enumerate(messages):
-        if i >= protected_start:
-            result.append(msg)
-            continue
-
-        content = msg.get("content", "")
-        if not isinstance(content, str):
-            result.append(msg)
-            continue
-
-        tokens = encoder.encode(content)
-        if len(tokens) > max_tokens_per_message:
-            truncated_text = encoder.decode(tokens[:max_tokens_per_message]) + '...'
-            result.append({**msg, "content": truncated_text})
-        else:
-            result.append(msg)
-
-    return result
 
 
 # Mirror of the markers defined in app.agent.reasoning_agent. Re-declared here

@@ -6,6 +6,7 @@ export interface ModelOption {
   value: string;
   provider: string;
   reasoning_effort?: string[];
+  vision?: boolean;
 }
 
 export function useLLMModels() {
@@ -22,6 +23,7 @@ export function useLLMModels() {
           value: `${p.name}/${m.id}`,
           provider: p.name,
           reasoning_effort: m.reasoning_effort,
+          vision: m.vision,
         });
       }
     }
@@ -33,10 +35,19 @@ export function useLLMModels() {
     return allModels.value.filter((m) => m.provider === providerName);
   }
 
+  // Vision-capable models only (optionally scoped to one provider). Used by
+  // the dedicated Vision model selector so users pick a model that can
+  // actually process images.
+  function getVisionModels(providerName?: string): ModelOption[] {
+    return allModels.value.filter(
+      (m) => m.vision && (!providerName || m.provider === providerName),
+    );
+  }
+
   function getReasoningOptions(modelValue: string): string[] {
     const model = allModels.value.find((m) => m.value === modelValue);
     return model?.reasoning_effort || [];
   }
 
-  return { allModels, rebuildModelList, getFilteredModels, getReasoningOptions };
+  return { allModels, rebuildModelList, getFilteredModels, getVisionModels, getReasoningOptions };
 }

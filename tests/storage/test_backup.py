@@ -251,8 +251,8 @@ def test_backup_iteration_skips_missing_tables_end_to_end(tmp_path: Path) -> Non
     Base.metadata.tables["profiles"].create(bind=engine)
     with engine.begin() as conn:
         conn.execute(text(
-            "INSERT INTO profiles (id, name, created_at, updated_at, skill_mode) "
-            "VALUES ('p1', 'alice', 0, 0, 'manual')"
+            "INSERT INTO profiles (id, name, created_at, updated_at) "
+            "VALUES ('p1', 'alice', 0, 0)"
         ))
 
     snapshot = tmp_path / "snap.pgsnap.gz"

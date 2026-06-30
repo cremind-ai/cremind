@@ -12,9 +12,10 @@ import mimetypes
 import os
 import platform
 import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.tools.builtin.base import (
     BuiltInTool,
@@ -203,6 +204,51 @@ def _safe_resolve(
     )
 
 
+# Shared guidance appended to every path-style parameter description. The
+# reasoning model used to relativize absolute paths — stripping the home/drive
+# prefix off an attached-file path — which then resolved under the wrong base
+# (the working directory) and 404'd. ``_safe_resolve`` already accepts an
+# absolute path verbatim when it lands inside an allowed root, so the fix is to
+# tell the model absolute paths are first-class and must be passed unchanged.
+_ABS_PATH_NOTE = (
+    "May be given relative to the current working directory, OR as an absolute "
+    "path (e.g. 'C:\\Users\\...' on Windows, '/home/...' on POSIX). When an "
+    "absolute path is provided — such as an attached/uploaded file listed in the "
+    "prompt — pass it EXACTLY as given: never shorten it, strip the home/drive "
+    "prefix, or convert it to a relative path. Relative paths resolve under the "
+    "current working directory; do not repeat that directory's own name."
+)
+
+
+def _relative_abs_hint(path: str, data_dir: str, arguments: Dict[str, Any]) -> str:
+    """Return a one-line correction hint to append to a 'Not found' message.
+
+    Fires only when *path* is relative yet the same trailing path exists under
+    the user's home or an allowed root — the signature of the model having
+    relativized an absolute/attached path (e.g. stripping the ``C:\\Users\\you``
+    prefix off an upload path). Purely read-only: it never resolves or mutates
+    anything, and changes no path-resolution semantics. Empty string otherwise.
+    """
+    raw = os.path.expanduser(path or "")
+    is_abs = os.path.isabs(raw) or (len(raw) >= 2 and raw[1] == ":")
+    if is_abs:
+        return ""
+    tail = raw.lstrip("/\\")
+    if not tail:
+        return ""
+    bases = [os.path.expanduser("~"), *(_allowed_roots(arguments, data_dir) or [])]
+    for base in bases:
+        try:
+            if base and os.path.exists(os.path.join(base, tail)):
+                return (
+                    " If you meant an attached or absolute path, pass it EXACTLY "
+                    "as given (do not strip the home/drive prefix or relativize it)."
+                )
+        except OSError:
+            continue
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # File helpers
 # ---------------------------------------------------------------------------
@@ -220,6 +266,26 @@ def _is_binary(file_path: str) -> bool:
 def _guess_mime(file_path: str) -> str:
     mime, _ = mimetypes.guess_type(file_path)
     return mime or "application/octet-stream"
+
+
+def _image_dimensions(file_path: str, mime: str) -> Tuple[Optional[int], Optional[int]]:
+    """Return ``(width, height)`` in pixels for an image, or ``(None, None)``.
+
+    Lazily imports Pillow; if it is not installed (an optional dependency) the
+    dimensions are simply omitted rather than failing — ``get_file_info`` still
+    returns the rest of the metadata.
+    """
+    if not mime.startswith("image/"):
+        return None, None
+    try:
+        from PIL import Image  # lazy; optional
+    except ImportError:
+        return None, None
+    try:
+        with Image.open(file_path) as im:
+            return int(im.width), int(im.height)
+    except Exception:  # noqa: BLE001
+        return None, None
 
 
 def _format_size(size: int) -> str:
@@ -394,8 +460,8 @@ def _find_block(lines: List[str], block: List[str], hint_start: int) -> int:
 def _deescape_quotes(line: str) -> str:
     r"""Undo backslash-escaped quotes (\' and \") in a diff line.
 
-    A model that wraps the diff in a quoted Action_Input string often escapes
-    the quotes inside it (e.g. ``don\'t``), and those backslashes leak into the
+    A model that passes the diff as a quoted JSON string often escapes the
+    quotes inside it (e.g. ``don\'t``), and those backslashes leak into the
     diff argument. Used only as a fallback when the verbatim match fails, so a
     file that genuinely contains ``\'`` keeps matching exactly.
     """
@@ -564,7 +630,7 @@ class SearchFilesTool(BuiltInTool):
         "Recursively search for files or directories by name within the user's "
         "data directory. Supports deep searching through nested folders using "
         "case-insensitive keyword matching. All query words must appear in the "
-        "file name. E.g. 'find the file open claw' will match 'OpenClaw.pdf'."
+        "file name. E.g. 'find the file cremind' will match 'cremind.pdf'."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -574,17 +640,15 @@ class SearchFilesTool(BuiltInTool):
                 "description": (
                     "Search query. Split into keywords; a file matches if ALL "
                     "keywords appear in its name (case-insensitive). "
-                    "E.g. 'open claw' matches 'OpenClaw.pdf'."
+                    "E.g. 'cremind' matches 'cremind.pdf'."
                 ),
             },
             "path": {
                 "type": "string",
                 "description": (
-                    "Optional sub-path **relative to the current working "
-                    "directory** to start searching from. Defaults to '.' "
-                    "(the current working directory itself). Do not repeat "
-                    "the working directory's own name here — e.g. if the "
-                    "cwd is '.../Lee', use '.' or omit, not 'Lee'."
+                    "Optional sub-path to start searching from. "
+                    + _ABS_PATH_NOTE + " Defaults to '.' (the current working "
+                    "directory itself)."
                 ),
             },
             "pattern": {
@@ -736,11 +800,9 @@ class GrepFilesTool(BuiltInTool):
             "path": {
                 "type": "string",
                 "description": (
-                    "Optional sub-path **relative to the current working "
-                    "directory** to search. May be a directory (searched "
-                    "recursively) or a single file. Defaults to '.' (the "
-                    "current working directory). Do not repeat the working "
-                    "directory's own name here."
+                    "Optional sub-path to search — a directory (searched "
+                    "recursively) or a single file. " + _ABS_PATH_NOTE
+                    + " Defaults to '.' (the current working directory)."
                 ),
             },
             "glob": {
@@ -1258,11 +1320,8 @@ class ListFilesTool(BuiltInTool):
             "path": {
                 "type": "string",
                 "description": (
-                    "Optional sub-path **relative to the current working "
-                    "directory** to list. Defaults to '.' (the current "
-                    "working directory itself). Do not repeat the working "
-                    "directory's own name here — e.g. if the cwd is "
-                    "'.../Lee', use '.' or omit, not 'Lee'."
+                    "Optional sub-path to list. " + _ABS_PATH_NOTE + " Defaults "
+                    "to '.' (the current working directory itself)."
                 ),
             },
             "pattern": {
@@ -1331,15 +1390,16 @@ class GetFileInfoTool(BuiltInTool):
     name: str = "get_file_info"
     description: str = (
         "Get detailed metadata about a single file: name, size, MIME type, "
-        "modification date, whether it is binary, and its extension. "
-        "E.g. 'get info about ./report.pdf'"
+        "modification date, whether it is binary, its extension, and — for "
+        "image files — its pixel width and height (when available). "
+        "E.g. 'get info about ./report.pdf' or 'what are the dimensions of ./photo.png'"
     )
     parameters: Dict[str, Any] = {
         "type": "object",
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Relative path to the file within the data directory.",
+                "description": "Path to the file. " + _ABS_PATH_NOTE,
             },
         },
         "required": ["path"],
@@ -1361,7 +1421,11 @@ class GetFileInfoTool(BuiltInTool):
             return BuiltInToolResult(structured_content={"error": "Access denied", "message": str(e)})
 
         if not os.path.exists(target):
-            return BuiltInToolResult(structured_content={"error": "Not found", "message": f"'{rel_path}' does not exist."})
+            return BuiltInToolResult(structured_content={
+                "error": "Not found",
+                "message": f"'{rel_path}' does not exist."
+                           + _relative_abs_hint(rel_path, data_dir, arguments),
+            })
 
         try:
             stat = os.stat(target)
@@ -1372,7 +1436,7 @@ class GetFileInfoTool(BuiltInTool):
         binary = _is_binary(target) if os.path.isfile(target) else False
         ext = os.path.splitext(target)[1]
 
-        return BuiltInToolResult(structured_content={
+        info: Dict[str, Any] = {
             "name": os.path.basename(target),
             "path": rel_path,
             "size": stat.st_size,
@@ -1383,7 +1447,16 @@ class GetFileInfoTool(BuiltInTool):
             "extension": ext,
             "modified": _format_timestamp(stat.st_mtime),
             "os": platform.system(),
-        })
+        }
+
+        if os.path.isfile(target):
+            width, height = _image_dimensions(target, mime)
+            if width is not None and height is not None:
+                info["width"] = width
+                info["height"] = height
+                info["dimensions"] = f"{width}x{height}"
+
+        return BuiltInToolResult(structured_content=info)
 
 
 class ReadFileTool(BuiltInTool):
@@ -1399,7 +1472,7 @@ class ReadFileTool(BuiltInTool):
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Relative path to the file within the data directory.",
+                "description": "Path to the file. " + _ABS_PATH_NOTE,
             },
             "readable": {
                 "type": "boolean",
@@ -1433,7 +1506,8 @@ class ReadFileTool(BuiltInTool):
         if not os.path.isfile(target):
             return BuiltInToolResult(structured_content={
                 "error": "Not found",
-                "message": f"'{rel_path}' is not a file or does not exist.",
+                "message": f"'{rel_path}' is not a file or does not exist."
+                           + _relative_abs_hint(rel_path, data_dir, arguments),
             })
 
         mime = _guess_mime(target)
@@ -1540,8 +1614,10 @@ class WriteFileTool(BuiltInTool):
             "path": {
                 "type": "string",
                 "description": (
-                    "Relative path within the data directory for the output file. "
-                    "Must have a text file extension (e.g. .txt, .md, .json)."
+                    "Output file path. " + _ABS_PATH_NOTE + " Must have a text "
+                    "file extension (e.g. .txt, .md, .json). To move or copy a "
+                    "binary file such as an image or PDF, use move_file / "
+                    "copy_file instead."
                 ),
             },
             "content": {
@@ -1654,9 +1730,10 @@ class OverwriteFileTool(BuiltInTool):
             "path": {
                 "type": "string",
                 "description": (
-                    "Relative path to the existing text file to edit in place. "
-                    "Must be a human-readable text file that already exists. To "
-                    "create or fully replace a file, use write_file instead."
+                    "Path to the existing text file to edit in place. "
+                    + _ABS_PATH_NOTE + " Must be a human-readable text file that "
+                    "already exists. To create or fully replace a file use "
+                    "write_file; to move or copy a file use move_file / copy_file."
                 ),
             },
             "diff": {
@@ -1828,6 +1905,265 @@ class OverwriteFileTool(BuiltInTool):
         return BuiltInToolResult(structured_content=payload)
 
 
+def _resolve_relocation(
+    data_dir: str,
+    source_path: str,
+    destination_path: str,
+    overwrite: bool,
+    arguments: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[str], Optional[BuiltInToolResult]]:
+    """Resolve + validate a move/copy. Returns ``(src, final_target, error)``.
+
+    Both endpoints are passed through ``_safe_resolve`` (so neither can escape
+    the working dir / allowed roots), the source must exist, and the
+    destination is interpreted as a target directory (keep the source's name)
+    when it is an existing directory, otherwise as the full target path. On any
+    failure ``src``/``final_target`` are ``None`` and ``error`` is a ready
+    ``BuiltInToolResult``; on success ``error`` is ``None``.
+    """
+    roots = _allowed_roots(arguments, data_dir)
+
+    try:
+        src = _safe_resolve(data_dir, source_path, roots)
+    except ValueError as e:
+        return None, None, BuiltInToolResult(structured_content={"error": "Access denied", "message": str(e)})
+
+    if not os.path.exists(src):
+        return None, None, BuiltInToolResult(structured_content={
+            "error": "Not found",
+            "message": f"Source '{source_path}' does not exist."
+                       + _relative_abs_hint(source_path, data_dir, arguments),
+        })
+
+    try:
+        dst = _safe_resolve(data_dir, destination_path, roots)
+    except ValueError as e:
+        return None, None, BuiltInToolResult(structured_content={"error": "Access denied", "message": str(e)})
+
+    if os.path.isdir(dst):
+        # Destination is an existing folder → move/copy the source inside it,
+        # keeping its name. Re-validate the joined path stays inside a root.
+        try:
+            final_target = _safe_resolve(
+                data_dir, os.path.join(dst, os.path.basename(src)), roots)
+        except ValueError as e:
+            return None, None, BuiltInToolResult(structured_content={"error": "Access denied", "message": str(e)})
+    else:
+        final_target = dst
+
+    if os.path.realpath(src) == os.path.realpath(final_target):
+        return None, None, BuiltInToolResult(structured_content={
+            "error": "Same file",
+            "message": "Source and destination are the same file.",
+        })
+
+    if os.path.exists(final_target) and not overwrite:
+        return None, None, BuiltInToolResult(structured_content={
+            "error": "Destination exists",
+            "message": (
+                f"'{_report_path(final_target, os.path.realpath(data_dir))}' already "
+                "exists. Pass overwrite=true to replace it."
+            ),
+        })
+
+    return src, final_target, None
+
+
+def _relocation_result(
+    src: str, final_target: str, data_dir: str, verb: str,
+) -> BuiltInToolResult:
+    """Build the success result for a move/copy, mirroring ``write_file``'s shape."""
+    base = os.path.realpath(data_dir)
+    rel_output = _report_path(final_target, base)
+    text = f"{verb} '{os.path.basename(src)}' to {rel_output}."
+    if os.path.isdir(final_target):
+        return BuiltInToolResult(structured_content={"text": text})
+    file_entry: ToolResultFile = {
+        "uri": final_target.replace(os.sep, "/"),
+        "name": os.path.basename(final_target),
+        "mime_type": _guess_mime(final_target),
+    }
+    payload: ToolResultWithFiles = {"text": text, "_files": [file_entry]}
+    return BuiltInToolResult(structured_content=payload)
+
+
+class MoveFileTool(BuiltInTool):
+    name: str = "move_file"
+    description: str = (
+        "Move or rename a file or directory. Works for ANY file type, including "
+        "binary files such as images, PDFs and archives (unlike write_file, which "
+        "is text-only). Use this to relocate an uploaded/attached file into the "
+        "user's working directory, or to rename a file. If the destination is an "
+        "existing directory the item is moved inside it keeping its name; "
+        "otherwise the destination is treated as the full target path (a rename). "
+        "E.g. source_path='C:/Users/you/.cremind/admin/uploads_tmp/<id>/photo.png', "
+        "destination_path='C:/Users/you/Documents'."
+    )
+    parameters: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "source_path": {
+                "type": "string",
+                "description": "The file or directory to move. " + _ABS_PATH_NOTE,
+            },
+            "destination_path": {
+                "type": "string",
+                "description": (
+                    "Where to move it: an existing directory (the source keeps "
+                    "its name) or a full target path (a rename). " + _ABS_PATH_NOTE
+                ),
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": (
+                    "If true, replace an existing destination file. Default false "
+                    "— the move fails if the destination already exists."
+                ),
+            },
+        },
+        "required": ["source_path", "destination_path"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self, data_dir: str):
+        self._data_dir = data_dir
+
+    async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
+        data_dir = arguments.pop("_working_directory", None) or self._data_dir
+        source_path = (arguments.get("source_path") or "").strip()
+        destination_path = (arguments.get("destination_path") or "").strip()
+        overwrite = bool(arguments.get("overwrite", False))
+
+        if not source_path or not destination_path:
+            return BuiltInToolResult(structured_content={
+                "error": "Missing parameter",
+                "message": "Both source_path and destination_path are required.",
+            })
+
+        src, final_target, error = _resolve_relocation(
+            data_dir, source_path, destination_path, overwrite, arguments)
+        if error is not None:
+            return error
+
+        # Replace an existing FILE target first: os.rename (used by shutil.move
+        # on a same-filesystem move) refuses to clobber on Windows. Never remove
+        # a directory here.
+        if overwrite and os.path.isfile(final_target):
+            try:
+                os.remove(final_target)
+            except OSError as e:
+                return BuiltInToolResult(structured_content={
+                    "error": "Move error",
+                    "message": f"Failed to replace destination: {e}",
+                })
+
+        parent = os.path.dirname(final_target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        try:
+            shutil.move(src, final_target)
+        except (OSError, shutil.Error) as e:
+            logger.error(f"[MoveFileTool] move failed: {e}")
+            return BuiltInToolResult(structured_content={
+                "error": "Move error",
+                "message": f"Failed to move file: {e}",
+            })
+
+        logger.info(f"[MoveFileTool] moved {source_path} -> {final_target}")
+        return _relocation_result(src, final_target, data_dir, verb="Moved")
+
+
+class CopyFileTool(BuiltInTool):
+    name: str = "copy_file"
+    description: str = (
+        "Duplicate a file, leaving the original in place. Works for ANY file "
+        "type, including binary files such as images and PDFs. If the destination "
+        "is an existing directory the copy is placed inside it keeping the "
+        "source's name; otherwise the destination is the full target path. "
+        "Copies a single file only — to relocate a whole directory use move_file."
+    )
+    parameters: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "source_path": {
+                "type": "string",
+                "description": "The file to copy. " + _ABS_PATH_NOTE,
+            },
+            "destination_path": {
+                "type": "string",
+                "description": (
+                    "Where to put the copy: an existing directory (the copy keeps "
+                    "the source's name) or a full target path. " + _ABS_PATH_NOTE
+                ),
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": (
+                    "If true, replace an existing destination file. Default false "
+                    "— the copy fails if the destination already exists."
+                ),
+            },
+        },
+        "required": ["source_path", "destination_path"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self, data_dir: str):
+        self._data_dir = data_dir
+
+    async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
+        data_dir = arguments.pop("_working_directory", None) or self._data_dir
+        source_path = (arguments.get("source_path") or "").strip()
+        destination_path = (arguments.get("destination_path") or "").strip()
+        overwrite = bool(arguments.get("overwrite", False))
+
+        if not source_path or not destination_path:
+            return BuiltInToolResult(structured_content={
+                "error": "Missing parameter",
+                "message": "Both source_path and destination_path are required.",
+            })
+
+        src, final_target, error = _resolve_relocation(
+            data_dir, source_path, destination_path, overwrite, arguments)
+        if error is not None:
+            return error
+
+        if os.path.isdir(src):
+            return BuiltInToolResult(structured_content={
+                "error": "Unsupported",
+                "message": (
+                    "copy_file copies a single file, not a directory. Use "
+                    "move_file to relocate a directory, or copy its files individually."
+                ),
+            })
+
+        if overwrite and os.path.isfile(final_target):
+            try:
+                os.remove(final_target)
+            except OSError as e:
+                return BuiltInToolResult(structured_content={
+                    "error": "Copy error",
+                    "message": f"Failed to replace destination: {e}",
+                })
+
+        parent = os.path.dirname(final_target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        try:
+            shutil.copy2(src, final_target)
+        except (OSError, shutil.Error) as e:
+            logger.error(f"[CopyFileTool] copy failed: {e}")
+            return BuiltInToolResult(structured_content={
+                "error": "Copy error",
+                "message": f"Failed to copy file: {e}",
+            })
+
+        logger.info(f"[CopyFileTool] copied {source_path} -> {final_target}")
+        return _relocation_result(src, final_target, data_dir, verb="Copied")
+
+
 def get_tools(config: dict) -> list[BuiltInTool]:
     """Return tool instances for this server.
 
@@ -1852,6 +2188,8 @@ def get_tools(config: dict) -> list[BuiltInTool]:
         ReadFileTool(data_dir=data_dir),
         WriteFileTool(data_dir=data_dir),
         OverwriteFileTool(data_dir=data_dir),
+        MoveFileTool(data_dir=data_dir),
+        CopyFileTool(data_dir=data_dir),
         RegisterFileWatcherTool(),
         ListFileWatchersTool(),
         DeleteFileWatcherTool(),
@@ -1869,18 +2207,26 @@ TOOL_CONFIG: ToolConfig = {
     "locked": True,
     "llm_parameters": {
         "tool_instructions": (
-            "A file management assistant. Operates inside the conversation's "
+            "File management inside the conversation's "
             "*current* working directory — which may have just been changed by "
-            "the `change_working_directory` tool. All `path` arguments are "
+            "the `change_working_directory` tool. A relative `path` argument is "
             "interpreted relative to that current directory, never to a fixed "
-            "root. To act on the current directory itself, omit `path` (or "
-            "pass '.'). Never repeat the working directory's own name as a "
-            "`path` value: if the user says 'list files in the Lee folder' "
-            "and the cwd is already '.../Lee', call list_files with no path. "
+            "root; an absolute path is also accepted and used as-is. When the "
+            "user or the prompt gives you an absolute path (e.g. an "
+            "attached/uploaded file under a temporary folder), pass it through "
+            "EXACTLY as written — do not shorten it, strip the home/drive "
+            "prefix, or turn it into a relative path. To act on the current "
+            "directory itself, omit `path` (or pass '.'). Never repeat the "
+            "working directory's own name as a relative `path` value: if the "
+            "user says 'list files in the Lee folder' and the cwd is already "
+            "'.../Lee', call list_files with no path. "
             "Use search_files to find files by NAME and grep_files to search "
             "file CONTENTS by regular expression. "
             "Edit part of an existing file with overwrite_file (apply a unified "
             "diff); create or replace a whole file with write_file. "
+            "Move or rename a file — any type, including binary files such as "
+            "images and PDFs — with move_file, and duplicate one with copy_file; "
+            "both accept absolute source and destination paths. "
             "Also registers file/folder watchers that notify you or re-run an "
             "action whenever files are created, modified, deleted, or moved on "
             "disk — use this when the user asks to be notified or to act on "
@@ -1952,44 +2298,17 @@ TOOL_CONFIG: ToolConfig = {
 
 def _make_server_instructions(_data_dir: str) -> str:
     return (
-        "A file management assistant. Operates inside the conversation's "
-        "current working directory; all `path` arguments are relative to "
-        "that directory and default to '.' when omitted. Find files by name "
+        "File management inside the conversation's "
+        "current working directory; a relative `path` is relative to that "
+        "directory and defaults to '.' when omitted, while an absolute path is "
+        "used as-is — pass an absolute path (e.g. an attached/uploaded file) "
+        "EXACTLY as given, never relativized. Find files by name "
         "with search_files and search file contents by regex with grep_files. "
         "Edit part of an existing file with overwrite_file (a unified diff); "
-        "create or replace a whole file with write_file. "
+        "create or replace a whole file with write_file. Move or rename a file "
+        "(any type, including binary) with move_file and duplicate one with "
+        "copy_file. "
         "Also registers "
         "file/folder watchers that notify you or re-run an action whenever "
         "files are created, modified, deleted, or moved on disk."
     )
-
-
-def get_prepare_tools() -> Optional[Callable]:
-    """Module hook auto-detected by ``register_builtin_tools``.
-
-    Returns a ``prepare_tools`` callback that suppresses the
-    ``register_file_watcher`` subtool on event-triggered runs. Registering a
-    new watcher while *reacting* to a watcher/skill event risks recursive
-    event storms (event → reasoning → register → event → …), so the reasoning
-    agent injects ``_triggered_by_event=True`` into the System File dispatch
-    arguments for those runs (see ``reasoning_agent._dispatch``). ``list`` and
-    ``delete`` stay available — they pose no storm risk.
-    """
-
-    def prepare_tools(
-        query: str,  # noqa: ARG001
-        tools: List[Dict[str, Any]],
-        *,
-        arguments: Optional[Dict[str, Any]] = None,
-        context_id: Optional[str] = None,  # noqa: ARG001
-        profile: Optional[str] = None,  # noqa: ARG001
-        **_: Any,
-    ) -> List[Dict[str, Any]]:
-        if not (arguments or {}).get("_triggered_by_event"):
-            return tools
-        return [
-            t for t in tools
-            if (t.get("function") or {}).get("name") != "register_file_watcher"
-        ]
-
-    return prepare_tools

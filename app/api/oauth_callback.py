@@ -148,40 +148,12 @@ async def _handle_google_calendar_callback(request: Request) -> HTMLResponse:
     return HTMLResponse(_SUCCESS_HTML, status_code=200)
 
 
-async def _handle_a2a_callback(request: Request) -> HTMLResponse:
-    """Resolve the in-process Future for an A2A OAuth consent redirect.
-
-    A2A tool auth runs in THIS process (not a subprocess), so the authorization
-    code is handed back through an in-memory rendezvous keyed by ``state`` rather
-    than the file inbox the skill subprocesses use.
-    """
-    from app.tools.a2a.oauth_rendezvous import resolve
-
-    params = request.query_params
-    state = params.get("state", "")
-    if not state:
-        logger.warning("[oauth-callback] a2a callback with missing state; ignoring")
-        return HTMLResponse(_ERROR_HTML, status_code=400)
-    if "error" in params:
-        logger.info("[oauth-callback] a2a consent returned an error")
-        resolve(state, None)
-        return HTMLResponse(_ERROR_HTML, status_code=200)
-    code = params.get("code", "")
-    if not code or not resolve(state, code):
-        logger.warning("[oauth-callback] a2a callback with no code or unknown state")
-        return HTMLResponse(_ERROR_HTML, status_code=400)
-    logger.info("[oauth-callback] a2a captured authorization code")
-    return HTMLResponse(_SUCCESS_HTML, status_code=200)
-
-
 def get_oauth_callback_routes() -> list[Route]:
     """Backend OAuth callback routes. Registered PRE-storage in app/server.py so a
-    consent redirect can't 404 while an account-link (driven over the pre-storage
-    A2A endpoint) is in flight. Mounted under ``/api`` so they ride the K8s
-    proxy's existing ``/api`` route to the backend."""
+    consent redirect can't 404 while an account-link is in flight. Mounted under
+    ``/api`` so they ride the K8s proxy's existing ``/api`` route to the backend."""
     return [
         Route("/api/oauth/callback", methods=["GET"], endpoint=_handle_inbox_callback),
-        Route("/api/oauth/a2a/callback", methods=["GET"], endpoint=_handle_a2a_callback),
         Route(
             "/api/oauth/google-calendar/callback",
             methods=["GET"], endpoint=_handle_google_calendar_callback,

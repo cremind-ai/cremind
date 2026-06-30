@@ -96,6 +96,7 @@ async def _worker(conversation_id: str) -> None:
                         user_parts=item.get("user_parts"),
                         user_message_metadata=item.get("user_message_metadata"),
                         agent_message_metadata=item.get("agent_message_metadata"),
+                        attachments=item.get("attachments"),
                         push_user_message=item.get("push_user_message", True),
                         publish_notification=False,
                         update_title_from_query=item.get(
@@ -200,10 +201,18 @@ async def enqueue_user_message(
     user_parts: Optional[List[Any]] = None,
     user_message_metadata: Optional[Dict[str, Any]] = None,
     agent_message_metadata: Optional[Dict[str, Any]] = None,
+    attachments: Optional[List[Dict[str, Any]]] = None,
     push_user_message: bool = True,
     update_title_from_query: bool = True,
 ) -> None:
-    """Add a user-typed message to the conversation's queue."""
+    """Add a user-typed message to the conversation's queue.
+
+    ``attachments`` is the list of files the user uploaded with this message
+    (``{"name", "path"}`` entries, paths already validated to live inside the
+    conversation's temp upload dir). Their absolute paths are injected into the
+    text the agent sees so it can read / convert / move them; they are kept out
+    of the persisted/published user-message metadata (names-only) on purpose.
+    """
     queue = _ensure_worker(conversation_id)
     await queue.put({
         "kind": "user_message",
@@ -215,6 +224,7 @@ async def enqueue_user_message(
         "user_parts": user_parts,
         "user_message_metadata": user_message_metadata,
         "agent_message_metadata": agent_message_metadata,
+        "attachments": attachments,
         "push_user_message": push_user_message,
         "update_title_from_query": update_title_from_query,
     })

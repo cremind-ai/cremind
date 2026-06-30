@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
-import { ElForm, ElFormItem, ElSelect, ElOption, ElButton, ElMessage } from 'element-plus';
+import { ElForm, ElFormItem, ElSelect, ElOption, ElButton, ElSwitch, ElMessage } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import {
@@ -18,13 +18,17 @@ import ProviderConfigFields, { type ProviderWithState } from '../components/shar
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
 const settingsStore = useSettingsStore();
-const { rebuildModelList, getFilteredModels, getReasoningOptions } = useLLMModels();
+const { rebuildModelList, getFilteredModels, getVisionModels, getReasoningOptions } = useLLMModels();
 
 const providers = ref<ProviderWithState[]>([]);
-const modelGroups = ref<Record<string, string>>({ high: '', low: '' });
+// Main reasoning model (``high``), plus optional ``vision`` and ``low`` models.
+const modelGroups = ref<Record<string, string>>({ high: '', vision: '', low: '' });
 const reasoningEfforts = ref<Record<string, string | null>>({ high: null, low: null });
 const highProvider = ref('');
+const visionProvider = ref('');
 const lowProvider = ref('');
+// Specialized Vision Model feature toggle (opt-in; off by default).
+const visionEnabled = ref(false);
 const apiKeyProvider = ref('');
 const loading = ref(false);
 const saving = ref(false);
@@ -61,6 +65,7 @@ const selectedApiKeyProvider = computed(() =>
 );
 
 const highFilteredModels = computed(() => getFilteredModels(highProvider.value));
+const visionFilteredModels = computed(() => getVisionModels(visionProvider.value));
 const lowFilteredModels = computed(() => getFilteredModels(lowProvider.value));
 const highModelReasoningOptions = computed(() => getReasoningOptions(modelGroups.value.high));
 const lowModelReasoningOptions = computed(() => getReasoningOptions(modelGroups.value.low));
@@ -72,6 +77,14 @@ watch(highProvider, (newProvider, oldProvider) => {
     if (currentProvider !== newProvider) {
       modelGroups.value.high = '';
       reasoningEfforts.value.high = null;
+    }
+  }
+});
+watch(visionProvider, (newProvider, oldProvider) => {
+  if (oldProvider && newProvider !== oldProvider) {
+    const currentProvider = extractProvider(modelGroups.value.vision);
+    if (currentProvider !== newProvider) {
+      modelGroups.value.vision = '';
     }
   }
 });
@@ -103,11 +116,17 @@ onMounted(async () => {
 
     providers.value = provRes.providers.map(buildProviderState);
 
-    modelGroups.value = groupRes.model_groups;
+    modelGroups.value = {
+      high: groupRes.model_groups.high || '',
+      vision: groupRes.model_groups.vision || '',
+      low: groupRes.model_groups.low || '',
+    };
 
-    // Initialize per-group providers from stored model group values
+    // Initialize per-section providers from stored model values
     highProvider.value = extractProvider(groupRes.model_groups.high) || groupRes.default_provider || '';
-    lowProvider.value = extractProvider(groupRes.model_groups.low) || groupRes.default_provider || '';
+    visionProvider.value = extractProvider(groupRes.model_groups.vision || '') || '';
+    lowProvider.value = extractProvider(groupRes.model_groups.low || '') || '';
+    visionEnabled.value = groupRes.vision_enabled ?? false;
 
     for (const p of providers.value) {
       try {
@@ -117,7 +136,7 @@ onMounted(async () => {
     }
 
     rebuildModelList(providers.value);
-    reasoningEfforts.value = groupRes.reasoning_efforts || { high: null, low: null };
+    reasoningEfforts.value = groupRes.reasoning_efforts || { high: null };
   } catch (e) {
     ElMessage.error('Failed to load LLM settings');
   } finally {
@@ -259,14 +278,15 @@ async function removeProviderConfiguration(provider: ProviderWithState) {
 async function saveModelGroups() {
   saving.value = true;
   try {
-    // Derive default_provider from the high group's provider
-    const derivedDefaultProvider = highProvider.value || lowProvider.value || '';
+    // Derive default_provider from the single model's provider
+    const derivedDefaultProvider = highProvider.value || '';
     await updateModelGroups(
       settingsStore.agentUrl,
       settingsStore.authToken,
       modelGroups.value,
       derivedDefaultProvider,
       reasoningEfforts.value,
+      visionEnabled.value,
     );
     ElMessage.success('Model groups updated');
   } catch (e) {
@@ -321,10 +341,12 @@ function goBack() {
           </ElForm>
         </div>
 
-        <!-- High Group -->
+        <!-- Model -->
         <div class="section">
-          <h2 class="section-title">High Group (Reasoning)</h2>
-          <p class="section-description">Select the provider and model used for reasoning tasks.</p>
+          <h2 class="section-title">Model</h2>
+          <p class="section-description">
+            The single model the assistant uses for reasoning, tool calls, and replies.
+          </p>
 
           <ElForm label-position="top" class="groups-form">
             <ElFormItem label="Provider">
@@ -334,7 +356,7 @@ function goBack() {
             </ElFormItem>
 
             <ElFormItem label="Model">
-              <ElSelect v-model="modelGroups.high" filterable placeholder="Select reasoning model">
+              <ElSelect v-model="modelGroups.high" filterable placeholder="Select model">
                 <ElOption v-for="m in highFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
               </ElSelect>
             </ElFormItem>
@@ -346,20 +368,52 @@ function goBack() {
           </ElForm>
         </div>
 
-        <!-- Low Group -->
+        <!-- Specialized Vision Model (optional, opt-in) -->
         <div class="section">
-          <h2 class="section-title">Low Group (Tools)</h2>
-          <p class="section-description">Select the provider and model used for tool calls.</p>
+          <div class="section-title-row">
+            <h2 class="section-title">Specialized Vision Model (Image Understanding)</h2>
+            <ElSwitch v-model="visionEnabled" />
+          </div>
+          <p class="section-description">
+            When off (default), images are understood by your main model if it supports vision.
+            Turn this on to use a separate, dedicated vision model — useful when your main model
+            can't see images. Leave the model empty to fall back to the main model.
+          </p>
 
-          <ElForm label-position="top" class="groups-form">
+          <ElForm v-if="visionEnabled" label-position="top" class="groups-form">
             <ElFormItem label="Provider">
-              <ElSelect v-model="lowProvider" placeholder="Select provider">
+              <ElSelect v-model="visionProvider" placeholder="Select provider" clearable>
                 <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
               </ElSelect>
             </ElFormItem>
 
             <ElFormItem label="Model">
-              <ElSelect v-model="modelGroups.low" filterable placeholder="Select tools model">
+              <ElSelect v-model="modelGroups.vision" filterable clearable placeholder="Select vision model (defaults to main)">
+                <ElOption v-for="m in visionFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
+              </ElSelect>
+            </ElFormItem>
+          </ElForm>
+        </div>
+
+        <!-- Low-Performance Model (optional; defaults to main) -->
+        <div class="section">
+          <h2 class="section-title">Low-Performance Model</h2>
+          <p class="section-description">
+            An optional cheaper/faster model used for lightweight background tasks —
+            currently the skill-event matching gate that checks whether an incoming
+            event matches your automation rule before running the assistant. Can be any
+            model from the list above. Leave empty to fall back to the main model.
+          </p>
+
+          <ElForm label-position="top" class="groups-form">
+            <ElFormItem label="Provider">
+              <ElSelect v-model="lowProvider" placeholder="Select provider" clearable>
+                <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
+              </ElSelect>
+            </ElFormItem>
+
+            <ElFormItem label="Model">
+              <ElSelect v-model="modelGroups.low" filterable clearable placeholder="Select model (defaults to main)">
                 <ElOption v-for="m in lowFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
               </ElSelect>
             </ElFormItem>
@@ -371,7 +425,7 @@ function goBack() {
           </ElForm>
         </div>
 
-        <ElButton type="primary" :loading="saving" @click="saveModelGroups">Save Model Groups</ElButton>
+        <ElButton type="primary" :loading="saving" @click="saveModelGroups">Save</ElButton>
       </template>
     </div>
   </div>
@@ -397,6 +451,8 @@ function goBack() {
 .loading-state { text-align: center; padding: 40px; color: var(--text-secondary); }
 
 .section { margin-bottom: 32px; }
+.section-title-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.section-title-row .section-title { margin: 0; }
 .section-title { font-size: 1.1rem; font-weight: 600; color: var(--text-primary); margin: 0 0 8px 0; }
 .section-description { color: var(--text-secondary); font-size: 0.85rem; margin: 0 0 16px 0; }
 

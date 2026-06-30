@@ -14,7 +14,6 @@ from app.lib.llm.factory import SUPPORTED_LLM_PROVIDERS
 from app.runtime import BootedState
 from app.utils.logger import logger
 
-# GitHub Copilot device code flow constants (from OpenClaw)
 _GH_CLIENT_ID = "Iv1.b507a08c87ecfe98"
 _GH_DEVICE_CODE_URL = "https://github.com/login/device/code"
 _GH_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
@@ -254,7 +253,15 @@ def get_llm_routes(state: BootedState) -> list[Route]:
         return JSONResponse({"success": True, "deleted_keys": deleted})
 
     async def handle_get_model_groups(request: Request) -> JSONResponse:
-        """Get current model group assignments (high/low) and their reasoning_effort."""
+        """Get the configured reasoning model (``high``) plus the optional
+        ``vision`` and ``low`` models, and their reasoning_effort.
+
+        ``high`` is the one model the agent reasons on. ``vision`` is an optional
+        override used only by image_understanding. ``low`` is the optional
+        low-performance / cheap model used for lightweight auxiliary tasks (e.g.
+        the skill-event matching gate). Both optional groups fall back to the
+        single model when unset.
+        """
         unauth = _require_auth(request)
         if unauth is not None:
             return unauth
@@ -266,7 +273,7 @@ def get_llm_routes(state: BootedState) -> list[Route]:
 
         groups = {}
         reasoning_efforts: dict[str, str | None] = {}
-        for group in ("high", "low"):
+        for group in ("high", "vision", "low"):
             # SQLite first
             val = config_storage.get("llm_config", f"model_group.{group}", profile=profile)
             if not val:
@@ -288,10 +295,15 @@ def get_llm_routes(state: BootedState) -> list[Route]:
             except Exception:
                 default_provider = ""
 
+        # Specialized Vision Model feature toggle (opt-in; unset reads as off).
+        ve_raw = config_storage.get("llm_config", "model_group.vision.enabled", profile=profile)
+        vision_enabled = str(ve_raw).strip().lower() in {"1", "true", "yes", "on"}
+
         return JSONResponse({
             "model_groups": groups,
             "default_provider": default_provider,
             "reasoning_efforts": reasoning_efforts,
+            "vision_enabled": vision_enabled,
         })
 
     async def handle_update_model_groups(request: Request) -> JSONResponse:
@@ -310,13 +322,13 @@ def get_llm_routes(state: BootedState) -> list[Route]:
 
         model_groups = body.get("model_groups", {})
         for group, value in model_groups.items():
-            if group in ("high", "low"):
+            if group in ("high", "vision", "low"):
                 config_storage.set("llm_config", f"model_group.{group}", str(value), profile=profile)
 
         # Save reasoning_effort per group
         reasoning_efforts = body.get("reasoning_efforts", {})
         for group, value in reasoning_efforts.items():
-            if group in ("high", "low"):
+            if group in ("high", "vision", "low"):
                 if value:
                     config_storage.set("llm_config", f"model_group.{group}.reasoning_effort", str(value), profile=profile)
                 else:
@@ -325,6 +337,15 @@ def get_llm_routes(state: BootedState) -> list[Route]:
         default_provider = body.get("default_provider")
         if default_provider:
             config_storage.set("llm_config", "default_provider", default_provider, profile=profile)
+
+        # Specialized Vision Model feature toggle. Kept outside the model_groups
+        # loop so it isn't mistaken for a model value. Only written when present.
+        vision_enabled = body.get("vision_enabled")
+        if vision_enabled is not None:
+            config_storage.set(
+                "llm_config", "model_group.vision.enabled",
+                "true" if vision_enabled else "false", profile=profile,
+            )
 
         from app.events.settings_state_bus import publish_settings_state_changed
         publish_settings_state_changed(profile)

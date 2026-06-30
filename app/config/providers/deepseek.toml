@@ -14,16 +14,28 @@ is_default = true
 [provider.auth_methods.fields]
 api_key = { description = "DeepSeek API Key", type = "string", secret = true, required = true }
 
+# Cache pricing: DeepSeek context caching bills a cache hit at ~0.10x the input
+# rate with no separate cache-write fee.
+
 [[models]]
 id = "deepseek-chat"
+context_window = 131072
 display_name = "DeepSeek V3.2"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.28
 output_price_per_1m = 0.42
+cache_read_price_per_1m = 0.028   # 0.10x input (cache hit)
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "deepseek-reasoner"
+context_window = 131072
 display_name = "DeepSeek R1 (V3.2)"
 group_hint = "high"
+supports_reasoning = true
+prompt_cache = true
 input_price_per_1m = 0.28
 output_price_per_1m = 0.42
+cache_read_price_per_1m = 0.028   # 0.10x input (cache hit)
+cache_write_price_per_1m = 0.0    # no separate cache-write fee

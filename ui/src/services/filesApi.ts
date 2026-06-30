@@ -143,6 +143,43 @@ export async function uploadFiles(
   return (data.results || []) as UploadResult[];
 }
 
+export interface TempUploadResult extends UploadResult {
+  // Absolute server path of the saved file (temp uploads only). Attached to
+  // the next message so the agent can read/convert/move it.
+  path?: string;
+}
+
+// Upload files into the conversation's temporary folder. The destination is
+// computed server-side from the authenticated profile + conversation, so —
+// unlike uploadFiles — no path is sent. Returns each file's absolute path.
+export async function uploadTempFiles(
+  agentUrl: string,
+  token: string,
+  conversationId: string,
+  files: File[],
+): Promise<TempUploadResult[]> {
+  if (!files.length) return [];
+  const base = resolveBaseUrl(agentUrl);
+  const form = new FormData();
+  form.append('conversation_id', conversationId);
+  for (const f of files) form.append('files', f, f.name);
+  // Note: do NOT set Content-Type — the browser writes the multipart boundary.
+  const res = await fetch(`${base}/api/files/upload-temp`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: form,
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new DirectoryAccessError(
+      res.status,
+      data.error || `Upload failed: ${res.statusText}`,
+    );
+  }
+  const data = await res.json();
+  return (data.results || []) as TempUploadResult[];
+}
+
 export async function deleteEntry(
   agentUrl: string,
   token: string,

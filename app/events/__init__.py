@@ -16,11 +16,16 @@ from app.events.file_watcher_manager import (
     FileWatcherManager,
     get_file_watcher_manager,
 )
-from app.events.manager import EventManager, get_event_manager
+from app.events.manager import (
+    EventManager,
+    get_event_manager,
+    wipe_event_folders_on_startup,
+)
 from app.events.schedule_manager import ScheduleManager, get_schedule_manager
 from app.events.notifications_buffer import EventNotificationsBuffer, get_event_notifications
 from app.events.notifications_bus import NotificationsStreamBus, get_notifications_stream_bus
 from app.events.stream_bus import ConversationStreamBus, get_event_stream_bus
+from app.events.uploads_cleanup import UploadsCleanupManager, get_uploads_cleanup_manager
 
 __all__ = [
     "ConversationStreamBus",
@@ -29,10 +34,13 @@ __all__ = [
     "FileWatcherManager",
     "ScheduleManager",
     "NotificationsStreamBus",
+    "UploadsCleanupManager",
     "get_event_manager",
     "get_event_notifications",
     "get_event_stream_bus",
     "get_file_watcher_manager",
     "get_schedule_manager",
     "get_notifications_stream_bus",
+    "get_uploads_cleanup_manager",
+    "wipe_event_folders_on_startup",
 ]

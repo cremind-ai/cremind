@@ -104,16 +104,13 @@ class ToolRegistry:
     def _default_enabled(tool_type: ToolType) -> bool:
         """Default enabled state when no ``profile_tools`` row exists.
 
-        - intrinsic / builtin : on by default (always available, opt-out per
-                                profile)
-        - skill               : on by default *for its owner profile*; invisible
-                                to other profiles (filtered in
-                                :meth:`tools_for_profile`).
-        - a2a / mcp           : off by default (opt-in per profile, except for
-                                the owner profile which gets enabled=1 at
-                                registration)
+        - builtin : on by default (always available, opt-out per profile)
+        - skill   : on by default *for its owner profile*; invisible to other
+                    profiles (filtered in :meth:`tools_for_profile`).
+        - mcp     : off by default (opt-in per profile, except for the owner
+                    profile which gets enabled=1 at registration)
         """
-        return tool_type in (ToolType.INTRINSIC, ToolType.BUILTIN, ToolType.SKILL)
+        return tool_type in (ToolType.BUILTIN, ToolType.SKILL)
 
     @staticmethod
     def _skill_belongs_to_profile(tool: Tool, profile: str) -> bool:
@@ -140,17 +137,14 @@ class ToolRegistry:
     def tools_for_profile(self, profile: str) -> List[Tool]:
         """Return tools the reasoning agent should expose to ``profile``.
 
-        Intrinsic tools are always included. Skills owned by other profiles
-        are excluded. Every other type honors a per-profile ``profile_tools``
-        row when present, falling back to the type's default (built-in = on;
-        a2a / mcp = off).
+        Skills owned by other profiles are excluded. Every type — skills
+        included — honors a per-profile ``profile_tools`` row when present,
+        falling back to the type's default (built-in = on; skill = on;
+        mcp = off), so a skill disabled in Settings is no longer exposed.
         """
         enabled_per_profile = self._storage.list_profile_tools(profile)
         out: List[Tool] = []
         for tool in self._tools.values():
-            if tool.tool_type is ToolType.INTRINSIC:
-                out.append(tool)
-                continue
             # Hidden system built-ins are always-on for every profile —
             # their lifecycle is the runtime's, not the user's, so a stale
             # ``profile_tools`` row must not be able to suppress them.
@@ -163,14 +157,31 @@ class ToolRegistry:
                 out.append(tool)
                 continue
             if tool.tool_type is ToolType.SKILL:
-                if self._skill_belongs_to_profile(tool, profile):
-                    out.append(tool)
-                continue
+                if not self._skill_belongs_to_profile(tool, profile):
+                    continue
+                # owned skill — fall through to the shared enabled check so a
+                # ``profile_tools`` row with enabled=0 (set via Settings)
+                # suppresses it just like any other tool. Absent a row, the
+                # SKILL default (on) keeps it exposed.
             explicit = enabled_per_profile.get(tool.tool_id)
             enabled = explicit if explicit is not None else self._default_enabled(tool.tool_type)
             if enabled:
                 out.append(tool)
         return out
+
+    def owned_skills(self, profile: str) -> List[Tool]:
+        """Return every skill owned by ``profile`` regardless of enabled state.
+
+        Unlike :meth:`tools_for_profile`, this ignores the per-profile
+        ``enabled`` flag — callers that operate on a profile's skills as
+        on-disk assets (e.g. re-materializing ``scripts/.env``) need the full
+        set, not just the ones currently exposed to the agent.
+        """
+        return [
+            tool
+            for tool in self._tools.values()
+            if self._skill_belongs_to_profile(tool, profile)
+        ]
 
     def visible_for_profile(self, profile: str) -> List[dict]:
         """Return UI rows for ``profile`` -- includes disabled stubs.
@@ -206,17 +217,6 @@ class ToolRegistry:
 
     def _taken(self) -> set[str]:
         return set(self._tools.keys())
-
-    # ── intrinsic registration (in-memory only) ────────────────────────
-
-    def register_intrinsic(self, tool: Tool) -> str:
-        if tool.tool_type is not ToolType.INTRINSIC:
-            raise ValueError("register_intrinsic requires a Tool with tool_type=INTRINSIC")
-        tool_id = allocate_fixed_tool_id(tool.name, self._taken())
-        tool.tool_id = tool_id
-        self._tools[tool_id] = tool
-        logger.info(f"Registered intrinsic tool '{tool.name}' (tool_id={tool_id})")
-        return tool_id
 
     def repersist_builtin_tools(self) -> int:
         """Re-write rows for every in-memory built-in tool to the storage backend.
@@ -312,18 +312,7 @@ class ToolRegistry:
             f"Renamed displaced tool to '{new_id}' (per-profile state preserved)."
         )
 
-    # ── a2a / mcp registration (persisted, profile_tools backfilled) ──
-
-    async def register_a2a(self, tool: Tool, *, source: str, owner_profile: str | None) -> str:
-        if tool.tool_type is not ToolType.A2A:
-            raise ValueError("register_a2a requires a Tool with tool_type=A2A")
-        async with self._lock:
-            tool_id = self._register_dynamic(
-                tool, source=source, owner_profile=owner_profile,
-                tool_type_value=ToolType.A2A.value,
-            )
-        self._fire_change()
-        return tool_id
+    # ── mcp registration (persisted, profile_tools backfilled) ──
 
     async def register_mcp(
         self, tool: Tool, *, source: str, owner_profile: str | None, extra: dict | None = None,
@@ -423,7 +412,7 @@ class ToolRegistry:
             owner_is_other_fixed = (
                 owner is not None
                 and owner is not tool
-                and owner.tool_type in (ToolType.INTRINSIC, ToolType.BUILTIN)
+                and owner.tool_type is ToolType.BUILTIN
             )
             if owner_is_other_fixed:
                 fresh = self._unique_skill_id(preferred)
@@ -605,10 +594,6 @@ class ToolRegistry:
         tool = self._tools.get(tool_id)
         if tool is None:
             raise KeyError(f"Tool '{tool_id}' is not registered")
-        if tool.tool_type is ToolType.INTRINSIC:
-            raise ValueError(
-                f"Tool '{tool_id}' is intrinsic and cannot be disabled."
-            )
         if tool.hidden:
             raise ValueError(
                 f"Tool '{tool_id}' is a hidden system tool and cannot be "
@@ -621,6 +606,71 @@ class ToolRegistry:
                 f"Tool '{tool_id}' is locked and cannot be disabled."
             )
         self._storage.set_profile_tool(profile, tool_id, enabled)
+
+    # ── per-leaf enable/disable (sub-tools of a built-in/MCP group) ─────
+
+    def disabled_leaves_by_tool(self, profile: str) -> Dict[str, set[str]]:
+        """Return ``{tool_id: {leaf_name, ...}}`` of disabled leaves for ``profile``.
+
+        Used by the reasoning agent's per-step tool build to suppress disabled
+        sub-tools in one read, mirroring :meth:`tools_for_profile`'s use of
+        ``list_profile_tools``.
+        """
+        return self._storage.list_disabled_leaves(profile)
+
+    def leaves_for_profile(self, profile: str, tool_id: str) -> dict:
+        """Return the UI payload describing a tool's sub-tools for ``profile``.
+
+        Built from the tool's ``skills`` (static for built-in groups, live for
+        MCP servers, empty for a disconnected MCP stub) merged with the
+        per-profile disabled set. ``supports_leaf_toggle`` is False for
+        single-leaf groups (toggling the one leaf is redundant with the tool's
+        own enable switch) so the UI can hide the section.
+        """
+        tool = self._tools.get(tool_id)
+        if tool is None:
+            raise KeyError(f"Tool '{tool_id}' is not registered")
+        try:
+            skills = tool.skills
+        except Exception:  # noqa: BLE001
+            logger.exception(f"leaves_for_profile: skills failed for '{tool_id}'")
+            skills = []
+        disabled = self._config.get_disabled_leaves(tool_id, profile)
+        leaves = [
+            {
+                "leaf_name": s.id,
+                "name": s.name,
+                "description": s.description,
+                "enabled": s.id not in disabled,
+            }
+            for s in skills
+        ]
+        return {
+            "supports_leaf_toggle": len(leaves) > 1,
+            "disconnected": bool(getattr(tool, "connection_error", None)),
+            "leaves": leaves,
+        }
+
+    def set_profile_tool_leaf_enabled(
+        self, profile: str, tool_id: str, leaf: str, enabled: bool,
+    ) -> None:
+        """Enable/disable a single sub-tool ("leaf") of a tool for ``profile``.
+
+        Refuses ``hidden`` system tools (never user-facing). Unlike
+        :meth:`set_profile_tool_enabled`, ``locked`` tools ARE allowed: the lock
+        protects the group's presence, while per-leaf control is the whole point
+        (e.g. make a locked ``system_file`` read-only). The leaf row is
+        independent of the parent ``profile_tools`` flag, so the choice persists
+        across a parent disable/re-enable.
+        """
+        tool = self._tools.get(tool_id)
+        if tool is None:
+            raise KeyError(f"Tool '{tool_id}' is not registered")
+        if tool.hidden:
+            raise ValueError(
+                f"Tool '{tool_id}' is a hidden system tool and has no per-leaf controls."
+            )
+        self._config.set_leaf_enabled(tool_id, profile, leaf, enabled)
 
 
 # ── singleton ──────────────────────────────────────────────────────────────

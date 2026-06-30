@@ -92,7 +92,7 @@ def resolve_group(group_name: str, profile: str) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class AgentRuntimeConfig:
-    """Snapshot of agent + history config for one ReAct run."""
+    """Snapshot of agent config for one ReAct run."""
 
     max_steps: int
     max_llm_retries: int
@@ -100,19 +100,18 @@ class AgentRuntimeConfig:
     reasoning_max_tokens: int
     reasoning_retry: int
     steps_length: int
-    history_max_tokens_total: int
-    history_max_tokens_per_message: int
+    enable_prompt_cache: bool
     tool_result_enabled: bool
     tool_result_max_tokens: int
     tool_result_preserve_recent: int
     tool_result_head_tokens: int
     tool_result_tail_tokens: int
+    replay_reasoning_steps: bool
 
 
 def resolve_agent_config(profile: str) -> AgentRuntimeConfig:
     """Build an :class:`AgentRuntimeConfig` for ``profile``."""
     agent = resolve_group("agent", profile)
-    history = resolve_group("history", profile)
     tool_result = resolve_group("tool_result", profile)
     return AgentRuntimeConfig(
         max_steps=int(agent["max_steps"]),
@@ -121,42 +120,53 @@ def resolve_agent_config(profile: str) -> AgentRuntimeConfig:
         reasoning_max_tokens=int(agent["reasoning_max_tokens"]),
         reasoning_retry=int(agent["reasoning_retry"]),
         steps_length=int(agent["steps_length"]),
-        history_max_tokens_total=int(history["max_tokens_total"]),
-        history_max_tokens_per_message=int(history["max_tokens_per_message"]),
+        enable_prompt_cache=bool(agent["enable_prompt_cache"]),
         tool_result_enabled=bool(tool_result["enabled"]),
         tool_result_max_tokens=int(tool_result["max_tokens"]),
         tool_result_preserve_recent=int(tool_result["preserve_recent"]),
         tool_result_head_tokens=int(tool_result["head_tokens"]),
         tool_result_tail_tokens=int(tool_result["tail_tokens"]),
+        replay_reasoning_steps=bool(agent["replay_reasoning_steps"]),
     )
 
 
+def replay_reasoning_enabled(profile: str) -> bool:
+    """Whether each turn's native reasoning trace is replayed into history.
+
+    Safe accessor for the history builders — never raises (a config-resolution
+    failure must not break loading conversation history); falls back to ``False``.
+    """
+    try:
+        return bool(resolve_agent_config(profile).replay_reasoning_steps)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @dataclass(frozen=True)
-class SkillClassifierConfig:
+class CompactionConfig:
+    """Snapshot of the conversation-compaction tunables for one profile."""
+
+    enabled: bool
+    compact_threshold_percent: float
+    keep_recent_tokens: int
+    keep_recent_messages: int
     temperature: float
     max_tokens: int
     retry: int
 
 
-def resolve_skill_classifier_config(profile: str) -> SkillClassifierConfig:
-    values = resolve_group("skill_classifier", profile)
-    return SkillClassifierConfig(
-        temperature=float(values["temperature"]),
-        max_tokens=int(values["max_tokens"]),
-        retry=int(values["retry"]),
-    )
+def resolve_compaction_config(profile: str) -> CompactionConfig:
+    """Build a :class:`CompactionConfig` for ``profile``.
 
-
-@dataclass(frozen=True)
-class SummarizerConfig:
-    temperature: float
-    max_tokens: int
-    retry: int
-
-
-def resolve_summarizer_config(profile: str) -> SummarizerConfig:
-    values = resolve_group("summarizer", profile)
-    return SummarizerConfig(
+    Re-read at consumption time (not cached) so toggling the feature or its
+    thresholds in Settings takes effect on the next turn.
+    """
+    values = resolve_group("compaction", profile)
+    return CompactionConfig(
+        enabled=bool(values["enabled"]),
+        compact_threshold_percent=float(values["compact_threshold_percent"]),
+        keep_recent_tokens=int(values["keep_recent_tokens"]),
+        keep_recent_messages=int(values["keep_recent_messages"]),
         temperature=float(values["temperature"]),
         max_tokens=int(values["max_tokens"]),
         retry=int(values["retry"]),
@@ -165,34 +175,32 @@ def resolve_summarizer_config(profile: str) -> SummarizerConfig:
 
 @dataclass(frozen=True)
 class MemoryConfig:
-    """Snapshot of the conversation-memory tunables for one profile."""
+    """Snapshot of the conversation-memory tunables for one profile.
+
+    Memory generation is unified with conversation compaction (see
+    :mod:`app.agent.compaction`): the fold's auxiliary LLM call uses the
+    ``[compaction]`` tunables (temperature/max_tokens/retry/threshold), so those
+    are intentionally absent here. ``enabled`` requires ``[compaction]`` enabled.
+    ``long_term_queue_size`` bounds only the DB path (embedding off); the vector
+    path (embedding on) is effectively unlimited.
+    """
 
     enabled: bool
-    trigger_token_threshold: int
-    short_term_queue_size: int
     long_term_queue_size: int
-    short_term_max_tokens: int
     long_term_max_tokens: int
-    temperature: float
-    max_tokens: int
-    retry: int
+    long_term_retrieve_limit: int
 
 
 def resolve_memory_config(profile: str) -> MemoryConfig:
     """Build a :class:`MemoryConfig` for ``profile``.
 
-    Re-read at extraction/consumption time (not cached) so toggling the feature
-    or its thresholds in Settings takes effect on the next turn.
+    Re-read at consumption time (not cached) so toggling the feature or its
+    limits in Settings takes effect on the next turn.
     """
     values = resolve_group("memory", profile)
     return MemoryConfig(
         enabled=bool(values["enabled"]),
-        trigger_token_threshold=int(values["trigger_token_threshold"]),
-        short_term_queue_size=int(values["short_term_queue_size"]),
         long_term_queue_size=int(values["long_term_queue_size"]),
-        short_term_max_tokens=int(values["short_term_max_tokens"]),
         long_term_max_tokens=int(values["long_term_max_tokens"]),
-        temperature=float(values["temperature"]),
-        max_tokens=int(values["max_tokens"]),
-        retry=int(values["retry"]),
+        long_term_retrieve_limit=int(values["long_term_retrieve_limit"]),
     )

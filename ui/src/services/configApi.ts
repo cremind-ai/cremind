@@ -500,6 +500,7 @@ export interface LLMModel {
   input_price_per_1m: number;
   output_price_per_1m: number;
   reasoning_effort?: string[];
+  vision?: boolean;
 }
 
 export async function listLLMProviders(
@@ -598,7 +599,7 @@ export async function pollDeviceCode(
 export async function getModelGroups(
   agentUrl: string,
   token: string
-): Promise<{ model_groups: Record<string, string>; default_provider: string; reasoning_efforts: Record<string, string | null> }> {
+): Promise<{ model_groups: Record<string, string>; default_provider: string; reasoning_efforts: Record<string, string | null>; vision_enabled: boolean }> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/llm/model-groups`, {
     headers: authHeaders(token),
@@ -613,11 +614,13 @@ export async function updateModelGroups(
   modelGroups: Record<string, string>,
   defaultProvider?: string,
   reasoningEfforts?: Record<string, string | null>,
+  visionEnabled?: boolean,
 ): Promise<{ success: boolean }> {
   const base = resolveBaseUrl(agentUrl);
   const body: Record<string, unknown> = { model_groups: modelGroups };
   if (defaultProvider) body.default_provider = defaultProvider;
   if (reasoningEfforts) body.reasoning_efforts = reasoningEfforts;
+  if (visionEnabled !== undefined) body.vision_enabled = visionEnabled;
   const res = await fetch(`${base}/api/llm/model-groups`, {
     method: 'PUT',
     headers: authHeaders(token),
@@ -706,6 +709,10 @@ export interface ToolStatus {
    *  toggle is locked ON (the API rejects disable). The UI renders the switch
    *  disabled with a lock icon. Sourced from TOOL_CONFIG.locked. */
   toggle_locked?: boolean;
+  /** Built-in groups / MCP servers only: true when the tool exposes more than
+   *  one sub-tool ("leaf"), so the Settings card shows a per-sub-tool toggle
+   *  section. The UI lazy-loads the leaf list (``listToolLeaves``) only when set. */
+  supports_leaf_toggle?: boolean;
 }
 
 export async function listTools(
@@ -797,6 +804,60 @@ export async function setToolEnabled(
     }
   }
   if (!res.ok) throw new Error(`Failed to set tool enabled: ${res.statusText}`);
+  return res.json();
+}
+
+// ── Per-sub-tool ("leaf") enable/disable ──
+
+/** One sub-tool of a built-in group or MCP server. */
+export interface ToolLeaf {
+  /** Original sub-tool name within the group (not the namespaced function name). */
+  leaf_name: string;
+  /** Display name. */
+  name: string;
+  /** Short description shown next to the toggle. */
+  description: string;
+  /** Whether this sub-tool is currently enabled for the profile. */
+  enabled: boolean;
+}
+
+export interface ToolLeavesResponse {
+  /** False for single-leaf tools (toggling is redundant with the tool switch). */
+  supports_leaf_toggle: boolean;
+  /** True when an MCP server is disconnected and its sub-tools can't be listed. */
+  disconnected: boolean;
+  leaves: ToolLeaf[];
+}
+
+/** List a tool's sub-tools with their per-profile enabled state. */
+export async function listToolLeaves(
+  agentUrl: string,
+  token: string,
+  toolId: string
+): Promise<ToolLeavesResponse> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/tools/${encodeURIComponent(toolId)}/leaves`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(`Failed to list sub-tools: ${res.statusText}`);
+  return res.json();
+}
+
+/** Enable/disable one or more sub-tools. Pass a single key for a per-row
+ *  toggle, or many for "Enable all" / "Disable all". */
+export async function setToolLeaves(
+  agentUrl: string,
+  token: string,
+  toolId: string,
+  leaves: Record<string, boolean>
+): Promise<{ success: boolean }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/tools/${encodeURIComponent(toolId)}/leaves`, {
+    method: 'PUT',
+    headers: authHeaders(token),
+    body: JSON.stringify({ leaves }),
+  });
+  if (!res.ok) throw new Error(`Failed to update sub-tools: ${res.statusText}`);
   return res.json();
 }
 

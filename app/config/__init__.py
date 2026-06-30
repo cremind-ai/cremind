@@ -3,6 +3,7 @@
 Priority chain: SQLite dynamic config > TOML file defaults > environment variable fallback.
 """
 
+import os
 from pathlib import Path
 
 import toml
@@ -30,6 +31,153 @@ def load_provider_catalog(provider_name: str) -> dict:
         return {}
     with open(toml_path, "r") as f:
         return toml.load(f)
+
+
+def _vision_overrides() -> set[str]:
+    """Models force-flagged vision-capable via the ``CREMIND_VISION_MODELS``
+    env var (comma-separated ``provider/model`` or bare ``model`` ids).
+
+    Escape hatch for custom / dynamic / proxy models (ollama, vllm, litellm,
+    OpenAI-compatible gateways) whose catalog entries are illustrative and may
+    not list the actual vision-capable model the user runs.
+    """
+    raw = os.environ.get("CREMIND_VISION_MODELS", "")
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def model_supports_vision(provider_name: str, model_name: str) -> bool:
+    """Return True if ``model_name`` is flagged vision-capable for its provider.
+
+    Looks up the ``vision`` flag on the matching ``[[models]]`` entry in the
+    provider catalog. Unknown models (not listed — e.g. a custom or dynamic
+    model) default to False so the vision tool raises a clean, actionable error
+    rather than letting the request fail opaquely at the provider API. The
+    ``CREMIND_VISION_MODELS`` env var can force-enable a specific model.
+    """
+    if not provider_name or not model_name:
+        return False
+    model = model_name
+    prefix = f"{provider_name}/"
+    if model.startswith(prefix):
+        model = model[len(prefix):]
+
+    overrides = _vision_overrides()
+    if f"{provider_name}/{model}" in overrides or model in overrides:
+        return True
+
+    catalog = load_provider_catalog(provider_name)
+    for entry in catalog.get("models", []) or []:
+        if isinstance(entry, dict) and entry.get("id") == model:
+            return bool(entry.get("vision", False))
+    return False
+
+
+def vision_feature_enabled(profile: str | None = None) -> bool:
+    """Whether the Specialized Vision Model feature is enabled for ``profile``.
+
+    The feature is opt-in: when on, image understanding is routed through the
+    dedicated ``vision`` model group and the ``image_understanding`` tool is
+    exposed to the agent (and listed in Settings → Tools). When off (the
+    default — an unset flag reads as False), the tool is withheld entirely.
+
+    Reads the ``model_group.vision.enabled`` flag from ``llm_config`` (written
+    via the model-groups API). Stored as ``"true"``/``"false"``; coerced with an
+    explicit truthy set so the string ``"false"`` is correctly falsy.
+    """
+    from app.config.settings import get_dynamic
+    raw = get_dynamic("llm_config", "model_group.vision.enabled", profile=profile)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def model_supports_prompt_cache(provider_name: str, model_name: str) -> bool:
+    """Return True if ``model_name`` is flagged prompt-cache-capable for its provider.
+
+    Looks up the ``prompt_cache`` flag on the matching ``[[models]]`` entry in the
+    provider catalog. Unknown / unlisted models default to False. This is
+    informational metadata (surfaced via the model catalog API); cached-token
+    *accounting* happens at runtime in the provider classes regardless of this flag.
+    """
+    if not provider_name or not model_name:
+        return False
+    model = model_name
+    prefix = f"{provider_name}/"
+    if model.startswith(prefix):
+        model = model[len(prefix):]
+
+    catalog = load_provider_catalog(provider_name)
+    for entry in catalog.get("models", []) or []:
+        if isinstance(entry, dict) and entry.get("id") == model:
+            return bool(entry.get("prompt_cache", False))
+    return False
+
+
+def model_parallel_tool_calls(provider_name: str, model_name: str) -> bool:
+    """Return True if ``model_name`` may emit multiple tool calls in one turn.
+
+    Looks up the ``parallel_tool_calls`` flag on the matching ``[[models]]`` entry
+    in the provider catalog. Unlike ``supports_reasoning``/``prompt_cache``, the
+    default is **True** — parallel tool use is the default-on behavior for every
+    provider, and the agent already executes leaf tool calls concurrently. Set the
+    flag to ``false`` on a model entry only to *opt out* (e.g. OpenAI o-series /
+    reasoning models that reject the ``parallel_tool_calls`` request parameter).
+    Unknown / unlisted models default to True.
+    """
+    if not provider_name or not model_name:
+        return True
+    model = model_name
+    prefix = f"{provider_name}/"
+    if model.startswith(prefix):
+        model = model[len(prefix):]
+
+    catalog = load_provider_catalog(provider_name)
+    for entry in catalog.get("models", []) or []:
+        if isinstance(entry, dict) and entry.get("id") == model:
+            return bool(entry.get("parallel_tool_calls", True))
+    return True
+
+
+def _reasoning_overrides() -> set[str]:
+    """Models force-flagged native-reasoning-capable via the
+    ``CREMIND_REASONING_MODELS`` env var (comma-separated ``provider/model`` or
+    bare ``model`` ids).
+
+    Escape hatch for custom / dynamic / proxy models (ollama, vllm, litellm,
+    OpenAI-compatible gateways) whose catalog entries are illustrative. Marking
+    a model here means it HAS native reasoning, so the agent's ``reasoning``
+    think-tool is *disabled* for it (the inverse of the vision override, which
+    enables a feature).
+    """
+    raw = os.environ.get("CREMIND_REASONING_MODELS", "")
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def model_supports_reasoning(provider_name: str, model_name: str) -> bool:
+    """Return True if ``model_name`` has native step-by-step reasoning.
+
+    Looks up the ``supports_reasoning`` flag on the matching ``[[models]]``
+    entry in the provider catalog. Unknown / unlisted models (e.g. a custom or
+    dynamic model) default to ``False`` — i.e. treated as *non*-reasoning — so
+    the agent's ``reasoning`` think-tool is enabled for them by default (the
+    safe, beneficial default: a local/unknown model almost certainly lacks
+    native reasoning). The ``CREMIND_REASONING_MODELS`` env var can force-mark a
+    specific model as reasoning-capable.
+    """
+    if not provider_name or not model_name:
+        return False
+    model = model_name
+    prefix = f"{provider_name}/"
+    if model.startswith(prefix):
+        model = model[len(prefix):]
+
+    overrides = _reasoning_overrides()
+    if f"{provider_name}/{model}" in overrides or model in overrides:
+        return True
+
+    catalog = load_provider_catalog(provider_name)
+    for entry in catalog.get("models", []) or []:
+        if isinstance(entry, dict) and entry.get("id") == model:
+            return bool(entry.get("supports_reasoning", False))
+    return False
 
 
 def load_all_provider_catalogs() -> dict[str, dict]:

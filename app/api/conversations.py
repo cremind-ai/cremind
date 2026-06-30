@@ -1,14 +1,19 @@
 import asyncio
 import json
+import os
 from typing import Any, Dict
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
-from app.agent import memory_runner
 from app.agent.stream_runner import cancel_run, make_run_id
-from app.config.user_config import resolve_memory_config
+from app.config.embedding_state import embedding_state
+from app.config.settings import BaseConfig
+from app.config.user_config import (
+    replay_reasoning_enabled,
+    resolve_memory_config,
+)
 from app.events import queue as event_queue
 from app.api.events import publish_skill_events_admin_changed
 from app.api.file_watchers import publish_file_watchers_admin_changed
@@ -17,10 +22,11 @@ from app.events.conversations_list_bus import (
     publish_conversations_changed,
 )
 from app.events.stream_bus import get_event_stream_bus
-from app.storage import get_memory_storage
+from app.storage import get_memory_storage, get_usage_storage
 from app.storage.conversation_storage import ConversationStorage, is_valid_conversation_id
 from app.utils import logger
 from app.utils.common import convert_db_messages_to_history
+from app.utils.uploads_tmp import is_inside_conversation_tmp
 
 
 def _profile_from_request(request: Request) -> str:
@@ -31,6 +37,93 @@ def _require_auth(request: Request):
     if not getattr(request.user, "is_authenticated", False):
         return JSONResponse({"error": "Unauthenticated"}, status_code=401)
     return None
+
+
+def _usage_sum(rows: list[dict]) -> dict:
+    """Sum a set of usage rows into a TokenBreakdown (cost skips null estimates)."""
+    it = sum(r["input_tokens"] for r in rows)
+    cr = sum(r["cache_read_input_tokens"] for r in rows)
+    cc = sum(r["cache_creation_input_tokens"] for r in rows)
+    ot = sum(r["output_tokens"] for r in rows)
+    cost = sum((r["estimated_cost_usd"] or 0.0) for r in rows)
+    return {
+        "input_tokens": it,
+        "cache_read_input_tokens": cr,
+        "cache_creation_input_tokens": cc,
+        "output_tokens": ot,
+        "total_tokens": it + cr + cc + ot,
+        "estimated_cost_usd": cost,
+    }
+
+
+def _usage_by_source(rows: list[dict]) -> list[dict]:
+    """Group rows by (source_kind, tool_id) — reasoning agent + each tool/sub-agent."""
+    groups: dict[tuple, list[dict]] = {}
+    order: list[tuple] = []
+    for r in rows:
+        key = (r["source_kind"], r.get("tool_id"))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+    out = []
+    for sk, tid in order:
+        grp = groups[(sk, tid)]
+        out.append({
+            "source": tid or sk,
+            "display_name": grp[0].get("label") or tid or sk,
+            "source_type": sk,
+            "tool_id": tid,
+            "request_count": len(grp),
+            **_usage_sum(grp),
+        })
+    out.sort(key=lambda e: e["estimated_cost_usd"], reverse=True)
+    return out
+
+
+def _cache_hit_rate(totals: dict) -> float:
+    denom = totals["input_tokens"] + totals["cache_read_input_tokens"]
+    return (totals["cache_read_input_tokens"] / denom) if denom else 0.0
+
+
+def _uniform_rates(rows: list[dict]) -> dict | None:
+    """Per-1M rate card for the turn, only when it explains the cost exactly.
+
+    Returns the four per-1M rates iff **every** row shares one identical rate
+    snapshot. If any row is unpriced (no snapshot) or uses a different rate set
+    (e.g. a sub-agent on another model), returns ``None`` — then the aggregate
+    ``tokens × rate`` would not equal the frozen total, so the UI shows the
+    symbolic formula instead of a worked, plugged-in one.
+    """
+    seen: tuple | None = None
+    for r in rows:
+        # Zero-token rows (bookkeeping / intrinsic) add nothing to the token sum
+        # or the cost, so they can't break the `tokens × rate == total` identity
+        # — skip them rather than let a missing snapshot veto the rate card.
+        if not (r["input_tokens"] + r["cache_read_input_tokens"]
+                + r["cache_creation_input_tokens"] + r["output_tokens"]):
+            continue
+        snap = r.get("rate_snapshot")
+        if not snap:
+            return None
+        rates = (
+            snap.get("input_per_1m"),
+            snap.get("output_per_1m"),
+            snap.get("cache_read_per_1m"),
+            snap.get("cache_write_per_1m"),
+        )
+        if seen is None:
+            seen = rates
+        elif rates != seen:
+            return None
+    if seen is None:
+        return None
+    return {
+        "input_per_1m": seen[0],
+        "output_per_1m": seen[1],
+        "cache_read_per_1m": seen[2],
+        "cache_write_per_1m": seen[3],
+    }
 
 
 def get_conversation_routes(
@@ -157,11 +250,14 @@ def get_conversation_routes(
         return JSONResponse({"messages": messages})
 
     async def handle_get_memory(request: Request) -> JSONResponse:
-        """Return this conversation's short-term + the profile's long-term memory.
+        """Return this conversation's running summary (short-term) + long-term memory.
 
-        Also reports progress toward the next auto-extraction (un-extracted
-        message-content tokens vs. the configured threshold) and whether an
-        extraction is currently running, so the UI panel can poll for updates.
+        Short-term memory is now the conversation's running compaction summary;
+        long-term comes from the vector store (embedding on) or the DB queue
+        (embedding off). Also reports progress toward the next fold — the model's
+        reported context size for the latest turn vs. the threshold
+        (``compact_threshold_percent`` of the active model's context window; see
+        :func:`app.agent.compaction.context_usage`) — so the UI panel can poll.
         """
         unauth = _require_auth(request)
         if unauth is not None:
@@ -174,33 +270,47 @@ def get_conversation_routes(
         if conv.get("profile") != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
 
-        storage = get_memory_storage()
         cfg = resolve_memory_config(profile)
-        short_term = await storage.get_short_term(conversation_id)
-        long_term = await storage.get_long_term(profile)
-        _, last_extracted_at = await storage.get_watermark(conversation_id)
-        try:
-            current_tokens = await memory_runner.pending_token_count(conversation_id)
-        except Exception:  # noqa: BLE001
-            current_tokens = 0
+        summary, watermark, last_compacted_at = await conversation_storage.get_compaction_state(
+            conversation_id
+        )
+
+        if BaseConfig.is_embedding_enabled() and embedding_state.is_ready():
+            from app.agent import memory_vectorstore
+            from app.events.runner import get_cremind_agent
+            long_term = await asyncio.to_thread(
+                memory_vectorstore.list_long_term,
+                agent=get_cremind_agent(), profile=profile, limit=50,
+            )
+        else:
+            long_term = await get_memory_storage().get_long_term(profile)
+
+        from app.agent import compaction
+        usage = await compaction.context_usage(
+            conversation_id=conversation_id,
+            profile=profile,
+            conversation_storage=conversation_storage,
+        )
         return JSONResponse({
-            "short_term": short_term,
+            "summary": summary or "",
             "long_term": long_term,
             "token_progress": {
-                "current": current_tokens,
-                "threshold": cfg.trigger_token_threshold,
+                "current": usage["current_tokens"],
+                "threshold": usage["threshold"],
+                "context_window": usage["context_window"],
             },
             "enabled": cfg.enabled,
-            "extracting": memory_runner.is_extracting(conversation_id),
-            "last_extracted_at": last_extracted_at,
+            "last_compacted_at": last_compacted_at,
         })
 
     async def handle_trigger_memory(request: Request) -> JSONResponse:
-        """Manually kick off a background memory extraction for this conversation.
+        """Compact this conversation now (model-driven).
 
-        User-initiated, so it runs even when auto-extraction is disabled in
-        settings (``force=True``). Returns ``202`` immediately; the extraction
-        runs in the background and the panel polls ``GET …/memory`` for results.
+        Runs a synthetic "please compact" turn through the agent so the MAIN
+        model — with the conversation already in its cached prefix — writes the
+        running summary (and any long-term facts) by calling the
+        ``compact_conversation`` tool. The synthetic message and the model's
+        reply are NOT persisted and never shown to the user.
         """
         unauth = _require_auth(request)
         if unauth is not None:
@@ -213,8 +323,56 @@ def get_conversation_routes(
         if conv.get("profile") != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
 
-        memory_runner.schedule_extraction(conversation_id, profile, force=True)
-        return JSONResponse({"scheduled": True}, status_code=202)
+        from app.agent import compaction
+        from app.events.runner import get_cremind_agent
+
+        agent = get_cremind_agent()
+        if agent is None:
+            return JSONResponse({"error": "Agent not available"}, status_code=503)
+
+        context_id = conv.get("context_id") or conversation_id
+        # Effective history (current summary + verbatim tail) = the cached prefix.
+        history = await compaction.build_compacted_history(
+            conversation_id=conversation_id,
+            profile=profile,
+            conversation_storage=conversation_storage,
+            fallback_history=[],
+        )
+        synthetic = (
+            "Please compact our conversation now to free up context. Summarize "
+            "EVERYTHING discussed so far into a single dense, self-contained "
+            "running summary that preserves all facts, decisions, identifiers "
+            "(IDs, file paths, URLs, commands, config keys, exact values), "
+            "unresolved questions and pending TODOs, and my goals, constraints "
+            "and preferences. Then call the compact_conversation tool with that "
+            "summary (and any durable long_term_memories). Do not do anything "
+            "else."
+        )
+        # NOTE: this is a technique — the synthetic message is never persisted to
+        # the conversation and the user never sees it. We drain the stream; the
+        # compact_conversation tool does the persistence.
+        before, _, _ = await conversation_storage.get_compaction_state(conversation_id)
+        try:
+            async for _chunk in agent.run(
+                query=synthetic,
+                task_history=history,
+                context_id=context_id,
+                profile=profile,
+                reasoning=True,
+            ):
+                pass
+        except Exception as e:  # noqa: BLE001
+            logger.exception(f"compaction run failed for {conversation_id}")
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+        after, _, _ = await conversation_storage.get_compaction_state(conversation_id)
+        compacted = after != before
+        try:
+            from app.events.stream_bus import get_event_stream_bus
+            await get_event_stream_bus().publish(conversation_id, "compacted", {})
+        except Exception:  # noqa: BLE001
+            logger.debug("failed to publish compacted event", exc_info=True)
+        return JSONResponse({"compacted": compacted}, status_code=200)
 
     async def handle_post_message(request: Request) -> JSONResponse:
         """Enqueue a user message for streaming agent processing.
@@ -246,6 +404,30 @@ def get_conversation_routes(
                 status_code=400,
             )
         reasoning = bool(body.get("reasoning", True))
+
+        # Files attached from the composer were uploaded to this conversation's
+        # temp dir via /api/files/upload-temp. Keep only entries whose path
+        # still resolves inside that dir and exists — anything else is dropped
+        # (never injected into what the agent sees).
+        attachments: list[dict] = []
+        raw_attachments = body.get("attachments")
+        if isinstance(raw_attachments, list):
+            for item in raw_attachments:
+                if not isinstance(item, dict):
+                    continue
+                path = item.get("path")
+                name = item.get("name") or (os.path.basename(path) if path else "")
+                if not path or not isinstance(path, str):
+                    continue
+                if not is_inside_conversation_tmp(profile, conversation_id, path):
+                    logger.warning(
+                        "POST message: dropping attachment outside temp dir: %r", path,
+                    )
+                    continue
+                if not os.path.isfile(path):
+                    logger.warning("POST message: dropping missing attachment: %r", path)
+                    continue
+                attachments.append({"name": name, "path": path})
 
         conv = await conversation_storage.get_conversation(conversation_id)
         if conv is None:
@@ -280,7 +462,9 @@ def get_conversation_routes(
         try:
             db_msgs = await conversation_storage.get_messages(conversation_id)
             if db_msgs:
-                history_messages = convert_db_messages_to_history(db_msgs, inject_ids=True)
+                history_messages = convert_db_messages_to_history(
+                    db_msgs, include_reasoning=replay_reasoning_enabled(profile),
+                )
         except Exception:  # noqa: BLE001
             logger.exception(
                 f"POST message: failed to load history for {conversation_id}"
@@ -295,6 +479,11 @@ def get_conversation_routes(
             query=text,
             history_messages=history_messages,
             reasoning=reasoning,
+            attachments=attachments or None,
+            user_message_metadata=(
+                {"attachments": [{"name": a["name"]} for a in attachments]}
+                if attachments else None
+            ),
             push_user_message=True,
             update_title_from_query=True,
         )
@@ -551,6 +740,62 @@ def get_conversation_routes(
             cancelled = agent_executor.cancel_by_task_id(task_id)
         return JSONResponse({"cancelled": cancelled})
 
+    async def handle_get_conversation_usage(request: Request) -> JSONResponse:
+        """Per-request + cumulative token usage & estimated cost for a conversation.
+
+        Returns one entry per assistant turn (request), each broken down by
+        source (reasoning agent vs. each sub-agent/tool), plus conversation-wide
+        totals and a per-source rollup. Built from a single ``usage_records``
+        query; all grouping happens in Python over the (few dozen) rows.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile_from_request(request)
+        conversation_id = request.path_params["conversation_id"]
+        conv = await conversation_storage.get_conversation(conversation_id)
+        if not conv:
+            return JSONResponse({"error": "Conversation not found"}, status_code=404)
+        if conv.get("profile") != profile and profile != "admin":
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+        rows = await get_usage_storage().per_request_breakdown(conversation_id)
+
+        # Group rows into requests (one assistant turn = one message_id),
+        # preserving first-seen order (rows arrive ordered by message/step).
+        req_groups: dict = {}
+        req_order: list = []
+        for r in rows:
+            mid = r["message_id"]
+            if mid not in req_groups:
+                req_groups[mid] = []
+                req_order.append(mid)
+            req_groups[mid].append(r)
+
+        requests = []
+        for mid in req_order:
+            grp = req_groups[mid]
+            reasoning = next((x for x in grp if x["source_kind"] == "reasoning"), grp[0])
+            requests.append({
+                "message_id": mid,
+                "created_at": min(x["created_at"] for x in grp),
+                "model": reasoning.get("model"),
+                "provider": reasoning.get("provider"),
+                **_usage_sum(grp),
+                "rates": _uniform_rates(grp),
+                "by_source": _usage_by_source(grp),
+            })
+
+        totals = _usage_sum(rows) if rows else _usage_sum([])
+        return JSONResponse({
+            "conversation_id": conversation_id,
+            "totals": totals,
+            "cache_hit_rate": _cache_hit_rate(totals),
+            "request_count": len(requests),
+            "by_source": _usage_by_source(rows),
+            "requests": requests,
+        })
+
     return [
         Route(
             "/api/conversations",
@@ -578,6 +823,11 @@ def get_conversation_routes(
         Route(
             "/api/conversations/{conversation_id}/memory",
             endpoint=handle_get_memory,
+            methods=["GET"],
+        ),
+        Route(
+            "/api/conversations/{conversation_id}/usage",
+            endpoint=handle_get_conversation_usage,
             methods=["GET"],
         ),
         Route(

@@ -2,15 +2,12 @@
 
 Fetches an HTTP(S) URL and extracts readable markdown/text using the standard
 library only (regex HTML->markdown, no renderer, no HTML-parser dependency).
-Ported from OpenClaw's ``web_fetch`` + its SSRF guard.
 
-Dispatch contract
------------------
-Uses the adapter's DEFAULT routing LLM (NO ``direct_dispatch``). The agent's
-Action_Input is usually prose ("fetch the pricing page at example.com as
-text"); the routing child LLM extracts a clean ``url`` plus optional
-``extract_mode``/``max_chars`` -- the same value ``weather``/``gg_places`` get
-from routing.
+Invocation
+----------
+The reasoning model calls ``fetch_url`` directly via native function calling,
+filling ``url`` plus optional ``extract_mode``/``max_chars`` from the tool's
+JSON-Schema. There is no per-group routing LLM.
 
 Security: SSRF guard
 --------------------
@@ -94,7 +91,7 @@ TOOL_CONFIG: ToolConfig = {
             "default": DEFAULT_MAX_CHARS,
         },
     },
-    # No direct_dispatch: the routing LLM extracts url/extract_mode/max_chars.
+    # The model fills url/extract_mode/max_chars directly via native function calling.
 }
 
 

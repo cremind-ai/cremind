@@ -24,23 +24,38 @@ kind = "api_key"
 [provider.auth_methods.fields]
 api_key = { description = "Moonshot API Key", type = "string", secret = true, required = true }
 
+# Cache pricing: Kimi context caching bills cached input at ~0.15x the input rate
+# (~85% discount) with no separate cache-write fee.
+
 [[models]]
 id = "kimi-k2.5"
+context_window = 262144
 display_name = "Kimi K2.5"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.60
 output_price_per_1m = 2.50
+cache_read_price_per_1m = 0.09    # 0.15x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "kimi-k2"
+context_window = 131072
 display_name = "Kimi K2"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.15
 output_price_per_1m = 2.50
+cache_read_price_per_1m = 0.0225  # 0.15x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "kimi-latest"
+context_window = 131072
 display_name = "Kimi Latest"
 group_hint = "high"
+prompt_cache = true
 input_price_per_1m = 0.84
 output_price_per_1m = 0.84
+cache_read_price_per_1m = 0.126   # 0.15x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee

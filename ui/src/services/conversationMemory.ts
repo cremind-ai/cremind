@@ -25,12 +25,14 @@ export interface MemoryEntry {
 }
 
 export interface ConversationMemory {
-  short_term: MemoryEntry[];
+  // Short-term memory is the conversation's running compaction summary.
+  summary: string;
   long_term: MemoryEntry[];
-  token_progress: { current: number; threshold: number };
+  // current = the model's reported context size for the latest turn; threshold =
+  // compact_threshold_percent / 100 * context_window (when to suggest compacting).
+  token_progress: { current: number; threshold: number; context_window: number };
   enabled: boolean;
-  extracting: boolean;
-  last_extracted_at: number | null;
+  last_compacted_at: number | null;
 }
 
 export async function fetchConversationMemory(
@@ -45,15 +47,17 @@ export async function fetchConversationMemory(
   return res.json();
 }
 
-// Kicks off a background extraction. Returns immediately (202); the caller
-// should poll `fetchConversationMemory` until `extracting` flips back to false.
+// Folds the conversation now (running summary + long-term memory), regardless of
+// the compaction threshold. Runs synchronously server-side and returns whether a
+// fold happened, so the caller can simply re-fetch afterwards.
 export async function triggerConversationMemory(
   agentUrl: string, authToken: string, conversationId: string,
-): Promise<void> {
+): Promise<{ folded: boolean }> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(
     `${base}/api/conversations/${encodeURIComponent(conversationId)}/memory/trigger`,
     { method: 'POST', headers: authHeaders(authToken) },
   );
-  if (!res.ok) throw new Error(`Failed to trigger memory extraction: ${res.statusText}`);
+  if (!res.ok) throw new Error(`Failed to update memory: ${res.statusText}`);
+  return res.json();
 }

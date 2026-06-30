@@ -33,33 +33,15 @@ TOOL_CONFIG: ToolConfig = {
     "name": "datetime_parser",
     "display_name": "Datetime Parser",
     # Lightweight, structured extraction — matches every other extraction tool
-    # (register_skill_event, documentation_search, weather all use "low").
+    # (documentation_search, weather all use "low").
     "default_model_group": "low",
     "hidden": True,
-    # NOTE: must NOT be direct_dispatch. Direct dispatch bypasses the routing
-    # LLM and feeds {"query": <text>} verbatim, but this tool's entire contract
-    # is that the LLM fills the structured schema below.
+    # The reasoning model fills the structured schema below directly via
+    # native function calling — that decomposition is this tool's entire
+    # contract, so the raw text is never passed through verbatim.
     "llm_parameters": {
         "tool_instructions": (
             "Decompose time expressions in a sentence into structured, computed datetime(s)."
-        ),
-        "system_prompt": (
-            "You decompose a natural-language time expression into atomic time "
-            "offsets and call the datetime_parser tool with the result. You have "
-            "exactly one task.\n"
-            "NEVER use your own knowledge of the current date or time to compute "
-            "anything — emit only offsets and let the system compute the actual "
-            "datetime. For example: 'last year' is a relative year offset of -1; "
-            "'tomorrow' is a relative day offset of 1; '3pm' is an absolute hour "
-            "of 15; 'next Monday' is offset_unit='monday' with offset_value=1.\n"
-            "Decompose each time mention left-to-right into one time_elements "
-            "entry per atomic unit. For an explicit range ('from X to Y'), tag "
-            "the start units with time_range='start' and the end units with "
-            "time_range='end'; otherwise use 'start'. Set single_time_mode=true "
-            "for a single precise instant, false for a period to expand into a "
-            "range.\n"
-            "Do not answer questions or perform any other task. Always respond by "
-            "calling datetime_parser."
         ),
     },
 }
@@ -68,7 +50,15 @@ TOOL_CONFIG: ToolConfig = {
 class DatetimeParserTool(BuiltInTool):
     name: str = "datetime_parser"
     description: str = (
-        "Decompose time spans within a sentence into a list of independent atomic time elements."
+        "Decompose the time expression(s) in a sentence into a list of atomic, "
+        "structured time elements (year/month/day/hour/minute/weekday offsets) "
+        "that the system then resolves into concrete datetime(s). Emit only the "
+        "offsets and units — do NOT compute the absolute date or time yourself "
+        "from your own knowledge of 'now'; the server applies the offsets to the "
+        "real current time. Decompose each mention left-to-right, one element per "
+        "atomic unit, tagging an explicit range ('from X to Y') with "
+        "time_range='start'/'end'. Use it for any request containing a time "
+        "expression, e.g. 'tomorrow at 3pm', 'next Monday', 'last year'."
     )
     parameters: Dict[str, Any] = {
         "type": "object",

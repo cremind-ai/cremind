@@ -15,7 +15,7 @@ from app.utils import logger
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolUnionParam, ChatCompletionNamedToolChoiceParam
 from openai.types import ResponseFormatJSONObject, ResponseFormatJSONSchema, ResponseFormatText
 
-from .base import LLMProvider
+from .base import LLMProvider, openai_usage_breakdown
 
 
 class GroqLLMProvider(LLMProvider):
@@ -106,8 +106,13 @@ class GroqLLMProvider(LLMProvider):
                             function_calling[tool_call.index]["arguments"] += tool_call.function.arguments
                     if len(chunk.choices) > 0 and chunk.choices[0].finish_reason:
                         finish_reason = chunk.choices[0].finish_reason
+                    # Groq reports streaming token usage under `x_groq.usage`
+                    # (the final chunk), not the top-level `usage` field. Prefer
+                    # whichever is present so cost tracking stays accurate.
                     if chunk.usage:
                         usage = chunk.usage
+                    elif getattr(chunk, "x_groq", None) and chunk.x_groq.usage:
+                        usage = chunk.x_groq.usage
 
                 parsed_function_calling = [
                     {
@@ -134,8 +139,7 @@ class GroqLLMProvider(LLMProvider):
 
                 res = {
                     "type": ChatCompletionTypeEnum.DONE,
-                    "input_tokens": usage.prompt_tokens if usage else None,
-                    "output_tokens": usage.completion_tokens if usage else None,
+                    **openai_usage_breakdown(usage),
                     "finish_reason": finish_reason,
                 }
                 if len(content_total) > 0:
@@ -254,8 +258,7 @@ class GroqLLMProvider(LLMProvider):
 
                 yield {
                     "type": ChatCompletionTypeEnum.DONE,
-                    "input_tokens": response.usage.prompt_tokens if response.usage else None,
-                    "output_tokens": response.usage.completion_tokens if response.usage else None,
+                    **openai_usage_breakdown(response.usage),
                     "finish_reason": response.choices[0].finish_reason if len(response.choices) > 0 else None,
                     "data": response.choices[0].message.content,
                 }

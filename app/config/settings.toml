@@ -37,16 +37,27 @@ persist_path = ""         # mode = "persistent" only; defaults to <system_dir>/s
 # ── Settings → Config defaults (per-profile, overridable in the UI) ──
 
 [agent]
-max_steps = 40
+max_steps = 200
 max_llm_retries = 2
 reasoning_temperature = 1.0
 reasoning_max_tokens = 32768
 reasoning_retry = 3
 steps_length = 20
+enable_prompt_cache = true
+replay_reasoning_steps = true     # replay each turn's tool-call/tool-result trace into later-turn history (keeps the reasoning context cache-warm)
 
-[history]
-max_tokens_total = 5000
-max_tokens_per_message = 500
+[compaction]
+enabled = true                    # summarization-based history compaction (model-driven compact_conversation tool)
+# The threshold is a FRACTION of the active model's context window (from the provider
+# catalog), so it auto-scales across models and leaves headroom for the response.
+# Compaction is suggest-only: once the model's reported context reaches the threshold,
+# the UI proposes compacting (the user clicks to run it); it is never forced.
+compact_threshold_percent = 85    # suggest compaction once context reaches this % of the window
+keep_recent_tokens = 12000        # after compaction, the verbatim tail kept alongside the summary
+keep_recent_messages = 4          # keep at least this many recent messages out of the summary
+temperature = 0.3
+max_tokens = 2048                 # hard cap on the running summary's size
+retry = 2
 
 [tool_result]
 enabled = true
@@ -55,23 +66,8 @@ preserve_recent = 1
 head_tokens = 200
 tail_tokens = 200
 
-[skill_classifier]
-temperature = 0.0
-max_tokens = 64
-retry = 2
-
-[summarizer]
-temperature = 0.3
-max_tokens = 1024
-retry = 2
-
 [memory]
-enabled = false              # opt-in; setup wizard offers to flip this to true
-trigger_token_threshold = 100000
-short_term_queue_size = 10
-long_term_queue_size = 20
-short_term_max_tokens = 300
-long_term_max_tokens = 50
-temperature = 0.3
-max_tokens = 1024
-retry = 2
+enabled = false                # opt-in; setup wizard offers to flip this to true. Requires [compaction] enabled — long-term memory is generated at the compaction fold.
+long_term_queue_size = 20      # max long-term facts kept in the DB queue (embedding-off mode; vector mode is unlimited)
+long_term_max_tokens = 50      # clip each long-term fact to this many tokens (both modes)
+long_term_retrieve_limit = 10  # top-K long-term facts retrieved from the vector store for the ## Memory block (embedding-on mode)

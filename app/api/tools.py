@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import urllib.parse
+from pathlib import Path
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -34,6 +35,7 @@ from app.tools.builtin.exec_shell import publish_process_list_changed
 from app.tools.builtin.exec_shell_autostart import (
     normalize_command_paths,
     spawn_from_autostart,
+    teardown_processes_for_dir,
 )
 from app.utils.logger import logger
 
@@ -101,6 +103,14 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         if not profile and config_storage is not None and config_storage.is_setup_complete():
             return JSONResponse({"error": "Profile is required"}, status_code=400)
         rows = registry.visible_for_profile(profile)
+        # Keep this view consistent with what the reasoning agent is actually
+        # given: the ``image_understanding`` tool is available iff the model that
+        # would run it can see images (the dedicated vision model when the
+        # Specialized Vision Model feature is on, otherwise the main model). Hidden
+        # only when the feature is off AND the main model is text-only.
+        mgr = getattr(state, "model_group_mgr", None)
+        if mgr is not None and not mgr.image_understanding_available(profile):
+            rows = [r for r in rows if r["tool_id"] != "image_understanding"]
         enriched: list[dict] = []
         for row in rows:
             tool = registry.get(row["tool_id"])
@@ -111,9 +121,6 @@ def get_tool_routes(state: BootedState) -> list[Route]:
                 "configured": _is_tool_configured(tool, snapshot),
                 "config": snapshot,
                 "required_fields": required_fields,
-                "llm_defaults": _llm_defaults_for_tool(tool),
-                "locked_llm_fields": _locked_llm_fields_for_tool(tool),
-                "full_reasoning": bool(snapshot.get("llm", {}).get("full_reasoning", False)),
                 # Optional pip-extras feature key (built-in tools only).
                 # Drives the Setup Wizard "Installs: cremind[…]" hint and
                 # the post-setup enable-toggle install dialog.
@@ -127,6 +134,12 @@ def get_tool_routes(state: BootedState) -> list[Route]:
                 row["is_stub"] = True
             else:
                 row["is_stub"] = bool(getattr(tool, "is_stub", False))
+            # Multi-leaf tools (built-in groups, MCP servers) expose a per-
+            # sub-tool toggle section; the UI lazy-loads leaves only for these.
+            try:
+                row["supports_leaf_toggle"] = len(tool.skills) > 1
+            except Exception:  # noqa: BLE001
+                row["supports_leaf_toggle"] = False
             if hasattr(tool, "is_llm_bound"):
                 row["llm_bound"] = bool(tool.is_llm_bound)
             if hasattr(tool, "url"):
@@ -171,8 +184,6 @@ def get_tool_routes(state: BootedState) -> list[Route]:
             "arguments_schema": tool.arguments_schema,
             "schema": schema,
             "config": snapshot,
-            "llm_defaults": _llm_defaults_for_tool(tool),
-            "locked_llm_fields": _locked_llm_fields_for_tool(tool),
             "configured": _is_tool_configured(tool, snapshot),
         }
         lra = _long_running_app_for_tool(tool)
@@ -226,230 +237,6 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         # to prepare the environment for the generic exec_shell tool.
         if tool and tool.tool_type is ToolType.SKILL:
             _write_skill_env_file(tool, config_manager, profile)
-
-        publish_settings_state_changed(profile)
-        return JSONResponse({"success": True})
-
-    async def handle_set_arguments(request: Request) -> JSONResponse:
-        """Update Tool Arguments (JSON-Schema parameter values)."""
-        unauth = _require_auth(request)
-        if unauth is not None:
-            return unauth
-        registry = state.registry
-        if registry is None:
-            return _storage_not_ready()
-        config_manager = registry.config
-        profile = _profile_from_request(request)
-        if not profile:
-            return JSONResponse({"error": "Profile is required"}, status_code=400)
-        tool_id = request.path_params["tool_id"]
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        arguments = body.get("arguments", {})
-        if not isinstance(arguments, dict):
-            return JSONResponse({"error": "'arguments' must be an object"}, status_code=400)
-        config_manager.set_arguments(tool_id, profile, arguments)
-        publish_settings_state_changed(profile)
-        return JSONResponse({"success": True})
-
-    async def handle_set_llm_params(request: Request) -> JSONResponse:
-        """Update LLM Parameters (provider, model, full_reasoning, reasoning_effort)."""
-        unauth = _require_auth(request)
-        if unauth is not None:
-            return unauth
-        registry = state.registry
-        if registry is None:
-            return _storage_not_ready()
-        config_manager = registry.config
-        config_storage = state.config_storage
-        profile = _profile_from_request(request)
-        if not profile:
-            return JSONResponse({"error": "Profile is required"}, status_code=400)
-        tool_id = request.path_params["tool_id"]
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        llm_params = body.get("llm", {})
-        if not isinstance(llm_params, dict):
-            return JSONResponse({"error": "'llm' must be an object"}, status_code=400)
-
-        tool = registry.get(tool_id)
-        locked = set(_locked_llm_fields_for_tool(tool))
-        if locked:
-            llm_defaults = _llm_defaults_for_tool(tool)
-            for key in locked:
-                if key in llm_params and llm_params[key] != llm_defaults.get(key):
-                    return JSONResponse(
-                        {
-                            "error": (
-                                f"LLM parameter '{key}' is locked for tool "
-                                f"'{tool_id}' and cannot be modified."
-                            )
-                        },
-                        status_code=400,
-                    )
-
-        for key, value in llm_params.items():
-            config_manager.set_llm_param(tool_id, profile, key, value)
-
-        # If provider/model/reasoning_effort changed, rebuild the adapter's LLM.
-        # Read the *post-write* DB values so partial updates (e.g. only
-        # reasoning_effort in the body) are merged with the existing settings.
-        if tool and hasattr(tool, "update_runtime_config") and any(
-            k in llm_params for k in ("llm_provider", "llm_model", "reasoning_effort")
-        ):
-            try:
-                merged = config_manager.get_llm_params(tool_id, profile)
-                provider_name = merged.get("llm_provider") or None
-                model_name = merged.get("llm_model") or None
-
-                # When no per-tool model override, fall back to the "low"
-                # model group (same source as startup in server.py).
-                if not model_name:
-                    group_value = BaseConfig.get_model_group("low", profile=profile)
-                    if group_value:
-                        parts = group_value.split("/", 1)
-                        if not provider_name:
-                            provider_name = parts[0]
-                        model_name = parts[1] if len(parts) > 1 else parts[0]
-
-                if not provider_name:
-                    provider_name = BaseConfig.get_default_provider(profile=profile)
-
-                if model_name:
-                    new_llm = create_llm_provider(
-                        provider_name=provider_name,
-                        model_name=model_name,
-                        config_storage=config_storage,
-                        profile=profile,
-                        default_reasoning_effort=merged.get("reasoning_effort"),
-                    )
-                    tool.update_runtime_config(llm=new_llm)
-                else:
-                    logger.warning(
-                        f"No model resolved for tool '{tool_id}'; skipping LLM rebuild"
-                    )
-            except ValueError as e:
-                return JSONResponse({"error": f"Invalid LLM: {e}"}, status_code=400)
-            except Exception as e:  # noqa: BLE001
-                logger.exception(
-                    f"Failed to apply LLM change to running tool '{tool_id}'"
-                )
-                return JSONResponse(
-                    {"error": f"Failed to apply LLM change: {e}"}, status_code=500,
-                )
-
-        # If full_reasoning changed, propagate to the running adapter
-        if tool and "full_reasoning" in llm_params and hasattr(tool, "update_runtime_config"):
-            tool.update_runtime_config(full_reasoning=bool(llm_params["full_reasoning"]))
-
-        publish_settings_state_changed(profile)
-        return JSONResponse({"success": True})
-
-    async def handle_reset_llm_params(request: Request) -> JSONResponse:
-        """Delete selected LLM-parameter overrides so code defaults apply again.
-
-        Body: ``{"keys": ["system_prompt", "llm_provider", ...]}``.
-
-        Keys in ``{system_prompt, description}`` are removed from the ``meta``
-        scope; all other keys are removed from the ``llm`` scope. When any
-        provider-shaping key is reset, the adapter's child LLM is rebuilt so
-        the change takes effect without a restart.
-        """
-        unauth = _require_auth(request)
-        if unauth is not None:
-            return unauth
-        registry = state.registry
-        if registry is None:
-            return _storage_not_ready()
-        config_manager = registry.config
-        config_storage = state.config_storage
-        profile = _profile_from_request(request)
-        if not profile:
-            return JSONResponse({"error": "Profile is required"}, status_code=400)
-        tool_id = request.path_params["tool_id"]
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        keys = body.get("keys", [])
-        if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
-            return JSONResponse(
-                {"error": "'keys' must be an array of strings"}, status_code=400,
-            )
-
-        tool = registry.get(tool_id)
-        if tool is None:
-            return JSONResponse({"error": f"Tool '{tool_id}' not found"}, status_code=404)
-
-        locked = set(_locked_llm_fields_for_tool(tool))
-        if locked:
-            blocked = [k for k in keys if k in locked]
-            if blocked:
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"Cannot reset locked LLM parameter(s) "
-                            f"{blocked} for tool '{tool_id}'."
-                        )
-                    },
-                    status_code=400,
-                )
-
-        storage = config_manager.storage
-        from app.storage.tool_storage import SCOPE_LLM, SCOPE_META
-        for key in keys:
-            scope = SCOPE_META if key in _META_KEYS else SCOPE_LLM
-            try:
-                storage.delete_config(
-                    profile=profile, tool_id=tool_id, scope=scope, key=key,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    f"Failed to delete {scope}.{key} for tool '{tool_id}'"
-                )
-
-        # If a provider-shaping key was reset, rebuild the child LLM using
-        # the remaining DB values (falling back to the profile's model group).
-        if any(k in ("llm_provider", "llm_model", "reasoning_effort") for k in keys) \
-                and hasattr(tool, "update_runtime_config"):
-            try:
-                merged = config_manager.get_llm_params(tool_id, profile)
-                provider_name = merged.get("llm_provider") or None
-                model_name = merged.get("llm_model") or None
-                if not model_name:
-                    group_value = BaseConfig.get_model_group("low", profile=profile)
-                    if group_value:
-                        parts = group_value.split("/", 1)
-                        if not provider_name:
-                            provider_name = parts[0]
-                        model_name = parts[1] if len(parts) > 1 else parts[0]
-                if not provider_name:
-                    provider_name = BaseConfig.get_default_provider(profile=profile)
-                if model_name:
-                    new_llm = create_llm_provider(
-                        provider_name=provider_name,
-                        model_name=model_name,
-                        config_storage=config_storage,
-                        profile=profile,
-                        default_reasoning_effort=merged.get("reasoning_effort"),
-                    )
-                    tool.update_runtime_config(llm=new_llm)
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    f"Failed to rebuild LLM for tool '{tool_id}' after reset"
-                )
-
-        # Push cleared system_prompt / description straight to the running
-        # adapter so in-flight changes take effect immediately.
-        if hasattr(tool, "update_runtime_config"):
-            if "system_prompt" in keys:
-                tool.update_runtime_config(system_prompt="")
-            if "description" in keys:
-                tool.update_runtime_config(description="")
 
         publish_settings_state_changed(profile)
         return JSONResponse({"success": True})
@@ -582,6 +369,16 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         # native separator so the same SKILL.md works on POSIX and Windows.
         command = normalize_command_paths(lra["command"], working_dir)
 
+        # Self-heal: tear down any listener already running for this skill dir
+        # (and drop its stale autostart rows) before spawning a fresh one. A
+        # single-instance listener takes an exclusive lock on
+        # ``scripts/.listener.lock``; if a prior one is still alive — including
+        # an orphan left behind on Windows after Stop/Unregister killed only the
+        # shell leader — the new process would exit immediately ("another
+        # listener is already running"). Killing the tree first makes Register
+        # idempotent: it always restarts cleanly.
+        await teardown_processes_for_dir(Path(working_dir), profile=profile)
+
         storage = get_autostart_storage()
         duplicate = storage.find_duplicate(profile, command, working_dir=working_dir)
         if duplicate and not force:
@@ -625,14 +422,98 @@ def get_tool_routes(state: BootedState) -> list[Route]:
             "working_dir": working_dir,
         })
 
+    async def handle_list_leaves(request: Request) -> JSONResponse:
+        """List a tool's sub-tools ("leaves") with their per-profile enabled state.
+
+        Returns ``{supports_leaf_toggle, disconnected, leaves: [{leaf_name,
+        name, description, enabled}]}``. Built-in groups list statically; MCP
+        servers list live and return an empty list (``disconnected=true``) when
+        the connection is down.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        registry = state.registry
+        if registry is None:
+            return _storage_not_ready()
+        profile = _profile_from_request(request)
+        if not profile:
+            return JSONResponse({"error": "Profile is required"}, status_code=400)
+        tool_id = request.path_params["tool_id"]
+        try:
+            return JSONResponse(registry.leaves_for_profile(profile, tool_id))
+        except KeyError:
+            return JSONResponse({"error": f"Tool '{tool_id}' not found"}, status_code=404)
+
+    async def handle_set_leaves(request: Request) -> JSONResponse:
+        """Enable/disable one or more sub-tools ("leaves") of a tool.
+
+        Body: ``{"leaves": {"<leaf_name>": <bool>, ...}}``. A single key is a
+        per-row toggle; many keys drive "Enable all" / "Disable all". Unknown
+        leaf names are rejected when the tool exposes a live sub-tool list;
+        when that list is empty (e.g. a disconnected MCP server) the write is
+        accepted so a persisted choice survives a reconnect.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        registry = state.registry
+        if registry is None:
+            return _storage_not_ready()
+        profile = _profile_from_request(request)
+        if not profile:
+            return JSONResponse({"error": "Profile is required"}, status_code=400)
+        tool_id = request.path_params["tool_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        leaves = body.get("leaves")
+        if not isinstance(leaves, dict) or not leaves:
+            return JSONResponse(
+                {"error": "'leaves' must be a non-empty object of {leaf_name: bool}"},
+                status_code=400,
+            )
+
+        tool = registry.get(tool_id)
+        if tool is None:
+            return JSONResponse({"error": f"Tool '{tool_id}' not found"}, status_code=404)
+        # Validate against the live sub-tool list when available.
+        try:
+            known = {s.id for s in tool.skills}
+        except Exception:  # noqa: BLE001
+            known = set()
+        if known:
+            unknown = [name for name in leaves if name not in known]
+            if unknown:
+                return JSONResponse(
+                    {"error": f"Unknown sub-tool(s): {', '.join(sorted(unknown))}"},
+                    status_code=400,
+                )
+
+        try:
+            for leaf, enabled in leaves.items():
+                registry.set_profile_tool_leaf_enabled(
+                    profile, tool_id, str(leaf), bool(enabled),
+                )
+        except KeyError:
+            return JSONResponse({"error": f"Tool '{tool_id}' not found"}, status_code=404)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+        # Deliberately NOT publishing a settings-state change: the reasoning
+        # agent re-reads disabled leaves from the DB every step (no in-memory
+        # cache to invalidate), and an SSE refresh would collapse the expanded
+        # Settings card the user is toggling sub-tools in.
+        return JSONResponse({"success": True})
+
     return [
         Route("/api/tools", handle_list_tools, methods=["GET"]),
         Route("/api/tools/{tool_id}", handle_get_tool, methods=["GET"]),
         Route("/api/tools/{tool_id}/variables", handle_set_variables, methods=["PUT"]),
-        Route("/api/tools/{tool_id}/arguments", handle_set_arguments, methods=["PUT"]),
-        Route("/api/tools/{tool_id}/llm", handle_set_llm_params, methods=["PUT"]),
-        Route("/api/tools/{tool_id}/llm", handle_reset_llm_params, methods=["DELETE"]),
         Route("/api/tools/{tool_id}/enabled", handle_set_enabled, methods=["PUT"]),
+        Route("/api/tools/{tool_id}/leaves", handle_list_leaves, methods=["GET"]),
+        Route("/api/tools/{tool_id}/leaves", handle_set_leaves, methods=["PUT"]),
         Route(
             "/api/tools/{tool_id}/long-running-app/register",
             handle_register_long_running_app,

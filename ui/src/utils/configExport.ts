@@ -28,6 +28,11 @@ export interface ConfigExportSnapshot {
     novnc_port?: number;
     vnc_port?: number;
     resolution?: string;
+    // Deployment environment for the VNC desktop. Docker exposes separate
+    // noVNC/VNC ports (6080/5900); Kubernetes fronts everything through one
+    // nginx proxy port and serves noVNC at <origin>/vnc/vnc.html instead.
+    // Absent is treated as 'docker' (the historical behaviour).
+    environment?: 'docker' | 'kubernetes';
   };
   workingDir: string;
   systemDir: string;
@@ -114,20 +119,28 @@ export function buildMarkdownExport(s: ConfigExportSnapshot): string {
   if (s.vnc) {
     const v = s.vnc;
     const host = v.host || 'localhost';
+    const isK8s = v.environment === 'kubernetes';
     const novncPort = v.novnc_port ?? 6080;
     const vncPort = v.vnc_port ?? 5900;
-    const novncUrl = v.novnc_url || `http://${host}:${novncPort}/vnc.html`;
+    const novncUrl = v.novnc_url || (isK8s
+      ? `http://${host}:1515/vnc/vnc.html`
+      : `http://${host}:${novncPort}/vnc.html`);
     const vncEndpoint = v.vnc_endpoint || `${host}:${vncPort}`;
-    lines.push('## VNC Desktop (Docker)');
+    lines.push(`## VNC Desktop (${isK8s ? 'Kubernetes' : 'Docker'})`);
     lines.push('');
     lines.push('> **Sensitive.**');
     lines.push('');
     lines.push(`- **Password:** \`${v.password}\``);
     lines.push(`- **Host:** \`${host}\``);
     lines.push(`- **Web client (noVNC):** ${novncUrl}`);
-    lines.push(`- **VNC client:** \`${vncEndpoint}\``);
-    lines.push(`- **noVNC port:** \`${novncPort}\``);
-    lines.push(`- **VNC port:** \`${vncPort}\``);
+    // Kubernetes fronts noVNC/VNC through a single nginx proxy port — the
+    // raw 6080/5900 ports and a direct VNC endpoint aren't exposed, so omit
+    // those lines there.
+    if (!isK8s) {
+      lines.push(`- **VNC client:** \`${vncEndpoint}\``);
+      lines.push(`- **noVNC port:** \`${novncPort}\``);
+      lines.push(`- **VNC port:** \`${vncPort}\``);
+    }
     if (v.resolution) lines.push(`- **Resolution:** \`${v.resolution}\``);
     lines.push('');
   }

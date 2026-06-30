@@ -9,6 +9,7 @@ import { Icon } from '@iconify/vue';
 import { copyTextToClipboard } from '../utils/clipboard';
 import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
+import MessageUsageChip from './MessageUsageChip.vue';
 
 const props = defineProps<{
   message: ChatMessage;
@@ -63,6 +64,7 @@ marked.use({
 });
 
 const isUser = computed(() => props.message.role === 'user');
+const isRejectedTrigger = computed(() => props.message.isRejectedTrigger === true);
 const hasThinking = computed(() => props.message.thinkingSteps && props.message.thinkingSteps.length > 0);
 
 const copied = ref(false);
@@ -77,9 +79,20 @@ const parsedContent = computed(() => {
   return marked.parse(props.message.content) as string;
 });
 
-const parsedSummary = computed(() => {
-  if (!props.message.summary) return '';
-  return marked.parse(props.message.summary) as string;
+// Group per-tool thinking steps by ``step`` so parallel tool calls in one model
+// turn render together under a single "Step N".
+const thinkingGroups = computed(() => {
+  const steps = props.message.thinkingSteps || [];
+  const groups: { step: number | null; tools: any[] }[] = [];
+  for (const s of steps) {
+    const last = groups[groups.length - 1];
+    if (last && s.step != null && last.step === s.step) {
+      last.tools.push(s);
+    } else {
+      groups.push({ step: s.step ?? null, tools: [s] });
+    }
+  }
+  return groups;
 });
 
 // Format latency information for display
@@ -120,26 +133,19 @@ const formatLatencyMs = (ms: number): string => {
   return `${(ms / 1000).toFixed(1)}s`;
 };
 
-// Calculate per-step latency for timeline display (relative to previous step)
-const getStepLatency = (step: any, index: number): string => {
-  if (!step.receivedAt || !props.message.latency?.requestSentAt) {
-    return '';
-  }
-  
+// Latency for a grouped step (relative to the previous group / request start).
+const groupLatency = (group: any, gIdx: number): string => {
+  const tool = group.tools?.[0];
+  if (!tool?.receivedAt || !props.message.latency?.requestSentAt) return '';
   let ms: number;
-  if (index === 0) {
-    // First step: calculate from when the user message was sent
-    ms = step.receivedAt - props.message.latency.requestSentAt;
+  if (gIdx === 0) {
+    ms = tool.receivedAt - props.message.latency.requestSentAt;
   } else {
-    // Subsequent steps: calculate from the previous step's receivedAt time
-    const prevStep = props.message.thinkingSteps?.[index - 1];
-    if (!prevStep?.receivedAt) {
-      return '';
-    }
-    ms = step.receivedAt - prevStep.receivedAt;
+    const prev = thinkingGroups.value[gIdx - 1]?.tools?.[0];
+    if (!prev?.receivedAt) return '';
+    ms = tool.receivedAt - prev.receivedAt;
   }
-  
-  return ` · ${formatLatencyMs(ms)}`;
+  return ms > 0 ? ` · ${formatLatencyMs(ms)}` : '';
 };
 
 // Extract text-only observation parts for display in code block
@@ -298,9 +304,6 @@ watch(
 // Collapse state for thinking process timeline
 const activeCollapse = ref<string[]>([]);
 
-// Collapse state for the reasoning summary (collapsed by default)
-const activeSummaryCollapse = ref<string[]>([]);
-
 // Track when the collapse was last expanded to prevent expand-then-immediately-collapse
 const lastExpandTime = ref<number>(0);
 
@@ -397,7 +400,7 @@ const handleThinkingClick = (event: MouseEvent) => {
       <img src="/agent-avatar.png" alt="Agent" class="agent-avatar-img" />
     </div>
 
-    <div class="message-bubble" :class="{ 'user-message': isUser, 'agent-message': !isUser }">
+    <div class="message-bubble" :class="{ 'user-message': isUser, 'agent-message': !isUser, 'rejected-trigger': isRejectedTrigger }">
       <div class="message-header">
         <span class="message-role">{{ isUser ? 'You' : 'Agent' }}</span>
         <span class="message-time">{{ message.timestamp.toLocaleTimeString() }}</span>
@@ -407,17 +410,24 @@ const handleThinkingClick = (event: MouseEvent) => {
       </div>
 
     <div class="message-content">
+      <!-- Rejected skill-event trigger: a filtered event that did NOT match the
+           user's automation rule. Shown for visibility; the agent never ran. -->
+      <div v-if="isRejectedTrigger" class="rejected-trigger-banner">
+        <Icon icon="mdi:filter-remove-outline" class="rejected-trigger-icon" />
+        <div class="rejected-trigger-text">
+          <span class="rejected-trigger-title">Trigger skipped — didn't match your rule</span>
+          <span v-if="message.rejectedReason" class="rejected-trigger-reason">{{ message.rejectedReason }}</span>
+        </div>
+      </div>
+
       <!-- Main text content -->
       <div v-if="message.content" class="text-content marked-content" v-html="parsedContent" v-link-blank></div>
 
       <!-- Streaming cursor -->
       <span v-if="message.isStreaming" class="streaming-cursor">▊</span>
 
-      <!-- Token usage footer -->
-      <div v-if="message.tokenUsage" class="token-usage">
-        {{ message.tokenUsage.totalTokens }} tokens
-        ({{ message.tokenUsage.inputTokens }} in + {{ message.tokenUsage.outputTokens }} out)
-      </div>
+      <!-- Token usage + estimated cost (expandable per sub-agent/tool) -->
+      <MessageUsageChip v-if="message.tokenUsage" :message="message" />
 
       <!-- Latency information -->
       <div v-if="latencyDisplay && !isUser" class="latency-info">
@@ -436,51 +446,42 @@ const handleThinkingClick = (event: MouseEvent) => {
             <template #title>
               <span class="collapse-title">
                 <Icon icon="mdi:brain" class="collapse-icon" />
-                Thinking Process ({{ message.thinkingSteps?.length || 0 }} steps)
-                <span v-if="message.reasoningModelLabel" class="model-badge reasoning-model">
-                  {{ message.reasoningModelLabel }}
-                </span>
+                Thinking Process ({{ thinkingGroups.length }} steps)
               </span>
             </template>
             <el-timeline>
               <el-timeline-item
-                v-for="(step, index) in message.thinkingSteps"
-                :key="index"
-                :type="step.observation?.length ? 'success' : 'primary'"
-                :hollow="!step.observation?.length"
-                :timestamp="`Step ${index + 1}${getStepLatency(step, index)}`"
+                v-for="(group, gIdx) in thinkingGroups"
+                :key="gIdx"
+                :type="group.tools.some(t => t.result?.length) ? 'success' : 'primary'"
+                :hollow="!group.tools.some(t => t.result?.length)"
+                :timestamp="`Step ${gIdx + 1}${groupLatency(group, gIdx)}`"
                 placement="top"
               >
                 <el-card shadow="never" class="timeline-card">
-                  <div class="step-content">
-                    <span v-if="step.modelLabel" class="model-badge step-model">
-                      {{ step.modelLabel }}
+                  <div v-for="(tool, tIdx) in group.tools" :key="tIdx" class="step-content">
+                    <span v-if="tool.modelLabel" class="model-badge step-model">
+                      {{ tool.modelLabel }}
                     </span>
                     <div class="step-detail">
                       <span class="step-label">
-                        <Icon icon="mdi:brain" class="step-icon" /> Thought
+                        <Icon icon="mdi:flash" class="step-icon" /> Tool
                       </span>
-                      <p>{{ step.thought }}</p>
+                      <p>{{ tool.tool }}</p>
                     </div>
-                    <div class="step-detail">
-                      <span class="step-label">
-                        <Icon icon="mdi:flash" class="step-icon" /> Action
-                      </span>
-                      <p>{{ step.action }}</p>
-                    </div>
-                    <div v-if="step.actionInput" class="step-detail">
+                    <div v-if="tool.toolInput" class="step-detail">
                       <span class="step-label">
                         <Icon icon="mdi:code-tags" class="step-icon" /> Input
                       </span>
-                      <p class="action-input">{{ step.actionInput }}</p>
+                      <p class="action-input">{{ tool.toolInput }}</p>
                     </div>
-                    <div v-if="step.observation && step.observation.length" class="step-detail observation">
+                    <div v-if="tool.result && tool.result.length" class="step-detail observation">
                       <span class="step-label">
-                        <Icon icon="mdi:check-circle" class="step-icon success-icon" /> Observation
+                        <Icon icon="mdi:check-circle" class="step-icon success-icon" /> Result
                       </span>
-                      <pre v-if="formatObservationText(step.observation)" class="observation-code"><code>{{ formatObservationText(step.observation) }}</code></pre>
-                      <!-- Compact file cards inside observation -->
-                      <div v-for="(filePart, fIdx) in getObservationFiles(step.observation)" :key="fIdx" class="file-card">
+                      <pre v-if="formatObservationText(tool.result)" class="observation-code"><code>{{ formatObservationText(tool.result) }}</code></pre>
+                      <!-- Compact file cards inside the result -->
+                      <div v-for="(filePart, fIdx) in getObservationFiles(tool.result)" :key="fIdx" class="file-card">
                         <Icon :icon="getFileIcon(filePart.file.mime_type)" class="file-card-icon" :class="{ 'pdf-icon': isPdfMime(filePart.file.mime_type), 'text-icon': filePart.file.mime_type?.startsWith('text/') }" />
                         <div class="file-card-info">
                           <span class="file-name">{{ filePart.file.name || 'file' }}</span>
@@ -498,21 +499,6 @@ const handleThinkingClick = (event: MouseEvent) => {
           </el-collapse-item>
         </el-collapse>
         </div>
-
-      <!-- Reasoning summary (TL;DR of the ReAct trace; collapsible, below Thinking Process) -->
-      <div v-if="message.summary" class="reasoning-summary">
-        <el-collapse v-model="activeSummaryCollapse">
-          <el-collapse-item name="summary">
-            <template #title>
-              <span class="collapse-title">
-                <Icon icon="mdi:text-box-outline" class="collapse-icon" />
-                Summary
-              </span>
-            </template>
-            <div class="reasoning-summary-body marked-content" v-html="parsedSummary" v-link-blank></div>
-          </el-collapse-item>
-        </el-collapse>
-      </div>
 
       <!-- File attachments carousel (bottom of bubble) -->
       <div v-if="hasCarouselContent" class="file-carousel-section">
@@ -674,6 +660,38 @@ const handleThinkingClick = (event: MouseEvent) => {
 
 [data-theme="dark"] .agent-message:hover {
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+}
+
+/* Rejected skill-event trigger: muted, de-emphasized, with a warning accent. */
+.agent-message.rejected-trigger {
+  border-left-color: var(--warning-color, #f59e0b);
+  opacity: 0.78;
+}
+.rejected-trigger-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  border-radius: 8px;
+  background: var(--warning-bg, rgba(245, 158, 11, 0.1));
+  border: 1px solid var(--warning-color, #f59e0b);
+}
+.rejected-trigger-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+  font-size: 1.05rem;
+  color: var(--warning-color, #f59e0b);
+}
+.rejected-trigger-text { display: flex; flex-direction: column; gap: 2px; }
+.rejected-trigger-title {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--warning-color, #f59e0b);
+}
+.rejected-trigger-reason {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
 }
 
 /* Message Header */

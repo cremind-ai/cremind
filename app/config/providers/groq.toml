@@ -14,53 +14,73 @@ is_default = true
 [provider.auth_methods.fields]
 api_key = { description = "Groq API Key", type = "string", secret = true, required = true }
 
+# Cache pricing: Groq prompt caching (currently GPT-OSS models only) discounts
+# cached input by 50% (0.50x input) with no separate cache-write fee. Models with
+# prompt_cache = false do not cache, so they carry no cache pricing.
+
 [[models]]
 id = "llama-3.3-70b-versatile"
+context_window = 131072
 display_name = "Llama 3.3 70B Versatile"
+prompt_cache = false
 group_hint = "high"
 input_price_per_1m = 0.59
 output_price_per_1m = 0.79
 
 [[models]]
 id = "llama-3.1-8b-instant"
+context_window = 131072
 display_name = "Llama 3.1 8B Instant"
+prompt_cache = false
 group_hint = "low"
 input_price_per_1m = 0.05
 output_price_per_1m = 0.08
 
 [[models]]
 id = "openai/gpt-oss-120b"
+context_window = 131072
 display_name = "GPT OSS 120B (via Groq)"
+prompt_cache = true
+supports_reasoning = true
 group_hint = "high"
 input_price_per_1m = 0.15
 output_price_per_1m = 0.60
 reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.075   # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "openai/gpt-oss-20b"
+context_window = 131072
 display_name = "GPT OSS 20B (via Groq)"
+prompt_cache = true
+supports_reasoning = true
 group_hint = "low"
 input_price_per_1m = 0.075
 output_price_per_1m = 0.30
 reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.0375  # 0.50x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "meta-llama/llama-4-scout-17b-16e-instruct"
+context_window = 131072
 display_name = "Llama 4 Scout 17B 16E"
+prompt_cache = false
 group_hint = "high"
+vision = true
 input_price_per_1m = 0.11
 output_price_per_1m = 0.34
 
 [[models]]
 id = "qwen/qwen3-32b"
+context_window = 131072
 display_name = "Qwen3 32B"
+prompt_cache = false
+supports_reasoning = true
 group_hint = "high"
 input_price_per_1m = 0.29
 output_price_per_1m = 0.59
 
-[[models]]
-id = "moonshotai/kimi-k2-instruct"
-display_name = "Kimi K2"
-group_hint = "high"
-input_price_per_1m = 0.50
-output_price_per_1m = 1.50
+# Removed moonshotai/kimi-k2-instruct: deprecated by Groq on 2025-10-10
+# (replacement: openai/gpt-oss-120b). See console.groq.com/docs/deprecations.

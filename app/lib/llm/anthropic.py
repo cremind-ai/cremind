@@ -139,6 +139,84 @@ def _convert_tools(tools: Optional[List[ChatCompletionToolUnionParam]]) -> list[
     return anthropic_tools
 
 
+_CACHE_CONTROL = {"type": "ephemeral"}
+
+
+def _system_param(system_text: str, cache_enabled: bool):
+    """Return the Anthropic ``system`` param, adding a cache breakpoint when enabled.
+
+    A plain string when caching is off; a single text block carrying
+    ``cache_control`` when on, so Anthropic caches the system prefix.
+    """
+    if not cache_enabled:
+        return system_text
+    return [{"type": "text", "text": system_text, "cache_control": _CACHE_CONTROL}]
+
+
+def _cache_last_tool(anthropic_tools: list[dict], cache_enabled: bool) -> list[dict]:
+    """Mark the last tool with ``cache_control`` so the whole tools block is cached.
+
+    Tools precede ``system`` in Anthropic's cache prefix, so a breakpoint on the
+    final tool caches every tool definition. Returns the list unchanged when
+    caching is off or there are no tools.
+    """
+    if not cache_enabled or not anthropic_tools:
+        return anthropic_tools
+    return anthropic_tools[:-1] + [{**anthropic_tools[-1], "cache_control": _CACHE_CONTROL}]
+
+
+def _cache_history(anthropic_messages: list[dict], cache_enabled: bool) -> list[dict]:
+    """Mark the last *history* message so ``[tools + system + history]`` is cached.
+
+    The reasoning loop appends the volatile turn last, so ``messages[-1]`` is the
+    per-step input and ``messages[-2]`` is the last (byte-stable) history message.
+    A breakpoint on its last content block caches the whole history prefix. No-op
+    when caching is off or there is no history (< 2 messages). Only the reasoning
+    loop sets ``prompt_cache``, so the "last message is volatile" assumption holds.
+    """
+    if not cache_enabled or len(anthropic_messages) < 2:
+        return anthropic_messages
+    idx = len(anthropic_messages) - 2
+    msg = anthropic_messages[idx]
+    content = msg.get("content")
+    if isinstance(content, list) and content:
+        new_content = content[:-1] + [{**content[-1], "cache_control": _CACHE_CONTROL}]
+    elif isinstance(content, str) and content:
+        new_content = [{"type": "text", "text": content, "cache_control": _CACHE_CONTROL}]
+    else:
+        return anthropic_messages
+    return (
+        anthropic_messages[:idx]
+        + [{**msg, "content": new_content}]
+        + anthropic_messages[idx + 1:]
+    )
+
+
+def _anthropic_tool_choice(
+    tool_choice: Optional[Union[str, Dict[str, Any]]],
+    parallel_tool_calls: Optional[bool],
+) -> Optional[dict]:
+    """Map an OpenAI-style ``tool_choice`` to Anthropic's, honoring parallel control.
+
+    Returns the ``tool_choice`` dict to send, or ``None`` to omit the field (e.g.
+    for ``"none"`` or an unrecognized value). Anthropic runs tools in parallel by
+    default, so ``disable_parallel_tool_use`` is added only when
+    ``parallel_tool_calls`` is explicitly ``False`` (``True``/``None`` leave the
+    parallel-on default untouched).
+    """
+    if tool_choice == "auto" or tool_choice is None:
+        choice: Optional[dict] = {"type": "auto"}
+    elif tool_choice == "required":
+        choice = {"type": "any"}
+    elif isinstance(tool_choice, dict) and "function" in tool_choice:
+        choice = {"type": "tool", "name": tool_choice["function"].get("name", "")}
+    else:
+        choice = None  # "none" or unrecognized → don't send tool_choice
+    if choice is not None and parallel_tool_calls is False:
+        choice["disable_parallel_tool_use"] = True
+    return choice
+
+
 class AnthropicLLMProvider(LLMProvider):
     def __init__(
         self,
@@ -186,12 +264,15 @@ class AnthropicLLMProvider(LLMProvider):
     ) -> AsyncGenerator[ChatCompletionStreamResponseType, None]:
         last_error: Any = None
         logger.debug(f"[llm:anthropic] chat_completion_stream model={self.model_name}")
+        cache_enabled = bool((args or {}).get("prompt_cache"))
 
         for attempt in range((retry or 0) + 1):
             content_total = ""
             tool_use_blocks: List[dict] = []
             current_tool: Optional[dict] = None
             input_tokens = 0
+            cache_read_input_tokens = 0
+            cache_creation_input_tokens = 0
             output_tokens = 0
             finish_reason = None
 
@@ -201,12 +282,12 @@ class AnthropicLLMProvider(LLMProvider):
 
                 params: Dict[str, Any] = {
                     "model": self.model_name,
-                    "messages": anthropic_messages,
+                    "messages": _cache_history(anthropic_messages, cache_enabled),
                     "max_tokens": self._resolve_max_tokens(max_tokens),
                     "stream": True,
                 }
                 if system_text:
-                    params["system"] = system_text
+                    params["system"] = _system_param(system_text, cache_enabled)
                 if temperature is not None:
                     params["temperature"] = temperature
                 if top_p is not None:
@@ -214,25 +295,27 @@ class AnthropicLLMProvider(LLMProvider):
                 if stop:
                     params["stop_sequences"] = [stop]
                 if anthropic_tools:
-                    params["tools"] = anthropic_tools
-                    # Map OpenAI tool_choice to Anthropic
-                    if tool_choice == "auto" or tool_choice is None:
-                        params["tool_choice"] = {"type": "auto"}
-                    elif tool_choice == "required":
-                        params["tool_choice"] = {"type": "any"}
-                    elif tool_choice == "none":
-                        pass  # Don't send tool_choice
-                    elif isinstance(tool_choice, dict) and "function" in tool_choice:
-                        params["tool_choice"] = {
-                            "type": "tool",
-                            "name": tool_choice["function"].get("name", ""),
-                        }
+                    params["tools"] = _cache_last_tool(anthropic_tools, cache_enabled)
+                    tc = _anthropic_tool_choice(tool_choice, parallel_tool_calls)
+                    if tc is not None:
+                        params["tool_choice"] = tc
 
                 async with self.client.messages.stream(**params) as stream:
                     async for event in stream:
                         if event.type == "message_start":
                             if hasattr(event, "message") and event.message.usage:
-                                input_tokens = event.message.usage.input_tokens
+                                usage = event.message.usage
+                                # Anthropic reports cached tokens separately from
+                                # ``input_tokens`` (which is the uncached remainder).
+                                # Keep them distinct so cost is attributable.
+                                cache_read_input_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+                                cache_creation_input_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                                input_tokens = usage.input_tokens
+                                if cache_enabled:
+                                    logger.debug(
+                                        f"[llm:anthropic] prompt cache: read={cache_read_input_tokens} "
+                                        f"creation={cache_creation_input_tokens} uncached={input_tokens}"
+                                    )
 
                         elif event.type == "content_block_start":
                             block = event.content_block
@@ -301,6 +384,8 @@ class AnthropicLLMProvider(LLMProvider):
                 res: dict = {
                     "type": ChatCompletionTypeEnum.DONE,
                     "input_tokens": input_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens,
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
                     "output_tokens": output_tokens,
                     "finish_reason": finish_reason,
                 }
@@ -332,6 +417,7 @@ class AnthropicLLMProvider(LLMProvider):
     ) -> AsyncGenerator[ChatCompletionStreamResponseType, None]:
         last_error: Any = None
         logger.debug(f"[llm:anthropic] chat_completion model={self.model_name}")
+        cache_enabled = bool((args or {}).get("prompt_cache"))
 
         for attempt in range((retry or 0) + 1):
             try:
@@ -340,11 +426,11 @@ class AnthropicLLMProvider(LLMProvider):
 
                 params: Dict[str, Any] = {
                     "model": self.model_name,
-                    "messages": anthropic_messages,
+                    "messages": _cache_history(anthropic_messages, cache_enabled),
                     "max_tokens": self._resolve_max_tokens(max_tokens),
                 }
                 if system_text:
-                    params["system"] = system_text
+                    params["system"] = _system_param(system_text, cache_enabled)
                 if temperature is not None:
                     params["temperature"] = temperature
                 if top_p is not None:
@@ -352,18 +438,10 @@ class AnthropicLLMProvider(LLMProvider):
                 if stop:
                     params["stop_sequences"] = [stop]
                 if anthropic_tools:
-                    params["tools"] = anthropic_tools
-                    if tool_choice == "auto" or tool_choice is None:
-                        params["tool_choice"] = {"type": "auto"}
-                    elif tool_choice == "required":
-                        params["tool_choice"] = {"type": "any"}
-                    elif tool_choice == "none":
-                        pass
-                    elif isinstance(tool_choice, dict) and "function" in tool_choice:
-                        params["tool_choice"] = {
-                            "type": "tool",
-                            "name": tool_choice["function"].get("name", ""),
-                        }
+                    params["tools"] = _cache_last_tool(anthropic_tools, cache_enabled)
+                    tc = _anthropic_tool_choice(tool_choice, parallel_tool_calls)
+                    if tc is not None:
+                        params["tool_choice"] = tc
 
                 response = await self.client.messages.create(**params)
 
@@ -435,10 +513,29 @@ class AnthropicLLMProvider(LLMProvider):
                 elif response.stop_reason == "max_tokens":
                     finish_reason = "length"
 
+                input_tokens = None
+                cache_read_input_tokens = None
+                cache_creation_input_tokens = None
+                output_tokens = None
+                if response.usage:
+                    # Anthropic reports cached tokens separately from
+                    # ``input_tokens`` (the uncached remainder). Keep them
+                    # distinct so cost is attributable, and log cache activity.
+                    cache_read_input_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+                    cache_creation_input_tokens = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+                    input_tokens = response.usage.input_tokens
+                    output_tokens = response.usage.output_tokens
+                    if cache_enabled:
+                        logger.debug(
+                            f"[llm:anthropic] prompt cache: read={cache_read_input_tokens} "
+                            f"creation={cache_creation_input_tokens} uncached={input_tokens}"
+                        )
                 yield {
                     "type": ChatCompletionTypeEnum.DONE,
-                    "input_tokens": response.usage.input_tokens if response.usage else None,
-                    "output_tokens": response.usage.output_tokens if response.usage else None,
+                    "input_tokens": input_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens,
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
+                    "output_tokens": output_tokens,
                     "finish_reason": finish_reason,
                     "data": text_content or None,
                 }

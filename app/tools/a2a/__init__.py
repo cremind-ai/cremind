@@ -1,17 +1,6 @@
-"""A2A remote agent tools."""
+"""A2A remote-agent (outbound) support — REMOVED.
 
-from app.tools.a2a.connection import RemoteAgentConnections
-from app.tools.a2a.tool import (
-    A2ATool,
-    build_a2a_stub,
-    build_a2a_tool,
-    fetch_agent_card,
-)
-
-__all__ = [
-    "A2ATool",
-    "RemoteAgentConnections",
-    "build_a2a_tool",
-    "build_a2a_stub",
-    "fetch_agent_card",
-]
+The outbound A2A tool type was removed when the agent moved to a single-model
+native function-calling loop. This package is intentionally empty; delete the
+``app/tools/a2a`` directory from version control (``git rm -r app/tools/a2a``).
+"""

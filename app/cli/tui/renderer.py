@@ -190,12 +190,18 @@ def extract_token_usage(event: Event) -> str:
     usage = data.get("token_usage") if isinstance(data.get("token_usage"), dict) else {}
     try:
         in_tok = int(usage.get("input_tokens") or 0)
+        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+        cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
         out_tok = int(usage.get("output_tokens") or 0)
     except (TypeError, ValueError):
         return ""
-    total = in_tok + out_tok
+    # ``input_tokens`` is uncached only; add cached reads/writes back for the total.
+    cached = cache_read + cache_creation
+    total = in_tok + cached + out_tok
     if total == 0:
         return ""
+    if cached:
+        return f"tokens: {total}  (in {in_tok}, cached {cached} / out {out_tok})"
     return f"tokens: {total}  (in {in_tok} / out {out_tok})"
 
 

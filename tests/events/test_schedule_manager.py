@@ -38,12 +38,12 @@ def _seed(store: ScheduleEventSubscriptionStorage, *, profile="admin", conv="c1"
     now = time.time()
     with store._engine.begin() as conn:
         conn.execute(text(
-            "INSERT INTO profiles (id, name, created_at, updated_at, skill_mode) "
-            "VALUES ('p', :profile, :now, :now, 'manual')"
+            "INSERT INTO profiles (id, name, created_at, updated_at) "
+            "VALUES ('p', :profile, :now, :now)"
         ), {"profile": profile, "now": now})
         conn.execute(text(
-            "INSERT INTO conversations (id, profile, title, created_at, updated_at, memory_watermark) "
-            "VALUES (:conv, :profile, 't', :now, :now, 0)"
+            "INSERT INTO conversations (id, profile, title, created_at, updated_at) "
+            "VALUES (:conv, :profile, 't', :now, :now)"
         ), {"conv": conv, "profile": profile, "now": now})
 
 

@@ -16,35 +16,48 @@ api_key = { description = "NVIDIA API Key", type = "string", secret = true, requ
 
 [[models]]
 id = "meta/llama-3.3-70b-instruct"
+context_window = 131072
 display_name = "Llama 3.3 70B"
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
 [[models]]
 id = "nvidia/llama-3.1-nemotron-ultra-253b-v1"
+context_window = 131072
 display_name = "Nemotron Ultra 253B"
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
 [[models]]
 id = "deepseek-ai/deepseek-r1"
+context_window = 131072
 display_name = "DeepSeek R1"
+supports_reasoning = true
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
 [[models]]
 id = "meta/llama-4-scout-17b-16e-instruct"
+context_window = 1048576
 display_name = "Llama 4 Scout"
 group_hint = "high"
+prompt_cache = false
+vision = true
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
 [[models]]
 id = "qwen/qwen3-235b-a22b"
+context_window = 262144
 display_name = "Qwen 3 235B"
+supports_reasoning = true
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00

@@ -16,35 +16,48 @@ api_key = { description = "Chutes API Key", type = "string", secret = true, requ
 
 [[models]]
 id = "deepseek-ai/DeepSeek-V3-0324"
+context_window = 131072
 display_name = "DeepSeek V3"
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 0.50
 output_price_per_1m = 1.50
 
 [[models]]
 id = "deepseek-ai/DeepSeek-R1-0528"
+context_window = 131072
 display_name = "DeepSeek R1"
+supports_reasoning = true
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 1.00
 output_price_per_1m = 4.00
 
 [[models]]
 id = "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+context_window = 1048576
 display_name = "Llama 4 Maverick"
 group_hint = "high"
+prompt_cache = false
+vision = true
 input_price_per_1m = 0.22
 output_price_per_1m = 0.88
 
 [[models]]
 id = "Qwen/Qwen3-235B-A22B"
+context_window = 262144
 display_name = "Qwen 3 235B"
+supports_reasoning = true
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 0.50
 output_price_per_1m = 1.50
 
 [[models]]
 id = "moonshotai/Kimi-K2.5"
+context_window = 262144
 display_name = "Kimi K2.5"
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 0.60
 output_price_per_1m = 3.00

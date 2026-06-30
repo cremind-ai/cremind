@@ -50,47 +50,6 @@ from app.tools.mcp.mcp_auth import MCPOAuthClient
 from app.utils.context_storage import get_context
 from app.utils.logger import logger
 
-BUILTIN_AGENT_SYSTEM_PROMPT = (
-    "You fulfill a request by calling the available tools. The request often "
-    "begins with the exact name of the tool to call (e.g. 'overwrite_file ...'); "
-    "when it does, call THAT tool and pass the given arguments faithfully. Never "
-    "substitute a different tool - do not read, search or list when asked to "
-    "write, edit or delete. Don't answer questions or add explanations; always "
-    "call the appropriate tool(s) to get the data needed to answer."
-)
-
-# Word-boundary chars that may follow a leading tool name in an Action_Input
-# (e.g. 'overwrite_file path=...', 'read_file:', 'grep_files(').
-_NAME_BOUNDARY = " \t\r\n:=(,\"'"
-
-
-def _leading_tool_name(query: str, tool_names: List[str]) -> Optional[str]:
-    """Return the subtool the query explicitly starts with, else None.
-
-    The reasoning agent prefixes its Action_Input with the intended subtool
-    name; honoring that verbatim removes the routing LLM's chance to mis-pick
-    (e.g. running ``read_file`` when ``overwrite_file`` was requested). Matches
-    the longest name at a word boundary so prose like 'search files ...' (a
-    space, not the 'search_files' token) never matches.
-    """
-    head = query.lstrip()
-    for name in sorted(tool_names, key=len, reverse=True):
-        if head.startswith(name):
-            rest = head[len(name):]
-            if rest == "" or rest[0] in _NAME_BOUNDARY:
-                return name
-    return None
-
-
-def _looks_like_diff(query: str) -> bool:
-    """True if the query is a bare unified-diff hunk (starts with an '@@' header).
-
-    The reasoning agent occasionally dumps a diff with no leading sub-tool name;
-    this lets the dispatcher route it to overwrite_file instead of mis-guessing.
-    """
-    return query.lstrip().startswith("@@")
-
-
 class BuiltInToolAdapter:
     """Wraps built-in tools to behave like an A2A agent.
 
@@ -201,18 +160,61 @@ class BuiltInToolAdapter:
         if full_reasoning is not None:
             self._full_reasoning = full_reasoning
 
+    def build_specs(
+        self,
+        query: str = "",
+        arguments: Optional[Dict[str, Any]] = None,
+        context_id: Optional[str] = None,
+        profile: str = "default",
+    ) -> List[Dict[str, Any]]:
+        """Return OpenAI-format function specs for this group's sub-tools.
+
+        Runs the optional ``prepare_tools`` callback so per-request
+        customization (dynamic enums sourced from caller-injected ``arguments``
+        or conversation-scoped ``ContextStorage`` state, e.g.
+        ``change_working_directory``'s loaded-skill enum, ``system_file``'s
+        event-run suppression) is reflected in the schemas the model sees.
+        """
+        available_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "parameters": copy.deepcopy(tool.parameters)
+                    if tool.parameters else {"type": "object", "properties": {}},
+                },
+            }
+            for tool in self._tools
+        ]
+        if self._prepare_tools:
+            try:
+                available_tools = self._prepare_tools(
+                    query,
+                    available_tools,
+                    arguments=arguments,
+                    context_id=context_id,
+                    profile=profile,
+                )
+            except Exception as e:
+                logger.warning(f"prepare_tools callback failed for '{self.name}': {e}")
+        return available_tools
+
     async def request(
         self,
         query: str,
         context_id: Optional[str] = None,
         metadata: Optional[Dict] = None,
         profile: str = "default",
+        decided_calls: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncGenerator[Any, None]:
-        """Process a query using LLM + built-in tools and yield synthetic A2A events.
+        """Execute one or more decided sub-tool calls and yield synthetic A2A events.
 
-        This is the core bridge: the Reasoning Agent calls this method the same
-        way it calls MCPAgentAdapter.request(). The response events are
-        compatible with parse_agent_events().
+        Native function calling means the reasoning model has already chosen the
+        sub-tool(s) and their typed arguments, passed here as ``decided_calls``
+        (``[{"name", "arguments"}]``). There is no inner routing LLM: this method
+        injects runtime args, runs the tool(s), and produces the same event
+        stream that ``parse_agent_events()`` consumes.
         """
         task_id = str(uuid.uuid4())
         context_id = context_id or str(uuid.uuid4())
@@ -224,52 +226,14 @@ class BuiltInToolAdapter:
             yield self._make_error_event(
                 context_id, task_id,
                 f"No LLM configured for built-in tool adapter '{self.name}'. "
-                "Check that setup is complete and model groups are configured.",
+                "Check that setup is complete and a model is configured.",
             )
             return
 
-        # Build OpenAI-format tools from built-in tools
-        available_tools = []
-        for tool in self._tools:
-            available_tools.append({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "parameters": copy.deepcopy(tool.parameters) if tool.parameters else {"type": "object", "properties": {}},
-                },
-            })
-
-        # Allow per-request tool customization (e.g., semantic type filtering,
-        # dynamic enums sourced from caller-injected arguments or per-context
-        # state held in ContextStorage). ``context_id`` and ``profile`` are
-        # passed through so callbacks that need conversation-scoped state
-        # (e.g. ``change_working_directory``'s loaded-skill enum) can read it.
-        if self._prepare_tools:
-            try:
-                meta_arguments = (metadata or {}).get("arguments") if metadata else None
-                available_tools = self._prepare_tools(
-                    query,
-                    available_tools,
-                    arguments=meta_arguments,
-                    context_id=context_id,
-                    profile=profile,
-                )
-            except Exception as e:
-                logger.warning(f"prepare_tools callback failed for '{self.name}': {e}")
-
-        # Inject the group's own tool_instructions so the routing LLM sees the
-        # per-group steering (e.g. "edit with overwrite_file") -- it otherwise
-        # only reaches the parent reasoning agent, not this dispatcher.
-        system_content = self._system_prompt or BUILTIN_AGENT_SYSTEM_PROMPT
-        if self._server_instructions:
-            system_content = f"{system_content}\n\n{self._server_instructions}"
-        messages: List[ChatCompletionMessageParam] = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": query},
-        ]
-
-        logger.info(f"Built-in adapter '{self.name}' processing query: {query[:100]}...")
+        logger.info(
+            f"Built-in adapter '{self.name}' executing "
+            f"{[c.get('name') for c in (decided_calls or [])]}"
+        )
 
         # Yield working status
         yield TaskStatusUpdateEvent(
@@ -279,85 +243,12 @@ class BuiltInToolAdapter:
             status=TaskStatus(state=TaskState.working),
         )
 
-        # Collect LLM response
         total_input_tokens = 0
+        total_cache_read_input_tokens = 0
+        total_cache_creation_input_tokens = 0
         total_output_tokens = 0
         content_parts: List[str] = []
-        function_calls: List[Dict] = []
-
-        # Direct-dispatch fast path: skip the routing LLM round when the
-        # group is configured for it. The user's query is the tool's input
-        # verbatim, so there's no decision for an LLM to make and we save
-        # a chat_completion call.
-        if self._direct_dispatch and len(self._tools) == 1:
-            sole_tool = self._tools[0]
-            logger.info(
-                f"[Built-in '{self.name}'] direct dispatch -> "
-                f"{sole_tool.name}(query=...) (routing LLM bypassed)"
-            )
-            function_calls = [{
-                "name": sole_tool.name,
-                "arguments": {"query": query},
-            }]
-        else:
-            logger.debug(messages)
-            logger.info(
-                f"[Built-in '{self.name}'] Invoking child LLM | "
-                f"provider={self._llm.provider_name}, model={self._llm.model_label}, "
-                f"reasoning_effort={getattr(self._llm, 'default_reasoning_effort', None)}, "
-                f"full_reasoning={self._full_reasoning}"
-            )
-            # logger.debug(f"Available tools for LLM: {available_tools}")
-            # When the query explicitly names a subtool, force that function so
-            # the routing LLM can't mis-pick; otherwise fall back to "auto".
-            names = [t["function"]["name"] for t in available_tools] if available_tools else []
-            forced = _leading_tool_name(query, names) if names else None
-            # Safety net: the reasoning agent sometimes dumps a bare unified diff
-            # with no leading subtool name. Route it to the editor instead of
-            # letting the LLM mis-guess (it tends to pick grep_files); the editor
-            # then returns an actionable "path required" error if needed.
-            if not forced and "overwrite_file" in names and _looks_like_diff(query):
-                forced = "overwrite_file"
-                logger.info(f"[Built-in '{self.name}'] bare diff -> forcing overwrite_file")
-            if forced:
-                tool_choice: Any = {"type": "function", "function": {"name": forced}}
-                # Send ONLY the forced tool's schema: the child LLM can't pick
-                # anything else anyway, and this keeps providers that validate tool
-                # schemas (Groq) from choking on the group's other, complex schemas
-                # (e.g. the scheduler parser) on a forced call. Defensive ``or``:
-                # ``forced`` always comes from ``names``, so the filter can't empty.
-                call_tools = [
-                    t for t in available_tools if t["function"]["name"] == forced
-                ] or available_tools
-                logger.info(f"[Built-in '{self.name}'] forcing subtool -> {forced}")
-            else:
-                tool_choice = "auto" if available_tools else None
-                call_tools = available_tools
-            try:
-                async for response in self._llm.chat_completion(
-                    messages=messages,
-                    tools=call_tools if call_tools else None,
-                    tool_choice=tool_choice,
-                    temperature=0,
-                ):
-                    logger.debug(response)
-                    if response["type"] == ChatCompletionTypeEnum.CONTENT:
-                        content = response.get("data")
-                        if content:
-                            content_parts.append(content)
-                    elif response["type"] == ChatCompletionTypeEnum.FUNCTION_CALLING:
-                        if (response.get("data") and isinstance(response["data"], dict)
-                                and response["data"].get("function")):
-                            function_calls = response["data"]["function"]
-                    elif response["type"] == ChatCompletionTypeEnum.DONE:
-                        total_input_tokens += response.get("input_tokens") or 0
-                        total_output_tokens += response.get("output_tokens") or 0
-                        break
-
-            except Exception as e:
-                logger.error(f"LLM call failed in built-in adapter '{self.name}': {e}")
-                yield self._make_error_event(context_id, task_id, str(e))
-                return
+        function_calls: List[Dict] = list(decided_calls or [])
 
         # Execute tool calls if any
         tool_results: Dict[str, Any] = {}
@@ -488,82 +379,6 @@ class BuiltInToolAdapter:
                     logger.error(f"Built-in tool '{tool_name}' failed: {e}")
                     tool_results[tool_name] = {"error": str(e)}
 
-            # --- Full reasoning: second LLM pass to process tool results ---
-            if self._full_reasoning and tool_results:
-                try:
-                    second_pass_messages: List[ChatCompletionMessageParam] = list(messages)
-
-                    # Add assistant message with tool_calls
-                    second_pass_messages.append({
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "id": f"call_{i}",
-                                "type": "function",
-                                "function": {
-                                    "name": fc.get("name", ""),
-                                    "arguments": json.dumps(fc.get("arguments", {}))
-                                    if isinstance(fc.get("arguments"), dict)
-                                    else fc.get("arguments", "{}"),
-                                },
-                            }
-                            for i, fc in enumerate(function_calls)
-                        ],
-                    })
-
-                    # Add tool result messages
-                    for i, fc in enumerate(function_calls):
-                        t_name = fc.get("name", "")
-                        result_data = tool_results.get(t_name, "")
-                        result_str = json.dumps(result_data) if not isinstance(result_data, str) else result_data
-                        second_pass_messages.append({
-                            "role": "tool",
-                            "tool_call_id": f"call_{i}",
-                            "content": result_str,
-                        })
-
-                    # Second LLM call (no tools, just generate answer)
-                    logger.info(
-                        f"[Built-in '{self.name}'] Invoking child LLM (full reasoning pass) | "
-                        f"provider={self._llm.provider_name}, model={self._llm.model_label}, "
-                        f"reasoning_effort={getattr(self._llm, 'default_reasoning_effort', None)}, "
-                        f"full_reasoning={self._full_reasoning}"
-                    )
-                    reasoning_content_parts: List[str] = []
-                    async for response in self._llm.chat_completion(
-                        messages=second_pass_messages,
-                        tools=None,
-                        temperature=1,
-                    ):
-                        if response["type"] == ChatCompletionTypeEnum.CONTENT:
-                            content = response.get("data")
-                            if content:
-                                reasoning_content_parts.append(content)
-                        elif response["type"] == ChatCompletionTypeEnum.DONE:
-                            total_input_tokens += response.get("input_tokens") or 0
-                            total_output_tokens += response.get("output_tokens") or 0
-                            break
-
-                    if reasoning_content_parts:
-                        yield TaskArtifactUpdateEvent(
-                            contextId=context_id,
-                            taskId=task_id,
-                            artifact=Artifact(
-                                artifactId=str(uuid.uuid4()),
-                                name="tool_results",
-                                parts=[Part(root=TextPart(text=" ".join(reasoning_content_parts)))],
-                            ),
-                        )
-                        # Clear so the normal path below doesn't re-emit raw results
-                        tool_results = {}
-
-                except Exception as e:
-                    logger.warning(
-                        f"Full reasoning second pass failed for '{self.name}': {e}, "
-                        "falling back to raw results"
-                    )
-                    # Fall through to normal artifact building
-
             # Build artifact parts from tool results.
             artifact_parts: list[Part] = []
             has_file_parts = False
@@ -638,6 +453,8 @@ class BuiltInToolAdapter:
                 parts=[Part(root=DataPart(data={
                     "token_usage": {
                         "input_tokens": total_input_tokens,
+                        "cache_read_input_tokens": total_cache_read_input_tokens,
+                        "cache_creation_input_tokens": total_cache_creation_input_tokens,
                         "output_tokens": total_output_tokens,
                     }
                 }))],

@@ -84,7 +84,6 @@ from app.tools import (
     ToolType,
     set_tool_registry,
 )
-from app.tools.a2a import build_a2a_stub, build_a2a_tool
 from app.tools.builtin import (
     BuiltInToolGroup,
     refresh_builtin_tool_oauth,
@@ -93,7 +92,6 @@ from app.tools.builtin import (
 from app.channels.sidecars.bootstrap import ensure_all_sidecars_installed
 from app.tools.builtin.exec_shell import cleanup_stdout_on_startup
 from app.tools.builtin.exec_shell_autostart import run_autostart_on_boot
-from app.tools.intrinsic import register_intrinsic_tools
 from app.tools.mcp import (
     build_http_mcp_tool,
     build_mcp_stub,
@@ -169,22 +167,6 @@ class JWTCallContextBuilder(CallContextBuilder):
 _STUB_ERR_LAZY = "Not connected (disabled by all profiles)"
 
 
-async def _connect_a2a_tool(row: dict):
-    """Build a live A2A tool from a persisted row; fall back to a stub on failure."""
-    url = row["source"]
-    owner = row["owner_profile"]
-    try:
-        return await build_a2a_tool(url=url, owner_profile=owner)
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"A2A tool '{url}' unreachable: {e}")
-        return build_a2a_stub(
-            url=url,
-            name=row["name"],
-            owner_profile=owner,
-            error=str(e),
-        )
-
-
 async def _connect_mcp_tool(
     registry: ToolRegistry,
     model_group_mgr: ModelGroupManager,
@@ -193,7 +175,7 @@ async def _connect_mcp_tool(
     """Build a live MCP tool from a persisted row; fall back to a stub on failure.
 
     Preserves startup's LLM-resolution chain: per-tool LLM override via
-    ``config.get_llm_params`` → fallback to ``model_group_mgr`` "low" group.
+    ``config.get_llm_params`` → fallback to the single configured model.
     Honors ``full_reasoning`` and the ``stdio`` vs ``http`` transport branch.
     """
     url = row["source"]
@@ -215,7 +197,7 @@ async def _connect_mcp_tool(
                 profile=profile,
                 default_reasoning_effort=_params.get("reasoning_effort"),
             )
-        return model_group_mgr.create_llm_for_group("low", profile=profile)
+        return model_group_mgr.create_llm_for_model(profile=profile)
 
     try:
         llm_params = registry.config.get_llm_params(tool_id, owner or "admin")
@@ -262,15 +244,6 @@ async def _connect_mcp_tool(
     return tool
 
 
-def _lazy_a2a_stub_from_row(row: dict):
-    return build_a2a_stub(
-        url=row["source"],
-        name=row["name"],
-        owner_profile=row["owner_profile"],
-        error=_STUB_ERR_LAZY,
-    )
-
-
 def _lazy_mcp_stub_from_row(row: dict):
     extra = row.get("extra") or {}
     return build_mcp_stub(
@@ -300,19 +273,13 @@ async def _hydrate_persisted_tools(
 
     for row in persisted:
         tool_type = row["tool_type"]
-        if tool_type not in (ToolType.A2A.value, ToolType.MCP.value):
+        if tool_type != ToolType.MCP.value:
             continue
         tool_id = row["tool_id"]
         if tool_id in enabled_ids:
-            if tool_type == ToolType.A2A.value:
-                tool = await _connect_a2a_tool(row)
-            else:
-                tool = await _connect_mcp_tool(registry, model_group_mgr, row)
+            tool = await _connect_mcp_tool(registry, model_group_mgr, row)
         else:
-            if tool_type == ToolType.A2A.value:
-                tool = _lazy_a2a_stub_from_row(row)
-            else:
-                tool = _lazy_mcp_stub_from_row(row)
+            tool = _lazy_mcp_stub_from_row(row)
             logger.info(
                 f"{tool_type.upper()} tool '{row['name']}' (tool_id={tool_id}) "
                 f"registered as stub — no profile has it enabled"
@@ -351,8 +318,8 @@ async def connect_persisted_tool(
             tool = registry.get(tool_id)
             if tool is None:
                 return False, f"Tool '{tool_id}' not registered"
-            if tool.tool_type not in (ToolType.A2A, ToolType.MCP):
-                return False, f"Tool '{tool_id}' is not an A2A/MCP tool"
+            if tool.tool_type is not ToolType.MCP:
+                return False, f"Tool '{tool_id}' is not an MCP tool"
             if not getattr(tool, "is_stub", False):
                 return True, None  # already connected
 
@@ -360,10 +327,7 @@ async def connect_persisted_tool(
             if row is None:
                 return False, f"Tool '{tool_id}' not persisted"
 
-            if tool.tool_type is ToolType.A2A:
-                new_tool = await _connect_a2a_tool(row)
-            else:
-                new_tool = await _connect_mcp_tool(registry, model_group_mgr, row)
+            new_tool = await _connect_mcp_tool(registry, model_group_mgr, row)
 
             if getattr(new_tool, "is_stub", False):
                 err = getattr(new_tool, "connection_error", None) or "connection failed"
@@ -420,6 +384,18 @@ SHUTDOWN_TIMEOUT_S = 8.0
 async def _do_shutdown() -> None:
     """The actual cleanup body. Module-level so tests can patch it."""
     try:
+        from app.events import get_uploads_cleanup_manager
+
+        get_uploads_cleanup_manager().stop()
+    except Exception:  # noqa: BLE001
+        logger.exception("Error stopping uploads cleanup manager during shutdown")
+    try:
+        from app.events import get_event_manager
+
+        get_event_manager().stop()
+    except Exception:  # noqa: BLE001
+        logger.exception("Error stopping skill event manager during shutdown")
+    try:
         stop_all_watchers()
     except Exception:  # noqa: BLE001
         logger.exception("Error stopping skill watchers during shutdown")
@@ -455,6 +431,17 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
 
     # 0. Purge stale exec_shell stdout directories from previous runs.
     cleanup_stdout_on_startup()
+
+    # 0'. Wipe temporary chat-upload folders left behind by the previous run.
+    #     They are ephemeral by design (a file the user asked to keep has
+    #     already been moved into their working dir). Best-effort — a locked
+    #     file must never block boot.
+    try:
+        from app.utils.uploads_tmp import wipe_all_on_startup
+
+        wipe_all_on_startup()
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[boot] uploads_tmp wipe best-effort failed: {e}")
 
     # 0a. Clear the in-app upgrade status file if the previous run
     #     terminated (done/failed). Leaves an in-flight upgrade alone
@@ -683,10 +670,7 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
             registry = ToolRegistry(tool_storage, config_manager)
             set_tool_registry(registry)
 
-            # 3. Intrinsic tools
-            register_intrinsic_tools(registry)
-
-            # 3b. Embedding model + vector store (only when enabled).
+            # 3. Embedding model + vector store (only when enabled).
             from app.config.embedding_state import embedding_state, initialize_embedding_subsystem
 
             embedding: LocalEmbeddings | None = None
@@ -708,20 +692,14 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
             model_group_mgr = ModelGroupManager(config_storage)
 
             def _builtin_llm_factory(tool_id: str, profile: str):
-                """Create an LLM for a built-in tool, respecting per-tool overrides."""
-                try:
-                    _llm_params = config_manager.get_llm_params(tool_id, profile)
-                except Exception:  # noqa: BLE001
-                    _llm_params = {}
-                if _llm_params.get("llm_provider") or _llm_params.get("llm_model"):
-                    return create_llm_provider(
-                        provider_name=_llm_params.get("llm_provider") or BaseConfig.get_default_provider(),
-                        model_name=_llm_params.get("llm_model") or None,
-                        config_storage=config_storage,
-                        profile=profile,
-                        default_reasoning_effort=_llm_params.get("reasoning_effort"),
-                    )
-                return model_group_mgr.create_llm_for_group("low", profile=profile)
+                """Create the child LLM for a built-in tool's internal LLM step.
+
+                The single configured model, except ``image_understanding`` which
+                resolves the optional vision model (``create_llm_for_tool``).
+                ``tool_id`` may be a module name (boot) or a slug (runtime
+                refresh) — both contain ``image_understanding`` for that tool.
+                """
+                return model_group_mgr.create_llm_for_tool(tool_id, profile=profile)
 
             try:
                 await register_builtin_tools(
@@ -769,6 +747,17 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                 except Exception:  # noqa: BLE001
                     logger.exception(f"Skill init failed for profile '{profile_name}'")
 
+            # 6a. Clean slate: wipe any stale skill event files left over from a
+            # previous run *before* listeners spawn (7c) and the watch arms
+            # (7d), so operation begins with no junk. The blanket per-profile
+            # watch keeps the folders clean from then on.
+            try:
+                from app.events import wipe_event_folders_on_startup
+
+                wipe_event_folders_on_startup(known_profiles)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to wipe skill event folders on startup")
+
             # 6b. Documentation Search
             #
             # The reconcile step embeds existing ``.md`` files; the watcher
@@ -809,11 +798,11 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
             except Exception:  # noqa: BLE001
                 logger.exception("Documentation Search subsystem failed to initialize")
 
-            # 7. High-group LLM (admin) + CremindAgent
+            # 7. Single configured model (admin) + CremindAgent
             runner = None
             if config_storage.is_setup_complete():
                 try:
-                    runner = model_group_mgr.create_llm_for_group("high", profile="admin")
+                    runner = model_group_mgr.create_llm_for_model(profile="admin")
                 except (ValueError, ImportError) as e:
                     # ValueError: the provider is misconfigured or its
                     # credentials are missing. ImportError (incl.
@@ -836,13 +825,6 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                 conversation_storage=conversation_storage,
             )
 
-            # 7b. Eager embedding sync
-            for profile_name in known_profiles:
-                try:
-                    cremind_agent.update_embeddings(profile_name)
-                except Exception:  # noqa: BLE001
-                    logger.exception(f"Eager embedding sync failed for profile '{profile_name}'")
-
             # 7c. Autostart long-running processes
             try:
                 asyncio.create_task(run_autostart_on_boot(get_autostart_storage()))
@@ -858,7 +840,18 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                     cremind_agent=cremind_agent,
                     conversation_storage=conversation_storage,
                 )
-                get_event_manager().start(loop)
+                event_manager = get_event_manager()
+                event_manager.start(loop)
+                # Arm one recursive watch per profile over its skills tree so
+                # every event-listener skill's events/ folder is always
+                # monitored (junk deleted, subscribed events fanned out).
+                for profile_name in known_profiles:
+                    try:
+                        event_manager.watch_profile(profile_name, registry)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            f"Failed to arm event watch for profile '{profile_name}'"
+                        )
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to start skill event manager")
 
@@ -878,6 +871,16 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                 get_schedule_manager().start(loop)
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to start schedule manager")
+
+            # 7g. Temporary chat-upload pruner — periodically removes idle
+            # per-conversation upload folders so the temp tree never grows
+            # unbounded during a long-lived process.
+            try:
+                from app.events import get_uploads_cleanup_manager
+
+                get_uploads_cleanup_manager().start(loop)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to start uploads cleanup manager")
 
             # 8. Build the real agent executor and the post-setup callback.
             agent_executor = CremindAgentExecutor(
@@ -930,7 +933,6 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                     except Exception:  # noqa: BLE001
                         logger.exception(f"Post-setup document watcher failed for profile '{profile}'")
 
-                cremind_agent.update_embeddings()
                 logger.info("Post-setup: built-in tools rebound and skills synced")
 
             def _mcp_llm_factory(tool_id: str | None = None, profile: str = "admin"):
@@ -949,7 +951,7 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                             default_reasoning_effort=_params.get("reasoning_effort"),
                         )
                 try:
-                    return model_group_mgr.create_llm_for_group("low", profile=profile)
+                    return model_group_mgr.create_llm_for_model(profile=profile)
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"Failed to create MCP LLM: {e}")
                     return None

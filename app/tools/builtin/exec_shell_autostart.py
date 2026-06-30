@@ -14,7 +14,6 @@ import asyncio
 import os
 import platform
 import re
-import subprocess
 import time
 import uuid as _uuid
 from pathlib import Path
@@ -27,6 +26,7 @@ from app.storage.autostart_storage import AutostartStorage
 from app.tools.builtin.exec_shell import (
     LogWriterState,
     ProcessInfo,
+    _kill_process_tree,
     _log_writer_loop,
     _process_registry,
     _shell_for,
@@ -70,38 +70,6 @@ def normalize_command_paths(command: str, working_dir: str) -> str:
         return token
 
     return re.sub(r"[^\s\"']+", maybe_rewrite, command)
-
-
-# Windows: don't pop a console window when shelling out to taskkill.
-_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
-
-
-def _kill_process_tree(pid: Optional[int]) -> None:
-    """Forcibly terminate *pid* and all of its descendants.
-
-    ``Process.terminate()`` only signals the spawned shell, not the grandchild
-    it launched (e.g. ``pwsh -> uv run -> python``). That grandchild can hold
-    open file handles inside a skill directory (``scripts/.listener.lock`` on
-    Windows), which then blocks ``shutil.rmtree``. Killing the whole tree
-    releases those handles.
-
-    Windows uses ``taskkill /T /F``; POSIX relies on the caller's
-    ``stop_process`` (terminate/kill of the leader) plus the fact that an open
-    file does not prevent directory removal on Unix.
-    """
-    if not pid:
-        return
-    if os.name != "nt":
-        return
-    try:
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True,
-            timeout=15,
-            creationflags=_CREATE_NO_WINDOW,
-        )
-    except (OSError, subprocess.SubprocessError):
-        logger.warning(f"taskkill failed for pid {pid}", exc_info=True)
 
 
 def _is_under(candidate: str, root: Path) -> bool:

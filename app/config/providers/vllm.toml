@@ -12,28 +12,38 @@ is_default = true
 
 [[models]]
 id = "meta-llama/Llama-3.3-70B-Instruct"
+context_window = 131072
 display_name = "Llama 3.3 70B Instruct"
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
 [[models]]
 id = "meta-llama/Llama-3.1-8B-Instruct"
+context_window = 131072
 display_name = "Llama 3.1 8B Instruct"
 group_hint = "low"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
 [[models]]
 id = "Qwen/Qwen3-32B"
+context_window = 131072
 display_name = "Qwen 3 32B"
+supports_reasoning = true
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
 [[models]]
 id = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+context_window = 1048576
 display_name = "Llama 4 Scout"
 group_hint = "high"
+prompt_cache = false
+vision = true
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00

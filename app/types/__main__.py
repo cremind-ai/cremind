@@ -9,7 +9,6 @@ from a2a.types import (
 
 if TYPE_CHECKING:
     import pandas as pd
-    from app.tools.a2a import RemoteAgentConnections
 
 from app.constants import ChatCompletionTypeEnum
 
@@ -78,7 +77,7 @@ class MCPServerConfig(TypedDict):
 
 
 class AgentInfo(TypedDict):
-    remote_agent_connections: "RemoteAgentConnections"
+    remote_agent_connections: Any
     context_storage: Dict[str, str]
     card: AgentCard
     url: str
@@ -188,7 +187,7 @@ class ToolConfig(TypedDict, total=False):
     # When True, the tool is still registered with the agent (and remains
     # available at runtime) but is suppressed from the Settings UI and the
     # Setup Wizard catalog. Use for "system" built-ins whose lifecycle is
-    # controlled by the runtime, not the user (e.g. ``register_skill_event``):
+    # controlled by the runtime, not the user (e.g. ``change_working_directory``):
     # disabling them would break internal flows.
     hidden: bool
     required_config: dict[str, RequiredConfigField]
@@ -202,12 +201,10 @@ class ToolConfig(TypedDict, total=False):
     # ``full_reasoning=False`` because relevance ranking already runs
     # inside the tool).
     locked_llm_fields: list[str]
-    # When True, ``BuiltInToolAdapter`` skips its routing LLM call and
-    # invokes the group's single sub-tool directly with
-    # ``{"query": <Action_Input>}``. Use this for tool groups whose
-    # contract is "take the user's input verbatim and do the work" --
-    # the routing LLM otherwise just paraphrases the input into a
-    # one-tool-call no-op (token waste with no decision to make).
+    # Legacy single-sub-tool marker from the pre-native-function-calling
+    # design (when a per-group routing LLM chose the sub-tool). The reasoning
+    # model now calls each leaf directly with its typed arguments, so there is
+    # no routing call to skip; the flag is retained for backward compatibility.
     direct_dispatch: bool
     # Optional Python deps group needed for this tool to run. Maps to a
     # key in ``app.features.manifest.FEATURES``. Used by the Setup Wizard
@@ -228,7 +225,13 @@ class ChatCompletionStreamResponseType(TypedDict):
     type: ChatCompletionTypeEnum
     data: Required[Optional[Any]]
     last_token: NotRequired[bool]
+    # ``input_tokens`` is the UNCACHED input only. Cached prompt tokens are
+    # reported separately so cost can be attributed accurately:
+    #   cache_read_input_tokens     -- served from cache (heavily discounted)
+    #   cache_creation_input_tokens -- written to cache (Anthropic only; premium)
     input_tokens: NotRequired[Optional[int]]
+    cache_read_input_tokens: NotRequired[Optional[int]]
+    cache_creation_input_tokens: NotRequired[Optional[int]]
     output_tokens: NotRequired[Optional[int]]
     finish_reason: NotRequired[Optional[str]]
 
@@ -248,5 +251,14 @@ class VectorEmbeddingType(Enum):
 class ReasoningStreamResponseType(TypedDict):
     type: ChatCompletionTypeEnum
     data: Required[Any]
+    # ``input_tokens`` is uncached input only; cached tokens are reported
+    # separately (see ``ChatCompletionStreamResponseType``).
     input_tokens: NotRequired[Optional[int]]
+    cache_read_input_tokens: NotRequired[Optional[int]]
+    cache_creation_input_tokens: NotRequired[Optional[int]]
     output_tokens: NotRequired[Optional[int]]
+    # Per-source token attribution for this turn (one entry per LLM invocation:
+    # reasoning step vs. specific tool/sub-agent). Carried on terminal chunks so
+    # the runner can freeze cost and persist to ``usage_records``. The aggregate
+    # token fields above remain authoritative for backward compatibility.
+    usage_records: NotRequired[list[dict]]

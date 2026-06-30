@@ -12,42 +12,58 @@ is_default = true
 
 [[models]]
 id = "llama3.3:70b"
+context_window = 131072
 display_name = "Llama 3.3 70B"
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
 [[models]]
 id = "llama3.1:8b"
+context_window = 131072
 display_name = "Llama 3.1 8B"
 group_hint = "low"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
 [[models]]
 id = "qwen3:32b"
+context_window = 131072
 display_name = "Qwen 3 32B"
+supports_reasoning = true
 group_hint = "high"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
 [[models]]
 id = "qwen3:8b"
+context_window = 131072
 display_name = "Qwen 3 8B"
+supports_reasoning = true
 group_hint = "low"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
 [[models]]
 id = "gemma3:27b"
+context_window = 131072
 display_name = "Gemma 3 27B"
 group_hint = "high"
+prompt_cache = false
+vision = true
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
 [[models]]
 id = "deepseek-r1:14b"
+context_window = 131072
 display_name = "DeepSeek R1 14B"
+supports_reasoning = true
 group_hint = "low"
+prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00

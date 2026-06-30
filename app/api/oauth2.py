@@ -14,7 +14,6 @@ from starlette.routing import Route
 
 from app.config.settings import BaseConfig
 from app.tools import ToolRegistry, ToolType
-from app.tools.a2a import A2ATool
 from app.utils import logger
 
 
@@ -88,9 +87,6 @@ def get_oauth2_routes(
         )
         logger.info(f"[auth] OAuth2 exchange {'succeeded' if success else 'failed'}: tool_id={tool_id} profile={profile}")
 
-        if success and isinstance(tool, A2ATool) and tool.connection is not None:
-            tool.connection.update_auth_header_for_profile(profile)
-
         if success and tool.tool_type is ToolType.MCP:
             adapter = getattr(tool, "adapter", None)
             if adapter is not None and hasattr(adapter, "_ensure_auth"):
@@ -130,10 +126,6 @@ def get_oauth2_routes(
 
 def _get_oauth_client(tool, profile: str):
     """Return the OAuth client for ``tool``, or ``None`` if not OAuth-capable."""
-    if isinstance(tool, A2ATool):
-        if tool.connection is None:
-            return None
-        return tool.connection.get_oauth_client_for_profile(profile)
     adapter = getattr(tool, "adapter", None)
     if adapter is None:
         return None
