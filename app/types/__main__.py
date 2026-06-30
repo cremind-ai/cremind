@@ -162,27 +162,10 @@ class OAuthConfig(TypedDict, total=False):
     extra_authorize_params: dict[str, str]
 
 
-class LLMParameters(TypedDict, total=False):
-    """Default LLM-related parameters a built-in tool ships with.
-
-    User-level overrides are persisted per-profile in the ``llm`` and ``meta``
-    scopes of ``tool_configs``; values here are code defaults surfaced to the
-    UI as placeholders and used as fallbacks at tool registration / execution.
-    """
-    tool_instructions: str
-    description: str
-    system_prompt: str
-    llm_provider: str
-    llm_model: str
-    reasoning_effort: str
-    full_reasoning: bool
-
-
 class ToolConfig(TypedDict, total=False):
     """Static configuration exported as ``TOOL_CONFIG`` by each built-in tool module."""
     name: Required[str]
     display_name: Required[str]
-    default_model_group: Required[str]
     visible: bool
     # When True, the tool is still registered with the agent (and remains
     # available at runtime) but is suppressed from the Settings UI and the
@@ -193,19 +176,6 @@ class ToolConfig(TypedDict, total=False):
     required_config: dict[str, RequiredConfigField]
     oauth: OAuthConfig
     arguments: dict[str, Any]
-    llm_parameters: LLMParameters
-    # Names of LLM-parameter keys whose user-facing override is forbidden.
-    # The settings UI disables the field and the API rejects writes that
-    # would change it. Used by tools whose contract depends on a specific
-    # LLM-parameter value (e.g. documentation_search keeps
-    # ``full_reasoning=False`` because relevance ranking already runs
-    # inside the tool).
-    locked_llm_fields: list[str]
-    # Legacy single-sub-tool marker from the pre-native-function-calling
-    # design (when a per-group routing LLM chose the sub-tool). The reasoning
-    # model now calls each leaf directly with its typed arguments, so there is
-    # no routing call to skip; the flag is retained for backward compatibility.
-    direct_dispatch: bool
     # Optional Python deps group needed for this tool to run. Maps to a
     # key in ``app.features.manifest.FEATURES``. Used by the Setup Wizard
     # auto-installer and the post-setup enable pre-flight to pip-install

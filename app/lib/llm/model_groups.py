@@ -8,8 +8,9 @@ Two **optional** auxiliary groups fall back to the single model when unset:
 
 - ``vision`` — used only by the ``image_understanding`` tool.
 - ``low`` — the low-performance / cheap model for lightweight auxiliary tasks
-  (e.g. the skill-event matching gate). Generalized so future features needing a
-  cheaper model can resolve it via ``create_llm_for_group("low", ...)``.
+  (e.g. the skill-event matching gate and the ``documentation_search`` relevance
+  judge). Generalized so future features needing a cheaper model can resolve it
+  via ``create_llm_for_group("low", ...)``.
 """
 
 from typing import Optional
@@ -109,9 +110,10 @@ class ModelGroupManager:
     def create_llm_for_tool(self, tool_name: str, profile: str | None = None) -> LLMProvider:
         """Create the child LLM for a tool's internal LLM step.
 
-        Per-tool model overrides were removed. ``image_understanding`` is the only
-        special case, and the Specialized Vision Model toggle decides *which* model
-        runs it:
+        Per-tool model overrides were removed. Two tools are special-cased:
+
+        ``image_understanding`` — the Specialized Vision Model toggle decides
+        *which* model runs it:
 
         - feature ON  → the dedicated ``vision`` model (which itself falls back to
           the single model when the user hasn't picked one).
@@ -119,14 +121,25 @@ class ModelGroupManager:
           ``vision`` group here so a *stale* dedicated model the user configured and
           then turned off can't leak back in.
 
+        ``documentation_search`` — its relevance judge is a frugal LLM-as-judge, so
+        it runs on the ``low`` (low-performance) model, which itself falls back to
+        the single model when unset.
+
         Every other tool uses the single configured model. ``tool_name`` may be a
-        module name or a slug — both contain ``image_understanding`` for that tool.
+        module name or a slug — both contain the relevant substring for that tool.
         """
-        if "image_understanding" in (tool_name or ""):
+        name = tool_name or ""
+        if "image_understanding" in name:
             from app.config import vision_feature_enabled
             if vision_feature_enabled(profile):
                 return self.create_llm_for_group("vision", profile=profile)
             return self.create_llm_for_model(profile=profile)
+        # The documentation_search relevance judge is a lightweight LLM-as-judge
+        # (name+description only, structured tool-call output, no bodies/history) —
+        # exactly the cheap auxiliary task the low-performance group exists for.
+        # Falls back to the single model when ``low`` is unset.
+        if "documentation_search" in name:
+            return self.create_llm_for_group("low", profile=profile)
         return self.create_llm_for_model(profile=profile)
 
     def image_understanding_available(self, profile: str | None = None) -> bool:

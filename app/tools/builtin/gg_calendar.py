@@ -26,13 +26,9 @@ TOOL_CONFIG: ToolConfig = {
     "name": "gg_calendar",
     "visible": False,
     "display_name": "Google Calendar",
-    "default_model_group": "low",
     # Requires the ``google`` feature (googleapiclient + google-auth). See
     # app.features.manifest.FEATURES.
     "requires_feature": "google",
-    "llm_parameters": {
-        "tool_instructions": "List upcoming events and create new events on the user's Google Calendar.",
-    },
     "required_config": {
         Var.CLIENT_ID: {
             "description": "Google OAuth Client ID",

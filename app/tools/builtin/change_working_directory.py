@@ -93,15 +93,7 @@ def _resolve_target(
 TOOL_CONFIG: ToolConfig = {
     "name": "change_working_directory",
     "display_name": "Change Working Directory",
-    "default_model_group": "low",
     "hidden": True,
-    "llm_parameters": {
-        "tool_instructions": (
-            "Switch the conversation's active working directory — to the profile "
-            "default (user working), the documents or skills folder, a loaded "
-            "skill's source directory, or a custom absolute path."
-        ),
-    },
 }
 
 

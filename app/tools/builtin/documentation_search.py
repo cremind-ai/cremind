@@ -31,13 +31,6 @@ The reasoning model calls ``search_documentation`` directly via native
 function calling, filling the ``query`` argument; there is no per-group
 routing LLM. The tool's INTERNAL judge LLM (below) is the only LLM call it makes.
 
-Why ``full_reasoning`` is locked OFF
-------------------------------------
-The judge already runs inside ``run()``. The adapter's post-tool LLM pass
-would only add a second round whose job is to paraphrase the body we
-already produced. ``locked_llm_fields = ["full_reasoning"]`` keeps the
-toggle disabled in the Settings UI and rejected by the API.
-
 The leaf ``description`` (what the reasoning model sees) frames this as a
 *document search tool*. The tool's INTERNAL judge LLM, by contrast, is told
 its sole job is to pick the most accurate candidate -- not to reason about
@@ -48,10 +41,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.constants import ChatCompletionTypeEnum
 from app.documents import get_service
+from app.lib.llm.base import done_chunk_token_usage
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
 from app.types import ToolConfig
 from app.utils.logger import logger
@@ -64,12 +58,6 @@ DEFAULT_TOP_K = 10
 
 NO_RESULT_MESSAGE = "no relevant result found"
 
-
-_DOC_TOOL_INSTRUCTIONS = (
-    "Look up Cremind's documentation and guides — a semantic knowledge base "
-    "over the user's Markdown documents. Returns the body of the single "
-    "best-matching document."
-)
 
 _JUDGE_SYSTEM_PROMPT = (
     "You are the Documentation Search relevance judge. Vector search has "
@@ -98,17 +86,9 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "documentation_search",
     "display_name": SERVER_NAME,
-    "default_model_group": "low",
     # Visible in Settings (so its top-k can be configured) but locked on —
     # the agent must always be able to search its own documentation.
     "locked": True,
-    "llm_parameters": {
-        "tool_instructions": _DOC_TOOL_INSTRUCTIONS,
-        # Locked off: the relevance ranking happens INSIDE run() via the
-        # internal LLM judge. Turning the adapter's post-tool pass on
-        # would add a redundant second LLM round.
-        "full_reasoning": False,
-    },
     "required_config": {
         Var.DEFAULT_TOP_K_KEY: {
             "description": (
@@ -119,23 +99,20 @@ TOOL_CONFIG: ToolConfig = {
             "default": DEFAULT_TOP_K,
         },
     },
-    # Fields the user is not allowed to override -- enforced by the API
-    # and the Settings UI. ``full_reasoning`` is required to stay False
-    # because the tool already runs its own LLM judgement step.
-    "locked_llm_fields": ["full_reasoning"],
-    # Single sub-tool: the model fills ``query`` directly via native function
-    # calling. The tool's own LLM judge inside run() is the only LLM call this
-    # tool needs.
-    "direct_dispatch": True,
 }
 
 
 class DocumentationSearchTool(BuiltInTool):
     name: str = "search_documentation"
     description: str = (
-        "Search Cremind's Markdown documentation by semantic query. Returns "
+        "Search Cremind's documentation by semantic query. Returns "
         "the body of the single most accurate document, or "
-        f"\"{NO_RESULT_MESSAGE}\" when nothing matches."
+        f"\"{NO_RESULT_MESSAGE}\" when nothing matches. \n"
+        "In the documents you find, if a document explains "
+        "how to use the cremind CLI, you must use the `exec_shell` "
+        "tool to run the cremind CLI and produce the result, "
+        "rather than just showing those instructions for the "
+        "user to run themselves."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -227,11 +204,11 @@ class DocumentationSearchTool(BuiltInTool):
             )
             return _no_result()
 
-        chosen_index = await _select_best_candidate(
+        chosen_index, judge_usage = await _select_best_candidate(
             llm=llm, query=query, candidates=candidates,
         )
         if chosen_index is None:
-            return _no_result()
+            return _no_result(token_usage=judge_usage)
 
         chosen = candidates[chosen_index]
         body = service.read_body(Path(chosen["file_path"]))
@@ -241,7 +218,7 @@ class DocumentationSearchTool(BuiltInTool):
                 f"[documentation_search] chosen file missing on disk: "
                 f"{chosen['file_path']}"
             )
-            return _no_result()
+            return _no_result(token_usage=judge_usage)
 
         # Resolve $VAR system-variable tokens in the body for the active
         # profile (e.g. $CREMIND_SERVER, $CREMIND_PROFILE) — same syntax as
@@ -255,15 +232,17 @@ class DocumentationSearchTool(BuiltInTool):
         # plain string, which is what the Reasoning Agent should see.
         return BuiltInToolResult(
             content=[{"type": "text", "text": body}],
+            token_usage=judge_usage,
         )
 
 
-def _no_result() -> BuiltInToolResult:
+def _no_result(token_usage: Optional[Dict[str, int]] = None) -> BuiltInToolResult:
     return BuiltInToolResult(
         structured_content={
             "message": NO_RESULT_MESSAGE,
             "relevant": False,
-        }
+        },
+        token_usage=token_usage,
     )
 
 
@@ -272,14 +251,17 @@ async def _select_best_candidate(
     llm,
     query: str,
     candidates: List[Dict[str, Any]],
-) -> Optional[int]:
-    """Run the LLM judge over ``candidates`` and return the chosen index.
+) -> Tuple[Optional[int], Dict[str, int]]:
+    """Run the LLM judge over ``candidates`` and return ``(index, token_usage)``.
 
     The judge MUST decide by calling one of two function tools:
-    ``select_document(index)`` or ``no_relevant_result()``. Returns the
-    chosen 0-based index, or ``None`` for no-match / parse-failure /
-    LLM-error cases. The caller turns ``None`` into the standard
-    "no relevant result found" response.
+    ``select_document(index)`` or ``no_relevant_result()``. The first element is
+    the chosen 0-based index, or ``None`` for no-match / parse-failure / LLM-error
+    cases (the caller turns ``None`` into the standard "no relevant result found"
+    response). The second element is the four-way token usage the judge call
+    consumed — captured off the terminal ``DONE`` chunk and returned in every case
+    (even no-match / error) so the caller can attribute the cost; all-zero when the
+    call errored before producing usage.
     """
     judge_tools = _build_judge_tools(num_candidates=len(candidates))
     user_message = _format_judge_prompt(query=query, candidates=candidates)
@@ -290,6 +272,7 @@ async def _select_best_candidate(
     logger.debug(f"judge_tools: {judge_tools}")
     logger.debug(f"user_message: {user_message}")
     function_calls: List[Dict[str, Any]] = []
+    token_usage: Dict[str, int] = done_chunk_token_usage({})
     try:
         async for response in llm.chat_completion(
             messages=messages,
@@ -304,17 +287,18 @@ async def _select_best_candidate(
                 if isinstance(data, dict) and data.get("function"):
                     function_calls = data["function"]
             elif rtype == ChatCompletionTypeEnum.DONE:
+                token_usage = done_chunk_token_usage(response)
                 break
     except Exception:  # noqa: BLE001
         logger.exception("[documentation_search] judge LLM call failed")
-        return None
+        return None, token_usage
 
     if not function_calls:
         logger.warning(
             "[documentation_search] judge produced no tool call; "
             "treating as no-match"
         )
-        return None
+        return None, token_usage
 
     call = function_calls[0]
     name = call.get("name") or ""
@@ -326,7 +310,7 @@ async def _select_best_candidate(
             args = {}
 
     if name == _NO_MATCH_TOOL_NAME:
-        return None
+        return None, token_usage
 
     if name == _SELECT_TOOL_NAME:
         raw_index = args.get("index") if isinstance(args, dict) else None
@@ -337,20 +321,20 @@ async def _select_best_candidate(
                 f"[documentation_search] judge passed non-integer index: "
                 f"{raw_index!r}"
             )
-            return None
+            return None, token_usage
         if 0 <= idx < len(candidates):
-            return idx
+            return idx, token_usage
         logger.warning(
             f"[documentation_search] judge index {idx} out of range "
             f"(have {len(candidates)} candidates)"
         )
-        return None
+        return None, token_usage
 
     logger.warning(
         f"[documentation_search] judge called unknown tool {name!r}; "
         "treating as no-match"
     )
-    return None
+    return None, token_usage
 
 
 def _build_judge_tools(*, num_candidates: int) -> List[Dict[str, Any]]:

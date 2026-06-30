@@ -27,11 +27,7 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "weather",
     "display_name": "Weather",
-    "default_model_group": "low",
     "visible": True,
-    "llm_parameters": {
-        "tool_instructions": "Retrieve weather forecasts and current conditions for a location.",
-    },
     "required_config": {
         Var.API_KEY: {
             "description": "AccuWeather API Key",

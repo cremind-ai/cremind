@@ -72,7 +72,6 @@ class BuiltInToolGroup(Tool):
         system_prompt: Optional[str] = None,
         tool_instructions: Optional[str] = None,
         llm_factory: Optional[Callable[[str, str], LLMProvider]] = None,
-        direct_dispatch: bool = False,
     ):
         super().__init__()
         self._config_name = config_name
@@ -90,7 +89,6 @@ class BuiltInToolGroup(Tool):
             tool_instructions=tool_instructions,
             prepare_tools=prepare_tools,
             full_reasoning=full_reasoning,
-            direct_dispatch=direct_dispatch,
         )
         self._oauth_provider = oauth_provider
         if oauth_provider is not None:

@@ -323,6 +323,3 @@ def test_web_tools_have_no_required_feature():
     from app.tools.builtin.web_fetch import TOOL_CONFIG as wf_cfg
     assert ws_cfg.get("requires_feature") is None
     assert wf_cfg.get("requires_feature") is None
-    # web_search is the single-tool, direct-dispatch group.
-    assert ws_cfg.get("direct_dispatch") is True
-    assert wf_cfg.get("direct_dispatch") is not True

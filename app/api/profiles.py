@@ -14,6 +14,7 @@ from app.skills import initialize_profile_skills, teardown_profile_skills
 from app.storage.conversation_storage import ConversationStorage
 from app.tools import ToolRegistry
 from app.utils import logger
+from app.utils.agent_name import read_agent_name, write_agent_name
 from app.utils.persona import ensure_persona_file, read_persona_file, write_persona_file
 
 
@@ -201,12 +202,71 @@ def get_profile_routes(
             logger.error(f"Error writing persona for '{profile_name}': {e}")
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    async def handle_list_agent_names(request: Request) -> JSONResponse:
+        """Agent names for every visible profile — feeds the chat ``@`` menu."""
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        try:
+            profiles = await conversation_storage.list_profiles()
+            agents = [
+                {"profile": p["name"], "name": read_agent_name(p["name"])}
+                for p in profiles
+                if not p["name"].startswith("__")
+            ]
+            return JSONResponse({"agents": agents}, status_code=200)
+        except Exception as e:
+            logger.error(f"Error listing agent names: {e}")
+            return JSONResponse({"error": f"Internal server error: {e}"}, status_code=500)
+
+    async def handle_get_agent_name(request: Request) -> JSONResponse:
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile_name = urllib.parse.unquote(request.path_params.get("profile_name", ""))
+        if not profile_name:
+            return JSONResponse({"error": "Profile name is required"}, status_code=400)
+        if profile_name != _profile_from_request(request):
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        try:
+            return JSONResponse({"name": read_agent_name(profile_name)})
+        except Exception as e:
+            logger.error(f"Error reading agent name for '{profile_name}': {e}")
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    async def handle_update_agent_name(request: Request) -> JSONResponse:
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile_name = urllib.parse.unquote(request.path_params.get("profile_name", ""))
+        if not profile_name:
+            return JSONResponse({"error": "Profile name is required"}, status_code=400)
+        if profile_name != _profile_from_request(request):
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return JSONResponse({"error": "'name' field is required"}, status_code=400)
+        if len(name.strip()) > 128:
+            return JSONResponse({"error": "Agent name must be at most 128 characters"}, status_code=400)
+        try:
+            write_agent_name(profile_name, name)
+            return JSONResponse({"success": True})
+        except Exception as e:
+            logger.error(f"Error writing agent name for '{profile_name}': {e}")
+            return JSONResponse({"error": str(e)}, status_code=500)
+
 
     return [
         Route(path="/api/profiles", methods=["GET"], endpoint=handle_list_profiles),
         Route(path="/api/profiles", methods=["POST"], endpoint=handle_add_profile),
         # Public (pre-auth): names only, for the login screen's dropdown.
         Route(path="/api/profiles/names", methods=["GET"], endpoint=handle_list_profile_names),
+        # Agent names for the chat `@` menu (static path; before `{profile_name}`).
+        Route(path="/api/profiles/agent-names", methods=["GET"], endpoint=handle_list_agent_names),
         Route(
             path="/api/profiles/{profile_name}/persona",
             methods=["GET"], endpoint=handle_get_persona,
@@ -214,6 +274,14 @@ def get_profile_routes(
         Route(
             path="/api/profiles/{profile_name}/persona",
             methods=["PUT"], endpoint=handle_update_persona,
+        ),
+        Route(
+            path="/api/profiles/{profile_name}/agent-name",
+            methods=["GET"], endpoint=handle_get_agent_name,
+        ),
+        Route(
+            path="/api/profiles/{profile_name}/agent-name",
+            methods=["PUT"], endpoint=handle_update_agent_name,
         ),
         Route(
             path="/api/profiles/{profile_name}",

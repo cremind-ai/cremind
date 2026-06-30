@@ -31,16 +31,9 @@ SERVER_NAME = "Current Time"
 TOOL_CONFIG: ToolConfig = {
     "name": "current_time",
     "display_name": "Current Time",
-    # Lightweight, structured extraction — matches every other extraction tool.
-    "default_model_group": "low",
     # NOT hidden: the reasoning agent must see this tool to answer time
     # questions. The reasoning model fills the structured ``timezone``
     # argument directly (resolving a named location to its IANA zone).
-    "llm_parameters": {
-        "tool_instructions": (
-            "Get the current date and time, optionally in a specific timezone."
-        ),
-    },
 }
 
 
