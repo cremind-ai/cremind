@@ -111,6 +111,9 @@ const cost = computed(() => request.value?.estimated_cost_usd ?? null);
 const bySource = computed(() => request.value?.by_source ?? []);
 const hasBreakdown = computed(() => bySource.value.length > 0);
 
+// Friendlier badge text for source types whose raw key reads awkwardly.
+const sourceTypeLabel = (t: string) => (t === 'event_gate' ? 'event filter' : t);
+
 const modelLabel = computed(() => request.value?.model ?? '');
 
 // One worked cost term per token category, plugging in the model's per-1M rate.
@@ -231,7 +234,7 @@ const costTerms = computed<CostTerm[]>(() => {
           <div v-for="s in bySource" :key="s.source" class="bd-row">
             <span class="bd-src">
               {{ s.display_name }}
-              <span class="bd-type" :class="`t-${s.source_type}`">{{ s.source_type }}</span>
+              <span class="bd-type" :class="`t-${s.source_type}`">{{ sourceTypeLabel(s.source_type) }}</span>
             </span>
             <span class="num">{{ formatTokens(s.total_tokens) }}</span>
             <span class="num">{{ formatUsd(s.estimated_cost_usd) }}</span>
@@ -347,6 +350,7 @@ const costTerms = computed<CostTerm[]>(() => {
 .usage-popover .t-reasoning { color: var(--primary-color); }
 .usage-popover .t-subagent { color: var(--danger-color, #ef4444); }
 .usage-popover .t-tool { color: var(--warning-color, #f59e0b); }
+.usage-popover .t-event_gate { color: var(--info-color, #0ea5e9); }
 
 .usage-popover .up-hover-toggle {
   display: flex;

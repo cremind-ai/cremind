@@ -21,11 +21,12 @@ const settingsStore = useSettingsStore();
 const { rebuildModelList, getFilteredModels, getVisionModels, getReasoningOptions } = useLLMModels();
 
 const providers = ref<ProviderWithState[]>([]);
-// Single model stored under the historical ``high`` key, plus an optional vision model.
-const modelGroups = ref<Record<string, string>>({ high: '', vision: '' });
-const reasoningEfforts = ref<Record<string, string | null>>({ high: null });
+// Main reasoning model (``high``), plus optional ``vision`` and ``low`` models.
+const modelGroups = ref<Record<string, string>>({ high: '', vision: '', low: '' });
+const reasoningEfforts = ref<Record<string, string | null>>({ high: null, low: null });
 const highProvider = ref('');
 const visionProvider = ref('');
+const lowProvider = ref('');
 // Specialized Vision Model feature toggle (opt-in; off by default).
 const visionEnabled = ref(false);
 const apiKeyProvider = ref('');
@@ -65,7 +66,9 @@ const selectedApiKeyProvider = computed(() =>
 
 const highFilteredModels = computed(() => getFilteredModels(highProvider.value));
 const visionFilteredModels = computed(() => getVisionModels(visionProvider.value));
+const lowFilteredModels = computed(() => getFilteredModels(lowProvider.value));
 const highModelReasoningOptions = computed(() => getReasoningOptions(modelGroups.value.high));
+const lowModelReasoningOptions = computed(() => getReasoningOptions(modelGroups.value.low));
 
 // When provider changes, clear model selection if the current model doesn't belong to the new provider
 watch(highProvider, (newProvider, oldProvider) => {
@@ -85,10 +88,22 @@ watch(visionProvider, (newProvider, oldProvider) => {
     }
   }
 });
+watch(lowProvider, (newProvider, oldProvider) => {
+  if (oldProvider && newProvider !== oldProvider) {
+    const currentProvider = extractProvider(modelGroups.value.low);
+    if (currentProvider !== newProvider) {
+      modelGroups.value.low = '';
+      reasoningEfforts.value.low = null;
+    }
+  }
+});
 
 // Clear reasoning effort when model changes and new model doesn't support it
 watch(() => modelGroups.value.high, () => {
   if (highModelReasoningOptions.value.length === 0) reasoningEfforts.value.high = null;
+});
+watch(() => modelGroups.value.low, () => {
+  if (lowModelReasoningOptions.value.length === 0) reasoningEfforts.value.low = null;
 });
 
 onMounted(async () => {
@@ -101,11 +116,16 @@ onMounted(async () => {
 
     providers.value = provRes.providers.map(buildProviderState);
 
-    modelGroups.value = { high: groupRes.model_groups.high || '', vision: groupRes.model_groups.vision || '' };
+    modelGroups.value = {
+      high: groupRes.model_groups.high || '',
+      vision: groupRes.model_groups.vision || '',
+      low: groupRes.model_groups.low || '',
+    };
 
     // Initialize per-section providers from stored model values
     highProvider.value = extractProvider(groupRes.model_groups.high) || groupRes.default_provider || '';
     visionProvider.value = extractProvider(groupRes.model_groups.vision || '') || '';
+    lowProvider.value = extractProvider(groupRes.model_groups.low || '') || '';
     visionEnabled.value = groupRes.vision_enabled ?? false;
 
     for (const p of providers.value) {
@@ -370,6 +390,36 @@ function goBack() {
             <ElFormItem label="Model">
               <ElSelect v-model="modelGroups.vision" filterable clearable placeholder="Select vision model (defaults to main)">
                 <ElOption v-for="m in visionFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
+              </ElSelect>
+            </ElFormItem>
+          </ElForm>
+        </div>
+
+        <!-- Low-Performance Model (optional; defaults to main) -->
+        <div class="section">
+          <h2 class="section-title">Low-Performance Model</h2>
+          <p class="section-description">
+            An optional cheaper/faster model used for lightweight background tasks —
+            currently the skill-event matching gate that checks whether an incoming
+            event matches your automation rule before running the assistant. Can be any
+            model from the list above. Leave empty to fall back to the main model.
+          </p>
+
+          <ElForm label-position="top" class="groups-form">
+            <ElFormItem label="Provider">
+              <ElSelect v-model="lowProvider" placeholder="Select provider" clearable>
+                <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
+              </ElSelect>
+            </ElFormItem>
+
+            <ElFormItem label="Model">
+              <ElSelect v-model="modelGroups.low" filterable clearable placeholder="Select model (defaults to main)">
+                <ElOption v-for="m in lowFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
+              </ElSelect>
+            </ElFormItem>
+            <ElFormItem v-if="lowModelReasoningOptions.length > 0" label="Reasoning Effort">
+              <ElSelect v-model="reasoningEfforts.low" placeholder="Select reasoning effort" clearable>
+                <ElOption v-for="opt in lowModelReasoningOptions" :key="opt" :label="opt" :value="opt" />
               </ElSelect>
             </ElFormItem>
           </ElForm>

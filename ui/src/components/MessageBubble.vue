@@ -64,6 +64,7 @@ marked.use({
 });
 
 const isUser = computed(() => props.message.role === 'user');
+const isRejectedTrigger = computed(() => props.message.isRejectedTrigger === true);
 const hasThinking = computed(() => props.message.thinkingSteps && props.message.thinkingSteps.length > 0);
 
 const copied = ref(false);
@@ -399,7 +400,7 @@ const handleThinkingClick = (event: MouseEvent) => {
       <img src="/agent-avatar.png" alt="Agent" class="agent-avatar-img" />
     </div>
 
-    <div class="message-bubble" :class="{ 'user-message': isUser, 'agent-message': !isUser }">
+    <div class="message-bubble" :class="{ 'user-message': isUser, 'agent-message': !isUser, 'rejected-trigger': isRejectedTrigger }">
       <div class="message-header">
         <span class="message-role">{{ isUser ? 'You' : 'Agent' }}</span>
         <span class="message-time">{{ message.timestamp.toLocaleTimeString() }}</span>
@@ -409,6 +410,16 @@ const handleThinkingClick = (event: MouseEvent) => {
       </div>
 
     <div class="message-content">
+      <!-- Rejected skill-event trigger: a filtered event that did NOT match the
+           user's automation rule. Shown for visibility; the agent never ran. -->
+      <div v-if="isRejectedTrigger" class="rejected-trigger-banner">
+        <Icon icon="mdi:filter-remove-outline" class="rejected-trigger-icon" />
+        <div class="rejected-trigger-text">
+          <span class="rejected-trigger-title">Trigger skipped — didn't match your rule</span>
+          <span v-if="message.rejectedReason" class="rejected-trigger-reason">{{ message.rejectedReason }}</span>
+        </div>
+      </div>
+
       <!-- Main text content -->
       <div v-if="message.content" class="text-content marked-content" v-html="parsedContent" v-link-blank></div>
 
@@ -649,6 +660,38 @@ const handleThinkingClick = (event: MouseEvent) => {
 
 [data-theme="dark"] .agent-message:hover {
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+}
+
+/* Rejected skill-event trigger: muted, de-emphasized, with a warning accent. */
+.agent-message.rejected-trigger {
+  border-left-color: var(--warning-color, #f59e0b);
+  opacity: 0.78;
+}
+.rejected-trigger-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  border-radius: 8px;
+  background: var(--warning-bg, rgba(245, 158, 11, 0.1));
+  border: 1px solid var(--warning-color, #f59e0b);
+}
+.rejected-trigger-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+  font-size: 1.05rem;
+  color: var(--warning-color, #f59e0b);
+}
+.rejected-trigger-text { display: flex; flex-direction: column; gap: 2px; }
+.rejected-trigger-title {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--warning-color, #f59e0b);
+}
+.rejected-trigger-reason {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
 }
 
 /* Message Header */

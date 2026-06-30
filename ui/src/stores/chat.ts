@@ -107,6 +107,10 @@ export interface ChatMessage {
   latency?: LatencyInfo;
   reasoningModelLabel?: string;
   summary?: string;
+  // Skill-event trigger that the matching gate rejected: shown in the UI as a
+  // distinct "skipped — didn't match" bubble, but never fed to the agent.
+  isRejectedTrigger?: boolean;
+  rejectedReason?: string;
 }
 
 export interface ObservationPart {
@@ -958,6 +962,30 @@ export const useChatStore = defineStore('chat', {
           return;
         }
 
+        case 'event_trigger_rejected': {
+          // Skill-event trigger the matching gate filtered out: render a
+          // standalone, visually-distinct bubble so the user knows an event
+          // arrived and was skipped. No agent run follows — do NOT flip the
+          // conversation into the streaming state.
+          const id: string | undefined = data.id;
+          const content: string = data.content ?? '';
+          const alreadyPresent =
+            id !== undefined && bucket.some(m => m.id === id);
+          if (!alreadyPresent) {
+            bucket.push({
+              id: id ?? this.generateId(),
+              role: 'assistant',
+              content,
+              parts: [{ kind: 'text', text: content } as Part],
+              timestamp: new Date(),
+              isStreaming: false,
+              isRejectedTrigger: true,
+              rejectedReason: data.reason ?? data.metadata?.rejected_reason ?? '',
+            });
+          }
+          return;
+        }
+
         case 'thinking': {
           const message = ensureAssistant();
           const stepReceivedAt = Date.now();
@@ -1280,6 +1308,8 @@ export const useChatStore = defineStore('chat', {
             }))
         : undefined;
 
+      const isRejectedTrigger = msg.metadata?.kind === 'rejected_trigger';
+
       return {
         id: msg.id,
         role: msg.role === 'agent' ? 'assistant' : 'user',
@@ -1293,6 +1323,8 @@ export const useChatStore = defineStore('chat', {
         terminalAttachments: terminalAttachments && terminalAttachments.length > 0 ? terminalAttachments : undefined,
         reasoningModelLabel,
         summary: msg.summary ?? undefined,
+        isRejectedTrigger: isRejectedTrigger || undefined,
+        rejectedReason: isRejectedTrigger ? (msg.metadata?.rejected_reason ?? '') : undefined,
       };
     },
 

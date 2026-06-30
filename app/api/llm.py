@@ -253,13 +253,14 @@ def get_llm_routes(state: BootedState) -> list[Route]:
         return JSONResponse({"success": True, "deleted_keys": deleted})
 
     async def handle_get_model_groups(request: Request) -> JSONResponse:
-        """Get the single configured model (``high``) + optional ``vision`` model,
-        and their reasoning_effort.
+        """Get the configured reasoning model (``high``) plus the optional
+        ``vision`` and ``low`` models, and their reasoning_effort.
 
-        The high/low split was removed when the agent moved to native function
-        calling; ``high`` is the one model the agent runs on. The key name is
-        kept for config back-compat. ``vision`` is an optional override used only
-        by image_understanding (falls back to the single model when unset).
+        ``high`` is the one model the agent reasons on. ``vision`` is an optional
+        override used only by image_understanding. ``low`` is the optional
+        low-performance / cheap model used for lightweight auxiliary tasks (e.g.
+        the skill-event matching gate). Both optional groups fall back to the
+        single model when unset.
         """
         unauth = _require_auth(request)
         if unauth is not None:
@@ -272,7 +273,7 @@ def get_llm_routes(state: BootedState) -> list[Route]:
 
         groups = {}
         reasoning_efforts: dict[str, str | None] = {}
-        for group in ("high", "vision"):
+        for group in ("high", "vision", "low"):
             # SQLite first
             val = config_storage.get("llm_config", f"model_group.{group}", profile=profile)
             if not val:
@@ -321,13 +322,13 @@ def get_llm_routes(state: BootedState) -> list[Route]:
 
         model_groups = body.get("model_groups", {})
         for group, value in model_groups.items():
-            if group in ("high", "vision"):
+            if group in ("high", "vision", "low"):
                 config_storage.set("llm_config", f"model_group.{group}", str(value), profile=profile)
 
         # Save reasoning_effort per group
         reasoning_efforts = body.get("reasoning_efforts", {})
         for group, value in reasoning_efforts.items():
-            if group in ("high", "vision"):
+            if group in ("high", "vision", "low"):
                 if value:
                     config_storage.set("llm_config", f"model_group.{group}.reasoning_effort", str(value), profile=profile)
                 else:

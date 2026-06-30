@@ -40,7 +40,12 @@ from a2a.types import DataPart, Part, TextPart
 
 from app.agent.usage import UsageRecord
 from app.utils.formatting import dict_to_text
-from app.config import model_supports_reasoning, model_supports_vision, vision_feature_enabled
+from app.config import (
+    model_parallel_tool_calls,
+    model_supports_reasoning,
+    model_supports_vision,
+    vision_feature_enabled,
+)
 from app.config.settings import get_user_working_directory
 from app.config.user_config import resolve_agent_config
 from app.constants import ChatCompletionTypeEnum
@@ -149,6 +154,11 @@ def _coerce_args(raw: Any) -> Dict[str, Any]:
 class ReasoningAgent:
     """Native function-calling loop driven by the unified :class:`Tool` registry."""
 
+    # Safe default for the per-model parallel-tool-calls flag; ``__init__`` resolves
+    # the real value from the model catalog. Keeps construction via ``__new__``
+    # (used in tests) and any future subclass from tripping on a missing attribute.
+    _parallel_tool_calls: bool = True
+
     def __init__(
         self,
         llm: LLMProvider,
@@ -177,10 +187,12 @@ class ReasoningAgent:
         # Snapshot the tool list available to this profile for this run.
         tools = registry.tools_for_profile(profile)
         # Event-triggered runs must not register new watchers/events (recursive
-        # event storms). The skill tool's ``subscribe`` block is omitted from the
-        # spec when ``_triggered_by_event`` is set (see _build_tools_and_dispatch),
-        # and ``register_file_watcher`` (a system_file subtool) is suppressed the
-        # same way via ``_triggered_by_event`` injected into spec-building below.
+        # event storms). This is enforced at DISPATCH time — ``_handle_skill_call``
+        # refuses a ``subscribe`` call and ``_loop`` refuses a ``register_file_watcher``
+        # call when ``_triggered_by_event`` is set — NOT by mutating the tool schema.
+        # The ``tools=`` block stays byte-identical to a normal run so the prompt
+        # cache prefix is reused on event runs (a prior schema divergence here
+        # dropped event cache hits to ~29%).
         self._triggered_by_event = triggered_by_event
         # The ``reasoning`` think-tool exists only to give models WITHOUT native
         # step-by-step reasoning a place to think before acting. Drop it (and
@@ -192,6 +204,13 @@ class ReasoningAgent:
         self._inject_reasoning_guidance = not native_reasoning
         if native_reasoning:
             tools = [t for t in tools if t.tool_id != "reasoning"]
+        # Whether the model may emit several tool calls in one turn. Default-on for
+        # every provider; the agent already runs leaf calls concurrently (see the
+        # asyncio.gather in _loop). A per-model TOML flag can opt a model out.
+        self._parallel_tool_calls = model_parallel_tool_calls(
+            getattr(self.llm, "provider_name", ""),
+            getattr(self.llm, "model_name", ""),
+        )
         # Image understanding only ever happens through the ``image_understanding``
         # tool. The Specialized Vision Model toggle picks *which* model runs it:
         # ON → a dedicated vision model; OFF → the main model (``self.llm``).
@@ -331,11 +350,14 @@ class ReasoningAgent:
             return {}
 
     def _tool_arguments(self, tool_id: str) -> dict:
-        """Persisted client arguments (config defaults) plus run-kind injections."""
-        args = self._load_arguments(tool_id) if tool_id in self._tools_by_id else {}
-        if tool_id == "system_file" and self._triggered_by_event:
-            args = {**args, "_triggered_by_event": True}
-        return args
+        """Persisted client arguments (config defaults) for a tool.
+
+        No run-kind injection here: event-triggered runs MUST send the exact same
+        tool schema as normal runs (the ``tools=`` block is the front of the prompt
+        cache prefix). Storm-prevention that used to filter the schema on event runs
+        is now enforced at dispatch time in ``_loop`` / ``_handle_skill_call``.
+        """
+        return self._load_arguments(tool_id) if tool_id in self._tools_by_id else {}
 
     # ── prompt building ───────────────────────────────────────────────
 
@@ -373,8 +395,12 @@ class ReasoningAgent:
         the cached ``tools=`` prefix intact. Event-bearing skills additionally
         expose a ``subscribe`` object carrying that skill's own event enum, so a
         subscription is unambiguously tied to the skill whose tool was called
-        (no active-skill state). ``subscribe`` is omitted on event-triggered runs
-        to prevent recursive event storms.
+        (no active-skill state). The ``subscribe`` block is present on every run
+        — including event-triggered ones — so the ``tools=`` prefix is identical
+        regardless of how the turn started (a previous schema divergence here cost
+        the prompt cache on every event run). Recursive event storms are prevented
+        at dispatch time instead: ``_handle_skill_call`` refuses a ``subscribe``
+        call when ``_triggered_by_event`` is set.
         """
         properties: Dict[str, Any] = {
             SKILL_REQUEST_ARG: {
@@ -386,7 +412,7 @@ class ReasoningAgent:
             },
         }
         items = self._skill_event_items(tool)
-        if items and not self._triggered_by_event:
+        if items:
             names = [i["name"] for i in items]
             desc_lines = [
                 f"- {i['name']}: {i.get('description', '')}".rstrip(": ").rstrip()
@@ -472,6 +498,21 @@ class ReasoningAgent:
 
         return specs, dispatch
 
+    # Leaf sub-tools whose schema stays exposed on every run (byte-stable tools
+    # prefix) but whose EXECUTION is blocked while reacting to an event, to stop
+    # recursive event storms. Matched on the bare leaf name + owning tool_id (the
+    # model emits the namespaced ``system_file__register_file_watcher``, but the
+    # dispatch entry carries the bare ``register_file_watcher`` in ``entry[2]``).
+    _EVENT_BLOCKED_LEAVES: frozenset = frozenset({("system_file", "register_file_watcher")})
+
+    def _is_event_blocked_leaf(self, entry) -> bool:
+        return (
+            self._triggered_by_event
+            and bool(entry)
+            and entry[0] == "leaf"
+            and (entry[1].tool_id, entry[2]) in self._EVENT_BLOCKED_LEAVES
+        )
+
     # ── main entry point ──────────────────────────────────────────────
 
     async def run(
@@ -526,6 +567,7 @@ class ReasoningAgent:
                     messages=messages,
                     tools=specs or None,
                     tool_choice="auto" if specs else None,
+                    parallel_tool_calls=self._parallel_tool_calls,
                     temperature=self._reasoning_temperature,
                     max_tokens=self._reasoning_max_tokens,
                     retry=self._reasoning_retry,
@@ -611,7 +653,14 @@ class ReasoningAgent:
                 )
                 yield self._thinking_artifact(step_no, call_id, name, display_args, tool)
 
-            leaf_calls = [(c, n, a, e) for (c, n, a, e) in resolved if e and e[0] == "leaf"]
+            # Storm-blocked leaves keep their schema but are NOT executed on an
+            # event run; they still get a paired role:"tool" result below so the
+            # turn's tool_calls group is fully answered (an unanswered tool_use
+            # would 400 on replay / be truncated by _normalize_turn_messages).
+            leaf_calls = [
+                (c, n, a, e) for (c, n, a, e) in resolved
+                if e and e[0] == "leaf" and not self._is_event_blocked_leaf(e)
+            ]
             outcomes: Dict[str, "_LeafOutcome"] = {}
             if leaf_calls:
                 gathered = await asyncio.gather(*[
@@ -630,6 +679,17 @@ class ReasoningAgent:
                 if entry[0] == "skill":
                     async for item in self._handle_skill_call(entry[1], args, call_id, step_no):
                         yield item
+                    continue
+                if self._is_event_blocked_leaf(entry):
+                    obs = (
+                        "Registering a file watcher is not allowed while reacting "
+                        "to an event (this prevents recursive event loops). "
+                        "Ignoring this request."
+                    )
+                    self._append_tool_result(call_id, obs, fn_name=name)
+                    yield self._result_artifact(
+                        step_no, call_id, [Part(root=TextPart(text=obs))]
+                    )
                     continue
                 outcome = outcomes.get(call_id)
                 if outcome is None:
@@ -899,11 +959,13 @@ class ReasoningAgent:
         """Args to SHOW for a skill call in the UI Thinking Process.
 
         Mirrors ``_handle_skill_call``'s branch: a subscribe call shows its
-        ``subscribe`` payload verbatim; any other (load) call shows the same
-        fixed marker the recorded ``request`` is overwritten to, so the UI step
-        matches the trace the model actually sees.
+        ``subscribe`` payload verbatim (even on an event-triggered run, where the
+        call is refused — the displayed payload matches what the model emitted and
+        the refusal trace); any other (load) call shows the same fixed marker the
+        recorded ``request`` is overwritten to, so the UI step matches the trace
+        the model actually sees.
         """
-        if self._is_skill_subscribe_args(args) and not self._triggered_by_event:
+        if self._is_skill_subscribe_args(args):
             return args
         return {SKILL_REQUEST_ARG: SKILL_LOAD_REQUEST.format(name=tool.name)}
 
@@ -940,7 +1002,22 @@ class ReasoningAgent:
         skill_md_path = dir_path / "SKILL.md"
 
         # ── subscribe path: register an event for this exact skill ──────────
-        if self._is_skill_subscribe_args(args) and not self._triggered_by_event:
+        if self._is_skill_subscribe_args(args):
+            # The ``subscribe`` block is always in the spec (byte-stable tools
+            # prefix), so the model can emit it even while reacting to an event.
+            # Refuse it at runtime there: subscribing during an event run risks a
+            # recursive event storm (event → reasoning → subscribe → event → …).
+            if self._triggered_by_event:
+                obs = (
+                    "Subscriptions cannot be created while reacting to an event "
+                    "(this prevents recursive event loops). Ignoring this "
+                    "subscribe request."
+                )
+                self._append_tool_result(call_id, obs, fn_name=tool.tool_id)
+                yield self._result_artifact(
+                    step_no, call_id, [Part(root=TextPart(text=obs))]
+                )
+                return
             from app.tools.builtin.register_skill_event import (
                 register_skill_events,
                 _normalize_triggers,

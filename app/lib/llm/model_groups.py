@@ -1,14 +1,15 @@
 """LLM Model Group Manager.
 
-The agent runs on a **single configured model**. Historically there were two
-model "groups" (``high`` for reasoning, ``low`` for the inner tool-routing LLM);
-the routing LLM was removed when the agent moved to native function calling, so
-``high`` and ``low`` now resolve to the *same* model. The single model is still
-stored under the ``model_group.high`` key (kept to avoid a config migration);
-``create_llm_for_model`` is the canonical accessor.
+The agent reasons on a **single configured model** (the ``high`` group, stored
+under ``model_group.high``); ``create_llm_for_model`` is the canonical accessor.
+``main`` is an alias for it.
 
-A separate **optional** ``vision`` model remains, used only by the
-``image_understanding`` tool. When unset it falls back to the single model.
+Two **optional** auxiliary groups fall back to the single model when unset:
+
+- ``vision`` — used only by the ``image_understanding`` tool.
+- ``low`` — the low-performance / cheap model for lightweight auxiliary tasks
+  (e.g. the skill-event matching gate). Generalized so future features needing a
+  cheaper model can resolve it via ``create_llm_for_group("low", ...)``.
 """
 
 from typing import Optional
@@ -32,14 +33,13 @@ class ModelGroupManager:
         The group value format is 'provider/model_name' (e.g., 'groq/openai/gpt-oss-120b').
         The first segment before '/' is the provider, the rest is the model identifier.
 
-        ``high`` / ``low`` / ``main`` all resolve to the single configured model
-        (stored under ``model_group.high``). ``vision`` resolves its own optional
-        key, falling back to the single model. Priority: SQLite override > TOML default.
+        ``high`` / ``main`` resolve to the single configured reasoning model
+        (stored under ``model_group.high``). ``low`` and ``vision`` resolve their
+        own optional keys, each falling back to the single model when unset.
+        Priority: SQLite override > TOML default.
         """
-        # Collapse the legacy high/low split: there is one model now. Any caller
-        # asking for the reasoning ("high"), the old routing ("low"), or the
-        # canonical ("main") group gets the single configured model.
-        if group in ("high", "low", "main"):
+        # ``main`` is an alias for the single configured reasoning model.
+        if group in ("high", "main"):
             group = "high"
 
         # Try SQLite first
@@ -53,11 +53,12 @@ class ModelGroupManager:
             except Exception:
                 pass
 
-        # The dedicated "vision" group is optional: when the user hasn't picked
-        # a vision model it transparently falls back to the "high" group, so
-        # image understanding works out of the box on a vision-capable high
-        # model. A non-vision model still surfaces a clear error at use time.
-        if not group_value and group == "vision":
+        # The dedicated "vision" and "low" groups are optional: when the user
+        # hasn't picked one they transparently fall back to the "high" group, so
+        # the dependent feature works out of the box. ``vision`` on a non-vision
+        # model still surfaces a clear error at use time; ``low`` (the
+        # low-performance / cheap auxiliary model) just runs on the main model.
+        if not group_value and group in ("vision", "low"):
             return self.get_provider_and_model("high", profile=profile)
 
         if not group_value:

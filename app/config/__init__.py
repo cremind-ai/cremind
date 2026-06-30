@@ -111,6 +111,31 @@ def model_supports_prompt_cache(provider_name: str, model_name: str) -> bool:
     return False
 
 
+def model_parallel_tool_calls(provider_name: str, model_name: str) -> bool:
+    """Return True if ``model_name`` may emit multiple tool calls in one turn.
+
+    Looks up the ``parallel_tool_calls`` flag on the matching ``[[models]]`` entry
+    in the provider catalog. Unlike ``supports_reasoning``/``prompt_cache``, the
+    default is **True** — parallel tool use is the default-on behavior for every
+    provider, and the agent already executes leaf tool calls concurrently. Set the
+    flag to ``false`` on a model entry only to *opt out* (e.g. OpenAI o-series /
+    reasoning models that reject the ``parallel_tool_calls`` request parameter).
+    Unknown / unlisted models default to True.
+    """
+    if not provider_name or not model_name:
+        return True
+    model = model_name
+    prefix = f"{provider_name}/"
+    if model.startswith(prefix):
+        model = model[len(prefix):]
+
+    catalog = load_provider_catalog(provider_name)
+    for entry in catalog.get("models", []) or []:
+        if isinstance(entry, dict) and entry.get("id") == model:
+            return bool(entry.get("parallel_tool_calls", True))
+    return True
+
+
 def _reasoning_overrides() -> set[str]:
     """Models force-flagged native-reasoning-capable via the
     ``CREMIND_REASONING_MODELS`` env var (comma-separated ``provider/model`` or

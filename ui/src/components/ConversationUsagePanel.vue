@@ -43,7 +43,11 @@ async function load() {
 watch(() => props.modelValue, (open) => { if (open) load(); });
 
 const tagType = (t: string) =>
-  t === 'reasoning' ? 'primary' : t === 'subagent' ? 'danger' : t === 'intrinsic' ? 'success' : 'warning';
+  t === 'reasoning' ? 'primary' : t === 'subagent' ? 'danger' : t === 'intrinsic' ? 'success'
+    : t === 'event_gate' ? 'info' : 'warning';
+
+// Friendlier badge text for source types whose raw key reads awkwardly.
+const sourceTypeLabel = (t: string) => (t === 'event_gate' ? 'event filter' : t);
 
 // Requests are sortable from the column headers (When / Model / Tokens / Est.
 // cost), defaulting to newest-first — which also fixes the unordered rows the
@@ -92,7 +96,7 @@ const modelSort = (a: RequestUsage, b: RequestUsage) =>
           <ElTableColumn label="Source" min-width="180">
             <template #default="{ row }">
               <span class="src-name">{{ row.display_name }}</span>
-              <ElTag size="small" :type="tagType(row.source_type)" effect="light">{{ row.source_type }}</ElTag>
+              <ElTag size="small" :type="tagType(row.source_type)" effect="light">{{ sourceTypeLabel(row.source_type) }}</ElTag>
             </template>
           </ElTableColumn>
           <ElTableColumn label="Calls" width="70" align="right" prop="request_count" />
@@ -120,7 +124,7 @@ const modelSort = (a: RequestUsage, b: RequestUsage) =>
               <div class="req-detail">
                 <div v-for="s in row.by_source" :key="s.source" class="req-src-row">
                   <span class="src-name">{{ s.display_name }}</span>
-                  <ElTag size="small" :type="tagType(s.source_type)" effect="plain">{{ s.source_type }}</ElTag>
+                  <ElTag size="small" :type="tagType(s.source_type)" effect="plain">{{ sourceTypeLabel(s.source_type) }}</ElTag>
                   <span class="grow"></span>
                   <span class="muted">{{ formatTokens(s.input_tokens + s.cache_read_input_tokens) }} in / {{ formatTokens(s.output_tokens) }} out</span>
                   <span class="cost">{{ formatUsd(s.estimated_cost_usd) }}</span>
