@@ -210,6 +210,12 @@ def convert_db_messages_to_history(
     """
     messages: list[ChatCompletionMessageParam] = []
     for m in db_messages:
+        # UI-only messages (e.g. rejected skill-event triggers the matching gate
+        # filtered out) are shown in the conversation but must never enter the
+        # model's context — the agent has no knowledge of them. This is the single
+        # chokepoint every history-building path routes through.
+        if (m.get("metadata") or {}).get("ui_only"):
+            continue
         trace = m.get("llm_messages") if include_reasoning else None
         if trace:
             messages.extend(trace)

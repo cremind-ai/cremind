@@ -89,3 +89,48 @@ def test_mixed_old_and_new_turns() -> None:
 def test_empty_content_without_trace_skipped() -> None:
     db = [{"role": "agent", "content": "   ", "llm_messages": None}]
     assert convert_db_messages_to_history(db, include_reasoning=True) == []
+
+
+def test_ui_only_messages_excluded_from_agent_history() -> None:
+    # Rejected skill-event triggers carry metadata.ui_only=True. They are shown
+    # in the UI but must never enter the model's context — on every history path.
+    db = [
+        {"role": "user", "content": "q1"},
+        {
+            "role": "agent",
+            "content": "Trigger: new_email\nAction: ...\nContent: ...",
+            "metadata": {"ui_only": True, "kind": "rejected_trigger"},
+        },
+        {"role": "agent", "content": "a1"},
+    ]
+    out = convert_db_messages_to_history(db, include_reasoning=False)
+    assert out == [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    ]
+
+
+def test_ui_only_excluded_even_with_reasoning_trace() -> None:
+    # A ui_only flag wins even if the row somehow carries an llm_messages trace.
+    db = [
+        {
+            "role": "agent",
+            "content": "rejected",
+            "metadata": {"ui_only": True},
+            "llm_messages": _trace(),
+        },
+    ]
+    assert convert_db_messages_to_history(db, include_reasoning=True) == []
+
+
+def test_metadata_none_or_missing_is_safe() -> None:
+    # metadata may be absent or explicitly None — neither should raise.
+    db = [
+        {"role": "user", "content": "q1"},
+        {"role": "agent", "content": "a1", "metadata": None},
+    ]
+    out = convert_db_messages_to_history(db)
+    assert out == [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    ]

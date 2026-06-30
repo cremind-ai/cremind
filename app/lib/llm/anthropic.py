@@ -192,6 +192,31 @@ def _cache_history(anthropic_messages: list[dict], cache_enabled: bool) -> list[
     )
 
 
+def _anthropic_tool_choice(
+    tool_choice: Optional[Union[str, Dict[str, Any]]],
+    parallel_tool_calls: Optional[bool],
+) -> Optional[dict]:
+    """Map an OpenAI-style ``tool_choice`` to Anthropic's, honoring parallel control.
+
+    Returns the ``tool_choice`` dict to send, or ``None`` to omit the field (e.g.
+    for ``"none"`` or an unrecognized value). Anthropic runs tools in parallel by
+    default, so ``disable_parallel_tool_use`` is added only when
+    ``parallel_tool_calls`` is explicitly ``False`` (``True``/``None`` leave the
+    parallel-on default untouched).
+    """
+    if tool_choice == "auto" or tool_choice is None:
+        choice: Optional[dict] = {"type": "auto"}
+    elif tool_choice == "required":
+        choice = {"type": "any"}
+    elif isinstance(tool_choice, dict) and "function" in tool_choice:
+        choice = {"type": "tool", "name": tool_choice["function"].get("name", "")}
+    else:
+        choice = None  # "none" or unrecognized → don't send tool_choice
+    if choice is not None and parallel_tool_calls is False:
+        choice["disable_parallel_tool_use"] = True
+    return choice
+
+
 class AnthropicLLMProvider(LLMProvider):
     def __init__(
         self,
@@ -271,18 +296,9 @@ class AnthropicLLMProvider(LLMProvider):
                     params["stop_sequences"] = [stop]
                 if anthropic_tools:
                     params["tools"] = _cache_last_tool(anthropic_tools, cache_enabled)
-                    # Map OpenAI tool_choice to Anthropic
-                    if tool_choice == "auto" or tool_choice is None:
-                        params["tool_choice"] = {"type": "auto"}
-                    elif tool_choice == "required":
-                        params["tool_choice"] = {"type": "any"}
-                    elif tool_choice == "none":
-                        pass  # Don't send tool_choice
-                    elif isinstance(tool_choice, dict) and "function" in tool_choice:
-                        params["tool_choice"] = {
-                            "type": "tool",
-                            "name": tool_choice["function"].get("name", ""),
-                        }
+                    tc = _anthropic_tool_choice(tool_choice, parallel_tool_calls)
+                    if tc is not None:
+                        params["tool_choice"] = tc
 
                 async with self.client.messages.stream(**params) as stream:
                     async for event in stream:
@@ -423,17 +439,9 @@ class AnthropicLLMProvider(LLMProvider):
                     params["stop_sequences"] = [stop]
                 if anthropic_tools:
                     params["tools"] = _cache_last_tool(anthropic_tools, cache_enabled)
-                    if tool_choice == "auto" or tool_choice is None:
-                        params["tool_choice"] = {"type": "auto"}
-                    elif tool_choice == "required":
-                        params["tool_choice"] = {"type": "any"}
-                    elif tool_choice == "none":
-                        pass
-                    elif isinstance(tool_choice, dict) and "function" in tool_choice:
-                        params["tool_choice"] = {
-                            "type": "tool",
-                            "name": tool_choice["function"].get("name", ""),
-                        }
+                    tc = _anthropic_tool_choice(tool_choice, parallel_tool_calls)
+                    if tc is not None:
+                        params["tool_choice"] = tc
 
                 response = await self.client.messages.create(**params)
 

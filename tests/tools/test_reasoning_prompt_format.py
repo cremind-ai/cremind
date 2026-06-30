@@ -252,3 +252,97 @@ def test_parallel_tool_calls_run_and_group_in_one_step(monkeypatch) -> None:
     assert roles == ["assistant", "tool", "tool"]
     tool_texts = " ".join(m["content"] for m in agent._turn_messages if m["role"] == "tool")
     assert "add=5" in tool_texts and "mul=20" in tool_texts
+
+
+# ── event-triggered storm prevention: register_file_watcher ───────────────────
+#
+# The register_file_watcher subtool stays in the schema on EVERY run (the tools=
+# block must be byte-identical for prompt-cache reuse), but its EXECUTION is
+# blocked while reacting to an event to avoid recursive event storms. The blocked
+# call must still get a paired role:"tool" result (no dangling tool_use on replay).
+
+class _FakeWatcherTool(_FakeLeafTool):
+    """A system_file-like group exposing the register_file_watcher leaf."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._tool_id = "system_file"
+
+    @property
+    def name(self) -> str:
+        return "System File"
+
+    def leaf_function_specs(self, *, context_id, profile, query="", arguments=None):
+        return [FunctionSpec(
+            name="system_file__register_file_watcher",
+            leaf_name="register_file_watcher",
+            schema={"type": "function", "function": {
+                "name": "system_file__register_file_watcher",
+                "parameters": {"type": "object", "properties": {}},
+            }},
+        )]
+
+    async def execute_leaf(self, *, leaf_name, args, context_id, profile,
+                           arguments, variables, llm_params):
+        self.calls.append({"leaf": leaf_name, "args": args})
+        yield ToolResultEvent(observation_text="WATCHER REGISTERED")
+
+
+class _WatcherCallLLM(_ScriptedLLM):
+    async def chat_completion_stream(self, *, messages, tools=None, tool_choice=None, **kwargs):
+        self._step += 1
+        if self._step == 1:
+            yield {
+                "type": ChatCompletionTypeEnum.FUNCTION_CALLING,
+                "data": {"function": [
+                    {"index": 0, "id": "w1",
+                     "name": "system_file__register_file_watcher",
+                     "arguments": {"path": ".", "action": "do x"}},
+                ]},
+            }
+            yield {"type": ChatCompletionTypeEnum.DONE, "input_tokens": 5,
+                   "output_tokens": 2, "finish_reason": "tool_calls"}
+        else:
+            yield {"type": ChatCompletionTypeEnum.CONTENT, "data": "ok"}
+            yield {"type": ChatCompletionTypeEnum.DONE, "input_tokens": 3,
+                   "output_tokens": 1, "finish_reason": "stop"}
+
+
+def _build_watcher_agent(monkeypatch):
+    agent, _ = _build_agent(monkeypatch)
+    tool = _FakeWatcherTool()
+    agent.llm = _WatcherCallLLM()
+    agent._tools = [tool]
+    agent._tools_by_id = {"system_file": tool}
+    return agent, tool
+
+
+def test_event_run_blocks_register_file_watcher(monkeypatch) -> None:
+    agent, tool = _build_watcher_agent(monkeypatch)
+    agent._triggered_by_event = True
+
+    async def _run():
+        return [c async for c in agent.run("watch this folder", history_messages=[])]
+
+    asyncio.run(_run())
+
+    # The leaf was NOT executed...
+    assert tool.calls == []
+    # ...but the tool_call still got a paired role:"tool" refusal (replay-safe).
+    roles = [m["role"] for m in agent._turn_messages]
+    assert roles[:2] == ["assistant", "tool"]
+    assert "not allowed while reacting to an event" in agent._turn_messages[1]["content"]
+
+
+def test_normal_run_allows_register_file_watcher(monkeypatch) -> None:
+    agent, tool = _build_watcher_agent(monkeypatch)
+    # _triggered_by_event stays False (set by _build_agent) → the leaf runs.
+
+    async def _run():
+        async for _ in agent.run("watch this folder", history_messages=[]):
+            pass
+
+    asyncio.run(_run())
+    assert tool.calls == [
+        {"leaf": "register_file_watcher", "args": {"path": ".", "action": "do x"}}
+    ]
