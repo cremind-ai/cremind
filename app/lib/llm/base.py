@@ -70,6 +70,24 @@ def openai_usage_breakdown(usage: Any) -> Dict[str, Optional[int]]:
     }
 
 
+def done_chunk_token_usage(response: Dict[str, Any]) -> Dict[str, int]:
+    """Read the four-way token breakdown off a terminal ``DONE`` completion chunk.
+
+    Every provider's ``chat_completion`` emits its usage on the terminal
+    ``ChatCompletionTypeEnum.DONE`` chunk as four top-level int fields. This is the
+    single place that names them, so direct ``chat_completion`` consumers (the
+    skill-event gate, the ``documentation_search`` judge, ``image_understanding``)
+    read usage identically instead of each re-listing the keys. Missing/``None``
+    values coerce to 0.
+    """
+    return {
+        "input_tokens": int(response.get("input_tokens") or 0),
+        "cache_read_input_tokens": int(response.get("cache_read_input_tokens") or 0),
+        "cache_creation_input_tokens": int(response.get("cache_creation_input_tokens") or 0),
+        "output_tokens": int(response.get("output_tokens") or 0),
+    }
+
+
 class LLMProvider(ABC):
     provider_name: str = ""
 

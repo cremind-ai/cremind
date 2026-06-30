@@ -4,6 +4,9 @@ import { Icon } from '@iconify/vue';
 
 export interface MentionItem {
   name: string;
+  // Owning profile, for agent-name items — used only as a stable list key
+  // (two profiles may share an agent name). Absent for system vars.
+  profile?: string;
   description?: string;
   // System variables carry a resolved value (may be null when unset, e.g. no
   // profile). Profiles omit the key entirely — `undefined` means "no value
@@ -20,7 +23,10 @@ const props = defineProps<{
   top: number;
   left: number;
   activeIndex: number;
-  prefix: '$' | '@';
+  // Glyph shown before each item's name in the list/detail. `'$'` for system
+  // vars; `''` for agent names (the `@` trigger is dropped on selection, so the
+  // menu shows the bare name).
+  prefix: string;
 }>();
 
 const emit = defineEmits<{
@@ -86,7 +92,7 @@ watch(() => props.visible, () => { revealed.value = false; });
       <ul class="mention-menu" role="listbox">
         <li
           v-for="(item, idx) in items"
-          :key="item.name"
+          :key="item.profile ?? item.name"
           :class="['mention-item', { active: idx === activeIndex }]"
           role="option"
           :aria-selected="idx === activeIndex"

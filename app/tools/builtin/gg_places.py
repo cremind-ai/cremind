@@ -31,17 +31,10 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "gg_places",
     "display_name": "Google Places",
-    "default_model_group": "low",
     "visible": False,
     # Requires the ``google`` feature (googleapiclient + google-auth). See
     # app.features.manifest.FEATURES.
     "requires_feature": "google",
-    "llm_parameters": {
-        "tool_instructions": (
-            "Search for nearby places with Google Maps (search_places) and "
-            "generate Google Maps directions links (map_direction_link)."
-        ),
-    },
     "required_config": {
         Var.API_KEY: {
             "description": "Google Maps API Key",

@@ -105,20 +105,7 @@ _DURATION_SCHEMA: Dict[str, Any] = {
 TOOL_CONFIG: ToolConfig = {
     "name": "scheduler",
     "display_name": "Scheduler",
-    # Lightweight structured extraction, like datetime_parser and the other
-    # extraction tools.
-    "default_model_group": "low",
     "hidden": True,
-    # This tool's contract is that the reasoning model fills the structured
-    # schema below directly via native function calling.
-    "llm_parameters": {
-        "tool_instructions": (
-            "Classify and normalize a schedule expression (a single time, an "
-            "interval, a recurring rule, a hand-listed set, a query window, or "
-            "a filtering constraint) into machine-usable datetimes and, for "
-            "recurrences, an RFC 5545 RRULE."
-        ),
-    },
 }
 
 

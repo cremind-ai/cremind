@@ -78,6 +78,14 @@ def _resolve_skill_dir(profile: Optional[str]) -> Optional[str]:
     return str(profile_skills_dir(profile))
 
 
+def _resolve_agent_name(profile: Optional[str]) -> Optional[str]:
+    if not profile:
+        return None
+    # Lazy import to keep this module's import graph light.
+    from app.utils.agent_name import read_agent_name
+    return read_agent_name(profile)
+
+
 @dataclass(frozen=True)
 class SystemVarSpec:
     name: str
@@ -116,6 +124,11 @@ SYSTEM_VARS: list[SystemVarSpec] = [
         name="CREMIND_PROFILE",
         resolve=lambda profile: profile or None,
         description="Active profile name; omitted when no profile is set.",
+    ),
+    SystemVarSpec(
+        name="CREMIND_AGENT_NAME",
+        resolve=_resolve_agent_name,
+        description="The agent's display name for this profile; omitted when no profile.",
     ),
     SystemVarSpec(
         name="CREMIND_TOKEN",

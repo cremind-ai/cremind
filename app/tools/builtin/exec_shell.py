@@ -266,16 +266,9 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "exec_shell",
     "display_name": "Shell Executor",
-    "default_model_group": "low",
     # Visible in Settings (so its output-handling options can be configured)
     # but locked on — a core capability the user must not disable.
     "locked": True,
-    "llm_parameters": {
-        "tool_instructions": (
-            "Run command-line instructions on the terminal, including "
-            "interactive/long-running processes. Works on Linux, Windows, and macOS."
-        ),
-    },
     "required_config": {
         Var.LARGE_OUTPUT_MODE: {
             "description": (

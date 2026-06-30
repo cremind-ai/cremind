@@ -64,6 +64,7 @@ from app.types import ReasoningStreamResponseType
 from app.utils.common import truncate_to_tokens
 from app.utils.context_storage import clear_context, get_context, set_context
 from app.utils.logger import logger
+from app.utils.message_tokens import resolve_system_var_tokens
 from app.utils.persona import read_persona_file
 from app.utils.working_directory import set_in_memory_override
 
@@ -362,7 +363,10 @@ class ReasoningAgent:
     # ── prompt building ───────────────────────────────────────────────
 
     def _build_instruction(self) -> str:
-        persona = read_persona_file(self.profile)
+        # Render `$CREMIND_*` system-variable tokens (e.g. $CREMIND_AGENT_NAME)
+        # in the persona before it goes to the model. The persona GET endpoint
+        # still serves the raw file, so the editor keeps showing the template.
+        persona = resolve_system_var_tokens(read_persona_file(self.profile), self.profile)
         override = (
             get_context(self.context_id, "_working_directory_override")
             if self.context_id else None

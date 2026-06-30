@@ -37,9 +37,15 @@ class BuiltInToolResult:
     Attributes:
         content: Optional list of content items (dicts with 'type'/'text'/'data' keys).
         structured_content: Optional dict returned as structured JSON data.
+        token_usage: Optional four-way token breakdown of any internal LLM call the
+            tool made (e.g. the documentation_search judge, image_understanding's
+            vision call). The adapter folds this into the tool result's token_usage
+            so it lands in a ``source_kind="tool"`` usage record; ``None`` for tools
+            that make no LLM call.
     """
     content: Optional[List[Any]] = None
     structured_content: Optional[Dict[str, Any]] = None
+    token_usage: Optional[Dict[str, int]] = None
 
 
 class BuiltInTool:

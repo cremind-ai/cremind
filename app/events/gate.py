@@ -34,16 +34,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 from app.constants import ChatCompletionTypeEnum
+from app.lib.llm.base import done_chunk_token_usage
 from app.utils.logger import logger
 
 _TOOL_NAME = "report_match"
-
-_TOKEN_KEYS = (
-    "input_tokens",
-    "cache_read_input_tokens",
-    "cache_creation_input_tokens",
-    "output_tokens",
-)
 
 _GATE_SYSTEM_PROMPT = (
     "You are an event filter for an automation system. The user subscribed to a "
@@ -67,7 +61,7 @@ class GateResult:
 
     matched: bool
     reason: str
-    tokens: Dict[str, int] = field(default_factory=lambda: {k: 0 for k in _TOKEN_KEYS})
+    tokens: Dict[str, int] = field(default_factory=lambda: done_chunk_token_usage({}))
 
 
 def _build_gate_tools() -> List[Dict[str, Any]]:
@@ -160,7 +154,7 @@ async def classify_event_match(
     ]
 
     function_calls: List[Dict[str, Any]] = []
-    tokens: Dict[str, int] = {k: 0 for k in _TOKEN_KEYS}
+    tokens: Dict[str, int] = done_chunk_token_usage({})
 
     # tool_choice="auto" mirrors the documentation_search judge (works across all
     # configured providers); the lone tool + strong instruction make a call the
@@ -176,8 +170,7 @@ async def classify_event_match(
             if isinstance(data, dict) and data.get("function"):
                 function_calls = data["function"]
         elif rtype == ChatCompletionTypeEnum.DONE:
-            for k in _TOKEN_KEYS:
-                tokens[k] = int(response.get(k) or 0)
+            tokens = done_chunk_token_usage(response)
             break
 
     if not function_calls:

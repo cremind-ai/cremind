@@ -57,19 +57,7 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "web_search",
     "display_name": SERVER_NAME,
-    "default_model_group": "low",
     "visible": True,
-    "llm_parameters": {
-        "tool_instructions": (
-            "Search the public web for current information (news, facts, "
-            "documentation, products). Returns a ranked list of results, each "
-            "with a title, URL and snippet; pair it with the Web Fetch tool to "
-            "read a result's full page."
-        ),
-        # Results are returned as structured_content; a second LLM pass would
-        # only paraphrase the list. Keep it off (and locked).
-        "full_reasoning": False,
-    },
     "required_config": {
         Var.PROVIDER: {
             "description": (
@@ -107,9 +95,6 @@ TOOL_CONFIG: ToolConfig = {
             "default": "moderate",
         },
     },
-    "locked_llm_fields": ["full_reasoning"],
-    # Single sub-tool; the model fills ``query`` directly.
-    "direct_dispatch": True,
 }
 
 

@@ -27,6 +27,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from app.config import model_supports_vision
 from app.constants import ChatCompletionTypeEnum
+from app.lib.llm.base import done_chunk_token_usage
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
 from app.tools.builtin.system_file import _allowed_roots, _guess_mime, _safe_resolve
 from app.types import ToolConfig
@@ -48,19 +49,6 @@ _VISION_SYSTEM_PROMPT = (
     "Be concise and do not speculate about anything not visible in the image."
 )
 
-_IMAGE_TOOL_INSTRUCTIONS = (
-    "Use the Image Understanding tool ONLY when the user wants to understand the "
-    "visual content of an image — read or extract text shown in it (OCR), "
-    "describe what it depicts, or answer a question about what is pictured. The "
-    "image is sent to a vision model. Do NOT use it for operations that do not "
-    "require seeing the picture: file dimensions / size / format / metadata (use "
-    "the System File 'get_file_info' sub-tool), moving / copying / renaming a "
-    "file (use the System File 'move_file' or 'copy_file' sub-tool), or "
-    "converting an image to another format such as markdown (use Convert To "
-    "Markdown). If the request is about the file rather than the picture, do not "
-    "use this tool."
-)
-
 
 class Var:
     MAX_IMAGE_BYTES = "MAX_IMAGE_BYTES"
@@ -70,17 +58,6 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "image_understanding",
     "display_name": SERVER_NAME,
-    # Vision = a strong, capable model. Defaults to the dedicated "vision"
-    # group, which itself falls back to "high" when the user hasn't picked a
-    # vision model. A per-tool model override (Settings) still works.
-    "default_model_group": "vision",
-    "llm_parameters": {
-        "tool_instructions": _IMAGE_TOOL_INSTRUCTIONS,
-        # The vision answer is produced inside run(); the adapter's post-tool
-        # reasoning pass would only paraphrase it.
-        "full_reasoning": False,
-    },
-    "locked_llm_fields": ["full_reasoning"],
     "required_config": {
         Var.MAX_IMAGE_BYTES: {
             "description": (
@@ -290,6 +267,7 @@ class AnalyzeImageTool(BuiltInTool):
         ]
 
         answer = ""
+        token_usage: Dict[str, int] = done_chunk_token_usage({})
         try:
             async for response in llm.chat_completion(
                 messages=messages,
@@ -303,6 +281,7 @@ class AnalyzeImageTool(BuiltInTool):
                     if chunk:
                         answer += chunk
                 elif rtype == ChatCompletionTypeEnum.DONE:
+                    token_usage = done_chunk_token_usage(response)
                     break
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[image_understanding] vision call failed: {e}")
@@ -319,10 +298,13 @@ class AnalyzeImageTool(BuiltInTool):
             return BuiltInToolResult(structured_content={
                 "error": "Empty response",
                 "message": "The vision model returned no content for this image.",
-            })
+            }, token_usage=token_usage)
 
         # Single text content item → unwrapped to a plain-string observation.
-        return BuiltInToolResult(content=[{"type": "text", "text": answer}])
+        return BuiltInToolResult(
+            content=[{"type": "text", "text": answer}],
+            token_usage=token_usage,
+        )
 
 
 def get_tools(config: dict) -> list[BuiltInTool]:
