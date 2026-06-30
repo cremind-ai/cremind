@@ -32,18 +32,7 @@ SERVER_NAME = "Datetime Parser"
 TOOL_CONFIG: ToolConfig = {
     "name": "datetime_parser",
     "display_name": "Datetime Parser",
-    # Lightweight, structured extraction — matches every other extraction tool
-    # (documentation_search, weather all use "low").
-    "default_model_group": "low",
     "hidden": True,
-    # The reasoning model fills the structured schema below directly via
-    # native function calling — that decomposition is this tool's entire
-    # contract, so the raw text is never passed through verbatim.
-    "llm_parameters": {
-        "tool_instructions": (
-            "Decompose time expressions in a sentence into structured, computed datetime(s)."
-        ),
-    },
 }
 
 

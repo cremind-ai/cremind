@@ -32,18 +32,10 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "markdown_converter",
     "display_name": "Markdown Converter",
-    "default_model_group": "low",
     "hidden": True,
     # Requires the ``documents`` feature (markitdown + pandas). See
     # app.features.manifest.FEATURES.
     "requires_feature": "documents",
-    "llm_parameters": {
-        "tool_instructions": (
-            "Converts files (PDF, DOCX, XLSX, PPTX, HTML, CSV, etc.) to Markdown "
-            "format. Use this tool when the user wants to convert a document to "
-            "markdown for further processing, editing, or analysis."
-        ),
-    },
     "required_config": {
         Var.MAX_FILE_SIZE: {
             "description": (

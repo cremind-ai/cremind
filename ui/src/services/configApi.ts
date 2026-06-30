@@ -668,23 +668,6 @@ export interface ToolStatus {
   /** Mirrored from config.llm.full_reasoning for convenience. */
   full_reasoning: boolean;
   arguments_schema: Record<string, unknown> | null;
-  /** Code-level defaults shipped with the tool (from TOOL_CONFIG.llm_parameters).
-   *  Surfaced here so the UI can render them as placeholders without writing
-   *  them into the database until the user actually overrides a value. */
-  llm_defaults?: {
-    server_instructions?: string;
-    description?: string;
-    system_prompt?: string;
-    llm_provider?: string;
-    llm_model?: string;
-    reasoning_effort?: string;
-    full_reasoning?: boolean;
-  };
-  /** LLM-parameter keys whose user-facing override is forbidden. The Settings
-   *  UI disables these fields and the API rejects writes that would change
-   *  them. Currently used by `documentation_search` to keep
-   *  `full_reasoning` locked on. */
-  locked_llm_fields?: string[];
   /** Optional fields surfaced by the registry: */
   url?: string;
   owner_profile?: string | null;
@@ -1188,6 +1171,58 @@ export async function updatePersona(
     body: JSON.stringify({ content }),
   });
   if (!res.ok) throw new Error(`Failed to update persona: ${res.statusText}`);
+  return res.json();
+}
+
+// ── Agent name ──
+
+export interface AgentNameEntry {
+  profile: string;
+  name: string;
+}
+
+/** Agent names for every visible profile — feeds the chat `@` menu. */
+export async function fetchAgentNames(
+  agentUrl: string,
+  token: string
+): Promise<{ agents: AgentNameEntry[] }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/profiles/agent-names`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(`Failed to list agent names: ${res.statusText}`);
+  return res.json();
+}
+
+export async function getAgentName(
+  agentUrl: string,
+  token: string,
+  profileName: string
+): Promise<{ name: string }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/profiles/${encodeURIComponent(profileName)}/agent-name`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(`Failed to load agent name: ${res.statusText}`);
+  return res.json();
+}
+
+export async function setAgentName(
+  agentUrl: string,
+  token: string,
+  profileName: string,
+  name: string
+): Promise<{ success: boolean }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/profiles/${encodeURIComponent(profileName)}/agent-name`, {
+    method: 'PUT',
+    headers: authHeaders(token),
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to update agent name: ${res.statusText}`);
+  }
   return res.json();
 }
 

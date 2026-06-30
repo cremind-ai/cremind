@@ -77,11 +77,6 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         configuration form without an extra round-trip:
         - ``required_fields`` -- built-in tool required_config schema
         - ``config`` -- current per-profile values (variables/arguments/llm/meta)
-        - ``full_reasoning`` -- mirrored from ``config.llm.full_reasoning`` so
-          the frontend doesn't have to know about the scoping
-        - ``locked_llm_fields`` -- LLM-parameter keys whose user-facing
-          override is forbidden (the UI disables them and the API rejects
-          writes)
 
         Open during first-run setup (no JWT, no profile) so the wizard
         can render the tool catalog with default enabled flags and empty
@@ -552,36 +547,6 @@ def _long_running_app_for_tool(tool) -> dict | None:
     if isinstance(description, str) and description:
         out["description"] = description
     return out
-
-
-def _llm_defaults_for_tool(tool) -> dict:
-    """Return the code-level ``llm_parameters`` defaults for a built-in tool.
-
-    For skills / MCP / A2A / intrinsic tools, returns ``{}`` — those don't ship
-    code-level defaults via ``TOOL_CONFIG``.
-    """
-    if tool is None:
-        return {}
-    if tool.tool_type is ToolType.BUILTIN and isinstance(tool, BuiltInToolGroup):
-        schema = get_builtin_tool_config(tool.config_name)
-        return dict(schema.get("tool", {}).get("llm_parameters") or {})
-    return {}
-
-
-def _locked_llm_fields_for_tool(tool) -> list[str]:
-    """Return ``locked_llm_fields`` declared by a built-in tool's TOOL_CONFIG.
-
-    These keys cannot be overridden via the API or the Settings UI. Returns
-    an empty list for tools without that declaration (the common case).
-    """
-    if tool is None:
-        return []
-    if tool.tool_type is ToolType.BUILTIN and isinstance(tool, BuiltInToolGroup):
-        schema = get_builtin_tool_config(tool.config_name)
-        raw = schema.get("tool", {}).get("locked_llm_fields") or []
-        if isinstance(raw, list):
-            return [str(k) for k in raw if isinstance(k, str)]
-    return []
 
 
 def _is_secret_var_name(name: str) -> bool:

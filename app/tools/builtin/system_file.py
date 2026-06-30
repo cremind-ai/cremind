@@ -2201,38 +2201,9 @@ SERVER_NAME = "System File"
 TOOL_CONFIG: ToolConfig = {
     "name": "system_file",
     "display_name": "System File",
-    "default_model_group": "low",
     # Visible in Settings (so its token/size limits can be configured) but
     # locked on — a core capability the user must not disable.
     "locked": True,
-    "llm_parameters": {
-        "tool_instructions": (
-            "File management inside the conversation's "
-            "*current* working directory — which may have just been changed by "
-            "the `change_working_directory` tool. A relative `path` argument is "
-            "interpreted relative to that current directory, never to a fixed "
-            "root; an absolute path is also accepted and used as-is. When the "
-            "user or the prompt gives you an absolute path (e.g. an "
-            "attached/uploaded file under a temporary folder), pass it through "
-            "EXACTLY as written — do not shorten it, strip the home/drive "
-            "prefix, or turn it into a relative path. To act on the current "
-            "directory itself, omit `path` (or pass '.'). Never repeat the "
-            "working directory's own name as a relative `path` value: if the "
-            "user says 'list files in the Lee folder' and the cwd is already "
-            "'.../Lee', call list_files with no path. "
-            "Use search_files to find files by NAME and grep_files to search "
-            "file CONTENTS by regular expression. "
-            "Edit part of an existing file with overwrite_file (apply a unified "
-            "diff); create or replace a whole file with write_file. "
-            "Move or rename a file — any type, including binary files such as "
-            "images and PDFs — with move_file, and duplicate one with copy_file; "
-            "both accept absolute source and destination paths. "
-            "Also registers file/folder watchers that notify you or re-run an "
-            "action whenever files are created, modified, deleted, or moved on "
-            "disk — use this when the user asks to be notified or to act on "
-            "changes to a file or folder."
-        ),
-    },
     "required_config": {
         Var.MAX_READABLE_TOKENS: {
             "description": (

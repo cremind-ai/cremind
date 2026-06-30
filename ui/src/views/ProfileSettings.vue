@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router';
 import { ElInput, ElButton, ElMessage, ElTable, ElTableColumn, ElPopconfirm, ElAlert, ElDialog } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
-import { listProfiles, deleteProfile, reconfigure, getPersona, updatePersona } from '../services/configApi';
+import { listProfiles, deleteProfile, reconfigure, getPersona, updatePersona, getAgentName, setAgentName } from '../services/configApi';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -17,10 +17,42 @@ const nameError = ref('');
 const showReconfigureConfirm = ref(false);
 const reconfiguring = ref(false);
 
+// Agent name (loaded from backend)
+const agentName = ref('');
+const loadingAgentName = ref(false);
+const savingAgentName = ref(false);
+
 // PERSONA.md content (loaded from backend)
 const personaContent = ref('');
 const loadingPersona = ref(false);
 const savingPersona = ref(false);
+
+async function loadAgentName() {
+  loadingAgentName.value = true;
+  try {
+    const res = await getAgentName(settingsStore.agentUrl, settingsStore.authToken, props.profile);
+    agentName.value = res.name;
+  } catch {
+    ElMessage.error('Failed to load agent name');
+  } finally {
+    loadingAgentName.value = false;
+  }
+}
+
+async function saveAgentName() {
+  const name = agentName.value.trim();
+  if (!name) { ElMessage.error('Agent name is required'); return; }
+  savingAgentName.value = true;
+  try {
+    await setAgentName(settingsStore.agentUrl, settingsStore.authToken, props.profile, name);
+    agentName.value = name;
+    ElMessage.success('Agent name saved');
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to save agent name');
+  } finally {
+    savingAgentName.value = false;
+  }
+}
 
 async function loadPersona() {
   loadingPersona.value = true;
@@ -50,7 +82,7 @@ async function savePersona() {
 const PROFILE_NAME_RE = /^[a-z0-9_-]+$/;
 
 onMounted(async () => {
-  await Promise.all([loadProfiles(), loadPersona()]);
+  await Promise.all([loadProfiles(), loadAgentName(), loadPersona()]);
 });
 
 async function loadProfiles() {
@@ -124,6 +156,31 @@ function goBack() { router.push(`/${props.profile}/settings`); }
         </button>
         <h1 class="page-title">Profiles</h1>
         <p class="page-subtitle">Manage user profiles</p>
+      </div>
+
+      <!-- Agent Name -->
+      <div class="section">
+        <h2 class="section-title">
+          <Icon icon="mdi:robot-outline" class="section-icon" /> Agent Name
+        </h2>
+        <p class="section-desc">
+          The name your assistant goes by. Available in prompts as
+          <code>$CREMIND_AGENT_NAME</code> and shown in the chat <code>@</code> menu.
+        </p>
+        <div v-if="loadingAgentName" class="loading-state">Loading...</div>
+        <div v-else class="create-form">
+          <div class="input-group">
+            <ElInput
+              v-model="agentName"
+              placeholder="e.g. Cremind"
+              class="profile-input"
+              maxlength="128"
+            />
+          </div>
+          <ElButton type="primary" :loading="savingAgentName" :disabled="!agentName.trim()" @click="saveAgentName">
+            <Icon icon="mdi:content-save" style="margin-right: 6px;" /> Save
+          </ElButton>
+        </div>
       </div>
 
       <!-- PERSONA.md -->

@@ -49,9 +49,6 @@ interface SetupToolItem {
   reasoningEffort: string;
   fullReasoning: boolean;
 
-  // Code-level defaults from TOOL_CONFIG.llm_parameters (placeholders only).
-  llmDefaults: NonNullable<ToolStatus['llm_defaults']>;
-
   enabled: boolean;
   expanded: boolean;
 
@@ -168,14 +165,13 @@ onMounted(async () => {
         configValues: { ...initVarValues(tool.required_fields, tool.config?.variables), ...toolConf },
         argumentsSchema: schema,
         argValues: initArgValues(schema, tool.config?.arguments),
-        // User override only; code defaults are shown as placeholders via llmDefaults.
+        // User override only.
         description: metaCfg.description || '',
         systemPrompt: (metaCfg.system_prompt as string) || '',
         llmProvider: (llmCfg.llm_provider as string) || '',
         llmModel: (llmCfg.llm_model as string) || '',
         reasoningEffort: (llmCfg.reasoning_effort as string) || '',
         fullReasoning: !!tool.full_reasoning,
-        llmDefaults: tool.llm_defaults ?? {},
         // Locked tools can't be opted out of — force them on so the submitted
         // _enabled payload never disables them.
         enabled: tool.toggle_locked ? true : tool.enabled,
@@ -299,12 +295,6 @@ watch(items, emitConfigs, { deep: true });
                   :providers="llmProviders"
                   :get-filtered-models="getFilteredModels"
                   :get-reasoning-options="getReasoningOptions"
-                  :default-description="item.llmDefaults.description || item.llmDefaults.server_instructions || ''"
-                  :default-system-prompt="item.llmDefaults.system_prompt || ''"
-                  :default-llm-provider="item.llmDefaults.llm_provider || ''"
-                  :default-llm-model="item.llmDefaults.llm_model || ''"
-                  :default-reasoning-effort="item.llmDefaults.reasoning_effort || ''"
-                  :default-full-reasoning="item.llmDefaults.full_reasoning"
                 />
               </div>
 

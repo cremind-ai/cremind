@@ -39,11 +39,15 @@ def test_catalog_has_no_standalone_file_watcher_tool() -> None:
     assert "Register File Watcher" not in names
 
 
-def test_system_file_catalog_description_mentions_watching() -> None:
+def test_system_file_surfaces_watching_via_subtools() -> None:
+    # The group's TOOL_CONFIG no longer ships instruction text (llm_parameters
+    # was removed), so the catalog description falls back to the server name.
+    # The parent agent / wizard now learns System File handles watching from
+    # the self-describing watcher subtools instead of a group blurb.
     catalog = {row["tool_id"]: row for row in list_builtin_tool_catalog()}
     assert "system_file" in catalog
-    # The parent agent / wizard must learn System File now handles watching.
-    assert "watch" in catalog["system_file"]["description"].lower()
+    tools = {t.name: t for t in system_file.get_tools({})}
+    assert any("watch" in tools[name].description.lower() for name in _WATCHER_NAMES)
 
 
 def test_get_tools_includes_watcher_subtools() -> None:

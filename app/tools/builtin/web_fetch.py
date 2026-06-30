@@ -71,16 +71,7 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "web_fetch",
     "display_name": SERVER_NAME,
-    "default_model_group": "low",
     "visible": True,
-    "llm_parameters": {
-        "tool_instructions": (
-            "Fetch a single web page by URL and return its readable content as "
-            "markdown or plain text. Lightweight page access -- no browser "
-            "automation, no JavaScript. Give it the URL to read; optionally ask "
-            "for plain text or a smaller character limit."
-        ),
-    },
     "required_config": {
         Var.MAX_CHARS: {
             "description": (

@@ -15,28 +15,8 @@ withDefaults(defineProps<{
   getFilteredModels: (providerName: string) => ModelOption[];
   getReasoningOptions: (modelValue: string) => string[];
   showFullReasoning?: boolean;
-  /** When true, the Full Reasoning switch is disabled and shows a lock
-   *  icon. The tool requires its default value (e.g. documentation_search
-   *  needs `full_reasoning=true` because the post-tool LLM step IS the
-   *  relevance judge). */
-  lockedFullReasoning?: boolean;
-  /** Code defaults shipped with the tool (TOOL_CONFIG.llm_parameters).
-   *  Rendered as placeholders when the corresponding bound value is empty. */
-  defaultDescription?: string;
-  defaultSystemPrompt?: string;
-  defaultLlmProvider?: string;
-  defaultLlmModel?: string;
-  defaultReasoningEffort?: string;
-  defaultFullReasoning?: boolean;
 }>(), {
   showFullReasoning: true,
-  lockedFullReasoning: false,
-  defaultDescription: '',
-  defaultSystemPrompt: '',
-  defaultLlmProvider: '',
-  defaultLlmModel: '',
-  defaultReasoningEffort: '',
-  defaultFullReasoning: undefined,
 });
 
 const emit = defineEmits<{
@@ -57,14 +37,6 @@ function resetProviderModel() {
   emit('reset-field', 'llm_model');
 }
 
-function truncate(value: string, max = 80): string {
-  const trimmed = value.replace(/\s+/g, ' ').trim();
-  return trimmed.length > max ? trimmed.slice(0, max - 1) + '…' : trimmed;
-}
-
-function defaultPlaceholder(defaultValue: string, fallback: string): string {
-  return defaultValue ? `Default: ${truncate(defaultValue)}` : fallback;
-}
 </script>
 
 <template>
@@ -75,7 +47,7 @@ function defaultPlaceholder(defaultValue: string, fallback: string): string {
           <ElInput
             :model-value="description"
             @update:model-value="emit('update:description', $event)"
-            :placeholder="defaultPlaceholder(defaultDescription, 'Description')"
+            placeholder="Description"
             style="flex: 1;"
           />
           <ElButton v-if="description" text size="small" @click="emit('update:description', ''); emit('reset-field', 'description')">
@@ -90,7 +62,7 @@ function defaultPlaceholder(defaultValue: string, fallback: string): string {
             @update:model-value="emit('update:systemPrompt', $event)"
             type="textarea"
             :rows="3"
-            :placeholder="defaultPlaceholder(defaultSystemPrompt, 'Custom system prompt')"
+            placeholder="Custom system prompt"
             style="flex: 1;"
           />
           <ElButton v-if="systemPrompt" text size="small" @click="emit('update:systemPrompt', ''); emit('reset-field', 'system_prompt')">
@@ -103,7 +75,7 @@ function defaultPlaceholder(defaultValue: string, fallback: string): string {
           <ElSelect
             :model-value="llmProvider"
             @update:model-value="emit('update:llmProvider', $event)"
-            :placeholder="defaultLlmProvider ? `Default: ${defaultLlmProvider}` : 'Default (from model group)'"
+            placeholder="Default (from model group)"
             clearable
             style="flex: 1;"
           >
@@ -120,7 +92,7 @@ function defaultPlaceholder(defaultValue: string, fallback: string): string {
           @update:model-value="emit('update:llmModel', $event)"
           filterable
           clearable
-          :placeholder="defaultLlmModel ? `Default: ${defaultLlmModel}` : 'Default (from model group)'"
+          placeholder="Default (from model group)"
           style="width: 100%"
         >
           <ElOption v-for="m in getFilteredModels(llmProvider)" :key="m.value" :label="m.label" :value="m.value" />
@@ -131,7 +103,7 @@ function defaultPlaceholder(defaultValue: string, fallback: string): string {
           <ElSelect
             :model-value="reasoningEffort"
             @update:model-value="emit('update:reasoningEffort', $event)"
-            :placeholder="defaultReasoningEffort ? `Default: ${defaultReasoningEffort}` : 'Default'"
+            placeholder="Default"
             clearable
             style="flex: 1;"
           >
@@ -146,20 +118,10 @@ function defaultPlaceholder(defaultValue: string, fallback: string): string {
         <div style="display: flex; align-items: center; gap: 8px;">
           <ElSwitch
             :model-value="fullReasoning"
-            :disabled="lockedFullReasoning"
             @update:model-value="emit('update:fullReasoning', $event as boolean)"
           />
-          <Icon
-            v-if="lockedFullReasoning"
-            icon="mdi:lock"
-            style="color: var(--text-tertiary); font-size: 14px;"
-          />
           <span style="font-size: 12px; color: var(--text-tertiary);">
-            Process tool results through LLM before returning to main agent<template v-if="defaultFullReasoning !== undefined">
-              &nbsp;·&nbsp;Default: {{ defaultFullReasoning ? 'on' : 'off' }}
-            </template><template v-if="lockedFullReasoning">
-              &nbsp;·&nbsp;locked
-            </template>
+            Process tool results through LLM before returning to main agent
           </span>
         </div>
       </ElFormItem>

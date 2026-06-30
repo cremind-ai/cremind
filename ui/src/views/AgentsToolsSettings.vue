@@ -82,12 +82,6 @@ interface UnifiedItem {
   saving: boolean;
   /** Built-in tools only: false until a child LLM is bound (post-setup). */
   llmBound: boolean;
-  /** Code-level defaults from TOOL_CONFIG.llm_parameters (placeholders only).
-   *  Empty for skills / MCP / A2A — those don't ship code defaults. */
-  llmDefaults: NonNullable<ToolStatus['llm_defaults']>;
-  /** LLM fields whose user override is forbidden. The matching switches/inputs
-   *  in the form are rendered disabled. */
-  lockedLlmFields: string[];
   /** Built-in tools only: true when the enable/disable toggle is locked on
    *  (the tool can't be disabled). Renders the switch disabled + a lock icon. */
   toggleLocked: boolean;
@@ -317,13 +311,6 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
     const metaCfg = (tool.config?.meta ?? {}) as Record<string, string>;
     const schema = (tool.arguments_schema as JsonSchema | null) ?? null;
 
-    const llmDefaults = tool.llm_defaults ?? {};
-    const lockedLlmFields = tool.locked_llm_fields ?? [];
-    // For locked `full_reasoning`, surface the code default in the toggle so
-    // the user sees the effective value instead of an unwritten DB blank.
-    const fullReasoningEffective = lockedLlmFields.includes('full_reasoning')
-      ? !!llmDefaults.full_reasoning
-      : !!tool.full_reasoning;
     result.push({
       name: tool.tool_id,
       displayName: tool.name,
@@ -335,15 +322,14 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       agentName: tool.tool_id,
       // Skills have no description override and no LLM form — surface the real
       // SKILL.md description so the expanded card explains what the skill does.
-      // Built-in/MCP tools use this as the user override (placeholder via
-      // `llmDefaults` on the LLM form).
+      // Built-in/MCP tools use this as the user override on the LLM form.
       description: isSkill ? (tool.description || '') : (metaCfg.description || ''),
       url: tool.url || '',
       systemPrompt: (metaCfg.system_prompt as string) || '',
       llmProvider: (llmCfg.llm_provider as string) || '',
       llmModel: (llmCfg.llm_model as string) || '',
       reasoningEffort: (llmCfg.reasoning_effort as string) || '',
-      fullReasoning: fullReasoningEffective,
+      fullReasoning: !!tool.full_reasoning,
       enabled: tool.enabled,
       connectionError: tool.connection_error ?? null,
       hasAgent: !isSkill,  // skills have no MCP/A2A backing agent
@@ -358,8 +344,6 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       saving: false,
       // Skills don't have a child LLM; treat them as bound.
       llmBound: isSkill ? true : (tool.llm_bound ?? true),
-      llmDefaults,
-      lockedLlmFields,
       toggleLocked: !!tool.toggle_locked,
       isBuiltinSkill: isSkill && !!tool.is_builtin,
       longRunningApp: tool.long_running_app ?? null,
@@ -408,8 +392,6 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       expanded: false,
       saving: false,
       llmBound: true,
-      llmDefaults: {},
-      lockedLlmFields: [],
       toggleLocked: false,
       isBuiltinSkill: false,
       longRunningApp: null,
@@ -455,8 +437,6 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       expanded: false,
       saving: false,
       llmBound: true,
-      llmDefaults: {},
-      lockedLlmFields: [],
       toggleLocked: false,
       isBuiltinSkill: false,
       longRunningApp: null,
