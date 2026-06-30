@@ -69,7 +69,6 @@ class BuiltInToolAdapter:
         tool_instructions: Optional[str] = None,
         prepare_tools: Optional[Callable[..., List[Dict[str, Any]]]] = None,
         full_reasoning: bool = False,
-        direct_dispatch: bool = False,
     ):
         self._tools = tools
         self._tools_by_name: Dict[str, BuiltInTool] = {t.name: t for t in tools}
@@ -82,11 +81,6 @@ class BuiltInToolAdapter:
         self._server_instructions = tool_instructions or ""
         self._prepare_tools = prepare_tools
         self._full_reasoning = full_reasoning
-        # When True the adapter bypasses its routing LLM call for groups
-        # with exactly one sub-tool and dispatches the user's query
-        # directly to ``tool.run({"query": <query>})``. Saves a useless
-        # LLM round when there is nothing to route.
-        self._direct_dispatch = direct_dispatch
 
     @property
     def name(self) -> str:
@@ -250,6 +244,25 @@ class BuiltInToolAdapter:
         content_parts: List[str] = []
         function_calls: List[Dict] = list(decided_calls or [])
 
+        def _fold_result_usage(result: Any) -> None:
+            """Fold a tool result's internal-LLM token usage into the running totals.
+
+            A built-in tool that makes its own LLM call (e.g. documentation_search's
+            judge, image_understanding's vision call) reports it on
+            ``BuiltInToolResult.token_usage``; tools that make no LLM call leave it
+            ``None`` and contribute nothing. The folded totals flow into the
+            ``token_usage`` artifact below and on to a ``source_kind="tool"`` record.
+            """
+            nonlocal total_input_tokens, total_cache_read_input_tokens
+            nonlocal total_cache_creation_input_tokens, total_output_tokens
+            tu = getattr(result, "token_usage", None)
+            if not tu:
+                return
+            total_input_tokens += tu.get("input_tokens", 0) or 0
+            total_cache_read_input_tokens += tu.get("cache_read_input_tokens", 0) or 0
+            total_cache_creation_input_tokens += tu.get("cache_creation_input_tokens", 0) or 0
+            total_output_tokens += tu.get("output_tokens", 0) or 0
+
         # Execute tool calls if any
         tool_results: Dict[str, Any] = {}
         if function_calls:
@@ -331,6 +344,7 @@ class BuiltInToolAdapter:
                     else:
                         result = await tool.run(tool_args)
                     result_data = self._extract_tool_result(result)
+                    _fold_result_usage(result)
                     tool_results[tool_name] = result_data
                     logger.info(f"Built-in tool '{tool_name}' result received")
                 except asyncio.TimeoutError:
@@ -360,6 +374,7 @@ class BuiltInToolAdapter:
                                 else:
                                     result = await tool.run(tool_args)
                                 result_data = self._extract_tool_result(result)
+                                _fold_result_usage(result)
                                 tool_results[tool_name] = result_data
                                 logger.info(f"Built-in tool '{tool_name}' succeeded after token refresh")
                                 continue

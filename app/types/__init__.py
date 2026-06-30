@@ -11,7 +11,6 @@ from .__main__ import (
     ToolResultWithFiles,
     RequiredConfigField,
     OAuthConfig,
-    LLMParameters,
     ToolConfig,
 )
 __all__ = [
@@ -27,6 +26,5 @@ __all__ = [
     "ToolResultWithFiles",
     "RequiredConfigField",
     "OAuthConfig",
-    "LLMParameters",
     "ToolConfig",
 ]

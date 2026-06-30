@@ -32,9 +32,6 @@ SERVER_NAME = "Reasoning"
 TOOL_CONFIG: ToolConfig = {
     "name": "reasoning",
     "display_name": "Reasoning",
-    # No internal LLM call happens here (the tool just echoes), so the model
-    # group is irrelevant; "low" matches the other lightweight built-ins.
-    "default_model_group": "low",
     # System-managed: present in the registry but suppressed from the Settings
     # UI. The reasoning agent gates actual exposure on the model's reasoning
     # capability rather than a per-profile toggle.

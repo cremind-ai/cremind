@@ -3,21 +3,17 @@
 Each tool group lives at ``app.tools.builtin.{module_name}`` and exports:
 
 - ``TOOL_CONFIG`` (dict)              -- static config (name, display_name,
-                                         default_model_group, required_config,
-                                         optional ``arguments`` / ``oauth`` /
-                                         ``llm_parameters``). ``llm_parameters``
-                                         carries code-level defaults for the
-                                         tool's tool_instructions, system
-                                         prompt, provider/model, reasoning
-                                         effort and full_reasoning. DB overrides
-                                         (from the ``llm``/``meta`` tool-config
-                                         scopes) win per-key.
+                                         required_config, optional
+                                         ``description`` / ``arguments`` /
+                                         ``oauth``). The group's description
+                                         text comes from ``description`` (or
+                                         ``_make_server_instructions``), else
+                                         falls back to ``SERVER_NAME``.
 - ``SERVER_NAME`` (str)               -- display name in the UI
 - ``get_tools(config: dict) -> list[BuiltInTool]`` -- in-process functions
 - ``get_prepare_tools()`` (optional)  -- per-request tool customization callback
 - ``_make_server_instructions(working_dir: str)`` (optional) -- dynamic
-                                         override for ``tool_instructions``
-                                         (wins over ``TOOL_CONFIG["llm_parameters"]["tool_instructions"]``)
+                                         override for the group description
 
 Registration is driven by the explicit ``_BUILTIN_MODULE_NAMES`` tuple below.
 Adding a new built-in tool means adding a module in this package, exporting
@@ -114,13 +110,7 @@ def list_builtin_tool_catalog() -> list[dict]:
 
         server_name = getattr(module, "SERVER_NAME", module_name)
         tool_id = slugify(server_name)
-        llm_defaults: dict = dict(tool_info.get("llm_parameters") or {})
         required_fields = tool_info.get("required_config", {}) or {}
-        locked_raw = tool_info.get("locked_llm_fields") or []
-        locked_llm_fields: list[str] = (
-            [str(k) for k in locked_raw if isinstance(k, str)]
-            if isinstance(locked_raw, list) else []
-        )
 
         # Match ``_is_tool_configured`` semantics when the snapshot is empty:
         # a tool with no required fields, or with defaults on every required
@@ -136,11 +126,7 @@ def list_builtin_tool_catalog() -> list[dict]:
             "tool_id": tool_id,
             "name": server_name,
             "display_name": server_name,
-            "description": (
-                llm_defaults.get("description")
-                or llm_defaults.get("tool_instructions")
-                or server_name
-            ),
+            "description": tool_info.get("description") or server_name,
             "tool_type": "builtin",
             # Default-enabled in the wizard catalog so new installs are
             # useful out of the box. Tools with unfilled required vars
@@ -150,9 +136,6 @@ def list_builtin_tool_catalog() -> list[dict]:
             "configured": configured,
             "config": {},
             "required_fields": required_fields,
-            "llm_defaults": llm_defaults,
-            "locked_llm_fields": locked_llm_fields,
-            "full_reasoning": bool(llm_defaults.get("full_reasoning", False)),
             "is_stub": False,
             "arguments_schema": tool_info.get("arguments"),
             # Optional feature key whose pip extras must be installed for
@@ -310,10 +293,6 @@ def _register_stub_group(
         display_name=server_name,
         description=description,
         functions=[stub_tool],
-        # No child LLM / OAuth / prepare_tools — the stub's run() returns
-        # the same structured error on any call, so the child-LLM routing
-        # layer is pure overhead. ``direct_dispatch`` skips it.
-        direct_dispatch=True,
     )
     registry.register_builtin(group, source=module_name)
 
@@ -416,13 +395,9 @@ async def register_builtin_tools(
 
         server_name = getattr(module, "SERVER_NAME", module_name)
         # Group description text only (no inner-LLM steering — there is no inner
-        # routing LLM). ``description`` (top-level) wins; legacy
-        # ``llm_parameters.tool_instructions`` is read purely as fallback text.
-        instructions = (
-            tool_info.get("description")
-            or (tool_info.get("llm_parameters") or {}).get("tool_instructions", "")
-            or ""
-        )
+        # routing LLM). The top-level ``description`` wins; otherwise the group
+        # falls back to ``SERVER_NAME`` at construction below.
+        instructions = tool_info.get("description") or ""
         if hasattr(module, "_make_server_instructions"):
             instructions = module._make_server_instructions(config["CREMIND_SYSTEM_DIR"])
 

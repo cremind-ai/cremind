@@ -4,7 +4,7 @@ import { ElPopover, ElSwitch, ElNotification } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { useChatStore } from '../stores/chat';
-import { fetchSystemVars, listProfiles } from '../services/configApi';
+import { fetchSystemVars, fetchAgentNames } from '../services/configApi';
 import { uploadTempFiles } from '../services/filesApi';
 import MentionMenu, { type MentionItem } from './MentionMenu.vue';
 
@@ -109,12 +109,13 @@ const items = ref<MentionItem[]>([]);
 const activeIndex = ref(0);
 const menuPos = ref({ top: 0, left: 0 });
 
-// Lists of known names — drive both the menu contents and the
-// known-vs-unknown styling in the highlight layer.
+// Lists that drive the menu contents. `sysVars` also drives the known-vs-unknown
+// styling for `$VAR` tokens in the highlight layer; `agents` (one per profile)
+// only feeds the `@` menu — picking one inserts the bare name as plain text, so
+// there is no `@` token to highlight.
 const sysVars = ref<MentionItem[]>([]);
-const profiles = ref<MentionItem[]>([]);
+const agents = ref<MentionItem[]>([]);
 const sysVarSet = computed(() => new Set(sysVars.value.map(v => v.name)));
-const profileSet = computed(() => new Set(profiles.value.map(p => p.name)));
 // Until the lists arrive, treat tokens as known so we don't briefly flash
 // every chip as "unknown" on first paint.
 const listsLoaded = ref(false);
@@ -122,15 +123,16 @@ const listsLoaded = ref(false);
 const menuVisible = computed(() => triggerKind.value !== null);
 
 // ── highlight segmentation ──
-// Splits inputText into a flat sequence of plain-text and token segments
-// using the same regex shapes the backend uses to resolve tokens. Tokens
+// Splits inputText into a flat sequence of plain-text and `$VAR` token segments
+// using the same regex shape the backend uses to resolve system vars. Tokens
 // flagged `known: false` are styled as warnings — covers both never-existed
-// names and names that have since been removed from the system.
+// names and names that have since been removed from the system. (`@` agent
+// names are inserted as plain text, so they are never tokenized here.)
 type Segment =
   | { kind: 'text'; value: string }
-  | { kind: 'sys' | 'profile'; raw: string; name: string; known: boolean };
+  | { kind: 'sys'; raw: string; name: string; known: boolean };
 
-const TOKEN_RE = /(\$[A-Z][A-Z0-9_]*)|(@[a-z0-9_-]+)/g;
+const TOKEN_RE = /(\$[A-Z][A-Z0-9_]*)/g;
 
 const segments = computed<Segment[]>(() => {
   const text = inputText.value;
@@ -142,23 +144,13 @@ const segments = computed<Segment[]>(() => {
     if (match.index > lastIndex) {
       out.push({ kind: 'text', value: text.slice(lastIndex, match.index) });
     }
-    if (match[1]) {
-      const name = match[1].slice(1);
-      out.push({
-        kind: 'sys',
-        raw: match[0],
-        name,
-        known: !listsLoaded.value || sysVarSet.value.has(name),
-      });
-    } else {
-      const name = match[2].slice(1);
-      out.push({
-        kind: 'profile',
-        raw: match[0],
-        name,
-        known: !listsLoaded.value || profileSet.value.has(name),
-      });
-    }
+    const name = match[1].slice(1);
+    out.push({
+      kind: 'sys',
+      raw: match[0],
+      name,
+      known: !listsLoaded.value || sysVarSet.value.has(name),
+    });
     lastIndex = TOKEN_RE.lastIndex;
   }
   if (lastIndex < text.length) {
@@ -254,9 +246,9 @@ onMounted(async () => {
   // immediately. Failures are silent; tokens stay flagged as "known"
   // (no warning style) until a successful fetch.
   try {
-    const [sv, pr] = await Promise.all([
+    const [sv, ag] = await Promise.all([
       fetchSystemVars(settingsStore.agentUrl, settingsStore.authToken),
-      listProfiles(settingsStore.agentUrl, settingsStore.authToken),
+      fetchAgentNames(settingsStore.agentUrl, settingsStore.authToken),
     ]);
     sysVars.value = sv.map(v => ({
       name: v.name,
@@ -264,7 +256,7 @@ onMounted(async () => {
       value: v.value,
       secret: v.secret,
     }));
-    profiles.value = pr.profiles.map(name => ({ name }));
+    agents.value = ag.agents.map(a => ({ name: a.name, profile: a.profile }));
   } catch {
     // leave lists empty; listsLoaded stays false so no chip flashes red.
     return;
@@ -273,7 +265,11 @@ onMounted(async () => {
 });
 
 const itemsForKind = (kind: Trigger): MentionItem[] =>
-  kind === '$' ? sysVars.value : profiles.value;
+  kind === '$' ? sysVars.value : agents.value;
+
+// Glyph the menu shows before each name: `$` keeps its prefix; agent names
+// (`@` trigger) show bare, since the `@` is dropped on selection.
+const menuPrefix = computed(() => (triggerKind.value === '@' ? '' : '$'));
 
 // ── menu open/insert ──
 const openMenu = (
@@ -296,7 +292,9 @@ const insertSelection = (item: MentionItem) => {
   const caret = ta.selectionStart ?? value.length;
   const start = replaceRange.value ? replaceRange.value.start : triggerStart.value;
   const end = replaceRange.value ? replaceRange.value.end : caret;
-  const insert = `${triggerKind.value}${item.name}`;
+  // `$` vars keep their sigil; agent names (`@`) are inserted bare — the `@`
+  // trigger is consumed so the composer shows just the name as plain text.
+  const insert = triggerKind.value === '@' ? item.name : `${triggerKind.value}${item.name}`;
   inputText.value = value.slice(0, start) + insert + value.slice(end);
   closeMenu();
   nextTick(() => {
@@ -504,7 +502,7 @@ const handleReasoningToggle = (value: boolean | string | number) => {
         :top="menuPos.top"
         :left="menuPos.left"
         :active-index="activeIndex"
-        :prefix="triggerKind ?? '$'"
+        :prefix="menuPrefix"
         @select="insertSelection"
         @update:active-index="activeIndex = $event"
       />
@@ -673,11 +671,6 @@ const handleReasoningToggle = (value: boolean | string | number) => {
 .hl-token--sys {
   background: rgba(37, 99, 235, 0.14);
   color: var(--primary-color);
-}
-
-.hl-token--profile {
-  background: rgba(16, 185, 129, 0.14);
-  color: #059669;
 }
 
 .hl-token--unknown {

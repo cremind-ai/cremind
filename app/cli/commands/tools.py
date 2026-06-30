@@ -105,9 +105,6 @@ def tools_get(
     if isinstance(tool.get("config"), dict):
         sys.stdout.write("\n--- config ---\n")
         sys.stdout.write(_json.dumps(tool["config"], indent=2, ensure_ascii=False, default=str) + "\n")
-    locked = tool.get("locked_llm_fields")
-    if isinstance(locked, list) and locked:
-        sys.stdout.write("\nlocked_llm_fields: " + ", ".join(str(v) for v in locked) + "\n")
 
 
 @tools_app.command("enable")
