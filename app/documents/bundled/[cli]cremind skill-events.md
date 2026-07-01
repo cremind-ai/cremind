@@ -1,5 +1,5 @@
 ---
-description: "Complete reference for the `cremind skill-events` CLI command (alias `cremind events`) — the terminal-side counterpart to the **Skill Events** page in the Cremind web UI — covering how to list and delete skill event subscriptions for the active profile, simulate an event by dropping a markdown file into the watched folder (`simulate`), tail server-wide events (`stream`) and per-profile notifications (`notifications`) over SSE, browse the events declared by a skill (`events <skill>`), check whether a skill's listener daemon is alive (`listener-status`), and start/resume that daemon as an autostart process (`listener-start`). Documents the streaming output format and the `--since` resume cursor."
+description: "Subscribe to and manage **skill events and notifications**: `list` or `delete` a skill's event subscriptions for the active profile, `simulate` an event by dropping a markdown file in the watched folder, `stream` events and `notifications` over SSE, browse the events a skill declares (`events <skill>`), and check or start its listener daemon (`listener-status`, `listener-start`). Use this for events emitted by installed skills — distinct from filesystem (`cremind file-watchers`) and time (`cremind calendar`) events."
 ---
 
 # `cremind skill-events` — Skill Event Subscriptions and Notifications

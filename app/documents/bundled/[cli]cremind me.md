@@ -1,5 +1,5 @@
 ---
-description: "Reference for the `cremind me` CLI command — a one-shot identity probe that decodes the current `CREMIND_TOKEN` JWT and prints the profile, subject, issued-at and expires-at timestamps, and the server-side and user-scoped working directories. Useful for confirming which profile a CLI session is acting as, verifying that a token has not expired, and discovering the working directory the agent will use, all without making any state-changing calls."
+description: "Show the **identity** of the current CLI session: decode the active `CREMIND_TOKEN` JWT and print the profile, subject, issued-at and expires-at times, and the server-side and user working directories. Use this to confirm which profile you are acting as, check whether the token has expired, or find the working directory the agent will use — a read-only probe that changes nothing."
 ---
 
 # `cremind me` — Identity Info for the Current Token

@@ -1,5 +1,5 @@
 ---
-description: "Complete reference for the `cremind setup` CLI command — the headless equivalent of the Cremind first-run wizard — covering how to check setup status, mint the very first admin JWT (`cremind setup complete`), recover from an orphaned half-setup (`reset-orphaned`), trigger a re-run of the wizard (`reconfigure`), and read or write server-wide non-secret config (`server-config get/set`). Spells out which subcommands need an `CREMIND_TOKEN` and which are deliberately unauthenticated, documents the JSON payload schema accepted by `setup complete`, and gives admin-friendly examples for scripted bootstrap and reconfiguration."
+description: "Bootstrap a fresh Cremind server headlessly — the CLI equivalent of the first-run wizard: check setup `status`, mint the very first admin JWT (`setup complete`), `reset-orphaned` a half-finished install, `reconfigure` to re-run the wizard, and read or write server-wide non-secret config (`server-config get/set`). Use this for initial install, obtaining the first admin token, and server-level configuration — distinct from `cremind profile` (creating profiles afterward)."
 ---
 
 # `cremind setup` — First-Run Setup and Server Configuration
