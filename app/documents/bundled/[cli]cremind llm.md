@@ -1,5 +1,5 @@
 ---
-description: "Complete reference for the `cremind llm` CLI command — the terminal-side counterpart to the **Settings → LLM Providers** page in the Cremind web UI — covering how to list and configure LLM providers, browse the models each provider exposes, assign the high/low/default model groups the agent picks from, and run the GitHub Copilot device-code authentication flow. Documents every subcommand under `providers`, `model-groups`, and `device-code`, the JSON shape sent to `providers configure`, the exact polling behavior of `device-code poll`, and the fields rendered in each table."
+description: "Configure **LLM providers and models**: list and `configure` providers (add an API key), browse each provider's available models, assign the high / low / default **model groups** the agent picks from, and run the **GitHub Copilot** device-code login. Use this to add a provider, choose which model the agent uses, or authenticate a provider — distinct from `cremind config` (agent behavior) and `cremind agents` (MCP/A2A servers)."
 ---
 
 # `cremind llm` — LLM Providers, Model Groups, and Device-Code Auth

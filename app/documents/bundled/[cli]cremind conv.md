@@ -1,5 +1,5 @@
 ---
-description: "Complete reference for the `cremind conv` CLI command (alias `cremind conversation`) — the terminal-side counterpart to the **Conversations** view in the Cremind web UI — covering how to list, create, fetch, rename (`rename` for the title and `set-id` for the conversation id), and delete conversations, send messages and stream responses (`send`), attach to an in-flight run without sending (`attach`), cancel a run (`cancel`), and bulk-delete every conversation for the active profile (`delete-all`). Documents the three streaming modes (default TUI, `--raw` text, root `--json` event-per-line), the `--detail` replay TUI for `get`, the `--no-reasoning` toggle, pagination, the conversation-id format rules, and the contract for piping conversation IDs in scripts."
+description: "Manage **conversations** and stream agent replies from the terminal: create a new conversation, list, fetch history, rename or change its id (`rename`, `set-id`), delete or delete-all, and `send` a message to stream the response, plus attach or cancel a run, inspect memory and running summary, force compaction, and per-conversation token usage. Use this to script one-shot messages and manage threads — distinct from `cremind chat` (the interactive REPL)."
 ---
 
 # `cremind conv` — Conversation Management and Streaming
@@ -21,7 +21,9 @@ The group splits into three concerns:
   sending anything), `cancel` (stop an in-flight run by its `run_id`).
 - **Inspection** — `get --detail` opens a TUI that replays the full
   thinking-process trace (Thought / Action / Input / Observation /
-  Response) for every agent turn.
+  Response) for every agent turn. `memory` shows the conversation's
+  running summary and long-term memory, `compact` forces a compaction
+  fold now, and `usage` reports per-request token usage and cost.
 
 For an interactive REPL that wraps `new` + `send` into a chat loop,
 see `cremind chat`. `cremind conv send` is the right command when you want to
@@ -426,6 +428,97 @@ cancelled
 # Cancel whatever is running in conversation c_82bc (one-liner)
 $ run=$(cremind conv list --json | jq -r '.[] | select(.id=="c_82bc") | .task_id')
 $ cremind conv cancel "$run"
+```
+
+### `cremind conv memory`
+
+**Purpose.** Show a conversation's **running summary** (short-term memory)
+and **long-term memory**, plus progress toward the next compaction fold.
+
+**Syntax.**
+
+```bash
+cremind conv memory <id>
+```
+
+**Behavior.** Prints `enabled` (whether long-term memory is on),
+`last_compacted_at`, a `context: <current> / <threshold> (window <N>)`
+line showing how close the latest turn is to triggering a fold, the
+`--- running summary ---` block, and a `--- long-term memory ---` list.
+With `--json`, returns the full object (`summary`, `long_term`,
+`token_progress`, `enabled`, `last_compacted_at`).
+
+**Example.**
+
+```bash
+$ cremind conv memory c_82bc
+enabled: True
+last_compacted_at: 2026-06-29T22:10:04Z
+context: 48210 / 95000 (window 200000)
+
+--- running summary ---
+The user (Lee) is preparing a Q3 marketing plan ...
+
+--- long-term memory ---
+- Prefers concise, bulleted replies.
+```
+
+### `cremind conv compact`
+
+**Purpose.** Force a compaction **now** — fold the oldest turns into the
+running summary instead of waiting for the context window to fill. Runs a
+synthetic, non-persisted "please compact" turn through the agent.
+
+**Syntax.**
+
+```bash
+cremind conv compact <id>
+```
+
+**Behavior.** Prints `compacted` if the running summary changed, or
+`no change` if nothing needed folding. With `--json`, emits
+`{"compacted": true|false}`. Requires `compaction.enabled` (see
+`cremind config`).
+
+**Example.**
+
+```bash
+$ cremind conv compact c_82bc
+compacted
+```
+
+### `cremind conv usage`
+
+**Purpose.** Per-request and cumulative token usage & estimated cost for one
+conversation — the drill-down behind a single conversation on the
+**Usage & Cost** dashboard.
+
+**Syntax.**
+
+```bash
+cremind conv usage <id>
+```
+
+**Behavior.** Prints a headline (conversation id, request count, cache-hit
+rate, and the conversation-wide totals), then a `--- requests ---` table of
+`CREATED_AT / MODEL / PROVIDER / TOKENS / COST_USD`, one row per assistant
+turn. With `--json`, returns the full object (`totals`, `cache_hit_rate`,
+`request_count`, `by_source`, `requests`). For the cross-conversation
+aggregate, use `cremind usage`.
+
+**Example.**
+
+```bash
+$ cremind conv usage c_82bc
+cache_hit_rate    0.58
+conversation_id   c_82bc
+request_count     6
+total_tokens      184320
+...
+
+--- requests ---
+CREATED_AT            MODEL            PROVIDER    TOKENS   COST_USD
+2026-05-02T08:00:01Z  claude-opus-4-8  anthropic   31002    0.21
 ```
 
 ### `cremind conv delete`

@@ -1,5 +1,5 @@
 ---
-description: "Complete reference for the `cremind config` CLI command — the terminal-side counterpart to the **Settings → Config** page in the Cremind web UI — covering how to inspect, override, and reset per-profile agent settings using the four subcommands `cremind config schema`, `cremind config get`, `cremind config set`, and `cremind config reset`. Lists every configurable key across the reasoning agent loop (max steps, retries, temperature, max tokens, steps history), conversation history token budgets, skill classifier, and trace summarizer, with dotted names, types, defaults, allowed ranges, and the matching card and field label on the Settings page so users can switch between CLI and UI without losing their place."
+description: "Inspect, override, and reset **per-profile agent settings** with `cremind config schema`, `get`, `set`, and `reset`: tune the reasoning-agent loop (max steps, retries, temperature, max tokens, steps history, prompt caching, reasoning-trace replay), conversation compaction, tool-result truncation, and long-term memory. Use this to change how the agent behaves for a profile — distinct from `cremind llm` (which models/providers) and `cremind tools` (per-tool config)."
 ---
 
 # `cremind config` — Per-Profile Settings Reference
@@ -14,13 +14,14 @@ get`.
 The settings are grouped into four areas:
 
 - **Reasoning Agent** — iteration limits and per-call LLM parameters
-  for the ReAct loop that drives every conversation turn.
-- **Conversation History** — token budgets for the message window
-  assembled before each LLM call.
-- **Skill Classifier** — the lightweight LLM that decides whether an
-  incoming request maps to a registered skill.
-- **Trace Summarizer** — the LLM that compresses long reasoning traces
-  back into the conversation history when they grow too large.
+  for the agent loop that drives every conversation turn, plus the
+  prompt-cache and reasoning-trace-replay switches.
+- **Conversation Compaction** — folds the oldest turns into a running
+  summary so long conversations stay within the model's context window.
+- **Tool Result Truncation** — shortens older tool observations before
+  they are re-sent to the reasoning LLM (the full result is always kept
+  in the database and shown in the web UI).
+- **Memory** — long-term, cross-conversation facts about the user.
 
 Every setting has a built-in **default**. When you change a setting
 with `cremind config set`, your value becomes an **override** that takes
@@ -41,17 +42,18 @@ The Config page is a vertical stack of cards, one card per group, in
 this order:
 
 1. **Reasoning Agent** — the `agent.*` keys.
-2. **Conversation History** — the `history.*` keys.
-3. **Trace Summarizer** — the `summarizer.*` keys.
+2. **Conversation Compaction** — the `compaction.*` keys.
+3. **Tool Result Truncation** — the `tool_result.*` keys.
+4. **Memory** — the `memory.*` keys.
 
 Inside each card, every row shows the field's label, a one-line
 description, the current default, and a type-appropriate input — a
-number spinner that enforces the min/max, a toggle, or a dropdown.
-When a value differs from its default, a **Reset** button appears next
-to the row to revert just that key. Edits are batched: a **Save
-changes** button at the top of the page commits all pending edits in
-one go. The per-group tables below list the exact UI label for every
-key so you can match it to the row you see in the card.
+number spinner that enforces the min/max, or a toggle. When a value
+differs from its default, a **Reset** button appears next to the row to
+revert just that key. Edits are batched: a **Save changes** button at
+the top of the page commits all pending edits in one go. The per-group
+tables below list the exact UI label for every key so you can match it
+to the row you see in the card.
 
 ## Global flags
 
@@ -90,12 +92,15 @@ includes each key's `min`, `max`, `step`, `label`, and `description`.
 ```bash
 $ cremind config schema
 [agent] Reasoning Agent
-  Controls the ReAct loop's iteration limits and per-call LLM parameters.
+  Controls the agent loop's iteration limits and per-call LLM parameters.
+  agent.enable_prompt_cache  type=boolean default=True
   agent.max_llm_retries  type=number default=2
-  agent.max_steps  type=number default=40
+  agent.max_steps  type=number default=200
   agent.reasoning_max_tokens  type=number default=32768
   agent.reasoning_retry  type=number default=3
-  agent.reasoning_temperature  type=number default=1
+  agent.reasoning_temperature  type=number default=1.0
+  agent.replay_reasoning_steps  type=boolean default=True
+  agent.steps_length  type=number default=20
   ...
 ```
 
@@ -127,18 +132,18 @@ the override if one is set, otherwise the default.
 # All keys with their override and default values
 $ cremind config get
 KEY                              VALUE   DEFAULT
+agent.enable_prompt_cache                true
 agent.max_llm_retries                    2
-agent.max_steps                  80      40
-agent.reasoning_max_tokens               32768
+agent.max_steps                  300     200
 ...
 
 # A single key
 $ cremind config get agent.max_steps
-80
+300
 
 # JSON output (full structure including both maps)
 $ cremind config get --json
-{"values":{"agent.max_steps":80},"defaults":{"agent.max_steps":40, ...}}
+{"values":{"agent.max_steps":300},"defaults":{"agent.max_steps":200, ...}}
 ```
 
 ### `cremind config set`
@@ -162,7 +167,7 @@ cremind config set <group.key> <value>
 **Type coercion.** The string-to-type rules are:
 
 - `"true"` or `"false"` (case-insensitive) → boolean
-- An integer literal (e.g. `40`, `-3`) → integer
+- An integer literal (e.g. `200`, `-3`) → integer
 - A decimal or exponential literal (e.g. `0.5`, `1e-3`) → float
 - Anything else → string
 
@@ -173,13 +178,13 @@ unknown key) the override is **not** applied and an error is reported.
 
 ```bash
 # Integer
-cremind config set agent.max_steps 80
+cremind config set agent.max_steps 300
 
 # Float
 cremind config set agent.reasoning_temperature 0.5
 
-# Boolean (none of the current keys are boolean, but the coercion works)
-cremind config set some.flag true
+# Boolean
+cremind config set memory.enabled true
 ```
 
 ### `cremind config reset`
@@ -214,19 +219,21 @@ values for your installation.
 
 ### Group `agent` — Reasoning Agent
 
-Controls the ReAct loop's iteration limits and per-call LLM parameters.
+Controls the agent loop's iteration limits and per-call LLM parameters.
 
 **Settings → Config card:** **Reasoning Agent** (the first card on the
 page).
 
-| Key                            | UI label              | Type   | Default | Range          | Meaning                                                                             |
-|--------------------------------|-----------------------|--------|---------|----------------|-------------------------------------------------------------------------------------|
-| `agent.max_steps`              | Max steps             | number | `40`    | 1 – 200        | Maximum ReAct iterations before the agent stops a turn.                             |
-| `agent.max_llm_retries`        | Max LLM retries       | number | `2`     | 0 – 10         | How many times the loop retries after an LLM error before giving up.                |
-| `agent.reasoning_temperature`  | Reasoning temperature | number | `1.0`   | 0 – 2 (±0.1)   | Sampling temperature for the main reasoning LLM call.                               |
-| `agent.reasoning_max_tokens`   | Reasoning max tokens  | number | `32768` | 256 – 131072   | Output token cap for the reasoning LLM call.                                        |
-| `agent.reasoning_retry`        | Per-call retry count  | number | `3`     | 0 – 10         | How many times an individual reasoning LLM call retries on transient errors.        |
-| `agent.steps_length`           | Steps history length  | number | `80`    | 5 – 500        | Maximum number of recent ReAct step entries kept in the prompt context. Older entries are dropped once this is exceeded. |
+| Key                            | UI label              | Type    | Default | Range          | Meaning                                                                             |
+|--------------------------------|-----------------------|---------|---------|----------------|-------------------------------------------------------------------------------------|
+| `agent.max_steps`              | Max steps             | number  | `200`   | 1 – 500        | Maximum tool-calling iterations before the agent stops a turn.                      |
+| `agent.max_llm_retries`        | Max LLM retries       | number  | `2`     | 0 – 10         | How many times the loop retries after an LLM error before giving up.                |
+| `agent.reasoning_temperature`  | Reasoning temperature | number  | `1.0`   | 0 – 2 (±0.1)   | Sampling temperature for the main reasoning LLM call.                               |
+| `agent.reasoning_max_tokens`   | Reasoning max tokens  | number  | `32768` | 256 – 131072   | Output token cap for the reasoning LLM call.                                        |
+| `agent.reasoning_retry`        | Per-call retry count  | number  | `3`     | 0 – 10         | How many times an individual reasoning LLM call retries on transient errors.        |
+| `agent.steps_length`           | Steps history length  | number  | `20`    | 5 – 500        | Maximum number of recent step entries kept in the prompt context. Older entries are dropped once this is exceeded. |
+| `agent.enable_prompt_cache`    | Prompt caching        | boolean | `true`  | —              | Reuse the cached system+tools prefix across reasoning steps to cut input tokens. Anthropic uses explicit cache markers; OpenAI-family providers cache automatically. Harmless on providers without cache support. |
+| `agent.replay_reasoning_steps` | Replay reasoning steps| boolean | `true`  | —              | Send each prior turn's full tool-call/tool-result trace back into history (not just the final answer), so the model resumes the real transcript and the cached prefix covers the reasoning. Larger prompts — cheap on Anthropic (cached), but extra input tokens on providers without caching. |
 
 ### Group `compaction` — Conversation Compaction
 
@@ -242,25 +249,45 @@ the page).
 |---------------------------------------|-----------------------------|---------|----------|-----------------|------------------------------------------------------------------------------------------|
 | `compaction.enabled`                  | Enabled                     | boolean | `true`   | —               | When off, full history is sent (bounded only by the model's context window).             |
 | `compaction.compact_threshold_percent` | Compaction threshold (% of context window) | number | `85` | 10 – 100 (±5) | Suggest folding the oldest turns once the model's reported context reaches this percentage of its context window. Lower it to compact earlier. |
-| `compaction.keep_recent_tokens`       | Keep-recent target          | number  | `40000`  | 500 – 500000    | After a compaction, keep about this many tokens of recent turns verbatim (hysteresis band). |
-| `compaction.keep_recent_messages`     | Keep-recent messages floor  | number  | `4`      | 0 – 50          | Never fold below this many of the most recent messages.                                  |
+| `compaction.keep_recent_tokens`       | Keep-recent target (tokens) | number  | `12000`  | 500 – 500000    | After a compaction, keep about this many tokens of recent turns verbatim (the hysteresis band that keeps the cached summary stable across turns). |
+| `compaction.keep_recent_messages`     | Keep-recent messages (floor) | number | `4`      | 0 – 50          | Never fold below this many of the most recent messages.                                  |
 | `compaction.temperature`              | Temperature                 | number  | `0.3`    | 0 – 2 (±0.1)    | Sampling temperature for the summarization call.                                         |
 | `compaction.max_tokens`               | Max tokens                  | number  | `2048`   | 128 – 8192      | Output token cap for the running summary (also its hard size bound).                     |
 | `compaction.retry`                    | Retry count                 | number  | `2`      | 0 – 10          | Retries on transient summarization LLM errors.                                           |
 
-### Group `summarizer` — Trace Summarizer
+### Group `tool_result` — Tool Result Truncation
 
-LLM that compresses long reasoning traces back into the conversation
-history.
+Limits applied to tool observations when they are re-sent to the reasoning
+LLM. The full result is always stored in the database and shown in the web UI;
+only the copy fed back into the next reasoning prompt is shortened.
 
-**Settings → Config card:** **Trace Summarizer** (the third card on
+**Settings → Config card:** **Tool Result Truncation** (the third card on
 the page).
 
-| Key                       | UI label    | Type   | Default | Range          | Meaning                                                  |
-|---------------------------|-------------|--------|---------|----------------|----------------------------------------------------------|
-| `summarizer.temperature`  | Temperature | number | `0.3`   | 0 – 2 (±0.1)   | Sampling temperature for the summarization call.         |
-| `summarizer.max_tokens`   | Max tokens  | number | `1024`  | 128 – 8192     | Output token cap for the summary.                        |
-| `summarizer.retry`        | Retry count | number | `2`     | 0 – 10         | Retries on transient summarizer LLM errors.              |
+| Key                          | UI label                       | Type    | Default | Range           | Meaning                                                                                  |
+|------------------------------|--------------------------------|---------|---------|-----------------|------------------------------------------------------------------------------------------|
+| `tool_result.enabled`        | Enabled                        | boolean | `true`  | —               | When on, older tool observations are shortened to a head/tail excerpt before being included in the next reasoning prompt. |
+| `tool_result.max_tokens`     | Per-observation token threshold | number | `1000`  | 100 – 200000    | An older observation longer than this many tokens is replaced with a head excerpt + truncation marker + tail excerpt. |
+| `tool_result.preserve_recent`| Recent observations kept full  | number  | `1`     | 0 – 10          | The N most recent observations always pass through at full length, regardless of size.   |
+| `tool_result.head_tokens`    | Head excerpt tokens            | number  | `200`   | 0 – 10000       | Tokens kept from the beginning of a truncated observation.                               |
+| `tool_result.tail_tokens`    | Tail excerpt tokens            | number  | `200`   | 0 – 10000       | Tokens kept from the end of a truncated observation.                                      |
+
+### Group `memory` — Memory
+
+Lets the agent recall durable, long-term facts about the user across
+conversations. Long-term memory is extracted together with the conversation
+summary at the compaction fold (so it **requires Compaction enabled**). When
+Vector Embedding is on, facts are stored in the vector store and retrieved by
+relevance; otherwise they live in a small size-capped queue. Off by default.
+
+**Settings → Config card:** **Memory** (the fourth card on the page).
+
+| Key                              | UI label                   | Type    | Default | Range    | Meaning                                                                                  |
+|----------------------------------|----------------------------|---------|---------|----------|------------------------------------------------------------------------------------------|
+| `memory.enabled`                 | Enabled                    | boolean | `false` | —        | Master switch for long-term memory. Requires Compaction enabled (memory is generated at the compaction fold). When off, the agent reads and writes no long-term memory. |
+| `memory.long_term_queue_size`    | Long-term queue size       | number  | `20`    | 1 – 100  | Max long-term facts kept per profile in the DB queue (Vector-Embedding-OFF mode). Oldest is dropped on overflow. Ignored in vector mode (unlimited). |
+| `memory.long_term_max_tokens`    | Long-term entry max tokens | number  | `50`    | 10 – 500 | Each long-term fact is clipped to at most this many tokens.                              |
+| `memory.long_term_retrieve_limit`| Long-term retrieval limit  | number  | `10`    | 1 – 50   | Top-K long-term facts retrieved from the vector store for the prompt (Vector-Embedding-ON mode). |
 
 ## Worked examples
 
@@ -270,12 +297,12 @@ the page).
 $ cremind config get
 ```
 
-### Raise the ReAct step ceiling for long tasks
+### Raise the step ceiling for long tasks
 
 ```bash
-$ cremind config set agent.max_steps 80
+$ cremind config set agent.max_steps 300
 $ cremind config get agent.max_steps
-80
+300
 ```
 
 ### Undo the override
@@ -283,14 +310,22 @@ $ cremind config get agent.max_steps
 ```bash
 $ cremind config reset agent.max_steps
 $ cremind config get agent.max_steps
-40
+200
 ```
 
 ### Compact sooner (fold before the context window fills)
 
 ```bash
 $ cremind config set compaction.compact_threshold_percent 70
-$ cremind config set compaction.keep_recent_tokens 15000
+$ cremind config set compaction.keep_recent_tokens 8000
+```
+
+### Turn on long-term memory
+
+```bash
+# Memory needs compaction enabled (facts are written at the compaction fold).
+$ cremind config set compaction.enabled true
+$ cremind config set memory.enabled true
 ```
 
 ### Pipe the schema into `jq`
@@ -298,11 +333,13 @@ $ cremind config set compaction.keep_recent_tokens 15000
 ```bash
 $ cremind config schema --json | jq '.groups.agent.fields | keys'
 [
+  "enable_prompt_cache",
   "max_llm_retries",
   "max_steps",
   "reasoning_max_tokens",
   "reasoning_retry",
   "reasoning_temperature",
+  "replay_reasoning_steps",
   "steps_length"
 ]
 ```
@@ -320,6 +357,11 @@ validation. Common causes:
 
 Run `cremind config schema` to confirm the exact key name and allowed
 range, then retry.
+
+**`memory.enabled` is on but nothing is remembered** — Long-term memory is
+generated at the compaction fold, so it requires `compaction.enabled` to be
+`true`. Turn compaction on (and have a conversation long enough to trigger a
+fold) for memory to start accumulating.
 
 **Override "doesn't seem to apply"** — Overrides are stored per profile.
 An override set under one profile is invisible to another; if you have
