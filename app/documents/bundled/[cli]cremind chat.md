@@ -1,5 +1,5 @@
 ---
-description: "Reference for the `cremind chat` CLI command — an interactive full-screen chat REPL that opens a TUI against a new or existing conversation and streams the agent's thinking, text, and tool output as it arrives. Documents how `chat` differs from `cremind conv send` (REPL vs one-shot scripting), the keyboard shortcuts (Enter to send, Ctrl+C to cancel an in-flight run or quit when idle, Ctrl+D to quit, PgUp/PgDn to scroll), the optional conversation-id argument that resumes an existing thread, the `-t/--title` flag for new conversations, how to rename a conversation's id or title from outside the REPL via `cremind conv set-id` and `cremind conv rename`, and what to reach for when you want to script a single message instead of sit at a prompt."
+description: "Open an interactive full-screen **chat REPL** (TUI) against a new or existing conversation and watch the agent's thinking, text, and tool output stream live. Use this to sit and talk with the agent interactively — keyboard shortcuts, resume a conversation by id, `-t/--title` for a new thread. Distinct from `cremind conv send`, which scripts a single one-shot message without a prompt."
 ---
 
 # `cremind chat` — Interactive Chat REPL

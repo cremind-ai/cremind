@@ -11,9 +11,14 @@ two watched documentation roots:
 - Per-profile: `<CREMIND_WORKING_DIR>/<profile>/documents/*.md`
 
 When a file appears in either tree, the documents watcher parses it and, if
-it is valid, indexes its `description` into the Qdrant collection used by
-the `documentation_search` built-in tool. The body is read from disk on
-demand only after a query matches the description.
+it is valid, indexes it into the Qdrant collection used by the
+`documentation_search` built-in tool. What gets embedded is the file's
+identity (its filename, with any leading `[tag]` stripped) followed by its
+`description` — the body is *not* indexed. Retrieval then runs in two
+stages: vector search ranks candidates by that embedded text, and an
+internal LLM judge picks the single best match from the top candidates'
+names + descriptions. The body is read from disk on demand only after the
+judge picks a document.
 
 ## File format
 
@@ -44,35 +49,56 @@ description: "<one-sentence summary of the whole file>"
 
 ## The `description` field
 
-This is the single most important field in the file. It is the **only**
-text that gets embedded into the vector store — the body is not indexed.
-Retrieval ranking for `documentation_search` is driven entirely by how
-well a query matches the description.
+This is the single most important field in the file. Together with the
+file's name it is the **only** text embedded into the vector store — the
+body is not indexed — and it is also what the internal LLM judge reads to
+pick the winning document. Retrieval quality is driven almost entirely by
+how *discriminating* this one string is.
 
-Write the description as a **concise summary of the entire file's
-content**: a single sentence (or short paragraph) that names the topic
-and the scenarios in which the document is useful.
+Write it to be **distinctive, not merely thorough.** Two consumers read it:
+the embedder (which rewards specific, front-loaded keywords) and the judge
+(which needs enough scenario detail to tell this doc apart from its
+neighbors). A two-sentence shape serves both:
+
+1. **Recall sentence** — lead with the topic's *distinctive* verbs and
+   object noun, plus the natural-language synonyms someone would actually
+   search: "Create, list, and delete profiles — make, add, or register a
+   new profile…".
+2. **Disambiguation sentence** — name the scenario and, where docs are
+   easily confused, say what this one is *distinct from*: "…distinct from
+   `cremind chat` (the interactive REPL)."
 
 Guidelines:
 
-- Front-load topic keywords. The description is matched semantically, but
-  concrete nouns help (e.g. tool names, command names, artifact names).
-- Name the *scenario*, not just the topic — "How to configure X when Y"
-  beats "About X".
-- Avoid vague phrases like "documentation about ..." or "notes on ...".
-- Quote the value (`description: "..."`) so colons, hashes, and other YAML
-  special characters parse cleanly.
-- Keep it to one sentence when possible. If two sentences are needed,
-  separate them with a period and a space inside the same quoted string.
+- **No shared boilerplate.** Do NOT open with a generic prefix that many
+  docs repeat (e.g. "Complete reference for the `cremind X` CLI command —
+  the terminal-side counterpart to the **Y** page in the web UI — covering
+  how to…"). Identical prefixes pull every doc's embedding toward the same
+  point and flatten the ranking. Put the UI-counterpart fact in the body.
+- **Front-load distinctive keywords.** The first ~10 words decide most of
+  the match; spend them on what makes this doc unique, not on filler.
+- **Bind common words to a unique object.** A token like "create" or
+  "profile" that appears across many docs doesn't discriminate on its own —
+  tie it to this doc's unique object ("create a profile", "create a
+  conversation", "create a schedule event").
+- **Include user-intent synonyms** (create / make / add / register / new)
+  so natural-language queries find lexical anchors.
+- **Aim for roughly two sentences (~250–350 characters).** Don't enumerate
+  every subcommand — list only the ones that disambiguate; the body carries
+  the rest.
+- **Quote the value** (`description: "..."`) so colons, hashes, and other
+  YAML special characters parse cleanly; escape embedded double quotes as
+  `\"`.
+- **Avoid vague phrases** like "documentation about ..." or "notes on ...".
 
 Examples:
 
 ```yaml
-description: "Step-by-step guide for writing a new Cremind skill, including the SKILL.md frontmatter format, the skill directory layout, and how to register the skill so the Reasoning Agent can discover it."
+description: "Create, list, inspect, rename, and delete Cremind profiles — how to make, add, or register a new profile, remove one, and read or edit a profile's persona text and the assistant's agent name. Distinct from `cremind setup`, which mints the very first admin during install."
 ```
 
 ```yaml
-description: "How to configure the `exec_shell` built-in tool to run long-running background apps, including the `metadata.long_running_app.command` key and autostart behavior."
+description: "Manage conversations and stream agent replies from the terminal: create, list, fetch, rename, delete, and `send` a message to stream the response. Use this to script one-shot messages and manage threads — distinct from `cremind chat` (the interactive REPL)."
 ```
 
 ## Body conventions
@@ -117,6 +143,11 @@ After saving a new document:
 3. Call the `documentation_search` built-in tool with a query whose
    keywords appear in your description; the new file should be in the
    results.
+
+> **System docs are different.** The watcher covers the two documentation
+> roots above. The docs *bundled with Cremind* are mirrored into the shared
+> root and re-embedded at server **boot**, so edits to a bundled doc take
+> effect on the next restart — not via the live watcher.
 
 If the file doesn't appear, the most common causes are:
 

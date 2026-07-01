@@ -1,5 +1,5 @@
 ---
-description: "Complete reference for the `cremind proc` CLI command (alias `cremind process`) — the terminal-side counterpart to the **Processes** page in the Cremind web UI — covering how to list and inspect long-running processes, terminate them (`stop`), feed them stdin (literal text, named keys, or piped stdin), resize their PTY, attach a raw-mode interactive PTY session (`attach`, with detach via Ctrl-\\), tail a live SSE stream of process snapshots (`stream`), and manage autostart registrations (`autostart list/add/delete/run`) so processes relaunch at server boot. Documents the named-key vocabulary for `stdin --keys`, the line-ending modes, the WebSocket-backed `attach`, and how `register-long-running` from `cremind tools` ties into autostart."
+description: "Control **long-running processes** the agent has spawned (shells, daemons, PTYs): `list` and inspect them, `stop` one, feed `stdin` (literal text, named keys, or piped input), resize the PTY, `attach` a raw interactive session, `stream` live process snapshots over SSE, and manage `autostart` registrations so a process relaunches at server boot. Use this to monitor, kill, or interact with background and interactive processes."
 ---
 
 # `cremind proc` — Long-Running Process Control

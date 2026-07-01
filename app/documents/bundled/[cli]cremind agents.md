@@ -1,5 +1,5 @@
 ---
-description: "Complete reference for the `cremind agents` CLI command (alias `cremind agent`) — the terminal-side counterpart to the **Agents** page in the Cremind web UI — covering how to register and remove A2A and MCP servers, enable/disable them per profile, retry stub connections, run the OAuth authorize flow (`auth-url`), drop a profile's stored OAuth token (`unlink`), and read or patch the per-profile LLM and meta config attached to each agent. Documents the two ways to register an MCP server (`--url` vs `--json-config`), the per-server LLM override flags, and how `agents config set` differs from `tools set-llm`."
+description: "Register and manage external **A2A agents and MCP servers** the agent can call: `add` a server by `--url` or `--json-config`, remove it, enable or disable it per profile, retry a stub connection, run the **OAuth** authorize flow (`auth-url`) or `unlink` a stored token, and set a per-agent LLM override. Use this to connect a new MCP or A2A tool server — distinct from `cremind tools` (configuring already-registered tools) and `cremind llm` (LLM providers)."
 ---
 
 # `cremind agents` — A2A and MCP Server Registration

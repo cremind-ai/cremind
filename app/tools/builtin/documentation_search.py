@@ -105,14 +105,17 @@ TOOL_CONFIG: ToolConfig = {
 class DocumentationSearchTool(BuiltInTool):
     name: str = "search_documentation"
     description: str = (
-        "Search Cremind's documentation by semantic query. Returns "
-        "the body of the single most accurate document, or "
-        f"\"{NO_RESULT_MESSAGE}\" when nothing matches. \n"
-        "In the documents you find, if a document explains "
-        "how to use the cremind CLI, you must use the `exec_shell` "
-        "tool to run the cremind CLI and produce the result, "
-        "rather than just showing those instructions for the "
-        "user to run themselves."
+        "Operate the Cremind system through its command-line interface. The "
+        "cremind CLI is a very powerful surface that can do anything a user can "
+        "do in the UI: install and manage skills & tools, change configuration, "
+        "and manage profiles, conversations, files, calendar, channels, usage "
+        "and more. Given a natural-language goal, this returns the exact CLI "
+        "usage instructions for it. E.g. 'how to change your name' to fulfill "
+        "this request, you need to find it in the documentation and follow the "
+        "instructions.\n"
+        "After finding the documentation you need, you must run that command "
+        "using the cremind CLI via the `exec_shell` tool instead of showing "
+        "those instructions for the user to run themselves."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -273,12 +276,32 @@ async def _select_best_candidate(
     logger.debug(f"user_message: {user_message}")
     function_calls: List[Dict[str, Any]] = []
     token_usage: Dict[str, int] = done_chunk_token_usage({})
+
+    # One always-on INFO summary per search, emitted at every return path below.
+    # Lets us tell a ranking miss (target doc never reached top-K) from a judge
+    # miss (target ranked but rejected) without dumping bodies or descriptions.
+    def _fmt_score(v: Any) -> str:
+        return f"{v:.4f}" if isinstance(v, (int, float)) else "n/a"
+
+    ranked = ", ".join(
+        f"{c.get('name', '')}={_fmt_score(c.get('score'))}" for c in candidates
+    )
+
+    def _log(decision: str) -> None:
+        logger.info(
+            f"[documentation_search] query={query!r} ranked=[{ranked}] "
+            f"decision={decision}"
+        )
+
     try:
         async for response in llm.chat_completion(
             messages=messages,
             tools=judge_tools,
             tool_choice="auto",
-            temperature=1,
+            # Relevance judging is a deterministic single-pick classification;
+            # sampling variance (temperature > 0) is pure downside here — it can
+            # flip a borderline-correct pick to no_relevant_result() on retry.
+            temperature=0,
         ):
             logger.debug(f"judge response: {response}")
             rtype = response.get("type")
@@ -291,6 +314,7 @@ async def _select_best_candidate(
                 break
     except Exception:  # noqa: BLE001
         logger.exception("[documentation_search] judge LLM call failed")
+        _log("error:judge-llm-failed")
         return None, token_usage
 
     if not function_calls:
@@ -298,6 +322,7 @@ async def _select_best_candidate(
             "[documentation_search] judge produced no tool call; "
             "treating as no-match"
         )
+        _log("no-match:no-tool-call")
         return None, token_usage
 
     call = function_calls[0]
@@ -310,6 +335,7 @@ async def _select_best_candidate(
             args = {}
 
     if name == _NO_MATCH_TOOL_NAME:
+        _log("no_relevant_result")
         return None, token_usage
 
     if name == _SELECT_TOOL_NAME:
@@ -321,19 +347,23 @@ async def _select_best_candidate(
                 f"[documentation_search] judge passed non-integer index: "
                 f"{raw_index!r}"
             )
+            _log(f"no-match:non-integer-index:{raw_index!r}")
             return None, token_usage
         if 0 <= idx < len(candidates):
+            _log(f"select:{candidates[idx].get('name', '')}[{idx}]")
             return idx, token_usage
         logger.warning(
             f"[documentation_search] judge index {idx} out of range "
             f"(have {len(candidates)} candidates)"
         )
+        _log(f"no-match:index-out-of-range:{idx}")
         return None, token_usage
 
     logger.warning(
         f"[documentation_search] judge called unknown tool {name!r}; "
         "treating as no-match"
     )
+    _log(f"no-match:unknown-tool:{name!r}")
     return None, token_usage
 
 

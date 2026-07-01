@@ -1,5 +1,5 @@
 ---
-description: "Reference for the `cremind system-vars` CLI command — a one-shot read-only query that asks the Cremind server which environment variables it injects into every `exec_shell` subprocess (`CREMIND_SERVER`, `CREMIND_TOKEN`, `CREMIND_SYSTEM_WORKING_DIR`, `CREMIND_USER_WORKING_DIR`, `CREMIND_SKILL_DIR`, plus any extensions registered later) and prints each one's name, currently-resolved value for the caller's profile, and description. Useful for discovering which env vars are available inside agent-spawned shells, confirming what an `exec_shell` run will actually see, and verifying that the server-side registry is in sync with what the CLI expects."
+description: "List the **environment variables** the Cremind server injects into every `exec_shell` subprocess — `CREMIND_SERVER`, `CREMIND_TOKEN`, `CREMIND_SYSTEM_WORKING_DIR`, `CREMIND_USER_WORKING_DIR`, `CREMIND_SKILL_DIR`, and any extensions — with each one's resolved value and description. Use this to discover what env vars an agent-spawned shell will see; a read-only query, distinct from `cremind me` (which decodes the token identity)."
 ---
 
 # `cremind system-vars` — List Env Vars Injected Into Shells

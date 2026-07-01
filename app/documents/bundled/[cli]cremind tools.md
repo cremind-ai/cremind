@@ -1,5 +1,5 @@
 ---
-description: "Complete reference for the `cremind tools` CLI command (alias `cremind tool`) — the terminal-side counterpart to the **Tools** page in the Cremind web UI — covering how to list every tool the agent can call (built-in, mcp, a2a, skill, intrinsic), inspect a tool's current configuration, enable or disable A2A/MCP tools, set tool variables (env-style key/value pairs), set tool arguments from a JSON object, override the LLM the tool uses, reset those overrides, and register a skill's `long_running_app` as an autostart process. Lists the five tool types, the locked-LLM-fields concept, and the rules for partial vs full updates."
+description: "List and configure the **tools** the agent can call (built-in, MCP, A2A, skill, intrinsic): inspect a tool's config, enable or disable A2A/MCP tools, set tool variables (env-style key/value) or arguments (JSON), override or reset the tool's LLM, toggle a tool's sub-tools (\"leaves\"), and register a skill's long-running app as an autostart process. Use this to turn tools on or off and configure them — distinct from `cremind agents` (registering MCP/A2A servers)."
 ---
 
 # `cremind tools` — Tool & Skill Configuration
@@ -17,6 +17,9 @@ The group's surface area is small but covers every angle of tool config:
 - **Per-tool configuration** — `set-var` (env-style variables),
   `set-args` (a structured JSON arguments object), `set-llm`
   (per-tool LLM overrides), `reset-llm` (drop those overrides).
+- **Sub-tools ("leaves")** — `leaves` to list a grouped tool's
+  individual sub-tools and their enabled state, `set-leaf` to turn
+  specific ones on or off.
 - **Skill-specific** — `register-long-running` to spin up a skill's
   long-running daemon and persist it as an autostart entry.
 
@@ -298,6 +301,64 @@ cremind tools reset-llm <tool_id> <key> [key...]
 
 ```bash
 $ cremind tools reset-llm skill.review-pr llm_provider llm_model reasoning_effort
+```
+
+### `cremind tools leaves`
+
+**Purpose.** List a tool's sub-tools ("leaves") with their per-profile
+enabled state. Grouped tools — built-in groups and connected MCP servers —
+expose several callable sub-tools under one `tool_id`; this shows them
+individually so you can toggle just the ones you want.
+
+**Syntax.**
+
+```bash
+cremind tools leaves <tool_id>
+```
+
+**Behavior.** Renders a `LEAF / NAME / ENABLED / DESCRIPTION` table. If the
+tool is a disconnected MCP server, a `(tool is disconnected — live sub-tool
+list unavailable)` note is printed to stderr and the list may be empty. With
+`--json`, returns `{supports_leaf_toggle, disconnected, leaves: [{leaf_name,
+name, description, enabled}]}`.
+
+**Example.**
+
+```bash
+$ cremind tools leaves mcp.linear
+LEAF              NAME            ENABLED  DESCRIPTION
+list_issues       List issues     yes      List issues in a team.
+create_issue      Create issue    no       Create a new issue.
+```
+
+### `cremind tools set-leaf`
+
+**Purpose.** Enable or disable specific sub-tools of a grouped tool. A single
+pair is a per-leaf toggle; pass several to drive an "enable all" / "disable
+all".
+
+**Syntax.**
+
+```bash
+cremind tools set-leaf <tool_id> NAME=true|false [NAME=true|false...]
+```
+
+**Arguments** (at least one pair required):
+
+- `<tool_id>` — Target tool.
+- `NAME=BOOL` — Repeatable. `NAME` is the `leaf_name` from
+  `cremind tools leaves`; the value accepts `true/false`, `1/0`, `yes/no`,
+  `on/off`.
+
+**Behavior.** Unknown leaf names are rejected when the tool exposes a live
+sub-tool list; when that list is empty (e.g. a disconnected MCP server) the
+write is accepted so the choice survives a reconnect. Silent on success.
+
+**Example.**
+
+```bash
+# Keep only the read-only Linear sub-tools
+$ cremind tools set-leaf mcp.linear list_issues=true create_issue=false update_issue=false
 ```
 
 ### `cremind tools register-long-running`
