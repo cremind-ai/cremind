@@ -43,6 +43,13 @@ if TYPE_CHECKING:
 COLLECTION_NAME = "documentation_search"
 SHARED_SCOPE = "shared"
 
+# In degraded mode (no embedding model / vector store) the LLM relevance judge
+# is the ONLY discriminator, so it must see the whole bounded system-doc set --
+# not an arbitrary alphabetical prefix. This cap is deliberately far above both
+# the vector ``top_k`` and the ~18 bundled docs; it exists only to bound a
+# pathologically large per-profile corpus, and any truncation is logged.
+FALLBACK_MAX_CANDIDATES = 50
+
 
 class DocumentSyncService:
     """Sync `.md` documents under the working directory into Qdrant."""
@@ -171,8 +178,8 @@ class DocumentSyncService:
                 cur = existing_ids.get(fid)
                 if cur and cur.get("content_hash") == payload["content_hash"]:
                     continue
-                description = payload.pop("_description")
-                vector = self._embed(description)
+                embed_text = payload.pop("_embed_text")
+                vector = self._embed(embed_text)
                 if vector is None:
                     continue
                 points.append({"id": fid, "vector": vector, "payload": payload})
@@ -222,12 +229,13 @@ class DocumentSyncService:
                 )
                 return
 
-            content_hash = _hash_text(parsed.description + "\0" + parsed.body)
+            embed_text = _embedding_text(Path(relpath).stem, parsed.description)
+            content_hash = _hash_text(embed_text + "\0" + parsed.body)
             existing = self._fetch_one(fid)
             if existing and existing.get("content_hash") == content_hash:
                 return
 
-            vector = self._embed(parsed.description)
+            vector = self._embed(embed_text)
             if vector is None:
                 return
             self._ensure_collection(len(vector))
@@ -266,11 +274,15 @@ class DocumentSyncService:
         logger.debug(f"[documents] search: query={query!r} profile={profile!r} limit={limit}")
         if self._vector_store is None or self._embedding is None:
             logger.debug("[documents] vector search unavailable, falling back to full scan")
-            return self._list_all_for_scopes(profile=profile, limit=limit)
+            return self._list_all_for_scopes(
+                profile=profile, limit=FALLBACK_MAX_CANDIDATES
+            )
 
         if not self._vector_store.collection_exists(COLLECTION_NAME):
             logger.debug("[documents] collection does not exist, falling back to full scan")
-            return self._list_all_for_scopes(profile=profile, limit=limit)
+            return self._list_all_for_scopes(
+                profile=profile, limit=FALLBACK_MAX_CANDIDATES
+            )
 
         try:
             vector = self._embedding.embed_query(query)
@@ -298,9 +310,13 @@ class DocumentSyncService:
         disabled or vector store not connected). The caller's LLM judge
         does the relevance pick over the resulting list.
 
-        Documents are ordered scope-then-relpath for deterministic output;
-        truncation at ``limit`` keeps the judge prompt manageable when a
-        profile accumulates many docs.
+        Documents are ordered scope-then-relpath with shared/system docs first,
+        so they survive truncation. Because the judge is the sole discriminator
+        in this mode, ``limit`` must be generous enough to include the whole
+        system-doc set (see ``FALLBACK_MAX_CANDIDATES``); capping below it hides
+        docs from the judge -- which is exactly what made tail-sorted docs like
+        ``profile`` unreachable. The cap therefore only bounds a pathologically
+        large per-profile corpus, and any truncation is logged, never silent.
         """
         results: list[dict] = []
         for scope in (SHARED_SCOPE, profile):
@@ -311,10 +327,16 @@ class DocumentSyncService:
             )
             for payload in payloads:
                 payload = dict(payload)
-                payload.pop("_description", None)
+                payload.pop("_embed_text", None)
                 payload["score"] = 0.0
                 results.append(payload)
         if limit and len(results) > limit:
+            logger.warning(
+                f"[documents] full-scan fallback truncated {len(results)} "
+                f"candidates to {limit}; {len(results) - limit} doc(s) hidden "
+                f"from the relevance judge (raise FALLBACK_MAX_CANDIDATES or "
+                f"enable vector search)"
+            )
             results = results[:limit]
         return results
 
@@ -331,7 +353,7 @@ class DocumentSyncService:
     # ── Internals: scanning and Qdrant plumbing ────────────────────────────
 
     def _scan_scope(self, scope: str) -> dict[int, dict]:
-        """Build ``{file_id: payload-dict-with-_description}`` for a scope."""
+        """Build ``{file_id: payload-dict-with-_embed_text}`` for a scope."""
         directory = self.scope_dir(scope)
         out: dict[int, dict] = {}
         if not directory.exists():
@@ -345,7 +367,8 @@ class DocumentSyncService:
             if relpath is None:
                 continue
             fid = self._file_id(scope, relpath)
-            content_hash = _hash_text(parsed.description + "\0" + parsed.body)
+            embed_text = _embedding_text(Path(relpath).stem, parsed.description)
+            content_hash = _hash_text(embed_text + "\0" + parsed.body)
             payload = self._build_payload(
                 scope=scope,
                 relpath=relpath,
@@ -353,7 +376,9 @@ class DocumentSyncService:
                 description=parsed.description,
                 content_hash=content_hash,
             )
-            payload["_description"] = parsed.description
+            # Transient (stripped before upsert): the exact string to embed, so
+            # full_reconcile embeds precisely what the content hash covers.
+            payload["_embed_text"] = embed_text
             out[fid] = payload
         return out
 
@@ -484,3 +509,31 @@ def _hash_text(text: str) -> str:
 
 def _hash_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _clean_name(stem: str) -> str:
+    """Strip a leading ``[tag]`` from a filename stem for embedding.
+
+    Doc stems look like ``[cli]cremind profile``; the bracketed tag is a
+    routing marker, not identity. Dropping it lets the embedder see
+    ``cremind profile`` as clean identity tokens rather than a fragmented
+    bracketed blob.
+    """
+    if stem.startswith("[") and "]" in stem:
+        stem = stem.split("]", 1)[1]
+    return stem.strip()
+
+
+def _embedding_text(stem: str, description: str) -> str:
+    """Compose the text embedded for a doc: identity (name) then description.
+
+    The cleaned name leads so the doc's own identity term (e.g. ``profile``)
+    carries weight in the vector instead of being drowned out by boilerplate
+    the descriptions share across docs. This is the *single* definition of
+    what gets embedded — the content hash (below, in the sync methods) hashes
+    exactly this string so any change to the formula forces a re-embed.
+    """
+    ident = _clean_name(stem)
+    if not ident:
+        return description
+    return f"{ident}\n\n{description}"
