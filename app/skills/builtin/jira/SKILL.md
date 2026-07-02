@@ -1,19 +1,43 @@
 ---
 name: jira
 description: Search, view, create, comment on, and transition Jira Cloud issues via OAuth2 (Atlassian 3LO), and receive issue-change events in real time. Authorizes through the Cremind Connect service (no Atlassian app setup on the client); tokens stay on this machine. A persistent listener registers a Jira webhook and (via the relay) drops changed issues as markdown, classified into per-lifecycle events (created/updated/transitioned/commented/deleted).
-metadata: {
-  environment_variables: [
-    {"name": "CREMIND_CONNECT_URL", "description": "Cremind Connect base URL (OAuth broker)", "required": false, "type": "string", "default": "https://connect.cremind.io"},
-    {"name": "ATLASSIAN_CLIENT_ID", "description": "Atlassian OAuth Client ID (auto-fetched from Cremind Connect when blank)", "required": false, "type": "string", "default": ""},
-    {"name": "JIRA_SITE_URL", "description": "Jira site URL (default: first accessible site)", "required": false, "type": "string", "default": ""},
-    {"name": "JIRA_WEBHOOK_JQL", "description": "JQL filter selecting which issues raise events", "required": false, "type": "string", "default": "assignee = currentUser()"}
-  ],
-  events: {"event_type":[{"name":"issue_created","description":"A Jira issue was created"},{"name":"issue_updated","description":"A Jira issue's fields were edited (other than a status transition)"},{"name":"issue_transitioned","description":"A Jira issue moved to a new status"},{"name":"issue_commented","description":"A comment was added to a Jira issue"},{"name":"issue_deleted","description":"A Jira issue was deleted (live only; a deletion while the listener is offline is missed)"}]},
-  long_running_app: {
-    command: "uv run scripts/event_listener.py",
-    description: "Persistent Jira listener. Registers + refreshes a Jira dynamic webhook, subscribes to the Cremind Connect relay, and drops changed issues as markdown.",
-  }
-}
+metadata:
+  environment_variables:
+    - name: CREMIND_CONNECT_URL
+      description: Cremind Connect base URL (OAuth broker)
+      required: false
+      type: string
+      default: https://connect.cremind.io
+    - name: ATLASSIAN_CLIENT_ID
+      description: Atlassian OAuth Client ID (auto-fetched from Cremind Connect when blank)
+      required: false
+      type: string
+      default: ''
+    - name: JIRA_SITE_URL
+      description: 'Jira site URL (default: first accessible site)'
+      required: false
+      type: string
+      default: ''
+    - name: JIRA_WEBHOOK_JQL
+      description: JQL filter selecting which issues raise events
+      required: false
+      type: string
+      default: assignee = currentUser()
+  events:
+    event_type:
+      - name: issue_created
+        description: A Jira issue was created
+      - name: issue_updated
+        description: A Jira issue's fields were edited (other than a status transition)
+      - name: issue_transitioned
+        description: A Jira issue moved to a new status
+      - name: issue_commented
+        description: A comment was added to a Jira issue
+      - name: issue_deleted
+        description: A Jira issue was deleted (live only; a deletion while the listener is offline is missed)
+  long_running_app:
+    command: uv run scripts/event_listener.py
+    description: Persistent Jira listener. Registers + refreshes a Jira dynamic webhook, subscribes to the Cremind Connect relay, and drops changed issues as markdown.
 ---
 
 # jira
