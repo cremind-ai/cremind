@@ -31,12 +31,15 @@ from app.cli.commands import chat as chat_cmd
 from app.cli.commands import me as me_cmd
 from app.cli.commands import serve as serve_cmd
 from app.cli.commands import system_vars as system_vars_cmd
+from app.cli.commands import usage as usage_cmd
 from app.cli.commands.agents import agents_app
+from app.cli.commands.calendar import calendar_app
 from app.cli.commands.channels import channels_app
 from app.cli.commands.config import config_app
 from app.cli.commands.conv import conv_app
 from app.cli.commands.db import db_app
 from app.cli.commands.file_watchers import file_watchers_app
+from app.cli.commands.files import files_app
 from app.cli.commands.llm import llm_app
 from app.cli.commands.processes import proc_app
 from app.cli.commands.profile import profile_app
@@ -109,12 +112,19 @@ app.command(
     help="List the env vars Cremind injects into exec_shell subprocesses.",
 )(system_vars_cmd.system_vars)
 
+app.command(
+    "usage",
+    help="Show the token-usage & estimated-cost summary.",
+)(usage_cmd.usage)
+
 app.add_typer(profile_app, name="profile")
 app.add_typer(conv_app, name="conv")
 app.add_typer(tools_app, name="tools")
 app.add_typer(llm_app, name="llm")
 app.add_typer(agents_app, name="agents")
 app.add_typer(channels_app, name="channels")
+app.add_typer(files_app, name="files")
+app.add_typer(calendar_app, name="calendar")
 app.add_typer(file_watchers_app, name="file-watchers")
 app.add_typer(skill_events_app, name="skill-events")
 app.add_typer(proc_app, name="proc")

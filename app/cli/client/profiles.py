@@ -41,15 +41,15 @@ async def set_persona(client: Client, name: str, content: str) -> None:
     )
 
 
-async def get_skill_mode(client: Client, name: str) -> str:
-    resp = await client.get_json(f"/api/profiles/{quote(name, safe='')}/skill-mode")
+async def get_agent_name(client: Client, name: str) -> str:
+    resp = await client.get_json(f"/api/profiles/{quote(name, safe='')}/agent-name")
     if isinstance(resp, dict):
-        return str(resp.get("mode") or "")
+        return str(resp.get("name") or "")
     return ""
 
 
-async def set_skill_mode(client: Client, name: str, mode: str) -> None:
+async def set_agent_name(client: Client, name: str, agent_name: str) -> None:
     await client.put_json(
-        f"/api/profiles/{quote(name, safe='')}/skill-mode",
-        {"mode": mode},
+        f"/api/profiles/{quote(name, safe='')}/agent-name",
+        {"name": agent_name},
     )

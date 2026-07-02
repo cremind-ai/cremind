@@ -172,6 +172,10 @@ class ProcessInfo:
     # Autostart registration id, set when the process was spawned (either at
     # server boot or via manual retry) from a row in ``autostart_processes``.
     autostart_id: Optional[str] = None
+    # Set once the caller closes stdin (sends EOF).  A process that reads
+    # stdin-until-EOF (``cat``, ``cremind profile persona set``) only completes
+    # after this; further writes are rejected with a clear error.
+    stdin_closed: bool = False
 
 
 _process_registry: Dict[str, ProcessInfo] = {}
@@ -433,6 +437,56 @@ async def _check_stdin_blocked(process: asyncio.subprocess.Process) -> bool | No
     return await is_child_blocked_on_read(process.pid, platform.system())
 
 
+def _send_stdin_eof(
+    process: Union[asyncio.subprocess.Process, PtyProcess], is_pty: bool,
+) -> None:
+    """Half-close the child's stdin so it sees EOF.
+
+    A process reading stdin-until-EOF (``cat``, ``cremind profile persona set
+    <name>``) only completes once its stdin is closed. PTYs get a ^D via
+    ``send_eof``; plain pipes use ``write_eof`` when the transport supports it
+    (POSIX) and fall back to ``close`` otherwise (Windows Proactor pipes, where
+    closing the write end delivers EOF to the child's ``ReadFile``).
+
+    Raises on failure so callers can surface a structured error; callers that
+    close proactively (classification auto-EOF) swallow it.
+    """
+    if is_pty:
+        process.send_eof()  # type: ignore[union-attr]
+        return
+    stdin = process.stdin
+    if stdin is None:
+        raise RuntimeError("process has no stdin pipe")
+    if stdin.can_write_eof():
+        stdin.write_eof()
+    else:
+        stdin.close()
+
+
+async def _prime_stdin(
+    process: Union[asyncio.subprocess.Process, PtyProcess],
+    is_pty: bool,
+    stdin_text: Optional[str],
+    keep_stdin_open: bool,
+) -> None:
+    """Write an up-front ``stdin`` payload to a freshly spawned child.
+
+    Written then closed (EOF) unless *keep_stdin_open* is set, so a
+    read-until-EOF command completes during classification instead of hanging.
+    Best-effort: a stdin failure must not abort the command itself (a command
+    that never reads stdin is unaffected).
+    """
+    if stdin_text is None:
+        return
+    try:
+        process.stdin.write(stdin_text.encode("utf-8"))
+        await process.stdin.drain()
+        if not keep_stdin_open:
+            _send_stdin_eof(process, is_pty)
+    except Exception as exc:
+        logger.warning(f"exec_shell: failed to prime stdin: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Classification (pre-long-running): read initial output and decide category
 # ---------------------------------------------------------------------------
@@ -443,12 +497,19 @@ async def _classify_stream(
     silence_timeout: float = _DEFAULT_SILENCE_TIMEOUT,
     long_running_timeout: float = _DEFAULT_LONG_RUNNING_TIMEOUT,
     skip_tui: bool = False,
+    auto_close_stdin_when_idle: bool = False,
     terminal_state: Optional[TerminalState] = None,
 ) -> dict:
     """Read stdout/stderr from *process* until classification is decided.
 
     Returns a dict with: stdout, stderr, return_code, completed, category,
     waiting_for_input, and optionally timed_out / tui_detected.
+
+    When *auto_close_stdin_when_idle* is set (non-PTY command, no up-front
+    ``stdin`` supplied, ``keep_stdin_open`` not requested), a process that goes
+    idle having produced no output is treated as a silent read-until-EOF command
+    (``cat``, ``cremind profile persona set <name>``): its stdin is closed once
+    so it can finish instead of hanging forever. See the two idle branches below.
     """
     stdout_buf = ""
     stderr_buf = ""
@@ -456,6 +517,7 @@ async def _classify_stream(
     stderr_done = False
     start = time.monotonic()
     last_data = start
+    auto_eof_sent = False
 
     while not (stdout_done and stderr_done):
         elapsed = time.monotonic() - start
@@ -465,6 +527,7 @@ async def _classify_stream(
                 "return_code": None, "completed": False,
                 "category": "long_running",
                 "waiting_for_input": False, "timed_out": True,
+                "stdin_closed": auto_eof_sent,
             }
 
         task_map: Dict[asyncio.Task, str] = {}
@@ -501,20 +564,51 @@ async def _classify_stream(
             if silence_duration < silence_timeout:
                 continue
 
+            # A command that produced no output before going idle is the
+            # signature of a silent read-until-EOF reader (cat, `persona set
+            # <name>`). A command that printed a prompt is treated as
+            # interactive and left waiting for the agent to respond.
+            no_output = not (stdout_buf.strip() or stderr_buf.strip())
+
             blocked = await _check_stdin_blocked(process)
             if blocked is True:
+                # Positively parked on a stdin read (POSIX only).
+                if auto_close_stdin_when_idle and no_output and not auto_eof_sent:
+                    try:
+                        _send_stdin_eof(process, False)
+                    except Exception:
+                        pass
+                    auto_eof_sent = True
+                    last_data = time.monotonic()  # brief grace to exit
+                    continue
                 return {
                     "stdout": stdout_buf, "stderr": stderr_buf,
                     "return_code": None, "completed": False,
                     "category": "long_running",
                     "waiting_for_input": True,
+                    "stdin_closed": auto_eof_sent,
                 }
             if silence_duration >= long_running_timeout:
+                # Idle with no positive stdin-block signal — the Windows path,
+                # where detection is inconclusive. A no-output idle command is
+                # most likely blocked reading stdin, so send EOF once to unblock
+                # read-until-EOF commands. Harmless for a process that never
+                # reads stdin (it gets an EOF-ready fd it ignores) — that comes
+                # back here and is filed as long_running on the next pass.
+                if auto_close_stdin_when_idle and no_output and not auto_eof_sent:
+                    try:
+                        _send_stdin_eof(process, False)
+                    except Exception:
+                        pass
+                    auto_eof_sent = True
+                    last_data = time.monotonic()  # brief grace to exit
+                    continue
                 return {
                     "stdout": stdout_buf, "stderr": stderr_buf,
                     "return_code": None, "completed": False,
                     "category": "long_running",
                     "waiting_for_input": False,
+                    "stdin_closed": auto_eof_sent,
                 }
             continue
 
@@ -551,6 +645,7 @@ async def _classify_stream(
                 "return_code": None, "completed": False,
                 "category": "long_running",
                 "waiting_for_input": False,
+                "stdin_closed": auto_eof_sent,
             }
 
     # Both streams closed -> process finished.
@@ -958,6 +1053,7 @@ async def write_stdin_to_process(
     input_text: Optional[str] = None,
     keys: Optional[List[str]] = None,
     line_ending: Optional[str] = None,
+    close_stdin: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Send stdin to a long-running process.
 
@@ -972,7 +1068,16 @@ async def write_stdin_to_process(
     exclusive within a single call — the intended flow is to send
     navigation, observe stdout to confirm cursor/selection, then send
     a separate action call to commit.
+
+    ``close_stdin`` sends EOF to the process after any input is written (or
+    on its own, with no input). Commands that read stdin until EOF
+    (``cat``, ``cremind profile persona set <name>``) never complete until
+    stdin is closed, so the caller must close it once the full input has
+    been sent.  It cannot be combined with ``navigation``/``action`` keys.
     """
+    close_stdin = bool(close_stdin)
+    close_only = False
+
     if not process_id:
         return {
             "error": "Missing parameter",
@@ -991,6 +1096,9 @@ async def write_stdin_to_process(
     if mode is None:
         if input_text is not None and keys is None:
             mode = "input_text"
+        elif close_stdin and input_text is None and keys is None:
+            # Close-only call: just send EOF, no input channel.
+            close_only = True
         else:
             return {
                 "error": "Missing parameter",
@@ -1002,28 +1110,38 @@ async def write_stdin_to_process(
                 ),
             }
 
-    if mode == "input_text":
-        if input_text is None:
-            return {
-                "error": "Invalid parameters",
-                "message": "mode='input_text' requires 'input_text'.",
-            }
-        if keys is not None:
-            return {
-                "error": "Invalid parameters",
-                "message": "mode='input_text' must not supply 'keys'.",
-            }
-    else:
-        if keys is None:
-            return {
-                "error": "Invalid parameters",
-                "message": f"mode={mode!r} requires 'keys'.",
-            }
-        if input_text is not None:
-            return {
-                "error": "Invalid parameters",
-                "message": f"mode={mode!r} must not supply 'input_text'.",
-            }
+    if close_stdin and mode in ("navigation", "action"):
+        return {
+            "error": "Invalid parameters",
+            "message": (
+                "'close_stdin' cannot be combined with navigation/action "
+                "keys; send those first, then close stdin on its own call."
+            ),
+        }
+
+    if not close_only:
+        if mode == "input_text":
+            if input_text is None:
+                return {
+                    "error": "Invalid parameters",
+                    "message": "mode='input_text' requires 'input_text'.",
+                }
+            if keys is not None:
+                return {
+                    "error": "Invalid parameters",
+                    "message": "mode='input_text' must not supply 'keys'.",
+                }
+        else:
+            if keys is None:
+                return {
+                    "error": "Invalid parameters",
+                    "message": f"mode={mode!r} requires 'keys'.",
+                }
+            if input_text is not None:
+                return {
+                    "error": "Invalid parameters",
+                    "message": f"mode={mode!r} must not supply 'input_text'.",
+                }
 
     try:
         info = _require_process(process_id, profile)
@@ -1043,6 +1161,25 @@ async def write_stdin_to_process(
             ),
         }
 
+    if info.stdin_closed:
+        if close_only:
+            return {
+                "process_id": process_id,
+                "input_sent": False,
+                "stdin_closed": True,
+                "command": info.command,
+                "message": "stdin was already closed (EOF sent).",
+            }
+        return {
+            "error": "Stdin closed",
+            "message": (
+                "stdin for this process was already closed (EOF sent); no "
+                "more input can be written."
+            ),
+            "process_id": process_id,
+            "stdin_closed": True,
+        }
+
     if line_ending is None:
         if info.is_pty and platform.system() == "Windows":
             line_ending = "\r"
@@ -1050,30 +1187,31 @@ async def write_stdin_to_process(
             line_ending = "\n"
 
     resolved_key_bytes: Optional[List[str]] = None
-    if mode in ("navigation", "action"):
-        if not isinstance(keys, list) or not keys:
-            return {
-                "error": "Invalid parameters",
-                "message": "'keys' must be a non-empty array.",
-            }
-        group_map = _KEY_GROUPS[mode]
-        resolved_key_bytes = []
-        for idx, name in enumerate(keys):
-            if not isinstance(name, str) or name not in group_map:
+    payload: Optional[str] = None
+    if not close_only:
+        if mode in ("navigation", "action"):
+            if not isinstance(keys, list) or not keys:
                 return {
                     "error": "Invalid parameters",
-                    "message": (
-                        f"keys[{idx}]={name!r} is not a valid {mode} key. "
-                        f"Valid {mode} keys: {sorted(group_map)}."
-                    ),
+                    "message": "'keys' must be a non-empty array.",
                 }
-            resolved_key_bytes.append(group_map[name])
-        payload: Optional[str] = None
-    else:
-        if line_ending == "none":
-            payload = input_text or ""
+            group_map = _KEY_GROUPS[mode]
+            resolved_key_bytes = []
+            for idx, name in enumerate(keys):
+                if not isinstance(name, str) or name not in group_map:
+                    return {
+                        "error": "Invalid parameters",
+                        "message": (
+                            f"keys[{idx}]={name!r} is not a valid {mode} key. "
+                            f"Valid {mode} keys: {sorted(group_map)}."
+                        ),
+                    }
+                resolved_key_bytes.append(group_map[name])
         else:
-            payload = (input_text or "") + line_ending
+            if line_ending == "none":
+                payload = input_text or ""
+            else:
+                payload = (input_text or "") + line_ending
 
     process = info.process
 
@@ -1088,28 +1226,40 @@ async def write_stdin_to_process(
             "process_id": process_id,
         }
 
-    try:
-        if resolved_key_bytes is not None:
-            key_bytes = [s.encode("utf-8") for s in resolved_key_bytes]
-            for i, chunk in enumerate(key_bytes):
-                process.stdin.write(chunk)
+    if not close_only:
+        try:
+            if resolved_key_bytes is not None:
+                key_bytes = [s.encode("utf-8") for s in resolved_key_bytes]
+                for i, chunk in enumerate(key_bytes):
+                    process.stdin.write(chunk)
+                    await process.stdin.drain()
+                    if i < len(key_bytes) - 1:
+                        await asyncio.sleep(_KEYSTROKE_DELAY_SEC)
+            else:
+                payload_bytes = (payload or "").encode("utf-8")
+                logger.debug(
+                    f"write_stdin_to_process({process_id}): writing "
+                    f"{payload_bytes!r} to stdin"
+                )
+                process.stdin.write(payload_bytes)
                 await process.stdin.drain()
-                if i < len(key_bytes) - 1:
-                    await asyncio.sleep(_KEYSTROKE_DELAY_SEC)
-        else:
-            payload_bytes = (payload or "").encode("utf-8")
-            logger.debug(
-                f"write_stdin_to_process({process_id}): writing "
-                f"{payload_bytes!r} to stdin"
-            )
-            process.stdin.write(payload_bytes)
-            await process.stdin.drain()
-    except Exception as exc:
-        return {
-            "error": "Write error",
-            "message": f"Failed to write to process stdin: {exc}",
-            "process_id": process_id,
-        }
+        except Exception as exc:
+            return {
+                "error": "Write error",
+                "message": f"Failed to write to process stdin: {exc}",
+                "process_id": process_id,
+            }
+
+    if close_stdin:
+        try:
+            _send_stdin_eof(process, info.is_pty)
+        except Exception as exc:
+            return {
+                "error": "Close error",
+                "message": f"Failed to close process stdin: {exc}",
+                "process_id": process_id,
+            }
+        info.stdin_closed = True
 
     # Input was just sent, so the cached "process is waiting for input"
     # classification is now stale.  Clearing it lets the next exec_shell_output
@@ -1118,12 +1268,22 @@ async def write_stdin_to_process(
     if info.log_writer_state is not None:
         info.log_writer_state.last_input_mode = None
 
-    return {
+    result: Dict[str, Any] = {
         "process_id": process_id,
-        "input_sent": True,
+        "input_sent": not close_only,
         "command": info.command,
-        "message": "Input sent. Use exec shell stdout to read the response.",
     }
+    if close_stdin:
+        result["stdin_closed"] = True
+        result["message"] = (
+            "stdin closed (EOF sent). Use exec shell output to read the "
+            "response; the process can now finish reading and complete."
+        )
+    else:
+        result["message"] = (
+            "Input sent. Use exec shell stdout to read the response."
+        )
+    return result
 
 
 async def resize_pty(process_id: str, cols: int, rows: int, *, profile: str) -> Dict[str, Any]:
@@ -1397,7 +1557,15 @@ class ExecShellTool(BuiltInTool):
         "A long-running command returns a `process_id` with `completed` set to "
         "false. While `completed` is false there may still be buffered output: "
         "call `exec_shell_output` with that `process_id` to read the remainder "
-        "until `completed` becomes true."
+        "until `completed` becomes true.\n"
+        "Standard input: a command that reads piped stdin until EOF (cat, jq, "
+        "`cremind profile persona set <name>`) would otherwise block forever — "
+        "pass its input via `stdin` and it is written then closed (EOF) so the "
+        "command finishes. If you send no input and the command sits idle "
+        "having printed nothing, stdin is auto-closed for you so it can finish. "
+        "For a command you intend to drive turn-by-turn (feed input, read the "
+        "reply, repeat), set `keep_stdin_open: true` and use exec_shell_input, "
+        "ending with exec_shell_input(close_stdin=true)."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -1429,6 +1597,28 @@ class ExecShellTool(BuiltInTool):
                 "description": (
                     "Seconds of output silence before checking whether the "
                     "process is waiting for input. Default: 3."
+                ),
+            },
+            "stdin": {
+                "type": "string",
+                "description": (
+                    "Text to write to the command's standard input at launch. "
+                    "It is written and then stdin is closed (EOF sent), so a "
+                    "command that reads stdin until EOF completes instead of "
+                    "hanging. Use for one-shot piped input (e.g. `cat`, `jq`, "
+                    "`cremind profile persona set <name>`). Leave unset for "
+                    "commands that don't read stdin."
+                ),
+            },
+            "keep_stdin_open": {
+                "type": "boolean",
+                "description": (
+                    "Keep stdin open instead of auto-closing it when the "
+                    "command goes idle. Set this only when you intend to drive "
+                    "the command interactively via exec_shell_input (feed "
+                    "input, read the reply, repeat) and will finish with "
+                    "exec_shell_input(close_stdin=true). Ignored when `stdin` "
+                    "is provided. Default: false."
                 ),
             },
             "pty": {
@@ -1486,6 +1676,8 @@ class ExecShellTool(BuiltInTool):
         logger.debug(f"Determined shell working directory: {shell_working_directory!r}")
         timeout = arguments.get("timeout", 120)
         silence_timeout = arguments.get("silence_timeout", _DEFAULT_SILENCE_TIMEOUT)
+        stdin_text = arguments.get("stdin")
+        keep_stdin_open = bool(arguments.get("keep_stdin_open"))
         pty_arg = arguments.get("pty")
         cols = int(arguments.get("cols") or 100)
         rows = int(arguments.get("rows") or 50)
@@ -1564,6 +1756,7 @@ class ExecShellTool(BuiltInTool):
         terminal_state = TerminalState()
 
         try:
+            await _prime_stdin(proc, use_pty, stdin_text, keep_stdin_open)
             classify_timeout = min(timeout, 5.0) if use_pty else timeout
             result = await _classify_stream(
                 proc,
@@ -1571,6 +1764,9 @@ class ExecShellTool(BuiltInTool):
                 silence_timeout=silence_timeout,
                 long_running_timeout=long_running_timeout,
                 skip_tui=use_pty,
+                auto_close_stdin_when_idle=(
+                    not use_pty and not keep_stdin_open and stdin_text is None
+                ),
                 terminal_state=terminal_state,
             )
 
@@ -1602,6 +1798,7 @@ class ExecShellTool(BuiltInTool):
                             "pty": True,
                         }
                     )
+                await _prime_stdin(proc, True, stdin_text, keep_stdin_open)
                 classify_timeout = min(timeout, 5.0)
                 # Fresh state for the respawn — the previous process's toggles
                 # died with it.
@@ -1612,6 +1809,8 @@ class ExecShellTool(BuiltInTool):
                     silence_timeout=silence_timeout,
                     long_running_timeout=long_running_timeout,
                     skip_tui=True,
+                    # Respawn is always PTY (interactive), so never auto-close.
+                    auto_close_stdin_when_idle=False,
                     terminal_state=terminal_state,
                 )
 
@@ -1734,6 +1933,12 @@ class ExecShellTool(BuiltInTool):
                 _log_writer_loop(proc, writer_state)
             )
 
+            # stdin is closed if the up-front payload was written+closed, or if
+            # classification auto-closed it while unblocking a silent reader.
+            stdin_already_closed = bool(result.get("stdin_closed")) or (
+                stdin_text is not None and not keep_stdin_open
+            )
+
             expire_time = time.monotonic() + (cleanup_ttl_hours * 3600)
             _process_registry[process_id] = ProcessInfo(
                 process=proc,
@@ -1747,6 +1952,7 @@ class ExecShellTool(BuiltInTool):
                 is_pty=use_pty,
                 task_id=current_task_id_var.get(),
                 profile=arguments.get("_profile") or None,
+                stdin_closed=stdin_already_closed,
             )
             publish_process_list_changed(arguments.get("_profile") or None)
 
@@ -1755,6 +1961,21 @@ class ExecShellTool(BuiltInTool):
                 f"(command={command!r}, pty={use_pty})"
             )
 
+            waiting_for_input = bool(result.get("waiting_for_input"))
+            message = (
+                f"Long-running process started with id '{process_id}'. "
+                "Use exec shell output to read output, exec shell input to "
+                "send input, or exec shell stop to terminate."
+            )
+            if waiting_for_input and not stdin_already_closed:
+                message += (
+                    " It appears to be waiting for input: send it with "
+                    "exec_shell_input, or — if it reads piped input until EOF "
+                    "(e.g. cat, `cremind profile persona set <name>`) — call "
+                    "exec_shell_input with close_stdin=true to send EOF so it "
+                    "can finish."
+                )
+
             return BuiltInToolResult(
                 structured_content={
                     "process_id": process_id,
@@ -1762,17 +1983,14 @@ class ExecShellTool(BuiltInTool):
                     "stderr": result.get("stderr", ""),
                     "status": "running",
                     "category": "long_running",
-                    "waiting_for_input": result.get("waiting_for_input", False),
+                    "waiting_for_input": waiting_for_input,
+                    "stdin_closed": stdin_already_closed,
                     "command": command,
                     "working_directory": shell_working_directory,
                     "os": system,
                     "shell": shell,
                     **({"pty": True, "stderr_merged_into_stdout": True} if use_pty else {}),
-                    "message": (
-                        f"Long-running process started with id '{process_id}'. "
-                        "Use exec shell stdout to read output, exec shell input "
-                        "to send input, or exec shell stop to terminate."
-                    ),
+                    "message": message,
                 }
             )
 
@@ -1846,7 +2064,13 @@ class ExecShellInputTool(BuiltInTool):
         "safely, position with mode='navigation' (batching keys is fine), then "
         "read exec_shell_output to confirm the cursor/selection landed where you "
         "expect, then commit with mode='action'. Skipping that confirmation read "
-        "risks committing in the wrong place."
+        "risks committing in the wrong place.\n"
+        "Set 'close_stdin' to true to send EOF (close the process's stdin). A "
+        "command that reads stdin until EOF (e.g. 'cremind profile persona set "
+        "<name>', 'cat', or piping a document in) will NOT complete until stdin "
+        "is closed — send the content with input_text and close_stdin=true, or "
+        "make a follow-up call with only close_stdin=true. Otherwise the process "
+        "blocks forever and exec_shell_output keeps reporting it as running."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -1911,6 +2135,18 @@ class ExecShellInputTool(BuiltInTool):
                     "'navigation' or 'action'."
                 ),
             },
+            "close_stdin": {
+                "type": "boolean",
+                "description": (
+                    "Send EOF (close the process's stdin) after any "
+                    "input is written. Required for commands that read "
+                    "stdin until EOF (e.g. 'cremind profile persona set "
+                    "<name>', 'cat') — they never finish until stdin is "
+                    "closed. Combine with input_text to send-and-close in "
+                    "one call, or send it alone to close after a prior "
+                    "input. Cannot be combined with navigation/action keys."
+                ),
+            },
         },
         "required": ["process_id"],
     }
@@ -1924,7 +2160,8 @@ class ExecShellInputTool(BuiltInTool):
             f"mode={arguments.get('mode')!r}, "
             f"input_text={arguments.get('input_text')!r}, "
             f"keys={arguments.get('keys')!r}, "
-            f"line_ending={arguments.get('line_ending')!r}"
+            f"line_ending={arguments.get('line_ending')!r}, "
+            f"close_stdin={arguments.get('close_stdin')!r}"
         )
         result = await write_stdin_to_process(
             process_id,
@@ -1933,6 +2170,7 @@ class ExecShellInputTool(BuiltInTool):
             input_text=arguments.get("input_text"),
             keys=arguments.get("keys"),
             line_ending=arguments.get("line_ending"),
+            close_stdin=arguments.get("close_stdin"),
         )
         return BuiltInToolResult(structured_content=result)
 

@@ -66,7 +66,7 @@ from app.documents import (
     DocumentSyncService,
     set_service as set_document_service,
 )
-from app.documents.sync import SHARED_SCOPE
+from app.documents.sync import CLI_SCOPE, SHARED_SCOPE
 from app.documents.watcher import DocumentWatcher
 from app.lib.embedding import LocalEmbeddings
 from app.lib.llm.factory import create_llm_provider
@@ -779,6 +779,15 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                 DocumentWatcher(
                     scope=SHARED_SCOPE,
                     directory=document_service.shared_dir(),
+                    sync_service=document_service,
+                ).start()
+
+                # CLI-reference corpus: a disjoint scope searched by the `cli`
+                # built-in tool, kept separate from the general docs above.
+                document_service.full_reconcile(CLI_SCOPE)
+                DocumentWatcher(
+                    scope=CLI_SCOPE,
+                    directory=document_service.cli_dir(),
                     sync_service=document_service,
                 ).start()
 

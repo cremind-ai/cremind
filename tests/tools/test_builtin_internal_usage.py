@@ -92,7 +92,7 @@ def _patch_docsearch_service(monkeypatch, *, body="BODY: how to write a skill"):
     }]
 
     class _Svc:
-        def search(self, *, query, profile, limit):
+        def search(self, *, query, profile, limit, scopes=None):
             return hits
 
         def read_body(self, path):

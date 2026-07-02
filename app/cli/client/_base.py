@@ -177,3 +177,54 @@ class Client:
         from app.cli.client._sse import stream_events
 
         return stream_events(self._stream_http, path)
+
+    async def download(
+        self,
+        path: str,
+        sink: Any,
+        *,
+        params: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Stream a binary GET response into `sink` (a `.write(bytes)` sink).
+
+        Uses the no-timeout stream client so large files don't trip the 60s
+        request timeout. On a non-2xx the body is buffered to build an APIError.
+        """
+        async with self._stream_http.stream("GET", path, params=params) as resp:
+            if resp.status_code >= 400:
+                raw = await resp.aread()
+                body = ""
+                if raw:
+                    try:
+                        decoded = json.loads(raw)
+                    except json.JSONDecodeError:
+                        decoded = None
+                    if isinstance(decoded, dict) and isinstance(decoded.get("error"), str):
+                        body = decoded["error"]
+                    else:
+                        body = raw.decode(errors="replace").strip()
+                raise APIError(status=resp.status_code, body=body, raw=raw)
+            async for chunk in resp.aiter_bytes():
+                sink.write(chunk)
+
+    async def upload(
+        self,
+        path: str,
+        *,
+        files: Any,
+        data: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        """POST a multipart/form-data body (`files` + optional `data` fields).
+
+        `files` is anything httpx accepts — typically a list of
+        ``("file", (basename, bytes))`` tuples (the server keys off the
+        per-part filename, not the field name).
+        """
+        resp = await self._http.post(path, files=files, data=data)
+        self._check_response(resp)
+        if not resp.content:
+            return None
+        try:
+            return resp.json()
+        except json.JSONDecodeError:
+            return None

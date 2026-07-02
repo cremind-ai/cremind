@@ -355,6 +355,138 @@ def conv_cancel(
         sys.stdout.write("cancelled\n" if cancelled else "no active run for that id\n")
 
 
+@conv_app.command("memory")
+@graceful_errors
+def conv_memory(
+    ctx: typer.Context,
+    conv_id: str = typer.Argument(..., help="Conversation id."),
+) -> None:
+    """Show a conversation's running summary + long-term memory."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.conversations import get_memory
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await get_memory(client, conv_id)
+
+    out = asyncio.run(_run())
+
+    if mode.json:
+        print_json(out)
+        return
+
+    progress = out.get("token_progress") or {}
+    sys.stdout.write(f"enabled: {out.get('enabled')}\n")
+    sys.stdout.write(f"last_compacted_at: {out.get('last_compacted_at')}\n")
+    if isinstance(progress, dict):
+        sys.stdout.write(
+            f"context: {progress.get('current')} / {progress.get('threshold')} "
+            f"(window {progress.get('context_window')})\n"
+        )
+    sys.stdout.write("\n--- running summary ---\n")
+    sys.stdout.write((out.get("summary") or "") + "\n")
+    long_term = out.get("long_term") or []
+    sys.stdout.write("\n--- long-term memory ---\n")
+    if isinstance(long_term, list):
+        for item in long_term:
+            if isinstance(item, dict):
+                sys.stdout.write(f"- {item.get('text') or item.get('content') or item}\n")
+            else:
+                sys.stdout.write(f"- {item}\n")
+
+
+@conv_app.command("compact")
+@graceful_errors
+def conv_compact(
+    ctx: typer.Context,
+    conv_id: str = typer.Argument(..., help="Conversation id."),
+) -> None:
+    """Force a compaction now (folds old turns into the running summary)."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.conversations import trigger_memory
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> bool:
+        async with Client(cfg) as client:
+            return await trigger_memory(client, conv_id)
+
+    compacted = asyncio.run(_run())
+
+    if mode.json:
+        print_json({"compacted": compacted})
+    else:
+        sys.stdout.write("compacted\n" if compacted else "no change\n")
+
+
+@conv_app.command("usage")
+@graceful_errors
+def conv_usage(
+    ctx: typer.Context,
+    conv_id: str = typer.Argument(..., help="Conversation id."),
+) -> None:
+    """Show per-request + cumulative token usage & cost for a conversation."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.conversations import get_usage
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, Table, print_json, print_map
+    from app.cli.output.formatting import string_field
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await get_usage(client, conv_id)
+
+    out = asyncio.run(_run())
+
+    if mode.json:
+        print_json(out)
+        return
+
+    totals = out.get("totals") if isinstance(out.get("totals"), dict) else {}
+    headline = {
+        "conversation_id": out.get("conversation_id"),
+        "request_count": out.get("request_count"),
+        "cache_hit_rate": out.get("cache_hit_rate"),
+        **totals,
+    }
+    print_map(headline)
+
+    requests = out.get("requests") or []
+    requests = [r for r in requests if isinstance(r, dict)]
+    if requests:
+        sys.stdout.write("\n--- requests ---\n")
+        table = Table(mode, "CREATED_AT", "MODEL", "PROVIDER", "TOKENS", "COST_USD")
+        for r in requests:
+            table.add_row(
+                string_field(r, "created_at"),
+                string_field(r, "model"),
+                string_field(r, "provider"),
+                string_field(r, "total_tokens"),
+                string_field(r, "cost_usd"),
+            )
+        table.render()
+
+
 @conv_app.command("delete")
 @graceful_errors
 def conv_delete(

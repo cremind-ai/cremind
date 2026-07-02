@@ -133,5 +133,23 @@ async def cancel_task(client: Client, task_id: str) -> bool:
     return False
 
 
+async def get_memory(client: Client, conv_id: str) -> dict[str, Any]:
+    resp = await client.get_json(f"/api/conversations/{quote(conv_id, safe='')}/memory")
+    return resp if isinstance(resp, dict) else {}
+
+
+async def trigger_memory(client: Client, conv_id: str) -> bool:
+    """Force a compaction now; returns whether the running summary changed."""
+    resp = await client.post_json(f"/api/conversations/{quote(conv_id, safe='')}/memory/trigger")
+    if isinstance(resp, dict):
+        return bool(resp.get("compacted") or False)
+    return False
+
+
+async def get_usage(client: Client, conv_id: str) -> dict[str, Any]:
+    resp = await client.get_json(f"/api/conversations/{quote(conv_id, safe='')}/usage")
+    return resp if isinstance(resp, dict) else {}
+
+
 def conversation_stream_path(conv_id: str) -> str:
     return f"/api/conversations/{quote(conv_id, safe='')}/stream"

@@ -308,6 +308,98 @@ def tools_reset_llm(
     asyncio.run(_run())
 
 
+@tools_app.command("leaves")
+@graceful_errors
+def tools_leaves(
+    ctx: typer.Context,
+    tool_id: str = typer.Argument(..., help="Tool id."),
+) -> None:
+    """List a tool's sub-tools ("leaves") with their per-profile enabled state."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.tools import list_tool_leaves
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, Table, print_json
+    from app.cli.output.formatting import bool_field, string_field
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await list_tool_leaves(client, tool_id)
+
+    out = asyncio.run(_run())
+
+    if mode.json:
+        print_json(out)
+        return
+
+    if out.get("disconnected"):
+        sys.stderr.write("(tool is disconnected — live sub-tool list unavailable)\n")
+    leaves = out.get("leaves") or []
+    table = Table(mode, "LEAF", "NAME", "ENABLED", "DESCRIPTION")
+    for leaf in leaves:
+        if not isinstance(leaf, dict):
+            continue
+        table.add_row(
+            string_field(leaf, "leaf_name"),
+            string_field(leaf, "name"),
+            bool_field(leaf, "enabled", True),
+            string_field(leaf, "description"),
+        )
+    table.render()
+
+
+@tools_app.command("set-leaf")
+@graceful_errors
+def tools_set_leaf(
+    ctx: typer.Context,
+    tool_id: str = typer.Argument(..., help="Tool id."),
+    pairs: list[str] = typer.Argument(
+        ...,
+        help="One or more NAME=true|false sub-tool toggles.",
+        metavar="NAME=BOOL",
+    ),
+) -> None:
+    """Enable or disable a tool's sub-tools ("leaves")."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.tools import set_tool_leaves
+    from app.cli.config import Config
+
+    if not pairs:
+        typer.echo("expected at least one NAME=true|false pair", err=True)
+        raise typer.Exit(code=1)
+
+    leaves: dict[str, bool] = {}
+    for kv in pairs:
+        if "=" not in kv:
+            typer.echo(f"expected NAME=true|false, got '{kv}'", err=True)
+            raise typer.Exit(code=1)
+        name, raw = kv.split("=", 1)
+        v = raw.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            leaves[name] = True
+        elif v in ("false", "0", "no", "off"):
+            leaves[name] = False
+        else:
+            typer.echo(f"'{raw}' is not a boolean (use true/false)", err=True)
+            raise typer.Exit(code=1)
+
+    cfg: Config = ctx.obj["cfg"]
+    cfg.require_token()
+
+    async def _run() -> None:
+        async with Client(cfg) as client:
+            await set_tool_leaves(client, tool_id, leaves)
+
+    asyncio.run(_run())
+
+
 @tools_app.command("register-long-running")
 @graceful_errors
 def tools_register_long_running(
