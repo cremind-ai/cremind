@@ -1,69 +1,138 @@
 ---
 name: homeassistant
 description: Read entity states, call services (turn lights/switches on/off, set values, run scripts), and receive granular real-time events (motion detected, door opened, light turned on, person arrived home, ...) from a self-hosted or HA Cloud Home Assistant instance. Connects directly — no add-on, no cloud relay. Authenticate with a pasted Long-Lived Access Token, or leave it blank and authorize via the OAuth 2.0 browser flow.
-metadata: {
-  environment_variables: [
-    {"name": "HA_URL", "description": "Home Assistant base URL, e.g. http://homeassistant.local:8123", "required": true, "type": "string"},
-    {"name": "HA_TOKEN", "description": "Long-Lived Access Token (leave blank to authorize via the OAuth browser flow)", "required": false, "secret": true, "type": "string"},
-    {"name": "HA_ENTITY_FILTER", "description": "Comma-separated entity globs (fnmatch); empty = all entities", "required": false, "type": "string", "default": ""},
-    {"name": "HA_VERIFY_SSL", "description": "Verify TLS certificates (turn off for self-signed/local certs)", "required": false, "type": "boolean", "default": "true"},
-    {"name": "LOG_LEVEL", "description": "Logging verbosity", "required": false, "type": "enum", "enum": ["DEBUG", "INFO", "WARNING", "ERROR"], "default": "INFO"}
-  ],
-  events: {"event_type": [
-    {"name": "became_unavailable", "description": "An entity went offline / its state became unavailable or unknown"},
-    {"name": "became_available", "description": "An entity came back online from an unavailable/unknown state"},
-    {"name": "light_turned_on", "description": "A light was turned on"},
-    {"name": "light_turned_off", "description": "A light was turned off"},
-    {"name": "switch_turned_on", "description": "A switch was turned on"},
-    {"name": "switch_turned_off", "description": "A switch was turned off"},
-    {"name": "fan_turned_on", "description": "A fan was turned on"},
-    {"name": "fan_turned_off", "description": "A fan was turned off"},
-    {"name": "input_boolean_turned_on", "description": "An input_boolean helper was turned on"},
-    {"name": "input_boolean_turned_off", "description": "An input_boolean helper was turned off"},
-    {"name": "lock_locked", "description": "A lock was locked"},
-    {"name": "lock_unlocked", "description": "A lock was unlocked"},
-    {"name": "cover_opened", "description": "A cover (garage door, blind, shade) finished opening"},
-    {"name": "cover_closed", "description": "A cover finished closing"},
-    {"name": "cover_opening", "description": "A cover started opening"},
-    {"name": "cover_closing", "description": "A cover started closing"},
-    {"name": "motion_detected", "description": "A motion sensor detected motion"},
-    {"name": "motion_cleared", "description": "A motion sensor cleared (no more motion)"},
-    {"name": "occupancy_detected", "description": "An occupancy/presence sensor detected presence"},
-    {"name": "occupancy_cleared", "description": "An occupancy/presence sensor cleared"},
-    {"name": "door_opened", "description": "A door (or garage door) binary sensor reports open"},
-    {"name": "door_closed", "description": "A door (or garage door) binary sensor reports closed"},
-    {"name": "window_opened", "description": "A window/opening binary sensor reports open"},
-    {"name": "window_closed", "description": "A window/opening binary sensor reports closed"},
-    {"name": "moisture_detected", "description": "A leak/moisture sensor detected water"},
-    {"name": "moisture_cleared", "description": "A leak/moisture sensor cleared"},
-    {"name": "smoke_detected", "description": "A smoke/gas/CO sensor triggered"},
-    {"name": "smoke_cleared", "description": "A smoke/gas/CO sensor cleared"},
-    {"name": "binary_sensor_on", "description": "A binary_sensor (no specific device_class) turned on"},
-    {"name": "binary_sensor_off", "description": "A binary_sensor (no specific device_class) turned off"},
-    {"name": "person_arrived_home", "description": "A person arrived home"},
-    {"name": "person_left_home", "description": "A person left home"},
-    {"name": "person_location_changed", "description": "A person moved to a different (non-home) zone"},
-    {"name": "device_arrived_home", "description": "A device tracker arrived home"},
-    {"name": "device_left_home", "description": "A device tracker left home"},
-    {"name": "climate_changed", "description": "A climate/thermostat entity changed (mode or target)"},
-    {"name": "alarm_armed", "description": "An alarm control panel was armed (home/away/night)"},
-    {"name": "alarm_disarmed", "description": "An alarm control panel was disarmed"},
-    {"name": "alarm_triggered", "description": "An alarm control panel was triggered"},
-    {"name": "media_started_playing", "description": "A media player started playing"},
-    {"name": "media_paused", "description": "A media player was paused"},
-    {"name": "media_stopped", "description": "A media player stopped / went idle / turned off"},
-    {"name": "temperature_changed", "description": "A temperature sensor value changed"},
-    {"name": "humidity_changed", "description": "A humidity sensor value changed"},
-    {"name": "power_changed", "description": "A power/energy sensor value changed"},
-    {"name": "battery_level_changed", "description": "A battery sensor value changed"},
-    {"name": "sensor_value_changed", "description": "A sensor (no specific device_class) value changed"},
-    {"name": "state_changed", "description": "An entity changed state and matched no more specific event type"}
-  ]},
-  long_running_app: {
-    command: "uv run scripts/event_listener.py",
-    description: "Persistent Home Assistant WebSocket listener. Authenticates (LLAT or OAuth), subscribes to state_changed, and drops granular, classified state changes as markdown.",
-  }
-}
+metadata:
+  environment_variables:
+    - name: HA_URL
+      description: Home Assistant base URL, e.g. http://homeassistant.local:8123
+      required: true
+      type: string
+    - name: HA_TOKEN
+      description: Long-Lived Access Token (leave blank to authorize via the OAuth browser flow)
+      required: false
+      secret: true
+      type: string
+    - name: HA_ENTITY_FILTER
+      description: Comma-separated entity globs (fnmatch); empty = all entities
+      required: false
+      type: string
+      default: ''
+    - name: HA_VERIFY_SSL
+      description: Verify TLS certificates (turn off for self-signed/local certs)
+      required: false
+      type: boolean
+      default: 'true'
+    - name: LOG_LEVEL
+      description: Logging verbosity
+      required: false
+      type: enum
+      enum:
+        - DEBUG
+        - INFO
+        - WARNING
+        - ERROR
+      default: INFO
+  events:
+    event_type:
+      - name: became_unavailable
+        description: An entity went offline / its state became unavailable or unknown
+      - name: became_available
+        description: An entity came back online from an unavailable/unknown state
+      - name: light_turned_on
+        description: A light was turned on
+      - name: light_turned_off
+        description: A light was turned off
+      - name: switch_turned_on
+        description: A switch was turned on
+      - name: switch_turned_off
+        description: A switch was turned off
+      - name: fan_turned_on
+        description: A fan was turned on
+      - name: fan_turned_off
+        description: A fan was turned off
+      - name: input_boolean_turned_on
+        description: An input_boolean helper was turned on
+      - name: input_boolean_turned_off
+        description: An input_boolean helper was turned off
+      - name: lock_locked
+        description: A lock was locked
+      - name: lock_unlocked
+        description: A lock was unlocked
+      - name: cover_opened
+        description: A cover (garage door, blind, shade) finished opening
+      - name: cover_closed
+        description: A cover finished closing
+      - name: cover_opening
+        description: A cover started opening
+      - name: cover_closing
+        description: A cover started closing
+      - name: motion_detected
+        description: A motion sensor detected motion
+      - name: motion_cleared
+        description: A motion sensor cleared (no more motion)
+      - name: occupancy_detected
+        description: An occupancy/presence sensor detected presence
+      - name: occupancy_cleared
+        description: An occupancy/presence sensor cleared
+      - name: door_opened
+        description: A door (or garage door) binary sensor reports open
+      - name: door_closed
+        description: A door (or garage door) binary sensor reports closed
+      - name: window_opened
+        description: A window/opening binary sensor reports open
+      - name: window_closed
+        description: A window/opening binary sensor reports closed
+      - name: moisture_detected
+        description: A leak/moisture sensor detected water
+      - name: moisture_cleared
+        description: A leak/moisture sensor cleared
+      - name: smoke_detected
+        description: A smoke/gas/CO sensor triggered
+      - name: smoke_cleared
+        description: A smoke/gas/CO sensor cleared
+      - name: binary_sensor_on
+        description: A binary_sensor (no specific device_class) turned on
+      - name: binary_sensor_off
+        description: A binary_sensor (no specific device_class) turned off
+      - name: person_arrived_home
+        description: A person arrived home
+      - name: person_left_home
+        description: A person left home
+      - name: person_location_changed
+        description: A person moved to a different (non-home) zone
+      - name: device_arrived_home
+        description: A device tracker arrived home
+      - name: device_left_home
+        description: A device tracker left home
+      - name: climate_changed
+        description: A climate/thermostat entity changed (mode or target)
+      - name: alarm_armed
+        description: An alarm control panel was armed (home/away/night)
+      - name: alarm_disarmed
+        description: An alarm control panel was disarmed
+      - name: alarm_triggered
+        description: An alarm control panel was triggered
+      - name: media_started_playing
+        description: A media player started playing
+      - name: media_paused
+        description: A media player was paused
+      - name: media_stopped
+        description: A media player stopped / went idle / turned off
+      - name: temperature_changed
+        description: A temperature sensor value changed
+      - name: humidity_changed
+        description: A humidity sensor value changed
+      - name: power_changed
+        description: A power/energy sensor value changed
+      - name: battery_level_changed
+        description: A battery sensor value changed
+      - name: sensor_value_changed
+        description: A sensor (no specific device_class) value changed
+      - name: state_changed
+        description: An entity changed state and matched no more specific event type
+  long_running_app:
+    command: uv run scripts/event_listener.py
+    description: Persistent Home Assistant WebSocket listener. Authenticates (LLAT or OAuth), subscribes to state_changed, and drops granular, classified state changes as markdown.
 ---
 
 # homeassistant

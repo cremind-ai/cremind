@@ -1,13 +1,23 @@
 ---
 name: confluence
 description: Search, read, create, and update Confluence Cloud pages via OAuth2 (Atlassian 3LO). Authorizes through the Cremind Connect service (no Atlassian app setup on the client); tokens stay on this machine. Phase 1 is API-only — no event listener (Confluence has no OAuth webhook path; real-time push is planned via a Forge app).
-metadata: {
-  environment_variables: [
-    {"name": "CREMIND_CONNECT_URL", "description": "Cremind Connect base URL (OAuth broker)", "required": false, "type": "string", "default": "https://connect.cremind.io"},
-    {"name": "ATLASSIAN_CLIENT_ID", "description": "Atlassian OAuth Client ID (auto-fetched from Cremind Connect when blank)", "required": false, "type": "string", "default": ""},
-    {"name": "CONFLUENCE_SITE_URL", "description": "Confluence site URL (default: first accessible site)", "required": false, "type": "string", "default": ""}
-  ]
-}
+metadata:
+  environment_variables:
+    - name: CREMIND_CONNECT_URL
+      description: Cremind Connect base URL (OAuth broker)
+      required: false
+      type: string
+      default: https://connect.cremind.io
+    - name: ATLASSIAN_CLIENT_ID
+      description: Atlassian OAuth Client ID (auto-fetched from Cremind Connect when blank)
+      required: false
+      type: string
+      default: ''
+    - name: CONFLUENCE_SITE_URL
+      description: 'Confluence site URL (default: first accessible site)'
+      required: false
+      type: string
+      default: ''
 ---
 
 # confluence
