@@ -106,12 +106,11 @@ class DocumentationSearchTool(BuiltInTool):
     name: str = "search_documentation"
     description: str = (
         "Search Cremind's documentation and knowledge base by semantic query — "
-        "skills, how-to guides, and any documents the user has added. Given a "
-        "natural-language question, this returns the body of the single most "
-        f"relevant document, or \"{NO_RESULT_MESSAGE}\" when nothing matches. "
-        "Use it to look things up or answer questions about how Cremind and its "
-        "skills work. (To operate Cremind through its command-line interface, "
-        "use the `cli` tool instead.)"
+        "skills, how-to guides, `cremind` CLI usage, and any documents the user "
+        "has added. Given a natural-language question, this returns the body of "
+        f"the single most relevant document, or \"{NO_RESULT_MESSAGE}\" when "
+        "nothing matches. Use it to look things up or answer questions about how "
+        "Cremind and its skills work."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -139,9 +138,8 @@ class DocumentationSearchTool(BuiltInTool):
     }
 
     async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
-        # Searches the general (shared + per-profile) documentation corpus. The
-        # CLI-reference corpus is a separate scope owned by the `cli` tool; both
-        # share the vector-search + LLM-judge engine below via run_doc_search.
+        # Searches the general (shared + per-profile) documentation corpus via
+        # the shared vector-search + LLM-judge engine below.
         return await run_doc_search(arguments)
 
 
@@ -154,10 +152,9 @@ async def run_doc_search(
     """Shared vector-search + LLM-judge pipeline for documentation-style tools.
 
     ``documentation_search`` calls this with the default scopes (shared + the
-    active profile). The ``cli`` tool passes ``scopes=[CLI_SCOPE]`` so it
-    searches the disjoint CLI-reference corpus and the two tools never surface
-    each other's documents. ``log_label`` tags the diagnostic log lines so the
-    callers are distinguishable in the logs; it does not affect behaviour.
+    active profile). ``scopes`` is a generic filter so callers can narrow the
+    corpus if needed; ``log_label`` tags the diagnostic log lines and does not
+    affect behaviour.
     """
     tag = f"[{log_label}]"
     query = (arguments.get("query") or "").strip()

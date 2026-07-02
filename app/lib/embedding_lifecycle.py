@@ -270,9 +270,8 @@ def _rebuild_caches(*, agent, embedding, vector_store, profiles: list[str]) -> N
             # Force re-creation by clearing the "collection ready" flag —
             # the new store has no collections yet.
             service._collection_ready = False
-            from app.documents.sync import CLI_SCOPE, SHARED_SCOPE
+            from app.documents.sync import SHARED_SCOPE
             service.full_reconcile(SHARED_SCOPE)
-            service.full_reconcile(CLI_SCOPE)
             for profile in profiles:
                 service.full_reconcile(profile)
     except Exception as e:  # noqa: BLE001
