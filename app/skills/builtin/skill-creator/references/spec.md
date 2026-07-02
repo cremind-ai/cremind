@@ -62,13 +62,23 @@ followed by a markdown body:
 ---
 name: my-skill
 description: One or two sentences describing what the skill does and when to use it.
-metadata: { ... optional ... }
+metadata:              # optional — see §3–§5 for the sub-keys
+  environment_variables:
+    - name: EXAMPLE     # ...
+  events:
+    event_type:
+      - name: example   # ...
+  long_running_app:
+    command: uv run scripts/event_listener.py
 ---
 
 # my-skill
 
 ...markdown body the agent follows when the skill is loaded...
 ```
+
+Write `metadata` in **YAML block style** (the nested `key:` / `- item` form shown
+in §3–§5), not JSON flow style — matching the Agent Skills standard.
 
 ### Parsing rules (exactly how Cremind reads it)
 
@@ -78,6 +88,11 @@ metadata: { ... optional ... }
   a Markdown horizontal-rule `---` placed before you meant to close the block)
   ends the frontmatter early — everything after it silently becomes body. Don't
   put `---` inside frontmatter values.
+- **Gotcha:** an unquoted value containing a `:` followed by a space (e.g.
+  `description: does X: then Y`) makes the YAML loader read `X:` as a nested
+  mapping key and fail with `mapping values are not allowed here` — again silently
+  skipping the skill. Wrap any such value in double quotes:
+  `description: "does X: then Y"`.
 - The block is parsed with a standard YAML loader. If it fails to parse, or does
   not parse to a mapping, **the whole skill is silently skipped** (a warning is
   logged to the server, but nothing surfaces in the conversation). This is the
@@ -87,7 +102,9 @@ metadata: { ... optional ... }
   slugified directory name, so a mismatch causes subtle event bugs.)
 - **`description`** (required): must be a non-empty string. This is the text the
   model sees *before* loading the skill — it is what makes the model decide to
-  load it. Front-load capabilities and trigger conditions.
+  load it. Front-load capabilities and trigger conditions. If it contains a
+  colon-space (`: `) or other YAML special character, wrap it in double quotes
+  (see the gotcha above).
 - **`metadata`** (optional): must be a mapping if present. Preserved verbatim.
   **Only three keys are consumed** (§3–§5); every other key under `metadata`,
   and every top-level frontmatter key other than `name`/`description`/`metadata`
