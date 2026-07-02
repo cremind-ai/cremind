@@ -43,18 +43,13 @@ if TYPE_CHECKING:
 COLLECTION_NAME = "documentation_search"
 SHARED_SCOPE = "shared"
 
-# CLI-reference docs (the bundled ``[cli]cremind *.md`` files) live in their own
-# scope so the ``cli`` built-in tool and ``documentation_search`` never surface
-# each other's corpus. Structurally the scope behaves like a reserved,
-# profile-like directory (``<working_dir>/cli/documents``) — ``scope_dir``
-# already resolves any non-shared scope to ``<working_dir>/<scope>/documents``.
-CLI_SCOPE = "cli"
-
-# Bundled docs whose filename carries this marker are CLI-reference docs and are
-# routed to the CLI scope on seed; every other bundled doc stays in the shared
-# corpus. The marker mirrors the ``[cli]`` filename convention in
-# ``app/documents/bundled/``.
-CLI_DOC_PREFIX = "[cli]"
+# Retired scope. CLI-reference docs (the bundled ``[cli]cremind *.md`` files)
+# once lived in their own ``"cli"`` scope, searched by a dedicated ``cli``
+# built-in tool. That tool was removed and the docs folded back into the shared
+# corpus; ``seed_shared_from_app`` drops any stale ``<working_dir>/cli`` tree and
+# ``prune_scope("cli")`` removes leftover points so upgraded installs carry no
+# orphaned CLI-scope state.
+_LEGACY_CLI_SCOPE = "cli"
 
 # In degraded mode (no embedding model / vector store) the LLM relevance judge
 # is the ONLY discriminator, so it must see the whole bounded system-doc set --
@@ -88,42 +83,40 @@ class DocumentSyncService:
     def profile_dir(self, profile: str) -> Path:
         return self._working_dir / profile / "documents"
 
-    def cli_dir(self) -> Path:
-        """On-disk root for the CLI-reference corpus (the ``cli`` scope)."""
-        return self.scope_dir(CLI_SCOPE)
-
     def scope_dir(self, scope: str) -> Path:
         return self.shared_dir() if scope == SHARED_SCOPE else self.profile_dir(scope)
 
     # ── System-level seeding ───────────────────────────────────────────────
 
     def seed_shared_from_app(self, app_documents_dir: Path) -> None:
-        """Mirror bundled docs into their scope dirs exactly.
+        """Mirror every bundled doc into the shared scope dir exactly.
 
-        The bundle is authoritative for system documents. Bundled files are
-        partitioned by the ``[cli]`` filename marker: CLI-reference docs are
-        mirrored into the CLI scope (``cli_dir()``) and every other bundled doc
-        into the shared scope (``shared_dir()``). Each target is reconciled
-        independently — for that target, on every boot:
+        The bundle is authoritative for system documents, so on every boot:
 
-        - Files missing from dst are copied in.
+        - Files missing from ``shared_dir()`` are copied in.
         - Files whose content differs from the bundle are overwritten.
-        - Any file in dst that doesn't belong to that target is deleted (so an
-          older install that seeded ``[cli]*`` docs into the shared dir has them
-          removed there and re-created under the CLI dir).
+        - Any file in ``shared_dir()`` not present in the bundle is deleted.
 
         Mid-session edits or extras therefore live only until the next restart.
         Profile-scoped docs under ``<working_dir>/<profile>/`` are unaffected.
+
+        The bundled ``[cli]cremind *.md`` CLI-reference docs are part of this
+        shared corpus (searched by ``documentation_search``). Older installs
+        that seeded them into a separate ``<working_dir>/cli`` scope are cleaned
+        up here — the stale tree is removed and its vector points are pruned by
+        ``prune_scope("cli")`` at boot.
         """
         if not app_documents_dir.exists():
             return
 
         sources = list(app_documents_dir.glob("**/*.md"))
-        cli_sources = [p for p in sources if _is_cli_doc(p.name)]
-        shared_sources = [p for p in sources if not _is_cli_doc(p.name)]
+        self._mirror_bundle(sources, app_documents_dir, self.shared_dir())
 
-        self._mirror_bundle(shared_sources, app_documents_dir, self.shared_dir())
-        self._mirror_bundle(cli_sources, app_documents_dir, self.cli_dir())
+        # Retire the legacy CLI scope directory from upgraded installs (its docs
+        # now live in the shared corpus above).
+        legacy_cli_dir = self._working_dir / _LEGACY_CLI_SCOPE
+        if legacy_cli_dir.exists():
+            shutil.rmtree(legacy_cli_dir, ignore_errors=True)
 
     def _mirror_bundle(
         self, sources: list[Path], app_documents_dir: Path, target: Path,
@@ -234,6 +227,24 @@ class DocumentSyncService:
                     f"[documents] reconcile scope={scope!r}: deleted {len(to_delete)}"
                 )
 
+    def prune_scope(self, scope: str) -> None:
+        """Delete every vector point belonging to ``scope`` (a one-shot cleanup).
+
+        Unlike :meth:`full_reconcile`, this never scans disk or upserts — it
+        removes all points whose payload ``scope`` matches, regardless of what
+        is on disk. Used to retire a scope that no longer exists (e.g. the
+        legacy ``cli`` corpus) so upgraded installs carry no orphaned points.
+        Idempotent: a no-op once the scope is empty.
+        """
+        if self._vector_store is None:
+            return
+        with self._lock:
+            existing = self._fetch_scope_payloads(scope)
+            ids = [p["id"] for p in existing]
+            if ids:
+                self._delete_ids(ids)
+                logger.info(f"[documents] pruned scope={scope!r}: deleted {len(ids)}")
+
     def apply_event(self, scope: str, path: Path) -> None:
         """Apply a single watcher event for ``path`` in ``scope``.
 
@@ -302,9 +313,8 @@ class DocumentSyncService:
         """Vector-search the collection, filtered to ``scopes``.
 
         ``scopes`` defaults to ``[shared, profile]`` (the general documentation
-        corpus). The ``cli`` tool passes ``[CLI_SCOPE]`` to search the disjoint
-        CLI-reference corpus instead, so the two corpora never surface each
-        other's documents.
+        corpus). It is a generic filter, so a caller may narrow the search to a
+        subset of scopes if needed.
 
         Returns flat payload dicts plus ``id`` and ``score`` keys. Body
         content is loaded from disk by the caller, not stored here.
@@ -560,16 +570,11 @@ def _hash_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _is_cli_doc(filename: str) -> bool:
-    """True for a bundled CLI-reference doc (``[cli]…``), routed to CLI_SCOPE."""
-    return filename.startswith(CLI_DOC_PREFIX)
-
-
 def _clean_name(stem: str) -> str:
     """Strip a leading ``[tag]`` from a filename stem for embedding.
 
     Doc stems look like ``[cli]cremind profile``; the bracketed tag is a
-    routing marker, not identity. Dropping it lets the embedder see
+    filename convention, not identity. Dropping it lets the embedder see
     ``cremind profile`` as clean identity tokens rather than a fragmented
     bracketed blob.
     """
