@@ -105,17 +105,13 @@ TOOL_CONFIG: ToolConfig = {
 class DocumentationSearchTool(BuiltInTool):
     name: str = "search_documentation"
     description: str = (
-        "Operate the Cremind system through its command-line interface. The "
-        "cremind CLI is a very powerful surface that can do anything a user can "
-        "do in the UI: install and manage skills & tools, change configuration, "
-        "and manage profiles, conversations, files, calendar, channels, usage "
-        "and more. Given a natural-language goal, this returns the exact CLI "
-        "usage instructions for it. E.g. 'how to change your name' to fulfill "
-        "this request, you need to find it in the documentation and follow the "
-        "instructions.\n"
-        "After finding the documentation you need, you must run that command "
-        "using the cremind CLI via the `exec_shell` tool instead of showing "
-        "those instructions for the user to run themselves."
+        "Search Cremind's documentation and knowledge base by semantic query — "
+        "skills, how-to guides, and any documents the user has added. Given a "
+        "natural-language question, this returns the body of the single most "
+        f"relevant document, or \"{NO_RESULT_MESSAGE}\" when nothing matches. "
+        "Use it to look things up or answer questions about how Cremind and its "
+        "skills work. (To operate Cremind through its command-line interface, "
+        "use the `cli` tool instead.)"
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -143,100 +139,117 @@ class DocumentationSearchTool(BuiltInTool):
     }
 
     async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
-        query = (arguments.get("query") or "").strip()
-        profile = arguments.get("_profile") or "admin"
-        llm = arguments.get("_llm")
+        # Searches the general (shared + per-profile) documentation corpus. The
+        # CLI-reference corpus is a separate scope owned by the `cli` tool; both
+        # share the vector-search + LLM-judge engine below via run_doc_search.
+        return await run_doc_search(arguments)
 
-        variables = arguments.get("_variables") or {}
-        try:
-            default_top_k = int(variables.get(Var.DEFAULT_TOP_K_KEY) or DEFAULT_TOP_K)
-        except (TypeError, ValueError):
-            default_top_k = DEFAULT_TOP_K
 
-        top_k = arguments.get("top_k") or default_top_k
-        try:
-            top_k = max(1, min(int(top_k), 20))
-        except (TypeError, ValueError):
-            top_k = default_top_k
+async def run_doc_search(
+    arguments: Dict[str, Any],
+    *,
+    scopes: Optional[List[str]] = None,
+    log_label: str = "documentation_search",
+) -> BuiltInToolResult:
+    """Shared vector-search + LLM-judge pipeline for documentation-style tools.
 
-        if not query:
-            return _no_result()
+    ``documentation_search`` calls this with the default scopes (shared + the
+    active profile). The ``cli`` tool passes ``scopes=[CLI_SCOPE]`` so it
+    searches the disjoint CLI-reference corpus and the two tools never surface
+    each other's documents. ``log_label`` tags the diagnostic log lines so the
+    callers are distinguishable in the logs; it does not affect behaviour.
+    """
+    tag = f"[{log_label}]"
+    query = (arguments.get("query") or "").strip()
+    profile = arguments.get("_profile") or "admin"
+    llm = arguments.get("_llm")
 
-        service = get_service()
-        if service is None:
-            logger.warning(
-                "[documentation_search] sync service not initialized; "
-                "vector store unavailable"
-            )
-            return _no_result()
+    variables = arguments.get("_variables") or {}
+    try:
+        default_top_k = int(variables.get(Var.DEFAULT_TOP_K_KEY) or DEFAULT_TOP_K)
+    except (TypeError, ValueError):
+        default_top_k = DEFAULT_TOP_K
 
-        try:
-            hits = service.search(query=query, profile=profile, limit=top_k)
-            logger.debug(f"vector search hits: {hits}")
-        except Exception:  # noqa: BLE001
-            logger.exception("[documentation_search] vector search failed")
-            return _no_result()
+    top_k = arguments.get("top_k") or default_top_k
+    try:
+        top_k = max(1, min(int(top_k), 20))
+    except (TypeError, ValueError):
+        top_k = default_top_k
 
-        if not hits:
-            return _no_result()
+    if not query:
+        return _no_result()
 
-        # Lightweight candidates: name + description + file_path only. We
-        # deliberately do NOT load bodies here -- the judge picks based on
-        # description alone, and we read the body of the winner only.
-        candidates: List[Dict[str, Any]] = []
-        for hit in hits:
-            file_path = hit.get("file_path")
-            description = hit.get("text") or ""
-            if not file_path or not description:
-                continue
-            candidates.append({
-                "name": hit.get("name") or "",
-                "description": description,
-                "file_path": file_path,
-                "scope": hit.get("scope"),
-                "score": hit.get("score"),
-            })
-
-        if not candidates:
-            return _no_result()
-
-        if llm is None:
-            logger.warning(
-                "[documentation_search] no internal LLM available; cannot "
-                "judge relevance, returning no-result"
-            )
-            return _no_result()
-
-        chosen_index, judge_usage = await _select_best_candidate(
-            llm=llm, query=query, candidates=candidates,
+    service = get_service()
+    if service is None:
+        logger.warning(
+            f"{tag} sync service not initialized; vector store unavailable"
         )
-        if chosen_index is None:
-            return _no_result(token_usage=judge_usage)
+        return _no_result()
 
-        chosen = candidates[chosen_index]
-        body = service.read_body(Path(chosen["file_path"]))
-        if body is None:
-            # Source file disappeared between vector search and read.
-            logger.warning(
-                f"[documentation_search] chosen file missing on disk: "
-                f"{chosen['file_path']}"
-            )
-            return _no_result(token_usage=judge_usage)
+    try:
+        hits = service.search(query=query, profile=profile, limit=top_k, scopes=scopes)
+        logger.debug(f"vector search hits: {hits}")
+    except Exception:  # noqa: BLE001
+        logger.exception(f"{tag} vector search failed")
+        return _no_result()
 
-        # Resolve $VAR system-variable tokens in the body for the active
-        # profile (e.g. $CREMIND_SERVER, $CREMIND_PROFILE) — same syntax as
-        # chat; `$$NAME` escapes to a literal `$NAME`. Done here at serving
-        # time only, never during indexing, so resolved values never enter
-        # the vector store or content hash.
-        body = resolve_system_var_tokens(body, profile)
+    if not hits:
+        return _no_result()
 
-        # Return the body of the chosen document. The adapter's
-        # _extract_tool_result unwraps a single text content item to a
-        # plain string, which is what the Reasoning Agent should see.
-        return BuiltInToolResult(
-            content=[{"type": "text", "text": body}],
-            token_usage=judge_usage,
+    # Lightweight candidates: name + description + file_path only. We
+    # deliberately do NOT load bodies here -- the judge picks based on
+    # description alone, and we read the body of the winner only.
+    candidates: List[Dict[str, Any]] = []
+    for hit in hits:
+        file_path = hit.get("file_path")
+        description = hit.get("text") or ""
+        if not file_path or not description:
+            continue
+        candidates.append({
+            "name": hit.get("name") or "",
+            "description": description,
+            "file_path": file_path,
+            "scope": hit.get("scope"),
+            "score": hit.get("score"),
+        })
+
+    if not candidates:
+        return _no_result()
+
+    if llm is None:
+        logger.warning(
+            f"{tag} no internal LLM available; cannot judge relevance, "
+            "returning no-result"
         )
+        return _no_result()
+
+    chosen_index, judge_usage = await _select_best_candidate(
+        llm=llm, query=query, candidates=candidates, log_label=log_label,
+    )
+    if chosen_index is None:
+        return _no_result(token_usage=judge_usage)
+
+    chosen = candidates[chosen_index]
+    body = service.read_body(Path(chosen["file_path"]))
+    if body is None:
+        # Source file disappeared between vector search and read.
+        logger.warning(f"{tag} chosen file missing on disk: {chosen['file_path']}")
+        return _no_result(token_usage=judge_usage)
+
+    # Resolve $VAR system-variable tokens in the body for the active
+    # profile (e.g. $CREMIND_SERVER, $CREMIND_PROFILE) — same syntax as
+    # chat; `$$NAME` escapes to a literal `$NAME`. Done here at serving
+    # time only, never during indexing, so resolved values never enter
+    # the vector store or content hash.
+    body = resolve_system_var_tokens(body, profile)
+
+    # Return the body of the chosen document. The adapter's
+    # _extract_tool_result unwraps a single text content item to a
+    # plain string, which is what the Reasoning Agent should see.
+    return BuiltInToolResult(
+        content=[{"type": "text", "text": body}],
+        token_usage=judge_usage,
+    )
 
 
 def _no_result(token_usage: Optional[Dict[str, int]] = None) -> BuiltInToolResult:
@@ -254,6 +267,7 @@ async def _select_best_candidate(
     llm,
     query: str,
     candidates: List[Dict[str, Any]],
+    log_label: str = "documentation_search",
 ) -> Tuple[Optional[int], Dict[str, int]]:
     """Run the LLM judge over ``candidates`` and return ``(index, token_usage)``.
 
@@ -289,7 +303,7 @@ async def _select_best_candidate(
 
     def _log(decision: str) -> None:
         logger.info(
-            f"[documentation_search] query={query!r} ranked=[{ranked}] "
+            f"[{log_label}] query={query!r} ranked=[{ranked}] "
             f"decision={decision}"
         )
 
