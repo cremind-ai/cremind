@@ -52,6 +52,14 @@ watch(
 
 const bannerVisible = computed(() => {
   if (dismissedBanner.value) return false
+  // Dev channel: the backend synthesises an always-newer "X.Y.Z+devforced"
+  // release (see app/upgrade/manifest._synthesize_dev_release) so the
+  // updater UI is testable on a working-copy install. That makes /check
+  // permanently report "available", which would nag this banner open on
+  // every reload. Suppress the banner here — the Updates settings page
+  // still surfaces the same "available" card + Update button, so the
+  // updater flow stays fully testable on dev; we just don't nag.
+  if (state.value.channel === 'dev') return false
   return state.value.phase === 'available' || state.value.phase === 'blocked'
 })
 

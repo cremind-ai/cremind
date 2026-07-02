@@ -43,6 +43,19 @@ if TYPE_CHECKING:
 COLLECTION_NAME = "documentation_search"
 SHARED_SCOPE = "shared"
 
+# CLI-reference docs (the bundled ``[cli]cremind *.md`` files) live in their own
+# scope so the ``cli`` built-in tool and ``documentation_search`` never surface
+# each other's corpus. Structurally the scope behaves like a reserved,
+# profile-like directory (``<working_dir>/cli/documents``) — ``scope_dir``
+# already resolves any non-shared scope to ``<working_dir>/<scope>/documents``.
+CLI_SCOPE = "cli"
+
+# Bundled docs whose filename carries this marker are CLI-reference docs and are
+# routed to the CLI scope on seed; every other bundled doc stays in the shared
+# corpus. The marker mirrors the ``[cli]`` filename convention in
+# ``app/documents/bundled/``.
+CLI_DOC_PREFIX = "[cli]"
+
 # In degraded mode (no embedding model / vector store) the LLM relevance judge
 # is the ONLY discriminator, so it must see the whole bounded system-doc set --
 # not an arbitrary alphabetical prefix. This cap is deliberately far above both
@@ -75,35 +88,60 @@ class DocumentSyncService:
     def profile_dir(self, profile: str) -> Path:
         return self._working_dir / profile / "documents"
 
+    def cli_dir(self) -> Path:
+        """On-disk root for the CLI-reference corpus (the ``cli`` scope)."""
+        return self.scope_dir(CLI_SCOPE)
+
     def scope_dir(self, scope: str) -> Path:
         return self.shared_dir() if scope == SHARED_SCOPE else self.profile_dir(scope)
 
     # ── System-level seeding ───────────────────────────────────────────────
 
     def seed_shared_from_app(self, app_documents_dir: Path) -> None:
-        """Mirror bundled docs into the shared dir exactly.
+        """Mirror bundled docs into their scope dirs exactly.
 
-        The bundle is authoritative for system documents. On every boot:
+        The bundle is authoritative for system documents. Bundled files are
+        partitioned by the ``[cli]`` filename marker: CLI-reference docs are
+        mirrored into the CLI scope (``cli_dir()``) and every other bundled doc
+        into the shared scope (``shared_dir()``). Each target is reconciled
+        independently — for that target, on every boot:
 
         - Files missing from dst are copied in.
         - Files whose content differs from the bundle are overwritten.
-        - Any file in dst that doesn't exist in the bundle is deleted.
+        - Any file in dst that doesn't belong to that target is deleted (so an
+          older install that seeded ``[cli]*`` docs into the shared dir has them
+          removed there and re-created under the CLI dir).
 
-        Mid-session edits or extras therefore live only until the next
-        restart. Profile-scoped docs under ``<working_dir>/<profile>/``
-        are unaffected -- this method only touches the shared dir.
+        Mid-session edits or extras therefore live only until the next restart.
+        Profile-scoped docs under ``<working_dir>/<profile>/`` are unaffected.
         """
         if not app_documents_dir.exists():
             return
 
-        target = self.shared_dir()
+        sources = list(app_documents_dir.glob("**/*.md"))
+        cli_sources = [p for p in sources if _is_cli_doc(p.name)]
+        shared_sources = [p for p in sources if not _is_cli_doc(p.name)]
+
+        self._mirror_bundle(shared_sources, app_documents_dir, self.shared_dir())
+        self._mirror_bundle(cli_sources, app_documents_dir, self.cli_dir())
+
+    def _mirror_bundle(
+        self, sources: list[Path], app_documents_dir: Path, target: Path,
+    ) -> None:
+        """Mirror ``sources`` (a subset of the bundle) into ``target`` exactly.
+
+        Copies new/changed files in and deletes any file in ``target`` that is
+        not one of ``sources``. Nested scope roots do not overlap
+        (``documents/`` vs ``cli/documents`` vs ``<profile>/documents``), so
+        this never deletes another scope's files.
+        """
         target.mkdir(parents=True, exist_ok=True)
 
         bundled_dst: set[Path] = set()
         copied = 0
         overwritten = 0
 
-        for src in app_documents_dir.glob("**/*.md"):
+        for src in sources:
             rel = src.relative_to(app_documents_dir)
             dst = target / rel
             bundled_dst.add(dst.resolve())
@@ -143,7 +181,7 @@ class DocumentSyncService:
 
         if copied or overwritten or deleted:
             logger.info(
-                f"[documents] mirror from {app_documents_dir}: "
+                f"[documents] mirror -> {target}: "
                 f"copied={copied} overwritten={overwritten} deleted={deleted}"
             )
 
@@ -259,29 +297,39 @@ class DocumentSyncService:
         query: str,
         profile: str,
         limit: int = 10,
+        scopes: Optional[list[str]] = None,
     ) -> list[dict]:
-        """Vector-search the collection, filtered to ``shared`` + ``profile``.
+        """Vector-search the collection, filtered to ``scopes``.
+
+        ``scopes`` defaults to ``[shared, profile]`` (the general documentation
+        corpus). The ``cli`` tool passes ``[CLI_SCOPE]`` to search the disjoint
+        CLI-reference corpus instead, so the two corpora never surface each
+        other's documents.
 
         Returns flat payload dicts plus ``id`` and ``score`` keys. Body
         content is loaded from disk by the caller, not stored here.
 
         When Vector Embedding is disabled (no embedding model and/or no
         vector store), falls back to enumerating every eligible document in
-        the user's scopes from disk — capped at ``limit`` — so the LLM
+        the requested scopes from disk — capped at ``limit`` — so the LLM
         relevance judge in the search tool still has candidates to choose
         from.
         """
-        logger.debug(f"[documents] search: query={query!r} profile={profile!r} limit={limit}")
+        scopes = scopes if scopes is not None else [SHARED_SCOPE, profile]
+        logger.debug(
+            f"[documents] search: query={query!r} profile={profile!r} "
+            f"scopes={scopes} limit={limit}"
+        )
         if self._vector_store is None or self._embedding is None:
             logger.debug("[documents] vector search unavailable, falling back to full scan")
             return self._list_all_for_scopes(
-                profile=profile, limit=FALLBACK_MAX_CANDIDATES
+                scopes=scopes, limit=FALLBACK_MAX_CANDIDATES
             )
 
         if not self._vector_store.collection_exists(COLLECTION_NAME):
             logger.debug("[documents] collection does not exist, falling back to full scan")
             return self._list_all_for_scopes(
-                profile=profile, limit=FALLBACK_MAX_CANDIDATES
+                scopes=scopes, limit=FALLBACK_MAX_CANDIDATES
             )
 
         try:
@@ -295,7 +343,7 @@ class DocumentSyncService:
                 collection_name=COLLECTION_NAME,
                 vector=vector,
                 limit=limit,
-                filter={"scope": [SHARED_SCOPE, profile]},
+                filter={"scope": scopes},
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[documents] query_by_vector failed: {e}")
@@ -303,23 +351,24 @@ class DocumentSyncService:
 
         return hits
 
-    def _list_all_for_scopes(self, *, profile: str, limit: int) -> list[dict]:
-        """Return every eligible doc in ``shared`` + ``profile``, no ranking.
+    def _list_all_for_scopes(self, *, scopes: list[str], limit: int) -> list[dict]:
+        """Return every eligible doc in ``scopes``, no ranking.
 
         Used as the fallback when vector search is unavailable (embedding
         disabled or vector store not connected). The caller's LLM judge
         does the relevance pick over the resulting list.
 
-        Documents are ordered scope-then-relpath with shared/system docs first,
-        so they survive truncation. Because the judge is the sole discriminator
-        in this mode, ``limit`` must be generous enough to include the whole
-        system-doc set (see ``FALLBACK_MAX_CANDIDATES``); capping below it hides
-        docs from the judge -- which is exactly what made tail-sorted docs like
-        ``profile`` unreachable. The cap therefore only bounds a pathologically
-        large per-profile corpus, and any truncation is logged, never silent.
+        Documents are ordered scope-then-relpath following ``scopes`` order
+        (shared/system docs first by default), so they survive truncation.
+        Because the judge is the sole discriminator in this mode, ``limit`` must
+        be generous enough to include the whole system-doc set (see
+        ``FALLBACK_MAX_CANDIDATES``); capping below it hides docs from the judge
+        -- which is exactly what made tail-sorted docs like ``profile``
+        unreachable. The cap therefore only bounds a pathologically large
+        per-profile corpus, and any truncation is logged, never silent.
         """
         results: list[dict] = []
-        for scope in (SHARED_SCOPE, profile):
+        for scope in scopes:
             scanned = self._scan_scope(scope)
             payloads = sorted(
                 scanned.values(),
@@ -509,6 +558,11 @@ def _hash_text(text: str) -> str:
 
 def _hash_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _is_cli_doc(filename: str) -> bool:
+    """True for a bundled CLI-reference doc (``[cli]…``), routed to CLI_SCOPE."""
+    return filename.startswith(CLI_DOC_PREFIX)
 
 
 def _clean_name(stem: str) -> str:

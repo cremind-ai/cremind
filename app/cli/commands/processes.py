@@ -135,11 +135,17 @@ def proc_stdin(
         None, "--line-ending",
         help="Line ending to append: none | lf | crlf.",
     ),
+    close_stdin: bool = typer.Option(
+        False, "--close-stdin", "--eof",
+        help="Send EOF after the input so a process reading stdin until "
+             "EOF (e.g. cat, `cremind profile persona set <name>`) can finish.",
+    ),
 ) -> None:
     """Send input to a running process.
 
     With --keys, sends named keys. With --text, sends a literal string.
-    Without either, reads from stdin and sends verbatim.
+    Without either, reads from stdin and sends verbatim. Pass --close-stdin
+    to also send EOF so a process reading stdin until EOF can complete.
     """
     import asyncio
 
@@ -168,6 +174,9 @@ def proc_stdin(
         body["input_text"] = text
     else:
         body["input_text"] = sys.stdin.read()
+
+    if close_stdin:
+        body["close_stdin"] = True
 
     cfg: Config = ctx.obj["cfg"]
     mode: OutputMode = ctx.obj["mode"]

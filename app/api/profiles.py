@@ -10,6 +10,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from app.api.config import PROFILE_NAME_PATTERN
 from app.skills import initialize_profile_skills, teardown_profile_skills
 from app.storage.conversation_storage import ConversationStorage
 from app.tools import ToolRegistry
@@ -26,6 +27,37 @@ def _require_auth(request: Request):
 
 def _profile_from_request(request: Request) -> str:
     return getattr(request.user, "username", "") or ""
+
+
+def _require_own_profile(request: Request) -> tuple[str | None, JSONResponse | None]:
+    """Authorize a ``{profile_name}``-scoped route.
+
+    Returns ``(name, None)`` when the caller is authenticated and the URL's
+    profile name is valid and owned by the caller; otherwise ``(None, error)``:
+
+    * 401 — unauthenticated;
+    * 400 — name missing, or not a valid profile name (bad characters / too
+      long). A mis-slotted CLI argument (e.g. the persona *text* passed in the
+      name position) now gets this clear 400 instead of a confusing 403;
+    * 403 — a *valid* name that is not the caller's own profile. A token is
+      scoped to exactly one profile (its JWT ``sub``), so it may only touch
+      that profile.
+    """
+    unauth = _require_auth(request)
+    if unauth is not None:
+        return None, unauth
+    name = urllib.parse.unquote(request.path_params.get("profile_name", "") or "")
+    if not name:
+        return None, JSONResponse({"error": "Profile name is required"}, status_code=400)
+    if not PROFILE_NAME_PATTERN.match(name) or len(name) > 64:
+        return None, JSONResponse({"error": "Invalid profile name"}, status_code=400)
+    own = _profile_from_request(request)
+    if name != own:
+        return None, JSONResponse(
+            {"error": f"You can only modify your own profile ('{own}')."},
+            status_code=403,
+        )
+    return name, None
 
 
 def get_profile_routes(
@@ -118,17 +150,10 @@ def get_profile_routes(
             return JSONResponse({"error": f"Internal server error: {e}"}, status_code=500)
 
     async def handle_delete_profile(request: Request) -> JSONResponse:
-        unauth = _require_auth(request)
-        if unauth is not None:
-            return unauth
+        profile_name, err = _require_own_profile(request)
+        if err is not None:
+            return err
         try:
-            profile_name = request.path_params.get("profile_name")
-            if not profile_name:
-                return JSONResponse({"error": "Profile name is required"}, status_code=400)
-            profile_name = urllib.parse.unquote(profile_name)
-            if profile_name != _profile_from_request(request):
-                return JSONResponse({"error": "Forbidden"}, status_code=403)
-
             # Cascade FKs handle profile_tools / tool_configs / conversations / messages
             success = await conversation_storage.delete_profile(profile_name)
             if not success:
@@ -164,14 +189,9 @@ def get_profile_routes(
             return JSONResponse({"error": f"Internal server error: {e}"}, status_code=500)
 
     async def handle_get_persona(request: Request) -> JSONResponse:
-        unauth = _require_auth(request)
-        if unauth is not None:
-            return unauth
-        profile_name = urllib.parse.unquote(request.path_params.get("profile_name", ""))
-        if not profile_name:
-            return JSONResponse({"error": "Profile name is required"}, status_code=400)
-        if profile_name != _profile_from_request(request):
-            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        profile_name, err = _require_own_profile(request)
+        if err is not None:
+            return err
         try:
             content = read_persona_file(profile_name)
             return JSONResponse({"content": content})
@@ -180,14 +200,9 @@ def get_profile_routes(
             return JSONResponse({"error": str(e)}, status_code=500)
 
     async def handle_update_persona(request: Request) -> JSONResponse:
-        unauth = _require_auth(request)
-        if unauth is not None:
-            return unauth
-        profile_name = urllib.parse.unquote(request.path_params.get("profile_name", ""))
-        if not profile_name:
-            return JSONResponse({"error": "Profile name is required"}, status_code=400)
-        if profile_name != _profile_from_request(request):
-            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        profile_name, err = _require_own_profile(request)
+        if err is not None:
+            return err
         try:
             body = await request.json()
         except Exception:
@@ -220,14 +235,9 @@ def get_profile_routes(
             return JSONResponse({"error": f"Internal server error: {e}"}, status_code=500)
 
     async def handle_get_agent_name(request: Request) -> JSONResponse:
-        unauth = _require_auth(request)
-        if unauth is not None:
-            return unauth
-        profile_name = urllib.parse.unquote(request.path_params.get("profile_name", ""))
-        if not profile_name:
-            return JSONResponse({"error": "Profile name is required"}, status_code=400)
-        if profile_name != _profile_from_request(request):
-            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        profile_name, err = _require_own_profile(request)
+        if err is not None:
+            return err
         try:
             return JSONResponse({"name": read_agent_name(profile_name)})
         except Exception as e:
@@ -235,14 +245,9 @@ def get_profile_routes(
             return JSONResponse({"error": str(e)}, status_code=500)
 
     async def handle_update_agent_name(request: Request) -> JSONResponse:
-        unauth = _require_auth(request)
-        if unauth is not None:
-            return unauth
-        profile_name = urllib.parse.unquote(request.path_params.get("profile_name", ""))
-        if not profile_name:
-            return JSONResponse({"error": "Profile name is required"}, status_code=400)
-        if profile_name != _profile_from_request(request):
-            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        profile_name, err = _require_own_profile(request)
+        if err is not None:
+            return err
         try:
             body = await request.json()
         except Exception:

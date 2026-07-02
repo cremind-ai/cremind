@@ -144,8 +144,9 @@ supported, picked by the flag combination.
 **Syntax.**
 
 ```bash
-cremind proc stdin <pid> [--text "..."] [--keys K1,K2,...] [--line-ending none|lf|crlf]
-cremind proc stdin <pid>                                # body read from stdin
+cremind proc stdin <pid> [--text "..."] [--keys K1,K2,...] [--line-ending none|lf|crlf] [--close-stdin]
+cremind proc stdin <pid> [--close-stdin]               # body read from stdin
+cremind proc stdin <pid> --close-stdin                 # send EOF only (no input)
 ```
 
 **Flags.**
@@ -155,11 +156,18 @@ cremind proc stdin <pid>                                # body read from stdin
 | `--text`         | string   | `""`    | Literal string. Combine with `--line-ending` to append `\n` / `\r\n`.   |
 | `--keys`         | []string | `nil`   | Comma-separated list of named keys (see vocabulary below).             |
 | `--line-ending`  | string   | `""`    | One of `none` / `lf` / `crlf`. Server uses its default if omitted.     |
+| `--close-stdin` / `--eof` | bool | `false` | Send EOF after the input (or on its own) so a process reading stdin until EOF can finish. |
 
 If neither `--text` nor `--keys` is given, the CLI reads everything on
 its own stdin until EOF and forwards it verbatim. `--keys` and
 `--text` are mutually exclusive (the server picks `--keys` when both
 are present).
+
+A process that reads stdin until EOF (`cat`, `cremind profile persona
+set <name>`) never completes on input alone — its stdin stays open for
+more. Add `--close-stdin` to send EOF once the full payload has been
+written, or run `cremind proc stdin <pid> --close-stdin` on its own to
+close a stdin you fed over earlier calls.
 
 **Named-key vocabulary.** The full list is server-side, but the
 common ones are:
@@ -183,6 +191,9 @@ $ cremind proc stdin p_9d72 --keys Enter
 
 # Pipe a payload from a file
 $ cremind proc stdin p_9d72 < commands.txt
+
+# Feed a document to a stdin-until-EOF reader and let it finish
+$ cremind proc stdin p_9d72 --text "$(cat persona.md)" --close-stdin
 ```
 
 ### `cremind proc resize`
@@ -428,6 +439,12 @@ $ cremind proc stream --json | jq -r 'select(.type=="exited") | "\(.data.id) exi
 **`stdin` reads from your terminal forever** — That is the default
 when neither `--text` nor `--keys` is provided. Either pipe a file in
 (`< file.txt`) or use `--text`/`--keys`.
+
+**Process stays "running" after you sent its input** — A process that
+reads stdin until EOF (`cat`, `cremind profile persona set <name>`)
+keeps waiting because its stdin is still open. Re-send with
+`--close-stdin`, or run `cremind proc stdin <pid> --close-stdin` on its
+own, to deliver the EOF that lets it finish.
 
 **`attach` shows garbled output / no response** — The process is not
 running under a PTY. Check `cremind proc list --json | jq '.[] | .is_pty'`.

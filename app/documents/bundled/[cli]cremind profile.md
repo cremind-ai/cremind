@@ -41,10 +41,13 @@ change here is immediately visible to `cremind profile get`.
 ## Global flags
 
 All `cremind profile` subcommands accept the root-level `--json` flag to
-force JSON output instead of the default tables/key-value view:
+force JSON output instead of the default tables/key-value view. Because
+it is a **root** flag it must come *before* the subcommand path, not
+after it:
 
 ```bash
-cremind profile list --json
+cremind --json profile list          # correct
+cremind profile list --json          # WRONG — "No such option: --json"
 ```
 
 `CREMIND_TOKEN` is required for every subcommand in this group.
@@ -85,12 +88,12 @@ This is the equivalent of opening the profile's detail panel in the UI.
 **Syntax.**
 
 ```bash
-cremind profile get <name>
+cremind profile get <profile name>
 ```
 
 **Arguments** (required):
 
-- `<name>` — Profile to inspect.
+- `<profile name>` — Profile to inspect.
 
 **Behavior.** Prints a header with `name` and `agent_name`, a blank
 line, and the literal `--- persona ---` separator followed by the full
@@ -116,12 +119,12 @@ the server-default persona and agent name.
 **Syntax.**
 
 ```bash
-cremind profile create <name>
+cremind profile create <profile name>
 ```
 
 **Arguments** (required):
 
-- `<name>` — Profile name. Must not already exist.
+- `<profile name>` — Profile name. Must not already exist.
 
 **Behavior.** Calls the server's create endpoint and, on success, prints
 the new profile name on stdout (so the command is pipe-friendly).
@@ -140,12 +143,12 @@ alice
 **Syntax.**
 
 ```bash
-cremind profile delete <name>
+cremind profile delete <profile name>
 ```
 
 **Arguments** (required):
 
-- `<name>` — Profile to remove.
+- `<profile name>` — Profile to remove.
 
 **Behavior.** Cascades to the profile's conversations, tool overrides,
 agent OAuth tokens, and skill registrations. **There is no confirmation
@@ -166,12 +169,12 @@ file, an editor, or a diff.
 **Syntax.**
 
 ```bash
-cremind profile persona get <name>
+cremind profile persona get <profile name>
 ```
 
 **Arguments** (required):
 
-- `<name>` — Profile whose persona should be printed.
+- `<profile name>` — Profile whose persona should be printed.
 
 **Behavior.** Writes the persona to stdout with no trailing newline
 beyond what the persona itself contains. With `--json`, wraps it as
@@ -188,26 +191,56 @@ $ wc -l admin.persona.md
 ### `cremind profile persona set`
 
 **Purpose.** Replace the persona text for a profile in one shot. The
-new persona is read from **standard input**, so this command composes
-naturally with `cat`, redirection, and editor pipelines.
+new persona can be passed **inline as an argument** or read from
+**standard input**, so this command composes naturally with `cat`,
+redirection, and editor pipelines.
 
 **Syntax.**
 
 ```bash
-cremind profile persona set <name>      # reads persona from stdin
+cremind profile persona set <profile name> <content>   # inline persona text
+cremind profile persona set <profile name>             # reads persona from stdin
 ```
 
-**Arguments** (required):
+**Arguments.** Order matters — the profile **name comes first**, the
+persona text second:
 
-- `<name>` — Profile whose persona is being overwritten.
+- `<profile name>` (required) — Profile whose persona is being overwritten. It
+  must be an existing profile name (lowercase letters, numbers, `-`,
+  `_`). A common mistake is passing the persona text here and forgetting
+  the name; the server then rejects it (you can only edit your own
+  profile).
+- `<content>` (optional) — The persona text. If given, it is used
+  verbatim (quote multi-line text). If omitted, the persona is read
+  from stdin until EOF. Providing no text — an interactive terminal, an
+  empty pipe, or `< /dev/null` — is an error: the command prints a usage
+  hint and exits non-zero rather than storing an empty persona.
 
-**Behavior.** Reads everything on stdin until EOF and posts it as the
-new persona. The previous persona is replaced wholesale (there is no
-patch/append mode). Silent on success.
+**Behavior.** Uses the `<content>` argument when present; otherwise
+reads everything on stdin until EOF. Empty/blank text is rejected (to
+deliberately clear a persona, pass an explicit empty argument:
+`cremind profile persona set <profile name> ""`). The text is posted as the new
+persona, replacing the previous one wholesale (there is no patch/append
+mode). Silent on success.
+
+**Driving this non-interactively (agents / scripts).** Two robust
+paths: (1) pass the persona as the inline `<content>` argument — best
+for short, simple text; or (2) use the stdin form and feed the text
+through a mechanism that **closes stdin (sends EOF)** when done — this
+avoids shell-quoting hazards for content with `$`, backticks, or
+newlines, and is the safest path for large multi-line personas. When
+run through the process tools, send the content and then close stdin
+(e.g. `exec_shell_input` with `close_stdin=true`, or `cremind proc
+stdin <pid> --close-stdin`); if stdin is closed with no text sent, the
+command exits with the usage hint instead of hanging or storing an
+empty persona.
 
 **Examples.**
 
 ```bash
+# Inline (quote multi-line text)
+$ cremind profile persona set admin "You are an Cremind admin assistant. Be concise."
+
 # From a file
 $ cremind profile persona set admin < admin.persona.md
 
@@ -230,7 +263,7 @@ $ cremind profile persona set admin < /tmp/persona.md
 **Syntax.**
 
 ```bash
-cremind profile agent-name get <name>
+cremind profile agent-name get <profile name>
 ```
 
 **Behavior.** Prints just the agent name on a single line (empty if the
@@ -251,12 +284,12 @@ Ada
 **Syntax.**
 
 ```bash
-cremind profile agent-name set <name> <agent-name>
+cremind profile agent-name set <profile name> <agent-name>
 ```
 
 **Arguments** (both required):
 
-- `<name>` — Profile to update.
+- `<profile name>` — Profile to update.
 - `<agent-name>` — The new agent name (at most 128 characters). Quote it
   if it contains spaces.
 
@@ -290,7 +323,7 @@ You are Alice's research assistant ...
 ### Roll out a persona update across all profiles
 
 ```bash
-$ for p in $(cremind profile list --json | jq -r '.[]'); do
+$ for p in $(cremind --json profile list | jq -r '.[]'); do
     cremind profile persona set "$p" < templates/shared.persona.md
   done
 ```
@@ -321,15 +354,25 @@ collides with an existing profile. Pick a different name, or
 all require the profile to exist. Run `cremind profile list` to confirm
 spelling.
 
-**`persona set` does nothing / persona is empty** — `persona set`
-reads from stdin. If you ran it interactively without redirection, it
-is waiting for input — terminate with Ctrl-D after typing, or pipe a
-file in with `<`.
+**`persona set` errors asking for the persona text** — With no
+`<content>` argument, `persona set` reads stdin; if that yields nothing
+(interactive terminal, empty pipe, or `< /dev/null`) it exits with a
+usage hint instead of storing an empty persona. Pass the persona as a
+quoted argument, or pipe/redirect a file in with `<`.
+
+**`persona set` returns `403` / `You can only modify your own profile`**
+— The `<profile name>` argument doesn't match the profile your token grants (a
+frequent cause is passing the persona *text* in the name slot and
+omitting the name). Put the profile name first:
+`cremind profile persona set <profile name> <text>`. Run `cremind me` to see
+your profile, and `cremind profile list` for valid names. A name with
+spaces/newlines/invalid characters is rejected with `400 Invalid
+profile name`.
 
 **`agent-name set` rejected** — The name must be non-empty and at most
 128 characters. Trim it (or quote a name with spaces) and retry.
 
 **Override of "the" profile vs the current profile** — Every subcommand
-takes an explicit `<name>`; nothing in `cremind profile` implicitly targets
+takes an explicit `<profile name>`; nothing in `cremind profile` implicitly targets
 the active profile. To find out which profile the current token grants,
 run `cremind me`.

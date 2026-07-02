@@ -142,6 +142,7 @@ def get_process_routes() -> list:
             input_text=body.get("input_text"),
             keys=body.get("keys"),
             line_ending=body.get("line_ending"),
+            close_stdin=body.get("close_stdin"),
         )
         status_code = 200
         if result.get("error") == "Process not found":

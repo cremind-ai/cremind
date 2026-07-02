@@ -87,6 +87,23 @@ async def reset_tool_llm_params(
     )
 
 
+async def list_tool_leaves(client: Client, tool_id: str) -> dict[str, Any]:
+    """Return ``{supports_leaf_toggle, disconnected, leaves: [...]}``."""
+    out = await client.get_json(f"/api/tools/{quote(tool_id, safe='')}/leaves")
+    return out if isinstance(out, dict) else {}
+
+
+async def set_tool_leaves(
+    client: Client,
+    tool_id: str,
+    leaves: dict[str, bool],
+) -> None:
+    await client.put_json(
+        f"/api/tools/{quote(tool_id, safe='')}/leaves",
+        {"leaves": leaves},
+    )
+
+
 async def register_long_running_app(
     client: Client,
     tool_id: str,

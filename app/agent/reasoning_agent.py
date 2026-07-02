@@ -47,7 +47,7 @@ from app.config import (
     vision_feature_enabled,
 )
 from app.config.settings import get_user_working_directory
-from app.config.user_config import resolve_agent_config
+from app.config.user_config import resolve_agent_config, resolve_memory_config
 from app.constants import ChatCompletionTypeEnum
 from app.lib.exception import AgentException
 from app.lib.llm.base import LLMProvider
@@ -59,6 +59,7 @@ from app.tools import (
     ToolThinkingEvent,
     ToolType,
 )
+from app.tools.base import make_leaf_name
 from app.skills.scanner import generate_dir_tree
 from app.types import ReasoningStreamResponseType
 from app.utils.common import truncate_to_tokens
@@ -90,7 +91,9 @@ SYSTEM_TEMPLATE = '''{persona_description}
 
 Current OS: {current_os}
 Current User Working Directory: `{current_user_working_directory}`
-
+Active profile: $CREMIND_PROFILE
+Your name: $CREMIND_AGENT_NAME
+{long_term_memory}
 You are a capable assistant. Fulfil the user's request by calling the available
 tools (functions) when you need to act or fetch information, then reply to the
 user in plain text. Call a tool ONLY when it is actually needed; when you have
@@ -102,7 +105,7 @@ For any request that contains a time expression you MUST first call the
 `datetime_parser` tool to normalise it; if it also contains a recurring
 schedule you MUST call the `scheduler` tool instead. Do this before calling
 other tools that need the normalised time.
-{reasoning_guidance}
+{reasoning_guidance}{search_guidance}
 PRESERVE THE USER'S LANGUAGE: any human-facing value you put in a tool argument
 -- especially the title/name of something you create on the user's behalf (a
 schedule event, reminder, note, or task) and any message shown to the user --
@@ -123,6 +126,134 @@ know, and which tool you will call next and why. Treat it as a private
 scratchpad: think there, then act. Re-call it whenever the situation changes or
 before any non-trivial decision. Never put the final user-facing answer in it.
 '''
+
+
+# Upper bound on facts folded into the frozen system-prompt memory section. The
+# DB path is already queue-capped (``memory.long_term_queue_size``); this also
+# bounds the effectively-unlimited vector path so the block can't bloat the cache
+# prefix.
+_MEMORY_SNAPSHOT_LIMIT = 50
+
+# Per-process, per-profile snapshot of the long-term-memory section injected into
+# ``SYSTEM_TEMPLATE``. Loaded ONCE (first turn to need it for a profile) and never
+# refreshed on memory writes -- coupling the system block to frequently-changing
+# memory would bust the prompt cache. A process restart is the only refresh.
+_LONG_TERM_MEMORY_SNAPSHOT: dict[str, str] = {}
+
+
+def _format_memory_block(facts: list[str]) -> str:
+    """Render durable facts as the ``{long_term_memory}`` section, or "" for none.
+
+    Self-wrapped ``'\\n...\\n'`` (like REASONING_GUIDANCE) so it drops cleanly into
+    the template's identity block and collapses to a single blank line when empty.
+    """
+    facts = [f.strip() for f in facts if f and f.strip()]
+    if not facts:
+        return ""
+    body = "\n".join(f"- {f}" for f in facts)
+    return (
+        "\nLONG-TERM MEMORY (durable facts about the user, remembered across past "
+        "conversations):\n" + body + "\n"
+    )
+
+
+def _search_tool_classes():
+    """The built-in search tool CLASSES in guidance order: ``(local_tier, web)``.
+
+    Imported lazily and defensively straight from ``app.tools.builtin`` so this
+    module hard-codes no tool names: each tool's own class is the single source
+    of truth for its identity (the defining module == the registered group's
+    ``config_name``) and the function name the model sees (the class ``name`` ==
+    the leaf). A rename/move of a class therefore breaks the import loudly here
+    instead of silently drifting. Lazy + guarded because a tool module may fail
+    to import when an optional dependency is absent -- in which case the tool is
+    not registered either, so omitting it from the guidance is correct. By the
+    time an agent is constructed these modules are already imported (at
+    registration), so the lazy import is just a cached lookup.
+
+    Returns ``([local_classes], web_class_or_None)``.
+    """
+    local = []
+    web = None
+    try:
+        from app.tools.builtin.documentation_search import DocumentationSearchTool
+        local.append(DocumentationSearchTool)
+    except Exception:  # noqa: BLE001 - missing optional dep => tool not registered
+        pass
+    try:
+        from app.tools.builtin.search_memory import SearchMemoryTool
+        local.append(SearchMemoryTool)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.tools.builtin.web_search import WebSearchTool
+        web = WebSearchTool
+    except Exception:  # noqa: BLE001
+        pass
+    return local, web
+
+
+def _build_search_guidance(tools) -> str:
+    """Assemble the fallback-search guidance from the search tools actually
+    enabled for this run, naming ONLY the ones present so the prompt never
+    references a tool the user turned off. Local lookup (documentation/memory) is
+    tried first; web search is the last-resort internet fallback. Returns "" when
+    none are enabled. Wrapped ``'\\n...\\n'`` to match REASONING_GUIDANCE's spacing.
+
+    Each search tool is matched to its LIVE registered group by its defining
+    module (``cls.__module__`` == the group's ``config_name``); the function name
+    the model sees is ``make_leaf_name(group.tool_id, cls.name)`` -- the group's
+    real registry id plus the class-defined leaf -- so it always matches the
+    ``tools=`` block and re-derives automatically on any rename.
+
+    Enablement is judged at the group level (presence in ``tools``). The rare
+    case of a single-leaf group whose sole leaf is disabled via the API-only
+    per-leaf path (the Settings UI hides leaf toggles for single-leaf groups) is
+    not handled -- the group still counts as enabled here.
+    """
+    local_classes, web_class = _search_tool_classes()
+    group_by_stem = {}
+    for tool in tools:
+        stem = getattr(tool, "config_name", None)
+        if stem is not None:
+            group_by_stem[stem] = tool
+
+    def exposed(cls) -> Optional[str]:
+        if cls is None:
+            return None
+        group = group_by_stem.get(cls.__module__.rsplit(".", 1)[-1])
+        return make_leaf_name(group.tool_id, cls.name) if group is not None else None
+
+    local = [f"`{fn}`" for fn in (exposed(c) for c in local_classes) if fn]
+    web = exposed(web_class)
+
+    if not local and not web:
+        return ""
+    if local:
+        joined = " and ".join(local)
+        body = (
+            "Except for casual chat where you can respond to the user immediately, "
+            "if it is a request or information lookup you must not affirm whether "
+            f"this request/information can be fulfilled or not — instead call {joined} "
+            f"tool{'s' if len(local) > 1 else ''} to ensure that the request/information "
+            "has been verified."
+        )
+        if web:
+            body += (
+                f" Only if that returns nothing useful may you then call `{web}` "
+                "to search the public internet."
+            )
+    else:
+        # documentation_search is locked-on, so a local tool is normally always
+        # present; this web-only branch is a defensive fallback.
+        body = (
+            "Except for casual chat where you can respond to the user immediately, "
+            "if it is a request or information lookup you must not affirm whether "
+            "this request/information can be fulfilled or not — instead call the "
+            f"`{web}` tool to search the public internet to ensure that the "
+            "request/information has been verified."
+        )
+    return "\n" + body + "\n"
 
 
 class _LeafOutcome:
@@ -159,6 +290,16 @@ class ReasoningAgent:
     # the real value from the model catalog. Keeps construction via ``__new__``
     # (used in tests) and any future subclass from tripping on a missing attribute.
     _parallel_tool_calls: bool = True
+
+    # Fallback-search system-prompt block; ``__init__`` recomputes it from the
+    # run's enabled tools. Class-level default keeps ``__new__`` construction
+    # (used in tests) from tripping on a missing attribute.
+    _search_guidance: str = ""
+
+    # Frozen long-term-memory section; ``_loop`` fills it once per run from the
+    # per-process snapshot. Class-level default keeps ``__new__`` construction and
+    # direct ``_build_instruction`` calls (tests) from tripping on a missing attr.
+    _long_term_memory_block: str = ""
 
     def __init__(
         self,
@@ -227,6 +368,11 @@ class ReasoningAgent:
             tools = [t for t in tools if t.tool_id != "image_understanding"]
         self._tools = tools
         self._tools_by_id = {t.tool_id: t for t in self._tools}
+        # Fallback-search guidance, built from the live enabled tool groups
+        # (static for the run) so the system prompt stays byte-identical across
+        # steps. Names only the search tools actually enabled for this profile,
+        # using the exact function names those groups expose to the model.
+        self._search_guidance = _build_search_guidance(self._tools)
 
         self.max_steps = max_steps if max_steps is not None else cfg.max_steps
         self.current_step_count = 0
@@ -362,29 +508,87 @@ class ReasoningAgent:
 
     # ── prompt building ───────────────────────────────────────────────
 
+    async def _load_long_term_memory_block(self) -> str:
+        """Snapshot this profile's long-term memory as the ``{long_term_memory}`` section.
+
+        Read ONCE per process per profile (cached in ``_LONG_TERM_MEMORY_SNAPSHOT``)
+        and never refreshed on memory writes, so the system block stays byte-stable
+        for prompt-cache reuse across every step AND turn. Facts remembered later in
+        the session surface only after a process restart; they remain reachable
+        in-session via the ``search_memory`` tool. Mirrors that tool's retrieval
+        paths (:mod:`app.tools.builtin.search_memory`) but lists all facts rather
+        than a query-ranked slice. Returns "" when memory is off, empty, or
+        unreadable -- a snapshot failure must never break the turn.
+        """
+        if not resolve_memory_config(self.profile).enabled:
+            return ""
+        from types import SimpleNamespace
+
+        from app.agent import memory_vectorstore
+        from app.config.embedding_state import embedding_state
+
+        facts: list[str] = []
+        shim = SimpleNamespace(
+            embedding=embedding_state.embedding, vector_store=embedding_state.vector_store,
+        )
+        if memory_vectorstore.vector_long_term_available(shim):
+            rows = memory_vectorstore.list_long_term(
+                agent=shim, profile=self.profile, limit=_MEMORY_SNAPSHOT_LIMIT,
+            )
+            facts = [r["content"] for r in rows if r.get("content")]
+        else:
+            try:
+                from app.storage import get_memory_storage
+
+                rows = await get_memory_storage().get_long_term(self.profile)
+                facts = [r["content"] for r in rows if r.get("content")][:_MEMORY_SNAPSHOT_LIMIT]
+            except Exception:  # noqa: BLE001
+                logger.exception("[memory] long-term snapshot DB read failed")
+                facts = []
+        return _format_memory_block(facts)
+
+    async def _ensure_long_term_memory_loaded(self) -> None:
+        """Fill ``self._long_term_memory_block`` from the frozen per-process,
+        per-profile snapshot, loading it once on first need. Called at the start of
+        ``_loop`` (the run's init point) -- never inside ``_build_instruction`` --
+        so a memory write never re-renders the system block and busts the cache
+        prefix. Concurrent first-turns for a profile may both load; the result is
+        identical, so last-write-wins is safe.
+        """
+        if self.profile not in _LONG_TERM_MEMORY_SNAPSHOT:
+            _LONG_TERM_MEMORY_SNAPSHOT[self.profile] = await self._load_long_term_memory_block()
+        self._long_term_memory_block = _LONG_TERM_MEMORY_SNAPSHOT[self.profile]
+
     def _build_instruction(self) -> str:
-        # Render `$CREMIND_*` system-variable tokens (e.g. $CREMIND_AGENT_NAME)
-        # in the persona before it goes to the model. The persona GET endpoint
-        # still serves the raw file, so the editor keeps showing the template.
-        persona = resolve_system_var_tokens(read_persona_file(self.profile), self.profile)
         override = (
             get_context(self.context_id, "_working_directory_override")
             if self.context_id else None
         )
         cwd = override or get_user_working_directory()
-        return SYSTEM_TEMPLATE.format(
-            persona_description=persona,
+        instruction = SYSTEM_TEMPLATE.format(
+            persona_description=read_persona_file(self.profile),  # raw; resolved below
             current_os=platform.system(),
             current_user_working_directory=cwd,
             reasoning_guidance=REASONING_GUIDANCE if self._inject_reasoning_guidance else "",
+            search_guidance=self._search_guidance,
+            long_term_memory=self._long_term_memory_block,
         )
+        # Render `$CREMIND_*` system-variable tokens (e.g. $CREMIND_PROFILE,
+        # $CREMIND_AGENT_NAME) across the whole prompt -- persona body AND the
+        # template's own tokens -- in one pass. Doing it AFTER .format() means a
+        # token value that happens to contain braces can't break formatting, and
+        # the persona is still resolved exactly once. The persona GET endpoint
+        # keeps serving the raw file, so the editor still shows the template.
+        return resolve_system_var_tokens(instruction, self.profile)
 
     def _render_input(self) -> str:
         """The volatile per-turn user message (just the query).
 
-        Long-term memory is no longer injected here — the model retrieves it on
-        demand via the ``search_memory`` tool — so the [system + tools + history]
-        prefix stays byte-stable for prompt caching.
+        Long-term memory is not injected into this volatile input — that would
+        break the cached prefix. A frozen per-process snapshot of it now lives in
+        the system block instead (see ``_load_long_term_memory_block``), and the
+        model can still pull more on demand via the ``search_memory`` tool, so the
+        [system + tools + history] prefix stays byte-stable for prompt caching.
         """
         return self._current_query
 
@@ -543,6 +747,7 @@ class ReasoningAgent:
 
     async def _loop(self) -> AsyncGenerator[ReasoningStreamResponseType, None]:
         llm_retry = 0
+        await self._ensure_long_term_memory_loaded()
         while True:
             if self.current_step_count >= self.max_steps:
                 final = (
