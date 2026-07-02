@@ -232,9 +232,11 @@ def _build_search_guidance(tools) -> str:
     if local:
         joined = " and ".join(local)
         body = (
-            "Except for casual chat where you can respond to the user immediately, "
-            "if it is a request or information lookup you must not affirm whether "
-            f"this request/information can be fulfilled or not — instead call {joined} "
+            "When there is a request or information lookup from a user — if it is "
+            "casual chat you can respond immediately. If it is not casual chat, "
+            "you can check the list of supported tools to see if any tool can fulfill "
+            "the user's need. If not, do not give up too quickly — you must not affirm "
+            f"whether this request/information can be fulfilled or not — instead call {joined} "
             f"tool{'s' if len(local) > 1 else ''} to ensure that the request/information "
             "has been verified."
         )
@@ -247,9 +249,11 @@ def _build_search_guidance(tools) -> str:
         # documentation_search is locked-on, so a local tool is normally always
         # present; this web-only branch is a defensive fallback.
         body = (
-            "Except for casual chat where you can respond to the user immediately, "
-            "if it is a request or information lookup you must not affirm whether "
-            "this request/information can be fulfilled or not — instead call the "
+            "When there is a request or information lookup from a user — if it is "
+            "casual chat you can respond immediately. If it is not casual chat, "
+            "you can check the list of supported tools to see if any tool can fulfill "
+            "the user's need. If not, do not give up too quickly — you must not affirm "
+            f"whether this request/information can be fulfilled or not — instead call the "
             f"`{web}` tool to search the public internet to ensure that the "
             "request/information has been verified."
         )
