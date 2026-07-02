@@ -84,7 +84,10 @@ SKILL_REQUEST_ARG = "request"
 
 # What we overwrite a skill load call's ``request`` arg with so the persisted /
 # replayed trace is deterministic and byte-stable (better prompt-cache reuse).
-SKILL_LOAD_REQUEST = "You need to load the SKILL.md file for skill {name}"
+# Phrased as a completed label, NOT an imperative ("You need to load…") — a weak
+# model re-reading the replayed trace must not mistake it for a pending instruction
+# and re-call the skill (the SKILL.md is already above in history).
+SKILL_LOAD_REQUEST = "Load skill '{name}' instructions (SKILL.md)"
 
 
 SYSTEM_TEMPLATE = '''{persona_description}
@@ -385,7 +388,9 @@ class ReasoningAgent:
         # Seeded at run() start from the replayed history (a skill stays "loaded"
         # only while its load tool call is still in the tail; it drops out once
         # compaction folds that call into the summary), then extended as new skills
-        # load this turn. Used to skip re-loading an already-loaded skill.
+        # load this turn. Drives ``_skill_function_spec``: a loaded skill's load
+        # affordance is removed from the ``tools=`` block (subscribe-only, or
+        # dropped entirely) so it cannot be re-loaded, and its call short-circuits.
         self._loaded_skill_ids: set[str] = set()
 
         # Per-turn token accounting (cached reads/writes split for cost attribution).
@@ -598,76 +603,113 @@ class ReasoningAgent:
 
     # ── tool spec assembly ─────────────────────────────────────────────
 
-    def _skill_function_spec(self, tool) -> dict:
-        """Build the native function spec for one skill tool.
+    def _skill_subscribe_spec(self, items: List[dict]) -> dict:
+        """The ``subscribe`` object shared by an event-bearing skill's spec.
 
-        The spec is derived purely from static skill metadata (description +
-        declared events), so it is byte-stable across steps and turns — loaded
-        skills are NOT removed and no per-request mutation happens, which keeps
-        the cached ``tools=`` prefix intact. Event-bearing skills additionally
-        expose a ``subscribe`` object carrying that skill's own event enum, so a
-        subscription is unambiguously tied to the skill whose tool was called
-        (no active-skill state). The ``subscribe`` block is present on every run
-        — including event-triggered ones — so the ``tools=`` prefix is identical
-        regardless of how the turn started (a previous schema divergence here cost
-        the prompt cache on every event run). Recursive event storms are prevented
-        at dispatch time instead: ``_handle_skill_call`` refuses a ``subscribe``
-        call when ``_triggered_by_event`` is set.
+        Byte-identical whether or not the skill is loaded, so the ``tools=`` block
+        stays cache-stable across event-triggered and normal runs for a given
+        loaded-skill set.
         """
-        properties: Dict[str, Any] = {
-            SKILL_REQUEST_ARG: {
-                "type": "string",
-                "description": (
-                    "What you want this skill to do right now (one-shot use). "
-                    "Provide this to load and use the skill."
-                ),
-            },
-        }
-        items = self._skill_event_items(tool)
-        if items:
-            names = [i["name"] for i in items]
-            desc_lines = [
-                f"- {i['name']}: {i.get('description', '')}".rstrip(": ").rstrip()
-                for i in items
-            ]
-            properties["subscribe"] = {
-                "type": "object",
-                "description": (
-                    "Provide INSTEAD of `request` to subscribe this conversation "
-                    "to one or more of this skill's events so an action runs "
-                    "automatically whenever an event fires."
-                ),
-                "properties": {
-                    "trigger": {
-                        "type": "array",
-                        "items": {"type": "string", "enum": names},
-                        "minItems": 1,
-                        "uniqueItems": True,
-                        "description": (
-                            "One or more event names declared by this skill. "
-                            "Available events:\n" + "\n".join(desc_lines)
-                        ),
-                    },
-                    "action": {
-                        "type": "string",
-                        "description": (
-                            "Short imperative of WHAT to do when an event fires "
-                            "(no trigger phrasing)."
-                        ),
-                    },
+        names = [i["name"] for i in items]
+        desc_lines = [
+            f"- {i['name']}: {i.get('description', '')}".rstrip(": ").rstrip()
+            for i in items
+        ]
+        return {
+            "type": "object",
+            "description": (
+                "Subscribe this conversation to one or more of this skill's "
+                "events so an action runs automatically whenever an event fires."
+            ),
+            "properties": {
+                "trigger": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": names},
+                    "minItems": 1,
+                    "uniqueItems": True,
+                    "description": (
+                        "One or more event names declared by this skill. "
+                        "Available events:\n" + "\n".join(desc_lines)
+                    ),
                 },
-                "required": ["trigger", "action"],
-                "additionalProperties": False,
+                "action": {
+                    "type": "string",
+                    "description": (
+                        "Short imperative of WHAT to do when an event fires "
+                        "(no trigger phrasing)."
+                    ),
+                },
+            },
+            "required": ["trigger", "action"],
+            "additionalProperties": False,
+        }
+
+    def _skill_function_spec(self, tool, *, loaded: bool) -> Optional[dict]:
+        """Build the native function spec for one skill tool, or ``None`` to omit it.
+
+        The spec depends on whether the skill is already loaded this turn
+        (``_loaded_skill_ids``):
+
+        - **Not loaded** → expose ``request`` (load-and-use) plus, for
+          event-bearing skills, the ``subscribe`` object.
+        - **Loaded, has events** → expose ``subscribe`` ONLY. The SKILL.md is
+          already in history, so re-loading is pointless; dropping ``request``
+          makes a re-load call impossible while keeping the skill subscribable.
+        - **Loaded, no events** → return ``None`` so the stub is dropped from the
+          ``tools=`` block entirely; the model must act on the loaded instructions
+          (via Exec Shell), not by re-calling the skill.
+
+        The spec is therefore byte-stable GIVEN a fixed loaded-skill set; it
+        changes exactly once when a skill loads — a deliberate one-time prompt-cache
+        break that makes skill-load loops impossible — and reverts only if
+        compaction folds the load call out of the replayed tail (the content is
+        then genuinely gone from history, so re-loading is correct). Event enums
+        come from static metadata. The ``subscribe`` block stays present on every
+        run — including event-triggered ones — so recursive event storms are
+        prevented at dispatch time instead: ``_handle_skill_call`` refuses a
+        ``subscribe`` call when ``_triggered_by_event`` is set.
+        """
+        items = self._skill_event_items(tool)
+        subscribe_spec = self._skill_subscribe_spec(items) if items else None
+
+        if loaded:
+            if subscribe_spec is None:
+                return None  # nothing left to expose — drop the stub entirely
+            properties: Dict[str, Any] = {"subscribe": subscribe_spec}
+            description = (
+                f"{tool.description} Its instructions are already loaded in this "
+                "conversation — follow them directly to act (do NOT call this to "
+                "use it). Call this ONLY to subscribe to one of its events."
+            )
+            parameters: Dict[str, Any] = {
+                "type": "object",
+                "properties": properties,
+                "required": ["subscribe"],
             }
+        else:
+            properties = {
+                SKILL_REQUEST_ARG: {
+                    "type": "string",
+                    "description": (
+                        "What you want this skill to do right now (one-shot use). "
+                        "Provide this to load and use the skill."
+                    ),
+                },
+            }
+            if subscribe_spec is not None:
+                properties["subscribe"] = subscribe_spec
+            description = (
+                f"{tool.description} Call this to use the skill; pass the "
+                "user's request. The skill's instructions load on first use."
+            )
+            parameters = {"type": "object", "properties": properties}
+
         return {
             "type": "function",
             "function": {
                 "name": tool.tool_id,
-                "description": (
-                    f"{tool.description} Call this to use the skill; pass the "
-                    "user's request. The skill's instructions load on first use."
-                ),
-                "parameters": {"type": "object", "properties": properties},
+                "description": description,
+                "parameters": parameters,
             },
         }
 
@@ -676,9 +718,10 @@ class ReasoningAgent:
 
         Returns ``(specs, dispatch)`` where ``dispatch[name]`` is
         ``("leaf", tool, leaf_name)`` for built-in/MCP sub-tools or
-        ``("skill", tool, None)`` for skill functions. Skill specs are static
-        (all skills always present, derived from metadata) so the tools block is
-        byte-stable for prompt caching.
+        ``("skill", tool, None)`` for skill functions. A skill's spec depends on
+        whether it is already loaded (see ``_skill_function_spec``): the block is
+        byte-stable for a fixed loaded-skill set and changes once per skill load,
+        so re-loading an already-loaded skill is made impossible.
         """
         specs: List[dict] = []
         dispatch: Dict[str, tuple] = {}
@@ -687,7 +730,14 @@ class ReasoningAgent:
 
         for tool in self._tools:
             if tool.tool_type is ToolType.SKILL:
-                specs.append(self._skill_function_spec(tool))
+                loaded = tool.tool_id in self._loaded_skill_ids
+                spec = self._skill_function_spec(tool, loaded=loaded)
+                if spec is not None:
+                    specs.append(spec)
+                # Keep the dispatch entry even when the spec is omitted: a
+                # same-step parallel duplicate call, or a model that echoes the
+                # now-removed function name, must still route to the already-loaded
+                # short-circuit rather than "Unknown tool '<skill>'".
                 dispatch[tool.tool_id] = ("skill", tool, None)
                 continue
 
@@ -1255,8 +1305,9 @@ class ReasoningAgent:
         if tool.tool_id in self._loaded_skill_ids:
             obs = (
                 f"Skill '{tool.name}' is already loaded in this conversation; its "
-                "instructions are available above. Follow them directly — no need "
-                "to load it again."
+                "instructions are available above. Do NOT call this tool again. To "
+                "act on those instructions, run the skill's commands with the Exec "
+                f"Shell tool using '{tool.tool_id}' as the <skill-name> argument."
             )
             self._append_tool_result(call_id, obs, fn_name=tool.tool_id, truncate=False)
             yield self._result_artifact(

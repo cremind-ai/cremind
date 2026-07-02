@@ -8,8 +8,10 @@ After the rework:
 - "Loaded" is derived from the replayed history, so a repeat call short-circuits.
 - Event subscription is folded onto the skill tool's own ``subscribe`` object and
   pinned to that exact skill — no active-skill state, no separate tool.
-- Skill specs are static (loaded skills are NOT removed; event enums come from
-  metadata), keeping the ``tools=`` block byte-stable for prompt caching.
+- Once a skill is loaded, its load affordance is removed from the ``tools=`` block
+  (subscribe-only for event-bearing skills, dropped entirely otherwise) so it
+  cannot be re-loaded. The block is byte-stable for a fixed loaded-skill set and
+  changes exactly once per load; event enums come from metadata.
 """
 
 from __future__ import annotations
@@ -80,10 +82,12 @@ class _SkillCallLLM:
         self._step = 0
         self._skill_id = skill_id
         self._call_args = call_args
+        self.tools_per_step: List[Optional[list]] = []  # tools= seen at each step
 
     async def chat_completion_stream(self, *, messages, tools=None, tool_choice=None,
                                      **kwargs) -> AsyncGenerator[dict, None]:
         self._step += 1
+        self.tools_per_step.append(tools)
         if self._step == 1:
             yield {
                 "type": ChatCompletionTypeEnum.FUNCTION_CALLING,
@@ -160,7 +164,7 @@ def test_skill_load_overwrites_request_and_returns_full_content(monkeypatch):
     # regardless of what the model originally typed.
     assert trace[0]["role"] == "assistant"
     args = json.loads(trace[0]["tool_calls"][0]["function"]["arguments"])
-    assert args == {"request": "You need to load the SKILL.md file for skill gmail"}
+    assert args == {"request": "Load skill 'gmail' instructions (SKILL.md)"}
 
     # The full SKILL.md content rides the tool result, untruncated, with the
     # usage guidance that used to live in the system prompt.
@@ -174,7 +178,10 @@ def test_skill_load_overwrites_request_and_returns_full_content(monkeypatch):
 def test_already_loaded_skill_short_circuits(monkeypatch):
     body = "SECRET SKILL INSTRUCTIONS"
     skill = _FakeSkillTool("default__gmail", "gmail", full_content=body)
-    # History already contains a load call for this skill (replayed trace).
+    # History already contains a load call for this skill (replayed trace). It
+    # carries the OLD sentinel text on purpose: load detection is by args *shape*
+    # (non-subscribe), not text, so pre-existing conversations stay recognized as
+    # loaded after the sentinel was reworded.
     history = [
         {"role": "assistant", "content": None, "tool_calls": [{
             "id": "p1", "type": "function",
@@ -194,6 +201,30 @@ def test_already_loaded_skill_short_circuits(monkeypatch):
     assert "already loaded" in tool_msg["content"]
     # The full content is NOT re-emitted (it is already above in history).
     assert body not in tool_msg["content"]
+    # The skill was loaded (derived from history), so its no-event stub is dropped
+    # from the tools block — it physically cannot be re-loaded. The dispatch entry
+    # still survived to route the model's (hallucinated) call to the short-circuit.
+    step1_tools = llm.tools_per_step[0] or []
+    assert all(t["function"]["name"] != "default__gmail" for t in step1_tools)
+
+
+def test_skill_load_affordance_removed_within_same_turn(monkeypatch):
+    """Loading a skill mid-turn removes its load affordance from the very next
+    step's tools block, so a weak model cannot re-call it in a loop (the
+    imap-email bug: gpt-4.1 re-called the loaded skill instead of acting on it)."""
+    skill = _FakeSkillTool("default__gmail", "gmail", full_content="BODY")  # no events
+    llm = _SkillCallLLM("default__gmail", {"request": "list my emails"})
+    agent = _build_agent(monkeypatch, llm, [skill])
+
+    _run(agent, "use gmail", history=[])
+
+    assert len(llm.tools_per_step) >= 2
+    step1 = llm.tools_per_step[0] or []
+    step2 = llm.tools_per_step[1] or []
+    # Loadable on the step that loads it...
+    assert any(t["function"]["name"] == "default__gmail" for t in step1)
+    # ...and gone on the next step (no events → dropped from the tools block).
+    assert all(t["function"]["name"] != "default__gmail" for t in step2)
 
 
 def test_skill_load_thinking_artifact_shows_marker(monkeypatch):
@@ -208,7 +239,7 @@ def test_skill_load_thinking_artifact_shows_marker(monkeypatch):
     skill_think = [t for t in thinks if t["data"]["Tool"] == "default__gmail"]
     assert skill_think
     args = json.loads(skill_think[0]["data"]["Tool_Input"])
-    assert args == {"request": "You need to load the SKILL.md file for skill gmail"}
+    assert args == {"request": "Load skill 'gmail' instructions (SKILL.md)"}
 
 
 # ── subscribe path ──────────────────────────────────────────────────────────
@@ -273,23 +304,31 @@ def _spec_agent(monkeypatch, tools, *, triggered_by_event=False):
     return agent
 
 
-def test_skill_spec_is_stable_and_carries_event_enum(monkeypatch):
+def test_event_skill_spec_becomes_subscribe_only_once_loaded(monkeypatch):
     gmail = _FakeSkillTool("default__gmail", "gmail",
                            events=[{"name": "new_email", "description": "new mail"}])
     agent = _spec_agent(monkeypatch, [gmail])
 
-    specs1, _ = agent._build_tools_and_dispatch()
-    # Marking the skill loaded must NOT change the spec (no exclusion) — the
-    # tools block stays byte-stable across turns for prompt caching.
-    agent._loaded_skill_ids = {"default__gmail"}
-    specs2, _ = agent._build_tools_and_dispatch()
-    assert specs1 == specs2
-
-    fn = specs1[0]["function"]
-    assert fn["name"] == "default__gmail"
-    props = fn["parameters"]["properties"]
+    # Unloaded: exposes `request` (load-and-use) plus `subscribe` (with the enum).
+    specs_unloaded, _ = agent._build_tools_and_dispatch()
+    props = specs_unloaded[0]["function"]["parameters"]["properties"]
     assert "request" in props
     assert props["subscribe"]["properties"]["trigger"]["items"]["enum"] == ["new_email"]
+
+    # Loaded: the load affordance (`request`) is dropped so the skill cannot be
+    # re-loaded; only `subscribe` remains (now required) so events still work.
+    agent._loaded_skill_ids = {"default__gmail"}
+    specs_loaded, dispatch = agent._build_tools_and_dispatch()
+    fn = specs_loaded[0]["function"]
+    assert fn["name"] == "default__gmail"
+    loaded_props = fn["parameters"]["properties"]
+    assert set(loaded_props) == {"subscribe"}
+    assert "request" not in loaded_props
+    assert fn["parameters"]["required"] == ["subscribe"]
+    assert loaded_props["subscribe"]["properties"]["trigger"]["items"]["enum"] == ["new_email"]
+    # Dispatch entry survives even though the load spec is gone, so a stray call
+    # still routes to the already-loaded short-circuit rather than "Unknown tool".
+    assert dispatch["default__gmail"][0] == "skill"
 
 
 def test_event_triggered_run_keeps_subscribe_in_spec(monkeypatch):
