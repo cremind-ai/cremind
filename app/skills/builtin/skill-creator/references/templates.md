@@ -4,6 +4,11 @@ Copy-adapt starting points. Every block has `# EDIT:` / `TODO(author)` markers
 where you fill in specifics. Adapt them — don't paste verbatim. Read `spec.md`
 for the frontmatter contract and `events.md` for the event/listener contract.
 
+**Quote the `description`** in double quotes if it contains a colon-space (`: `)
+or other YAML special character — an unquoted `:` makes YAML read a nested key,
+the frontmatter fails to parse, and the skill silently fails to load. See
+`spec.md` → Parsing rules.
+
 Contents:
 - A. Minimal `SKILL.md` (instructions-only skill)
 - B. Full `SKILL.md` (env vars + events + listener)
@@ -21,7 +26,7 @@ Cremind injects it into the conversation and the agent follows it.
 ````markdown
 ---
 name: my-skill
-description: EDIT — one or two sentences: what this does and when to load it. This is what makes the model choose it, so name the capability and the trigger.
+description: EDIT — one or two sentences on what this does and when to load it. This is what makes the model choose it, so name the capability and the trigger. (Quote the whole value in double quotes if it contains a colon-space.)
 ---
 
 # my-skill

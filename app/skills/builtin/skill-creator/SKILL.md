@@ -87,7 +87,9 @@ skill directory must not be read with System File):
    folder; create `scripts/.gitignore` (template E in `references/templates.md`).
 5. **Write `SKILL.md`.** Start from a skeleton in `references/templates.md`
    (template A for Tier A, template B for Tier B/C). Make the `description`
-   trigger-worthy, and write a body a future agent can follow with no other
+   trigger-worthy — and **quote it in double quotes if it contains a colon-space
+   (`: `)** or other YAML special char, or the frontmatter fails to parse and the
+   skill silently never loads. Write a body a future agent can follow with no other
    context (Purpose, Setup, CLI table, Examples, Event listener + event schema,
    Troubleshooting, Module layout — the shape of the shipped built-ins).
 6. **Write scripts** (Tier B/C). Adapt templates C/D: self-contained PEP-723
@@ -115,7 +117,9 @@ skill directory must not be read with System File):
     `cremind skill-events listener-start <name>` (it respawns on boot); (c) to
     automate, load the skill in the conversation that should react and ask for it
     (that creates a subscription — note subscriptions can't be created while
-    reacting to an event); (d) editing `SKILL.md` hot-reloads within ~1s.
+    reacting to an event); (d) editing `SKILL.md` hot-reloads within ~1s —
+    **re-run `validate.py` after any frontmatter edit** (an unquoted `:` or a
+    stray `---` silently drops the skill; step 7 is not a one-time gate).
 
 ## Hard rules
 
@@ -137,7 +141,9 @@ skill directory must not be read with System File):
 as Cremind's scanner does and checks: valid YAML; `name`/`description` present;
 `name` == directory; no sibling/built-in name collision; `metadata` shapes; each
 declared event has a matching folder; `long_running_app` has a command. A `PASS`
-means Cremind will load the skill.
+means Cremind will load the skill. Re-run it after **every** frontmatter edit —
+Cremind hot-reloads whatever you last saved, and a parse failure is skipped
+silently (only a server-log warning), so a stale PASS proves nothing.
 
 ## Module layout
 

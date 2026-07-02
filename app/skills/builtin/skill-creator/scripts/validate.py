@@ -92,6 +92,34 @@ def _find_skill_md(entry: Path) -> Path | None:
     return candidates[0] if candidates else None
 
 
+def _yaml_error_message(exc: yaml.YAMLError, yaml_block: str) -> str:
+    """Turn a raw PyYAML exception into an actionable validation error.
+
+    The #1 author mistake is an unquoted value containing a ``:`` followed by a
+    space (e.g. ``description: does X: then Y``). YAML reads ``X:`` as a nested
+    mapping key and rejects it with ``mapping values are not allowed here`` — the
+    frontmatter then fails to parse and Cremind silently skips the skill. Surface
+    the offending line and tell the author to quote the value.
+    """
+    msg = f"YAML frontmatter failed to parse: {exc}"
+    problem = str(getattr(exc, "problem", "") or "")
+    if "mapping values are not allowed" in problem or "mapping values are not allowed" in str(exc):
+        mark = getattr(exc, "problem_mark", None)
+        offending = ""
+        if mark is not None and getattr(mark, "line", None) is not None:
+            lines = yaml_block.splitlines()
+            if 0 <= mark.line < len(lines):
+                offending = lines[mark.line].strip()
+        msg += (
+            "\n  Hint: a value contains an unquoted ':' followed by a space, which "
+            "YAML reads as a nested key. Wrap the whole value in double quotes, e.g.\n"
+            '    description: "…text with: a colon…"'
+        )
+        if offending:
+            msg += f"\n  Offending line: {offending}"
+    return msg
+
+
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any] | None, str, str | None]:
     """Extract YAML frontmatter, mirroring ``scanner._parse_frontmatter``.
 
@@ -116,7 +144,7 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any] | None, str, str | Non
     try:
         data = yaml.safe_load(yaml_block)
     except yaml.YAMLError as exc:
-        return None, body, f"YAML frontmatter failed to parse: {exc}"
+        return None, body, _yaml_error_message(exc, yaml_block)
 
     if not isinstance(data, dict):
         return None, body, "YAML frontmatter is not a mapping (expected key: value pairs)"
