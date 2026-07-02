@@ -1,19 +1,36 @@
 ---
 name: gcalendar
 description: List, view, create, update, and delete Google Calendar events via OAuth2, and receive calendar-change events in real time. Authorizes through the Cremind Connect service (no GCP setup); tokens stay on this machine. A persistent listener uses Calendar watch channels (via the relay) and drops changed events as markdown. This is the Google Calendar skill (for CalDAV providers like iCloud/Fastmail, use caldav-calendar instead).
-metadata: {
-  environment_variables: [
-    {"name": "CREMIND_CONNECT_URL", "description": "Cremind Connect base URL (OAuth broker)", "required": false, "type": "string", "default": "https://connect.cremind.io"},
-    {"name": "GOOGLE_CLIENT_ID", "description": "Google OAuth Client ID (auto-fetched from Cremind Connect when blank)", "required": false, "type": "string", "default": ""},
-    {"name": "GOOGLE_CLIENT_SECRET", "description": "Google OAuth Client Secret (auto-fetched from Cremind Connect when blank)", "required": false, "secret": true, "type": "string", "default": ""},
-    {"name": "CALENDAR_ID", "description": "Calendar ID to operate on", "required": false, "type": "string", "default": "primary"}
-  ],
-  events: {"event_type":[{"name":"event_changed","description":"A calendar event was created, modified, or cancelled"}]},
-  long_running_app: {
-    command: "uv run scripts/event_listener.py",
-    description: "Persistent Google Calendar listener. Maintains the watch channel, subscribes to the Cremind Connect relay, and drops changed events as markdown.",
-  }
-}
+metadata:
+  environment_variables:
+    - name: CREMIND_CONNECT_URL
+      description: Cremind Connect base URL (OAuth broker)
+      required: false
+      type: string
+      default: https://connect.cremind.io
+    - name: GOOGLE_CLIENT_ID
+      description: Google OAuth Client ID (auto-fetched from Cremind Connect when blank)
+      required: false
+      type: string
+      default: ''
+    - name: GOOGLE_CLIENT_SECRET
+      description: Google OAuth Client Secret (auto-fetched from Cremind Connect when blank)
+      required: false
+      secret: true
+      type: string
+      default: ''
+    - name: CALENDAR_ID
+      description: Calendar ID to operate on
+      required: false
+      type: string
+      default: primary
+  events:
+    event_type:
+      - name: event_changed
+        description: A calendar event was created, modified, or cancelled
+  long_running_app:
+    command: uv run scripts/event_listener.py
+    description: Persistent Google Calendar listener. Maintains the watch channel, subscribes to the Cremind Connect relay, and drops changed events as markdown.
 ---
 
 # gcalendar
