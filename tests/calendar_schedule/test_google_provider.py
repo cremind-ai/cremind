@@ -5,6 +5,8 @@ these are pure-logic tests (no DB, no network, no Google)."""
 
 from __future__ import annotations
 
+import types
+
 import app.calendar.provider as P
 
 
@@ -100,17 +102,45 @@ def test_occurrence_no_match_is_readonly_google():
 class _FakeStore:
     def __init__(self, rows):
         self._rows = rows
+        self.inserted = None
 
     def list_by_profile(self, profile):
         return list(self._rows)
+
+    def insert(self, **kwargs):
+        row = {"id": "newrow", **kwargs}
+        self.inserted = row
+        return row
+
+    def update_fields(self, event_id, **fields):
+        return {"id": event_id, **fields}
+
+    def get(self, event_id):
+        return None
 
 
 def _provider_with(rows):
     gp = P.GoogleCalendarProvider("p")
     fake = _FakeStore(rows)
     gp._store = fake
-    gp._internal._store = fake  # used by the internal fallback path
+    gp._internal._store = fake  # used by the internal fallback / merge path
+    # Trigger engine is irrelevant to these pure-logic tests.
+    gp._internal._manager = lambda: types.SimpleNamespace(
+        arm=lambda row: None, refresh=lambda x: None, remove=lambda x: None,
+    )
     return gp
+
+
+# ── google_supports_rrule ────────────────────────────────────────────────────
+
+def test_google_supports_rrule():
+    assert P.google_supports_rrule(None) is True
+    assert P.google_supports_rrule("FREQ=DAILY") is True
+    assert P.google_supports_rrule("FREQ=WEEKLY;BYDAY=MO") is True
+    assert P.google_supports_rrule("FREQ=MONTHLY;BYMONTHDAY=15") is True
+    assert P.google_supports_rrule("FREQ=HOURLY;INTERVAL=2") is False
+    assert P.google_supports_rrule("freq=minutely") is False  # case-insensitive
+    assert P.google_supports_rrule("FREQ=SECONDLY") is False
 
 
 def test_list_occurrences_reconciles_mirrored_and_pure(monkeypatch):
@@ -147,6 +177,73 @@ def test_list_occurrences_falls_back_to_internal_on_api_error(monkeypatch):
     monkeypatch.setattr(gp, "_request", boom)
     occ = gp.list_occurrences("p", "2026-06-22T00:00:00", "2026-06-22T23:59:59")
     assert occ == []  # internal fallback over an empty store
+
+
+def test_list_occurrences_merges_local_only_events(monkeypatch):
+    # A mirrored row (external_event_id set) is represented by its Google item; a
+    # local-only row (never mirrored) must ALSO show while connected — otherwise
+    # locally-created reminders vanish from the page the moment Google connects.
+    rows = [
+        {  # mirrored -> comes from Google, must not be double-counted
+            "id": "row1", "external_event_id": "gbase", "title": "Mirrored",
+            "schedule_kind": "instant", "rrule": None, "status": "active",
+            "dtstart": "2026-06-22T09:00:00", "duration_minutes": 30,
+        },
+        {  # local-only -> merged in from the internal store
+            "id": "row2", "external_event_id": None, "title": "Local reminder",
+            "action": "take meds", "schedule_kind": "instant", "rrule": None,
+            "status": "active", "source": "agent", "conversation_id": "c1",
+            "dtstart": "2026-06-22T10:00:00", "duration_minutes": 30,
+        },
+    ]
+    gp = _provider_with(rows)
+    events = {"items": [
+        {"id": "gbase", "recurringEventId": "gbase", "summary": "Mirrored",
+         "start": {"dateTime": "2026-06-22T09:00:00+00:00"},
+         "end": {"dateTime": "2026-06-22T09:30:00+00:00"}},
+    ]}
+    monkeypatch.setattr(gp, "_request", lambda method, path, **kw: events)
+
+    occ = gp.list_occurrences("p", "2026-06-22T00:00:00", "2026-06-22T23:59:59")
+    assert sum(1 for o in occ if o["title"] == "Mirrored") == 1  # no duplicate
+    local = [o for o in occ if o["title"] == "Local reminder"]
+    assert len(local) == 1
+    assert local[0]["subscription_id"] == "row2" and local[0]["action"] == "take meds"
+
+
+def test_create_event_skips_google_mirror_for_subdaily(monkeypatch):
+    gp = _provider_with([])
+
+    def boom(*a, **k):
+        raise AssertionError("must not mirror a sub-daily recurrence to Google")
+
+    monkeypatch.setattr(gp, "_request", boom)
+    row = gp.create_event(
+        profile="p", conversation_id="c1", title="meds", action="take meds",
+        schedule_kind="recurrence", dtstart="2026-06-22T09:00:00",
+        duration_minutes=30, rrule="FREQ=HOURLY;INTERVAL=2",
+    )
+    # Row created locally (fires + shows via merge), never mirrored to Google.
+    assert row["rrule"] == "FREQ=HOURLY;INTERVAL=2"
+    assert not row.get("external_event_id")
+
+
+def test_create_event_mirrors_supported_recurrence(monkeypatch):
+    gp = _provider_with([])
+    seen = {}
+
+    def fake_request(method, path, **kw):
+        seen["method"] = method
+        return {"id": "gnew"}
+
+    monkeypatch.setattr(gp, "_request", fake_request)
+    row = gp.create_event(
+        profile="p", conversation_id="c1", title="standup", action="",
+        schedule_kind="recurrence", dtstart="2026-06-22T09:00:00",
+        duration_minutes=30, rrule="FREQ=DAILY",
+    )
+    assert seen.get("method") == "POST"
+    assert row.get("external_event_id") == "gnew"
 
 
 # ── route presence ──────────────────────────────────────────────────────────

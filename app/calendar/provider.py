@@ -322,6 +322,18 @@ class InternalCalendarProvider(CalendarProvider):
         persisted. Cancelled rows are skipped; completed/active are included so
         past one-shots still show on the calendar.
         """
+        return self._expand_subscriptions(
+            self._store.list_by_profile(profile), range_start, range_end,
+        )
+
+    def _expand_subscriptions(
+        self, subs: List[Dict[str, Any]], range_start: str, range_end: str,
+    ) -> List[Dict[str, Any]]:
+        """Expand the given subscription rows into occurrences within the window.
+
+        Shared by :meth:`list_occurrences` and :class:`GoogleCalendarProvider`,
+        which merges local-only rows alongside the events it fetches from Google.
+        """
         rs = R.parse_local(range_start)
         re_ = R.parse_local(range_end)
         # Widen the expansion start so a multi-day event that began before the
@@ -329,7 +341,7 @@ class InternalCalendarProvider(CalendarProvider):
         # spans are expanded by their dtstart, which may sit just before rs.)
         rs_expand = rs - timedelta(days=_MULTIDAY_LOOKBACK_DAYS)
         out: List[Dict[str, Any]] = []
-        for sub in self._store.list_by_profile(profile):
+        for sub in subs:
             if sub.get("status") == "cancelled":
                 continue
             until = sub.get("recurrence_end_value") if sub.get("recurrence_end_type") == "until" else None
@@ -365,6 +377,20 @@ class InternalCalendarProvider(CalendarProvider):
 
 class GoogleApiError(RuntimeError):
     pass
+
+
+# Google Calendar recurrence supports only DAILY/WEEKLY/MONTHLY/YEARLY; sub-daily
+# frequencies (hourly/minutely/secondly) are rejected by the API with HTTP 400.
+_GOOGLE_UNSUPPORTED_FREQS = ("SECONDLY", "MINUTELY", "HOURLY")
+
+
+def google_supports_rrule(rrule: Optional[str]) -> bool:
+    """Whether ``rrule`` can be mirrored to Google Calendar. A one-shot (no
+    rrule) is fine; a sub-daily ``FREQ`` (hourly/minutely/secondly) is not."""
+    if not rrule:
+        return True
+    up = rrule.upper()
+    return not any(f"FREQ={f}" in up for f in _GOOGLE_UNSUPPORTED_FREQS)
 
 
 def _to_rfc3339_local(naive_iso: str) -> str:
@@ -515,6 +541,14 @@ class GoogleCalendarProvider(CalendarProvider):
     # ── CRUD (internal row is the source of truth for triggering) ───────
     def create_event(self, **kwargs: Any) -> Dict[str, Any]:
         row = self._internal.create_event(**kwargs)
+        if not google_supports_rrule(row.get("rrule")):
+            # Sub-daily recurrence Google can't store: keep it local-only (it still
+            # fires and shows via the list_occurrences merge). No mirror attempt.
+            logger.info(
+                f"[google] event {row['id']} rrule={row.get('rrule')!r} is sub-daily; "
+                "kept local-only (Google Calendar can't store it)"
+            )
+            return row
         try:
             ev = self._request("POST", f"/calendars/{self.CALENDAR_ID}/events", json_body=self._mirror_body(row))
             gid = ev.get("id")
@@ -528,7 +562,7 @@ class GoogleCalendarProvider(CalendarProvider):
 
     def update_event(self, event_id: str, **fields: Any) -> Optional[Dict[str, Any]]:
         row = self._internal.update_event(event_id, **fields)
-        if row and row.get("external_event_id"):
+        if row and row.get("external_event_id") and google_supports_rrule(row.get("rrule")):
             try:
                 self._request(
                     "PATCH", f"/calendars/{self.CALENDAR_ID}/events/{row['external_event_id']}",
@@ -588,6 +622,12 @@ class GoogleCalendarProvider(CalendarProvider):
             occ = _google_event_to_occurrence(ev, match)
             if occ.get("start"):
                 out.append(occ)
+        # Merge local-only Cremind events (never mirrored to Google) so they still
+        # show while connected — e.g. sub-daily reminders Google can't store, or
+        # events created before connecting / whose mirror POST failed. Mirrored
+        # rows stay represented by their Google copy above, so no double-counting.
+        local_only = [r for r in rows if not r.get("external_event_id")]
+        out.extend(self._internal._expand_subscriptions(local_only, range_start, range_end))
         out.sort(key=lambda e: e["start"])
         return out
 
