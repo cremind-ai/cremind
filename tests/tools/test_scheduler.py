@@ -199,6 +199,24 @@ def test_recurrence_count_no_preview_for_monthly():
     assert "preview" not in rec  # monthly: no preview
 
 
+def test_recurrence_subdaily_anchors_to_now():
+    # "every 2 hours" has no time-of-day anchor and no bounded preview. dtstart
+    # must be anchored to now (rounded to the minute) so the grid starts ~now,
+    # rather than left unset for the LLM to invent (and potentially forward stale).
+    out = _run({
+        "reasoning": "every 2 hours",
+        "parsable": True,
+        "schedule_kind": "recurrence",
+        "time_elements": [],
+        "components_count": 0,
+        "recurrence": {"frequency": "hourly", "interval": 2},
+        "_now": NOW,
+    })
+    rec = out["recurrence"]
+    assert rec["rrule"] == "FREQ=HOURLY;INTERVAL=2"
+    assert rec["dtstart"] == "2026-06-20T14:30:00"  # now, rounded to the minute
+
+
 def test_recurrence_ordinal_first_monday():
     out = _run({
         "reasoning": "first Monday of each month",

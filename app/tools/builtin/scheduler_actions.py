@@ -19,6 +19,7 @@ fires the action in the conversation that created it (via the injected
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
@@ -133,6 +134,16 @@ class ScheduleCreateTool(BuiltInTool):
                     "'never'."
                 ),
             },
+            "allow_local_only": {
+                "type": "boolean",
+                "description": (
+                    "Set true ONLY after the user confirms they want a Cremind-only "
+                    "reminder that won't appear on their connected Google Calendar. "
+                    "Use it to proceed past the 'google_unsupported_recurrence' "
+                    "warning — Google Calendar can't store sub-daily recurring "
+                    "events (hourly/every-few-minutes). Leave omitted otherwise."
+                ),
+            },
         },
         "required": ["title", "dtstart"],
         "additionalProperties": False,
@@ -156,6 +167,29 @@ class ScheduleCreateTool(BuiltInTool):
         action = (arguments.get("action") or "").strip() or title
         rrule = (arguments.get("rrule") or "").strip() or None
         all_day = bool(arguments.get("all_day", False))
+
+        # Guard against a stale/past dtstart on a recurrence (e.g. an anchor
+        # carried over from replayed reasoning history): roll it forward to the
+        # first occurrence at/after now so we never persist a past anchor. This
+        # preserves the rule's cadence/phase and keeps dtstart consistent with the
+        # provider-seeded next_fire_at.
+        if rrule:
+            from app.calendar import recurrence as _R
+            try:
+                now = datetime.now().replace(microsecond=0)
+                if _R.parse_local(dtstart) < now:
+                    until = (
+                        arguments.get("recurrence_end_value")
+                        if arguments.get("recurrence_end_type") == "until"
+                        else None
+                    )
+                    occ = _R.first_occurrence_on_or_after(
+                        rrule=rrule, dtstart=dtstart, moment=now, until=until,
+                    )
+                    if occ is not None:
+                        dtstart = _R.format_local(occ)
+            except Exception:  # noqa: BLE001 — keep the LLM-supplied dtstart on any parse error
+                pass
 
         # Duration: explicit minutes, else derived from an `end` (span / multi-day).
         duration_minutes = int(arguments.get("duration_minutes") or 0)
@@ -184,8 +218,29 @@ class ScheduleCreateTool(BuiltInTool):
                 "message": "Could not resolve the active conversation.",
             })
 
-        from app.calendar.provider import get_calendar_provider
+        from app.calendar.provider import get_calendar_provider, google_supports_rrule
         provider = get_calendar_provider(profile)
+
+        # Google Calendar can't store sub-daily recurrences (hourly/minutely). When
+        # Google is the active provider, warn instead of silently creating a
+        # reminder that never shows on the user's Google Calendar — unless they've
+        # explicitly opted into a Cremind-only reminder.
+        if (
+            rrule
+            and getattr(provider, "name", "") == "google"
+            and not google_supports_rrule(rrule)
+            and not bool(arguments.get("allow_local_only", False))
+        ):
+            return BuiltInToolResult(structured_content={
+                "ok": False,
+                "error": "google_unsupported_recurrence",
+                "message": (
+                    "Google Calendar can't store sub-daily recurring reminders "
+                    "(e.g. hourly or every-few-minutes). Ask the user to pick a "
+                    "daily-or-coarser cadence, or to confirm they want a "
+                    "Cremind-only reminder (then retry with allow_local_only=true)."
+                ),
+            })
         try:
             row = provider.create_event(
                 profile=profile,
