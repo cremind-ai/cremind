@@ -113,16 +113,18 @@ function barClass(seg: DaySegment) {
 
 <style scoped>
 .cal-month { display: flex; flex-direction: column; border: 1px solid var(--border-color); border-radius: 12px; overflow: hidden; background: var(--surface-color); }
-.cal-dow-row { display: grid; grid-template-columns: repeat(7, 1fr); background: var(--hover-bg); }
+.cal-dow-row { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); background: var(--hover-bg); }
 .cal-dow { padding: 8px; text-align: center; font-size: 0.72rem; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--text-tertiary); }
 .cal-grid { display: flex; flex-direction: column; }
 
-.cal-week { position: relative; display: grid; grid-template-columns: repeat(7, 1fr); }
+.cal-week { position: relative; display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
 .cal-week:not(:last-child) { border-bottom: 1px solid var(--border-color); }
 
 .cal-day {
   position: relative;
+  min-width: 0;
   min-height: 116px;
+  overflow: hidden;
   padding: 4px 4px 6px;
   border-right: 1px solid var(--border-color);
   display: flex; flex-direction: column;
@@ -152,7 +154,7 @@ function barClass(seg: DaySegment) {
 .cal-chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--primary-color); flex: none; }
 .cal-chip.done { opacity: .5; }
 .cal-chip .t { color: var(--text-tertiary); font-variant-numeric: tabular-nums; flex: none; }
-.cal-chip .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cal-chip .title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cal-more { border: none; background: transparent; color: var(--text-tertiary); font-size: .7rem; cursor: pointer; text-align: left; padding: 1px 4px; }
 .cal-more:hover { color: var(--primary-color); }
 
@@ -168,5 +170,5 @@ function barClass(seg: DaySegment) {
 .cal-mbar.done { opacity: .55; }
 .cal-mbar.continues-left { border-top-left-radius: 0; border-bottom-left-radius: 0; }
 .cal-mbar.continues-right { border-top-right-radius: 0; border-bottom-right-radius: 0; }
-.mbar-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mbar-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
