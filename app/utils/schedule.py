@@ -477,6 +477,16 @@ def _compute_recurrence(arguments: dict, now_str: str) -> dict:
     if preview:
         dtstart_iso = preview[0]
 
+    # A bare sub-daily recurrence ("every 2 hours") has no time-of-day anchor and
+    # no bounded preview, leaving dtstart unset — anchor it to now (rounded to the
+    # minute) so its grid is fresh (starting ~now) and the LLM never has to invent,
+    # or forward a stale, dtstart. Daily+ recurrences keep their existing behavior
+    # (preview snap, or LLM-supplied anchor). Parse tolerantly: now_str may carry
+    # microseconds.
+    if not dtstart_iso and str(rec.frequency).lower() in ("secondly", "minutely", "hourly"):
+        anchor = datetime.fromisoformat(now_str).replace(second=0, microsecond=0, tzinfo=None)
+        dtstart_iso = _dt_to_iso(anchor)
+
     if until_iso:
         recurrence_end = {"type": "until", "value": until_iso}
     elif rec.count:

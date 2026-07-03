@@ -156,6 +156,15 @@ access; the OAuth callback completes the link server-side (same pattern as
 or the Google client isn't configured) it returns `409 unavailable`.
 `disconnect` drops the stored token.
 
+While connected, new events are mirrored to Google Calendar, and the `events`
+view merges your Google events with Cremind-managed ones. **Sub-daily
+recurrences** (hourly / every-few-minutes, e.g. `FREQ=HOURLY`) are the one
+exception: Google Calendar only stores `DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY`
+recurrences, so a sub-daily reminder stays **Cremind-only** — it still fires and
+still shows in `cremind calendar events`, but it will not appear on Google
+Calendar. (Creating one through the agent's `schedule_create` tool warns and
+asks you to confirm; `cremind calendar add` just keeps it local.)
+
 ### `cremind calendar schedule list`
 
 **Purpose.** List the raw schedule-event subscriptions for the active profile
@@ -213,6 +222,12 @@ Calendar & Schedule setup docs.
 **Created an event but it never fires** — Confirm `cremind calendar settings`
 shows `enabled: true` (disabling the feature disarms events) and that
 `cremind calendar schedule status` is `active`, not `paused`/`cancelled`.
+
+**Added a recurring reminder but it's not on Google Calendar** — If it's a
+sub-daily recurrence (e.g. "every 2 hours" → `FREQ=HOURLY`), Google Calendar
+can't store it; it stays Cremind-only. It still fires and still shows in
+`cremind calendar events`. Use a daily-or-coarser cadence to have it appear on
+Google Calendar.
 
 ## Related
 
