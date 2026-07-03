@@ -63,6 +63,10 @@ migration will break existing installs on upgrade.
   split destructive changes across two releases, backfill **inside** the
   migration, and test the upgrade from a real older install (not just a fresh
   DB).
+- Migrations must work on **both SQLite and PostgreSQL** — Cremind supports
+  both backends. Avoid backend-specific SQL and DDL that one engine can't run
+  (e.g. SQLite can't `ALTER COLUMN`; use batch operations / `op.batch_alter_table`),
+  and test the upgrade against each.
 - Only bump `MIN_SUPPORTED_UPGRADE_FROM` in
   [app/__version__.py](app/__version__.py) when explicitly dropping support for
   older versions.
