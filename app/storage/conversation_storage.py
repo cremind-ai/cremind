@@ -9,8 +9,7 @@ from app.databases import DatabaseProvider, get_database_provider
 from app.storage.migrations import ensure_at_head
 from app.storage.models import (
     ChannelModel, ChannelSenderModel, ConversationModel,
-    FileWatcherSubscriptionModel, MessageModel, ProfileModel,
-    SkillEventSubscriptionModel,
+    MessageModel, ProfileModel,
 )
 from app.utils.logger import logger
 
@@ -327,10 +326,12 @@ class ConversationStorage:
     ) -> dict | None:
         """Rename a conversation's primary id, cascading to FK children.
 
-        Atomic across `messages.conversation_id` and
-        `skill_event_subscriptions.conversation_id` via SQLite's
-        ``PRAGMA defer_foreign_keys=ON`` (FKs are re-checked at COMMIT, so the
-        parent row can be updated before all children).
+        Atomic across **every** table with a foreign key to
+        ``conversations.id`` — discovered from the ORM metadata rather than a
+        hand-maintained list, so a table that later adds such an FK is repointed
+        automatically. Relies on SQLite's ``PRAGMA defer_foreign_keys=ON`` (FKs
+        are re-checked at COMMIT, so the parent row can be updated before all
+        children).
 
         Returns the refreshed conversation dict on success, or ``None`` if
         ``old_id`` does not exist or ``new_id`` is already in use.
@@ -367,21 +368,21 @@ class ConversationStorage:
             # COMMIT — scoped to this connection/transaction.
             await session.execute(text("PRAGMA defer_foreign_keys=ON"))
 
-            await session.execute(
-                update(MessageModel)
-                .where(MessageModel.conversation_id == old_id)
-                .values(conversation_id=new_id)
-            )
-            await session.execute(
-                update(SkillEventSubscriptionModel)
-                .where(SkillEventSubscriptionModel.conversation_id == old_id)
-                .values(conversation_id=new_id)
-            )
-            await session.execute(
-                update(FileWatcherSubscriptionModel)
-                .where(FileWatcherSubscriptionModel.conversation_id == old_id)
-                .values(conversation_id=new_id)
-            )
+            # Repoint every child column that FK-references conversations.id,
+            # discovered from the schema so new FK tables are covered without a
+            # code change here. Order is irrelevant under defer_foreign_keys;
+            # sorted_tables is used only for determinism.
+            conv_table = ConversationModel.__table__
+            for table in conv_table.metadata.sorted_tables:
+                if table is conv_table:
+                    continue
+                for column in table.columns:
+                    if any(fk.column is conv_table.c.id for fk in column.foreign_keys):
+                        await session.execute(
+                            table.update()
+                            .where(column == old_id)
+                            .values({column.key: new_id})
+                        )
 
             now = time.time() * 1000
             values: dict = {
