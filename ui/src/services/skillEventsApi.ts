@@ -56,9 +56,21 @@ export interface EventNotificationEntry {
   conversation_id: string;
   conversation_title: string;
   message_preview: string;
-  kind: 'started' | 'completed' | 'error' | 'channel_otp' | 'skill_register_required';
+  kind:
+    | 'started'
+    | 'completed'
+    | 'error'
+    | 'channel_otp'
+    | 'skill_register_required'
+    | 'event_run_pending'
+    | 'event_run_completed'
+    | 'event_run_failed';
   priority?: 'high' | 'normal';
   created_at: number;
+  // Event-run extras (when kind starts with 'event_run_').
+  event_run_id?: string;
+  source_kind?: string;
+  subscription_id?: string;
   // Channel-specific extras when kind === 'channel_otp'.
   channel_id?: string;
   channel_type?: string;

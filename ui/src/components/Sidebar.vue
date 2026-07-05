@@ -2,7 +2,7 @@
 import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { Icon } from '@iconify/vue';
-import { ElBadge, ElButton, ElDialog, ElInput, ElMessage, ElOption, ElPopover, ElSelect, ElSwitch, ElTooltip } from 'element-plus';
+import { ElBadge, ElButton, ElDialog, ElInput, ElMessage, ElNotification, ElOption, ElPopover, ElSelect, ElSwitch, ElTooltip } from 'element-plus';
 import { useSettingsStore } from '../stores/settings';
 import { useChatStore } from '../stores/chat';
 import { useNotificationsStore } from '../stores/notifications';
@@ -138,12 +138,32 @@ watch(
         // the sidebar can lazily open that SSE and the streaming-dot lights
         // up even for conversations the user has never visited this session.
         if (entry.kind === 'started') {
+          // Event runs never emit 'started' (their hidden conversation must not
+          // be lazy-tracked into the sidebar) — this only fires for chat runs.
           console.log('[debug:notif] handling started for', entry.conversation_id);
           const { runtime } = chatStore.ensureBucket(entry.conversation_id);
           runtime.isStreaming = true;
           runtime.startedAt = Date.now();
           chatStore.trackConversation(entry.conversation_id, 'streaming');
           return;
+        }
+        // Event-run notifications never lazy-track their hidden conversation
+        // (they must not appear in the sidebar). A run awaiting the user's
+        // reply raises a sticky toast that deep-links to the run detail.
+        if (entry.kind === 'event_run_pending' && entry.event_run_id) {
+          const profile = route.params.profile as string;
+          const runId = entry.event_run_id;
+          ElNotification({
+            title: 'Event run needs your input',
+            message: entry.message_preview || entry.conversation_title,
+            type: 'warning',
+            duration: 0,
+            onClick: () => {
+              if (profile) {
+                router.push({ name: 'skill-events', params: { profile }, query: { run: runId } });
+              }
+            },
+          });
         }
         // The user is already watching this conversation — record the
         // notification but pre-mark it seen so the bell badge doesn't bump
@@ -166,6 +186,8 @@ watch(
           otp: entry.otp,
           skillId: entry.skill_id,
           skillName: entry.skill_name,
+          eventRunId: entry.event_run_id,
+          sourceKind: entry.source_kind,
         });
         if (!isActive) triggerBellAnimation(priority);
       },

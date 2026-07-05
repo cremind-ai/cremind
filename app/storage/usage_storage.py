@@ -63,16 +63,23 @@ class UsageStorage:
 
     async def add_usage_records(
         self,
-        conversation_id: str,
+        conversation_id: str | None,
         profile: str,
         records: list[UsageRecordInput],
         message_id: str | None = None,
+        event_run_id: str | None = None,
     ) -> list[str]:
         """Insert one turn's attributed usage rows in a single transaction.
 
         Cost is frozen per row from current catalog rates. Returns the new row
         ids. Silently no-ops on an empty list. Never raises on a pricing error —
         cost falls back to NULL so usage is recorded regardless.
+
+        ``conversation_id`` may be ``None`` (e.g. an event-gate rejection that
+        never opened a conversation). ``event_run_id`` is stamped on every row
+        when the turn ran inside a hidden event-run conversation, so per-run
+        usage stays attributable even after the run and its conversation are
+        deleted.
         """
         if not records:
             return []
@@ -103,6 +110,7 @@ class UsageStorage:
                 id=rid,
                 conversation_id=conversation_id,
                 message_id=message_id,
+                event_run_id=event_run_id,
                 profile=profile,
                 provider=provider,
                 model=model,
@@ -165,6 +173,45 @@ class UsageStorage:
                 )
             )).one()
         return self._totals_row_to_dict(row)
+
+    async def rollup_by_event_run(self, run_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Token + cost totals per event run, keyed by ``event_run_id``.
+
+        One ``GROUP BY event_run_id`` over ``usage_records`` — the source of
+        truth for per-run usage that survives deletion of the run and its
+        conversation (usage rows outlive both; ``event_run_id`` stays set).
+        Returns only runs that have at least one usage row.
+        """
+        if not run_ids:
+            return {}
+        async with self.async_session_maker() as session:
+            stmt = (
+                select(
+                    UsageRecordModel.event_run_id,
+                    func.coalesce(func.sum(UsageRecordModel.input_tokens), 0),
+                    func.coalesce(func.sum(UsageRecordModel.cache_read_input_tokens), 0),
+                    func.coalesce(func.sum(UsageRecordModel.cache_creation_input_tokens), 0),
+                    func.coalesce(func.sum(UsageRecordModel.output_tokens), 0),
+                    func.sum(UsageRecordModel.total_usd),
+                    func.count(func.distinct(UsageRecordModel.message_id)),
+                )
+                .where(UsageRecordModel.event_run_id.in_(run_ids))
+                .group_by(UsageRecordModel.event_run_id)
+            )
+            rows = (await session.execute(stmt)).all()
+        out: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            it, cr, cc, ot = int(r[1]), int(r[2]), int(r[3]), int(r[4])
+            out[r[0]] = {
+                "input_tokens": it,
+                "cache_read_input_tokens": cr,
+                "cache_creation_input_tokens": cc,
+                "output_tokens": ot,
+                "total_tokens": it + cr + cc + ot,
+                "total_usd": float(r[5]) if r[5] is not None else 0.0,
+                "request_count": int(r[6]),
+            }
+        return out
 
     # ── dashboard reads (optional profile / time-range scope) ────────────────
 
@@ -284,6 +331,11 @@ class UsageStorage:
                 ).join(
                     ConversationModel,
                     ConversationModel.id == UsageRecordModel.conversation_id,
+                ).where(
+                    # After a conversation delete the FK SET-NULLs conversation_id
+                    # (usage totals still count it), but there is no id/title left
+                    # to rank — exclude those rows from the leaderboard.
+                    UsageRecordModel.conversation_id.is_not(None),
                 ),
                 profile, start_ms, end_ms,
             ).group_by(

@@ -41,16 +41,19 @@ async def _record_gate_usage(
     *,
     llm: Any,
     tokens: dict,
-    conversation_id: str,
+    conversation_id: str | None,
     profile: str,
     event_type: str,
     message_id: str | None,
+    event_run_id: str | None = None,
 ) -> None:
     """Persist the matching gate's LLM call as an ``event_gate`` usage record.
 
     Best-effort: usage accounting must never break event delivery. The gate runs
     a cheap model, but its cost is still attributed (per the product requirement)
-    as a request type distinct from reasoning/tool calls.
+    as a request type distinct from reasoning/tool calls. ``conversation_id`` may
+    be ``None`` (a rejected event never opens a conversation); ``event_run_id``
+    attributes matched-gate cost to the run it precedes.
     """
     if llm is None or not tokens or not any(tokens.values()):
         return
@@ -76,6 +79,7 @@ async def _record_gate_usage(
             profile=profile,
             records=[record.to_dict()],
             message_id=message_id,
+            event_run_id=event_run_id,
         )
     except Exception:  # noqa: BLE001
         logger.exception("[skill_event] failed to record event_gate usage")

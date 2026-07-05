@@ -71,3 +71,9 @@ enabled = false                # opt-in; setup wizard offers to flip this to tru
 long_term_queue_size = 20      # max long-term facts kept in the DB queue (embedding-off mode; vector mode is unlimited)
 long_term_max_tokens = 50      # clip each long-term fact to this many tokens (both modes)
 long_term_retrieve_limit = 10  # top-K long-term facts retrieved from the vector store for the ## Memory block (embedding-on mode)
+
+[event_runs]
+# Each fired event trigger (skill / file-watcher / schedule) runs in its own
+# hidden conversation, in parallel. These are process-global engine knobs.
+max_parallel_runs = 5          # max simultaneous event-triggered agent runs (server-wide)
+run_history_cap = 50           # run records kept per event rule; older terminal runs are pruned automatically

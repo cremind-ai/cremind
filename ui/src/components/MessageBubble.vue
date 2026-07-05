@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { computed, inject, ref, watch } from 'vue';
 import type { ChatMessage, FileAttachment, TerminalAttachment } from '../stores/chat';
+import { OpenTerminalKey } from '../composables/terminalTarget';
 import { Marked } from 'marked';
 import { markedHighlight } from 'marked-highlight';
 import hljs from 'highlight.js';
@@ -9,10 +10,16 @@ import { Icon } from '@iconify/vue';
 import { copyTextToClipboard } from '../utils/clipboard';
 import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
+import { getProcess } from '../services/processApi';
+import { ElMessage } from 'element-plus';
 import MessageUsageChip from './MessageUsageChip.vue';
 
 const props = defineProps<{
   message: ChatMessage;
+  // When embedded (e.g. the event-run drawer), the id of the conversation this
+  // bubble belongs to — forwarded to MessageUsageChip so it resolves usage for
+  // the right conversation instead of the globally-active one.
+  conversationId?: string | null;
 }>();
 
 const settingsStore = useSettingsStore();
@@ -199,7 +206,11 @@ const openFileInNewTab = async (uri: string) => {
   if (!tab) return;
   try {
     const resp = await fetch(resolveFileUrl(uri), { headers: authHeaders() });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    if (!resp.ok) {
+      tab.close();
+      if (resp.status === 404) ElMessage.warning('This file is no longer available.');
+      return;
+    }
     const blob = await resp.blob();
     const blobUrl = URL.createObjectURL(blob);
     tab.location.href = blobUrl;
@@ -212,7 +223,10 @@ const openFileInNewTab = async (uri: string) => {
 const downloadFile = async (uri: string, name: string) => {
   try {
     const resp = await fetch(resolveFileUrl(uri), { headers: authHeaders() });
-    if (!resp.ok) return;
+    if (!resp.ok) {
+      if (resp.status === 404) ElMessage.warning('This file is no longer available.');
+      return;
+    }
     const blob = await resp.blob();
     const blobUrl = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -237,11 +251,19 @@ const isPdfMime = (mime: string): boolean => {
   return mime === 'application/pdf';
 };
 
+// Image-thumbnail URIs that failed to load (deleted/moved files) — render the
+// generic file icon instead of a broken <img>.
+const failedThumbs = ref<Set<string>>(new Set());
+
 // Copy file text content to clipboard
 const fileCopied = ref<string | null>(null);
 const copyFileContent = async (url: string, fileName: string) => {
   try {
     const resp = await fetch(url, { headers: authHeaders() });
+    if (!resp.ok) {
+      if (resp.status === 404) ElMessage.warning('This file is no longer available.');
+      return;
+    }
     const text = await resp.text();
     if (!(await copyTextToClipboard(text))) return;
     fileCopied.value = fileName;
@@ -284,8 +306,27 @@ const hasCarouselContent = computed(
 );
 
 const terminalPanel = useTerminalPanelStore();
+// A surrounding surface (e.g. the event-run drawer) can provide its own
+// terminal-open handler; otherwise fall back to the global Workspace panel.
+const injectedOpenTerminal = inject(OpenTerminalKey, null);
 
-const openTerminal = (term: TerminalAttachment) => {
+const openTerminal = async (term: TerminalAttachment) => {
+  // Terminal processes live only in an in-memory registry (they die on server
+  // restart / TTL), so a persisted chip often points at a process that's gone.
+  // Probe before opening and surface "not found" instead of a dead panel. Skip
+  // the probe while streaming — the process is known-live and being watched.
+  if (!props.message.isStreaming) {
+    try {
+      await getProcess(settingsStore.agentUrl, settingsStore.authToken, term.processId);
+    } catch {
+      ElMessage.warning('This terminal is no longer available.');
+      return;
+    }
+  }
+  if (injectedOpenTerminal) {
+    injectedOpenTerminal(term);
+    return;
+  }
   terminalPanel.openTerminal(term);
 };
 
@@ -427,7 +468,7 @@ const handleThinkingClick = (event: MouseEvent) => {
       <span v-if="message.isStreaming" class="streaming-cursor">▊</span>
 
       <!-- Token usage + estimated cost (expandable per sub-agent/tool) -->
-      <MessageUsageChip v-if="message.tokenUsage" :message="message" />
+      <MessageUsageChip v-if="message.tokenUsage" :message="message" :conversation-id="conversationId" />
 
       <!-- Latency information -->
       <div v-if="latencyDisplay && !isUser" class="latency-info">
@@ -514,9 +555,9 @@ const handleThinkingClick = (event: MouseEvent) => {
             <Icon icon="mdi:console" class="file-chip-icon terminal-icon" />
             <span class="file-chip-name">{{ term.commandShort || term.command }}</span>
           </div>
-          <div v-for="(file, fIdx) in fileAttachments" :key="fIdx" class="file-chip" :class="{ 'file-chip-image': isImageMime(file.mimeType) }">
-            <!-- Image thumbnail -->
-            <img v-if="isImageMime(file.mimeType)" :src="resolveFileUrl(file.uri)" :alt="file.name" class="file-chip-thumb" loading="lazy" />
+          <div v-for="(file, fIdx) in fileAttachments" :key="fIdx" class="file-chip" :class="{ 'file-chip-image': isImageMime(file.mimeType) && !failedThumbs.has(file.uri) }">
+            <!-- Image thumbnail (falls back to a file icon if the image is gone) -->
+            <img v-if="isImageMime(file.mimeType) && !failedThumbs.has(file.uri)" :src="resolveFileUrl(file.uri)" :alt="file.name" class="file-chip-thumb" loading="lazy" @error="failedThumbs.add(file.uri)" />
             <!-- File type icon -->
             <Icon v-else :icon="getFileIcon(file.mimeType)" class="file-chip-icon" :class="{ 'pdf-icon': isPdfMime(file.mimeType), 'text-icon': file.mimeType?.startsWith('text/') }" />
             <span class="file-chip-name" :title="file.name">{{ file.name }}</span>

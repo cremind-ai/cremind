@@ -9,7 +9,12 @@ import { Icon } from '@iconify/vue';
 const props = defineProps<{
   messages: ChatMessage[];
   isStreaming?: boolean;
+  // Set when embedded (event-run drawer): forwarded to each bubble's usage chip
+  // and suppresses the compaction banner (a main-chat-only affordance).
+  conversationId?: string | null;
 }>();
+
+const embedded = computed(() => props.conversationId != null);
 
 const chatStore = useChatStore();
 
@@ -92,18 +97,20 @@ const scrollToBottom = () => {
     </div>
     
     <TransitionGroup v-else name="message-list" tag="div" class="messages-list">
-      <MessageBubble 
-        v-for="message in messages" 
-        :key="message.id" 
+      <MessageBubble
+        v-for="message in messages"
+        :key="message.id"
         :message="message"
+        :conversation-id="conversationId"
       />
     </TransitionGroup>
 
     <ThinkingIndicator v-if="isStreaming" :label="thinkingLabel" />
 
-    <!-- Compaction suggestion: subtle, non-blocking; suggest-only (never forced). -->
+    <!-- Compaction suggestion: subtle, non-blocking; suggest-only (never forced).
+         Suppressed in embedded (event-run drawer) mini chats. -->
     <Transition name="compaction-fade">
-      <div v-if="compaction && !isStreaming" class="compaction-banner">
+      <div v-if="compaction && !isStreaming && !embedded" class="compaction-banner">
         <Icon icon="mdi:archive-arrow-down-outline" class="compaction-icon" />
         <div class="compaction-text">
           <strong>This chat is getting long.</strong>

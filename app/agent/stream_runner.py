@@ -27,6 +27,8 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import mimetypes
+import os
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -194,6 +196,8 @@ async def run_agent_to_bus(
     publish_notification: bool = False,
     update_title_from_query: bool = True,
     trigger_event: Dict[str, Any] | None = None,
+    event_run_id: str | None = None,
+    event_run: bool = False,
 ) -> None:
     """Run the reasoning agent for one conversation, publishing chunks to the bus.
 
@@ -218,6 +222,20 @@ async def run_agent_to_bus(
     # them precisely (mirrors the legacy executor's ContextVar usage).
     ctx_token = current_task_id_var.set(run_id)
     _running_runs[run_id] = asyncio.current_task()
+
+    # Event-run start hook: mark the tracking row running (this turn's stream
+    # run_id is the cancel target) and clear any stale pending flag. Done once
+    # per turn — the trigger turn and any user-reply turns all pass through here.
+    if event_run_id:
+        from app.events import run_state
+        run_state.clear(run_id)
+        try:
+            from app.storage import get_event_run_storage
+            await get_event_run_storage().update_status(
+                event_run_id, status="running", run_id=run_id, clear_pending=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(f"stream_runner: failed to mark event run running for {event_run_id}")
 
     # Capture conversation context up front. We allow get_conversation to
     # fail (e.g. transient DB hiccup) without aborting the run -- the agent
@@ -266,7 +284,11 @@ async def run_agent_to_bus(
     # the 'streaming' tracker that opens the per-conversation SSE. Push a
     # started notification on the global notifications stream so the sidebar
     # can lazily open that SSE and light up the streaming-dot.
-    if publish_notification:
+    #
+    # Event runs are excluded: their conversations are hidden (never in the
+    # sidebar), so a 'started' entry would wrongly lazy-track a hidden conv.
+    # They get event-run-specific notifications at the terminal boundary below.
+    if publish_notification and not event_run_id:
         try:
             logger.debug(
                 f"[debug:started] pushing started notification "
@@ -286,6 +308,12 @@ async def run_agent_to_bus(
     final_text_parts: List[str] = []
     collected_thinking_steps: List[dict] = []
     collected_file_parts: List[Part] = []
+    # Long-running terminal artifacts, collected as flat DataPart dicts so a
+    # reload can re-render the terminal chip (see mapBackendMessage on the UI
+    # side, which keys off ``kind:"data"`` + ``data.process_id``). Deduped by
+    # process_id across the turn's observations.
+    collected_terminal_parts: List[dict] = []
+    seen_terminal_pids: set[str] = set()
     total_input_tokens = 0
     total_cache_read_input_tokens = 0
     total_cache_creation_input_tokens = 0
@@ -341,13 +369,34 @@ async def run_agent_to_bus(
                 "metadata": user_message_metadata or {},
             })
         elif push_user_message:
+            # Persist composer-uploaded attachments as file parts on the user
+            # message so they re-render as file chips on reload (their abs path
+            # lives under CREMIND_SYSTEM_DIR, so the ``uri`` is servable via
+            # /api/files/open). The caller's own ``user_parts`` win if supplied.
+            attachment_parts: List[dict] = []
+            for a in (attachments or []):
+                path = a.get("path")
+                name = a.get("name") or os.path.basename(path or "")
+                if not path:
+                    continue
+                mime, _ = mimetypes.guess_type(name or path)
+                attachment_parts.append({
+                    "kind": "file",
+                    "file": {
+                        "name": name,
+                        "mimeType": mime or "application/octet-stream",
+                        "uri": path,
+                    },
+                })
+            effective_user_parts = user_parts or (attachment_parts or None)
+
             user_msg_id: Optional[str] = None
             try:
                 user_msg = await conversation_storage.add_message(
                     conversation_id=conversation_id,
                     role="user",
                     content=query,
-                    parts=user_parts,
+                    parts=effective_user_parts,
                     metadata=user_message_metadata,
                 )
                 user_msg_id = user_msg.get("id") if isinstance(user_msg, dict) else None
@@ -406,6 +455,7 @@ async def run_agent_to_bus(
                 profile=profile,
                 reasoning=reasoning,
                 triggered_by_event=trigger_event is not None,
+                event_run=event_run,
             ):
                 ctype = chunk.get("type")
 
@@ -449,6 +499,13 @@ async def run_agent_to_bus(
 
                     for terminal in _terminal_payloads(result_parts):
                         await bus.publish(conversation_id, "terminal", terminal)
+                        pid = terminal["process_id"]
+                        if pid not in seen_terminal_pids:
+                            seen_terminal_pids.add(pid)
+                            collected_terminal_parts.append({
+                                "kind": "data",
+                                "data": {**terminal, "category": "long_running"},
+                            })
 
                     # Attach the result to its originating step (match by call_id,
                     # so parallel tools in one step pair up correctly).
@@ -564,7 +621,7 @@ async def run_agent_to_bus(
             ctx = context_tokens_from_records(collected_usage_records)
             if ctx is not None:
                 token_usage_data["context_tokens"] = ctx
-        persist_parts = collected_file_parts if collected_file_parts else None
+        persist_parts = (collected_file_parts or []) + collected_terminal_parts or None
 
         # Stamp the turn's reasoning provider/model onto the message metadata so
         # the aggregate ``token_usage`` blob is attributable even without the
@@ -617,6 +674,7 @@ async def run_agent_to_bus(
                     profile=profile,
                     records=collected_usage_records,
                     message_id=assistant_msg_id,
+                    event_run_id=event_run_id,
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
@@ -668,6 +726,46 @@ async def run_agent_to_bus(
             except Exception:  # noqa: BLE001
                 logger.debug("compaction suggestion check failed", exc_info=True)
 
+        # 6c. Event-run status finalize. A clarifying question left the run
+        #     'pending' (the agent called request_user_input and stopped);
+        #     otherwise the turn completed / failed / was cancelled. Written
+        #     before 'complete' so subscribers see a consistent status.
+        run_row: dict | None = None
+        if event_run_id:
+            from app.events import run_state
+            pending_q = run_state.get_pending(run_id)
+            if cancelled:
+                run_status = "cancelled"
+            elif errored:
+                run_status = "failed"
+            elif pending_q:
+                run_status = "pending"
+            else:
+                run_status = "completed"
+            is_terminal = run_status != "pending"
+            try:
+                from app.storage import get_event_run_storage
+                store = get_event_run_storage()
+                run_row = await store.get(event_run_id)
+                await store.update_status(
+                    event_run_id,
+                    status=run_status,
+                    run_id=run_id,
+                    pending_question=pending_q if run_status == "pending" else None,
+                    error=(final_text if errored else None),
+                    clear_pending=is_terminal,
+                    increment_turn=True,
+                    mark_finished=is_terminal,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(f"stream_runner: failed to finalize event run {event_run_id}")
+            run_state.clear(run_id)
+            try:
+                from app.events.event_runs_admin_bus import publish_event_runs_changed
+                publish_event_runs_changed(profile)
+            except Exception:  # noqa: BLE001
+                pass
+
         # 7. Terminal event so subscribers can flip isStreaming=false.
         await bus.publish(conversation_id, "complete", {
             "assistant_id": assistant_msg_id,
@@ -675,17 +773,30 @@ async def run_agent_to_bus(
             "cancelled": cancelled,
         })
 
-        # 8. Optional notification (only the skill-event path opts in today).
+        # 8. Optional notification. Event runs deep-link to the run detail
+        #    (drawer) via event_run_id and use run-specific kinds; ordinary
+        #    skill/schedule/file runs on chat conversations keep the plain kinds.
         if publish_notification:
             try:
-                get_event_notifications().push(
-                    profile=profile,
-                    conversation_id=conversation_id,
-                    conversation_title=title,
-                    message_preview=_trim(final_text),
-                    kind="error" if errored else "completed",
-                    priority="high" if errored else "normal",
-                )
+                if event_run_id:
+                    _push_event_run_notification(
+                        profile=profile,
+                        conversation_id=conversation_id,
+                        title=title,
+                        preview=_trim(final_text),
+                        run_status=run_status,
+                        event_run_id=event_run_id,
+                        run_row=run_row,
+                    )
+                else:
+                    get_event_notifications().push(
+                        profile=profile,
+                        conversation_id=conversation_id,
+                        conversation_title=title,
+                        message_preview=_trim(final_text),
+                        kind="error" if errored else "completed",
+                        priority="high" if errored else "normal",
+                    )
             except Exception:  # noqa: BLE001
                 logger.exception("stream_runner: failed to push notification")
     finally:
@@ -698,3 +809,47 @@ async def run_agent_to_bus(
 def make_run_id(conversation_id: str, kind: str = "msg") -> str:
     """Generate a unified run id. ``kind`` is purely informational (``msg`` or ``event``)."""
     return f"{kind}:{conversation_id}:{uuid.uuid4()}"
+
+
+def _push_event_run_notification(
+    *,
+    profile: str,
+    conversation_id: str,
+    title: str,
+    preview: str,
+    run_status: str,
+    event_run_id: str,
+    run_row: dict | None,
+) -> None:
+    """Push a run-aware notification that deep-links to the Events run detail.
+
+    ``pending`` is a high-priority prompt (the user must reply); ``failed`` is a
+    normal-priority error; ``completed`` a normal completion. Cancelled runs are
+    user-initiated, so they raise no notification.
+    """
+    if run_status == "cancelled":
+        return
+    kind_map = {
+        "pending": "event_run_pending",
+        "completed": "event_run_completed",
+        "failed": "event_run_failed",
+    }
+    kind = kind_map.get(run_status)
+    if kind is None:
+        return
+    extra = {
+        "event_run_id": event_run_id,
+        "source_kind": (run_row or {}).get("source_kind"),
+        "subscription_id": (run_row or {}).get("subscription_id"),
+    }
+    if run_status == "pending":
+        preview = (run_row or {}).get("pending_question") or preview
+    get_event_notifications().push(
+        profile=profile,
+        conversation_id=conversation_id,
+        conversation_title=title,
+        message_preview=preview,
+        kind=kind,
+        priority="high" if run_status in ("pending", "failed") else "normal",
+        extra=extra,
+    )

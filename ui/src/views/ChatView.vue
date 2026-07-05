@@ -101,6 +101,10 @@ const openUsagePanel = () => { usagePanelOpen.value = true; };
 onMounted(async () => {
   // Right panel (file tree) is visible by default on entering Conversations.
   terminalPanel.restore();
+  // Guard: the event-run drawer focuses the workspace on a hidden run
+  // conversation while open; ensure returning to the main chat always shows
+  // the active conversation's workspace, never a stale run focus.
+  terminalPanel.setFocusConversation(null);
 
   // Connect if we have active credentials but aren't connected yet
   if (settingsStore.profileId && settingsStore.authToken && !chatStore.isConnected) {

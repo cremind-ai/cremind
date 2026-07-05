@@ -557,6 +557,14 @@ class DeleteFileWatcherTool(BuiltInTool):
         if existing["profile"] != profile:
             return _err("That file watcher belongs to a different user.")
 
+        # Cascade: delete this rule's run history + hidden run conversations
+        # (usage survives) before removing the subscription row.
+        try:
+            from app.events.run_lifecycle import delete_runs_for_subscription, FILE_WATCHER
+            await delete_runs_for_subscription(FILE_WATCHER, sub_id, profile)
+        except Exception:  # noqa: BLE001
+            logger.exception("delete_file_watcher: run cascade failed")
+
         try:
             store.delete(sub_id)
         except Exception as exc:  # noqa: BLE001

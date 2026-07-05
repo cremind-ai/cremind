@@ -23,6 +23,7 @@ import {
   type AdminEventsSubHandle,
 } from '../services/adminEventsStream';
 import CollapsibleSection from './CollapsibleSection.vue';
+import EventRunHistory from './events/EventRunHistory.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -150,7 +151,12 @@ async function confirmDelete(row: ScheduleEventSubscription) {
       description="No schedule events yet."
     />
 
-    <ElTable v-else-if="sortedSubs.length" :data="sortedSubs" stripe class="sched-table">
+    <ElTable v-else-if="sortedSubs.length" :data="sortedSubs" stripe class="sched-table" row-key="id">
+      <ElTableColumn type="expand">
+        <template #default="{ row }">
+          <EventRunHistory source-kind="schedule" :subscription-id="row.id" />
+        </template>
+      </ElTableColumn>
       <ElTableColumn prop="title" label="Title" min-width="160" />
       <ElTableColumn label="Schedule" min-width="180">
         <template #default="{ row }">

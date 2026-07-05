@@ -14,6 +14,7 @@ from app.storage.dynamic_config_storage import DynamicConfigStorage
 from app.storage.event_subscription_storage import EventSubscriptionStorage
 from app.storage.file_watcher_storage import FileWatcherSubscriptionStorage
 from app.storage.schedule_event_storage import ScheduleEventSubscriptionStorage
+from app.storage.event_run_storage import EventRunStorage, get_event_run_storage
 from app.storage.memory_storage import MemoryStorage
 from app.storage.usage_storage import UsageStorage
 from app.storage.tool_storage import ToolStorage, get_tool_storage
@@ -107,6 +108,8 @@ def invalidate_storage_singletons() -> None:
     # them too — otherwise they'd hold engines pointing at the old DB.
     from app.storage.tool_storage import _reset_tool_storage_singleton
     _reset_tool_storage_singleton()
+    import app.storage.event_run_storage as _ers
+    _ers._instance = None
     try:
         from app.utils.client_storage import _reset_auth_client_storage_singleton
         _reset_auth_client_storage_singleton()
@@ -121,6 +124,7 @@ __all__ = [
     "EventSubscriptionStorage",
     "FileWatcherSubscriptionStorage",
     "ScheduleEventSubscriptionStorage",
+    "EventRunStorage",
     "MemoryStorage",
     "UsageStorage",
     "ToolStorage",
@@ -130,6 +134,7 @@ __all__ = [
     "get_event_subscription_storage",
     "get_file_watcher_storage",
     "get_schedule_event_storage",
+    "get_event_run_storage",
     "get_memory_storage",
     "get_usage_storage",
     "get_tool_storage",

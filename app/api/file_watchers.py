@@ -173,6 +173,10 @@ def get_file_watcher_routes() -> list[Route]:
             return JSONResponse({"error": "Not found"}, status_code=404)
         if profile and existing["profile"] != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
+        # Cascade: delete this rule's run history + hidden run conversations
+        # (usage survives) before removing the subscription row.
+        from app.events.run_lifecycle import delete_runs_for_subscription, FILE_WATCHER
+        await delete_runs_for_subscription(FILE_WATCHER, sub_id, existing["profile"])
         store.delete(sub_id)
         try:
             get_file_watcher_manager().disarm(existing)

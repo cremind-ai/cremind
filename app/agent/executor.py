@@ -111,6 +111,12 @@ class CremindAgentExecutor(AgentExecutor):
         total_output_tokens = 0
         collected_thinking_steps: list[dict] = []
         collected_file_parts: list[Part] = []
+        # Long-running terminal artifacts as flat DataPart dicts, persisted so a
+        # reload re-renders the terminal chip. Kept separate from
+        # ``collected_file_parts`` (which also feeds the A2A response message) and
+        # merged only at persist time. Deduped by process_id across observations.
+        collected_terminal_parts: list[dict] = []
+        persisted_terminal_pids: set[str] = set()
         # The turn's native reasoning trace (carried on the terminal DONE chunk),
         # persisted so later turns can replay it into history. None when no tools ran.
         collected_llm_messages: list | None = None
@@ -261,6 +267,12 @@ class CremindAgentExecutor(AgentExecutor):
                                     append=False,
                                     last_chunk=True,
                                 )
+                                if pid not in persisted_terminal_pids:
+                                    persisted_terminal_pids.add(pid)
+                                    collected_terminal_parts.append({
+                                        "kind": "data",
+                                        "data": {**terminal_payload, "category": "long_running"},
+                                    })
 
                     # Attach the result to its originating step (match by call_id).
                     _rcid = result_data.get("Call_Id")
@@ -401,8 +413,10 @@ class CremindAgentExecutor(AgentExecutor):
                         "output_tokens": total_output_tokens,
                     }
 
-                # Only persist non-text parts (FileParts); text is already in `content` column
-                persist_parts = collected_file_parts if collected_file_parts else None
+                # Persist non-text parts (FileParts + terminal DataParts); text is
+                # already in the `content` column. Terminal parts let a reload
+                # re-render terminal chips (see mapBackendMessage on the UI side).
+                persist_parts = (collected_file_parts or []) + collected_terminal_parts or None
 
                 await self.conversation_storage.add_message(
                     conversation_id=conversation_id,

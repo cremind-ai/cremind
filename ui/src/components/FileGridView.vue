@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue';
 import { Icon } from '@iconify/vue';
-import { useChatStore } from '../stores/chat';
 import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
 import {
@@ -26,7 +25,6 @@ const props = defineProps<{
 
 const settings = useSettingsStore();
 const panel = useTerminalPanelStore();
-const chat = useChatStore();
 const { navigate } = useCwdNavigation();
 
 const INTERNAL_MIME = 'application/x-cremind-path';
@@ -59,7 +57,7 @@ async function onTileDblClick(entry: DirectoryEntry) {
       settings.agentUrl,
       settings.authToken,
       entry.path,
-      chat.activeConversationId || undefined,
+      panel.scopeConversationId || undefined,
     );
   } catch (e) {
     statusMsg((e as Error)?.message || 'Failed to open file');
@@ -119,7 +117,7 @@ async function handleMenuPick(action: FileContextAction) {
             settings.authToken,
             entry.path,
             entry.name,
-            chat.activeConversationId || undefined,
+            panel.scopeConversationId || undefined,
           );
         } catch (e) {
           statusMsg((e as Error)?.message || 'Download failed');
@@ -138,7 +136,7 @@ async function handleMenuPick(action: FileContextAction) {
             settings.agentUrl,
             settings.authToken,
             entry.path,
-            chat.activeConversationId || undefined,
+            panel.scopeConversationId || undefined,
           );
         } catch (e) {
           statusMsg((e as Error)?.message || 'Delete failed');
@@ -164,7 +162,7 @@ async function handleMenuPick(action: FileContextAction) {
             settings.agentUrl,
             settings.authToken,
             dest,
-            chat.activeConversationId || undefined,
+            panel.scopeConversationId || undefined,
           );
         } catch (e) {
           statusMsg((e as Error)?.message || 'mkdir failed');
@@ -204,7 +202,7 @@ async function commitRename(entry: DirectoryEntry) {
       settings.authToken,
       entry.path,
       dest,
-      chat.activeConversationId || undefined,
+      panel.scopeConversationId || undefined,
     );
   } catch (e) {
     statusMsg((e as Error)?.message || 'Rename failed');
@@ -281,7 +279,7 @@ async function handleDrop(ev: DragEvent, targetDir: string) {
         settings.authToken,
         targetDir,
         files,
-        chat.activeConversationId || undefined,
+        panel.scopeConversationId || undefined,
       );
     } catch (e) {
       statusMsg((e as Error)?.message || 'Upload failed');
@@ -302,7 +300,7 @@ async function handleDrop(ev: DragEvent, targetDir: string) {
       settings.authToken,
       src,
       dest,
-      chat.activeConversationId || undefined,
+      panel.scopeConversationId || undefined,
     );
   } catch (e) {
     statusMsg((e as Error)?.message || 'Move failed');
@@ -335,7 +333,7 @@ async function onFileInputChange(ev: Event) {
       settings.authToken,
       uploadTargetDir.value || panel.cwd,
       files,
-      chat.activeConversationId || undefined,
+      panel.scopeConversationId || undefined,
     );
   } catch (e) {
     statusMsg((e as Error)?.message || 'Upload failed');

@@ -6,6 +6,7 @@ from app.api.calendar import get_calendar_routes
 from app.api.channels import get_channel_routes
 from app.api.conversations import get_conversation_routes
 from app.api.events import get_event_routes
+from app.api.event_runs import get_event_run_routes
 from app.api.file_watchers import get_file_watcher_routes
 from app.api.files import get_file_routes
 from app.api.oauth2 import get_oauth2_routes
@@ -72,6 +73,7 @@ def get_api_routes(
     routes.extend(get_user_config_routes(config_storage))
     routes.extend(get_process_routes())
     routes.extend(get_event_routes())
+    routes.extend(get_event_run_routes())
     routes.extend(get_file_watcher_routes())
     routes.extend(get_calendar_routes(conversation_storage))
     routes.extend(get_admin_stream_routes())

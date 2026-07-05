@@ -36,6 +36,7 @@ from app.storage.models import (  # noqa: E402
     ChannelModel,
     ChannelSenderModel,
     ConversationModel,
+    EventRunModel,
     FileWatcherSubscriptionModel,
     MessageModel,
     ProfileModel,
@@ -54,11 +55,13 @@ _TABLES = (
     "skill_event_subscriptions",
     "file_watcher_subscriptions",
     "schedule_event_subscriptions",
+    "event_runs",
 )
 
 # Every table that FK-references conversations.id — the rename must move all of
 # these. Kept explicit (not derived) so the test is an independent check on the
-# schema-driven loop in rename_conversation_id.
+# schema-driven loop in rename_conversation_id. ``event_runs.conversation_id``
+# is a SET NULL FK, but the rename still repoints the live value.
 _CHILD_MODELS = (
     MessageModel,
     UsageRecordModel,
@@ -66,6 +69,7 @@ _CHILD_MODELS = (
     SkillEventSubscriptionModel,
     FileWatcherSubscriptionModel,
     ScheduleEventSubscriptionModel,
+    EventRunModel,
 )
 
 _OLD = "c1-old"
@@ -123,6 +127,11 @@ async def _seed(store: ConversationStorage) -> None:
         s.add(ScheduleEventSubscriptionModel(
             id="sch1", conversation_id=_OLD, profile="admin",
             dtstart="2026-01-01T00:00:00", created_at=now, updated_at=now,
+        ))
+        s.add(EventRunModel(
+            id="er1", conversation_id=_OLD, profile="admin",
+            source_kind="schedule", subscription_id="sch1", status="completed",
+            label="run", action="a", created_at=now, updated_at=now,
         ))
 
 
