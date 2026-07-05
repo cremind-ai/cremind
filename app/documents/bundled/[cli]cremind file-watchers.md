@@ -12,6 +12,11 @@ event fires. This is the parallel system to skill events, but the trigger
 comes from `watchdog` watching real files instead of a skill's listener
 daemon dropping `.md` files under `events/<event_type>/`.
 
+Each time a watcher *fires*, that single filesystem event now runs in its own
+isolated, hidden per-run conversation, tracked with a status and token usage.
+Browse that run history — and reply to a firing that paused to ask you
+something — with `cremind event-runs` (`cremind event-runs list --kind file-watcher`).
+
 The group covers three orthogonal concerns:
 
 - **Subscriptions** — `list`, `delete`, `register`. Each subscription
@@ -417,6 +422,9 @@ written.
 
 - `cremind skill-events` — the parallel system for events declared by a
   skill's `SKILL.md` rather than raw filesystem changes.
+- `cremind event-runs` — the per-firing run history: each matching filesystem
+  event runs in its own isolated conversation with a status and token usage,
+  viewable (and replyable, when pending) here.
 - `documents/document.md` — how to write Cremind docs (this file's
   conventions).
 - `app/tools/builtin/register_file_watcher.py` — the in-process

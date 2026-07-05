@@ -212,10 +212,15 @@ class ConversationStorage:
     async def create_conversation(
         self, profile: str, context_id: str | None = None,
         task_id: str | None = None, title: str = "Untitled Chat",
-        channel_id: str | None = None,
+        channel_id: str | None = None, kind: str = "chat",
     ) -> dict:
         """Create a conversation. If ``channel_id`` is omitted, the profile's
-        ``main`` channel is used (auto-created if missing)."""
+        ``main`` channel is used (auto-created if missing).
+
+        ``kind`` is ``chat`` (normal thread, shown in the sidebar) or
+        ``event_run`` (a hidden per-trigger conversation backing one event run,
+        excluded from :meth:`list_conversations`).
+        """
         await self._ensure_initialized()
         now = time.time() * 1000
         async with self.async_session_maker.begin() as session:
@@ -227,6 +232,7 @@ class ConversationStorage:
                 context_id=context_id,
                 task_id=task_id,
                 title=title,
+                kind=kind,
                 created_at=now,
                 updated_at=now,
             )
@@ -289,6 +295,10 @@ class ConversationStorage:
                 select(ConversationModel, msg_count_subq.c.message_count)
                 .outerjoin(msg_count_subq, ConversationModel.id == msg_count_subq.c.conversation_id)
                 .where(ConversationModel.profile == profile)
+                # Hidden per-trigger event-run conversations never appear in the
+                # conversation list / sidebar — they are reached via the Events
+                # page run history, not the normal thread list.
+                .where(ConversationModel.kind == "chat")
             )
             if resolved_channel_id is not None:
                 stmt = stmt.where(ConversationModel.channel_id == resolved_channel_id)
@@ -418,11 +428,22 @@ class ConversationStorage:
             return result.rowcount > 0
 
     async def delete_all_conversations(self, profile: str) -> int:
+        """Delete all *chat* conversations for a profile.
+
+        Scoped to ``kind='chat'`` so it never sweeps hidden event-run
+        conversations out from under their run rows — those are torn down via
+        the event-run lifecycle when their rule (or registering chat) is
+        deleted. The API layer collects and cascades any rules homed on the
+        deleted chats before calling this.
+        """
         await self._ensure_initialized()
         async with self.async_session_maker.begin() as session:
-            # Get conversation IDs for this profile
+            # Get chat conversation IDs for this profile
             result = await session.execute(
-                select(ConversationModel.id).where(ConversationModel.profile == profile)
+                select(ConversationModel.id).where(
+                    ConversationModel.profile == profile,
+                    ConversationModel.kind == "chat",
+                )
             )
             conv_ids = [row[0] for row in result.all()]
             if not conv_ids:
@@ -433,7 +454,7 @@ class ConversationStorage:
             )
             # Delete conversations
             result = await session.execute(
-                delete(ConversationModel).where(ConversationModel.profile == profile)
+                delete(ConversationModel).where(ConversationModel.id.in_(conv_ids))
             )
             return result.rowcount
 
@@ -773,6 +794,7 @@ class ConversationStorage:
             "context_id": conv.context_id,
             "task_id": conv.task_id,
             "title": conv.title,
+            "kind": getattr(conv, "kind", "chat"),
             "working_directory": getattr(conv, "working_directory", None),
             "created_at": conv.created_at,
             "updated_at": conv.updated_at,

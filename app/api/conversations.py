@@ -472,6 +472,28 @@ def get_conversation_routes(
 
         run_id = make_run_id(conversation_id, kind="msg")
 
+        # If this is a hidden event-run conversation, the message is a reply to a
+        # pending run: resume it (running + tick) and thread event_run flags so
+        # the run's status/usage update and request_user_input stays available.
+        event_run_id: str | None = None
+        is_event_run = conv.get("kind") == "event_run"
+        if is_event_run:
+            try:
+                from app.storage import get_event_run_storage
+                store = get_event_run_storage()
+                run = await store.get_by_conversation(conversation_id)
+                if run is not None:
+                    event_run_id = run["id"]
+                    await store.update_status(
+                        run["id"], status="running", clear_pending=True,
+                    )
+                    from app.events.event_runs_admin_bus import publish_event_runs_changed
+                    publish_event_runs_changed(profile)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    f"POST message: failed to resume event run for {conversation_id}"
+                )
+
         await event_queue.enqueue_user_message(
             conversation_id=conversation_id,
             run_id=run_id,
@@ -485,10 +507,18 @@ def get_conversation_routes(
                 if attachments else None
             ),
             push_user_message=True,
-            update_title_from_query=True,
+            # Event-run conversations keep meaningful titles; replies stream a
+            # run-aware notification and update the run row.
+            update_title_from_query=not is_event_run,
+            event_run_id=event_run_id,
+            event_run=is_event_run,
+            publish_notification=is_event_run,
         )
 
-        publish_conversations_changed(profile)
+        # Hidden event-run conversations never appear in the conversation list,
+        # so skip the list-changed nudge for them.
+        if not is_event_run:
+            publish_conversations_changed(profile)
 
         return JSONResponse(
             {"run_id": run_id, "conversation_id": conversation_id},
@@ -592,6 +622,65 @@ def get_conversation_routes(
         conv = await conversation_storage.get_conversation(conversation_id)
         return JSONResponse({"conversation": conv})
 
+    async def _cleanup_conversation_dependents(conversation_id: str) -> None:
+        """Before deleting a conversation, tear down anything homed on it.
+
+        Deleting a conversation CASCADE-deletes any event subscriptions bound to
+        it (a DB-level path that bypasses app cleanup) — which would orphan those
+        rules' run rows and hidden run conversations. So first cascade-delete each
+        bound rule's runs and disarm its manager, then discard this conversation's
+        own queue/stream state (a pre-existing gap: only the rename path did this).
+        """
+        from app.events.run_lifecycle import (
+            delete_runs_for_subscription, SKILL, FILE_WATCHER, SCHEDULE,
+        )
+        from app.storage import (
+            get_event_subscription_storage, get_file_watcher_storage,
+            get_schedule_event_storage,
+        )
+        try:
+            for sub in get_event_subscription_storage().list_by_conversation(conversation_id):
+                await delete_runs_for_subscription(SKILL, sub["id"], sub.get("profile"))
+        except Exception:  # noqa: BLE001
+            logger.exception("delete conversation: skill-event run cascade failed")
+        try:
+            fw_mgr = None
+            try:
+                from app.events.file_watcher_manager import get_file_watcher_manager
+                fw_mgr = get_file_watcher_manager()
+            except Exception:  # noqa: BLE001
+                fw_mgr = None
+            for sub in get_file_watcher_storage().list_by_conversation(conversation_id):
+                await delete_runs_for_subscription(FILE_WATCHER, sub["id"], sub.get("profile"))
+                if fw_mgr is not None:
+                    try:
+                        fw_mgr.disarm(sub)
+                    except Exception:  # noqa: BLE001
+                        logger.debug("disarm failed during conv delete", exc_info=True)
+        except Exception:  # noqa: BLE001
+            logger.exception("delete conversation: file-watcher run cascade failed")
+        try:
+            from app.events.schedule_manager import get_schedule_manager
+            sch_mgr = get_schedule_manager()
+            for sub in get_schedule_event_storage().list_by_conversation(conversation_id):
+                await delete_runs_for_subscription(SCHEDULE, sub["id"], sub.get("profile"))
+                try:
+                    sch_mgr.remove(sub["id"])
+                except Exception:  # noqa: BLE001
+                    logger.debug("schedule remove failed during conv delete", exc_info=True)
+        except Exception:  # noqa: BLE001
+            logger.exception("delete conversation: schedule run cascade failed")
+        # Discard this conversation's own queue + stream-bus state (gap fix).
+        try:
+            event_queue.discard_queue(conversation_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("discard_queue failed during conv delete", exc_info=True)
+        try:
+            from app.events.stream_bus import get_event_stream_bus
+            await get_event_stream_bus().discard(conversation_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("bus.discard failed during conv delete", exc_info=True)
+
     async def handle_delete_conversation(request: Request) -> JSONResponse:
         """Delete a single conversation."""
         unauth = _require_auth(request)
@@ -604,6 +693,7 @@ def get_conversation_routes(
             return JSONResponse({"error": "Conversation not found"}, status_code=404)
         if conv.get("profile") != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
+        await _cleanup_conversation_dependents(conversation_id)
         deleted = await conversation_storage.delete_conversation(conversation_id)
         if not deleted:
             return JSONResponse({"error": "Conversation not found"}, status_code=404)
@@ -620,6 +710,15 @@ def get_conversation_routes(
         profile = _profile_from_request(request)
         if not profile:
             return JSONResponse({"error": "Profile is required"}, status_code=400)
+
+        # Cascade dependents for every chat conversation before the bulk delete
+        # (delete_all_conversations is scoped to kind='chat', so hidden run
+        # conversations are handled by the per-rule cascade, not swept blindly).
+        try:
+            for conv in await conversation_storage.list_conversations(profile, limit=10_000):
+                await _cleanup_conversation_dependents(conv["id"])
+        except Exception:  # noqa: BLE001
+            logger.exception("delete-all: dependent cleanup failed")
 
         deleted_count = await conversation_storage.delete_all_conversations(profile)
         publish_conversations_changed(profile)

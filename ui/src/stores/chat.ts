@@ -78,6 +78,28 @@ export interface FileAttachment {
   uri: string;
 }
 
+// Best-effort MIME guess from a filename, used only to pick the chip's icon
+// for optimistically-rendered composer uploads. The backend persists the
+// authoritative mime via mimetypes.guess_type, so this just needs to be close.
+const _MIME_BY_EXT: Record<string, string> = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp',
+  pdf: 'application/pdf',
+  txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', log: 'text/plain',
+  json: 'application/json', xml: 'application/xml', yaml: 'text/yaml', yml: 'text/yaml',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  zip: 'application/zip',
+};
+function guessMimeFromName(name: string): string {
+  const ext = name.split('.').pop()?.toLowerCase() ?? '';
+  return _MIME_BY_EXT[ext] || 'application/octet-stream';
+}
+
 export interface TerminalAttachment {
   processId: string;
   command: string;
@@ -408,12 +430,25 @@ export const useChatStore = defineStore('chat', {
       // and the user sees instant feedback. The server will also emit a
       // `user_message` SSE event with the persisted id; the handler dedupes.
       const optimisticUserId = this.generateId();
+      // Render composer-uploaded attachments as file chips right away. The
+      // backend persists matching file parts on the user message, so the same
+      // chips reappear on reload via mapBackendMessage (no double render — a
+      // reload replaces the message list).
+      const optimisticFileAttachments: FileAttachment[] | undefined =
+        options?.attachments && options.attachments.length
+          ? options.attachments.map(a => ({
+              name: a.name,
+              mimeType: guessMimeFromName(a.name),
+              uri: a.path,
+            }))
+          : undefined;
       const userMessage: ChatMessage = {
         id: optimisticUserId,
         role: 'user',
         content: text,
         parts: [{ kind: 'text', text } as Part],
         timestamp: new Date(),
+        fileAttachments: optimisticFileAttachments,
       };
       bucket.push(userMessage);
 
@@ -794,7 +829,13 @@ export const useChatStore = defineStore('chat', {
 
         const { conversation, messages } = await fetchConversationMessages(agentUrl, authToken, id);
 
-        this.messagesByConversation[id] = messages.map(this.mapBackendMessage);
+        // Live SSE events may have populated the bucket while we awaited the
+        // fetch (the hasBucket guard runs before the await). Don't clobber the
+        // live stream's in-progress mutations — e.g. a terminal chip published
+        // mid-run, before its DataPart is persisted.
+        if (!this.messagesByConversation[id]) {
+          this.messagesByConversation[id] = messages.map(this.mapBackendMessage);
+        }
         this.channelIdsByConversation[id] = conversation.channel_id ?? null;
         const runtime = this.runtimes[id] ?? makeRuntime();
         runtime.currentTaskId = conversation.task_id ?? undefined;
@@ -808,6 +849,41 @@ export const useChatStore = defineStore('chat', {
         // Roll back the tracker if we couldn't load the conversation.
         this.untrackConversation(id, 'active');
         if (previousId) this.trackConversation(previousId, 'active');
+      }
+    },
+
+    /**
+     * Load a conversation's history into its bucket WITHOUT making it the
+     * active conversation. Used by the event-run detail drawer, which shows a
+     * mini chat for a hidden run conversation while the main view stays put.
+     * No-op (returns true) when the bucket already exists so we never clobber a
+     * live stream's in-progress mutations. Mirrors the fetch block of
+     * switchConversation minus the activeConversationId / markSeen side effects.
+     */
+    async loadConversationIntoBucket(id: string): Promise<boolean> {
+      if (!id) return false;
+      if (this.messagesByConversation[id]) return true;
+      try {
+        const settingsStore = useSettingsStore();
+        const { conversation, messages } = await fetchConversationMessages(
+          settingsStore.agentUrl, settingsStore.authToken, id,
+        );
+        // Live SSE events may have created the bucket while we awaited the fetch
+        // (the line-859 guard runs before the await). Overwriting now would
+        // discard in-progress mutations — e.g. a terminal chip published mid-run,
+        // before its DataPart is persisted. Keep the live bucket.
+        if (!this.messagesByConversation[id]) {
+          this.messagesByConversation[id] = messages.map(this.mapBackendMessage);
+        }
+        this.channelIdsByConversation[id] = conversation.channel_id ?? null;
+        const runtime = this.runtimes[id] ?? makeRuntime();
+        runtime.currentTaskId = conversation.task_id ?? undefined;
+        runtime.currentContextId = conversation.context_id ?? undefined;
+        this.runtimes[id] = runtime;
+        return true;
+      } catch (e) {
+        console.error('Failed to load conversation into bucket:', e);
+        return false;
       }
     },
 

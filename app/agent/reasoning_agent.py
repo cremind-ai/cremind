@@ -131,6 +131,23 @@ before any non-trivial decision. Never put the final user-facing answer in it.
 '''
 
 
+# Appended (only) to an event run's system prompt. Event runs fire automatically
+# with no user watching live, so the agent must work autonomously — but when it
+# genuinely needs a decision or missing input it parks the run 'pending' via the
+# request_user_input tool instead of guessing.
+EVENT_RUN_GUIDANCE = '''
+
+AUTOMATED EVENT RUN: This turn was triggered automatically by an event rule, not
+by a person typing. No user is watching live. Work autonomously and complete the
+requested action end to end. If — and only if — you genuinely need the user to
+confirm a risky/irreversible action or to supply missing information you cannot
+obtain yourself, call the `request_user_input` tool with ONE clear question and
+then stop; the run is parked as *pending* until the user answers in the run's
+chat, and their reply arrives as your next turn. Do not use `request_user_input`
+for progress updates or narration, and never ask when you can reasonably proceed.
+'''
+
+
 # Upper bound on facts folded into the frozen system-prompt memory section. The
 # DB path is already queue-capped (``memory.long_term_queue_size``); this also
 # bounds the effectively-unlimited vector path so the block can't bloat the cache
@@ -317,11 +334,16 @@ class ReasoningAgent:
         max_steps: Optional[int] = None,
         reasoning: bool = True,
         triggered_by_event: bool = False,
+        event_run: bool = False,
     ):
         self.llm = llm
         self.registry = registry
         self.profile = profile
         self.reasoning = reasoning
+        # This run executes inside a hidden event-run conversation (both the
+        # trigger turn and any user-reply turns). Gates the request_user_input
+        # tool + its guidance, and drives the "park pending" turn-end below.
+        self._event_run = event_run
 
         cfg = resolve_agent_config(profile)
         self._runtime_cfg = cfg
@@ -353,6 +375,14 @@ class ReasoningAgent:
         self._inject_reasoning_guidance = not native_reasoning
         if native_reasoning:
             tools = [t for t in tools if t.tool_id != "reasoning"]
+        # ``request_user_input`` lets an event run park itself 'pending' awaiting
+        # the user's reply. It only makes sense inside an event-run conversation
+        # (a normal chat turn ends by just asking in text). Withhold it
+        # everywhere else. Event runs form their own prompt-cache population
+        # (disjoint hidden conversations), so this divergence costs no chat-run
+        # cache hits, and it's stable across an event run's own turns.
+        if not event_run:
+            tools = [t for t in tools if t.tool_id != "request_user_input"]
         # Whether the model may emit several tool calls in one turn. Default-on for
         # every provider; the agent already runs leaf calls concurrently (see the
         # asyncio.gather in _loop). A per-model TOML flag can opt a model out.
@@ -588,7 +618,14 @@ class ReasoningAgent:
         # token value that happens to contain braces can't break formatting, and
         # the persona is still resolved exactly once. The persona GET endpoint
         # keeps serving the raw file, so the editor still shows the template.
-        return resolve_system_var_tokens(instruction, self.profile)
+        resolved = resolve_system_var_tokens(instruction, self.profile)
+        # Event-run guidance is appended (not a template slot) so ordinary chat
+        # runs render byte-identical; event runs are a disjoint cache population,
+        # and this block is stable across an event run's own turns. ``getattr``
+        # tolerates skeleton agents built via ``__new__`` in tests.
+        if getattr(self, "_event_run", False):
+            resolved = resolved + EVENT_RUN_GUIDANCE
+        return resolved
 
     def _render_input(self) -> str:
         """The volatile per-turn user message (just the query).
@@ -961,6 +998,21 @@ class ReasoningAgent:
                     yield status_chunk
                 self._append_tool_result(call_id, outcome.tool_text, fn_name=name)
                 yield self._result_artifact(step_no, call_id, outcome.parts)
+
+            # Event run parked pending: the agent called request_user_input this
+            # step (the tool recorded the question in run_state, keyed by the
+            # stream run id). Its tool group is fully answered above, so end the
+            # turn now — the question becomes the final assistant message and the
+            # user's reply arrives as the next turn.
+            if getattr(self, "_event_run", False):
+                from app.events import run_state
+                from app.utils.task_context import current_task_id_var
+                run_id = current_task_id_var.get()
+                question = run_state.get_pending(run_id) if run_id else None
+                if question:
+                    self._final_answer_text = question
+                    yield self._final_chunk(question)
+                    return
 
     def _final_chunk(self, data: str) -> Dict[str, Any]:
         """Terminal DONE chunk. ``data`` is empty when the answer was streamed.

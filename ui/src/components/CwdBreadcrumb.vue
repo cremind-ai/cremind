@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 import { Icon } from '@iconify/vue';
-import { useChatStore } from '../stores/chat';
 import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
 import {
@@ -18,7 +17,6 @@ interface Segment {
 
 const panel = useTerminalPanelStore();
 const settings = useSettingsStore();
-const chat = useChatStore();
 const { navigate, canNavigateTo } = useCwdNavigation();
 
 function detectSep(p: string): string {
@@ -161,7 +159,7 @@ async function refreshSuggestions() {
       listPath,
       panel.showHiddenFiles,
       dropdownAbortCtl.signal,
-      chat.activeConversationId || undefined,
+      panel.scopeConversationId || undefined,
     );
     dropdownEntries.value = data.entries;
     dropdownIndex.value = -1;

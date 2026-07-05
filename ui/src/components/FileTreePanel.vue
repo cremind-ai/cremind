@@ -3,7 +3,6 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
-import { useChatStore } from '../stores/chat';
 import {
   listDirectory,
   getInitialCwd,
@@ -20,7 +19,6 @@ import CwdBreadcrumb from './CwdBreadcrumb.vue';
 
 const settings = useSettingsStore();
 const panel = useTerminalPanelStore();
-const chat = useChatStore();
 
 const rootEntries = ref<DirectoryEntry[]>([]);
 const loading = ref(false);
@@ -59,14 +57,14 @@ async function loadRoot() {
       panel.cwd,
       panel.showHiddenFiles,
       abortCtl.signal,
-      chat.activeConversationId || undefined,
+      panel.scopeConversationId || undefined,
     );
     rootEntries.value = data.entries;
     truncated.value = data.truncated;
     // Only no-conversation cwds are safe rollback targets — conversation cwds
     // are widened server-side via the override and may sit outside the static
     // allowlist.
-    if (!chat.activeConversationId) lastGoodCwd.value = panel.cwd;
+    if (!panel.scopeConversationId) lastGoodCwd.value = panel.cwd;
   } catch (e: unknown) {
     if ((e as Error)?.name === 'AbortError') return;
     // Without a conversation, a 403/404 means the target resolves outside the
@@ -78,7 +76,7 @@ async function loadRoot() {
     if (
       e instanceof DirectoryAccessError &&
       (e.status === 403 || e.status === 404) &&
-      !chat.activeConversationId &&
+      !panel.scopeConversationId &&
       lastGoodCwd.value &&
       lastGoodCwd.value !== panel.cwd
     ) {
@@ -132,7 +130,7 @@ function openWatch() {
       if (parents.includes(panel.cwd)) scheduleRootRefetch();
     },
     undefined,
-    chat.activeConversationId || undefined,
+    panel.scopeConversationId || undefined,
   );
 }
 
@@ -179,7 +177,7 @@ async function onPanelDrop(ev: DragEvent) {
       settings.authToken,
       panel.cwd,
       Array.from(files),
-      chat.activeConversationId || undefined,
+      panel.scopeConversationId || undefined,
     );
   } catch (e) {
     // The watch SSE will refresh on success; surface only the failure.
@@ -206,7 +204,10 @@ onMounted(async () => {
 });
 
 watch(
-  () => panel.cwd,
+  // Re-fetch when the cwd changes OR the scope conversation changes (e.g. the
+  // event-run drawer focuses a run whose cwd equals the chat's — same path,
+  // different backend read-allowlist scope).
+  () => [panel.cwd, panel.scopeConversationId] as const,
   () => {
     loadRoot();
     openWatch();

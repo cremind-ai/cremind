@@ -38,10 +38,12 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from app.api.calendar import build_schedule_events_admin_snapshot
+from app.api.event_runs import build_event_runs_admin_snapshot
 from app.api.events import _build_skill_events_admin_snapshot
 from app.api.file_watchers import (
     _build_admin_snapshot as _build_file_watcher_admin_snapshot,
 )
+from app.events.event_runs_admin_bus import get_event_runs_admin_stream_bus
 from app.events.file_watcher_admin_bus import get_file_watcher_admin_stream_bus
 from app.events.schedule_events_admin_bus import get_schedule_events_admin_stream_bus
 from app.events.skill_events_admin_bus import get_skill_events_admin_stream_bus
@@ -81,11 +83,14 @@ def get_admin_stream_routes() -> list[Route]:
         fw_queue = fw_bus.subscribe(profile)
         sch_bus = get_schedule_events_admin_stream_bus()
         sch_queue = sch_bus.subscribe(profile)
+        er_bus = get_event_runs_admin_stream_bus()
+        er_queue = er_bus.subscribe(profile)
 
         async def generator():
             se_task: asyncio.Task | None = None
             fw_task: asyncio.Task | None = None
             sch_task: asyncio.Task | None = None
+            er_task: asyncio.Task | None = None
             try:
                 yield _event_frame(
                     "skill-events",
@@ -99,15 +104,20 @@ def get_admin_stream_routes() -> list[Route]:
                     "schedule-events",
                     await build_schedule_events_admin_snapshot(profile),
                 )
+                yield _event_frame(
+                    "event-runs",
+                    await build_event_runs_admin_snapshot(profile),
+                )
                 yield _event_frame("ready", {})
 
                 se_task = asyncio.ensure_future(se_queue.get())
                 fw_task = asyncio.ensure_future(fw_queue.get())
                 sch_task = asyncio.ensure_future(sch_queue.get())
+                er_task = asyncio.ensure_future(er_queue.get())
 
                 while True:
                     done, _pending = await asyncio.wait(
-                        [se_task, fw_task, sch_task],
+                        [se_task, fw_task, sch_task, er_task],
                         return_when=asyncio.FIRST_COMPLETED,
                         timeout=15.0,
                     )
@@ -139,19 +149,24 @@ def get_admin_stream_routes() -> list[Route]:
                                 await build_schedule_events_admin_snapshot(profile),
                             )
                             sch_task = asyncio.ensure_future(sch_queue.get())
+                        elif task is er_task:
+                            _ = task.result()
+                            yield _event_frame(
+                                "event-runs",
+                                await build_event_runs_admin_snapshot(profile),
+                            )
+                            er_task = asyncio.ensure_future(er_queue.get())
 
                     if await request.is_disconnected():
                         return
             finally:
-                if se_task is not None and not se_task.done():
-                    se_task.cancel()
-                if fw_task is not None and not fw_task.done():
-                    fw_task.cancel()
-                if sch_task is not None and not sch_task.done():
-                    sch_task.cancel()
+                for t in (se_task, fw_task, sch_task, er_task):
+                    if t is not None and not t.done():
+                        t.cancel()
                 se_bus.unsubscribe(profile, se_queue)
                 fw_bus.unsubscribe(profile, fw_queue)
                 sch_bus.unsubscribe(profile, sch_queue)
+                er_bus.unsubscribe(profile, er_queue)
 
         headers = {
             "Cache-Control": "no-cache",

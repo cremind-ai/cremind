@@ -40,7 +40,6 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.api import ObservedWatch
 
-from app.events import queue as event_queue
 from app.storage import get_event_subscription_storage
 from app.utils.logger import logger
 
@@ -151,20 +150,13 @@ class _ProfileEventHandler(FileSystemEventHandler):
         except Exception:  # noqa: BLE001
             logger.exception("EventManager: subscription lookup failed")
             return
+        from app.events import run_dispatcher
         for sub in subs:
             try:
-                await event_queue.enqueue(
-                    conversation_id=sub["conversation_id"],
-                    profile=sub["profile"],
-                    skill_name=sub["skill_name"],
-                    event_type=sub["event_type"],
-                    action=sub["action"],
-                    file_content=content,
-                )
+                await run_dispatcher.dispatch_skill_event(sub=sub, content=content)
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    f"EventManager: enqueue failed for conversation "
-                    f"{sub['conversation_id']}"
+                    f"EventManager: dispatch failed for subscription {sub.get('id')}"
                 )
 
 

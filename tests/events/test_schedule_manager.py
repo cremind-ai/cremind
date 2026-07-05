@@ -48,15 +48,28 @@ def _seed(store: ScheduleEventSubscriptionStorage, *, profile="admin", conv="c1"
 
 
 def _wire(monkeypatch, store):
-    """Point the manager at our temp store, force feature on, capture enqueues."""
+    """Point the manager at our temp store, force feature on, capture dispatches.
+
+    Fired triggers now go to ``run_dispatcher.dispatch_schedule_event`` instead
+    of the old per-conversation queue. We capture those calls; the recorded
+    dict exposes ``subscription_id``/``conversation_id`` (flattened from ``sub``)
+    plus ``action`` so the assertions stay stable.
+    """
+    import app.events.run_dispatcher as rd
     recorded: list[dict] = []
 
-    async def fake_enqueue(**kw):
-        recorded.append(kw)
+    async def fake_dispatch(*, sub, action, payload):
+        recorded.append({
+            "sub": sub,
+            "subscription_id": sub["id"],
+            "conversation_id": sub.get("conversation_id"),
+            "action": action,
+            "payload": payload,
+        })
 
     monkeypatch.setattr(sm, "get_schedule_event_storage", lambda *a, **k: store)
     monkeypatch.setattr(sm, "feature_enabled", lambda profile: True)
-    monkeypatch.setattr(sm.event_queue, "enqueue_schedule_event", fake_enqueue)
+    monkeypatch.setattr(rd, "dispatch_schedule_event", fake_dispatch)
     monkeypatch.setattr(sm.ScheduleManager, "_publish_admin_changed", staticmethod(lambda profile: None))
     return recorded
 
@@ -159,16 +172,17 @@ def test_manager_runs_action_falling_back_to_title(tmp_path, monkeypatch):
 
 
 def test_manager_skips_disabled_profile(tmp_path, monkeypatch):
+    import app.events.run_dispatcher as rd
     store = _make_store(tmp_path)
     _seed(store)
     recorded: list[dict] = []
 
-    async def fake_enqueue(**kw):
+    async def fake_dispatch(**kw):
         recorded.append(kw)
 
     monkeypatch.setattr(sm, "get_schedule_event_storage", lambda *a, **k: store)
     monkeypatch.setattr(sm, "feature_enabled", lambda profile: False)  # feature OFF
-    monkeypatch.setattr(sm.event_queue, "enqueue_schedule_event", fake_enqueue)
+    monkeypatch.setattr(rd, "dispatch_schedule_event", fake_dispatch)
     monkeypatch.setattr(sm.ScheduleManager, "_publish_admin_changed", staticmethod(lambda profile: None))
 
     fire_at = time.time() + 0.2

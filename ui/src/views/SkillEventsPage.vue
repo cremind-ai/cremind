@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { useRouter } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import { goBackToChat } from '../utils/backToChat';
 import {
+  ElBadge,
   ElButton,
   ElDialog,
   ElEmpty,
@@ -17,6 +18,7 @@ import {
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { useChatStore } from '../stores/chat';
+import { useEventRunsStore } from '../stores/eventRuns';
 import {
   deleteSubscription,
   simulateEvent,
@@ -26,16 +28,21 @@ import {
 } from '../services/skillEventsApi';
 import {
   subscribeSkillEventsAdmin,
+  subscribeEventRunsAdmin,
   type AdminEventsSubHandle,
 } from '../services/adminEventsStream';
 import FileWatcherSection from '../components/FileWatcherSection.vue';
 import ScheduleEventsSection from '../components/ScheduleEventsSection.vue';
 import CollapsibleSection from '../components/CollapsibleSection.vue';
+import EventRunHistory from '../components/events/EventRunHistory.vue';
+import EventRunDetailDrawer from '../components/events/EventRunDetailDrawer.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
+const route = useRoute();
 const settings = useSettingsStore();
 const chatStore = useChatStore();
+const eventRuns = useEventRunsStore();
 
 const subscriptions = ref<SkillEventSubscription[]>([]);
 const listenerByName = ref<Record<string, ListenerStatus>>({});
@@ -52,6 +59,7 @@ const sortedSubs = computed(() =>
 );
 
 let streamHandle: AdminEventsSubHandle | null = null;
+let runsStreamHandle: AdminEventsSubHandle | null = null;
 
 function streamStart() {
   streamStop();
@@ -68,6 +76,12 @@ function streamStart() {
       errorMessage.value = '';
     },
   );
+  // Feed the shared event-runs store for all three sections' child tables.
+  runsStreamHandle = subscribeEventRunsAdmin(
+    settings.agentUrl,
+    settings.authToken,
+    (snap) => eventRuns.applySnapshot(snap.runs, snap.summaries),
+  );
 }
 
 function streamStop() {
@@ -75,7 +89,37 @@ function streamStop() {
     streamHandle.close();
     streamHandle = null;
   }
+  if (runsStreamHandle) {
+    runsStreamHandle.close();
+    runsStreamHandle = null;
+  }
 }
+
+// Deep link: /:profile/events?run=<id> opens the run detail drawer.
+watch(
+  () => route.query.run,
+  (runId) => {
+    if (typeof runId === 'string' && runId) {
+      eventRuns.openRunById(runId);
+    }
+  },
+  { immediate: true },
+);
+
+// Keep the URL in sync with the open drawer (so it's shareable / back-navigable).
+watch(
+  () => eventRuns.activeRunId,
+  (id) => {
+    const current = typeof route.query.run === 'string' ? route.query.run : undefined;
+    if (id && current !== id) {
+      router.replace({ query: { ...route.query, run: id } });
+    } else if (!id && current) {
+      const q = { ...route.query };
+      delete q.run;
+      router.replace({ query: q });
+    }
+  },
+);
 
 onMounted(() => {
   if (!settings.authToken && props.profile) {
@@ -209,9 +253,24 @@ function formatDate(ms: number): string {
 
     <ElEmpty v-if="!loading && sortedSubs.length === 0" description="No active subscriptions." />
 
-    <ElTable v-else :data="sortedSubs" stripe class="subs-table">
+    <ElTable v-else :data="sortedSubs" stripe class="subs-table" row-key="id">
+      <ElTableColumn type="expand">
+        <template #default="{ row }">
+          <EventRunHistory source-kind="skill_event" :subscription-id="row.id" />
+        </template>
+      </ElTableColumn>
       <ElTableColumn prop="skill_name" label="Skill" min-width="120" />
-      <ElTableColumn prop="event_type" label="Trigger" min-width="120" />
+      <ElTableColumn label="Trigger" min-width="120">
+        <template #default="{ row }">
+          {{ row.event_type }}
+          <ElBadge
+            v-if="eventRuns.pendingCountForSubscription('skill_event', row.id) > 0"
+            :value="eventRuns.pendingCountForSubscription('skill_event', row.id)"
+            type="warning"
+            class="pending-badge"
+          />
+        </template>
+      </ElTableColumn>
       <ElTableColumn label="Action" min-width="260">
         <template #default="{ row }">
           <ElTooltip :content="row.action" placement="top">
@@ -293,6 +352,9 @@ function formatDate(ms: number): string {
     <FileWatcherSection :profile="profile" />
 
     <ScheduleEventsSection :profile="profile" />
+
+    <!-- Run-detail drawer (hosted once; opened from any section's child table). -->
+    <EventRunDetailDrawer />
   </div>
 </template>
 

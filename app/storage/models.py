@@ -93,6 +93,15 @@ class ConversationModel(Base):
         String(36), ForeignKey("channels.id", ondelete="CASCADE"), nullable=True, index=True
     )
     context_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    # Conversation kind: ``chat`` (normal user/channel thread, shown in the
+    # sidebar) or ``event_run`` (a hidden, per-trigger conversation that backs
+    # one fired event run — excluded from conversation lists and the sidebar).
+    # ``server_default`` so tables built straight from this metadata (fresh
+    # install baseline, tests) and existing rows migrated additively both carry
+    # the ``chat`` default at the DB level.
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="chat", server_default="chat"
+    )
     # Wide enough for composite task ids like ``msg:<conv-uuid>:<msg-uuid>``
     # produced by the A2A executor (~77 chars). 36 was the original sizing
     # for bare UUIDs, which Postgres VARCHAR strictly enforces.
@@ -165,8 +174,21 @@ class UsageRecordModel(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
 
     # ── scope / grouping keys ──
-    conversation_id: Mapped[str] = mapped_column(
-        String(128), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    # SET NULL (not CASCADE) so deleting a conversation does NOT erase its usage
+    # history — Usage & Cost keeps counting deleted conversations, runs, and
+    # rules. Nullable so a record can outlive its conversation (id → NULL) and so
+    # event-gate rejections (no conversation) can still be recorded. The FK is
+    # explicitly named so fresh-install metadata and the upgrade migration
+    # converge on the same constraint name across both backends.
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey(
+            "conversations.id",
+            ondelete="SET NULL",
+            name="fk_usage_records_conversation_id",
+        ),
+        nullable=True,
+        index=True,
     )
     # The assistant turn this rolled up into. SET NULL (not CASCADE) so a turn
     # re-write / message delete doesn't drop usage history; the conversation
@@ -175,6 +197,12 @@ class UsageRecordModel(Base):
     message_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # The event run this usage belongs to (when the turn ran inside a hidden
+    # per-trigger event-run conversation). Plain column, NO FK: usage must
+    # survive run pruning/deletion, and ``event_runs.id`` values are never
+    # renamed, so it needs neither CASCADE nor rename-repointing. NULL for
+    # ordinary chat/channel turns.
+    event_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     # Denormalized for cheap filtering / parity with other per-profile tables.
     profile: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
 
@@ -183,7 +211,7 @@ class UsageRecordModel(Base):
     # Catalog group_hint (high|low|...) so the dashboard can group by tier.
     model_group: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
-    # reasoning | tool | subagent | intrinsic | aggregate
+    # reasoning | tool | subagent | intrinsic | aggregate | event_gate
     source_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="reasoning", index=True)
     tool_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     label: Mapped[str | None] = mapped_column(String(256), nullable=True)
@@ -484,6 +512,76 @@ class ScheduleEventSubscriptionModel(Base):
     external_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class EventRunModel(Base):
+    """One fired event trigger, executed in its own hidden conversation.
+
+    Every time a skill / file-watcher / schedule subscription fires, the run
+    dispatcher creates a fresh hidden conversation (``conversations.kind =
+    'event_run'``) and one of these rows to track that single execution. This
+    decouples event execution from the registering conversation: runs execute
+    in parallel (per-rule serial, global cap) and never share chat history.
+
+    Lifecycle: ``running`` → one of ``pending`` (the agent called
+    ``request_user_input`` and awaits the user's reply in the run's mini chat),
+    ``completed``, ``failed``, or ``cancelled``. A user reply flips ``pending``
+    back to ``running``.
+
+    ``subscription_id`` + ``source_kind`` reference one of three subscription
+    tables; it is a plain column (no FK — three possible parents) with an
+    app-level cascade on rule delete. ``conversation_id`` IS a real FK
+    (``SET NULL``) so :meth:`ConversationStorage.rename_conversation_id`'s
+    metadata-driven repointing covers it, and deleting/pruning the run
+    conversation degrades this row instead of dropping run history.
+
+    Per-run token usage is NOT denormalized here — it is a ``GROUP BY
+    event_run_id`` rollup over ``usage_records`` (which outlive the run), so
+    Usage & Cost keeps counting even after the run and its conversation are
+    deleted.
+    """
+    __tablename__ = "event_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # skill_event | file_watcher | schedule
+    source_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    # The subscription row (in one of the three subscription tables) that fired.
+    # Plain column, no FK — app-level cascade on rule delete.
+    subscription_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    # The hidden per-run conversation. SET NULL so pruning/deleting it keeps the
+    # run row; a real FK so rename-repointing covers it.
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Latest stream run id (make_run_id(...)) — the cancel target. Updated each
+    # turn (trigger turn + any reply turns).
+    run_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # running | pending | completed | failed | cancelled
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running", index=True)
+    # Display name frozen at fire time (subscriptions are editable later):
+    # schedule title / watcher name / "{skill_name}:{event_type}".
+    label: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    # Action text frozen at fire time.
+    action: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Trigger detail (path / fired_at / event_type / content preview …).
+    trigger_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # Latest request_user_input question, for child-table display without opening
+    # the conversation. Set while ``status == 'pending'``.
+    pending_question: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Failure message when ``status == 'failed'``.
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    turn_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)  # epoch ms
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)  # epoch ms
+    finished_at: Mapped[float | None] = mapped_column(Float, nullable=True)  # epoch ms
+
+    __table_args__ = (
+        Index("ix_event_runs_sub", "source_kind", "subscription_id", "created_at"),
+        Index("ix_event_runs_profile_created", "profile", "created_at"),
+    )
 
 
 class LongTermMemoryModel(Base):

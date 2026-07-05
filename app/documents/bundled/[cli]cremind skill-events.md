@@ -11,6 +11,11 @@ it can spawn a conversation, run a script, or notify the user. This
 group lets you inspect those subscriptions, tail live events, and
 control the listener daemons that emit them.
 
+Each time a subscribed skill event *fires*, that single firing now runs in its
+own isolated, hidden per-run conversation, tracked with a status and token
+usage. Browse that run history — and reply to a firing that paused to ask you
+something — with `cremind event-runs` (`cremind event-runs list --kind skill`).
+
 The group covers four orthogonal concerns:
 
 - **Subscriptions** — `list`, `delete`. Each subscription binds an

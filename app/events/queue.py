@@ -1,22 +1,15 @@
-"""Per-conversation sequential agent run queue.
+"""Per-conversation sequential user-message queue.
 
-Runs for the same conversation are processed strictly sequentially: a worker
-awaits each agent run to completion before draining the next item. Different
-conversations run concurrently.
+User-typed messages POSTed to ``/api/conversations/{id}/messages`` are processed
+strictly sequentially per conversation: a worker awaits each agent run to
+completion before draining the next. Different conversations run concurrently.
+This keeps a conversation's storage/stream mutations from interleaving.
 
-Three run kinds share this queue:
-
-* ``"skill_event"`` — synthesised events from a watched skill folder; the
-  worker delegates to :func:`app.events.runner.run_event`.
-* ``"file_watcher_event"`` — filesystem events from a registered watch root;
-  the worker delegates to :func:`app.events.file_watcher_runner.run_event`.
-* ``"user_message"`` — user-typed messages POSTed to
-  ``/api/conversations/{id}/messages``; the worker delegates to
-  :func:`app.agent.stream_runner.run_agent_to_bus` directly.
-
-Sharing a single per-conversation queue means a user message and an
-event-triggered run for the same conversation never interleave their
-mutations to storage or the stream bus's ring buffer.
+Event-triggered runs no longer use this queue — each fired trigger runs in its
+own isolated conversation via :mod:`app.events.run_dispatcher` (per-rule FIFO +
+global concurrency cap). A **reply** to a pending event run is an ordinary user
+message on that run's conversation, so it flows through this queue like any
+other chat turn (carrying ``event_run_id`` so the run's status/usage update).
 """
 
 from __future__ import annotations
@@ -25,8 +18,6 @@ import asyncio
 from typing import Any, Dict, List, Optional
 
 from app.events import runner as event_runner
-from app.events import file_watcher_runner
-from app.events import schedule_event_runner
 from app.utils.logger import logger
 
 
@@ -42,70 +33,37 @@ async def _worker(conversation_id: str) -> None:
             queue.task_done()
             break
         try:
-            kind = item.get("kind", "skill_event")
-            if kind == "skill_event":
-                await event_runner.run_event(
-                    conversation_id=conversation_id,
-                    profile=item["profile"],
-                    skill_name=item["skill_name"],
-                    event_type=item["event_type"],
-                    action=item["action"],
-                    file_content=item["file_content"],
+            # Lazy import: stream_runner pulls in app.events.notifications_buffer
+            # which retriggers loading of app.events at module import time and
+            # produces a circular import. Importing inside the worker avoids
+            # that — by the time _worker actually runs (on the loop) all packages
+            # are fully initialised.
+            from app.agent.stream_runner import run_agent_to_bus
+            cremind_agent = event_runner.get_cremind_agent()
+            conversation_storage = event_runner.get_conversation_storage()
+            if cremind_agent is None or conversation_storage is None:
+                logger.error(
+                    "Queue worker: globals not initialized; dropping user message"
                 )
-            elif kind == "file_watcher_event":
-                await file_watcher_runner.run_event(
-                    conversation_id=conversation_id,
-                    profile=item["profile"],
-                    subscription_id=item["subscription_id"],
-                    watch_name=item["watch_name"],
-                    action=item["action"],
-                    payload=item["payload"],
-                )
-            elif kind == "schedule_event":
-                await schedule_event_runner.run_event(
-                    conversation_id=conversation_id,
-                    profile=item["profile"],
-                    subscription_id=item["subscription_id"],
-                    title=item["title"],
-                    action=item["action"],
-                    payload=item["payload"],
-                )
-            elif kind == "user_message":
-                # Lazy import: stream_runner pulls in app.events.notifications_buffer
-                # which retriggers loading of app.events at module import time
-                # and produces a circular import. Importing inside the worker
-                # avoids that — by the time _worker actually runs (on the loop)
-                # all packages are fully initialised.
-                from app.agent.stream_runner import run_agent_to_bus
-                cremind_agent = event_runner.get_cremind_agent()
-                conversation_storage = event_runner.get_conversation_storage()
-                if cremind_agent is None or conversation_storage is None:
-                    logger.error(
-                        "Queue worker: globals not initialized; dropping user message"
-                    )
-                else:
-                    await run_agent_to_bus(
-                        cremind_agent=cremind_agent,
-                        conversation_storage=conversation_storage,
-                        conversation_id=conversation_id,
-                        run_id=item["run_id"],
-                        profile=item["profile"],
-                        query=item["query"],
-                        history_messages=item.get("history_messages") or [],
-                        reasoning=item.get("reasoning", True),
-                        user_parts=item.get("user_parts"),
-                        user_message_metadata=item.get("user_message_metadata"),
-                        agent_message_metadata=item.get("agent_message_metadata"),
-                        attachments=item.get("attachments"),
-                        push_user_message=item.get("push_user_message", True),
-                        publish_notification=False,
-                        update_title_from_query=item.get(
-                            "update_title_from_query", True,
-                        ),
-                    )
             else:
-                logger.warning(
-                    f"Queue worker: unknown run kind {kind!r} for {conversation_id}"
+                await run_agent_to_bus(
+                    cremind_agent=cremind_agent,
+                    conversation_storage=conversation_storage,
+                    conversation_id=conversation_id,
+                    run_id=item["run_id"],
+                    profile=item["profile"],
+                    query=item["query"],
+                    history_messages=item.get("history_messages") or [],
+                    reasoning=item.get("reasoning", True),
+                    user_parts=item.get("user_parts"),
+                    user_message_metadata=item.get("user_message_metadata"),
+                    agent_message_metadata=item.get("agent_message_metadata"),
+                    attachments=item.get("attachments"),
+                    push_user_message=item.get("push_user_message", True),
+                    publish_notification=item.get("publish_notification", False),
+                    update_title_from_query=item.get("update_title_from_query", True),
+                    event_run_id=item.get("event_run_id"),
+                    event_run=item.get("event_run", False),
                 )
         except Exception:  # noqa: BLE001
             logger.exception(
@@ -121,73 +79,10 @@ def _ensure_worker(conversation_id: str) -> asyncio.Queue:
         queue = asyncio.Queue()
         _queues[conversation_id] = queue
         task = asyncio.create_task(
-            _worker(conversation_id), name=f"event_worker:{conversation_id}",
+            _worker(conversation_id), name=f"user_msg_worker:{conversation_id}",
         )
         _workers[conversation_id] = task
     return queue
-
-
-async def enqueue(
-    *,
-    conversation_id: str,
-    profile: str,
-    skill_name: str,
-    event_type: str,
-    action: str,
-    file_content: str,
-) -> None:
-    """Add a skill event to the conversation's queue (worker is created lazily)."""
-    queue = _ensure_worker(conversation_id)
-    await queue.put({
-        "kind": "skill_event",
-        "profile": profile,
-        "skill_name": skill_name,
-        "event_type": event_type,
-        "action": action,
-        "file_content": file_content,
-    })
-
-
-async def enqueue_file_watcher_event(
-    *,
-    conversation_id: str,
-    profile: str,
-    subscription_id: str,
-    watch_name: str,
-    action: str,
-    payload: Dict[str, Any],
-) -> None:
-    """Add a file-watcher event to the conversation's queue."""
-    queue = _ensure_worker(conversation_id)
-    await queue.put({
-        "kind": "file_watcher_event",
-        "profile": profile,
-        "subscription_id": subscription_id,
-        "watch_name": watch_name,
-        "action": action,
-        "payload": payload,
-    })
-
-
-async def enqueue_schedule_event(
-    *,
-    conversation_id: str,
-    profile: str,
-    subscription_id: str,
-    title: str,
-    action: str,
-    payload: Dict[str, Any],
-) -> None:
-    """Add a schedule (time-based) event to the conversation's queue."""
-    queue = _ensure_worker(conversation_id)
-    await queue.put({
-        "kind": "schedule_event",
-        "profile": profile,
-        "subscription_id": subscription_id,
-        "title": title,
-        "action": action,
-        "payload": payload,
-    })
 
 
 async def enqueue_user_message(
@@ -204,6 +99,9 @@ async def enqueue_user_message(
     attachments: Optional[List[Dict[str, Any]]] = None,
     push_user_message: bool = True,
     update_title_from_query: bool = True,
+    event_run_id: Optional[str] = None,
+    event_run: bool = False,
+    publish_notification: bool = False,
 ) -> None:
     """Add a user-typed message to the conversation's queue.
 
@@ -212,6 +110,10 @@ async def enqueue_user_message(
     conversation's temp upload dir). Their absolute paths are injected into the
     text the agent sees so it can read / convert / move them; they are kept out
     of the persisted/published user-message metadata (names-only) on purpose.
+
+    ``event_run_id`` / ``event_run`` are set when the conversation is a hidden
+    event-run conversation (a reply to a pending run) so the run's status and
+    usage update and the ``request_user_input`` tool stays available.
     """
     queue = _ensure_worker(conversation_id)
     await queue.put({
@@ -227,6 +129,9 @@ async def enqueue_user_message(
         "attachments": attachments,
         "push_user_message": push_user_message,
         "update_title_from_query": update_title_from_query,
+        "event_run_id": event_run_id,
+        "event_run": event_run,
+        "publish_notification": publish_notification,
     })
 
 

@@ -22,6 +22,7 @@ import {
   type AdminEventsSubHandle,
 } from '../services/adminEventsStream';
 import CollapsibleSection from './CollapsibleSection.vue';
+import EventRunHistory from './events/EventRunHistory.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -142,7 +143,12 @@ function formatDate(seconds: number): string {
       description="No active file watchers."
     />
 
-    <ElTable v-else :data="sortedSubs" stripe class="fw-table">
+    <ElTable v-else :data="sortedSubs" stripe class="fw-table" row-key="id">
+      <ElTableColumn type="expand">
+        <template #default="{ row }">
+          <EventRunHistory source-kind="file_watcher" :subscription-id="row.id" />
+        </template>
+      </ElTableColumn>
       <ElTableColumn prop="name" label="Name" min-width="140" />
       <ElTableColumn label="Path" min-width="240">
         <template #default="{ row }">

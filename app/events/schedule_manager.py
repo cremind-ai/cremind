@@ -28,7 +28,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.calendar import recurrence as R
 from app.calendar.feature import is_enabled as feature_enabled
-from app.events import queue as event_queue
 from app.storage import get_schedule_event_storage
 from app.utils.logger import logger
 
@@ -237,16 +236,12 @@ class ScheduleManager:
             "next_fire_at_iso": R.format_local(nxt) if nxt is not None else None,
         }
         try:
-            await event_queue.enqueue_schedule_event(
-                conversation_id=sub["conversation_id"],
-                profile=sub["profile"],
-                subscription_id=sub_id,
-                title=sub.get("title", ""),
-                action=action,
-                payload=payload,
+            from app.events import run_dispatcher
+            await run_dispatcher.dispatch_schedule_event(
+                sub=sub, action=action, payload=payload,
             )
         except Exception:  # noqa: BLE001
-            logger.exception(f"ScheduleManager: enqueue failed for {sub_id}")
+            logger.exception(f"ScheduleManager: dispatch failed for {sub_id}")
 
         # Nudge any open Events-page / calendar SSE subscribers.
         self._publish_admin_changed(sub["profile"])

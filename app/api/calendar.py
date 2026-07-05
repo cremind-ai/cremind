@@ -276,6 +276,10 @@ def get_calendar_routes(conversation_storage=None) -> list[Route]:
         provider = get_calendar_provider(profile)
         if not any(s["id"] == event_id for s in provider.list_subscriptions(profile)):
             return JSONResponse({"error": "Not found"}, status_code=404)
+        # Cascade: delete this rule's run history + hidden run conversations
+        # (usage survives) before removing the subscription row.
+        from app.events.run_lifecycle import delete_runs_for_subscription, SCHEDULE
+        await delete_runs_for_subscription(SCHEDULE, event_id, profile)
         provider.delete_event(event_id)
         publish_schedule_events_admin_changed(profile)
         return JSONResponse({"ok": True})
