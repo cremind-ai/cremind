@@ -812,7 +812,6 @@ class ConversationStorage:
             "name": profile.name,
             "created_at": profile.created_at,
             "updated_at": profile.updated_at,
-            "skill_mode": getattr(profile, "skill_mode", "manual") or "manual",
         }
 
     @staticmethod
