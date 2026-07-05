@@ -1226,40 +1226,6 @@ export async function setAgentName(
   return res.json();
 }
 
-export type SkillMode = 'manual' | 'automatic';
-
-export async function getSkillMode(
-  agentUrl: string,
-  token: string,
-  profileName: string
-): Promise<{ mode: SkillMode; embedding_enabled?: boolean }> {
-  const base = resolveBaseUrl(agentUrl);
-  const res = await fetch(`${base}/api/profiles/${encodeURIComponent(profileName)}/skill-mode`, {
-    headers: authHeaders(token),
-  });
-  if (!res.ok) throw new Error(`Failed to load skill mode: ${res.statusText}`);
-  return res.json();
-}
-
-export async function setSkillMode(
-  agentUrl: string,
-  token: string,
-  profileName: string,
-  mode: SkillMode
-): Promise<{ success: boolean; mode: SkillMode }> {
-  const base = resolveBaseUrl(agentUrl);
-  const res = await fetch(`${base}/api/profiles/${encodeURIComponent(profileName)}/skill-mode`, {
-    method: 'PUT',
-    headers: authHeaders(token),
-    body: JSON.stringify({ mode }),
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || `Failed to update skill mode: ${res.statusText}`);
-  }
-  return res.json();
-}
-
 // ── Tool Arguments ──
 
 export async function getToolArguments(

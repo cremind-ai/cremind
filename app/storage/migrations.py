@@ -156,11 +156,13 @@ def _compat_preflight(conn, provider) -> None:
     These were idempotent in the old code path and remain idempotent here.
     Order matters only for the column rename + the channel_id add (it must
     exist before the conversation backfill runs in ``ConversationStorage``).
+
+    Note: ``profiles.skill_mode`` used to be added here too, but the Automatic
+    Skill Mode feature was removed and the column is dropped by the
+    ``20260705_drop_profile_skill_mode`` migration that runs right after this
+    preflight, so re-adding it is pointless — pre-Alembic DBs already carry the
+    column from their old inline migrations, and the drop handles it either way.
     """
-    _add_column_if_absent(
-        conn, provider, "profiles",
-        "skill_mode VARCHAR(16) NOT NULL DEFAULT 'manual'",
-    )
     _add_column_if_absent(
         conn, provider, "conversations",
         "channel_id VARCHAR(36) REFERENCES channels(id) ON DELETE CASCADE",

@@ -7,7 +7,6 @@ Settings → Tools & Skills page or in the Agents drawer has changed:
 - remote agents (enable/disable, register, auth status)
 - LLM providers (config, models)
 - setup status
-- skill mode
 
 The bus payload is empty — the client refetches the resources it cares
 about (via the existing REST endpoints) on each wakeup. This avoids
