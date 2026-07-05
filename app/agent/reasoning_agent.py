@@ -49,8 +49,9 @@ from app.config import (
 from app.config.settings import get_user_working_directory
 from app.config.user_config import resolve_agent_config, resolve_memory_config
 from app.constants import ChatCompletionTypeEnum
+from app.constants.status import Status
 from app.lib.exception import AgentException
-from app.lib.llm.base import LLMProvider
+from app.lib.llm.base import LLMProvider, is_context_overflow
 from app.tools import (
     ToolErrorEvent,
     ToolRegistry,
@@ -838,6 +839,7 @@ class ReasoningAgent:
 
     async def _loop(self) -> AsyncGenerator[ReasoningStreamResponseType, None]:
         llm_retry = 0
+        overflow_retry = 0
         await self._ensure_long_term_memory_loaded()
         while True:
             if self.current_step_count >= self.max_steps:
@@ -890,6 +892,24 @@ class ReasoningAgent:
                         finish_reason = resp.get("finish_reason")
             except AgentException as err:
                 logger.error(f"LLM call failed at step {self.current_step_count}: {err}")
+                # L3b — a context overflow (rare: the pre-flight floor should prevent
+                # it) is never fixed by an identical retry. Clip history harder and
+                # retry the step once; halving guarantees forward progress.
+                is_overflow = (
+                    getattr(err, "code", None) == Status.LLM_CONTEXT_OVERFLOW
+                    or is_context_overflow(err)
+                )
+                if is_overflow and overflow_retry < 1:
+                    from app.agent.compaction import enforce_ceiling, estimate_prompt_tokens
+                    overflow_retry += 1
+                    target = max(1024, int(estimate_prompt_tokens(self.history_messages) * 0.5))
+                    self.history_messages = enforce_ceiling(self.history_messages, target)
+                    self.current_step_count -= 1
+                    logger.warning(
+                        f"[reasoning] context overflow at step {self.current_step_count + 1}; "
+                        f"clipped history to ~{target} tokens and retrying once"
+                    )
+                    continue
                 if llm_retry < self._max_llm_retries:
                     llm_retry += 1
                     self.current_step_count -= 1

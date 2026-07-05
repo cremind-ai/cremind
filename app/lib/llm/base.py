@@ -14,6 +14,29 @@ if TYPE_CHECKING:
     from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolUnionParam
 
 
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context length",
+    "context_length_exceeded",
+    "maximum context",
+    "prompt is too long",
+    "input is too long",
+    "too many tokens",
+    "reduce the length",
+    "context window",
+    "exceeds the maximum",
+)
+
+
+def is_context_overflow(err: Any) -> bool:
+    """Best-effort detection of a provider 'prompt too large for the window' error.
+
+    Matches an exception or its message string across SDKs, so such errors can be
+    routed to a clip-history-and-retry-once path instead of a doomed identical retry.
+    """
+    text = str(err or "").lower()
+    return bool(text) and any(marker in text for marker in _CONTEXT_OVERFLOW_MARKERS)
+
+
 def _openai_cached_tokens(usage: Any, prompt: int) -> int:
     """Extract the cached-prompt-token count from an OpenAI-style ``usage`` object.
 

@@ -154,7 +154,12 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
             "enabled": Field(
                 type="boolean", default_toml="compaction.enabled",
                 label="Enabled",
-                description="When off, full history is sent (bounded only by the model's context window).",
+                description="When off, summarization is skipped; a deterministic floor still clamps the prompt to the model's window so it can never overflow.",
+            ),
+            "auto_compact_enabled": Field(
+                type="boolean", default_toml="compaction.auto_compact_enabled",
+                label="Automatic compaction",
+                description="Fold automatically (no click) once context crosses a high band above the suggestion threshold. Off = today's suggest-only behavior for UI clients; useful for CLI/headless/event runs that have no popup. The safety floor guarantees no overflow regardless.",
             ),
             "compact_threshold_percent": Field(
                 type="number", default_toml="compaction.compact_threshold_percent",
@@ -173,6 +178,12 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
                 label="Keep-recent messages (floor)",
                 description="Never fold below this many of the most recent messages, even if the tail is over the keep-recent target.",
                 min=0, max=50,
+            ),
+            "fold_target_percent": Field(
+                type="number", default_toml="compaction.fold_target_percent",
+                label="Fold target (% of context window)",
+                description="A fold aims to land the prompt at or below this fraction of the window (summary + keep-recent tail + reply reserve), so folds stay rare and the safety floor never fires the turn after one. Must be below the suggestion threshold.",
+                min=20, max=90, step=5,
             ),
             "temperature": Field(
                 type="number", default_toml="compaction.temperature",

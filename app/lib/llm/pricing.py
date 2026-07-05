@@ -97,6 +97,7 @@ class ModelRates:
     cache_write_multiplier: float
     source: str  # "catalog" | "unknown"
     context_window: Optional[int] = None  # max context tokens, from the catalog entry
+    max_output_tokens: Optional[int] = None  # max response tokens, from the catalog entry
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,7 @@ def get_model_rates(provider: Optional[str], model: Optional[str]) -> ModelRates
         cache_read_per_1m=cache_read_per_1m, cache_write_per_1m=cache_write_per_1m,
         cache_read_multiplier=read_mult, cache_write_multiplier=write_mult,
         source=source, context_window=_as_int(entry.get("context_window")),
+        max_output_tokens=_as_int(entry.get("max_output_tokens")),
     )
 
 
@@ -188,6 +190,16 @@ def context_window_for(provider: Optional[str], model: Optional[str]) -> Optiona
     ``context_window`` — callers fall back to :data:`DEFAULT_CONTEXT_WINDOW`.
     """
     return get_model_rates(provider, model).context_window
+
+
+def max_output_tokens_for(provider: Optional[str], model: Optional[str]) -> Optional[int]:
+    """Max response tokens for ``(provider, model)`` from the catalog.
+
+    ``None`` when the provider/model is unknown or the catalog entry omits
+    ``max_output_tokens`` — compaction derives the response reserve from this and
+    falls back to a flat default when it is ``None``.
+    """
+    return get_model_rates(provider, model).max_output_tokens
 
 
 def _as_float(value: Any) -> Optional[float]:

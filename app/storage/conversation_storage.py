@@ -690,25 +690,55 @@ class ConversationStorage:
 
     async def get_messages_after(
         self, conversation_id: str, after_ordering: int, limit: int = 5000,
+        newest_first: bool = False,
     ) -> list[dict]:
         """Full message dicts with ``ordering > after_ordering``, oldest → newest.
 
         Unlike :meth:`get_messages` (which caps at the *oldest* 100), this returns
         the un-compacted tail regardless of total length, so compaction sees every
         message past the watermark. Pass ``-1`` to get the whole conversation.
+
+        With ``newest_first=True`` the ``limit`` is applied at the **frontier** —
+        the newest ``limit`` messages above ``after_ordering``, still returned in
+        chronological order — so a very long un-compacted tail keeps its recent
+        end rather than the oldest ``limit`` rows. (For a tail shorter than
+        ``limit`` the two modes return the identical set in the identical order.)
         """
         await self._ensure_initialized()
         async with self.async_session_maker() as session:
+            order = (
+                MessageModel.ordering.desc() if newest_first
+                else MessageModel.ordering.asc()
+            )
             result = await session.execute(
                 select(MessageModel)
                 .where(
                     MessageModel.conversation_id == conversation_id,
                     MessageModel.ordering > after_ordering,
                 )
-                .order_by(MessageModel.ordering.asc())
+                .order_by(order)
                 .limit(limit)
             )
-            return [self._msg_to_dict(msg) for msg in result.scalars().all()]
+            rows = result.scalars().all()
+            if newest_first:
+                rows = list(reversed(rows))
+            return [self._msg_to_dict(msg) for msg in rows]
+
+    async def get_max_ordering(self, conversation_id: str) -> int:
+        """Highest ``ordering`` in the conversation, or ``-1`` when empty.
+
+        The true frontier. Compaction must pin the watermark to this (captured
+        when the fold input was assembled), never to ``max()`` over a possibly
+        row-capped read, so an interleaved message cannot be buried below the
+        watermark and silently dropped from the tail.
+        """
+        await self._ensure_initialized()
+        async with self.async_session_maker() as session:
+            result = await session.execute(
+                select(func.coalesce(func.max(MessageModel.ordering), -1))
+                .where(MessageModel.conversation_id == conversation_id)
+            )
+            return int(result.scalar())
 
     async def get_latest_agent_message(self, conversation_id: str) -> dict | None:
         """Most recent ``agent`` message dict (highest ``ordering``), or ``None``.
