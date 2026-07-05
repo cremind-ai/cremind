@@ -103,14 +103,14 @@ function loadOlder() {
           <template #default="{ row }">{{ formatUsd(row.usage.total_usd) }}</template>
         </ElTableColumn>
         <ElTableColumn label="Duration" width="90" align="right">
-          <template #default="{ row }">{{ duration(row) }}</template>
+          <template #default="{ row }">{{ duration(row as EventRun) }}</template>
         </ElTableColumn>
         <ElTableColumn label="" width="120" align="right">
           <template #default="{ row }">
-            <ElButton size="small" text @click.stop="open(row)">
+            <ElButton size="small" text @click.stop="open(row as EventRun)">
               <Icon icon="mdi:open-in-app" /> Open
             </ElButton>
-            <ElButton size="small" text type="danger" @click.stop="confirmDelete(row)">
+            <ElButton size="small" text type="danger" @click.stop="confirmDelete(row as EventRun)">
               <Icon icon="mdi:delete-outline" />
             </ElButton>
           </template>
