@@ -331,42 +331,19 @@ def get_conversation_routes(
             return JSONResponse({"error": "Agent not available"}, status_code=503)
 
         context_id = conv.get("context_id") or conversation_id
-        # Effective history (current summary + verbatim tail) = the cached prefix.
-        history = await compaction.build_compacted_history(
-            conversation_id=conversation_id,
-            profile=profile,
-            conversation_storage=conversation_storage,
-            fallback_history=[],
-        )
-        synthetic = (
-            "Please compact our conversation now to free up context. Summarize "
-            "EVERYTHING discussed so far into a single dense, self-contained "
-            "running summary that preserves all facts, decisions, identifiers "
-            "(IDs, file paths, URLs, commands, config keys, exact values), "
-            "unresolved questions and pending TODOs, and my goals, constraints "
-            "and preferences. Then call the compact_conversation tool with that "
-            "summary (and any durable long_term_memories). Do not do anything "
-            "else."
-        )
-        # NOTE: this is a technique — the synthetic message is never persisted to
-        # the conversation and the user never sees it. We drain the stream; the
-        # compact_conversation tool does the persistence.
-        before, _, _ = await conversation_storage.get_compaction_state(conversation_id)
+        # Shared model-driven fold: the MAIN model writes the running summary from its
+        # warm cached prefix via the compact_conversation tool (no separate summarizer).
+        # The synthetic "please compact" turn is not persisted; the tool persists the
+        # summary under a per-conversation lock.
         try:
-            async for _chunk in agent.run(
-                query=synthetic,
-                task_history=history,
+            compacted = await compaction.run_model_fold(
+                agent, conversation_id, profile, conversation_storage,
                 context_id=context_id,
-                profile=profile,
-                reasoning=True,
-            ):
-                pass
+            )
         except Exception as e:  # noqa: BLE001
             logger.exception(f"compaction run failed for {conversation_id}")
             return JSONResponse({"error": str(e)}, status_code=500)
 
-        after, _, _ = await conversation_storage.get_compaction_state(conversation_id)
-        compacted = after != before
         try:
             from app.events.stream_bus import get_event_stream_bus
             await get_event_stream_bus().publish(conversation_id, "compacted", {})

@@ -147,9 +147,11 @@ class CompactionConfig:
     """Snapshot of the conversation-compaction tunables for one profile."""
 
     enabled: bool
+    auto_compact_enabled: bool
     compact_threshold_percent: float
     keep_recent_tokens: int
     keep_recent_messages: int
+    fold_target_percent: float
     temperature: float
     max_tokens: int
     retry: int
@@ -164,9 +166,11 @@ def resolve_compaction_config(profile: str) -> CompactionConfig:
     values = resolve_group("compaction", profile)
     return CompactionConfig(
         enabled=bool(values["enabled"]),
+        auto_compact_enabled=bool(values["auto_compact_enabled"]),
         compact_threshold_percent=float(values["compact_threshold_percent"]),
         keep_recent_tokens=int(values["keep_recent_tokens"]),
         keep_recent_messages=int(values["keep_recent_messages"]),
+        fold_target_percent=float(values["fold_target_percent"]),
         temperature=float(values["temperature"]),
         max_tokens=int(values["max_tokens"]),
         retry=int(values["retry"]),

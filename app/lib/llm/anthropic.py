@@ -19,7 +19,7 @@ from app.utils import logger
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolUnionParam
 from openai.types import ResponseFormatJSONObject, ResponseFormatJSONSchema, ResponseFormatText
 
-from .base import LLMProvider
+from .base import LLMProvider, is_context_overflow
 
 
 def _convert_messages(messages: List[ChatCompletionMessageParam]):
@@ -396,6 +396,10 @@ class AnthropicLLMProvider(LLMProvider):
                 return  # success
             except Exception as err:
                 last_error = err
+                if is_context_overflow(err):
+                    # Retrying an oversized prompt is futile — surface it distinctly
+                    # so the reasoning loop can clip history and retry once.
+                    raise AgentException(Status.LLM_CONTEXT_OVERFLOW, str(err))
                 if attempt == (retry or 0):
                     raise AgentException(Status.LLM_CHAT_COMPLETION_ERROR, str(err))
                 await asyncio.sleep(0.5 * (attempt + 1))

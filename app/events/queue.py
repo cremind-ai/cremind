@@ -65,12 +65,19 @@ async def _worker(conversation_id: str) -> None:
                     event_run_id=item.get("event_run_id"),
                     event_run=item.get("event_run", False),
                 )
-        except Exception:  # noqa: BLE001
+        except asyncio.CancelledError:
+            # Intentional teardown (discard_queue) — exit cleanly.
+            queue.task_done()
+            raise
+        except BaseException:  # noqa: BLE001
+            # Never let one item kill the worker and wedge the conversation; a dead
+            # worker is also self-healed by _ensure_worker on the next enqueue.
             logger.exception(
                 f"Event queue: worker for conversation {conversation_id} failed on item"
             )
-        finally:
             queue.task_done()
+            continue
+        queue.task_done()
 
 
 def _ensure_worker(conversation_id: str) -> asyncio.Queue:
@@ -78,6 +85,10 @@ def _ensure_worker(conversation_id: str) -> asyncio.Queue:
     if queue is None:
         queue = asyncio.Queue()
         _queues[conversation_id] = queue
+    # Self-heal: (re)spawn the worker if it was never started or has died (e.g. an
+    # unexpected error escaped the item handler) so a conversation never wedges.
+    task = _workers.get(conversation_id)
+    if task is None or task.done():
         task = asyncio.create_task(
             _worker(conversation_id), name=f"user_msg_worker:{conversation_id}",
         )

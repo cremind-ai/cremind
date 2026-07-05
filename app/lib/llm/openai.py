@@ -16,7 +16,7 @@ from app.utils import logger
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolUnionParam, ChatCompletionNamedToolChoiceParam
 from openai.types import ResponseFormatJSONObject, ResponseFormatJSONSchema, ResponseFormatText
 
-from .base import LLMProvider, openai_usage_breakdown
+from .base import LLMProvider, is_context_overflow, openai_usage_breakdown
 
 
 class OpenAILLMProvider(LLMProvider):
@@ -138,6 +138,10 @@ class OpenAILLMProvider(LLMProvider):
                 return  # success
             except Exception as err:
                 last_error = err
+                if is_context_overflow(err):
+                    # Retrying an oversized prompt is futile — surface it distinctly
+                    # so the reasoning loop can clip history and retry once.
+                    raise AgentException(Status.LLM_CONTEXT_OVERFLOW, str(err))
                 if attempt == (retry or 0):
                     raise AgentException(Status.LLM_CHAT_COMPLETION_ERROR, str(err))
                 await asyncio.sleep(0.5 * (attempt + 1))

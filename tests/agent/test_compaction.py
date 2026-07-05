@@ -136,8 +136,15 @@ class _FakeStore:
     async def get_compaction_state(self, cid):
         return self._summary, self._watermark, None
 
-    async def get_messages_after(self, cid, after, limit=5000):
-        return [m for m in self._messages if m["ordering"] > after][:limit]
+    async def get_messages_after(self, cid, after, limit=5000, newest_first=False):
+        rows = [m for m in self._messages if m["ordering"] > after]
+        if newest_first:
+            # newest `limit` in chronological order (frontier-anchored)
+            return sorted(rows, key=lambda m: m["ordering"])[-limit:]
+        return rows[:limit]
+
+    async def get_max_ordering(self, cid):
+        return max((m["ordering"] for m in self._messages), default=-1)
 
     async def get_latest_agent_message(self, cid):
         return self._latest_agent
@@ -183,13 +190,15 @@ def _async_return(value):
     return _fn
 
 
-def _cfg(*, enabled=True, percent=85.0, keep_recent_tokens=5, keep_recent_messages=1,
-         max_tokens=2048) -> CompactionConfig:
+def _cfg(*, enabled=True, auto_compact_enabled=False, percent=85.0, keep_recent_tokens=5,
+         keep_recent_messages=1, fold_target_percent=60.0, max_tokens=2048) -> CompactionConfig:
     return CompactionConfig(
         enabled=enabled,
+        auto_compact_enabled=auto_compact_enabled,
         compact_threshold_percent=percent,
         keep_recent_tokens=keep_recent_tokens,
         keep_recent_messages=keep_recent_messages,
+        fold_target_percent=fold_target_percent,
         temperature=0.3,
         max_tokens=max_tokens,
         retry=0,
@@ -302,7 +311,12 @@ def test_context_usage_threshold_from_window(monkeypatch) -> None:
     usage = asyncio.run(compaction.context_usage(
         conversation_id="c1", profile="admin", conversation_storage=store,
     ))
-    assert usage == {"current_tokens": 900, "context_window": 1000, "threshold": 850}
+    # current = max(trace-aware estimate of the (empty) history, reported 900) = 900.
+    assert usage["current_tokens"] == 900
+    assert usage["context_window"] == 1000
+    assert usage["threshold"] == 850
+    # New keys expose the reply reserve and the hard floor ceiling.
+    assert "response_reserve" in usage and "ceiling" in usage
 
 
 def test_context_usage_defaults_when_no_turn(monkeypatch) -> None:
@@ -355,8 +369,11 @@ def test_build_effective_replays_trace_when_enabled() -> None:
     assert out_off == [{"role": "assistant", "content": "final"}]
 
 
-def test_apply_compaction_persists_summary_and_advances_watermark(monkeypatch) -> None:
-    _patch_cfg(monkeypatch, _cfg(max_tokens=2048))
+def test_apply_compaction_persists_summary_and_leaves_keep_recent_tail(monkeypatch) -> None:
+    # L4: the fold no longer collapses everything — it leaves a boundary-safe verbatim
+    # tail. With keep_recent_messages=1 (and ~15-token messages > keep_recent_tokens=5),
+    # the newest message (ordering 3) stays verbatim, so the watermark lands at 2.
+    _patch_cfg(monkeypatch, _cfg(keep_recent_tokens=5, keep_recent_messages=1, max_tokens=2048))
     monkeypatch.setattr(
         compaction, "_store_long_term_facts",
         _async_return(0),
@@ -366,8 +383,23 @@ def test_apply_compaction_persists_summary_and_advances_watermark(monkeypatch) -
         conversation_id="c1", profile="admin",
         summary="THE RUNNING SUMMARY", long_term=[], conversation_storage=store,
     ))
-    assert result["watermark"] == 3          # newest message ordering
-    assert store.set_calls == [("THE RUNNING SUMMARY", 3)]
+    assert result["watermark"] == 2          # newest message (3) kept verbatim
+    assert store.set_calls == [("THE RUNNING SUMMARY", 2)]
+
+
+def test_apply_compaction_empty_summary_is_noop(monkeypatch) -> None:
+    # An empty/refused summary must NOT advance the watermark (that would silently
+    # drop un-summarized messages).
+    _patch_cfg(monkeypatch, _cfg())
+    monkeypatch.setattr(compaction, "_store_long_term_facts", _async_return(0))
+    store = _FakeStore([_msg(i, _TEN) for i in range(4)], summary="OLD", watermark=1)
+    result = asyncio.run(compaction.apply_compaction(
+        conversation_id="c1", profile="admin",
+        summary="   ", long_term=[], conversation_storage=store,
+    ))
+    assert result.get("skipped") == "empty_summary"
+    assert result["watermark"] == 1          # unchanged
+    assert store.set_calls == []             # state never written
 
 
 def test_apply_compaction_routes_long_term_facts(monkeypatch) -> None:
@@ -409,3 +441,155 @@ def test_compaction_config_is_frozen_snapshot() -> None:
     assert cfg.compact_threshold_percent == 85.0
     with pytest.raises(Exception):
         cfg.enabled = False  # frozen dataclass
+
+
+# ── trace-aware estimator + deterministic floor (L1/L3) ─────────────────────────
+
+def _fold_turn(n: int, big: int = 800) -> list[dict]:
+    """A wire-shaped turn: user → assistant(tool_call) → tool result → assistant."""
+    return [
+        {"role": "user", "content": f"question {n} " + "x" * 40},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": str(n), "type": "function",
+             "function": {"name": "exec", "arguments": "a" * big}},
+        ]},
+        {"role": "tool", "tool_call_id": str(n), "content": "r" * big},
+        {"role": "assistant", "content": f"answer {n}"},
+    ]
+
+
+def test_estimate_prompt_tokens_is_trace_aware() -> None:
+    content_only = [{"role": "user", "content": "x" * 400}]
+    trace = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "1", "type": "function",
+             "function": {"name": "exec", "arguments": "a" * 4000}}]},
+        {"role": "tool", "tool_call_id": "1", "content": "b" * 8000},
+    ]
+    # The trace (tool args + tool result) dwarfs a same-glance content-only message.
+    assert compaction.estimate_prompt_tokens(trace) > compaction.estimate_prompt_tokens(content_only) * 10
+
+
+def test_enforce_ceiling_fits_user_first_and_deterministic() -> None:
+    import json
+    sh = compaction._SUMMARY_HEADER
+    hist = [{"role": "user", "content": sh + "running summary " + "s" * 120}]
+    for n in range(1, 6):
+        hist += _fold_turn(n)
+    ceiling = compaction.estimate_prompt_tokens(hist) // 3
+    out = compaction.enforce_ceiling(hist, ceiling)
+    assert compaction.estimate_prompt_tokens(out) <= ceiling      # fits
+    assert out[0]["role"] == "user"                                # Anthropic first-msg rule
+    # deterministic in (history, ceiling) → byte-identical prefix across calls
+    assert json.dumps(compaction.enforce_ceiling(hist, ceiling)) == json.dumps(out)
+
+
+def test_enforce_ceiling_never_starts_with_orphan_tool_result() -> None:
+    sh = compaction._SUMMARY_HEADER
+    hist = [{"role": "user", "content": sh + "s"}]
+    for n in range(1, 5):
+        hist += _fold_turn(n, big=2000)
+    out = compaction.enforce_ceiling(hist, compaction.estimate_prompt_tokens(hist) // 4)
+    assert out[0]["role"] == "user"
+    rest = out[1:] if out[0]["content"].startswith(sh) else out
+    if rest:
+        assert rest[0].get("role") != "tool"     # never an orphaned tool result
+
+
+def test_enforce_ceiling_monster_turn_omits_to_fit() -> None:
+    huge = [{"role": "user", "content": "u"}, {"role": "assistant", "content": "z" * 200000}]
+    out = compaction.enforce_ceiling(list(huge), 500)
+    assert compaction.estimate_prompt_tokens(out) <= 500
+    assert out[0]["role"] == "user"
+
+
+def test_build_compacted_history_floor_runs_even_when_disabled(monkeypatch) -> None:
+    # The deterministic floor is UNCONDITIONAL: a giant raw history is clamped even
+    # with compaction disabled, so the prompt can never overflow.
+    _patch_cfg(monkeypatch, _cfg(enabled=False))
+
+    async def _limits(cid, storage):
+        return 200, 50      # window 200, reserve 50 → ceiling 150
+
+    monkeypatch.setattr(compaction, "_model_limits", _limits)
+    fallback = [{"role": "user", "content": "u"}] + [
+        {"role": "assistant", "content": "z" * 5000},
+    ]
+    out = asyncio.run(compaction.build_compacted_history(
+        conversation_id="c1", profile="admin",
+        conversation_storage=_FakeStore([]), fallback_history=fallback,
+    ))
+    assert compaction.estimate_prompt_tokens(out) <= 150
+    assert out[0]["role"] == "user"
+
+
+# ── keep-recent boundary (L4) + frontier reads ─────────────────────────────────
+
+def test_find_boundary_watermark_snaps_to_turn_start() -> None:
+    rows = []
+    for i in range(10):
+        if i % 2 == 0:
+            rows.append({"ordering": i, "role": "user", "content": "u" * 400, "llm_messages": None})
+        else:
+            rows.append({"ordering": i, "role": "agent", "content": "a" * 400,
+                         "llm_messages": [{"role": "assistant", "content": "a" * 400}]})
+    wm = compaction.find_boundary_watermark(
+        rows, keep_recent_tokens=200, keep_recent_messages=2,
+        include_reasoning=True, default=-1,
+    )
+    assert -1 <= wm < 9                                  # below the frontier
+    tail = [r for r in rows if r["ordering"] > wm]
+    assert compaction._row_is_turn_start(tail[0], include_reasoning=True)
+
+
+def test_get_messages_after_is_frontier_anchored(tmp_path: Path) -> None:
+    store = _make_storage(tmp_path)
+    _seed(store, n_messages=10)                          # orderings 0..9
+
+    async def run():
+        newest3 = await store.get_messages_after("c1", -1, limit=3, newest_first=True)
+        assert [m["ordering"] for m in newest3] == [7, 8, 9]     # frontier, chronological
+        oldest3 = await store.get_messages_after("c1", -1, limit=3)
+        assert [m["ordering"] for m in oldest3] == [0, 1, 2]     # legacy oldest-anchored
+        assert await store.get_max_ordering("c1") == 9
+
+    asyncio.run(run())
+
+
+# ── auto-fold decision (L2/L5) + overflow classifier (L3b) ─────────────────────
+
+def test_auto_fold_threshold_sits_between_suggest_and_ceiling() -> None:
+    t = compaction._auto_fold_threshold(window=100000, suggest_percent=85, ceiling=95000)
+    assert 85000 < t < 95000
+    # clamped strictly below the ceiling even when the offset would exceed it
+    t2 = compaction._auto_fold_threshold(window=100000, suggest_percent=90, ceiling=91000)
+    assert 90000 < t2 < 91000
+
+
+def test_after_turn_compaction_suggests_when_auto_off(monkeypatch) -> None:
+    _patch_cfg(monkeypatch, _cfg(auto_compact_enabled=False, percent=85))
+    monkeypatch.setattr(compaction, "context_window_for", lambda p, m: 1000)
+    store = _FakeStore([], latest_agent=_agent_msg(900))
+    evt = asyncio.run(compaction.after_turn_compaction(None, "c1", "admin", store, context_id="c1"))
+    assert evt is not None and evt["type"] == "compaction_suggested"
+
+
+def test_after_turn_compaction_auto_folds_when_enabled(monkeypatch) -> None:
+    _patch_cfg(monkeypatch, _cfg(auto_compact_enabled=True, percent=85))
+    monkeypatch.setattr(compaction, "context_window_for", lambda p, m: 1000)
+
+    async def _fake_fold(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(compaction, "run_model_fold", _fake_fold)
+    store = _FakeStore([], latest_agent=_agent_msg(980))
+    evt = asyncio.run(compaction.after_turn_compaction(object(), "c1", "admin", store, context_id="c1"))
+    assert evt is not None and evt["type"] == "compaction_auto_folded"
+
+
+def test_is_context_overflow_classifier() -> None:
+    from app.lib.llm.base import is_context_overflow
+    assert is_context_overflow("Error: prompt is too long: 250000 tokens > 200000 maximum")
+    assert is_context_overflow(Exception("context_length_exceeded"))
+    assert not is_context_overflow("connection reset by peer")
+    assert not is_context_overflow("")
