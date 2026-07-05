@@ -238,19 +238,26 @@ page).
 ### Group `compaction` — Conversation Compaction
 
 Keeps long conversations within budget by folding the oldest turns into a
-running summary (via the low model group) while recent turns stay verbatim.
-Replaces fixed token-window truncation and is prompt-cache friendly — the
-summary at the front stays byte-stable between compactions.
+running summary (via the main model, from its warm cached prefix) while recent
+turns stay verbatim. Replaces fixed token-window truncation and is prompt-cache
+friendly — the summary at the front stays byte-stable between compactions. By
+default it is **suggest-only** (the UI proposes compacting and the user clicks);
+turn on `auto_compact_enabled` to fold without a click — useful for the CLI,
+headless, and event runs that have no popup. A deterministic floor always clamps
+the assembled prompt to the model's window, so it can **never overflow**, even
+when compaction is disabled.
 
 **Settings → Config card:** **Conversation Compaction** (the second card on
 the page).
 
 | Key                                   | UI label                    | Type    | Default  | Range           | Meaning                                                                                  |
 |---------------------------------------|-----------------------------|---------|----------|-----------------|------------------------------------------------------------------------------------------|
-| `compaction.enabled`                  | Enabled                     | boolean | `true`   | —               | When off, full history is sent (bounded only by the model's context window).             |
-| `compaction.compact_threshold_percent` | Compaction threshold (% of context window) | number | `85` | 10 – 100 (±5) | Suggest folding the oldest turns once the model's reported context reaches this percentage of its context window. Lower it to compact earlier. |
-| `compaction.keep_recent_tokens`       | Keep-recent target (tokens) | number  | `12000`  | 500 – 500000    | After a compaction, keep about this many tokens of recent turns verbatim (the hysteresis band that keeps the cached summary stable across turns). |
-| `compaction.keep_recent_messages`     | Keep-recent messages (floor) | number | `4`      | 0 – 50          | Never fold below this many of the most recent messages.                                  |
+| `compaction.enabled`                  | Enabled                     | boolean | `true`   | —               | When off, summarization is skipped; the deterministic floor still clamps the prompt to the model's window so it can never overflow. |
+| `compaction.auto_compact_enabled`     | Automatic compaction        | boolean | `false`  | —               | Fold automatically (no click) once context crosses a high band above the suggestion threshold. Off = today's suggest-only behavior for UI clients; useful for CLI/headless/event runs. Safety is guaranteed by the floor regardless. |
+| `compaction.compact_threshold_percent` | Compaction threshold (% of context window) | number | `85` | 10 – 100 (±5) | Suggest folding the oldest turns once context reaches this percentage of the model's context window. Lower it to compact earlier. |
+| `compaction.keep_recent_tokens`       | Keep-recent target (tokens) | number  | `12000`  | 500 – 500000    | After a compaction, keep about this many tokens of recent turns verbatim (the hysteresis band that keeps the cached summary stable across turns). Clamped down at fold time when needed to hit the fold target. |
+| `compaction.keep_recent_messages`     | Keep-recent messages (floor) | number | `4`      | 0 – 50          | Enforced floor — never fold below this many of the most recent messages, even if the tail is over the keep-recent target. |
+| `compaction.fold_target_percent`      | Fold target (% of context window) | number | `60`  | 20 – 90 (±5)    | A fold aims to land the prompt at/below this fraction of the window (summary + kept tail + reply reserve), so folds stay rare and the floor never fires the turn after one. Must be below the threshold. |
 | `compaction.temperature`              | Temperature                 | number  | `0.3`    | 0 – 2 (±0.1)    | Sampling temperature for the summarization call.                                         |
 | `compaction.max_tokens`               | Max tokens                  | number  | `2048`   | 128 – 8192      | Output token cap for the running summary (also its hard size bound).                     |
 | `compaction.retry`                    | Retry count                 | number  | `2`      | 0 – 10          | Retries on transient summarization LLM errors.                                           |

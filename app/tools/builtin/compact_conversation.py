@@ -36,16 +36,23 @@ TOOL_CONFIG: ToolConfig = {
 class CompactConversationTool(BuiltInTool):
     name: str = "compact_conversation"
     description: str = (
-        "Compact this conversation to free up context. Call this when the user "
-        "asks to compact/summarize the conversation (or when asked to free "
-        "context). Provide `summary`: a dense, self-contained running summary of "
-        "EVERYTHING discussed so far that preserves all facts, decisions, "
-        "identifiers (IDs, file paths, URLs, commands, config keys, exact "
-        "values), unresolved questions and pending TODOs, and the user's goals, "
-        "constraints and preferences — written so you could continue seamlessly "
-        "with only this summary plus the most recent messages. Optionally provide "
-        "`long_term_memories`: durable, session-independent facts worth "
-        "remembering across future conversations."
+        "Compact this conversation to free up context. Call this when asked to "
+        "compact/summarize the conversation or to free context. Provide `summary`: a "
+        "dense, self-contained running summary that UPDATES any existing summary shown "
+        "earlier in the conversation — fold the newer turns into it, never discard prior "
+        "facts, and move items from In-Progress to Done as they complete. Use exactly "
+        "these sections:\n"
+        "- Goal: what the user is ultimately trying to achieve.\n"
+        "- Constraints & Preferences: rules, standards, and choices to honor.\n"
+        "- Progress: Done / In-Progress / Blocked.\n"
+        "- Key Decisions: what was decided and why.\n"
+        "- Next Steps: what remains, in order.\n"
+        "- Critical Context: identifiers to preserve verbatim — file paths, IDs, URLs, "
+        "commands, config keys, error messages, exact values.\n"
+        "Write it so you could continue seamlessly with only this summary plus the most "
+        "recent messages, and keep it within the conversation's summary token budget. "
+        "Optionally provide `long_term_memories`: durable, session-independent facts "
+        "worth remembering across future conversations."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -53,8 +60,9 @@ class CompactConversationTool(BuiltInTool):
             "summary": {
                 "type": "string",
                 "description": (
-                    "The dense running summary of the whole conversation so far "
-                    "(preserve facts, identifiers, TODOs, goals, constraints)."
+                    "The dense running summary, updating any earlier summary. Sections: "
+                    "Goal; Constraints & Preferences; Progress (Done/In-Progress/Blocked); "
+                    "Key Decisions; Next Steps; Critical Context (verbatim identifiers)."
                 ),
             },
             "long_term_memories": {

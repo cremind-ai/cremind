@@ -273,6 +273,28 @@ def truncate_to_tokens(text: str, max_tokens: int, model: str = "gpt-4o") -> str
         return text
 
 
+def truncate_to_tokens_tail(text: str, max_tokens: int, model: str = "gpt-4o") -> str:
+    """Like :func:`truncate_to_tokens` but keeps the **tail** (last ``max_tokens``).
+
+    Used to clip an over-budget running summary while preserving its most recent
+    sections (Next Steps / Critical Context) rather than head-keeping and dropping
+    them. Falls back to the original text if tiktoken is unavailable.
+    """
+    if not text or max_tokens <= 0:
+        return text or ""
+    try:
+        global _CONTENT_TOKEN_ENCODER
+        if _CONTENT_TOKEN_ENCODER is None:
+            from tiktoken import encoding_for_model
+            _CONTENT_TOKEN_ENCODER = encoding_for_model(model)
+        tokens = _CONTENT_TOKEN_ENCODER.encode(text)
+        if len(tokens) <= max_tokens:
+            return text
+        return _CONTENT_TOKEN_ENCODER.decode(tokens[-max_tokens:]).lstrip()
+    except Exception:  # noqa: BLE001
+        return text
+
+
 # Mirror of the markers defined in app.agent.reasoning_agent. Re-declared here
 # to avoid a circular import (reasoning_agent imports from this module).
 _OBSERVATION_START_MARKER = "------------OBS-START------------"

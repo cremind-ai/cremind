@@ -711,20 +711,25 @@ async def run_agent_to_bus(
         except Exception:  # noqa: BLE001
             logger.debug("conversations-list publish failed", exc_info=True)
 
-        # 6b. Suggest compaction (popup) when the conversation crosses the
-        #     threshold. Suggest-only — never forced; the user clicks to compact.
+        # 6b. Post-turn compaction: auto-fold when enabled + over the auto band
+        #     (emits "compaction_auto_folded"), else suggest the popup over the
+        #     threshold ("compaction_suggested"). Runs inline on this conversation's
+        #     worker, so it can't interleave with another turn. The deterministic
+        #     floor in build_compacted_history guarantees safety regardless.
         if not errored and not cancelled:
             try:
                 from app.agent import compaction
-                suggestion = await compaction.compaction_suggestion(
-                    conversation_id=conversation_id,
-                    profile=profile,
-                    conversation_storage=conversation_storage,
+                evt = await compaction.after_turn_compaction(
+                    cremind_agent,
+                    conversation_id,
+                    profile,
+                    conversation_storage,
+                    context_id=context_id,
                 )
-                if suggestion:
-                    await bus.publish(conversation_id, "compaction_suggested", suggestion)
+                if evt:
+                    await bus.publish(conversation_id, evt["type"], evt["data"])
             except Exception:  # noqa: BLE001
-                logger.debug("compaction suggestion check failed", exc_info=True)
+                logger.debug("post-turn compaction check failed", exc_info=True)
 
         # 6c. Event-run status finalize. A clarifying question left the run
         #     'pending' (the agent called request_user_input and stopped);
