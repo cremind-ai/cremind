@@ -758,6 +758,17 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to wipe skill event folders on startup")
 
+            # 6a-bis. Event-run boot recovery: any run left 'running' by a crash
+            # can never resume, so mark it failed (interrupted). 'pending' runs
+            # survive untouched — their reply path is fully DB-backed. Runs before
+            # the managers start (7d–7f) so no fresh run races the sweep.
+            try:
+                from app.storage import get_event_run_storage
+
+                await get_event_run_storage().recover_after_restart()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to run event-run boot recovery")
+
             # 6b. Documentation Search
             #
             # The reconcile step embeds existing ``.md`` files; the watcher

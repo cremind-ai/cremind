@@ -42,8 +42,17 @@ function loadInitialCollapsed(): boolean {
 }
 
 interface State {
-  openTerminals: TerminalAttachment[];
-  activePid: string | null;
+  // Main-chat terminal list (the focus-null path — behavior unchanged). When a
+  // ``focusConversationId`` is set (the event-run drawer), the ``openTerminals``
+  // / ``activePid`` getters resolve to that run's isolated bucket instead, so
+  // the run's terminals never leak into the main chat.
+  globalTerminals: TerminalAttachment[];
+  globalActivePid: string | null;
+  // Set by the event-run detail drawer to point the whole workspace (cwd, file
+  // tree, terminals) at a specific run's conversation instead of the active one.
+  focusConversationId: string | null;
+  focusTerminalsByConversation: Record<string, TerminalAttachment[]>;
+  focusActivePidByConversation: Record<string, string | null>;
   minimized: boolean;
   collapsed: boolean;
   panelWidth: number;
@@ -75,8 +84,11 @@ interface State {
 
 export const useTerminalPanelStore = defineStore('terminalPanel', {
   state: (): State => ({
-    openTerminals: [],
-    activePid: null,
+    globalTerminals: [],
+    globalActivePid: null,
+    focusConversationId: null,
+    focusTerminalsByConversation: {},
+    focusActivePidByConversation: {},
     minimized: true,
     collapsed: loadInitialCollapsed(),
     panelWidth: loadInitialWidth(),
@@ -94,16 +106,34 @@ export const useTerminalPanelStore = defineStore('terminalPanel', {
     visible(state): boolean {
       return !state.minimized;
     },
-    hasTerminals(state): boolean {
-      return state.openTerminals.length > 0;
+    // The conversation the workspace (cwd, file tree, terminals) is scoped to:
+    // the drawer's focused run when set, otherwise the active chat. Single
+    // source of truth so the file-tree components can retarget their backend
+    // read-allowlist scope in one place.
+    scopeConversationId(state): string | null {
+      if (state.focusConversationId) return state.focusConversationId;
+      return useChatStore().activeConversationId ?? null;
     },
-    // The effective cwd shown in the file tree. Follows the active
-    // conversation; falls back to the user default for the no-conversation
-    // slot. Re-evaluates whenever ``activeConversationId`` or the per-
-    // conversation map entry changes.
+    // Terminal tabs for the current scope: the run's isolated bucket when
+    // focused, else the main-chat global list (unchanged behavior).
+    openTerminals(state): TerminalAttachment[] {
+      const fid = state.focusConversationId;
+      if (fid) return state.focusTerminalsByConversation[fid] ?? [];
+      return state.globalTerminals;
+    },
+    activePid(state): string | null {
+      const fid = state.focusConversationId;
+      if (fid) return state.focusActivePidByConversation[fid] ?? null;
+      return state.globalActivePid;
+    },
+    hasTerminals(): boolean {
+      return this.openTerminals.length > 0;
+    },
+    // The effective cwd shown in the file tree. Follows the scope conversation
+    // (focused run or active chat); falls back to the user default for the
+    // no-conversation slot.
     cwd(state): string {
-      const chatStore = useChatStore();
-      const id = chatStore.activeConversationId;
+      const id = this.scopeConversationId;
       if (id && state.cwdByConversation[id]) {
         return state.cwdByConversation[id];
       }
@@ -112,29 +142,54 @@ export const useTerminalPanelStore = defineStore('terminalPanel', {
   },
 
   actions: {
-    openTerminal(attachment: TerminalAttachment) {
-      const existing = this.openTerminals.find(t => t.processId === attachment.processId);
-      if (!existing) {
-        this.openTerminals.push({ ...attachment });
+    // Point the workspace at a specific run's conversation (drawer maximized),
+    // or clear back to following the active chat (null).
+    setFocusConversation(id: string | null) {
+      this.focusConversationId = id;
+    },
+
+    // The terminal list + active-pid setter for the current scope. Focused →
+    // the run's bucket; else the main-chat global list.
+    _scopeTerminals(): TerminalAttachment[] {
+      const fid = this.focusConversationId;
+      if (fid) {
+        if (!this.focusTerminalsByConversation[fid]) {
+          this.focusTerminalsByConversation[fid] = [];
+        }
+        return this.focusTerminalsByConversation[fid];
       }
-      this.activePid = attachment.processId;
+      return this.globalTerminals;
+    },
+    _setScopeActive(pid: string | null) {
+      const fid = this.focusConversationId;
+      if (fid) this.focusActivePidByConversation[fid] = pid;
+      else this.globalActivePid = pid;
+    },
+
+    openTerminal(attachment: TerminalAttachment) {
+      const list = this._scopeTerminals();
+      if (!list.find(t => t.processId === attachment.processId)) {
+        list.push({ ...attachment });
+      }
+      this._setScopeActive(attachment.processId);
       this.minimized = false;
     },
 
     setActive(pid: string) {
-      if (this.openTerminals.some(t => t.processId === pid)) {
-        this.activePid = pid;
+      if (this._scopeTerminals().some(t => t.processId === pid)) {
+        this._setScopeActive(pid);
         this.minimized = false;
       }
     },
 
     closeTab(pid: string) {
-      const idx = this.openTerminals.findIndex(t => t.processId === pid);
+      const list = this._scopeTerminals();
+      const idx = list.findIndex(t => t.processId === pid);
       if (idx === -1) return;
-      this.openTerminals.splice(idx, 1);
+      list.splice(idx, 1);
       if (this.activePid === pid) {
-        const next = this.openTerminals[idx] || this.openTerminals[idx - 1] || null;
-        this.activePid = next ? next.processId : null;
+        const next = list[idx] || list[idx - 1] || null;
+        this._setScopeActive(next ? next.processId : null);
       }
       // Tree stays visible after the last terminal closes — don't auto-minimize.
     },
@@ -196,10 +251,20 @@ export const useTerminalPanelStore = defineStore('terminalPanel', {
       this.userWorkingRoot = path;
     },
 
-    // Drop a conversation's cached cwd (e.g. when it gets deleted).
+    // Drop a conversation's cached cwd + focused terminal bucket (e.g. when a
+    // run/conversation gets deleted).
     forgetConversation(conversationId: string) {
       if (this.cwdByConversation[conversationId] !== undefined) {
         delete this.cwdByConversation[conversationId];
+      }
+      if (this.focusTerminalsByConversation[conversationId] !== undefined) {
+        delete this.focusTerminalsByConversation[conversationId];
+      }
+      if (this.focusActivePidByConversation[conversationId] !== undefined) {
+        delete this.focusActivePidByConversation[conversationId];
+      }
+      if (this.focusConversationId === conversationId) {
+        this.focusConversationId = null;
       }
     },
 

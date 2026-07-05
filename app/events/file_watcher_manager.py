@@ -36,7 +36,6 @@ from watchdog.events import (
 )
 from watchdog.observers import Observer
 
-from app.events import queue as event_queue
 from app.storage import get_file_watcher_storage
 from app.utils.logger import logger
 
@@ -312,18 +311,13 @@ class _SharedHandler(FileSystemEventHandler):
                 continue
             matched += 1
             try:
-                await event_queue.enqueue_file_watcher_event(
-                    conversation_id=sub["conversation_id"],
-                    profile=sub["profile"],
-                    subscription_id=sub["id"],
-                    watch_name=sub["name"],
-                    action=sub["action"],
-                    payload=dict(payload),
+                from app.events import run_dispatcher
+                await run_dispatcher.dispatch_file_watcher_event(
+                    sub=sub, payload=dict(payload),
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    f"FileWatcherManager: enqueue failed for conversation "
-                    f"{sub['conversation_id']}"
+                    f"FileWatcherManager: dispatch failed for subscription {sub.get('id')}"
                 )
         if matched:
             logger.info(

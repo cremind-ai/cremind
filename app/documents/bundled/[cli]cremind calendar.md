@@ -17,6 +17,12 @@ fires. Manual events created here run in the profile's dedicated
 The feature is **off by default per profile** and must be enabled
 (`cremind calendar enable`) before events can be created.
 
+Each time a schedule event *fires*, that single firing now runs in its own
+isolated, hidden per-run conversation (not one shared `__schedule__` thread),
+tracked with a status and token usage. Browse that run history — and reply to a
+firing that paused to ask you something — with `cremind event-runs`
+(`cremind event-runs list --kind schedule`).
+
 ## Finding this in the web UI
 
 Two surfaces back this command group:
@@ -233,4 +239,7 @@ Google Calendar.
 
 - `cremind skill-events` / `cremind file-watchers` — the other two event
   sources that trigger agent runs (skill listeners and filesystem changes).
+- `cremind event-runs` — the per-firing run history: each time a schedule event
+  fires it runs in its own isolated conversation with a status and token usage,
+  viewable (and replyable, when pending) here.
 - `app/api/calendar.py` — the Calendar & Schedule API these commands wrap.

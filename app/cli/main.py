@@ -38,6 +38,7 @@ from app.cli.commands.channels import channels_app
 from app.cli.commands.config import config_app
 from app.cli.commands.conv import conv_app
 from app.cli.commands.db import db_app
+from app.cli.commands.event_runs import event_runs_app
 from app.cli.commands.file_watchers import file_watchers_app
 from app.cli.commands.files import files_app
 from app.cli.commands.llm import llm_app
@@ -127,6 +128,7 @@ app.add_typer(files_app, name="files")
 app.add_typer(calendar_app, name="calendar")
 app.add_typer(file_watchers_app, name="file-watchers")
 app.add_typer(skill_events_app, name="skill-events")
+app.add_typer(event_runs_app, name="event-runs")
 app.add_typer(proc_app, name="proc")
 app.add_typer(setup_app, name="setup")
 app.add_typer(config_app, name="config")

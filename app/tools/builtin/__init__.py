@@ -75,6 +75,7 @@ _BUILTIN_MODULE_NAMES: tuple[str, ...] = (
     "search_memory",
     "compact_conversation",
     "reasoning",
+    "request_user_input",
 )
 
 

@@ -3,7 +3,6 @@ import { nextTick, ref, watch } from 'vue';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
-import { useChatStore } from '../stores/chat';
 import {
   listDirectory,
   parentDir,
@@ -29,7 +28,6 @@ const props = defineProps<{
 
 const settings = useSettingsStore();
 const panel = useTerminalPanelStore();
-const chat = useChatStore();
 
 const expanded = ref(false);
 const loading = ref(false);
@@ -51,7 +49,7 @@ async function loadChildren() {
       props.entry.path,
       panel.showHiddenFiles,
       abortCtl.signal,
-      chat.activeConversationId || undefined,
+      panel.scopeConversationId || undefined,
     );
     children.value = data.entries;
     truncated.value = data.truncated;
@@ -118,7 +116,7 @@ function handleFileDoubleClick() {
     settings.agentUrl,
     settings.authToken,
     props.entry.path,
-    chat.activeConversationId || undefined,
+    panel.scopeConversationId || undefined,
   ).catch(() => {
     /* surfaced via console; tree row stays put */
   });
@@ -176,7 +174,7 @@ async function handleMenuPick(action: FileContextAction) {
           settings.authToken,
           entry.path,
           entry.name,
-          chat.activeConversationId || undefined,
+          panel.scopeConversationId || undefined,
         );
       } catch (e) {
         // eslint-disable-next-line no-console
@@ -194,7 +192,7 @@ async function handleMenuPick(action: FileContextAction) {
           settings.agentUrl,
           settings.authToken,
           entry.path,
-          chat.activeConversationId || undefined,
+          panel.scopeConversationId || undefined,
         );
       } catch (e) {
         // eslint-disable-next-line no-console
@@ -218,7 +216,7 @@ async function handleMenuPick(action: FileContextAction) {
           settings.agentUrl,
           settings.authToken,
           dest,
-          chat.activeConversationId || undefined,
+          panel.scopeConversationId || undefined,
         );
       } catch (e) {
         // eslint-disable-next-line no-console
@@ -257,7 +255,7 @@ async function commitRename() {
       settings.authToken,
       props.entry.path,
       dest,
-      chat.activeConversationId || undefined,
+      panel.scopeConversationId || undefined,
     );
   } catch (e) {
     // eslint-disable-next-line no-console
@@ -308,7 +306,7 @@ async function onDrop(ev: DragEvent) {
         settings.authToken,
         props.entry.path,
         Array.from(files),
-        chat.activeConversationId || undefined,
+        panel.scopeConversationId || undefined,
       );
       if (!expanded.value) await toggleExpand();
     } catch (e) {
@@ -328,7 +326,7 @@ async function onDrop(ev: DragEvent) {
       settings.authToken,
       src,
       dest,
-      chat.activeConversationId || undefined,
+      panel.scopeConversationId || undefined,
     );
   } catch (e) {
     // eslint-disable-next-line no-console
@@ -357,7 +355,7 @@ async function onFileInputChange(ev: Event) {
       settings.authToken,
       uploadTargetDir.value || props.entry.path,
       files,
-      chat.activeConversationId || undefined,
+      panel.scopeConversationId || undefined,
     );
     if (!expanded.value && props.entry.is_dir) await toggleExpand();
   } catch (e) {

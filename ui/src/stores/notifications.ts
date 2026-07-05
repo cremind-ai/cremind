@@ -4,7 +4,10 @@ export type NotificationKind =
   | 'completed'
   | 'error'
   | 'channel_otp'
-  | 'skill_register_required';
+  | 'skill_register_required'
+  | 'event_run_pending'
+  | 'event_run_completed'
+  | 'event_run_failed';
 
 export type NotificationPriority = 'high' | 'normal';
 
@@ -25,6 +28,10 @@ export interface NotificationEntry {
   // Skill registration prompt (only present when kind === 'skill_register_required').
   skillId?: string;
   skillName?: string;
+  // Event-run context (only present when kind starts with 'event_run_'). Used to
+  // deep-link the notification to the Events-page run detail drawer.
+  eventRunId?: string;
+  sourceKind?: string;
 }
 
 interface NotificationsState {

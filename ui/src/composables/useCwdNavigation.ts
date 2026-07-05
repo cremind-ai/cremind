@@ -5,7 +5,6 @@
 // against the conversation cwd, and the no-conversation fallback that
 // updates the user-default cwd locally without hitting the backend.
 
-import { useChatStore } from '../stores/chat';
 import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
 import { setConversationCwd, DirectoryAccessError } from '../services/filesApi';
@@ -16,7 +15,6 @@ export interface NavigateResult {
 }
 
 export function useCwdNavigation() {
-  const chat = useChatStore();
   const settings = useSettingsStore();
   const panel = useTerminalPanelStore();
 
@@ -37,13 +35,13 @@ export function useCwdNavigation() {
   // no override to set, so navigation must stay inside the user working dir
   // (an allowed base) or the backend would 403 and strand the tree.
   function canNavigateTo(target: string): boolean {
-    if (chat.activeConversationId) return true;
+    if (panel.scopeConversationId) return true;
     return isWithinRoot(target);
   }
 
   async function navigate(newPath: string): Promise<NavigateResult> {
     if (!newPath) return { ok: false, error: 'empty path' };
-    const conversationId = chat.activeConversationId;
+    const conversationId = panel.scopeConversationId;
     const previous = panel.cwd;
     if (previous === newPath) return { ok: true };
 

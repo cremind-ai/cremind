@@ -15,12 +15,14 @@ import { useUsageStore } from '../stores/usage';
 import { useSettingsStore } from '../stores/settings';
 import { formatTokens, formatUsd, formatPercent, formatRatePerM } from '../utils/usageFormat';
 
-const props = defineProps<{ message: ChatMessage }>();
+const props = defineProps<{ message: ChatMessage; conversationId?: string | null }>();
 const chat = useChatStore();
 const usage = useUsageStore();
 const settings = useSettingsStore();
 
-const conversationId = computed(() => chat.activeConversationId);
+// When embedded (event-run drawer) an explicit conversationId is passed;
+// otherwise resolve usage for the globally-active conversation.
+const conversationId = computed(() => props.conversationId ?? chat.activeConversationId);
 
 // Hover (default) vs. click to open the explanation popover — a global, persisted
 // preference. The :key on the popover forces a clean re-bind when the mode flips.

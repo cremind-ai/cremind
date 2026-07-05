@@ -17,6 +17,9 @@ const props = withDefaults(defineProps<{
   disabled?: boolean;
   isProcessing?: boolean;
   reasoningEnabled?: boolean;
+  // Set when embedded (event-run drawer): uploads target this run conversation
+  // instead of ensuring/creating the active one.
+  conversationId?: string | null;
 }>(), {
   reasoningEnabled: true,
 });
@@ -58,9 +61,10 @@ const onFilesPicked = async (event: Event) => {
   // while the first is still being provisioned for the upload.
   uploading.value = true;
   try {
-    // Files must land in a real conversation's temp dir, so ensure one exists
+    // Files must land in a real conversation's temp dir. When embedded, upload
+    // to the given run conversation; otherwise ensure the active one exists
     // (created upfront for a brand-new chat) before uploading.
-    const cid = await chatStore.ensureConversation();
+    const cid = props.conversationId ?? await chatStore.ensureConversation();
     if (!cid) {
       ElNotification({ title: 'Upload failed', message: 'No active conversation', type: 'error' });
       return;
