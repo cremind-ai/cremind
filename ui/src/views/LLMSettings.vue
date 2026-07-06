@@ -9,11 +9,17 @@ import {
   getProviderModels,
   updateProvider,
   deleteProviderConfig,
+  createCustomProvider,
   getModelGroups,
   updateModelGroups,
+  type CustomProviderModel,
 } from '../services/configApi';
 import { useLLMModels } from '../composables/useLLMModels';
 import ProviderConfigFields, { type ProviderWithState } from '../components/shared/ProviderConfigFields.vue';
+import CustomProviderForm from '../components/shared/CustomProviderForm.vue';
+
+// Sentinel dropdown value for the "add a new custom provider" affordance.
+const ADD_CUSTOM = '__add_custom__';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -64,6 +70,9 @@ const selectedApiKeyProvider = computed(() =>
   providers.value.find(p => p.name === apiKeyProvider.value) || null
 );
 
+const addingCustomProvider = computed(() => apiKeyProvider.value === ADD_CUSTOM);
+const editingCustomProvider = computed(() => !!selectedApiKeyProvider.value?.is_custom);
+
 const highFilteredModels = computed(() => getFilteredModels(highProvider.value));
 const visionFilteredModels = computed(() => getVisionModels(visionProvider.value));
 const lowFilteredModels = computed(() => getFilteredModels(lowProvider.value));
@@ -106,15 +115,35 @@ watch(() => modelGroups.value.low, () => {
   if (lowModelReasoningOptions.value.length === 0) reasoningEfforts.value.low = null;
 });
 
+/** Fetch every provider and eagerly load its model list (built-in + custom). */
+async function fetchProvidersWithModels(): Promise<ProviderWithState[]> {
+  const provRes = await listLLMProviders(settingsStore.agentUrl, settingsStore.authToken);
+  const list = provRes.providers.map(buildProviderState);
+  for (const p of list) {
+    try {
+      const modelRes = await getProviderModels(settingsStore.agentUrl, settingsStore.authToken, p.name);
+      p.models = modelRes.models;
+    } catch { /* ignore */ }
+  }
+  return list;
+}
+
+/** Reload the provider list + flattened model options; optionally reselect one. */
+async function reloadProviders(selectName?: string) {
+  providers.value = await fetchProvidersWithModels();
+  rebuildModelList(providers.value);
+  if (selectName !== undefined) apiKeyProvider.value = selectName;
+}
+
 onMounted(async () => {
   loading.value = true;
   try {
-    const [provRes, groupRes] = await Promise.all([
-      listLLMProviders(settingsStore.agentUrl, settingsStore.authToken),
+    const [list, groupRes] = await Promise.all([
+      fetchProvidersWithModels(),
       getModelGroups(settingsStore.agentUrl, settingsStore.authToken),
     ]);
 
-    providers.value = provRes.providers.map(buildProviderState);
+    providers.value = list;
 
     modelGroups.value = {
       high: groupRes.model_groups.high || '',
@@ -128,13 +157,6 @@ onMounted(async () => {
     lowProvider.value = extractProvider(groupRes.model_groups.low || '') || '';
     visionEnabled.value = groupRes.vision_enabled ?? false;
 
-    for (const p of providers.value) {
-      try {
-        const modelRes = await getProviderModels(settingsStore.agentUrl, settingsStore.authToken, p.name);
-        p.models = modelRes.models;
-      } catch { /* ignore */ }
-    }
-
     rebuildModelList(providers.value);
     reasoningEfforts.value = groupRes.reasoning_efforts || { high: null };
   } catch (e) {
@@ -143,6 +165,57 @@ onMounted(async () => {
     loading.value = false;
   }
 });
+
+type CustomFormPayload = { display_name: string; base_url: string; api_key?: string; models: CustomProviderModel[] };
+
+async function handleCreateCustom(payload: CustomFormPayload) {
+  saving.value = true;
+  try {
+    const res = await createCustomProvider(settingsStore.agentUrl, settingsStore.authToken, payload);
+    ElMessage.success(`${payload.display_name} created`);
+    await reloadProviders(res.name);
+  } catch (e) {
+    ElMessage.error(`Failed to create: ${e instanceof Error ? e.message : 'Unknown error'}`);
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function handleUpdateCustom(payload: CustomFormPayload) {
+  const name = apiKeyProvider.value;
+  saving.value = true;
+  try {
+    const body: Record<string, unknown> = {
+      display_name: payload.display_name,
+      base_url: payload.base_url,
+      models: payload.models,
+    };
+    if (payload.api_key) body.api_key = payload.api_key;
+    await updateProvider(settingsStore.agentUrl, settingsStore.authToken, name, body);
+    ElMessage.success('Custom provider updated');
+    await reloadProviders(name);
+  } catch (e) {
+    ElMessage.error(`Failed to save: ${e instanceof Error ? e.message : 'Unknown error'}`);
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function handleDeleteCustom() {
+  const name = apiKeyProvider.value;
+  const display = selectedApiKeyProvider.value?.display_name || 'this provider';
+  if (!confirm(`Delete custom provider "${display}"? This removes its models and stored API key.`)) return;
+  saving.value = true;
+  try {
+    await deleteProviderConfig(settingsStore.agentUrl, settingsStore.authToken, name);
+    ElMessage.success('Custom provider deleted');
+    await reloadProviders('');
+  } catch (e) {
+    ElMessage.error(`Failed to delete: ${e instanceof Error ? e.message : 'Unknown error'}`);
+  } finally {
+    saving.value = false;
+  }
+}
 
 /** Save provider credentials using the new auth_methods flow. */
 async function saveProvider(provider: ProviderWithState) {
@@ -317,16 +390,42 @@ function goBack() {
         <!-- API Keys Section -->
         <div class="section">
           <h2 class="section-title">API Keys</h2>
-          <p class="section-description">Configure API keys and credentials for your LLM providers.</p>
+          <p class="section-description">
+            Configure API keys and credentials for your LLM providers, or add a custom
+            OpenAI API-compatible provider not in the list.
+          </p>
 
           <ElForm label-position="top" class="groups-form">
             <ElFormItem label="Provider">
               <ElSelect v-model="apiKeyProvider" placeholder="Select a provider to configure">
                 <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
+                <ElOption :value="ADD_CUSTOM" label="➕ Add custom provider" />
               </ElSelect>
             </ElFormItem>
 
-            <div v-if="selectedApiKeyProvider" class="provider-config-inline">
+            <!-- Create a new custom provider -->
+            <div v-if="addingCustomProvider" class="provider-config-inline">
+              <CustomProviderForm
+                mode="create"
+                :saving="saving"
+                @submit="handleCreateCustom"
+                @cancel="apiKeyProvider = ''"
+              />
+            </div>
+
+            <!-- Edit an existing custom provider -->
+            <div v-else-if="editingCustomProvider && selectedApiKeyProvider" class="provider-config-inline">
+              <CustomProviderForm
+                mode="edit"
+                :provider="selectedApiKeyProvider"
+                :saving="saving"
+                @submit="handleUpdateCustom"
+                @delete="handleDeleteCustom"
+              />
+            </div>
+
+            <!-- Built-in provider credentials -->
+            <div v-else-if="selectedApiKeyProvider" class="provider-config-inline">
               <ProviderConfigFields
                 :provider="selectedApiKeyProvider"
                 :show-configured-badge="true"
@@ -368,33 +467,6 @@ function goBack() {
           </ElForm>
         </div>
 
-        <!-- Specialized Vision Model (optional, opt-in) -->
-        <div class="section">
-          <div class="section-title-row">
-            <h2 class="section-title">Specialized Vision Model (Image Understanding)</h2>
-            <ElSwitch v-model="visionEnabled" />
-          </div>
-          <p class="section-description">
-            When off (default), images are understood by your main model if it supports vision.
-            Turn this on to use a separate, dedicated vision model — useful when your main model
-            can't see images. Leave the model empty to fall back to the main model.
-          </p>
-
-          <ElForm v-if="visionEnabled" label-position="top" class="groups-form">
-            <ElFormItem label="Provider">
-              <ElSelect v-model="visionProvider" placeholder="Select provider" clearable>
-                <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
-              </ElSelect>
-            </ElFormItem>
-
-            <ElFormItem label="Model">
-              <ElSelect v-model="modelGroups.vision" filterable clearable placeholder="Select vision model (defaults to main)">
-                <ElOption v-for="m in visionFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
-              </ElSelect>
-            </ElFormItem>
-          </ElForm>
-        </div>
-
         <!-- Low-Performance Model (optional; defaults to main) -->
         <div class="section">
           <h2 class="section-title">Low-Performance Model</h2>
@@ -420,6 +492,33 @@ function goBack() {
             <ElFormItem v-if="lowModelReasoningOptions.length > 0" label="Reasoning Effort">
               <ElSelect v-model="reasoningEfforts.low" placeholder="Select reasoning effort" clearable>
                 <ElOption v-for="opt in lowModelReasoningOptions" :key="opt" :label="opt" :value="opt" />
+              </ElSelect>
+            </ElFormItem>
+          </ElForm>
+        </div>
+
+        <!-- Specialized Vision Model (optional, opt-in) -->
+        <div class="section">
+          <div class="section-title-row">
+            <h2 class="section-title">Specialized Vision Model (Image Understanding)</h2>
+            <ElSwitch v-model="visionEnabled" />
+          </div>
+          <p class="section-description">
+            When off (default), images are understood by your main model if it supports vision.
+            Turn this on to use a separate, dedicated vision model — useful when your main model
+            can't see images. Leave the model empty to fall back to the main model.
+          </p>
+
+          <ElForm v-if="visionEnabled" label-position="top" class="groups-form">
+            <ElFormItem label="Provider">
+              <ElSelect v-model="visionProvider" placeholder="Select provider" clearable>
+                <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
+              </ElSelect>
+            </ElFormItem>
+
+            <ElFormItem label="Model">
+              <ElSelect v-model="modelGroups.vision" filterable clearable placeholder="Select vision model (defaults to main)">
+                <ElOption v-for="m in visionFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
               </ElSelect>
             </ElFormItem>
           </ElForm>

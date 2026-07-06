@@ -240,7 +240,7 @@ class AnalyzeImageTool(BuiltInTool):
         # receives image data; the agent relays this error to the user.
         provider = getattr(llm, "provider_name", "") or ""
         model = getattr(llm, "model_name", "") or ""
-        if not model_supports_vision(provider, model):
+        if not model_supports_vision(provider, model, profile=arguments.get("_profile")):
             return BuiltInToolResult(structured_content={
                 "error": "VisionNotSupported",
                 "model": getattr(llm, "model_label", model),

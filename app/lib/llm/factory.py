@@ -190,6 +190,29 @@ def create_llm_provider(
             default_reasoning_effort=default_reasoning_effort,
         )
 
+    elif provider_name.startswith("custom:"):
+        # User-defined custom provider — an OpenAI-API-compatible endpoint added
+        # from the LLM Providers page. Its base_url + model list live in the
+        # per-profile ``custom_providers`` registry (see ``resolve_catalog``); its
+        # API key is a secret row ``custom:<slug>.api_key`` read via ``_get_api_key``.
+        from app.config import resolve_catalog
+        catalog = resolve_catalog(provider_name, profile)
+        base_url = (catalog.get("provider") or {}).get("base_url")
+        if not base_url:
+            raise ValueError(
+                f"Custom provider '{provider_name}' is not configured "
+                f"(deleted, or missing an API Base URL)."
+            )
+        api_key = _get_api_key(provider_name, config_storage, profile=profile)
+        if not api_key:
+            display = (catalog.get("provider") or {}).get("display_name", provider_name)
+            raise ValueError(f"{display} API key is not configured")
+        from .openai import OpenAILLMProvider
+        provider = OpenAILLMProvider(
+            api_key=api_key, model_name=model, base_url=base_url,
+            default_reasoning_effort=default_reasoning_effort,
+        )
+
     else:
         # Generic OpenAI-compatible provider — uses base_url from its TOML catalog
         catalog = load_provider_catalog(provider_name)

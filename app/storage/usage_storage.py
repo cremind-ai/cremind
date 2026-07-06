@@ -96,7 +96,7 @@ class UsageStorage:
                 "output_tokens": int(rec.get("output_tokens") or 0),
             }
             try:
-                cost = cost_columns_for(provider, model, tokens)
+                cost = cost_columns_for(provider, model, tokens, profile=profile)
             except Exception as exc:  # noqa: BLE001 — never lose usage over a pricing bug
                 logger.warning(f"[usage] cost computation failed for {provider}/{model}: {exc}")
                 cost = {
