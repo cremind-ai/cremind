@@ -62,6 +62,8 @@ class _ChatState:
     status: str = "connecting..."
     tokens: str = ""
     run_id: Optional[str] = None
+    # Session turn mode (plan | reasoning | instant), fixed at launch via --mode.
+    mode: Optional[str] = None
 
 
 async def run_chat(
@@ -70,10 +72,11 @@ async def run_chat(
     conv_title: str,
     *,
     initial_message: str = "",
+    mode: Optional[str] = None,
 ) -> None:
     """Open the chat TUI for `conv_id` and block until the user quits."""
     theme = monochrome_theme() if cfg.no_color else default_theme()
-    state = _ChatState(title=conv_title or conv_id)
+    state = _ChatState(title=conv_title or conv_id, mode=mode)
 
     if initial_message:
         # Echo the initial message into the transcript so the user sees their
@@ -120,7 +123,10 @@ async def run_chat(
         )
 
     def _get_status() -> ANSI:
-        parts = [state.status]
+        parts = []
+        if state.mode:
+            parts.append(f"mode:{state.mode}")
+        parts.append(state.status)
         if state.tokens:
             parts.append(state.tokens)
         body = "  ".join(parts)
@@ -250,7 +256,11 @@ async def run_chat(
             while True:
                 text = await pending.get()
                 try:
-                    resp = await send_message(client, conv_id, text, reasoning=True)
+                    resp = await send_message(
+                        client, conv_id, text,
+                        reasoning=(state.mode != "instant"),
+                        mode=state.mode,
+                    )
                     state.run_id = resp.run_id
                     state.status = "running"
                 except asyncio.CancelledError:

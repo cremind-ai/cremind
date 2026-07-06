@@ -27,6 +27,10 @@ export interface ConversationStreamEvent {
     | 'summary'
     | 'compaction_suggested'
     | 'compacted'
+    | 'ask_user_question'
+    | 'plan_ready'
+    | 'plan_decision'
+    | 'todos'
     | 'complete'
     | 'error'
     | 'cwd';

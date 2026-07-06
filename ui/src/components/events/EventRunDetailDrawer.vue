@@ -11,7 +11,6 @@ import {
 import { Icon } from '@iconify/vue';
 import { useEventRunsStore } from '../../stores/eventRuns';
 import { useChatStore } from '../../stores/chat';
-import { useSettingsStore } from '../../stores/settings';
 import { useTerminalPanelStore } from '../../stores/terminalPanel';
 import ChatWindow from '../ChatWindow.vue';
 import MessageInput from '../MessageInput.vue';
@@ -27,7 +26,6 @@ const COLLAPSED_WORKSPACE_WIDTH = 36;
 
 const store = useEventRunsStore();
 const chat = useChatStore();
-const settings = useSettingsStore();
 const terminalPanel = useTerminalPanelStore();
 
 const run = computed(() => store.activeRun);
@@ -111,7 +109,8 @@ function onSend(payload: { text: string; attachments: { name: string; path: stri
   chat.sendMessage(payload.text, {
     conversationId: cid.value,
     attachments: payload.attachments,
-    reasoning: settings.reasoningEnabled ?? true,
+    // Event-run mini-chat never uses plan mode.
+    mode: 'reasoning',
   });
 }
 
@@ -232,6 +231,7 @@ async function deleteRun() {
             <MessageInput
               :conversation-id="cid"
               :is-processing="isStreaming"
+              :show-mode-selector="false"
               @send="onSend"
               @stop="onStop"
             />

@@ -14,10 +14,12 @@ import {
   createConversation as apiCreateConversation,
   sendMessageRequest,
   cancelTask,
+  cancelPlan as apiCancelPlan,
   updateConversationTitle as apiUpdateConversationTitle,
   updateConversationId as apiUpdateConversationId,
 } from '../services/conversationApi';
 import type { MessageRecord } from '../services/conversationApi';
+import type { ChatMode } from '../constants/chatModes';
 import {
   openConversationStream,
   type ConversationStreamEvent,
@@ -133,6 +135,9 @@ export interface ChatMessage {
   // distinct "skipped — didn't match" bubble, but never fed to the agent.
   isRejectedTrigger?: boolean;
   rejectedReason?: string;
+  // Non-default turn mode this user message was sent with (plan | instant),
+  // shown as a chip on the bubble. Undefined for reasoning (the default).
+  mode?: ChatMode;
 }
 
 export interface ObservationPart {
@@ -195,11 +200,64 @@ export interface CompactionSuggestion {
   contextWindow?: number;
 }
 
+// ── Plan-mode runtime state (per conversation) ──
+
+export interface QuestionOption {
+  label: string;
+  description?: string;
+}
+
+export interface PendingQuestion {
+  id: string;
+  question: string;
+  description?: string;
+  options: QuestionOption[];
+  multiSelect: boolean;
+  allowFreeText: boolean;
+}
+
+export interface PendingQuestionSet {
+  questions: PendingQuestion[];
+  createdAt: number;
+}
+
+export interface PendingPlan {
+  path: string;
+  filename: string;
+  title?: string;
+  markdown: string;
+  createdAt: number;
+}
+
+export type TodoStatus = 'pending' | 'in_progress' | 'completed';
+
+export interface TodoItem {
+  id: string;
+  content: string;
+  status: TodoStatus;
+}
+
+export interface TodoState {
+  items: TodoItem[];
+  // Ids whose status/content changed on the latest update — drives the
+  // highlight-then-fade in the todo panel.
+  changedIds: string[];
+  // Monotonic counter bumped on each update so the panel re-flashes even when
+  // the same ids change twice in a row.
+  updateSeq: number;
+}
+
 interface ChatState {
   messagesByConversation: Record<string, ChatMessage[]>;
   runtimes: Record<string, ConversationRuntime>;
   /** Pending "compaction suggested" popup per conversation (null when none). */
   compactionByConversation: Record<string, CompactionSuggestion | null>;
+  /** Plan-mode: pending clarifying-questions form per conversation. */
+  pendingQuestionByConversation: Record<string, PendingQuestionSet | null>;
+  /** Plan-mode: plan awaiting Accept/Cancel per conversation. */
+  pendingPlanByConversation: Record<string, PendingPlan | null>;
+  /** Plan-mode: live todo list per conversation. */
+  todosByConversation: Record<string, TodoState | null>;
   agentCard: AgentCard | null;
   agentName: string;
   isConnected: boolean;
@@ -233,6 +291,9 @@ export const useChatStore = defineStore('chat', {
     messagesByConversation: {},
     runtimes: {},
     compactionByConversation: {},
+    pendingQuestionByConversation: {},
+    pendingPlanByConversation: {},
+    todosByConversation: {},
     agentCard: null,
     agentName: 'Agent',
     isConnected: false,
@@ -274,6 +335,21 @@ export const useChatStore = defineStore('chat', {
     compactionSuggestion(state): CompactionSuggestion | null {
       if (!state.activeConversationId) return null;
       return state.compactionByConversation[state.activeConversationId] ?? null;
+    },
+    /** Plan-mode: pending question form for the active conversation, or null. */
+    activePendingQuestion(state): PendingQuestionSet | null {
+      if (!state.activeConversationId) return null;
+      return state.pendingQuestionByConversation[state.activeConversationId] ?? null;
+    },
+    /** Plan-mode: plan awaiting approval for the active conversation, or null. */
+    activePendingPlan(state): PendingPlan | null {
+      if (!state.activeConversationId) return null;
+      return state.pendingPlanByConversation[state.activeConversationId] ?? null;
+    },
+    /** Plan-mode: live todo list for the active conversation, or null. */
+    activeTodos(state): TodoState | null {
+      if (!state.activeConversationId) return null;
+      return state.todosByConversation[state.activeConversationId] ?? null;
     },
     /**
      * Map of conversationId -> isStreaming, used by the sidebar to show
@@ -372,7 +448,8 @@ export const useChatStore = defineStore('chat', {
     async sendMessage(
       text: string,
       options?: {
-        reasoning?: boolean;
+        mode?: ChatMode;
+        planAction?: 'accept';
         conversationId?: string;
         attachments?: { name: string; path: string }[];
       },
@@ -426,6 +503,12 @@ export const useChatStore = defineStore('chat', {
 
       const { bucket, runtime } = this.ensureBucket(cid);
 
+      // A user turn supersedes any parked Plan-mode question / plan approval for
+      // this conversation — clear them optimistically so the popup/banner closes
+      // the instant the reply is sent (whether via the form or by free-typing).
+      this.pendingQuestionByConversation[cid] = null;
+      this.pendingPlanByConversation[cid] = null;
+
       // Optimistically render the user message so the input clears at once
       // and the user sees instant feedback. The server will also emit a
       // `user_message` SSE event with the persisted id; the handler dedupes.
@@ -449,6 +532,7 @@ export const useChatStore = defineStore('chat', {
         parts: [{ kind: 'text', text } as Part],
         timestamp: new Date(),
         fileAttachments: optimisticFileAttachments,
+        mode: options?.mode && options.mode !== 'reasoning' ? options.mode : undefined,
       };
       bucket.push(userMessage);
 
@@ -482,8 +566,11 @@ export const useChatStore = defineStore('chat', {
           authToken,
           cid,
           text,
-          options?.reasoning !== false,
-          options?.attachments,
+          {
+            mode: options?.mode,
+            planAction: options?.planAction,
+            attachments: options?.attachments,
+          },
         );
         runtime.currentTaskId = resp.run_id;
       } catch (e: any) {
@@ -565,6 +652,100 @@ export const useChatStore = defineStore('chat', {
         );
       } catch (e) {
         console.warn('Compaction failed:', e);
+      }
+    },
+
+    // ── plan mode ─────────────────────────────────────────────────────
+
+    /**
+     * Decline a pending Plan-mode approval. Interrupts any active run, clears
+     * the approval UI optimistically, and hits the run-free cancel endpoint
+     * (which persists a visible marker and broadcasts `plan_decision`).
+     */
+    async cancelPlanApproval(conversationId: string) {
+      if (this.runtimes[conversationId]?.isStreaming) {
+        await this.stopMessage(conversationId);
+      }
+      this.pendingPlanByConversation[conversationId] = null;
+      this.pendingQuestionByConversation[conversationId] = null;
+      try {
+        const settings = useSettingsStore();
+        await apiCancelPlan(settings.agentUrl, settings.authToken, conversationId);
+        // The visible marker bubble arrives via the `plan_decision` SSE event
+        // (deduped by message_id), and persists for reload.
+      } catch (e) {
+        console.warn('Plan cancel failed:', e);
+      }
+    },
+
+    /**
+     * Restore parked Plan-mode state from a freshly-fetched message list. SSE
+     * replay can't do this (the ring is dropped on `complete`), so on reload /
+     * conversation-switch we reconstruct from `message_metadata.plan_mode`.
+     */
+    restorePlanModeState(conversationId: string, messages: MessageRecord[]) {
+      this.pendingQuestionByConversation[conversationId] = null;
+      this.pendingPlanByConversation[conversationId] = null;
+      this.todosByConversation[conversationId] = null;
+      if (!messages || !messages.length) return;
+
+      // Pending question / plan only if the LAST message is that parked agent
+      // turn (any later message means it was answered / decided).
+      const last = messages[messages.length - 1];
+      const lastPm = (last?.metadata?.plan_mode ?? null) as any;
+      if (last?.role === 'agent' && lastPm && typeof lastPm === 'object') {
+        if (lastPm.stage === 'awaiting_answers' && Array.isArray(lastPm.questions)) {
+          this.pendingQuestionByConversation[conversationId] = {
+            createdAt: Date.now(),
+            questions: lastPm.questions.slice(0, 4).map((q: any, i: number) => ({
+              id: String(q.id ?? `q${i}`),
+              question: q.question ?? '',
+              description: q.description || undefined,
+              options: Array.isArray(q.options)
+                ? q.options.map((o: any) => ({
+                    label: o.label ?? '',
+                    description: o.description || undefined,
+                  }))
+                : [],
+              multiSelect: !!q.multi_select,
+              allowFreeText: q.allow_free_text !== false,
+            })),
+          };
+        } else if (lastPm.stage === 'awaiting_approval' && lastPm.plan) {
+          this.pendingPlanByConversation[conversationId] = {
+            path: lastPm.plan.path ?? '',
+            filename: lastPm.plan.filename ?? 'plan.md',
+            title: lastPm.plan.title || undefined,
+            // The plan markdown is the message content (kept verbatim in history).
+            markdown: last.content ?? '',
+            createdAt: Date.now(),
+          };
+        }
+      }
+
+      // Todos: the latest message bearing a todo snapshot, if not all completed.
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const pm = (messages[i]?.metadata?.plan_mode ?? null) as any;
+        if (pm && typeof pm === 'object' && Array.isArray(pm.todos)) {
+          const items: TodoItem[] = pm.todos.map((t: any, j: number) => ({
+            id: String(t.id ?? `t${j}`),
+            content: t.content ?? '',
+            status:
+              t.status === 'in_progress' || t.status === 'completed'
+                ? t.status
+                : 'pending',
+          }));
+          const allDone =
+            items.length > 0 && items.every(t => t.status === 'completed');
+          if (items.length && !allDone) {
+            this.todosByConversation[conversationId] = {
+              items,
+              changedIds: [],
+              updateSeq: 0,
+            };
+          }
+          break;
+        }
       }
     },
 
@@ -723,6 +904,9 @@ export const useChatStore = defineStore('chat', {
       this.activeConversationId = null;
       this.conversations = [];
       this.channelIdsByConversation = {};
+      this.pendingQuestionByConversation = {};
+      this.pendingPlanByConversation = {};
+      this.todosByConversation = {};
       this.error = null;
 
       if (this.isConnected) {
@@ -835,6 +1019,10 @@ export const useChatStore = defineStore('chat', {
         // mid-run, before its DataPart is persisted.
         if (!this.messagesByConversation[id]) {
           this.messagesByConversation[id] = messages.map(this.mapBackendMessage);
+          // Restore any parked Plan-mode state (question form / plan approval /
+          // todo panel) from message metadata — SSE replay can't (the ring is
+          // dropped on `complete`).
+          this.restorePlanModeState(id, messages);
         }
         this.channelIdsByConversation[id] = conversation.channel_id ?? null;
         const runtime = this.runtimes[id] ?? makeRuntime();
@@ -874,6 +1062,7 @@ export const useChatStore = defineStore('chat', {
         // before its DataPart is persisted. Keep the live bucket.
         if (!this.messagesByConversation[id]) {
           this.messagesByConversation[id] = messages.map(this.mapBackendMessage);
+          this.restorePlanModeState(id, messages);
         }
         this.channelIdsByConversation[id] = conversation.channel_id ?? null;
         const runtime = this.runtimes[id] ?? makeRuntime();
@@ -996,14 +1185,20 @@ export const useChatStore = defineStore('chat', {
             (lastUserIdx >= 0 && bucket[lastUserIdx].content === content)
             || (id !== undefined && bucket.some(m => m.id === id));
           if (!alreadyPresent) {
+            const evtMode = data.metadata?.mode;
             bucket.push({
               id: id ?? this.generateId(),
               role: 'user',
               content,
               parts: [{ kind: 'text', text: content } as Part],
               timestamp: new Date(),
+              mode: evtMode && evtMode !== 'reasoning' ? evtMode : undefined,
             });
           }
+          // A new user turn supersedes any parked Plan-mode question/plan
+          // (covers replies typed from another tab or the CLI).
+          this.pendingQuestionByConversation[conversationId] = null;
+          this.pendingPlanByConversation[conversationId] = null;
           // A new run is starting; reset stream-local state.
           scratch.currentTextPart = '';
           runtime.streamingAssistantId = undefined;
@@ -1031,6 +1226,8 @@ export const useChatStore = defineStore('chat', {
               isStreaming: false,
             });
           }
+          this.pendingQuestionByConversation[conversationId] = null;
+          this.pendingPlanByConversation[conversationId] = null;
           scratch.currentTextPart = '';
           runtime.streamingAssistantId = undefined;
           runtime.isStreaming = true;
@@ -1166,6 +1363,91 @@ export const useChatStore = defineStore('chat', {
           return;
         }
 
+        case 'ask_user_question': {
+          // Plan mode: the agent parked 1-4 clarifying questions. Store them so
+          // the composer's question form opens. Do NOT push a bubble — the
+          // parked turn's readable text already streams via `text`/`complete`.
+          const qs = Array.isArray(data.questions) ? data.questions : [];
+          this.pendingQuestionByConversation[conversationId] = {
+            createdAt: Date.now(),
+            questions: qs.slice(0, 4).map((q: any, i: number) => ({
+              id: String(q.id ?? `q${i}`),
+              question: q.question ?? '',
+              description: q.description || undefined,
+              options: Array.isArray(q.options)
+                ? q.options.map((o: any) => ({
+                    label: o.label ?? '',
+                    description: o.description || undefined,
+                  }))
+                : [],
+              multiSelect: !!q.multi_select,
+              allowFreeText: q.allow_free_text !== false,
+            })),
+          };
+          return;
+        }
+
+        case 'plan_ready': {
+          // Plan mode: a plan was written and awaits Accept/Cancel.
+          this.pendingPlanByConversation[conversationId] = {
+            path: data.path ?? '',
+            filename: data.filename ?? 'plan.md',
+            title: data.title || undefined,
+            markdown: data.markdown ?? '',
+            createdAt: Date.now(),
+          };
+          return;
+        }
+
+        case 'plan_decision': {
+          // Plan mode: the plan was cancelled (run-free endpoint). Clear the
+          // approval UI and show the visible marker bubble (deduped by id).
+          this.pendingPlanByConversation[conversationId] = null;
+          if (data.decision === 'cancelled') {
+            const id: string | undefined = data.message_id;
+            const already = id !== undefined && bucket.some(m => m.id === id);
+            if (!already) {
+              bucket.push({
+                id: id ?? this.generateId(),
+                role: 'user',
+                content: data.content ?? 'Cancel this plan.',
+                parts: [{ kind: 'text', text: data.content ?? 'Cancel this plan.' } as Part],
+                timestamp: new Date(),
+              });
+            }
+          }
+          return;
+        }
+
+        case 'todos': {
+          // Plan mode: a full todo snapshot. Diff against the prior list to mark
+          // which items changed (drives the highlight-then-fade).
+          const items: TodoItem[] = (Array.isArray(data.todos) ? data.todos : []).map(
+            (t: any, i: number) => ({
+              id: String(t.id ?? `t${i}`),
+              content: t.content ?? '',
+              status:
+                t.status === 'in_progress' || t.status === 'completed'
+                  ? t.status
+                  : 'pending',
+            }),
+          );
+          const prev = this.todosByConversation[conversationId];
+          const prevById = new Map((prev?.items ?? []).map(t => [t.id, t]));
+          const changedIds = items
+            .filter(t => {
+              const p = prevById.get(t.id);
+              return !p || p.status !== t.status || p.content !== t.content;
+            })
+            .map(t => t.id);
+          this.todosByConversation[conversationId] = {
+            items,
+            changedIds,
+            updateSeq: (prev?.updateSeq ?? 0) + 1,
+          };
+          return;
+        }
+
         case 'compaction_suggested': {
           // The conversation crossed the compaction threshold. Surface a subtle
           // popup (suggest-only; never forced).
@@ -1208,6 +1490,18 @@ export const useChatStore = defineStore('chat', {
           runtime.isSummarizing = false;
           runtime.streamingAssistantId = undefined;
           scratch.currentTextPart = '';
+          // Plan mode: once every todo is completed the plan is done — clear the
+          // panel. A partial list survives a stop/interrupt so the panel shows
+          // where execution halted (resumable via "continue").
+          {
+            const todos = this.todosByConversation[conversationId];
+            if (
+              todos && todos.items.length > 0 &&
+              todos.items.every(t => t.status === 'completed')
+            ) {
+              this.todosByConversation[conversationId] = null;
+            }
+          }
           // Drop this turn's usage rollup so the usage panel / chips re-fetch
           // the freshly-persisted per-source records (lazy import: the usage
           // store must not be a load-time dependency of the chat store).
@@ -1401,6 +1695,9 @@ export const useChatStore = defineStore('chat', {
         summary: msg.summary ?? undefined,
         isRejectedTrigger: isRejectedTrigger || undefined,
         rejectedReason: isRejectedTrigger ? (msg.metadata?.rejected_reason ?? '') : undefined,
+        mode: msg.metadata?.mode && msg.metadata.mode !== 'reasoning'
+          ? (msg.metadata.mode as ChatMode)
+          : undefined,
       };
     },
 
@@ -1446,6 +1743,9 @@ export const useChatStore = defineStore('chat', {
       delete this.messagesByConversation[id];
       delete this.runtimes[id];
       delete this.channelIdsByConversation[id];
+      delete this.pendingQuestionByConversation[id];
+      delete this.pendingPlanByConversation[id];
+      delete this.todosByConversation[id];
       const settingsStore = useSettingsStore();
       if (settingsStore.profileId) {
         useNotificationsStore().clearForConversation(settingsStore.profileId, id);
@@ -1509,6 +1809,16 @@ export const useChatStore = defineStore('chat', {
         this.channelIdsByConversation[newId] = this.channelIdsByConversation[oldId];
         delete this.channelIdsByConversation[oldId];
       }
+      for (const map of [
+        this.pendingQuestionByConversation,
+        this.pendingPlanByConversation,
+        this.todosByConversation,
+      ] as Record<string, unknown>[]) {
+        if (oldId in map) {
+          map[newId] = map[oldId];
+          delete map[oldId];
+        }
+      }
       if (this.activeConversationId === oldId) {
         this.activeConversationId = newId;
       }
@@ -1547,6 +1857,9 @@ export const useChatStore = defineStore('chat', {
       this.messagesByConversation = {};
       this.runtimes = {};
       this.channelIdsByConversation = {};
+      this.pendingQuestionByConversation = {};
+      this.pendingPlanByConversation = {};
+      this.todosByConversation = {};
       this.error = null;
     },
 

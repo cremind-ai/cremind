@@ -2,12 +2,11 @@
 import { computed, inject, ref, watch } from 'vue';
 import type { ChatMessage, FileAttachment, TerminalAttachment } from '../stores/chat';
 import { OpenTerminalKey } from '../composables/terminalTarget';
-import { Marked } from 'marked';
-import { markedHighlight } from 'marked-highlight';
-import hljs from 'highlight.js';
+import { createChatMarked } from '../utils/markdown';
 import vLinkBlank from '../directives/v-link-blank';
 import { Icon } from '@iconify/vue';
 import { copyTextToClipboard } from '../utils/clipboard';
+import { chatModeMeta } from '../constants/chatModes';
 import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
 import { getProcess } from '../services/processApi';
@@ -38,41 +37,15 @@ const resolveApiUrl = (href: string): string => {
   return href;
 };
 
-// Configure marked with syntax highlighting + URL rewriting
-const marked = new Marked(
-  markedHighlight({
-    langPrefix: 'hljs language-',
-    highlight(code, lang) {
-      const language = hljs.getLanguage(lang) ? lang : 'plaintext';
-      return hljs.highlight(code, { language }).value;
-    }
-  })
-);
-marked.use({
-  silent: true,
-  breaks: true,
-  renderer: {
-    image({ href, title, text }) {
-      const src = resolveApiUrl(href);
-      const alt = text || '';
-      const titleAttr = title ? ` title="${title}"` : '';
-      return `<img src="${src}" alt="${alt}"${titleAttr} loading="lazy" style="max-width:100%;border-radius:6px;" />`;
-    },
-    link({ href, title, tokens }) {
-      const url = resolveApiUrl(href);
-      const titleAttr = title ? ` title="${title}"` : '';
-      const text = this.parser.parseInline(tokens);
-      if (url.match(/\/api\/files\//)) {
-        return `<a href="${url}"${titleAttr} target="_blank" rel="noopener">${text}</a>`;
-      }
-      return `<a href="${url}"${titleAttr}>${text}</a>`;
-    },
-  },
-});
+// Configure marked with syntax highlighting + URL rewriting (shared factory).
+const marked = createChatMarked(resolveApiUrl);
 
 const isUser = computed(() => props.message.role === 'user');
 const isRejectedTrigger = computed(() => props.message.isRejectedTrigger === true);
 const hasThinking = computed(() => props.message.thinkingSteps && props.message.thinkingSteps.length > 0);
+const modeMeta = computed(() =>
+  props.message.mode ? chatModeMeta(props.message.mode) : null,
+);
 
 const copied = ref(false);
 const copyToClipboard = async () => {
@@ -444,6 +417,10 @@ const handleThinkingClick = (event: MouseEvent) => {
     <div class="message-bubble" :class="{ 'user-message': isUser, 'agent-message': !isUser, 'rejected-trigger': isRejectedTrigger }">
       <div class="message-header">
         <span class="message-role">{{ isUser ? 'You' : 'Agent' }}</span>
+        <span v-if="isUser && modeMeta" class="mode-chip" :title="modeMeta.label">
+          <Icon :icon="modeMeta.icon" />
+          {{ modeMeta.label }}
+        </span>
         <span class="message-time">{{ message.timestamp.toLocaleTimeString() }}</span>
         <button v-if="message.content && !message.isStreaming" class="copy-btn" :class="{ copied }" @click.stop="copyToClipboard" :title="copied ? 'Copied!' : 'Copy to clipboard'">
           <Icon :icon="copied ? 'mdi:check' : 'mdi:content-copy'" />
@@ -756,6 +733,18 @@ const handleThinkingClick = (event: MouseEvent) => {
 
 .user-message .message-role {
   color: rgba(255, 255, 255, 0.9);
+}
+
+.mode-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.95);
 }
 
 .message-time {

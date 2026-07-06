@@ -14,6 +14,7 @@ from typing import Optional
 import typer
 
 from app.cli.commands._helpers import graceful_errors
+from app.cli.modes import ChatMode
 
 
 @graceful_errors
@@ -26,6 +27,10 @@ def chat(
     title: Optional[str] = typer.Option(
         None, "--title", "-t",
         help="Title to use when creating a new conversation.",
+    ),
+    chat_mode: Optional[ChatMode] = typer.Option(
+        None, "--mode", case_sensitive=False,
+        help="Turn mode for this session: plan, reasoning (default), or instant.",
     ),
 ) -> None:
     """Open an interactive chat REPL with streamed thinking.
@@ -61,7 +66,10 @@ def chat(
 
     async def _main() -> None:
         conv_id, conv_title = await _resolve_conversation()
-        await run_chat(cfg, conv_id, conv_title)
+        await run_chat(
+            cfg, conv_id, conv_title,
+            mode=chat_mode.value if chat_mode is not None else None,
+        )
 
     try:
         asyncio.run(_main())
