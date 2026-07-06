@@ -33,6 +33,60 @@ def load_provider_catalog(provider_name: str) -> dict:
         return toml.load(f)
 
 
+def load_custom_providers(profile: str | None = None) -> dict:
+    """Load the per-profile registry of user-defined "custom" providers.
+
+    Custom providers are OpenAI-API-compatible endpoints the user adds from the
+    LLM Providers page. They are stored per-profile in ``llm_config`` under a
+    single non-secret JSON row keyed ``custom_providers`` — a mapping of
+    ``slug -> {display_name, base_url, models: [...]}``. Their API keys live in
+    separate secret rows (``custom:<slug>.api_key``), never in this registry.
+
+    Returns an empty dict when no profile is given, storage isn't ready, or the
+    row is missing/corrupt.
+    """
+    if profile is None:
+        return {}
+    import json
+
+    from app.config.settings import get_dynamic
+
+    raw = get_dynamic("llm_config", "custom_providers", profile=profile)
+    if not raw:
+        return {}
+    try:
+        registry = json.loads(raw) if isinstance(raw, str) else raw
+    except (ValueError, TypeError):
+        return {}
+    return registry if isinstance(registry, dict) else {}
+
+
+def resolve_catalog(provider_name: str, profile: str | None = None) -> dict:
+    """Resolve a provider's catalog, transparently handling custom providers.
+
+    For built-in providers this is just ``load_provider_catalog``. For
+    user-defined ``custom:<slug>`` providers it synthesizes a TOML-catalog-shaped
+    dict (``{provider: {name, display_name, base_url}, models: [...]}``) from the
+    per-profile registry so every catalog consumer — capability flags, the LLM
+    factory, the models API — works unchanged.
+
+    Returns ``{}`` for an unknown built-in provider or a deleted custom slug.
+    """
+    if provider_name and provider_name.startswith("custom:"):
+        entry = load_custom_providers(profile).get(provider_name[len("custom:"):])
+        if not entry:
+            return {}
+        return {
+            "provider": {
+                "name": provider_name,
+                "display_name": entry.get("display_name", provider_name),
+                "base_url": entry.get("base_url"),
+            },
+            "models": entry.get("models", []) or [],
+        }
+    return load_provider_catalog(provider_name)
+
+
 def _vision_overrides() -> set[str]:
     """Models force-flagged vision-capable via the ``CREMIND_VISION_MODELS``
     env var (comma-separated ``provider/model`` or bare ``model`` ids).
@@ -45,7 +99,7 @@ def _vision_overrides() -> set[str]:
     return {part.strip() for part in raw.split(",") if part.strip()}
 
 
-def model_supports_vision(provider_name: str, model_name: str) -> bool:
+def model_supports_vision(provider_name: str, model_name: str, profile: str | None = None) -> bool:
     """Return True if ``model_name`` is flagged vision-capable for its provider.
 
     Looks up the ``vision`` flag on the matching ``[[models]]`` entry in the
@@ -53,6 +107,9 @@ def model_supports_vision(provider_name: str, model_name: str) -> bool:
     model) default to False so the vision tool raises a clean, actionable error
     rather than letting the request fail opaquely at the provider API. The
     ``CREMIND_VISION_MODELS`` env var can force-enable a specific model.
+
+    Passing ``profile`` lets a per-profile ``custom:<slug>`` provider's stored
+    ``vision`` flag be honored (see ``resolve_catalog``).
     """
     if not provider_name or not model_name:
         return False
@@ -65,7 +122,7 @@ def model_supports_vision(provider_name: str, model_name: str) -> bool:
     if f"{provider_name}/{model}" in overrides or model in overrides:
         return True
 
-    catalog = load_provider_catalog(provider_name)
+    catalog = resolve_catalog(provider_name, profile)
     for entry in catalog.get("models", []) or []:
         if isinstance(entry, dict) and entry.get("id") == model:
             return bool(entry.get("vision", False))
@@ -151,7 +208,7 @@ def _reasoning_overrides() -> set[str]:
     return {part.strip() for part in raw.split(",") if part.strip()}
 
 
-def model_supports_reasoning(provider_name: str, model_name: str) -> bool:
+def model_supports_reasoning(provider_name: str, model_name: str, profile: str | None = None) -> bool:
     """Return True if ``model_name`` has native step-by-step reasoning.
 
     Looks up the ``supports_reasoning`` flag on the matching ``[[models]]``
@@ -161,6 +218,9 @@ def model_supports_reasoning(provider_name: str, model_name: str) -> bool:
     safe, beneficial default: a local/unknown model almost certainly lacks
     native reasoning). The ``CREMIND_REASONING_MODELS`` env var can force-mark a
     specific model as reasoning-capable.
+
+    Passing ``profile`` lets a per-profile ``custom:<slug>`` provider's stored
+    ``supports_reasoning`` flag be honored (see ``resolve_catalog``).
     """
     if not provider_name or not model_name:
         return False
@@ -173,7 +233,7 @@ def model_supports_reasoning(provider_name: str, model_name: str) -> bool:
     if f"{provider_name}/{model}" in overrides or model in overrides:
         return True
 
-    catalog = load_provider_catalog(provider_name)
+    catalog = resolve_catalog(provider_name, profile)
     for entry in catalog.get("models", []) or []:
         if isinstance(entry, dict) and entry.get("id") == model:
             return bool(entry.get("supports_reasoning", False))

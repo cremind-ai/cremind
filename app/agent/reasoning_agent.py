@@ -451,6 +451,7 @@ class ReasoningAgent:
         native_reasoning = model_supports_reasoning(
             getattr(self.llm, "provider_name", ""),
             getattr(self.llm, "model_name", ""),
+            profile=profile,
         )
         # Instant mode also drops the think-tool + its guidance for the turn (on
         # top of suppressing extended thinking at the LLM call — see _loop).
@@ -499,6 +500,7 @@ class ReasoningAgent:
         main_can_see = model_supports_vision(
             getattr(self.llm, "provider_name", "") or "",
             getattr(self.llm, "model_name", "") or "",
+            profile=profile,
         )
         if not vision_feature_enabled(profile) and not main_can_see:
             tools = [t for t in tools if t.tool_id != "image_understanding"]

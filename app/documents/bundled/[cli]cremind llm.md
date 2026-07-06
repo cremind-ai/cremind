@@ -1,5 +1,5 @@
 ---
-description: "Configure **LLM providers and models**: list and `configure` providers (add an API key), browse each provider's available models, assign the high / low / default **model groups** the agent picks from, and run the **GitHub Copilot** device-code login. Use this to add a provider, choose which model the agent uses, or authenticate a provider — distinct from `cremind config` (agent behavior) and `cremind agents` (MCP/A2A servers)."
+description: "Configure **LLM providers and models**: list and `configure` providers (add an API key), add your own **custom OpenAI-compatible providers** (name + base URL + model list) with `create-custom`, browse each provider's available models, assign the high / low / default **model groups** the agent picks from, and run the **GitHub Copilot** device-code login. Use this to add a provider (built-in or custom), choose which model the agent uses, or authenticate a provider — distinct from `cremind config` (agent behavior) and `cremind agents` (MCP/A2A servers)."
 ---
 
 # `cremind llm` — LLM Providers, Model Groups, and Device-Code Auth
@@ -11,9 +11,12 @@ the GitHub Copilot device-code OAuth dance.
 
 The group splits into three subcommand sets:
 
-- **`providers`** — list, configure, and delete LLM provider configs.
-  Supports any provider that the server knows about (Anthropic, OpenAI,
-  GitHub Copilot, etc.).
+- **`providers`** — list, configure, and delete LLM provider configs,
+  and `create-custom` your own OpenAI-compatible providers. Supports any
+  provider that the server knows about (Anthropic, OpenAI, GitHub
+  Copilot, etc.) plus user-defined **custom providers** (internal name
+  `custom:<slug>`) for any OpenAI-API-compatible endpoint not in the
+  built-in list.
 - **`model-groups`** — read/write the `high` / `low` model assignments
   and the default provider. The agent picks from these groups when it
   needs a heavyweight or lightweight model.
@@ -152,10 +155,92 @@ $ cremind llm providers configure copilot --auth-method oauth_business
 $ cremind llm providers configure openai --json '{"organization":"org-...","base_url":"https://api.openai.com/v1"}'
 ```
 
+### `cremind llm providers create-custom`
+
+**Purpose.** Add a **custom provider** — any OpenAI-API-compatible
+endpoint that isn't in the built-in list — with your own name, API base
+URL, API key, and a manually specified model list. Create as many as you
+like; each gets a distinct internal name `custom:<slug>` (the slug is
+derived from the display name and de-duplicated per profile). Custom
+providers then behave like built-in ones: they show up in
+`providers list`, `providers models`, and are assignable via
+`model-groups set`.
+
+**Syntax.**
+
+```bash
+cremind llm providers create-custom --name <name> --base-url <url> \
+    [--api-key K] [--model <id> ...] [--models-json '[...]']
+```
+
+**Flags.**
+
+| Flag             | Type       | Default | Meaning                                                                                 |
+|------------------|------------|---------|-----------------------------------------------------------------------------------------|
+| `--name`         | string     | —       | **Required.** Display name for the provider (e.g. `My Company LLM`).                     |
+| `--base-url`     | string     | —       | **Required.** OpenAI-compatible base URL (e.g. `https://api.example.com/v1`).            |
+| `--api-key`      | string     | `""`    | API key value. Stored server-side; never surfaced back.                                 |
+| `--model`        | string (repeatable) | — | A model id to expose. Defaults to no vision/reasoning and unknown (untracked) cost. |
+| `--models-json`  | string     | `""`    | Model list as a JSON array for per-model control (see below).                           |
+
+At least one model is required (via `--model` and/or `--models-json`).
+Custom models assume the default **128k context window**; a model with no
+prices set has its cost left **untracked** (rather than shown as $0).
+
+Each object in `--models-json` accepts:
+`{"id": "...", "display_name": "...", "vision": bool, "supports_reasoning": bool, "input_price_per_1m": num, "output_price_per_1m": num, "cache_read_price_per_1m": num, "cache_write_price_per_1m": num}`.
+Only `id` is required. `supports_reasoning: true` marks the model as a native
+reasoner (the agent skips its own think-tool) and enables the Reasoning Effort
+selector when the model is assigned; omit it (or pass `false`) for an ordinary
+chat model. Omit any price field to leave that cost component untracked.
+
+**Behavior.** Prints the new provider's internal `name` on success
+(`custom:<slug>`), or the same object under `--json`.
+
+**Examples.**
+
+```bash
+# Quick: two plain chat models
+$ cremind llm providers create-custom \
+    --name "My LLM" --base-url https://api.example.com/v1 \
+    --api-key sk-... --model my-large --model my-small
+name  custom:my-llm
+
+# Rich: per-model vision / reasoning effort / pricing
+$ cremind llm providers create-custom \
+    --name "Acme" --base-url https://api.acme.ai/v1 --api-key sk-... \
+    --models-json '[
+      {"id":"acme-large","display_name":"Acme Large","vision":true,"input_price_per_1m":2.5,"output_price_per_1m":10,"cache_read_price_per_1m":0.25},
+      {"id":"acme-mini","supports_reasoning":true}
+    ]'
+
+# Then assign it to the agent's main model
+$ cremind llm model-groups set --high custom:my-llm/my-large
+```
+
+**Editing / deleting a custom provider.** Reuse the generic commands with
+the `custom:<slug>` name. `configure` accepts `display_name`, `base_url`,
+and a `models` array (as a JSON array) via `--json`, plus `--api-key`:
+
+```bash
+# Rename + swap base URL (key preserved if omitted)
+$ cremind llm providers configure custom:my-llm \
+    --json '{"display_name":"My LLM v2","base_url":"https://api.example.com/v2"}'
+
+# Replace the model list
+$ cremind llm providers configure custom:my-llm \
+    --json '{"models":[{"id":"my-large","supports_reasoning":true,"input_price_per_1m":1.5,"output_price_per_1m":6}]}'
+
+# Delete the whole custom provider (definition + key)
+$ cremind llm providers delete-config custom:my-llm
+```
+
 ### `cremind llm providers delete-config`
 
 **Purpose.** Remove every stored config field for a provider — API
-keys, OAuth tokens, base URLs, the lot.
+keys, OAuth tokens, base URLs, the lot. For a **custom provider**
+(`custom:<slug>`) this also removes its definition (name, base URL, model
+list) entirely and clears any model-group assignment that pointed at it.
 
 **Syntax.**
 
@@ -163,14 +248,16 @@ keys, OAuth tokens, base URLs, the lot.
 cremind llm providers delete-config <provider>
 ```
 
-**Behavior.** Silent on success. The provider remains *known* (it will
-still appear in `providers list`), but its `configured` flag flips to
-`no` and any models that depended on the config become unavailable.
+**Behavior.** Silent on success. A built-in provider remains *known* (it
+still appears in `providers list`) but its `configured` flag flips to
+`no`. A custom provider is removed completely — it disappears from
+`providers list`.
 
 **Example.**
 
 ```bash
 $ cremind llm providers delete-config openai
+$ cremind llm providers delete-config custom:my-llm
 ```
 
 ### `cremind llm model-groups get`

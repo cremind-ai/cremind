@@ -163,7 +163,7 @@ class ModelGroupManager:
             provider, model = self.get_provider_and_model("high", profile=profile)
         except Exception:  # noqa: BLE001 — unconfigured/missing model → treat as unavailable
             return False
-        return model_supports_vision(provider, model)
+        return model_supports_vision(provider, model, profile=profile)
 
     def _get_group_reasoning_effort(self, group: str, profile: str | None = None) -> Optional[str]:
         """Look up the user's selected reasoning_effort for a model group from SQLite."""
