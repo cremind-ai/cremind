@@ -1,5 +1,5 @@
 ---
-description: "Open an interactive full-screen **chat REPL** (TUI) against a new or existing conversation and watch the agent's thinking, text, and tool output stream live. Use this to sit and talk with the agent interactively — keyboard shortcuts, resume a conversation by id, `-t/--title` for a new thread. Distinct from `cremind conv send`, which scripts a single one-shot message without a prompt."
+description: "Open an interactive full-screen **chat REPL** (TUI) against a new or existing conversation and watch the agent's thinking, text, and tool output stream live. Use this to sit and talk with the agent interactively — keyboard shortcuts, resume a conversation by id, `-t/--title` for a new thread, `--mode plan|reasoning|instant` sets the session's turn mode. Distinct from `cremind conv send`, which scripts a single one-shot message without a prompt."
 ---
 
 # `cremind chat` — Interactive Chat REPL
@@ -55,9 +55,10 @@ cremind chat [<conversation_id>] [-t <title>]
 
 **Flags.**
 
-| Flag             | Type   | Default | Meaning                                                            |
-|------------------|--------|---------|--------------------------------------------------------------------|
-| `--title`, `-t`  | string | `""`    | Title to apply when creating a new conversation. Ignored when an id is supplied. |
+| Flag             | Type   | Default     | Meaning                                                            |
+|------------------|--------|-------------|--------------------------------------------------------------------|
+| `--title`, `-t`  | string | `""`        | Title to apply when creating a new conversation. Ignored when an id is supplied. |
+| `--mode`         | choice | `reasoning` | Turn mode for every message sent this session: `plan`, `reasoning`, or `instant`. |
 
 ## Keyboard shortcuts
 
@@ -68,10 +69,13 @@ cremind chat [<conversation_id>] [-t <title>]
 | **Ctrl+D**      | Quit the TUI immediately. Any in-flight run is left running on the server.         |
 | **PgUp / PgDn** | Scroll the message history.                                                       |
 
-Reasoning mode is always **on** in `chat` — the agent runs its full
-ReAct loop (Thought / Action / Input / Observation / Response) for
-every turn, and the TUI renders each step as it streams. To send a
-message without reasoning, use `cremind conv send --no-reasoning` instead.
+The session's turn mode is fixed at launch with `--mode` (default
+`reasoning`). `--mode plan` runs every message through the Plan-mode
+workflow — the agent asks clarifying questions, proposes a plan file, and
+waits for you to type `accept` before executing (todo checklist updates
+render in the transcript as `[x]` / `[>]` / `[ ]` blocks). `--mode instant`
+disables extended thinking for the fastest replies. The active mode is
+shown in the status bar.
 
 ## Behavior
 
@@ -107,6 +111,14 @@ $ cremind chat -t "Quick question"
 $ cremind chat c_82bc
 # (TUI opens with the conversation's title; previous messages
 # are scrollable via PgUp/PgDn)
+```
+
+### Start a plan-mode session
+
+```bash
+$ cremind chat c_82bc --mode plan
+# The agent asks clarifying questions; answer them, then type "accept"
+# when it proposes a plan and it executes with live todo updates.
 ```
 
 ### Pipe an answer instead of sitting at a TUI

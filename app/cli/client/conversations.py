@@ -89,10 +89,17 @@ async def send_message(
     conv_id: str,
     text: str,
     reasoning: bool = True,
+    mode: Optional[str] = None,
 ) -> SendMessageResponse:
+    body: dict[str, Any] = {"text": text, "reasoning": reasoning}
+    if mode:
+        # Send both so a new CLI works against an old server (reads reasoning)
+        # and a new server (reads mode); keep them coherent.
+        body["mode"] = mode
+        body["reasoning"] = mode != "instant"
     resp = await client.post_json(
         f"/api/conversations/{quote(conv_id, safe='')}/messages",
-        {"text": text, "reasoning": reasoning},
+        body,
     )
     if not isinstance(resp, dict):
         raise RuntimeError("unexpected /messages response")

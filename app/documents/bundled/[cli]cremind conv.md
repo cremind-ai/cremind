@@ -1,5 +1,5 @@
 ---
-description: "Manage **conversations** and stream agent replies from the terminal: create a new conversation, list, fetch history, rename or change its id (`rename`, `set-id`), delete or delete-all, and `send` a message to stream the response, plus attach or cancel a run, inspect memory and running summary, force compaction, and per-conversation token usage. Use this to script one-shot messages and manage threads — distinct from `cremind chat` (the interactive REPL)."
+description: "Manage **conversations** and stream agent replies from the terminal: create, list, fetch history, rename or change its id (`rename`, `set-id`), delete or delete-all, and `send` a message with `--mode plan|reasoning|instant` (Plan mode asks clarifying questions and writes a plan you approve before it executes), plus attach or cancel a run, inspect memory and running summary, force compaction, and per-conversation token usage. Use this to script one-shot messages and manage threads — distinct from `cremind chat` (the interactive REPL)."
 ---
 
 # `cremind conv` — Conversation Management and Streaming
@@ -250,7 +250,7 @@ $ cremind conv history c_82bc --limit 3 --offset 0
 **Syntax.**
 
 ```bash
-cremind conv send <id> <message> [--raw] [--no-reasoning]
+cremind conv send <id> <message> [--raw] [--mode plan|reasoning|instant] [--no-reasoning]
 ```
 
 **Arguments** (both required):
@@ -260,10 +260,11 @@ cremind conv send <id> <message> [--raw] [--no-reasoning]
 
 **Flags.**
 
-| Flag              | Type | Default | Meaning                                                          |
-|-------------------|------|---------|------------------------------------------------------------------|
-| `--raw`           | bool | `false` | Plain-text streaming (no TUI). Pipe-friendly.                    |
-| `--no-reasoning`  | bool | `false` | Disable reasoning mode for this message — the agent answers without an explicit ReAct loop. |
+| Flag              | Type   | Default     | Meaning                                                          |
+|-------------------|--------|-------------|------------------------------------------------------------------|
+| `--raw`           | bool   | `false`     | Plain-text streaming (no TUI). Pipe-friendly.                    |
+| `--mode`          | choice | `reasoning` | Turn mode. `plan`: the agent researches read-only, asks clarifying questions, writes a plan file for your approval, then executes it with live todo updates. `reasoning`: today's default behavior. `instant`: fastest — extended thinking is disabled for the turn. |
+| `--no-reasoning`  | bool   | `false`     | **Deprecated** alias for `--mode instant`. Note: on older releases this flag was accepted but had no effect; it now genuinely disables extended thinking. |
 
 The root `--json` flag overrides `--raw` and selects the JSON-per-line
 renderer.
@@ -285,9 +286,36 @@ $ cremind conv send c_82bc "Anything urgent?" --raw | tee answer.txt
 # Structured event stream
 $ cremind conv send c_82bc "Anything urgent?" --json | jq -r 'select(.type=="text").data.token'
 
-# One-shot answer, no reasoning steps
-$ cremind conv send c_82bc "Summarize in one sentence" --raw --no-reasoning
+# Fastest answer, no extended thinking
+$ cremind conv send c_82bc "Summarize in one sentence" --raw --mode instant
+
+# Start a plan-mode workflow (see "Plan mode over the CLI" below)
+$ cremind conv send c_82bc "refactor the auth module" --mode plan
 ```
+
+## Plan mode over the CLI
+
+Plan mode is a multi-turn workflow; each reply is a new `conv send` on the
+same conversation with `--mode plan`:
+
+1. `cremind conv send <id> "refactor the auth module" --mode plan`
+   The agent researches read-only, then ends the turn with clarifying
+   questions. In `--raw` mode the assistant text streams on stdout; the
+   numbered questions, their options, and a reply hint print on stderr.
+2. Answer by sending a normal message:
+   `cremind conv send <id> "1: option b; 2: only the login flow" --mode plan`
+3. The agent writes a plan file (saved under
+   `~/.cremind/<profile>/plans/<conversation_id>/`) and ends the turn
+   awaiting approval. The plan body streams as assistant text; the saved
+   path and an accept hint print on stderr.
+4. Approve: `cremind conv send <id> "accept" --mode plan` — the agent
+   executes the plan, emitting `todos` checklist updates as it goes
+   (`[x]` done / `[>]` in progress / `[ ]` pending, on stderr in raw mode).
+   Decline: `cremind conv cancel <run_id>` stops an in-flight run; a later
+   "continue, please implement this plan" resumes from history.
+
+With `--json`, the structured events are `ask_user_question`, `plan_ready`,
+and `todos`, alongside the usual `thinking` / `text` / `complete`.
 
 ### `cremind conv attach`
 
@@ -611,6 +639,11 @@ $ cremind conv list --json | jq -c '.[] | select(.task_id != "")' | while read r
 **`cremind conv send` opens a TUI when I want raw text** — Pass `--raw`
 (plain text) or `--json` (structured events). The TUI is the default
 only when stdout is a TTY.
+
+**`--no-reasoning` prints a deprecation warning** — It is now an alias for
+`--mode instant`. Use `--mode instant` instead. Unlike older releases where
+the flag had no server-side effect, it now genuinely disables extended
+thinking for the turn.
 
 **`Ctrl-C` killed the CLI but the run kept going** — Almost always
 caused by exiting before the TUI handed Ctrl-C to the cancel hook.

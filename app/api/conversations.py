@@ -381,6 +381,14 @@ def get_conversation_routes(
                 status_code=400,
             )
         reasoning = bool(body.get("reasoning", True))
+        # Turn mode (plan | reasoning | instant). Absent/invalid ⇒ derived from
+        # the legacy ``reasoning`` boolean (see app.agent.modes.normalize_mode).
+        from app.agent.modes import normalize_mode
+        mode = normalize_mode(body.get("mode"), reasoning=reasoning)
+        # Only set on a Plan-mode Accept POST; drives the execution phase.
+        plan_action = body.get("plan_action")
+        if plan_action not in ("accept",):
+            plan_action = None
 
         # Files attached from the composer were uploaded to this conversation's
         # temp dir via /api/files/upload-temp. Keep only entries whose path
@@ -454,6 +462,12 @@ def get_conversation_routes(
         # the run's status/usage update and request_user_input stays available.
         event_run_id: str | None = None
         is_event_run = conv.get("kind") == "event_run"
+        # Plan mode is meaningless inside a hidden event-run conversation (those
+        # own the request_user_input flow); force it back to reasoning so the
+        # plan tools/guidance never collide with an event run.
+        if is_event_run and mode == "plan":
+            mode = "reasoning"
+            plan_action = None
         if is_event_run:
             try:
                 from app.storage import get_event_run_storage
@@ -471,6 +485,26 @@ def get_conversation_routes(
                     f"POST message: failed to resume event run for {conversation_id}"
                 )
 
+        # User-message metadata: attachment names (kept out of the agent's text),
+        # the non-default turn mode (for the UI mode chip + diagnosing "plan mode
+        # didn't engage"), plus, on a Plan-mode Accept, a marker so history
+        # records the approval.
+        user_message_metadata: dict | None = None
+        if attachments:
+            user_message_metadata = {
+                "attachments": [{"name": a["name"]} for a in attachments]
+            }
+        if mode != "reasoning":
+            user_message_metadata = {
+                **(user_message_metadata or {}),
+                "mode": mode,
+            }
+        if plan_action == "accept":
+            user_message_metadata = {
+                **(user_message_metadata or {}),
+                "plan_mode": {"stage": "accepted"},
+            }
+
         await event_queue.enqueue_user_message(
             conversation_id=conversation_id,
             run_id=run_id,
@@ -478,11 +512,10 @@ def get_conversation_routes(
             query=text,
             history_messages=history_messages,
             reasoning=reasoning,
+            mode=mode,
+            plan_action=plan_action,
             attachments=attachments or None,
-            user_message_metadata=(
-                {"attachments": [{"name": a["name"]} for a in attachments]}
-                if attachments else None
-            ),
+            user_message_metadata=user_message_metadata,
             push_user_message=True,
             # Event-run conversations keep meaningful titles; replies stream a
             # run-aware notification and update the run row.
@@ -657,6 +690,15 @@ def get_conversation_routes(
             await get_event_stream_bus().discard(conversation_id)
         except Exception:  # noqa: BLE001
             logger.debug("bus.discard failed during conv delete", exc_info=True)
+        # Remove any saved Plan-mode files for this conversation (best-effort).
+        try:
+            from app.utils.plans_dir import remove_conversation_plans
+            conv = await conversation_storage.get_conversation(conversation_id)
+            plan_profile = (conv or {}).get("profile")
+            if plan_profile:
+                remove_conversation_plans(plan_profile, conversation_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("plans dir cleanup failed during conv delete", exc_info=True)
 
     async def handle_delete_conversation(request: Request) -> JSONResponse:
         """Delete a single conversation."""
@@ -816,6 +858,54 @@ def get_conversation_routes(
             cancelled = agent_executor.cancel_by_task_id(task_id)
         return JSONResponse({"cancelled": cancelled})
 
+    async def handle_plan_cancel(request: Request) -> JSONResponse:
+        """Decline a pending Plan-mode approval WITHOUT starting an agent run.
+
+        A normal POST /messages always enqueues a run, but declining a plan must
+        run nothing. So this persists a visible user-role "Cancel this plan."
+        marker (kept IN model context so a later resume knows the plan was
+        declined) and publishes a ``plan_decision`` event so every open tab clears
+        the approval UI. Any run still in flight is left to
+        POST /api/tasks/{task_id}/cancel.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile_from_request(request)
+        if not profile:
+            return JSONResponse({"error": "Profile is required"}, status_code=400)
+        conversation_id = request.path_params["conversation_id"]
+        conv = await conversation_storage.get_conversation(conversation_id)
+        if conv is None:
+            return JSONResponse({"error": "Conversation not found"}, status_code=404)
+        if conv.get("profile") != profile:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+        content = "Cancel this plan."
+        message_id: str | None = None
+        try:
+            msg = await conversation_storage.add_message(
+                conversation_id=conversation_id,
+                role="user",
+                content=content,
+                metadata={"plan_mode": {"stage": "cancelled"}},
+            )
+            message_id = msg.get("id") if isinstance(msg, dict) else None
+        except Exception:  # noqa: BLE001
+            logger.exception(f"plan cancel: failed to persist marker for {conversation_id}")
+
+        try:
+            await get_event_stream_bus().publish(conversation_id, "plan_decision", {
+                "decision": "cancelled",
+                "message_id": message_id,
+                "content": content,
+            })
+        except Exception:  # noqa: BLE001
+            logger.exception(f"plan cancel: failed to publish plan_decision for {conversation_id}")
+
+        publish_conversations_changed(profile)
+        return JSONResponse({"message_id": message_id, "content": content})
+
     async def handle_get_conversation_usage(request: Request) -> JSONResponse:
         """Per-request + cumulative token usage & estimated cost for a conversation.
 
@@ -914,6 +1004,11 @@ def get_conversation_routes(
         Route(
             "/api/tasks/{task_id}/cancel",
             endpoint=handle_cancel_task,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/conversations/{conversation_id}/plan/cancel",
+            endpoint=handle_plan_cancel,
             methods=["POST"],
         ),
     ]

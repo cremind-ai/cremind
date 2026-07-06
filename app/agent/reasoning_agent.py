@@ -149,6 +149,73 @@ for progress updates or narration, and never ask when you can reasonably proceed
 '''
 
 
+# Appended (only) to a Plan-mode PLANNING turn's system prompt. The user wants a
+# plan before any changes are made, so the agent researches read-only, asks
+# clarifying questions, then writes a plan for approval. Kept append-after-format
+# (like EVENT_RUN_GUIDANCE) so ordinary chat/instant runs render byte-identical.
+PLAN_MODE_PLANNING_GUIDANCE = '''
+
+PLAN MODE — PLANNING PHASE: The user wants a plan before any changes are made.
+Work READ-ONLY in this phase: you may read files, search, and inspect, but do NOT
+modify anything, run mutating commands, or create/edit files — only the plan
+tools below write anything.
+1. If the user's message is telling you to carry out a plan that was ALREADY
+   written earlier in this conversation (e.g. "continue", "go ahead", "implement
+   the plan" — even after a previous cancel), treat that as approval: stop
+   planning, maintain a live todo list with `update_todos`, and execute that plan
+   to completion using your normal tools.
+2. Otherwise, if you have NOT yet asked clarifying questions in this planning
+   cycle, first research the request read-only, then call `ask_user_question`
+   with 1-4 focused questions and STOP — end your turn. Always ask at least one
+   clarifying question before writing a plan.
+3. Once the user has answered your questions (their answers appear earlier in
+   this turn's history), call `write_plan` with a detailed, complete Markdown
+   plan, then STOP — end your turn and wait for the user's Accept/Cancel.
+Do not call any other tool in the same step as `ask_user_question` or
+`write_plan`. Never start a fresh planning cycle while an approved plan's todos
+are still incomplete — treat such messages as steering for the ongoing work.
+Write your questions and plan in the user's language.
+'''
+
+
+# Appended (only) to a Plan-mode EXECUTION turn's system prompt (the user
+# approved the plan, or is resuming an interrupted execution).
+PLAN_MODE_EXECUTION_GUIDANCE = '''
+
+PLAN MODE — EXECUTION PHASE: The user approved the plan. Execute it end to end.
+The plan is earlier in this conversation; if it has scrolled out of context
+(compaction, or a later resume) read it back from its saved file with
+`system_file` before proceeding. Maintain a live todo list with the
+`update_todos` tool: call it with the FULL current list (each item has content +
+status pending|in_progress|completed) right after you read the plan, whenever you
+start an item (mark it in_progress — keep at most one in_progress at a time), and
+whenever you complete one. Do the real work with your normal tools between
+updates. Keep executing until every todo is completed, then give a short final
+summary. If the user sends a message while you are executing, treat it as
+steering for the ongoing plan (adjust and continue) rather than a request for a
+brand-new plan.
+'''
+
+
+def _plan_parked_final_text(questions: Optional[dict], plan: Optional[dict]) -> str:
+    """Readable final-assistant text for a parked Plan-mode turn.
+
+    The plan turn's content is the full plan markdown (so execution turns, the
+    CLI, and compaction-resume see it verbatim); the questions turn's content is
+    a readable rendering of the questions (the structured form is delivered
+    separately via the ``ask_user_question`` bus event + message metadata).
+    """
+    if plan:
+        return str(plan.get("markdown") or "").strip() or "I've prepared a plan for your review."
+    if questions:
+        qs = questions.get("questions") or []
+        lines = ["I have a few questions before I write the plan:"]
+        for i, q in enumerate(qs, 1):
+            lines.append(f"{i}. {q.get('question', '')}")
+        return "\n".join(lines)
+    return ""
+
+
 # Upper bound on facts folded into the frozen system-prompt memory section. The
 # DB path is already queue-capped (``memory.long_term_queue_size``); this also
 # bounds the effectively-unlimited vector path so the block can't bloat the cache
@@ -326,6 +393,12 @@ class ReasoningAgent:
     # direct ``_build_instruction`` calls (tests) from tripping on a missing attr.
     _long_term_memory_block: str = ""
 
+    # Turn mode + plan phase. Class-level defaults keep ``__new__`` construction
+    # (tests) and direct ``_build_instruction`` calls from tripping on a missing
+    # attribute; a normal run always sets them in ``__init__``.
+    _mode: str = "reasoning"
+    _plan_phase: Optional[str] = None
+
     def __init__(
         self,
         llm: LLMProvider,
@@ -336,11 +409,17 @@ class ReasoningAgent:
         reasoning: bool = True,
         triggered_by_event: bool = False,
         event_run: bool = False,
+        mode: str = "reasoning",
+        plan_phase: Optional[str] = None,
     ):
         self.llm = llm
         self.registry = registry
         self.profile = profile
         self.reasoning = reasoning
+        # Per-request turn mode ("reasoning" | "instant" | "plan") and, for plan
+        # mode, the phase ("planning" | "execute") computed server-side.
+        self._mode = mode
+        self._plan_phase = plan_phase
         # This run executes inside a hidden event-run conversation (both the
         # trigger turn and any user-reply turns). Gates the request_user_input
         # tool + its guidance, and drives the "park pending" turn-end below.
@@ -373,8 +452,11 @@ class ReasoningAgent:
             getattr(self.llm, "provider_name", ""),
             getattr(self.llm, "model_name", ""),
         )
-        self._inject_reasoning_guidance = not native_reasoning
-        if native_reasoning:
+        # Instant mode also drops the think-tool + its guidance for the turn (on
+        # top of suppressing extended thinking at the LLM call — see _loop).
+        instant = self._mode == "instant"
+        self._inject_reasoning_guidance = not native_reasoning and not instant
+        if native_reasoning or instant:
             tools = [t for t in tools if t.tool_id != "reasoning"]
         # ``request_user_input`` lets an event run park itself 'pending' awaiting
         # the user's reply. It only makes sense inside an event-run conversation
@@ -384,6 +466,18 @@ class ReasoningAgent:
         # cache hits, and it's stable across an event run's own turns.
         if not event_run:
             tools = [t for t in tools if t.tool_id != "request_user_input"]
+        # Plan-mode tools are exposed only on plan runs, and only in the matching
+        # phase (mirrors the request_user_input gate above). Withholding them
+        # everywhere else keeps reasoning/instant runs (and event runs) byte-
+        # identical to today, so their prompt-cache prefix is unaffected.
+        #   planning phase → ask_user_question, write_plan, update_todos
+        #   execute  phase → update_todos only
+        plan_planning = self._mode == "plan" and self._plan_phase == "planning"
+        plan_execute = self._mode == "plan" and self._plan_phase == "execute"
+        if not plan_planning:
+            tools = [t for t in tools if t.tool_id not in ("ask_user_question", "write_plan")]
+        if not (plan_planning or plan_execute):
+            tools = [t for t in tools if t.tool_id != "update_todos"]
         # Whether the model may emit several tool calls in one turn. Default-on for
         # every provider; the agent already runs leaf calls concurrently (see the
         # asyncio.gather in _loop). A per-model TOML flag can opt a model out.
@@ -391,6 +485,10 @@ class ReasoningAgent:
             getattr(self.llm, "provider_name", ""),
             getattr(self.llm, "model_name", ""),
         )
+        # In the planning phase force one tool per step so ask_user_question /
+        # write_plan can't be batched with other calls (they park + end the turn).
+        if plan_planning:
+            self._parallel_tool_calls = False
         # Image understanding only ever happens through the ``image_understanding``
         # tool. The Specialized Vision Model toggle picks *which* model runs it:
         # ON → a dedicated vision model; OFF → the main model (``self.llm``).
@@ -626,6 +724,15 @@ class ReasoningAgent:
         # tolerates skeleton agents built via ``__new__`` in tests.
         if getattr(self, "_event_run", False):
             resolved = resolved + EVENT_RUN_GUIDANCE
+        # Plan-mode guidance is likewise appended (not a template slot) so
+        # reasoning/instant runs render byte-identical. Plan runs are their own
+        # cache population and this block is stable across a plan phase's turns.
+        if getattr(self, "_mode", "reasoning") == "plan":
+            phase = getattr(self, "_plan_phase", None)
+            if phase == "execute":
+                resolved = resolved + PLAN_MODE_EXECUTION_GUIDANCE
+            else:
+                resolved = resolved + PLAN_MODE_PLANNING_GUIDANCE
         return resolved
 
     def _render_input(self) -> str:
@@ -636,7 +743,26 @@ class ReasoningAgent:
         the system block instead (see ``_load_long_term_memory_block``), and the
         model can still pull more on demand via the ``search_memory`` tool, so the
         [system + tools + history] prefix stays byte-stable for prompt caching.
+
+        Plan mode prepends a short phase marker HERE (adjacent to the task, where
+        weaker models actually attend — the appended system guidance alone is too
+        easy to ignore). This is the volatile turn input, never part of the cached
+        prefix, so it can't fragment the cache; reasoning/instant return the raw
+        query byte-identically.
         """
+        if self._mode == "plan":
+            if self._plan_phase == "execute":
+                marker = (
+                    "[Plan mode — EXECUTION phase: carry out the approved plan and "
+                    "keep the todo list current with `update_todos`.]"
+                )
+            else:
+                marker = (
+                    "[Plan mode — PLANNING phase: do NOT execute the task yet. "
+                    "Work read-only; ask your clarifying questions with "
+                    "`ask_user_question`, then call `write_plan` and stop.]"
+                )
+            return f"{marker}\n\n{self._current_query}"
         return self._current_query
 
     # ── tool spec assembly ─────────────────────────────────────────────
@@ -813,6 +939,33 @@ class ReasoningAgent:
             and (entry[1].tool_id, entry[2]) in self._EVENT_BLOCKED_LEAVES
         )
 
+    # Mutating leaves refused (at dispatch, schema still exposed) during the plan
+    # PLANNING phase: planning is strictly read-only, so nothing changes on the
+    # system before the user accepts the plan. Read-only leaves (search/grep/list/
+    # read/get_file_info, exec_shell_output/_stop) stay allowed so the agent can
+    # research. Guidance alone isn't enough — a weaker model will run these anyway.
+    _PLAN_BLOCKED_LEAVES: frozenset = frozenset({
+        ("exec_shell", "exec_shell"),
+        ("exec_shell", "exec_shell_input"),
+        ("system_file", "write_file"),
+        ("system_file", "overwrite_file"),
+        ("system_file", "move_file"),
+        ("system_file", "copy_file"),
+        ("system_file", "register_file_watcher"),
+        ("system_file", "delete_file_watcher"),
+        ("scheduler", "schedule_create"),
+        ("scheduler", "schedule_cancel"),
+    })
+
+    def _is_plan_blocked_leaf(self, entry) -> bool:
+        return (
+            self._mode == "plan"
+            and self._plan_phase == "planning"
+            and bool(entry)
+            and entry[0] == "leaf"
+            and (entry[1].tool_id, entry[2]) in self._PLAN_BLOCKED_LEAVES
+        )
+
     # ── main entry point ──────────────────────────────────────────────
 
     async def run(
@@ -872,6 +1025,11 @@ class ReasoningAgent:
                     parallel_tool_calls=self._parallel_tool_calls,
                     temperature=self._reasoning_temperature,
                     max_tokens=self._reasoning_max_tokens,
+                    # Instant mode: an explicit empty string suppresses the
+                    # provider's default reasoning_effort (falsy in every
+                    # provider's ``if _re:`` guard) without touching the shared
+                    # client; None preserves today's default-fallback behavior.
+                    reasoning_effort="" if self._mode == "instant" else None,
                     retry=self._reasoning_retry,
                     args={"prompt_cache": True} if self._enable_prompt_cache else None,
                 ):
@@ -973,13 +1131,16 @@ class ReasoningAgent:
                 )
                 yield self._thinking_artifact(step_no, call_id, name, display_args, tool)
 
-            # Storm-blocked leaves keep their schema but are NOT executed on an
-            # event run; they still get a paired role:"tool" result below so the
-            # turn's tool_calls group is fully answered (an unanswered tool_use
-            # would 400 on replay / be truncated by _normalize_turn_messages).
+            # Storm-blocked leaves (event runs) and mutating leaves (plan-mode
+            # planning phase) keep their schema but are NOT executed; they still
+            # get a paired role:"tool" result below so the turn's tool_calls group
+            # is fully answered (an unanswered tool_use would 400 on replay / be
+            # truncated by _normalize_turn_messages).
             leaf_calls = [
                 (c, n, a, e) for (c, n, a, e) in resolved
-                if e and e[0] == "leaf" and not self._is_event_blocked_leaf(e)
+                if e and e[0] == "leaf"
+                and not self._is_event_blocked_leaf(e)
+                and not self._is_plan_blocked_leaf(e)
             ]
             outcomes: Dict[str, "_LeafOutcome"] = {}
             if leaf_calls:
@@ -1011,6 +1172,19 @@ class ReasoningAgent:
                         step_no, call_id, [Part(root=TextPart(text=obs))]
                     )
                     continue
+                if self._is_plan_blocked_leaf(entry):
+                    obs = (
+                        "Plan mode (planning phase) is READ-ONLY — this action was "
+                        "NOT executed. Do not try to carry out the task yet. "
+                        "Research with read-only tools, ask the user what you need "
+                        "with `ask_user_question`, and call `write_plan` when ready; "
+                        "execution begins only after the user accepts the plan."
+                    )
+                    self._append_tool_result(call_id, obs, fn_name=name)
+                    yield self._result_artifact(
+                        step_no, call_id, [Part(root=TextPart(text=obs))]
+                    )
+                    continue
                 outcome = outcomes.get(call_id)
                 if outcome is None:
                     continue
@@ -1033,6 +1207,30 @@ class ReasoningAgent:
                     self._final_answer_text = question
                     yield self._final_chunk(question)
                     return
+
+            # Plan mode: surface any UI events the plan tools queued this step
+            # (ask_user_question / plan_ready / todos) as PLAN_EVENT chunks the
+            # stream runner translates to bus events. Then, if the agent asked
+            # questions or wrote a plan, park + end the turn (like event runs):
+            # the readable questions / plan markdown becomes the final assistant
+            # message and the user's answer/decision arrives as the next turn.
+            if getattr(self, "_mode", "reasoning") == "plan":
+                from app.agent import plan_state
+                from app.utils.task_context import current_task_id_var
+                run_id = current_task_id_var.get()
+                if run_id:
+                    for item in plan_state.drain_emit(run_id):
+                        yield {
+                            "type": ChatCompletionTypeEnum.PLAN_EVENT,
+                            "data": item,
+                        }
+                    parked_q = plan_state.get_questions(run_id)
+                    parked_p = plan_state.get_plan(run_id)
+                    if parked_q or parked_p:
+                        final = _plan_parked_final_text(parked_q, parked_p)
+                        self._final_answer_text = final
+                        yield self._final_chunk(final)
+                        return
 
     def _final_chunk(self, data: str) -> Dict[str, Any]:
         """Terminal DONE chunk. ``data`` is empty when the answer was streamed.

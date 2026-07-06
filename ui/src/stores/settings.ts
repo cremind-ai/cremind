@@ -2,6 +2,7 @@ import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
 import { fetchMe } from '../services/agentApi';
 import { getAgentUrl, setAgentUrl as persistAgentUrl } from '../services/runtimeConfig';
+import { type ChatMode, isChatMode, DEFAULT_CHAT_MODE } from '../constants/chatModes';
 
 export type ProfileValue = string | boolean | number | Record<string, unknown>;
 
@@ -80,8 +81,9 @@ export const useSettingsStore = defineStore('settings', () => {
   // Working directory from backend (for resolving absolute file paths to API URLs)
   const workingDir = ref('');
 
-  // Reasoning toggle (per-profile, default: enabled)
-  const reasoningEnabled = ref(true);
+  // Chat mode (per-profile, default: reasoning). Replaces the old reasoning
+  // toggle; the mode is remembered across sessions and sticky until changed.
+  const chatMode = ref<ChatMode>(DEFAULT_CHAT_MODE);
 
   // Detect if running in Electron
   const isElectron = computed(() => {
@@ -120,14 +122,20 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  function getReasoningEnabled(profileName: string): boolean {
-    const val = localStorage.getItem(`reasoning_enabled_${profileName}`);
-    return val !== 'false'; // default: true
+  function getChatMode(profileName: string): ChatMode {
+    const val = localStorage.getItem(`chat_mode_${profileName}`);
+    if (isChatMode(val)) return val;
+    // Migrate from the legacy per-profile reasoning toggle: off → instant.
+    const legacy = localStorage.getItem(`reasoning_enabled_${profileName}`);
+    return legacy === 'false' ? 'instant' : DEFAULT_CHAT_MODE;
   }
 
-  function setReasoningEnabled(profileName: string, enabled: boolean) {
-    reasoningEnabled.value = enabled;
-    localStorage.setItem(`reasoning_enabled_${profileName}`, String(enabled));
+  function setChatMode(profileName: string, mode: ChatMode) {
+    chatMode.value = mode;
+    localStorage.setItem(`chat_mode_${profileName}`, mode);
+    // Keep the legacy key coherent (mode !== instant ⇒ reasoning on) so a
+    // rollback to an older build still reflects the user's thinking preference.
+    localStorage.setItem(`reasoning_enabled_${profileName}`, String(mode !== 'instant'));
   }
 
   function removeTokenForProfile(profileName: string) {
@@ -151,7 +159,7 @@ export const useSettingsStore = defineStore('settings', () => {
 
     authToken.value = token;
     profileId.value = profileName;
-    reasoningEnabled.value = getReasoningEnabled(profileName);
+    chatMode.value = getChatMode(profileName);
 
     fetchMe(agentUrl.value, token)
       .then((me) => {
@@ -234,10 +242,10 @@ export const useSettingsStore = defineStore('settings', () => {
     removeTokenForProfile,
     getLoggedInProfiles,
     activateProfile,
-    // Reasoning toggle
-    reasoningEnabled,
-    getReasoningEnabled,
-    setReasoningEnabled,
+    // Chat mode (plan / reasoning / instant)
+    chatMode,
+    getChatMode,
+    setChatMode,
     // Desktop-app update preferences
     autoUpdate,
     setAutoUpdate,

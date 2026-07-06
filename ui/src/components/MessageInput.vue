@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue';
-import { ElPopover, ElSwitch, ElNotification } from 'element-plus';
+import { ElPopover, ElNotification } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { useChatStore } from '../stores/chat';
 import { fetchSystemVars, fetchAgentNames } from '../services/configApi';
 import { uploadTempFiles } from '../services/filesApi';
+import { CHAT_MODES, chatModeMeta, type ChatMode } from '../constants/chatModes';
 import MentionMenu, { type MentionItem } from './MentionMenu.vue';
 
 export interface Attachment {
@@ -16,18 +17,22 @@ export interface Attachment {
 const props = withDefaults(defineProps<{
   disabled?: boolean;
   isProcessing?: boolean;
-  reasoningEnabled?: boolean;
+  mode?: ChatMode;
+  // Hide the mode selector (e.g. inside the event-run drawer, where plan mode
+  // is meaningless).
+  showModeSelector?: boolean;
   // Set when embedded (event-run drawer): uploads target this run conversation
   // instead of ensuring/creating the active one.
   conversationId?: string | null;
 }>(), {
-  reasoningEnabled: true,
+  mode: 'reasoning',
+  showModeSelector: true,
 });
 
 const emit = defineEmits<{
   send: [payload: { text: string; attachments: Attachment[] }];
   stop: [];
-  'update:reasoningEnabled': [enabled: boolean];
+  'update:mode': [mode: ChatMode];
 }>();
 
 const settingsStore = useSettingsStore();
@@ -434,8 +439,10 @@ const handleBlur = () => {
   }, 0);
 };
 
-const handleReasoningToggle = (value: boolean | string | number) => {
-  emit('update:reasoningEnabled', Boolean(value));
+const activeModeMeta = computed(() => chatModeMeta(props.mode));
+
+const selectMode = (mode: ChatMode) => {
+  emit('update:mode', mode);
   popoverVisible.value = false;
 };
 </script>
@@ -511,28 +518,42 @@ const handleReasoningToggle = (value: boolean | string | number) => {
         @update:active-index="activeIndex = $event"
       />
       <ElPopover
+        v-if="showModeSelector"
         :visible="popoverVisible"
         placement="top"
-        :width="180"
+        :width="280"
+        popper-class="mode-popover"
         @update:visible="popoverVisible = $event"
       >
         <template #reference>
           <button
-            class="reasoning-toggle-button"
-            :class="{ 'active': reasoningEnabled }"
+            class="mode-toggle-button"
+            :class="activeModeMeta.buttonClass"
+            :title="activeModeMeta.label"
             @click="popoverVisible = !popoverVisible"
             type="button"
           >
-            <Icon icon="mdi:chevron-up" />
+            <Icon :icon="activeModeMeta.icon" />
           </button>
         </template>
-        <div class="reasoning-popover-content">
-          <span>Reasoning</span>
-          <ElSwitch
-            :model-value="reasoningEnabled"
-            @update:model-value="handleReasoningToggle"
-            size="small"
-          />
+        <div class="mode-menu" role="menu">
+          <button
+            v-for="m in CHAT_MODES"
+            :key="m.id"
+            type="button"
+            role="menuitemradio"
+            :aria-checked="m.id === mode"
+            class="mode-item"
+            :class="{ active: m.id === mode }"
+            @click="selectMode(m.id)"
+          >
+            <Icon :icon="m.icon" class="mode-item-icon" />
+            <span class="mode-item-text">
+              <span class="mode-item-label">{{ m.label }}</span>
+              <span class="mode-item-desc">{{ m.description }}</span>
+            </span>
+            <Icon v-if="m.id === mode" icon="mdi:check" class="mode-item-check" />
+          </button>
         </div>
       </ElPopover>
       <button
@@ -684,7 +705,7 @@ const handleReasoningToggle = (value: boolean | string | number) => {
   text-decoration-color: rgba(239, 68, 68, 0.6);
 }
 
-.reasoning-toggle-button {
+.mode-toggle-button {
   position: absolute;
   bottom: 74px;
   right: 10px;
@@ -704,23 +725,28 @@ const handleReasoningToggle = (value: boolean | string | number) => {
   z-index: 3;
 }
 
-.reasoning-toggle-button:hover {
+.mode-toggle-button:hover {
   border-color: var(--primary-color);
   color: var(--primary-color);
 }
 
-.reasoning-toggle-button.active {
+/* Active-mode appearance (icon + tint) so the mode reads without opening. */
+.mode-toggle-button.mode-reasoning {
   color: var(--primary-color);
   border-color: var(--primary-color);
   background: rgba(37, 99, 235, 0.08);
 }
 
-.reasoning-popover-content {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 13px;
-  color: var(--text-primary);
+.mode-toggle-button.mode-plan {
+  color: var(--warning-color);
+  border-color: var(--warning-color);
+  background: rgba(245, 158, 11, 0.10);
+}
+
+.mode-toggle-button.mode-instant {
+  color: var(--text-tertiary);
+  border-color: var(--border-color);
+  background: transparent;
 }
 
 .send-button {
@@ -863,5 +889,79 @@ const handleReasoningToggle = (value: boolean | string | number) => {
 .chip-remove:hover {
   color: var(--text-primary);
   background: var(--border-color);
+}
+</style>
+
+<!-- Non-scoped: the ElPopover content is teleported to <body>, so scoped
+     styles would not reach the mode-menu rows. -->
+<style>
+.mode-popover.el-popover.el-popper {
+  padding: 6px;
+}
+
+.mode-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mode-menu .mode-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  color: var(--text-primary);
+  transition: background 0.15s ease;
+}
+
+.mode-menu .mode-item:hover {
+  background: rgba(37, 99, 235, 0.08);
+}
+
+.mode-menu .mode-item.active {
+  background: rgba(37, 99, 235, 0.10);
+}
+
+.mode-menu .mode-item-icon {
+  flex-shrink: 0;
+  font-size: 18px;
+  margin-top: 1px;
+  color: var(--text-secondary);
+}
+
+.mode-menu .mode-item.active .mode-item-icon {
+  color: var(--primary-color);
+}
+
+.mode-menu .mode-item-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.mode-menu .mode-item-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.mode-menu .mode-item-desc {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-tertiary);
+}
+
+.mode-menu .mode-item-check {
+  flex-shrink: 0;
+  font-size: 16px;
+  color: var(--primary-color);
+  margin-top: 1px;
 }
 </style>

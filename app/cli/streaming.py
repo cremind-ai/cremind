@@ -25,6 +25,7 @@ from app.cli.client.conversations import (
     send_message as _send_message,
 )
 from app.cli.output.console import OutputMode
+from app.cli.plan_render import plan_hint_lines, questions_lines, todos_lines
 
 
 # ── renderer protocol ─────────────────────────────────────────────────────
@@ -39,11 +40,15 @@ class Renderer(Protocol):
 
 
 class RawRenderer:
-    """Print only the assistant `text` events to stdout. Errors are surfaced
-    on stderr; complete/error end the loop with a trailing newline.
+    """Print only the assistant `text` events to stdout. Errors + Plan-mode
+    prompts are surfaced on stderr (stdout stays assistant-text-only and
+    pipe-safe); complete/error end the loop with a trailing newline.
 
     Mirrors `cli/internal/stream/renderers.go`'s `RawRenderer`.
     """
+
+    def __init__(self, conversation_id: str = "") -> None:
+        self.conversation_id = conversation_id
 
     def render(self, event: Event) -> bool:
         if event.type == "text":
@@ -53,6 +58,19 @@ class RawRenderer:
                 if isinstance(text, str) and text:
                     sys.stdout.write(text)
                     sys.stdout.flush()
+            return True
+        if event.type in ("ask_user_question", "plan_ready", "todos"):
+            payload = event.data.get("data") if isinstance(event.data, dict) else None
+            payload = payload if isinstance(payload, dict) else {}
+            if event.type == "ask_user_question":
+                lines = questions_lines(payload)
+            elif event.type == "plan_ready":
+                lines = plan_hint_lines(payload, self.conversation_id)
+            else:
+                lines = todos_lines(payload)
+            for ln in lines:
+                sys.stderr.write(ln + "\n")
+            sys.stderr.flush()
             return True
         if event.type == "error":
             data = event.data.get("data") if isinstance(event.data, dict) else None
@@ -105,6 +123,7 @@ async def run_stream(
     *,
     send_text: str = "",
     reasoning: bool = True,
+    mode: Optional[str] = None,
     renderer: Renderer,
     on_run_id: Optional[Callable[[str], Awaitable[None] | None]] = None,
 ) -> None:
@@ -126,7 +145,11 @@ async def run_stream(
             if event.type == "ready" and not ready:
                 ready = True
                 if send_text and not sent:
-                    resp = await _send_message(client, conversation_id, send_text, reasoning)
+                    resp = await _send_message(
+                        client, conversation_id, send_text,
+                        reasoning if mode is None else mode != "instant",
+                        mode=mode,
+                    )
                     sent = True
                     if on_run_id is not None:
                         result = on_run_id(resp.run_id)
