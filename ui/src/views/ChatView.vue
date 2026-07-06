@@ -13,6 +13,10 @@ import RightPanel from '../components/RightPanel.vue';
 import ResizableDivider from '../components/ResizableDivider.vue';
 import ConversationMemoryPanel from '../components/ConversationMemoryPanel.vue';
 import ConversationUsagePanel from '../components/ConversationUsagePanel.vue';
+import TodoPanel from '../components/plan/TodoPanel.vue';
+import PlanBanner from '../components/plan/PlanBanner.vue';
+import PlanApprovalDialog from '../components/plan/PlanApprovalDialog.vue';
+import AskUserQuestionDialog from '../components/plan/AskUserQuestionDialog.vue';
 
 const props = defineProps<{
   profile?: string;
@@ -193,7 +197,7 @@ const handleSendMessage = async (
 ) => {
   try {
     await chatStore.sendMessage(payload.text, {
-      reasoning: settingsStore.reasoningEnabled,
+      mode: settingsStore.chatMode,
       attachments: payload.attachments,
     });
   } catch (error: any) {
@@ -203,6 +207,33 @@ const handleSendMessage = async (
       type: 'error',
     });
   }
+};
+
+// ── plan mode dialogs ──
+const questionDialogOpen = ref(false);
+const planDialogOpen = ref(false);
+
+// Auto-open the question form when a new question set arrives (identity = the
+// createdAt stamp), so dismissing it doesn't immediately reopen.
+watch(
+  () => chatStore.activePendingQuestion?.createdAt,
+  (stamp) => {
+    if (stamp) questionDialogOpen.value = true;
+  },
+);
+
+const acceptPlan = async () => {
+  planDialogOpen.value = false;
+  await chatStore.sendMessage(
+    'I accept the plan. Please execute it to completion.',
+    { mode: 'plan', planAction: 'accept' },
+  );
+};
+
+const cancelPlan = async () => {
+  planDialogOpen.value = false;
+  const cid = chatStore.activeConversationId;
+  if (cid) await chatStore.cancelPlanApproval(cid);
 };
 </script>
 
@@ -232,6 +263,14 @@ const handleSendMessage = async (
         :isStreaming="chatStore.isStreaming"
       />
 
+      <PlanBanner
+        v-if="!isExternalChannel"
+        @review="planDialogOpen = true"
+        @answer="questionDialogOpen = true"
+        @accept="acceptPlan"
+        @cancel="cancelPlan"
+      />
+
       <div v-if="isExternalChannel" class="readonly-banner">
         <Icon icon="mdi:lock-outline" />
         <span v-if="chatStore.activeConversationId">
@@ -248,11 +287,13 @@ const handleSendMessage = async (
         v-else
         :disabled="!chatStore.isConnected || chatStore.isStreaming"
         :isProcessing="chatStore.isStreaming"
-        :reasoningEnabled="settingsStore.reasoningEnabled"
-        @update:reasoningEnabled="settingsStore.setReasoningEnabled(settingsStore.profileId, $event)"
+        :mode="settingsStore.chatMode"
+        @update:mode="settingsStore.setChatMode(settingsStore.profileId, $event)"
         @send="handleSendMessage"
         @stop="chatStore.stopMessage()"
       />
+
+      <TodoPanel v-if="chatStore.activeTodos" :state="chatStore.activeTodos" />
 
       <button
         v-if="showMinimizedPill"
@@ -287,6 +328,14 @@ const handleSendMessage = async (
     <ConversationUsagePanel
       v-model="usagePanelOpen"
       :conversation-id="chatStore.activeConversationId"
+    />
+
+    <AskUserQuestionDialog v-model="questionDialogOpen" />
+
+    <PlanApprovalDialog
+      v-model="planDialogOpen"
+      @accept="acceptPlan"
+      @cancel="cancelPlan"
     />
   </div>
 </template>

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from app.cli.client._sse import Event
+from app.cli.plan_render import plan_hint_lines, questions_lines, todos_lines
 
 
 # ── ANSI palette (256-color, matching the Go lipgloss palette) ───────────
@@ -155,6 +156,37 @@ def format_event(event: Event, theme: Theme) -> Optional[RenderedLine]:
             "thinking",
             t.style(t.dim, "  <- Observation: " + indented),
         )
+
+    if event.type == "ask_user_question":
+        lines = questions_lines(data)
+        if not lines:
+            return None
+        head = t.style(t.section, lines[0])
+        rest = "\n".join(t.style(t.dim, ln) for ln in lines[1:])
+        body = head + ("\n" + rest if rest else "")
+        return RenderedLine(
+            "question",
+            body + "\n" + t.style(t.dim, "type your answer below and press Enter"),
+        )
+
+    if event.type == "plan_ready":
+        lines = plan_hint_lines(data)
+        if not lines:
+            return None
+        head = t.style(t.section, lines[0])
+        rest = "\n".join(t.style(t.dim, ln) for ln in lines[1:])
+        return RenderedLine("plan", head + ("\n" + rest if rest else ""))
+
+    if event.type == "todos":
+        lines = todos_lines(data)
+        if not lines:
+            return None
+        head = t.style(t.section, lines[0])
+        body_lines = []
+        for ln in lines[1:]:
+            style = t.dim if ln.startswith("[x]") else (t.phase if ln.startswith("[>]") else t.assist_msg)
+            body_lines.append(t.style(style, ln))
+        return RenderedLine("todos", head + ("\n" + "\n".join(body_lines) if body_lines else ""))
 
     if event.type == "complete":
         return RenderedLine("info", t.style(t.dim, "* run complete"))

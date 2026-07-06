@@ -14,6 +14,7 @@ from typing import Any, Optional
 import typer
 
 from app.cli.commands._helpers import graceful_errors
+from app.cli.modes import ChatMode
 
 
 conv_app = typer.Typer(
@@ -204,12 +205,21 @@ def conv_send(
     conv_id: str = typer.Argument(..., help="Conversation id."),
     message: str = typer.Argument(..., help="User message."),
     raw: bool = typer.Option(False, "--raw", help="Plain text output (currently the default)."),
-    no_reasoning: bool = typer.Option(False, "--no-reasoning", help="Disable reasoning mode."),
+    chat_mode: Optional[ChatMode] = typer.Option(
+        None, "--mode", case_sensitive=False,
+        help=(
+            "Turn mode: plan (research + clarifying questions + approved plan, "
+            "then execute), reasoning (default), instant (no extended thinking)."
+        ),
+    ),
+    no_reasoning: bool = typer.Option(
+        False, "--no-reasoning", help="Deprecated: alias for --mode instant.",
+    ),
 ) -> None:
     """Send a message; streams the agent run to stdout.
 
-    Phase 4 will add an interactive TUI; for now both default and `--raw`
-    behave the same. `--json` (root flag) emits JSONL.
+    `--json` (root flag) emits JSONL. In plan mode the clarifying-question /
+    plan / todo prompts print on stderr (stdout stays assistant text only).
     """
     import asyncio
 
@@ -223,7 +233,15 @@ def conv_send(
     cfg.require_token()
     _ = raw  # accepted for forward-compatibility; raw is the only mode in Phase 3
 
-    renderer = JSONRenderer() if mode.json else RawRenderer()
+    # --no-reasoning is the deprecated alias for --mode instant.
+    if no_reasoning:
+        if chat_mode is not None and chat_mode != ChatMode.instant:
+            raise typer.BadParameter("--no-reasoning conflicts with --mode; pass --mode only")
+        sys.stderr.write("warning: --no-reasoning is deprecated; use --mode instant\n")
+        chat_mode = ChatMode.instant
+
+    turn_mode = chat_mode.value if chat_mode is not None else None
+    renderer = JSONRenderer() if mode.json else RawRenderer(conversation_id=conv_id)
 
     async def _run() -> None:
         async with Client(cfg) as client:
@@ -231,7 +249,7 @@ def conv_send(
                 client,
                 conv_id,
                 send_text=message,
-                reasoning=not no_reasoning,
+                mode=turn_mode,
                 renderer=renderer,
             )
 
@@ -265,7 +283,7 @@ def conv_attach(
     cfg.require_token()
     _ = raw
 
-    renderer = JSONRenderer() if mode.json else RawRenderer()
+    renderer = JSONRenderer() if mode.json else RawRenderer(conversation_id=conv_id)
 
     async def _run() -> None:
         async with Client(cfg) as client:

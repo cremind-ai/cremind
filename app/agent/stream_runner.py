@@ -188,6 +188,8 @@ async def run_agent_to_bus(
     query: str,
     history_messages: List[Any],
     reasoning: bool = True,
+    mode: str = "reasoning",
+    plan_action: str | None = None,
     user_parts: List[Any] | None = None,
     user_message_metadata: Dict[str, Any] | None = None,
     agent_message_metadata: Dict[str, Any] | None = None,
@@ -223,6 +225,11 @@ async def run_agent_to_bus(
     ctx_token = current_task_id_var.set(run_id)
     _running_runs[run_id] = asyncio.current_task()
 
+    # Plan mode: clear any stale registry entry for this run id (defensive; ids
+    # are unique per run) so a fresh turn never sees a prior turn's parked state.
+    from app.agent import plan_state
+    plan_state.clear(run_id)
+
     # Event-run start hook: mark the tracking row running (this turn's stream
     # run_id is the cancel target) and clear any stale pending flag. Done once
     # per turn — the trigger turn and any user-reply turns all pass through here.
@@ -250,6 +257,20 @@ async def run_agent_to_bus(
         )
     context_id = (conv or {}).get("context_id") or conversation_id
     title = (conv or {}).get("title") or "Untitled Chat"
+
+    # Plan mode: decide the phase for this turn from the request + the
+    # conversation's persisted plan state (see _compute_plan_phase).
+    plan_phase: str | None = None
+    if mode == "plan":
+        plan_phase = await _compute_plan_phase(
+            conversation_storage, conversation_id, plan_action,
+        )
+    # Observability: make the received mode/phase visible for diagnosing
+    # "plan mode didn't engage" (only log the non-default modes).
+    if mode != "reasoning":
+        logger.info(
+            f"stream_runner: run {run_id} mode={mode} plan_phase={plan_phase}"
+        )
 
     # Back-fill context_id on the conv row when it was created via the web
     # POST /api/conversations path (which leaves context_id=NULL). Without
@@ -456,6 +477,8 @@ async def run_agent_to_bus(
                 reasoning=reasoning,
                 triggered_by_event=trigger_event is not None,
                 event_run=event_run,
+                mode=mode,
+                plan_phase=plan_phase,
             ):
                 ctype = chunk.get("type")
 
@@ -519,6 +542,15 @@ async def run_agent_to_bus(
                             if "result" not in step:
                                 step["result"] = serialized_result
                                 break
+
+                elif ctype == ChatCompletionTypeEnum.PLAN_EVENT:
+                    # Plan-mode UI signal. ``data`` is {"event": <name>,
+                    # "data": {...}}; publish it verbatim as its own bus event so
+                    # the UI can render the question form / plan approval / todos.
+                    evt = chunk.get("data") or {}
+                    evt_name = evt.get("event")
+                    if evt_name:
+                        await bus.publish(conversation_id, evt_name, evt.get("data") or {})
 
                 elif ctype in (
                     ChatCompletionTypeEnum.DONE,
@@ -636,6 +668,21 @@ async def run_agent_to_bus(
                 "provider": reasoning_rec.get("provider"),
                 "model": reasoning_rec.get("model"),
             }
+
+        # Plan mode: stamp the turn's plan state onto the message metadata so a
+        # reload / restart can restore the pending question form, the plan
+        # awaiting approval, or the todo panel. The plan tools wrote this into the
+        # per-run registry; read the final snapshot here (todos are overwritten on
+        # each update_todos call, so this is the latest). Stamped even on cancel
+        # (this block runs after CancelledError is caught), so an interrupted
+        # execution keeps its todo progress for resume.
+        if mode == "plan":
+            plan_meta = _plan_metadata_for_persist(run_id, plan_phase, cancelled)
+            if plan_meta:
+                agent_message_metadata = {
+                    **(agent_message_metadata or {}),
+                    "plan_mode": plan_meta,
+                }
 
         assistant_msg_id: Optional[str] = None
         try:
@@ -806,6 +853,10 @@ async def run_agent_to_bus(
                 logger.exception("stream_runner: failed to push notification")
     finally:
         _running_runs.pop(run_id, None)
+        # Clear the plan-mode registry unconditionally (event runs clear
+        # run_state above only for event runs; the plan registry must never leak
+        # an entry per parked chat run).
+        plan_state.clear(run_id)
         if ctx_token is not None:
             current_task_id_var.reset(ctx_token)
         await bus.end_run(conversation_id)
@@ -814,6 +865,80 @@ async def run_agent_to_bus(
 def make_run_id(conversation_id: str, kind: str = "msg") -> str:
     """Generate a unified run id. ``kind`` is purely informational (``msg`` or ``event``)."""
     return f"{kind}:{conversation_id}:{uuid.uuid4()}"
+
+
+async def _compute_plan_phase(
+    conversation_storage: Any, conversation_id: str, plan_action: str | None,
+) -> str:
+    """Determine the Plan-mode phase for this turn ("planning" | "execute").
+
+    - An explicit ``accept`` decision → execute the approved plan.
+    - The latest plan-bearing agent message tagged ``stage=="executing"`` with
+      todos not all completed → execute (resume an in-progress / interrupted run).
+    - Otherwise → planning. A fresh request, answered questions, a plan awaiting
+      approval, or a resume-after-cancel all start in planning; the planning
+      guidance itself routes an "implement the plan" message to execution (it has
+      the update_todos tool available in the planning phase for exactly this).
+    """
+    if plan_action == "accept":
+        return "execute"
+    try:
+        msgs = await conversation_storage.get_messages_after(
+            conversation_id, -1, limit=50, newest_first=True,
+        )
+    except Exception:  # noqa: BLE001
+        return "planning"
+    for msg in reversed(msgs or []):
+        if msg.get("role") != "agent":
+            continue
+        meta = msg.get("metadata")
+        pm = meta.get("plan_mode") if isinstance(meta, dict) else None
+        if not isinstance(pm, dict):
+            continue
+        if pm.get("stage") == "executing":
+            todos = pm.get("todos") or []
+            if not todos or not all(
+                isinstance(t, dict) and t.get("status") == "completed" for t in todos
+            ):
+                return "execute"
+        # The most recent plan-bearing agent message decides; stop scanning.
+        return "planning"
+    return "planning"
+
+
+def _plan_metadata_for_persist(
+    run_id: str, plan_phase: str | None, cancelled: bool,
+) -> Optional[dict]:
+    """Assemble the ``plan_mode`` metadata blob for the persisted assistant turn.
+
+    Reads the per-run plan registry (:mod:`app.agent.plan_state`). On a cancelled
+    turn we skip parked questions/plan (a half-run tool may have recorded them)
+    but still persist the latest todo snapshot so an interrupted execution can
+    resume from where it stopped.
+    """
+    from app.agent import plan_state
+    questions = plan_state.get_questions(run_id)
+    plan = plan_state.get_plan(run_id)
+    todos = plan_state.get_todos(run_id)
+
+    if not cancelled and questions:
+        return {"stage": "awaiting_answers", "questions": questions.get("questions") or []}
+    if not cancelled and plan:
+        return {
+            "stage": "awaiting_approval",
+            "plan": {
+                "path": plan.get("path"),
+                "filename": plan.get("filename"),
+                "title": plan.get("title"),
+            },
+        }
+    if todos is not None:
+        all_done = bool(todos) and all(
+            isinstance(t, dict) and t.get("status") == "completed" for t in todos
+        )
+        stage = "completed" if (all_done and not cancelled) else "executing"
+        return {"stage": stage, "todos": todos}
+    return None
 
 
 def _push_event_run_notification(

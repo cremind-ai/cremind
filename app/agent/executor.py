@@ -142,8 +142,17 @@ class CremindAgentExecutor(AgentExecutor):
         if not history_messages:
             history_messages = convert_task_history_to_messages(task.history or [])
 
-        # Extract reasoning preference from request metadata (default: True)
+        # Extract reasoning preference from request metadata (default: True).
+        # A2A clients may also send an explicit ``mode``; plan mode is UI/CLI-only
+        # (its SSE events don't surface over A2A), so this only carries
+        # reasoning/instant meaningfully — normalize_mode derives it either way.
         reasoning = context.metadata.get("reasoning", True)
+        from app.agent.modes import normalize_mode
+        mode = normalize_mode(context.metadata.get("mode"), reasoning=reasoning)
+        # Plan mode is an interactive UI/CLI flow (its clarifying-question / plan /
+        # todo events have no A2A surface); fall back to reasoning over A2A.
+        if mode == "plan":
+            mode = "reasoning"
 
         # Register this asyncio task so the cancel API can target it, and
         # publish the task id to the ContextVar so downstream code (notably
@@ -154,7 +163,7 @@ class CremindAgentExecutor(AgentExecutor):
         ctx_token = current_task_id_var.set(task_key)
 
         try:
-            async for chunk in self.cremind_agent.run(query, history_messages, context_id, profile=profile, reasoning=reasoning):
+            async for chunk in self.cremind_agent.run(query, history_messages, context_id, profile=profile, reasoning=reasoning, mode=mode):
                 # logger.debug(f"Received chunk from CremindAgent: {chunk}")
                 if chunk["type"] == ChatCompletionTypeEnum.CONTENT:
                     content = chunk.get("data")

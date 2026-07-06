@@ -1,3 +1,5 @@
+import type { ChatMode } from '../constants/chatModes';
+
 function resolveBaseUrl(agentUrl: string): string {
   if (agentUrl.startsWith('http://') || agentUrl.startsWith('https://')) {
     return agentUrl;
@@ -177,17 +179,29 @@ export interface MessageAttachment {
   path: string;
 }
 
+export interface SendMessageOptions {
+  mode?: ChatMode; // default 'reasoning'
+  planAction?: 'accept'; // only on a Plan-mode Accept
+  attachments?: MessageAttachment[];
+}
+
 export async function sendMessageRequest(
   agentUrl: string,
   authToken: string,
   conversationId: string,
   text: string,
-  reasoning: boolean = true,
-  attachments?: MessageAttachment[],
+  opts: SendMessageOptions = {},
 ): Promise<SendMessageResponse> {
   const base = resolveBaseUrl(agentUrl);
-  const body: Record<string, unknown> = { text, reasoning };
-  if (attachments && attachments.length) body.attachments = attachments;
+  const mode = opts.mode ?? 'reasoning';
+  const body: Record<string, unknown> = {
+    text,
+    mode,
+    // Keep the legacy boolean coherent so an older server still behaves.
+    reasoning: mode !== 'instant',
+  };
+  if (opts.planAction) body.plan_action = opts.planAction;
+  if (opts.attachments && opts.attachments.length) body.attachments = opts.attachments;
   const res = await fetch(
     `${base}/api/conversations/${encodeURIComponent(conversationId)}/messages`,
     {
@@ -197,6 +211,29 @@ export async function sendMessageRequest(
     },
   );
   if (!res.ok) throw new Error(`Failed to send message: ${res.statusText}`);
+  return res.json();
+}
+
+export interface PlanCancelResponse {
+  message_id?: string;
+  content?: string;
+}
+
+// Decline a pending Plan-mode approval WITHOUT starting an agent run.
+export async function cancelPlan(
+  agentUrl: string,
+  authToken: string,
+  conversationId: string,
+): Promise<PlanCancelResponse> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/conversations/${encodeURIComponent(conversationId)}/plan/cancel`,
+    {
+      method: 'POST',
+      headers: authHeaders(authToken),
+    },
+  );
+  if (!res.ok) throw new Error(`Failed to cancel plan: ${res.statusText}`);
   return res.json();
 }
 
