@@ -198,8 +198,13 @@ class RegisterFileWatcherTool(BuiltInTool):
                 "type": "string",
                 "description": (
                     "Natural-language instruction for the assistant to run "
-                    "when the watcher fires. The runtime appends a "
-                    "structured Content block describing the event."
+                    "when the watcher fires, capturing the user's full request. "
+                    "Preserve every detail and qualifier in the user's own "
+                    "wording and language — do NOT summarize, shorten, or omit "
+                    "information. Do not embed event metadata "
+                    "(path/type/timestamp) into it; the runtime appends a "
+                    "structured Content block describing the event "
+                    "automatically."
                 ),
             },
         },
