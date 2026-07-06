@@ -799,8 +799,14 @@ class ReasoningAgent:
                 "action": {
                     "type": "string",
                     "description": (
-                        "Short imperative of WHAT to do when an event fires "
-                        "(no trigger phrasing)."
+                        "WHAT to do when an event fires, capturing the user's "
+                        "full request. Preserve every detail, condition, "
+                        "qualifier, recipient, and format in the user's own "
+                        "wording and language — do NOT summarize, shorten, or "
+                        "omit information. Only leave out the bare event name "
+                        "itself (it is captured in `trigger`); keep any "
+                        "conditions that decide WHEN to act (e.g. 'only if "
+                        "from my boss')."
                     ),
                 },
             },
@@ -1451,7 +1457,8 @@ class ReasoningAgent:
             + "\n".join(bullets)
             + "\n\nIf the user wants that, call this same skill again with a "
             "`subscribe` object: `trigger` = one or more of the event names above, "
-            "`action` = a short imperative of what to do when an event fires."
+            "`action` = what to do when an event fires, preserving the user's full "
+            "request and wording (every detail and condition) — do not summarize it."
         )
 
     @staticmethod

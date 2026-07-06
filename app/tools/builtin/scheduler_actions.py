@@ -89,8 +89,13 @@ class ScheduleCreateTool(BuiltInTool):
                 "description": (
                     "The command to run when the event fires (e.g. 'turn off the "
                     "porch light', 'summarize my unread email'), in the user's "
-                    "ORIGINAL language. If omitted, the title is used as the "
-                    "command — so a bare command like 'tắt đèn hiên' still runs."
+                    "ORIGINAL language and wording. Preserve the user's full "
+                    "request — every detail, qualifier, and specific — do NOT "
+                    "summarize or simplify it. Whenever the command carries any "
+                    "detail beyond the title, put the full instruction here "
+                    "(don't rely on the title fallback). If omitted, the title "
+                    "is used as the command — so a bare command like 'tắt đèn "
+                    "hiên' still runs."
                 ),
             },
             "duration_minutes": {
