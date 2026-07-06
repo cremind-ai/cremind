@@ -137,7 +137,7 @@ def test_image_understanding_attaches_usage(monkeypatch, tmp_path):
     img = tmp_path / "pic.png"
     img.write_bytes(b"\x89PNG\r\n\x1a\n not-a-real-image")
     # Bypass the capability gate and image encoding to focus on usage wiring.
-    monkeypatch.setattr(iu, "model_supports_vision", lambda provider, model: True)
+    monkeypatch.setattr(iu, "model_supports_vision", lambda provider, model, **kw: True)
     monkeypatch.setattr(
         iu, "_prepare_image_data_url",
         lambda *a, **k: ("data:image/png;base64,AAAA", None),

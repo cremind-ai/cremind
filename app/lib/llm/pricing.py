@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Optional
 
-from app.config import load_provider_catalog
+from app.config import load_provider_catalog, resolve_catalog
 
 # Bump when the multiplier table or cost logic changes, so a stored
 # ``rate_snapshot`` records which generation of the estimator produced it.
@@ -128,13 +128,14 @@ def _strip_provider_prefix(provider: Optional[str], model: str) -> str:
     return model
 
 
-@lru_cache(maxsize=512)
-def get_model_rates(provider: Optional[str], model: Optional[str]) -> ModelRates:
-    """Resolve per-1M rates for ``(provider, model)`` from the TOML catalog.
+def _rates_from_catalog(
+    provider: Optional[str], model: Optional[str], catalog: dict
+) -> ModelRates:
+    """Resolve rates for ``(provider, model)`` against an already-loaded catalog.
 
-    Unknown provider/model (or a listed model with no ``input_price_per_1m``)
-    yields ``input_per_1m`` / ``output_per_1m`` of ``None`` and ``source =
-    "unknown"`` so the caller leaves cost null. ``lru_cache``-d on the pair.
+    Shared by the cached built-in path and the per-profile custom path. A model
+    with no ``input_price_per_1m`` yields ``source = "unknown"`` so cost stays
+    null (never silently zero).
     """
     family = provider_family(provider)
     read_mult, write_mult = _CACHE_MULTIPLIERS[family]
@@ -149,7 +150,6 @@ def get_model_rates(provider: Optional[str], model: Optional[str]) -> ModelRates
         )
 
     bare = _strip_provider_prefix(provider, model)
-    catalog = load_provider_catalog(provider)
     entry: dict[str, Any] = {}
     for candidate in catalog.get("models", []) or []:
         if isinstance(candidate, dict) and candidate.get("id") == bare:
@@ -183,23 +183,58 @@ def get_model_rates(provider: Optional[str], model: Optional[str]) -> ModelRates
     )
 
 
-def context_window_for(provider: Optional[str], model: Optional[str]) -> Optional[int]:
+@lru_cache(maxsize=512)
+def _get_model_rates_toml(provider: Optional[str], model: Optional[str]) -> ModelRates:
+    """Cached rate lookup for built-in providers (static TOML catalog)."""
+    return _rates_from_catalog(
+        provider, model, load_provider_catalog(provider) if provider else {}
+    )
+
+
+def get_model_rates(
+    provider: Optional[str], model: Optional[str], profile: Optional[str] = None
+) -> ModelRates:
+    """Resolve per-1M rates for ``(provider, model)``.
+
+    Built-in providers use the ``lru_cache``-d TOML path. User-defined
+    ``custom:<slug>`` providers are per-profile — their prices live in the
+    ``custom_providers`` registry, not a TOML file — so they bypass the cache
+    (one JSON parse) and resolve against ``resolve_catalog(provider, profile)``.
+    This keeps built-ins on the hot cached path while custom prices are always
+    fresh (no cache invalidation on edit) and never cross-contaminate between
+    profiles that reuse the same slug.
+    """
+    if provider and provider.startswith("custom:") and profile is not None:
+        return _rates_from_catalog(provider, model, resolve_catalog(provider, profile))
+    return _get_model_rates_toml(provider, model)
+
+
+# Preserve the ``get_model_rates.cache_clear()`` interface (the cache now lives on
+# the inner TOML lookup) so callers/tests that reset it keep working.
+get_model_rates.cache_clear = _get_model_rates_toml.cache_clear  # type: ignore[attr-defined]
+
+
+def context_window_for(
+    provider: Optional[str], model: Optional[str], profile: Optional[str] = None
+) -> Optional[int]:
     """Max context window (tokens) for ``(provider, model)`` from the catalog.
 
     ``None`` when the provider/model is unknown or the catalog entry omits
     ``context_window`` — callers fall back to :data:`DEFAULT_CONTEXT_WINDOW`.
     """
-    return get_model_rates(provider, model).context_window
+    return get_model_rates(provider, model, profile).context_window
 
 
-def max_output_tokens_for(provider: Optional[str], model: Optional[str]) -> Optional[int]:
+def max_output_tokens_for(
+    provider: Optional[str], model: Optional[str], profile: Optional[str] = None
+) -> Optional[int]:
     """Max response tokens for ``(provider, model)`` from the catalog.
 
     ``None`` when the provider/model is unknown or the catalog entry omits
     ``max_output_tokens`` — compaction derives the response reserve from this and
     falls back to a flat default when it is ``None``.
     """
-    return get_model_rates(provider, model).max_output_tokens
+    return get_model_rates(provider, model, profile).max_output_tokens
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -235,6 +270,7 @@ def compute_cost(
     cache_creation_input_tokens: int = 0,
     output_tokens: int = 0,
     rates: Optional[ModelRates] = None,
+    profile: Optional[str] = None,
 ) -> CostBreakdown:
     """Estimate USD cost from a four-way token breakdown.
 
@@ -243,7 +279,7 @@ def compute_cost(
     when every component is unknown). ``rate_snapshot`` always captures the
     resolved rates, multipliers, ``source`` and ``PRICING_VERSION``.
     """
-    rates = rates or get_model_rates(provider, model)
+    rates = rates or get_model_rates(provider, model, profile)
 
     uncached_input_usd = _component(input_tokens, rates.input_per_1m)
     cache_read_usd = _component(cache_read_input_tokens, rates.cache_read_per_1m)
@@ -278,15 +314,17 @@ def cost_columns_for(
     provider: Optional[str],
     model: Optional[str],
     token_usage: Optional[dict],
+    profile: Optional[str] = None,
 ) -> dict:
     """Return cost columns ready to splat into a ``UsageRecordModel`` row.
 
     ``token_usage`` uses Cremind's canonical four keys (``input_tokens``,
     ``cache_read_input_tokens``, ``cache_creation_input_tokens``,
     ``output_tokens``). Always succeeds — an unknown model yields null costs.
+    ``profile`` resolves per-profile prices for ``custom:<slug>`` providers.
     """
     usage = token_usage or {}
-    rates = get_model_rates(provider, model)
+    rates = get_model_rates(provider, model, profile)
     cost = compute_cost(
         provider, model,
         input_tokens=int(usage.get("input_tokens") or 0),

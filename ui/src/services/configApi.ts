@@ -491,14 +491,46 @@ export interface LLMProvider {
   current_values?: Record<string, string>;
   auth_methods?: AuthMethod[];
   active_auth_method?: string;
+  // Present (true) on user-defined custom providers; `base_url` carries their
+  // stored API Base URL so the editor can prefill it.
+  is_custom?: boolean;
+  base_url?: string;
+}
+
+// A model row as entered in the custom-provider editor. Distinct from
+// `LLMModel`, which is the read-only catalog view.
+//   - `supports_reasoning`: whether the model supports Reasoning Effort. When
+//     true it enables the Reasoning Effort selector in the Model /
+//     Low-Performance sections and tells the agent to skip its own think-tool.
+//   - prices: per-1M-token USD; `null`/blank = unknown cost (not tracked).
+export interface CustomProviderModel {
+  id: string;
+  display_name: string;
+  vision: boolean;
+  supports_reasoning: boolean;
+  input_price_per_1m: number | null;
+  output_price_per_1m: number | null;
+  cache_read_price_per_1m: number | null;
+  cache_write_price_per_1m: number | null;
+}
+
+export interface CustomProviderInput {
+  display_name: string;
+  base_url: string;
+  api_key?: string;
+  models: CustomProviderModel[];
 }
 
 export interface LLMModel {
   id: string;
   display_name: string;
   group_hint: string;
-  input_price_per_1m: number;
-  output_price_per_1m: number;
+  // Nullable: custom-provider models omit a price when the user leaves it blank
+  // (→ unknown cost). Built-in catalog models always carry a number.
+  input_price_per_1m: number | null;
+  output_price_per_1m: number | null;
+  cache_read_price_per_1m?: number | null;
+  cache_write_price_per_1m?: number | null;
   reasoning_effort?: string[];
   vision?: boolean;
 }
@@ -532,7 +564,7 @@ export async function updateProvider(
   agentUrl: string,
   token: string,
   providerName: string,
-  config: Record<string, string>
+  config: Record<string, unknown>
 ): Promise<{ success: boolean }> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/llm/providers/${encodeURIComponent(providerName)}`, {
@@ -555,6 +587,28 @@ export async function deleteProviderConfig(
     headers: authHeaders(token),
   });
   if (!res.ok) throw new Error(`Failed to remove provider config: ${res.statusText}`);
+  return res.json();
+}
+
+export async function createCustomProvider(
+  agentUrl: string,
+  token: string,
+  body: CustomProviderInput
+): Promise<{ success: boolean; name: string }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/llm/providers/custom`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const data = await res.json();
+      if (data?.error) detail = data.error;
+    } catch { /* keep statusText */ }
+    throw new Error(detail);
+  }
   return res.json();
 }
 

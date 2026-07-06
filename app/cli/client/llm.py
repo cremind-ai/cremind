@@ -37,6 +37,19 @@ async def configure_provider(
     await client.put_json(f"/api/llm/providers/{quote(provider, safe='')}", kv)
 
 
+async def create_custom_provider(
+    client: Client,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    """Create a user-defined OpenAI-compatible custom provider.
+
+    ``body`` = ``{display_name, base_url, api_key?, models: [...]}``.
+    Returns the server response, including the internal ``name`` (``custom:<slug>``).
+    """
+    out = await client.post_json("/api/llm/providers/custom", body)
+    return out if isinstance(out, dict) else {}
+
+
 async def delete_provider_config(client: Client, provider: str) -> None:
     await client.delete(f"/api/llm/providers/{quote(provider, safe='')}/config")
 

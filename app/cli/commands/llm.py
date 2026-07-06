@@ -173,6 +173,76 @@ def providers_configure(
     asyncio.run(_run())
 
 
+@providers_app.command("create-custom")
+@graceful_errors
+def providers_create_custom(
+    ctx: typer.Context,
+    name: str = typer.Option(..., "--name", help="Display name for the custom provider."),
+    base_url: str = typer.Option(
+        ..., "--base-url", help="OpenAI API-compatible base URL (e.g. https://api.example.com/v1)."
+    ),
+    api_key: Optional[str] = typer.Option(
+        None, "--api-key", help="API key value (kept secret server-side)."
+    ),
+    model: Optional[list[str]] = typer.Option(
+        None, "--model",
+        help="A model id to expose (repeatable). Defaults to tier=high, no vision/reasoning.",
+    ),
+    models_json: Optional[str] = typer.Option(
+        None, "--models-json",
+        help="Model list as a JSON array of "
+             "{id, display_name?, group_hint?, vision?, supports_reasoning?} objects "
+             "(for per-model tier/vision/reasoning).",
+    ),
+) -> None:
+    """Add a custom OpenAI-compatible provider with a manually specified model list."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.llm import create_custom_provider
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json, print_kv
+
+    models: list[dict[str, Any]] = []
+    if models_json:
+        try:
+            parsed = _json.loads(models_json)
+        except _json.JSONDecodeError as e:
+            typer.echo(f"invalid --models-json: {e}", err=True)
+            raise typer.Exit(code=1) from e
+        if not isinstance(parsed, list):
+            typer.echo("--models-json must be a JSON array", err=True)
+            raise typer.Exit(code=1)
+        models.extend(m for m in parsed if isinstance(m, dict))
+    for mid in (model or []):
+        mid = mid.strip()
+        if mid:
+            models.append({"id": mid})
+
+    if not models:
+        typer.echo("at least one --model or a non-empty --models-json is required", err=True)
+        raise typer.Exit(code=1)
+
+    body: dict[str, Any] = {"display_name": name, "base_url": base_url, "models": models}
+    if api_key:
+        body["api_key"] = api_key
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await create_custom_provider(client, body)
+
+    out = asyncio.run(_run())
+
+    if mode.json:
+        print_json(out)
+        return
+    print_kv([("name", str(out.get("name") or ""))])
+
+
 @providers_app.command("delete-config")
 @graceful_errors
 def providers_delete_config(
