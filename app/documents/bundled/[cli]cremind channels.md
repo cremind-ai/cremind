@@ -1,24 +1,29 @@
 ---
-description: "Connect and manage external **messaging channels** such as Telegram: `list` connected channels, `add` one from a JSON config, run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Use this to link a Telegram bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
+description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), set a channel's push-notification filter with `notify-filter`, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
 ---
 
 # `cremind channels` — External Messaging Channel Management
 
 `cremind channels` is the CLI for managing Cremind's external messaging
-channels — Telegram, WhatsApp, Discord, Messenger, and Slack — that
+channels — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo — that
 let users on those platforms talk to your Cremind agent. Each channel
 is a row in the per-profile `channels` table; conversations created
 from inbound messages on that channel are linked back to it via a
 foreign key, and the Cremind web UI shows them filtered into the
 sidebar's channel selector.
 
-The group covers four operations:
+The group covers these operations:
 
 - **`list`** — Show every configured channel for the active profile,
   with live runtime status pulled from the in-process registry.
 - **`add`** — Register a new channel by picking a `--type`, a `--mode`
-  (bot vs user account), and a JSON blob of platform-specific config
+  (`bot`/`userbot` for conversation, or `notification` for push-only
+  alerts), and a JSON blob of platform-specific config
   (e.g. `{"bot_token":"…"}` for Telegram).
+- **`pair`** — Run the interactive pairing flow (WhatsApp QR, Telegram
+  userbot code + 2FA) in the terminal.
+- **`notify-filter`** — Show or set the notification filter of a
+  `notification`-mode channel (see **Notification mode** below).
 - **`delete`** — Tear down the adapter and remove the row. **Cascades
   delete to every conversation that belonged to that channel and
   every per-sender authentication state.**
@@ -39,9 +44,9 @@ Each row returned by `list` looks like:
 | Field              | Meaning                                                                                                                  |
 |--------------------|--------------------------------------------------------------------------------------------------------------------------|
 | `id`               | UUID of the channel row. Used by `delete`, the API's `PATCH /api/channels/{id}`, and the conversation FK.                |
-| `channel_type`     | `telegram` \| `whatsapp` \| `discord` \| `messenger` \| `slack`. Unique per profile (you can't register two Telegrams).  |
-| `mode`             | `bot` (a separate bot account replies — Telegram bot, Discord bot, Messenger Page bot, Slack bot) or `userbot` (your own user account auto-replies on your behalf — WhatsApp today, Telegram/Discord/Messenger/Slack scaffolded as "coming soon" in the catalog). |
-| `auth_mode`        | `none` \| `otp` \| `password`. Which gate to apply per inbound sender before the agent runs.                              |
+| `channel_type`     | `telegram` \| `whatsapp` \| `discord` \| `slack` \| `messenger` \| `zalo`. Unique per profile (you can't register two Telegrams).  |
+| `mode`             | `bot` (a separate bot account replies — Telegram/Discord/Slack/Zalo bot, Messenger Page bot), `userbot` (your own account auto-replies — WhatsApp and Zalo personal via QR pairing), or `notification` (push-only: no conversation; forwards Cremind's automation/event notifications to the chat with a configurable filter). |
+| `auth_mode`        | `none` \| `otp` \| `password`. Which gate to apply per inbound sender before the agent runs. Ignored in `notification` mode (there is no agent dispatch; use `subscribe_passcode` in config to gate who may `/start`). |
 | `response_mode`    | `normal` (final answer only) or `detail` (also stream Thinking-Process step bubbles).                                    |
 | `enabled`          | `true`/`false`. Disabling stops the in-process adapter without deleting the row.                                          |
 | `status`           | `running` / `stopped` — derived live from the registry, not stored.                                                       |
@@ -109,7 +114,7 @@ cremind channels list
 |------------|------------------|--------------------------------------------------------|
 | `ID`       | `id`             | Channel row UUID (used by `delete`).                   |
 | `TYPE`     | `channel_type`   | `telegram` / `whatsapp` / etc.                         |
-| `MODE`     | `mode`           | `bot` or `normal`.                                     |
+| `MODE`     | `mode`           | `bot` / `userbot` / `notification`.                    |
 | `AUTH`     | `auth_mode`      | `none` / `otp` / `password`.                           |
 | `REPLY`    | `response_mode`  | `normal` (final answer) / `detail` (with thinking).    |
 | `ENABLED`  | `enabled`        | `true`/`false`.                                        |
@@ -138,7 +143,7 @@ start its adapter.
 
 ```bash
 cremind channels add --type <kind>
-                 [--mode bot|userbot]
+                 [--mode bot|userbot|notification]
                  [--auth-mode none|otp|password]
                  [--response-mode normal|detail]
                  [--enabled true|false]
@@ -173,7 +178,7 @@ the web UI or run `cremind channels pair <id>` after enabling).
 | Flag              | Type    | Default   | Meaning                                                                            |
 |-------------------|---------|-----------|------------------------------------------------------------------------------------|
 | `--type`          | string  | (required)| Channel type. Must match an entry in `cremind channels catalog`.                       |
-| `--mode`          | string  | `bot`     | Adapter mode (`bot` or `userbot`). Catalog-declared modes only; modes flagged `implemented = false` are rejected. |
+| `--mode`          | string  | `bot`     | Adapter mode (`bot`, `userbot`, or `notification`). Catalog-declared modes only; modes flagged `implemented = false` are rejected. |
 | `--auth-mode`     | string  | `none`    | Per-sender gate.                                                                   |
 | `--response-mode` | string  | `normal`  | Reply detail (`normal` or `detail`).                                               |
 | `--enabled`       | bool    | `true`    | Start the adapter immediately.                                                     |
@@ -238,6 +243,82 @@ $ cremind channels add --type whatsapp --mode userbot \
 # WhatsApp under Windows PowerShell — use --config to dodge PS's quote stripping
 PS> cremind channels add --type whatsapp --mode userbot --auth-mode otp `
                      --config phone=+84986664411
+
+# Register a Telegram NOTIFICATION channel (push-only alerts, no conversation).
+# The default filter forwards everything except the noisy "started" pings and
+# OTP codes. After `add`, DM the bot /start to subscribe.
+$ cremind channels add --type telegram --mode notification \
+                   --json '{"bot_token":"123:abc...","notification_filter":{"min_priority":"all"}}'
+```
+
+### Notification mode
+
+`--mode notification` turns a channel into a **push-only alert feed**: it holds
+no conversation and never dispatches to the agent. Instead it subscribes to the
+profile's notification stream — the same automation/event activity the web UI
+shows (schedule / file-watcher / skill-event runs, run errors, pending prompts) —
+and forwards entries that pass a **filter** to the chat.
+
+**Transports.** Telegram notification runs over a normal bot (BotFather token —
+no account login). WhatsApp notification runs over your linked WhatsApp account
+(same QR pairing as its userbot mode).
+
+**Subscribing (recipients).** A bot can't message someone who hasn't started it,
+so recipients opt in:
+
+- Send `/start` to the bot (or, on WhatsApp, message the linked account) to
+  **subscribe**; `/stop` to unsubscribe. Subscriptions are stored as
+  `channel_senders` rows and survive restarts.
+- Or set `target_chat_ids` in config (comma-separated chat ids / JIDs) to push
+  to a known group/channel without anyone having to `/start`.
+- Set `subscribe_passcode` in config to require `/start <passcode>`.
+
+**One channel per platform.** A profile can register only one Telegram (and one
+WhatsApp) channel, so choosing `notification` **replaces** conversational
+`bot`/`userbot` on that platform. To have both conversation and alerts, use two
+different platforms (e.g. chat on Telegram, alerts on WhatsApp).
+
+**The filter** lives in `config.notification_filter` and is validated/normalized
+server-side (invalid → HTTP 400). All fields optional; a notification is
+delivered only if it matches **every** set dimension (empty list = no constraint
+on that dimension):
+
+| Field              | Meaning                                                                                     |
+|--------------------|---------------------------------------------------------------------------------------------|
+| `min_priority`     | `all` (default) or `high` — deliver only high-priority (errors, pending prompts).            |
+| `kinds`            | Allowlist of notification kinds. Empty = all kinds (then `exclude_kinds` applies).           |
+| `exclude_kinds`    | Denylist. Defaults to `["started","channel_otp"]` when omitted. `channel_otp` is **always** dropped regardless (never relay another channel's login code). |
+| `source_kinds`     | Allowlist over `schedule` / `file_watcher` / `skill_event` (only applies to event runs).     |
+| `subscription_ids` | Allowlist — only these specific automations.                                                 |
+| `conversation_ids` | Allowlist — only these specific conversations.                                               |
+| `keywords`         | Case-insensitive substrings matched against the title + preview.                             |
+| `keywords_mode`    | `any` (default) or `all` — how many keywords must hit.                                        |
+| `quiet_hours`      | `{enabled, start:"HH:MM", end:"HH:MM", tz:"<IANA>", allow_high}` — mute during a daily window (crossing midnight supported); `allow_high` still lets high-priority through. `tz` defaults to server local. |
+
+### `cremind channels notify-filter`
+
+**Purpose.** Show or set the notification filter of a `notification`-mode channel.
+
+**Syntax.**
+
+```bash
+cremind channels notify-filter <id> [--json '<filter-object>']
+```
+
+**Behavior.** With `--json`, PATCHes `config.notification_filter` (merged,
+validated, and the adapter restarted so it takes effect immediately). Without
+`--json`, prints the channel's current filter. `--json` at the root prints the
+filter as compact JSON.
+
+**Examples.**
+
+```bash
+# Show the current filter
+$ cremind channels notify-filter e2e8...d4f1
+
+# Only high-priority alerts from scheduled automations, muted 22:00–07:00 local
+$ cremind channels notify-filter e2e8...d4f1 --json \
+    '{"min_priority":"high","source_kinds":["schedule"],"quiet_hours":{"enabled":true,"start":"22:00","end":"07:00","allow_high":true}}'
 ```
 
 ### `cremind channels pair`
@@ -367,8 +448,8 @@ $ cremind channels catalog
       "display_name": "Telegram",
       "icon": "mdi:telegram",
       "supports_bot": true,
-      "supports_normal": false,
-      "auth_modes": ["none"],
+      "supports_userbot": true,
+      "auth_modes": ["none", "otp", "password"],
       "default_response_mode": "normal",
       "modes": [
         {
@@ -485,13 +566,16 @@ channel per type.
 
 **`add` succeeds but `STATUS` is `stopped`** — The adapter raised
 during startup. Check `state.last_error` via `cremind channels list
---json`; common causes are an invalid `bot_token`, a Telegram userbot
-waiting for the verification code in the pairing dialog (status flips
-to `running` once `ready` fires), a missing `node_modules/` directory
-under `app/channels/sidecars/whatsapp/` (run `npm install` once),
-Node not on PATH, or a platform adapter that's still a stub (`discord`,
-`messenger`, and `slack` raise `ChannelNotImplemented` on first
-start in v1).
+--json`; common causes are an invalid `bot_token`, a Telegram/Zalo
+userbot waiting for the verification code or QR scan in the pairing
+dialog (status flips to `running` once `ready` fires), a missing SDK for
+the platform (Discord needs `discord.py`, Slack needs `slack-bolt` —
+installed on demand by the Setup Wizard, or `pip install
+cremind[channel-discord]` / `cremind[channel-slack]`), a missing
+`node_modules/` under `app/channels/sidecars/whatsapp/` or
+`app/channels/sidecars/zalo/` (run `npm install` once, or restart to
+auto-install), Node not on PATH, or — for Messenger — the Cremind host
+not being publicly reachable so Meta's webhook can't deliver.
 
 **Telegram userbot keeps prompting for the code** — Either the code
 expired (Telegram codes are short-lived; the dialog will say "Code

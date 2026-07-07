@@ -6,38 +6,54 @@ supports_bot = true
 supports_userbot = true
 auth_modes = ["none", "otp", "password"]
 default_response_mode = "normal"
-implemented = false
+implemented = true
 
 [[channel.modes]]
 id = "bot"
 label = "Bot"
-implemented = false
-instructions = """**Coming soon — adapter implementation pending.**
-
-1. Visit https://api.slack.com/apps → Create New App → From scratch.
-2. Under OAuth & Permissions, add scopes: chat:write, im:history, im:read, im:write.
+implemented = true
+instructions = """1. Visit https://api.slack.com/apps → Create New App → From scratch.
+2. Under OAuth & Permissions, add bot scopes: chat:write, im:history, im:read, im:write, users:read.
 3. Install the app to your workspace; copy the Bot User OAuth Token (starts with xoxb-).
-4. Under Socket Mode, generate an App-Level Token (xapp-...) and enable Socket Mode.
-5. Subscribe to the message.im event under Event Subscriptions.
-6. Paste both tokens below."""
+4. Under Socket Mode, enable it and generate an App-Level Token (xapp-...) with connections:write.
+5. Under Event Subscriptions, subscribe to the bot event message.im.
+6. Paste both tokens below.
+
+DM the bot and the Cremind agent replies. No public URL is needed — Socket Mode
+connects outbound."""
 [channel.modes.fields]
 bot_token = { description = "Bot User OAuth Token (xoxb-)", type = "string", secret = true, required = true }
 app_token = { description = "App-Level Token (xapp-)", type = "string", secret = true, required = true }
 
 [[channel.modes]]
+id = "notification"
+label = "Notification"
+implemented = true
+instructions = """Push-only alerts — no conversation. The Slack app forwards Cremind
+notifications to subscribers via DM, with a configurable filter.
+
+Setup:
+1. Create the app as in Bot mode (same xoxb- + xapp- tokens) and paste them below.
+2. Save, then DM the bot /start to subscribe (/stop to unsubscribe).
+3. To alert a channel or specific users without subscribing, put their ids in
+   "Target chat ids" (comma-separated) — a channel id (C…) posts to that channel;
+   a user id (U…) opens a DM."""
+[channel.modes.fields]
+bot_token = { description = "Bot User OAuth Token (xoxb-)", type = "string", secret = true, required = true }
+app_token = { description = "App-Level Token (xapp-)", type = "string", secret = true, required = true }
+target_chat_ids = { description = "Optional target channel/user ids (comma-separated)", type = "string", required = false }
+subscribe_passcode = { description = "Optional passcode; senders must /start <passcode> to subscribe", type = "string", secret = true, required = false }
+
+[[channel.modes]]
 id = "userbot"
 label = "Userbot (your account)"
 implemented = false
-instructions = """**Coming soon.**
+instructions = """**Not supported yet.**
 
-Runs under your own Slack account so DMs to you are auto-answered by the
-agent. Slack permits user OAuth tokens (``xoxp-…``) for legitimate
-automation, but check your workspace's policy first — admins can also
-restrict user-token use.
-
-Get a User OAuth Token by installing a custom app to your workspace
-with user scopes (``chat:write``, ``im:history``, ``im:read``,
-``im:write``)."""
+Would run under your own Slack account so DMs to you are auto-answered by the
+agent. Slack permits user OAuth tokens (``xoxp-…``) for legitimate automation,
+but check your workspace's policy first — admins can also restrict user-token
+use."""
 [channel.modes.fields]
 user_token = { description = "User OAuth Token (xoxp-)", type = "string", secret = true, required = true }
 app_token = { description = "App-Level Token (xapp-) for socket mode", type = "string", secret = true, required = true }

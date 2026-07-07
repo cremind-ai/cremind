@@ -186,6 +186,13 @@ def _features_required_by_setup_payload(body: dict) -> list[str]:
             key = "channel.telegram.userbot" if mode == "userbot" else "channel.telegram.bot"
             if key in FEATURES:
                 features.append(key)
+        elif ch_type == "discord" and mode != "userbot":
+            # bot + notification both need discord.py; the disabled userbot mode
+            # would need a different (TOS-risky) lib we don't ship.
+            features.append("channel.discord.bot")
+        elif ch_type == "slack" and mode != "userbot":
+            features.append("channel.slack.bot")
+        # messenger + zalo have no Python extras group (httpx core / Node sidecar).
 
     # Built-in tools the user enabled in the wizard. Each tool config row
     # carries an ``_enabled`` flag (string ``"true"`` / ``"false"``);

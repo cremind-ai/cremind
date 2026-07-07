@@ -71,6 +71,61 @@ export interface ChannelSenderRow {
   updated_at: number;
 }
 
+/**
+ * Filter config for a channel in ``mode === 'notification'``, stored under
+ * ``config.notification_filter``. Mirrors ``app/channels/notification_filter.py``.
+ * A notification is delivered only if it matches ALL set dimensions (empty list
+ * = no constraint on that dimension). The backend normalizes/validates on write.
+ */
+export interface NotificationQuietHours {
+  enabled: boolean;
+  start: string; // HH:MM (24h)
+  end: string;   // HH:MM (24h)
+  tz: string;    // IANA name; '' = server local
+  allow_high: boolean;
+}
+
+export interface NotificationFilter {
+  version?: number;
+  min_priority: 'all' | 'high';
+  kinds: string[];
+  exclude_kinds: string[];
+  source_kinds: string[];
+  subscription_ids: string[];
+  conversation_ids: string[];
+  keywords: string[];
+  keywords_mode: 'any' | 'all';
+  quiet_hours: NotificationQuietHours;
+}
+
+/** Notification ``kind`` values Cremind emits (checkbox source for the UI). */
+export const NOTIFICATION_KINDS = [
+  'event_run_completed', 'event_run_failed', 'event_run_pending',
+  'completed', 'error', 'started', 'skill_register_required',
+] as const;
+
+/** Trigger engines behind an event run. */
+export const NOTIFICATION_SOURCE_KINDS = [
+  'schedule', 'file_watcher', 'skill_event',
+] as const;
+
+/** Default filter seeded into a fresh notification channel — forwards
+ *  everything except the noisy ``started`` ping and ``channel_otp`` codes. */
+export function defaultNotificationFilter(): NotificationFilter {
+  return {
+    version: 1,
+    min_priority: 'all',
+    kinds: [],
+    exclude_kinds: ['started', 'channel_otp'],
+    source_kinds: [],
+    subscription_ids: [],
+    conversation_ids: [],
+    keywords: [],
+    keywords_mode: 'any',
+    quiet_hours: { enabled: false, start: '22:00', end: '07:00', tz: '', allow_high: true },
+  };
+}
+
 function readChannelEntry(raw: any): ChannelCatalogEntry | null {
   const ch = raw?.channel;
   if (!ch || !ch.type || !ch.display_name) return null;

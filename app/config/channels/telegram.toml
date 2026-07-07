@@ -42,3 +42,27 @@ Setup:
 api_id = { description = "API ID (from my.telegram.org)", type = "string", required = true }
 api_hash = { description = "API Hash (from my.telegram.org)", type = "string", secret = true, required = true }
 phone = { description = "Phone (international format, e.g. +14155551212)", type = "string", required = true }
+
+[[channel.modes]]
+id = "notification"
+label = "Notification"
+implemented = true
+instructions = """Push-only alerts — no conversation. A Telegram bot forwards
+Cremind notifications (automation/event runs, errors, pending prompts) to a
+chat, with a configurable filter so you only get what matters.
+
+Setup:
+1. Create a bot with @BotFather (as in Bot mode) and paste its token below.
+2. Save, then open Telegram and send /start to your bot to subscribe. Send
+   /stop anytime to unsubscribe.
+3. To alert a group or channel instead, add the bot there and put the chat id
+   in "Target chat ids" (comma-separated). Direct-message recipients must /start
+   the bot first — a bot cannot message someone who hasn't.
+
+Note: a profile can register only one Telegram channel, so choosing Notification
+replaces conversational Bot/Userbot on Telegram for this profile (use a
+different platform, e.g. WhatsApp, if you want both)."""
+[channel.modes.fields]
+bot_token = { description = "Bot API Token", type = "string", secret = true, required = true }
+target_chat_ids = { description = "Optional target chat ids (comma-separated) for groups/channels", type = "string", required = false }
+subscribe_passcode = { description = "Optional passcode; senders must /start <passcode> to subscribe", type = "string", secret = true, required = false }

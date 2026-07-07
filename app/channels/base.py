@@ -26,6 +26,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any
 
+from app.channels.notification_delivery import NotificationDeliveryMixin
 from app.events import queue as event_queue
 from app.events.notifications_buffer import get_event_notifications
 from app.events.stream_bus import get_event_stream_bus
@@ -40,7 +41,7 @@ _OTP_TTL_SECONDS = 600  # 10 minutes
 _MAX_MESSAGE_CHARS = 3500
 
 
-class BaseChannelAdapter(ABC):
+class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
     """Lifecycle + inbound handling shared across all channel adapters.
 
     Subclasses are constructed by :class:`ChannelRegistry` with the channel
@@ -51,12 +52,20 @@ class BaseChannelAdapter(ABC):
     - Implement :meth:`_run` (the receive loop) and :meth:`_send_text`
       (platform-specific send call).
     - Call :meth:`_handle_inbound` for every incoming user message.
+
+    Notification mode (``channel["mode"] == "notification"``) is layered on top
+    via :class:`NotificationDeliveryMixin`: the transport's own ``_run`` still
+    connects and routes inbound (so ``/start`` subscribe works), but inbound is
+    handled as control commands instead of agent dispatch, and a second task
+    (:meth:`_run_notification_delivery`) relays the notifications bus outward.
     """
 
     def __init__(self, channel: dict, storage: Any) -> None:
         self.channel = channel
         self.storage = storage
         self._task: asyncio.Task | None = None
+        # Notification-mode delivery loop (mode == "notification" only).
+        self._notif_task: asyncio.Task | None = None
         # Per-sender in-flight forwarder tasks. Used both to (a) ack the user
         # when a second message arrives while we're still processing the first
         # ("busy ack" — the closest a bot can come to blocking input on
@@ -103,6 +112,15 @@ class BaseChannelAdapter(ABC):
         self._task = asyncio.create_task(
             self._run(), name=f"channel:{self.channel_type}:{self.channel_id}",
         )
+        # Notification-mode channels also run a bus-consuming delivery loop
+        # alongside the transport's receive loop. The transport still receives
+        # inbound (for /start subscribe), but replies are control-command acks
+        # rather than agent dispatch (see ``_handle_inbound``).
+        if self._is_notification_mode():
+            self._notif_task = asyncio.create_task(
+                self._run_notification_delivery(),
+                name=f"channel-notify:{self.channel_type}:{self.channel_id}",
+            )
 
     async def stop(self) -> None:
         # Cancel any in-flight per-sender forwarders so shutdown doesn't
@@ -115,6 +133,16 @@ class BaseChannelAdapter(ABC):
         for fwd in inflight:
             try:
                 await fwd
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        # Tear down the notification delivery loop (if any) so it unsubscribes
+        # from the bus and doesn't outlive the adapter.
+        notif = self._notif_task
+        self._notif_task = None
+        if notif is not None and not notif.done():
+            notif.cancel()
+            try:
+                await notif
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         task = self._task
@@ -343,6 +371,12 @@ class BaseChannelAdapter(ABC):
             f"[channels:{self.channel_type}] inbound channel_id={self.channel_id} "
             f"from={sender_id} msg_len={len(text)}"
         )
+
+        # Notification-mode channels don't converse: inbound messages are
+        # subscribe/unsubscribe control commands, not agent prompts.
+        if self._is_notification_mode():
+            await self._handle_notification_command(sender_id, display_name, text)
+            return
 
         sender = await self.storage.get_or_create_sender(
             self.channel_id, sender_id, display_name=display_name,

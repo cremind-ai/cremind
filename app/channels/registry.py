@@ -55,6 +55,13 @@ def _resolve_adapter_class(
     if channel_type == "slack":
         from app.channels.adapters.slack import SlackAdapter
         return SlackAdapter
+    if channel_type == "zalo":
+        if mode == "userbot":
+            from app.channels.adapters.zalo_userbot import ZaloUserbotAdapter
+            return ZaloUserbotAdapter
+        # bot + notification both ride the Zalo Bot API transport.
+        from app.channels.adapters.zalo import ZaloBotAdapter
+        return ZaloBotAdapter
     raise ChannelNotImplemented(
         f"No adapter registered for channel_type={channel_type!r} mode={mode!r}",
     )

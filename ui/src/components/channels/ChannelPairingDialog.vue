@@ -52,6 +52,13 @@ const titleSuffix = computed(() => {
   }
 });
 
+// The on-phone path to the QR scanner differs per platform.
+const qrSteps = computed(() =>
+  /zalo/i.test(props.channelLabel)
+    ? 'Settings → scan the QR code'
+    : 'Settings → Linked Devices → Link a Device',
+);
+
 function openStream() {
   closeStream();
   if (!props.channelId) return;
@@ -172,12 +179,11 @@ function handleClose() {
         <span>Waiting for the adapter to start the pairing flow…</span>
       </div>
 
-      <!-- WhatsApp QR -->
+      <!-- QR pairing (WhatsApp / Zalo) -->
       <div v-else-if="status === 'qr'" class="state">
         <p class="hint">
           Open <strong>{{ channelLabel }}</strong> on your phone →
-          <strong>Settings → Linked Devices → Link a Device</strong>, then
-          scan the code below.
+          <strong>{{ qrSteps }}</strong>, then scan the code below.
         </p>
         <img v-if="qrDataUrl" :src="qrDataUrl" alt="Pairing QR" class="qr-image" />
       </div>

@@ -106,6 +106,31 @@ async def create_channel(
     raise RuntimeError("unexpected /api/channels response")
 
 
+async def get_channel(client: Client, channel_id: str) -> Channel:
+    resp = await client.get_json(f"/api/channels/{quote(channel_id, safe='')}")
+    if isinstance(resp, dict) and isinstance(resp.get("channel"), dict):
+        return Channel.from_dict(resp["channel"])
+    raise RuntimeError("unexpected /api/channels/{id} response")
+
+
+async def set_notification_filter(
+    client: Client, channel_id: str, notification_filter: dict[str, Any],
+) -> Channel:
+    """PATCH ``config.notification_filter`` on a notification-mode channel.
+
+    The server merges into the existing config, validates/normalizes the filter
+    (HTTP 400 on invalid), and restarts the adapter so the new filter takes
+    effect immediately.
+    """
+    resp = await client.patch_json(
+        f"/api/channels/{quote(channel_id, safe='')}",
+        {"config": {"notification_filter": notification_filter}},
+    )
+    if isinstance(resp, dict) and isinstance(resp.get("channel"), dict):
+        return Channel.from_dict(resp["channel"])
+    raise RuntimeError("unexpected /api/channels/{id} response")
+
+
 async def delete_channel(client: Client, channel_id: str) -> None:
     await client.delete(f"/api/channels/{quote(channel_id, safe='')}")
 

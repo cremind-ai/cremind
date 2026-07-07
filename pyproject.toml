@@ -108,6 +108,8 @@ google = ["google-api-python-client>=2.0.0", "google-auth>=2.0.0"]
 # External chat-channel adapters.
 channel-telegram-bot = ["python-telegram-bot>=21.0"]
 channel-telegram-userbot = ["telethon>=1.36.0"]
+channel-discord = ["discord.py>=2.4.0"]
+channel-slack = ["slack-bolt>=1.18.0"]
 
 # Convenience meta-extra. Installs every feature group above — handy for
 # power users who want the old all-in behaviour back via
@@ -132,6 +134,8 @@ all = [
     "google-auth>=2.0.0",
     "python-telegram-bot>=21.0",
     "telethon>=1.36.0",
+    "discord.py>=2.4.0",
+    "slack-bolt>=1.18.0",
 ]
 
 [project.scripts]

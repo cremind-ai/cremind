@@ -1,0 +1,17 @@
+{
+  "name": "cremind-zalo-sidecar",
+  "version": "0.1.0",
+  "description": "zca-js-based sidecar that bridges a Zalo personal account to the Cremind Zalo channel adapter over a localhost WebSocket.",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "zca-js": "2.1.2",
+    "ws": "^8.18.0",
+    "minimist": "^1.2.8"
+  }
+}

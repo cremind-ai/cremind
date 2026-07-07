@@ -122,9 +122,9 @@ onMounted(loadCatalog);
     <h3 class="step-title">Channels (optional)</h3>
     <p class="step-description">
       Channels let external messaging platforms (Telegram, WhatsApp, Discord,
-      Messenger, Slack) talk to your Cremind agent. Add as many as you like
+      Slack, Messenger, Zalo) talk to your Cremind agent. Add as many as you like
       now or skip and configure them later from <strong>Settings → Channels</strong>.
-      Channels that need interactive pairing (WhatsApp QR scan, Telegram code)
+      Channels that need interactive pairing (WhatsApp / Zalo QR scan, Telegram code)
       will prompt you immediately after Complete Setup.
     </p>
 

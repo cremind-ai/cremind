@@ -6,27 +6,46 @@ supports_bot = true
 supports_userbot = true
 auth_modes = ["none", "otp", "password"]
 default_response_mode = "normal"
-implemented = false
+implemented = true
 
 [[channel.modes]]
 id = "bot"
 label = "Bot"
-implemented = false
-instructions = """**Coming soon — adapter implementation pending.**
-
-1. Visit https://discord.com/developers/applications and create a new application.
+implemented = true
+instructions = """1. Visit https://discord.com/developers/applications and create a new application.
 2. Open the Bot tab → Add Bot, then click 'Reset Token' and copy the token.
 3. Under Privileged Gateway Intents, enable MESSAGE CONTENT INTENT.
 4. Use OAuth2 → URL Generator to invite the bot (scopes: bot; permissions: Send Messages, Read Message History).
-5. Paste the bot token below."""
+5. Paste the bot token below.
+
+Direct-message the bot and the Cremind agent will reply. Server-channel
+messages are ignored — this is a 1:1 DM bridge."""
 [channel.modes.fields]
 bot_token = { description = "Bot Token", type = "string", secret = true, required = true }
+
+[[channel.modes]]
+id = "notification"
+label = "Notification"
+implemented = true
+instructions = """Push-only alerts — no conversation. The Discord bot forwards Cremind
+notifications (automation/event runs, errors, pending prompts) to whoever
+subscribes, with a configurable filter.
+
+Setup:
+1. Create a bot as in Bot mode and paste its token below.
+2. Save, then DM the bot /start to subscribe (/stop to unsubscribe).
+3. To alert specific users without them subscribing, put their Discord user ids
+   in "Target chat ids" (comma-separated)."""
+[channel.modes.fields]
+bot_token = { description = "Bot Token", type = "string", secret = true, required = true }
+target_chat_ids = { description = "Optional target user ids (comma-separated)", type = "string", required = false }
+subscribe_passcode = { description = "Optional passcode; senders must /start <passcode> to subscribe", type = "string", secret = true, required = false }
 
 [[channel.modes]]
 id = "userbot"
 label = "Userbot (your account)"
 implemented = false
-instructions = """**Coming soon — and use at your own risk.**
+instructions = """**Not supported — use at your own risk.**
 
 User-account automation ("selfbots") **violates Discord's Terms of
 Service** and can result in your account being banned. Discord enforces
