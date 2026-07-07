@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json as _json
 import sys
-from typing import Any
+from typing import Any, Optional
 
 import typer
 
@@ -81,6 +81,61 @@ def skill_events_delete(
             await delete_skill_event_subscription(client, sub_id)
 
     asyncio.run(_run())
+
+
+@skill_events_app.command("edit")
+@graceful_errors
+def skill_events_edit(
+    ctx: typer.Context,
+    sub_id: str = typer.Argument(..., help="Subscription id to edit."),
+    trigger: Optional[str] = typer.Option(
+        None, "--trigger",
+        help="New trigger (must be an event the skill declares).",
+    ),
+    action: Optional[str] = typer.Option(
+        None, "--action",
+        help="New natural-language instruction the assistant runs on the event.",
+    ),
+) -> None:
+    """Edit a skill event subscription (only the flags you pass are changed)."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.skill_events import update_skill_event_subscription
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json, print_kv
+    from app.cli.output.formatting import string_field
+
+    fields: dict[str, Any] = {}
+    if trigger is not None:
+        fields["event_type"] = trigger
+    if action is not None:
+        fields["action"] = action
+
+    if not fields:
+        typer.echo("nothing to update — pass --trigger and/or --action", err=True)
+        raise typer.Exit(code=1)
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await update_skill_event_subscription(client, sub_id, fields)
+
+    out = asyncio.run(_run())
+
+    if mode.json:
+        print_json(out)
+        return
+    print_kv([
+        ("id", string_field(out, "id")),
+        ("skill_name", string_field(out, "skill_name")),
+        ("event_type", string_field(out, "event_type")),
+        ("action", string_field(out, "action")),
+        ("conversation_id", string_field(out, "conversation_id")),
+    ])
 
 
 @skill_events_app.command("simulate")

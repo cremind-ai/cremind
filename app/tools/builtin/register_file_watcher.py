@@ -204,7 +204,13 @@ class RegisterFileWatcherTool(BuiltInTool):
                     "information. Do not embed event metadata "
                     "(path/type/timestamp) into it; the runtime appends a "
                     "structured Content block describing the event "
-                    "automatically."
+                    "automatically. The action MAY be a multi-line, step-by-step "
+                    "procedure; when a plan for this automation exists, embed its "
+                    "full per-fire steps here so they run on every fire. The "
+                    "action runs later in a FRESH conversation with no access to "
+                    "this one: inline every concrete value verbatim (full URLs, "
+                    "email addresses, file paths, IDs, criteria) — never write "
+                    "'the provided X' or 'the X above'."
                 ),
             },
         },
@@ -302,6 +308,22 @@ class RegisterFileWatcherTool(BuiltInTool):
         if conv is None:
             return _err("Could not resolve the active conversation.")
         conversation_id = conv["id"]
+
+        # Self-containment gate: a watcher's action runs later in a fresh
+        # conversation with no context, so refuse to persist one that references
+        # info it doesn't inline. Fail-open (no LLM / error → proceeds).
+        from app.events.action_check import gate_registration_action, build_rejection_message
+        from app.utils.context_storage import get_context
+
+        check = await gate_registration_action(
+            profile=profile, action=action,
+            request_context=get_context(context_id or "", "_current_query", "") or "",
+            tool_name="register_file_watcher", conversation_id=conversation_id,
+        )
+        if check is not None:
+            return _err(build_rejection_message(
+                tool_name="register_file_watcher", missing=check.missing, reason=check.reason,
+            ))
 
         # Persist subscription row.
         store = get_file_watcher_storage()

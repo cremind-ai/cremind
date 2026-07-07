@@ -144,3 +144,21 @@ def test_metadata_cancelled_skips_parked_questions():
         assert meta is None
     finally:
         plan_state.clear(run_id)
+
+
+def test_metadata_event_run_persists_todos_with_no_phase():
+    # Event runs expose update_todos but have plan_phase=None. The todos snapshot
+    # must still persist (as the {stage, todos} branch) so the run's live panel
+    # restores on reload — questions/plan tools are never exposed there.
+    run_id = "msg:c1:evt"
+    plan_state.set_todos(run_id, [
+        {"id": "t0", "content": "fetch page", "status": "completed"},
+        {"id": "t1", "content": "email results", "status": "in_progress"},
+    ])
+    try:
+        meta = sr._plan_metadata_for_persist(run_id, None, cancelled=False)
+        assert meta["stage"] == "executing"
+        assert len(meta["todos"]) == 2
+        assert "questions" not in meta and "plan" not in meta
+    finally:
+        plan_state.clear(run_id)

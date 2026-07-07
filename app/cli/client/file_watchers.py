@@ -30,5 +30,16 @@ async def create_file_watcher(
     return resp if isinstance(resp, dict) else {}
 
 
+async def update_file_watcher(
+    client: Client,
+    watcher_id: str,
+    fields: dict[str, Any],
+) -> dict[str, Any]:
+    resp = await client.patch_json(
+        f"/api/file-watchers/{quote(watcher_id, safe='')}", fields,
+    )
+    return resp if isinstance(resp, dict) else {}
+
+
 def file_watchers_admin_stream_path() -> str:
     return "/api/file-watchers/admin/stream"

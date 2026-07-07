@@ -43,7 +43,7 @@ def _fake_cfg() -> SimpleNamespace:
 _ALL_TOOLS = ["reasoning", "ask_user_question", "write_plan", "update_todos", "calc"]
 
 
-def _build(monkeypatch, provider="fake", model="fake-model", *, mode="reasoning", plan_phase=None):
+def _build(monkeypatch, provider="fake", model="fake-model", *, mode="reasoning", plan_phase=None, event_run=False):
     monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
     monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
@@ -52,7 +52,7 @@ def _build(monkeypatch, provider="fake", model="fake-model", *, mode="reasoning"
     registry = _FakeRegistry([_FakeTool(t) for t in _ALL_TOOLS])
     return ra.ReasoningAgent(
         llm=llm, registry=registry, profile="default", context_id="ctx",
-        mode=mode, plan_phase=plan_phase,
+        mode=mode, plan_phase=plan_phase, event_run=event_run,
     )
 
 
@@ -84,6 +84,31 @@ def test_plan_execute_phase_exposes_only_update_todos(monkeypatch):
     assert "write_plan" not in agent._tools_by_id
     prompt = agent._build_instruction()
     assert "PLAN MODE — EXECUTION PHASE" in prompt
+
+
+def test_planning_prompt_has_automation_branch(monkeypatch):
+    agent = _build(monkeypatch, mode="plan", plan_phase="planning")
+    assert "AUTOMATION REQUESTS" in agent._build_instruction()
+
+
+def test_execution_prompt_has_automation_branch(monkeypatch):
+    agent = _build(monkeypatch, mode="plan", plan_phase="execute")
+    assert "AUTOMATION PLANS ARE DIFFERENT" in agent._build_instruction()
+
+
+def test_event_run_exposes_update_todos(monkeypatch):
+    # A multi-step event action drives a live todo panel: update_todos is exposed
+    # on event runs, but the plan authoring tools never are.
+    agent = _build(monkeypatch, mode="reasoning", event_run=True)
+    assert "update_todos" in agent._tools_by_id
+    assert "ask_user_question" not in agent._tools_by_id
+    assert "write_plan" not in agent._tools_by_id
+
+
+def test_reasoning_chat_run_never_sees_update_todos(monkeypatch):
+    # Ordinary (non-event, non-plan) chat runs must stay byte-identical to today.
+    agent = _build(monkeypatch, mode="reasoning", event_run=False)
+    assert "update_todos" not in agent._tools_by_id
 
 
 def test_instant_mode_drops_think_tool_and_guidance(monkeypatch):
@@ -135,6 +160,24 @@ def test_reasoning_and_instant_never_block(monkeypatch):
     for mode in ("reasoning", "instant"):
         agent = _build(monkeypatch, mode=mode)
         assert agent._is_plan_blocked_leaf(_leaf("exec_shell", "exec_shell")) is False
+
+
+# ── event-run storm prevention (dispatch-time block) ───────────────────────
+
+def test_event_run_blocks_registration_leaves(monkeypatch):
+    agent = _build(monkeypatch, mode="reasoning", event_run=True)
+    # Event-CREATION leaves are refused inside an event run...
+    assert agent._is_event_blocked_leaf(_leaf("scheduler", "schedule_create")) is True
+    assert agent._is_event_blocked_leaf(_leaf("system_file", "register_file_watcher")) is True
+    # ...but DE-registration leaves stay allowed (they can't storm).
+    assert agent._is_event_blocked_leaf(_leaf("scheduler", "schedule_cancel")) is False
+    assert agent._is_event_blocked_leaf(_leaf("system_file", "delete_file_watcher")) is False
+
+
+def test_non_event_run_allows_registration_leaves(monkeypatch):
+    agent = _build(monkeypatch, mode="reasoning", event_run=False)
+    assert agent._is_event_blocked_leaf(_leaf("scheduler", "schedule_create")) is False
+    assert agent._is_event_blocked_leaf(_leaf("system_file", "register_file_watcher")) is False
 
 
 # ── per-turn plan marker in the volatile input ─────────────────────────────

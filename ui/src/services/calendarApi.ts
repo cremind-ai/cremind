@@ -26,6 +26,7 @@ export interface ScheduleEventSubscription {
   profile: string;
   title: string;
   action: string;
+  all_day?: boolean;
   schedule_kind: string;
   dtstart: string;
   duration_minutes: number;

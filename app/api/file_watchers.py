@@ -320,6 +320,152 @@ def get_file_watcher_routes() -> list[Route]:
         publish_file_watchers_admin_changed(profile)
         return JSONResponse({**row, "armed": armed}, status_code=201)
 
+    async def handle_update(request: Request) -> JSONResponse:
+        """Edit an existing file watcher (Events-page / CLI edits).
+
+        Only keys present in the body are changed; each is validated with the
+        same rules as ``handle_create``. Because path / recursive / filters may
+        have changed, the watchdog observer is re-armed (disarm old, arm new).
+        The self-containment gate is intentionally not run here — like the
+        create endpoint, manual edits are the user's direct responsibility.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile_from_request(request)
+        sub_id = request.path_params["id"]
+        store = get_file_watcher_storage()
+        existing = store.get(sub_id)
+        if existing is None:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        if profile and existing["profile"] != profile:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+        fields: Dict[str, Any] = {}
+
+        if "action" in body:
+            action = (body.get("action") or "").strip()
+            if not action:
+                return JSONResponse(
+                    {"error": "Missing parameter", "message": "action cannot be empty"},
+                    status_code=400,
+                )
+            fields["action"] = action
+
+        if "target_kind" in body:
+            target_kind = (body.get("target_kind") or "any").strip().lower()
+            if target_kind not in _VALID_TARGET_KINDS:
+                return JSONResponse(
+                    {
+                        "error": "invalid_target_kind",
+                        "message": f"target_kind must be one of {sorted(_VALID_TARGET_KINDS)}",
+                    },
+                    status_code=400,
+                )
+            fields["target_kind"] = target_kind
+
+        if "triggers" in body:
+            triggers_raw = body.get("triggers")
+            if not isinstance(triggers_raw, list):
+                return JSONResponse(
+                    {"error": "invalid_triggers", "message": "triggers must be an array"},
+                    status_code=400,
+                )
+            triggers: List[str] = []
+            seen: set[str] = set()
+            for t in triggers_raw:
+                if not isinstance(t, str):
+                    continue
+                tt = t.strip().lower()
+                if not tt or tt in seen:
+                    continue
+                if tt not in _VALID_EVENT_TYPES:
+                    return JSONResponse(
+                        {
+                            "error": "invalid_trigger",
+                            "message": f"unknown trigger {tt!r}; valid: "
+                                       f"{sorted(_VALID_EVENT_TYPES)}",
+                        },
+                        status_code=400,
+                    )
+                seen.add(tt)
+                triggers.append(tt)
+            if not triggers:
+                return JSONResponse(
+                    {"error": "invalid_triggers", "message": "at least one trigger is required"},
+                    status_code=400,
+                )
+            fields["event_types"] = ",".join(triggers)
+
+        if "extensions" in body:
+            fields["extensions"] = ",".join(_normalize_extensions(body.get("extensions")))
+
+        if "recursive" in body:
+            fields["recursive"] = bool(body.get("recursive"))
+
+        if "path" in body:
+            resolved_path, was_relative = _resolve_path(body.get("path"))
+            if was_relative:
+                base = get_user_working_directory()
+                if not _is_under(resolved_path, base):
+                    return JSONResponse(
+                        {
+                            "error": "path_escape",
+                            "message": (
+                                f"Relative path resolves outside the user working "
+                                f"directory ({base}); refusing to watch."
+                            ),
+                        },
+                        status_code=400,
+                    )
+            if not os.path.exists(resolved_path) or not os.path.isdir(resolved_path):
+                return JSONResponse(
+                    {
+                        "error": "invalid_path",
+                        "message": f"{resolved_path} is not an existing directory",
+                    },
+                    status_code=400,
+                )
+            fields["root_path"] = resolved_path
+
+        if "name" in body:
+            name = (body.get("name") or "").strip()
+            if name:
+                fields["name"] = name
+
+        if not fields:
+            return JSONResponse({**existing, "armed": get_file_watcher_manager().is_armed(existing)})
+
+        manager = get_file_watcher_manager()
+        updated = store.update_fields(sub_id, **fields)
+        if updated is None:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        # Arm the (possibly new) root FIRST — arm is idempotent when the
+        # (root, recursive) key is unchanged. Then tear down the OLD observer,
+        # but only if this edit actually moved the watcher off its old key.
+        # disarm() consults list_by_root, so it must run AFTER the row is
+        # updated (otherwise the still-old row keeps the old observer alive).
+        armed = False
+        try:
+            armed = manager.arm(updated)
+        except Exception:  # noqa: BLE001
+            logger.exception("file_watchers.handle_update: arm failed")
+        key_changed = (
+            existing["root_path"] != updated["root_path"]
+            or bool(existing["recursive"]) != bool(updated["recursive"])
+        )
+        if key_changed:
+            try:
+                manager.disarm(existing)
+            except Exception:  # noqa: BLE001
+                logger.exception("file_watchers.handle_update: disarm failed")
+        publish_file_watchers_admin_changed(profile)
+        return JSONResponse({**updated, "armed": armed})
+
     async def handle_admin_stream(request: Request) -> Any:
         """SSE endpoint pushing the live file-watcher admin snapshot."""
         unauth = _require_auth(request)
@@ -368,5 +514,6 @@ def get_file_watcher_routes() -> list[Route]:
             "/api/file-watchers/admin/stream",
             handle_admin_stream, methods=["GET"],
         ),
+        Route("/api/file-watchers/{id}", handle_update, methods=["PATCH"]),
         Route("/api/file-watchers/{id}", handle_delete, methods=["DELETE"]),
     ]

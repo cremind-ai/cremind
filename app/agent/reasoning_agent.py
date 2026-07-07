@@ -78,6 +78,13 @@ from app.utils.working_directory import set_in_memory_override
 # ``app.tools.builtin.change_working_directory``.
 LOADED_SKILLS_KEY = "_loaded_skill_ids"
 
+# ContextStorage key holding the current turn's raw user query. Leaf tools (e.g.
+# the registration tools' self-containment gate) read it to compare a frozen
+# ``action`` against the request that asked for it, without an agent reference.
+# Duplicated at the read sites (scheduler_actions / register_file_watcher) per
+# the LOADED_SKILLS_KEY mirror-constant convention.
+CURRENT_QUERY_KEY = "_current_query"
+
 # Parameter name a skill function exposes so the model can pass the user's
 # intent. On first use it is overwritten to a fixed marker and the SKILL.md
 # content is returned as the tool result (see ``_handle_skill_call``).
@@ -146,6 +153,9 @@ obtain yourself, call the `request_user_input` tool with ONE clear question and
 then stop; the run is parked as *pending* until the user answers in the run's
 chat, and their reply arrives as your next turn. Do not use `request_user_input`
 for progress updates or narration, and never ask when you can reasonably proceed.
+If your action is a multi-step procedure, maintain a live todo list with
+`update_todos` (pass the FULL list every call, one item in_progress at a time)
+so progress is visible; it does not end your turn.
 '''
 
 
@@ -171,6 +181,16 @@ tools below write anything.
 3. Once the user has answered your questions (their answers appear earlier in
    this turn's history), call `write_plan` with a detailed, complete Markdown
    plan, then STOP — end your turn and wait for the user's Accept/Cancel.
+AUTOMATION REQUESTS: If the request is to set up a recurring or event-triggered
+automation (a schedule, a file watcher, or a skill event), the plan's deliverable
+is the REGISTRATION — not a one-off run. The step list you write runs on EVERY
+fire, later, in a FRESH conversation that has no memory of this one, so the plan
+must contain: (a) the trigger (what fires and when), and (b) a complete,
+self-contained per-fire procedure in the user's language with every detail,
+condition, recipient, dedupe rule, and output format spelled out — with NO
+references to "this conversation" or to work already done here. The execution
+section of the plan covers ONLY registering the trigger; do NOT plan a first
+inline run of the task itself.
 Do not call any other tool in the same step as `ask_user_question` or
 `write_plan`. Never start a fresh planning cycle while an approved plan's todos
 are still incomplete — treat such messages as steering for the ongoing work.
@@ -194,6 +214,19 @@ updates. Keep executing until every todo is completed, then give a short final
 summary. If the user sends a message while you are executing, treat it as
 steering for the ongoing plan (adjust and continue) rather than a request for a
 brand-new plan.
+AUTOMATION PLANS ARE DIFFERENT: If the approved plan is to set up an automation
+(schedule / file watcher / skill event), EXECUTION means registering the trigger
+ONLY. Call the matching registration tool exactly once — `schedule_create`,
+`register_file_watcher`, or the skill's `subscribe` — and copy the full per-fire
+procedure from the plan verbatim into its `action` field (in the user's language,
+self-contained). Inline every concrete value from the plan and the user's request
+verbatim (full URLs, email addresses, file paths, IDs) — the action runs later
+with no access to this conversation, so phrases like 'the provided URL' will
+dangle. Do NOT perform the task itself even once, and do NOT drive a
+todo list for the task's steps — registration is one or two tool calls, so no
+todo list is needed. Claim success only AFTER the registration tool returns OK,
+then end with a one-line summary of what was registered (the trigger and where
+results go).
 '''
 
 
@@ -469,15 +502,21 @@ class ReasoningAgent:
             tools = [t for t in tools if t.tool_id != "request_user_input"]
         # Plan-mode tools are exposed only on plan runs, and only in the matching
         # phase (mirrors the request_user_input gate above). Withholding them
-        # everywhere else keeps reasoning/instant runs (and event runs) byte-
-        # identical to today, so their prompt-cache prefix is unaffected.
+        # everywhere else keeps reasoning/instant chat runs byte-identical to
+        # today, so their prompt-cache prefix is unaffected.
         #   planning phase → ask_user_question, write_plan, update_todos
         #   execute  phase → update_todos only
+        #   event run      → update_todos only (see below)
+        # ``update_todos`` is ALSO exposed to event runs so a multi-step action
+        # can drive a live todo panel in its hidden conversation. Event runs form
+        # their own prompt-cache population (disjoint from chat), so adding it here
+        # costs a one-time event-run cache miss and no chat-run cache hits, and
+        # stays byte-stable across an event run's own turns.
         plan_planning = self._mode == "plan" and self._plan_phase == "planning"
         plan_execute = self._mode == "plan" and self._plan_phase == "execute"
         if not plan_planning:
             tools = [t for t in tools if t.tool_id not in ("ask_user_question", "write_plan")]
-        if not (plan_planning or plan_execute):
+        if not (plan_planning or plan_execute or event_run):
             tools = [t for t in tools if t.tool_id != "update_todos"]
         # Whether the model may emit several tool calls in one turn. Default-on for
         # every provider; the agent already runs leaf calls concurrently (see the
@@ -756,7 +795,9 @@ class ReasoningAgent:
             if self._plan_phase == "execute":
                 marker = (
                     "[Plan mode — EXECUTION phase: carry out the approved plan and "
-                    "keep the todo list current with `update_todos`.]"
+                    "keep the todo list current with `update_todos`. If it is an "
+                    "automation-registration plan, just register the trigger with "
+                    "the full action — do NOT run the task or drive a todo list.]"
                 )
             else:
                 marker = (
@@ -808,7 +849,14 @@ class ReasoningAgent:
                         "omit information. Only leave out the bare event name "
                         "itself (it is captured in `trigger`); keep any "
                         "conditions that decide WHEN to act (e.g. 'only if "
-                        "from my boss')."
+                        "from my boss'). The action MAY be a multi-line, "
+                        "step-by-step procedure; when a plan for this automation "
+                        "exists, embed its full per-fire steps here so they run "
+                        "on every fire. The action runs later in a FRESH "
+                        "conversation with no access to this one: inline every "
+                        "concrete value verbatim (full URLs, email addresses, "
+                        "file paths, IDs, criteria) — never write 'the provided "
+                        "X' or 'the X above'."
                     ),
                 },
             },
@@ -932,16 +980,24 @@ class ReasoningAgent:
 
         return specs, dispatch
 
-    # Leaf sub-tools whose schema stays exposed on every run (byte-stable tools
-    # prefix) but whose EXECUTION is blocked while reacting to an event, to stop
-    # recursive event storms. Matched on the bare leaf name + owning tool_id (the
-    # model emits the namespaced ``system_file__register_file_watcher``, but the
-    # dispatch entry carries the bare ``register_file_watcher`` in ``entry[2]``).
-    _EVENT_BLOCKED_LEAVES: frozenset = frozenset({("system_file", "register_file_watcher")})
+    # Event-CREATION leaves: their schema stays exposed on every run (byte-stable
+    # tools prefix) but their EXECUTION is blocked anywhere inside an event-run
+    # conversation (the trigger turn AND later reply turns) to stop recursive
+    # event storms — an action that registers another event would re-register on
+    # every fire. De-registration leaves (schedule_cancel, delete_file_watcher)
+    # are intentionally NOT listed: they can't storm, and an event action may
+    # legitimately cancel/remove a schedule or watcher. Matched on the bare leaf
+    # name + owning tool_id (the model emits the namespaced
+    # ``system_file__register_file_watcher``, but the dispatch entry carries the
+    # bare ``register_file_watcher`` in ``entry[2]``).
+    _EVENT_BLOCKED_LEAVES: frozenset = frozenset({
+        ("system_file", "register_file_watcher"),
+        ("scheduler", "schedule_create"),
+    })
 
     def _is_event_blocked_leaf(self, entry) -> bool:
         return (
-            self._triggered_by_event
+            (self._triggered_by_event or getattr(self, "_event_run", False))
             and bool(entry)
             and entry[0] == "leaf"
             and (entry[1].tool_id, entry[2]) in self._EVENT_BLOCKED_LEAVES
@@ -993,6 +1049,9 @@ class ReasoningAgent:
         self._loaded_skill_ids = self._derive_loaded_skills_from_history()
         if self.context_id:
             set_context(self.context_id, LOADED_SKILLS_KEY, sorted(self._loaded_skill_ids))
+            # Expose the raw query so registration tools' self-containment gate can
+            # compare a frozen action against the request that asked for it.
+            set_context(self.context_id, CURRENT_QUERY_KEY, input)
         async for item in self._loop():
             yield item
 
@@ -1171,8 +1230,10 @@ class ReasoningAgent:
                     continue
                 if self._is_event_blocked_leaf(entry):
                     obs = (
-                        "Registering a file watcher is not allowed while reacting "
-                        "to an event (this prevents recursive event loops). "
+                        "Registering a new event or automation (schedule, file "
+                        "watcher, or skill subscription) is not allowed from "
+                        "inside an event-triggered run — this prevents recursive "
+                        "event storms where an action keeps creating more events. "
                         "Ignoring this request."
                     )
                     self._append_tool_result(call_id, obs, fn_name=name)
@@ -1222,7 +1283,10 @@ class ReasoningAgent:
             # questions or wrote a plan, park + end the turn (like event runs):
             # the readable questions / plan markdown becomes the final assistant
             # message and the user's answer/decision arrives as the next turn.
-            if getattr(self, "_mode", "reasoning") == "plan":
+            # Event runs also drain here: they expose ``update_todos`` (not the
+            # question/plan tools), so their ``todos`` emits reach the bus while
+            # ``parked_q``/``parked_p`` stay None — no false parking.
+            if getattr(self, "_mode", "reasoning") == "plan" or getattr(self, "_event_run", False):
                 from app.agent import plan_state
                 from app.utils.task_context import current_task_id_var
                 run_id = current_task_id_var.get()
@@ -1460,7 +1524,12 @@ class ReasoningAgent:
             + "\n\nIf the user wants that, call this same skill again with a "
             "`subscribe` object: `trigger` = one or more of the event names above, "
             "`action` = what to do when an event fires, preserving the user's full "
-            "request and wording (every detail and condition) — do not summarize it."
+            "request and wording (every detail and condition) — do not summarize it. "
+            "The action may be a multi-line, step-by-step procedure and should embed "
+            "the full plan-derived steps when a plan for this automation exists. It "
+            "runs later in a fresh conversation with no access to this one, so inline "
+            "every concrete value verbatim (URLs, emails, paths, IDs) — never 'the "
+            "provided X'."
         )
 
     @staticmethod
@@ -1546,14 +1615,32 @@ class ReasoningAgent:
         # ── subscribe path: register an event for this exact skill ──────────
         if self._is_skill_subscribe_args(args):
             # The ``subscribe`` block is always in the spec (byte-stable tools
-            # prefix), so the model can emit it even while reacting to an event.
-            # Refuse it at runtime there: subscribing during an event run risks a
-            # recursive event storm (event → reasoning → subscribe → event → …).
-            if self._triggered_by_event:
+            # prefix), so the model can emit it even inside an event run. Refuse
+            # it there (trigger turn AND reply turns): subscribing during an event
+            # run risks a recursive event storm (event → reasoning → subscribe →
+            # event → …).
+            if self._triggered_by_event or getattr(self, "_event_run", False):
                 obs = (
-                    "Subscriptions cannot be created while reacting to an event "
-                    "(this prevents recursive event loops). Ignoring this "
-                    "subscribe request."
+                    "Subscriptions cannot be created from inside an "
+                    "event-triggered run (this prevents recursive event loops). "
+                    "Ignoring this subscribe request."
+                )
+                self._append_tool_result(call_id, obs, fn_name=tool.tool_id)
+                yield self._result_artifact(
+                    step_no, call_id, [Part(root=TextPart(text=obs))]
+                )
+                return
+            # Registration is a mutation; the plan PLANNING phase is read-only
+            # (mirrors _PLAN_BLOCKED_LEAVES for the leaf tools). A subscribe is a
+            # "skill" dispatch entry, not a "leaf", so that gate can't catch it —
+            # refuse it here. Registration happens in the EXECUTION phase.
+            if self._mode == "plan" and self._plan_phase == "planning":
+                obs = (
+                    "Plan mode (planning phase) is READ-ONLY — no event "
+                    "subscription was created. Registration happens in the "
+                    "EXECUTION phase, after the user accepts the plan. For now, "
+                    "capture the full per-fire action in the plan you write with "
+                    "`write_plan`."
                 )
                 self._append_tool_result(call_id, obs, fn_name=tool.tool_id)
                 yield self._result_artifact(
@@ -1572,6 +1659,7 @@ class ReasoningAgent:
                 skill_source=str(dir_path),
                 triggers=_normalize_triggers(sub.get("trigger")),
                 action=(sub.get("action") or "").strip(),
+                request_context=self._current_query or "",
             )
             self._append_tool_result(call_id, obs, fn_name=tool.tool_id)
             yield self._result_artifact(step_no, call_id, [Part(root=TextPart(text=obs))])

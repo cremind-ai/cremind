@@ -3,23 +3,21 @@ import { computed, onMounted, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { goBackToChat } from '../utils/backToChat';
 import {
-  ElButton, ElDatePicker, ElDialog, ElInput, ElInputNumber, ElMessage,
-  ElMessageBox, ElOption, ElRadioButton, ElRadioGroup, ElSelect, ElSwitch,
-  ElTimePicker, ElTooltip,
+  ElButton, ElMessage, ElMessageBox, ElRadioButton, ElRadioGroup, ElSwitch,
+  ElTooltip,
 } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import {
-  connectGoogleCalendar, createCalendarEvent, deleteCalendarEvent,
-  disconnectGoogleCalendar, getCalendarSettings, listCalendarEvents,
-  setCalendarEnabled, updateCalendarEvent, type CalendarOccurrence,
+  connectGoogleCalendar, disconnectGoogleCalendar, getCalendarSettings,
+  listCalendarEvents, setCalendarEnabled, type CalendarOccurrence,
 } from '../services/calendarApi';
 import CalendarMonthView from '../components/calendar/CalendarMonthView.vue';
 import CalendarTimeGridView from '../components/calendar/CalendarTimeGridView.vue';
 import CalendarAgendaView from '../components/calendar/CalendarAgendaView.vue';
+import ScheduleEventDialog from '../components/ScheduleEventDialog.vue';
 import {
-  type CalView, viewRange, titleFor, navigate, weekDays, startOfDay, addDays,
-  isoDate, parseLocal,
+  type CalView, viewRange, titleFor, navigate, weekDays, startOfDay,
 } from '../components/calendar/calendarUtils';
 
 const props = defineProps<{ profile: string }>();
@@ -143,127 +141,11 @@ async function onDisconnectGoogle() {
 }
 
 // ── create / edit dialog ───────────────────────────────────────────────────
-const dialogOpen = ref(false);
-const editingId = ref<string | null>(null);
-const readOnly = ref(false);  // a pure Google event (not Cremind-managed)
-type Repeat = 'none' | 'daily' | 'weekdays' | 'weekly' | 'monthly';
-const form = ref({
-  title: '', all_day: false, date: isoDate(new Date()), time: '09:00',
-  end_date: isoDate(new Date()), duration_minutes: 30,
-  repeat: 'none' as Repeat, end_type: 'never' as 'never' | 'count' | 'until',
-  end_count: 5, end_until: '', action: '',
-});
-
-function resetForm(date?: string, time?: string) {
-  const d = date || isoDate(new Date());
-  form.value = {
-    title: '', all_day: false, date: d, time: time || '09:00',
-    end_date: d, duration_minutes: 30, repeat: 'none', end_type: 'never',
-    end_count: 5, end_until: '', action: '',
-  };
-}
-
-function openCreate(dtstart?: string) {
-  editingId.value = null; readOnly.value = false;
-  if (dtstart && dtstart.includes('T')) resetForm(dtstart.slice(0, 10), dtstart.slice(11, 16));
-  else resetForm(dtstart);
-  dialogOpen.value = true;
-}
-
-function openEdit(ev: CalendarOccurrence) {
-  if (!ev.subscription_id) {
-    // Pure Google event — read-only detail.
-    editingId.value = null; readOnly.value = true;
-    resetForm(ev.start.slice(0, 10), ev.start.slice(11, 16));
-    form.value.title = ev.title;
-    form.value.all_day = ev.all_day;
-    dialogOpen.value = true;
-    return;
-  }
-  editingId.value = ev.subscription_id; readOnly.value = false;
-  resetForm(ev.start.slice(0, 10), ev.start.slice(11, 16));
-  form.value.title = ev.title;
-  form.value.all_day = ev.all_day;
-  form.value.action = ev.action || '';
-  // inclusive end date for an all-day event (end is stored exclusive-ish)
-  const endD = parseLocal(ev.end);
-  form.value.end_date = isoDate(ev.all_day ? addDays(endD, endD.getHours() === 0 && endD.getMinutes() === 0 ? -1 : 0) : endD);
-  if (!ev.all_day) {
-    const mins = Math.max(15, Math.round((parseLocal(ev.end).getTime() - parseLocal(ev.start).getTime()) / 60000));
-    form.value.duration_minutes = mins;
-  }
-  dialogOpen.value = true;
-}
-
-const WEEKDAY_CODES = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
-function buildRrule(): string | null {
-  const d = parseLocal(`${form.value.date}T00:00:00`);
-  switch (form.value.repeat) {
-    case 'daily': return 'FREQ=DAILY';
-    case 'weekdays': return 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR';
-    case 'weekly': return `FREQ=WEEKLY;BYDAY=${WEEKDAY_CODES[(d.getDay() + 6) % 7]}`;
-    case 'monthly': return `FREQ=MONTHLY;BYMONTHDAY=${d.getDate()}`;
-    default: return null;
-  }
-}
-
-async function submitForm() {
-  if (!form.value.title.trim()) { ElMessage.warning('Title is required'); return; }
-  const allDay = form.value.all_day;
-  const dtstart = allDay ? `${form.value.date}T00:00:00` : `${form.value.date}T${form.value.time}:00`;
-  let duration = form.value.duration_minutes;
-  if (allDay) {
-    const days = Math.max(1, Math.round((parseLocal(`${form.value.end_date}T00:00:00`).getTime()
-      - parseLocal(`${form.value.date}T00:00:00`).getTime()) / 86400000) + 1);
-    duration = days * 1440;
-  }
-  const rrule = buildRrule();
-  let endType: string | null = null; let endValue: string | null = null;
-  if (rrule) {
-    endType = form.value.end_type;
-    if (endType === 'count') endValue = String(form.value.end_count);
-    else if (endType === 'until') endValue = form.value.end_until ? `${form.value.end_until}T23:59:59` : null;
-  }
-  const payload = {
-    title: form.value.title.trim(),
-    dtstart,
-    action: form.value.action.trim(),
-    all_day: allDay,
-    duration_minutes: duration,
-    rrule,
-    recurrence_end_type: endType,
-    recurrence_end_value: endValue,
-  };
-  busy.value = true;
-  try {
-    if (editingId.value) {
-      await updateCalendarEvent(settings.agentUrl, settings.authToken, editingId.value, payload);
-      ElMessage.success('Event updated');
-    } else {
-      await createCalendarEvent(settings.agentUrl, settings.authToken, payload);
-      ElMessage.success('Event created');
-    }
-    dialogOpen.value = false;
-    await loadEvents();
-  } catch (err) { ElMessage.error(err instanceof Error ? err.message : String(err)); }
-  finally { busy.value = false; }
-}
-
-async function deleteCurrent() {
-  if (!editingId.value) return;
-  try {
-    await ElMessageBox.confirm(`Delete '${form.value.title}'?`, 'Confirm delete',
-      { confirmButtonText: 'Delete', cancelButtonText: 'Cancel', type: 'warning' });
-  } catch { return; }
-  busy.value = true;
-  try {
-    await deleteCalendarEvent(settings.agentUrl, settings.authToken, editingId.value);
-    ElMessage.success('Deleted');
-    dialogOpen.value = false;
-    await loadEvents();
-  } catch (err) { ElMessage.error(err instanceof Error ? err.message : String(err)); }
-  finally { busy.value = false; }
-}
+// The dialog + form live in the shared ScheduleEventDialog component (reused by
+// the Events page). These thin wrappers keep the existing template bindings.
+const scheduleDialog = ref<InstanceType<typeof ScheduleEventDialog> | null>(null);
+function openCreate(dtstart?: string) { scheduleDialog.value?.openCreate(dtstart); }
+function openEdit(ev: CalendarOccurrence) { scheduleDialog.value?.openEdit(ev); }
 </script>
 
 <template>
@@ -337,92 +219,8 @@ async function deleteCurrent() {
       <CalendarAgendaView v-else :events="events" @select="openEdit" />
     </template>
 
-    <!-- create / edit dialog -->
-    <ElDialog
-      v-model="dialogOpen"
-      :title="readOnly ? 'Event' : (editingId ? 'Edit event' : 'New event')"
-      width="520px"
-    >
-      <div class="form">
-        <p v-if="readOnly" class="ro-note">
-          <Icon icon="mdi:google" /> A Google Calendar event — manage it in Google Calendar.
-        </p>
-        <label class="f-label">Title</label>
-        <ElInput v-model="form.title" :disabled="readOnly" placeholder="e.g. Daily standup" />
-
-        <div class="f-toggle">
-          <span class="f-label">All day</span>
-          <ElSwitch v-model="form.all_day" :disabled="readOnly" />
-        </div>
-
-        <div class="f-row" v-if="!form.all_day">
-          <div class="f-col">
-            <label class="f-label">Date</label>
-            <ElDatePicker v-model="form.date" type="date" value-format="YYYY-MM-DD" :disabled="readOnly" :clearable="false" style="width:100%" />
-          </div>
-          <div class="f-col">
-            <label class="f-label">Time</label>
-            <ElTimePicker v-model="form.time" format="HH:mm" value-format="HH:mm" :disabled="readOnly" :clearable="false" style="width:100%" />
-          </div>
-          <div class="f-col">
-            <label class="f-label">Duration (min)</label>
-            <ElInputNumber v-model="form.duration_minutes" :min="5" :step="15" :disabled="readOnly" controls-position="right" style="width:100%" />
-          </div>
-        </div>
-        <div class="f-row" v-else>
-          <div class="f-col">
-            <label class="f-label">Start date</label>
-            <ElDatePicker v-model="form.date" type="date" value-format="YYYY-MM-DD" :disabled="readOnly" :clearable="false" style="width:100%" />
-          </div>
-          <div class="f-col">
-            <label class="f-label">End date</label>
-            <ElDatePicker v-model="form.end_date" type="date" value-format="YYYY-MM-DD" :disabled="readOnly" :clearable="false" style="width:100%" />
-          </div>
-        </div>
-
-        <template v-if="!readOnly">
-          <label class="f-label">Repeat</label>
-          <ElSelect v-model="form.repeat" style="width:100%">
-            <ElOption label="Does not repeat" value="none" />
-            <ElOption label="Every day" value="daily" />
-            <ElOption label="Every weekday (Mon–Fri)" value="weekdays" />
-            <ElOption label="Weekly (on this weekday)" value="weekly" />
-            <ElOption label="Monthly (on this date)" value="monthly" />
-          </ElSelect>
-
-          <template v-if="form.repeat !== 'none'">
-            <label class="f-label">Ends</label>
-            <ElSelect v-model="form.end_type" style="width:100%">
-              <ElOption label="Never" value="never" />
-              <ElOption label="After N occurrences" value="count" />
-              <ElOption label="On a date" value="until" />
-            </ElSelect>
-            <ElInputNumber v-if="form.end_type === 'count'" v-model="form.end_count" :min="1" style="margin-top:8px" />
-            <ElDatePicker v-if="form.end_type === 'until'" v-model="form.end_until" type="date" value-format="YYYY-MM-DD" style="margin-top:8px;width:100%" />
-          </template>
-
-          <label class="f-label">Command to run when it fires</label>
-          <ElInput
-            v-model="form.action"
-            type="textarea"
-            :rows="3"
-            placeholder="Runs in the Schedule conversation. Leave empty to run the title as the command (e.g. 'tắt đèn hiên')."
-          />
-        </template>
-      </div>
-      <template #footer>
-        <div class="dlg-footer">
-          <ElButton v-if="editingId && !readOnly" type="danger" plain @click="deleteCurrent">
-            <Icon icon="mdi:delete-outline" /> Delete
-          </ElButton>
-          <div class="spacer" />
-          <ElButton @click="dialogOpen = false">{{ readOnly ? 'Close' : 'Cancel' }}</ElButton>
-          <ElButton v-if="!readOnly" type="primary" :loading="busy" @click="submitForm">
-            {{ editingId ? 'Save' : 'Create' }}
-          </ElButton>
-        </div>
-      </template>
-    </ElDialog>
+    <!-- create / edit dialog (shared component) -->
+    <ScheduleEventDialog ref="scheduleDialog" @saved="loadEvents" @deleted="loadEvents" />
   </div>
 </template>
 
@@ -448,12 +246,4 @@ async function deleteCurrent() {
 .nav { display: flex; align-items: center; gap: 8px; }
 .cal-title { font-weight: 600; font-size: 1.1rem; color: var(--text-primary); margin-left: 8px; }
 .toolbar-right { display: flex; align-items: center; gap: 12px; }
-
-.form { display: flex; flex-direction: column; gap: 6px; }
-.f-label { font-size: .8125rem; color: var(--text-secondary); margin-top: 6px; }
-.f-row { display: flex; gap: 12px; }
-.f-col { display: flex; flex-direction: column; gap: 4px; flex: 1; }
-.f-toggle { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; padding: 6px 0; }
-.ro-note { display: flex; align-items: center; gap: 6px; color: var(--text-secondary); font-size: .85rem; margin: 0 0 4px; }
-.dlg-footer { display: flex; align-items: center; gap: 8px; width: 100%; }
 </style>

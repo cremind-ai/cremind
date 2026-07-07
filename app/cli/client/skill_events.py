@@ -22,6 +22,17 @@ async def delete_skill_event_subscription(client: Client, sub_id: str) -> None:
     await client.delete(f"/api/skill-events/{quote(sub_id, safe='')}")
 
 
+async def update_skill_event_subscription(
+    client: Client,
+    sub_id: str,
+    fields: dict[str, Any],
+) -> dict[str, Any]:
+    resp = await client.patch_json(
+        f"/api/skill-events/{quote(sub_id, safe='')}", fields,
+    )
+    return resp if isinstance(resp, dict) else {}
+
+
 async def simulate_skill_event(
     client: Client,
     sub_id: str,

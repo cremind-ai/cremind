@@ -24,8 +24,14 @@ import {
 } from '../services/adminEventsStream';
 import CollapsibleSection from './CollapsibleSection.vue';
 import EventRunHistory from './events/EventRunHistory.vue';
+import ScheduleEventDialog from './ScheduleEventDialog.vue';
 
 const props = defineProps<{ profile: string }>();
+
+const scheduleDialog = ref<InstanceType<typeof ScheduleEventDialog> | null>(null);
+function openEdit(row: ScheduleEventSubscription) {
+  scheduleDialog.value?.openEditSubscription(row);
+}
 const router = useRouter();
 const settings = useSettingsStore();
 
@@ -195,8 +201,15 @@ async function confirmDelete(row: ScheduleEventSubscription) {
           <span class="muted">{{ row.source }}</span>
         </template>
       </ElTableColumn>
-      <ElTableColumn label="Actions" min-width="180">
+      <ElTableColumn label="Actions" min-width="250">
         <template #default="{ row }">
+          <ElButton
+            v-if="row.status === 'active' || row.status === 'paused'"
+            size="small"
+            @click="openEdit(row as ScheduleEventSubscription)"
+          >
+            <Icon icon="mdi:pencil-outline" /> Edit
+          </ElButton>
           <ElButton
             v-if="row.status === 'active' || row.status === 'paused'"
             size="small"
@@ -211,6 +224,8 @@ async function confirmDelete(row: ScheduleEventSubscription) {
         </template>
       </ElTableColumn>
     </ElTable>
+
+    <ScheduleEventDialog ref="scheduleDialog" />
     </CollapsibleSection>
   </section>
 </template>
