@@ -125,7 +125,12 @@ export function openProcessesStream(
   onError?: (e: any) => void,
 ): ProcessStreamHandle {
   return createSharedStream<ProcessRow[]>({
-    key: 'cremind:processes',
+    // Namespace by token so each profile's tab is its own stream leader and
+    // fetches /api/processes/stream with its OWN token. A fixed key would let
+    // a still-open admin tab (the leader) broadcast admin's process list to a
+    // newly-created profile's follower tab. Mirrors settingsStateStream /
+    // profileEventsStream, which also key by profile/token.
+    key: `cremind:processes:${authToken || 'anon'}`,
     bufferSize: 1,
     openRaw: (handleEvent, handleError) =>
       openProcessesStreamRaw(agentUrl, authToken, handleEvent, handleError),

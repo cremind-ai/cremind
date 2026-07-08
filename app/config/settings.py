@@ -388,6 +388,35 @@ class BaseConfig:
         return _dynaconf_get("general.jwt_secret", "")
 
     @classmethod
+    def mint_token(
+        cls, profile: str, secret: str | None = None, hours: int | None = None
+    ) -> tuple[str, str]:
+        """Mint an HS256 session JWT for a profile. Returns (token, expires_at).
+
+        Single source of truth for the session-token claim shape, shared by the
+        setup wizard (``app/api/config.py``) and the restore engine
+        (``app/backup/engine.py``, which re-mints token files under the local
+        secret). ``secret`` defaults to the live installation secret; ``hours``
+        defaults to ``JWT_EXPIRATION_HOURS``.
+        """
+        import jwt
+        from datetime import datetime, timedelta, timezone
+
+        key = secret or cls.get_jwt_secret()
+        if hours is None:
+            hours = cls.JWT_EXPIRATION_HOURS
+        now = datetime.now(timezone.utc)
+        payload = {
+            "sub": profile,
+            "profile": profile,
+            "iat": now,
+            "exp": now + timedelta(hours=hours),
+        }
+        token = jwt.encode(payload, key, algorithm="HS256")
+        expires_at = (now + timedelta(hours=hours)).isoformat()
+        return token, expires_at
+
+    @classmethod
     def get_server_config(cls, key: str, default=None):
         """Get a server config value from SQLite, falling back to class attribute or default."""
         dynamic_val = get_dynamic("server_config", key)

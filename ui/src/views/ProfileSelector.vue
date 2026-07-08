@@ -53,18 +53,25 @@ const loginError = ref('');
 // pre-dropdown behavior.
 const availableProfiles = ref<string[]>([]);
 
-async function loadAvailableProfiles() {
+// Returns true only when the server gave a definitive answer, so callers can
+// safely reconcile the saved-profile cache against it (a failed fetch must
+// never be treated as "no profiles exist").
+async function loadAvailableProfiles(): Promise<boolean> {
   try {
     const { profiles } = await listPublicProfileNames(settingsStore.agentUrl);
     availableProfiles.value = profiles;
+    return true;
   } catch {
     availableProfiles.value = [];
+    return false;
   }
 }
 
 onMounted(async () => {
-  // Fire-and-forget: don't gate the setup-status flow on this.
-  void loadAvailableProfiles();
+  // Kick off the authoritative profile-name fetch in parallel with the
+  // setup-status probe. It feeds the login dropdown and, below, prunes
+  // deleted profiles from the saved-profile cards.
+  const profileNamesReady = loadAvailableProfiles();
 
   const status = await readStableSetupStatus();
 
@@ -117,6 +124,19 @@ onMounted(async () => {
       // Network failure — keep the token.
     }
   }));
+
+  // Reconcile the saved-profile cache against the authoritative live list:
+  // a profile deleted on the server (via Settings, the CLI, or another
+  // browser) leaves a still-valid JWT behind, so the /api/me probe above
+  // can't detect it — it must be pruned by membership in the live list.
+  // Only prune when we got a definitive list; a failed fetch keeps the cards.
+  const listOk = await profileNamesReady;
+  if (listOk) {
+    const live = new Set(availableProfiles.value);
+    for (const p of settingsStore.getLoggedInProfiles()) {
+      if (!live.has(p)) settingsStore.removeTokenForProfile(p);
+    }
+  }
 
   loggedInProfiles.value = settingsStore.getLoggedInProfiles();
   checking.value = false;

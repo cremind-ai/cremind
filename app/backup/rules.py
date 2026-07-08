@@ -1,9 +1,10 @@
 """Inclusion/exclusion rules for the file trees under ``CREMIND_SYSTEM_DIR``.
 
 Include-list driven (safer than exclude-driven for a directory that also holds
-venvs, caches, and the DB): only ``tokens/``, the shared ``browser-profile/``,
-and each ``<profile>/`` tree named in the DB are walked. Within those, transient
-and rebuildable content is pruned:
+venvs, caches, and the DB): only the shared ``browser-profile/`` and each
+``<profile>/`` tree named in the DB are walked. The ``tokens/`` tree (JWT
+session tokens) is intentionally excluded — see :func:`include_roots`. Within
+those roots, transient and rebuildable content is pruned:
 
 - the relational DB (``storage/``) is captured as a portable logical dump, not
   copied file-for-file; ``storage/chroma`` embeddings rebuild on boot
@@ -57,8 +58,17 @@ def long_path(p: str) -> str:
 
 
 def include_roots(profiles: list[str], *, include_browser_profiles: bool = True) -> list[str]:
-    """Top-level relative roots to walk, in a stable order."""
-    roots = ["tokens"]
+    """Top-level relative roots to walk, in a stable order.
+
+    ``tokens/`` (per-profile JWT session tokens) is deliberately **not** walked:
+    the JWT signing secret and its issued tokens are local to an installation —
+    carrying them across a restore breaks auth (they'd be verified against a
+    different secret). Restore re-mints these files under the target's own secret
+    (see ``app/backup/engine.py``). Per-profile OAuth tokens (e.g. a skill's
+    ``scripts/.google_token.json``) live under the ``<profile>/`` root and are
+    still backed up as user data.
+    """
+    roots: list[str] = []
     if include_browser_profiles:
         roots.append("browser-profile")
     roots.extend(sorted(profiles))

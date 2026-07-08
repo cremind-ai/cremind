@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue';
-import { ElCard, ElDivider } from 'element-plus';
+import { ElDivider } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import {
   listTools, listLLMProviders, getProviderModels,
@@ -9,13 +9,17 @@ import {
 import type { JsonSchema } from '../../services/agentApi';
 import type { ProfileValue } from '../../stores/settings';
 import { useLLMModels } from '../../composables/useLLMModels';
-import ItemCardHeader from '../shared/ItemCardHeader.vue';
+import ToolSkillCard from '../shared/ToolSkillCard.vue';
 import ToolVariablesForm from '../shared/ToolVariablesForm.vue';
 import ToolArgumentsForm from '../shared/ToolArgumentsForm.vue';
 import LLMParametersForm from '../shared/LLMParametersForm.vue';
+import { initVarValues, initArgValues } from '../../utils/toolItemForm';
 
 const props = defineProps<{
   agentUrl: string;
+  // Admin JWT for loading the tool/provider catalog during a per-profile
+  // setup (empty on first-run setup, where the endpoints are open).
+  token?: string;
   configs: Record<string, Record<string, string>>;
   profile: string;
   isFirstSetup: boolean;
@@ -60,6 +64,11 @@ interface SetupToolItem {
   /** Built-in tools only: when true the enable toggle is locked on — the
    *  tool can't be opted out of during setup. Sourced from TOOL_CONFIG.locked. */
   toggleLocked: boolean;
+
+  /** Skills only: true when the skill is a shipped built-in. A new profile
+   *  gets its own copy of every built-in skill; admin's imported/custom skills
+   *  don't carry over, so we hide them from the per-profile setup. */
+  isBuiltinSkill: boolean;
 }
 
 const items = ref<SetupToolItem[]>([]);
@@ -67,41 +76,13 @@ const llmProviders = ref<LLMProvider[]>([]);
 const loading = ref(false);
 
 const builtinItems = computed(() => items.value.filter(i => !i.isSkill));
-const skillItems = computed(() => items.value.filter(i => i.isSkill));
+// For a per-profile setup the catalog is loaded with the admin token, so the
+// listed skills are admin's. Only shipped built-in skills carry over to the new
+// profile (seeded at completeSetup), so hide admin-only custom skills there.
+const skillItems = computed(() =>
+  items.value.filter(i => i.isSkill && (props.isFirstSetup || i.isBuiltinSkill)),
+);
 const hasSkills = computed(() => skillItems.value.length > 0);
-
-function getDefaultForType(type: string): ProfileValue {
-  if (type === 'number') return 0;
-  if (type === 'boolean') return false;
-  return '';
-}
-
-function initVarValues(
-  fields: Record<string, { default?: unknown }> | undefined,
-  stored: Record<string, string> | undefined,
-): Record<string, string> {
-  const values: Record<string, string> = {};
-  if (fields) {
-    for (const [key, field] of Object.entries(fields)) {
-      if (field.default != null) values[key] = String(field.default);
-    }
-  }
-  if (stored) Object.assign(values, stored);
-  return values;
-}
-
-function initArgValues(
-  schema: JsonSchema | null,
-  storedValues?: Record<string, unknown> | null,
-): Record<string, ProfileValue> {
-  if (!schema || !schema.properties) return {};
-  const stored = storedValues || {};
-  const values: Record<string, ProfileValue> = {};
-  for (const [propName, propDef] of Object.entries(schema.properties)) {
-    values[propName] = (stored[propName] as ProfileValue) ?? getDefaultForType(propDef.type);
-  }
-  return values;
-}
 
 function getStatusTag(item: SetupToolItem) {
   // Built-in tools report `llm_bound=false` until setup completes, so using it
@@ -121,8 +102,9 @@ function getStatusTag(item: SetupToolItem) {
 onMounted(async () => {
   loading.value = true;
   try {
-    // Fetch tools (always available, no auth needed during setup)
-    const toolRes = await listTools(props.agentUrl, '');
+    // Fetch tools. On first-run setup the endpoint is open (setup mode);
+    // for a per-profile setup it requires the admin JWT passed in via props.
+    const toolRes = await listTools(props.agentUrl, props.token ?? '');
 
     // Built-in tools and skills are returned directly by /api/tools (with
     // tool_type 'builtin' or 'skill'). /api/agents only carries a2a/mcp
@@ -130,12 +112,12 @@ onMounted(async () => {
 
     // Load LLM providers and models
     try {
-      const provRes = await listLLMProviders(props.agentUrl, '');
+      const provRes = await listLLMProviders(props.agentUrl, props.token ?? '');
       llmProviders.value = provRes.providers;
       const providersWithModels: { name: string; display_name: string; models: any[] }[] = [];
       for (const p of provRes.providers) {
         try {
-          const modelRes = await getProviderModels(props.agentUrl, '', p.name);
+          const modelRes = await getProviderModels(props.agentUrl, props.token ?? '', p.name);
           providersWithModels.push({ name: p.name, display_name: p.display_name, models: modelRes.models });
         } catch {
           providersWithModels.push({ name: p.name, display_name: p.display_name, models: [] });
@@ -173,11 +155,15 @@ onMounted(async () => {
         reasoningEffort: (llmCfg.reasoning_effort as string) || '',
         fullReasoning: !!tool.full_reasoning,
         // Locked tools can't be opted out of — force them on so the submitted
-        // _enabled payload never disables them.
-        enabled: tool.toggle_locked ? true : tool.enabled,
+        // _enabled payload never disables them. Otherwise start from the
+        // profile-independent DEFAULT (not the admin profile's resolved state),
+        // so a new profile's wizard shows pristine defaults. Falls back to
+        // ``enabled`` for older backends that don't send ``default_enabled``.
+        enabled: tool.toggle_locked ? true : (tool.default_enabled ?? tool.enabled),
         expanded: false,
         requiresFeature: tool.requires_feature ?? null,
         toggleLocked: !!tool.toggle_locked,
+        isBuiltinSkill: tool.tool_type === 'skill' ? !!tool.is_builtin : false,
       };
     });
   } catch {
@@ -250,64 +236,64 @@ watch(items, emitConfigs, { deep: true });
         </h4>
 
         <div class="items-list">
-          <ElCard v-for="item in builtinItems" :key="item.name" class="item-card" shadow="hover">
-            <ItemCardHeader
-              :name="item.displayName"
-              :status-tag="getStatusTag(item)"
-              :expanded="item.expanded"
-              :enabled="item.enabled"
-              :toggle-locked="item.toggleLocked"
-              @toggle-expand="item.expanded = !item.expanded"
-              @update:enabled="item.enabled = $event"
-            />
+          <ToolSkillCard
+            v-for="item in builtinItems"
+            :key="item.name"
+            :name="item.displayName"
+            :status-tag="getStatusTag(item)"
+            :expanded="item.expanded"
+            :enabled="item.enabled"
+            :toggle-locked="item.toggleLocked"
+            @toggle-expand="item.expanded = !item.expanded"
+            @update:enabled="item.enabled = $event"
+          >
+            <template #banner>
+              <div
+                v-if="item.requiresFeature && item.enabled"
+                class="requires-feature-hint"
+              >
+                <Icon icon="mdi:package-down" /> Installs:
+                <code>cremind[{{ item.requiresFeature }}]</code>
+                <span class="requires-feature-note">
+                  — pip extras for this tool will be installed when you submit.
+                </span>
+              </div>
+            </template>
 
-            <div
-              v-if="item.requiresFeature && item.enabled"
-              class="requires-feature-hint"
-            >
-              <Icon icon="mdi:package-down" /> Installs:
-              <code>cremind[{{ item.requiresFeature }}]</code>
-              <span class="requires-feature-note">
-                — pip extras for this tool will be installed when you submit.
-              </span>
+            <!-- Tool Variables -->
+            <div v-if="Object.keys(item.configFields).length > 0" class="config-section">
+              <ToolVariablesForm
+                :fields="item.configFields"
+                :values="item.configValues"
+                @update:values="item.configValues = $event"
+              />
             </div>
 
-            <div v-if="item.expanded" class="item-config">
-              <!-- Tool Variables -->
-              <div v-if="Object.keys(item.configFields).length > 0" class="config-section">
-                <ToolVariablesForm
-                  :fields="item.configFields"
-                  :values="item.configValues"
-                  @update:values="item.configValues = $event"
-                />
-              </div>
-
-              <!-- LLM Parameters -->
-              <div class="config-section">
-                <h4 class="config-section-title">LLM Parameters</h4>
-                <LLMParametersForm
-                  v-model:description="item.description"
-                  v-model:system-prompt="item.systemPrompt"
-                  v-model:llm-provider="item.llmProvider"
-                  v-model:llm-model="item.llmModel"
-                  v-model:reasoning-effort="item.reasoningEffort"
-                  v-model:full-reasoning="item.fullReasoning"
-                  :providers="llmProviders"
-                  :get-filtered-models="getFilteredModels"
-                  :get-reasoning-options="getReasoningOptions"
-                />
-              </div>
-
-              <!-- Tool Arguments -->
-              <div v-if="item.argumentsSchema && Object.keys(item.argumentsSchema.properties).length > 0" class="config-section">
-                <ToolArgumentsForm
-                  :schema="item.argumentsSchema"
-                  :arg-values="item.argValues"
-                  @update:arg-values="item.argValues = $event"
-                />
-              </div>
+            <!-- LLM Parameters -->
+            <div class="config-section">
+              <h4 class="config-section-title">LLM Parameters</h4>
+              <LLMParametersForm
+                v-model:description="item.description"
+                v-model:system-prompt="item.systemPrompt"
+                v-model:llm-provider="item.llmProvider"
+                v-model:llm-model="item.llmModel"
+                v-model:reasoning-effort="item.reasoningEffort"
+                v-model:full-reasoning="item.fullReasoning"
+                :providers="llmProviders"
+                :get-filtered-models="getFilteredModels"
+                :get-reasoning-options="getReasoningOptions"
+              />
             </div>
-          </ElCard>
+
+            <!-- Tool Arguments -->
+            <div v-if="item.argumentsSchema && Object.keys(item.argumentsSchema.properties).length > 0" class="config-section">
+              <ToolArgumentsForm
+                :schema="item.argumentsSchema"
+                :arg-values="item.argValues"
+                @update:arg-values="item.argValues = $event"
+              />
+            </div>
+          </ToolSkillCard>
         </div>
       </div>
 
@@ -321,37 +307,35 @@ watch(items, emitConfigs, { deep: true });
           </h4>
 
           <div class="items-list">
-            <ElCard v-for="item in skillItems" :key="item.name" class="item-card" shadow="hover">
-              <ItemCardHeader
-                :name="item.displayName"
-                :status-tag="getStatusTag(item)"
-                :expanded="item.expanded"
-                :enabled="item.enabled"
-                :toggle-locked="item.toggleLocked"
-                @toggle-expand="item.expanded = !item.expanded"
-                @update:enabled="item.enabled = $event"
-              />
-
-              <div v-if="item.expanded" class="item-config">
-                <!-- Tool Variables -->
-                <div v-if="Object.keys(item.configFields).length > 0" class="config-section">
-                  <ToolVariablesForm
-                    :fields="item.configFields"
-                    :values="item.configValues"
-                    @update:values="item.configValues = $event"
-                  />
-                </div>
-
-                <!-- Tool Arguments -->
-                <div v-if="item.argumentsSchema && Object.keys(item.argumentsSchema.properties).length > 0" class="config-section">
-                  <ToolArgumentsForm
-                    :schema="item.argumentsSchema"
-                    :arg-values="item.argValues"
-                    @update:arg-values="item.argValues = $event"
-                  />
-                </div>
+            <ToolSkillCard
+              v-for="item in skillItems"
+              :key="item.name"
+              :name="item.displayName"
+              :status-tag="getStatusTag(item)"
+              :expanded="item.expanded"
+              :enabled="item.enabled"
+              :toggle-locked="item.toggleLocked"
+              @toggle-expand="item.expanded = !item.expanded"
+              @update:enabled="item.enabled = $event"
+            >
+              <!-- Tool Variables -->
+              <div v-if="Object.keys(item.configFields).length > 0" class="config-section">
+                <ToolVariablesForm
+                  :fields="item.configFields"
+                  :values="item.configValues"
+                  @update:values="item.configValues = $event"
+                />
               </div>
-            </ElCard>
+
+              <!-- Tool Arguments -->
+              <div v-if="item.argumentsSchema && Object.keys(item.argumentsSchema.properties).length > 0" class="config-section">
+                <ToolArgumentsForm
+                  :schema="item.argumentsSchema"
+                  :arg-values="item.argValues"
+                  @update:arg-values="item.argValues = $event"
+                />
+              </div>
+            </ToolSkillCard>
           </div>
         </div>
       </template>
@@ -382,14 +366,6 @@ watch(items, emitConfigs, { deep: true });
 .section-icon { font-size: 18px; color: var(--primary-color); }
 
 .items-list { display: flex; flex-direction: column; gap: 10px; }
-
-.item-card { background: var(--surface-color); }
-
-.item-config {
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border-color, #e4e7ed);
-}
 
 .config-section { margin-bottom: 12px; }
 .config-section + .config-section {

@@ -21,6 +21,7 @@ import hashlib
 import io
 import json
 import os
+import secrets
 import shutil
 import socket
 import sys
@@ -461,6 +462,14 @@ def apply_staged_restore(staged_dir: Path, *, target_system_dir: str) -> Restore
     engine = provider.sync_engine()
     target_home = os.path.expanduser("~")
     pm = build_path_map(manifest, target_system_dir, target_home)
+
+    # The JWT signing secret is local to this installation, not part of the
+    # backup: capture it before the DB is wiped (generate one if this is a
+    # fresh, pre-setup target) so it can be re-pinned after the load. Restoring
+    # the archive's secret instead would invalidate every token this install
+    # already issued — a 401 across the board on the next boot.
+    local_secret = _read_local_jwt_secret(engine) or secrets.token_urlsafe(32)
+
     load_stats = None
     try:
         drop_all_tables(engine)
@@ -474,6 +483,16 @@ def apply_staged_restore(staged_dir: Path, *, target_system_dir: str) -> Restore
             load_stats = provider.load_logical(fh, row_transform=_xform)
 
         migrations.upgrade("head")
+
+        # Re-pin the local secret — overwrites any value an older archive
+        # carried and guarantees the row exists for newer archives that omit it
+        # — then re-mint each restored profile's token file under it.
+        from app.storage.dynamic_config_storage import DynamicConfigStorage
+
+        DynamicConfigStorage(provider).set(
+            "server_config", "jwt_secret", local_secret, is_secret=True
+        )
+        _reissue_profile_tokens(engine, target_system_dir, local_secret)
     finally:
         try:
             engine.dispose()
@@ -484,7 +503,11 @@ def apply_staged_restore(staged_dir: Path, *, target_system_dir: str) -> Restore
     # Replace file trees (merge-overwrite into the target system dir).
     file_count = _restore_file_trees(staged_dir, target_system_dir)
 
-    warnings: list[str] = []
+    warnings: list[str] = [
+        "JWT signing secret and session tokens were kept local to this "
+        "installation (not restored from the backup); token files were "
+        "re-issued for each restored profile."
+    ]
     if report.unmapped:
         warnings.append(
             f"{len(report.unmapped)} stored path(s) point outside the backed-up "
@@ -506,6 +529,54 @@ def apply_staged_restore(staged_dir: Path, *, target_system_dir: str) -> Restore
     )
 
 
+def _read_local_jwt_secret(engine) -> str:
+    """Read the target's current ``jwt_secret`` before the DB is wiped.
+
+    Returns ``""`` when there is no ``server_config`` row yet (a fresh install
+    that hasn't completed setup) — the caller then generates one.
+    """
+    from sqlalchemy import text
+
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT value FROM server_config WHERE key = 'jwt_secret'")
+            ).first()
+        return (row[0] if row else "") or ""
+    except Exception:  # noqa: BLE001 — table may not exist on a bare DB
+        return ""
+
+
+def _reissue_profile_tokens(engine, target_system_dir: str, secret: str) -> None:
+    """Re-mint every restored profile's JWT token file under the local secret.
+
+    The ``tokens/`` tree is not restored from the archive (those tokens were
+    signed with the *source's* secret). Instead each restored profile gets a
+    fresh recovery token signed with THIS installation's secret, so the token
+    files stay valid for CLI use / login-by-paste. Best-effort per profile — a
+    single failure must never abort the restore.
+    """
+    from sqlalchemy import text
+
+    from app.config.settings import BaseConfig
+
+    try:
+        with engine.connect() as conn:
+            names = [r[0] for r in conn.execute(text("SELECT name FROM profiles"))]
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[backup:restore] could not list profiles to re-mint tokens: {e}")
+        return
+
+    tokens_dir = Path(target_system_dir) / "tokens"
+    for name in names:
+        try:
+            tokens_dir.mkdir(parents=True, exist_ok=True)
+            token, _exp = BaseConfig.mint_token(name, secret=secret)
+            (tokens_dir / f"{name}.token").write_text(token, encoding="utf-8")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[backup:restore] could not re-mint token for profile {name!r}: {e}")
+
+
 def _restore_file_trees(staged_dir: Path, target_system_dir: str) -> int:
     files_root = Path(staged_dir) / "files"
     if not files_root.is_dir():
@@ -516,6 +587,13 @@ def _restore_file_trees(staged_dir: Path, target_system_dir: str) -> int:
         for fn in filenames:
             src = os.path.join(dirpath, fn)
             rel = os.path.relpath(src, str(files_root))
+            # Never restore archived JWT token files — they were signed with the
+            # source's secret. Restore re-mints them under the local secret
+            # (see _reissue_profile_tokens). Guards older archives that still
+            # carry a tokens/ tree.
+            rel_posix = rel.replace(os.sep, "/")
+            if rel_posix == "tokens" or rel_posix.startswith("tokens/"):
+                continue
             dst = target / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             try:

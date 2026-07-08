@@ -358,6 +358,16 @@ if (settingsStore.agentUrl) {
 // Determine if this is the first setup or a profile-specific setup
 const profileName = computed(() => props.profile || 'admin');
 const isFirstSetup = ref(true);
+
+// Token used for the wizard's data-loading calls. During first-run setup no
+// ``admin`` token exists yet (fresh install) and the relevant endpoints are
+// open in setup mode, so this resolves to '' and behaviour is unchanged. For
+// any subsequent profile, setup is already complete and those endpoints
+// require a valid JWT — the setup tab shares the same origin as the opener,
+// so admin's token is available in localStorage. It's used to load the
+// wizard and to authorize the finishing POST; ``handleFinish`` then switches
+// the session to the new profile's own token.
+const adminToken = computed(() => settingsStore.getTokenForProfile('admin'));
 const generatedToken = ref('');
 const tokenExpiresAt = ref<string>('');
 // True once the user has triggered at least one config download on the
@@ -645,8 +655,21 @@ async function runPostInstallSetupChecks() {
   try {
     const status = await checkSetupStatus(settingsStore.agentUrl, profileName.value);
     isFirstSetup.value = !status.setup_complete;
+
+    // Per-profile setup runs against a fully set-up backend, so its
+    // data-loading endpoints require the admin JWT. If it's missing
+    // (admin signed out, or the 30-day token expired) every step would
+    // silently 401 and render empty — surface an actionable message
+    // instead of repeating the original symptom.
+    if (!isFirstSetup.value && props.profile && !adminToken.value) {
+      ElMessage.error(
+        "Can't load setup — no admin session found in this browser. " +
+        'Sign in as the "admin" profile first, then create the profile again.',
+      );
+    }
+
     try {
-      serviceCapabilities.value = await fetchServiceCapabilities(settingsStore.agentUrl);
+      serviceCapabilities.value = await fetchServiceCapabilities(settingsStore.agentUrl, adminToken.value);
     } catch {
       // Capability fetch is best-effort — when it fails the wizard
       // continues without per-service deployment radios. Falls back
@@ -905,7 +928,7 @@ async function handleCompleteSetup() {
       config.channel_configs = channelConfigs.value;
     }
 
-    const result = await completeSetup(settingsStore.agentUrl, config as any);
+    const result = await completeSetup(settingsStore.agentUrl, config as any, adminToken.value);
     generatedToken.value = result.token;
     tokenExpiresAt.value = (result as any).expires_at || '';
     restartRequired.value = Boolean((result as any).restart_required);
@@ -1562,12 +1585,14 @@ async function downloadConfigFile(format: ExportFormat) {
         <StepLLMConfig
           v-else-if="currentStepKey === 'llm'"
           :agent-url="settingsStore.agentUrl"
+          :token="adminToken"
           :config="llmConfig"
           @update="handleLLMConfigUpdate"
         />
         <StepToolConfig
           v-else-if="currentStepKey === 'tools'"
           :agent-url="settingsStore.agentUrl"
+          :token="adminToken"
           :configs="toolConfigs"
           :profile="profileName"
           :is-first-setup="isFirstSetup"

@@ -136,12 +136,18 @@ export async function completeSetup(
     embedding_config?: EmbeddingSetupConfig;
     llm_config?: Record<string, string>;
     tool_configs?: Record<string, Record<string, string>>;
-  }
+  },
+  // Empty for first-run setup (endpoint is open in setup mode); the admin
+  // token for any subsequent profile, which the backend requires via
+  // ``require_admin``. The target profile is taken from ``config.profile``,
+  // not the token — so admin's JWT authorizes creating a differently-named
+  // profile.
+  token?: string,
 ): Promise<{ success: boolean; token: string; expires_at: string; profile: string }> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/config/setup`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders(token ?? ''),
     body: JSON.stringify(config),
   });
   if (!res.ok) {
@@ -709,6 +715,10 @@ export interface ToolStatus {
    *  (Intrinsic tools are filtered out server-side.) */
   tool_type: 'builtin' | 'a2a' | 'mcp' | 'skill' | string;
   enabled: boolean;
+  /** Profile-independent default enabled state (ignores this profile's
+   *  overrides). Used by the Setup Wizard to show pristine defaults for a
+   *  brand-new profile instead of the admin profile's customized toggles. */
+  default_enabled?: boolean;
   configured: boolean;
   /** TOML required_config schema for built-in tools. {} for skills/a2a/mcp. */
   required_fields: Record<string, ToolConfigField>;

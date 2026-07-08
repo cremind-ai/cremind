@@ -122,6 +122,10 @@ function handleCreateProfile() {
 async function handleDeleteProfile(name: string) {
   try {
     await deleteProfile(settingsStore.agentUrl, settingsStore.authToken, name);
+    // Drop the deleted profile's cached token + saved-profile entry so it
+    // stops appearing on the profile selector in this browser. Other browsers
+    // reconcile against the live list on the selector (ProfileSelector.vue).
+    settingsStore.removeTokenForProfile(name);
     ElMessage.success(`Profile '${name}' deleted`);
     await loadProfiles();
   } catch (e) {

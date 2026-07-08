@@ -29,6 +29,14 @@ DBDUMP_FORMAT = "cremind-dbdump"
 DBDUMP_VERSION = 1
 _BATCH_ROWS = 500
 
+# Rows never written to the portable dump. The JWT signing secret is local to
+# an installation — carrying it across a restore breaks auth (tokens issued on
+# the target were signed with a different secret). Restore preserves the
+# target's own secret (see app/backup/engine.py::apply_staged_restore); a dump
+# that omits it also avoids shipping the plaintext signing key in every archive.
+# ``table -> {key-column value, ...}`` for key/value tables.
+_EXCLUDE_ROWS: dict[str, set[str]] = {"server_config": {"jwt_secret"}}
+
 
 @dataclass
 class DumpStats:
@@ -108,9 +116,12 @@ def dump_logical(engine: Engine, fileobj: BinaryIO) -> DumpStats:
 
             for table in live_tables:
                 col_names = [c.name for c in table.columns]
+                excluded_keys = _EXCLUDE_ROWS.get(table.name)
                 count = 0
                 result = conn.execute(table.select())
                 for row in result.mappings():
+                    if excluded_keys and row.get("key") in excluded_keys:
+                        continue  # installation-local (e.g. jwt_secret) — never dumped
                     payload = {name: _jsonable(row[name]) for name in col_names}
                     gz.write(
                         (json.dumps({"table": table.name, "row": payload}) + "\n").encode("utf-8")

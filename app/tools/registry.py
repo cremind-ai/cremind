@@ -209,6 +209,11 @@ class ToolRegistry:
                 "description": tool.description,
                 "tool_type": tool.tool_type.value,
                 "enabled": enabled,
+                # Profile-independent default (ignores any ``profile_tools``
+                # override) so callers can show pristine defaults instead of
+                # the caller's resolved state — used by the Setup Wizard when
+                # configuring a brand-new profile.
+                "default_enabled": self._default_enabled(tool.tool_type) or tool.locked,
                 "arguments_schema": tool.arguments_schema,
             })
         return rows
