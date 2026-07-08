@@ -56,6 +56,10 @@ dependencies = [
     "jinja2>=3.1.6",
     "dynaconf>=3.2.0",
     "toml>=0.10.2",
+    # AES-GCM for optional passphrase-encrypted backups (app/backup/crypto.py).
+    # Already present transitively (fastmcp → authlib → cryptography); pinned
+    # explicitly so encrypted backups don't rely on a transitive dependency.
+    "cryptography>=43",
     # Filesystem watching. Used unconditionally by every install path —
     # documents-folder sync, skills hot-reload, the file-browser SSE
     # endpoint, the ``register_file_watcher`` built-in tool — so it ships

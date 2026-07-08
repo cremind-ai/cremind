@@ -20,6 +20,38 @@ from app.channels.exceptions import ChannelNotImplemented
 from app.utils.logger import logger
 
 
+def _notify_channel_disabled(channel: dict, reason: str) -> None:
+    """Surface an auto-disabled channel as a high-priority notification.
+
+    A channel that fails to start at boot is silently flipped to ``enabled=False``
+    with ``state.last_error``. After a restore onto a different host, session-based
+    channels (telegram-userbot / whatsapp / zalo) whose session files don't
+    transfer will fail exactly this way — the user needs a *warning*, not a
+    silently-disabled channel. The notifications buffer replays to UI clients
+    that connect after boot. Fully guarded — a notification must never affect
+    channel startup.
+    """
+    try:
+        from app.events import get_event_notifications
+
+        ctype = channel.get("channel_type") or "channel"
+        mode = channel.get("mode") or "bot"
+        get_event_notifications().push(
+            profile=channel.get("profile") or "admin",
+            conversation_id="",
+            conversation_title=f"Channel disabled: {ctype}",
+            message_preview=(
+                f"The {ctype} channel ({mode}) failed to start and was disabled: "
+                f"{reason}. Re-link it under Settings → Channels."
+            ),
+            kind="channel_disabled",
+            priority="high",
+            extra={"channel_id": channel.get("id"), "channel_type": ctype},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"channels: disable notification push failed: {exc}")
+
+
 def _resolve_adapter_class(
     channel_type: str, mode: str,
 ) -> type[BaseChannelAdapter]:
@@ -125,6 +157,7 @@ class ChannelRegistry:
             logger.warning(
                 f"channels: {channel['channel_type']} disabled: {exc}",
             )
+            _notify_channel_disabled(channel, str(exc))
             return channel
         except Exception as exc:  # noqa: BLE001
             await self.storage.update_channel(
@@ -137,6 +170,7 @@ class ChannelRegistry:
             logger.exception(
                 f"channels: start failed for {channel['channel_type']}",
             )
+            _notify_channel_disabled(channel, f"start failed: {exc}")
             return channel
 
         async with self._lock:

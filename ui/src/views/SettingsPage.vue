@@ -55,6 +55,13 @@ const allCards: SettingsCard[] = [
     icon: 'mdi:account-group',
     route: 'profiles',
   },
+  {
+    title: 'Backup & Restore',
+    description: 'Create full backups, download archives, and restore this system from a backup',
+    icon: 'mdi:backup-restore',
+    route: 'backup',
+    adminOnly: true,
+  },
 ];
 
 // Vector Embedding is a server-wide configuration owned by the admin

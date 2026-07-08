@@ -189,6 +189,22 @@ async def post_upgrade_apply(request: Request) -> JSONResponse:
             status_code=409,
         )
 
+    # Don't upgrade on top of an in-flight restore (it would race the DB swap).
+    try:
+        from app.backup import status as backup_status
+        from app.backup.pending import has_pending
+
+        if has_pending() or backup_status.any_running():
+            return JSONResponse(
+                {
+                    "error": "A backup restore is in progress.",
+                    "status_url": "/api/backup/restore/status",
+                },
+                status_code=409,
+            )
+    except ImportError:
+        pass
+
     # Optional ``{"target_version": "X.Y.ZrcN.devM"}`` from the test-channel
     # version picker. Honored ONLY on the test channel — on production / dev
     # we ignore it and upgrade to the latest, exactly as before, so the

@@ -33,6 +33,7 @@ from app.cli.commands import serve as serve_cmd
 from app.cli.commands import system_vars as system_vars_cmd
 from app.cli.commands import usage as usage_cmd
 from app.cli.commands.agents import agents_app
+from app.cli.commands.backup import backup_app
 from app.cli.commands.calendar import calendar_app
 from app.cli.commands.channels import channels_app
 from app.cli.commands.config import config_app
@@ -134,6 +135,7 @@ app.add_typer(setup_app, name="setup")
 app.add_typer(config_app, name="config")
 app.add_typer(db_app, name="db")
 app.add_typer(upgrade_app, name="upgrade")
+app.add_typer(backup_app, name="backup")
 
 app.command(
     "chat",
