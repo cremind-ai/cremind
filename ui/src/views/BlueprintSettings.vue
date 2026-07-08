@@ -235,8 +235,8 @@ onMounted(async () => {
           </ElTableColumn>
           <ElTableColumn label="Actions" width="170">
             <template #default="{ row }">
-              <ElButton size="small" @click="onDownload(row)">Download</ElButton>
-              <ElButton size="small" type="danger" plain @click="onDelete(row)">Delete</ElButton>
+              <ElButton size="small" @click="onDownload(row as BlueprintEntry)">Download</ElButton>
+              <ElButton size="small" type="danger" plain @click="onDelete(row as BlueprintEntry)">Delete</ElButton>
             </template>
           </ElTableColumn>
         </ElTable>
