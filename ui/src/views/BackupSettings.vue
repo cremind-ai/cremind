@@ -223,9 +223,9 @@ onMounted(() => { void refresh(); });
           </ElTableColumn>
           <ElTableColumn label="Actions" width="240">
             <template #default="{ row }">
-              <ElButton size="small" @click="onDownload(row)">Download</ElButton>
-              <ElButton size="small" type="primary" @click="openRestore(row)">Restore…</ElButton>
-              <ElButton size="small" type="danger" text @click="onDelete(row)">Delete</ElButton>
+              <ElButton size="small" @click="onDownload(row as BackupEntry)">Download</ElButton>
+              <ElButton size="small" type="primary" @click="openRestore(row as BackupEntry)">Restore…</ElButton>
+              <ElButton size="small" type="danger" text @click="onDelete(row as BackupEntry)">Delete</ElButton>
             </template>
           </ElTableColumn>
         </ElTable>
