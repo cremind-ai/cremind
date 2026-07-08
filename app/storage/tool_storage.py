@@ -425,6 +425,26 @@ class ToolStorage(SyncStorageBase):
                 out.setdefault(tool_id, set()).add(key)
             return out
 
+    def list_config_keys(self, profile: str) -> list[dict]:
+        """Return ``[{tool_id, scope, key, is_secret}]`` for a profile's configs.
+
+        Existence-only listing (values are never read) — used by the blueprint
+        exporter to discover which tools a profile has configured and which
+        config keys are secrets, without ever pulling a secret value.
+        """
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT tool_id, scope, key, is_secret FROM tool_configs "
+                    "WHERE profile = :profile"
+                ),
+                {"profile": profile},
+            ).fetchall()
+            return [
+                {"tool_id": r[0], "scope": r[1], "key": r[2], "is_secret": bool(r[3])}
+                for r in rows
+            ]
+
     def delete_all_configs(self, *, profile: str, tool_id: str) -> int:
         """Delete every config row (all scopes) for one (profile, tool_id).
 

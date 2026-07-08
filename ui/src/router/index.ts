@@ -119,6 +119,20 @@ const routes = [
     },
   },
   {
+    path: '/:profile/settings/blueprints',
+    name: 'blueprint-settings',
+    component: () => import('../views/BlueprintSettings.vue'),
+    props: true,
+    meta: { title: 'Blueprints' },
+  },
+  {
+    path: '/:profile/settings/blueprints/import',
+    name: 'blueprint-import',
+    component: () => import('../views/BlueprintImportWizard.vue'),
+    props: true,
+    meta: { title: 'Import Blueprint' },
+  },
+  {
     path: '/:profile/settings/profiles',
     name: 'profile-settings',
     component: () => import('../views/ProfileSettings.vue'),

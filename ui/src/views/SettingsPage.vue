@@ -62,6 +62,12 @@ const allCards: SettingsCard[] = [
     route: 'backup',
     adminOnly: true,
   },
+  {
+    title: 'Blueprints',
+    description: "Package this profile's design (persona, tools, skills, LLM, settings, events) to share, or import one into a new profile",
+    icon: 'mdi:file-document-multiple-outline',
+    route: 'blueprints',
+  },
 ];
 
 // Vector Embedding is a server-wide configuration owned by the admin

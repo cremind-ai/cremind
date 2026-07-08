@@ -855,6 +855,14 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to schedule autostart run on boot")
 
+            # 7c-bis. Sweep abandoned blueprint-import staging sessions (24h TTL).
+            try:
+                from app.blueprint.store import sweep_stale_sessions
+
+                await asyncio.to_thread(sweep_stale_sessions)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to sweep stale blueprint import sessions")
+
             # 7d. Skill event manager
             try:
                 from app.events import get_event_manager

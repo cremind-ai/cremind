@@ -113,6 +113,62 @@ def install_skills_from_dir(source_root: Path, profile: str) -> dict:
     return {"installed": installed, "skipped": skipped}
 
 
+def install_single_skill(
+    src_dir: Path, profile: str, *, on_conflict: str = "skip",
+) -> dict:
+    """Install one already-extracted skill directory into ``profile``.
+
+    Unlike :func:`install_skills_from_dir` (which never overwrites), this honours
+    an explicit ``on_conflict`` decision — used by the blueprint importer, whose
+    wizard asks the user per skill:
+
+    - ``"skip"`` / ``"keep_local"`` — leave an existing dir untouched (no copy).
+    - ``"use_blueprint"`` / ``"overwrite"`` — replace an existing dir with the
+      bundled one.
+
+    A dir name matching a shipped built-in is always kept local (the boot-time
+    ``sync_builtin_skills_into_profile`` overwrites built-in-named dirs anyway,
+    so a bundled copy could never win durably). ``src_dir`` must itself be a
+    valid skill directory (contain a ``SKILL.md``). The basename is used as the
+    install dir name and is guarded to land strictly inside the skills dir.
+
+    Returns ``{"dir", "installed": bool, "action", "reason"}``.
+    """
+    from app.skills.scanner import parse_skill_dir
+
+    info = parse_skill_dir(src_dir)
+    if info is None:
+        return {"dir": src_dir.name, "installed": False, "action": "skip",
+                "reason": "not a valid skill (no SKILL.md)"}
+
+    dir_name = src_dir.name
+    skills_root = profile_skills_dir(profile)
+    skills_root.mkdir(parents=True, exist_ok=True)
+    dest = skills_root / dir_name
+
+    # Traversal guard: the basename copy must land strictly inside the skills dir.
+    if dest.resolve().parent != skills_root.resolve():
+        return {"dir": dir_name, "installed": False, "action": "skip",
+                "reason": "invalid skill directory name"}
+
+    if dir_name in builtin_skill_dir_names():
+        return {"dir": dir_name, "installed": False, "action": "keep_local",
+                "reason": "matches a built-in skill (kept local)"}
+
+    if dest.exists():
+        if on_conflict in ("use_blueprint", "overwrite"):
+            shutil.rmtree(dest, ignore_errors=True)
+            shutil.copytree(src_dir, dest)
+            logger.info(f"Overwrote skill '{info.name}' in profile '{profile}' from blueprint")
+            return {"dir": dir_name, "installed": True, "action": "overwrite", "reason": ""}
+        return {"dir": dir_name, "installed": False, "action": "keep_local",
+                "reason": "a skill with this name already exists (kept local)"}
+
+    shutil.copytree(src_dir, dest)
+    logger.info(f"Installed skill '{info.name}' into profile '{profile}'")
+    return {"dir": dir_name, "installed": True, "action": "install", "reason": ""}
+
+
 # ── archive import ──────────────────────────────────────────────────────────
 
 
