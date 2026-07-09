@@ -470,13 +470,20 @@ class ReasoningAgent:
 
         # Snapshot the tool list available to this profile for this run.
         tools = registry.tools_for_profile(profile)
-        # Event-triggered runs must not register new watchers/events (recursive
-        # event storms). This is enforced at DISPATCH time — ``_handle_skill_call``
-        # refuses a ``subscribe`` call and ``_loop`` refuses a ``register_file_watcher``
-        # call when ``_triggered_by_event`` is set — NOT by mutating the tool schema.
-        # The ``tools=`` block stays byte-identical to a normal run so the prompt
-        # cache prefix is reused on event runs (a prior schema divergence here
-        # dropped event cache hits to ~29%).
+        # Event runs must not register new watchers/events (recursive event
+        # storms) AND should not even SEE the registration tools. The event-
+        # CREATION leaves (schedule_create / register_file_watcher) and the skill
+        # ``subscribe`` object are hidden from the ``tools=`` schema on event runs
+        # — see ``_build_tools_and_dispatch`` and ``_skill_function_spec``. This is
+        # gated on ``event_run`` (constant across the WHOLE event conversation:
+        # the trigger turn AND later reply turns), so the tools block stays byte-
+        # stable across an event run's own turns; event runs form a prompt-cache
+        # population disjoint from chat, so hiding them costs no chat-run cache
+        # hits. (An earlier divergence gated on the turn-varying
+        # ``triggered_by_event`` was NOT stable within a conversation and dropped
+        # event cache hits to ~29% — that is why the gate is ``event_run``.)
+        # Dispatch-time refusal (``_is_event_blocked_leaf`` / ``_handle_skill_call``)
+        # stays as a backstop for replayed-history or hallucinated calls.
         self._triggered_by_event = triggered_by_event
         # The ``reasoning`` think-tool exists only to give models WITHOUT native
         # step-by-step reasoning a place to think before acting. Drop it (and
@@ -890,6 +897,14 @@ class ReasoningAgent:
         ``subscribe`` call when ``_triggered_by_event`` is set.
         """
         items = self._skill_event_items(tool)
+        # Event runs never see the `subscribe` object — an automation must not
+        # register further event subscriptions (recursive storms). Gated on
+        # ``_event_run`` (constant across the whole event conversation) so the
+        # tools block stays byte-stable across its turns. A not-loaded event
+        # skill then exposes only ``request`` (still loadable/usable); a loaded
+        # event skill's stub drops entirely (subscribe_spec is None → return None).
+        if getattr(self, "_event_run", False):
+            items = []
         subscribe_spec = self._skill_subscribe_spec(items) if items else None
 
         if loaded:
@@ -975,7 +990,13 @@ class ReasoningAgent:
             for fs in leaf_specs:
                 if fs.leaf_name in disabled:
                     continue  # sub-tool disabled for this profile
-                specs.append(fs.schema)
+                # Event runs never SEE the event-CREATION leaves (schedule_create /
+                # register_file_watcher): an automation must not register further
+                # automations. Keep the dispatch entry as a backstop (a replayed or
+                # hallucinated call is still gracefully refused, not "Unknown tool");
+                # drop only the schema so the model isn't offered the tool.
+                if not self._is_event_blocked_leaf(("leaf", tool, fs.leaf_name)):
+                    specs.append(fs.schema)
                 dispatch[fs.name] = ("leaf", tool, fs.leaf_name)
 
         return specs, dispatch

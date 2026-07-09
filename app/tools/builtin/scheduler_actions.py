@@ -73,7 +73,10 @@ class ScheduleCreateTool(BuiltInTool):
                     "Short human-readable name for the event/reminder, in the "
                     "USER'S ORIGINAL LANGUAGE — use the user's own wording and "
                     "never translate it (e.g. keep 'tắt đèn hiên'; do not render "
-                    "'Turn off porch light')."
+                    "'Turn off porch light'). Name WHAT the event does, not WHEN "
+                    "it fires — no cadence/time phrasing (e.g. 'every 2 hours') "
+                    "here, since the title is used as the command when `action` "
+                    "is omitted."
                 ),
             },
             "dtstart": {
@@ -91,7 +94,13 @@ class ScheduleCreateTool(BuiltInTool):
                     "porch light', 'summarize my unread email'), in the user's "
                     "ORIGINAL language and wording. Preserve the user's full "
                     "request — every detail, qualifier, and specific — do NOT "
-                    "summarize or simplify it. Whenever the command carries any "
+                    "summarize or simplify it. Leave OUT the schedule itself — "
+                    "the cadence, frequency, dates, and times (e.g. 'every 2 "
+                    "hours', 'at 9am daily', 'tomorrow') are captured structurally "
+                    "in dtstart/rrule and MUST NOT be repeated here; put ONLY what "
+                    "to do on each fire, plus any conditions that decide WHETHER "
+                    "to act on a given fire (e.g. 'only if there are unread "
+                    "emails'). Whenever the command carries any "
                     "detail beyond the title, put the full instruction here "
                     "(don't rely on the title fallback). The action MAY be a "
                     "multi-line, step-by-step procedure; when a plan for this "

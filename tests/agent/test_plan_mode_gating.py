@@ -26,6 +26,9 @@ class _FakeRegistry:
     def tools_for_profile(self, profile):
         return list(self._tools)
 
+    def disabled_leaves_by_tool(self, profile):
+        return {}
+
 
 def _fake_cfg() -> SimpleNamespace:
     return SimpleNamespace(
@@ -201,3 +204,122 @@ def test_render_input_unchanged_for_reasoning_and_instant(monkeypatch):
         agent = _build(monkeypatch, mode=mode)
         agent._current_query = "hello world"
         assert agent._render_input() == "hello world"
+
+
+# ── event-run schema hiding (registration tools ABSENT from the tools block) ──
+#
+# Dispatch-time blocking (above) is the backstop; these assert the event-run
+# conversation is not even OFFERED the three registration entry points.
+
+from app.tools.base import FunctionSpec, ToolType, make_leaf_name  # noqa: E402
+
+
+class _FakeLeafTool:
+    """A built-in group exposing named leaves via ``leaf_function_specs``."""
+
+    tool_type = ToolType.BUILTIN
+
+    def __init__(self, tool_id, leaf_names):
+        self.tool_id = tool_id
+        self._leaf_names = leaf_names
+
+    def leaf_function_specs(self, *, context_id, profile, query="", arguments=None):
+        return [
+            FunctionSpec(
+                name=make_leaf_name(self.tool_id, leaf),
+                leaf_name=leaf,
+                schema={"type": "function", "function": {"name": make_leaf_name(self.tool_id, leaf)}},
+            )
+            for leaf in self._leaf_names
+        ]
+
+
+class _FakeSkillTool:
+    """A skill tool declaring one or more subscribable events."""
+
+    tool_type = ToolType.SKILL
+
+    def __init__(self, tool_id, event_names):
+        self.tool_id = tool_id
+        self.description = f"{tool_id} skill."
+        self.info = SimpleNamespace(
+            metadata={"events": {"event_type": [{"name": n} for n in event_names]}}
+        )
+
+
+def _build_dispatch_agent(monkeypatch, tools, *, event_run, loaded_skill_ids=()):
+    monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: _fake_cfg())
+    monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
+    monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
+    monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
+    llm = SimpleNamespace(provider_name="fake", model_name="fake-model")
+    agent = ra.ReasoningAgent(
+        llm=llm, registry=_FakeRegistry(tools), profile="default", context_id="ctx",
+        mode="reasoning", event_run=event_run,
+    )
+    # Attributes normally seeded during run(), not __init__.
+    agent._current_query = ""
+    agent._loaded_skill_ids = set(loaded_skill_ids)
+    return agent
+
+
+def _leaf_tools():
+    return [
+        _FakeLeafTool("scheduler", ["schedule_create", "schedule_cancel"]),
+        _FakeLeafTool("system_file", ["register_file_watcher", "read_file"]),
+    ]
+
+
+def test_event_run_hides_registration_leaves_from_schema(monkeypatch):
+    agent = _build_dispatch_agent(monkeypatch, _leaf_tools(), event_run=True)
+    specs, dispatch = agent._build_tools_and_dispatch()
+    names = {s["function"]["name"] for s in specs}
+    sc = make_leaf_name("scheduler", "schedule_create")
+    rfw = make_leaf_name("system_file", "register_file_watcher")
+    # Registration leaves are NOT offered to the model...
+    assert sc not in names
+    assert rfw not in names
+    # ...but stay in the dispatch map as a backstop for replayed/echoed calls.
+    assert sc in dispatch and rfw in dispatch
+    # Non-registration leaves (de-register, read) remain visible.
+    assert make_leaf_name("scheduler", "schedule_cancel") in names
+    assert make_leaf_name("system_file", "read_file") in names
+
+
+def test_chat_run_offers_registration_leaves(monkeypatch):
+    agent = _build_dispatch_agent(monkeypatch, _leaf_tools(), event_run=False)
+    specs, _ = agent._build_tools_and_dispatch()
+    names = {s["function"]["name"] for s in specs}
+    assert make_leaf_name("scheduler", "schedule_create") in names
+    assert make_leaf_name("system_file", "register_file_watcher") in names
+
+
+def test_event_run_drops_skill_subscribe(monkeypatch):
+    # Not-loaded event skill on an event run → exposes `request` only, no subscribe.
+    tools = [_FakeSkillTool("mailskill", ["new_email"])]
+    agent = _build_dispatch_agent(monkeypatch, tools, event_run=True)
+    specs, _ = agent._build_tools_and_dispatch()
+    skill_spec = next(s for s in specs if s["function"]["name"] == "mailskill")
+    props = skill_spec["function"]["parameters"]["properties"]
+    assert "subscribe" not in props
+    assert ra.SKILL_REQUEST_ARG in props
+
+
+def test_event_run_drops_loaded_event_skill_stub(monkeypatch):
+    # A LOADED event skill would expose only `subscribe`; hiding it drops the whole
+    # stub, but the dispatch entry stays so a re-call short-circuits gracefully.
+    tools = [_FakeSkillTool("mailskill", ["new_email"])]
+    agent = _build_dispatch_agent(
+        monkeypatch, tools, event_run=True, loaded_skill_ids=["mailskill"]
+    )
+    specs, dispatch = agent._build_tools_and_dispatch()
+    assert not any(s["function"]["name"] == "mailskill" for s in specs)
+    assert dispatch["mailskill"] == ("skill", tools[0], None)
+
+
+def test_chat_run_keeps_skill_subscribe(monkeypatch):
+    tools = [_FakeSkillTool("mailskill", ["new_email"])]
+    agent = _build_dispatch_agent(monkeypatch, tools, event_run=False)
+    specs, _ = agent._build_tools_and_dispatch()
+    skill_spec = next(s for s in specs if s["function"]["name"] == "mailskill")
+    assert "subscribe" in skill_spec["function"]["parameters"]["properties"]
