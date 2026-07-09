@@ -153,6 +153,33 @@ class DynamicConfigStorage(SyncStorageBase):
                     result[row[0]] = row[1]
             return result
 
+    def list_keys(self, table: str, profile: str = "admin") -> list[dict]:
+        """Return ``[{"key", "is_secret"}]`` without reading secret values.
+
+        Existence-only listing for callers (e.g. the blueprint exporter) that
+        need to know *which* keys exist and whether each is a secret, but must
+        never read secret values. ``user_config`` has no secret column, so
+        ``is_secret`` is always ``False`` there.
+        """
+        if table not in _VALID_TABLES:
+            return []
+        with self._engine.connect() as conn:
+            if table == "server_config":
+                rows = conn.execute(text("SELECT key, is_secret FROM server_config")).fetchall()
+                return [{"key": r[0], "is_secret": bool(r[1])} for r in rows]
+            if table == "llm_config":
+                rows = conn.execute(
+                    text("SELECT key, is_secret FROM llm_config WHERE profile = :profile"),
+                    {"profile": profile},
+                ).fetchall()
+                return [{"key": r[0], "is_secret": bool(r[1])} for r in rows]
+            # user_config — no is_secret column
+            rows = conn.execute(
+                text("SELECT key FROM user_config WHERE profile = :profile"),
+                {"profile": profile},
+            ).fetchall()
+            return [{"key": r[0], "is_secret": False} for r in rows]
+
     # ── Setup status ──
 
     def is_setup_complete(self) -> bool:

@@ -2,6 +2,7 @@ from starlette.routing import Route
 
 from app.api.admin_stream import get_admin_stream_routes
 from app.api.agents import get_agent_routes
+from app.api.blueprints import get_blueprint_routes
 from app.api.calendar import get_calendar_routes
 from app.api.channels import get_channel_routes
 from app.api.conversations import get_conversation_routes
@@ -82,4 +83,10 @@ def get_api_routes(
     routes.extend(get_logs_stream_routes())
     routes.extend(get_profile_events_routes(conversation_storage))
     routes.extend(get_usage_routes())
+    routes.extend(get_blueprint_routes(
+        registry=registry,
+        conversation_storage=conversation_storage,
+        config_storage=config_storage,
+        drop_profile_embeddings=drop_profile_embeddings,
+    ))
     return routes
