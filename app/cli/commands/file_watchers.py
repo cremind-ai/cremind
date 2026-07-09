@@ -178,6 +178,90 @@ def file_watchers_register(
     ])
 
 
+@file_watchers_app.command("edit")
+@graceful_errors
+def file_watchers_edit(
+    ctx: typer.Context,
+    watcher_id: str = typer.Argument(..., help="Watcher id to edit."),
+    path: Optional[str] = typer.Option(
+        None, "--path",
+        help="New directory to watch (relative paths join user working dir).",
+    ),
+    name: Optional[str] = typer.Option(None, "--name", help="New display name."),
+    triggers: Optional[str] = typer.Option(
+        None, "--triggers",
+        help="CSV subset of created,modified,deleted,moved.",
+    ),
+    target_kind: Optional[str] = typer.Option(
+        None, "--target", help="file | folder | any.",
+    ),
+    extensions: Optional[str] = typer.Option(
+        None, "--ext",
+        help="CSV extensions e.g. .py,.md (pass empty to match all).",
+    ),
+    recursive: Optional[bool] = typer.Option(
+        None, "--recursive/--no-recursive", help="Toggle recursive watching.",
+    ),
+    action: Optional[str] = typer.Option(
+        None, "--action",
+        help="New natural-language instruction the assistant runs on each event.",
+    ),
+) -> None:
+    """Edit a file watcher (only the flags you pass are changed)."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.file_watchers import update_file_watcher
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json, print_kv
+    from app.cli.output.formatting import bool_field, string_field
+
+    fields: dict[str, Any] = {}
+    if path is not None:
+        fields["path"] = path
+    if name is not None:
+        fields["name"] = name
+    if triggers is not None:
+        fields["triggers"] = _split_csv(triggers)
+    if target_kind is not None:
+        fields["target_kind"] = target_kind
+    if extensions is not None:
+        fields["extensions"] = _split_csv(extensions)
+    if recursive is not None:
+        fields["recursive"] = recursive
+    if action is not None:
+        fields["action"] = action
+
+    if not fields:
+        typer.echo("nothing to update — pass at least one field flag", err=True)
+        raise typer.Exit(code=1)
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await update_file_watcher(client, watcher_id, fields)
+
+    out = asyncio.run(_run())
+
+    if mode.json:
+        print_json(out)
+        return
+    print_kv([
+        ("id", string_field(out, "id")),
+        ("name", string_field(out, "name")),
+        ("root_path", string_field(out, "root_path")),
+        ("event_types", string_field(out, "event_types")),
+        ("target_kind", string_field(out, "target_kind")),
+        ("extensions", string_field(out, "extensions")),
+        ("recursive", bool_field(out, "recursive", True)),
+        ("armed", bool_field(out, "armed", False)),
+        ("conversation_id", string_field(out, "conversation_id")),
+    ])
+
+
 @file_watchers_app.command("stream")
 @graceful_errors
 def file_watchers_stream(ctx: typer.Context) -> None:

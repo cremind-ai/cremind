@@ -16,7 +16,13 @@ NOW = "2026-06-20T14:30:00"  # Saturday
 def _run(arguments):
     from app.tools.builtin.scheduler import SchedulerTool
     tool = SchedulerTool()
-    return asyncio.run(tool.run(arguments)).structured_content
+    out = asyncio.run(tool.run(arguments)).structured_content
+    # The anti-false-completion note is orthogonal to parse structure and is
+    # exercised on its own in test_scheduler_note.py; strip it here so these
+    # structural assertions stay focused.
+    if isinstance(out, dict):
+        out.pop("registration_note", None)
+    return out
 
 
 def _elem(mode, time_range, offset_unit, offset_value):

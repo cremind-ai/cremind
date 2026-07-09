@@ -8,7 +8,8 @@ pinned todo panel updates (and highlights the changed item). Unlike
 agent keeps working between updates.
 
 Lifecycle is *system-managed*: the tool is ``hidden`` and the reasoning agent
-exposes it only during a Plan-mode execution turn.
+exposes it during a Plan-mode planning/execution turn and during an automated
+event run (so a multi-step event action can drive the same live panel).
 """
 
 from typing import Any, Dict, List
@@ -34,12 +35,13 @@ _STATUSES = ("pending", "in_progress", "completed")
 class UpdateTodosTool(BuiltInTool):
     name: str = "update_todos"
     description: str = (
-        "Plan mode execution only: maintain your todo list while carrying out the "
-        "approved plan. Pass the FULL current list every time (not a delta): each "
-        "item has `content` and `status` (pending | in_progress | completed). Call "
-        "it right after reading the plan (seed the list), when you start an item "
-        "(mark it in_progress — keep at most one in_progress at a time), and when "
-        "you complete one. This updates the user's live todo panel. It does not end "
+        "Plan-mode execution or an automated event run: maintain your todo list "
+        "while carrying out the approved plan (or a multi-step event action). Pass "
+        "the FULL current list every time (not a delta): each item has `content` "
+        "and `status` (pending | in_progress | completed). Call it right after "
+        "reading the plan (seed the list), when you start an item (mark it "
+        "in_progress — keep at most one in_progress at a time), and when you "
+        "complete one. This updates the user's live todo panel. It does not end "
         "your turn; keep executing between updates."
     )
     parameters: Dict[str, Any] = {
@@ -89,7 +91,8 @@ class UpdateTodosTool(BuiltInTool):
         run_id = current_task_id_var.get()
         if not run_id:
             return BuiltInToolResult(content=[{"type": "text", "text": (
-                "update_todos is only available inside a Plan-mode execution run."
+                "update_todos is only available inside a Plan-mode execution run "
+                "or an automated event run."
             )}])
 
         from app.agent import plan_state

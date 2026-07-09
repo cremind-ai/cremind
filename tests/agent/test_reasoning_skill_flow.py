@@ -387,3 +387,96 @@ def test_event_triggered_subscribe_is_refused(monkeypatch):
     # Leading phrase only: _build_agent caps tool results at a tiny token budget
     # (proving results are truncated); the full refusal survives the real 1000-tok cap.
     assert "Subscriptions cannot be created" in trace[1]["content"]
+
+
+def test_event_run_reply_turn_subscribe_is_refused(monkeypatch):
+    # A later turn in an event-run conversation (the user replied after a
+    # request_user_input park) has _triggered_by_event=False but _event_run=True.
+    # Subscribing must STILL be refused — the whole event conversation is locked
+    # against registration, not just the trigger turn.
+    called = {"n": 0}
+
+    async def fake_register(**kwargs):  # pragma: no cover - must NOT be called
+        called["n"] += 1
+        return "SUBSCRIBED OK"
+
+    monkeypatch.setattr(rse, "register_skill_events", fake_register)
+
+    jira = _FakeSkillTool("default__jira", "jira",
+                          events=[{"name": "issue_created", "description": "new issue"}])
+    llm = _SkillCallLLM(
+        "default__jira",
+        {"subscribe": {"trigger": ["issue_created"], "action": "summarize the issue"}},
+    )
+    agent = _build_agent(monkeypatch, llm, [jira])
+    agent._triggered_by_event = False
+    agent._event_run = True
+
+    chunks = _run(agent, "subscribe to jira issues", history=[])
+    trace = _done(chunks)["llm_messages"]
+
+    assert called["n"] == 0  # nothing registered on a reply turn either
+    assert trace[1]["role"] == "tool"
+    assert "Subscriptions cannot be created" in trace[1]["content"]
+
+
+def test_plan_planning_subscribe_is_refused(monkeypatch):
+    # The plan PLANNING phase is read-only: a subscribe emitted while planning
+    # must be refused WITHOUT registering anything (registration happens in the
+    # execution phase, after the user accepts the plan). The tool call still gets
+    # a paired role:"tool" result so the trace has no dangling tool_use.
+    called = {"n": 0}
+
+    async def fake_register(**kwargs):  # pragma: no cover - must NOT be called
+        called["n"] += 1
+        return "SUBSCRIBED OK"
+
+    monkeypatch.setattr(rse, "register_skill_events", fake_register)
+
+    jira = _FakeSkillTool("default__jira", "jira",
+                          events=[{"name": "issue_created", "description": "new issue"}])
+    llm = _SkillCallLLM(
+        "default__jira",
+        {"subscribe": {"trigger": ["issue_created"], "action": "summarize the issue"}},
+    )
+    agent = _build_agent(monkeypatch, llm, [jira])
+    agent._mode = "plan"
+    agent._plan_phase = "planning"
+
+    chunks = _run(agent, "subscribe to jira issues", history=[])
+    trace = _done(chunks)["llm_messages"]
+
+    assert called["n"] == 0  # nothing registered during the read-only planning phase
+    assert trace[1]["role"] == "tool"
+    # Leading phrase only: _build_agent caps tool results at a tiny token budget
+    # (proving truncation); the full refusal survives the real 1000-tok cap.
+    assert "Plan mode (planning phase" in trace[1]["content"]
+
+
+def test_plan_execute_subscribe_still_registers(monkeypatch):
+    # Guard: after the user accepts the plan (execution phase) the same subscribe
+    # DOES register — the planning-phase refusal must not leak into execution.
+    called = {"n": 0}
+
+    async def fake_register(**kwargs):
+        called["n"] += 1
+        return "SUBSCRIBED OK"
+
+    monkeypatch.setattr(rse, "register_skill_events", fake_register)
+
+    jira = _FakeSkillTool("default__jira", "jira",
+                          events=[{"name": "issue_created", "description": "new issue"}])
+    llm = _SkillCallLLM(
+        "default__jira",
+        {"subscribe": {"trigger": ["issue_created"], "action": "summarize the issue"}},
+    )
+    agent = _build_agent(monkeypatch, llm, [jira])
+    agent._mode = "plan"
+    agent._plan_phase = "execute"
+
+    chunks = _run(agent, "register the automation", history=[])
+    trace = _done(chunks)["llm_messages"]
+
+    assert called["n"] == 1  # registered in the execution phase
+    assert trace[1]["role"] == "tool"
+    assert "SUBSCRIBED OK" in trace[1]["content"]

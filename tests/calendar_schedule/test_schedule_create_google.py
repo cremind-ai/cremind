@@ -36,6 +36,11 @@ def _drive(arguments, provider, monkeypatch):
     monkeypatch.setattr(SA, "_resolve_conversation_id", _fake_resolve)
     monkeypatch.setattr(SA, "_publish_changed", lambda profile: None)
     monkeypatch.setattr(P, "get_calendar_provider", lambda profile: provider)
+    # The self-containment gate is exercised in test_schedule_create_action_gate.py;
+    # here always accept so these logic tests don't depend on a live LLM.
+    async def _accept(**kw):
+        return None
+    monkeypatch.setattr("app.events.action_check.gate_registration_action", _accept)
     args = {"_profile": "p", "_context_id": "ctx", **arguments}
     return asyncio.run(SA.ScheduleCreateTool().run(args)).structured_content
 

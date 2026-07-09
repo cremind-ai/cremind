@@ -205,6 +205,78 @@ def get_event_routes() -> list[Route]:
         publish_skill_events_admin_changed(profile)
         return JSONResponse({"ok": True})
 
+    async def handle_update(request: Request) -> JSONResponse:
+        """Edit an existing skill-event subscription (Events-page / CLI edits).
+
+        Only ``event_type`` (the trigger) and ``action`` are editable. A changed
+        trigger is validated against the events the skill declares in its
+        ``SKILL.md`` (same rule as the ``subscribe`` path). No watcher re-arm is
+        needed — the blanket per-profile watch resolves triggers on fan-out. The
+        self-containment gate is not run here (consistent with manual paths).
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile_from_request(request)
+        sub_id = request.path_params["id"]
+        store = get_event_subscription_storage()
+        existing = store.get(sub_id)
+        if existing is None:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        if profile and existing["profile"] != profile:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+        fields: Dict[str, Any] = {}
+
+        if "action" in body:
+            action = (body.get("action") or "").strip()
+            if not action:
+                return JSONResponse(
+                    {"error": "Missing parameter", "message": "action cannot be empty"},
+                    status_code=400,
+                )
+            fields["action"] = action
+
+        if "event_type" in body:
+            event_type = (body.get("event_type") or "").strip()
+            if not event_type:
+                return JSONResponse(
+                    {"error": "Missing parameter", "message": "event_type cannot be empty"},
+                    status_code=400,
+                )
+            source_dir = _resolve_skill_source(existing["skill_name"], profile)
+            if not source_dir:
+                return JSONResponse({"error": "Skill source not found"}, status_code=404)
+            from app.tools.builtin.register_skill_event import _read_events_metadata
+
+            declared = _read_events_metadata(Path(source_dir))
+            valid_names = {e.get("name") for e in declared if e.get("name")}
+            if event_type not in valid_names:
+                return JSONResponse(
+                    {
+                        "error": "invalid_trigger",
+                        "message": (
+                            f"{existing['skill_name']} does not declare event "
+                            f"{event_type!r}; valid: {sorted(n for n in valid_names)}"
+                        ),
+                    },
+                    status_code=400,
+                )
+            fields["event_type"] = event_type
+
+        if not fields:
+            return JSONResponse(existing)
+
+        updated = store.update_fields(sub_id, **fields)
+        if updated is None:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        publish_skill_events_admin_changed(profile)
+        return JSONResponse(updated)
+
     async def handle_simulate(request: Request) -> JSONResponse:
         unauth = _require_auth(request)
         if unauth is not None:
@@ -519,6 +591,7 @@ def get_event_routes() -> list[Route]:
             "/api/skill-events/admin/stream",
             handle_admin_stream, methods=["GET"],
         ),
+        Route("/api/skill-events/{id}", handle_update, methods=["PATCH"]),
         Route("/api/skill-events/{id}", handle_delete, methods=["DELETE"]),
         Route("/api/skill-events/{id}/simulate", handle_simulate, methods=["POST"]),
         Route("/api/skills/{skill_name}/events", handle_skill_events, methods=["GET"]),

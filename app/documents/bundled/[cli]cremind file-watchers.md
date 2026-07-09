@@ -1,5 +1,5 @@
 ---
-description: "Watch the **filesystem** and trigger the agent when files change: register a directory watch (relative to `CREMIND_USER_WORKING_DIR` or absolute), filtered by event type (created / modified / deleted / moved), target kind (file / folder), and file extensions; `list` and `delete` watcher subscriptions for the active profile; and tail admin snapshots over SSE. Use this to run the agent when a file is added, edited, or removed — filesystem events, unlike time-based `cremind calendar` or skill events."
+description: "Watch the **filesystem** and trigger the agent when files change: register a directory watch (relative to `CREMIND_USER_WORKING_DIR` or absolute), filtered by event type (created / modified / deleted / moved), target kind (file / folder), and file extensions; `list`, `edit`, and `delete` watcher subscriptions for the active profile; and tail admin snapshots over SSE. Use this to run the agent when a file is added, edited, or removed — filesystem events, unlike time-based `cremind calendar` or skill events."
 ---
 
 # `cremind file-watchers` — Filesystem Watch Subscriptions
@@ -19,8 +19,10 @@ something — with `cremind event-runs` (`cremind event-runs list --kind file-wa
 
 The group covers three orthogonal concerns:
 
-- **Subscriptions** — `list`, `delete`, `register`. Each subscription
-  binds a directory + filter set to a conversation-scoped action.
+- **Subscriptions** — `list`, `register`, `edit`, `delete`. Each
+  subscription binds a directory + filter set to a conversation-scoped
+  action; `edit` changes any of those fields on an existing watcher and
+  re-arms its Observer.
 - **Live streaming** — `stream` emits a Server-Sent Events feed of the
   current admin snapshot whenever any subscription is created, deleted,
   or its arm-state changes. Runs until interrupted with Ctrl-C.
@@ -37,12 +39,15 @@ the Cremind web UI:
 
 The Events page renders two sections: **Skill Events** at the top and
 **File Watcher Events** below. The lower table mirrors
-`cremind file-watchers list`; deletes propagate live through the same
-admin SSE stream that powers `cremind file-watchers stream`. There is no
-"register" button in the UI — subscriptions are created either by the
-assistant via the `register_file_watcher` builtin tool (e.g.
-"when a python file changes in the 'Lee' directory, notify me") or
-from the CLI with `cremind file-watchers register`.
+`cremind file-watchers list`; each row has an **Edit** button (a dialog
+with select/toggle/tag controls for Triggers, Target, Extensions, and
+Recursive — the same fields as `cremind file-watchers edit`) and a
+**Delete** button; both propagate live through the same admin SSE stream
+that powers `cremind file-watchers stream`. There is no "register" button
+in the UI — subscriptions are created either by the assistant via the
+`register_file_watcher` builtin tool (e.g. "when a python file changes in
+the 'Lee' directory, notify me") or from the CLI with
+`cremind file-watchers register`.
 
 ## How a watcher fires
 
@@ -271,6 +276,57 @@ $ cremind file-watchers register \
     --recursive=false \
     --conversation c_19a8 \
     --action "log when a new project folder appears or vanishes"
+```
+
+### `cremind file-watchers edit`
+
+**Purpose.** Change fields on an existing watcher. Only the flags you
+pass are updated; everything else is left as-is. Because the path,
+recursion, or filters may change, the server disarms the old watchdog
+Observer and arms a fresh one for the updated row.
+
+**Syntax.**
+
+```bash
+cremind file-watchers edit <id>
+                       [--path <directory>]
+                       [--name <label>]
+                       [--triggers <csv>]
+                       [--target file|folder|any]
+                       [--ext <csv>]
+                       [--recursive | --no-recursive]
+                       [--action "<instruction>"]
+```
+
+**Flags.** Same meanings and validation as `register` (`--path` is
+re-resolved and must exist and be a directory; `--triggers` must be a
+subset of `created,modified,deleted,moved`; `--target` must be
+`file|folder|any`). Differences:
+
+- Every flag is optional — pass at least one, or the command exits with
+  "nothing to update".
+- `--ext ""` clears the extension filter (match all files);
+  omit `--ext` to leave it unchanged.
+- `--recursive/--no-recursive` is only sent when you pass it; omitting it
+  leaves the current value.
+- There is no `--conversation` flag — a watcher stays bound to its
+  original conversation.
+
+**Behavior.** PATCHes `/api/file-watchers/{id}`. On success prints the
+same key-value table as `register` (including the refreshed `armed`
+flag). With `--json`, returns the full updated row.
+
+**Examples.**
+
+```bash
+# Narrow an existing watcher to just modified events and stop recursing
+$ cremind file-watchers edit fw_a3f1 --triggers modified --no-recursive
+
+# Change the action and clear the extension filter (watch all files)
+$ cremind file-watchers edit fw_a3f1 --ext "" --action "log every change to the audit file"
+
+# Repoint a watcher at a different directory
+$ cremind file-watchers edit fw_a3f1 --path Projects/active
 ```
 
 ### `cremind file-watchers stream`

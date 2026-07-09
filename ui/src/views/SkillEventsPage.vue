@@ -10,6 +10,8 @@ import {
   ElInput,
   ElMessage,
   ElMessageBox,
+  ElOption,
+  ElSelect,
   ElTable,
   ElTableColumn,
   ElTag,
@@ -21,9 +23,12 @@ import { useChatStore } from '../stores/chat';
 import { useEventRunsStore } from '../stores/eventRuns';
 import {
   deleteSubscription,
+  getSkillEvents,
   simulateEvent,
   startListener,
+  updateSubscription,
   type ListenerStatus,
+  type SkillEventDeclaration,
   type SkillEventSubscription,
 } from '../services/skillEventsApi';
 import {
@@ -53,6 +58,24 @@ const simulateOpen = ref(false);
 const simulateTarget = ref<SkillEventSubscription | null>(null);
 const simulateFilename = ref('');
 const simulateContent = ref('');
+
+// ── edit dialog ────────────────────────────────────────────────────────────
+const editOpen = ref(false);
+const editBusy = ref(false);
+const editTarget = ref<SkillEventSubscription | null>(null);
+const editEventType = ref('');
+const editAction = ref('');
+const editTriggerOptions = ref<SkillEventDeclaration[]>([]);
+
+// Always include the current trigger, even if the skill no longer declares it
+// or the discovery call fails, so the dropdown never loses the saved value.
+const editTriggerNames = computed(() => {
+  const names = editTriggerOptions.value.map(e => e.name).filter(Boolean);
+  if (editEventType.value && !names.includes(editEventType.value)) {
+    names.unshift(editEventType.value);
+  }
+  return names;
+});
 
 const sortedSubs = computed(() =>
   [...subscriptions.value].sort((a, b) => b.created_at - a.created_at),
@@ -172,6 +195,39 @@ function openSimulate(row: SkillEventSubscription) {
   simulateFilename.value = '';
   simulateContent.value = '';
   simulateOpen.value = true;
+}
+
+async function openEditSkill(row: SkillEventSubscription) {
+  editTarget.value = row;
+  editEventType.value = row.event_type;
+  editAction.value = row.action;
+  editTriggerOptions.value = [{ name: row.event_type }];
+  editOpen.value = true;
+  try {
+    const info = await getSkillEvents(settings.agentUrl, settings.authToken, row.skill_name);
+    if (info.events && info.events.length) editTriggerOptions.value = info.events;
+  } catch {
+    // Discovery failed — keep the current trigger as the only option.
+  }
+}
+
+async function submitEditSkill() {
+  if (!editTarget.value) return;
+  if (!editEventType.value.trim()) { ElMessage.warning('Trigger is required'); return; }
+  if (!editAction.value.trim()) { ElMessage.warning('Action is required'); return; }
+  editBusy.value = true;
+  try {
+    await updateSubscription(settings.agentUrl, settings.authToken, editTarget.value.id, {
+      event_type: editEventType.value,
+      action: editAction.value.trim(),
+    });
+    ElMessage.success('Subscription updated');
+    editOpen.value = false;
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : String(err));
+  } finally {
+    editBusy.value = false;
+  }
 }
 
 async function fireSimulate() {
@@ -304,8 +360,11 @@ function formatDate(ms: number): string {
           <span class="muted">{{ formatDate(row.created_at) }}</span>
         </template>
       </ElTableColumn>
-      <ElTableColumn label="Actions" min-width="180">
+      <ElTableColumn label="Actions" min-width="250">
         <template #default="{ row }">
+          <ElButton size="small" @click="openEditSkill(row as SkillEventSubscription)">
+            <Icon icon="mdi:pencil-outline" /> Edit
+          </ElButton>
           <ElButton size="small" @click="openSimulate(row as SkillEventSubscription)">
             <Icon icon="mdi:flask-outline" /> Simulate
           </ElButton>
@@ -315,6 +374,31 @@ function formatDate(ms: number): string {
         </template>
       </ElTableColumn>
     </ElTable>
+
+    <ElDialog v-model="editOpen" title="Edit skill event" width="560px">
+      <p class="dialog-info" v-if="editTarget">
+        Editing the subscription for <strong>{{ editTarget.skill_name }}</strong>.
+      </p>
+      <div class="sim-field">
+        <label class="sim-label">Trigger</label>
+        <ElSelect v-model="editEventType" placeholder="Select a trigger" style="width:100%">
+          <ElOption v-for="name in editTriggerNames" :key="name" :label="name" :value="name" />
+        </ElSelect>
+      </div>
+      <div class="sim-field">
+        <label class="sim-label">Action</label>
+        <ElInput
+          v-model="editAction"
+          type="textarea"
+          :rows="6"
+          placeholder="Natural-language instruction the assistant runs when the event fires."
+        />
+      </div>
+      <template #footer>
+        <ElButton @click="editOpen = false">Cancel</ElButton>
+        <ElButton type="primary" :loading="editBusy" @click="submitEditSkill">Save</ElButton>
+      </template>
+    </ElDialog>
     </CollapsibleSection>
 
     <ElDialog v-model="simulateOpen" title="Simulate event" width="640px">

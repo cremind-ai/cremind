@@ -108,6 +108,25 @@ export async function deleteSubscription(
   }
 }
 
+export async function updateSubscription(
+  agentUrl: string,
+  token: string,
+  id: string,
+  fields: { event_type?: string; action?: string },
+): Promise<SkillEventSubscription> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/skill-events/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: authHeaders(token),
+    body: JSON.stringify(fields),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.message || data.error || `Failed to update subscription: ${res.statusText}`);
+  }
+  return data;
+}
+
 export async function simulateEvent(
   agentUrl: string,
   token: string,

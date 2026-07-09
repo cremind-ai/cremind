@@ -1,5 +1,5 @@
 ---
-description: "Subscribe to and manage **skill events and notifications**: `list` or `delete` a skill's event subscriptions for the active profile, `simulate` an event by dropping a markdown file in the watched folder, `stream` events and `notifications` over SSE, browse the events a skill declares (`events <skill>`), and check or start its listener daemon (`listener-status`, `listener-start`). Use this for events emitted by installed skills — distinct from filesystem (`cremind file-watchers`) and time (`cremind calendar`) events."
+description: "Subscribe to and manage **skill events and notifications**: `list`, `edit`, or `delete` a skill's event subscriptions for the active profile, `simulate` an event by dropping a markdown file in the watched folder, `stream` events and `notifications` over SSE, browse the events a skill declares (`events <skill>`), and check or start its listener daemon (`listener-status`, `listener-start`). Use this for events emitted by installed skills — distinct from filesystem (`cremind file-watchers`) and time (`cremind calendar`) events."
 ---
 
 # `cremind skill-events` — Skill Event Subscriptions and Notifications
@@ -18,8 +18,10 @@ something — with `cremind event-runs` (`cremind event-runs list --kind skill`)
 
 The group covers four orthogonal concerns:
 
-- **Subscriptions** — `list`, `delete`. Each subscription binds an
-  event type to a skill (and optionally to a conversation).
+- **Subscriptions** — `list`, `edit`, `delete`. Each subscription binds an
+  event type to a skill (and optionally to a conversation); `edit` changes
+  the trigger (validated against the skill's declared events) and/or the
+  action.
 - **Live streaming** — `stream` (admin-wide snapshot) and
   `notifications` (per-profile notifications) emit Server-Sent Events
   until interrupted with Ctrl-C.
@@ -41,9 +43,11 @@ page of the Cremind web UI:
 
 The page lists subscriptions in the left rail (matching `cremind skill-events list`),
 shows recent notifications in the main area (matching
-`cremind skill-events notifications`), and exposes a **Simulate** button on
-each subscription row that opens a small editor for the markdown body
-(matching `cremind skill-events simulate`).
+`cremind skill-events notifications`), and exposes an **Edit** button (a
+dialog whose Trigger is a dropdown of the skill's declared events, plus an
+Action editor — the same fields as `cremind skill-events edit`) and a
+**Simulate** button on each subscription row that opens a small editor for
+the markdown body (matching `cremind skill-events simulate`).
 
 ## Streaming output format
 
@@ -113,6 +117,45 @@ cremind skill-events delete <id>
 
 ```bash
 $ cremind skill-events delete sub_19a8
+```
+
+### `cremind skill-events edit`
+
+**Purpose.** Change an existing subscription's trigger and/or action.
+Only the flags you pass are updated. A skill-event subscription is one
+row per trigger, so `--trigger` re-points *this* row to a different event
+the skill declares; to watch an additional event, create a separate
+subscription rather than editing this one.
+
+**Syntax.**
+
+```bash
+cremind skill-events edit <id> [--trigger <event_type>] [--action "<instruction>"]
+```
+
+**Flags.**
+
+| Flag        | Type   | Default | Meaning                                                                                     |
+|-------------|--------|---------|---------------------------------------------------------------------------------------------|
+| `--trigger` | string | —       | New event type. Must be one the skill declares (see `cremind skill-events events <skill>`); an undeclared value is rejected. |
+| `--action`  | string | —       | New natural-language instruction the assistant runs when the event fires. Cannot be empty.  |
+
+Pass at least one flag, or the command exits with "nothing to update".
+
+**Behavior.** PATCHes `/api/skill-events/{id}`. On success prints a
+key-value table with the updated `id`, `skill_name`, `event_type`,
+`action`, and `conversation_id`. With `--json`, returns the updated row.
+No listener restart is needed — the blanket per-profile watch resolves
+the new trigger on the next firing.
+
+**Examples.**
+
+```bash
+# Re-point a subscription to a different declared event
+$ cremind skill-events edit sub_19a8 --trigger evening
+
+# Change just the action
+$ cremind skill-events edit sub_4f02 --action "summarize the PR and post it to #eng"
 ```
 
 ### `cremind skill-events simulate`

@@ -47,6 +47,16 @@ export interface FileWatcherCreatePayload {
   conversation_id?: string;
 }
 
+export interface FileWatcherUpdatePayload {
+  path?: string;
+  name?: string;
+  triggers?: string[];
+  target_kind?: 'file' | 'folder' | 'any';
+  extensions?: string[];
+  recursive?: boolean;
+  action?: string;
+}
+
 export async function listFileWatchers(
   agentUrl: string,
   token: string,
@@ -87,6 +97,25 @@ export async function createFileWatcher(
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     throw new Error(data.message || data.error || `Failed to create file watcher: ${res.statusText}`);
+  }
+  return data;
+}
+
+export async function updateFileWatcher(
+  agentUrl: string,
+  token: string,
+  id: string,
+  payload: FileWatcherUpdatePayload,
+): Promise<FileWatcherSubscription> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/file-watchers/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: authHeaders(token),
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.message || data.error || `Failed to update file watcher: ${res.statusText}`);
   }
   return data;
 }

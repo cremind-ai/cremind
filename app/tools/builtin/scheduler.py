@@ -40,6 +40,10 @@ from app.utils.schedule import compute_schedule
 
 SERVER_NAME = "Scheduler"
 
+# Schedule kinds that represent something to BOOK (vs. a query window/predicate).
+# Only these get the "parsed only — nothing registered yet" note in the result.
+_BOOK_KINDS = frozenset({"instant", "interval", "recurrence", "explicit_set"})
+
 
 # Atomic time-element item schema — copied verbatim from datetime_parser so the
 # LLM's time-decomposition contract is identical everywhere a time appears.
@@ -466,6 +470,30 @@ class SchedulerTool(BuiltInTool):
                     "parsable": False,
                     "message": f"Failed to compute schedule: {e}",
                 }
+            )
+
+        # Booking kinds normalize into a task the user expects to be scheduled.
+        # The parser alone registers NOTHING (schedule_create does) — a false
+        # "it's scheduled now" is a real failure mode, so attach an explicit note.
+        # Query kinds (window/constraint) are lookups, never a booking; skip them.
+        if isinstance(result, dict) and schedule_kind in _BOOK_KINDS:
+            profile = arguments.get("_profile")
+            feature_on = False
+            if profile:
+                try:
+                    from app.calendar.feature import is_enabled
+                    feature_on = is_enabled(profile)
+                except Exception:  # noqa: BLE001
+                    feature_on = False
+            result["registration_note"] = (
+                "PARSED ONLY — nothing is scheduled yet. This tool just "
+                "normalized the time. To actually register the task you MUST now "
+                "call `schedule_create` with this output and a complete `action`; "
+                "do not tell the user it is scheduled until schedule_create "
+                "returns OK."
+                if feature_on else
+                "PARSED ONLY — nothing is scheduled yet; this tool just "
+                "normalized the time."
             )
 
         logger.info(f"[scheduler] Converted result: {result}")

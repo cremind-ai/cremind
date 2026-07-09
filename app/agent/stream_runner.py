@@ -676,7 +676,11 @@ async def run_agent_to_bus(
         # each update_todos call, so this is the latest). Stamped even on cancel
         # (this block runs after CancelledError is caught), so an interrupted
         # execution keeps its todo progress for resume.
-        if mode == "plan":
+        # Event runs also expose ``update_todos`` (a multi-step action can drive a
+        # live todo panel), so persist their todo snapshot too. ``plan_phase`` is
+        # None there, which yields only the ``{stage, todos}`` branch — exactly the
+        # todo panel, no question/plan form (those tools aren't exposed on runs).
+        if mode == "plan" or event_run:
             plan_meta = _plan_metadata_for_persist(run_id, plan_phase, cancelled)
             if plan_meta:
                 agent_message_metadata = {

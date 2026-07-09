@@ -93,9 +93,15 @@ class ScheduleCreateTool(BuiltInTool):
                     "request — every detail, qualifier, and specific — do NOT "
                     "summarize or simplify it. Whenever the command carries any "
                     "detail beyond the title, put the full instruction here "
-                    "(don't rely on the title fallback). If omitted, the title "
-                    "is used as the command — so a bare command like 'tắt đèn "
-                    "hiên' still runs."
+                    "(don't rely on the title fallback). The action MAY be a "
+                    "multi-line, step-by-step procedure; when a plan for this "
+                    "automation exists, embed its full per-fire steps here so "
+                    "they run on every fire. The action runs later in a FRESH "
+                    "conversation with no access to this one: inline every "
+                    "concrete value verbatim (full URLs, email addresses, file "
+                    "paths, IDs, criteria) — never write 'the provided X' or 'the "
+                    "X above'. If omitted, the title is used as the command — so "
+                    "a bare command like 'tắt đèn hiên' still runs."
                 ),
             },
             "duration_minutes": {
@@ -246,6 +252,29 @@ class ScheduleCreateTool(BuiltInTool):
                     "Cremind-only reminder (then retry with allow_local_only=true)."
                 ),
             })
+
+        # Self-containment gate: a schedule's action runs later in a fresh
+        # conversation with no context, so refuse to persist one that references
+        # info it doesn't inline ("the provided URL"). Fail-open (no LLM / error
+        # → proceeds). Gate the effective action (post title-fallback).
+        from app.events.action_check import gate_registration_action, build_rejection_message
+        from app.utils.context_storage import get_context
+
+        check = await gate_registration_action(
+            profile=profile, action=action,
+            request_context=get_context(context_id or "", "_current_query", "") or "",
+            tool_name="schedule_create", conversation_id=conversation_id,
+        )
+        if check is not None:
+            return BuiltInToolResult(structured_content={
+                "ok": False,
+                "error": "action_not_self_contained",
+                "missing": check.missing,
+                "message": build_rejection_message(
+                    tool_name="schedule_create", missing=check.missing, reason=check.reason,
+                ),
+            })
+
         try:
             row = provider.create_event(
                 profile=profile,

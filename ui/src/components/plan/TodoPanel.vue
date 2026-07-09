@@ -5,11 +5,27 @@ import type { TodoState } from '../../stores/chat';
 
 const props = defineProps<{ state: TodoState }>();
 
-const COLLAPSE_KEY = 'todo_panel_collapsed';
-const collapsed = ref(localStorage.getItem(COLLAPSE_KEY) === '1');
-function toggleCollapsed() {
-  collapsed.value = !collapsed.value;
-  localStorage.setItem(COLLAPSE_KEY, collapsed.value ? '1' : '0');
+const MAX_KEY = 'todo_panel_maximized';
+// `maximized` is a deliberate size preference, so it persists across reloads.
+const maximized = ref(localStorage.getItem(MAX_KEY) === '1');
+// `minimized` is session-only: the flag is global but todo state is
+// per-conversation, so persisting it would pre-hide unrelated task lists.
+const minimized = ref(false);
+
+function minimize() {
+  minimized.value = true;
+}
+function restore() {
+  // Only un-hide — keep whatever size (normal/maximized) the panel had.
+  minimized.value = false;
+}
+function toggleMaximized() {
+  maximized.value = !maximized.value;
+  try {
+    localStorage.setItem(MAX_KEY, maximized.value ? '1' : '0');
+  } catch {
+    /* noop */
+  }
 }
 
 const doneCount = computed(() => props.state.items.filter(t => t.status === 'completed').length);
@@ -47,17 +63,42 @@ function statusIcon(status: string): string {
 </script>
 
 <template>
-  <div class="todo-panel" :class="{ bright }">
-    <div class="todo-header" @click="toggleCollapsed">
+  <button
+    v-if="minimized"
+    class="todo-pill"
+    :class="{ bright }"
+    title="Show tasks"
+    aria-label="Show tasks"
+    @click="restore"
+  >
+    <Icon icon="mdi:format-list-checks" class="todo-header-icon" />
+    <span class="todo-title">Tasks</span>
+    <span class="todo-count">{{ doneCount }}/{{ total }}</span>
+  </button>
+
+  <div v-else class="todo-panel" :class="{ bright, maximized }">
+    <div class="todo-header">
       <Icon icon="mdi:format-list-checks" class="todo-header-icon" />
       <span class="todo-title">Tasks</span>
       <span class="todo-count">{{ doneCount }}/{{ total }}</span>
-      <Icon
-        :icon="collapsed ? 'mdi:chevron-up' : 'mdi:chevron-down'"
-        class="todo-chevron"
-      />
+      <button
+        class="todo-action"
+        :title="maximized ? 'Restore size' : 'Maximize tasks'"
+        :aria-label="maximized ? 'Restore size' : 'Maximize tasks'"
+        @click="toggleMaximized"
+      >
+        <Icon :icon="maximized ? 'mdi:arrow-collapse' : 'mdi:arrow-expand'" />
+      </button>
+      <button
+        class="todo-action"
+        title="Minimize tasks"
+        aria-label="Minimize tasks"
+        @click="minimize"
+      >
+        <Icon icon="mdi:window-minimize" />
+      </button>
     </div>
-    <ul v-if="!collapsed" class="todo-list">
+    <ul class="todo-list">
       <li
         v-for="item in state.items"
         :key="item.id"
@@ -88,7 +129,7 @@ function statusIcon(status: string): string {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
   z-index: 6;
   opacity: 0.55;
-  transition: opacity 0.4s ease, box-shadow 0.4s ease;
+  transition: opacity 0.4s ease, box-shadow 0.4s ease, width 0.25s ease;
 }
 
 .todo-panel.bright {
@@ -100,13 +141,23 @@ function statusIcon(status: string): string {
   opacity: 1;
 }
 
+/* Maximized: widen and fill the chat height (top → clear of the composer).
+   bottom:116px clears the Workspace restore pill so it stays clickable. The
+   width transitions smoothly; the max-height→top/bottom height change snaps. */
+.todo-panel.maximized {
+  width: 420px;
+  bottom: 116px;
+  max-height: none;
+  opacity: 1;
+}
+
 .todo-header {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 10px 12px;
-  cursor: pointer;
   user-select: none;
+  flex-shrink: 0;
   border-bottom: 1px solid var(--border-color);
 }
 
@@ -127,15 +178,32 @@ function statusIcon(status: string): string {
   margin-left: auto;
 }
 
-.todo-chevron {
-  font-size: 16px;
+.todo-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 4px;
+  border: none;
+  background: transparent;
   color: var(--text-tertiary);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.todo-action:hover {
+  background: var(--hover-bg);
+  color: var(--text-primary);
 }
 
 .todo-list {
   list-style: none;
   margin: 0;
   padding: 6px;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
 }
 
@@ -177,5 +245,30 @@ function statusIcon(status: string): string {
 .todo-item-text {
   line-height: 1.4;
   word-break: break-word;
+}
+
+/* Minimized: compact pill pinned top-right (matches the panel's theme + dim). */
+.todo-pill {
+  position: absolute;
+  top: 12px;
+  right: 16px;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  color: var(--text-primary);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 0.4s ease;
+}
+
+.todo-pill:hover,
+.todo-pill.bright {
+  opacity: 1;
 }
 </style>

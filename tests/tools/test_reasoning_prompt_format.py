@@ -331,7 +331,7 @@ def test_event_run_blocks_register_file_watcher(monkeypatch) -> None:
     # ...but the tool_call still got a paired role:"tool" refusal (replay-safe).
     roles = [m["role"] for m in agent._turn_messages]
     assert roles[:2] == ["assistant", "tool"]
-    assert "not allowed while reacting to an event" in agent._turn_messages[1]["content"]
+    assert "not allowed from inside an event-triggered run" in agent._turn_messages[1]["content"]
 
 
 def test_normal_run_allows_register_file_watcher(monkeypatch) -> None:
@@ -345,4 +345,99 @@ def test_normal_run_allows_register_file_watcher(monkeypatch) -> None:
     asyncio.run(_run())
     assert tool.calls == [
         {"leaf": "register_file_watcher", "args": {"path": ".", "action": "do x"}}
+    ]
+
+
+# ── event-triggered storm prevention: schedule_create ─────────────────────────
+#
+# Same contract as register_file_watcher: schedule_create stays in the schema on
+# every run but its EXECUTION is blocked inside an event run so an action can't
+# register another schedule on every fire.
+
+class _FakeSchedulerTool(_FakeLeafTool):
+    """A scheduler-like group exposing the schedule_create leaf."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._tool_id = "scheduler"
+
+    @property
+    def name(self) -> str:
+        return "Scheduler"
+
+    def leaf_function_specs(self, *, context_id, profile, query="", arguments=None):
+        return [FunctionSpec(
+            name="scheduler__schedule_create",
+            leaf_name="schedule_create",
+            schema={"type": "function", "function": {
+                "name": "scheduler__schedule_create",
+                "parameters": {"type": "object", "properties": {}},
+            }},
+        )]
+
+    async def execute_leaf(self, *, leaf_name, args, context_id, profile,
+                           arguments, variables, llm_params):
+        self.calls.append({"leaf": leaf_name, "args": args})
+        yield ToolResultEvent(observation_text="SCHEDULE CREATED")
+
+
+class _ScheduleCallLLM(_ScriptedLLM):
+    async def chat_completion_stream(self, *, messages, tools=None, tool_choice=None, **kwargs):
+        self._step += 1
+        if self._step == 1:
+            yield {
+                "type": ChatCompletionTypeEnum.FUNCTION_CALLING,
+                "data": {"function": [
+                    {"index": 0, "id": "s1",
+                     "name": "scheduler__schedule_create",
+                     "arguments": {"title": "t", "dtstart": "2026-07-10T09:00:00",
+                                   "action": "do x"}},
+                ]},
+            }
+            yield {"type": ChatCompletionTypeEnum.DONE, "input_tokens": 5,
+                   "output_tokens": 2, "finish_reason": "tool_calls"}
+        else:
+            yield {"type": ChatCompletionTypeEnum.CONTENT, "data": "ok"}
+            yield {"type": ChatCompletionTypeEnum.DONE, "input_tokens": 3,
+                   "output_tokens": 1, "finish_reason": "stop"}
+
+
+def _build_scheduler_agent(monkeypatch):
+    agent, _ = _build_agent(monkeypatch)
+    tool = _FakeSchedulerTool()
+    agent.llm = _ScheduleCallLLM()
+    agent._tools = [tool]
+    agent._tools_by_id = {"scheduler": tool}
+    return agent, tool
+
+
+def test_event_run_blocks_schedule_create(monkeypatch) -> None:
+    agent, tool = _build_scheduler_agent(monkeypatch)
+    agent._triggered_by_event = True
+
+    async def _run():
+        return [c async for c in agent.run("schedule this", history_messages=[])]
+
+    asyncio.run(_run())
+
+    # The leaf was NOT executed...
+    assert tool.calls == []
+    # ...but the tool_call still got a paired role:"tool" refusal (replay-safe).
+    roles = [m["role"] for m in agent._turn_messages]
+    assert roles[:2] == ["assistant", "tool"]
+    assert "not allowed from inside an event-triggered run" in agent._turn_messages[1]["content"]
+
+
+def test_normal_run_allows_schedule_create(monkeypatch) -> None:
+    agent, tool = _build_scheduler_agent(monkeypatch)
+    # _triggered_by_event stays False (set by _build_agent) → the leaf runs.
+
+    async def _run():
+        async for _ in agent.run("schedule this", history_messages=[]):
+            pass
+
+    asyncio.run(_run())
+    assert tool.calls == [
+        {"leaf": "schedule_create",
+         "args": {"title": "t", "dtstart": "2026-07-10T09:00:00", "action": "do x"}}
     ]

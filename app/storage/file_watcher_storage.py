@@ -144,6 +144,37 @@ class FileWatcherSubscriptionStorage(SyncStorageBase):
             "created_at": now,
         }
 
+    # Columns a caller may edit (manual Events-page / CLI edits). Excludes
+    # identity/bookkeeping columns (id, conversation_id, profile, created_at).
+    _EDITABLE = {
+        "name", "root_path", "recursive", "target_kind", "event_types",
+        "extensions", "action",
+    }
+
+    def update_fields(self, id: str, **fields: Any) -> Optional[Dict[str, Any]]:
+        """Patch editable columns. Returns the refreshed row (or None if absent).
+
+        There is no ``updated_at`` column on this table, so nothing is bumped.
+        Mirrors ``insert`` normalization: ``recursive`` → bool, empty
+        ``extensions`` → NULL.
+        """
+        sets = {k: v for k, v in fields.items() if k in self._EDITABLE}
+        if not sets:
+            return self.get(id)
+        if "recursive" in sets:
+            sets["recursive"] = bool(sets["recursive"])
+        if "extensions" in sets:
+            sets["extensions"] = sets["extensions"] or None
+        assignments = ", ".join(f"{k} = :{k}" for k in sets)
+        params = dict(sets)
+        params["id"] = id
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(f"UPDATE file_watcher_subscriptions SET {assignments} WHERE id = :id"),
+                params,
+            )
+        return self.get(id)
+
     def delete(self, id: str) -> bool:
         with self._engine.begin() as conn:
             cur = conn.execute(

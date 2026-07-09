@@ -136,6 +136,7 @@ async def register_skill_events(
     skill_source: str,
     triggers: List[str],
     action: str,
+    request_context: str = "",
 ) -> str:
     """Subscribe a conversation to one or more of a skill's declared events.
 
@@ -212,6 +213,20 @@ async def register_skill_events(
     if conv is None:
         return "Could not resolve the active conversation."
     conversation_id = conv["id"]
+
+    # Self-containment gate: the subscription's action runs later in a fresh
+    # conversation with no context, so refuse to persist one that references info
+    # it doesn't inline. Fail-open (no LLM / error → proceeds).
+    from app.events.action_check import gate_registration_action, build_rejection_message
+
+    check = await gate_registration_action(
+        profile=profile, action=action, request_context=request_context,
+        tool_name="this skill's subscribe", conversation_id=conversation_id,
+    )
+    if check is not None:
+        return build_rejection_message(
+            tool_name="this skill's subscribe", missing=check.missing, reason=check.reason,
+        )
 
     # Persist + watch using the canonical tool_id so every entry agrees
     # regardless of the surface form the LLM happened to pass. One row + one

@@ -129,6 +129,29 @@ class EventSubscriptionStorage(SyncStorageBase):
             "created_at": now,
         }
 
+    # Columns a caller may edit (manual Events-page / CLI edits). skill_name is
+    # not editable (the subscription is pinned to its skill); identity and
+    # created_at are excluded.
+    _EDITABLE = {"event_type", "action"}
+
+    def update_fields(self, id: str, **fields: Any) -> Optional[Dict[str, Any]]:
+        """Patch editable columns. Returns the refreshed row (or None if absent).
+
+        There is no ``updated_at`` column on this table, so nothing is bumped.
+        """
+        sets = {k: v for k, v in fields.items() if k in self._EDITABLE}
+        if not sets:
+            return self.get(id)
+        assignments = ", ".join(f"{k} = :{k}" for k in sets)
+        params = dict(sets)
+        params["id"] = id
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(f"UPDATE skill_event_subscriptions SET {assignments} WHERE id = :id"),
+                params,
+            )
+        return self.get(id)
+
     def delete(self, id: str) -> bool:
         with self._engine.begin() as conn:
             cur = conn.execute(
