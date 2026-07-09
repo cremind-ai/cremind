@@ -27,7 +27,7 @@ def _resolve_client() -> tuple[str, str, list[str]]:
     if not client_id:
         raise SystemExit("No GOOGLE_CLIENT_ID (set it in scripts/.env or ensure cremind-connect is reachable).")
     if not scopes:
-        scopes = ["openid", "email", "https://www.googleapis.com/auth/calendar"]
+        scopes = ["openid", "email", "https://www.googleapis.com/auth/calendar.events"]
     return client_id, client_secret, scopes
 
 
@@ -91,14 +91,6 @@ def cmd_status(_args) -> Any:
     except auth.AuthError:
         return {"linked": False}
     return {"linked": True, "email": data.get("email"), "account_key": data.get("account_key"), "scopes": data.get("scopes")}
-
-
-def cmd_list_calendars(_args) -> Any:
-    svc = _svc()
-    return [
-        {"id": c.get("id"), "summary": c.get("summary"), "primary": c.get("primary", False), "access": c.get("accessRole")}
-        for c in gcal_api.list_calendars(svc)
-    ]
 
 
 def cmd_list(args) -> Any:
@@ -187,7 +179,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_complete_link)
 
     sub.add_parser("status", help="show link status").set_defaults(func=cmd_status)
-    sub.add_parser("list-calendars", help="list calendars").set_defaults(func=cmd_list_calendars)
 
     sp = sub.add_parser("list", help="list events")
     sp.add_argument("--calendar")

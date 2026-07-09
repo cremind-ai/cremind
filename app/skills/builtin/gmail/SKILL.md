@@ -1,6 +1,6 @@
 ---
 name: gmail
-description: Read, search, send, reply to, label, and trash Gmail messages via OAuth2, and receive new-email events in real time. Authorizes through the Cremind Connect service (no GCP setup); tokens stay on this machine. A persistent listener uses Gmail watch + Pub/Sub (via the relay) and drops new INBOX messages as markdown.
+description: Read, search, send, reply to, and trash Gmail messages via OAuth2, and receive new-email events in real time. Authorizes through the Cremind Connect service (no GCP setup); tokens stay on this machine. A persistent listener uses Gmail watch + Pub/Sub (via the relay) and drops new INBOX messages as markdown.
 metadata:
   environment_variables:
     - name: CREMIND_CONNECT_URL

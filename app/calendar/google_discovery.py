@@ -29,7 +29,7 @@ DEFAULT_BASE = "https://connect.cremind.io"
 CALENDAR_SCOPES_FALLBACK = [
     "openid",
     "email",
-    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/calendar.events",
 ]
 
 _TTL = 300.0
