@@ -4,7 +4,11 @@ Uses :pypi:`python-telegram-bot` (added to ``pyproject.toml`` as part of the
 channels feature). Each adapter instance owns one :class:`telegram.Bot` and
 runs ``getUpdates`` long-polling in :meth:`_run`.
 
-Bot-mode only in v1; ``mode == "normal"`` (user account) is not supported.
+Serves two modes over the same bot transport: conversational ``bot`` mode and
+``notification`` mode (outbound alerts, no conversation — the notification
+behavior itself lives in
+:class:`app.channels.notification_delivery.NotificationDeliveryMixin` on the
+base class). The user-account transport is the separate userbot adapter.
 """
 
 from __future__ import annotations
@@ -74,8 +78,15 @@ class TelegramAdapter(BaseChannelAdapter):
             logger.debug(f"[channels:telegram] bot shutdown during reset raised: {e}")
 
     async def _run(self) -> None:
-        if self.channel.get("mode") != "bot":
-            raise ChannelNotImplemented("Telegram normal (user-account) mode is not implemented")
+        # This adapter powers both conversational bot mode and notification
+        # mode (a notification channel reuses the bot transport — same token,
+        # same getUpdates loop — and layers on ``NotificationDeliveryMixin``
+        # behavior via the base class). The userbot transport is a separate
+        # adapter, so anything else here is unsupported.
+        if self.channel.get("mode") not in ("bot", "notification"):
+            raise ChannelNotImplemented(
+                f"TelegramAdapter does not support mode={self.channel.get('mode')!r}",
+            )
 
         try:
             self._bot = await self._build_bot()

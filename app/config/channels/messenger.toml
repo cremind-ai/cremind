@@ -6,36 +6,58 @@ supports_bot = true
 supports_userbot = true
 auth_modes = ["none", "otp", "password"]
 default_response_mode = "normal"
-implemented = false
+implemented = true
 
 [[channel.modes]]
 id = "bot"
 label = "Page Bot"
-implemented = false
-instructions = """**Coming soon — adapter implementation pending.**
+implemented = true
+instructions = """**Requires a publicly-reachable HTTPS host.** Unlike Discord/Slack/Zalo,
+Meta only delivers messages via an inbound webhook, so Cremind must be reachable
+from the internet (a real deployment, or a tunnel such as ngrok / cloudflared).
 
 1. Create a Facebook Page (or use an existing one).
-2. Visit https://developers.facebook.com → My Apps → Create App → Business.
-3. Add the Messenger product, generate a Page Access Token, and copy it.
-4. Set the webhook callback URL to <your-cremind-host>/api/channels/webhook/messenger
-   and choose the messages, messaging_postbacks subscriptions.
-5. Paste the page access token and the verify token you set on the webhook below."""
+2. Visit https://developers.facebook.com → My Apps → Create App → Business, and add the Messenger product.
+3. Generate a Page Access Token and copy it. (Optional: copy the App Secret too, to enable webhook signature verification.)
+4. Save this channel first to obtain its id, then in the Meta dashboard set the
+   webhook callback URL to:
+       https://<your-public-cremind-host>/api/channels/webhook/messenger/<this-channel-id>
+   and the Verify Token to the value you enter below. Subscribe to the
+   messages and messaging_postbacks fields.
+5. Paste the page access token and the verify token below (and the app secret, if using signature verification)."""
 [channel.modes.fields]
 page_access_token = { description = "Page Access Token", type = "string", secret = true, required = true }
-verify_token = { description = "Webhook Verify Token", type = "string", secret = true, required = true }
+verify_token = { description = "Webhook Verify Token (you choose this)", type = "string", secret = true, required = true }
+app_secret = { description = "App Secret (optional; enables X-Hub-Signature-256 verification)", type = "string", secret = true, required = false }
+
+[[channel.modes]]
+id = "notification"
+label = "Notification"
+implemented = true
+instructions = """Push-only alerts — no conversation. Forwards Cremind notifications to
+Messenger recipients with a configurable filter. Same public-URL requirement and
+setup as Page Bot mode (webhook + verify token).
+
+⚠️ Meta's **24-hour standard messaging window** applies: the Page can only
+proactively message a user who messaged it within the last 24 hours (outside
+that window a message tag is required). Put recipient PSIDs in "Target chat ids",
+or have recipients DM the Page /start to subscribe."""
+[channel.modes.fields]
+page_access_token = { description = "Page Access Token", type = "string", secret = true, required = true }
+verify_token = { description = "Webhook Verify Token (you choose this)", type = "string", secret = true, required = true }
+app_secret = { description = "App Secret (optional; enables X-Hub-Signature-256 verification)", type = "string", secret = true, required = false }
+target_chat_ids = { description = "Optional target PSIDs (comma-separated)", type = "string", required = false }
+subscribe_passcode = { description = "Optional passcode; senders must /start <passcode> to subscribe", type = "string", secret = true, required = false }
 
 [[channel.modes]]
 id = "userbot"
 label = "Userbot (your account)"
 implemented = false
-instructions = """**Coming soon — and use at your own risk.**
+instructions = """**Not supported — use at your own risk.**
 
 User-account automation **violates Facebook's Terms of Service** and may
 result in your account being locked or disabled. The community libraries
 that drove this (e.g. ``fbchat``) are largely unmaintained because Meta
-keeps tightening client-side detection.
-
-Configuration would require pasting Facebook session cookies, which
-gives the agent full access to your account — sensitive."""
+keeps tightening client-side detection."""
 [channel.modes.fields]
 session_cookies = { description = "Session cookies (JSON or string)", type = "string", secret = true, required = true }

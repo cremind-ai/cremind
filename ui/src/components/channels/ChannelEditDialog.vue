@@ -4,8 +4,10 @@ import {
   ElButton, ElDialog, ElForm, ElFormItem, ElInput, ElOption,
   ElRadioButton, ElRadioGroup, ElSelect, ElTag,
 } from 'element-plus';
-import type {
-  ChannelCatalogEntry, ChannelCatalogMode, CreateChannelPayload,
+import NotificationFilterEditor from './NotificationFilterEditor.vue';
+import {
+  defaultNotificationFilter,
+  type ChannelCatalogEntry, type ChannelCatalogMode, type CreateChannelPayload,
 } from '../../services/channelApi';
 
 const props = defineProps<{
@@ -41,6 +43,18 @@ const modeEntry = computed<ChannelCatalogMode | null>(() => {
   const entry = catalogEntry.value;
   if (!entry) return null;
   return entry.modes.find((m) => m.id === dialogMode.value) || entry.modes[0] || null;
+});
+
+// Notification mode has no conversation: it shows a filter editor instead of
+// auth/response controls, which are irrelevant to a push-only channel.
+const isNotification = computed(() => dialogMode.value === 'notification');
+
+// Seed a default filter the first time the user lands on notification mode so
+// the editor has an object to bind to (create path clears dialogConfig).
+watch(isNotification, (on) => {
+  if (on && !dialogConfig.notification_filter) {
+    dialogConfig.notification_filter = defaultNotificationFilter();
+  }
 });
 
 // Reset / pre-fill the form whenever the dialog opens. Watching
@@ -93,13 +107,21 @@ function handleClose() {
 function handleSubmit() {
   if (!catalogEntry.value) return;
   const config: Record<string, any> = { ...dialogConfig };
-  if (dialogAuthMode.value === 'password' && dialogPassword.value) {
-    config.password = dialogPassword.value;
+  if (isNotification.value) {
+    // Push-only channel: no auth gate; ensure the filter is present and drop
+    // nothing else. Force auth_mode=none so a stale selection can't gate sends.
+    config.notification_filter = dialogConfig.notification_filter || defaultNotificationFilter();
+  } else {
+    // Not a notification channel — never leak a filter into its config.
+    delete config.notification_filter;
+    if (dialogAuthMode.value === 'password' && dialogPassword.value) {
+      config.password = dialogPassword.value;
+    }
   }
   emit('submit', {
     channel_type: props.channelType,
     mode: dialogMode.value,
-    auth_mode: dialogAuthMode.value,
+    auth_mode: isNotification.value ? 'none' : dialogAuthMode.value,
     response_mode: dialogResponseMode.value,
     enabled: true,
     config,
@@ -157,33 +179,41 @@ function handleSubmit() {
           />
         </ElFormItem>
 
-        <ElFormItem
-          v-if="(catalogEntry.auth_modes?.length || 0) > 1"
-          label="Authentication"
-        >
-          <ElSelect v-model="dialogAuthMode" style="width: 100%">
-            <ElOption
-              v-for="m in (catalogEntry.auth_modes || ['none'])"
-              :key="m" :value="m" :label="m"
+        <template v-if="isNotification">
+          <ElFormItem label="Notification filter">
+            <NotificationFilterEditor v-model="dialogConfig.notification_filter" />
+          </ElFormItem>
+        </template>
+
+        <template v-else>
+          <ElFormItem
+            v-if="(catalogEntry.auth_modes?.length || 0) > 1"
+            label="Authentication"
+          >
+            <ElSelect v-model="dialogAuthMode" style="width: 100%">
+              <ElOption
+                v-for="m in (catalogEntry.auth_modes || ['none'])"
+                :key="m" :value="m" :label="m"
+              />
+            </ElSelect>
+          </ElFormItem>
+
+          <ElFormItem v-if="dialogAuthMode === 'password'" label="Password">
+            <ElInput
+              v-model="dialogPassword"
+              type="password"
+              show-password
+              placeholder="Senders must reply with this exact password to chat"
             />
-          </ElSelect>
-        </ElFormItem>
+          </ElFormItem>
 
-        <ElFormItem v-if="dialogAuthMode === 'password'" label="Password">
-          <ElInput
-            v-model="dialogPassword"
-            type="password"
-            show-password
-            placeholder="Senders must reply with this exact password to chat"
-          />
-        </ElFormItem>
-
-        <ElFormItem label="Reply detail">
-          <ElRadioGroup v-model="dialogResponseMode">
-            <ElRadioButton value="normal">Final answer only</ElRadioButton>
-            <ElRadioButton value="detail">Include thinking</ElRadioButton>
-          </ElRadioGroup>
-        </ElFormItem>
+          <ElFormItem label="Reply detail">
+            <ElRadioGroup v-model="dialogResponseMode">
+              <ElRadioButton value="normal">Final answer only</ElRadioButton>
+              <ElRadioButton value="detail">Include thinking</ElRadioButton>
+            </ElRadioGroup>
+          </ElFormItem>
+        </template>
       </ElForm>
     </div>
 

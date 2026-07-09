@@ -131,6 +131,21 @@ FEATURES: dict[str, Feature] = {
         probes=("telethon",),
         requires_restart=True,
     ),
+    "channel.discord.bot": Feature(
+        key="channel.discord.bot",
+        extras=("channel-discord",),
+        probes=("discord",),
+        requires_restart=True,
+    ),
+    "channel.slack.bot": Feature(
+        key="channel.slack.bot",
+        extras=("channel-slack",),
+        probes=("slack_bolt",),
+        requires_restart=True,
+    ),
+    # Messenger (Graph API webhook) and Zalo (Bot API long-poll) ride the core
+    # ``httpx`` client, and the Zalo personal channel is a Node sidecar — none
+    # of them need a Python extras group, so they have no FEATURES entry.
 }
 
 

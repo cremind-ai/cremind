@@ -96,9 +96,9 @@ def channels_add(
     ctx: typer.Context,
     channel_type: Optional[str] = typer.Option(
         None, "--type",
-        help="Channel type (telegram, whatsapp, discord, messenger, slack).",
+        help="Channel type (telegram, whatsapp, discord, messenger, slack, zalo).",
     ),
-    mode: str = typer.Option("bot", "--mode", help="Channel mode (bot|userbot)."),
+    mode: str = typer.Option("bot", "--mode", help="Channel mode (bot|userbot|notification)."),
     auth_mode: str = typer.Option("none", "--auth-mode", help="Auth mode (none|otp|password)."),
     response_mode: str = typer.Option("normal", "--response-mode", help="Reply detail (normal|detail)."),
     config_json: Optional[str] = typer.Option(
@@ -209,6 +209,70 @@ def channels_add(
             f"Run: cremind channels pair {channel.id}\n"
             f"(Auto-pairing on `add` lands in Phase 4 of the migration.)\n"
         )
+
+
+@channels_app.command("notify-filter")
+@graceful_errors
+def channels_notify_filter(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id (a notification-mode channel)."),
+    filter_json: Optional[str] = typer.Option(
+        None, "--json",
+        help="New notification filter as JSON; omit to just print the current filter.",
+    ),
+) -> None:
+    """Show or set the notification filter of a notification-mode channel.
+
+    Examples:
+      cremind channels notify-filter <id>
+      cremind channels notify-filter <id> --json '{"min_priority":"high","source_kinds":["schedule"]}'
+
+    The filter is validated/normalized server-side; setting it restarts the
+    adapter so the change takes effect immediately.
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import get_channel, set_notification_filter
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    new_filter: Optional[dict[str, Any]] = None
+    if filter_json is not None:
+        try:
+            parsed = _json.loads(filter_json)
+        except _json.JSONDecodeError as e:
+            typer.echo(f"--json: {e}", err=True)
+            raise typer.Exit(code=1) from e
+        if not isinstance(parsed, dict):
+            typer.echo("--json must be an object", err=True)
+            raise typer.Exit(code=1)
+        new_filter = parsed
+
+    cfg: Config = ctx.obj["cfg"]
+    out_mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            if new_filter is not None:
+                ch = await set_notification_filter(client, channel_id, new_filter)
+            else:
+                ch = await get_channel(client, channel_id)
+            return ch.to_dict()
+
+    ch = asyncio.run(_run())
+    if ch.get("mode") != "notification":
+        typer.echo(
+            f"Warning: channel mode is {ch.get('mode')!r}, not 'notification' — "
+            "the filter only applies in notification mode.",
+            err=True,
+        )
+    current = (ch.get("config") or {}).get("notification_filter") or {}
+    if out_mode.json:
+        print_json(current)
+        return
+    typer.echo(_json.dumps(current, indent=2, ensure_ascii=False))
 
 
 @channels_app.command("pair")

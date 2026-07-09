@@ -27,3 +27,29 @@ Prerequisites (one-time): install Node.js 18+ on PATH, then run
    only known to you."""
 [channel.modes.fields]
 phone = { description = "Phone (international format, e.g. +14155551212)", type = "string", required = false }
+
+[[channel.modes]]
+id = "notification"
+label = "Notification"
+setup_kind = "qr"
+implemented = true
+instructions = """Push-only alerts — no conversation. Runs under your own
+WhatsApp account (linked device) and forwards Cremind notifications
+(automation/event runs, errors, pending prompts) to chats you choose, with a
+configurable filter.
+
+Prerequisites (one-time): Node.js 18+ on PATH, then `npm install` inside
+`app/channels/sidecars/whatsapp/`.
+
+Setup:
+1. Save the channel, open the Channels page, and scan the QR with WhatsApp →
+   Linked Devices (same as Userbot pairing).
+2. Put the target chat ids (JIDs, comma-separated) in "Target chat ids", or
+   have a contact message the linked account /start to subscribe. Send /stop to
+   unsubscribe.
+
+Note: a profile can register only one WhatsApp channel, so choosing Notification
+replaces conversational Userbot on WhatsApp for this profile."""
+[channel.modes.fields]
+target_chat_ids = { description = "Target chat ids / JIDs (comma-separated)", type = "string", required = false }
+subscribe_passcode = { description = "Optional passcode; senders must /start <passcode> to subscribe", type = "string", secret = true, required = false }

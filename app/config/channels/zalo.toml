@@ -1,0 +1,65 @@
+[channel]
+type = "zalo"
+display_name = "Zalo"
+icon = "mdi:message-text"
+supports_bot = true
+supports_userbot = true
+auth_modes = ["none", "otp", "password"]
+default_response_mode = "normal"
+implemented = true
+
+[[channel.modes]]
+id = "bot"
+label = "Bot (official)"
+implemented = true
+instructions = """Official Zalo Bot API — no account login, no public URL. The bot
+long-polls for messages.
+
+1. Create a bot on the Zalo bot platform (https://bot.zaloplatforms.com) and copy
+   its token (shaped like `12345689:abc-xyz`).
+2. Paste the token below.
+3. Message the bot on Zalo and the Cremind agent will reply.
+
+Note: this is a Zalo *bot* account (Bot Creator / Marketplace), distinct from a
+Zalo Official Account (OA)."""
+[channel.modes.fields]
+bot_token = { description = "Bot API Token (id:secret)", type = "string", secret = true, required = true }
+
+[[channel.modes]]
+id = "userbot"
+label = "Personal account"
+implemented = true
+setup_kind = "qr"
+instructions = """Runs under your own Zalo account, auto-replying to DMs on your behalf
+(ported from OpenClaw's zca-js integration). Pairs by QR scan — no token to paste.
+
+⚠️ **Unofficial and use at your own risk.** Automating a personal Zalo account
+relies on a reverse-engineered client and **may violate Zalo's terms and result
+in your account being suspended or banned**. Prefer the official Bot mode when
+possible.
+
+Setup:
+1. Save this channel (it needs Node.js 20+ on the server; dependencies install
+   automatically on first boot).
+2. A QR code appears in the pairing dialog. Open Zalo on your phone →
+   Settings → scan the QR to link this session.
+3. Once linked, DMs to your Zalo account are answered by the agent. Group chats
+   are ignored in this version."""
+
+[[channel.modes]]
+id = "notification"
+label = "Notification"
+implemented = true
+instructions = """Push-only alerts — no conversation. A Zalo bot (Bot API, same token as
+Bot mode) forwards Cremind notifications to subscribers with a configurable
+filter.
+
+Setup:
+1. Create a bot as in Bot mode and paste its token below.
+2. Save, then message the bot /start to subscribe (/stop to unsubscribe).
+3. To alert specific chats without subscribing, put their chat ids in
+   "Target chat ids" (comma-separated)."""
+[channel.modes.fields]
+bot_token = { description = "Bot API Token (id:secret)", type = "string", secret = true, required = true }
+target_chat_ids = { description = "Optional target chat ids (comma-separated)", type = "string", required = false }
+subscribe_passcode = { description = "Optional passcode; senders must /start <passcode> to subscribe", type = "string", secret = true, required = false }

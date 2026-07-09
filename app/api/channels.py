@@ -8,14 +8,17 @@ verbatim in ``ChannelModel.config``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 from typing import Any
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.routing import Route
 
 from app.channels import get_channel_registry
+from app.channels.notification_filter import normalize_notification_filter
 from app.config import load_all_channel_catalogs
 from app.storage.conversation_storage import ConversationStorage
 from app.utils.logger import logger
@@ -165,6 +168,19 @@ async def create_channel_for_profile(
                     "status": 400,
                 }
 
+    # Notification-mode channels carry a structured filter that simple TOML
+    # fields can't express; validate + normalize it before persisting.
+    if mode == "notification" and "notification_filter" in config:
+        try:
+            config = {
+                **config,
+                "notification_filter": normalize_notification_filter(
+                    config.get("notification_filter"),
+                ),
+            }
+        except ValueError as exc:
+            return None, {"error": f"Invalid notification_filter: {exc}", "status": 400}
+
     enabled = bool(payload.get("enabled", True))
 
     ch = await conversation_storage.create_channel(
@@ -296,6 +312,17 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
                 if v == _REDACTED:
                     continue
                 merged[k] = v
+            eff_mode = update.get("mode") or ch.get("mode")
+            if eff_mode == "notification" and "notification_filter" in merged:
+                try:
+                    merged["notification_filter"] = normalize_notification_filter(
+                        merged.get("notification_filter"),
+                    )
+                except ValueError as exc:
+                    return JSONResponse(
+                        {"error": f"Invalid notification_filter: {exc}"},
+                        status_code=400,
+                    )
             update["config"] = merged
 
         updated = await conversation_storage.update_channel(cid, **update)
@@ -481,6 +508,72 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         ]
         return JSONResponse({"senders": redacted})
 
+    async def handle_messenger_webhook(request: Request):
+        """Public Facebook Messenger webhook (GET verify + POST receive).
+
+        Intentionally NOT behind ``_require_auth``: Meta calls this endpoint
+        directly with no bearer token. Authenticity is instead established by
+        the ``hub.verify_token`` challenge (GET) and the ``X-Hub-Signature-256``
+        HMAC over the raw body (POST, when an ``app_secret`` is configured).
+
+        Reads the verify token / app secret straight from the stored channel
+        config (``storage.get_channel`` returns the row un-redacted), so GET
+        verification works even before the adapter is enabled — Meta verifies
+        the callback URL at setup time.
+        """
+        channel_id = request.path_params["channel_id"]
+        ch = await conversation_storage.get_channel(channel_id)
+        if not ch or ch.get("channel_type") != "messenger":
+            return PlainTextResponse("Not found", status_code=404)
+        config = ch.get("config") or {}
+
+        if request.method == "GET":
+            params = request.query_params
+            mode = params.get("hub.mode")
+            token = params.get("hub.verify_token")
+            challenge = params.get("hub.challenge")
+            verify_token = config.get("verify_token")
+            if mode == "subscribe" and verify_token and token == verify_token:
+                return PlainTextResponse(challenge or "")
+            logger.warning(f"messenger[{channel_id}]: webhook verify rejected")
+            return PlainTextResponse("Verification failed", status_code=403)
+
+        # POST — inbound message events.
+        raw = await request.body()
+        app_secret = config.get("app_secret")
+        if app_secret:
+            sig = request.headers.get("X-Hub-Signature-256", "")
+            expected = "sha256=" + hmac.new(
+                str(app_secret).encode(), raw, hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(sig, expected):
+                logger.warning(f"messenger[{channel_id}]: bad webhook signature")
+                return PlainTextResponse("Bad signature", status_code=403)
+
+        try:
+            payload = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return PlainTextResponse("Bad request", status_code=400)
+
+        adapter = get_channel_registry().get_adapter(channel_id)
+        if payload.get("object") == "page" and hasattr(adapter, "handle_webhook_message"):
+            for entry in payload.get("entry") or []:
+                for evt in entry.get("messaging") or []:
+                    message = evt.get("message") or {}
+                    if message.get("is_echo"):
+                        continue
+                    sender = (evt.get("sender") or {}).get("id")
+                    text = message.get("text")
+                    if sender and text:
+                        try:
+                            await adapter.handle_webhook_message(str(sender), str(text))
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                f"messenger[{channel_id}]: inbound handling failed",
+                            )
+        # Meta requires a prompt 200 regardless of processing outcome.
+        return PlainTextResponse("EVENT_RECEIVED")
+
     async def handle_channels_dispatch(request: Request) -> JSONResponse:
         if request.method == "GET":
             return await handle_list_channels(request)
@@ -499,6 +592,13 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
 
     return [
         Route("/api/channels/catalog", endpoint=handle_get_catalog, methods=["GET"]),
+        # Public webhook (no auth) — must be declared before the generic
+        # ``/api/channels/{channel_id}`` route. Meta hits this directly.
+        Route(
+            "/api/channels/webhook/messenger/{channel_id}",
+            endpoint=handle_messenger_webhook,
+            methods=["GET", "POST"],
+        ),
         Route(
             "/api/channels",
             endpoint=handle_channels_dispatch,

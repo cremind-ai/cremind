@@ -45,7 +45,7 @@ const allCards: SettingsCard[] = [
   },
   {
     title: 'Channels',
-    description: 'Connect Telegram, WhatsApp, Discord, Messenger, and Slack',
+    description: 'Connect Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo',
     icon: 'mdi:link-variant',
     route: 'channels',
   },
