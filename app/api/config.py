@@ -7,9 +7,6 @@ import secrets
 import time
 from pathlib import Path
 
-import jwt
-from datetime import datetime, timezone, timedelta
-
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -377,19 +374,12 @@ async def _resolve_vectorstore(embedding_body: dict) -> dict:
 
 
 def _generate_token(jwt_secret: str, profile: str, hours: int | None = None) -> tuple[str, str]:
-    """Generate a JWT token for a profile. Returns (token, expires_at)."""
-    if hours is None:
-        hours = BaseConfig.JWT_EXPIRATION_HOURS
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": profile,
-        "profile": profile,
-        "iat": now,
-        "exp": now + timedelta(hours=hours),
-    }
-    token = jwt.encode(payload, jwt_secret, algorithm="HS256")
-    expires_at = (now + timedelta(hours=hours)).isoformat()
-    return token, expires_at
+    """Generate a JWT token for a profile. Returns (token, expires_at).
+
+    Thin wrapper over :meth:`BaseConfig.mint_token` (the shared claim shape) so
+    setup and restore mint identical tokens.
+    """
+    return BaseConfig.mint_token(profile, secret=jwt_secret, hours=hours)
 
 
 def get_config_routes(state: BootedState) -> list[Route]:
@@ -944,6 +934,33 @@ def get_config_routes(state: BootedState) -> list[Route]:
         # Create profile directory and copy PERSONA.md template
         ensure_persona_file(profile_name)
 
+        # For additional profiles, seed skills + backfill a2a/mcp tool rows NOW
+        # (before the tool_configs loop below), mirroring handle_add_profile in
+        # profiles.py. Registering this profile's own ``<profile>__…`` skills
+        # here lets the wizard's per-skill enable/disable toggles resolve to
+        # THIS profile (see the remap in the tool_configs loop), and fixes new
+        # profiles otherwise having no skills until the next server restart.
+        # First-setup (admin) skill seeding still runs via ``on_first_setup``.
+        if not is_first_setup and registry is not None:
+            import asyncio
+
+            from app.skills import initialize_profile_skills
+
+            _emit_setup("skills", f"Setting up skills for {profile_name!r}…")
+            try:
+                await initialize_profile_skills(
+                    profile_name, registry, loop=asyncio.get_running_loop(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(f"Skill init failed for new profile '{profile_name}': {exc}")
+            try:
+                inserted = registry.on_profile_created(profile_name)
+                logger.info(
+                    f"Backfilled {inserted} profile_tools row(s) for new profile '{profile_name}'"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(f"profile_tools backfill failed for '{profile_name}': {exc}")
+
         # Save server config only on first setup
         if is_first_setup:
             _emit_setup("server_config", "Saving server configuration…")
@@ -1052,11 +1069,43 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 f"Saving configuration for {len(tool_configs)} tool(s)…",
             )
         if registry is not None:
+            from app.tools.base import ToolType
             from app.tools.ids import slugify
 
             for tool_key, configs in tool_configs.items():
                 # Tool keys may arrive as either tool_id (slug) or display name
                 tool_id = tool_key if registry.get(tool_key) else slugify(tool_key)
+                # The wizard loads the tool/skill catalog with the admin token,
+                # so skill keys arrive owner-prefixed (``admin__<base>``). Remap
+                # them to THIS profile's copy (``<profile>__<base>``, seeded
+                # above) so the enable/disable toggle lands on the right rows.
+                # Skip skills with no counterpart for this profile (e.g. an
+                # admin-only custom skill that isn't a shipped builtin).
+                resolved = registry.get(tool_id)
+                if (
+                    resolved is not None
+                    and resolved.tool_type is ToolType.SKILL
+                    and "__" in resolved.tool_id
+                    and not resolved.tool_id.startswith(f"{profile_name}__")
+                ):
+                    base = resolved.tool_id.split("__", 1)[1]
+                    mapped_id = f"{profile_name}__{base}"
+                    if registry.get(mapped_id) is not None:
+                        tool_id = mapped_id
+                    else:
+                        logger.info(
+                            f"setup: skipping skill {resolved.tool_id!r} — "
+                            f"no counterpart for profile {profile_name!r}"
+                        )
+                        continue
+                # A tool_id that resolves to nothing can't be configured here.
+                # This is the first-run case for built-in skills: they're seeded
+                # only in ``on_first_setup`` (below), after this loop. Their
+                # enable states are applied in the post-seed pass further down;
+                # skipping now avoids writing orphan config rows keyed by an
+                # unregistered id.
+                if registry.get(tool_id) is None:
+                    continue
                 arg_values: dict[str, object] = {}
                 for key, value in configs.items():
                     if key == "_enabled":
@@ -1192,12 +1241,40 @@ def get_config_routes(state: BootedState) -> list[Route]:
         token_file.write_text(token, encoding="utf-8")
         logger.info(f"Token saved to {token_file}")
 
-        # Initialize built-in tools that were skipped at startup due to missing LLM
-        if is_first_setup and on_first_setup:
+        # Bind built-in tool LLMs, (re)sync skills, and reconcile documents for
+        # the just-configured profile. Runs for EVERY profile (not just first
+        # setup) so a wizard-created profile is fully wired without a server
+        # restart. ``initialize_profile_skills`` is the idempotent per-boot sync,
+        # so re-running it after the seed above is safe.
+        if on_first_setup:
             try:
                 await on_first_setup(profile_name)
             except Exception as e:
                 logger.warning(f"Post-setup built-in tool initialization failed: {e}")
+
+        # First-run setup seeds admin's skills only inside ``on_first_setup``
+        # above — i.e. AFTER the tool_configs loop ran — so any skill enable/
+        # disable the wizard collected couldn't be applied there (the skill rows
+        # didn't exist yet). Apply them now that the skills are registered.
+        # Skills are keyed ``<profile>__<slug>``; the first-run catalog sends the
+        # bare ``<slug>`` (see app/skills/sync.py::list_builtin_skill_catalog).
+        if is_first_setup and registry is not None and tool_configs:
+            from app.tools.ids import slugify
+
+            for tool_key, configs in tool_configs.items():
+                if not isinstance(configs, dict) or "_enabled" not in configs:
+                    continue
+                skill_id = f"{profile_name}__{slugify(tool_key)}"
+                if registry.get(skill_id) is None:
+                    continue
+                try:
+                    registry.set_profile_tool_enabled(
+                        profile_name,
+                        skill_id,
+                        str(configs["_enabled"]).lower() == "true",
+                    )
+                except (KeyError, ValueError) as e:
+                    logger.warning(f"setup: skipping skill _enabled for {skill_id!r}: {e}")
 
         # If first setup just turned Vector Embedding on, kick off model
         # load + rebuild in the background so the agent becomes usable

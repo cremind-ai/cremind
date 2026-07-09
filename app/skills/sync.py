@@ -117,6 +117,47 @@ def is_builtin_skill_dir(dir_name: str) -> bool:
     return (BUILTIN_SKILLS_DIR / dir_name).is_dir()
 
 
+def list_builtin_skill_catalog() -> list[dict]:
+    """Catalog rows for the shipped built-in skills — for the first-run wizard.
+
+    During first-run setup no profile exists yet, so the registry holds no skill
+    rows and ``GET /api/tools`` returns none (skills are profile-owned). The
+    wizard still needs to show built-in skills so the admin can choose which to
+    enable. This scans ``app/skills/builtin`` and returns rows shaped like the
+    skill entries from :meth:`ToolRegistry.visible_for_profile`. ``tool_id`` is
+    the profile-independent ``slugify(name)`` — the *base* of the
+    ``<profile>__<slug>`` id the skill gets when it is seeded on Apply — so the
+    wizard's chosen enable states map straight onto the seeded skills (applied
+    in the first-setup pass in ``app/api/config.py``).
+    """
+    from app.tools.ids import slugify
+
+    rows: list[dict] = []
+    for info in scan_skills(BUILTIN_SKILLS_DIR).values():
+        row = {
+            "tool_id": slugify(info.name),
+            "name": info.name,
+            "display_name": info.name,
+            "description": info.description,
+            "tool_type": "skill",
+            # Built-in skills default on so a fresh install is useful out of the
+            # box; the user can opt out per-skill before submitting.
+            "enabled": True,
+            "default_enabled": True,
+            "configured": True,
+            "config": {},
+            "required_fields": {},
+            "is_stub": False,
+            "is_builtin": True,
+            "toggle_locked": False,
+        }
+        lra = info.metadata.get("long_running_app") if isinstance(info.metadata, dict) else None
+        if isinstance(lra, dict):
+            row["long_running_app"] = lra
+        rows.append(row)
+    return rows
+
+
 def _assert_inside_profile_skills(profile: str, dir_name: str) -> Path:
     """Resolve ``<profile skills>/<dir_name>`` and guard against traversal.
 

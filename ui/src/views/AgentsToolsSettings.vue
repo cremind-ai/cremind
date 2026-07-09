@@ -29,10 +29,12 @@ import type { JsonSchema } from '../services/agentApi';
 import { getAuthUrl, unlinkAgent, reconnectAgent } from '../services/agentApi';
 import { useLLMModels } from '../composables/useLLMModels';
 import ItemCardHeader from '../components/shared/ItemCardHeader.vue';
+import ToolSkillCard from '../components/shared/ToolSkillCard.vue';
 import ToolVariablesForm from '../components/shared/ToolVariablesForm.vue';
 import ToolArgumentsForm from '../components/shared/ToolArgumentsForm.vue';
 import LLMParametersForm from '../components/shared/LLMParametersForm.vue';
 import LeafToggleSection from '../components/shared/LeafToggleSection.vue';
+import { initVarValues, initArgValues } from '../utils/toolItemForm';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -267,36 +269,6 @@ onUnmounted(() => {
   window.removeEventListener('message', handleAuthMessage);
   closeLiveSettingsStream();
 });
-
-function getDefaultForType(type: string): ProfileValue {
-  if (type === 'number') return 0;
-  if (type === 'boolean') return false;
-  return '';
-}
-
-function initVarValues(
-  fields: Record<string, { default?: unknown }> | undefined,
-  stored: Record<string, string> | undefined,
-): Record<string, string> {
-  const values: Record<string, string> = {};
-  if (fields) {
-    for (const [key, field] of Object.entries(fields)) {
-      if (field.default != null) values[key] = String(field.default);
-    }
-  }
-  if (stored) Object.assign(values, stored);
-  return values;
-}
-
-function initArgValues(schema: JsonSchema | null, storedValues?: Record<string, unknown> | null): Record<string, ProfileValue> {
-  if (!schema || !schema.properties) return {};
-  const stored = storedValues || {};
-  const values: Record<string, ProfileValue> = {};
-  for (const [propName, propDef] of Object.entries(schema.properties)) {
-    values[propName] = (stored[propName] as ProfileValue) ?? getDefaultForType(propDef.type);
-  }
-  return values;
-}
 
 function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
   const result: UnifiedItem[] = [];
@@ -931,51 +903,49 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
           </h2>
 
           <div class="items-list">
-            <ElCard v-for="item in builtinItems" :key="item.name" class="item-card" shadow="hover">
-              <ItemCardHeader
-                :name="item.displayName"
-                :status-tag="getBuiltinStatusTag(item)"
-                :expanded="item.expanded"
-                :enabled="item.enabled"
-                :toggle-locked="item.toggleLocked"
-                :show-authenticate="item.showAuthenticate"
-                :show-unlink="item.showUnlink"
-                @toggle-expand="toggleExpand(item)"
-                @update:enabled="toggleItemEnabled(item, $event)"
-                @authenticate="handleAuthenticate(item)"
-                @unlink="handleUnlink(item)"
+            <ToolSkillCard
+              v-for="item in builtinItems"
+              :key="item.name"
+              :name="item.displayName"
+              :status-tag="getBuiltinStatusTag(item)"
+              :expanded="item.expanded"
+              :enabled="item.enabled"
+              :toggle-locked="item.toggleLocked"
+              :show-authenticate="item.showAuthenticate"
+              :show-unlink="item.showUnlink"
+              @toggle-expand="toggleExpand(item)"
+              @update:enabled="toggleItemEnabled(item, $event)"
+              @authenticate="handleAuthenticate(item)"
+              @unlink="handleUnlink(item)"
+            >
+              <div v-if="Object.keys(item.toolConfigFields).length > 0" class="config-section">
+                <ToolVariablesForm
+                  :fields="item.toolConfigFields"
+                  :values="item.toolConfigValues"
+                  @update:values="item.toolConfigValues = $event"
+                />
+              </div>
+
+              <div v-if="Object.keys(item.toolConfigFields).length > 0"
+                   style="display: flex; align-items: center; gap: 8px;">
+                <ElButton type="primary" size="small" :loading="item.saving" @click="saveItemConfig(item)">Save</ElButton>
+              </div>
+
+              <LeafToggleSection
+                v-if="item.supportsLeafToggle || item.leavesLoading"
+                :leaves="item.leaves"
+                :loading="item.leavesLoading"
+                :disconnected="item.leavesDisconnected"
+                :parent-enabled="item.enabled"
+                @toggle="(leaf, val) => toggleLeaf(item, leaf, val)"
+                @set-all="(val) => setAllLeaves(item, val)"
               />
 
-              <div v-if="item.expanded" class="item-config">
-                <div v-if="Object.keys(item.toolConfigFields).length > 0" class="config-section">
-                  <ToolVariablesForm
-                    :fields="item.toolConfigFields"
-                    :values="item.toolConfigValues"
-                    @update:values="item.toolConfigValues = $event"
-                  />
-                </div>
-
-                <div v-if="Object.keys(item.toolConfigFields).length > 0"
-                     style="display: flex; align-items: center; gap: 8px;">
-                  <ElButton type="primary" size="small" :loading="item.saving" @click="saveItemConfig(item)">Save</ElButton>
-                </div>
-
-                <LeafToggleSection
-                  v-if="item.supportsLeafToggle || item.leavesLoading"
-                  :leaves="item.leaves"
-                  :loading="item.leavesLoading"
-                  :disconnected="item.leavesDisconnected"
-                  :parent-enabled="item.enabled"
-                  @toggle="(leaf, val) => toggleLeaf(item, leaf, val)"
-                  @set-all="(val) => setAllLeaves(item, val)"
-                />
-
-                <div
-                  v-if="Object.keys(item.toolConfigFields).length === 0 && !item.supportsLeafToggle && !item.leavesLoading"
-                  class="empty-args"
-                >No configuration required for this tool.</div>
-              </div>
-            </ElCard>
+              <div
+                v-if="Object.keys(item.toolConfigFields).length === 0 && !item.supportsLeafToggle && !item.leavesLoading"
+                class="empty-args"
+              >No configuration required for this tool.</div>
+            </ToolSkillCard>
           </div>
         </div>
 
@@ -998,82 +968,80 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
           </div>
 
           <div v-else class="items-list">
-            <ElCard v-for="item in skillItems" :key="item.name" class="item-card" shadow="hover">
-              <ItemCardHeader
-                :name="item.displayName"
-                :status-tag="getBuiltinStatusTag(item)"
-                :expanded="item.expanded"
-                :enabled="item.enabled"
-                :toggle-locked="item.toggleLocked"
-                :show-authenticate="item.showAuthenticate"
-                :show-unlink="item.showUnlink"
-                :show-remove="true"
-                :remove-name="item.displayName"
-                :remove-label="item.isBuiltinSkill ? 'Reset to Default' : 'Delete'"
-                :remove-icon="item.isBuiltinSkill ? 'mdi:restore' : 'mdi:delete'"
-                :remove-type="item.isBuiltinSkill ? 'warning' : 'danger'"
-                :remove-title="item.isBuiltinSkill
-                  ? `Reset '${item.displayName}' to its default? Your local changes will be discarded.`
-                  : `Delete '${item.displayName}'? This cannot be undone.`"
-                @toggle-expand="item.expanded = !item.expanded"
-                @update:enabled="toggleItemEnabled(item, $event)"
-                @authenticate="handleAuthenticate(item)"
-                @unlink="handleUnlink(item)"
-                @remove="handleDeleteSkill(item)"
-              />
+            <ToolSkillCard
+              v-for="item in skillItems"
+              :key="item.name"
+              :name="item.displayName"
+              :status-tag="getBuiltinStatusTag(item)"
+              :expanded="item.expanded"
+              :enabled="item.enabled"
+              :toggle-locked="item.toggleLocked"
+              :show-authenticate="item.showAuthenticate"
+              :show-unlink="item.showUnlink"
+              :show-remove="true"
+              :remove-name="item.displayName"
+              :remove-label="item.isBuiltinSkill ? 'Reset to Default' : 'Delete'"
+              :remove-icon="item.isBuiltinSkill ? 'mdi:restore' : 'mdi:delete'"
+              :remove-type="item.isBuiltinSkill ? 'warning' : 'danger'"
+              :remove-title="item.isBuiltinSkill
+                ? `Reset '${item.displayName}' to its default? Your local changes will be discarded.`
+                : `Delete '${item.displayName}'? This cannot be undone.`"
+              @toggle-expand="item.expanded = !item.expanded"
+              @update:enabled="toggleItemEnabled(item, $event)"
+              @authenticate="handleAuthenticate(item)"
+              @unlink="handleUnlink(item)"
+              @remove="handleDeleteSkill(item)"
+            >
+              <p v-if="item.description" class="item-desc skill-description">{{ item.description }}</p>
 
-              <div v-if="item.expanded" class="item-config">
-                <p v-if="item.description" class="item-desc skill-description">{{ item.description }}</p>
+              <ElDivider v-if="item.description && Object.keys(item.toolConfigFields).length > 0" />
 
-                <ElDivider v-if="item.description && Object.keys(item.toolConfigFields).length > 0" />
+              <div v-if="Object.keys(item.toolConfigFields).length > 0" class="config-section">
+                <ToolVariablesForm
+                  title="Skill Variables"
+                  :fields="item.toolConfigFields"
+                  :values="item.toolConfigValues"
+                  @update:values="item.toolConfigValues = $event"
+                />
+                <ElButton type="primary" size="small" :loading="item.saving" @click="saveItemConfig(item)">Save</ElButton>
+              </div>
 
-                <div v-if="Object.keys(item.toolConfigFields).length > 0" class="config-section">
-                  <ToolVariablesForm
-                    title="Skill Variables"
-                    :fields="item.toolConfigFields"
-                    :values="item.toolConfigValues"
-                    @update:values="item.toolConfigValues = $event"
-                  />
-                  <ElButton type="primary" size="small" :loading="item.saving" @click="saveItemConfig(item)">Save</ElButton>
-                </div>
-
-                <div
-                  v-if="item.longRunningApp"
-                  class="config-section lra-section"
-                  :data-skill-id="item.name"
+              <div
+                v-if="item.longRunningApp"
+                class="config-section lra-section"
+                :data-skill-id="item.name"
+              >
+                <h4 class="config-section-title">Register Long-Running Process</h4>
+                <p v-if="item.longRunningApp.description" class="lra-description">
+                  {{ item.longRunningApp.description }}
+                </p>
+                <pre class="lra-command">{{ item.longRunningApp.command }}</pre>
+                <ElButton
+                  type="primary"
+                  size="small"
+                  :loading="item.registering"
+                  @click="registerLongRunningApp(item)"
                 >
-                  <h4 class="config-section-title">Register Long-Running Process</h4>
-                  <p v-if="item.longRunningApp.description" class="lra-description">
-                    {{ item.longRunningApp.description }}
-                  </p>
-                  <pre class="lra-command">{{ item.longRunningApp.command }}</pre>
-                  <ElButton
-                    type="primary"
-                    size="small"
-                    :loading="item.registering"
-                    @click="registerLongRunningApp(item)"
-                  >
-                    <Icon icon="mdi:play-circle-outline" />&nbsp;Register Process
-                  </ElButton>
-                  <div v-if="item.lastRegisteredProcess" class="lra-result">
-                    <Icon icon="mdi:check-circle" class="lra-result-icon" />
-                    <span>
-                      Process started:
-                      <RouterLink
-                        class="lra-link"
-                        :to="{
-                          name: 'process-terminal',
-                          params: { profile: props.profile, pid: item.lastRegisteredProcess.process_id },
-                        }"
-                      >
-                        {{ item.lastRegisteredProcess.process_id }}
-                      </RouterLink>
-                      — open the detail page to view logs and send input.
-                    </span>
-                  </div>
+                  <Icon icon="mdi:play-circle-outline" />&nbsp;Register Process
+                </ElButton>
+                <div v-if="item.lastRegisteredProcess" class="lra-result">
+                  <Icon icon="mdi:check-circle" class="lra-result-icon" />
+                  <span>
+                    Process started:
+                    <RouterLink
+                      class="lra-link"
+                      :to="{
+                        name: 'process-terminal',
+                        params: { profile: props.profile, pid: item.lastRegisteredProcess.process_id },
+                      }"
+                    >
+                      {{ item.lastRegisteredProcess.process_id }}
+                    </RouterLink>
+                    — open the detail page to view logs and send input.
+                  </span>
                 </div>
               </div>
-            </ElCard>
+            </ToolSkillCard>
           </div>
         </div>
 

@@ -1,5 +1,5 @@
 ---
-description: "Create, list, download, upload, delete, and restore **full-system backups** of Cremind — one portable `.cremind-backup` archive holding the entire database (conversations, LLM providers and API keys, custom providers, channels, events/schedules, memories) plus the on-disk trees (skills, Google/OAuth token files, personas, per-profile documents, JWT tokens, channel sessions, browser login state). Restores across environments — Windows↔Docker/K8s, SQLite↔PostgreSQL, a new home directory — by relocating stored absolute paths automatically. Use this to move Cremind to another machine, reinstall without losing data, or recover from failure. Distinct from `cremind db backup`, which snapshots only the database. Optional passphrase encryption."
+description: "Create, list, download, upload, delete, and restore **full-system backups** of Cremind — one portable `.cremind-backup` archive holding the entire database (conversations, LLM providers and API keys, custom providers, channels, events/schedules, memories) plus the on-disk trees (skills, Google/OAuth token files, personas, per-profile documents, channel sessions, browser login state). The JWT sign-in secret and session tokens are kept local to each install (re-issued on restore), not carried in the archive. Restores across environments — Windows↔Docker/K8s, SQLite↔PostgreSQL, a new home directory — by relocating stored absolute paths automatically. Use this to move Cremind to another machine, reinstall without losing data, or recover from failure. Distinct from `cremind db backup`, which snapshots only the database. Optional passphrase encryption."
 ---
 
 # `cremind backup` — Full-System Backup & Restore
@@ -11,8 +11,15 @@ after a disk failure without losing anything.
 
 Unlike `cremind db backup` (which snapshots only the relational database), a
 full backup also includes everything Cremind keeps on disk: per-profile skills
-(and their Google/OAuth token files), personas, per-profile documents, JWT
-recovery tokens, channel session files, and browser login state.
+(and their Google/OAuth token files), personas, per-profile documents, channel
+session files, and browser login state.
+
+The JWT sign-in secret and the per-profile session tokens are **not** backed
+up — they are local to each installation. Carrying them across a restore would
+invalidate the target's own sign-ins (tokens are verified against the secret
+that signed them). A restore keeps the target's current secret and re-issues a
+fresh token file for every restored profile, so you stay signed in and each
+profile's `tokens/<profile>.token` stays valid.
 
 ## What a backup contains
 
@@ -23,13 +30,15 @@ A `.cremind-backup` archive is a gzipped tar with three parts:
   profile list.
 - **A portable database dump** — a backend-neutral logical dump, so a backup
   taken on SQLite restores into PostgreSQL and vice-versa.
-- **The file trees** under `CREMIND_SYSTEM_DIR` (skills, tokens, personas,
-  per-profile documents, channel sessions, browser profiles).
+- **The file trees** under `CREMIND_SYSTEM_DIR` (skills, personas, per-profile
+  documents, channel sessions, browser profiles).
 
-Rebuildable/transient content is intentionally excluded: the raw database
-files (dumped logically instead), the embeddings vector store (rebuilt on
-boot), the shared documents corpus (re-seeded from the bundle), temporary chat
-uploads, and derived skill `.env` files (regenerated from the database).
+Rebuildable/transient and installation-local content is intentionally excluded:
+the raw database files (dumped logically instead), the embeddings vector store
+(rebuilt on boot), the shared documents corpus (re-seeded from the bundle),
+temporary chat uploads, derived skill `.env` files (regenerated from the
+database), and the JWT sign-in secret and session tokens (kept per-install;
+re-issued on restore).
 
 ## Environment independence
 
@@ -94,10 +103,11 @@ cremind backup report   [--ack]
 | `--ack`                | report            | Mark the restore report as acknowledged.                                |
 
 The passphrase may also be supplied via the `CREMIND_BACKUP_PASSPHRASE`
-environment variable. A backup contains every secret Cremind holds (LLM API
+environment variable. A backup contains the secrets Cremind holds (LLM API
 keys, channel bot tokens, OAuth refresh tokens, database passwords) in the
 clear unless you encrypt it — prefer a passphrase for archives that leave the
-machine.
+machine. (The JWT sign-in secret and session tokens are not among them — they
+stay local to each install.)
 
 ## Where archives live
 

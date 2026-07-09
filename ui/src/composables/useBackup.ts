@@ -145,16 +145,12 @@ function startRestorePoll(): void {
 }
 
 async function onRestoreDone(): Promise<void> {
-  // The restored JWT secret invalidates the current session token; send the
-  // user to sign in again. Load the report first so it survives the reload.
+  // The install's JWT secret is preserved across a restore, so the session
+  // token the browser already holds stays valid — keep the user signed in.
+  // Load the report first so it survives the reload, then reload to re-activate
+  // the profile against the restarted server (activateProfile re-validates the
+  // token on boot; the guard falls back to login only if it's genuinely stale).
   await loadReport()
-  const s = useSettingsStore()
-  try {
-    // Best-effort: clear the active profile token so the guard routes to login.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ;(s as any).authToken = ''
-  } catch { /* ignore */ }
-  // Give the user a moment to see the success state, then reload.
   setTimeout(() => { window.location.reload() }, 1500)
 }
 

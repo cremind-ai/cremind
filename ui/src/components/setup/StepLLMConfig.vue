@@ -1,12 +1,16 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue';
-import { ElForm, ElFormItem, ElSelect, ElOption } from 'element-plus';
+import { ElForm, ElFormItem, ElSelect, ElOption, ElSwitch } from 'element-plus';
 import { listLLMProviders, getProviderModels } from '../../services/configApi';
 import { useLLMModels } from '../../composables/useLLMModels';
 import ProviderConfigFields, { type ProviderWithState } from '../shared/ProviderConfigFields.vue';
+import ModelGroupFields from '../shared/ModelGroupFields.vue';
 
 const props = defineProps<{
   agentUrl: string;
+  // Admin JWT for loading the provider/model catalog during a per-profile
+  // setup (empty on first-run setup, where the endpoints are open).
+  token?: string;
   config: Record<string, string>;
 }>();
 
@@ -14,13 +18,20 @@ const emit = defineEmits<{
   update: [config: Record<string, string>];
 }>();
 
-const { rebuildModelList, getFilteredModels, getReasoningOptions } = useLLMModels();
+const { rebuildModelList, allModels } = useLLMModels();
 
 const providers = ref<ProviderWithState[]>([]);
-// Single model. Stored under the historical ``model_group.high`` key.
+// Main reasoning model (``high``), plus optional Low-Performance (``low``) and
+// Vision (``vision``) groups — mirrors Settings → LLM Providers.
 const highProvider = ref(extractProvider(props.config['model_group.high']) || props.config.default_provider || 'groq');
 const modelGroupHigh = ref(props.config['model_group.high'] || '');
-const reasoningEffortHigh = ref(props.config['model_group.high.reasoning_effort'] || '');
+const reasoningEffortHigh = ref<string | null>(props.config['model_group.high.reasoning_effort'] || null);
+const lowProvider = ref(extractProvider(props.config['model_group.low']) || '');
+const modelGroupLow = ref(props.config['model_group.low'] || '');
+const reasoningEffortLow = ref<string | null>(props.config['model_group.low.reasoning_effort'] || null);
+const visionProvider = ref(extractProvider(props.config['model_group.vision']) || '');
+const modelGroupVision = ref(props.config['model_group.vision'] || '');
+const visionEnabled = ref(props.config['model_group.vision.enabled'] === 'true');
 const apiKeyProvider = ref('');
 const loading = ref(false);
 
@@ -35,30 +46,13 @@ function extractProvider(groupValue: string | undefined): string {
   return idx > 0 ? groupValue.substring(0, idx) : groupValue;
 }
 
-const highFilteredModels = computed(() => getFilteredModels(highProvider.value));
-
-const highModelReasoningOptions = computed(() => getReasoningOptions(modelGroupHigh.value));
-
-// When provider changes, clear model selection if current model doesn't belong to new provider
-watch(highProvider, (newProvider, oldProvider) => {
-  if (oldProvider && newProvider !== oldProvider) {
-    const currentProvider = extractProvider(modelGroupHigh.value);
-    if (currentProvider !== newProvider) {
-      modelGroupHigh.value = '';
-      reasoningEffortHigh.value = '';
-    }
-  }
-});
-
-// Clear reasoning_effort when model changes and new model doesn't support it
-watch(modelGroupHigh, () => {
-  if (highModelReasoningOptions.value.length === 0) reasoningEffortHigh.value = '';
-});
+// Per-group model filtering, reasoning options, and the "clear stale model on
+// provider change" behavior now live inside <ModelGroupFields>.
 
 onMounted(async () => {
   loading.value = true;
   try {
-    const res = await listLLMProviders(props.agentUrl, '');
+    const res = await listLLMProviders(props.agentUrl, props.token ?? '');
     providers.value = res.providers.map((p) => {
       // Determine active auth method
       const authMethods = p.auth_methods || [];
@@ -89,7 +83,7 @@ onMounted(async () => {
 
     for (const p of providers.value) {
       try {
-        const modelRes = await getProviderModels(props.agentUrl, '', p.name);
+        const modelRes = await getProviderModels(props.agentUrl, props.token ?? '', p.name);
         p.models = modelRes.models;
       } catch { /* Provider catalog may not exist */ }
     }
@@ -104,11 +98,16 @@ onMounted(async () => {
 
 function emitConfig() {
   const config: Record<string, string> = {
-    // Derive default_provider from the single model's provider
+    // Derive default_provider from the main model's provider
     default_provider: highProvider.value || 'groq',
   };
   if (modelGroupHigh.value) config['model_group.high'] = modelGroupHigh.value;
   if (reasoningEffortHigh.value) config['model_group.high.reasoning_effort'] = reasoningEffortHigh.value;
+  if (modelGroupLow.value) config['model_group.low'] = modelGroupLow.value;
+  if (reasoningEffortLow.value) config['model_group.low.reasoning_effort'] = reasoningEffortLow.value;
+  if (modelGroupVision.value) config['model_group.vision'] = modelGroupVision.value;
+  // Always emit the vision feature toggle so turning it off also persists.
+  config['model_group.vision.enabled'] = String(visionEnabled.value);
 
   for (const p of providers.value) {
     // Emit auth_method selection
@@ -135,7 +134,14 @@ function emitConfig() {
   emit('update', config);
 }
 
-watch([highProvider, modelGroupHigh, reasoningEffortHigh], emitConfig);
+watch(
+  [
+    highProvider, modelGroupHigh, reasoningEffortHigh,
+    lowProvider, modelGroupLow, reasoningEffortLow,
+    visionProvider, modelGroupVision, visionEnabled,
+  ],
+  emitConfig,
+);
 watch(providers, emitConfig, { deep: true });
 </script>
 
@@ -171,30 +177,57 @@ watch(providers, emitConfig, { deep: true });
       <div class="model-groups-section">
         <h4 class="section-subtitle">Model</h4>
 
-      <div class="group-block">
-        <p class="step-description">
-          The single model the assistant uses for reasoning, tool calls, and replies.
-        </p>
-        <ElForm label-position="top" class="groups-form">
-          <ElFormItem label="Provider">
-            <ElSelect v-model="highProvider" placeholder="Select provider">
-              <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
-            </ElSelect>
-          </ElFormItem>
+        <div class="group-block">
+          <p class="step-description">
+            The main model the assistant uses for reasoning, tool calls, and replies.
+          </p>
+          <ModelGroupFields
+            :providers="providers"
+            :all-models="allModels"
+            v-model:provider="highProvider"
+            v-model:model="modelGroupHigh"
+            v-model:reasoning-effort="reasoningEffortHigh"
+          />
+        </div>
 
-          <ElFormItem label="Model">
-            <ElSelect v-model="modelGroupHigh" placeholder="Select model" filterable>
-              <ElOption v-for="m in highFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
-            </ElSelect>
-          </ElFormItem>
+        <div class="group-block">
+          <p class="step-description">
+            <strong>Low-Performance Model (optional).</strong> A cheaper/faster model
+            for lightweight background tasks (e.g. the skill-event matching gate).
+            Leave empty to fall back to the main model.
+          </p>
+          <ModelGroupFields
+            :providers="providers"
+            :all-models="allModels"
+            clearable
+            model-placeholder="Select model (defaults to main)"
+            v-model:provider="lowProvider"
+            v-model:model="modelGroupLow"
+            v-model:reasoning-effort="reasoningEffortLow"
+          />
+        </div>
 
-          <ElFormItem v-if="highModelReasoningOptions.length > 0" label="Reasoning Effort">
-            <ElSelect v-model="reasoningEffortHigh" placeholder="Select reasoning effort" clearable>
-              <ElOption v-for="opt in highModelReasoningOptions" :key="opt" :label="opt" :value="opt" />
-            </ElSelect>
-          </ElFormItem>
-        </ElForm>
-      </div>
+        <div class="group-block">
+          <div class="group-title-row">
+            <p class="step-description" style="margin: 0;">
+              <strong>Specialized Vision Model (optional).</strong> Turn on to use a
+              dedicated vision model for image understanding when your main model
+              can't see images. Leave empty to fall back to the main model.
+            </p>
+            <ElSwitch v-model="visionEnabled" />
+          </div>
+          <ModelGroupFields
+            v-if="visionEnabled"
+            :providers="providers"
+            :all-models="allModels"
+            :use-vision="true"
+            :show-reasoning="false"
+            clearable
+            model-placeholder="Select vision model (defaults to main)"
+            v-model:provider="visionProvider"
+            v-model:model="modelGroupVision"
+          />
+        </div>
       </div>
     </template>
   </div>
@@ -239,6 +272,14 @@ watch(providers, emitConfig, { deep: true });
 }
 
 .group-block .step-description { margin-bottom: 12px; }
+
+.group-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
 
 .groups-form { max-width: 480px; }
 </style>

@@ -235,8 +235,10 @@ onMounted(() => { void refresh(); });
     <!-- Create dialog -->
     <ElDialog v-model="showCreate" title="Create backup" width="440px">
       <p class="muted">
-        Optionally encrypt this backup with a passphrase. A backup contains all
-        secrets (API keys, tokens) in the clear unless encrypted.
+        Optionally encrypt this backup with a passphrase. A backup contains your
+        secrets (API keys, OAuth and channel tokens) in the clear unless
+        encrypted. The JWT sign-in secret and session tokens are kept local to
+        each install and are not included.
       </p>
       <ElInput v-model="createPass" type="password" placeholder="Passphrase (optional)" show-password />
       <ElInput
@@ -284,7 +286,7 @@ onMounted(() => { void refresh(); });
       <p v-if="restoreError" class="error-line">{{ restoreError }}</p>
       <p v-else class="muted">
         The connection will drop while the server restarts — this page reconnects
-        automatically and will return you to sign-in when the restore completes.
+        automatically and keeps you signed in when the restore completes.
       </p>
     </ElDialog>
   </div>

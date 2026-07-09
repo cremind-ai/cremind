@@ -22,7 +22,7 @@ from app.events.settings_state_bus import publish_settings_state_changed
 from app.lib.llm.factory import create_llm_provider
 from app.runtime import BootedState
 from app.skills.env_file import write_skill_env_file
-from app.skills.sync import is_builtin_skill_dir
+from app.skills.sync import is_builtin_skill_dir, list_builtin_skill_catalog
 from app.storage import get_autostart_storage
 from app.tools import ToolType
 from app.tools.builtin import (
@@ -88,11 +88,16 @@ def get_tool_routes(state: BootedState) -> list[Route]:
             denied = require_auth_or_setup_mode(request, config_storage)
             if denied is not None:
                 return denied
-        # Deferred-storage window: no registry yet. Return the static built-in
-        # catalog so the wizard's Tools step renders before the user clicks
-        # "Apply" (which is what materialises storage and the registry).
+        # Deferred-storage window: no registry yet (first-run setup, pre-Apply).
+        # Return the static built-in tool catalog AND the built-in skill catalog
+        # so the wizard's Tools step can render tools and skills together before
+        # the user clicks "Apply" (which materialises storage + the registry and
+        # seeds this profile's skills). Skills are absent from the registry here
+        # because they are profile-owned and no profile exists yet.
         if registry is None:
-            return JSONResponse({"tools": list_builtin_tool_catalog()})
+            return JSONResponse(
+                {"tools": list_builtin_tool_catalog() + list_builtin_skill_catalog()}
+            )
         config_manager = registry.config
         profile = _profile_from_request(request)
         if not profile and config_storage is not None and config_storage.is_setup_complete():
