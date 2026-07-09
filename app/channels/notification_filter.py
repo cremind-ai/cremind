@@ -43,6 +43,8 @@ KNOWN_KINDS = (
     "event_run_pending",
     "event_run_completed",
     "event_run_failed",
+    "autostart_failed",
+    "channel_disabled",
 )
 
 # Closed set: the three trigger engines behind an event run.
@@ -337,6 +339,8 @@ _EMOJI_BY_KIND = {
     "event_run_pending": "❓",
     "skill_register_required": "🔧",
     "started": "▶️",
+    "autostart_failed": "⚠️",
+    "channel_disabled": "⚠️",
 }
 
 _SOURCE_LABEL = {

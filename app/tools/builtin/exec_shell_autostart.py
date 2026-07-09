@@ -318,10 +318,43 @@ async def _spawn_one(storage: AutostartStorage, row: Dict[str, Any]) -> None:
             # as ``failed_to_autostart``; push the change so the UI lights it
             # up without waiting for any other event.
             publish_process_list_changed(row.get("profile") or None)
+            _notify_autostart_failure(row, error)
         else:
             storage.clear_error(row["id"])
     except Exception as exc:  # noqa: BLE001
         logger.error(f"autostart[{row.get('id')}]: failed to update status row: {exc}")
+
+
+def _notify_autostart_failure(row: Dict[str, Any], error: str) -> None:
+    """Surface an autostart failure as a high-priority notification.
+
+    The Process-Manager list bus already reflects the failed row, but that's
+    only visible if the user is looking at the process list. After a restore
+    onto a different machine, autostart commands may not be runnable in the new
+    environment (missing binaries, incompatible paths) — the user asked to be
+    *warned* about exactly this. The notifications buffer replays to UI clients
+    that connect after boot, which is essential because these failures happen
+    before anyone has subscribed. A notification must never break autostart
+    handling, so this is fully guarded.
+    """
+    try:
+        from app.events import get_event_notifications
+
+        command = (row.get("command") or "").strip()
+        get_event_notifications().push(
+            profile=row.get("profile") or "admin",
+            conversation_id="",
+            conversation_title="Autostart process failed",
+            message_preview=(
+                f"'{command[:120]}' could not be started: {error}. "
+                "Open the Process Manager to start it manually."
+            ),
+            kind="autostart_failed",
+            priority="high",
+            extra={"autostart_id": row.get("id"), "working_dir": row.get("working_dir")},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"autostart[{row.get('id')}]: failure notification push failed: {exc}")
 
 
 async def run_autostart_on_boot(storage: AutostartStorage) -> None:

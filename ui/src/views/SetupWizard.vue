@@ -16,6 +16,7 @@ import StepToolConfig from '../components/setup/StepToolConfig.vue';
 import StepMemoryConfig from '../components/setup/StepMemoryConfig.vue';
 import StepChannelsConfig from '../components/setup/StepChannelsConfig.vue';
 import StepProfileCreate from '../components/setup/StepProfileCreate.vue';
+import RestoreFromBackupCard from '../components/setup/RestoreFromBackupCard.vue';
 import ChannelPairingDialog from '../components/channels/ChannelPairingDialog.vue';
 import { storeToRefs } from 'pinia';
 import {
@@ -67,6 +68,10 @@ const chatStore = useChatStore();
 
 const currentStep = ref(0);
 const submitting = ref(false);
+// Toggles the welcome pane between "configure a fresh install" and the
+// restore-from-backup card. Setup-mode restore is a self-contained flow that
+// boots the restored system and routes to the profile selector on success.
+const showRestoreCard = ref(false);
 // True when the backend's /api/config/setup response flagged that one or
 // more newly-installed features (e.g. embedding.me5 / sentence-transformers
 // + torch) cannot be activated in-process and require restarting the
@@ -1291,7 +1296,11 @@ async function downloadConfigFile(format: ExportFormat) {
 
       <div class="step-content">
         <!-- ── Installer phase (Electron + first-run only) ──────── -->
-        <div v-if="currentStepKey === 'install-welcome'" class="installer-pane">
+        <div v-if="currentStepKey === 'install-welcome' && showRestoreCard" class="installer-pane">
+          <RestoreFromBackupCard @cancel="showRestoreCard = false" />
+        </div>
+
+        <div v-else-if="currentStepKey === 'install-welcome'" class="installer-pane">
           <h2>Let's get Cremind running.</h2>
           <p v-if="installEnv?.channel === 'dev'">
             Developer install. We'll reuse the local checkout's
@@ -1315,6 +1324,10 @@ async function downloadConfigFile(format: ExportFormat) {
             <ElTag>{{ installEnv.os }} / {{ installEnv.arch }}</ElTag>
           </p>
           <p v-else-if="detectingInstallEnv">Detecting your environment…</p>
+          <p class="restore-link">
+            Already have a Cremind backup?
+            <a @click="showRestoreCard = true">Restore it instead</a>
+          </p>
         </div>
 
         <div v-else-if="currentStepKey === 'install-deployment'" class="installer-pane">
@@ -1921,6 +1934,16 @@ async function downloadConfigFile(format: ExportFormat) {
   gap: 8px;
   flex-wrap: wrap;
   margin-top: 12px;
+}
+.installer-pane .restore-link {
+  margin-top: 20px;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+}
+.installer-pane .restore-link a {
+  color: var(--primary-color);
+  cursor: pointer;
+  text-decoration: underline;
 }
 /* Log-pane styling is intentionally not scoped to ``.installer-pane`` —
    the same markup is rendered inside the ``.stage-transition`` block as

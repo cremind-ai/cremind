@@ -102,6 +102,23 @@ const routes = [
     },
   },
   {
+    path: '/:profile/settings/backup',
+    name: 'backup-settings',
+    component: () => import('../views/BackupSettings.vue'),
+    props: true,
+    meta: { title: 'Backup & Restore' },
+    // Backup & Restore is a server-wide, admin-owned operation (the backend
+    // gates it with require_admin). Mirror the embedding-settings guard so
+    // non-admin profiles never land on a 403'd page.
+    beforeEnter: (to: RouteLocationNormalized) => {
+      const profile = to.params.profile as string | undefined;
+      if (profile && profile !== 'admin') {
+        return { path: `/${profile}/settings`, replace: true };
+      }
+      return true;
+    },
+  },
+  {
     path: '/:profile/settings/profiles',
     name: 'profile-settings',
     component: () => import('../views/ProfileSettings.vue'),

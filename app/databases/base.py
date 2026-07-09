@@ -128,3 +128,30 @@ class DatabaseProvider(ABC):
         Implementations should fail cleanly on format mismatches rather than
         silently corrupting the live DB.
         """
+
+    # ── Portable logical dump (cross-backend) ────────────────────────────────
+    # Separate from backup()/restore() above, which are same-backend fast paths
+    # the upgrader relies on. These produce/consume the provider-neutral
+    # ``cremind-dbdump`` format used by the full-system Backup & Restore feature,
+    # which must round-trip across SQLite↔PostgreSQL. Concrete (not abstract):
+    # the implementation is fully engine-agnostic through SQLAlchemy, so every
+    # provider gets it for free.
+
+    def dump_logical(self, fileobj) -> Any:
+        """Stream a portable ``cremind-dbdump`` gzipped JSONL into ``fileobj``.
+
+        Returns a ``DumpStats`` (revision + per-table row counts).
+        """
+        from app.backup.dbdump import dump_logical
+
+        return dump_logical(self.sync_engine(), fileobj)
+
+    def load_logical(self, fileobj, row_transform=None) -> Any:
+        """Insert rows from a portable dump into an already-migrated schema.
+
+        Returns a ``LoadStats``. The caller runs migrations to the dump's
+        revision first (see :mod:`app.backup.engine`).
+        """
+        from app.backup.dbdump import load_logical
+
+        return load_logical(self.sync_engine(), fileobj, row_transform)

@@ -48,6 +48,7 @@ from pathlib import Path
 from app.agent.agent import CremindAgent
 from app.agent.executor import CremindAgentExecutor
 from app.api import get_api_routes
+from app.api.backup import get_backup_routes
 from app.api.config import get_config_routes
 from app.api.features import get_features_routes
 from app.api.oauth_callback import get_oauth_callback_routes
@@ -577,6 +578,11 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
     # (registry=None → catalog-only) and the post-boot UI seamlessly.
     routes.extend(get_version_routes())
     routes.extend(get_upgrade_routes())
+    # Backup & Restore registered pre-storage: a restore must work in setup
+    # mode (fresh install, storage not yet booted) and its status/stream
+    # endpoints must answer immediately after the restore-triggered restart,
+    # before storage comes up. Handlers resolve ``state`` lazily at request time.
+    routes.extend(get_backup_routes(state))
     routes.extend(get_system_routes())
     routes.extend(get_features_routes())
     routes.extend(get_config_routes(state))
@@ -1032,6 +1038,18 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
             )
 
     state.boot_fn = boot_storage_and_post_storage
+
+    # 0a''. Apply a pending restore staged by a previous run's detached runner
+    #       (Phase 2). Runs BEFORE storage boots so it can drop+reimport the DB
+    #       and swap file trees with no open handles. Also sweeps a stale
+    #       terminal restore-status file. Never raises — a failed restore rolls
+    #       back from its safety backup and boot continues.
+    try:
+        from app.backup.pending import apply_pending_restore_if_any
+
+        await asyncio.to_thread(apply_pending_restore_if_any)
+    except Exception as e:  # noqa: BLE001
+        logger.exception(f"[boot] pending-restore apply hook failed unexpectedly: {e}")
 
     # Run the boot now in normal mode; in deferred mode the wizard's
     # POST /api/config/setup triggers it instead.

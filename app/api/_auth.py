@@ -38,3 +38,17 @@ def require_auth_or_setup_mode(request: Request, config_storage) -> JSONResponse
     if config_storage is not None and not config_storage.is_setup_complete():
         return None
     return require_auth(request)
+
+
+def require_admin_or_setup_mode(request: Request, config_storage) -> JSONResponse | None:
+    """Open during first-run setup (fresh install), admin-only once set up.
+
+    Unlike :func:`require_auth_or_setup_mode`, a ``None`` ``config_storage``
+    (deferred-storage mode — no DB yet) is treated as setup mode and passes
+    open, rather than demanding a JWT that can't exist yet. Used by the restore
+    endpoints, which must work both on a fresh install (no auth) and on a
+    running system (admin only).
+    """
+    if config_storage is None or not config_storage.is_setup_complete():
+        return None
+    return require_admin(request)
