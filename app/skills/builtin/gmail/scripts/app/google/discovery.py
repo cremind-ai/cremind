@@ -130,8 +130,13 @@ class Discovery:
             raise DiscoveryError("discovery doc has no gmail pubsubTopic")
         return topic
 
-    def calendar_webhook_url(self) -> str:
-        url = self.resource("calendar").get("webhookUrl", "")
+    def webhook_url(self, resource_id: str, provider_id: str = "google") -> str:
+        """Push-notification webhook URL for a web_hook-channel resource
+        (Calendar, Drive). Raises if the resource carries no ``webhookUrl``."""
+        url = self.resource(resource_id, provider_id).get("webhookUrl", "")
         if not url:
-            raise DiscoveryError("discovery doc has no calendar webhookUrl")
+            raise DiscoveryError(f"discovery doc has no {resource_id} webhookUrl")
         return url
+
+    def calendar_webhook_url(self) -> str:
+        return self.webhook_url("calendar")

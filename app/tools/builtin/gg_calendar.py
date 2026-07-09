@@ -65,7 +65,7 @@ def _get_calendar_service(access_token: str):
     creds = Credentials(
         token=access_token,
         token_uri="https://oauth2.googleapis.com/token",
-        scopes=["https://www.googleapis.com/auth/calendar.events", "https://www.googleapis.com/auth/calendar.modify"],
+        scopes=["https://www.googleapis.com/auth/calendar.events"],
     )
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 

@@ -14,7 +14,7 @@ _WELL_KNOWN = {
             "resources": [
                 {"resource": "gmail", "scopes": ["openid", "email", "gmail.readonly"]},
                 {"resource": "calendar", "scopes": [
-                    "openid", "email", "https://www.googleapis.com/auth/calendar",
+                    "openid", "email", "https://www.googleapis.com/auth/calendar.events",
                 ]},
             ],
         }
@@ -41,7 +41,7 @@ def _wire(monkeypatch, *, well_known=_WELL_KNOWN, creds=_CREDS):
 def test_calendar_scopes_picks_resource(monkeypatch):
     _wire(monkeypatch)
     assert gd.calendar_scopes() == [
-        "openid", "email", "https://www.googleapis.com/auth/calendar",
+        "openid", "email", "https://www.googleapis.com/auth/calendar.events",
     ]
 
 
@@ -50,7 +50,7 @@ def test_google_client_uses_creds_endpoint(monkeypatch):
     client = gd.google_client()
     assert client["client_id"] == "creds-client.apps.googleusercontent.com"
     assert client["client_secret"] == "secret-xyz"
-    assert "https://www.googleapis.com/auth/calendar" in client["scopes"]
+    assert "https://www.googleapis.com/auth/calendar.events" in client["scopes"]
 
 
 def test_env_overrides_win(monkeypatch):

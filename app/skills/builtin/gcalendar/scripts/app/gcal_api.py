@@ -1,8 +1,9 @@
 """Thin wrapper over the Google Calendar API (googleapiclient).
 
 Event plane: events.watch()/channels.stop() + incremental events.list(syncToken).
-Actions: list-calendars / list / get / create / update / delete events.
+Actions: list / get / create / update / delete events.
 All calls use the local user's own token — the relay is never involved here.
+Scoped to https://www.googleapis.com/auth/calendar.events (events only).
 """
 from __future__ import annotations
 
@@ -77,10 +78,6 @@ def incremental_changes(svc, *, calendar_id: str, sync_token: str) -> tuple[list
 
 
 # --- actions ---
-
-def list_calendars(svc) -> list[dict[str, Any]]:
-    return svc.calendarList().list().execute().get("items", []) or []
-
 
 def list_events(svc, *, calendar_id: str, time_min: str | None = None, time_max: str | None = None, query: str | None = None, max_results: int = 50) -> list[dict[str, Any]]:
     resp = (

@@ -91,7 +91,6 @@ Run `uv run scripts/__main__.py <subcommand>`. Output is JSON.
 |---|---|---|
 | `link` | — | `--no-browser` |
 | `status` | — | — |
-| `list-calendars` | — | — |
 | `list` | — | `--calendar`, `--since YYYY-MM-DD`, `--before YYYY-MM-DD`, `--query`, `--max-results` (50) |
 | `get` | `--id` | `--calendar` |
 | `create` | `--summary`, `--start`, `--end` | `--location`, `--description`, `--attendees a@b` (repeatable), `--all-day`, `--calendar` |
@@ -104,7 +103,6 @@ for all-day events. All-day `--end` is inclusive (converted to RFC 5545 exclusiv
 
 ## Examples
 ```bash
-uv run scripts/__main__.py list-calendars
 uv run scripts/__main__.py list --since 2026-06-01 --before 2026-06-30
 uv run scripts/__main__.py create --summary "Standup" --start 2026-06-10T09:00:00+07:00 --end 2026-06-10T09:30:00+07:00 --location Zoom
 uv run scripts/__main__.py create --all-day --summary "Conference" --start 2026-07-15 --end 2026-07-17

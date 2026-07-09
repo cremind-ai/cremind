@@ -1,7 +1,7 @@
 """Thin wrapper over the Gmail API (googleapiclient).
 
 Only the verbs the skill needs: profile/watch (event plane), and
-list/get/send/reply/trash/modify/history (actions + incremental sync). All calls
+list/get/send/reply/trash/history (actions + incremental sync). All calls
 use the local user's own access token — the relay is never involved here.
 """
 from __future__ import annotations
@@ -81,11 +81,6 @@ def get_message(svc, message_id: str, *, fmt: str = "full") -> dict[str, Any]:
 
 def trash_message(svc, message_id: str) -> dict[str, Any]:
     return svc.users().messages().trash(userId="me", id=message_id).execute()
-
-
-def modify_message(svc, message_id: str, *, add: list[str] | None = None, remove: list[str] | None = None) -> dict[str, Any]:
-    body = {"addLabelIds": add or [], "removeLabelIds": remove or []}
-    return svc.users().messages().modify(userId="me", id=message_id, body=body).execute()
 
 
 def _mime_to_raw(msg: MIMEText) -> str:

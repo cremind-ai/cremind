@@ -1,0 +1,8 @@
+.env
+.google_token.json
+.google_token.json.tmp
+.listener_state.json
+.listener_state.json.tmp
+.listener_heartbeat
+__pycache__/
+*.pyc
