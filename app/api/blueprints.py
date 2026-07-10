@@ -293,6 +293,74 @@ def get_blueprint_routes(
 
         return JSONResponse(session.public_dict(), status_code=201)
 
+    async def handle_import_hub(request: Request) -> JSONResponse:
+        """Stage a blueprint downloaded from the Cremind Hub into the import wizard.
+
+        Mirrors ``handle_import_upload`` (same one-import-at-a-time + replace
+        semantics) but the archive is fetched from the hub instead of uploaded.
+        """
+        unauth = require_auth(request)
+        if unauth is not None:
+            return unauth
+        busy = _busy_with_backup()
+        if busy is not None:
+            return busy
+
+        from app.blueprint.apply import abort as abort_session
+        from app.blueprint.hub import download_hub_blueprint
+        from app.blueprint.manifest import BlueprintError, BlueprintIncompatibleError
+        from app.blueprint.session import find_active_session
+
+        caller = _profile_from_request(request)
+        replace = request.query_params.get("replace") == "true"
+        existing = await asyncio.to_thread(find_active_session)
+        if existing is not None:
+            if not _owns(existing, caller):
+                return JSONResponse(
+                    {
+                        "error": "session_busy",
+                        "message": f"Another import (profile '{existing.owner}') is in progress.",
+                    },
+                    status_code=409,
+                )
+            if not replace:
+                return JSONResponse(
+                    {
+                        "error": "session_exists",
+                        "message": "An import is already in progress.",
+                        "session_id": existing.id,
+                    },
+                    status_code=409,
+                )
+            await abort_session(existing, _deps(), delete_profile=True)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid_body"}, status_code=400)
+        link = str(body.get("link") or "").strip()
+        if not link:
+            return JSONResponse({"error": "missing_link"}, status_code=400)
+
+        tmp = Path(tempfile.mkdtemp(prefix="cremind-bp-hub-"))
+        try:
+            saved = await asyncio.to_thread(download_hub_blueprint, link, tmp)
+            owner = _profile_from_request(request)
+            session = await asyncio.to_thread(_stage, saved, owner)
+        except BlueprintIncompatibleError as exc:
+            return JSONResponse({"error": "incompatible", "message": str(exc)}, status_code=422)
+        except BlueprintError as exc:
+            return JSONResponse({"error": "bad_blueprint", "message": str(exc)}, status_code=400)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[blueprint] hub import/stage failed")
+            return JSONResponse({"error": "stage_failed", "message": str(exc)}, status_code=500)
+        finally:
+            import shutil
+
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        return JSONResponse(session.public_dict(), status_code=201)
+
     async def handle_import_session(request: Request) -> JSONResponse:
         unauth = require_auth(request)
         if unauth is not None:
@@ -451,6 +519,7 @@ def get_blueprint_routes(
         Route("/api/blueprints", handle_list, methods=["GET"]),
         Route("/api/blueprints/download/{name}", handle_download, methods=["GET"]),
         Route("/api/blueprints/import/upload", handle_import_upload, methods=["POST"]),
+        Route("/api/blueprints/import/hub", handle_import_hub, methods=["POST"]),
         Route("/api/blueprints/import/session", handle_import_session, methods=["GET"]),
         Route("/api/blueprints/import/steps/{key}", handle_import_step, methods=["POST"]),
         Route("/api/blueprints/import/steps/{key}/skip", handle_import_step, methods=["POST"]),

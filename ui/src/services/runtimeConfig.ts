@@ -85,3 +85,30 @@ export async function setAgentUrl(url: string): Promise<void> {
 export function getDeploymentType(): 'local' | 'server' | 'custom' | '' {
   return window.cremind?.config?.deploymentType ?? ''
 }
+
+/**
+ * Resolve the Cremind Hub marketplace base URL (for the "Publish to Hub" flow —
+ * the authorize popup URL, postMessage origin check, and cross-origin upload).
+ *
+ * Precedence: ``VITE_CREMIND_HUB_URL`` (build-time override) → the backend's
+ * ``hub_url`` from ``/api/config/setup-status`` (authoritative, matches the
+ * downloader/CLI which read ``CREMIND_HUB_URL``) → the hardcoded default.
+ * Cached after the first resolve.
+ */
+const HUB_URL_DEFAULT = 'https://hub.cremind.io'
+let _hubUrl: string | null = null
+
+export async function getHubUrl(agentUrl: string): Promise<string> {
+  if (_hubUrl) return _hubUrl
+  const fromEnv = import.meta.env.VITE_CREMIND_HUB_URL as string | undefined
+  if (fromEnv) return (_hubUrl = fromEnv.replace(/\/$/, ''))
+  try {
+    const base = agentUrl.startsWith('http') ? agentUrl : `${window.location.origin}${agentUrl}`
+    const r = await fetch(`${base}/api/config/setup-status`)
+    const b = (await r.json()) as { hub_url?: string }
+    if (b?.hub_url) return (_hubUrl = b.hub_url.replace(/\/$/, ''))
+  } catch {
+    /* fall through to default */
+  }
+  return (_hubUrl = HUB_URL_DEFAULT)
+}
