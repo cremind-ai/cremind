@@ -28,7 +28,7 @@ def _resolve_client() -> tuple[str, str, list[str]]:
         scopes = [
             "openid",
             "email",
-            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/gmail.readonly",
             "https://www.googleapis.com/auth/gmail.send",
         ]
     return client_id, client_secret, scopes
@@ -141,12 +141,6 @@ def cmd_reply(args) -> Any:
     return {"sent": True, "id": res.get("id"), "thread_id": res.get("threadId")}
 
 
-def cmd_trash(args) -> Any:
-    svc = _svc()
-    gmail_api.trash_message(svc, args.id)
-    return {"trashed": True, "id": args.id}
-
-
 def cmd_watch(_args) -> Any:
     disc = Discovery(config.CREMIND_CONNECT_URL)
     creds, _ = auth.get_credentials(config.TOKEN_PATH)
@@ -211,10 +205,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--body")
     sp.add_argument("--body-file", dest="body_file")
     sp.set_defaults(func=cmd_reply)
-
-    sp = sub.add_parser("trash", help="move a message to trash")
-    sp.add_argument("--id", required=True)
-    sp.set_defaults(func=cmd_trash)
 
     sub.add_parser("watch", help="establish the Gmail watch once").set_defaults(func=cmd_watch)
     sub.add_parser("unwatch", help="stop the Gmail watch").set_defaults(func=cmd_unwatch)
