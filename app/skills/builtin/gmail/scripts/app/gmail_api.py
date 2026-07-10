@@ -1,7 +1,7 @@
 """Thin wrapper over the Gmail API (googleapiclient).
 
 Only the verbs the skill needs: profile/watch (event plane), and
-list/get/send/reply/trash/history (actions + incremental sync). All calls
+list/get/send/reply/history (actions + incremental sync). All calls
 use the local user's own access token — the relay is never involved here.
 """
 from __future__ import annotations
@@ -11,7 +11,7 @@ from email.mime.text import MIMEText
 from email.utils import formataddr
 from typing import Any
 
-GMAIL_SCOPE_HINT = "https://www.googleapis.com/auth/gmail.modify (+ gmail.send)"
+GMAIL_SCOPE_HINT = "https://www.googleapis.com/auth/gmail.readonly (+ gmail.send)"
 
 
 def build_service(creds):
@@ -77,10 +77,6 @@ def list_messages(svc, *, query: str | None = None, max_results: int = 10, label
 
 def get_message(svc, message_id: str, *, fmt: str = "full") -> dict[str, Any]:
     return svc.users().messages().get(userId="me", id=message_id, format=fmt).execute()
-
-
-def trash_message(svc, message_id: str) -> dict[str, Any]:
-    return svc.users().messages().trash(userId="me", id=message_id).execute()
 
 
 def _mime_to_raw(msg: MIMEText) -> str:
