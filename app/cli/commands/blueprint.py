@@ -482,22 +482,23 @@ def bp_install(
     _print_report(out.get("report") or {})
 
 
-# ── publish (to the Cremind Hub, device-code flow) ─────────────────────────────
+# ── upload (to the Cremind Hub, device-code flow) ──────────────────────────────
 
 
-@blueprint_app.command("publish")
+@blueprint_app.command("upload")
 @graceful_errors
-def bp_publish(
+def bp_upload(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Blueprint archive name on the server (see `cremind blueprint list`)."),
     display_name: Optional[str] = typer.Option(None, "--display-name", help="Human-readable name for the Hub listing."),
     no_browser: bool = typer.Option(False, "--no-browser", help="Don't open the approval URL in a browser."),
 ) -> None:
-    """Publish a blueprint to the Cremind Hub marketplace.
+    """Upload a blueprint to the Cremind Hub marketplace (stored as a draft).
 
     Downloads the archive from your local server, then runs a browser device-code
-    approval against the Hub (log in / approve there), and uploads on your behalf. No
-    Hub credentials are stored locally. Set ``CREMIND_HUB_URL`` to target a non-default hub.
+    approval against the Hub (log in / approve there), and uploads on your behalf. The
+    blueprint is stored as a DRAFT — publish it from its page on the Hub. No Hub
+    credentials are stored locally. Set ``CREMIND_HUB_URL`` to target a non-default hub.
     """
     import asyncio
     import io
@@ -524,7 +525,7 @@ def bp_publish(
         # 2. Start the Hub device-code flow.
         start = await api.publish_device_start(base, display_name or base)
         if not mode.json:
-            typer.echo("To publish, approve this request on the Cremind Hub:")
+            typer.echo("To upload, approve this request on the Cremind Hub:")
             print_kv([
                 ("verification_uri", start.verification_uri),
                 ("user_code", start.user_code),
@@ -543,12 +544,12 @@ def bp_publish(
                 token = poll.publish_token
                 break
             if poll.status == "expired":
-                raise RuntimeError("Approval expired; run `cremind blueprint publish` again.")
+                raise RuntimeError("Approval expired; run `cremind blueprint upload` again.")
             if poll.status == "denied":
-                raise RuntimeError("Publish request was denied.")
+                raise RuntimeError("Upload request was denied.")
             await asyncio.sleep(interval)
 
-        # 4. Upload with the Bearer publish token.
+        # 4. Upload with the Bearer upload token.
         result = await api.upload_to_hub(token, name, data)
         return result
 
@@ -562,7 +563,7 @@ def bp_publish(
     if mode.json:
         print_json({"ok": True, "url": url, "hub_url": full})
         return
-    typer.echo(f"Published to Cremind Hub: {full or '(see the Hub)'}")
+    typer.echo(f"Uploaded to Cremind Hub: {full or '(see the Hub)'} — publish it there when ready.")
     if full and not no_browser:
         import webbrowser
 

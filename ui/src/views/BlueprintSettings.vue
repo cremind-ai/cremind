@@ -9,7 +9,7 @@ import {
 
 import { useSettingsStore } from '../stores/settings';
 import { getHubUrl } from '../services/runtimeConfig';
-import { publishBlueprintToHub } from '../services/hubPublish';
+import { uploadBlueprintToHub } from '../services/hubPublish';
 import {
   deleteBlueprint, downloadBlueprint, exportBlueprint, getExportable,
   importBlueprintFromHub, listBlueprints,
@@ -36,9 +36,9 @@ const loading = ref(false);
 const exporting = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
 
-// Publish to Cremind Hub (Method 2 browser hand-off).
+// Upload to Cremind Hub (Method 2 browser hand-off).
 const hubUrl = ref('');
-const publishing = reactive<Record<string, boolean>>({});
+const uploading = reactive<Record<string, boolean>>({});
 
 // Import mode: from a local file, or downloaded from the Cremind Hub.
 const importMode = ref<'file' | 'hub'>('file');
@@ -155,26 +155,26 @@ async function onDelete(entry: BlueprintEntry) {
   }
 }
 
-async function onPublish(entry: BlueprintEntry) {
+async function onUpload(entry: BlueprintEntry) {
   const c = creds();
   if (!hubUrl.value) {
     ElMessage.error('Could not resolve the Cremind Hub URL.');
     return;
   }
-  publishing[entry.name] = true;
+  uploading[entry.name] = true;
   try {
-    await publishBlueprintToHub({
+    await uploadBlueprintToHub({
       agentUrl: c.url,
       authToken: c.token,
       hubUrl: hubUrl.value,
       name: entry.name,
       displayName: entry.manifest?.display_name,
     });
-    ElMessage.success('Published to Cremind Hub');
+    ElMessage.success('Uploaded to Cremind Hub — open it there to publish');
   } catch (e: any) {
-    ElMessage.error(e?.message ?? 'Publish failed');
+    ElMessage.error(e?.message ?? 'Upload failed');
   } finally {
-    publishing[entry.name] = false;
+    uploading[entry.name] = false;
   }
 }
 
@@ -306,10 +306,10 @@ onMounted(async () => {
               <ElButton size="small" @click="onDownload(row as BlueprintEntry)">Download</ElButton>
               <ElButton
                 size="small" type="primary" plain
-                :loading="publishing[(row as BlueprintEntry).name]"
-                @click="onPublish(row as BlueprintEntry)"
+                :loading="uploading[(row as BlueprintEntry).name]"
+                @click="onUpload(row as BlueprintEntry)"
               >
-                Publish to Hub
+                Upload to Hub
               </ElButton>
               <ElButton size="small" type="danger" plain @click="onDelete(row as BlueprintEntry)">Delete</ElButton>
             </template>
