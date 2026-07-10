@@ -96,18 +96,34 @@ Run `uv run scripts/__main__.py <subcommand>`. Output is JSON.
   open-ended `Sheet1!A2:B` (from row 2 down). `read` takes `--range` repeatably
   (batch read). `append`'s range is the table anchor — new rows go after the last
   populated row.
-- **Values** for `update`/`append` are a **JSON 2D array** (list of rows), passed
-  via `--values '[["Name","Score"],["Ada",99]]'`, `--values-file PATH`, or piped
-  on stdin. Default input mode is `USER_ENTERED` (formulas/dates are parsed like
-  typing in the UI); pass `--raw` to store strings verbatim.
+- **Values** for `update`/`append` are a **JSON 2D array** (list of rows). Provide
+  them one of three ways:
+  - **Prefer `--values-file PATH`** — write the JSON to a temp file and pass its
+    path. The only thing on the command line is a plain path, so this is **quote-safe
+    on every shell** and is the right default whenever the data may contain quotes,
+    apostrophes, commas, or newlines.
+  - ⚠️ **Avoid inline `--values '…'` for anything but tiny, quote-free payloads.**
+    This machine's shell is **PowerShell**, where an apostrophe inside a single-quoted
+    string (e.g. `That's`, `I'm`, `you're`) *terminates the string early* and the whole
+    command fails with `The string is missing the terminator: "` — the script never
+    runs. Inline is fine only for payloads like `"[[1,2,3]]"` with no quotes/apostrophes.
+  - **stdin** also works when neither flag is given; feed it through the exec-shell
+    `stdin` channel — **not** `echo '…' | …`, which re-introduces the same PowerShell
+    quoting hazard.
+  - Default input mode is `USER_ENTERED` (formulas/dates are parsed like typing in the
+    UI); pass `--raw` to store strings verbatim.
 
 ## Examples
 ```bash
 uv run scripts/__main__.py create --title "Q3 tracker" --tab Data --tab Summary
 uv run scripts/__main__.py info --spreadsheet https://docs.google.com/spreadsheets/d/ABC123/edit
 uv run scripts/__main__.py read --spreadsheet ABC123 --range 'Data!A1:C' --render unformatted
-echo '[["Ada",99],["Lin",87]]' | uv run scripts/__main__.py update --spreadsheet ABC123 --range 'Data!A2'
-uv run scripts/__main__.py append --spreadsheet ABC123 --range Data --values '[["Sam",73]]'
+# write values: put the JSON 2D array in a file, then pass --values-file (quote-safe on any shell).
+#   values.json contents: [["Ada","It's great!"],["Lin",87]]
+uv run scripts/__main__.py update --spreadsheet ABC123 --range 'Data!A2' --values-file values.json
+uv run scripts/__main__.py append --spreadsheet ABC123 --range Data --values-file values.json
+# inline --values is OK only for tiny, quote-free payloads:
+uv run scripts/__main__.py append --spreadsheet ABC123 --range Data --values "[[1,2,3]]"
 uv run scripts/__main__.py clear --spreadsheet ABC123 --range 'Data!A2:C'
 ```
 
@@ -118,6 +134,9 @@ uv run scripts/__main__.py clear --spreadsheet ABC123 --range 'Data!A2:C'
   (`list --mime-type application/vnd.google-apps.spreadsheet`).
 
 ## Troubleshooting
+- `The string is missing the terminator: "` (PowerShell) or `--values must be a JSON
+  2D array …` → your JSON was mangled by shell quoting before the script ran. Don't
+  inline it with `--values '…'`; write the array to a file and pass `--values-file PATH`.
 - `Account not linked` → run `uv run scripts/__main__.py link`.
 - `No GOOGLE_CLIENT_SECRET available` → cremind-connect must be reachable (it
   serves the secret), or set it in `scripts/.env` to override.

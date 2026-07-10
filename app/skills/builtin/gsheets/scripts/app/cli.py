@@ -74,7 +74,11 @@ def _read_values(args) -> list[list[Any]]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise SystemExit(f"--values must be a JSON 2D array (e.g. '[[\"a\",\"b\"],[\"c\",\"d\"]]'): {e}")
+        raise SystemExit(
+            f"--values must be a JSON 2D array (e.g. '[[\"a\",\"b\"],[\"c\",\"d\"]]'): {e}. "
+            "If the JSON contains quotes/apostrophes, write it to a file and pass "
+            "--values-file PATH instead of inline --values (shell quoting mangles it)."
+        )
     if not isinstance(data, list) or (data and not all(isinstance(row, list) for row in data)):
         raise SystemExit("--values must be a JSON 2D array (list of rows).")
     return data
