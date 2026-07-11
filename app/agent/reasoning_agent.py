@@ -494,7 +494,8 @@ class ReasoningAgent:
             profile=profile,
         )
         # Instant mode also drops the think-tool + its guidance for the turn (on
-        # top of suppressing extended thinking at the LLM call — see _loop).
+        # top of suppressing extended thinking and capping the turn at one round
+        # of tool calls at the LLM call — see _loop).
         instant = self._mode == "instant"
         self._inject_reasoning_guidance = not native_reasoning and not instant
         if native_reasoning or instant:
@@ -786,12 +787,20 @@ class ReasoningAgent:
         model can still pull more on demand via the ``search_memory`` tool, so the
         [system + tools + history] prefix stays byte-stable for prompt caching.
 
-        Plan mode prepends a short phase marker HERE (adjacent to the task, where
-        weaker models actually attend — the appended system guidance alone is too
+        Plan and instant modes prepend a short marker HERE (adjacent to the task,
+        where weaker models actually attend — appended system guidance alone is too
         easy to ignore). This is the volatile turn input, never part of the cached
-        prefix, so it can't fragment the cache; reasoning/instant return the raw
-        query byte-identically.
+        prefix, so it can't fragment the cache; reasoning returns the raw query
+        byte-identically.
         """
+        if self._mode == "instant":
+            marker = (
+                "[Instant mode: answer directly and fast. You may use AT MOST ONE "
+                "round of tool calls this turn — if you need tools, batch everything "
+                "into that single round; once the results arrive you must give your "
+                "final answer in plain text.]"
+            )
+            return f"{marker}\n\n{self._current_query}"
         if self._mode == "plan":
             if self._plan_phase == "execute":
                 marker = (
@@ -1089,6 +1098,13 @@ class ReasoningAgent:
             instruction = self._build_instruction()
             specs, dispatch = self._build_tools_and_dispatch()
 
+            # Instant mode: at most ONE round of tool calls per turn. Step 1
+            # offers tools normally; from step 2 the model must answer in text.
+            # Tools stay attached (Anthropic 400s on tool_use history without a
+            # tools param, and dropping them would bust the tools+system cache
+            # prefix) — tool_choice "none" forbids new calls instead.
+            instant_final = self._mode == "instant" and self.current_step_count >= 2
+
             messages: List["ChatCompletionMessageParam"] = [
                 {"role": "system", "content": instruction},
                 *self.history_messages,
@@ -1103,7 +1119,7 @@ class ReasoningAgent:
                 async for resp in self.llm.chat_completion_stream(
                     messages=messages,
                     tools=specs or None,
-                    tool_choice="auto" if specs else None,
+                    tool_choice=("none" if instant_final else "auto") if specs else None,
                     parallel_tool_calls=self._parallel_tool_calls,
                     temperature=self._reasoning_temperature,
                     max_tokens=self._reasoning_max_tokens,
@@ -1160,6 +1176,21 @@ class ReasoningAgent:
                 return
 
             assistant_text = "".join(assistant_parts)
+
+            if instant_final and tool_calls:
+                # A backend that ignores tool_choice="none" (e.g. some Ollama
+                # builds) can still emit calls on the forced-final step. Never
+                # run a second tool round: drop the calls and end the turn.
+                logger.warning(
+                    f"[instant] dropped {len(tool_calls)} tool call(s) on the forced-final step"
+                )
+                tool_calls = []
+                if not assistant_text:
+                    yield self._final_chunk(
+                        "I reached Instant Mode's one-round tool limit before I could "
+                        "finish. Try Reasoning mode for multi-step work."
+                    )
+                    return
 
             if not tool_calls:
                 # Plain text with no tool call == the final answer (already streamed).

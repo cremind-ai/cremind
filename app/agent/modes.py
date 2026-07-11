@@ -5,8 +5,10 @@ the turn:
 
 * ``reasoning`` — the default; today's behavior (extended thinking + the hidden
   ``reasoning`` think-tool for models that lack native reasoning).
-* ``instant`` — fastest: extended thinking is suppressed for the turn and the
-  think-tool + its guidance are dropped.
+* ``instant`` — fastest: extended thinking is suppressed for the turn, the
+  think-tool + its guidance are dropped, and the turn is capped at ONE round of
+  tool calls — after at most one batch of tool results the model is forced
+  (``tool_choice="none"``) to answer in text (≤ 2 LLM calls per turn).
 * ``plan`` — Claude-Code-style plan mode: research read-only, ask clarifying
   questions, write a plan file for approval, then execute with a live todo list.
 
