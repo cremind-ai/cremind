@@ -26,7 +26,9 @@ def test_helper_maps_tool_choice():
     assert _anthropic_tool_choice("auto", None) == {"type": "auto"}
     assert _anthropic_tool_choice(None, None) == {"type": "auto"}
     assert _anthropic_tool_choice("required", None) == {"type": "any"}
-    assert _anthropic_tool_choice("none", None) is None  # omitted
+    # "none" keeps tools attached but forbids calls (Instant mode's forced-final
+    # step relies on this — tool_use history 400s without a tools param).
+    assert _anthropic_tool_choice("none", None) == {"type": "none"}
     assert _anthropic_tool_choice(
         {"type": "function", "function": {"name": "f"}}, None
     ) == {"type": "tool", "name": "f"}
@@ -40,8 +42,8 @@ def test_helper_adds_disable_only_when_false():
     assert _anthropic_tool_choice("required", False) == {
         "type": "any", "disable_parallel_tool_use": True,
     }
-    # "none" produces no tool_choice, so there's nothing to disable.
-    assert _anthropic_tool_choice("none", False) is None
+    # "none" never carries the disable flag (documented only for auto/any/tool).
+    assert _anthropic_tool_choice("none", False) == {"type": "none"}
 
 
 # --- request-construction test via the provider -------------------------------
@@ -105,3 +107,14 @@ def test_false_sets_disable_flag():
         messages=_MSGS, tools=_TOOLS, tool_choice="auto", parallel_tool_calls=False,
     )))
     assert captured["tool_choice"] == {"type": "auto", "disable_parallel_tool_use": True}
+
+
+def test_none_keeps_tools_attached():
+    # Instant mode's forced-final step: tools must stay in the request (Anthropic
+    # 400s on tool_use history without them) while tool_choice forbids new calls.
+    p, captured = _make_provider()
+    asyncio.run(_drain(p.chat_completion(
+        messages=_MSGS, tools=_TOOLS, tool_choice="none",
+    )))
+    assert captured["tool_choice"] == {"type": "none"}
+    assert captured["tools"]  # tools remain attached

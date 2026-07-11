@@ -28,7 +28,7 @@ export const CHAT_MODES: ChatModeMeta[] = [
   {
     id: 'instant',
     label: 'Instant Mode',
-    description: 'Fastest. Skips extended thinking for the turn.',
+    description: 'Fastest. No extended thinking; at most one round of tool use.',
     icon: 'mdi:flash-outline',
     buttonClass: 'mode-instant',
   },
