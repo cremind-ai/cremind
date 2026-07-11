@@ -162,6 +162,11 @@ class Tool(ABC):
     # See ToolConfig.locked.
     locked: bool = False
 
+    # Default enabled state when no ``profile_tools`` row exists — drives both
+    # the Setup Wizard's initial toggle and the runtime fallback. Overridden per
+    # built-in from ``TOOL_CONFIG["default"]``. See ToolConfig.default.
+    default_enabled: bool = True
+
     def __init__(self) -> None:
         # Populated by ToolRegistry.register_*; safe defaults until then.
         self._tool_id: str = ""

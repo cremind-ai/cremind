@@ -140,10 +140,12 @@ def list_builtin_skill_catalog() -> list[dict]:
             "display_name": info.name,
             "description": info.description,
             "tool_type": "skill",
-            # Built-in skills default on so a fresh install is useful out of the
-            # box; the user can opt out per-skill before submitting.
-            "enabled": True,
-            "default_enabled": True,
+            # Skills start OFF in the Setup Wizard — the admin must opt each one
+            # in. (Wizard-display default only; a skill's runtime fallback stays
+            # on for its owner profile, so skills imported/created outside the
+            # wizard keep working — see ToolRegistry._default_enabled.)
+            "enabled": False,
+            "default_enabled": False,
             "configured": True,
             "config": {},
             "required_fields": {},

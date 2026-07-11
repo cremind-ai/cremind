@@ -23,9 +23,9 @@ def test_catalog_lists_every_builtin_skill_as_enableable() -> None:
     for row in rows:
         assert row["tool_type"] == "skill"
         assert row["is_builtin"] is True
-        assert row["enabled"] is True          # default on out of the box
-        assert row["default_enabled"] is True
-        assert row["toggle_locked"] is False   # the user can opt out
+        assert row["enabled"] is False         # skills start off in the wizard
+        assert row["default_enabled"] is False  # admin opts each one in
+        assert row["toggle_locked"] is False   # the user can opt in
         assert row["required_fields"] == {}    # skills render as a bare toggle
         # tool_id is the profile-independent base the seeded id is built from.
         assert row["tool_id"] == slugify(row["name"])

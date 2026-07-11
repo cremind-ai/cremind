@@ -34,7 +34,6 @@ from app.tools.builtin.base import (
     _StubErrorPayload,
     _StubErrorTool,
 )
-from app.tools.builtin.gg_calendar import Var as CalendarVar
 from app.tools.builtin.tool import BuiltInToolGroup
 from app.tools.config_manager import ToolConfigManager
 from app.tools.ids import slugify
@@ -61,7 +60,6 @@ _BUILTIN_MODULE_NAMES: tuple[str, ...] = (
     "image_understanding",
     "system_file",
     "weather",
-    "gg_calendar",
     "gg_places",
     "browser",
     "sleep",
@@ -80,6 +78,15 @@ _BUILTIN_MODULE_NAMES: tuple[str, ...] = (
     "write_plan",
     "update_todos",
 )
+
+
+# Variable-scope keys an OAuth-enabled built-in stores its Google client
+# credentials under. (Formerly imported from the now-removed ``gg_calendar``
+# module's ``Var``; kept here so the generic OAuth scaffolding in
+# ``register_builtin_tools`` / ``refresh_builtin_tool_oauth`` still resolves
+# credentials for any OAuth-enabled built-in that declares ``TOOL_CONFIG["oauth"]``.)
+_OAUTH_CLIENT_ID_VAR = "GOOGLE_CLIENT_ID"
+_OAUTH_CLIENT_SECRET_VAR = "GOOGLE_CLIENT_SECRET"
 
 
 def list_builtin_tool_catalog() -> list[dict]:
@@ -132,11 +139,12 @@ def list_builtin_tool_catalog() -> list[dict]:
             "display_name": server_name,
             "description": tool_info.get("description") or server_name,
             "tool_type": "builtin",
-            # Default-enabled in the wizard catalog so new installs are
-            # useful out of the box. Tools with unfilled required vars
-            # still surface a "Needs Config" tag in the UI, and the user
-            # can opt out per-tool before submitting.
-            "enabled": True,
+            # Wizard default toggle: enabled unless the tool declares
+            # ``TOOL_CONFIG["default"] = False`` (see ToolConfig.default). Tools
+            # with unfilled required vars still surface a "Needs Config" tag in
+            # the UI, and the user can opt out/in per-tool before submitting.
+            "enabled": tool_info.get("default", True),
+            "default_enabled": tool_info.get("default", True),
             "configured": configured,
             "config": {},
             "required_fields": required_fields,
@@ -176,8 +184,8 @@ def feature_keys_for_tool_ids(tool_ids: Iterable[str]) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     # Build a slug -> module-name index once so callers can pass either
-    # the registry slug (``"google_calendar"``) or the module stem
-    # (``"gg_calendar"``). The Setup Wizard payload uses slugs.
+    # the registry slug (``"google_places"``) or the module stem
+    # (``"gg_places"``). The Setup Wizard payload uses slugs.
     slug_to_module: dict[str, str] = {}
     for module_name in _BUILTIN_MODULE_NAMES:
         try:
@@ -427,9 +435,9 @@ async def register_builtin_tools(
             populated = dict(oauth_config)
             populated.setdefault("client_id", "")
             populated.setdefault("client_secret", "")
-            populated["client_id"] = vars_.get(CalendarVar.CLIENT_ID, populated["client_id"])
+            populated["client_id"] = vars_.get(_OAUTH_CLIENT_ID_VAR, populated["client_id"])
             populated["client_secret"] = vars_.get(
-                CalendarVar.CLIENT_SECRET, populated["client_secret"],
+                _OAUTH_CLIENT_SECRET_VAR, populated["client_secret"],
             )
             oauth_provider = _build_oauth_provider(
                 oauth_config=populated, server_name=server_name,
@@ -468,6 +476,9 @@ async def register_builtin_tools(
         # always exposes it to the reasoning agent — see ToolConfig.locked.
         if tool_info.get("locked", False):
             group.locked = True
+        # ``default`` sets the wizard/runtime default enabled state (default
+        # True; declare False to start the tool disabled) — see ToolConfig.default.
+        group.default_enabled = bool(tool_info.get("default", True))
         registry.register_builtin(group, source=module_name)
 
 
@@ -491,9 +502,9 @@ def refresh_builtin_tool_oauth(
     populated = dict(oauth_config)
     populated.setdefault("client_id", "")
     populated.setdefault("client_secret", "")
-    populated["client_id"] = vars_.get(CalendarVar.CLIENT_ID, populated["client_id"])
+    populated["client_id"] = vars_.get(_OAUTH_CLIENT_ID_VAR, populated["client_id"])
     populated["client_secret"] = vars_.get(
-        CalendarVar.CLIENT_SECRET, populated["client_secret"],
+        _OAUTH_CLIENT_SECRET_VAR, populated["client_secret"],
     )
 
     factory = _build_oauth_provider(

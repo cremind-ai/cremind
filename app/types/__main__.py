@@ -189,6 +189,12 @@ class ToolConfig(TypedDict, total=False):
     # the UI renders the toggle disabled with a lock icon (surfaced to the
     # frontend as the row field ``toggle_locked``).
     locked: bool
+    # When False, the tool starts DISABLED in the Setup Wizard's tools step
+    # (its toggle is off by default; the user opts in). Defaults to True, so an
+    # undeclared tool starts enabled. Built-in tools only. NOTE: this is a
+    # top-level flag distinct from ``RequiredConfigField.default`` (the default
+    # *value* of a required env var) — see that TypedDict above.
+    default: bool
 
 
 class ChatCompletionStreamResponseType(TypedDict):
