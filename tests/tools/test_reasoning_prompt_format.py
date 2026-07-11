@@ -62,12 +62,12 @@ class _FakeLeafTool(Tool):
         )]
 
     async def execute(self, *, query, context_id, profile, arguments,
-                      variables, llm_params):  # pragma: no cover - unused
+                      variables):  # pragma: no cover - unused
         if False:
             yield None  # type: ignore[unreachable]
 
     async def execute_leaf(self, *, leaf_name, args, context_id, profile,
-                           arguments, variables, llm_params):
+                           arguments, variables):
         self.calls.append({"leaf": leaf_name, "args": args})
         total = (args.get("a") or 0) + (args.get("b") or 0)
         yield ToolResultEvent(observation_text=f"result={total}")
@@ -200,7 +200,7 @@ class _TwoLeafTool(_FakeLeafTool):
         return out
 
     async def execute_leaf(self, *, leaf_name, args, context_id, profile,
-                           arguments, variables, llm_params):
+                           arguments, variables):
         self.calls.append({"leaf": leaf_name, "args": args})
         a, b = (args.get("a") or 0), (args.get("b") or 0)
         total = a + b if leaf_name == "add" else a * b
@@ -283,7 +283,7 @@ class _FakeWatcherTool(_FakeLeafTool):
         )]
 
     async def execute_leaf(self, *, leaf_name, args, context_id, profile,
-                           arguments, variables, llm_params):
+                           arguments, variables):
         self.calls.append({"leaf": leaf_name, "args": args})
         yield ToolResultEvent(observation_text="WATCHER REGISTERED")
 
@@ -376,7 +376,7 @@ class _FakeSchedulerTool(_FakeLeafTool):
         )]
 
     async def execute_leaf(self, *, leaf_name, args, context_id, profile,
-                           arguments, variables, llm_params):
+                           arguments, variables):
         self.calls.append({"leaf": leaf_name, "args": args})
         yield ToolResultEvent(observation_text="SCHEDULE CREATED")
 

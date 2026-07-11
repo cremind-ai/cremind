@@ -29,6 +29,7 @@ const COMPONENT_LABELS: Record<string, string> = {
 const exportable = ref<ExportableResponse | null>(null);
 const selected = ref<Record<string, boolean>>({});
 const selectedSkills = ref<Record<string, boolean>>({});
+const selectedTools = ref<Record<string, boolean>>({});
 const name = ref('');
 const description = ref('');
 const archives = ref<BlueprintEntry[]>([]);
@@ -50,6 +51,7 @@ const availableComponents = computed(() =>
 );
 
 const skillItems = computed(() => exportable.value?.components?.skills?.items ?? []);
+const toolItems = computed(() => exportable.value?.components?.tools?.items ?? []);
 
 function creds() {
   return { url: settings.agentUrl, token: settings.authToken };
@@ -65,7 +67,7 @@ function componentDetail(key: string): string {
     return `${n.schedule ?? 0} schedule, ${n.file_watcher ?? 0} watcher, ${n.skill_event ?? 0} skill event`;
   }
   if (key === 'llm') return `provider: ${c.summary?.default_provider ?? '-'}`;
-  if (key === 'tools') return `${c.count ?? 0} tool(s)`;
+  if (key === 'tools') return (c.items ?? []).map((i: any) => i.name).join(', ');
   if (key === 'listeners') return `${(c.items ?? []).length} listener(s)`;
   if (key === 'persona') return `agent: ${c.summary?.agent_name ?? '-'}`;
   return '';
@@ -81,6 +83,9 @@ async function loadExportable() {
   const skillSel: Record<string, boolean> = {};
   for (const s of skillItems.value) skillSel[s.slug] = true;
   selectedSkills.value = skillSel;
+  const toolSel: Record<string, boolean> = {};
+  for (const t of toolItems.value) toolSel[t.tool_id] = true;
+  selectedTools.value = toolSel;
 }
 
 async function loadArchives() {
@@ -114,11 +119,13 @@ async function doExport() {
     return;
   }
   const skills = skillItems.value.filter((s: any) => selectedSkills.value[s.slug]).map((s: any) => s.slug);
+  const tools = toolItems.value.filter((t: any) => selectedTools.value[t.tool_id]).map((t: any) => t.tool_id);
   exporting.value = true;
   try {
     const res = await exportBlueprint(c.url, c.token, {
       components,
       skills: components.includes('skills') ? skills : undefined,
+      tools: components.includes('tools') ? tools : undefined,
       name: name.value || undefined,
       display_name: name.value || undefined,
       description: description.value || undefined,
@@ -277,6 +284,20 @@ onMounted(async () => {
                   </span>
                 </ElCheckbox>
               </div>
+              <div v-if="key === 'tools' && selected['tools']" class="bp-subtools">
+                <div v-for="t in toolItems" :key="t.tool_id" class="bp-subtool">
+                  <ElCheckbox v-model="selectedTools[t.tool_id]">
+                    {{ t.name }}
+                    <span class="bp-kind">{{ t.kind === 'a2a' ? 'A2A' : t.kind === 'mcp' ? 'MCP' : 'built-in' }}</span>
+                    <span class="bp-hint">
+                      <template v-if="t.settings_count"> · {{ t.settings_count }} setting(s)</template>
+                      <template v-if="(t.secret_variables || []).length"> · needs: {{ t.secret_variables.join(', ') }}</template>
+                      <template v-if="t.disabled_leaves"> · {{ t.disabled_leaves }} sub-tool(s) disabled</template>
+                    </span>
+                  </ElCheckbox>
+                  <div v-if="t.description && t.description !== t.name" class="bp-hint bp-tool-desc">{{ t.description }}</div>
+                </div>
+              </div>
             </div>
           </div>
           <div class="bp-meta">
@@ -373,6 +394,10 @@ onMounted(async () => {
 .bp-label { font-weight: 600; }
 .bp-detail { color: var(--text-secondary); font-size: 0.8rem; margin-left: 24px; }
 .bp-subskills { display: flex; flex-direction: column; gap: 2px; margin: 4px 0 4px 24px; }
+.bp-subtools { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 4px 24px; }
+.bp-subtool { display: flex; flex-direction: column; gap: 0; }
+.bp-kind { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 8px; font-size: 0.65rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; color: var(--text-secondary); background: var(--el-fill-color-light, rgba(128, 128, 128, 0.15)); vertical-align: middle; }
+.bp-tool-desc { margin: 0 0 0 24px; line-height: 1.4; white-space: normal; }
 .bp-hint { color: var(--text-tertiary); font-size: 0.75rem; }
 .bp-meta { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
 .bp-warn { color: var(--el-color-warning); font-size: 0.78rem; margin: 0 0 12px 0; }

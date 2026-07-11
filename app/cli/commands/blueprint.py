@@ -83,7 +83,8 @@ def _exportable_detail(key: str, c: dict) -> str:
         s = c.get("summary") or {}
         return f"provider={s.get('default_provider') or '-'}"
     if key == "tools":
-        return f"{c.get('count', 0)} tool(s)"
+        items = c.get("items") or []
+        return ", ".join(i.get("name", "?") for i in items) or "-"
     if key == "listeners":
         return f"{len(c.get('items') or [])} listener(s)"
     return ""
@@ -98,6 +99,7 @@ def bp_export(
     ),
     all_: bool = typer.Option(False, "--all", help="Include every available component."),
     skills: Optional[str] = typer.Option(None, "--skills", help="Comma-separated skill slugs to bundle (default: all)."),
+    tools: Optional[str] = typer.Option(None, "--tools", help="Comma-separated tool ids to include (default: all)."),
     name: Optional[str] = typer.Option(None, "--name", help="Blueprint name (filename slug)."),
     display_name: Optional[str] = typer.Option(None, "--display-name", help="Human-readable name."),
     description: Optional[str] = typer.Option(None, "--description", help="One-line description."),
@@ -130,6 +132,8 @@ def bp_export(
             }
             if skills:
                 body["skills"] = [s.strip() for s in skills.split(",") if s.strip()]
+            if tools:
+                body["tools"] = [t.strip() for t in tools.split(",") if t.strip()]
             result = await api.export_blueprint(client, body)
             file_name = (result.get("file") or {}).get("name")
             saved = None

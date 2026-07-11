@@ -61,6 +61,7 @@ cremind blueprint exportable                 # show what can be exported
 cremind blueprint export --all               # export every available component
 cremind blueprint export --components persona,llm,skills --name cs-agent -o ./cs-agent.cremind-blueprint
 cremind blueprint export --skills imap-email,my-skill   # bundle only these skills
+cremind blueprint export --tools web_search,gmail       # include only these tools
 ```
 
 Options:
@@ -70,6 +71,7 @@ Options:
 | `--all` | Include every available component (default if `--components` omitted). |
 | `--components a,b,c` | Only these component keys (`persona,tools,llm,settings,skills,events,listeners`). |
 | `--skills a,b` | Bundle only these skill slugs (default: all customized skills). |
+| `--tools a,b` | Include only these tool ids (default: all customized tools). |
 | `--name` / `--display-name` / `--description` | Blueprint metadata. |
 | `-o, --out PATH` | Also download the archive to a local file. |
 

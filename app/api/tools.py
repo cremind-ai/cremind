@@ -525,9 +525,6 @@ def get_tool_routes(state: BootedState) -> list[Route]:
 # ── helpers ────────────────────────────────────────────────────────────────
 
 
-_META_KEYS: frozenset[str] = frozenset({"system_prompt", "description"})
-
-
 def _long_running_app_for_tool(tool) -> dict | None:
     """Return a skill's declared ``long_running_app`` metadata, or None.
 

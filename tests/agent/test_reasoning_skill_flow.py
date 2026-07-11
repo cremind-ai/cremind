@@ -67,7 +67,7 @@ class _FakeSkillTool(Tool):
         return self._info
 
     async def execute(self, *, query, context_id, profile, arguments,
-                      variables, llm_params):  # pragma: no cover - unused
+                      variables):  # pragma: no cover - unused
         if False:
             yield None  # type: ignore[unreachable]
 

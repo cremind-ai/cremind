@@ -17,7 +17,7 @@ from sqlalchemy import text
 
 import app.storage.models  # noqa: F401 — registers tables on Base.metadata
 from app.databases.sqlite import SqliteDatabaseProvider
-from app.storage.tool_storage import SCOPE_ARG, SCOPE_LLM, SCOPE_VARIABLE, ToolStorage
+from app.storage.tool_storage import SCOPE_ARG, SCOPE_META, SCOPE_VARIABLE, ToolStorage
 
 
 def _make_store(tmp_path: Path) -> ToolStorage:
@@ -59,8 +59,8 @@ def test_delete_all_configs_removes_every_scope(tmp_path: Path) -> None:
     store.set_config(profile="admin", tool_id=tid, scope=SCOPE_VARIABLE,
                      key="GMAIL_USER", value="me@example.com")
     store.set_config(profile="admin", tool_id=tid, scope=SCOPE_ARG, key="foo", value="bar")
-    store.set_config(profile="admin", tool_id=tid, scope=SCOPE_LLM,
-                     key="reasoning_effort", value="low")
+    store.set_config(profile="admin", tool_id=tid, scope=SCOPE_META,
+                     key="description", value="custom")
     # A different skill's config must survive.
     store.set_config(profile="admin", tool_id=other, scope=SCOPE_VARIABLE, key="K", value="v")
 

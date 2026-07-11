@@ -14,7 +14,6 @@ import platform
 import re
 import shutil
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.tools.builtin.base import (
@@ -2265,21 +2264,3 @@ TOOL_CONFIG: ToolConfig = {
         },
     },
 }
-
-
-def _make_server_instructions(_data_dir: str) -> str:
-    return (
-        "File management inside the conversation's "
-        "current working directory; a relative `path` is relative to that "
-        "directory and defaults to '.' when omitted, while an absolute path is "
-        "used as-is — pass an absolute path (e.g. an attached/uploaded file) "
-        "EXACTLY as given, never relativized. Find files by name "
-        "with search_files and search file contents by regex with grep_files. "
-        "Edit part of an existing file with overwrite_file (a unified diff); "
-        "create or replace a whole file with write_file. Move or rename a file "
-        "(any type, including binary) with move_file and duplicate one with "
-        "copy_file. "
-        "Also registers "
-        "file/folder watchers that notify you or re-run an action whenever "
-        "files are created, modified, deleted, or moved on disk."
-    )

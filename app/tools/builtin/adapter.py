@@ -14,9 +14,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-import os
 import uuid
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Dict, List, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from a2a.types import (
     AgentCapabilities,
@@ -36,14 +35,7 @@ from a2a.types import (
     TextPart,
 )
 
-# OpenAI types are used only in PEP 563-stringified annotations; keep
-# them under TYPE_CHECKING so the built-in tool adapter loads without
-# the ``llm-openai`` extras group installed.
-if TYPE_CHECKING:
-    from openai.types.chat import ChatCompletionMessageParam
-
 from app.config.settings import BaseConfig, get_user_working_directory
-from app.constants import ChatCompletionTypeEnum
 from app.lib.llm.base import LLMProvider
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
 from app.tools.mcp.mcp_auth import MCPOAuthClient
@@ -65,10 +57,8 @@ class BuiltInToolAdapter:
         mcp_auth: Optional[MCPOAuthClient] = None,
         description: Optional[str] = None,
         name: Optional[str] = None,
-        system_prompt: Optional[str] = None,
         tool_instructions: Optional[str] = None,
         prepare_tools: Optional[Callable[..., List[Dict[str, Any]]]] = None,
-        full_reasoning: bool = False,
     ):
         self._tools = tools
         self._tools_by_name: Dict[str, BuiltInTool] = {t.name: t for t in tools}
@@ -77,10 +67,8 @@ class BuiltInToolAdapter:
         self._description = description
         self._name = name or ""
         self._context_storage: Dict[str, str] = {}
-        self._system_prompt = system_prompt
         self._server_instructions = tool_instructions or ""
         self._prepare_tools = prepare_tools
-        self._full_reasoning = full_reasoning
 
     @property
     def name(self) -> str:
@@ -130,16 +118,10 @@ class BuiltInToolAdapter:
             skills=self.get_skills(),
         )
 
-    def get_context_storage(self) -> Dict[str, str]:
-        """Get the context_id -> task_id mapping."""
-        return self._context_storage
-
     def update_config(
         self,
         llm: Optional[LLMProvider] = None,
-        system_prompt: Optional[str] = None,
         description: Optional[str] = None,
-        full_reasoning: Optional[bool] = None,
     ) -> None:
         """Update adapter configuration in-place.
 
@@ -147,12 +129,8 @@ class BuiltInToolAdapter:
         """
         if llm is not None:
             self._llm = llm
-        if system_prompt is not None:
-            self._system_prompt = system_prompt if system_prompt else None
         if description is not None:
             self._description = description if description else None
-        if full_reasoning is not None:
-            self._full_reasoning = full_reasoning
 
     def build_specs(
         self,

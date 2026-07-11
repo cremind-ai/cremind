@@ -63,30 +63,6 @@ async def set_tool_enabled(
     )
 
 
-async def set_tool_llm_params(
-    client: Client,
-    tool_id: str,
-    params: dict[str, Any],
-) -> None:
-    """Partial update — only keys present in `params` are changed."""
-    await client.put_json(
-        f"/api/tools/{quote(tool_id, safe='')}/llm",
-        {"llm": params},
-    )
-
-
-async def reset_tool_llm_params(
-    client: Client,
-    tool_id: str,
-    keys: list[str],
-) -> None:
-    """DELETE with body — drop the listed override keys."""
-    await client.delete(
-        f"/api/tools/{quote(tool_id, safe='')}/llm",
-        body={"keys": keys},
-    )
-
-
 async def list_tool_leaves(client: Client, tool_id: str) -> dict[str, Any]:
     """Return ``{supports_leaf_toggle, disconnected, leaves: [...]}``."""
     out = await client.get_json(f"/api/tools/{quote(tool_id, safe='')}/leaves")

@@ -27,13 +27,12 @@ from app.utils.logger import logger
 
 SCOPE_ARG = "arg"
 SCOPE_VARIABLE = "variable"
-SCOPE_LLM = "llm"
 SCOPE_META = "meta"
 # ``leaf`` stores per-profile enable/disable for a built-in/MCP group's
 # individual sub-tools ("leaves"). Opt-out model: a row exists only for a
 # DISABLED leaf (key=leaf_name, value="false"); absence == enabled.
 SCOPE_LEAF = "leaf"
-VALID_SCOPES = {SCOPE_ARG, SCOPE_VARIABLE, SCOPE_LLM, SCOPE_META, SCOPE_LEAF}
+VALID_SCOPES = {SCOPE_ARG, SCOPE_VARIABLE, SCOPE_META, SCOPE_LEAF}
 
 
 class ToolStorage(SyncStorageBase):

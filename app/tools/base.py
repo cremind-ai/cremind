@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from a2a.types import AgentCard, Part
+from a2a.types import Part
 
 
 class ToolType(str, Enum):
@@ -87,11 +87,6 @@ class ToolSkill:
     name: str
     description: str
     examples: List[str] = field(default_factory=list)
-    # Optional JSON-schema for the sub-tool's arguments. Native function
-    # calling exposes the leaf's real JSON-Schema directly (see
-    # ``leaf_function_specs``); this field is retained for the few callers
-    # that still introspect a tool's sub-skills.
-    parameters: Optional[Dict[str, Any]] = None
 
 
 # ── Event stream emitted by Tool.execute() ─────────────────────────────────
@@ -104,9 +99,7 @@ class ToolEvent:
 
 @dataclass
 class ToolThinkingEvent(ToolEvent):
-    """Surface a model's chain of thought / tool-call to the UI."""
-    text: str
-    model_label: Optional[str] = None
+    """Marker event emitted while a tool is working (informational, no payload)."""
 
 
 @dataclass
@@ -230,7 +223,6 @@ class Tool(ABC):
         profile: str,
         arguments: Dict[str, Any],
         variables: Dict[str, str],
-        llm_params: Dict[str, Any],
     ) -> AsyncGenerator["ToolEvent", None]:
         """Execute one named leaf with model-chosen ``args`` and yield events.
 
@@ -240,18 +232,9 @@ class Tool(ABC):
         """
         async for ev in self.execute(
             query=leaf_name, context_id=context_id, profile=profile,
-            arguments={**arguments, **args}, variables=variables, llm_params=llm_params,
+            arguments={**arguments, **args}, variables=variables,
         ):
             yield ev
-
-    # ── prompt & UI helpers ─────────────────────────────────────────────
-
-    def get_card(self) -> Optional[AgentCard]:
-        """Return an :class:`AgentCard` for the UI, or ``None``.
-
-        Intrinsic tools usually return ``None`` (they're not user-managed).
-        """
-        return None
 
     # ── runtime LLM refresh ────────────────────────────────────────────
 
@@ -274,14 +257,12 @@ class Tool(ABC):
         profile: str,
         arguments: Dict[str, Any],
         variables: Dict[str, str],
-        llm_params: Dict[str, Any],
     ) -> AsyncGenerator[ToolEvent, None]:
         """Execute the tool and yield :class:`ToolEvent`(s).
 
         ``arguments`` are the LLM-chosen JSON-Schema args (filtered to the
         tool's schema). ``variables`` are environment-style values from the
-        ``variable`` config scope (secrets/keys). ``llm_params`` are
-        configuration for the child LLM (provider/model/full_reasoning).
+        ``variable`` config scope (secrets/keys).
         """
         if False:  # pragma: no cover -- type stub
             yield  # type: ignore[unreachable]

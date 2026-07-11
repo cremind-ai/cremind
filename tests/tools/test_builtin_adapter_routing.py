@@ -98,7 +98,7 @@ def test_group_execute_leaf_runs_tool_and_returns_result() -> None:
     group = _group(tool)
     events = _collect(group.execute_leaf(
         leaf_name="overwrite_file", args={"path": "x", "diff": "d"},
-        context_id="c", profile="p", arguments={}, variables={}, llm_params={},
+        context_id="c", profile="p", arguments={}, variables={},
     ))
     assert tool.calls and tool.calls[0]["path"] == "x"
     results = [e for e in events if isinstance(e, ToolResultEvent)]

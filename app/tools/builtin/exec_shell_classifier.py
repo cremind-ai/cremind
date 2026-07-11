@@ -16,24 +16,6 @@ Classification happens by observing what the process *does*:
 from __future__ import annotations
 
 import re
-from enum import Enum
-
-
-# ---------------------------------------------------------------------------
-# Public data structures
-# ---------------------------------------------------------------------------
-
-class CommandCategory(str, Enum):
-    """Process behaviour category for a shell command."""
-
-    FIRE_AND_FORGET = "fire_and_forget"
-    LONG_RUNNING = "long_running"
-    TUI_FULLSCREEN = "tui_fullscreen"
-
-
-UNSUPPORTED_CATEGORIES: frozenset[CommandCategory] = frozenset({
-    CommandCategory.TUI_FULLSCREEN,
-})
 
 
 # ---------------------------------------------------------------------------

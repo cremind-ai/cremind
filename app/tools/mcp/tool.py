@@ -8,7 +8,6 @@ call; this is the "low" model group (or per-server override).
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import urllib.parse
@@ -16,7 +15,6 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from a2a.types import AgentCard
 
-from app.config.settings import BaseConfig
 from app.lib.llm.base import LLMProvider
 from app.tools.base import (
     FunctionSpec,
@@ -48,19 +46,15 @@ class MCPServerTool(Tool):
         url: str,
         owner_profile: Optional[str],
         adapter: MCPAgentAdapter,
-        transport_type: str = "http",
         connection_error: Optional[str] = None,
         extra: Optional[dict] = None,
-        llm_factory: Optional[Callable[[str], LLMProvider]] = None,
     ):
         super().__init__()
         self._url = url
         self._owner_profile = owner_profile
         self._adapter = adapter
-        self._transport_type = transport_type
         self._connection_error = connection_error
         self._extra = extra or {}
-        self._llm_factory = llm_factory
 
     # ── identity ────────────────────────────────────────────────────────
 
@@ -71,10 +65,6 @@ class MCPServerTool(Tool):
     @property
     def owner_profile(self) -> Optional[str]:
         return self._owner_profile
-
-    @property
-    def transport_type(self) -> str:
-        return self._transport_type
 
     @property
     def name(self) -> str:
@@ -97,18 +87,11 @@ class MCPServerTool(Tool):
         return self._connection_error is not None
 
     @property
-    def extra(self) -> dict:
-        return self._extra
-
-    @property
     def skills(self) -> List[ToolSkill]:
         return [
             ToolSkill(id=s.id, name=s.name, description=s.description)
             for s in self._adapter.get_skills()
         ]
-
-    def get_card(self) -> AgentCard:
-        return self._adapter.create_synthetic_card()
 
     # ── native function calling ─────────────────────────────────────────
 
@@ -123,9 +106,7 @@ class MCPServerTool(Tool):
         """Expose each MCP tool as a native function, namespaced ``<tool_id>__<leaf>``."""
         if self._connection_error:
             return []
-        specs = self._adapter.build_specs(
-            query=query, arguments=arguments, context_id=context_id, profile=profile,
-        )
+        specs = self._adapter.build_specs()
         out: List[FunctionSpec] = []
         for s in specs:
             fn = s.get("function") or {}
@@ -146,7 +127,6 @@ class MCPServerTool(Tool):
         profile: str,
         arguments: Dict[str, Any],
         variables: Dict[str, str],
-        llm_params: Dict[str, Any],
     ) -> AsyncGenerator[ToolEvent, None]:
         if self._connection_error:
             yield ToolErrorEvent(
@@ -156,20 +136,13 @@ class MCPServerTool(Tool):
                 )
             )
             return
-        self.refresh_llm(profile)
-        if "full_reasoning" in llm_params:
-            self._adapter.update_config(full_reasoning=bool(llm_params["full_reasoning"]))
 
-        yield ToolThinkingEvent(
-            text=f"[{self.name}] {leaf_name}",
-            model_label=getattr(self._adapter._llm, "model_label", None) if self._adapter._llm else None,
-        )
+        yield ToolThinkingEvent()
 
         events: list = []
-        metadata = {"arguments": arguments} if arguments else None
         try:
             async for ev in self._adapter.request(
-                query=leaf_name, context_id=context_id, metadata=metadata, profile=profile,
+                context_id=context_id, profile=profile,
                 decided_calls=[{"name": leaf_name, "arguments": args}],
             ):
                 events.append(ev)
@@ -186,37 +159,15 @@ class MCPServerTool(Tool):
             token_usage=token_usage or {},
         )
 
-    # ── runtime LLM refresh ────────────────────────────────────────────
-
-    def refresh_llm(self, profile: str) -> None:
-        """Re-create the child LLM from current config (called before model-label read)."""
-        if self._llm_factory:
-            try:
-                llm = self._llm_factory(profile)
-                self._adapter.update_config(llm=llm)
-            except Exception:  # noqa: BLE001
-                pass  # keep current LLM; adapter handles the "no LLM" case
-
     # ── runtime updates ─────────────────────────────────────────────────
 
     def update_runtime_config(
         self,
         *,
         llm: Optional[LLMProvider] = None,
-        system_prompt: Optional[str] = None,
         description: Optional[str] = None,
-        full_reasoning: Optional[bool] = None,
     ) -> None:
-        self._adapter.update_config(
-            llm=llm, system_prompt=system_prompt,
-            description=description, full_reasoning=full_reasoning,
-        )
-
-    def mark_connection_error(self, error: str) -> None:
-        self._connection_error = error
-
-    def clear_connection_error(self) -> None:
-        self._connection_error = None
+        self._adapter.update_config(llm=llm, description=description)
 
     # ── execution ───────────────────────────────────────────────────────
 
@@ -228,7 +179,6 @@ class MCPServerTool(Tool):
         profile: str,
         arguments: Dict[str, Any],
         variables: Dict[str, str],
-        llm_params: Dict[str, Any],
     ) -> AsyncGenerator[ToolEvent, None]:
         if self._connection_error:
             yield ToolErrorEvent(
@@ -239,25 +189,13 @@ class MCPServerTool(Tool):
             )
             return
 
-        # Refresh the child LLM so config changes take effect without restart.
-        # (Also called by the reasoning agent before reading Model_Label.)
-        self.refresh_llm(profile)
-
-        # Apply per-call llm_params (e.g., full_reasoning override)
-        if "full_reasoning" in llm_params:
-            self._adapter.update_config(full_reasoning=bool(llm_params["full_reasoning"]))
-
-        yield ToolThinkingEvent(
-            text=f"[{self.name}] {query}",
-            model_label=getattr(self._adapter._llm, "model_label", None) if self._adapter._llm else None,
-        )
+        yield ToolThinkingEvent()
 
         events: list = []
-        metadata = {"arguments": arguments} if arguments else None
 
         try:
             async for ev in self._adapter.request(
-                query=query, context_id=context_id, metadata=metadata, profile=profile,
+                context_id=context_id, profile=profile,
             ):
                 events.append(ev)
                 yield ToolStatusEvent(raw=ev)
@@ -307,13 +245,10 @@ async def build_http_mcp_tool(
     url: str,
     llm: LLMProvider,
     owner_profile: Optional[str],
-    system_prompt: Optional[str] = None,
     description: Optional[str] = None,
     stored_server_name: Optional[str] = None,
-    full_reasoning: bool = False,
     on_first_connect: Optional[Callable[[MCPAgentAdapter], None]] = None,
     extra: Optional[dict] = None,
-    llm_factory: Optional[Callable[[str], LLMProvider]] = None,
 ) -> MCPServerTool:
     """Connect to an HTTP MCP server (handling 401/no-auth) and return an MCPServerTool."""
     auth_base_url = url.rsplit("/", 1)[0]
@@ -340,12 +275,10 @@ async def build_http_mcp_tool(
             description=description or f"MCP Server at {url} (authentication required)",
             name=server_name,
             on_first_connect=on_first_connect,
-            system_prompt=system_prompt,
-            full_reasoning=full_reasoning,
         )
         return MCPServerTool(
             url=url, owner_profile=owner_profile, adapter=adapter,
-            transport_type="http", extra=extra, llm_factory=llm_factory,
+            extra=extra,
         )
 
     if status == 0:
@@ -365,12 +298,10 @@ async def build_http_mcp_tool(
         mcp_auth=mcp_auth if has_auth else None,
         description=description,
         name=server_name,
-        system_prompt=system_prompt,
-        full_reasoning=full_reasoning,
     )
     return MCPServerTool(
         url=url, owner_profile=owner_profile, adapter=adapter,
-        transport_type="http", extra=extra, llm_factory=llm_factory,
+        transport_type="http", extra=extra,
     )
 
 
@@ -381,11 +312,8 @@ async def build_stdio_mcp_tool(
     env: Optional[Dict[str, str]],
     llm: LLMProvider,
     owner_profile: Optional[str],
-    system_prompt: Optional[str] = None,
     description: Optional[str] = None,
-    full_reasoning: bool = False,
     extra: Optional[dict] = None,
-    llm_factory: Optional[Callable[[str], LLMProvider]] = None,
 ) -> MCPServerTool:
     """Spawn a stdio MCP server subprocess and return an MCPServerTool."""
     connection = MCPConnection()
@@ -402,16 +330,12 @@ async def build_stdio_mcp_tool(
         mcp_auth=None,
         description=description,
         name=server_name,
-        system_prompt=system_prompt,
-        full_reasoning=full_reasoning,
     )
     return MCPServerTool(
         url=make_stdio_url(command, args),
         owner_profile=owner_profile,
         adapter=adapter,
-        transport_type="stdio",
         extra=extra,
-        llm_factory=llm_factory,
     )
 
 
@@ -422,7 +346,6 @@ def build_mcp_stub(
     owner_profile: Optional[str],
     error: Optional[str] = None,
     description: Optional[str] = None,
-    transport_type: str = "http",
     extra: Optional[dict] = None,
 ) -> MCPServerTool:
     """Build a stub MCPServerTool (disabled or connection-failed)."""
@@ -467,7 +390,7 @@ def build_mcp_stub(
     stub = _StubAdapter()
     tool = MCPServerTool(
         url=url, owner_profile=owner_profile, adapter=stub,  # type: ignore[arg-type]
-        transport_type=transport_type, connection_error=error,
+        connection_error=error,
         extra=extra,
     )
     return tool
