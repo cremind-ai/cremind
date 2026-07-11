@@ -14,10 +14,9 @@ import {
   listAgents, addAgent, removeAgent, updateAgentConfig,
   listTools, updateToolConfig, setToolEnabled,
   listToolLeaves, setToolLeaves,
-  listLLMProviders, getProviderModels,
   streamFeaturesInstall, FeatureNotInstalledError,
   deleteSkill, importSkillArchive, importSkillFromGitHub, importSkillFromHub,
-  type RemoteAgentInfo, type ToolStatus, type LLMProvider, type ToolLeaf,
+  type RemoteAgentInfo, type ToolStatus, type ToolLeaf,
   type FeatureNotInstalledDetail, type FeatureInstallEvent,
 } from '../services/configApi';
 import {
@@ -27,12 +26,10 @@ import { openSettingsStateStream, type SettingsStateStreamHandle } from '../serv
 
 import type { JsonSchema } from '../services/agentApi';
 import { getAuthUrl, unlinkAgent, reconnectAgent } from '../services/agentApi';
-import { useLLMModels } from '../composables/useLLMModels';
 import ItemCardHeader from '../components/shared/ItemCardHeader.vue';
 import ToolSkillCard from '../components/shared/ToolSkillCard.vue';
 import ToolVariablesForm from '../components/shared/ToolVariablesForm.vue';
 import ToolArgumentsForm from '../components/shared/ToolArgumentsForm.vue';
-import LLMParametersForm from '../components/shared/LLMParametersForm.vue';
 import LeafToggleSection from '../components/shared/LeafToggleSection.vue';
 import { initVarValues, initArgValues } from '../utils/toolItemForm';
 
@@ -46,13 +43,12 @@ const settingsStore = useSettingsStore();
 const tourOpen = ref(false);
 const tourTargetSelector = ref<string | undefined>(undefined);
 const tourSkillName = ref<string>('');
-const { rebuildModelList, getFilteredModels, getReasoningOptions } = useLLMModels();
 
 // ── Unified item type ──
 interface UnifiedItem {
   name: string;             // legacy: stable identifier (now == tool_id for builtin/skill)
   displayName: string;      // human-readable name shown on the card
-  kind: 'builtin' | 'skill' | 'mcp-remote' | 'a2a-remote';
+  kind: 'builtin' | 'skill' | 'mcp-remote';
 
   toolName: string | null;  // tool_id used by /api/tools/{tool_id} endpoints
   toolConfigFields: Record<string, { description: string; type: string; secret: boolean; configured: boolean; required?: boolean; enum?: string[]; default?: unknown }>;
@@ -62,11 +58,6 @@ interface UnifiedItem {
   agentName: string;
   description: string;
   url: string;
-  systemPrompt: string;
-  llmProvider: string;
-  llmModel: string;
-  reasoningEffort: string;
-  fullReasoning: boolean;
   enabled: boolean;
 
   showAuthenticate: boolean;
@@ -115,21 +106,15 @@ interface UnifiedItem {
 
 // ── Data ──
 const items = ref<UnifiedItem[]>([]);
-const llmProviders = ref<LLMProvider[]>([]);
 const loading = ref(false);
 
-// Add agent dialog
+// Add MCP server dialog
 const showAddDialog = ref(false);
 const addForm = ref({
   url: '',
-  type: 'mcp' as 'mcp' | 'a2a',
   inputMode: 'url' as 'url' | 'json',
   jsonConfig: '',
   description: '',
-  system_prompt: '',
-  llm_provider: '',
-  llm_model: '',
-  reasoning_effort: '',
 });
 const adding = ref(false);
 const jsonConfigError = ref('');
@@ -206,25 +191,10 @@ onMounted(async () => {
   openLiveSettingsStream();
   loading.value = true;
   try {
-    const [agentRes, toolRes, provRes] = await Promise.all([
+    const [agentRes, toolRes] = await Promise.all([
       listAgents(settingsStore.agentUrl, settingsStore.authToken),
       listTools(settingsStore.agentUrl, settingsStore.authToken),
-      listLLMProviders(settingsStore.agentUrl, settingsStore.authToken),
     ]);
-
-    llmProviders.value = provRes.providers;
-
-    // Load models for all providers using composable
-    const providersWithModels: { name: string; display_name: string; models: any[] }[] = [];
-    for (const p of provRes.providers) {
-      try {
-        const modelRes = await getProviderModels(settingsStore.agentUrl, settingsStore.authToken, p.name);
-        providersWithModels.push({ name: p.name, display_name: p.display_name, models: modelRes.models });
-      } catch {
-        providersWithModels.push({ name: p.name, display_name: p.display_name, models: [] });
-      }
-    }
-    rebuildModelList(providersWithModels);
 
     buildUnifiedItems(agentRes.agents, toolRes.tools);
     await maybeStartSkillRegistrationTour();
@@ -279,7 +249,6 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
 
   for (const tool of localTools) {
     const isSkill = tool.tool_type === 'skill';
-    const llmCfg = (tool.config?.llm ?? {}) as Record<string, unknown>;
     const metaCfg = (tool.config?.meta ?? {}) as Record<string, string>;
     const schema = (tool.arguments_schema as JsonSchema | null) ?? null;
 
@@ -292,16 +261,10 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       toolConfigValues: initVarValues(tool.required_fields, tool.config?.variables),
       toolConfigured: tool.configured,
       agentName: tool.tool_id,
-      // Skills have no description override and no LLM form — surface the real
-      // SKILL.md description so the expanded card explains what the skill does.
-      // Built-in/MCP tools use this as the user override on the LLM form.
+      // Skills surface their real SKILL.md description; built-in/MCP tools use
+      // this as the user-editable description override.
       description: isSkill ? (tool.description || '') : (metaCfg.description || ''),
       url: tool.url || '',
-      systemPrompt: (metaCfg.system_prompt as string) || '',
-      llmProvider: (llmCfg.llm_provider as string) || '',
-      llmModel: (llmCfg.llm_model as string) || '',
-      reasoningEffort: (llmCfg.reasoning_effort as string) || '',
-      fullReasoning: !!tool.full_reasoning,
       enabled: tool.enabled,
       connectionError: tool.connection_error ?? null,
       hasAgent: !isSkill,  // skills have no MCP/A2A backing agent
@@ -345,12 +308,6 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       agentName: agent.tool_id,
       description: agent.description || '',
       url: agent.url,
-      // Per-server LLM/system_prompt overrides are loaded on demand via /api/agents/{tool_id}/config
-      systemPrompt: '',
-      llmProvider: '',
-      llmModel: '',
-      reasoningEffort: '',
-      fullReasoning: false,
       enabled: agent.enabled,
       connectionError: agent.connection_error,
       hasAgent: true,
@@ -370,51 +327,6 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       registering: false,
       lastRegisteredProcess: null,
       // MCP servers can expose many tools; resolved on expand via listToolLeaves.
-      supportsLeafToggle: false,
-      leaves: [],
-      leavesLoading: false,
-      leavesLoaded: false,
-      leavesDisconnected: false,
-    });
-  }
-
-  for (const agent of remoteAgents.filter(a => a.agent_type === 'a2a')) {
-    const schema = (agent.arguments_schema as JsonSchema | null) ?? null;
-    result.push({
-      name: agent.tool_id,
-      displayName: agent.name,
-      kind: 'a2a-remote',
-      toolName: agent.tool_id,
-      toolConfigFields: {},
-      toolConfigValues: {},
-      toolConfigured: true,
-      agentName: agent.tool_id,
-      description: agent.description || '',
-      url: agent.url,
-      systemPrompt: '',
-      llmProvider: '',
-      llmModel: '',
-      reasoningEffort: '',
-      fullReasoning: false,
-      enabled: agent.enabled,
-      connectionError: agent.connection_error,
-      hasAgent: true,
-      agentType: 'a2a',
-      showAuthenticate: agent.show_authenticate,
-      showUnlink: agent.show_unlink,
-      badgeClass: agent.badge_class,
-      statusText: agent.status_text,
-      argumentsSchema: schema,
-      argValues: initArgValues(schema),
-      expanded: false,
-      saving: false,
-      llmBound: true,
-      toggleLocked: false,
-      isBuiltinSkill: false,
-      longRunningApp: null,
-      registering: false,
-      lastRegisteredProcess: null,
-      // A2A remote agents have no per-leaf controls.
       supportsLeafToggle: false,
       leaves: [],
       leavesLoading: false,
@@ -452,14 +364,10 @@ async function saveItemConfig(item: UnifiedItem) {
       await updateToolConfig(settingsStore.agentUrl, settingsStore.authToken, item.toolName, item.toolConfigValues);
     }
 
-    // MCP remote servers keep their own LLM/system-prompt config endpoint.
+    // MCP remote servers keep their own description on the agent config endpoint.
     if (item.kind === 'mcp-remote' && item.hasAgent) {
       await updateAgentConfig(settingsStore.agentUrl, settingsStore.authToken, item.agentName, {
         description: item.description || null,
-        system_prompt: item.systemPrompt || null,
-        llm_provider: item.llmProvider || null,
-        llm_model: item.llmModel || null,
-        reasoning_effort: getReasoningOptions(item.llmModel).length > 0 ? (item.reasoningEffort || null) : null,
       });
     }
 
@@ -472,13 +380,9 @@ async function saveItemConfig(item: UnifiedItem) {
   }
 }
 
-/** Client-side "Reset All to Default" for the MCP config form. */
+/** Client-side "Reset to Default" for the MCP config form. */
 function resetLLMDefaults(item: UnifiedItem) {
   item.description = '';
-  item.systemPrompt = '';
-  item.llmProvider = '';
-  item.llmModel = '';
-  item.reasoningEffort = '';
 }
 
 async function toggleItemEnabled(item: UnifiedItem, value: boolean) {
@@ -773,17 +677,17 @@ async function handleImportSkill() {
   }
 }
 
-function openAddDialog(type: 'mcp' | 'a2a') {
+function openAddDialog() {
   addForm.value = {
-    url: '', type, inputMode: 'url', jsonConfig: '',
-    description: '', system_prompt: '', llm_provider: '', llm_model: '', reasoning_effort: '',
+    url: '', inputMode: 'url', jsonConfig: '',
+    description: '',
   };
   jsonConfigError.value = '';
   showAddDialog.value = true;
 }
 
 async function handleAddAgent() {
-  const isMcpJson = addForm.value.type === 'mcp' && addForm.value.inputMode === 'json';
+  const isMcpJson = addForm.value.inputMode === 'json';
 
   if (isMcpJson) {
     if (!addForm.value.jsonConfig.trim()) return;
@@ -800,8 +704,8 @@ async function handleAddAgent() {
 
   adding.value = true;
   try {
-    const config: { type: string; url?: string; json_config?: string; description?: string; system_prompt?: string; llm_provider?: string; llm_model?: string; reasoning_effort?: string } = {
-      type: addForm.value.type,
+    const config: { type: string; url?: string; json_config?: string; description?: string } = {
+      type: 'mcp',
     };
 
     if (isMcpJson) {
@@ -810,20 +714,14 @@ async function handleAddAgent() {
       config.url = addForm.value.url.trim();
     }
 
-    if (addForm.value.type === 'mcp') {
-      if (addForm.value.description) config.description = addForm.value.description;
-      if (addForm.value.system_prompt) config.system_prompt = addForm.value.system_prompt;
-      if (addForm.value.llm_provider) config.llm_provider = addForm.value.llm_provider;
-      if (addForm.value.llm_model) config.llm_model = addForm.value.llm_model;
-      if (addForm.value.reasoning_effort) config.reasoning_effort = addForm.value.reasoning_effort;
-    }
+    if (addForm.value.description) config.description = addForm.value.description;
 
     await addAgent(settingsStore.agentUrl, settingsStore.authToken, config);
-    ElMessage.success('Agent added successfully');
+    ElMessage.success('MCP server added successfully');
     showAddDialog.value = false;
     await reloadAll();
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : 'Failed to add agent');
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to add MCP server');
   } finally {
     adding.value = false;
   }
@@ -1080,17 +978,12 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
 
               <div v-if="item.expanded" class="item-config">
                 <div class="config-section">
-                  <h4 class="config-section-title">LLM Parameters</h4>
-                  <LLMParametersForm
-                    v-model:description="item.description"
-                    v-model:system-prompt="item.systemPrompt"
-                    v-model:llm-provider="item.llmProvider"
-                    v-model:llm-model="item.llmModel"
-                    v-model:reasoning-effort="item.reasoningEffort"
-                    v-model:full-reasoning="item.fullReasoning"
-                    :providers="llmProviders"
-                    :get-filtered-models="getFilteredModels"
-                    :get-reasoning-options="getReasoningOptions"
+                  <h4 class="config-section-title">Description</h4>
+                  <ElInput
+                    v-model="item.description"
+                    type="textarea"
+                    :rows="2"
+                    placeholder="Description"
                   />
                 </div>
 
@@ -1104,7 +997,7 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
 
                 <div style="display: flex; align-items: center; gap: 8px;">
                   <ElButton type="primary" size="small" :loading="item.saving" @click="saveItemConfig(item)">Save</ElButton>
-                  <ElButton size="small" @click="resetLLMDefaults(item)">Reset All to Default</ElButton>
+                  <ElButton size="small" @click="resetLLMDefaults(item)">Reset to Default</ElButton>
                 </div>
 
                 <LeafToggleSection
@@ -1120,35 +1013,33 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
             </ElCard>
           </div>
 
-          <ElButton type="primary" class="add-btn" @click="openAddDialog('mcp')">
+          <ElButton type="primary" class="add-btn" @click="openAddDialog()">
             <Icon icon="mdi:plus" /> Add MCP Server
           </ElButton>
         </div>
       </template>
     </div>
 
-    <!-- Add Agent Dialog (MCP only) -->
+    <!-- Add MCP Server dialog -->
     <ElDialog v-model="showAddDialog" title="Add MCP Server" width="520px">
       <ElForm label-position="top">
-        <!-- Input mode toggle (MCP only) -->
-        <template v-if="addForm.type === 'mcp'">
-          <ElFormItem>
-            <ElRadioGroup v-model="addForm.inputMode" size="small">
-              <ElRadioButton value="url">URL</ElRadioButton>
-              <ElRadioButton value="json">JSON Config</ElRadioButton>
-            </ElRadioGroup>
-          </ElFormItem>
-        </template>
+        <!-- Input mode toggle -->
+        <ElFormItem>
+          <ElRadioGroup v-model="addForm.inputMode" size="small">
+            <ElRadioButton value="url">URL</ElRadioButton>
+            <ElRadioButton value="json">JSON Config</ElRadioButton>
+          </ElRadioGroup>
+        </ElFormItem>
 
         <!-- URL mode -->
-        <template v-if="addForm.inputMode === 'url' || addForm.type === 'a2a'">
+        <template v-if="addForm.inputMode === 'url'">
           <ElFormItem label="URL" required>
             <ElInput v-model="addForm.url" placeholder="http://localhost:9000/mcp" />
           </ElFormItem>
         </template>
 
-        <!-- JSON config mode (MCP only) -->
-        <template v-if="addForm.type === 'mcp' && addForm.inputMode === 'json'">
+        <!-- JSON config mode -->
+        <template v-if="addForm.inputMode === 'json'">
           <ElFormItem label="JSON Configuration" required :error="jsonConfigError">
             <ElInput
               v-model="addForm.jsonConfig"
@@ -1165,20 +1056,14 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
           </ElFormItem>
         </template>
 
-        <template v-if="addForm.type === 'mcp'">
-          <LLMParametersForm
-            v-model:description="addForm.description"
-            v-model:system-prompt="addForm.system_prompt"
-            v-model:llm-provider="addForm.llm_provider"
-            v-model:llm-model="addForm.llm_model"
-            v-model:reasoning-effort="addForm.reasoning_effort"
-            :full-reasoning="false"
-            :providers="llmProviders"
-            :get-filtered-models="getFilteredModels"
-            :get-reasoning-options="getReasoningOptions"
-            :show-full-reasoning="false"
+        <ElFormItem label="Description">
+          <ElInput
+            v-model="addForm.description"
+            type="textarea"
+            :rows="2"
+            placeholder="Description"
           />
-        </template>
+        </ElFormItem>
       </ElForm>
       <template #footer>
         <ElButton @click="showAddDialog = false">Cancel</ElButton>
@@ -1186,7 +1071,7 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
           type="primary"
           :loading="adding"
           @click="handleAddAgent"
-          :disabled="addForm.type === 'mcp' && addForm.inputMode === 'json'
+          :disabled="addForm.inputMode === 'json'
             ? !addForm.jsonConfig.trim()
             : !addForm.url.trim()"
         >Add</ElButton>

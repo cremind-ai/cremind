@@ -159,7 +159,6 @@ class ProcessInfo:
     log_dir: str = ""
     log_writer_state: Optional[LogWriterState] = None
     expire_time: float = 0.0
-    is_long_running: bool = False
     is_pty: bool = False
     # The agent task that spawned this process, used for targeted cancellation
     # via ``cancel_processes_by_task``. Populated from the executor's ContextVar
@@ -1948,7 +1947,6 @@ class ExecShellTool(BuiltInTool):
                 log_dir=log_dir,
                 log_writer_state=writer_state,
                 expire_time=expire_time,
-                is_long_running=True,
                 is_pty=use_pty,
                 task_id=current_task_id_var.get(),
                 profile=arguments.get("_profile") or None,

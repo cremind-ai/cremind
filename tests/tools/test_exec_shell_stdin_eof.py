@@ -61,7 +61,6 @@ async def _spawn_reader(pid: str, profile: str = "test") -> ProcessInfo:
         created_at=0.0,
         working_dir=".",
         command="python -c <stdin reader>",
-        is_long_running=True,
         is_pty=False,
         profile=profile,
     )

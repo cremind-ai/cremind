@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from a2a.types import (
     AgentCapabilities,
@@ -31,24 +31,11 @@ from a2a.types import (
     TextPart,
 )
 
-# OpenAI types are only used as annotations (PEP 563-stringified) so
-# loading them under TYPE_CHECKING keeps the MCP adapter importable on
-# a thin-core install.
-if TYPE_CHECKING:
-    from openai.types.chat import ChatCompletionMessageParam
-
 from app.config.settings import BaseConfig
-from app.constants import ChatCompletionTypeEnum
 from app.lib.llm.base import LLMProvider
 from app.tools.mcp.mcp_auth import MCPOAuthClient
 from app.tools.mcp.mcp_connection import MCPConnection
 from app.utils.logger import logger
-
-MCP_AGENT_SYSTEM_PROMPT = (
-    "You are an AI Agent returning results from tool calls. "
-    "Use the available tools to answer the user's query. "
-    "Always call the appropriate tool(s) to get the data needed to answer."
-)
 
 
 class MCPAgentAdapter:
@@ -66,8 +53,6 @@ class MCPAgentAdapter:
         description: Optional[str] = None,
         name: Optional[str] = None,
         on_first_connect=None,
-        system_prompt: Optional[str] = None,
-        full_reasoning: bool = False,
     ):
         self._connection = connection
         self._llm = llm
@@ -77,8 +62,6 @@ class MCPAgentAdapter:
         self._context_storage: Dict[str, str] = {}
         self._auth_lock = asyncio.Lock()
         self._on_first_connect = on_first_connect
-        self._system_prompt = system_prompt
-        self._full_reasoning = full_reasoning
 
     @property
     def name(self) -> str:
@@ -131,16 +114,10 @@ class MCPAgentAdapter:
             skills=self.get_skills(),
         )
 
-    def get_context_storage(self) -> Dict[str, str]:
-        """Get the context_id -> task_id mapping."""
-        return self._context_storage
-
     def update_config(
         self,
         llm: Optional[LLMProvider] = None,
-        system_prompt: Optional[str] = None,
         description: Optional[str] = None,
-        full_reasoning: Optional[bool] = None,
     ) -> None:
         """Update adapter configuration in-place without disrupting MCP connection.
 
@@ -148,12 +125,8 @@ class MCPAgentAdapter:
         """
         if llm is not None:
             self._llm = llm
-        if system_prompt is not None:
-            self._system_prompt = system_prompt if system_prompt else None
         if description is not None:
             self._description = description if description else None
-        if full_reasoning is not None:
-            self._full_reasoning = full_reasoning
 
     async def _ensure_auth(self, profile: str):
         """Ensure HTTP connection has current auth token.
@@ -203,13 +176,7 @@ class MCPAgentAdapter:
             headers = {"Authorization": f"Bearer {token}"}
             await self._connection.reconnect_http(headers=headers)
 
-    def build_specs(
-        self,
-        query: str = "",
-        arguments: Optional[Dict] = None,
-        context_id: Optional[str] = None,
-        profile: str = "default",
-    ) -> List[Dict[str, Any]]:
+    def build_specs(self) -> List[Dict[str, Any]]:
         """Return OpenAI-format function specs for this server's MCP tools."""
         return [
             {
@@ -225,9 +192,7 @@ class MCPAgentAdapter:
 
     async def request(
         self,
-        query: str,
         context_id: Optional[str] = None,
-        metadata: Optional[Dict] = None,
         profile: str = "default",
         decided_calls: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncGenerator[Any, None]:
@@ -263,7 +228,6 @@ class MCPAgentAdapter:
         total_cache_read_input_tokens = 0
         total_cache_creation_input_tokens = 0
         total_output_tokens = 0
-        content_parts: List[str] = []
         function_calls: List[Dict] = list(decided_calls or [])
 
         # Execute tool calls if any
@@ -403,18 +367,6 @@ class MCPAgentAdapter:
                     ),
                 )
 
-        # If we have text content from LLM, yield it as artifact
-        if content_parts:
-            yield TaskArtifactUpdateEvent(
-                contextId=context_id,
-                taskId=task_id,
-                artifact=Artifact(
-                    artifactId=str(uuid.uuid4()),
-                    name="response",
-                    parts=[Part(root=TextPart(text=" ".join(content_parts)))],
-                ),
-            )
-
         # Yield token_usage artifact
         yield TaskArtifactUpdateEvent(
             contextId=context_id,
@@ -437,7 +389,7 @@ class MCPAgentAdapter:
         # Data is already in artifact events above, so only add a message
         # when there are no artifacts at all.
         final_message = None
-        if not tool_results and not content_parts:
+        if not tool_results:
             final_message = Message(
                 messageId=str(uuid.uuid4()),
                 role=Role.agent,
@@ -481,19 +433,3 @@ class MCPAgentAdapter:
             return result.structured_content
 
         return str(result)
-
-    def _make_error_event(self, context_id: str, task_id: str, error_msg: str) -> TaskStatusUpdateEvent:
-        """Create a failed status event."""
-        return TaskStatusUpdateEvent(
-            contextId=context_id,
-            taskId=task_id,
-            final=True,
-            status=TaskStatus(
-                state=TaskState.failed,
-                message=Message(
-                    messageId=str(uuid.uuid4()),
-                    role=Role.agent,
-                    parts=[Part(root=TextPart(text=f"Error: {error_msg}"))],
-                ),
-            ),
-        )

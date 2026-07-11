@@ -1,5 +1,5 @@
 ---
-description: "List and configure the **tools** the agent can call (built-in, MCP, A2A, skill, intrinsic): inspect a tool's config, enable or disable A2A/MCP tools, set tool variables (env-style key/value) or arguments (JSON), override or reset the tool's LLM, toggle a tool's sub-tools (\"leaves\"), and register a skill's long-running app as an autostart process. Use this to turn tools on or off and configure them — distinct from `cremind agents` (registering MCP/A2A servers)."
+description: "List and configure the **tools** the agent can call (built-in, MCP, A2A, skill, intrinsic): inspect a tool's config, enable or disable A2A/MCP tools, set tool variables (env-style key/value) or arguments (JSON), toggle a tool's sub-tools (\"leaves\"), and register a skill's long-running app as an autostart process. Use this to turn tools on or off and configure them — distinct from `cremind agents` (registering MCP/A2A servers)."
 ---
 
 # `cremind tools` — Tool & Skill Configuration
@@ -15,8 +15,7 @@ The group's surface area is small but covers every angle of tool config:
 - **Inspection** — `list`, `get`.
 - **Lifecycle for A2A / MCP tools** — `enable`, `disable`.
 - **Per-tool configuration** — `set-var` (env-style variables),
-  `set-args` (a structured JSON arguments object), `set-llm`
-  (per-tool LLM overrides), `reset-llm` (drop those overrides).
+  `set-args` (a structured JSON arguments object).
 - **Sub-tools ("leaves")** — `leaves` to list a grouped tool's
   individual sub-tools and their enabled state, `set-leaf` to turn
   specific ones on or off.
@@ -25,7 +24,7 @@ The group's surface area is small but covers every angle of tool config:
 
 Most subcommands act on the **active profile**, which is resolved
 server-side from your `CREMIND_TOKEN`. Built-in and intrinsic tools cannot
-be deleted, but their LLM and variable overrides are profile-scoped, so
+be deleted, but their variable overrides are profile-scoped, so
 each profile can carry its own configuration.
 
 ## Tool types
@@ -49,8 +48,8 @@ the Cremind web UI:
 
 The page shows one row per tool with type, enabled toggle, and a "..."
 menu opening a configuration drawer. The drawer has tabs for
-**Variables**, **Arguments**, and **LLM Overrides** that map directly to
-`cremind tools set-var`, `set-args`, and `set-llm`. Skill rows additionally
+**Variables** and **Arguments** that map directly to
+`cremind tools set-var` and `set-args`. Skill rows additionally
 expose a **Register long-running app** action that maps to
 `cremind tools register-long-running`.
 
@@ -106,7 +105,7 @@ skill.daily-brief  skill  yes      no          Daily Brief
 ### `cremind tools get`
 
 **Purpose.** Show one tool's full configuration, including the
-formatted JSON config blob and any locked LLM fields.
+formatted JSON config blob.
 
 **Syntax.**
 
@@ -119,8 +118,7 @@ cremind tools get <tool_id>
 - `<tool_id>` — The id from `cremind tools list`.
 
 **Behavior.** Prints a key-value header followed by a `--- config ---`
-section containing the indented JSON config object, then a
-`locked_llm_fields:` line if any LLM fields are locked.
+section containing the indented JSON config object.
 
 **Header rows:**
 
@@ -131,10 +129,6 @@ section containing the indented JSON config object, then a
 | `tool_type`   | `built-in` / `mcp` / `a2a` / `skill` / `intrinsic`.            |
 | `description` | Long-form description (may be multi-line).                    |
 | `configured`  | `yes`/`no` — whether overrides exist for the active profile.  |
-
-`locked_llm_fields` lists keys (e.g. `llm_provider`, `reasoning_effort`)
-that the tool definition disallows overriding. `set-llm` calls touching
-those fields will fail server-side.
 
 **Example.**
 
@@ -148,12 +142,10 @@ configured   yes
 
 --- config ---
 {
-  "llm_provider": "anthropic",
-  "llm_model": "claude-sonnet-4-6",
-  "system_prompt": "..."
+  "arguments": {},
+  "variables": {},
+  "meta": {"description": "Read and update Linear issues."}
 }
-
-locked_llm_fields: llm_provider
 ```
 
 ### `cremind tools enable` / `cremind tools disable`
@@ -238,69 +230,6 @@ wholesale. Silent on success.
 
 ```bash
 $ cremind tools set-args mcp.shell --json '{"shells":["bash","pwsh"],"timeout_s":120}'
-```
-
-### `cremind tools set-llm`
-
-**Purpose.** Override the LLM parameters a tool uses — provider,
-model, reasoning effort, and the full-reasoning toggle. Useful for
-making one tool always use a heavier model than the global default, or
-for forcing a specific provider.
-
-**Syntax.**
-
-```bash
-cremind tools set-llm <tool_id> [--provider P] [--model M] [--reasoning-effort low|medium|high] [--full-reasoning true|false]
-```
-
-**Arguments** (required):
-
-- `<tool_id>` — Target tool.
-
-**Flags** (at least one required):
-
-| Flag                 | Type   | Default | Meaning                                                  |
-|----------------------|--------|---------|----------------------------------------------------------|
-| `--provider`         | string | `""`    | LLM provider id (e.g. `anthropic`, `openai`).            |
-| `--model`            | string | `""`    | Model id (e.g. `claude-sonnet-4-6`).                     |
-| `--reasoning-effort` | string | `""`    | `low` / `medium` / `high`.                               |
-| `--full-reasoning`   | string | `""`    | `true` / `false`. Any other value is rejected client-side.|
-
-**Behavior.** Each supplied flag updates exactly its corresponding
-field; omitted flags are unchanged. Fields listed in the tool's
-`locked_llm_fields` cannot be set and the server rejects such updates.
-Silent on success.
-
-**Examples.**
-
-```bash
-$ cremind tools set-llm skill.review-pr --provider anthropic --model claude-opus-4-7 --reasoning-effort high
-$ cremind tools set-llm mcp.shell --full-reasoning false
-```
-
-### `cremind tools reset-llm`
-
-**Purpose.** Remove specific LLM-parameter overrides so the tool falls
-back to the code-defined default.
-
-**Syntax.**
-
-```bash
-cremind tools reset-llm <tool_id> <key> [key...]
-```
-
-**Arguments** (at least two required):
-
-- `<tool_id>` — Target tool.
-- `<key>` — One or more LLM-parameter field names
-  (`llm_provider`, `llm_model`, `reasoning_effort`, `full_reasoning`).
-
-**Behavior.** Silent on success.
-
-**Example.**
-
-```bash
-$ cremind tools reset-llm skill.review-pr llm_provider llm_model reasoning_effort
 ```
 
 ### `cremind tools leaves`
@@ -413,18 +342,11 @@ working_dir   /home/li/work
 $ cremind tools disable mcp.linear
 ```
 
-### Configure a skill's environment and force it to use Opus
+### Configure a skill's environment
 
 ```bash
 $ cremind tools set-var skill.review-pr GITHUB_TOKEN=ghp_...
-$ cremind tools set-llm skill.review-pr --provider anthropic --model claude-opus-4-7 --reasoning-effort high
 $ cremind tools get skill.review-pr
-```
-
-### Drop all per-tool LLM overrides in one shot
-
-```bash
-$ cremind tools reset-llm skill.review-pr llm_provider llm_model reasoning_effort full_reasoning
 ```
 
 ### Find the tool ids of every disabled MCP server
@@ -445,12 +367,6 @@ $ cremind proc attach "$pid"
 **`enable` / `disable` rejected** — Built-in and intrinsic tools cannot
 be enabled or disabled — the server rejects the call. Use `cremind tools list`
 to confirm the type.
-
-**`set-llm` rejected for a locked field** — Some tool definitions lock
-specific LLM fields (visible in `cremind tools get` under
-`locked_llm_fields`). The locked field cannot be changed via
-`set-llm`; pick a different model or relax the lock at the tool
-definition level.
 
 **`set-args` requires `--json`** — Even for an empty object, you must
 pass `--json '{}'`. The empty default is a deliberate forcing function.

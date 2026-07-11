@@ -8,7 +8,6 @@ a unified :class:`Tool`.
 from app.tools.mcp.mcp_agent_adapter import MCPAgentAdapter
 from app.tools.mcp.mcp_auth import MCPOAuthClient
 from app.tools.mcp.mcp_connection import MCPConnection
-from app.tools.mcp.mcp_remote_shim import MCPRemoteConnectionShim
 from app.tools.mcp.tool import (
     MCPServerTool,
     build_http_mcp_tool,
@@ -22,7 +21,6 @@ __all__ = [
     "MCPConnection",
     "MCPAgentAdapter",
     "MCPOAuthClient",
-    "MCPRemoteConnectionShim",
     "MCPServerTool",
     "build_http_mcp_tool",
     "build_stdio_mcp_tool",

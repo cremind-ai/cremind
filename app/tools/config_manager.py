@@ -1,12 +1,11 @@
 """Per-profile tool configuration manager.
 
-Wraps :class:`app.storage.tool_storage.ToolStorage` with helpers for the four
+Wraps :class:`app.storage.tool_storage.ToolStorage` with helpers for the three
 configuration scopes:
 
 - ``arg``      Tool Arguments (JSON-Schema parameter values)
 - ``variable`` Tool Variables (env-style secrets / required config)
-- ``llm``      LLM Parameters (provider/model/full_reasoning, etc.)
-- ``meta``     Free-form metadata (system_prompt, description override, ...)
+- ``meta``     Free-form metadata (description override, ...)
 
 Argument values are always JSON-serialised so non-string types round-trip.
 """
@@ -17,7 +16,7 @@ import json
 from typing import Any
 
 from app.storage.tool_storage import (
-    SCOPE_ARG, SCOPE_LEAF, SCOPE_LLM, SCOPE_META, SCOPE_VARIABLE,
+    SCOPE_ARG, SCOPE_LEAF, SCOPE_META, SCOPE_VARIABLE,
     ToolStorage,
 )
 
@@ -67,38 +66,7 @@ class ToolConfigManager:
             key=key, value=value, is_secret=is_secret,
         )
 
-    def delete_variable(self, tool_id: str, profile: str, key: str) -> bool:
-        return self._storage.delete_config(
-            profile=profile, tool_id=tool_id, scope=SCOPE_VARIABLE, key=key,
-        )
-
-    # ── llm parameters ─────────────────────────────────────────────────
-
-    def get_llm_params(self, tool_id: str, profile: str) -> dict[str, Any]:
-        raw = self._storage.get_scope(profile=profile, tool_id=tool_id, scope=SCOPE_LLM)
-        out: dict[str, Any] = {}
-        for key, value in raw.items():
-            if value in ("true", "false"):
-                out[key] = value == "true"
-            else:
-                out[key] = value
-        return out
-
-    def set_llm_param(self, tool_id: str, profile: str, key: str, value: Any) -> None:
-        if value is None or (not isinstance(value, bool) and value == ""):
-            self._storage.delete_config(
-                profile=profile, tool_id=tool_id, scope=SCOPE_LLM, key=key,
-            )
-            return
-        if isinstance(value, bool):
-            stored = "true" if value else "false"
-        else:
-            stored = str(value)
-        self._storage.set_config(
-            profile=profile, tool_id=tool_id, scope=SCOPE_LLM, key=key, value=stored,
-        )
-
-    # ── meta (system_prompt, description override, ...) ────────────────
+    # ── meta (description override, ...) ───────────────────────────────
 
     def get_meta(self, tool_id: str, profile: str) -> dict[str, str]:
         return self._storage.get_scope(profile=profile, tool_id=tool_id, scope=SCOPE_META)
@@ -151,6 +119,5 @@ class ToolConfigManager:
         return {
             "arguments": self.get_arguments(tool_id, profile),
             "variables": scopes.get(SCOPE_VARIABLE, {}),
-            "llm": self.get_llm_params(tool_id, profile),
             "meta": scopes.get(SCOPE_META, {}),
         }

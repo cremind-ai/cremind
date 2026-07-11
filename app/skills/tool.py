@@ -11,8 +11,6 @@ from __future__ import annotations
 from typing import Any, AsyncGenerator, Dict, Optional
 
 from a2a.types import (
-    AgentCapabilities,
-    AgentCard,
     Part,
     TextPart,
 )
@@ -115,18 +113,6 @@ class SkillTool(Tool):
         """
         return [spec["name"] for spec in self.environment_variables]
 
-    def get_card(self) -> AgentCard:
-        return AgentCard(
-            name=self._info.name,
-            description=self._info.description,
-            url=f"skill://{self._info.name}",
-            version="1.0.0",
-            defaultInputModes=["text"],
-            defaultOutputModes=["text"],
-            capabilities=AgentCapabilities(streaming=True),
-            skills=[],
-        )
-
     async def execute(
         self,
         *,
@@ -135,7 +121,6 @@ class SkillTool(Tool):
         profile: str,
         arguments: Dict[str, Any],
         variables: Dict[str, str],
-        llm_params: Dict[str, Any],
     ) -> AsyncGenerator[ToolEvent, None]:
         content = self._info.full_content
         if not content:

@@ -41,6 +41,19 @@ async function jsonOrThrow(res: Response, what: string): Promise<any> {
   return res.status === 204 ? null : res.json();
 }
 
+export interface ToolItem {
+  tool_id: string;
+  name: string;
+  kind: string; // "builtin" | "a2a" | "mcp"
+  description?: string | null;
+  source?: string | null;
+  enabled?: boolean | null;
+  settings_count?: number;
+  secret_variables?: string[];
+  has_secret_variables?: boolean;
+  disabled_leaves?: number;
+}
+
 export interface ExportableComponent {
   available: boolean;
   count?: number;
@@ -129,7 +142,14 @@ export async function getExportable(agentUrl: string, authToken: string): Promis
 export async function exportBlueprint(
   agentUrl: string,
   authToken: string,
-  body: { components: string[]; skills?: string[]; name?: string; display_name?: string; description?: string },
+  body: {
+    components: string[];
+    skills?: string[];
+    tools?: string[];
+    name?: string;
+    display_name?: string;
+    description?: string;
+  },
 ): Promise<{ ok: boolean; file: { name: string; bytes: number }; manifest: BlueprintManifestSummary; warnings: string[] }> {
   const res = await fetch(`${resolveBaseUrl(agentUrl)}/api/blueprints/export`, {
     method: 'POST',

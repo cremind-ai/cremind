@@ -10,8 +10,8 @@ agent_name in path params):
 - ``POST   /api/agents/{tool_id}/reconnect``             retry a failed connection
 - ``GET    /api/agents/{tool_id}/auth-url``              OAuth: get authorization URL
 - ``POST   /api/agents/{tool_id}/unlink``                drop the OAuth token for this profile
-- ``GET    /api/agents/{tool_id}/config``                MCP-server LLM/system_prompt config
-- ``PUT    /api/agents/{tool_id}/config``                update LLM/system_prompt
+- ``GET    /api/agents/{tool_id}/config``                MCP-server config (URL + description)
+- ``PUT    /api/agents/{tool_id}/config``                update the description
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ from starlette.routing import Route
 from app.api._auth import require_auth_or_setup_mode
 from app.config.settings import BaseConfig
 from app.events.settings_state_bus import publish_settings_state_changed
-from app.lib.llm.factory import create_llm_provider
 from app.tools import ToolRegistry, ToolType
 from app.tools.mcp import (
     MCPServerTool,
@@ -159,12 +158,6 @@ def _serialize_tool(tool, profile: str) -> dict:
     }
 
 
-def _persist_llm_scope(config_manager, tool_id: str, profile: str, body: dict) -> None:
-    for key in ("llm_provider", "llm_model", "reasoning_effort", "full_reasoning"):
-        if body.get(key) is not None:
-            config_manager.set_llm_param(tool_id, profile, key, body[key])
-
-
 def _get_oauth_client(tool, profile: str):
     """Return the OAuth client used by ``tool`` for ``profile``, or None."""
     # MCP servers and built-in tools both carry their OAuth client on the adapter.
@@ -195,12 +188,6 @@ def get_agent_routes(
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"mcp_llm_factory raised: {e}")
         return None
-
-    def _bind_llm_factory(tool: MCPServerTool) -> None:
-        """Attach a per-tool LLM factory so execute() picks up config changes."""
-        if mcp_llm_factory is not None:
-            tid = tool.tool_id
-            tool._llm_factory = lambda profile: mcp_llm_factory(tid, profile)
 
     async def handle_list_agents(request: Request) -> JSONResponse:
         """Open during first-run setup (no JWT, no profile) so the
@@ -255,23 +242,7 @@ def get_agent_routes(
                 {"error": "MCP support is not configured"}, status_code=500,
             )
 
-        llm_provider = body.get("llm_provider")
-        llm_model = body.get("llm_model")
-        reasoning_effort = body.get("reasoning_effort")
-        system_prompt = body.get("system_prompt")
         agent_description = body.get("description")
-
-        if llm_provider or llm_model:
-            try:
-                llm = create_llm_provider(
-                    provider_name=llm_provider or BaseConfig.get_default_provider(),
-                    model_name=llm_model,
-                    config_storage=config_storage,
-                    profile=profile,
-                    default_reasoning_effort=reasoning_effort,
-                )
-            except ValueError as e:
-                return JSONResponse({"error": f"Invalid LLM config: {e}"}, status_code=400)
 
         if json_config:
             try:
@@ -284,7 +255,7 @@ def get_agent_routes(
                     tool = await build_stdio_mcp_tool(
                         command=parsed["command"], args=parsed["args"],
                         env=parsed.get("env"), llm=llm, owner_profile=profile,
-                        system_prompt=system_prompt, description=agent_description,
+                        description=agent_description,
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.error(f"Failed to start stdio MCP server: {e}")
@@ -300,8 +271,10 @@ def get_agent_routes(
                         "env": parsed.get("env"),
                     }.items() if v is not None},
                 )
-                _bind_llm_factory(tool)
-                _persist_llm_scope(config_manager, tool.tool_id, profile, body)
+                if agent_description:
+                    config_manager.set_meta(
+                        tool.tool_id, profile, "description", agent_description
+                    )
                 publish_settings_state_changed(profile)
                 return JSONResponse(
                     {"success": True, "agent": _serialize_tool(tool, profile)},
@@ -315,16 +288,12 @@ def get_agent_routes(
         try:
             tool = await build_http_mcp_tool(
                 url=url, llm=llm, owner_profile=profile,
-                system_prompt=system_prompt, description=agent_description,
+                description=agent_description,
             )
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to add MCP server at {url}: {e}")
             return JSONResponse({"error": str(e)}, status_code=400)
         await registry.register_mcp(tool, source=tool.url, owner_profile=profile)
-        _bind_llm_factory(tool)
-        _persist_llm_scope(config_manager, tool.tool_id, profile, body)
-        if system_prompt:
-            config_manager.set_meta(tool.tool_id, profile, "system_prompt", system_prompt)
         if agent_description:
             config_manager.set_meta(tool.tool_id, profile, "description", agent_description)
         publish_settings_state_changed(profile)
@@ -496,16 +465,10 @@ def get_agent_routes(
             return JSONResponse(
                 {"error": f"Tool '{tool_id}' does not support agent configuration"}, status_code=400,
             )
-        llm_params = config_manager.get_llm_params(tool_id, profile)
         meta = config_manager.get_meta(tool_id, profile)
         return JSONResponse({
             "config": {
                 "url": getattr(tool, "url", None),
-                "llm_provider": llm_params.get("llm_provider"),
-                "llm_model": llm_params.get("llm_model"),
-                "reasoning_effort": llm_params.get("reasoning_effort"),
-                "full_reasoning": llm_params.get("full_reasoning"),
-                "system_prompt": meta.get("system_prompt"),
                 "description": meta.get("description"),
             }
         })
@@ -531,71 +494,11 @@ def get_agent_routes(
             )
 
         _MISSING = object()
-        llm_provider = body.get("llm_provider", _MISSING)
-        llm_model = body.get("llm_model", _MISSING)
-        reasoning_effort = body.get("reasoning_effort", _MISSING)
-        system_prompt = body.get("system_prompt", _MISSING)
         agent_description = body.get("description", _MISSING)
-        full_reasoning = body.get("full_reasoning", _MISSING)
 
-        llm_keys_present = any(
-            v is not _MISSING for v in (llm_provider, llm_model, reasoning_effort)
-        )
-        if llm_keys_present:
-            try:
-                prov = llm_provider if llm_provider is not _MISSING else None
-                model = llm_model if llm_model is not _MISSING else None
-                effort = reasoning_effort if reasoning_effort is not _MISSING else None
-
-                # When no per-tool override, fall back to the single configured
-                # model (same source as startup in server.py _builtin_llm_factory).
-                if not model:
-                    group_value = BaseConfig.get_model_group("high", profile=profile)
-                    if group_value:
-                        parts = group_value.split("/", 1)
-                        if not prov:
-                            prov = parts[0]
-                        model = parts[1] if len(parts) > 1 else parts[0]
-
-                if not prov:
-                    prov = BaseConfig.get_default_provider(profile=profile)
-
-                if model:
-                    new_llm = create_llm_provider(
-                        provider_name=prov or BaseConfig.get_default_provider(),
-                        model_name=model,
-                        config_storage=config_storage,
-                        profile=profile,
-                        default_reasoning_effort=effort,
-                    )
-                    tool.update_runtime_config(llm=new_llm)
-                else:
-                    logger.warning(
-                        f"No model resolved for tool '{tool_id}'; skipping LLM rebuild"
-                    )
-            except ValueError as e:
-                return JSONResponse({"error": f"Invalid LLM: {e}"}, status_code=400)
-
-        tool.update_runtime_config(
-            system_prompt=system_prompt if system_prompt is not _MISSING else None,
-            description=agent_description if agent_description is not _MISSING else None,
-            full_reasoning=full_reasoning if full_reasoning is not _MISSING else None,
-        )
-
-        for key, value in [
-            ("llm_provider", llm_provider),
-            ("llm_model", llm_model),
-            ("reasoning_effort", reasoning_effort),
-            ("full_reasoning", full_reasoning),
-        ]:
-            if value is not _MISSING:
-                config_manager.set_llm_param(tool_id, profile, key, value)
-        for key, value in [
-            ("system_prompt", system_prompt),
-            ("description", agent_description),
-        ]:
-            if value is not _MISSING:
-                config_manager.set_meta(tool_id, profile, key, value)
+        if agent_description is not _MISSING:
+            tool.update_runtime_config(description=agent_description)
+            config_manager.set_meta(tool_id, profile, "description", agent_description)
 
         publish_settings_state_changed(profile)
         return JSONResponse({"success": True})

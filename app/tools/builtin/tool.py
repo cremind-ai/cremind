@@ -15,19 +15,8 @@ in-process), then collapses the synthetic A2A event stream into a single
 
 from __future__ import annotations
 
-import importlib
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
-from a2a.types import (
-    AgentCapabilities,
-    AgentCard,
-    AgentSkill,
-    TaskArtifactUpdateEvent,
-    TaskState,
-    TaskStatusUpdateEvent,
-)
-
-from app.config.settings import BaseConfig
 from app.lib.llm.base import LLMProvider
 from app.tools.base import (
     FunctionSpec,
@@ -68,9 +57,6 @@ class BuiltInToolGroup(Tool):
         arguments_schema: Optional[dict] = None,
         oauth_provider: Optional[Callable[[str], Any]] = None,
         prepare_tools: Optional[Callable[[str, list], list]] = None,
-        full_reasoning: bool = False,
-        system_prompt: Optional[str] = None,
-        tool_instructions: Optional[str] = None,
         llm_factory: Optional[Callable[[str, str], LLMProvider]] = None,
     ):
         super().__init__()
@@ -85,10 +71,7 @@ class BuiltInToolGroup(Tool):
             mcp_auth=None,  # set lazily via apply_oauth
             description=description,
             name=display_name,
-            system_prompt=system_prompt,
-            tool_instructions=tool_instructions,
             prepare_tools=prepare_tools,
-            full_reasoning=full_reasoning,
         )
         self._oauth_provider = oauth_provider
         if oauth_provider is not None:
@@ -133,8 +116,7 @@ class BuiltInToolGroup(Tool):
     @property
     def skills(self) -> List[ToolSkill]:
         return [
-            ToolSkill(id=f.name, name=f.name, description=f.description or f.name,
-                      parameters=f.parameters)
+            ToolSkill(id=f.name, name=f.name, description=f.description or f.name)
             for f in self._adapter._tools
         ]
 
@@ -176,18 +158,12 @@ class BuiltInToolGroup(Tool):
         profile: str,
         arguments: Dict[str, Any],
         variables: Dict[str, str],
-        llm_params: Dict[str, Any],
     ) -> AsyncGenerator[ToolEvent, None]:
         # Refresh the child LLM (used by tools with an internal LLM step, e.g.
         # image_understanding / documentation_search) so config changes apply.
         self.refresh_llm(profile)
-        if "full_reasoning" in llm_params:
-            self._adapter.update_config(full_reasoning=bool(llm_params["full_reasoning"]))
 
-        yield ToolThinkingEvent(
-            text=f"[{self._display_name}] {leaf_name}",
-            model_label=getattr(self._adapter._llm, "model_label", None) if self._adapter._llm else None,
-        )
+        yield ToolThinkingEvent()
 
         events: list = []
         metadata: dict = {}
@@ -215,9 +191,6 @@ class BuiltInToolGroup(Tool):
             token_usage=token_usage or {},
         )
 
-    def get_card(self) -> AgentCard:
-        return self._adapter.create_synthetic_card()
-
     # ── runtime LLM refresh ────────────────────────────────────────────
 
     def refresh_llm(self, profile: str) -> None:
@@ -235,16 +208,12 @@ class BuiltInToolGroup(Tool):
         self,
         *,
         llm: Optional[LLMProvider] = None,
-        system_prompt: Optional[str] = None,
         description: Optional[str] = None,
-        full_reasoning: Optional[bool] = None,
     ) -> None:
         """Update the underlying adapter's runtime knobs."""
         self._adapter.update_config(
             llm=llm,
-            system_prompt=system_prompt,
             description=description,
-            full_reasoning=full_reasoning,
         )
         if description is not None and description:
             self._description = description
@@ -259,21 +228,13 @@ class BuiltInToolGroup(Tool):
         profile: str,
         arguments: Dict[str, Any],
         variables: Dict[str, str],
-        llm_params: Dict[str, Any],
     ) -> AsyncGenerator[ToolEvent, None]:
         # Refresh the child LLM so config changes take effect without restart.
         # (Also called by the reasoning agent before reading Model_Label.)
         self.refresh_llm(profile)
 
-        # Apply per-call llm_params (e.g., full_reasoning override)
-        if "full_reasoning" in llm_params:
-            self._adapter.update_config(full_reasoning=bool(llm_params["full_reasoning"]))
-
         # Yield a thinking event for UI continuity
-        yield ToolThinkingEvent(
-            text=f"[{self._display_name}] {query}",
-            model_label=getattr(self._adapter._llm, "model_label", None) if self._adapter._llm else None,
-        )
+        yield ToolThinkingEvent()
 
         events: list = []
         metadata: dict = {}
@@ -300,11 +261,3 @@ class BuiltInToolGroup(Tool):
             observation_parts=observation_parts,
             token_usage=token_usage or {},
         )
-
-
-# ── module loader ──────────────────────────────────────────────────────────
-
-
-def load_builtin_tool_module(name: str):
-    """Import the built-in tool module ``app.tools.builtin.{name}``."""
-    return importlib.import_module(f"app.tools.builtin.{name}")

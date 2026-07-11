@@ -76,6 +76,7 @@ class ExportOptions:
     author: str | None = None
     components: set[str] = field(default_factory=lambda: set(COMPONENT_KEYS))
     skill_slugs: set[str] | None = None  # None => all detected skills
+    tool_ids: set[str] | None = None  # None => all configured tools
 
 
 @dataclass
@@ -268,7 +269,9 @@ def create_blueprint(
             continue
         builder = BUILDERS[key]
         if key == "tools":
-            doc, reqs = builder(profile, secret_map=secret_map)
+            doc, reqs = builder(
+                profile, selected_tool_ids=options.tool_ids, secret_map=secret_map
+            )
         elif key == "skills":
             doc, reqs = builder(
                 profile, selected_slugs=options.skill_slugs, secret_map=secret_map

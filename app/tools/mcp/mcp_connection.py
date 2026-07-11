@@ -106,14 +106,6 @@ class MCPConnection:
             f"with tools: {[t.name for t in self._tools]}"
         )
 
-    async def refresh_tools(self) -> List[MCPTool]:
-        """Refresh the cached tool list from the server."""
-        if not self.session:
-            raise RuntimeError("Not connected to any MCP server")
-        response = await self.session.list_tools()
-        self._tools = response.tools
-        return self._tools
-
     def get_tools(self) -> List[MCPTool]:
         """Return the cached list of MCP tools."""
         return self._tools

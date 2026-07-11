@@ -89,7 +89,7 @@ def _tool_config_bundle(
 ) -> dict[str, Any]:
     """Assemble the exportable config for one tool_id (non-skill or skill).
 
-    Returns ``{config: {arg, llm, meta}, variables, secret_variables,
+    Returns ``{config: {arg, meta}, variables, secret_variables,
     disabled_leaves}`` with all secret values stripped and secret variable
     *names* preserved in ``secret_variables``.
     """
@@ -97,7 +97,6 @@ def _tool_config_bundle(
     tool_secrets = secret_map.get(tool_id, {})
 
     args = _scrub(mgr.get_arguments(tool_id, profile), tool_secrets.get("arg", set()))
-    llm = _scrub(mgr.get_llm_params(tool_id, profile), tool_secrets.get("llm", set()))
     meta = _scrub(dict(mgr.get_meta(tool_id, profile)), tool_secrets.get("meta", set()))
     for key in exclude_meta_keys:
         meta.pop(key, None)
@@ -111,7 +110,7 @@ def _tool_config_bundle(
     disabled_leaves = sorted(mgr.get_disabled_leaves(tool_id, profile))
 
     return {
-        "config": {"arg": args, "llm": llm, "meta": meta},
+        "config": {"arg": args, "meta": meta},
         "variables": variables,
         "secret_variables": secret_variables,
         "disabled_leaves": disabled_leaves,
@@ -122,7 +121,6 @@ def _is_empty_config(bundle: dict[str, Any]) -> bool:
     cfg = bundle["config"]
     return (
         not cfg["arg"]
-        and not cfg["llm"]
         and not cfg["meta"]
         and not bundle["variables"]
         and not bundle["secret_variables"]
@@ -160,7 +158,12 @@ def _configured_tool_ids(profile: str) -> set[str]:
     return ids
 
 
-def build_tools_doc(profile: str, *, secret_map: dict | None = None) -> tuple[dict, list]:
+def build_tools_doc(
+    profile: str,
+    *,
+    selected_tool_ids: set[str] | None = None,
+    secret_map: dict | None = None,
+) -> tuple[dict, list]:
     from app.calendar.feature import FEATURE_KEY, SCHEDULER_TOOL_ID
 
     ts = _tool_storage()
@@ -172,6 +175,8 @@ def build_tools_doc(profile: str, *, secret_map: dict | None = None) -> tuple[di
     requirements: list[dict] = []
 
     for tool_id in sorted(_configured_tool_ids(profile)):
+        if selected_tool_ids is not None and tool_id not in selected_tool_ids:
+            continue
         if tool_id.startswith(prefix):
             continue  # a skill tool — handled by the skills component
         row = ts.get_tool(tool_id)

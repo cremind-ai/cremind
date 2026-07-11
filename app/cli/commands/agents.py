@@ -1,4 +1,4 @@
-"""`cremind agents ...` — manage A2A and MCP server registrations.
+"""`cremind agents ...` — manage MCP server registrations.
 
 Mirrors `cli/cmd/agents.go`.
 """
@@ -16,7 +16,7 @@ from app.cli.commands._helpers import graceful_errors
 
 agents_app = typer.Typer(
     name="agents",
-    help="Manage A2A and MCP server registrations.",
+    help="Manage MCP server registrations.",
     no_args_is_help=True,
 )
 agents_config_app = typer.Typer(
@@ -30,7 +30,7 @@ agents_app.add_typer(agents_config_app, name="config")
 @agents_app.command("list")
 @graceful_errors
 def agents_list(ctx: typer.Context) -> None:
-    """List registered A2A and MCP tools with auth + enabled status."""
+    """List registered MCP tools with auth + enabled status."""
     import asyncio
 
     from app.cli.client._base import Client
@@ -69,19 +69,14 @@ def agents_list(ctx: typer.Context) -> None:
 @graceful_errors
 def agents_add(
     ctx: typer.Context,
-    agent_type: Optional[str] = typer.Option(None, "--type", help="a2a | mcp."),
-    url: Optional[str] = typer.Option(None, "--url", help="Agent URL."),
+    url: Optional[str] = typer.Option(None, "--url", help="MCP server URL (HTTP/SSE)."),
     json_config: Optional[str] = typer.Option(
         None, "--json-config",
-        help="VS Code-style MCP server JSON (for --type mcp).",
+        help="VS Code-style MCP server JSON (for stdio servers).",
     ),
-    system_prompt: Optional[str] = typer.Option(None, "--system-prompt", help="MCP system prompt."),
-    description: Optional[str] = typer.Option(None, "--description", help="MCP description."),
-    llm_provider: Optional[str] = typer.Option(None, "--llm-provider", help="MCP LLM provider override."),
-    llm_model: Optional[str] = typer.Option(None, "--llm-model", help="MCP LLM model override."),
-    reasoning_effort: Optional[str] = typer.Option(None, "--reasoning-effort", help="MCP reasoning effort."),
+    description: Optional[str] = typer.Option(None, "--description", help="MCP server description."),
 ) -> None:
-    """Register a new A2A or MCP server."""
+    """Register a new MCP server."""
     import asyncio
 
     from app.cli.client._base import Client
@@ -90,28 +85,17 @@ def agents_add(
     from app.cli.output import OutputMode, print_json, print_kv
     from app.cli.output.formatting import string_field
 
-    if not agent_type:
-        typer.echo("--type is required (a2a or mcp)", err=True)
-        raise typer.Exit(code=1)
     if not url and not json_config:
         typer.echo("either --url or --json-config is required", err=True)
         raise typer.Exit(code=1)
 
-    body: dict[str, Any] = {"type": agent_type}
+    body: dict[str, Any] = {"type": "mcp"}
     if url:
         body["url"] = url
     if json_config:
         body["json_config"] = json_config
-    if system_prompt:
-        body["system_prompt"] = system_prompt
     if description:
         body["description"] = description
-    if llm_provider:
-        body["llm_provider"] = llm_provider
-    if llm_model:
-        body["llm_model"] = llm_model
-    if reasoning_effort:
-        body["reasoning_effort"] = reasoning_effort
 
     cfg: Config = ctx.obj["cfg"]
     mode: OutputMode = ctx.obj["mode"]
@@ -141,7 +125,7 @@ def agents_delete(
     ctx: typer.Context,
     tool_id: str = typer.Argument(..., help="Tool id."),
 ) -> None:
-    """Unregister an A2A or MCP tool."""
+    """Unregister an MCP tool."""
     import asyncio
 
     from app.cli.client._base import Client
@@ -283,7 +267,7 @@ def agents_config_get(
     ctx: typer.Context,
     tool_id: str = typer.Argument(..., help="Tool id."),
 ) -> None:
-    """Show the agent's LLM + meta config."""
+    """Show the agent's config (URL + description)."""
     import asyncio
 
     from app.cli.client._base import Client
@@ -312,14 +296,9 @@ def agents_config_get(
 def agents_config_set(
     ctx: typer.Context,
     tool_id: str = typer.Argument(..., help="Tool id."),
-    llm_provider: Optional[str] = typer.Option(None, "--llm-provider", help="LLM provider."),
-    llm_model: Optional[str] = typer.Option(None, "--llm-model", help="LLM model."),
-    reasoning_effort: Optional[str] = typer.Option(None, "--reasoning-effort", help="low | medium | high."),
-    full_reasoning: Optional[str] = typer.Option(None, "--full-reasoning", help="true | false."),
-    system_prompt: Optional[str] = typer.Option(None, "--system-prompt", help="System prompt."),
     description: Optional[str] = typer.Option(None, "--description", help="Description."),
 ) -> None:
-    """Patch an agent's LLM and meta config (only specified flags change)."""
+    """Patch an agent's config (only specified flags change)."""
     import asyncio
 
     from app.cli.client._base import Client
@@ -327,23 +306,6 @@ def agents_config_set(
     from app.cli.config import Config
 
     body: dict[str, Any] = {}
-    if llm_provider:
-        body["llm_provider"] = llm_provider
-    if llm_model:
-        body["llm_model"] = llm_model
-    if reasoning_effort:
-        body["reasoning_effort"] = reasoning_effort
-    if full_reasoning is not None and full_reasoning != "":
-        v = full_reasoning.lower()
-        if v == "true":
-            body["full_reasoning"] = True
-        elif v == "false":
-            body["full_reasoning"] = False
-        else:
-            typer.echo("--full-reasoning must be 'true' or 'false'", err=True)
-            raise typer.Exit(code=1)
-    if system_prompt:
-        body["system_prompt"] = system_prompt
     if description:
         body["description"] = description
 

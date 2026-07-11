@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Sequence
 
 from app.utils.logger import logger
 
@@ -108,10 +107,6 @@ def _read_wchan_linux(pid: int) -> str | None:
 def _is_blocked_on_read_linux(shell_pid: int) -> bool | None:
     """Linux: check if the shell's child command is blocked on stdin read."""
     target = _get_deepest_child_linux(shell_pid)
-    if target == shell_pid:
-        # No child found — the shell itself is the process.
-        # Check the shell's own wchan.
-        pass
 
     wchan = _read_wchan_linux(target)
     if wchan is None:

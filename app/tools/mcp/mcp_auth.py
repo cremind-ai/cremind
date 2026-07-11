@@ -6,10 +6,8 @@ and provides the same interface as the A2A OAuthClient.
 
 import base64
 import hashlib
-import json
 import os
 import secrets
-import time
 import urllib.parse
 from typing import Any, Dict, Optional
 
@@ -60,7 +58,6 @@ class MCPOAuthClient:
         if path:
             key += f"_{path}"
         return key
-        self._pkce_verifiers: Dict[str, str] = {}  # state -> code_verifier
 
     def set_auth_metadata(self, metadata: Dict[str, Any]) -> None:
         """Set OAuth metadata directly (for stdio servers with known OAuth endpoints).
@@ -183,23 +180,6 @@ class MCPOAuthClient:
             logger.error(f"DCR request failed for '{self.server_name}': {e}")
             return False
 
-    def _decode_jwt_exp(self, token: str) -> Optional[int]:
-        """Decode JWT token and extract the 'exp' claim."""
-        try:
-            parts = token.split('.')
-            if len(parts) != 3:
-                return None
-            payload = parts[1]
-            padding = 4 - len(payload) % 4
-            if padding != 4:
-                payload += '=' * padding
-            decoded_bytes = base64.urlsafe_b64decode(payload)
-            payload_dict = json.loads(decoded_bytes)
-            return payload_dict.get('exp')
-        except Exception as e:
-            logger.warning(f"Failed to decode JWT exp claim: {e}")
-            return None
-
     def get_token(self, profile: Optional[str] = None) -> str:
         """Get token for the current profile or a specified profile."""
         target_profile = profile if profile is not None else self.profile
@@ -210,30 +190,6 @@ class MCPOAuthClient:
         if target_profile == self.profile:
             self.token = token
         return token
-
-    def get_auth_status(self, profile: Optional[str] = None) -> str:
-        """Get the authentication status for this MCP server.
-
-        Returns:
-            One of: "not_supported", "authenticated", "expired", "not_authenticated"
-        """
-        if not self._auth_metadata:
-            return "not_supported"
-
-        token = self.get_token(profile)
-        if not token:
-            return "not_authenticated"
-
-        # Google access tokens are opaque (not JWT), so we can't decode exp.
-        # If token exists, consider it authenticated. Actual expiration is
-        # handled by refresh_access_token() when a 401 is encountered.
-        exp_timestamp = self._decode_jwt_exp(token)
-        if exp_timestamp:
-            current_time = int(time.time())
-            if exp_timestamp <= current_time:
-                return "expired"
-
-        return "authenticated"
 
     async def get_auth_url(self, redirect_uri: str, profile: str = "default", source: str = "api") -> Optional[str]:
         """Construct the OAuth authorization URL from discovered metadata.
@@ -448,72 +404,3 @@ class MCPOAuthClient:
             logger.error(f"Failed to unlink MCP token for '{self.server_name}': {e}")
             return False
 
-    def get_expiration_info(self, profile: Optional[str] = None) -> Optional[Dict]:
-        """Get human-readable expiration information for the token."""
-        token = self.get_token(profile)
-        if not token:
-            return None
-
-        exp_timestamp = self._decode_jwt_exp(token)
-        if not exp_timestamp:
-            return None
-
-        from datetime import datetime, timezone
-
-        exp_datetime = datetime.fromtimestamp(exp_timestamp, tz=timezone.utc)
-        current_datetime = datetime.now(timezone.utc)
-
-        time_diff = exp_datetime - current_datetime
-        total_seconds = int(time_diff.total_seconds())
-
-        if total_seconds <= 0:
-            relative = "Expired"
-        elif total_seconds < 60:
-            relative = f"Expires in {total_seconds} second{'s' if total_seconds != 1 else ''}"
-        elif total_seconds < 3600:
-            minutes = total_seconds // 60
-            relative = f"Expires in {minutes} minute{'s' if minutes != 1 else ''}"
-        elif total_seconds < 86400:
-            hours = total_seconds // 3600
-            relative = f"Expires in {hours} hour{'s' if hours != 1 else ''}"
-        else:
-            days = total_seconds // 86400
-            relative = f"Expires in {days} day{'s' if days != 1 else ''}"
-
-        exp_local = exp_datetime.astimezone()
-        formatted = exp_local.strftime("%B %d, %Y at %I:%M %p")
-
-        return {
-            'timestamp': exp_timestamp,
-            'formatted': formatted,
-            'relative': relative,
-        }
-
-
-class NoOpOAuthClient:
-    """No-op OAuth client for MCP servers that don't support authentication."""
-
-    def __init__(self, server_name: str = ""):
-        self.server_name = server_name
-        self.profile = "default"
-        self.token = None
-        self.state = None
-
-    def get_token(self, profile: Optional[str] = None) -> str:
-        return ""
-
-    def get_auth_status(self, profile: Optional[str] = None) -> str:
-        return "not_supported"
-
-    def get_auth_url(self, redirect_uri: str, profile: str = "default", source: str = "api") -> Optional[str]:
-        return None
-
-    async def handle_oauth_callback(self, code: str, redirect_uri: str,
-                                    state: Optional[str] = None, profile: Optional[str] = None) -> bool:
-        return False
-
-    def unlink_token(self, profile: Optional[str] = None) -> bool:
-        return False
-
-    def get_expiration_info(self, profile: Optional[str] = None) -> Optional[Dict]:
-        return None

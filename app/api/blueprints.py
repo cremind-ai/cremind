@@ -85,6 +85,8 @@ def get_blueprint_routes(
             )
         skills = body.get("skills")
         skill_slugs = set(skills) if isinstance(skills, list) else None
+        tools = body.get("tools")
+        tool_ids = set(tools) if isinstance(tools, list) else None
 
         from app.blueprint.engine import ExportOptions, create_blueprint
         from app.blueprint.manifest import BlueprintError
@@ -104,6 +106,7 @@ def get_blueprint_routes(
                 author=body.get("author"),
                 components=components,
                 skill_slugs=skill_slugs,
+                tool_ids=tool_ids,
             )
             result = await asyncio.to_thread(create_blueprint, options)
         except BlueprintError as exc:

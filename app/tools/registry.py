@@ -59,31 +59,6 @@ class ToolRegistry:
         self._tools: Dict[str, Tool] = {}
         # Async lock guarding all multi-step mutations (sync_skills, register_*).
         self._lock = asyncio.Lock()
-        # Optional callback fired after add/remove/sync mutations -- used by
-        # the CremindAgent to refresh its embedding tables. The callback may
-        # accept an optional ``profile`` kwarg; when set, only that profile's
-        # embedding table needs rebuilding (skill sync). When ``None``, the
-        # mutation affects every profile (builtin rebind, a2a/mcp change).
-        self._on_change: Optional[Callable[..., None]] = None
-
-    # ── observability ──────────────────────────────────────────────────
-
-    def set_change_callback(self, cb: Optional[Callable[..., None]]) -> None:
-        self._on_change = cb
-
-    def _fire_change(self, profile: Optional[str] = None) -> None:
-        if self._on_change:
-            try:
-                self._on_change(profile=profile)
-            except TypeError:
-                # Back-compat: callback that takes no arguments.
-                try:
-                    self._on_change()
-                except Exception:  # noqa: BLE001
-                    logger.exception("ToolRegistry change callback failed")
-            except Exception:  # noqa: BLE001
-                logger.exception("ToolRegistry change callback failed")
-
     @property
     def storage(self) -> ToolStorage:
         return self._storage
@@ -130,17 +105,6 @@ class ToolRegistry:
             tool.tool_type is ToolType.SKILL
             and tool.tool_id.startswith(f"{profile}__")
         )
-
-    def is_enabled_for_profile(self, tool: Tool, profile: str) -> bool:
-        """Resolve a tool's enabled state for ``profile``.
-
-        Looks at ``profile_tools`` for an explicit value; falls back to the
-        per-type default.
-        """
-        explicit = self._storage.get_profile_tool_enabled(profile, tool.tool_id)
-        if explicit is not None:
-            return explicit
-        return self._default_enabled(tool)
 
     def tools_for_profile(self, profile: str) -> List[Tool]:
         """Return tools the reasoning agent should expose to ``profile``.
@@ -238,33 +202,6 @@ class ToolRegistry:
     def _taken(self) -> set[str]:
         return set(self._tools.keys())
 
-    def repersist_builtin_tools(self) -> int:
-        """Re-write rows for every in-memory built-in tool to the storage backend.
-
-        Used by the setup wizard after the admin picks PostgreSQL: built-in
-        tools were registered into the boot-time SQLite DB, and the freshly
-        created Postgres ``tools`` table is empty. Without re-persisting,
-        any later ``tool_configs`` write that FK-references a built-in slug
-        fails with a ForeignKeyViolation.
-
-        Returns the number of rows upserted. Idempotent — safe to call when
-        not actually needed.
-        """
-        count = 0
-        for tool_id, tool in self._tools.items():
-            if tool.tool_type is not ToolType.BUILTIN:
-                continue
-            self._storage.upsert_tool(
-                tool_id=tool_id,
-                name=tool.name,
-                tool_type=ToolType.BUILTIN.value,
-                source=tool_id,
-                description=tool.description,
-                arguments_schema=tool.arguments_schema,
-            )
-            count += 1
-        return count
-
     # ── built-in registration (persisted, no profile_tools row) ────────
 
     def register_builtin(self, tool: Tool, *, source: str | None = None) -> str:
@@ -344,7 +281,6 @@ class ToolRegistry:
                 tool, source=source, owner_profile=owner_profile,
                 tool_type_value=ToolType.MCP.value, extra=extra,
             )
-        self._fire_change()
         return tool_id
 
     def _register_dynamic(
@@ -476,17 +412,12 @@ class ToolRegistry:
         only the in-memory mapping changes. This avoids the cascade-delete
         that ``unregister`` + ``register_*`` would cause, which previously
         wiped every profile's enabled state except the owner's.
-
-        Fires ``_on_change`` so the CremindAgent rebuilds its embedding table
-        (the agent skips stubs, so a stub → live swap must re-emit embeddings
-        to make the newly-connected tool routable).
         """
         async with self._lock:
             if tool_id not in self._tools:
                 raise KeyError(f"Tool '{tool_id}' is not registered")
             new_tool.tool_id = tool_id
             self._tools[tool_id] = new_tool
-        self._fire_change()
 
     # ── unregister ─────────────────────────────────────────────────────
 
@@ -494,8 +425,6 @@ class ToolRegistry:
         async with self._lock:
             existed = self._tools.pop(tool_id, None) is not None
             self._storage.delete_tool(tool_id)
-        if existed:
-            self._fire_change()
         return existed
 
     # ── skill sync ─────────────────────────────────────────────────────
@@ -562,8 +491,6 @@ class ToolRegistry:
                 source = str(info.dir_path)
                 tool = skill_factory(info)
                 self.register_skill_sync(tool, source=source, owner_profile=profile)
-
-        self._fire_change(profile=profile)
 
     def purge_legacy_skill_rows(self, valid_sources: Iterable[str]) -> int:
         """Remove persisted skill rows whose source is not under any known
