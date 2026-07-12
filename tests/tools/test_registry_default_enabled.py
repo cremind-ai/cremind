@@ -1,10 +1,11 @@
 """Unit tests for the per-tool ``default`` flag (ToolConfig.default).
 
 A built-in may declare ``TOOL_CONFIG["default"] = False`` to start DISABLED in
-the Setup Wizard and, absent a ``profile_tools`` row, at runtime too. Skills are
-a special case: they start OFF in the wizard (``visible_for_profile`` reports
-``default_enabled: False``) but their runtime fallback stays ON for the owner
-profile, so skills imported/created outside the wizard keep working.
+the Setup Wizard and, absent a ``profile_tools`` row, at runtime too. Skills
+start OFF both in the wizard (``visible_for_profile`` reports
+``default_enabled: False``) and at runtime (the ``_default_enabled`` fallback is
+off), so a fresh profile / the wizard / a factory reset all start skills off —
+the owner opts each one in.
 
 Fixtures mirror ``test_registry_locked.py`` / ``test_registry_skill_enabled.py``.
 """
@@ -140,7 +141,7 @@ def test_locked_overrides_default_false(tmp_path: Path) -> None:
     assert rows[tool_id]["default_enabled"] is True
 
 
-def test_skill_wizard_default_off_but_runtime_on(tmp_path: Path) -> None:
+def test_skill_default_off_wizard_and_runtime(tmp_path: Path) -> None:
     reg = _make_registry(tmp_path)
     _seed_profile(reg.storage, "admin")
     skill_id = reg.register_skill_sync(
@@ -150,9 +151,14 @@ def test_skill_wizard_default_off_but_runtime_on(tmp_path: Path) -> None:
     # Wizard-facing default: off (admin opts in).
     rows = {r["tool_id"]: r for r in reg.visible_for_profile("admin")}
     assert rows[skill_id]["default_enabled"] is False
-    # Runtime fallback: still on for the owner (no profile_tools row).
+    assert rows[skill_id]["enabled"] is False
+    # Runtime fallback: also off for the owner absent a profile_tools row.
     exposed = {t.tool_id for t in reg.tools_for_profile("admin")}
-    assert skill_id in exposed
+    assert skill_id not in exposed
+
+    # Opting in via a profile_tools row exposes it.
+    reg.set_profile_tool_enabled("admin", skill_id, True)
+    assert skill_id in {t.tool_id for t in reg.tools_for_profile("admin")}
 
 
 def test_catalog_honors_default_flag(monkeypatch) -> None:

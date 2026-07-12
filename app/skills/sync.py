@@ -140,10 +140,10 @@ def list_builtin_skill_catalog() -> list[dict]:
             "display_name": info.name,
             "description": info.description,
             "tool_type": "skill",
-            # Skills start OFF in the Setup Wizard — the admin must opt each one
-            # in. (Wizard-display default only; a skill's runtime fallback stays
-            # on for its owner profile, so skills imported/created outside the
-            # wizard keep working — see ToolRegistry._default_enabled.)
+            # Skills start OFF — the admin must opt each one in. This matches the
+            # runtime fallback (skills default disabled absent a ``profile_tools``
+            # row — see ToolRegistry._default_enabled), so a fresh profile, the
+            # Setup Wizard, and a factory reset all start skills off.
             "enabled": False,
             "default_enabled": False,
             "configured": True,
