@@ -387,17 +387,45 @@ def build_llm_doc(profile: str) -> tuple[dict, list]:
 def build_settings_doc(
     profile: str, *, selected_keys: set[str] | None = None
 ) -> tuple[dict, list]:
+    from app.config.config_schema import lookup
     from app.config.user_config import resolve_default
 
-    values = _config_storage().get_all("user_config", profile=profile)
+    stored = _config_storage().get_all("user_config", profile=profile)
+
     if selected_keys is not None:
-        values = {k: v for k, v in values.items() if k in selected_keys}
-    defaults_at_export: dict[str, Any] = {}
-    for key in values:
+        # Explicit selection (UI checkboxes / CLI --settings): export exactly
+        # what was asked for, verbatim.
+        values = {k: v for k, v in stored.items() if k in selected_keys}
+        defaults_at_export: dict[str, Any] = {}
+        for key in values:
+            try:
+                defaults_at_export[key] = resolve_default(key)
+            except KeyError:
+                continue  # not a schema key on this build — carried but unlabelled
+        data = {"values": values, "defaults_at_export": defaults_at_export}
+        return _doc("settings", data), []
+
+    # Whole-component export (no explicit selection): mirror the export
+    # checklist and drop any row whose value equals the schema default — a
+    # stored value equal to the default is not a real change. Unknown keys
+    # (no default to compare) are carried.
+    values = {}
+    defaults_at_export = {}
+    for key, raw in stored.items():
         try:
-            defaults_at_export[key] = resolve_default(key)
+            _, _, field = lookup(key)
         except KeyError:
-            continue  # not a schema key on this build — carried but unlabelled
+            values[key] = raw  # unlabelled override — carried as-is
+            continue
+        default = resolve_default(key)
+        try:
+            coerced = field.coerce(raw)
+        except ValueError:
+            coerced = raw
+        if coerced == default:
+            continue
+        values[key] = raw
+        defaults_at_export[key] = default
     data = {"values": values, "defaults_at_export": defaults_at_export}
     return _doc("settings", data), []
 

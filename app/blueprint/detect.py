@@ -143,8 +143,12 @@ def collect_exportable(profile: str) -> dict[str, Any]:
         },
     }
 
-    # settings — per-key detail (label/type/value vs default) so the UI can show
-    # exactly which overrides ship and let the creator deselect individual ones.
+    # settings — only overrides that actually differ from the default. A stored
+    # ``user_config`` row whose value equals the schema default (e.g. the Setup
+    # Wizard persists ``memory.enabled`` even when the default is accepted) is
+    # not a real change, so it is excluded — it never appears as an export
+    # suggestion, exactly like a setting with no stored row. Unknown keys (no
+    # schema default to compare against) are kept and flagged.
     from app.config.config_schema import CONFIG_SCHEMA, lookup
     from app.config.user_config import resolve_default
 
@@ -168,7 +172,6 @@ def collect_exportable(profile: str) -> dict[str, Any]:
                     "enum": None,
                     "value": raw,
                     "default": None,
-                    "is_default": False,
                     "unknown": True,
                 }
             )
@@ -178,6 +181,8 @@ def collect_exportable(profile: str) -> dict[str, Any]:
             value = field.coerce(raw)
         except ValueError:
             value = raw
+        if value == default:
+            continue  # equals the default — not a real change, skip it
         setting_items.append(
             {
                 "key": key,
@@ -189,14 +194,13 @@ def collect_exportable(profile: str) -> dict[str, Any]:
                 "enum": list(field.enum) if field.enum else None,
                 "value": value,
                 "default": default,
-                "is_default": value == default,
                 "unknown": False,
             }
         )
     components["settings"] = {
-        "available": bool(settings_vals),
-        "count": len(settings_vals),
-        "keys": sorted(settings_vals.keys()),
+        "available": bool(setting_items),
+        "count": len(setting_items),
+        "keys": [it["key"] for it in setting_items],
         "items": setting_items,
     }
 

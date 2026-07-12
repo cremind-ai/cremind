@@ -389,7 +389,6 @@ onMounted(async () => {
                       <td class="bp-st-val"><strong>{{ fmtSetting(s.value) }}</strong></td>
                       <td>
                         <ElTag v-if="s.unknown" type="warning" size="small" disable-transitions>not in this build</ElTag>
-                        <ElTag v-else-if="s.is_default" type="info" size="small" disable-transitions>same as default</ElTag>
                       </td>
                     </tr>
                   </tbody>

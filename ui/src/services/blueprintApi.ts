@@ -75,7 +75,6 @@ export interface SettingItem {
   enum?: string[] | null;
   value: any;
   default: any;
-  is_default: boolean;
   unknown: boolean;
 }
 
