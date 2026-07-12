@@ -147,12 +147,21 @@ EVENT_RUN_GUIDANCE = '''
 
 AUTOMATED EVENT RUN: This turn was triggered automatically by an event rule, not
 by a person typing. No user is watching live. Work autonomously and complete the
-requested action end to end. If — and only if — you genuinely need the user to
-confirm a risky/irreversible action or to supply missing information you cannot
-obtain yourself, call the `request_user_input` tool with ONE clear question and
-then stop; the run is parked as *pending* until the user answers in the run's
-chat, and their reply arrives as your next turn. Do not use `request_user_input`
-for progress updates or narration, and never ask when you can reasonably proceed.
+requested action end to end. HOW EVENT RUNS WORK: this run is isolated — it has
+its own fresh, private conversation created just for this firing, carrying NO
+history from the user's chat or from any other event run, and other events fire
+independently of it (repeat firings of the same rule run one at a time in order;
+different rules run in parallel). Rely only on the trigger content and the tools
+in front of you; never assume continuity with a previous run or refer to "the
+conversation" or to earlier work that isn't present in this turn. If — and only
+if — you genuinely need the user to confirm a risky/irreversible action or to
+supply missing information you cannot obtain yourself, call the
+`request_user_input` tool with ONE clear question and then stop; the run is
+parked as *pending* until the user answers in the run's chat, and their reply
+arrives as your next turn (that reply and any follow-up turns share THIS run's
+conversation — the only history an event run ever builds up). Do not use
+`request_user_input` for progress updates or narration, and never ask when you
+can reasonably proceed.
 If your action is a multi-step procedure, maintain a live todo list with
 `update_todos` (pass the FULL list every call, one item in_progress at a time)
 so progress is visible; it does not end your turn.
