@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
-import { ElInput, ElButton, ElMessage, ElTable, ElTableColumn, ElPopconfirm, ElAlert, ElDialog } from 'element-plus';
+import { ElInput, ElButton, ElMessage, ElTable, ElTableColumn, ElPopconfirm, ElAlert, ElDialog, ElCheckbox, ElCheckboxGroup } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { listProfiles, deleteProfile, reconfigure, getPersona, updatePersona, getAgentName, setAgentName } from '../services/configApi';
+import { cleanProfileData, CLEAN_GROUPS, type CleanScope } from '../services/cleanApi';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -16,6 +17,16 @@ const newProfileName = ref('');
 const nameError = ref('');
 const showReconfigureConfirm = ref(false);
 const reconfiguring = ref(false);
+
+// Danger Zone — per-profile "clean data". Acts on the signed-in profile (the one
+// /api/clean resolves from the token), so gate it when viewing another profile.
+const cleanGroups = CLEAN_GROUPS;
+const selectedComponents = ref<string[]>([]);
+const cleaning = ref(false);
+const showWorkingConfirm = ref(false);
+const showFactoryConfirm = ref(false);
+const factoryConfirmText = ref('');
+const isOwnProfile = computed(() => props.profile === settingsStore.profileId);
 
 // Agent name (loaded from backend)
 const agentName = ref('');
@@ -148,6 +159,48 @@ async function handleReconfigure() {
   }
 }
 
+async function runClean(scope: CleanScope, components: string[] = []) {
+  cleaning.value = true;
+  try {
+    const r = await cleanProfileData(settingsStore.agentUrl, settingsStore.authToken, scope, components);
+    const errorCount = Object.keys(r.errors || {}).length;
+    if (errorCount) {
+      ElMessage.warning(`Cleaned ${r.total} item(s); ${errorCount} component(s) had errors`);
+    } else {
+      ElMessage.success(`Cleaned ${r.total} item(s)`);
+    }
+    // Refresh the conversation list if we may have cleared it.
+    if (scope !== 'custom' || components.includes('conversations')) {
+      try {
+        const { useChatStore } = await import('../stores/chat');
+        await useChatStore().loadConversations();
+      } catch { /* not on a chat route / store not ready */ }
+    }
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to clean data');
+  } finally {
+    cleaning.value = false;
+  }
+}
+
+async function handleCleanSelected() {
+  if (!selectedComponents.value.length) { ElMessage.warning('Select at least one item to clean'); return; }
+  await runClean('custom', [...selectedComponents.value]);
+  selectedComponents.value = [];
+}
+
+async function handleWorkingReset() {
+  await runClean('working');
+  showWorkingConfirm.value = false;
+}
+
+async function handleFactoryReset() {
+  if (factoryConfirmText.value !== props.profile) return;
+  await runClean('factory');
+  showFactoryConfirm.value = false;
+  factoryConfirmText.value = '';
+}
+
 function goBack() { router.push(`/${props.profile}/settings`); }
 </script>
 
@@ -269,6 +322,59 @@ function goBack() { router.push(`/${props.profile}/settings`); }
           <Icon icon="mdi:refresh" /> Reconfigure from Scratch
         </ElButton>
       </div>
+
+      <!-- Danger Zone -->
+      <div class="section danger-zone">
+        <h2 class="section-title">
+          <Icon icon="mdi:alert-octagon-outline" class="section-icon danger-icon" /> Danger Zone
+        </h2>
+        <p class="section-desc">
+          Permanently delete data for the <strong>{{ props.profile }}</strong> profile.
+          These actions cannot be undone. The profile itself and server-wide settings are kept.
+        </p>
+
+        <div v-if="!isOwnProfile" class="loading-state">
+          Sign in as “{{ props.profile }}” to clean this profile's data.
+        </div>
+
+        <template v-else>
+          <!-- 1. Clean specific components -->
+          <h3 class="danger-subtitle">Clean specific data</h3>
+          <ElCheckboxGroup v-model="selectedComponents" class="clean-groups">
+            <div v-for="g in cleanGroups" :key="g.title" class="clean-group">
+              <p class="clean-group-title">{{ g.title }}</p>
+              <div class="clean-group-items">
+                <ElCheckbox v-for="c in g.components" :key="c.key" :value="c.key" :label="c.label" />
+              </div>
+            </div>
+          </ElCheckboxGroup>
+          <ElButton
+            type="danger" plain :loading="cleaning"
+            :disabled="!selectedComponents.length"
+            @click="handleCleanSelected"
+          >
+            <Icon icon="mdi:broom" style="margin-right: 6px;" />
+            Clean selected ({{ selectedComponents.length }})
+          </ElButton>
+
+          <!-- 2 & 3. Presets -->
+          <h3 class="danger-subtitle" style="margin-top: 24px;">Reset presets</h3>
+          <div class="danger-presets">
+            <ElButton type="warning" @click="showWorkingConfirm = true">
+              <Icon icon="mdi:refresh" style="margin-right: 6px;" /> Working-data reset
+            </ElButton>
+            <ElButton type="danger" @click="showFactoryConfirm = true">
+              <Icon icon="mdi:nuke" style="margin-right: 6px;" /> Full factory reset
+            </ElButton>
+          </div>
+          <p class="section-desc" style="margin-top: 8px;">
+            <strong>Working-data reset</strong> clears runtime data (conversations, memory, usage,
+            events, uploads) but keeps your configuration. <strong>Full factory reset</strong> also
+            strips LLM keys, OAuth logins, tools, skills, documents and settings back to a fresh
+            baseline — the Setup Wizard will not re-run.
+          </p>
+        </template>
+      </div>
     </div>
 
     <!-- Reconfigure Confirmation -->
@@ -281,6 +387,48 @@ function goBack() { router.push(`/${props.profile}/settings`); }
         <ElButton @click="showReconfigureConfirm = false">Cancel</ElButton>
         <ElButton type="warning" :loading="reconfiguring" @click="handleReconfigure">
           Confirm Reconfigure
+        </ElButton>
+      </template>
+    </ElDialog>
+
+    <!-- Working-data reset confirmation -->
+    <ElDialog v-model="showWorkingConfirm" title="Working-data reset" width="460px">
+      <ElAlert type="warning" :closable="false" show-icon>
+        This deletes conversations, long-term memory, usage records, event-runs,
+        schedules, file watchers, skill-events, uploads and plan files for
+        “{{ props.profile }}”. All configuration and credentials are kept.
+        This cannot be undone.
+      </ElAlert>
+      <template #footer>
+        <ElButton @click="showWorkingConfirm = false">Cancel</ElButton>
+        <ElButton type="warning" :loading="cleaning" @click="handleWorkingReset">
+          Wipe runtime data
+        </ElButton>
+      </template>
+    </ElDialog>
+
+    <!-- Full factory reset confirmation (type-to-confirm) -->
+    <ElDialog v-model="showFactoryConfirm" title="Full factory reset" width="480px">
+      <ElAlert type="error" :closable="false" show-icon>
+        This wipes ALL runtime data AND every post-setup customization for
+        “{{ props.profile }}”: LLM keys, OAuth logins, tools/MCP, skills,
+        documents, browser login and app settings all return to a fresh baseline
+        (no LLM configured, default persona, default skills, only the “main”
+        channel). The profile and the Setup Wizard status are kept — the wizard
+        will NOT re-run. This cannot be undone.
+      </ElAlert>
+      <p class="section-desc" style="margin-top: 14px;">
+        Type <strong>{{ props.profile }}</strong> to confirm:
+      </p>
+      <ElInput v-model="factoryConfirmText" :placeholder="props.profile" />
+      <template #footer>
+        <ElButton @click="showFactoryConfirm = false; factoryConfirmText = ''">Cancel</ElButton>
+        <ElButton
+          type="danger" :loading="cleaning"
+          :disabled="factoryConfirmText !== props.profile"
+          @click="handleFactoryReset"
+        >
+          Factory reset this profile
         </ElButton>
       </template>
     </ElDialog>
@@ -314,4 +462,24 @@ function goBack() { router.push(`/${props.profile}/settings`); }
 .input-group { flex: 1; }
 .profile-input { width: 100%; }
 .name-error { color: var(--el-color-danger); font-size: 0.75rem; margin: 4px 0 0 0; }
+
+/* Danger Zone */
+.danger-zone {
+  border: 1px solid var(--el-color-danger);
+  border-radius: 8px;
+  padding: 16px 20px;
+}
+.danger-icon { color: var(--el-color-danger); }
+.danger-subtitle {
+  font-size: 0.95rem; font-weight: 600; color: var(--text-primary);
+  margin: 8px 0 10px 0;
+}
+.clean-groups { display: block; margin-bottom: 16px; }
+.clean-group { margin-bottom: 12px; }
+.clean-group-title {
+  font-size: 0.8rem; font-weight: 600; color: var(--text-secondary);
+  margin: 0 0 4px 0;
+}
+.clean-group-items { display: flex; flex-wrap: wrap; gap: 4px 20px; }
+.danger-presets { display: flex; gap: 12px; flex-wrap: wrap; }
 </style>

@@ -18,7 +18,7 @@ import time
 import uuid
 from typing import Any, Optional, TypedDict
 
-from sqlalchemy import Integer, cast, func, select, update
+from sqlalchemy import Integer, cast, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from app.databases import DatabaseProvider, get_database_provider
@@ -142,6 +142,20 @@ class UsageStorage:
                 .where(UsageRecordModel.id.in_(ids))
                 .values(message_id=message_id)
             )
+
+    async def delete_for_profile(self, profile: str) -> int:
+        """Delete every usage record for a profile; returns the row count.
+
+        ``usage_records.profile`` has no foreign key (usage is deliberately
+        durable — it survives conversation/profile deletes so cost history is
+        never silently lost), so this explicit scoped delete is the only way to
+        clear a profile's usage. Portable across SQLite and PostgreSQL.
+        """
+        async with self.async_session_maker.begin() as session:
+            result = await session.execute(
+                delete(UsageRecordModel).where(UsageRecordModel.profile == profile)
+            )
+        return int(result.rowcount or 0)
 
     # ── per-conversation reads ──────────────────────────────────────────────
 

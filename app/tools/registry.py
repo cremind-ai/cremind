@@ -82,18 +82,19 @@ class ToolRegistry:
         - builtin : per-tool ``default`` flag (default on) — declared via
                     ``TOOL_CONFIG["default"]`` (see ToolConfig.default), so a
                     built-in can opt to start disabled.
-        - skill   : on by default *for its owner profile*; invisible to other
-                    profiles (filtered in :meth:`tools_for_profile`). The Setup
-                    Wizard shows skills off (see :meth:`visible_for_profile`),
-                    but that is a wizard-display default only — the runtime
-                    fallback here stays on so skills imported/created outside the
-                    wizard keep working.
-        - mcp     : off by default (opt-in per profile, except for the owner
-                    profile which gets enabled=1 at registration)
+        - skill   : **off by default** — the owner profile must opt each skill
+                    in (Setup Wizard, Settings, or a ``profile_tools`` row). This
+                    matches the wizard-display default (:meth:`visible_for_profile`
+                    reports ``default_enabled: False`` for skills) so a fresh
+                    profile, the wizard, and a factory reset all start skills off.
+        - mcp/a2a : off by default (opt-in per profile, except the owner profile
+                    which gets enabled=1 at registration).
         """
         if tool.tool_type is ToolType.BUILTIN:
             return tool.default_enabled
-        return tool.tool_type is ToolType.SKILL
+        # Skills and dynamic (mcp/a2a) tools start disabled until a profile
+        # explicitly enables them.
+        return False
 
     @staticmethod
     def _skill_belongs_to_profile(tool: Tool, profile: str) -> bool:
@@ -111,8 +112,9 @@ class ToolRegistry:
 
         Skills owned by other profiles are excluded. Every type — skills
         included — honors a per-profile ``profile_tools`` row when present,
-        falling back to the type's default (built-in = on; skill = on;
-        mcp = off), so a skill disabled in Settings is no longer exposed.
+        falling back to the type's default (built-in = per-tool default;
+        skill = off; mcp = off), so a skill is exposed only once the profile
+        explicitly enables it (and a skill disabled in Settings stays hidden).
         """
         enabled_per_profile = self._storage.list_profile_tools(profile)
         out: List[Tool] = []
@@ -132,9 +134,9 @@ class ToolRegistry:
                 if not self._skill_belongs_to_profile(tool, profile):
                     continue
                 # owned skill — fall through to the shared enabled check so a
-                # ``profile_tools`` row with enabled=0 (set via Settings)
-                # suppresses it just like any other tool. Absent a row, the
-                # SKILL default (on) keeps it exposed.
+                # ``profile_tools`` row set via Settings decides. Absent a row,
+                # the SKILL default (off) keeps it hidden until the profile
+                # opts it in.
             explicit = enabled_per_profile.get(tool.tool_id)
             enabled = explicit if explicit is not None else self._default_enabled(tool)
             if enabled:
@@ -184,10 +186,9 @@ class ToolRegistry:
                 # Profile-independent default (ignores any ``profile_tools``
                 # override) so callers can show pristine defaults instead of
                 # the caller's resolved state — used by the Setup Wizard when
-                # configuring a brand-new profile. Skills start OFF in the wizard
-                # (the admin opts each one in — this is a wizard-display default
-                # only; the runtime skill fallback stays on, see
-                # :meth:`_default_enabled`). Locked tools always report on;
+                # configuring a brand-new profile. Skills start OFF (the admin
+                # opts each one in; the runtime fallback in :meth:`_default_enabled`
+                # is off too, so this matches). Locked tools always report on;
                 # otherwise built-ins honor their per-tool ``default`` flag.
                 "default_enabled": (
                     False if tool.tool_type is ToolType.SKILL
