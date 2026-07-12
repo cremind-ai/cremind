@@ -54,11 +54,73 @@ export interface ToolItem {
   disabled_leaves?: number;
 }
 
+export interface SkillItem {
+  name: string;
+  slug: string;
+  dir: string;
+  builtin: boolean;
+  bundled: boolean;
+  secret_variables?: string[];
+  has_listener?: boolean;
+  approx_bytes?: number;
+}
+
+export interface SettingItem {
+  key: string;
+  label: string;
+  group: string | null;
+  group_label: string | null;
+  description?: string | null;
+  type: string; // "number" | "string" | "boolean" | "enum" | "unknown"
+  enum?: string[] | null;
+  value: any;
+  default: any;
+  is_default: boolean;
+  unknown: boolean;
+}
+
+export interface ScheduleEventItem {
+  id: string;
+  title: string;
+  schedule_kind?: string | null;
+  dtstart?: string | null;
+  rrule?: string | null;
+  timezone?: string | null;
+  all_day?: boolean;
+}
+
+export interface WatcherEventItem {
+  id: string;
+  name: string;
+  root_path: string;
+  recursive?: boolean;
+  event_types?: string | null;
+  extensions?: string | null;
+}
+
+export interface SkillEventItem {
+  id: string;
+  skill_slug: string;
+  skill_name: string;
+  event_type: string;
+}
+
+export interface EventItemGroups {
+  schedule: ScheduleEventItem[];
+  file_watcher: WatcherEventItem[];
+  skill_event: SkillEventItem[];
+}
+
+export interface ListenerItem {
+  skill_dir: string;
+  skill_name: string;
+}
+
 export interface ExportableComponent {
   available: boolean;
   count?: number;
   summary?: Record<string, any>;
-  items?: any;
+  items?: SettingItem[] | ToolItem[] | SkillItem[] | ListenerItem[] | EventItemGroups;
   counts?: Record<string, number>;
   keys?: string[];
   skipped_non_skill?: number;
@@ -146,6 +208,8 @@ export async function exportBlueprint(
     components: string[];
     skills?: string[];
     tools?: string[];
+    settings?: string[];
+    events?: string[];
     name?: string;
     display_name?: string;
     description?: string;

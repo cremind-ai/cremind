@@ -68,6 +68,8 @@ def bp_exportable(ctx: typer.Context) -> None:
             continue
         detail = _exportable_detail(key, c)
         typer.echo(f"  [x] {key:<10} {detail}")
+        for line in _exportable_extra_lines(key, c):
+            typer.echo(f"          {line}")
 
 
 def _exportable_detail(key: str, c: dict) -> str:
@@ -90,6 +92,39 @@ def _exportable_detail(key: str, c: dict) -> str:
     return ""
 
 
+def _exportable_extra_lines(key: str, c: dict) -> list[str]:
+    """Per-item detail printed under a component's summary line.
+
+    Settings show value vs default; events show the ``id=`` used by
+    ``--events``; listeners show skill names.
+    """
+    lines: list[str] = []
+    if key == "settings":
+        for it in c.get("items") or []:
+            if it.get("unknown"):
+                lines.append(f"{it.get('key')} = {it.get('value')!r} [unknown key]")
+                continue
+            suffix = " (= default)" if it.get("is_default") else f" (default {it.get('default')!r})"
+            lines.append(
+                f"{it.get('key')} = {it.get('value')!r}{suffix} [{it.get('type')}]"
+            )
+    elif key == "events":
+        items = c.get("items") or {}
+        for s in items.get("schedule") or []:
+            cadence = s.get("rrule") or ("one-time" if not s.get("all_day") else "one-time · all day")
+            lines.append(f"schedule \"{s.get('title')}\"  {cadence}  id={s.get('id')}")
+        for w in items.get("file_watcher") or []:
+            lines.append(f"watcher \"{w.get('name')}\" -> {w.get('root_path')}  id={w.get('id')}")
+        for e in items.get("skill_event") or []:
+            lines.append(
+                f"skill event {e.get('skill_slug')}/{e.get('event_type')}  id={e.get('id')}"
+            )
+    elif key == "listeners":
+        for li in c.get("items") or []:
+            lines.append(li.get("skill_name") or li.get("skill_dir") or "?")
+    return lines
+
+
 @blueprint_app.command("export")
 @graceful_errors
 def bp_export(
@@ -100,6 +135,8 @@ def bp_export(
     all_: bool = typer.Option(False, "--all", help="Include every available component."),
     skills: Optional[str] = typer.Option(None, "--skills", help="Comma-separated skill slugs to bundle (default: all)."),
     tools: Optional[str] = typer.Option(None, "--tools", help="Comma-separated tool ids to include (default: all)."),
+    settings: Optional[str] = typer.Option(None, "--settings", help="Comma-separated setting keys to include (default: all changed settings)."),
+    events: Optional[str] = typer.Option(None, "--events", help="Comma-separated event ids to include; see `cremind blueprint exportable` (default: all)."),
     name: Optional[str] = typer.Option(None, "--name", help="Blueprint name (filename slug)."),
     display_name: Optional[str] = typer.Option(None, "--display-name", help="Human-readable name."),
     description: Optional[str] = typer.Option(None, "--description", help="One-line description."),
@@ -134,6 +171,10 @@ def bp_export(
                 body["skills"] = [s.strip() for s in skills.split(",") if s.strip()]
             if tools:
                 body["tools"] = [t.strip() for t in tools.split(",") if t.strip()]
+            if settings:
+                body["settings"] = [s.strip() for s in settings.split(",") if s.strip()]
+            if events:
+                body["events"] = [e.strip() for e in events.split(",") if e.strip()]
             result = await api.export_blueprint(client, body)
             file_name = (result.get("file") or {}).get("name")
             saved = None
