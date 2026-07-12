@@ -172,8 +172,9 @@ def test_export_checklist_detection(env):
     from app.blueprint.detect import collect_exportable
     from app.config.user_config import resolve_default
 
-    # Add a setting whose stored value equals its default (should be flagged
-    # is_default) and a key no longer in the schema (should be flagged unknown).
+    # Add a setting whose stored value equals its default (a Setup-Wizard-style
+    # redundant row — must NOT appear as a change) and a key no longer in the
+    # schema (kept, flagged unknown).
     default_retries = resolve_default("agent.max_llm_retries")
     eng = get_database_provider().sync_engine()
     with eng.begin() as c:
@@ -191,20 +192,19 @@ def test_export_checklist_detection(env):
     # Only the components we actually customized should be available.
     for key in ("persona", "settings", "llm", "tools", "skills", "listeners"):
         assert comps[key]["available"] is True, f"{key} should be exportable"
-    # Three stored overrides now.
-    assert comps["settings"]["count"] == 3
+    # Two real overrides: the changed setting + the unknown key. The row equal
+    # to its default is filtered out.
+    assert comps["settings"]["count"] == 2
     items = {it["key"]: it for it in comps["settings"]["items"]}
-    # The changed setting carries full metadata and is not at its default.
+    assert "agent.max_llm_retries" not in items, "a default-equal row must not appear as a change"
+    # The changed setting carries full metadata.
     changed = items["agent.max_steps"]
     assert changed["type"] == "number"
     assert changed["label"]
     assert changed["group"] == "agent"
     assert changed["value"] == 300
     assert changed["default"] == resolve_default("agent.max_steps")
-    assert changed["is_default"] is False
     assert changed["unknown"] is False
-    # A stored value equal to its default is flagged.
-    assert items["agent.max_llm_retries"]["is_default"] is True
     # A key no longer in the schema is flagged unknown (still exportable).
     assert items["nope.gone"]["unknown"] is True
     # The bundled user skill shows up, flagged as needing its secret var.
@@ -212,6 +212,42 @@ def test_export_checklist_detection(env):
     assert any(s["slug"] == "my_skill" and "MY_API_KEY" in s["secret_variables"] for s in skills)
     # Events were not populated in this fixture → not available.
     assert comps["events"]["available"] is False
+
+
+def test_export_settings_skips_default_equal(env):
+    system_dir = env
+    _populate_src(system_dir)
+
+    from app.blueprint.engine import ExportOptions, create_blueprint
+    from app.config.user_config import resolve_default
+
+    # A redundant row equal to its default alongside the genuinely-changed one.
+    eng = get_database_provider().sync_engine()
+    with eng.begin() as c:
+        c.execute(
+            text("INSERT INTO user_config (profile,key,value,updated_at) VALUES ('src','agent.max_llm_retries',:v,:t)"),
+            {"v": str(resolve_default("agent.max_llm_retries")), "t": time.time() * 1000},
+        )
+
+    # Whole-component export (no explicit selection) drops the default-equal row.
+    result = create_blueprint(
+        ExportOptions(profile="src", name="allset", components={"settings"})
+    )
+    doc = _component_doc(result.path, "settings")
+    assert set(doc["data"]["values"].keys()) == {"agent.max_steps"}
+
+    # An explicit --settings selection is honoured verbatim, even for a
+    # default-equal key (power-user override).
+    result2 = create_blueprint(
+        ExportOptions(
+            profile="src",
+            name="explicit",
+            components={"settings"},
+            setting_keys={"agent.max_llm_retries"},
+        )
+    )
+    doc2 = _component_doc(result2.path, "settings")
+    assert set(doc2["data"]["values"].keys()) == {"agent.max_llm_retries"}
 
 
 def _seed_events(system_dir: Path) -> dict[str, str]:

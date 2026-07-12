@@ -104,9 +104,8 @@ def _exportable_extra_lines(key: str, c: dict) -> list[str]:
             if it.get("unknown"):
                 lines.append(f"{it.get('key')} = {it.get('value')!r} [unknown key]")
                 continue
-            suffix = " (= default)" if it.get("is_default") else f" (default {it.get('default')!r})"
             lines.append(
-                f"{it.get('key')} = {it.get('value')!r}{suffix} [{it.get('type')}]"
+                f"{it.get('key')} = {it.get('value')!r} (default {it.get('default')!r}) [{it.get('type')}]"
             )
     elif key == "events":
         items = c.get("items") or {}
