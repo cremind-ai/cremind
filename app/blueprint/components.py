@@ -384,10 +384,14 @@ def build_llm_doc(profile: str) -> tuple[dict, list]:
 # ── settings (changed-from-default user_config rows) ───────────────────────────
 
 
-def build_settings_doc(profile: str) -> tuple[dict, list]:
+def build_settings_doc(
+    profile: str, *, selected_keys: set[str] | None = None
+) -> tuple[dict, list]:
     from app.config.user_config import resolve_default
 
     values = _config_storage().get_all("user_config", profile=profile)
+    if selected_keys is not None:
+        values = {k: v for k, v in values.items() if k in selected_keys}
     defaults_at_export: dict[str, Any] = {}
     for key in values:
         try:
@@ -505,7 +509,9 @@ def build_skills_doc(
 # ── events (schedule + file-watcher + skill-event) ─────────────────────────────
 
 
-def build_events_doc(profile: str) -> tuple[dict, list]:
+def build_events_doc(
+    profile: str, *, selected_event_ids: set[str] | None = None
+) -> tuple[dict, list]:
     from app.calendar.feature import is_enabled
     from app.skills.scanner import scan_skills
     from app.skills.sync import profile_skills_dir
@@ -525,6 +531,8 @@ def build_events_doc(profile: str) -> tuple[dict, list]:
             excluded_mirrors += 1
             continue
         if row.get("status") == "cancelled":
+            continue
+        if selected_event_ids is not None and row["id"] not in selected_event_ids:
             continue
         schedule_out.append(
             {
@@ -546,6 +554,8 @@ def build_events_doc(profile: str) -> tuple[dict, list]:
     # File watchers — carry root_path raw; it is relocated/prompted on import.
     watcher_out: list[dict] = []
     for row in FileWatcherSubscriptionStorage().list_by_profile(profile):
+        if selected_event_ids is not None and row["id"] not in selected_event_ids:
+            continue
         watcher_out.append(
             {
                 "name": row["name"],
@@ -574,6 +584,8 @@ def build_events_doc(profile: str) -> tuple[dict, list]:
     }
     skill_event_out: list[dict] = []
     for row in EventSubscriptionStorage().list_by_profile(profile):
+        if selected_event_ids is not None and row["id"] not in selected_event_ids:
+            continue
         skill_event_out.append(
             {
                 "skill_slug": name_to_slug.get(row["skill_name"], slugify(row["skill_name"])),

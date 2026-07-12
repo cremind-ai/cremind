@@ -143,12 +143,61 @@ def collect_exportable(profile: str) -> dict[str, Any]:
         },
     }
 
-    # settings
+    # settings — per-key detail (label/type/value vs default) so the UI can show
+    # exactly which overrides ship and let the creator deselect individual ones.
+    from app.config.config_schema import CONFIG_SCHEMA, lookup
+    from app.config.user_config import resolve_default
+
     settings_vals = cs.get_all("user_config", profile=profile)
+    setting_items: list[dict] = []
+    for key in sorted(settings_vals.keys()):
+        raw = settings_vals[key]
+        try:
+            group_name, field_name, field = lookup(key)
+        except KeyError:
+            # A key no longer in the schema on this build (deleted setting still
+            # stored). It still exports; flag it so the UI can warn.
+            setting_items.append(
+                {
+                    "key": key,
+                    "label": key,
+                    "group": None,
+                    "group_label": None,
+                    "description": None,
+                    "type": "unknown",
+                    "enum": None,
+                    "value": raw,
+                    "default": None,
+                    "is_default": False,
+                    "unknown": True,
+                }
+            )
+            continue
+        default = resolve_default(key)
+        try:
+            value = field.coerce(raw)
+        except ValueError:
+            value = raw
+        setting_items.append(
+            {
+                "key": key,
+                "label": field.label or field_name,
+                "group": group_name,
+                "group_label": CONFIG_SCHEMA[group_name].label,
+                "description": field.description,
+                "type": field.type,
+                "enum": list(field.enum) if field.enum else None,
+                "value": value,
+                "default": default,
+                "is_default": value == default,
+                "unknown": False,
+            }
+        )
     components["settings"] = {
         "available": bool(settings_vals),
         "count": len(settings_vals),
         "keys": sorted(settings_vals.keys()),
+        "items": setting_items,
     }
 
     # events (need counts first so skills can reference them)
@@ -207,20 +256,51 @@ def collect_exportable(profile: str) -> dict[str, Any]:
         },
         "excluded": {"external_mirrors": excluded_mirrors},
         "items": {
-            "schedule": [{"title": r["title"]} for r in schedule_rows],
+            "schedule": [
+                {
+                    "id": r["id"],
+                    "title": r["title"],
+                    "schedule_kind": r["schedule_kind"],
+                    "dtstart": r["dtstart"],
+                    "rrule": r["rrule"],
+                    "timezone": r["timezone"],
+                    "all_day": r["all_day"],
+                }
+                for r in schedule_rows
+            ],
             "file_watcher": [
-                {"name": r["name"], "root_path": r["root_path"]} for r in watcher_rows
+                {
+                    "id": r["id"],
+                    "name": r["name"],
+                    "root_path": r["root_path"],
+                    "recursive": r["recursive"],
+                    "event_types": r["event_types"],
+                    "extensions": r["extensions"],
+                }
+                for r in watcher_rows
             ],
             "skill_event": [
-                {"skill_slug": slugify(r["skill_name"]), "event_type": r["event_type"]}
+                {
+                    "id": r["id"],
+                    "skill_slug": slugify(r["skill_name"]),
+                    "skill_name": r["skill_name"],
+                    "event_type": r["event_type"],
+                }
                 for r in skill_event_rows
             ],
         },
     }
 
+    dir_to_name = {e["dir"]: e["name"] for e in all_entries}
     components["listeners"] = {
         "available": bool(listener_items),
-        "items": [{"skill_dir": li["skill_dir"]} for li in listener_items],
+        "items": [
+            {
+                "skill_dir": li["skill_dir"],
+                "skill_name": dir_to_name.get(li["skill_dir"], li["skill_dir"]),
+            }
+            for li in listener_items
+        ],
         "skipped_non_skill": listeners_doc["data"].get("_skipped_non_skill", 0),
     }
 

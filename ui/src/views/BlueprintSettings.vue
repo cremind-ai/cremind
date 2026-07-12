@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router';
 import { Icon } from '@iconify/vue';
 import {
   ElButton, ElCard, ElCheckbox, ElInput, ElMessage, ElMessageBox,
-  ElRadioButton, ElRadioGroup, ElTable, ElTableColumn,
+  ElRadioButton, ElRadioGroup, ElTable, ElTableColumn, ElTag,
 } from 'element-plus';
 
 import { useSettingsStore } from '../stores/settings';
@@ -14,6 +14,8 @@ import {
   deleteBlueprint, downloadBlueprint, exportBlueprint, getExportable,
   importBlueprintFromHub, listBlueprints,
   type BlueprintEntry, type ExportableResponse,
+  type SettingItem, type SkillItem, type ToolItem, type ListenerItem,
+  type EventItemGroups, type SkillEventItem,
 } from '../services/blueprintApi';
 
 const props = defineProps<{ profile: string }>();
@@ -30,6 +32,8 @@ const exportable = ref<ExportableResponse | null>(null);
 const selected = ref<Record<string, boolean>>({});
 const selectedSkills = ref<Record<string, boolean>>({});
 const selectedTools = ref<Record<string, boolean>>({});
+const selectedSettings = ref<Record<string, boolean>>({});
+const selectedEvents = ref<Record<string, boolean>>({});
 const name = ref('');
 const description = ref('');
 const archives = ref<BlueprintEntry[]>([]);
@@ -50,25 +54,62 @@ const availableComponents = computed(() =>
   COMPONENT_ORDER.filter(k => exportable.value?.components?.[k]?.available),
 );
 
-const skillItems = computed(() => exportable.value?.components?.skills?.items ?? []);
-const toolItems = computed(() => exportable.value?.components?.tools?.items ?? []);
+const skillItems = computed<SkillItem[]>(() => (exportable.value?.components?.skills?.items as SkillItem[]) ?? []);
+const toolItems = computed<ToolItem[]>(() => (exportable.value?.components?.tools?.items as ToolItem[]) ?? []);
+const settingItems = computed<SettingItem[]>(() => (exportable.value?.components?.settings?.items as SettingItem[]) ?? []);
+const listenerItems = computed<ListenerItem[]>(() => (exportable.value?.components?.listeners?.items as ListenerItem[]) ?? []);
+const eventGroups = computed<EventItemGroups>(() => {
+  const g = exportable.value?.components?.events?.items as EventItemGroups | undefined;
+  return {
+    schedule: g?.schedule ?? [],
+    file_watcher: g?.file_watcher ?? [],
+    skill_event: g?.skill_event ?? [],
+  };
+});
+const allEventItems = computed(() => [
+  ...eventGroups.value.schedule,
+  ...eventGroups.value.file_watcher,
+  ...eventGroups.value.skill_event,
+]);
+
+function fmtSetting(v: any): string {
+  if (v === null || v === undefined || v === '') return '—';
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  return String(v);
+}
 
 function creds() {
   return { url: settings.agentUrl, token: settings.authToken };
 }
 
+function countSelected(map: Record<string, boolean>, ids: string[]): number {
+  return ids.filter(id => map[id]).length;
+}
+
 function componentDetail(key: string): string {
   const c = exportable.value?.components?.[key];
   if (!c) return '';
-  if (key === 'settings') return `${c.count ?? 0} setting(s) changed`;
-  if (key === 'skills') return (c.items ?? []).map((i: any) => i.name).join(', ');
-  if (key === 'events') {
-    const n = c.counts ?? {};
-    return `${n.schedule ?? 0} schedule, ${n.file_watcher ?? 0} watcher, ${n.skill_event ?? 0} skill event`;
+  if (key === 'settings') {
+    const total = settingItems.value.length;
+    const sel = countSelected(selectedSettings.value, settingItems.value.map(s => s.key));
+    return `${sel} of ${total} setting(s)`;
   }
-  if (key === 'llm') return `provider: ${c.summary?.default_provider ?? '-'}`;
-  if (key === 'tools') return (c.items ?? []).map((i: any) => i.name).join(', ');
-  if (key === 'listeners') return `${(c.items ?? []).length} listener(s)`;
+  if (key === 'skills') return skillItems.value.map(i => i.name).join(', ');
+  if (key === 'events') {
+    const g = eventGroups.value;
+    const s = countSelected(selectedEvents.value, g.schedule.map(e => e.id));
+    const w = countSelected(selectedEvents.value, g.file_watcher.map(e => e.id));
+    const e = countSelected(selectedEvents.value, g.skill_event.map(x => x.id));
+    return `${s}/${g.schedule.length} schedule, ${w}/${g.file_watcher.length} watcher, ${e}/${g.skill_event.length} skill event`;
+  }
+  if (key === 'llm') {
+    const s = c.summary ?? {};
+    const groups = s.model_groups ?? {};
+    const models = Object.entries(groups).map(([k, v]) => `${k}=${v}`).join(', ');
+    return `provider: ${s.default_provider ?? '-'}${models ? ` · ${models}` : ''}`;
+  }
+  if (key === 'tools') return toolItems.value.map(i => i.name).join(', ');
+  if (key === 'listeners') return listenerItems.value.map(i => i.skill_name).join(', ') || `${listenerItems.value.length} listener(s)`;
   if (key === 'persona') return `agent: ${c.summary?.agent_name ?? '-'}`;
   return '';
 }
@@ -86,6 +127,12 @@ async function loadExportable() {
   const toolSel: Record<string, boolean> = {};
   for (const t of toolItems.value) toolSel[t.tool_id] = true;
   selectedTools.value = toolSel;
+  const settingSel: Record<string, boolean> = {};
+  for (const s of settingItems.value) settingSel[s.key] = true;
+  selectedSettings.value = settingSel;
+  const eventSel: Record<string, boolean> = {};
+  for (const e of allEventItems.value) eventSel[e.id] = true;
+  selectedEvents.value = eventSel;
 }
 
 async function loadArchives() {
@@ -99,33 +146,56 @@ async function loadArchives() {
   }
 }
 
+// Selected skill events (their referenced skills must ship alongside them).
+const selectedSkillEvents = computed<SkillEventItem[]>(() =>
+  eventGroups.value.skill_event.filter(e => selectedEvents.value[e.id]),
+);
+
 // Events/listeners reference skills, so keep skills included when they are.
 const needsSkills = computed(() =>
-  (selected.value.events && (exportable.value?.components?.events?.counts?.skill_event ?? 0) > 0)
-  || (selected.value.listeners && (exportable.value?.components?.listeners?.items ?? []).length > 0),
+  (selected.value.events && selectedSkillEvents.value.length > 0)
+  || (selected.value.listeners && listenerItems.value.length > 0),
 );
 
 async function doExport() {
   const c = creds();
   if (!c.url) return;
+
+  const settingKeys = settingItems.value.filter(s => selectedSettings.value[s.key]).map(s => s.key);
+  const eventIds = allEventItems.value.filter(e => selectedEvents.value[e.id]).map(e => e.id);
+
   let components = COMPONENT_ORDER.filter(k => selected.value[k]);
+  // Drop a selected component that has items but none checked — it would export an empty doc.
+  if (components.includes('settings') && settingItems.value.length > 0 && settingKeys.length === 0) {
+    components = components.filter(k => k !== 'settings');
+    ElMessage.info('Changed settings skipped — no individual setting selected.');
+  }
+  if (components.includes('events') && allEventItems.value.length > 0 && eventIds.length === 0) {
+    components = components.filter(k => k !== 'events');
+    ElMessage.info('Events skipped — no individual event selected.');
+  }
+
   if (needsSkills.value && !components.includes('skills') && availableComponents.value.includes('skills')) {
     components.push('skills');
     selected.value.skills = true;
+    // Auto-check the skills the selected skill events reference so they actually ship.
+    for (const e of selectedSkillEvents.value) selectedSkills.value[e.skill_slug] = true;
     ElMessage.info('Skills included automatically — events/listeners reference them.');
   }
   if (components.length === 0) {
     ElMessage.warning('Select at least one component to export.');
     return;
   }
-  const skills = skillItems.value.filter((s: any) => selectedSkills.value[s.slug]).map((s: any) => s.slug);
-  const tools = toolItems.value.filter((t: any) => selectedTools.value[t.tool_id]).map((t: any) => t.tool_id);
+  const skills = skillItems.value.filter(s => selectedSkills.value[s.slug]).map(s => s.slug);
+  const tools = toolItems.value.filter(t => selectedTools.value[t.tool_id]).map(t => t.tool_id);
   exporting.value = true;
   try {
     const res = await exportBlueprint(c.url, c.token, {
       components,
       skills: components.includes('skills') ? skills : undefined,
       tools: components.includes('tools') ? tools : undefined,
+      settings: components.includes('settings') ? settingKeys : undefined,
+      events: components.includes('events') ? eventIds : undefined,
       name: name.value || undefined,
       display_name: name.value || undefined,
       description: description.value || undefined,
@@ -280,7 +350,7 @@ onMounted(async () => {
                   {{ s.name }}
                   <span class="bp-hint">
                     {{ s.builtin ? '(built-in — settings only)' : `(${fmtBytes(s.approx_bytes || 0)})` }}
-                    <template v-if="(s.secret_variables || []).length"> · needs: {{ s.secret_variables.join(', ') }}</template>
+                    <template v-if="(s.secret_variables || []).length"> · needs: {{ (s.secret_variables || []).join(', ') }}</template>
                   </span>
                 </ElCheckbox>
               </div>
@@ -291,11 +361,67 @@ onMounted(async () => {
                     <span class="bp-kind">{{ t.kind === 'a2a' ? 'A2A' : t.kind === 'mcp' ? 'MCP' : 'built-in' }}</span>
                     <span class="bp-hint">
                       <template v-if="t.settings_count"> · {{ t.settings_count }} setting(s)</template>
-                      <template v-if="(t.secret_variables || []).length"> · needs: {{ t.secret_variables.join(', ') }}</template>
+                      <template v-if="(t.secret_variables || []).length"> · needs: {{ (t.secret_variables || []).join(', ') }}</template>
                       <template v-if="t.disabled_leaves"> · {{ t.disabled_leaves }} sub-tool(s) disabled</template>
                     </span>
                   </ElCheckbox>
                   <div v-if="t.description && t.description !== t.name" class="bp-hint bp-tool-desc">{{ t.description }}</div>
+                </div>
+              </div>
+
+              <!-- settings: per-key detail + selection -->
+              <div v-if="key === 'settings' && selected['settings']" class="bp-settings">
+                <table class="bp-settings-table">
+                  <thead>
+                    <tr><th></th><th>Setting</th><th>Type</th><th>Default</th><th>Exported</th><th></th></tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="s in settingItems" :key="s.key">
+                      <td class="bp-st-check"><ElCheckbox v-model="selectedSettings[s.key]" /></td>
+                      <td>
+                        <div class="bp-st-label">{{ s.label }}</div>
+                        <div class="bp-hint">
+                          {{ s.key }}<template v-if="s.group_label"> · {{ s.group_label }}</template>
+                        </div>
+                      </td>
+                      <td><span class="bp-kind">{{ s.type }}</span></td>
+                      <td class="bp-st-val">{{ fmtSetting(s.default) }}</td>
+                      <td class="bp-st-val"><strong>{{ fmtSetting(s.value) }}</strong></td>
+                      <td>
+                        <ElTag v-if="s.unknown" type="warning" size="small" disable-transitions>not in this build</ElTag>
+                        <ElTag v-else-if="s.is_default" type="info" size="small" disable-transitions>same as default</ElTag>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <!-- events: per-item detail + selection, grouped by kind -->
+              <div v-if="key === 'events' && selected['events']" class="bp-events">
+                <div v-if="eventGroups.schedule.length" class="bp-event-group">
+                  <div class="bp-event-title">Schedules</div>
+                  <ElCheckbox v-for="s in eventGroups.schedule" :key="s.id" v-model="selectedEvents[s.id]">
+                    {{ s.title || '(untitled)' }}
+                    <span class="bp-hint">
+                      · {{ s.rrule ? s.rrule : (s.all_day ? 'one-time · all day' : 'one-time') }}
+                      <template v-if="s.timezone"> · {{ s.timezone }}</template>
+                    </span>
+                  </ElCheckbox>
+                </div>
+                <div v-if="eventGroups.file_watcher.length" class="bp-event-group">
+                  <div class="bp-event-title">File watchers</div>
+                  <ElCheckbox v-for="w in eventGroups.file_watcher" :key="w.id" v-model="selectedEvents[w.id]">
+                    {{ w.name }}
+                    <span class="bp-hint">
+                      · {{ w.root_path }}<template v-if="w.recursive"> · recursive</template>
+                    </span>
+                  </ElCheckbox>
+                </div>
+                <div v-if="eventGroups.skill_event.length" class="bp-event-group">
+                  <div class="bp-event-title">Skill events</div>
+                  <ElCheckbox v-for="e in eventGroups.skill_event" :key="e.id" v-model="selectedEvents[e.id]">
+                    {{ e.skill_name || e.skill_slug }} / {{ e.event_type }}
+                  </ElCheckbox>
                 </div>
               </div>
             </div>
@@ -399,6 +525,16 @@ onMounted(async () => {
 .bp-kind { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 8px; font-size: 0.65rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; color: var(--text-secondary); background: var(--el-fill-color-light, rgba(128, 128, 128, 0.15)); vertical-align: middle; }
 .bp-tool-desc { margin: 0 0 0 24px; line-height: 1.4; white-space: normal; }
 .bp-hint { color: var(--text-tertiary); font-size: 0.75rem; }
+.bp-settings { margin: 4px 0 4px 24px; overflow-x: auto; }
+.bp-settings-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+.bp-settings-table th { text-align: left; font-weight: 600; color: var(--text-secondary); padding: 4px 8px; border-bottom: 1px solid var(--el-border-color-lighter, rgba(128,128,128,0.2)); }
+.bp-settings-table td { padding: 4px 8px; border-bottom: 1px solid var(--el-border-color-lighter, rgba(128,128,128,0.12)); vertical-align: top; }
+.bp-st-check { width: 28px; }
+.bp-st-label { font-weight: 600; }
+.bp-st-val { font-family: var(--el-font-family-mono, monospace); white-space: nowrap; }
+.bp-events { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 4px 24px; }
+.bp-event-group { display: flex; flex-direction: column; gap: 2px; }
+.bp-event-title { font-weight: 600; font-size: 0.8rem; color: var(--text-secondary); }
 .bp-meta { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
 .bp-warn { color: var(--el-color-warning); font-size: 0.78rem; margin: 0 0 12px 0; }
 .bp-import-mode { margin-bottom: 12px; }

@@ -62,7 +62,14 @@ cremind blueprint export --all               # export every available component
 cremind blueprint export --components persona,llm,skills --name cs-agent -o ./cs-agent.cremind-blueprint
 cremind blueprint export --skills imap-email,my-skill   # bundle only these skills
 cremind blueprint export --tools web_search,gmail       # include only these tools
+cremind blueprint export --components settings,events --settings agent.max_steps --events <event-id>
 ```
+
+`exportable` prints each component's summary and, underneath it, per-item
+detail: every changed setting with its value vs default (e.g.
+`agent.max_steps = 300 (default 200) [number]`, or `(= default)` when the stored
+value matches the default) and every event with the `id=` you pass to
+`--events`.
 
 Options:
 
@@ -72,6 +79,8 @@ Options:
 | `--components a,b,c` | Only these component keys (`persona,tools,llm,settings,skills,events,listeners`). |
 | `--skills a,b` | Bundle only these skill slugs (default: all customized skills). |
 | `--tools a,b` | Include only these tool ids (default: all customized tools). |
+| `--settings a,b` | Include only these setting keys, e.g. `agent.max_steps,compaction.enabled` (default: all changed settings). |
+| `--events id1,id2` | Include only these event ids (from `cremind blueprint exportable`; default: all). |
 | `--name` / `--display-name` / `--description` | Blueprint metadata. |
 | `-o, --out PATH` | Also download the archive to a local file. |
 
