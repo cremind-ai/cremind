@@ -1,5 +1,5 @@
 ---
-description: "Browse and manage **files in the Cremind workspace**: `list`, `download`, `upload`, `mkdir`, `move`, and `delete` files, read or set a conversation's working directory (`cwd`, `set-cwd`), and `watch` filesystem-change events. Use this to move files into or out of the workspace and manage the agent's working directory — file operations, distinct from `cremind file-watchers` (which subscribes to change events)."
+description: "Browse and manage **files in the Cremind workspace**: `list`, `download`, `upload`, `upload-temp` (into a conversation's temp dir, returning attach-ready paths), `mkdir`, `move`, and `delete` files, read or set a conversation's working directory (`cwd`, `set-cwd`), and `watch` filesystem-change events. Use this to move files into or out of the workspace and manage the agent's working directory — file operations, distinct from `cremind file-watchers` (which subscribes to change events)."
 ---
 
 # `cremind files` — Workspace File Management
@@ -133,6 +133,33 @@ $ cremind files upload "C:\Users\me\workspace\inbox" ./a.csv ./b.csv
 NAME    SAVED_AS    STATUS   ERROR
 a.csv   a.csv       ok
 b.csv   b (1).csv   renamed
+```
+
+### `cremind files upload-temp`
+
+**Purpose.** Upload files into a **conversation's temporary upload folder** and
+get back each file's absolute server path — the path you attach to the
+conversation's next message.
+
+```bash
+cremind files upload-temp <conversation_id> <local_file>...
+```
+
+**Behavior.** Unlike `upload`, you supply **no server path**: the destination
+(`<system>/<profile>/uploads_tmp/<conversation_id>/`) is computed server-side
+from your profile + the conversation, and already lives inside the file tool's
+allowed roots. This is the only way to reach that per-conversation temp slice —
+the path-based `upload` allowlist can't. Prints a
+`NAME / SAVED_AS / STATUS / PATH / ERROR` table where `PATH` is the attach-ready
+absolute path; `--json` returns the raw `results` array. Only the conversation's
+owner may write into its slice.
+
+**Example.**
+
+```bash
+$ cremind files upload-temp c_82bc ./contract.pdf
+NAME          SAVED_AS      STATUS  PATH                                             ERROR
+contract.pdf  contract.pdf  ok      /home/li/.cremind/main/uploads_tmp/c_82bc/contract.pdf
 ```
 
 ### `cremind files mkdir`

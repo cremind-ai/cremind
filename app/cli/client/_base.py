@@ -110,6 +110,27 @@ class Client:
             return None
         return resp.json()
 
+    async def get_json_status(
+        self,
+        path: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+    ) -> tuple[int, Any]:
+        """GET returning `(status_code, parsed_body)` WITHOUT raising on non-2xx.
+
+        For endpoints that signal state through the status code rather than
+        treating it as a hard error — notably `GET /health`, which returns
+        503 (with a well-formed JSON body) when a subsystem is degraded.
+        """
+        resp = await self._http.get(path, params=params)
+        body: Any = None
+        if resp.content:
+            try:
+                body = resp.json()
+            except json.JSONDecodeError:
+                body = None
+        return resp.status_code, body
+
     async def post_json(
         self,
         path: str,
@@ -177,6 +198,16 @@ class Client:
         from app.cli.client._sse import stream_events
 
         return stream_events(self._stream_http, path)
+
+    def stream_post(self, path: str, body: Any) -> "AsyncIterator[Event]":  # noqa: F821
+        """Open a POST SSE stream (JSON `body`) and yield decoded events.
+
+        For POST-only streaming endpoints such as `/api/features/install`,
+        which take a request body describing what to do.
+        """
+        from app.cli.client._sse import stream_events_post
+
+        return stream_events_post(self._stream_http, path, body)
 
     async def download(
         self,

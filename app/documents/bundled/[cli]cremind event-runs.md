@@ -1,5 +1,5 @@
 ---
-description: "View and manage **event runs** — the per-trigger execution history of automatic event rules (skill, file-watcher, schedule). Each fired trigger runs in its own isolated conversation with a status (running/pending/completed/failed/cancelled) and token usage; reply to runs that are pending your input, inspect or delete run history."
+description: "View and manage **event runs** — the per-trigger execution history of automatic event rules (skill, file-watcher, schedule). Each fired trigger runs in its own isolated conversation with a status (running/pending/completed/failed/cancelled) and token usage; reply to runs pending your input, cancel a running run, and inspect or delete run history."
 ---
 
 # `cremind event-runs` — Event Run History
@@ -150,6 +150,26 @@ Silent on success. (Equivalent to `DELETE /api/event-runs/{id}`.)
 
 ```bash
 $ cremind event-runs delete 3f9c2a10-...-b1
+```
+
+### `cremind event-runs cancel`
+
+**Purpose.** Cancel a run that is currently **running**, without deleting it —
+the run and its transcript stay, its status moves to `cancelled`.
+
+```bash
+cremind event-runs cancel <run-id>
+```
+
+Prints `cancelled` on success, or `run was not running` when the run had
+already finished (or never started) — that case is a no-op, not an error. With
+`--json`, prints `{"cancelled": <bool>}`. (Equivalent to
+`POST /api/event-runs/{id}/cancel`.) Use `delete` instead if you also want to
+remove the run and its conversation.
+
+```bash
+$ cremind event-runs cancel 3f9c2a10-...-b1
+cancelled
 ```
 
 ## Worked examples

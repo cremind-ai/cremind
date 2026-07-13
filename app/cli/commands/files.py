@@ -223,6 +223,62 @@ def files_upload(
     table.render()
 
 
+@files_app.command("upload-temp")
+@graceful_errors
+def files_upload_temp(
+    ctx: typer.Context,
+    conversation_id: str = typer.Argument(
+        ..., help="Conversation whose temp upload dir to write into.",
+    ),
+    local_files: List[str] = typer.Argument(..., help="Local file(s) to upload."),
+) -> None:
+    """Upload files into a conversation's temp dir (returns attach-ready paths).
+
+    Unlike `files upload`, no server path is given — the destination is derived
+    server-side from your profile + the conversation. Each result's PATH is the
+    absolute path to attach to the conversation's next message.
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.files import upload_temp
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, Table, print_json
+    from app.cli.output.formatting import string_field
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    parts: list[tuple[str, bytes]] = []
+    for lf in local_files:
+        if not os.path.isfile(lf):
+            typer.echo(f"not a file: {lf}", err=True)
+            raise typer.Exit(code=1)
+        with open(lf, "rb") as fh:
+            parts.append((os.path.basename(lf), fh.read()))
+
+    async def _run() -> list[dict[str, Any]]:
+        async with Client(cfg) as client:
+            return await upload_temp(client, conversation_id, parts)
+
+    results = asyncio.run(_run())
+
+    if mode.json:
+        print_json(results)
+        return
+    table = Table(mode, "NAME", "SAVED_AS", "STATUS", "PATH", "ERROR")
+    for r in results:
+        table.add_row(
+            string_field(r, "name"),
+            string_field(r, "saved_as"),
+            string_field(r, "status"),
+            string_field(r, "path"),
+            string_field(r, "error"),
+        )
+    table.render()
+
+
 @files_app.command("mkdir")
 @graceful_errors
 def files_mkdir(

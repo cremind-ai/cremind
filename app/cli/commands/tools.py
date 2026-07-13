@@ -221,6 +221,47 @@ def tools_set_args(
     asyncio.run(_run())
 
 
+@tools_app.command("get-args")
+@graceful_errors
+def tools_get_args(
+    ctx: typer.Context,
+    tool_id: str = typer.Argument(..., help="Tool id."),
+) -> None:
+    """Show a tool's arguments schema and its saved argument values.
+
+    Complements `set-args`. Derived from the tool detail (`tools get`) — there
+    is no dedicated GET arguments endpoint.
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.tools import get_tool_arguments
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await get_tool_arguments(client, tool_id)
+
+    out = asyncio.run(_run())
+
+    if mode.json:
+        print_json(out)
+        return
+    sys.stdout.write("--- arguments_schema ---\n")
+    sys.stdout.write(
+        _json.dumps(out.get("arguments_schema"), indent=2, ensure_ascii=False, default=str) + "\n"
+    )
+    sys.stdout.write("\n--- arguments ---\n")
+    sys.stdout.write(
+        _json.dumps(out.get("arguments"), indent=2, ensure_ascii=False, default=str) + "\n"
+    )
+
+
 @tools_app.command("leaves")
 @graceful_errors
 def tools_leaves(
