@@ -113,7 +113,7 @@ def tools_enable(
     ctx: typer.Context,
     tool_id: str = typer.Argument(..., help="Tool id."),
 ) -> None:
-    """Enable an A2A or MCP tool."""
+    """Enable a tool (A2A, MCP, skill, or an optional built-in like claude_code)."""
     _set_tool_enabled(ctx, tool_id, True)
 
 
@@ -123,7 +123,7 @@ def tools_disable(
     ctx: typer.Context,
     tool_id: str = typer.Argument(..., help="Tool id."),
 ) -> None:
-    """Disable an A2A or MCP tool."""
+    """Disable a tool (A2A, MCP, skill, or an optional built-in like claude_code)."""
     _set_tool_enabled(ctx, tool_id, False)
 
 

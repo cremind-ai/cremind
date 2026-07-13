@@ -72,6 +72,19 @@ FEATURES: dict[str, Feature] = {
         requires_restart=True,
     ),
 
+    # ── Claude Code delegation (Claude Agent SDK bundles the CLI binary) ─────
+    # No post_install: the platform wheel ships the Claude Code CLI binary, so
+    # nothing extra to download. requires_restart=False: the claude_code tool
+    # imports the SDK lazily inside run() (never at module load), and the
+    # installer runs importlib.invalidate_caches() after pip, so a runtime pip
+    # install is importable in-process on the very next call — no restart.
+    "claude_code": Feature(
+        key="claude_code",
+        extras=("claude-code",),
+        probes=("claude_agent_sdk",),
+        requires_restart=False,
+    ),
+
     # ── Document ingestion + tabular processing ─────────────────────────────
     "documents": Feature(
         key="documents",

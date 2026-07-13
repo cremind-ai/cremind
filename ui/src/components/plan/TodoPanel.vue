@@ -114,12 +114,10 @@ function statusIcon(status: string): string {
 
 <style scoped>
 .todo-panel {
-  position: absolute;
-  top: 12px;
-  right: 16px;
+  /* Positioning is owned by the `.floating-panels` flex wrapper in ChatView. */
   width: 280px;
   max-width: calc(100% - 32px);
-  max-height: 45%;
+  max-height: 45vh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -141,13 +139,10 @@ function statusIcon(status: string): string {
   opacity: 1;
 }
 
-/* Maximized: widen and fill the chat height (top → clear of the composer).
-   bottom:116px clears the Workspace restore pill so it stays clickable. The
-   width transitions smoothly; the max-height→top/bottom height change snaps. */
+/* Maximized: widen and grow taller within the floating stack. */
 .todo-panel.maximized {
   width: 420px;
-  bottom: 116px;
-  max-height: none;
+  max-height: 70vh;
   opacity: 1;
 }
 
@@ -247,12 +242,8 @@ function statusIcon(status: string): string {
   word-break: break-word;
 }
 
-/* Minimized: compact pill pinned top-right (matches the panel's theme + dim). */
+/* Minimized: compact pill (positioned by the `.floating-panels` wrapper). */
 .todo-pill {
-  position: absolute;
-  top: 12px;
-  right: 16px;
-  z-index: 6;
   display: inline-flex;
   align-items: center;
   gap: 6px;

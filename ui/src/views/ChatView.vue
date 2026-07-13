@@ -14,6 +14,7 @@ import ResizableDivider from '../components/ResizableDivider.vue';
 import ConversationMemoryPanel from '../components/ConversationMemoryPanel.vue';
 import ConversationUsagePanel from '../components/ConversationUsagePanel.vue';
 import TodoPanel from '../components/plan/TodoPanel.vue';
+import AgentActivityPanel from '../components/agent/AgentActivityPanel.vue';
 import PlanBanner from '../components/plan/PlanBanner.vue';
 import PlanApprovalDialog from '../components/plan/PlanApprovalDialog.vue';
 import AskUserQuestionDialog from '../components/plan/AskUserQuestionDialog.vue';
@@ -293,7 +294,17 @@ const cancelPlan = async () => {
         @stop="chatStore.stopMessage()"
       />
 
-      <TodoPanel v-if="chatStore.activeTodos" :state="chatStore.activeTodos" />
+      <div
+        v-if="chatStore.activeTodos || chatStore.activeAgentActivity"
+        class="floating-panels"
+      >
+        <TodoPanel v-if="chatStore.activeTodos" :state="chatStore.activeTodos" />
+        <AgentActivityPanel
+          v-if="chatStore.activeAgentActivity"
+          :state="chatStore.activeAgentActivity"
+          @dismiss="chatStore.dismissAgentActivity(chatStore.activeConversationId!)"
+        />
+      </div>
 
       <button
         v-if="showMinimizedPill"
@@ -362,6 +373,30 @@ const cancelPlan = async () => {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+}
+
+/* Floating stack for the Todo + Agent Activity panels (both may show at once,
+   e.g. an approved plan whose execution delegates a coding task to Claude
+   Code). Absolutely positioned top-right of the chat column; the child panels
+   are static so they stack vertically without overlapping. */
+.floating-panels {
+  position: absolute;
+  top: 12px;
+  right: 16px;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  max-width: calc(100% - 32px);
+  max-height: calc(100% - 140px);
+  pointer-events: none;
+}
+
+/* Re-enable interaction on the panels themselves (the wrapper is click-through
+   so it never blocks the chat behind the empty gap between panels). */
+.floating-panels > * {
+  pointer-events: auto;
 }
 
 .right-panel-host {
