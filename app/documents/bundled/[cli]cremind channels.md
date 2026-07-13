@@ -1,5 +1,5 @@
 ---
-description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), set a channel's push-notification filter with `notify-filter`, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
+description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders`, run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), set a channel's push-notification filter with `notify-filter`, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
 ---
 
 # `cremind channels` — External Messaging Channel Management
@@ -319,6 +319,83 @@ $ cremind channels notify-filter e2e8...d4f1
 # Only high-priority alerts from scheduled automations, muted 22:00–07:00 local
 $ cremind channels notify-filter e2e8...d4f1 --json \
     '{"min_priority":"high","source_kinds":["schedule"],"quiet_hours":{"enabled":true,"start":"22:00","end":"07:00","allow_high":true}}'
+```
+
+### `cremind channels edit`
+
+**Purpose.** Update a channel's settings — mode, auth mode, response mode,
+and/or config — sending only the fields you pass.
+
+**Syntax.**
+
+```bash
+cremind channels edit <id> [--mode M] [--auth-mode A] [--response-mode R]
+                           [--json '<config>'] [--config KEY=VALUE ...]
+```
+
+**Flags.**
+
+| Flag              | Meaning                                                              |
+|-------------------|----------------------------------------------------------------------|
+| `--mode`          | Channel mode (`bot`/`userbot`/`notification`).                       |
+| `--auth-mode`     | Auth mode (`none`/`otp`/`password`).                                 |
+| `--response-mode` | Reply detail (`normal`/`detail`).                                    |
+| `--json`          | Config patch as a JSON object (on PowerShell prefer `--config`).     |
+| `--config`        | Config patch as repeatable `KEY=VALUE` (alternative to `--json`).    |
+
+**Behavior.** `config` is **merged** server-side, so you can patch one field
+without resending the rest (redaction sentinels like `***` are dropped, never
+overwriting a real secret). At least one flag is required. The adapter restarts
+when anything runtime-affecting changes. Prints the updated channel; `--json`
+returns the full object. The auto-created `main` channel cannot be edited.
+
+**Example.**
+
+```bash
+$ cremind channels edit e2e8...d4f1 --response-mode detail --config bot_token=123:abc
+```
+
+### `cremind channels enable` / `cremind channels disable`
+
+**Purpose.** Start or stop a channel's adapter.
+
+**Syntax.**
+
+```bash
+cremind channels enable <id>
+cremind channels disable <id>
+```
+
+**Behavior.** A thin shortcut for `edit --json '{"enabled": true|false}'`. Prints
+`<id>: enabled=<bool> status=<status>`; `--json` returns the full channel.
+
+**Example.**
+
+```bash
+$ cremind channels disable e2e8...d4f1
+e2e8...d4f1: enabled=false status=stopped
+```
+
+### `cremind channels senders`
+
+**Purpose.** List the senders (remote users) seen on a channel.
+
+**Syntax.**
+
+```bash
+cremind channels senders <id>
+```
+
+**Behavior.** Prints a `SENDER_ID / NAME / AUTHED / CONVERSATION_ID / PENDING_OTP`
+table (any active OTP code is redacted to `***`). `--json` returns the raw
+sender rows. Prints `no senders.` when the channel hasn't seen any.
+
+**Example.**
+
+```bash
+$ cremind channels senders e2e8...d4f1
+SENDER_ID    NAME        AUTHED  CONVERSATION_ID  PENDING_OTP
+84986664411  Lee Nguyen  yes     c_92bc
 ```
 
 ### `cremind channels pair`

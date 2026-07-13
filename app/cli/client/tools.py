@@ -30,6 +30,21 @@ async def get_tool(client: Client, tool_id: str) -> dict[str, Any]:
     return out if isinstance(out, dict) else {}
 
 
+async def get_tool_arguments(client: Client, tool_id: str) -> dict[str, Any]:
+    """Derive a tool's arguments view from `GET /api/tools/{id}`.
+
+    There is no dedicated GET arguments endpoint; the tool detail already
+    carries the `arguments_schema` plus the saved values under
+    `config.arguments`. Complements `set_tool_arguments`.
+    """
+    tool = await get_tool(client, tool_id)
+    config = tool.get("config") if isinstance(tool.get("config"), dict) else {}
+    return {
+        "arguments_schema": tool.get("arguments_schema"),
+        "arguments": config.get("arguments"),
+    }
+
+
 async def set_tool_variables(
     client: Client,
     tool_id: str,

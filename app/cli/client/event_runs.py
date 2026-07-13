@@ -53,6 +53,14 @@ async def delete_run(client, run_id: str) -> None:
     await client.delete(f"/api/event-runs/{quote(run_id, safe='')}")
 
 
+async def cancel_run(client, run_id: str) -> bool:
+    """Cancel a running event run. Returns False when it wasn't running."""
+    resp = await client.post_json(f"/api/event-runs/{quote(run_id, safe='')}/cancel")
+    if isinstance(resp, dict):
+        return bool(resp.get("cancelled") or False)
+    return False
+
+
 async def reply(
     client,
     conversation_id: str,

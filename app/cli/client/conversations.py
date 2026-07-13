@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Optional
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 from app.cli.client._base import Client
 
@@ -138,6 +138,18 @@ async def cancel_task(client: Client, task_id: str) -> bool:
     if isinstance(resp, dict):
         return bool(resp.get("cancelled") or False)
     return False
+
+
+async def cancel_plan(client: Client, conv_id: str) -> dict[str, Any]:
+    """Decline a pending Plan-mode approval WITHOUT starting a run.
+
+    Distinct from `cancel_task`, which aborts a run that is already running.
+    Returns `{"message_id", "content"}`.
+    """
+    resp = await client.post_json(
+        f"/api/conversations/{quote(conv_id, safe='')}/plan/cancel"
+    )
+    return resp if isinstance(resp, dict) else {}
 
 
 async def get_memory(client: Client, conv_id: str) -> dict[str, Any]:

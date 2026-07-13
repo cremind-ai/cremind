@@ -41,14 +41,19 @@ from app.cli.commands.clean import clean_app
 from app.cli.commands.config import config_app
 from app.cli.commands.conv import conv_app
 from app.cli.commands.db import db_app
+from app.cli.commands.embedding import embedding_app
 from app.cli.commands.event_runs import event_runs_app
+from app.cli.commands.features import features_app
 from app.cli.commands.file_watchers import file_watchers_app
 from app.cli.commands.files import files_app
 from app.cli.commands.llm import llm_app
+from app.cli.commands.logs import logs_app
 from app.cli.commands.processes import proc_app
 from app.cli.commands.profile import profile_app
+from app.cli.commands.server import server_app
 from app.cli.commands.setup import setup_app
 from app.cli.commands.skill_events import skill_events_app
+from app.cli.commands.skills import skills_app
 from app.cli.commands.tools import tools_app
 from app.cli.commands.upgrade import upgrade_app
 
@@ -140,6 +145,11 @@ app.add_typer(db_app, name="db")
 app.add_typer(upgrade_app, name="upgrade")
 app.add_typer(backup_app, name="backup")
 app.add_typer(blueprint_app, name="blueprint")
+app.add_typer(skills_app, name="skills")
+app.add_typer(features_app, name="features")
+app.add_typer(embedding_app, name="embedding")
+app.add_typer(logs_app, name="logs")
+app.add_typer(server_app, name="server")
 
 app.command(
     "chat",
