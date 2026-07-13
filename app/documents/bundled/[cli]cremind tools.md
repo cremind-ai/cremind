@@ -1,5 +1,5 @@
 ---
-description: "List and configure the **tools** the agent can call (built-in, MCP, A2A, skill, intrinsic): inspect a tool's config, enable or disable A2A/MCP tools, set tool variables (env-style key/value), get or set arguments (JSON), toggle a tool's sub-tools (\"leaves\"), and register a skill's long-running app as an autostart process. Use this to turn tools on or off and configure them — distinct from `cremind agents` (registering MCP/A2A servers)."
+description: "Configure the tools the Cremind agent can call, from the `cremind tools` CLI: enable or disable a tool, set its Tool Variables (env-style key=value — API keys, limits, modes), get or set its JSON Tool Arguments, and toggle a grouped tool's sub-tools (\"leaves\"). Explains how to change any tool's settings and how the agent configures tools itself by running these commands in its shell. Distinct from each tool's own `[tool] …` reference doc (which lists that one tool's full variables and allowed values, e.g. Claude Code's permission modes) and from `cremind agents` (registering MCP/A2A servers)."
 ---
 
 # `cremind tools` — Tool & Skill Configuration
@@ -41,17 +41,53 @@ Use `--type` on `cremind tools list` to filter by these labels.
 
 ## Finding this in the web UI
 
-Every operation in this group has a control on the **Tools** page of
+Every operation in this group has a control on the **Tools & Skills** page of
 the Cremind web UI:
 
-> **Sidebar → Tools**
+> **Settings → Tools & Skills**
 
-The page shows one row per tool with type, enabled toggle, and a "..."
-menu opening a configuration drawer. The drawer has tabs for
-**Variables** and **Arguments** that map directly to
-`cremind tools set-var` and `set-args`. Skill rows additionally
-expose a **Register long-running app** action that maps to
+The page shows one card per tool with its type, an enabled toggle, and a
+configuration panel. The panel renders the tool's **Tool Variables** (the same
+key/values as `cremind tools set-var`) — for example, Claude Code's *Permission
+mode* dropdown. Tool **Arguments** are managed from the CLI / API
+(`cremind tools set-args` / `get-args`), not from the built-in tool cards. Skill
+rows additionally expose a **Register long-running app** action that maps to
 `cremind tools register-long-running`.
+
+## The agent can configure tools itself
+
+The Cremind assistant can run any `cremind tools` command through its Shell
+Executor tool — the shell it spawns already has `CREMIND_SERVER` and
+`CREMIND_TOKEN` set for the active profile, so no flags are needed. That is how
+the agent answers "what permission modes can Claude Code use?" (via
+`cremind tools get claude_code --json`, or by searching its documentation) and
+applies "set Claude Code's permission mode to plan" (via
+`cremind tools set-var claude_code CLAUDE_CODE_PERMISSION_MODE=plan`). For the
+full list of a tool's variables and their allowed values, see the per-tool
+reference docs below.
+
+## Per-tool reference
+
+The variables and arguments differ per tool. Each configurable built-in tool
+has its own reference document — search the documentation for the tool's name to
+get its full variable list, allowed values, defaults, and CLI recipes:
+
+| Tool | `tool_id` | Reference doc | Notable variables |
+|------|-----------|---------------|-------------------|
+| Claude Code | `claude_code` | *Claude Code Tool* | `CLAUDE_CODE_PERMISSION_MODE` (enum), model, budget, API key |
+| Shell Executor | `exec_shell` | *Shell Executor Tool* | large-output mode, timeouts, RTK; `os` argument |
+| System File | `system_file` | *System File Tool* | read/list/search/grep caps |
+| Browser | `browser` | *Browser Tool* | headless, channel (enum), CDP URL |
+| Web Search | `web_search` | *Web Search Tool* | provider (enum), safe-search (enum), Parallel API key |
+| Web Fetch | `web_fetch` | *Web Fetch Tool* | `WEB_FETCH_MAX_CHARS` |
+| Image Understanding | `image_understanding` | *Image Understanding Tool* | max image bytes / dimension |
+| Google Places | `google_places` | *Google Places Tool* | Maps API key; lat/long arguments |
+| AccuWeather Weather | `accuweather_weather` | *AccuWeather Weather Tool* | AccuWeather API key |
+| Documentation Search | `documentation_search` | *Documentation Search Tool* | `DEFAULT_TOP_K` |
+
+For any tool not listed, `cremind tools get <tool_id> --json` prints its live
+variable schema (including any `enum` of allowed values) and current per-profile
+values.
 
 ## Global flags
 
@@ -207,7 +243,15 @@ not a *replace*). Silent on success.
 ```bash
 $ cremind tools set-var skill.daily-brief INBOX=/var/mail/li REPORT_TIME=09:00
 $ cremind tools set-var mcp.linear LINEAR_API_KEY=lin_api_...
+# Built-in tools take variables too — e.g. Claude Code's permission mode:
+$ cremind tools set-var claude_code CLAUDE_CODE_PERMISSION_MODE=plan
 ```
+
+For built-in tools whose variables declare an `enum` (such as
+`CLAUDE_CODE_PERMISSION_MODE`), the server validates the value and rejects
+anything outside the allowed set with HTTP 400 — so a typo fails loudly instead
+of silently persisting. See the per-tool reference docs (below) for each tool's
+variables and their allowed values.
 
 ### `cremind tools set-args`
 
@@ -257,7 +301,8 @@ profile). With `--json`, returns `{"arguments_schema": ..., "arguments": ...}`.
 
 This is derived from the tool detail (`cremind tools get`) — there is no
 dedicated GET-arguments endpoint — so it reflects exactly what `tools get`
-reports under `config.arguments`.
+reports under `config.arguments`. Built-in tools that declare arguments (e.g.
+`exec_shell`, `google_places`) report their real `arguments_schema` here.
 
 **Example.**
 
