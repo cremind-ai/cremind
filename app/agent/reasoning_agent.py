@@ -116,7 +116,7 @@ For any request that contains a time expression you MUST first call the
 `datetime_parser` tool to normalise it; if it also contains a recurring
 schedule you MUST call the `scheduler` tool instead. Do this before calling
 other tools that need the normalised time.
-{reasoning_guidance}{search_guidance}
+{reasoning_guidance}{search_guidance}{claude_code_guidance}
 PRESERVE THE USER'S LANGUAGE: any human-facing value you put in a tool argument
 -- especially the title/name of something you create on the user's behalf (a
 schedule event, reminder, note, or task) and any message shown to the user --
@@ -390,6 +390,56 @@ def _build_search_guidance(tools) -> str:
     return "\n" + body + "\n"
 
 
+def _build_claude_code_guidance(tools) -> str:
+    """Delegation guidance for the ``claude_code`` tool, present ONLY when it is
+    enabled for this run (matched to its live registered group by module stem),
+    naming the exact leaf function names the model sees. Returns "" otherwise so
+    the prompt stays byte-identical for the vast majority of profiles that keep
+    the disabled-by-default tool off — no prompt-cache impact for them. Wrapped
+    ``'\\n...\\n'`` like the other guidance blocks.
+    """
+    try:
+        from app.tools.builtin.claude_code import (
+            ClaudeCodeRunTool,
+            ClaudeCodeStatusTool,
+            ClaudeCodeStopTool,
+            ClaudeCodeWaitTool,
+        )
+    except Exception:  # noqa: BLE001 - missing optional dep => tool not registered
+        return ""
+
+    group_by_stem = {}
+    for tool in tools:
+        stem = getattr(tool, "config_name", None)
+        if stem is not None:
+            group_by_stem[stem] = tool
+    group = group_by_stem.get("claude_code")
+    if group is None:
+        return ""
+
+    run_fn = make_leaf_name(group.tool_id, ClaudeCodeRunTool.name)
+    wait_fn = make_leaf_name(group.tool_id, ClaudeCodeWaitTool.name)
+    stop_fn = make_leaf_name(group.tool_id, ClaudeCodeStopTool.name)
+    status_fn = make_leaf_name(group.tool_id, ClaudeCodeStatusTool.name)
+    body = (
+        f"CODING TASKS — DELEGATE TO CLAUDE CODE: `{run_fn}` drives Claude Code, an "
+        "expert autonomous coding agent working in the current working directory. "
+        "For software-engineering work — creating projects or apps, "
+        "writing/refactoring/debugging code, reviewing or explaining a codebase, "
+        "running and fixing tests — PREFER delegating to it instead of editing "
+        "files yourself with file/shell tools. Give it a complete task brief "
+        f"(goal, constraints, relevant paths). If it returns status 'running', keep "
+        f"calling `{wait_fn}` with the task_id until it completes, then report the "
+        "result (mention cost/duration when notable). Continue the same coding "
+        f"session by passing the returned session_id to a new `{run_fn}`. Stop a "
+        f"runaway task with `{stop_fn}`. To answer whether Claude Code is set up or "
+        f"logged in (before running a task), call `{status_fn}` (add probe=true for a "
+        "definitive live check). Do not use it for trivial single-line edits or "
+        "non-coding tasks."
+    )
+    return "\n" + body + "\n"
+
+
 class _LeafOutcome:
     """Collected output of one leaf tool run (so leaves can run concurrently)."""
 
@@ -429,6 +479,11 @@ class ReasoningAgent:
     # run's enabled tools. Class-level default keeps ``__new__`` construction
     # (used in tests) from tripping on a missing attribute.
     _search_guidance: str = ""
+
+    # Claude Code delegation block; ``__init__`` recomputes it from the run's
+    # enabled tools (empty unless the disabled-by-default claude_code tool is on).
+    # Class-level default keeps ``__new__`` construction (tests) safe.
+    _claude_code_guidance: str = ""
 
     # Frozen long-term-memory section; ``_loop`` fills it once per run from the
     # per-process snapshot. Class-level default keeps ``__new__`` construction and
@@ -567,6 +622,9 @@ class ReasoningAgent:
         # steps. Names only the search tools actually enabled for this profile,
         # using the exact function names those groups expose to the model.
         self._search_guidance = _build_search_guidance(self._tools)
+        # Claude Code delegation guidance — present only when the (disabled-by-
+        # default) claude_code tool is enabled for this profile; empty otherwise.
+        self._claude_code_guidance = _build_claude_code_guidance(self._tools)
 
         self.max_steps = max_steps if max_steps is not None else cfg.max_steps
         self.current_step_count = 0
@@ -761,6 +819,7 @@ class ReasoningAgent:
             current_user_working_directory=cwd,
             reasoning_guidance=REASONING_GUIDANCE if self._inject_reasoning_guidance else "",
             search_guidance=self._search_guidance,
+            claude_code_guidance=getattr(self, "_claude_code_guidance", ""),
             long_term_memory=self._long_term_memory_block,
         )
         # Render `$CREMIND_*` system-variable tokens (e.g. $CREMIND_PROFILE,

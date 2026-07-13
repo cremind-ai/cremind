@@ -31,6 +31,7 @@ export interface ConversationStreamEvent {
     | 'plan_ready'
     | 'plan_decision'
     | 'todos'
+    | 'agent_activity'
     | 'complete'
     | 'error'
     | 'cwd';

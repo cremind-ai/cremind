@@ -31,7 +31,7 @@ each profile can carry its own configuration.
 
 | Type        | Where it comes from                                                       | Can `enable/disable`? |
 |-------------|---------------------------------------------------------------------------|-----------------------|
-| `built-in`  | Compiled into the server (filesystem, shell, etc.).                       | No                    |
+| `built-in`  | Compiled into the server (filesystem, shell, etc.).                       | Optional ones only    |
 | `intrinsic` | Agent-control verbs the loop emits (e.g. `final_answer`, `think`).        | No                    |
 | `mcp`       | MCP server registered via `cremind agents add --type mcp`.                    | Yes                   |
 | `a2a`       | Peer A2A agent registered via `cremind agents add --type a2a`.                | Yes                   |
@@ -150,8 +150,16 @@ configured   yes
 
 ### `cremind tools enable` / `cremind tools disable`
 
-**Purpose.** Enable or disable an A2A or MCP tool for the active
-profile. Built-in / intrinsic tools cannot be disabled this way.
+**Purpose.** Enable or disable a tool for the active profile — A2A, MCP,
+skill, or an **optional built-in** (a built-in that ships disabled by default,
+e.g. `weather`, `browser`, `claude_code`). Core built-ins (filesystem, shell,
+…) and intrinsic tools are always on and cannot be toggled this way.
+
+Some optional built-ins depend on an installable feature (extra Python
+packages). Enabling one whose feature is not installed is rejected with HTTP
+409 `FeatureNotInstalled`; install the feature first with
+`cremind features install <feature>` (e.g. `cremind features install
+claude_code`), then re-run `enable`.
 
 **Syntax.**
 
@@ -394,9 +402,12 @@ $ cremind proc attach "$pid"
 
 ## Troubleshooting
 
-**`enable` / `disable` rejected** — Built-in and intrinsic tools cannot
-be enabled or disabled — the server rejects the call. Use `cremind tools list`
-to confirm the type.
+**`enable` / `disable` rejected** — Core built-in and intrinsic tools are
+always on and cannot be toggled — the server rejects the call. Optional
+built-ins (e.g. `weather`, `browser`, `claude_code`) *can* be toggled; if
+`enable` returns 409 `FeatureNotInstalled`, install the backing feature first
+(`cremind features install <feature>`). Use `cremind tools list` to confirm the
+type.
 
 **`set-args` requires `--json`** — Even for an empty object, you must
 pass `--json '{}'`. The empty default is a deliberate forcing function.

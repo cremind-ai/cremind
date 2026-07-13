@@ -87,6 +87,30 @@ export async function fetchConversationMessages(
   return res.json();
 }
 
+/**
+ * Fetch the live agent-activity snapshot for a conversation (Claude Code and
+ * future coding sub-agents). Returns the snapshot when a background task is
+ * still tracked in memory, or null when it is gone (finished/cleaned up or the
+ * server restarted). Used only to disambiguate a persisted "running" snapshot
+ * on reload; never throws (returns null on any error).
+ */
+export async function fetchAgentActivity(
+  agentUrl: string, authToken: string, conversationId: string,
+): Promise<any | null> {
+  try {
+    const base = resolveBaseUrl(agentUrl);
+    const res = await fetch(
+      `${base}/api/conversations/${encodeURIComponent(conversationId)}/agent-activity`,
+      { headers: authHeaders(authToken) },
+    );
+    if (!res.ok) return null;
+    const body = await res.json();
+    return body?.activity ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export async function deleteConversation(
   agentUrl: string, authToken: string, conversationId: string,
 ): Promise<void> {

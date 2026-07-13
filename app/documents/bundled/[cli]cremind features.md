@@ -57,6 +57,7 @@ $ cremind features list
 FEATURE          INSTALLED  RESTART_AFTER  EXTRAS
 embedding.me5    false      true           sentence-transformers, torch
 vectorstore.qdrant  true    false          qdrant-client
+claude_code      false      false          claude-agent-sdk
 ```
 
 ### `cremind features install`
