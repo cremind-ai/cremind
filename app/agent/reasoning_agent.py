@@ -849,6 +849,28 @@ class ReasoningAgent:
             cache_creation_input_tokens=cc, output_tokens=ot,
         ))
 
+    def _reasoning_usage_for_step(self, step: int) -> dict | None:
+        """Reasoning-call token counts for a step, for the UI Thinking Process.
+
+        Returns the four-way token split of the reasoning LLM call that produced
+        ``step`` (the record ``_record_reasoning_usage`` stamped with the matching
+        ``step_index``), or ``None`` when no usage was reported. ``reversed`` picks
+        the most recent record for the step, covering a rare in-step LLM retry.
+        """
+        rec = next(
+            (r for r in reversed(self._usage_records)
+             if r.source_kind == "reasoning" and r.step_index == step),
+            None,
+        )
+        if rec is None:
+            return None
+        return {
+            "input_tokens": rec.input_tokens,
+            "cache_read_input_tokens": rec.cache_read_input_tokens,
+            "cache_creation_input_tokens": rec.cache_creation_input_tokens,
+            "output_tokens": rec.output_tokens,
+        }
+
     def _accumulate_tokens(self, token_usage: dict) -> None:
         self._total_input_tokens += token_usage.get("input_tokens", 0) or 0
         self._total_cache_read_input_tokens += token_usage.get("cache_read_input_tokens", 0) or 0
@@ -1618,7 +1640,13 @@ class ReasoningAgent:
 
     def _thinking_artifact(self, step: int, call_id: str, tool_name: str,
                            args: Dict[str, Any], tool) -> Dict[str, Any]:
-        """UI artifact announcing one tool call in a step (Thought removed)."""
+        """UI artifact announcing one tool call in a step (Thought removed).
+
+        ``Token_Usage`` carries the reasoning call's four-way token split for this
+        step so the Thinking Process can show per-step token detail; the reasoning
+        usage is recorded on the step's DONE chunk before these artifacts are
+        yielded, so it is already available here.
+        """
         return {
             "type": ChatCompletionTypeEnum.THINKING_ARTIFACT,
             "data": {
@@ -1627,6 +1655,7 @@ class ReasoningAgent:
                 "Tool": tool_name,
                 "Tool_Input": json.dumps(args, ensure_ascii=False),
                 "Model_Label": self._model_label_for(tool) if tool is not None else self.llm.model_label,
+                "Token_Usage": self._reasoning_usage_for_step(step),
             },
         }
 
