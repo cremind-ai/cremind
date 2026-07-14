@@ -702,6 +702,10 @@ export interface ToolConfigField {
   required?: boolean;
   enum?: string[];
   default?: unknown;
+  /** When true, a live option list is available from
+   *  ``getToolVariableOptions`` (GET /api/tools/{id}/variable-options). Advisory:
+   *  values are not validated against it, so the field stays free-form. */
+  dynamic_options?: boolean;
 }
 
 export interface ToolStatus {
@@ -796,7 +800,10 @@ export async function updateToolConfig(
   const res = await fetch(`${base}/api/tools/${encodeURIComponent(toolId)}/variables`, {
     method: 'PUT',
     headers: authHeaders(token),
-    body: JSON.stringify({ variables }),
+    // The Model field is a free-form combobox (the dropdown lists valid ids but
+    // typing a custom one is intentional), so opt out of the server-side
+    // dynamic-option check that guards the agent/CLI path.
+    body: JSON.stringify({ variables, allow_unknown: true }),
   });
   if (!res.ok) throw new Error(`Failed to update tool variables: ${res.statusText}`);
   return res.json();
@@ -871,6 +878,40 @@ export interface ToolLeavesResponse {
   /** True when an MCP server is disconnected and its sub-tools can't be listed. */
   disconnected: boolean;
   leaves: ToolLeaf[];
+}
+
+/** One live option for a `dynamic_options` tool variable. */
+export interface VariableOption {
+  id: string;
+  label?: string;
+}
+
+/** Live option list for one `dynamic_options` variable. */
+export interface VariableOptionsResult {
+  options: VariableOption[];
+  /** Non-fatal per-variable error (e.g. no credential / API rejected the key).
+   *  When set with empty options, the UI falls back to a text input. */
+  error?: string | null;
+  /** Non-secret label of the credential source the list was fetched with. */
+  source?: string | null;
+}
+
+/** Fetch live option lists for a tool's `dynamic_options` variables. Tools
+ *  without a dynamic-options hook return an empty `variables` map. */
+export async function getToolVariableOptions(
+  agentUrl: string,
+  token: string,
+  toolId: string,
+  refresh = false
+): Promise<{ tool_id: string; variables: Record<string, VariableOptionsResult> }> {
+  const base = resolveBaseUrl(agentUrl);
+  const suffix = refresh ? '?refresh=1' : '';
+  const res = await fetch(
+    `${base}/api/tools/${encodeURIComponent(toolId)}/variable-options${suffix}`,
+    { headers: authHeaders(token) }
+  );
+  if (!res.ok) throw new Error(`Failed to get variable options: ${res.statusText}`);
+  return res.json();
 }
 
 /** List a tool's sub-tools with their per-profile enabled state. */

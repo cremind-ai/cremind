@@ -28,6 +28,7 @@ from app.tools import ToolType
 from app.tools.builtin import (
     BuiltInToolGroup,
     get_builtin_tool_config,
+    get_builtin_variable_options_hook,
     list_builtin_tool_catalog,
     refresh_builtin_tool_oauth,
 )
@@ -211,6 +212,7 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         variables = body.get("variables", {})
         if not isinstance(variables, dict):
             return JSONResponse({"error": "'variables' must be an object"}, status_code=400)
+        allow_unknown = bool(body.get("allow_unknown"))
 
         tool = registry.get(tool_id)
         schema = _schema_for_tool(tool) if tool else {}
@@ -239,6 +241,62 @@ def get_tool_routes(state: BootedState) -> list[Route]:
                     status_code=400,
                 )
             normalized[key] = value
+
+        # For variables with a live option list (``dynamic_options``, e.g.
+        # CLAUDE_CODE_MODEL / CLAUDE_CODE_PERMISSION_MODE), reject a value the
+        # resolved list doesn't actually offer — the list is fetched live (models
+        # include aliases; permission modes come from the installed SDK). Skipped
+        # when the caller opts out (``allow_unknown``: the Web UI's free-form
+        # field, the CLI ``--force`` flag) or when the list can't be resolved
+        # (offline / no credential / SDK not installed), so legitimate custom
+        # values and offline use still work. Runs before the write loop so a bad
+        # value never partially persists.
+        dynamic_keys = [
+            k for k, v in normalized.items()
+            if v and required_config.get(k, {}).get("dynamic_options")
+        ]
+        if (
+            dynamic_keys
+            and not allow_unknown
+            and tool is not None
+            and tool.tool_type is ToolType.BUILTIN
+            and isinstance(tool, BuiltInToolGroup)
+        ):
+            hook = get_builtin_variable_options_hook(tool.config_name)
+            if hook is not None:
+                merged = {
+                    **config_manager.get_variables(tool_id, profile, include_secrets=True),
+                    **normalized,
+                }
+                try:
+                    options_result = await hook(variables=merged, profile=profile, refresh=False)
+                except Exception:  # noqa: BLE001 — never block a write on the hook
+                    logger.debug(
+                        "variable-options check failed for tool '%s'", tool_id, exc_info=True
+                    )
+                    options_result = {}
+                for key in dynamic_keys:
+                    info = options_result.get(key) or {}
+                    valid = {
+                        o["id"]
+                        for o in (info.get("options") or [])
+                        if isinstance(o, dict) and o.get("id")
+                    }
+                    if valid and normalized[key] not in valid:
+                        return JSONResponse(
+                            {
+                                "error": (
+                                    f"'{normalized[key]}' is not one of the available "
+                                    f"values for '{key}'. Valid values: "
+                                    f"{', '.join(sorted(valid))}. Re-run with a valid one "
+                                    f"(see `cremind tools options {tool_id}`), or pass --force "
+                                    f"to set it anyway."
+                                ),
+                                "key": key,
+                                "allowed": sorted(valid),
+                            },
+                            status_code=400,
+                        )
 
         for key, value in normalized.items():
             field_spec = required_config.get(key, {})
@@ -596,10 +654,59 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         # Settings card the user is toggling sub-tools in.
         return JSONResponse({"success": True})
 
+    async def handle_get_variable_options(request: Request) -> JSONResponse:
+        """Live option lists for a tool's ``dynamic_options`` variables.
+
+        For a built-in tool that exports a ``get_variable_options`` hook (e.g.
+        ``claude_code`` for its ``CLAUDE_CODE_MODEL`` field), return the current
+        option list — the Settings dropdown and ``cremind tools options`` render
+        it. Query ``?refresh=1`` bypasses the server-side cache. Tools without a
+        hook return ``{"variables": {}}`` (200) so callers degrade to a text
+        input. Values are advisory: they are NOT enforced on write.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        registry = state.registry
+        if registry is None:
+            return _storage_not_ready()
+        profile = _profile_from_request(request)
+        if not profile:
+            return JSONResponse({"error": "Profile is required"}, status_code=400)
+        tool_id = request.path_params["tool_id"]
+        tool = registry.get(tool_id)
+        if tool is None:
+            return JSONResponse({"error": f"Tool '{tool_id}' not found"}, status_code=404)
+
+        hook = None
+        if tool.tool_type is ToolType.BUILTIN and isinstance(tool, BuiltInToolGroup):
+            hook = get_builtin_variable_options_hook(tool.config_name)
+        if hook is None:
+            return JSONResponse({"tool_id": tool_id, "variables": {}})
+
+        # Current values incl. secrets — the hook resolves account credentials
+        # from them (e.g. CLAUDE_CODE_API_KEY). Only non-secret labels/options
+        # are returned to the caller.
+        variables = registry.config.get_variables(tool_id, profile, include_secrets=True)
+        refresh = request.query_params.get("refresh") in ("1", "true")
+        try:
+            result = await hook(variables=variables, profile=profile, refresh=refresh)
+        except Exception as exc:  # noqa: BLE001 — hooks shouldn't raise; belt-and-braces
+            logger.exception("variable-options hook failed for tool '%s'", tool_id)
+            return JSONResponse(
+                {"error": f"Failed to resolve options: {exc}"}, status_code=500
+            )
+        return JSONResponse({"tool_id": tool_id, "variables": result})
+
     return [
         Route("/api/tools", handle_list_tools, methods=["GET"]),
         Route("/api/tools/{tool_id}", handle_get_tool, methods=["GET"]),
         Route("/api/tools/{tool_id}/variables", handle_set_variables, methods=["PUT"]),
+        Route(
+            "/api/tools/{tool_id}/variable-options",
+            handle_get_variable_options,
+            methods=["GET"],
+        ),
         Route("/api/tools/{tool_id}/arguments", handle_set_arguments, methods=["PUT"]),
         Route("/api/tools/{tool_id}/enabled", handle_set_enabled, methods=["PUT"]),
         Route("/api/tools/{tool_id}/leaves", handle_list_leaves, methods=["GET"]),

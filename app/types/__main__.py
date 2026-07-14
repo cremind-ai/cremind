@@ -152,6 +152,17 @@ class RequiredConfigField(TypedDict, total=False):
     secret: bool
     enum: list[str]
     default: Any
+    # When True, the UI/CLI can fetch a live option list for this variable from
+    # ``GET /api/tools/{tool_id}/variable-options`` (backed by the module-level
+    # ``get_variable_options`` hook). On write (``PUT .../variables``) a value IS
+    # validated against that live list when it resolves to a non-empty set — a
+    # value outside it is rejected (HTTP 400 with the valid values) — UNLESS the
+    # caller passes ``allow_unknown`` (the Web UI always does; the CLI does with
+    # ``--force``). Validation is skipped when the list can't be resolved
+    # (offline / no credential / backing SDK absent), so legitimate custom values
+    # and offline use still work. Use this (not ``enum``) when the valid set is
+    # discovered at runtime rather than fixed in the schema.
+    dynamic_options: bool
 
 
 class OAuthConfig(TypedDict, total=False):

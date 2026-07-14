@@ -20,11 +20,16 @@ from __future__ import annotations
 import asyncio
 import collections
 import dataclasses
+import hashlib
+import json
 import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional, Tuple
+
+import httpx
 
 from app.agent.agent_activity import AgentActivity
 from app.config.settings import BaseConfig, get_dynamic
@@ -242,9 +247,14 @@ def _construct_options(sdk, kwargs: Dict[str, Any]):
 
 
 def credential_source(variables: dict, profile: str) -> Optional[str]:
-    """Return a non-secret label for the credential :func:`resolve_auth_env`
-    would use for ``profile`` (or None when nothing is configured that Python
-    can see — the host's own ``claude login`` state is not visible here)."""
+    """Return a non-secret label for the credential Claude Code would use for
+    ``profile`` (or None when nothing is visible at all).
+
+    Covers the same chain the model listing resolves — explicit tool variable →
+    profile Anthropic creds → server env → host ``claude login`` store. The last
+    tier is readable on Windows/Linux (``~/.claude/.credentials.json``); a macOS
+    host stores it in the Keychain, which is not visible here, so ``None`` there
+    does not necessarily mean logged out (``probe=true`` settles it)."""
     if str(variables.get(Var.API_KEY) or "").strip():
         return "tool_variable_api_key"
     try:
@@ -259,7 +269,241 @@ def credential_source(variables: dict, profile: str) -> Optional[str]:
         return "env_anthropic_api_key"
     if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
         return "env_oauth_token"
+    if _read_host_claude_credentials():
+        return "host_claude_login"
     return None
+
+
+# --- Account model listing -------------------------------------------------
+#
+# Neither claude_agent_sdk nor the bundled ``claude`` CLI exposes a way to
+# enumerate the models available to the logged-in account, so we query the
+# Anthropic REST ``/v1/models`` endpoint directly with whatever credential the
+# coding task would use. This lets the Settings dropdown and the ``cremind
+# tools options`` CLI present a live, account-scoped model list.
+
+_MODELS_URL = "https://api.anthropic.com/v1/models"
+_ANTHROPIC_VERSION = "2023-06-01"
+_OAUTH_BETA = "oauth-2025-04-20"
+_MODELS_TIMEOUT = 10.0
+_MODELS_CACHE_TTL = 300.0  # seconds
+_MODEL_ALIASES = ("sonnet", "opus", "haiku", "opusplan")
+# Host ``claude login`` credential store (Windows/Linux; macOS uses the
+# Keychain, which is not readable here — the fetch simply degrades). Module-level
+# so tests can monkeypatch it to a temp file.
+_CLAUDE_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+
+# credential fingerprint -> (fetched_at, models). Errors are never cached.
+_models_cache: Dict[str, Tuple[float, List[dict]]] = {}
+
+
+def _read_host_claude_credentials() -> Optional[str]:
+    """Best-effort read of ``claudeAiOauth.accessToken`` from the host
+    ``claude login`` credential store. Returns None on any problem."""
+    try:
+        path = _CLAUDE_CREDENTIALS_PATH
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        token = (data.get("claudeAiOauth") or {}).get("accessToken")
+        return str(token) if token else None
+    except Exception:  # noqa: BLE001
+        logger.debug("claude_code: reading host claude credentials failed", exc_info=True)
+        return None
+
+
+def _build_models_headers(variables: dict, profile: str) -> Tuple[Dict[str, str], Optional[str]]:
+    """Resolve credentials into request headers for ``GET /v1/models``.
+
+    Returns ``(headers, source_label)`` where ``source_label`` reuses the
+    :func:`credential_source` vocabulary (plus ``host_claude_login``), or
+    ``({}, None)`` when no credential can be found.
+
+    Resolution order mirrors :func:`resolve_auth_env` / :func:`credential_source`:
+    explicit tool variable → profile Anthropic creds → server env → host
+    ``claude login`` store.
+    """
+    def _api_key_headers(key: str) -> Dict[str, str]:
+        return {"x-api-key": key, "anthropic-version": _ANTHROPIC_VERSION}
+
+    def _oauth_headers(token: str) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {token}",
+            "anthropic-version": _ANTHROPIC_VERSION,
+            "anthropic-beta": _OAUTH_BETA,
+        }
+
+    explicit = str(variables.get(Var.API_KEY) or "").strip()
+    if explicit:
+        return _api_key_headers(explicit), "tool_variable_api_key"
+    try:
+        auth_method = get_dynamic("llm_config", "anthropic.auth_method", profile=profile)
+        if auth_method == "setup_token":
+            token = get_dynamic("llm_config", "anthropic.setup_token", profile=profile)
+            if token:
+                return _oauth_headers(str(token)), "profile_setup_token"
+        prof_key = BaseConfig.get_provider_api_key("anthropic", profile=profile)
+        if prof_key:
+            return _api_key_headers(prof_key), "profile_api_key"
+    except Exception:  # noqa: BLE001
+        logger.debug("claude_code: profile auth resolution failed", exc_info=True)
+    env_key = os.environ.get("ANTHROPIC_API_KEY")
+    if env_key:
+        return _api_key_headers(env_key), "env_anthropic_api_key"
+    env_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if env_token:
+        return _oauth_headers(env_token), "env_oauth_token"
+    host_token = _read_host_claude_credentials()
+    if host_token:
+        return _oauth_headers(host_token), "host_claude_login"
+    return {}, None
+
+
+async def _fetch_models(headers: Dict[str, str]) -> List[dict]:
+    """One ``GET /v1/models`` call. Returns the raw ``data`` rows. Raises on
+    HTTP or transport failure so :func:`list_models` can surface the detail."""
+    async with httpx.AsyncClient(timeout=_MODELS_TIMEOUT) as client:
+        resp = await client.get(_MODELS_URL, params={"limit": 1000}, headers=headers)
+        resp.raise_for_status()
+        payload = resp.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return data if isinstance(data, list) else []
+
+
+def _cache_key(headers: Dict[str, str]) -> str:
+    """Fingerprint the credential material so cached lists never cross accounts.
+    Never uses the raw secret as a dict key."""
+    material = headers.get("x-api-key") or headers.get("Authorization") or ""
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+async def list_models(
+    variables: dict, profile: str, *, force_refresh: bool = False
+) -> Dict[str, Any]:
+    """List the Claude models available to the resolved account. Never raises.
+
+    Returns ``{"models": [{"id", "display_name", "created_at"}...], "source":
+    label, "cached": bool}`` on success, or ``{"models": [], "error": "<detail>",
+    "source": label|None}`` when no credential is available or the fetch fails.
+    """
+    headers, source = _build_models_headers(variables, profile)
+    if not headers:
+        return {
+            "models": [],
+            "error": (
+                "No Anthropic credential available. Set CLAUDE_CODE_API_KEY, "
+                "configure Anthropic under Settings -> LLM, or run `claude login` "
+                "on the host."
+            ),
+            "source": None,
+        }
+
+    key = _cache_key(headers)
+    if not force_refresh:
+        entry = _models_cache.get(key)
+        if entry is not None:
+            fetched_at, cached_models = entry
+            if (time.monotonic() - fetched_at) < _MODELS_CACHE_TTL:
+                return {"models": cached_models, "source": source, "cached": True}
+
+    try:
+        rows = await _fetch_models(headers)
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        detail = f"Anthropic API returned HTTP {status}"
+        if status in (401, 403):
+            detail += " (credential rejected)"
+        return {"models": [], "error": detail, "source": source}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("claude_code: model listing failed", exc_info=True)
+        return {"models": [], "error": f"Failed to list models: {exc}", "source": source}
+
+    models = [
+        {
+            "id": row["id"],
+            "display_name": row.get("display_name") or row["id"],
+            "created_at": row.get("created_at"),
+        }
+        for row in rows
+        if isinstance(row, dict) and row.get("id")
+    ]
+    _models_cache[key] = (time.monotonic(), models)
+    return {"models": models, "source": source, "cached": False}
+
+
+# --- Permission-mode listing -----------------------------------------------
+#
+# The Claude Agent SDK is the source of truth for which permission modes exist:
+# it exports them as the ``PermissionMode`` Literal (the same set the Claude Code
+# CLI cycles through with Shift+Tab), so a newer SDK with new modes is picked up
+# automatically. This is pure in-process introspection — no network, no cache —
+# so ``refresh`` is meaningless here (a failed ``import claude_agent_sdk`` is not
+# cached in ``sys.modules``, so installing the feature mid-process is seen on the
+# next call; an in-place SDK *upgrade* needs a restart, as with everything else).
+
+_PERMISSION_MODE_LABELS: Dict[str, str] = {
+    "default": "default (ask before privileged actions)",
+    "acceptEdits": "acceptEdits (auto-approve file edits)",
+    "plan": "plan (read-only planning, no changes)",
+    "bypassPermissions": "bypassPermissions (fully autonomous)",
+    "dontAsk": "dontAsk (never prompts; denies anything not pre-approved)",
+    "auto": "auto (no prompts; a safety classifier blocks destructive actions)",
+}
+
+
+def _permission_mode_ids(sdk) -> List[str]:
+    """Extract the ``PermissionMode`` Literal members from the installed SDK.
+
+    Tries the exported ``PermissionMode`` alias first, then the
+    ``ClaudeAgentOptions.permission_mode`` type hint (unwrapping
+    ``Optional[Literal[...]]``). Returns ``[]`` if neither shape is present.
+    Never raises.
+    """
+    import typing as _t
+
+    pm = getattr(sdk, "PermissionMode", None)
+    args = _t.get_args(pm) if pm is not None else ()
+    if args and all(isinstance(a, str) for a in args):
+        return list(args)
+    try:
+        hint = _t.get_type_hints(sdk.ClaudeAgentOptions).get("permission_mode")
+    except Exception:  # noqa: BLE001 — forward refs on some SDK versions
+        logger.debug("claude_code: permission-mode hint resolution failed", exc_info=True)
+        return []
+    for candidate in (hint, *_t.get_args(hint)):  # bare Literal or Optional[Literal]
+        inner = _t.get_args(candidate)
+        if inner and all(isinstance(a, str) for a in inner):
+            return list(inner)
+    return []
+
+
+def list_permission_modes() -> Dict[str, Any]:
+    """List the permission modes the installed Claude Agent SDK accepts.
+
+    Never raises. Mirrors :func:`list_models`'s envelope:
+    ``{"modes": [...], "source": "claude_agent_sdk"|None, "error": str|None}``.
+    When the SDK is not installed the list is empty (the tool cannot run without
+    it anyway) with an install hint; the API write-check treats an empty list as
+    "can't validate" and accepts any value, exactly like the model field offline.
+    """
+    sdk, err = load_sdk()
+    if sdk is None:
+        return {
+            "modes": [],
+            "error": (
+                "claude_agent_sdk is not installed — install it with "
+                "`cremind features install claude_code`. " + (err or "")
+            ).strip(),
+            "source": None,
+        }
+    modes = _permission_mode_ids(sdk)
+    if not modes:
+        return {
+            "modes": [],
+            "error": "Installed claude_agent_sdk does not expose a permission-mode list.",
+            "source": "claude_agent_sdk",
+        }
+    return {"modes": modes, "source": "claude_agent_sdk", "error": None}
 
 
 async def probe_auth(sdk, *, cwd: str, variables: dict, profile: str, timeout: float = 30.0) -> Dict[str, Any]:

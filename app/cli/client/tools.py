@@ -49,10 +49,14 @@ async def set_tool_variables(
     client: Client,
     tool_id: str,
     variables: dict[str, str],
+    allow_unknown: bool = False,
 ) -> None:
+    body: dict[str, Any] = {"variables": variables}
+    if allow_unknown:
+        body["allow_unknown"] = True
     await client.put_json(
         f"/api/tools/{quote(tool_id, safe='')}/variables",
-        {"variables": variables},
+        body,
     )
 
 
@@ -76,6 +80,24 @@ async def set_tool_enabled(
         f"/api/tools/{quote(tool_id, safe='')}/enabled",
         {"enabled": enabled},
     )
+
+
+async def get_tool_variable_options(
+    client: Client,
+    tool_id: str,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Return ``{tool_id, variables: {VAR: {options, error, source}}}``.
+
+    Live option lists for a tool's ``dynamic_options`` variables (e.g. the Claude
+    models available to the logged-in account for ``claude_code``). Tools without
+    a dynamic-options hook return an empty ``variables`` map.
+    """
+    params = {"refresh": "1"} if refresh else None
+    out = await client.get_json(
+        f"/api/tools/{quote(tool_id, safe='')}/variable-options", params=params,
+    )
+    return out if isinstance(out, dict) else {}
 
 
 async def list_tool_leaves(client: Client, tool_id: str) -> dict[str, Any]:
