@@ -1,5 +1,5 @@
 ---
-description: "Configure the tools the Cremind agent can call, from the `cremind tools` CLI: enable or disable a tool, set its Tool Variables (env-style key=value — API keys, limits, modes), get or set its JSON Tool Arguments, and toggle a grouped tool's sub-tools (\"leaves\"). Explains how to change any tool's settings and how the agent configures tools itself by running these commands in its shell. Distinct from each tool's own `[tool] …` reference doc (which lists that one tool's full variables and allowed values, e.g. Claude Code's permission modes) and from `cremind agents` (registering MCP/A2A servers)."
+description: "Configure the tools the Cremind agent can call, from the `cremind tools` CLI: enable or disable a tool, set its Tool Variables (env-style key=value — API keys, limits, modes), list the live option values of a tool's dynamic variables (`options` — e.g. the Claude models available to the logged-in account), get or set its JSON Tool Arguments, and toggle a grouped tool's sub-tools (\"leaves\"). Explains how to change any tool's settings and how the agent configures tools itself by running these commands in its shell. Distinct from each tool's own `[tool] …` reference doc (which lists that one tool's full variables and allowed values, e.g. Claude Code's permission modes) and from `cremind agents` (registering MCP/A2A servers)."
 ---
 
 # `cremind tools` — Tool & Skill Configuration
@@ -12,7 +12,8 @@ registered skills.
 
 The group's surface area is small but covers every angle of tool config:
 
-- **Inspection** — `list`, `get`.
+- **Inspection** — `list`, `get`, `options` (live option values for a tool's
+  dynamic variables, e.g. Claude Code's available models).
 - **Lifecycle for A2A / MCP tools** — `enable`, `disable`.
 - **Per-tool configuration** — `set-var` (env-style variables),
   `set-args` (a structured JSON arguments object).
@@ -49,7 +50,9 @@ the Cremind web UI:
 The page shows one card per tool with its type, an enabled toggle, and a
 configuration panel. The panel renders the tool's **Tool Variables** (the same
 key/values as `cremind tools set-var`) — for example, Claude Code's *Permission
-mode* dropdown. Tool **Arguments** are managed from the CLI / API
+mode* dropdown, and its *Model* dropdown, which is populated live from the
+account's available models (the same list as `cremind tools options`). Tool
+**Arguments** are managed from the CLI / API
 (`cremind tools set-args` / `get-args`), not from the built-in tool cards. Skill
 rows additionally expose a **Register long-running app** action that maps to
 `cremind tools register-long-running`.
@@ -60,11 +63,14 @@ The Cremind assistant can run any `cremind tools` command through its Shell
 Executor tool — the shell it spawns already has `CREMIND_SERVER` and
 `CREMIND_TOKEN` set for the active profile, so no flags are needed. That is how
 the agent answers "what permission modes can Claude Code use?" (via
-`cremind tools get claude_code --json`, or by searching its documentation) and
-applies "set Claude Code's permission mode to plan" (via
-`cremind tools set-var claude_code CLAUDE_CODE_PERMISSION_MODE=plan`). For the
-full list of a tool's variables and their allowed values, see the per-tool
-reference docs below.
+`cremind tools options claude_code --json`, or by searching its documentation)
+and applies "set Claude Code's permission mode to plan" (via
+`cremind tools set-var claude_code CLAUDE_CODE_PERMISSION_MODE=plan`). It is also
+how the agent handles "use Opus for Claude Code": discover the account's models
+with `cremind tools options claude_code --json`, match the requested name against
+the returned ids/labels, then apply it with `cremind tools set-var claude_code
+CLAUDE_CODE_MODEL=<id>`. For the full list of a tool's variables and their
+allowed values, see the per-tool reference docs below.
 
 ## Per-tool reference
 
@@ -74,7 +80,7 @@ get its full variable list, allowed values, defaults, and CLI recipes:
 
 | Tool | `tool_id` | Reference doc | Notable variables |
 |------|-----------|---------------|-------------------|
-| Claude Code | `claude_code` | *Claude Code Tool* | `CLAUDE_CODE_PERMISSION_MODE` (enum), model, budget, API key |
+| Claude Code | `claude_code` | *Claude Code Tool* | `CLAUDE_CODE_PERMISSION_MODE` and `CLAUDE_CODE_MODEL` (both dynamic lists via `options`), budget, API key |
 | Shell Executor | `exec_shell` | *Shell Executor Tool* | large-output mode, timeouts, RTK; `os` argument |
 | System File | `system_file` | *System File Tool* | read/list/search/grep caps |
 | Browser | `browser` | *Browser Tool* | headless, channel (enum), CDP URL |
@@ -225,7 +231,7 @@ environment variables.
 **Syntax.**
 
 ```bash
-cremind tools set-var <tool_id> KEY=VALUE [KEY=VALUE...]
+cremind tools set-var <tool_id> KEY=VALUE [KEY=VALUE...] [--force]
 ```
 
 **Arguments** (at least one required):
@@ -233,6 +239,12 @@ cremind tools set-var <tool_id> KEY=VALUE [KEY=VALUE...]
 - `<tool_id>` — Target tool.
 - `KEY=VALUE` — Repeatable. Splits on the first `=`; subsequent `=`
   characters are part of the value.
+
+**Flags.**
+
+| Flag           | Type | Default | Meaning                                                                 |
+|----------------|------|---------|-------------------------------------------------------------------------|
+| `--force`, `-f`| bool | `false` | Set even if a value isn't a recognized option for a variable with a live option list (e.g. a custom/unverified `CLAUDE_CODE_MODEL` id). |
 
 **Behavior.** Writes the variables to the server in one call; any
 existing variables not mentioned are left untouched (this is a *patch*,
@@ -247,11 +259,70 @@ $ cremind tools set-var mcp.linear LINEAR_API_KEY=lin_api_...
 $ cremind tools set-var claude_code CLAUDE_CODE_PERMISSION_MODE=plan
 ```
 
-For built-in tools whose variables declare an `enum` (such as
-`CLAUDE_CODE_PERMISSION_MODE`), the server validates the value and rejects
-anything outside the allowed set with HTTP 400 — so a typo fails loudly instead
-of silently persisting. See the per-tool reference docs (below) for each tool's
+For built-in tools whose variables declare a static `enum` (such as the
+Browser tool's `channel` or Web Search's `provider`), the server validates the
+value and rejects anything outside the allowed set with HTTP 400 — so a typo
+fails loudly instead of silently persisting. A variable with a **dynamic**
+option list (Claude Code's `CLAUDE_CODE_MODEL` and `CLAUDE_CODE_PERMISSION_MODE`,
+whose values come from `cremind tools options`) is validated the same way
+**when the list can be fetched**: an unrecognized value is rejected with the
+valid values listed (model aliases like `opus`/`sonnet` always pass). Pass
+`--force` to set a custom or unverified value anyway; if the list can't be
+fetched (no credential / offline for models, SDK not installed for modes) any
+value is accepted. See the per-tool reference docs (below) for each tool's
 variables and their allowed values.
+
+### `cremind tools options`
+
+**Purpose.** List the live option values for a tool's **dynamic** variables —
+values fetched at request time rather than baked into a static `enum`. The
+primary use is Claude Code: it prints the Claude models available to the account
+the tool's credential resolves to (`CLAUDE_CODE_MODEL`) and the permission modes
+the installed Claude Agent SDK accepts (`CLAUDE_CODE_PERMISSION_MODE`).
+
+**Syntax.**
+
+```bash
+cremind tools options <tool_id> [--refresh]
+```
+
+**Arguments** (required):
+
+- `<tool_id>` — Target tool.
+
+**Flags.**
+
+| Flag        | Type | Default | Meaning                                                     |
+|-------------|------|---------|-------------------------------------------------------------|
+| `--refresh` | bool | `false` | Bypass the 5-minute server-side cache and refetch the list. |
+
+**Behavior.** Renders a `VARIABLE / VALUE / LABEL` table, one row per option. A
+tool with no dynamic variables prints `(tool has no dynamic variables)` to
+stderr. If a variable's list can't be fetched (e.g. no Anthropic credential, or
+the API rejected it), a `(<VARIABLE>: <error>)` note is written to stderr and
+that variable contributes no rows. With `--json`, returns
+`{"tool_id": ..., "variables": {"<VAR>": {"options": [{"id", "label"}...],
+"error": <str|null>, "source": <str|null>}}}`.
+
+When a variable's list resolves, `set-var` **enforces** it: a value that isn't
+listed is rejected unless you pass `--force` (see `set-var` above). When the
+list can't be fetched, any value is accepted.
+
+**Example.**
+
+```bash
+$ cremind tools options claude_code
+VARIABLE                       VALUE                LABEL
+CLAUDE_CODE_MODEL              claude-opus-4-5      Claude Opus 4.5
+CLAUDE_CODE_MODEL              claude-sonnet-4-5    Claude Sonnet 4.5
+CLAUDE_CODE_MODEL              sonnet               sonnet (alias)
+CLAUDE_CODE_PERMISSION_MODE    bypassPermissions    bypassPermissions (fully autonomous)
+CLAUDE_CODE_PERMISSION_MODE    acceptEdits          acceptEdits (auto-approve file edits)
+CLAUDE_CODE_PERMISSION_MODE    plan                 plan (read-only planning, no changes)
+
+# Pick one and apply it
+$ cremind tools set-var claude_code CLAUDE_CODE_MODEL=claude-sonnet-4-5
+```
 
 ### `cremind tools set-args`
 

@@ -136,7 +136,7 @@ def install_fake_sdk(monkeypatch, produce, *, aenter_error: Optional[Exception] 
 
 
 @pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch):
+def _clean_registry(monkeypatch, tmp_path):
     """Isolate the module-level registry and keep the activity feed hermetic.
 
     The runner tests care about task lifecycle + the payloads Cremind sees, not
@@ -147,11 +147,18 @@ def _clean_registry(monkeypatch):
     loops badly under back-to-back ``asyncio.run`` calls), and resolve the
     conversation id without touching the DB. Step *tracking* stays real so the
     wait-heartbeat's ``total_steps`` count is exercised.
+
+    Also keep the model listing hermetic for the status leaf: point the host
+    ``claude login`` credentials path at a nonexistent file (so
+    ``credential_source`` doesn't pick up the developer's real login) and stub
+    ``list_models`` to an empty success (so ``status`` never hits the network).
+    Tests that care about the model list re-stub ``list_models`` locally.
     """
     from app.tools.builtin import claude_code_runner as r
     import app.agent.agent_activity as aa
 
     r._task_registry.clear()
+    r._models_cache.clear()
 
     async def _resolve(profile, context_id):
         return context_id
@@ -159,12 +166,18 @@ def _clean_registry(monkeypatch):
     async def _noop(self):
         return None
 
+    async def _empty_models(variables, profile, *, force_refresh=False):
+        return {"models": [], "source": None, "cached": False}
+
     monkeypatch.setattr(aa, "_resolve_conversation_id", _resolve)
     monkeypatch.setattr(aa.AgentActivity, "_publish_now", _noop)
     monkeypatch.setattr(aa.AgentActivity, "_patch_persisted", _noop)
     monkeypatch.setattr(aa.AgentActivity, "_schedule_flush", lambda self: None)
+    monkeypatch.setattr(r, "_CLAUDE_CREDENTIALS_PATH", tmp_path / "no_creds.json")
+    monkeypatch.setattr(r, "list_models", _empty_models)
     yield
     r._task_registry.clear()
+    r._models_cache.clear()
 
 
 def _run_tool(**args):
@@ -565,3 +578,76 @@ def test_status_probe_not_authenticated(monkeypatch, tmp_path):
     sc = res.structured_content
     assert sc["logged_in"] is False
     assert "not authenticated" in sc["message"].lower()
+
+
+def test_status_host_claude_login(monkeypatch, tmp_path):
+    """A host ``claude login`` store makes credentials visible even with no tool
+    variable / profile / env credential — the source the Web UI resolves too."""
+    from app.tools.builtin import claude_code_runner as r
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    cred = tmp_path / "creds.json"
+    cred.write_text('{"claudeAiOauth": {"accessToken": "host-tok"}}')
+    monkeypatch.setattr(r, "_CLAUDE_CREDENTIALS_PATH", cred)
+
+    async def produce(client):
+        if False:
+            yield
+
+    install_fake_sdk(monkeypatch, produce)
+    res = asyncio.run(_status_tool(_profile="default", _variables={}))
+    sc = res.structured_content
+    assert sc["credentials_configured"] is True
+    assert sc["credential_source"] == "host_claude_login"
+
+
+def test_status_includes_models(monkeypatch):
+    from app.tools.builtin import claude_code_runner as r
+
+    async def _models(variables, profile, *, force_refresh=False):
+        return {
+            "models": [
+                {"id": "claude-sonnet-4-5", "display_name": "Sonnet 4.5"},
+                {"id": "claude-opus-4-5", "display_name": "Opus 4.5"},
+            ],
+            "source": "host_claude_login",
+            "cached": False,
+        }
+
+    monkeypatch.setattr(r, "list_models", _models)
+
+    async def produce(client):
+        if False:
+            yield
+
+    install_fake_sdk(monkeypatch, produce)
+    res = asyncio.run(_status_tool(_profile="default", _variables={}))
+    sc = res.structured_content
+    ids = [m["id"] for m in sc["models"]]
+    assert ids == ["claude-sonnet-4-5", "claude-opus-4-5"]
+    assert not sc.get("models_error")
+    assert "cremind tools options claude_code" in sc["models_hint"]
+
+
+def test_status_models_error_passthrough(monkeypatch):
+    from app.tools.builtin import claude_code_runner as r
+
+    async def _models(variables, profile, *, force_refresh=False):
+        return {"models": [], "error": "credential rejected", "source": None}
+
+    monkeypatch.setattr(r, "list_models", _models)
+
+    async def produce(client):
+        if False:
+            yield
+
+    install_fake_sdk(monkeypatch, produce)
+    res = asyncio.run(
+        _status_tool(_profile="default", _variables={"CLAUDE_CODE_API_KEY": "sk-bad"})
+    )
+    sc = res.structured_content
+    assert sc["models"] == []
+    assert sc["models_error"] == "credential rejected"
+    # The credential-source status is independent of the model fetch outcome.
+    assert sc["credential_source"] == "tool_variable_api_key"
