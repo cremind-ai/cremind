@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
+import re
 import uuid
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
@@ -41,6 +43,72 @@ from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
 from app.tools.mcp.mcp_auth import MCPOAuthClient
 from app.utils.context_storage import get_context
 from app.utils.logger import logger
+
+
+def resolve_sandbox_recovery_dir(
+    result_data: Any, tool_args: Dict[str, Any]
+) -> Optional[str]:
+    """Directory the conversation cwd should switch to so a denied ``system_file``
+    call succeeds on retry — or ``None`` when auto-recovery must not apply.
+
+    Fires only for the specific ``system_file`` sandbox denial ("resolves outside
+    the allowed directories") and only when the offending path names an existing
+    location **under the user's home directory**. The home-dir gate is the trust
+    boundary: auto-recovery never reaches system dirs or other users' files, only
+    paths the user themselves can reach. Non-existent (typo) paths and paths
+    outside home return ``None`` so they still surface the denial to the model.
+
+    Pure/deterministic and side-effect free, so the decision is unit-testable
+    without the adapter's LLM.
+    """
+    if not isinstance(result_data, dict):
+        return None
+    if result_data.get("error") != "Access denied":
+        return None
+    message = result_data.get("message") or ""
+    if "resolves outside the allowed directories" not in message:
+        return None
+
+    # Recover the offending path: prefer the quoted path in the denial message,
+    # fall back to the tool's path-style arguments.
+    candidate = ""
+    m = re.search(r"Access denied: '([^']*)'", message)
+    if m:
+        candidate = m.group(1)
+    if not candidate:
+        for key in ("path", "source_path", "destination_path"):
+            val = tool_args.get(key)
+            if isinstance(val, str) and val:
+                candidate = val
+                break
+    if not candidate:
+        return None
+
+    raw = os.path.expanduser(candidate)
+    # Treat a Windows drive-qualified path ("C:\\...") as absolute too — mirrors
+    # ``_safe_resolve`` in system_file.
+    is_abs = os.path.isabs(raw) or (len(raw) >= 2 and raw[1] == ":")
+    if not is_abs:
+        return None
+    target = os.path.realpath(raw)
+
+    # An existing dir → switch into it; an existing/new file → switch into its
+    # parent (so both reading a file and writing a new file into an existing
+    # folder recover).
+    if os.path.isdir(target):
+        recovery = target
+    else:
+        parent = os.path.dirname(target)
+        recovery = parent if parent and os.path.isdir(parent) else ""
+    if not recovery:
+        return None
+
+    home = os.path.realpath(os.path.expanduser("~"))
+    recovery_real = os.path.realpath(recovery)
+    if recovery_real == home or recovery_real.startswith(home + os.sep):
+        return recovery_real
+    return None
+
 
 class BuiltInToolAdapter:
     """Wraps built-in tools to behave like an A2A agent.
@@ -322,6 +390,40 @@ class BuiltInToolAdapter:
                     else:
                         result = await tool.run(tool_args)
                     result_data = self._extract_tool_result(result)
+                    # Deterministic sandbox auto-recovery: when a system_file op
+                    # denies an absolute path that resolves outside the allowed
+                    # roots but names an existing directory under the user's home,
+                    # switch the conversation cwd there and retry once. Mirrors the
+                    # auth-refresh-retry-once pattern below and makes user-named
+                    # folders reachable without relying on a weak model to call
+                    # change_working_directory itself.
+                    if context_id:
+                        recovery_dir = resolve_sandbox_recovery_dir(result_data, tool_args)
+                        if recovery_dir:
+                            logger.info(
+                                "Sandbox denial from '%s'; auto-switching cwd to "
+                                "'%s' and retrying once", tool_name, recovery_dir,
+                            )
+                            try:
+                                from app.events.runner import get_conversation_storage
+                                from app.utils.working_directory import (
+                                    switch_conversation_cwd,
+                                )
+                                await switch_conversation_cwd(
+                                    context_id, recovery_dir, get_conversation_storage(),
+                                )
+                                tool_args["_working_directory"] = recovery_dir
+                                if tool_timeout is not None:
+                                    result = await asyncio.wait_for(
+                                        tool.run(tool_args), timeout=tool_timeout
+                                    )
+                                else:
+                                    result = await tool.run(tool_args)
+                                result_data = self._extract_tool_result(result)
+                            except Exception:  # noqa: BLE001
+                                logger.exception(
+                                    "Sandbox auto-recovery failed for '%s'", tool_name
+                                )
                     _fold_result_usage(result)
                     tool_results[tool_name] = result_data
                     logger.info(f"Built-in tool '{tool_name}' result received")

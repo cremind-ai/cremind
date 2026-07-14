@@ -143,6 +143,44 @@ def clear_in_memory_override(conversation_id: str) -> None:
     clear_context(conversation_id, WORKING_DIR_OVERRIDE_KEY)
 
 
+async def switch_conversation_cwd(
+    conversation_id: str,
+    path: str,
+    conv_storage: Any,
+    *,
+    publish: bool = True,
+) -> None:
+    """Point a conversation's working directory at *path* (an existing dir).
+
+    Performs the full in-memory + durable + notify tail shared by the
+    ``change_working_directory`` tool and the adapter's sandbox auto-recovery:
+
+    1. set the in-memory ContextStorage override (read on the next reasoning
+       step and by every built-in tool call this turn);
+    2. persist it to ``conversations.working_directory`` so it survives restart;
+    3. publish a ``cwd`` event on the conversation's event-stream bus so any
+       subscribed UI (the Vue ``CwdBreadcrumb``, the CLI tree) re-renders.
+
+    Persistence and publish failures are logged, not raised — the in-memory
+    value still drives the current run.
+    """
+    if not conversation_id or not path:
+        return
+    set_in_memory_override(conversation_id, path)
+    await persist_working_directory(conversation_id, path, conv_storage)
+    if publish:
+        try:
+            from app.events import get_event_stream_bus
+            await get_event_stream_bus().publish(
+                conversation_id, "cwd", {"working_directory": path},
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "switch_conversation_cwd: failed to publish cwd event for %s",
+                conversation_id,
+            )
+
+
 def set_in_memory_override(conversation_id: str, path: str) -> None:
     """Convenience wrapper around ``set_context`` for the override key."""
     if not conversation_id or not path:
