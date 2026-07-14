@@ -68,6 +68,13 @@ _DEFAULT_MAX_CONTENT_CHARS = 30000
 TOOL_CONFIG: ToolConfig = {
     "name": "browser",
     "display_name": "Browser",
+    "description": (
+        "Drives a real Chrome browser via the DevTools Protocol to navigate "
+        "pages, capture snapshots and screenshots, click, type, manage tabs, "
+        "and evaluate scripts. Use it for tasks that need a live browser — "
+        "signing into sites, interacting with web apps, or reading pages that "
+        "require JavaScript — rather than a plain HTTP fetch."
+    ),
     # Optional Python deps group (see app.features.manifest.FEATURES["browser"]).
     # Read by ``feature_keys_for_tool_ids`` to drive Setup Wizard auto-install
     # and the post-setup enable pre-flight. Tools without optional Python deps

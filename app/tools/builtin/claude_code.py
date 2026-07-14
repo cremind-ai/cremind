@@ -59,6 +59,13 @@ _EXTRAS = ("claude-code",)
 TOOL_CONFIG: ToolConfig = {
     "name": "claude_code",
     "display_name": "Claude Code",
+    "description": (
+        "Delegates software-engineering work to Claude Code, Anthropic's "
+        "autonomous coding agent, running in the current working directory. "
+        "Prefer it for creating projects, writing/refactoring/debugging code, "
+        "and reviewing or explaining a codebase: start a task with run, poll "
+        "long-running tasks with wait, and abort with stop."
+    ),
     "default": False,
     "requires_feature": "claude_code",
     "required_config": {

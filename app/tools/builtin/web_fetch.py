@@ -71,6 +71,12 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "web_fetch",
     "display_name": SERVER_NAME,
+    "description": (
+        "Fetches a specific HTTP(S) URL and extracts its readable "
+        "text/markdown content. Use it when you already have a URL and need "
+        "to read that page; an SSRF guard blocks private and internal "
+        "addresses."
+    ),
     "visible": True,
     "required_config": {
         Var.MAX_CHARS: {

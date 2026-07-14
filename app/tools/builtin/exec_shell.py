@@ -269,6 +269,13 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "exec_shell",
     "display_name": "Shell Executor",
+    "description": (
+        "Runs shell commands in the current working directory through the "
+        "platform shell (PowerShell on Windows, bash on POSIX). Handles "
+        "one-shot commands, interactive prompts, and long-running processes "
+        "that detach and stream their output to log files you can poll. Use "
+        "it for system operations, builds, scripts, and any command-line task."
+    ),
     # Visible in Settings (so its output-handling options can be configured)
     # but locked on — a core capability the user must not disable.
     "locked": True,

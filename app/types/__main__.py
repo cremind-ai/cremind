@@ -206,6 +206,18 @@ class ToolConfig(TypedDict, total=False):
     # top-level flag distinct from ``RequiredConfigField.default`` (the default
     # *value* of a required env var) — see that TypedDict above.
     default: bool
+    # Human-authored, model-facing summary of what this built-in tool is for.
+    # Consumed in two places:
+    #  (a) the group's ``description`` attribute — surfaced in the Settings UI,
+    #      GET /api/tools, ``cremind tools get``, and the ``tools.description`` DB
+    #      column (register_builtin upserts it on every boot); replaces the
+    #      SERVER_NAME fallback used when this key is absent.
+    #  (b) the dynamic "built-in tools" section of the reasoning system prompt
+    #      (see ``_build_builtin_tools_guidance``): each ENABLED, non-hidden
+    #      built-in that declares this field is listed with its purpose and its
+    #      leaf function names, re-rendered every turn from the live enabled set.
+    # Keep to 1-3 sentences. Omit for tools that should not advertise a blurb.
+    description: str
 
 
 class ChatCompletionStreamResponseType(TypedDict):

@@ -109,6 +109,13 @@ _DURATION_SCHEMA: Dict[str, Any] = {
 TOOL_CONFIG: ToolConfig = {
     "name": "scheduler",
     "display_name": "Scheduler",
+    "description": (
+        "Parses and normalizes a natural-language schedule expression (an "
+        "instant, a bounded interval, a recurrence, an explicit set of times, "
+        "a query window, or a constraint) into structured datetimes, emitting "
+        "an RFC 5545 RRULE for recurrences. It only interprets the schedule; "
+        "downstream tools perform the actual booking."
+    ),
     "hidden": True,
 }
 

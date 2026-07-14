@@ -27,6 +27,11 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "weather",
     "display_name": "Weather",
+    "description": (
+        "Retrieves current conditions and forecast weather for a location via "
+        "the AccuWeather API. Use it to answer weather questions for a named "
+        "place."
+    ),
     "default": False,
     "required_config": {
         Var.API_KEY: {
