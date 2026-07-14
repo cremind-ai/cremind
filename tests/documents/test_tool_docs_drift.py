@@ -19,6 +19,7 @@ BUNDLED = Path(__file__).resolve().parents[2] / "app" / "documents" / "bundled"
 # module stem  ->  bundled doc filename (without the .md extension)
 DOC_MAP = {
     "claude_code": "[tool]claude code",
+    "codex": "[tool]codex",
     "exec_shell": "[tool]shell executor",
     "system_file": "[tool]system file",
     "browser": "[tool]browser",

@@ -97,6 +97,14 @@ browser = ["playwright>=1.52.0"]
 # tool imports the SDK lazily inside run(), so this is never on the boot path.
 claude-code = ["claude-agent-sdk>=0.2.0"]
 
+# Codex delegation. The OpenAI Codex SDK drives Codex, OpenAI's autonomous
+# coding agent. openai-codex depends on openai-codex-cli-bin, whose per-platform
+# wheel bundles the codex binary (incl. win_amd64/win_arm64), so no npm/node
+# install is needed. The tool imports the SDK lazily inside run(), so this is
+# never on the boot path. The >=…b3 pre-release specifier lets pip accept the
+# beta without --pre; the upper bound guards against 0.x surface churn.
+codex = ["openai-codex>=0.1.0b3,<0.2"]
+
 # Document ingestion (markitdown converts office/pdf, pandas for tabular).
 documents = ["markitdown[all]>=0.1.0", "pandas>=3.0.1"]
 
@@ -133,6 +141,7 @@ all = [
     "chromadb>=0.5.0",
     "playwright>=1.52.0",
     "claude-agent-sdk>=0.2.0",
+    "openai-codex>=0.1.0b3,<0.2",
     "markitdown[all]>=0.1.0",
     "pandas>=3.0.1",
     "tiktoken>=0.12.0",
@@ -195,6 +204,18 @@ exclude = [
 
 [tool.uv]
 package = true
+# The optional ``codex`` extra pulls openai-codex (beta), which pins the
+# transitive ``openai-codex-cli-bin==0.137.0a4`` — a pre-release. uv locks EVERY
+# extra universally, and its default policy refuses pre-releases for transitive
+# deps even when the requirement names one, which breaks ``uv lock`` / ``uv run``
+# for the whole workspace. ``if-necessary`` doesn't help (uv judges "necessary"
+# per-package, and openai-codex-cli-bin does publish stable releases — just none
+# matching the exact ==…a4 pin), so ``allow`` is required. uv still prefers the
+# highest compatible STABLE version for every other dependency; ``allow`` only
+# means a pre-release is an eligible candidate, which is what the beta codex
+# chain needs. Regular ``pip install cremind[codex]`` already honours the pinned
+# pre-release specifier without any of this.
+prerelease = "allow"
 
 [dependency-groups]
 dev = [

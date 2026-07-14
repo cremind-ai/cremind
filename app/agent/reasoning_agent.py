@@ -120,7 +120,7 @@ For any request that contains a time expression you MUST first call the
 `datetime_parser` tool to normalise it; if it also contains a recurring
 schedule you MUST call the `scheduler` tool instead. Do this before calling
 other tools that need the normalised time.
-{reasoning_guidance}{builtin_tools_guidance}{search_guidance}{claude_code_guidance}
+{reasoning_guidance}{builtin_tools_guidance}{search_guidance}{coding_delegation_guidance}
 PRESERVE THE USER'S LANGUAGE: any human-facing value you put in a tool argument
 -- especially the title/name of something you create on the user's behalf (a
 schedule event, reminder, note, or task) and any message shown to the user --
@@ -394,42 +394,42 @@ def _build_search_guidance(tools) -> str:
     return "\n" + body + "\n"
 
 
-def _build_claude_code_guidance(tools) -> str:
-    """Delegation guidance for the ``claude_code`` tool, present ONLY when it is
-    enabled for this run (matched to its live registered group by module stem),
-    naming the exact leaf function names the model sees. Returns "" otherwise so
-    the prompt stays byte-identical for the vast majority of profiles that keep
-    the disabled-by-default tool off — no prompt-cache impact for them. Wrapped
-    ``'\\n...\\n'`` like the other guidance blocks.
-    """
-    try:
-        from app.tools.builtin.claude_code import (
-            ClaudeCodeRunTool,
-            ClaudeCodeStatusTool,
-            ClaudeCodeStopTool,
-            ClaudeCodeWaitTool,
-        )
-    except Exception:  # noqa: BLE001 - missing optional dep => tool not registered
-        return ""
+_CODING_LEAVES = ("run", "wait", "stop", "status")
 
-    group_by_stem = {}
+# When BOTH coding agents are enabled the model picks per task (the user can name
+# one). Isolated as a single constant so the preference policy is a one-line
+# change if it ever moves to claude-first / codex-first / ask-the-user.
+_BOTH_ENABLED_PREFERENCE = (
+    "Both Claude Code and Codex are available. Either can handle any coding task — "
+    "pick whichever fits (they are peers), and if the user names one (\"use "
+    "Codex\", \"ask Claude Code\") use that one. A session_id only resumes with "
+    "the SAME agent that produced it, and each agent has its own wait/stop/status "
+    "functions — poll the one you started."
+)
+
+
+def _coding_agent_fns(tools, stem: str) -> Optional[dict]:
+    """Return ``{leaf: fq_function_name}`` for an enabled coding-delegate group
+    (matched to its live registered group by module stem), or None when that
+    group is not enabled this run. Both delegates expose the same leaf names."""
     for tool in tools:
-        stem = getattr(tool, "config_name", None)
-        if stem is not None:
-            group_by_stem[stem] = tool
-    group = group_by_stem.get("claude_code")
-    if group is None:
-        return ""
+        if getattr(tool, "config_name", None) == stem:
+            return {leaf: make_leaf_name(tool.tool_id, leaf) for leaf in _CODING_LEAVES}
+    return None
 
-    run_fn = make_leaf_name(group.tool_id, ClaudeCodeRunTool.name)
-    wait_fn = make_leaf_name(group.tool_id, ClaudeCodeWaitTool.name)
-    stop_fn = make_leaf_name(group.tool_id, ClaudeCodeStopTool.name)
-    status_fn = make_leaf_name(group.tool_id, ClaudeCodeStatusTool.name)
-    body = (
-        f"CODING TASKS — ALWAYS DELEGATE TO CLAUDE CODE: `{run_fn}` drives Claude "
-        "Code, an expert autonomous coding agent working in the current working "
+
+def _single_agent_guidance(fns: dict, *, agent: str, extra: str) -> str:
+    """The one-agent delegation body, shared by the claude-only and codex-only
+    states (``extra`` describes the agent so the claude-only text stays
+    byte-identical to the historical prompt)."""
+    run_fn, wait_fn, stop_fn, status_fn = (
+        fns["run"], fns["wait"], fns["stop"], fns["status"],
+    )
+    return (
+        f"CODING TASKS — ALWAYS DELEGATE TO {agent}: `{run_fn}` drives {extra}, an "
+        "expert autonomous coding agent working in the current working "
         "directory. Cremind is a general-purpose assistant, NOT a coding specialist "
-        "— Claude Code is. So for ANY request involving source code, a code project, "
+        f"— {agent.title()} is. So for ANY request involving source code, a code project, "
         "a repository, or a programming file — whether the user wants you to READ, "
         "UNDERSTAND, EXPLORE, EXPLAIN, or REVIEW existing code (e.g. \"what is this "
         "source code for?\", \"what does this project do?\", \"explain/review this "
@@ -443,12 +443,69 @@ def _build_claude_code_guidance(tools) -> str:
         f"calling `{wait_fn}` with the task_id until it completes, then report the "
         "result (mention cost/duration when notable). Continue the same coding "
         f"session by passing the returned session_id to a new `{run_fn}`. Stop a "
-        f"runaway task with `{stop_fn}`. To check whether Claude Code is set up or "
+        f"runaway task with `{stop_fn}`. To check whether {agent.title()} is set up or "
         f"logged in, call `{status_fn}` (add probe=true for a definitive live check); "
-        "only if Claude Code is genuinely unavailable should you fall back to your "
+        f"only if {agent.title()} is genuinely unavailable should you fall back to your "
         "own file/shell tools. Only genuinely non-coding tasks are exempt from this "
         "rule."
     )
+
+
+def _both_agents_guidance(claude: dict, codex: dict) -> str:
+    """The two-agent delegation body: still hard-requires delegating coding to a
+    coding agent, but names both and lets the model pick per task."""
+    return (
+        f"CODING TASKS — ALWAYS DELEGATE TO A CODING AGENT: `{claude['run']}` drives "
+        f"Claude Code and `{codex['run']}` drives Codex — two expert autonomous "
+        "coding agents working in the current working directory. Cremind is a "
+        "general-purpose assistant, NOT a coding specialist — they are. So for ANY "
+        "request involving source code, a code project, a repository, or a "
+        "programming file — whether the user wants you to READ, UNDERSTAND, EXPLORE, "
+        "EXPLAIN, or REVIEW existing code (e.g. \"what is this source code for?\", "
+        "\"what does this project do?\", \"explain/review this codebase\") OR to "
+        "CREATE, WRITE, REFACTOR, DEBUG, TEST, or RUN code — you MUST delegate to "
+        f"`{claude['run']}` or `{codex['run']}` and MUST NOT inspect, browse, search, "
+        "or edit the code yourself with file/shell tools (e.g. list_files, "
+        "read_file, exec_shell). Understanding or explaining code COUNTS as a coding "
+        "task. First call `change_working_directory` to the relevant project "
+        "directory if it is not already the cwd, then call the chosen agent's run "
+        "function with a complete task brief (goal, constraints, relevant paths). "
+        "If it returns status 'running', keep calling that agent's wait function "
+        f"(`{claude['wait']}` or `{codex['wait']}`) with the task_id until it "
+        "completes, then report the result (mention cost/duration when notable). "
+        "Continue the same coding session by passing the returned session_id to a "
+        "new run of the SAME agent; stop a runaway task with that agent's stop "
+        f"function (`{claude['stop']}` or `{codex['stop']}`); check setup/login with "
+        f"its status function (`{claude['status']}` or `{codex['status']}`, "
+        "probe=true for a live check). Only if both are genuinely unavailable should "
+        "you fall back to your own file/shell tools. Only genuinely non-coding tasks "
+        f"are exempt from this rule. {_BOTH_ENABLED_PREFERENCE}"
+    )
+
+
+def _build_coding_delegation_guidance(tools) -> str:
+    """Coding-delegation guidance, present ONLY when a coding-delegate tool
+    (``claude_code`` and/or ``codex``) is enabled for this run, naming the exact
+    leaf function names the model sees. Returns "" otherwise so the prompt stays
+    byte-identical for the vast majority of profiles that keep both
+    disabled-by-default tools off — no prompt-cache impact for them.
+
+    Four states: neither enabled (""), only Claude Code (byte-identical to the
+    historical single-agent prompt), only Codex (the same body, Codex-worded), or
+    both (a neutral rule that hard-requires delegating coding to one of them and
+    lets the model pick per task). Wrapped ``'\\n...\\n'`` like the other blocks.
+    """
+    claude = _coding_agent_fns(tools, "claude_code")
+    codex = _coding_agent_fns(tools, "codex")
+
+    if claude and codex:
+        body = _both_agents_guidance(claude, codex)
+    elif claude:
+        body = _single_agent_guidance(claude, agent="CLAUDE CODE", extra="Claude Code")
+    elif codex:
+        body = _single_agent_guidance(codex, agent="CODEX", extra="Codex")
+    else:
+        return ""
     return "\n" + body + "\n"
 
 
@@ -546,10 +603,10 @@ class ReasoningAgent:
     # (used in tests) from tripping on a missing attribute.
     _search_guidance: str = ""
 
-    # Claude Code delegation block; ``__init__`` recomputes it from the run's
-    # enabled tools (empty unless the disabled-by-default claude_code tool is on).
-    # Class-level default keeps ``__new__`` construction (tests) safe.
-    _claude_code_guidance: str = ""
+    # Coding-delegation block (Claude Code and/or Codex); ``__init__`` recomputes
+    # it from the run's enabled tools (empty unless a disabled-by-default coding
+    # delegate is on). Class-level default keeps ``__new__`` construction (tests) safe.
+    _coding_delegation_guidance: str = ""
 
     # Built-in-tools catalogue block; ``__init__`` recomputes it from the run's
     # enabled tools (empty unless a described, non-hidden built-in is on).
@@ -694,9 +751,10 @@ class ReasoningAgent:
         # steps. Names only the search tools actually enabled for this profile,
         # using the exact function names those groups expose to the model.
         self._search_guidance = _build_search_guidance(self._tools)
-        # Claude Code delegation guidance — present only when the (disabled-by-
-        # default) claude_code tool is enabled for this profile; empty otherwise.
-        self._claude_code_guidance = _build_claude_code_guidance(self._tools)
+        # Coding-delegation guidance — present only when a (disabled-by-default)
+        # coding delegate (claude_code and/or codex) is enabled for this profile;
+        # empty otherwise. Names both agents when both are on (model picks).
+        self._coding_delegation_guidance = _build_coding_delegation_guidance(self._tools)
         # Built-in tools catalogue — one line per enabled, non-hidden built-in
         # that declares an authored description; empty otherwise. Static for the
         # run (group-level), so the system prompt stays byte-identical per step.
@@ -896,7 +954,7 @@ class ReasoningAgent:
             reasoning_guidance=REASONING_GUIDANCE if self._inject_reasoning_guidance else "",
             builtin_tools_guidance=self._builtin_tools_guidance,
             search_guidance=self._search_guidance,
-            claude_code_guidance=getattr(self, "_claude_code_guidance", ""),
+            coding_delegation_guidance=getattr(self, "_coding_delegation_guidance", ""),
             long_term_memory=self._long_term_memory_block,
         )
         # Render `$CREMIND_*` system-variable tokens (e.g. $CREMIND_PROFILE,

@@ -424,19 +424,21 @@ def test_feature_and_pip_spec():
 
 
 def test_guidance_present_only_when_enabled():
-    from app.agent.reasoning_agent import _build_claude_code_guidance
+    from app.agent.reasoning_agent import _build_coding_delegation_guidance
 
-    assert _build_claude_code_guidance([]) == ""
+    assert _build_coding_delegation_guidance([]) == ""
 
     class Group:
         config_name = "claude_code"
         tool_id = "claude_code"
 
-    text = _build_claude_code_guidance([Group()])
+    text = _build_coding_delegation_guidance([Group()])
     assert "claude_code__run" in text
     assert "claude_code__wait" in text
     assert "claude_code__stop" in text
     assert "claude_code__status" in text
+    # Claude-only guidance must not leak the peer agent's functions.
+    assert "codex__" not in text
 
 
 # ── auth-failure classification (the not-logged-in case) ──────────────────────
