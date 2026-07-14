@@ -86,6 +86,12 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "documentation_search",
     "display_name": SERVER_NAME,
+    "description": (
+        "Semantically searches the user's local Markdown documentation "
+        "library and returns the single most relevant document's contents, "
+        "chosen by an internal LLM judge. Try it first for any factual or "
+        "how-to lookup before searching the public web."
+    ),
     # Visible in Settings (so its top-k can be configured) but locked on —
     # the agent must always be able to search its own documentation.
     "locked": True,

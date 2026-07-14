@@ -31,6 +31,11 @@ SERVER_NAME = "Current Time"
 TOOL_CONFIG: ToolConfig = {
     "name": "current_time",
     "display_name": "Current Time",
+    "description": (
+        "Reports the present wall-clock time, optionally in a specified IANA "
+        "timezone. Call it whenever you need the present date or time — the "
+        "system prompt no longer carries a clock."
+    ),
     # NOT hidden: the reasoning agent must see this tool to answer time
     # questions. The reasoning model fills the structured ``timezone``
     # argument directly (resolving a named location to its IANA zone).

@@ -57,6 +57,12 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "web_search",
     "display_name": SERVER_NAME,
+    "description": (
+        "Searches the public web and returns ranked results with snippets. "
+        "Use it as the last-resort internet fallback when local tools "
+        "(documentation and memory) cannot answer, or when the user "
+        "explicitly wants fresh external information."
+    ),
     "visible": True,
     "required_config": {
         Var.PROVIDER: {

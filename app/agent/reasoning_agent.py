@@ -116,7 +116,7 @@ For any request that contains a time expression you MUST first call the
 `datetime_parser` tool to normalise it; if it also contains a recurring
 schedule you MUST call the `scheduler` tool instead. Do this before calling
 other tools that need the normalised time.
-{reasoning_guidance}{search_guidance}{claude_code_guidance}
+{reasoning_guidance}{builtin_tools_guidance}{search_guidance}{claude_code_guidance}
 PRESERVE THE USER'S LANGUAGE: any human-facing value you put in a tool argument
 -- especially the title/name of something you create on the user's behalf (a
 schedule event, reminder, note, or task) and any message shown to the user --
@@ -440,6 +440,60 @@ def _build_claude_code_guidance(tools) -> str:
     return "\n" + body + "\n"
 
 
+def _build_builtin_tools_guidance(tools) -> str:
+    """Dynamic catalogue of ENABLED, non-hidden built-in groups that declare an
+    authored ``description`` in their module ``TOOL_CONFIG`` — the tool's purpose
+    plus the exact leaf function names as they appear in the ``tools=`` block.
+
+    Opt-in and GROUP-LEVEL by design, so the block stays byte-stable within a run
+    and only changes when the enabled built-in SET changes — exactly like
+    ``_build_search_guidance``:
+      * a group with no authored description is skipped (``group.description``
+        falls back to SERVER_NAME, so we read the STATIC ``TOOL_CONFIG`` to
+        disambiguate authored-vs-fallback);
+      * ``hidden`` system built-ins (scheduler, datetime_parser, ...) are skipped
+        — they get dedicated guidance elsewhere and must not leak into the prompt;
+      * leaf names come from the group's STATIC registered leaves (``skills``),
+        NOT ``leaf_function_specs`` — the latter runs ``prepare_tools`` / per-leaf
+        disable suppression re-read every step, which would risk mid-turn cache
+        busts (see the byte-stability contract).
+    Returns "" when no described built-in is enabled. Wrapped ``'\\n...\\n'`` to
+    match the other guidance blocks' spacing.
+    """
+    from app.tools.builtin import get_builtin_tool_config  # lazy: avoid import cycle
+
+    lines: list[str] = []
+    for tool in tools:
+        config_name = getattr(tool, "config_name", None)
+        if config_name is None:            # skill / MCP / intrinsic — not a built-in group
+            continue
+        if getattr(tool, "hidden", False):  # hidden system built-ins never enter the prompt
+            continue
+        description = (
+            get_builtin_tool_config(config_name).get("tool", {}).get("description")
+        )
+        if not description:                 # opt-in: only authored descriptions render
+            continue
+        label = getattr(tool, "name", None) or config_name
+        fns = [
+            f"`{make_leaf_name(tool.tool_id, s.name)}`"
+            for s in getattr(tool, "skills", [])
+        ]
+        entry = f"- {label} — {description}"
+        if fns:
+            entry += " Functions: " + ", ".join(fns) + "."
+        lines.append(entry)
+
+    if not lines:
+        return ""
+    header = (
+        "BUILT-IN TOOLS — WHAT EACH IS FOR: The built-in tools enabled this turn "
+        "are grouped below by purpose. Read the purpose to choose the right tool, "
+        "then call one of its listed functions."
+    )
+    return "\n" + header + "\n" + "\n".join(lines) + "\n"
+
+
 class _LeafOutcome:
     """Collected output of one leaf tool run (so leaves can run concurrently)."""
 
@@ -484,6 +538,12 @@ class ReasoningAgent:
     # enabled tools (empty unless the disabled-by-default claude_code tool is on).
     # Class-level default keeps ``__new__`` construction (tests) safe.
     _claude_code_guidance: str = ""
+
+    # Built-in-tools catalogue block; ``__init__`` recomputes it from the run's
+    # enabled tools (empty unless a described, non-hidden built-in is on).
+    # Class-level default keeps ``__new__`` construction (tests) and direct
+    # ``_build_instruction`` calls from tripping on a missing attribute.
+    _builtin_tools_guidance: str = ""
 
     # Frozen long-term-memory section; ``_loop`` fills it once per run from the
     # per-process snapshot. Class-level default keeps ``__new__`` construction and
@@ -625,6 +685,10 @@ class ReasoningAgent:
         # Claude Code delegation guidance — present only when the (disabled-by-
         # default) claude_code tool is enabled for this profile; empty otherwise.
         self._claude_code_guidance = _build_claude_code_guidance(self._tools)
+        # Built-in tools catalogue — one line per enabled, non-hidden built-in
+        # that declares an authored description; empty otherwise. Static for the
+        # run (group-level), so the system prompt stays byte-identical per step.
+        self._builtin_tools_guidance = _build_builtin_tools_guidance(self._tools)
 
         self.max_steps = max_steps if max_steps is not None else cfg.max_steps
         self.current_step_count = 0
@@ -818,6 +882,7 @@ class ReasoningAgent:
             current_os=platform.system(),
             current_user_working_directory=cwd,
             reasoning_guidance=REASONING_GUIDANCE if self._inject_reasoning_guidance else "",
+            builtin_tools_guidance=self._builtin_tools_guidance,
             search_guidance=self._search_guidance,
             claude_code_guidance=getattr(self, "_claude_code_guidance", ""),
             long_term_memory=self._long_term_memory_block,
