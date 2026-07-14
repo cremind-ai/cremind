@@ -102,6 +102,10 @@ SYSTEM_TEMPLATE = '''{persona_description}
 
 Current OS: {current_os}
 Current User Working Directory: `{current_user_working_directory}`
+If the user refers to a file or folder OUTSIDE this working directory (any other
+absolute path on disk), do NOT refuse or ask them to move it: call
+`change_working_directory` (target='custom', path=<the absolute directory>) to
+switch there first, then read or act. The directory must already exist.
 Active profile: $CREMIND_PROFILE
 Your name: $CREMIND_AGENT_NAME
 {long_term_memory}
