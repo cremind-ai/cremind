@@ -42,6 +42,14 @@ export interface MessageRecord {
     // Legacy fields (older persisted messages) read for back-compat.
     observation?: { kind: string; text?: string; data?: Record<string, any>; file?: any }[];
     model_label?: string | null;
+    // Reasoning-call token counts for this step (absent on messages persisted
+    // before per-step tokens shipped).
+    token_usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+    } | null;
   }[] | null;
   token_usage: {
     input_tokens: number;

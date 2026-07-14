@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, inject, ref, watch } from 'vue';
-import type { ChatMessage, FileAttachment, TerminalAttachment } from '../stores/chat';
+import type { ChatMessage, FileAttachment, TerminalAttachment, StepTokenUsage } from '../stores/chat';
+import { formatTokens, formatTokensCompact, formatPercent } from '../utils/usageFormat';
 import { OpenTerminalKey } from '../composables/terminalTarget';
 import { createChatMarked } from '../utils/markdown';
 import vLinkBlank from '../directives/v-link-blank';
@@ -74,6 +75,31 @@ const thinkingGroups = computed(() => {
   }
   return groups;
 });
+
+// Reasoning-call token usage for a step group. Every tool call in the group
+// shares the one reasoning call that produced the step, so the first tool that
+// carries usage is authoritative. Null (no badge) for steps persisted before
+// per-step tokens shipped.
+const groupTokens = (group: { tools: any[] }): StepTokenUsage | null => {
+  for (const tool of group.tools) {
+    if (tool.tokenUsage) return tool.tokenUsage as StepTokenUsage;
+  }
+  return null;
+};
+
+// Cached fraction of the prompt (read + write), mirroring MessageUsageChip.
+const cachedFraction = (u: StepTokenUsage): number => {
+  const prompt = u.inputTokens + u.cacheReadTokens + u.cacheCreationTokens;
+  return prompt > 0 ? u.cacheReadTokens / prompt : 0;
+};
+
+// Full breakdown for the badge tooltip (new input / cached / cache-write / out).
+const stepTokenTitle = (u: StepTokenUsage): string =>
+  `Reasoning call for this step\n`
+  + `Input (new): ${formatTokens(u.inputTokens)}\n`
+  + `Cached (read): ${formatTokens(u.cacheReadTokens)}\n`
+  + `Cache write: ${formatTokens(u.cacheCreationTokens)}\n`
+  + `Output: ${formatTokens(u.outputTokens)}`;
 
 // Format latency information for display
 const latencyDisplay = computed(() => {
@@ -477,6 +503,20 @@ const handleThinkingClick = (event: MouseEvent) => {
                 placement="top"
               >
                 <el-card shadow="never" class="timeline-card">
+                  <div
+                    v-if="groupTokens(group)"
+                    class="step-tokens"
+                    :title="stepTokenTitle(groupTokens(group)!)"
+                  >
+                    <Icon icon="mdi:arrow-down-thin" class="step-tokens-icon" />
+                    <span>{{ formatTokensCompact(groupTokens(group)!.inputTokens) }} in</span>
+                    <span
+                      v-if="groupTokens(group)!.cacheReadTokens > 0"
+                      class="step-tokens-cache"
+                    >{{ formatPercent(cachedFraction(groupTokens(group)!)) }} cached</span>
+                    <Icon icon="mdi:arrow-up-thin" class="step-tokens-icon" />
+                    <span>{{ formatTokensCompact(groupTokens(group)!.outputTokens) }} out</span>
+                  </div>
                   <div v-for="(tool, tIdx) in group.tools" :key="tIdx" class="step-content">
                     <span v-if="tool.modelLabel" class="model-badge step-model">
                       {{ tool.modelLabel }}
@@ -1128,6 +1168,31 @@ const handleThinkingClick = (event: MouseEvent) => {
 .step-model {
   float: right;
   font-size: 0.75em;
+}
+
+/* Per-step reasoning-call token counts, above the step's tool calls. */
+.step-tokens {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 8px;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+}
+
+.step-tokens-icon {
+  font-size: 0.9em;
+  opacity: 0.7;
+}
+
+.step-tokens-cache {
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--el-color-info-light-8, #e6e8eb);
+  color: var(--el-color-info, #909399);
 }
 
 /* Timeline styles */

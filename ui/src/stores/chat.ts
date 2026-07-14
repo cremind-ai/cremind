@@ -148,6 +148,29 @@ export interface ObservationPart {
   file?: { name?: string; mime_type?: string; uri?: string; bytes?: string };
 }
 
+// Reasoning-call token counts for a single step, shown per step in the Thinking
+// Process. Shared by every tool call in the same step (they come from the one
+// reasoning LLM call that produced the step).
+export interface StepTokenUsage {
+  inputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  outputTokens: number;
+}
+
+// Map the backend's snake_case per-step token payload (same shape on the live
+// ``thinking`` SSE event and the persisted ``thinking_steps`` blob) to camelCase.
+// Returns null when absent or all-zero so the UI can skip the badge cleanly.
+export function mapStepTokenUsage(raw: any): StepTokenUsage | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const inputTokens = raw.input_tokens || 0;
+  const cacheReadTokens = raw.cache_read_input_tokens || 0;
+  const cacheCreationTokens = raw.cache_creation_input_tokens || 0;
+  const outputTokens = raw.output_tokens || 0;
+  if (!(inputTokens || cacheReadTokens || cacheCreationTokens || outputTokens)) return null;
+  return { inputTokens, cacheReadTokens, cacheCreationTokens, outputTokens };
+}
+
 export interface ThinkingStep {
   // One tool call within a step. ``step`` groups parallel tool calls made in the
   // same model turn; ``callId`` pairs a tool call with its result.
@@ -158,6 +181,7 @@ export interface ThinkingStep {
   result?: ObservationPart[];
   receivedAt?: number;
   modelLabel?: string | null;
+  tokenUsage?: StepTokenUsage | null;
 }
 
 export interface ArtifactInfo {
@@ -1393,6 +1417,7 @@ export const useChatStore = defineStore('chat', {
             toolInput: data.Tool_Input || '',
             receivedAt: stepReceivedAt,
             modelLabel: data.Model_Label || null,
+            tokenUsage: mapStepTokenUsage(data.Token_Usage),
           };
           message.thinkingSteps = message.thinkingSteps || [];
           message.thinkingSteps.push(thinkingStep);
@@ -1785,6 +1810,7 @@ export const useChatStore = defineStore('chat', {
             toolInput: (s as any).tool_input ?? '',
             result: ((s as any).result ?? s.observation) as ObservationPart[] | undefined,
             modelLabel: s.model_label || null,
+            tokenUsage: mapStepTokenUsage((s as any).token_usage),
           }))
         : undefined;
 

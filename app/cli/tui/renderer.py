@@ -103,17 +103,24 @@ def format_event(event: Event, theme: Theme) -> Optional[RenderedLine]:
         )
 
     if event.type == "thinking":
-        thought = str(data.get("Thought") or "")
-        action = str(data.get("Action") or "")
-        action_input = data.get("Action_Input")
+        # One tool call in a step. Fields mirror ``_thinking_artifact`` on the
+        # backend: ``Tool`` / ``Tool_Input`` / ``Model_Label`` / ``Token_Usage``.
+        tool = str(data.get("Tool") or "")
+        tool_input = data.get("Tool_Input")
+        model_label = str(data.get("Model_Label") or "")
+        token_usage = data.get("Token_Usage") if isinstance(data.get("Token_Usage"), dict) else {}
         body_parts: list[str] = []
-        if thought:
-            body_parts.append(t.style(t.thinking, "<> Thought: " + thought))
-        if action:
-            body_parts.append(t.style(t.dim, "  -> Action: " + action))
-        ai = _format_action_input(action_input)
+        if tool:
+            head = "<> Tool: " + tool
+            if model_label:
+                head += f"  [{model_label}]"
+            body_parts.append(t.style(t.thinking, head))
+        ai = _format_action_input(tool_input)
         if ai:
             body_parts.append(t.style(t.dim, "    Input: " + ai))
+        _, counts = _summarize_token_usage(token_usage)
+        if counts:
+            body_parts.append(t.style(t.dim, "    tokens " + counts))
         if not body_parts:
             return None
         return RenderedLine("thinking", "\n".join(body_parts))
@@ -209,6 +216,29 @@ def format_event(event: Event, theme: Theme) -> Optional[RenderedLine]:
     return None
 
 
+def _summarize_token_usage(usage: dict[str, Any]) -> tuple[int, str]:
+    """Return ``(total, "(in X, cached Y / out Z)")`` for a usage dict.
+
+    ``input_tokens`` is uncached only; cached reads/writes are added back for the
+    total. Returns ``(0, "")`` when the dict is empty or unparseable. Shared by the
+    per-turn status line (`extract_token_usage`) and the per-step thinking line.
+    """
+    try:
+        in_tok = int(usage.get("input_tokens") or 0)
+        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+        cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+        out_tok = int(usage.get("output_tokens") or 0)
+    except (TypeError, ValueError):
+        return 0, ""
+    cached = cache_read + cache_creation
+    total = in_tok + cached + out_tok
+    if total == 0:
+        return 0, ""
+    if cached:
+        return total, f"(in {in_tok}, cached {cached} / out {out_tok})"
+    return total, f"(in {in_tok} / out {out_tok})"
+
+
 def extract_token_usage(event: Event) -> str:
     """Parse a `token_usage` event into a one-line status string.
 
@@ -220,21 +250,10 @@ def extract_token_usage(event: Event) -> str:
     if isinstance(event.data, dict):
         data = event.data.get("data") if isinstance(event.data.get("data"), dict) else {}
     usage = data.get("token_usage") if isinstance(data.get("token_usage"), dict) else {}
-    try:
-        in_tok = int(usage.get("input_tokens") or 0)
-        cache_read = int(usage.get("cache_read_input_tokens") or 0)
-        cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
-        out_tok = int(usage.get("output_tokens") or 0)
-    except (TypeError, ValueError):
+    total, counts = _summarize_token_usage(usage)
+    if not counts:
         return ""
-    # ``input_tokens`` is uncached only; add cached reads/writes back for the total.
-    cached = cache_read + cache_creation
-    total = in_tok + cached + out_tok
-    if total == 0:
-        return ""
-    if cached:
-        return f"tokens: {total}  (in {in_tok}, cached {cached} / out {out_tok})"
-    return f"tokens: {total}  (in {in_tok} / out {out_tok})"
+    return f"tokens: {total}  {counts}"
 
 
 def _format_action_input(value: Any) -> str:
