@@ -186,12 +186,16 @@ async def get_variable_options(
 
 
 def _final_result(task) -> BuiltInToolResult:
-    """Return the task's frozen final payload, folding token usage exactly once."""
-    usage = None
-    if task.token_usage and not task.token_usage_reported:
-        usage = task.token_usage
-        task.token_usage_reported = True
-    return BuiltInToolResult(structured_content=task.result, token_usage=usage)
+    """Return the task's frozen final payload.
+
+    Codex is a *delegated sub-agent* running on OpenAI — a separate account from
+    Cremind's own reasoning model. Its token/cost usage is deliberately NOT folded into
+    the turn's Cremind accounting; it is surfaced only in the Agent Activity panel,
+    which reads context off the SDK stream (the Codex SDK reports no cost). The
+    model-visible ``usage`` field still rides ``structured_content`` (``task.result``)
+    so the delegating LLM can see it — it just isn't counted.
+    """
+    return BuiltInToolResult(structured_content=task.result)
 
 
 def _missing_sdk(detail: str) -> BuiltInToolResult:

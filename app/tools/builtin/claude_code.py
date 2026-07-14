@@ -196,12 +196,17 @@ async def get_variable_options(
 
 
 def _final_result(task) -> BuiltInToolResult:
-    """Return the task's frozen final payload, folding token usage exactly once."""
-    usage = None
-    if task.token_usage and not task.token_usage_reported:
-        usage = task.token_usage
-        task.token_usage_reported = True
-    return BuiltInToolResult(structured_content=task.result, token_usage=usage)
+    """Return the task's frozen final payload.
+
+    Claude Code is a *delegated sub-agent* running on Anthropic — a separate account
+    from Cremind's own reasoning model. Its token/cost usage is deliberately NOT folded
+    into the turn's Cremind accounting (it would otherwise dwarf the turn's real cost
+    and mis-attribute Anthropic spend to the parent model). It is surfaced only in the
+    Agent Activity panel, which reads Claude Code's own ``total_cost_usd`` + context off
+    the SDK stream. The model-visible ``usage`` field still rides ``structured_content``
+    (``task.result``) so the delegating LLM can see it — it just isn't counted.
+    """
+    return BuiltInToolResult(structured_content=task.result)
 
 
 def _missing_sdk(detail: str) -> BuiltInToolResult:

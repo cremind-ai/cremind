@@ -271,8 +271,11 @@ def test_fast_task_completes_in_grace_window(monkeypatch, tmp_path):
     assert sc["result"] == "Done. Created a.py"
     assert sc["session_id"] == "thread-42"
     assert sc["duration_ms"] == 5000
-    # Codex input_tokens includes cached; the mapping splits it (input - cached).
-    assert res.token_usage == {
+    # codex is a delegated sub-agent: usage is NOT folded into the turn (shown only in
+    # the Agent Activity panel). The model-visible payload still carries the split,
+    # where Codex's input_tokens (incl. cached) is split into input − cached.
+    assert res.token_usage is None
+    assert sc["usage"] == {
         "input_tokens": 5, "output_tokens": 20,
         "cache_read_input_tokens": 5, "cache_creation_input_tokens": 0,
     }
@@ -320,7 +323,10 @@ def test_slow_task_handle_then_wait_final_usage_once(monkeypatch, tmp_path):
         wait_res = await CodexWaitTool().run({"task_id": task_id, "timeout": 5})
         assert wait_res.structured_content["status"] == "completed"
         assert wait_res.structured_content["result"] == "Built the project"
-        assert wait_res.token_usage == {
+        # Delegated sub-agent usage is never folded into the turn; the model-visible
+        # payload still carries the split.
+        assert wait_res.token_usage is None
+        assert wait_res.structured_content["usage"] == {
             "input_tokens": 1, "output_tokens": 2,
             "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
         }
