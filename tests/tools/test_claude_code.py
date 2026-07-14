@@ -245,8 +245,11 @@ def test_fast_task_completes_in_grace_window(monkeypatch, tmp_path):
     assert sc["session_id"] == "sess-42"
     assert sc["num_turns"] == 3
     assert sc["total_cost_usd"] == 0.1234
-    # Token usage folded onto the BuiltInToolResult (usage record source).
-    assert res.token_usage == {
+    # claude_code is a delegated sub-agent: its usage is NOT folded into the turn's
+    # Cremind accounting (shown only in the Agent Activity panel). The model still
+    # sees the four-way split via structured_content["usage"].
+    assert res.token_usage is None
+    assert sc["usage"] == {
         "input_tokens": 10, "output_tokens": 20,
         "cache_read_input_tokens": 5, "cache_creation_input_tokens": 2,
     }
@@ -292,12 +295,13 @@ def test_slow_task_handle_then_wait_final_usage_once(monkeypatch, tmp_path):
         wait_res = await ClaudeCodeWaitTool().run({"task_id": task_id, "timeout": 5})
         assert wait_res.structured_content["status"] == "completed"
         assert wait_res.structured_content["result"] == "Built the project"
-        # Usage folded on the wait that first observed completion...
-        assert wait_res.token_usage == {
+        # Delegated sub-agent usage is never folded into the turn; the model-visible
+        # payload still carries the split.
+        assert wait_res.token_usage is None
+        assert wait_res.structured_content["usage"] == {
             "input_tokens": 1, "output_tokens": 2,
             "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
         }
-        # ...and NOT again on a re-issued wait.
         again = await ClaudeCodeWaitTool().run({"task_id": task_id, "timeout": 5})
         assert again.token_usage is None
 
