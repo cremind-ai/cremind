@@ -246,8 +246,15 @@ onBeforeUnmount(() => {
 }
 
 .aa-panel.maximized {
-  width: 440px;
-  max-height: 70vh;
+  /* Fill almost the entire chat frame. The .floating-panels wrapper (in
+     ChatView) caps its children at calc(100% - 32px) wide and
+     calc(100% - 140px) tall relative to the chat column, so an intentionally
+     oversized width plus max-width/height: 100% expands the panel out to
+     (nearly) that whole frame. A plain width: 100% would collapse here because
+     the wrapper is shrink-to-fit. */
+  width: 100vw;
+  max-width: 100%;
+  max-height: 100%;
   opacity: 1;
 }
 

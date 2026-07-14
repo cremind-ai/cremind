@@ -85,6 +85,19 @@ FEATURES: dict[str, Feature] = {
         requires_restart=False,
     ),
 
+    # ── Codex delegation (OpenAI Codex SDK bundles the codex binary) ─────────
+    # Mirrors claude_code: the openai-codex-cli-bin wheel ships the codex binary
+    # (incl. win_amd64), so there is no post_install download, and the codex tool
+    # imports openai_codex lazily inside run() (never at module load) — so, with
+    # the installer's importlib.invalidate_caches() after pip, a runtime install
+    # is importable in-process on the next call with no restart.
+    "codex": Feature(
+        key="codex",
+        extras=("codex",),
+        probes=("openai_codex",),
+        requires_restart=False,
+    ),
+
     # ── Document ingestion + tabular processing ─────────────────────────────
     "documents": Feature(
         key="documents",
