@@ -2,6 +2,7 @@
 import { computed, ref, watch, onBeforeUnmount, nextTick } from 'vue';
 import { Icon } from '@iconify/vue';
 import type { AgentActivityState, AgentActivityStep } from '../../stores/chat';
+import { formatTokensCompact, formatPercent } from '../../utils/usageFormat';
 
 const props = defineProps<{ state: AgentActivityState }>();
 const emit = defineEmits<{ (e: 'dismiss'): void }>();
@@ -94,6 +95,16 @@ const costLabel = computed(() => {
 const turnsLabel = computed(() => {
   const n = props.state.stats?.num_turns;
   return typeof n === 'number' ? `${n} turn${n === 1 ? '' : 's'}` : null;
+});
+const contextLabel = computed(() => {
+  const u = props.state.usage;
+  const used = u?.context_tokens;
+  if (typeof used !== 'number' || used <= 0) return null;
+  const win = u?.context_window;
+  if (typeof win === 'number' && win > 0) {
+    return `${formatTokensCompact(used)} / ${formatTokensCompact(win)} ctx (${formatPercent(used / win)})`;
+  }
+  return `${formatTokensCompact(used)} ctx`; // window unknown → tokens only
 });
 
 // Expand/collapse per-step detail.
@@ -211,10 +222,12 @@ onBeforeUnmount(() => {
       </li>
     </ul>
 
-    <div v-if="!isRunning" class="aa-footer">
+    <div v-if="!isRunning || contextLabel" class="aa-footer">
       <span v-if="turnsLabel">{{ turnsLabel }}</span>
       <span v-if="turnsLabel && costLabel" class="aa-dot">·</span>
       <span v-if="costLabel">{{ costLabel }}</span>
+      <span v-if="contextLabel && (turnsLabel || costLabel)" class="aa-dot">·</span>
+      <span v-if="contextLabel" class="aa-ctx">{{ contextLabel }}</span>
       <span v-if="isFailed && state.error" class="aa-error" :title="state.error">{{ state.error }}</span>
     </div>
   </div>
@@ -425,6 +438,11 @@ onBeforeUnmount(() => {
 
 .aa-dot {
   opacity: 0.6;
+}
+
+.aa-ctx {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .aa-error {

@@ -40,6 +40,7 @@ class Breakdown:
 class ThreadTokenUsage:
     last: Optional[Breakdown] = None
     total: Optional[Breakdown] = None
+    model_context_window: Optional[int] = None
 
 
 @dataclass
@@ -253,7 +254,8 @@ def test_fast_task_completes_in_grace_window(monkeypatch, tmp_path):
             status="completed", exit_code=0, aggregated_output="ok",
         ))
         yield _note("thread/tokenUsage/updated",
-                    token_usage=ThreadTokenUsage(last=Breakdown(10, 5, 20)))
+                    token_usage=ThreadTokenUsage(last=Breakdown(10, 5, 20),
+                                                 model_context_window=272_000))
         yield _note("turn/completed", turn=Turn(
             status="completed", duration_ms=5000,
             items=[Item(type="agentMessage", text="Done. Created a.py", phase="final_answer")],
@@ -273,6 +275,13 @@ def test_fast_task_completes_in_grace_window(monkeypatch, tmp_path):
     assert res.token_usage == {
         "input_tokens": 5, "output_tokens": 20,
         "cache_read_input_tokens": 5, "cache_creation_input_tokens": 0,
+    }
+    # Live context usage reached the activity snapshot: last.input_tokens verbatim
+    # (cached NOT subtracted here), window from the SDK's model_context_window.
+    task = r.get_task(sc["task_id"])
+    assert task is not None
+    assert task.activity.snapshot()["usage"] == {
+        "context_tokens": 10, "context_window": 272_000,
     }
 
 
@@ -494,6 +503,44 @@ def test_apply_notification_builds_steps():
         assert ("tool_use", "$ make", "c1", "running") in act.added
         assert ("c1", "ok") in act.resolved
         assert ("c2", "error") in act.resolved
+
+    asyncio.run(body())
+
+
+def test_apply_notification_updates_context_usage():
+    from app.tools.builtin.codex_activity import apply_notification
+
+    class FakeActivity:
+        def __init__(self):
+            self.usage = None
+
+        async def add_step(self, *, kind, label, detail=None, step_id=None, status=None):
+            return step_id or "s1"
+
+        async def resolve_step(self, step_id, *, status, detail_suffix=None):
+            return None
+
+        async def update_usage(self, usage):
+            self.usage = usage
+
+    async def body():
+        # last.input_tokens is used verbatim — cached is NOT subtracted (that split
+        # is only for cost accounting in the runner).
+        act = FakeActivity()
+        await apply_notification(act, _note(
+            "thread/tokenUsage/updated",
+            token_usage=ThreadTokenUsage(
+                last=Breakdown(input_tokens=42_000, cached_input_tokens=30_000, output_tokens=900),
+                model_context_window=272_000,
+            )))
+        assert act.usage == {"context_tokens": 42_000, "context_window": 272_000}
+
+        # Unknown window → tokens only.
+        no_window = FakeActivity()
+        await apply_notification(no_window, _note(
+            "thread/tokenUsage/updated",
+            token_usage=ThreadTokenUsage(last=Breakdown(input_tokens=5_000))))
+        assert no_window.usage == {"context_tokens": 5_000, "context_window": None}
 
     asyncio.run(body())
 

@@ -114,6 +114,7 @@ class AgentActivity:
         self._steps: List[_Step] = []
         self.total_steps = 0
         self.stats: Optional[Dict[str, Any]] = None
+        self.usage: Optional[Dict[str, Any]] = None
         self.error: Optional[str] = None
         self._auto_seq = 0
         self._flush_task: Optional[asyncio.Task] = None
@@ -198,6 +199,12 @@ class AgentActivity:
                 self._schedule_flush()
                 return
 
+    async def update_usage(self, usage: Dict[str, Any]) -> None:
+        """Replace the live context-usage payload. Coalesced like step mutations."""
+        self.usage = usage
+        self.updated_at = time.time()
+        self._schedule_flush()
+
     async def finish(
         self,
         *,
@@ -263,6 +270,7 @@ class AgentActivity:
             "steps": [s.to_dict() for s in self._steps],
             "total_steps": self.total_steps,
             "stats": self.stats,
+            "usage": self.usage,
             "error": self.error,
         }
 
