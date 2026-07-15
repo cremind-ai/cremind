@@ -13,10 +13,10 @@ import { useSettingsStore, type ProfileValue } from '../stores/settings';
 import {
   listAgents, addAgent, removeAgent, updateAgentConfig,
   listTools, updateToolConfig, setToolEnabled,
-  listToolLeaves, setToolLeaves,
+  listToolLeaves, setToolLeaves, getToolVariableOptions,
   streamFeaturesInstall, FeatureNotInstalledError,
   deleteSkill, importSkillArchive, importSkillFromGitHub, importSkillFromHub,
-  type RemoteAgentInfo, type ToolStatus, type ToolLeaf,
+  type RemoteAgentInfo, type ToolStatus, type ToolLeaf, type VariableOptionsResult,
   type FeatureNotInstalledDetail, type FeatureInstallEvent,
 } from '../services/configApi';
 import {
@@ -51,7 +51,7 @@ interface UnifiedItem {
   kind: 'builtin' | 'skill' | 'mcp-remote';
 
   toolName: string | null;  // tool_id used by /api/tools/{tool_id} endpoints
-  toolConfigFields: Record<string, { description: string; type: string; secret: boolean; configured: boolean; required?: boolean; enum?: string[]; default?: unknown }>;
+  toolConfigFields: Record<string, { description: string; type: string; secret: boolean; configured: boolean; required?: boolean; enum?: string[]; default?: unknown; dynamic_options?: boolean }>;
   toolConfigValues: Record<string, string>;
   toolConfigured: boolean;
 
@@ -102,6 +102,15 @@ interface UnifiedItem {
   leavesLoaded: boolean;
   /** True when an MCP server is disconnected and its sub-tools can't be listed. */
   leavesDisconnected: boolean;
+
+  // ── Live option lists for `dynamic_options` variables (e.g. Claude Code's
+  //    model list). Lazy-fetched when the card is expanded. ──
+  /** Per-variable option lists keyed by variable name. */
+  dynamicOptions: Record<string, VariableOptionsResult>;
+  /** Transient: true while the option lists are being fetched. */
+  dynamicOptionsLoading: boolean;
+  /** Whether the option lists have been fetched yet (lazy-load guard). */
+  dynamicOptionsLoaded: boolean;
 }
 
 // ── Data ──
@@ -289,6 +298,9 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       leavesLoading: false,
       leavesLoaded: false,
       leavesDisconnected: false,
+      dynamicOptions: {},
+      dynamicOptionsLoading: false,
+      dynamicOptionsLoaded: false,
     });
   }
 
@@ -332,6 +344,9 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       leavesLoading: false,
       leavesLoaded: false,
       leavesDisconnected: false,
+      dynamicOptions: {},
+      dynamicOptionsLoading: false,
+      dynamicOptionsLoaded: false,
     });
   }
 
@@ -422,6 +437,9 @@ function toggleExpand(item: UnifiedItem) {
   if (item.expanded && !item.leavesLoaded && (item.kind === 'builtin' || item.kind === 'mcp-remote')) {
     void loadLeaves(item);
   }
+  if (item.expanded && !item.dynamicOptionsLoaded && item.kind === 'builtin' && hasDynamicOptions(item)) {
+    void loadDynamicOptions(item);
+  }
 }
 
 async function loadLeaves(item: UnifiedItem) {
@@ -437,6 +455,27 @@ async function loadLeaves(item: UnifiedItem) {
     ElMessage.error(e instanceof Error ? e.message : 'Failed to load sub-tools');
   } finally {
     item.leavesLoading = false;
+  }
+}
+
+/** True when any of the tool's variables expose a live option list. */
+function hasDynamicOptions(item: UnifiedItem): boolean {
+  return Object.values(item.toolConfigFields).some(f => f?.dynamic_options);
+}
+
+/** Lazy-load live option lists (e.g. Claude Code's model list). Failures leave
+ *  the field as a plain text input, so we swallow errors silently. */
+async function loadDynamicOptions(item: UnifiedItem) {
+  const toolId = item.toolName ?? item.name;
+  item.dynamicOptionsLoading = true;
+  try {
+    const res = await getToolVariableOptions(settingsStore.agentUrl, settingsStore.authToken, toolId);
+    item.dynamicOptions = res.variables ?? {};
+    item.dynamicOptionsLoaded = true;
+  } catch {
+    // Keep dynamicOptions empty -> the form renders a text input instead.
+  } finally {
+    item.dynamicOptionsLoading = false;
   }
 }
 
@@ -820,6 +859,8 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
                 <ToolVariablesForm
                   :fields="item.toolConfigFields"
                   :values="item.toolConfigValues"
+                  :dynamic-options="item.dynamicOptions"
+                  :dynamic-loading="item.dynamicOptionsLoading"
                   @update:values="item.toolConfigValues = $event"
                 />
               </div>

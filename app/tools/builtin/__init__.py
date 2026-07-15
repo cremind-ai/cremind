@@ -11,6 +11,8 @@ Each tool group lives at ``app.tools.builtin.{module_name}`` and exports:
 - ``SERVER_NAME`` (str)               -- display name in the UI
 - ``get_tools(config: dict) -> list[BuiltInTool]`` -- in-process functions
 - ``get_prepare_tools()`` (optional)  -- per-request tool customization callback
+- ``get_variable_options(...)`` (optional) -- live option lists for
+                                         ``dynamic_options`` required_config vars
 
 Registration is driven by the explicit ``_BUILTIN_MODULE_NAMES`` tuple below.
 Adding a new built-in tool means adding a module in this package, exporting
@@ -45,6 +47,7 @@ __all__ = [
     "register_builtin_tools",
     "refresh_builtin_tool_oauth",
     "get_builtin_tool_config",
+    "get_builtin_variable_options_hook",
     "list_builtin_tool_catalog",
     "feature_keys_for_tool_ids",
     "required_feature_for_tool_id",
@@ -242,6 +245,28 @@ def get_builtin_tool_config(config_name: str) -> dict:
     if not isinstance(tool_config, dict):
         return {}
     return {"tool": tool_config}
+
+
+def get_builtin_variable_options_hook(config_name: str):
+    """Return a built-in module's optional ``get_variable_options`` coroutine, or
+    ``None``.
+
+    Contract (module-level, resolved at request time like ``TOOL_CONFIG`` /
+    ``get_prepare_tools``)::
+
+        async def get_variable_options(*, variables: dict, profile: str,
+                                       refresh: bool = False) -> dict[str, dict]
+
+    where the returned dict maps a variable name to
+    ``{"options": [{"id", "label"}], "error": str|None, "source": str|None}``.
+    Used to populate live option lists for ``dynamic_options`` variables.
+    """
+    try:
+        module = importlib.import_module(f"app.tools.builtin.{config_name}")
+    except ImportError:
+        return None
+    hook = getattr(module, "get_variable_options", None)
+    return hook if callable(hook) else None
 
 
 def _build_oauth_provider(*, oauth_config: Optional[dict], server_name: str):

@@ -64,22 +64,27 @@ TOOL_CONFIG: ToolConfig = {
     "required_config": {
         Var.MODEL: {
             "description": (
-                "Claude model override for coding tasks (e.g. 'claude-sonnet-4-5'). "
-                "Empty = Claude Code's default model."
+                "Claude model for coding tasks — pick from the account's live model "
+                "list or type a model id (e.g. 'claude-sonnet-4-5') or an alias "
+                "(sonnet, opus, haiku, opusplan). Empty = Claude Code's default model."
             ),
             "type": "string",
             "default": "",
+            "dynamic_options": True,
         },
         Var.PERMISSION_MODE: {
             "description": (
-                "Claude Code permission mode. 'bypassPermissions' runs fully "
-                "autonomously (recommended headless — same trust level as the Shell "
-                "Executor tool). 'acceptEdits' auto-approves file edits only; other "
-                "actions may be denied because no human is present to approve them."
+                "Claude Code permission mode — pick from the installed Claude Agent "
+                "SDK's live mode list (`cremind tools options claude_code`), the same "
+                "modes the Claude Code CLI cycles through with Shift+Tab. "
+                "'bypassPermissions' (the default) runs fully autonomously — the same "
+                "trust level as the Shell Executor tool. 'acceptEdits' auto-approves "
+                "file edits only; modes that pause for human approval (e.g. 'default') "
+                "stall headless because no one is present to approve them."
             ),
             "type": "string",
-            "enum": ["bypassPermissions", "acceptEdits", "default", "plan"],
             "default": "bypassPermissions",
+            "dynamic_options": True,
         },
         Var.MAX_TURNS: {
             "description": "Maximum agent turns per task. 0 = unlimited.",
@@ -134,6 +139,51 @@ TOOL_CONFIG: ToolConfig = {
         },
     },
 }
+
+
+async def get_variable_options(
+    *, variables: Dict[str, Any], profile: str, refresh: bool = False
+) -> Dict[str, Any]:
+    """Live option lists for ``dynamic_options`` variables (Settings dropdown +
+    ``cremind tools options``). Module-level hook discovered by
+    :func:`app.tools.builtin.get_builtin_variable_options_hook`.
+
+    Returns ``{Var.MODEL: {...}, Var.PERMISSION_MODE: {...}}`` where each value is
+    ``{"options": [{"id", "label"}...], "error": str|None, "source": str|None}``:
+
+    - ``Var.MODEL`` — the account's models (from the Anthropic ``/v1/models`` API
+      via the same credential chain the coding task uses) plus the CLI aliases.
+    - ``Var.PERMISSION_MODE`` — the installed Claude Agent SDK's ``PermissionMode``
+      Literal (introspected locally; ``refresh`` is a no-op for it).
+
+    Never raises.
+    """
+    listing = await runner.list_models(variables, profile, force_refresh=refresh)
+    options = [
+        {"id": m["id"], "label": m.get("display_name") or m["id"]}
+        for m in listing.get("models", [])
+    ]
+    if options:  # only offer aliases once the account list actually resolved
+        options += [
+            {"id": alias, "label": f"{alias} (alias)"} for alias in runner._MODEL_ALIASES
+        ]
+
+    modes = runner.list_permission_modes()
+    return {
+        Var.MODEL: {
+            "options": options,
+            "error": listing.get("error"),
+            "source": listing.get("source"),
+        },
+        Var.PERMISSION_MODE: {
+            "options": [
+                {"id": m, "label": runner._PERMISSION_MODE_LABELS.get(m, m)}
+                for m in modes.get("modes", [])
+            ],
+            "error": modes.get("error"),
+            "source": modes.get("source"),
+        },
+    }
 
 
 def _final_result(task) -> BuiltInToolResult:
@@ -398,14 +448,17 @@ class ClaudeCodeStopTool(BuiltInTool):
 class ClaudeCodeStatusTool(BuiltInTool):
     name: str = "status"
     description: str = (
-        "Report whether Claude Code is ready to use — WITHOUT starting a coding "
-        "task. Shows whether the SDK is installed and which Anthropic credential "
-        "source is configured (tool variable, this profile's LLM settings, or the "
-        "server environment). Use it to answer questions like 'is Claude Code set "
-        "up?'. Note: the server host may also be authenticated via `claude login`, "
-        "which Cremind cannot see directly — pass probe=true to run a tiny live "
-        "check that definitively confirms whether Claude Code is logged in and "
-        "authenticated (one minimal API call, no file changes)."
+        "Report whether Claude Code is ready to use, and list the Claude models "
+        "available to the resolved account — WITHOUT starting a coding task. Shows "
+        "whether the SDK is installed, which Anthropic credential source is "
+        "configured (tool variable, this profile's LLM settings, the server "
+        "environment, or a host `claude login`), and the account's available "
+        "`models`. Use it to answer 'is Claude Code set up?' AND 'which models can "
+        "Claude Code use?'. For the full list plus how to change the model, run "
+        "`cremind tools options claude_code` / `cremind tools set-var claude_code "
+        "CLAUDE_CODE_MODEL=<id>` via the Shell Executor. Pass probe=true to run a "
+        "tiny live check that definitively confirms authentication (one minimal API "
+        "call, no file changes)."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -454,10 +507,24 @@ class ClaudeCodeStatusTool(BuiltInTool):
             payload["message"] = (
                 "Claude Code is installed, but no Anthropic credential is visible to "
                 "Cremind (no CLAUDE_CODE_API_KEY tool variable, no Anthropic provider "
-                "in this profile's LLM settings, and no key in the server environment). "
-                "It may still be logged in via `claude login` on the server host — pass "
-                "probe=true to check for certain."
+                "in this profile's LLM settings, no key in the server environment, and "
+                "no host `claude login`). Pass probe=true to check for certain."
             )
+
+        # List the account's available models (cached, never raises) so the agent
+        # can answer "which models can Claude Code use?" without a separate tool.
+        listing = await runner.list_models(variables, profile)
+        payload["models"] = [
+            {"id": m["id"], "display_name": m.get("display_name") or m["id"]}
+            for m in listing.get("models", [])
+        ]
+        if listing.get("error"):
+            payload["models_error"] = listing["error"]
+        payload["models_hint"] = (
+            "Full list + change flow: `cremind tools options claude_code`, then "
+            "`cremind tools set-var claude_code CLAUDE_CODE_MODEL=<id>` "
+            "(run via the Shell Executor tool)."
+        )
 
         if arguments.get("probe"):
             raw_cwd = arguments.get("_working_directory") or get_user_working_directory()

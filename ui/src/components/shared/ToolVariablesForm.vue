@@ -2,11 +2,17 @@
 import { ElForm, ElFormItem, ElInput, ElInputNumber, ElSelect, ElOption, ElSwitch, ElTag } from 'element-plus';
 
 const props = withDefaults(defineProps<{
-  fields: Record<string, { description: string; type: string; secret: boolean; configured: boolean; required?: boolean; enum?: string[]; default?: unknown }>;
+  fields: Record<string, { description: string; type: string; secret: boolean; configured: boolean; required?: boolean; enum?: string[]; default?: unknown; dynamic_options?: boolean }>;
   values: Record<string, string>;
   title?: string;
+  // Live option lists for `dynamic_options` fields, keyed by variable name.
+  // Fetched by the parent from GET /api/tools/{id}/variable-options.
+  dynamicOptions?: Record<string, { options: { id: string; label?: string }[]; error?: string | null }>;
+  dynamicLoading?: boolean;
 }>(), {
   title: 'Tool Variables',
+  dynamicOptions: () => ({}),
+  dynamicLoading: false,
 });
 
 const emit = defineEmits<{
@@ -15,6 +21,18 @@ const emit = defineEmits<{
 
 function updateValue(key: string, value: string) {
   emit('update:values', { ...props.values, [key]: value });
+}
+
+function optionsFor(key: string): { id: string; label?: string }[] {
+  return props.dynamicOptions?.[key]?.options ?? [];
+}
+
+// Placeholder for a `dynamic_options` combobox. A field with a concrete default
+// (e.g. permission mode → "bypassPermissions") shows it; a field whose default
+// is empty (e.g. model → Claude Code's own default) shows generic guidance.
+function dynamicPlaceholder(field: { default?: unknown }): string {
+  const def = field.default;
+  return def != null && def !== '' ? `Default: ${def}` : 'Default (pick or type one)';
 }
 </script>
 
@@ -43,6 +61,26 @@ function updateValue(key: string, value: string) {
           style="width: 100%;"
         >
           <ElOption v-for="opt in field.enum" :key="opt" :label="opt" :value="opt" />
+        </ElSelect>
+        <ElSelect
+          v-else-if="field.dynamic_options && (optionsFor(key as string).length > 0 || dynamicLoading)"
+          :model-value="values[key] || ''"
+          @update:model-value="updateValue(key as string, $event ?? '')"
+          filterable
+          allow-create
+          default-first-option
+          clearable
+          :loading="dynamicLoading"
+          size="small"
+          style="width: 100%;"
+          :placeholder="dynamicPlaceholder(field)"
+        >
+          <ElOption
+            v-for="opt in optionsFor(key as string)"
+            :key="opt.id"
+            :label="opt.label || opt.id"
+            :value="opt.id"
+          />
         </ElSelect>
         <ElInputNumber
           v-else-if="field.type === 'number'"

@@ -154,6 +154,15 @@ def tools_set_var(
         help="One or more KEY=VALUE pairs.",
         metavar="KEY=VALUE",
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help=(
+            "Set even if the value isn't a recognized option (e.g. a custom or "
+            "unverified model id for a variable with a live option list)."
+        ),
+    ),
 ) -> None:
     """Set Tool Variables (env-style key/value pairs)."""
     import asyncio
@@ -179,7 +188,7 @@ def tools_set_var(
 
     async def _run() -> None:
         async with Client(cfg) as client:
-            await set_tool_variables(client, tool_id, variables)
+            await set_tool_variables(client, tool_id, variables, allow_unknown=force)
 
     asyncio.run(_run())
 
@@ -304,6 +313,63 @@ def tools_leaves(
             bool_field(leaf, "enabled", True),
             string_field(leaf, "description"),
         )
+    table.render()
+
+
+@tools_app.command("options")
+@graceful_errors
+def tools_options(
+    ctx: typer.Context,
+    tool_id: str = typer.Argument(..., help="Tool id."),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Bypass the server-side cache and refetch.",
+    ),
+) -> None:
+    """List live option values for a tool's dynamic variables.
+
+    For ``claude_code`` this lists the Claude models available to the logged-in
+    account (``CLAUDE_CODE_MODEL``) and the permission modes the installed Claude
+    Agent SDK accepts (``CLAUDE_CODE_PERMISSION_MODE``). When the list resolves,
+    ``set-var`` rejects a value that isn't in it (pass ``--force`` to override);
+    if it can't be fetched, any value is accepted. Pipe with ``set-var`` to
+    apply, e.g. ``cremind tools set-var claude_code CLAUDE_CODE_MODEL=<id>``.
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.tools import get_tool_variable_options
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, Table, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await get_tool_variable_options(client, tool_id, refresh=refresh)
+
+    out = asyncio.run(_run())
+
+    if mode.json:
+        print_json(out)
+        return
+
+    variables = out.get("variables") or {}
+    if not variables:
+        sys.stderr.write("(tool has no dynamic variables)\n")
+        return
+    table = Table(mode, "VARIABLE", "VALUE", "LABEL")
+    for var_name, info in variables.items():
+        if not isinstance(info, dict):
+            continue
+        error = info.get("error")
+        if error:
+            sys.stderr.write(f"({var_name}: {error})\n")
+        for opt in info.get("options") or []:
+            if not isinstance(opt, dict):
+                continue
+            table.add_row(var_name, str(opt.get("id", "")), str(opt.get("label", "")))
     table.render()
 
 

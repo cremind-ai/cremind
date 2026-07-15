@@ -8,8 +8,9 @@ Drives the route endpoints directly with a fake Request, backed by a real
   server never mounted it, so every call 404'd);
 - argument values round-trip through ``ToolConfigManager`` (incl. non-string
   JSON), and bad keys / enum values / bodies are rejected;
-- ``…/variables`` rejects a value outside a field's declared ``enum``
-  (e.g. an invalid Claude Code permission mode) instead of silently persisting.
+- ``…/variables`` rejects a value outside a field's live ``dynamic_options``
+  list (e.g. an invalid Claude Code model or permission mode) when the list
+  resolves, unless ``allow_unknown`` is set, instead of silently persisting.
 """
 
 from __future__ import annotations
@@ -75,7 +76,9 @@ def _make_registry(tmp_path: Path) -> ToolRegistry:
     reg = ToolRegistry(storage, ToolConfigManager(storage))
     _seed_profile(storage, "admin")
     # A tool whose config_name maps to the real claude_code module, so the
-    # handler resolves its real CLAUDE_CODE_PERMISSION_MODE enum.
+    # handler resolves its real dynamic_options fields (CLAUDE_CODE_MODEL and
+    # CLAUDE_CODE_PERMISSION_MODE) via the module's get_variable_options hook —
+    # which the tests stub for hermeticity.
     cc = BuiltInToolGroup(
         config_name="claude_code", display_name="Claude Code",
         description="cc", functions=[_FakeLeaf()], llm=object(),
@@ -98,7 +101,7 @@ def _handler(state, path: str, method: str) -> Callable:
     raise AssertionError(f"{method} {path} not registered")
 
 
-def _req(username="admin", path_params=None, body=None, *, authed=True):
+def _req(username="admin", path_params=None, body=None, *, authed=True, query_params=None):
     async def _json():
         if body is _NO_BODY:
             raise ValueError("no body")
@@ -106,6 +109,7 @@ def _req(username="admin", path_params=None, body=None, *, authed=True):
     return SimpleNamespace(
         user=SimpleNamespace(is_authenticated=authed, username=username),
         path_params=path_params or {},
+        query_params=query_params or {},
         json=_json,
     )
 
@@ -120,6 +124,51 @@ def _body(resp) -> dict:
 @pytest.fixture(autouse=True)
 def _silence_sse(monkeypatch):
     monkeypatch.setattr(tools_api, "publish_settings_state_changed", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
+def _stub_variable_options(monkeypatch):
+    """Keep set-var's dynamic-option check hermetic (no network / host creds / SDK).
+
+    By default both the model and permission-mode option lists resolve to empty,
+    which means "list unavailable" → any value is accepted. Tests that exercise
+    the reject path re-stub ``get_variable_options`` with a non-empty list.
+    """
+    import app.tools.builtin.claude_code as cc_module
+
+    async def _empty(*, variables, profile, refresh=False):
+        return {
+            "CLAUDE_CODE_MODEL": {"options": [], "error": None, "source": None},
+            "CLAUDE_CODE_PERMISSION_MODE": {"options": [], "error": None, "source": None},
+        }
+
+    monkeypatch.setattr(cc_module, "get_variable_options", _empty)
+
+
+def _stub_models(monkeypatch, ids):
+    """Re-stub the claude_code model options with a non-empty list of ids."""
+    import app.tools.builtin.claude_code as cc_module
+
+    async def _fake(*, variables, profile, refresh=False):
+        return {"CLAUDE_CODE_MODEL": {
+            "options": [{"id": i, "label": i} for i in ids],
+            "error": None, "source": "test",
+        }}
+
+    monkeypatch.setattr(cc_module, "get_variable_options", _fake)
+
+
+def _stub_modes(monkeypatch, ids):
+    """Re-stub the claude_code permission-mode options with a non-empty list."""
+    import app.tools.builtin.claude_code as cc_module
+
+    async def _fake(*, variables, profile, refresh=False):
+        return {"CLAUDE_CODE_PERMISSION_MODE": {
+            "options": [{"id": i, "label": i} for i in ids],
+            "error": None, "source": "claude_agent_sdk",
+        }}
+
+    monkeypatch.setattr(cc_module, "get_variable_options", _fake)
 
 
 # ── arguments route exists (bug-A regression) ───────────────────────────────
@@ -217,9 +266,13 @@ def test_set_arguments_registry_none_503(tmp_path: Path) -> None:
     assert resp.status_code == 503
 
 
-# ── variables enum validation ───────────────────────────────────────────────
+# ── variables dynamic-option validation: permission mode ────────────────────
 
-def test_set_variable_valid_enum_persists(tmp_path: Path) -> None:
+_MODE_IDS = ["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk"]
+
+
+def test_set_variable_permission_mode_accepts_known(tmp_path: Path, monkeypatch) -> None:
+    _stub_modes(monkeypatch, _MODE_IDS)
     reg = _make_registry(tmp_path)
     state = SimpleNamespace(registry=reg)
     handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
@@ -232,7 +285,8 @@ def test_set_variable_valid_enum_persists(tmp_path: Path) -> None:
     assert vars_["CLAUDE_CODE_PERMISSION_MODE"] == "plan"
 
 
-def test_set_variable_bad_enum_rejected(tmp_path: Path) -> None:
+def test_set_variable_permission_mode_rejects_unknown(tmp_path: Path, monkeypatch) -> None:
+    _stub_modes(monkeypatch, _MODE_IDS)
     reg = _make_registry(tmp_path)
     state = SimpleNamespace(registry=reg)
     handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
@@ -241,6 +295,213 @@ def test_set_variable_bad_enum_rejected(tmp_path: Path) -> None:
         body={"variables": {"CLAUDE_CODE_PERMISSION_MODE": "bogus"}},
     )))
     assert resp.status_code == 400
-    assert "bypassPermissions" in _body(resp)["allowed"]
+    body = _body(resp)
+    assert body["key"] == "CLAUDE_CODE_PERMISSION_MODE"
+    assert "bypassPermissions" in body["allowed"]
     # Nothing persisted on rejection.
     assert reg.config.get_variables("claude_code", "admin") == {}
+
+
+def test_set_variable_permission_mode_offline_accepts(tmp_path: Path) -> None:
+    """When the SDK mode list can't be resolved (autouse stub → empty), the
+    dynamic-option check is skipped and any value persists (graceful)."""
+    reg = _make_registry(tmp_path)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "claude_code"},
+        body={"variables": {"CLAUDE_CODE_PERMISSION_MODE": "someFutureMode"}},
+    )))
+    assert resp.status_code == 200
+    vars_ = reg.config.get_variables("claude_code", "admin", include_secrets=True)
+    assert vars_["CLAUDE_CODE_PERMISSION_MODE"] == "someFutureMode"
+
+
+def test_set_variable_permission_mode_force_accepts_unknown(tmp_path: Path, monkeypatch) -> None:
+    _stub_modes(monkeypatch, _MODE_IDS)
+    reg = _make_registry(tmp_path)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "claude_code"},
+        body={
+            "variables": {"CLAUDE_CODE_PERMISSION_MODE": "someFutureMode"},
+            "allow_unknown": True,
+        },
+    )))
+    assert resp.status_code == 200
+    vars_ = reg.config.get_variables("claude_code", "admin", include_secrets=True)
+    assert vars_["CLAUDE_CODE_PERMISSION_MODE"] == "someFutureMode"
+
+
+def test_set_variable_model_offline_accepts(tmp_path: Path) -> None:
+    """When the live model list can't be resolved (autouse stub → empty), the
+    dynamic-option check is skipped and any value persists (graceful)."""
+    reg = _make_registry(tmp_path)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "claude_code"},
+        body={"variables": {"CLAUDE_CODE_MODEL": "claude-fable-5"}},
+    )))
+    assert resp.status_code == 200
+    vars_ = reg.config.get_variables("claude_code", "admin", include_secrets=True)
+    assert vars_["CLAUDE_CODE_MODEL"] == "claude-fable-5"
+
+
+def test_set_variable_model_rejects_unknown(tmp_path: Path, monkeypatch) -> None:
+    _stub_models(monkeypatch, ["claude-opus-4-8", "claude-sonnet-5", "opus"])
+    reg = _make_registry(tmp_path)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "claude_code"},
+        body={"variables": {"CLAUDE_CODE_MODEL": "claude-3-opus-20240229"}},
+    )))
+    assert resp.status_code == 400
+    body = _body(resp)
+    assert body["key"] == "CLAUDE_CODE_MODEL"
+    assert "claude-opus-4-8" in body["allowed"]
+    # Nothing persisted on rejection.
+    assert reg.config.get_variables("claude_code", "admin") == {}
+
+
+def test_set_variable_model_accepts_known(tmp_path: Path, monkeypatch) -> None:
+    _stub_models(monkeypatch, ["claude-opus-4-8", "claude-sonnet-5", "opus"])
+    reg = _make_registry(tmp_path)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "claude_code"},
+        body={"variables": {"CLAUDE_CODE_MODEL": "claude-opus-4-8"}},
+    )))
+    assert resp.status_code == 200
+    vars_ = reg.config.get_variables("claude_code", "admin", include_secrets=True)
+    assert vars_["CLAUDE_CODE_MODEL"] == "claude-opus-4-8"
+
+
+def test_set_variable_model_alias_accepted(tmp_path: Path, monkeypatch) -> None:
+    _stub_models(monkeypatch, ["claude-opus-4-8", "opus"])
+    reg = _make_registry(tmp_path)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "claude_code"},
+        body={"variables": {"CLAUDE_CODE_MODEL": "opus"}},
+    )))
+    assert resp.status_code == 200
+
+
+def test_set_variable_model_allow_unknown_persists(tmp_path: Path, monkeypatch) -> None:
+    _stub_models(monkeypatch, ["claude-opus-4-8"])
+    reg = _make_registry(tmp_path)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "claude_code"},
+        body={
+            "variables": {"CLAUDE_CODE_MODEL": "my-custom-model"},
+            "allow_unknown": True,
+        },
+    )))
+    assert resp.status_code == 200
+    vars_ = reg.config.get_variables("claude_code", "admin", include_secrets=True)
+    assert vars_["CLAUDE_CODE_MODEL"] == "my-custom-model"
+
+
+# ── variable options ────────────────────────────────────────────────────────
+
+def test_variable_options_route_registered(tmp_path: Path) -> None:
+    reg = _make_registry(tmp_path)
+    state = SimpleNamespace(registry=reg)
+    assert _handler(state, "/api/tools/{tool_id}/variable-options", "GET") is not None
+
+
+def test_variable_options_happy_path(tmp_path: Path, monkeypatch) -> None:
+    import app.tools.builtin.claude_code as cc_module
+
+    reg = _make_registry(tmp_path)
+    # Seed a secret the hook should receive for credential resolution.
+    reg.config.set_variable(
+        "claude_code", "admin", "CLAUDE_CODE_API_KEY", "sk-test", is_secret=True,
+    )
+    seen: Dict[str, Any] = {}
+
+    async def _fake(*, variables, profile, refresh=False):
+        seen["variables"] = variables
+        seen["profile"] = profile
+        seen["refresh"] = refresh
+        return {"CLAUDE_CODE_MODEL": {
+            "options": [{"id": "claude-sonnet-4-5", "label": "Sonnet"}],
+            "error": None,
+            "source": "tool_variable_api_key",
+        }}
+
+    monkeypatch.setattr(cc_module, "get_variable_options", _fake)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variable-options", "GET")
+    resp = asyncio.run(handler(_req(path_params={"tool_id": "claude_code"})))
+    assert resp.status_code == 200
+    body = _body(resp)
+    assert body["tool_id"] == "claude_code"
+    opts = body["variables"]["CLAUDE_CODE_MODEL"]["options"]
+    assert opts[0]["id"] == "claude-sonnet-4-5"
+    # The hook received the stored secret + profile, and refresh defaulted False.
+    assert seen["variables"].get("CLAUDE_CODE_API_KEY") == "sk-test"
+    assert seen["profile"] == "admin"
+    assert seen["refresh"] is False
+
+
+def test_variable_options_refresh_param(tmp_path: Path, monkeypatch) -> None:
+    import app.tools.builtin.claude_code as cc_module
+
+    reg = _make_registry(tmp_path)
+    seen: Dict[str, Any] = {}
+
+    async def _fake(*, variables, profile, refresh=False):
+        seen["refresh"] = refresh
+        return {"CLAUDE_CODE_MODEL": {"options": [], "error": None, "source": None}}
+
+    monkeypatch.setattr(cc_module, "get_variable_options", _fake)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variable-options", "GET")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "claude_code"}, query_params={"refresh": "1"},
+    )))
+    assert resp.status_code == 200
+    assert seen["refresh"] is True
+
+
+def test_variable_options_tool_without_hook(tmp_path: Path) -> None:
+    reg = _make_registry(tmp_path)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variable-options", "GET")
+    # exec_shell exports no get_variable_options hook.
+    resp = asyncio.run(handler(_req(path_params={"tool_id": "exec_shell"})))
+    assert resp.status_code == 200
+    assert _body(resp) == {"tool_id": "exec_shell", "variables": {}}
+
+
+def test_variable_options_unknown_tool_404(tmp_path: Path) -> None:
+    reg = _make_registry(tmp_path)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variable-options", "GET")
+    resp = asyncio.run(handler(_req(path_params={"tool_id": "nope"})))
+    assert resp.status_code == 404
+
+
+def test_variable_options_unauthenticated_401(tmp_path: Path) -> None:
+    reg = _make_registry(tmp_path)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variable-options", "GET")
+    resp = asyncio.run(handler(_req(
+        authed=False, path_params={"tool_id": "claude_code"},
+    )))
+    assert resp.status_code == 401
+
+
+def test_variable_options_registry_none_503(tmp_path: Path) -> None:
+    state = SimpleNamespace(registry=None)
+    handler = _handler(state, "/api/tools/{tool_id}/variable-options", "GET")
+    resp = asyncio.run(handler(_req(path_params={"tool_id": "claude_code"})))
+    assert resp.status_code == 503
