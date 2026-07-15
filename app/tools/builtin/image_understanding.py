@@ -58,6 +58,12 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "image_understanding",
     "display_name": SERVER_NAME,
+    "description": (
+        "Sends an image to a vision-capable model to answer questions about "
+        "what it depicts — describe contents, read a chart, or OCR text shown "
+        "in it. Use it only for visual understanding; use system_file / "
+        "convert_to_markdown for plain file operations on an image."
+    ),
     "required_config": {
         Var.MAX_IMAGE_BYTES: {
             "description": (

@@ -2200,6 +2200,13 @@ SERVER_NAME = "System File"
 TOOL_CONFIG: ToolConfig = {
     "name": "system_file",
     "display_name": "System File",
+    "description": (
+        "Browses, reads, and writes files within the allowed working and "
+        "system directories. Reads text and binary files (converting rich "
+        "formats to markdown, with token limits), lists and inspects entries, "
+        "searches file names, and greps file contents; writes are restricted "
+        "to human-readable text files."
+    ),
     # Visible in Settings (so its token/size limits can be configured) but
     # locked on — a core capability the user must not disable.
     "locked": True,

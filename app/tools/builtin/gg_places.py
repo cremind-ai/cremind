@@ -31,6 +31,11 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "gg_places",
     "display_name": "Google Places",
+    "description": (
+        "Finds nearby places via the Google Places API and generates Google "
+        "Maps directions links. Use it for location and points-of-interest "
+        "queries and to give the user a maps route link."
+    ),
     "default": False,
     # Requires the ``google`` feature (googleapiclient + google-auth). See
     # app.features.manifest.FEATURES.

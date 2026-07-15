@@ -25,6 +25,12 @@ SERVER_NAME = "Memory Search"
 TOOL_CONFIG: ToolConfig = {
     "name": "search_memory",
     "display_name": "Memory Search",
+    "description": (
+        "Searches the user's long-term memory — durable facts, preferences, "
+        "and project/environment details remembered across past "
+        "conversations. Call it when answering would benefit from background "
+        "about the user not already in the current conversation."
+    ),
 }
 
 _DEFAULT_LIMIT = 10
