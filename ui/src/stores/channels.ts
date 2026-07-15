@@ -7,6 +7,7 @@ import {
   updateChannel as apiUpdateChannel,
   deleteChannel as apiDeleteChannel,
   fetchChannelSenders,
+  setSenderAuthenticated as apiSetSenderAuthenticated,
   type ChannelCatalogEntry,
   type ChannelRow,
   type ChannelSenderRow,
@@ -32,8 +33,10 @@ export const useChannelsStore = defineStore('channels', {
 
   getters: {
     filterOptions(state): Array<{ value: string; label: string; icon?: string }> {
+      // Notification-mode channels are push-only — they hold no conversations,
+      // so they must never appear in the conversation-list channel filter.
       const externals = state.channels.filter(
-        (ch) => ch.channel_type !== MAIN_CHANNEL_TYPE,
+        (ch) => ch.channel_type !== MAIN_CHANNEL_TYPE && ch.mode !== 'notification',
       );
       const opts: Array<{ value: string; label: string; icon?: string }> = [];
       // ``All`` only makes sense when there's more than one channel to combine.
@@ -79,6 +82,7 @@ export const useChannelsStore = defineStore('channels', {
       } finally {
         this.loading = false;
       }
+      this.ensureValidActiveFilter();
     },
     async createChannel(payload: CreateChannelPayload): Promise<ChannelRow> {
       const settings = useSettingsStore();
@@ -91,29 +95,37 @@ export const useChannelsStore = defineStore('channels', {
       const updated = await apiUpdateChannel(settings.agentUrl, settings.authToken, channelId, payload);
       const idx = this.channels.findIndex((c) => c.id === channelId);
       if (idx >= 0) this.channels[idx] = updated;
+      // Editing a channel into notification mode (or otherwise) can make the
+      // current filter selection disappear from the dropdown — re-validate it.
+      this.ensureValidActiveFilter();
       return updated;
     },
     async deleteChannel(channelId: string) {
       const settings = useSettingsStore();
       await apiDeleteChannel(settings.agentUrl, settings.authToken, channelId);
       this.channels = this.channels.filter((c) => c.id !== channelId);
-      // Reset filter if user just deleted the channel they were filtering on,
-      // or if removing it leaves the ``all`` virtual option with no externals
-      // to combine.
-      const hasExternals = this.channels.some(
-        (c) => c.channel_type !== MAIN_CHANNEL_TYPE,
-      );
-      const filterStillValid =
-        this.activeFilter === MAIN_CHANNEL_TYPE
-        || (this.activeFilter === ALL_CHANNELS_FILTER && hasExternals)
-        || this.channels.some((c) => c.channel_type === this.activeFilter);
-      if (!filterStillValid) {
+      this.ensureValidActiveFilter();
+    },
+    /** Reset ``activeFilter`` to ``main`` if it's no longer a selectable option
+     *  (channel deleted, switched to notification mode, ``all`` left with no
+     *  conversational externals, …). ``filterOptions`` is the source of truth. */
+    ensureValidActiveFilter() {
+      const valid = new Set(this.filterOptions.map((o) => o.value));
+      if (!valid.has(this.activeFilter)) {
         this.activeFilter = MAIN_CHANNEL_TYPE;
       }
     },
     async fetchSenders(channelId: string): Promise<ChannelSenderRow[]> {
       const settings = useSettingsStore();
       return fetchChannelSenders(settings.agentUrl, settings.authToken, channelId);
+    },
+    async setSenderAuthenticated(
+      channelId: string, senderId: string, authenticated: boolean,
+    ): Promise<ChannelSenderRow> {
+      const settings = useSettingsStore();
+      return apiSetSenderAuthenticated(
+        settings.agentUrl, settings.authToken, channelId, senderId, authenticated,
+      );
     },
     setFilter(filter: string) {
       this.activeFilter = filter || MAIN_CHANNEL_TYPE;

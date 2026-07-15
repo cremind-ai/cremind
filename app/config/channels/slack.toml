@@ -37,7 +37,12 @@ Setup:
 2. Save, then DM the bot /start to subscribe (/stop to unsubscribe).
 3. To alert a channel or specific users without subscribing, put their ids in
    "Target chat ids" (comma-separated) — a channel id (C…) posts to that channel;
-   a user id (U…) opens a DM."""
+   a user id (U…) opens a DM.
+
+Access control: pick a "Subscription authentication" method — open, passcode
+(/start <passcode>), one-time code (you relay a code per person), admin approval
+(approve each subscriber under Settings → Channels or `cremind channels approve`),
+or allowlist-only (no self-subscribe; only Target chat ids receive)."""
 [channel.modes.fields]
 bot_token = { description = "Bot User OAuth Token (xoxb-)", type = "string", secret = true, required = true }
 app_token = { description = "App-Level Token (xapp-)", type = "string", secret = true, required = true }

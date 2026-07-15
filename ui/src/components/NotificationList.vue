@@ -117,6 +117,9 @@ const formatTime = (ts: number): string => {
                   <template v-else-if="entry.kind === 'skill_register_required'">
                     Set up {{ entry.skillName || entry.skillId || 'skill' }}
                   </template>
+                  <template v-else-if="entry.kind === 'channel_subscribe_request'">
+                    Subscribe request: {{ entry.channelType || 'channel' }}
+                  </template>
                   <template v-else>{{ entry.conversationTitle }}</template>
                 </span>
                 <span class="time">{{ formatTime(entry.createdAt) }}</span>
@@ -183,6 +186,9 @@ const formatTime = (ts: number): string => {
                   </template>
                   <template v-else-if="entry.kind === 'skill_register_required'">
                     Set up {{ entry.skillName || entry.skillId || 'skill' }}
+                  </template>
+                  <template v-else-if="entry.kind === 'channel_subscribe_request'">
+                    Subscribe request: {{ entry.channelType || 'channel' }}
                   </template>
                   <template v-else>{{ entry.conversationTitle }}</template>
                 </span>

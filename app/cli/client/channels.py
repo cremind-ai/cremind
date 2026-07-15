@@ -154,6 +154,24 @@ async def list_senders(client: Client, channel_id: str) -> list[dict[str, Any]]:
     return []
 
 
+async def set_sender_authenticated(
+    client: Client, channel_id: str, sender_id: str, authenticated: bool,
+) -> dict[str, Any]:
+    """Approve (``authenticated=True``) or revoke a channel subscriber.
+
+    Backs ``cremind channels approve/revoke`` — the operator side of the
+    ``approval`` subscription-auth method for notification channels. The sender
+    must already exist (they've contacted the channel), else the server 404s.
+    """
+    resp = await client.patch_json(
+        f"/api/channels/{quote(channel_id, safe='')}/senders/{quote(sender_id, safe='')}",
+        {"authenticated": authenticated},
+    )
+    if isinstance(resp, dict) and isinstance(resp.get("sender"), dict):
+        return resp["sender"]
+    raise RuntimeError("unexpected /api/channels/{id}/senders/{sender} response")
+
+
 async def delete_channel(client: Client, channel_id: str) -> None:
     await client.delete(f"/api/channels/{quote(channel_id, safe='')}")
 
