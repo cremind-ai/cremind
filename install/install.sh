@@ -955,6 +955,15 @@ tui_run_bootstrap() {
             </dev/tty >/dev/tty || rc=$?
     fi
 
+    # Trust the cancel sentinel the TUI writes on Esc/Ctrl+C over $rc:
+    # `uv run` does not reliably propagate the child's exit code on Ctrl+C,
+    # which would otherwise fall through to the legacy prompts below instead
+    # of exiting. Checked before sourcing so the marker is never eval'd.
+    if grep -q '^CREMIND_TUI_CANCELLED=1$' "$tui_out" 2>/dev/null; then
+        err "Installer cancelled."
+        exit 1
+    fi
+
     if [ "$rc" -eq 0 ]; then
         # shellcheck disable=SC1090
         . "$tui_out"
