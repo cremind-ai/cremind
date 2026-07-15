@@ -4,6 +4,11 @@ Guidance for Claude Code and contributors working in this repo. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup and [RELEASING.md](RELEASING.md)
 for the release pipeline.
 
+## Branching
+
+Do not create new branches without permission. Before creating a branch for a
+new feature, consult the user first and get their explicit go-ahead.
+
 ## When you add, modify, or remove a feature
 
 Two checks are mandatory for every feature change. Both are easy to forget and
