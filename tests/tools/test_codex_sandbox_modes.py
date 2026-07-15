@@ -105,3 +105,80 @@ def test_hook_sandbox_empty_when_sdk_missing(monkeypatch):
     out = asyncio.run(codex.get_variable_options(variables={}, profile="admin"))
     assert out[Var.SANDBOX]["options"] == []
     assert "install" in out[Var.SANDBOX]["error"].lower()
+
+
+# ── sandbox_autonomy: classification + advisory (pure; no SDK) ───────────────
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        ("full-access", "autonomous"),
+        ("workspace-write", "edits_only"),
+        ("read-only", "blocked"),
+        ("new-mode", "unknown"),
+        (None, "unknown"),
+        ("", "unknown"),
+    ],
+)
+def test_sandbox_autonomy_classification(mode, expected):
+    assert runner.sandbox_autonomy(mode) == expected
+
+
+def test_sandbox_advisory_none_for_autonomous():
+    assert runner._sandbox_advisory("full-access") is None
+
+
+def test_sandbox_advisory_blocked_carries_exact_command():
+    adv = runner._sandbox_advisory("read-only")
+    assert adv is not None
+    assert adv["autonomy"] == "blocked"
+    assert adv["command"] == "cremind tools set-var codex CODEX_SANDBOX=full-access"
+    assert "ask once" in adv["remediation"].lower()
+
+
+def test_sandbox_advisory_unknown_never_claims_blocked():
+    adv = runner._sandbox_advisory("someFutureSandbox")
+    assert adv is not None
+    assert adv["autonomy"] == "unknown"
+    assert "someFutureSandbox" in adv["warning"]
+
+
+def test_sandbox_advisory_edits_only_is_milder():
+    adv = runner._sandbox_advisory("workspace-write")
+    assert adv is not None
+    assert adv["autonomy"] == "edits_only"
+    assert adv["command"].endswith("CODEX_SANDBOX=full-access")
+
+
+# ── resolve_sandbox: effective value the run actually uses ───────────────────
+
+def test_resolve_sandbox_valid_value_unchanged(monkeypatch):
+    mod = _install_sdk(monkeypatch, sandbox_values=_SDK_MODES)
+    assert runner.resolve_sandbox(mod, {"CODEX_SANDBOX": "read-only"}) == ("read-only", None)
+
+
+def test_resolve_sandbox_empty_defaults_full_access(monkeypatch):
+    mod = _install_sdk(monkeypatch, sandbox_values=_SDK_MODES)
+    assert runner.resolve_sandbox(mod, {}) == ("full-access", None)
+
+
+def test_resolve_sandbox_garbage_falls_open_with_note(monkeypatch):
+    mod = _install_sdk(monkeypatch, sandbox_values=_SDK_MODES)
+    effective, note = runner.resolve_sandbox(mod, {"CODEX_SANDBOX": "readonly"})
+    assert effective == "full-access"
+    assert note and "readonly" in note
+
+
+def test_resolve_sandbox_config_override_wins(monkeypatch):
+    mod = _install_sdk(monkeypatch, sandbox_values=_SDK_MODES)
+    effective, note = runner.resolve_sandbox(
+        mod, {"CODEX_SANDBOX": "full-access", "CODEX_CONFIG_OVERRIDES": "sandbox_mode=read-only"},
+    )
+    assert effective == "read-only"
+    assert note is None
+
+
+def test_config_override_sandbox_parsing(monkeypatch):
+    assert runner._config_override_sandbox({"CODEX_CONFIG_OVERRIDES": "a=1, sandbox_mode=read-only, b=2"}) == "read-only"
+    assert runner._config_override_sandbox({"CODEX_CONFIG_OVERRIDES": "model_reasoning_effort=high"}) is None
+    assert runner._config_override_sandbox({}) is None

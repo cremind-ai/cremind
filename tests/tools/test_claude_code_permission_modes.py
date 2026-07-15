@@ -129,3 +129,57 @@ def test_hook_permission_mode_empty_when_sdk_missing(monkeypatch):
     out = asyncio.run(claude_code.get_variable_options(variables={}, profile="admin"))
     assert out[Var.PERMISSION_MODE]["options"] == []
     assert "install" in out[Var.PERMISSION_MODE]["error"].lower()
+
+
+# ── permission_autonomy: mode classification (pure; no SDK) ──────────────────
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        ("bypassPermissions", "autonomous"),
+        ("auto", "autonomous"),
+        ("acceptEdits", "edits_only"),
+        ("plan", "blocked"),
+        ("default", "blocked"),
+        ("dontAsk", "blocked"),
+        ("newMode", "unknown"),   # a future SDK mode
+        (None, "unknown"),
+        ("", "unknown"),
+    ],
+)
+def test_permission_autonomy_classification(mode, expected):
+    assert runner.permission_autonomy(mode) == expected
+
+
+def test_permission_advisory_none_for_autonomous():
+    assert runner._permission_advisory("bypassPermissions") is None
+    assert runner._permission_advisory("auto") is None
+
+
+def test_permission_advisory_blocked_carries_exact_command():
+    adv = runner._permission_advisory("plan")
+    assert adv is not None
+    assert adv["autonomy"] == "blocked"
+    assert adv["command"] == (
+        "cremind tools set-var claude_code "
+        "CLAUDE_CODE_PERMISSION_MODE=bypassPermissions"
+    )
+    # The advisory must steer AWAY from the wrong (UI / claude CLI) remediation.
+    assert "ask once" in adv["remediation"].lower()
+    assert "plan mode" in adv["cause"].lower()
+
+
+def test_permission_advisory_unknown_never_claims_blocked():
+    adv = runner._permission_advisory("someFutureMode")
+    assert adv is not None
+    # An unrecognised mode is surfaced but never asserted to be blocked (a future
+    # SDK mode could be fully autonomous — no false alarm).
+    assert adv["autonomy"] == "unknown"
+    assert "someFutureMode" in adv["warning"]
+
+
+def test_permission_advisory_edits_only_is_milder():
+    adv = runner._permission_advisory("acceptEdits")
+    assert adv is not None
+    assert adv["autonomy"] == "edits_only"
+    assert adv["command"].endswith("CLAUDE_CODE_PERMISSION_MODE=bypassPermissions")

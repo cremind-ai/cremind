@@ -349,17 +349,22 @@ class ClaudeCodeRunTool(BuiltInTool):
         grace = min(runner._RUN_GRACE_SECONDS, _wait_cap())
         if await wait_for_task(task, grace):
             return _final_result(task)
-        return BuiltInToolResult(structured_content={
+        heartbeat: Dict[str, Any] = {
             "status": "running",
             "task_id": task.task_id,
             "session_id": task.session_id,
             "working_directory": task.cwd,
             "elapsed_seconds": task.elapsed_seconds(),
+            "effective_permission_mode": task.permission_mode,
             "message": (
                 "Claude Code is working. Call claude_code__wait with this task_id to "
                 "get the result; call claude_code__stop to abort."
             ),
-        })
+        }
+        advisory = runner._permission_advisory(task.permission_mode)
+        if advisory is not None:
+            heartbeat["permission_advisory"] = advisory
+        return BuiltInToolResult(structured_content=heartbeat)
 
 
 class ClaudeCodeWaitTool(BuiltInTool):
@@ -406,17 +411,22 @@ class ClaudeCodeWaitTool(BuiltInTool):
         wait_s = min(float(timeout) or runner._WAIT_DEFAULT_SECONDS, _wait_cap())
         if await wait_for_task(task, wait_s):
             return _final_result(task)
-        return BuiltInToolResult(structured_content={
+        heartbeat: Dict[str, Any] = {
             "status": "running",
             "task_id": task.task_id,
             "session_id": task.session_id,
             "elapsed_seconds": task.elapsed_seconds(),
             "activity_events": task.activity.total_steps if task.activity else 0,
+            "effective_permission_mode": task.permission_mode,
             "message": (
                 "Still working (progress is streaming to the user's Claude Code "
                 "panel). Call claude_code__wait again, or claude_code__stop to abort."
             ),
-        })
+        }
+        advisory = runner._permission_advisory(task.permission_mode)
+        if advisory is not None:
+            heartbeat["permission_advisory"] = advisory
+        return BuiltInToolResult(structured_content=heartbeat)
 
 
 class ClaudeCodeStopTool(BuiltInTool):
@@ -507,12 +517,19 @@ class ClaudeCodeStatusTool(BuiltInTool):
         source = credential_source(variables, profile)
         configured = source is not None
 
+        mode = variables.get(Var.PERMISSION_MODE) or "bypassPermissions"
         payload: Dict[str, Any] = {
             "available": True,
             "sdk_installed": True,
             "credential_source": source,
             "credentials_configured": configured,
+            "effective_permission_mode": mode,
         }
+        # Surface a blocking permission mode BEFORE a coding task is even started,
+        # so "is Claude Code set up?" reveals a mode that would stall coding work.
+        advisory = runner._permission_advisory(mode)
+        if advisory is not None:
+            payload["permission_advisory"] = advisory
         if configured:
             payload["message"] = (
                 f"Claude Code is installed and a credential is configured "

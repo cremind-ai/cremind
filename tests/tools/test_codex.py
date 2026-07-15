@@ -288,6 +288,263 @@ def test_fast_task_completes_in_grace_window(monkeypatch, tmp_path):
     }
 
 
+# ── sandbox awareness in the result payloads ─────────────────────────────────
+def _one_turn(result_text="Done.", *, thread_id="thread-sb", items=None):
+    async def produce(handle):
+        yield _note("thread/started", thread=SimpleNamespace(id=thread_id))
+        turn_items = items if items is not None else [
+            Item(type="agentMessage", text=result_text, phase="final_answer"),
+        ]
+        yield _note("turn/completed", turn=Turn(
+            status="completed", duration_ms=100, items=turn_items,
+        ))
+    return produce
+
+
+def test_read_only_sandbox_carries_advisory(monkeypatch, tmp_path):
+    from app.tools.builtin import codex_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 1.0)
+    install_fake_sdk(monkeypatch, _one_turn("Here's what I found."), thread_id="thread-sb")
+
+    res = asyncio.run(_run_tool(
+        prompt="review this", working_directory=str(tmp_path),
+        _context_id="conv-sb-1", _profile="default",
+        _variables={r.Var.SANDBOX: "read-only"},
+    ))
+    sc = res.structured_content
+    assert sc["status"] == "completed"
+    assert sc["effective_sandbox"] == "read-only"
+    adv = sc["sandbox_advisory"]
+    assert adv["autonomy"] == "blocked"
+    assert adv["command"] == "cremind tools set-var codex CODEX_SANDBOX=full-access"
+
+
+def test_full_access_sandbox_has_no_advisory(monkeypatch, tmp_path):
+    from app.tools.builtin import codex_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 1.0)
+    install_fake_sdk(monkeypatch, _one_turn("Done."), thread_id="thread-sb")
+
+    res = asyncio.run(_run_tool(
+        prompt="do it", working_directory=str(tmp_path),
+        _context_id="conv-sb-2", _profile="default",
+        _variables={r.Var.SANDBOX: "full-access"},
+    ))
+    sc = res.structured_content
+    assert sc["effective_sandbox"] == "full-access"
+    assert "sandbox_advisory" not in sc
+
+
+def test_empty_resume_guard(monkeypatch, tmp_path):
+    from app.tools.builtin import codex_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 1.0)
+    # A resumed thread that yields no final agent message → empty result.
+    install_fake_sdk(monkeypatch, _one_turn(items=[]), thread_id="sess-resume")
+
+    res = asyncio.run(_run_tool(
+        prompt="continue", working_directory=str(tmp_path),
+        _context_id="conv-sb-3", _profile="default",
+        session_id="sess-resume", _variables={},
+    ))
+    sc = res.structured_content
+    assert sc["status"] == "completed"
+    assert sc["resume_produced_no_work"] is True
+    assert sc["result"].strip()
+    assert "session_id" in sc["result"]
+
+
+def test_empty_result_fresh_no_resume_guard(monkeypatch, tmp_path):
+    from app.tools.builtin import codex_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 1.0)
+    # A FRESH (non-resumed) turn that yields no final message must pass through
+    # untouched — the guard only fires for a resume attempt.
+    install_fake_sdk(monkeypatch, _one_turn(items=[]), thread_id="thread-fresh")
+
+    res = asyncio.run(_run_tool(
+        prompt="do it", working_directory=str(tmp_path),
+        _context_id="conv-sb-fresh", _profile="default", _variables={},
+    ))
+    sc = res.structured_content
+    assert sc["status"] == "completed"
+    assert sc["result"] == ""
+    assert "resume_produced_no_work" not in sc
+
+
+def test_unset_sandbox_defaults_full_access_no_advisory(monkeypatch, tmp_path):
+    from app.tools.builtin import codex_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 1.0)
+    install_fake_sdk(monkeypatch, _one_turn("Done."), thread_id="thread-sb")
+
+    res = asyncio.run(_run_tool(
+        prompt="do it", working_directory=str(tmp_path),
+        _context_id="conv-sb-unset", _profile="default", _variables={},
+    ))
+    sc = res.structured_content
+    assert sc["effective_sandbox"] == "full-access"
+    assert "sandbox_advisory" not in sc
+    assert "sandbox_coercion_note" not in sc
+
+
+def test_invalid_sandbox_reports_full_access_with_note(monkeypatch, tmp_path):
+    from app.tools.builtin import codex_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 1.0)
+    install_fake_sdk(monkeypatch, _one_turn("Done."), thread_id="thread-sb")
+
+    # A garbage sandbox coerces to full-access at run time; the report must match
+    # the real run (no misleading "blocked" advisory) and flag the fall-open.
+    res = asyncio.run(_run_tool(
+        prompt="do it", working_directory=str(tmp_path),
+        _context_id="conv-sb-bad", _profile="default",
+        _variables={r.Var.SANDBOX: "readonly"},
+    ))
+    sc = res.structured_content
+    assert sc["effective_sandbox"] == "full-access"
+    assert "sandbox_advisory" not in sc
+    assert "readonly" in sc["sandbox_coercion_note"]
+
+
+def test_config_override_sandbox_read_only_advisory(monkeypatch, tmp_path):
+    from app.tools.builtin import codex_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 1.0)
+    install_fake_sdk(monkeypatch, _one_turn("Reviewed."), thread_id="thread-sb")
+
+    # A sandbox_mode override in CODEX_CONFIG_OVERRIDES is the real effective
+    # sandbox — the advisory must reflect it even though CODEX_SANDBOX is full.
+    res = asyncio.run(_run_tool(
+        prompt="review", working_directory=str(tmp_path),
+        _context_id="conv-sb-ovr", _profile="default",
+        _variables={r.Var.SANDBOX: "full-access",
+                    r.Var.CONFIG_OVERRIDES: "sandbox_mode=read-only"},
+    ))
+    sc = res.structured_content
+    assert sc["effective_sandbox"] == "read-only"
+    assert sc["sandbox_advisory"]["autonomy"] == "blocked"
+
+
+def test_running_heartbeat_carries_sandbox_advisory(monkeypatch, tmp_path):
+    from app.tools.builtin import codex_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 0.2)
+
+    async def produce(handle):
+        yield _note("thread/started", thread=SimpleNamespace(id="thread-hb"))
+        await handle.gate.wait()  # keep it "running" past the grace window
+        yield _note("turn/completed", turn=Turn(
+            status="completed", duration_ms=1,
+            items=[Item(type="agentMessage", text="done", phase="final_answer")],
+        ))
+
+    install_fake_sdk(monkeypatch, produce, thread_id="thread-hb")
+
+    async def body():
+        run_res = await _run_tool(
+            prompt="long job", working_directory=str(tmp_path),
+            _context_id="conv-sb-hb", _profile="default",
+            _variables={r.Var.SANDBOX: "read-only"},
+        )
+        sc = run_res.structured_content
+        assert sc["status"] == "running"
+        assert sc["effective_sandbox"] == "read-only"
+        assert sc["sandbox_advisory"]["autonomy"] == "blocked"
+        # release + drain so the background task doesn't outlive the test
+        task = r.get_task(sc["task_id"])
+        task.turn_handle.gate.set()
+        await r.wait_for_task(task, 5)
+
+    asyncio.run(body())
+
+
+def test_login_failure_surfaces_not_silent(monkeypatch, tmp_path):
+    from app.tools.builtin import codex_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 1.0)
+    mod = install_fake_sdk(monkeypatch, _one_turn("Done."), thread_id="thread-sb")
+
+    async def _boom(self, key):
+        raise RuntimeError("login failed: boom")
+
+    mod.AsyncCodex.login_api_key = _boom
+
+    # With an explicit key, a login failure must surface as a failed run (not be
+    # swallowed and silently proceed against a stale/empty store).
+    res = asyncio.run(_run_tool(
+        prompt="do it", working_directory=str(tmp_path),
+        _context_id="conv-sb-login", _profile="default",
+        _variables={r.Var.API_KEY: "sk-explicit"},
+    ))
+    sc = res.structured_content
+    assert sc["status"] == "failed"
+    assert sc["error"] == "CodexError"
+
+
+def test_auth_error_classified_from_error_code(monkeypatch, tmp_path):
+    from app.tools.builtin import codex_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 1.0)
+
+    async def produce(handle):
+        yield _note("thread/started", thread=SimpleNamespace(id="thread-auth"))
+        # Auth reason only in .code (not .message) — must still classify as auth,
+        # and must NOT be mislabeled a sandbox problem despite a restrictive sandbox.
+        yield _note("turn/completed", turn=Turn(
+            status="failed", duration_ms=1,
+            error=SimpleNamespace(message="", code="invalid_api_key"),
+        ))
+
+    install_fake_sdk(monkeypatch, produce, thread_id="thread-auth")
+    res = asyncio.run(_run_tool(
+        prompt="do it", working_directory=str(tmp_path),
+        _context_id="conv-sb-authcode", _profile="default",
+        _variables={r.Var.SANDBOX: "read-only"},
+    ))
+    sc = res.structured_content
+    assert sc["status"] == "failed"
+    assert sc["error"] == "AuthenticationError"
+    assert "sandbox_advisory" not in sc
+
+
+# Captured at import time, BEFORE the autouse fixture stubs runner.list_models,
+# so the timeout test can exercise the real implementation.
+from app.tools.builtin.codex_runner import list_models as _real_list_models  # noqa: E402
+
+
+def test_resolve_auth_isolates_home_per_credential(monkeypatch, tmp_path):
+    from app.tools.builtin import codex_runner as r
+
+    # (the autouse fixture already nulls profile creds + env vars)
+    a_aaa = r.resolve_auth({r.Var.API_KEY: "sk-AAA"}, "admin")
+    a_bbb = r.resolve_auth({r.Var.API_KEY: "sk-BBB"}, "admin")
+    a_aaa2 = r.resolve_auth({r.Var.API_KEY: "sk-AAA"}, "admin")
+    # Distinct keys → distinct CODEX_HOME; same key → same CODEX_HOME.
+    assert a_aaa.env_overrides["CODEX_HOME"] != a_bbb.env_overrides["CODEX_HOME"]
+    assert a_aaa.env_overrides["CODEX_HOME"] == a_aaa2.env_overrides["CODEX_HOME"]
+    # No key → ambient host store, no managed-home override.
+    assert r.resolve_auth({}, "admin").env_overrides == {}
+
+
+def test_list_models_times_out_gracefully(monkeypatch, tmp_path):
+    from app.tools.builtin import codex_runner as r
+
+    monkeypatch.setattr(r, "_MODELS_TIMEOUT", 0.05)
+    mod = install_fake_sdk(monkeypatch, _one_turn("x"))
+
+    async def _slow_models(self):
+        await asyncio.sleep(0.5)
+        return SimpleNamespace(data=[])
+
+    mod.AsyncCodex.models = _slow_models
+
+    out = asyncio.run(_real_list_models({r.Var.API_KEY: "sk-x"}, "admin"))
+    assert out["models"] == []
+    assert "timed out" in out["error"]
+
+
 # ── slow task: handle → wait → final; usage folded exactly once ───────────────
 def test_slow_task_handle_then_wait_final_usage_once(monkeypatch, tmp_path):
     from app.tools.builtin import codex_runner as r
