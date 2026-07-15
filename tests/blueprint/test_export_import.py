@@ -170,19 +170,159 @@ def test_export_checklist_detection(env):
     _populate_src(system_dir)
 
     from app.blueprint.detect import collect_exportable
+    from app.config.user_config import resolve_default
+
+    # Add a setting whose stored value equals its default (should be flagged
+    # is_default) and a key no longer in the schema (should be flagged unknown).
+    default_retries = resolve_default("agent.max_llm_retries")
+    eng = get_database_provider().sync_engine()
+    with eng.begin() as c:
+        c.execute(
+            text("INSERT INTO user_config (profile,key,value,updated_at) VALUES ('src','agent.max_llm_retries',:v,:t)"),
+            {"v": str(default_retries), "t": time.time() * 1000},
+        )
+        c.execute(
+            text("INSERT INTO user_config (profile,key,value,updated_at) VALUES ('src','nope.gone','whatever',:t)"),
+            {"t": time.time() * 1000},
+        )
 
     out = collect_exportable("src")
     comps = out["components"]
     # Only the components we actually customized should be available.
     for key in ("persona", "settings", "llm", "tools", "skills", "listeners"):
         assert comps[key]["available"] is True, f"{key} should be exportable"
-    # We changed exactly one setting.
-    assert comps["settings"]["count"] == 1
+    # Three stored overrides now.
+    assert comps["settings"]["count"] == 3
+    items = {it["key"]: it for it in comps["settings"]["items"]}
+    # The changed setting carries full metadata and is not at its default.
+    changed = items["agent.max_steps"]
+    assert changed["type"] == "number"
+    assert changed["label"]
+    assert changed["group"] == "agent"
+    assert changed["value"] == 300
+    assert changed["default"] == resolve_default("agent.max_steps")
+    assert changed["is_default"] is False
+    assert changed["unknown"] is False
+    # A stored value equal to its default is flagged.
+    assert items["agent.max_llm_retries"]["is_default"] is True
+    # A key no longer in the schema is flagged unknown (still exportable).
+    assert items["nope.gone"]["unknown"] is True
     # The bundled user skill shows up, flagged as needing its secret var.
     skills = comps["skills"]["items"]
     assert any(s["slug"] == "my_skill" and "MY_API_KEY" in s["secret_variables"] for s in skills)
     # Events were not populated in this fixture → not available.
     assert comps["events"]["available"] is False
+
+
+def _seed_events(system_dir: Path) -> dict[str, str]:
+    """Insert a conversation + 2 schedules + 1 skill event on ``src``.
+
+    Returns a mapping of a human label → row id so tests can select subsets.
+    """
+    now = time.time()
+    ids = {
+        "daily": "sch-daily",
+        "weekly": "sch-weekly",
+        "skillev": "se-1",
+    }
+    eng = get_database_provider().sync_engine()
+    with eng.begin() as c:
+        c.execute(
+            text("INSERT INTO conversations (id,profile,title,created_at,updated_at) "
+                 "VALUES ('conv-src','src','t',:t,:t)"),
+            {"t": now * 1000},
+        )
+        for rid, title, rrule in [
+            (ids["daily"], "Daily report", "FREQ=DAILY"),
+            (ids["weekly"], "Weekly review", "FREQ=WEEKLY"),
+        ]:
+            c.execute(
+                text("INSERT INTO schedule_event_subscriptions "
+                     "(id,conversation_id,profile,title,action,dtstart,rrule,created_at,updated_at) "
+                     "VALUES (:id,'conv-src','src',:title,:title,'2026-07-12T09:00:00',:rrule,:t,:t)"),
+                {"id": rid, "title": title, "rrule": rrule, "t": now * 1000},
+            )
+        c.execute(
+            text("INSERT INTO skill_event_subscriptions "
+                 "(id,conversation_id,profile,skill_name,event_type,action,created_at) "
+                 "VALUES (:id,'conv-src','src','My Skill','inbox','do it',:t)"),
+            {"id": ids["skillev"], "t": now},
+        )
+    return ids
+
+
+def test_export_events_carry_ids(env):
+    system_dir = env
+    _populate_src(system_dir)
+    ids = _seed_events(system_dir)
+
+    from app.blueprint.detect import collect_exportable
+
+    out = collect_exportable("src")
+    events = out["components"]["events"]
+    assert events["available"] is True
+    seen = {
+        it["id"]
+        for group in events["items"].values()
+        for it in group
+    }
+    assert set(ids.values()) <= seen, "every event item must carry its row id"
+
+
+def test_export_settings_subset(env):
+    system_dir = env
+    _populate_src(system_dir)
+
+    from app.blueprint.engine import ExportOptions, create_blueprint
+
+    # Add a second changed setting so the subset genuinely excludes something.
+    eng = get_database_provider().sync_engine()
+    with eng.begin() as c:
+        c.execute(
+            text("INSERT INTO user_config (profile,key,value,updated_at) VALUES ('src','compaction.enabled','false',:t)"),
+            {"t": time.time() * 1000},
+        )
+
+    result = create_blueprint(
+        ExportOptions(
+            profile="src",
+            name="subset",
+            components={"settings"},
+            setting_keys={"agent.max_steps"},
+        )
+    )
+    doc = _component_doc(result.path, "settings")
+    assert set(doc["data"]["values"].keys()) == {"agent.max_steps"}
+    assert set(doc["data"]["defaults_at_export"].keys()) == {"agent.max_steps"}
+    assert result.manifest.summary()["components"]["settings"]["count"] == 1
+
+
+def test_export_events_subset(env):
+    system_dir = env
+    _populate_src(system_dir)
+    ids = _seed_events(system_dir)
+
+    from app.blueprint.engine import ExportOptions, create_blueprint
+
+    result = create_blueprint(
+        ExportOptions(
+            profile="src",
+            name="subset-events",
+            components={"events"},
+            event_ids={ids["daily"]},
+        )
+    )
+    doc = _component_doc(result.path, "events")
+    titles = [s["title"] for s in doc["data"]["schedule"]]
+    assert titles == ["Daily report"]
+    assert doc["data"]["skill_event"] == []
+
+
+def _component_doc(path: Path, key: str) -> dict:
+    with tarfile.open(str(path), mode="r:gz") as tf:
+        member = tf.extractfile(f"components/{key}.json")
+        assert member is not None, f"components/{key}.json missing from archive"
+        return json.loads(member.read().decode("utf-8"))
 
 
 def test_export_import_parity(env):

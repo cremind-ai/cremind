@@ -77,6 +77,8 @@ class ExportOptions:
     components: set[str] = field(default_factory=lambda: set(COMPONENT_KEYS))
     skill_slugs: set[str] | None = None  # None => all detected skills
     tool_ids: set[str] | None = None  # None => all configured tools
+    setting_keys: set[str] | None = None  # None => all changed settings
+    event_ids: set[str] | None = None  # None => all events
 
 
 @dataclass
@@ -276,6 +278,10 @@ def create_blueprint(
             doc, reqs = builder(
                 profile, selected_slugs=options.skill_slugs, secret_map=secret_map
             )
+        elif key == "settings":
+            doc, reqs = builder(profile, selected_keys=options.setting_keys)
+        elif key == "events":
+            doc, reqs = builder(profile, selected_event_ids=options.event_ids)
         else:
             doc, reqs = builder(profile)
         # Surface any builder warnings (e.g. scrubbed base_urls) and drop the
