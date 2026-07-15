@@ -77,6 +77,10 @@ class ClientStorageBackend(Protocol):
         """Delete a token for the given agent, profile, and kind."""
         ...
 
+    def delete_tokens_for_profile(self, profile: str) -> int:
+        """Delete every auth token owned by a profile; returns the row count."""
+        ...
+
 
 class DatabaseClientStorage(SyncStorageBase):
     """Provider-backed client storage for auth tokens.
@@ -179,6 +183,24 @@ class DatabaseClientStorage(SyncStorageBase):
                 logger.info(f"Token deleted ({token_kind}): agent={safe_agent}, profile={profile}")
                 return True
             return False
+
+    def delete_tokens_for_profile(self, profile: str) -> int:
+        """Delete every auth token owned by a profile; returns the row count.
+
+        Used by the per-profile clean/factory-reset flow. ``auth_tokens.profile``
+        is a CASCADE FK on ``profiles``, but a clean keeps the profile row, so the
+        tokens must be removed explicitly. Never touches the ``__server__``
+        pseudo-profile (DCR credentials) unless that profile is passed.
+        """
+        with self._engine.begin() as conn:
+            cursor = conn.execute(
+                text("DELETE FROM auth_tokens WHERE profile = :profile"),
+                {"profile": profile},
+            )
+        count = int(cursor.rowcount or 0)
+        if count:
+            logger.info(f"Deleted {count} auth token(s) for profile={profile}")
+        return count
 
 
 # Backward-compatible alias name in case other code imports it.

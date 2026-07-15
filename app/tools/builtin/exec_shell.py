@@ -1436,6 +1436,50 @@ async def stop_process(process_id: str, *, profile: str) -> Dict[str, Any]:
     }
 
 
+async def stop_processes_for_profile(
+    profile: str, *, autostart: Optional[bool] = None
+) -> int:
+    """Stop every managed process owned by ``profile``; return the count stopped.
+
+    Used by the per-profile "clean data" feature to kill the background shells
+    the agent spawned during runtime. ``stop_process`` pops registry entries as
+    it goes, so we snapshot the target ids first.
+
+    ``autostart`` selects which processes to stop:
+
+    - ``None``  → every process owned by the profile.
+    - ``False`` → only ad-hoc runtime processes (``autostart_id is None``),
+                  leaving registered autostarts (config) running.
+    - ``True``  → only autostart-linked processes.
+
+    Ownership is matched **strictly** (``info.profile == profile``), so a
+    process with no profile tag is never swept into another profile's clean.
+    """
+    if not profile:
+        return 0
+    targets: List[str] = []
+    for pid, info in list(_process_registry.items()):
+        if info.profile != profile:
+            continue
+        if autostart is True and info.autostart_id is None:
+            continue
+        if autostart is False and info.autostart_id is not None:
+            continue
+        targets.append(pid)
+
+    stopped = 0
+    for pid in targets:
+        try:
+            result = await stop_process(pid, profile=profile)
+        except Exception:  # noqa: BLE001
+            logger.exception(f"stop_processes_for_profile: failed to stop {pid}")
+            continue
+        if isinstance(result, dict) and result.get("error"):
+            continue
+        stopped += 1
+    return stopped
+
+
 # ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------

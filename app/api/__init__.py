@@ -5,6 +5,7 @@ from app.api.agents import get_agent_routes
 from app.api.blueprints import get_blueprint_routes
 from app.api.calendar import get_calendar_routes
 from app.api.channels import get_channel_routes
+from app.api.clean import get_clean_routes
 from app.api.conversations import get_conversation_routes
 from app.api.events import get_event_routes
 from app.api.event_runs import get_event_run_routes
@@ -87,6 +88,12 @@ def get_api_routes(
         registry=registry,
         conversation_storage=conversation_storage,
         config_storage=config_storage,
+        drop_profile_embeddings=drop_profile_embeddings,
+    ))
+    routes.extend(get_clean_routes(
+        conversation_storage,
+        config_storage,
+        registry=registry,
         drop_profile_embeddings=drop_profile_embeddings,
     ))
     return routes

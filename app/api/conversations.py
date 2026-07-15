@@ -633,72 +633,13 @@ def get_conversation_routes(
         return JSONResponse({"conversation": conv})
 
     async def _cleanup_conversation_dependents(conversation_id: str) -> None:
-        """Before deleting a conversation, tear down anything homed on it.
+        """Tear down everything homed on a conversation before deleting it.
 
-        Deleting a conversation CASCADE-deletes any event subscriptions bound to
-        it (a DB-level path that bypasses app cleanup) — which would orphan those
-        rules' run rows and hidden run conversations. So first cascade-delete each
-        bound rule's runs and disarm its manager, then discard this conversation's
-        own queue/stream state (a pre-existing gap: only the rename path did this).
+        Delegates to the shared helper so the per-profile clean engine
+        (:mod:`app.reset.engine`) runs the exact same teardown sequence.
         """
-        from app.events.run_lifecycle import (
-            delete_runs_for_subscription, SKILL, FILE_WATCHER, SCHEDULE,
-        )
-        from app.storage import (
-            get_event_subscription_storage, get_file_watcher_storage,
-            get_schedule_event_storage,
-        )
-        try:
-            for sub in get_event_subscription_storage().list_by_conversation(conversation_id):
-                await delete_runs_for_subscription(SKILL, sub["id"], sub.get("profile"))
-        except Exception:  # noqa: BLE001
-            logger.exception("delete conversation: skill-event run cascade failed")
-        try:
-            fw_mgr = None
-            try:
-                from app.events.file_watcher_manager import get_file_watcher_manager
-                fw_mgr = get_file_watcher_manager()
-            except Exception:  # noqa: BLE001
-                fw_mgr = None
-            for sub in get_file_watcher_storage().list_by_conversation(conversation_id):
-                await delete_runs_for_subscription(FILE_WATCHER, sub["id"], sub.get("profile"))
-                if fw_mgr is not None:
-                    try:
-                        fw_mgr.disarm(sub)
-                    except Exception:  # noqa: BLE001
-                        logger.debug("disarm failed during conv delete", exc_info=True)
-        except Exception:  # noqa: BLE001
-            logger.exception("delete conversation: file-watcher run cascade failed")
-        try:
-            from app.events.schedule_manager import get_schedule_manager
-            sch_mgr = get_schedule_manager()
-            for sub in get_schedule_event_storage().list_by_conversation(conversation_id):
-                await delete_runs_for_subscription(SCHEDULE, sub["id"], sub.get("profile"))
-                try:
-                    sch_mgr.remove(sub["id"])
-                except Exception:  # noqa: BLE001
-                    logger.debug("schedule remove failed during conv delete", exc_info=True)
-        except Exception:  # noqa: BLE001
-            logger.exception("delete conversation: schedule run cascade failed")
-        # Discard this conversation's own queue + stream-bus state (gap fix).
-        try:
-            event_queue.discard_queue(conversation_id)
-        except Exception:  # noqa: BLE001
-            logger.debug("discard_queue failed during conv delete", exc_info=True)
-        try:
-            from app.events.stream_bus import get_event_stream_bus
-            await get_event_stream_bus().discard(conversation_id)
-        except Exception:  # noqa: BLE001
-            logger.debug("bus.discard failed during conv delete", exc_info=True)
-        # Remove any saved Plan-mode files for this conversation (best-effort).
-        try:
-            from app.utils.plans_dir import remove_conversation_plans
-            conv = await conversation_storage.get_conversation(conversation_id)
-            plan_profile = (conv or {}).get("profile")
-            if plan_profile:
-                remove_conversation_plans(plan_profile, conversation_id)
-        except Exception:  # noqa: BLE001
-            logger.debug("plans dir cleanup failed during conv delete", exc_info=True)
+        from app.reset._conversations import cleanup_conversation_dependents
+        await cleanup_conversation_dependents(conversation_storage, conversation_id)
 
     async def handle_delete_conversation(request: Request) -> JSONResponse:
         """Delete a single conversation."""

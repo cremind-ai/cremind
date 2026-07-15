@@ -103,6 +103,20 @@ class MemoryStorage:
             result = self._long_to_dict(row)
         return result
 
+    async def clear(self, profile: str) -> int:
+        """Delete all long-term memory rows for a profile; returns the row count.
+
+        The DB path only ever FIFO-evicts (see :meth:`_evict_long_term`); this is
+        the explicit "forget everything" used by the per-profile clean feature.
+        When embedding is ON, long-term memory lives in the vector store instead,
+        so callers also drop the profile's ``_memory_collection`` points.
+        """
+        async with self.async_session_maker.begin() as session:
+            result = await session.execute(
+                delete(LongTermMemoryModel).where(LongTermMemoryModel.profile == profile)
+            )
+        return int(result.rowcount or 0)
+
     # ── eviction helpers ───────────────────────────────────────────────────
 
     @staticmethod

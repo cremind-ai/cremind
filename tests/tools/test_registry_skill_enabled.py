@@ -6,7 +6,8 @@ could be loaded on request. ``tools_for_profile`` now applies the same enabled
 check to owned skills that it already applied to every other tool type, while:
 
 - skills owned by *other* profiles stay invisible (ownership filter unchanged);
-- a skill with no ``profile_tools`` row stays on (SKILL default is enabled);
+- a skill with no ``profile_tools`` row stays off (SKILL default is disabled —
+  the owner must opt each skill in);
 - ``owned_skills`` ignores the enabled flag (used for ``.env`` materialization,
   which must cover disabled skills too).
 
@@ -77,14 +78,17 @@ def _register_skill(reg: ToolRegistry, profile: str, name: str) -> str:
     )
 
 
-def test_owned_skill_enabled_by_default(tmp_path: Path) -> None:
+def test_owned_skill_disabled_by_default(tmp_path: Path) -> None:
     reg = _make_registry(tmp_path)
     _seed_profile(reg.storage, "admin")
     skill_id = _register_skill(reg, "admin", "weather")
 
-    # No profile_tools row -> SKILL default (on).
+    # No profile_tools row -> SKILL default (off): the owner must opt in.
     exposed = {t.tool_id for t in reg.tools_for_profile("admin")}
-    assert skill_id in exposed
+    assert skill_id not in exposed
+    # ...and Settings lists it (off) so it can be enabled.
+    rows = {r["tool_id"]: r for r in reg.visible_for_profile("admin")}
+    assert rows[skill_id]["enabled"] is False
 
 
 def test_disabled_skill_hidden_from_agent_but_visible_in_settings(tmp_path: Path) -> None:
