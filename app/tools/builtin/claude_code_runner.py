@@ -105,6 +105,7 @@ class ClaudeCodeTask:
     session_id: Optional[str] = None
     resumed_from: Optional[str] = None
     model: Optional[str] = None
+    permission_mode: Optional[str] = None
     runner: Optional[asyncio.Task] = None
     client: Any = None
     activity: Optional[AgentActivity] = None
@@ -450,6 +451,89 @@ _PERMISSION_MODE_LABELS: Dict[str, str] = {
     "auto": "auto (no prompts; a safety classifier blocks destructive actions)",
 }
 
+# Which permission modes let Claude Code actually make changes when running
+# headless (no human present to approve). Kept next to _PERMISSION_MODE_LABELS so
+# a new SDK mode gets a label AND a classification review in the same place.
+#   autonomous — writes files AND runs commands with no approval stall
+#   edits_only — writes files but non-edit actions may stall (acceptEdits)
+#   blocked    — cannot make changes headless (plan / default / dontAsk)
+#   unknown    — a mode this build doesn't recognise: surface it, never claim it
+#                is blocked (a future SDK mode could be fully autonomous)
+_AUTONOMOUS_MODES = frozenset({"bypassPermissions", "auto"})
+_EDITS_ONLY_MODES = frozenset({"acceptEdits"})
+_BLOCKED_MODES = frozenset({"plan", "default", "dontAsk"})
+
+_WRITE_CAPABLE_TARGET = "bypassPermissions"
+
+
+def permission_autonomy(mode: Optional[str]) -> str:
+    """Classify a permission mode as autonomous / edits_only / blocked / unknown.
+
+    Structural (mode is known at task start) — never parses result text."""
+    if mode in _AUTONOMOUS_MODES:
+        return "autonomous"
+    if mode in _EDITS_ONLY_MODES:
+        return "edits_only"
+    if mode in _BLOCKED_MODES:
+        return "blocked"
+    return "unknown"
+
+
+def _permission_advisory(mode: Optional[str]) -> Optional[Dict[str, Any]]:
+    """A machine-readable 'confirm once, then fix' advisory for a mode that may
+    prevent headless changes, or ``None`` when the mode is fully autonomous.
+
+    The remediation names the ONE real lever — Cremind's
+    ``CLAUDE_CODE_PERMISSION_MODE`` tool variable — and the exact
+    ``cremind tools set-var`` command, and forbids inventing a Claude Code UI /
+    plan-mode step. The orchestrator must ask the user once before running it."""
+    autonomy = permission_autonomy(mode)
+    if autonomy == "autonomous":
+        return None
+    command = (
+        f"cremind tools set-var claude_code "
+        f"CLAUDE_CODE_PERMISSION_MODE={_WRITE_CAPABLE_TARGET}"
+    )
+    if autonomy == "edits_only":
+        warning = (
+            f"Claude Code ran in permission mode '{mode}', which auto-approves file "
+            "edits but may block other actions (e.g. running commands) because no "
+            "human is present to approve them. If this task needed more than file "
+            "edits and some step was denied, this is why."
+        )
+    elif autonomy == "blocked":
+        warning = (
+            f"Claude Code ran in permission mode '{mode}', which does NOT let it "
+            "create or modify files when running headless (there is no human to "
+            "approve actions, and the ExitPlanMode tool is not available here). If "
+            "this task was meant to make changes and none were made, this is why."
+        )
+    else:  # unknown
+        warning = (
+            f"Claude Code ran in permission mode '{mode}', which Cremind does not "
+            "recognise as a fully-autonomous mode. If the task was meant to make "
+            "changes but none were made, this permission mode may be the reason."
+        )
+    return {
+        "autonomy": autonomy,
+        "warning": warning,
+        "cause": (
+            "This mode is set by Cremind's CLAUDE_CODE_PERMISSION_MODE tool "
+            "variable — NOT by Claude Code itself. There is no Claude Code "
+            "'plan mode' UI for the user to exit and no `claude` CLI command that "
+            "changes it. Do NOT tell the user to exit plan mode or run any claude "
+            "plan command."
+        ),
+        "remediation": (
+            "Tell the user Claude Code is in this mode and ask ONCE whether to "
+            f"switch it to {_WRITE_CAPABLE_TARGET} (fully autonomous). Only after "
+            "they agree, run the command below with the Shell Executor tool, then "
+            "re-run the task with claude_code__run (reuse the session_id to "
+            "continue). Do NOT change the mode without asking first."
+        ),
+        "command": command,
+    }
+
 
 def _permission_mode_ids(sdk) -> List[str]:
     """Extract the ``PermissionMode`` Literal members from the installed SDK.
@@ -631,6 +715,7 @@ async def start_task(
         session_id=session_id,
         resumed_from=session_id,
         model=model,
+        permission_mode=(variables.get(Var.PERMISSION_MODE) or "bypassPermissions"),
         agent_task_id=current_task_id_var.get(),
     )
     _task_registry[task.task_id] = task
@@ -828,10 +913,15 @@ async def _handle_message(task: ClaudeCodeTask, message: Any) -> None:
                     **stats,
                 )
             else:
+                # A non-auth failure may still stem from a restrictive permission
+                # mode; attach the advisory here (but never on the auth path, which
+                # carries its own credential remediation). Autonomous modes yield
+                # None, which _failure_payload filters out.
                 task.result = _failure_payload(
                     task,
                     error="ClaudeCodeError",
                     message=f"Claude Code did not complete successfully (subtype: {subtype}).",
+                    permission_advisory=_permission_advisory(task.permission_mode),
                     **stats,
                 )
         else:
@@ -859,21 +949,53 @@ def _map_usage(usage: Any) -> Optional[Dict[str, int]]:
 
 
 def _success_payload(task: ClaudeCodeTask, message: Any) -> Dict[str, Any]:
-    return {
+    result_text = getattr(message, "result", None) or ""
+    num_turns = getattr(message, "num_turns", None)
+    payload: Dict[str, Any] = {
         "status": "completed",
         "task_id": task.task_id,
         "session_id": task.session_id,
-        "result": getattr(message, "result", None) or "",
-        "num_turns": getattr(message, "num_turns", None),
+        "result": result_text,
+        "num_turns": num_turns,
         "duration_ms": getattr(message, "duration_ms", None),
         "total_cost_usd": getattr(message, "total_cost_usd", None),
         "usage": task.token_usage,
         "working_directory": task.cwd,
+        "effective_permission_mode": task.permission_mode,
         "note": (
             "To continue this coding session with a follow-up instruction, call "
             "claude_code__run with this session_id."
         ),
     }
+
+    # Empty-resume guard: a resumed session that cannot be continued (expired /
+    # evicted) comes back as an is_error=False ResultMessage with an empty result
+    # and no turns. Replace the bare empty string with an actionable note so the
+    # orchestrator never mistakes it for "the task produced no output". Gate
+    # tightly (empty AND no turns) so a legitimate empty final message with real
+    # turns still passes through unchanged.
+    if not result_text.strip() and (num_turns or 0) == 0:
+        payload["resume_produced_no_work"] = True
+        if task.resumed_from:
+            payload["result"] = (
+                "(no output) Resuming this coding session produced no work — the "
+                "session may have expired or is no longer resumable. Do NOT treat "
+                "this as 'the task produced no output'. Start a fresh task with "
+                "claude_code__run WITHOUT a session_id, repeating the full task "
+                "brief."
+            )
+        else:
+            payload["result"] = (
+                "(no output) Claude Code returned no result and took no turns. "
+                "This is not a normal completion. Re-run the task with a clearer, "
+                "more complete brief; if it recurs, check Claude Code's setup with "
+                "claude_code__status (probe=true)."
+            )
+
+    advisory = _permission_advisory(task.permission_mode)
+    if advisory is not None:
+        payload["permission_advisory"] = advisory
+    return payload
 
 
 def _failure_payload(task: ClaudeCodeTask, *, error: str, message: str, **extra: Any) -> Dict[str, Any]:
@@ -884,6 +1006,7 @@ def _failure_payload(task: ClaudeCodeTask, *, error: str, message: str, **extra:
         "error": error,
         "message": message,
         "working_directory": task.cwd,
+        "effective_permission_mode": task.permission_mode,
     }
     payload.update({k: v for k, v in extra.items() if v is not None})
     return payload
