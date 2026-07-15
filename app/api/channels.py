@@ -220,7 +220,13 @@ async def create_channel_for_profile(
 
     if enabled:
         try:
-            ch = await get_channel_registry().start_for_channel(ch)
+            # ``install_if_missing`` pip-installs the channel's optional SDK
+            # extras at runtime before the adapter starts (Telegram/Discord/
+            # Slack) so a post-setup connect doesn't fail with a missing
+            # package — mirrors the browser/claude_code tools.
+            ch = await get_channel_registry().start_for_channel(
+                ch, install_if_missing=True,
+            )
         except Exception:  # noqa: BLE001
             logger.exception(f"channels: failed to start {ch['id']}")
 
@@ -358,10 +364,16 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
             return JSONResponse({"error": "Channel not found"}, status_code=404)
 
         # Restart adapter when anything that affects runtime changed.
+        # ``install_if_missing`` covers the enable/mode-change case where the
+        # channel's SDK extras aren't on disk yet (e.g. switching an existing
+        # row to a new platform, or re-enabling on a host that never installed
+        # them) — install at runtime before the adapter restarts.
         runtime_keys = {"mode", "auth_mode", "enabled", "config"}
         if any(k in update for k in runtime_keys):
             try:
-                updated = await get_channel_registry().restart_for_channel(cid) or updated
+                updated = await get_channel_registry().restart_for_channel(
+                    cid, install_if_missing=True,
+                ) or updated
             except Exception:  # noqa: BLE001
                 logger.exception(f"channels: restart failed for {cid}")
 

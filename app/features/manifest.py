@@ -14,9 +14,13 @@ Each :class:`Feature` declares:
   :mod:`app.features.installer` (e.g. ``"playwright_install_chromium"``).
 - ``requires_restart``: True for features whose import has heavy native
   init that doesn't play well with same-process re-import — torch DLLs,
-  playwright event loops, telegram pollers. These features persist the
-  wizard's choice but defer the ``apply_*`` step until the user restarts
-  ``cremind serve``.
+  playwright event loops. These features persist the wizard's choice but
+  defer the ``apply_*`` step until the user restarts ``cremind serve``.
+  The chat-channel SDKs are *not* in this bucket: their adapters import
+  the SDK lazily inside methods (never at module load), so a runtime
+  install followed by ``importlib.invalidate_caches()`` is importable
+  in-process on the next connect — same rationale as ``claude_code`` /
+  ``codex`` below.
 """
 
 from __future__ import annotations
@@ -145,29 +149,35 @@ FEATURES: dict[str, Feature] = {
     ),
 
     # ── External chat channels ──────────────────────────────────────────────
+    # requires_restart=False: every channel adapter imports its SDK lazily
+    # inside methods (``TelegramAdapter._build_bot``, etc.), never at module
+    # load. The installer runs ``importlib.invalidate_caches()`` after pip, and
+    # the registry installs the feature *before* starting the adapter, so a
+    # runtime install is importable in-process on the very next connect — no
+    # restart (same reasoning as claude_code / codex).
     "channel.telegram.bot": Feature(
         key="channel.telegram.bot",
         extras=("channel-telegram-bot",),
         probes=("telegram",),
-        requires_restart=True,
+        requires_restart=False,
     ),
     "channel.telegram.userbot": Feature(
         key="channel.telegram.userbot",
         extras=("channel-telegram-userbot",),
         probes=("telethon",),
-        requires_restart=True,
+        requires_restart=False,
     ),
     "channel.discord.bot": Feature(
         key="channel.discord.bot",
         extras=("channel-discord",),
         probes=("discord",),
-        requires_restart=True,
+        requires_restart=False,
     ),
     "channel.slack.bot": Feature(
         key="channel.slack.bot",
         extras=("channel-slack",),
         probes=("slack_bolt",),
-        requires_restart=True,
+        requires_restart=False,
     ),
     # Messenger (Graph API webhook) and Zalo (Bot API long-poll) ride the core
     # ``httpx`` client, and the Zalo personal channel is a Node sidecar — none
@@ -183,6 +193,27 @@ LLM_PROVIDER_TO_FEATURE: dict[str, str] = {
     "openai": "llm.openai",
     "groq": "llm.groq",
 }
+
+
+def channel_feature_key(channel_type: str, mode: str) -> str | None:
+    """Feature key whose extras a channel adapter needs, or ``None``.
+
+    Returns ``None`` for channels that ride the core ``httpx`` client
+    (Messenger, Zalo bot/notification) or a Node.js sidecar (WhatsApp, Zalo
+    userbot) — none of those need a Python extras group. Single source of
+    truth for both the Setup Wizard preflight
+    (:func:`app.api.config._features_required_by_setup_payload`) and the
+    install-on-connect path in :meth:`ChannelRegistry.start_for_channel`.
+    """
+    ct = (channel_type or "").lower()
+    md = (mode or "").lower()
+    if ct == "telegram":
+        return "channel.telegram.userbot" if md == "userbot" else "channel.telegram.bot"
+    if ct == "discord":
+        return "channel.discord.bot"
+    if ct == "slack":
+        return "channel.slack.bot"
+    return None
 
 
 def is_installed(feature_key: str) -> bool:

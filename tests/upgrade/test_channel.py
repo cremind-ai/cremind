@@ -241,6 +241,58 @@ def test_pip_spec_defaults_to_production() -> None:
     assert spec == f"cremind[embeddings-me5]=={__version__}"
 
 
+# ── features.channel_feature_key + channel requires_restart ───────────────
+
+
+@pytest.mark.parametrize(
+    "channel_type,mode,expected",
+    [
+        ("telegram", "bot", "channel.telegram.bot"),
+        ("telegram", "notification", "channel.telegram.bot"),
+        ("telegram", "userbot", "channel.telegram.userbot"),
+        ("Telegram", "USERBOT", "channel.telegram.userbot"),  # case-insensitive
+        ("discord", "bot", "channel.discord.bot"),
+        ("discord", "notification", "channel.discord.bot"),
+        ("slack", "bot", "channel.slack.bot"),
+        # No Python extras group — httpx core / Node sidecar.
+        ("messenger", "bot", None),
+        ("zalo", "bot", None),
+        ("zalo", "userbot", None),
+        ("whatsapp", "userbot", None),
+        ("", "", None),
+    ],
+)
+def test_channel_feature_key(channel_type: str, mode: str, expected) -> None:
+    assert feature_manifest.channel_feature_key(channel_type, mode) == expected
+
+
+def test_channel_feature_keys_exist_in_registry() -> None:
+    # Every non-None key the resolver can return must be a real feature.
+    keys = {
+        feature_manifest.channel_feature_key(ct, md)
+        for ct, md in [
+            ("telegram", "bot"),
+            ("telegram", "userbot"),
+            ("discord", "bot"),
+            ("slack", "bot"),
+        ]
+    }
+    for key in keys:
+        assert key in feature_manifest.FEATURES
+
+
+def test_channel_features_do_not_require_restart() -> None:
+    # Channel adapters import their SDK lazily inside methods, so a runtime
+    # install is usable in-process — no restart (mirrors claude_code/codex).
+    for key in (
+        "channel.telegram.bot",
+        "channel.telegram.userbot",
+        "channel.discord.bot",
+        "channel.slack.bot",
+    ):
+        assert feature_manifest.FEATURES[key].requires_restart is False
+
+
 # ── manifest.py version helpers ───────────────────────────────────────────
 
 

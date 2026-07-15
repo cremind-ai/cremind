@@ -134,7 +134,11 @@ def _features_required_by_setup_payload(body: dict) -> list[str]:
     an LLM-only install, Postgres deps stay off for a SQLite install,
     etc.
     """
-    from app.features.manifest import FEATURES, LLM_PROVIDER_TO_FEATURE
+    from app.features.manifest import (
+        FEATURES,
+        LLM_PROVIDER_TO_FEATURE,
+        channel_feature_key,
+    )
 
     features: list[str] = []
 
@@ -173,23 +177,20 @@ def _features_required_by_setup_payload(body: dict) -> list[str]:
         if feature in FEATURES:
             features.append(feature)
 
-    # Channel adapters declared in the wizard.
+    # Channel adapters declared in the wizard. ``channel_feature_key`` is the
+    # single source of truth for the channel→feature mapping (shared with the
+    # install-on-connect path in ChannelRegistry); it returns ``None`` for
+    # channels with no Python extras group (messenger + zalo ride httpx core,
+    # whatsapp + zalo userbot ride a Node sidecar).
     for entry in body.get("channel_configs") or []:
         if not isinstance(entry, dict):
             continue
-        ch_type = str(entry.get("channel_type", "")).lower()
-        mode = str(entry.get("mode") or "").lower()
-        if ch_type == "telegram":
-            key = "channel.telegram.userbot" if mode == "userbot" else "channel.telegram.bot"
-            if key in FEATURES:
-                features.append(key)
-        elif ch_type == "discord" and mode != "userbot":
-            # bot + notification both need discord.py; the disabled userbot mode
-            # would need a different (TOS-risky) lib we don't ship.
-            features.append("channel.discord.bot")
-        elif ch_type == "slack" and mode != "userbot":
-            features.append("channel.slack.bot")
-        # messenger + zalo have no Python extras group (httpx core / Node sidecar).
+        key = channel_feature_key(
+            str(entry.get("channel_type", "")),
+            str(entry.get("mode") or ""),
+        )
+        if key and key in FEATURES:
+            features.append(key)
 
     # Built-in tools the user enabled in the wizard. Each tool config row
     # carries an ``_enabled`` flag (string ``"true"`` / ``"false"``);
