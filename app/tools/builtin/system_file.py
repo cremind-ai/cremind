@@ -198,8 +198,9 @@ def _safe_resolve(
     raise ValueError(
         f"Access denied: '{relative_path}' resolves outside the allowed "
         f"directories. Allowed roots: {roots}. Absolute paths are accepted only "
-        f"under one of these (e.g. a loaded skill's own directory). Use a path "
-        f"inside the current working directory, or call change_working_directory first."
+        f"under one of these (e.g. a loaded skill's own directory). To reach it, "
+        f"call change_working_directory with target='custom' and path set to the "
+        f"existing directory that contains it, then retry."
     )
 
 
