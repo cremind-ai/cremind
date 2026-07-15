@@ -99,7 +99,11 @@ def channels_add(
         help="Channel type (telegram, whatsapp, discord, messenger, slack, zalo).",
     ),
     mode: str = typer.Option("bot", "--mode", help="Channel mode (bot|userbot|notification)."),
-    auth_mode: str = typer.Option("none", "--auth-mode", help="Auth mode (none|otp|password)."),
+    auth_mode: str = typer.Option(
+        "none", "--auth-mode",
+        help="Legacy access auth (none|otp|password). Prefer the unified "
+             "--config subscribe_auth=open|passcode|otp|approval|allowlist.",
+    ),
     response_mode: str = typer.Option("normal", "--response-mode", help="Reply detail (normal|detail)."),
     config_json: Optional[str] = typer.Option(
         None, "--json",
@@ -320,7 +324,9 @@ def channels_edit(
         None, "--mode", help="Channel mode (bot|userbot|notification).",
     ),
     auth_mode: Optional[str] = typer.Option(
-        None, "--auth-mode", help="Auth mode (none|otp|password).",
+        None, "--auth-mode",
+        help="Legacy access auth (none|otp|password). Prefer the unified "
+             "--config subscribe_auth=open|passcode|otp|approval|allowlist.",
     ),
     response_mode: Optional[str] = typer.Option(
         None, "--response-mode", help="Reply detail (normal|detail).",
@@ -471,6 +477,62 @@ def channels_senders(
             string_field(s, "pending_otp"),
         )
     table.render()
+
+
+def _set_sender_authenticated(
+    ctx: typer.Context, channel_id: str, sender_id: str, authenticated: bool,
+) -> None:
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import set_sender_authenticated
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    out_mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await set_sender_authenticated(
+                client, channel_id, sender_id, authenticated,
+            )
+
+    sender = asyncio.run(_run())
+    if out_mode.json:
+        print_json(sender)
+        return
+    state = "approved" if sender.get("authenticated") else "revoked"
+    sys.stdout.write(
+        f"{sender.get('sender_id')}: {state} on channel {channel_id}\n"
+    )
+
+
+@channels_app.command("approve")
+@graceful_errors
+def channels_approve(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id (a notification-mode channel)."),
+    sender_id: str = typer.Argument(..., help="Sender id to approve (from `channels senders`)."),
+) -> None:
+    """Approve a pending subscriber on an `approval`-auth notification channel.
+
+    The subscriber must have contacted the channel first (sent /start); find
+    their id with `cremind channels senders <channel_id>`.
+    """
+    _set_sender_authenticated(ctx, channel_id, sender_id, True)
+
+
+@channels_app.command("revoke")
+@graceful_errors
+def channels_revoke(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    sender_id: str = typer.Argument(..., help="Sender id to revoke (from `channels senders`)."),
+) -> None:
+    """Revoke a subscriber so they stop receiving notifications."""
+    _set_sender_authenticated(ctx, channel_id, sender_id, False)
 
 
 @channels_app.command("pair")

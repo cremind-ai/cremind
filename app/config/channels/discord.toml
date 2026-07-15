@@ -35,7 +35,12 @@ Setup:
 1. Create a bot as in Bot mode and paste its token below.
 2. Save, then DM the bot /start to subscribe (/stop to unsubscribe).
 3. To alert specific users without them subscribing, put their Discord user ids
-   in "Target chat ids" (comma-separated)."""
+   in "Target chat ids" (comma-separated).
+
+Access control: pick a "Subscription authentication" method — open, passcode
+(/start <passcode>), one-time code (you relay a code per person), admin approval
+(approve each subscriber under Settings → Channels or `cremind channels approve`),
+or allowlist-only (no self-subscribe; only Target chat ids receive)."""
 [channel.modes.fields]
 bot_token = { description = "Bot Token", type = "string", secret = true, required = true }
 target_chat_ids = { description = "Optional target user ids (comma-separated)", type = "string", required = false }

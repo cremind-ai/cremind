@@ -74,6 +74,12 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         # tail of the previous run's events from the shared stream bus.
         self._inflight: dict[str, asyncio.Task] = {}
 
+        # Sender ids we've already raised an operator "access request"
+        # notification for (``approval`` conversational auth), to avoid
+        # re-notifying on every message from a still-pending sender. In-memory
+        # only — at worst one extra notification per process restart.
+        self._access_requested: set[str] = set()
+
         # Pairing / interactive-auth pub/sub. The same plumbing serves
         # WhatsApp's QR scan flow ({kind: "qr"}), the eventual Telegram
         # userbot code/password flow ({kind: "code_required"} /
@@ -384,12 +390,14 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
 
         conversation_id = await self._ensure_conversation(sender, display_name)
 
-        if self.auth_mode == "otp" and not sender["authenticated"]:
-            await self._handle_otp(sender, text)
-            return
-
-        if self.auth_mode == "password" and not sender["authenticated"]:
-            await self._handle_password(sender, text)
+        # Access authentication (shared with notification mode via
+        # ``config.subscribe_auth``): gate who may talk to the agent. An
+        # unauthenticated sender's message is never dispatched — the gate
+        # either advances them toward authentication (otp/passcode) or holds
+        # them (approval/allowlist) until an operator approves.
+        auth = self._subscribe_auth()
+        if auth != "open" and not sender["authenticated"]:
+            await self._handle_access_gate(sender, auth, text)
             return
 
         # Busy ack + serialize-per-sender. Both the ack and the await cover
@@ -470,13 +478,82 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             logger.exception("channels: failed to push OTP notification")
         await self.send(sender["sender_id"], "please provide OTP code")
 
-    async def _handle_password(self, sender: dict, text: str) -> None:
-        password = (self.channel.get("config") or {}).get("password")
-        if password and text == password:
+    async def _handle_access_gate(
+        self, sender: dict, auth: str, text: str,
+    ) -> None:
+        """Advance/hold an unauthenticated conversational sender per ``auth``.
+
+        Called from :meth:`_handle_inbound` when the channel's access method is
+        not ``open`` and the sender isn't authenticated yet. The caller returns
+        immediately after, so the sender's message is never dispatched to the
+        agent until they're authenticated.
+        """
+        if auth == "otp":
+            await self._handle_otp(sender, text)
+        elif auth == "passcode":
+            await self._handle_passcode(sender, text)
+        elif auth in ("approval", "allowlist"):
+            # approval raises an operator request + a "pending" ack; allowlist
+            # is a silent gate (unknown senders are simply refused, but the row
+            # exists so an operator can approve them from the Subscribers list).
+            await self._handle_access_request(sender, notify=(auth == "approval"))
+        else:  # pragma: no cover — _subscribe_auth only returns known methods
+            await self.send(sender["sender_id"], "This channel is not accepting messages.")
+
+    async def _handle_passcode(self, sender: dict, text: str) -> None:
+        # ``subscribe_passcode`` is the unified key; ``password`` is the legacy
+        # conversational key kept for back-compat.
+        config = self.channel.get("config") or {}
+        passcode = config.get("subscribe_passcode") or config.get("password")
+        if passcode and text.strip() == str(passcode):
             await self.storage.update_sender(sender["id"], authenticated=True)
             await self.send(sender["sender_id"], "Authenticated. You can chat now.")
             return
-        await self.send(sender["sender_id"], "please provide password")
+        await self.send(
+            sender["sender_id"],
+            "🔒 This channel is passcode-protected. Send the passcode to start chatting.",
+        )
+
+    async def _handle_access_request(self, sender: dict, *, notify: bool) -> None:
+        """Hold a sender pending operator approval (approval / allowlist)."""
+        if not notify:
+            # allowlist — flat refusal, no operator notification.
+            await self.send(
+                sender["sender_id"],
+                "🔒 You're not authorized to use this channel. "
+                "An admin must grant you access.",
+            )
+            return
+
+        # approval — notify the operator once, then ack the sender.
+        sid = sender["sender_id"]
+        if sid not in self._access_requested:
+            self._access_requested.add(sid)
+            try:
+                get_event_notifications().push(
+                    profile=self.profile,
+                    conversation_id="",
+                    conversation_title=f"Access request: {self.channel_type}",
+                    message_preview=(
+                        f"{sender.get('display_name') or sid} wants to chat on the "
+                        f"{self.channel_type} channel. Approve it under Settings → Channels."
+                    ),
+                    kind="channel_subscribe_request",
+                    priority="high",
+                    extra={
+                        "channel_id": self.channel_id,
+                        "channel_type": self.channel_type,
+                        "sender_id": sid,
+                        "sender_name": sender.get("display_name") or "",
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("channels: failed to push access request notification")
+        await self.send(
+            sid,
+            "⏳ Your request to chat is pending admin approval. "
+            "You'll be able to chat once approved.",
+        )
 
     # ── dispatch + reply forwarding ──
 

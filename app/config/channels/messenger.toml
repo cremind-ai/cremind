@@ -41,7 +41,12 @@ setup as Page Bot mode (webhook + verify token).
 ⚠️ Meta's **24-hour standard messaging window** applies: the Page can only
 proactively message a user who messaged it within the last 24 hours (outside
 that window a message tag is required). Put recipient PSIDs in "Target chat ids",
-or have recipients DM the Page /start to subscribe."""
+or have recipients DM the Page /start to subscribe.
+
+Access control: pick a "Subscription authentication" method — open, passcode
+(/start <passcode>), one-time code (you relay a code per person), admin approval
+(approve each subscriber under Settings → Channels or `cremind channels approve`),
+or allowlist-only (no self-subscribe; only Target chat ids receive)."""
 [channel.modes.fields]
 page_access_token = { description = "Page Access Token", type = "string", secret = true, required = true }
 verify_token = { description = "Webhook Verify Token (you choose this)", type = "string", secret = true, required = true }

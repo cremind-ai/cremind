@@ -1,5 +1,5 @@
 ---
-description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders`, run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), set a channel's push-notification filter with `notify-filter`, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
+description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders`, run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), set a channel's push-notification filter with `notify-filter`, push an ad-hoc message out to a notification channel with `send`, `approve`/`revoke` who may subscribe to a notification channel, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). All channels gate access with the same per-channel **authentication** method — open, passcode, one-time code (`otp`), admin approval, or allowlist — controlling who may chat (bot/userbot) or subscribe (notification); `approve`/`revoke` authorize individual senders and work in every mode. A notification channel can also receive one-off messages you send with `cremind channels send` — the same delivery the agent's `send_notification` tool uses when you ask it to 'notify me on Telegram'. Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
 ---
 
 # `cremind channels` — External Messaging Channel Management
@@ -24,6 +24,9 @@ The group covers these operations:
   userbot code + 2FA) in the terminal.
 - **`notify-filter`** — Show or set the notification filter of a
   `notification`-mode channel (see **Notification mode** below).
+- **`approve`** / **`revoke`** — Approve a pending subscriber (or revoke an
+  existing one) on a `notification`-mode channel — the operator side of the
+  `approval` subscription-auth method (see **Notification mode** below).
 - **`delete`** — Tear down the adapter and remove the row. **Cascades
   delete to every conversation that belonged to that channel and
   every per-sender authentication state.**
@@ -46,7 +49,7 @@ Each row returned by `list` looks like:
 | `id`               | UUID of the channel row. Used by `delete`, the API's `PATCH /api/channels/{id}`, and the conversation FK.                |
 | `channel_type`     | `telegram` \| `whatsapp` \| `discord` \| `slack` \| `messenger` \| `zalo`. Unique per profile (you can't register two Telegrams).  |
 | `mode`             | `bot` (a separate bot account replies — Telegram/Discord/Slack/Zalo bot, Messenger Page bot), `userbot` (your own account auto-replies — WhatsApp and Zalo personal via QR pairing), or `notification` (push-only: no conversation; forwards Cremind's automation/event notifications to the chat with a configurable filter). |
-| `auth_mode`        | `none` \| `otp` \| `password`. Which gate to apply per inbound sender before the agent runs. Ignored in `notification` mode (there is no agent dispatch; use `subscribe_passcode` in config to gate who may `/start`). |
+| `auth_mode`        | **Legacy** per-sender gate (`none` \| `otp` \| `password`), superseded by the unified `config.subscribe_auth` (see **Access authentication** below). Still read for back-compat on channels created before unification (`password`→`passcode`, `otp`→`otp`, `none`→`open`); new channels set `subscribe_auth` and leave this `none`. |
 | `response_mode`    | `normal` (final answer only) or `detail` (also stream Thinking-Process step bubbles).                                    |
 | `enabled`          | `true`/`false`. Disabling stops the in-process adapter without deleting the row.                                          |
 | `status`           | `running` / `stopped` — derived live from the registry, not stored.                                                       |
@@ -57,6 +60,28 @@ Each row returned by `list` looks like:
 The list of which fields are *secret* per channel type comes from the
 TOML catalog (`cremind channels catalog`); the API redacts those keys to
 `***` in any list/get response.
+
+## Access authentication (all modes)
+
+Every channel — conversational (`bot`/`userbot`) and `notification` — gates who
+may use it with the **same** per-channel setting, `config.subscribe_auth`, chosen
+in the web UI's **Authentication** dropdown or via
+`cremind channels edit <id> --config subscribe_auth=<method>`:
+
+| method | conversational (bot/userbot) — who may chat | notification — who may subscribe |
+|---|---|---|
+| `open` *(default)* | anyone who messages | anyone who `/start`s |
+| `passcode` | sender sends the passcode once to unlock (`config.subscribe_passcode`) | `/start <passcode>` |
+| `otp` | server code shown in your web-UI bell; the sender echoes it | same |
+| `approval` | first message is held; sender told "pending", you're notified; the agent replies only after you approve | `/start` creates a pending subscriber you approve |
+| `allowlist` | only approved senders may chat; unknown senders get a flat refusal | no self-subscribe; only `config.target_chat_ids` receive |
+
+For `approval`/`allowlist` you authorize a sender with **`cremind channels approve
+<id> <sender>`** (or the Approve button on the Channels page); `revoke` reverses
+it. Both work for any mode. Back-compat: the legacy conversational `auth_mode`
+(`none`/`otp`/`password`) and `config.password` are read automatically when
+`subscribe_auth` is unset, so channels created before unification keep their gate
+(`password`→`passcode`, `otp`→`otp`, `none`→`open`).
 
 ## Read-only contract
 
@@ -271,7 +296,26 @@ so recipients opt in:
   `channel_senders` rows and survive restarts.
 - Or set `target_chat_ids` in config (comma-separated chat ids / JIDs) to push
   to a known group/channel without anyone having to `/start`.
-- Set `subscribe_passcode` in config to require `/start <passcode>`.
+
+**Subscription authentication.** Who may subscribe is controlled per-channel by
+`config.subscribe_auth` (the web UI's **Subscription authentication** dropdown, or
+`cremind channels edit <id> --config subscribe_auth=<method>`). Without it a
+stranger who finds the bot can `/start` and receive your notifications, so pick a
+method other than `open` for anything sensitive:
+
+- `open` *(default)* — anyone who sends `/start` subscribes. Backward-compatible:
+  leaving `subscribe_auth` unset behaves this way, except a channel that only set
+  `subscribe_passcode` (before this setting existed) still behaves as `passcode`.
+- `passcode` — the sender must send `/start <passcode>` matching
+  `config.subscribe_passcode`.
+- `otp` — `/start` makes Cremind generate a one-time code shown to you in the web
+  UI's notification bell; you share it out-of-band and the sender replies with it
+  to subscribe. Codes expire after 10 minutes.
+- `approval` — `/start` creates a **pending** subscriber and notifies you; they
+  receive nothing until you approve them (`cremind channels approve <id> <sender>`
+  or the **Approve** button on the Channels page). `revoke` reverses it.
+- `allowlist` — self-subscribe is refused; only `config.target_chat_ids` receive
+  (any previously-approved self-subscribers are excluded too).
 
 **One channel per platform.** A profile can register only one Telegram (and one
 WhatsApp) channel, so choosing `notification` **replaces** conversational
@@ -396,6 +440,48 @@ sender rows. Prints `no senders.` when the channel hasn't seen any.
 $ cremind channels senders e2e8...d4f1
 SENDER_ID    NAME        AUTHED  CONVERSATION_ID  PENDING_OTP
 84986664411  Lee Nguyen  yes     c_92bc
+```
+
+### `cremind channels approve` / `cremind channels revoke`
+
+**Purpose.** Approve a pending sender (or revoke an existing one) on **any**
+channel. This is the operator side of the `approval`/`allowlist` access methods:
+on a `notification` channel a sender who `/start`s stays pending until approved;
+on a `bot`/`userbot` channel a sender's first message is held (the agent won't
+reply) until approved. Mode-agnostic — it just flips the sender's authorized flag.
+
+**Syntax.**
+
+```bash
+cremind channels approve <channel_id> <sender_id>
+cremind channels revoke  <channel_id> <sender_id>
+```
+
+**Behavior.** PATCHes `/api/channels/{id}/senders/{sender_id}` with
+`{"authenticated": true|false}`. The sender must already exist — i.e. they've
+contacted the channel (sent `/start`, or any message on a conversational
+channel) — otherwise the server returns 404 (so a typo can't seed a junk row).
+Find the `sender_id` with `cremind channels senders <channel_id>`. Approving
+clears any outstanding one-time code. `revoke` works on any sender regardless of
+the channel's auth method, so it's also how you cut off someone on an
+`open`/`passcode`/`otp` channel. The web UI's Channels page exposes the same
+**Approve** / **Revoke** buttons per sender.
+
+**Example.**
+
+```bash
+# See who's waiting / subscribed
+$ cremind channels senders e2e8...d4f1
+SENDER_ID    NAME        AUTHED  CONVERSATION_ID  PENDING_OTP
+84986664411  Lee Nguyen  no
+
+# Approve them
+$ cremind channels approve e2e8...d4f1 84986664411
+84986664411: approved on channel e2e8...d4f1
+
+# Later, revoke
+$ cremind channels revoke e2e8...d4f1 84986664411
+84986664411: revoked on channel e2e8...d4f1
 ```
 
 ### `cremind channels pair`

@@ -4,6 +4,7 @@ export type NotificationKind =
   | 'completed'
   | 'error'
   | 'channel_otp'
+  | 'channel_subscribe_request'
   | 'skill_register_required'
   | 'event_run_pending'
   | 'event_run_completed'

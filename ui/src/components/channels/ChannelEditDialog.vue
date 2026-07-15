@@ -30,9 +30,7 @@ const emit = defineEmits<{
 }>();
 
 const dialogMode = ref<string>('');
-const dialogAuthMode = ref<'none' | 'otp' | 'password'>('none');
 const dialogResponseMode = ref<'detail' | 'normal'>('normal');
-const dialogPassword = ref<string>('');
 const dialogConfig = reactive<Record<string, any>>({});
 
 const catalogEntry = computed<ChannelCatalogEntry | null>(() => {
@@ -49,8 +47,26 @@ const modeEntry = computed<ChannelCatalogMode | null>(() => {
 // auth/response controls, which are irrelevant to a push-only channel.
 const isNotification = computed(() => dialogMode.value === 'notification');
 
-// Seed a default filter the first time the user lands on notification mode so
-// the editor has an object to bind to (create path clears dialogConfig).
+// Access-authentication methods — the SAME set for every mode (stored in
+// config.subscribe_auth). Labels are phrased per mode: notification gates who
+// may *subscribe*, conversational gates who may *chat*.
+const authOptions = computed(() => (isNotification.value ? [
+  { value: 'open', label: 'Open — anyone can /start to subscribe' },
+  { value: 'passcode', label: 'Passcode — /start <passcode> required' },
+  { value: 'otp', label: 'One-time code — you share a code per subscriber' },
+  { value: 'approval', label: 'Approval — you approve each subscriber' },
+  { value: 'allowlist', label: 'Allowlist only — no self-subscribe' },
+] : [
+  { value: 'open', label: 'Open — anyone can message the bot' },
+  { value: 'passcode', label: 'Passcode — sender sends a passcode to chat' },
+  { value: 'otp', label: 'One-time code — you relay a code to the sender' },
+  { value: 'approval', label: 'Approval — you approve each sender before they can chat' },
+  { value: 'allowlist', label: 'Allowlist only — only approved senders may chat' },
+]));
+
+// Seed the notification filter the first time the user switches to notification
+// mode so the editor has an object to bind to (create path clears dialogConfig).
+// subscribe_auth is mode-independent and is seeded on dialog open below.
 watch(isNotification, (on) => {
   if (on && !dialogConfig.notification_filter) {
     dialogConfig.notification_filter = defaultNotificationFilter();
@@ -70,13 +86,27 @@ watch(
 
     if (props.initial) {
       dialogMode.value = props.initial.mode || entry.modes[0]?.id || 'bot';
-      dialogAuthMode.value = (props.initial.auth_mode || entry.auth_modes?.[0] || 'none') as any;
       dialogResponseMode.value = (props.initial.response_mode || entry.default_response_mode || 'normal') as any;
-      dialogPassword.value = (props.initial.config?.password as string) || '';
+      const initConfig = (props.initial.config || {}) as Record<string, any>;
       for (const k of Object.keys(dialogConfig)) delete dialogConfig[k];
-      for (const [k, v] of Object.entries(props.initial.config || {})) {
-        if (k === 'password') continue;
+      for (const [k, v] of Object.entries(initConfig)) {
+        if (k === 'password') continue;  // legacy conversational key → mapped below
         dialogConfig[k] = v;
+      }
+      // Legacy conversational passcode lived in config.password.
+      if (!dialogConfig.subscribe_passcode && initConfig.password) {
+        dialogConfig.subscribe_passcode = initConfig.password;
+      }
+      // Resolve the unified access method, mirroring the server's back-compat:
+      // explicit config.subscribe_auth → legacy auth_mode column → a configured
+      // passcode → open.
+      if (!dialogConfig.subscribe_auth) {
+        const legacy = (props.initial.auth_mode || '').toLowerCase();
+        dialogConfig.subscribe_auth =
+          legacy === 'password' ? 'passcode'
+            : legacy === 'otp' ? 'otp'
+              : dialogConfig.subscribe_passcode ? 'passcode'
+                : 'open';
       }
     } else {
       // Prefer the first implemented mode as the default — picking an
@@ -84,10 +114,9 @@ watch(
       // backend 400 is bad UX.
       const firstImplemented = entry.modes.find((m) => m.implemented !== false);
       dialogMode.value = (firstImplemented || entry.modes[0])?.id || 'bot';
-      dialogAuthMode.value = (entry.auth_modes?.[0] as any) || 'none';
       dialogResponseMode.value = (entry.default_response_mode as any) || 'normal';
-      dialogPassword.value = '';
       for (const k of Object.keys(dialogConfig)) delete dialogConfig[k];
+      dialogConfig.subscribe_auth = 'open';
     }
   },
   { immediate: true },
@@ -107,21 +136,20 @@ function handleClose() {
 function handleSubmit() {
   if (!catalogEntry.value) return;
   const config: Record<string, any> = { ...dialogConfig };
+  // Access auth (config.subscribe_auth) is shared by every mode.
+  config.subscribe_auth = dialogConfig.subscribe_auth || 'open';
   if (isNotification.value) {
-    // Push-only channel: no auth gate; ensure the filter is present and drop
-    // nothing else. Force auth_mode=none so a stale selection can't gate sends.
     config.notification_filter = dialogConfig.notification_filter || defaultNotificationFilter();
   } else {
-    // Not a notification channel — never leak a filter into its config.
+    // Never leak a notification-only filter into a conversational channel.
     delete config.notification_filter;
-    if (dialogAuthMode.value === 'password' && dialogPassword.value) {
-      config.password = dialogPassword.value;
-    }
   }
   emit('submit', {
     channel_type: props.channelType,
     mode: dialogMode.value,
-    auth_mode: isNotification.value ? 'none' : dialogAuthMode.value,
+    // auth_mode is deprecated (superseded by config.subscribe_auth); send a
+    // neutral value so the column no longer drives the gate.
+    auth_mode: 'none',
     response_mode: dialogResponseMode.value,
     enabled: true,
     config,
@@ -168,6 +196,7 @@ function handleSubmit() {
 
         <ElFormItem
           v-for="(field, name) in modeEntry?.fields || {}"
+          v-show="name !== 'subscribe_passcode'"
           :key="name"
           :label="field.description"
         >
@@ -179,41 +208,43 @@ function handleSubmit() {
           />
         </ElFormItem>
 
-        <template v-if="isNotification">
-          <ElFormItem label="Notification filter">
-            <NotificationFilterEditor v-model="dialogConfig.notification_filter" />
-          </ElFormItem>
-        </template>
-
-        <template v-else>
-          <ElFormItem
-            v-if="(catalogEntry.auth_modes?.length || 0) > 1"
-            label="Authentication"
-          >
-            <ElSelect v-model="dialogAuthMode" style="width: 100%">
-              <ElOption
-                v-for="m in (catalogEntry.auth_modes || ['none'])"
-                :key="m" :value="m" :label="m"
-              />
-            </ElSelect>
-          </ElFormItem>
-
-          <ElFormItem v-if="dialogAuthMode === 'password'" label="Password">
-            <ElInput
-              v-model="dialogPassword"
-              type="password"
-              show-password
-              placeholder="Senders must reply with this exact password to chat"
+        <!-- Access authentication — the same control for every mode
+             (stored in config.subscribe_auth). -->
+        <ElFormItem :label="isNotification ? 'Subscription authentication' : 'Authentication'">
+          <ElSelect v-model="dialogConfig.subscribe_auth" style="width: 100%">
+            <ElOption
+              v-for="opt in authOptions"
+              :key="opt.value"
+              :value="opt.value"
+              :label="opt.label"
             />
-          </ElFormItem>
+          </ElSelect>
+        </ElFormItem>
 
-          <ElFormItem label="Reply detail">
-            <ElRadioGroup v-model="dialogResponseMode">
-              <ElRadioButton value="normal">Final answer only</ElRadioButton>
-              <ElRadioButton value="detail">Include thinking</ElRadioButton>
-            </ElRadioGroup>
-          </ElFormItem>
-        </template>
+        <ElFormItem
+          v-if="dialogConfig.subscribe_auth === 'passcode'"
+          label="Passcode"
+        >
+          <ElInput
+            v-model="dialogConfig.subscribe_passcode"
+            type="password"
+            show-password
+            :placeholder="isNotification
+              ? 'Senders must send /start <passcode> to subscribe'
+              : 'Senders must send this passcode to start chatting'"
+          />
+        </ElFormItem>
+
+        <ElFormItem v-if="isNotification" label="Notification filter">
+          <NotificationFilterEditor v-model="dialogConfig.notification_filter" />
+        </ElFormItem>
+
+        <ElFormItem v-else label="Reply detail">
+          <ElRadioGroup v-model="dialogResponseMode">
+            <ElRadioButton value="normal">Final answer only</ElRadioButton>
+            <ElRadioButton value="detail">Include thinking</ElRadioButton>
+          </ElRadioGroup>
+        </ElFormItem>
       </ElForm>
     </div>
 
