@@ -40,6 +40,11 @@ from app.tools.builtin.exec_shell_autostart import (
 )
 from app.utils.logger import logger
 
+# The sentinel the storage layer substitutes for a secret value on read
+# (app/storage/tool_storage.py). A client that echoes it back on save means
+# "leave the secret unchanged" — persisting it would clobber the real secret.
+_SECRET_MASK = "***"
+
 
 def _profile_from_request(request: Request) -> str:
     return getattr(request.user, "username", "") or ""
@@ -301,6 +306,13 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         for key, value in normalized.items():
             field_spec = required_config.get(key, {})
             is_secret = bool(field_spec.get("secret") or _is_secret_var_name(key))
+            # A client that re-submits the masked placeholder for a secret it
+            # didn't retype means "keep the existing value" — skip the write so
+            # we never clobber the real secret with "***" (which would then be
+            # injected as a live credential). Mirrors app/api/llm.py's guard.
+            # A genuine clear still works: the client sends "" (not the mask).
+            if is_secret and value == _SECRET_MASK:
+                continue
             config_manager.set_variable(
                 tool_id, profile, key, value, is_secret=is_secret,
             )
