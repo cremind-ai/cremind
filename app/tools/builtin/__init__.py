@@ -64,6 +64,7 @@ _BUILTIN_MODULE_NAMES: tuple[str, ...] = (
     "browser",
     "sleep",
     "claude_code",
+    "codex",
     "documentation_search",
     "change_working_directory",
     "web_search",
