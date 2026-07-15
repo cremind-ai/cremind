@@ -267,6 +267,32 @@ export async function fetchChannelSenders(
 }
 
 /**
+ * Approve (`authenticated=true`) or revoke a channel subscriber — the operator
+ * side of the notification-channel `approval` subscription-auth method. The
+ * sender must already exist (they've contacted the channel), else the server 404s.
+ */
+export async function setSenderAuthenticated(
+  agentUrl: string, authToken: string, channelId: string,
+  senderId: string, authenticated: boolean,
+): Promise<ChannelSenderRow> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/channels/${encodeURIComponent(channelId)}/senders/${encodeURIComponent(senderId)}`,
+    {
+      method: 'PATCH',
+      headers: authHeaders(authToken),
+      body: JSON.stringify({ authenticated }),
+    },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Failed to update subscriber: ${res.statusText}`);
+  }
+  const data = await res.json();
+  return data.sender;
+}
+
+/**
  * Frames emitted by ``GET /api/channels/{id}/auth-events`` for any
  * channel currently in an interactive-pairing state. WhatsApp emits
  * ``qr``; Telegram userbot emits ``code_required`` and (if 2FA is

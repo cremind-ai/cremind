@@ -61,6 +61,25 @@ def _redact(channel: dict, catalog: dict[str, dict]) -> dict:
     return {**channel, "config": cfg}
 
 
+def _validate_subscribe_auth(config: dict) -> str | None:
+    """Return an error message if ``config.subscribe_auth`` is invalid, else None.
+
+    Absent/empty is valid (defaults to ``open``). Only meaningful for
+    notification-mode channels; callers gate on mode before calling.
+    """
+    from app.channels.notification_delivery import SUBSCRIBE_AUTH_METHODS
+
+    val = config.get("subscribe_auth")
+    if val in (None, ""):
+        return None
+    if str(val).strip().lower() not in SUBSCRIBE_AUTH_METHODS:
+        return (
+            "subscribe_auth must be one of "
+            f"{', '.join(SUBSCRIBE_AUTH_METHODS)}"
+        )
+    return None
+
+
 def _decorate(channel: dict) -> dict:
     """Add live-runtime ``status`` derived from the registry + persisted state.
 
@@ -181,6 +200,12 @@ async def create_channel_for_profile(
         except ValueError as exc:
             return None, {"error": f"Invalid notification_filter: {exc}", "status": 400}
 
+    # ``subscribe_auth`` is the unified access-auth setting for every mode
+    # (conversational + notification); validate it whenever present.
+    auth_err = _validate_subscribe_auth(config)
+    if auth_err:
+        return None, {"error": auth_err, "status": 400}
+
     enabled = bool(payload.get("enabled", True))
 
     ch = await conversation_storage.create_channel(
@@ -195,7 +220,13 @@ async def create_channel_for_profile(
 
     if enabled:
         try:
-            ch = await get_channel_registry().start_for_channel(ch)
+            # ``install_if_missing`` pip-installs the channel's optional SDK
+            # extras at runtime before the adapter starts (Telegram/Discord/
+            # Slack) so a post-setup connect doesn't fail with a missing
+            # package — mirrors the browser/claude_code tools.
+            ch = await get_channel_registry().start_for_channel(
+                ch, install_if_missing=True,
+            )
         except Exception:  # noqa: BLE001
             logger.exception(f"channels: failed to start {ch['id']}")
 
@@ -323,6 +354,9 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
                         {"error": f"Invalid notification_filter: {exc}"},
                         status_code=400,
                     )
+            auth_err = _validate_subscribe_auth(merged)
+            if auth_err:
+                return JSONResponse({"error": auth_err}, status_code=400)
             update["config"] = merged
 
         updated = await conversation_storage.update_channel(cid, **update)
@@ -330,10 +364,16 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
             return JSONResponse({"error": "Channel not found"}, status_code=404)
 
         # Restart adapter when anything that affects runtime changed.
+        # ``install_if_missing`` covers the enable/mode-change case where the
+        # channel's SDK extras aren't on disk yet (e.g. switching an existing
+        # row to a new platform, or re-enabling on a host that never installed
+        # them) — install at runtime before the adapter restarts.
         runtime_keys = {"mode", "auth_mode", "enabled", "config"}
         if any(k in update for k in runtime_keys):
             try:
-                updated = await get_channel_registry().restart_for_channel(cid) or updated
+                updated = await get_channel_registry().restart_for_channel(
+                    cid, install_if_missing=True,
+                ) or updated
             except Exception:  # noqa: BLE001
                 logger.exception(f"channels: restart failed for {cid}")
 
@@ -508,6 +548,131 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         ]
         return JSONResponse({"senders": redacted})
 
+    async def handle_set_sender_authenticated(request: Request) -> JSONResponse:
+        """Approve or revoke a channel subscriber (operator action).
+
+        Body: ``{"authenticated": bool}``. Backs the "Approve"/"Revoke"
+        controls in the Subscribers UI and ``cremind channels approve/revoke``
+        for notification channels using ``approval`` subscription auth — but is
+        mode-agnostic (it just flips the sender's ``authenticated`` flag). The
+        sender must already exist (i.e. they have contacted the channel);
+        returns 404 otherwise, so a typo can't seed a junk row.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile_from_request(request)
+        cid = request.path_params["channel_id"]
+        sid = request.path_params["sender_id"]
+        ch = await conversation_storage.get_channel(cid)
+        if not ch:
+            return JSONResponse({"error": "Channel not found"}, status_code=404)
+        if ch["profile"] != profile:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        authed = body.get("authenticated") if isinstance(body, dict) else None
+        if not isinstance(authed, bool):
+            return JSONResponse(
+                {"error": "'authenticated' (boolean) is required"},
+                status_code=400,
+            )
+
+        senders = await conversation_storage.list_senders(cid)
+        sender = next((s for s in senders if s.get("sender_id") == sid), None)
+        if sender is None:
+            return JSONResponse({"error": "Sender not found"}, status_code=404)
+
+        # Approving clears any outstanding OTP challenge so a stale code can't
+        # later be replayed; revoking just drops the subscription.
+        fields: dict[str, Any] = {"authenticated": authed}
+        if authed:
+            fields["pending_otp"] = None
+            fields["pending_otp_expires_at"] = None
+        updated = await conversation_storage.update_sender(sender["id"], **fields)
+        if updated is None:
+            return JSONResponse({"error": "Sender not found"}, status_code=404)
+        out = {
+            **updated,
+            "pending_otp": _REDACTED if updated.get("pending_otp") else None,
+        }
+        return JSONResponse({"sender": out})
+
+    async def handle_notify_channel(request: Request) -> JSONResponse:
+        """Push an ad-hoc message OUT to a notification-mode channel.
+
+        Body: ``{"message": "..."}``. Delivers straight to the channel's
+        recipients (configured ``target_chat_ids`` ∪ authenticated subscribers)
+        via the live adapter's ``deliver_text`` — a direct push that bypasses
+        the channel's ``NotificationFilter`` (an explicit, operator-initiated
+        send). Backs ``cremind channels send`` and mirrors the agent's
+        ``send_notification`` tool. Only valid for ``mode == "notification"``
+        channels with a running adapter.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile_from_request(request)
+        cid = request.path_params["channel_id"]
+        ch = await conversation_storage.get_channel(cid)
+        if not ch:
+            return JSONResponse({"error": "Channel not found"}, status_code=404)
+        if ch["profile"] != profile:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        if (ch.get("mode") or "") != "notification":
+            return JSONResponse(
+                {
+                    "error": "Not a notification channel",
+                    "message": (
+                        "Ad-hoc sends are only supported on channels in "
+                        "notification mode."
+                    ),
+                },
+                status_code=400,
+            )
+
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "Body must be a JSON object"}, status_code=400)
+        message = str(payload.get("message") or "").strip()
+        if not message:
+            return JSONResponse(
+                {"error": "'message' is required and cannot be empty"},
+                status_code=400,
+            )
+
+        try:
+            adapter = get_channel_registry().get_adapter(cid)
+        except RuntimeError:
+            adapter = None
+        if adapter is None:
+            return JSONResponse(
+                {
+                    "error": "Adapter not running",
+                    "message": (
+                        "The channel is not currently running, so nothing could "
+                        "be delivered."
+                    ),
+                },
+                status_code=409,
+            )
+
+        try:
+            recipients = await adapter.deliver_text(message)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(f"channels: notify send failed for {cid}")
+            return JSONResponse(
+                {"error": "Delivery failed", "message": str(exc)},
+                status_code=502,
+            )
+        return JSONResponse({"delivered": recipients > 0, "recipients": recipients})
+
     async def handle_messenger_webhook(request: Request):
         """Public Facebook Messenger webhook (GET verify + POST receive).
 
@@ -615,6 +780,11 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
             methods=["GET"],
         ),
         Route(
+            "/api/channels/{channel_id}/senders/{sender_id}",
+            endpoint=handle_set_sender_authenticated,
+            methods=["PATCH"],
+        ),
+        Route(
             "/api/channels/{channel_id}/qr",
             endpoint=handle_auth_events_stream,
             methods=["GET"],
@@ -627,6 +797,11 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         Route(
             "/api/channels/{channel_id}/auth-input",
             endpoint=handle_auth_input,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/channels/{channel_id}/notify",
+            endpoint=handle_notify_channel,
             methods=["POST"],
         ),
     ]

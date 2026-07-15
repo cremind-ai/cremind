@@ -99,7 +99,11 @@ def channels_add(
         help="Channel type (telegram, whatsapp, discord, messenger, slack, zalo).",
     ),
     mode: str = typer.Option("bot", "--mode", help="Channel mode (bot|userbot|notification)."),
-    auth_mode: str = typer.Option("none", "--auth-mode", help="Auth mode (none|otp|password)."),
+    auth_mode: str = typer.Option(
+        "none", "--auth-mode",
+        help="Legacy access auth (none|otp|password). Prefer the unified "
+             "--config subscribe_auth=open|passcode|otp|approval|allowlist.",
+    ),
     response_mode: str = typer.Option("normal", "--response-mode", help="Reply detail (normal|detail)."),
     config_json: Optional[str] = typer.Option(
         None, "--json",
@@ -275,6 +279,88 @@ def channels_notify_filter(
     typer.echo(_json.dumps(current, indent=2, ensure_ascii=False))
 
 
+@channels_app.command("send")
+@graceful_errors
+def channels_send(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id (a notification-mode channel)."),
+    message: Optional[str] = typer.Argument(
+        None, help="Message text. Omit to read from --message-file or stdin.",
+    ),
+    message_file: Optional[str] = typer.Option(
+        None, "--message-file", "-f",
+        help="Read the message from this file (use '-' for stdin). Preferred on "
+             "PowerShell, where inline quoting mangles apostrophes/quotes.",
+    ),
+) -> None:
+    """Push an ad-hoc message OUT to a notification-mode channel.
+
+    Delivers to the channel's recipients (configured target chat IDs plus
+    everyone who has /start-subscribed) via the running adapter, bypassing the
+    channel's notification filter. The channel must be in notification mode and
+    its adapter must be running.
+
+    Examples:
+      cremind channels send <id> "Deploy finished OK"
+      cremind channels send <id> --message-file note.txt
+      echo "1+1 = 2" | cremind channels send <id> -f -
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import notify_channel
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    if message is not None and message_file is not None:
+        typer.echo("pass either a message argument or --message-file, not both", err=True)
+        raise typer.Exit(code=1)
+
+    text: str
+    if message_file is not None:
+        if message_file == "-":
+            text = sys.stdin.read()
+        else:
+            try:
+                with open(message_file, encoding="utf-8") as fh:
+                    text = fh.read()
+            except OSError as e:
+                typer.echo(f"--message-file: {e}", err=True)
+                raise typer.Exit(code=1) from e
+    elif message is not None:
+        text = message
+    else:
+        # No message given anywhere — fall back to stdin (supports piping).
+        text = sys.stdin.read()
+
+    text = text.strip()
+    if not text:
+        typer.echo("message is empty — nothing to send", err=True)
+        raise typer.Exit(code=1)
+
+    cfg: Config = ctx.obj["cfg"]
+    out_mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await notify_channel(client, channel_id, text)
+
+    result = asyncio.run(_run())
+
+    if out_mode.json:
+        print_json(result)
+        return
+    recipients = int(result.get("recipients") or 0)
+    if result.get("delivered"):
+        sys.stdout.write(f"Delivered to {recipients} recipient(s).\n")
+    else:
+        sys.stdout.write(
+            "Not delivered — the channel has no recipients yet "
+            "(ask subscribers to /start, or set target chat IDs).\n"
+        )
+
+
 def _parse_config_option(
     config_json: Optional[str], config_kv: Optional[list[str]],
 ) -> Optional[dict[str, Any]]:
@@ -320,7 +406,9 @@ def channels_edit(
         None, "--mode", help="Channel mode (bot|userbot|notification).",
     ),
     auth_mode: Optional[str] = typer.Option(
-        None, "--auth-mode", help="Auth mode (none|otp|password).",
+        None, "--auth-mode",
+        help="Legacy access auth (none|otp|password). Prefer the unified "
+             "--config subscribe_auth=open|passcode|otp|approval|allowlist.",
     ),
     response_mode: Optional[str] = typer.Option(
         None, "--response-mode", help="Reply detail (normal|detail).",
@@ -471,6 +559,62 @@ def channels_senders(
             string_field(s, "pending_otp"),
         )
     table.render()
+
+
+def _set_sender_authenticated(
+    ctx: typer.Context, channel_id: str, sender_id: str, authenticated: bool,
+) -> None:
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import set_sender_authenticated
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    out_mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await set_sender_authenticated(
+                client, channel_id, sender_id, authenticated,
+            )
+
+    sender = asyncio.run(_run())
+    if out_mode.json:
+        print_json(sender)
+        return
+    state = "approved" if sender.get("authenticated") else "revoked"
+    sys.stdout.write(
+        f"{sender.get('sender_id')}: {state} on channel {channel_id}\n"
+    )
+
+
+@channels_app.command("approve")
+@graceful_errors
+def channels_approve(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id (a notification-mode channel)."),
+    sender_id: str = typer.Argument(..., help="Sender id to approve (from `channels senders`)."),
+) -> None:
+    """Approve a pending subscriber on an `approval`-auth notification channel.
+
+    The subscriber must have contacted the channel first (sent /start); find
+    their id with `cremind channels senders <channel_id>`.
+    """
+    _set_sender_authenticated(ctx, channel_id, sender_id, True)
+
+
+@channels_app.command("revoke")
+@graceful_errors
+def channels_revoke(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    sender_id: str = typer.Argument(..., help="Sender id to revoke (from `channels senders`)."),
+) -> None:
+    """Revoke a subscriber so they stop receiving notifications."""
+    _set_sender_authenticated(ctx, channel_id, sender_id, False)
 
 
 @channels_app.command("pair")

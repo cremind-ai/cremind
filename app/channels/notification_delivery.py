@@ -15,6 +15,14 @@ the overload is conflict-free. Recipients survive restart (they live in the DB),
 and are union'd with any static ``config.target_chat_ids`` (for groups/channels
 a bot can't be ``/start``ed in via DM).
 
+Who may subscribe is gated by ``config.subscribe_auth`` (:data:`SUBSCRIBE_AUTH_METHODS`):
+``open`` (default — anyone who ``/start``s), ``passcode`` (``/start <passcode>``),
+``otp`` (a one-time code shown to the operator that the subscriber must echo),
+``approval`` (the operator approves each pending subscriber), or ``allowlist``
+(no self-subscribe; only ``config.target_chat_ids`` receive). ``otp`` reuses the
+``pending_otp`` columns; ``approval`` a sender stays ``authenticated=False`` until
+an operator flips it via ``PATCH /api/channels/{id}/senders/{sender_id}``.
+
 Delivery is **live-only**: we subscribe to the bus and forward entries from
 subscribe-time forward, never replaying the ring buffer, so a server restart
 does not re-spam old notifications.
@@ -23,9 +31,12 @@ does not re-spam old notifications.
 from __future__ import annotations
 
 import asyncio
+import secrets
+import time
 from typing import Any
 
 from app.channels.notification_filter import NotificationFilter, format_notification
+from app.events.notifications_buffer import get_event_notifications
 from app.events.notifications_bus import get_notifications_stream_bus
 from app.utils.logger import logger
 
@@ -58,12 +69,13 @@ _SUBSCRIBE_CMDS = {"/start", "/subscribe"}
 _UNSUBSCRIBE_CMDS = {"/stop", "/unsubscribe"}
 _HELP_CMDS = {"/help", "/status"}
 
-_HELP_TEXT = (
-    "🔔 This is a Cremind *notification* channel.\n"
-    "It delivers alerts here but does not chat.\n\n"
-    "• /start — subscribe to notifications\n"
-    "• /stop — unsubscribe"
-)
+# Per-channel subscription-authentication methods (stored in
+# ``config.subscribe_auth``). ``open`` is the default (and the behavior of
+# channels created before this feature): anyone who ``/start``s is subscribed.
+SUBSCRIBE_AUTH_METHODS = ("open", "passcode", "otp", "approval", "allowlist")
+
+# One-time subscribe codes live as long as the conversational OTP (10 min).
+_SUBSCRIBE_OTP_TTL_SECONDS = 600
 
 
 class NotificationDeliveryMixin:
@@ -126,7 +138,14 @@ class NotificationDeliveryMixin:
             )
 
     async def _notification_recipients(self) -> list[str]:
-        """Distinct send targets: static ``config.target_chat_ids`` ∪ subscribers."""
+        """Distinct send targets: static ``config.target_chat_ids`` ∪ subscribers.
+
+        In ``allowlist`` subscription mode there are no self-subscribers
+        (``/start`` is refused), so only the statically configured chat ids
+        receive — any ``authenticated`` rows left over from a previous method
+        are deliberately excluded so switching to allowlist locks the channel
+        down immediately.
+        """
         targets: list[str] = []
         seen: set[str] = set()
 
@@ -135,6 +154,9 @@ class NotificationDeliveryMixin:
             if t not in seen:
                 seen.add(t)
                 targets.append(t)
+
+        if self._subscribe_auth() == "allowlist":
+            return targets
 
         try:
             senders = await self.storage.list_senders(self.channel_id)  # type: ignore[attr-defined]
@@ -152,32 +174,264 @@ class NotificationDeliveryMixin:
                 targets.append(sid)
         return targets
 
-    # ── inbound control commands (replaces agent dispatch in notification mode) ──
+    async def deliver_text(self, text: str) -> int:
+        """Send raw ``text`` to every notification recipient; return the count.
 
-    async def _handle_notification_command(
-        self, sender_id: str, display_name: str | None, text: str,
+        The programmatic push path used by the ``send_notification`` built-in
+        tool (and the ``POST /api/channels/{id}/notify`` endpoint). Resolves
+        recipients via :meth:`_notification_recipients` (static
+        ``config.target_chat_ids`` ∪ authenticated subscribers) and fans out via
+        ``_send_chunked`` (chunking + the per-transport ``_send_text``).
+
+        Unlike the bus delivery loop this is an *explicit, user-commanded* send,
+        so it does NOT apply the channel's :class:`NotificationFilter` and does
+        NOT swallow transport errors — it lets ``_send_text`` failures propagate
+        so the caller can report a down channel honestly. Returns ``0`` (without
+        sending) for empty text or when there are no recipients.
+        """
+        text = (text or "").strip()
+        if not text:
+            return 0
+        recipients = await self._notification_recipients()
+        for target in recipients:
+            await self._send_chunked(target, text)  # type: ignore[attr-defined]
+        return len(recipients)
+
+    # ── subscription authentication ──
+
+    def _subscribe_auth(self) -> str:
+        """The channel's access-auth method — shared by every channel mode.
+
+        Returns one of :data:`SUBSCRIBE_AUTH_METHODS`. ``config.subscribe_auth``
+        is the canonical setting for all modes (notification + conversational);
+        several back-compat fallbacks keep pre-existing channels working so an
+        upgrade never silently opens a gated channel:
+
+        1. ``config.subscribe_auth`` (canonical, written by the UI/CLI now).
+        2. The legacy conversational ``auth_mode`` column — ``password`` →
+           ``passcode``, ``otp`` → ``otp`` (bot/userbot channels created before
+           unification).
+        3. A configured passcode (``subscribe_passcode`` or the legacy
+           conversational ``config.password``) → ``passcode``.
+        4. ``open`` otherwise.
+        """
+        cfg = self.channel.get("config") or {}  # type: ignore[attr-defined]
+        raw = str(cfg.get("subscribe_auth") or "").strip().lower()
+        if raw in SUBSCRIBE_AUTH_METHODS:
+            return raw
+
+        legacy = str(self.channel.get("auth_mode") or "").strip().lower()  # type: ignore[attr-defined]
+        if legacy == "password":
+            return "passcode"
+        if legacy in SUBSCRIBE_AUTH_METHODS and legacy != "open":
+            # ``otp`` (and any future value already in the canonical set).
+            return legacy
+
+        if cfg.get("subscribe_passcode") or cfg.get("password"):
+            return "passcode"
+        return "open"
+
+    def _help_text(self, auth: str) -> str:
+        base = (
+            "🔔 This is a Cremind *notification* channel.\n"
+            "It delivers alerts here but does not chat.\n\n"
+        )
+        if auth == "passcode":
+            line = "• /start <passcode> — subscribe (a passcode is required)\n"
+        elif auth == "otp":
+            line = (
+                "• /start — request a one-time code, then reply with the code "
+                "the admin gives you to subscribe\n"
+            )
+        elif auth == "approval":
+            line = "• /start — request a subscription (an admin must approve you)\n"
+        elif auth == "allowlist":
+            line = "• Self-subscribe is disabled — an admin adds recipients\n"
+        else:  # open
+            line = "• /start — subscribe to notifications\n"
+        return base + line + "• /stop — unsubscribe"
+
+    async def _mark_subscribed(
+        self, sender_id: str, display_name: str | None,
     ) -> None:
-        cmd, arg = _parse_command(text)
+        sender = await self.storage.get_or_create_sender(  # type: ignore[attr-defined]
+            self.channel_id, sender_id, display_name=display_name,  # type: ignore[attr-defined]
+        )
+        await self.storage.update_sender(  # type: ignore[attr-defined]
+            sender["id"], authenticated=True,
+            pending_otp=None, pending_otp_expires_at=None,
+        )
+        await self.send(  # type: ignore[attr-defined]
+            sender_id,
+            "✅ Subscribed. You'll receive Cremind notifications here.\n"
+            "Send /stop to unsubscribe.",
+        )
 
-        if cmd in _SUBSCRIBE_CMDS:
+    def _push_operator_notification(
+        self, *, title: str, preview: str, kind: str, extra: dict,
+    ) -> None:
+        """Best-effort push to the operator's notification bell. Never raises."""
+        try:
+            get_event_notifications().push(
+                profile=self.profile,  # type: ignore[attr-defined]
+                conversation_id="",
+                conversation_title=title,
+                message_preview=preview,
+                kind=kind,
+                priority="high",
+                extra=extra,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                f"[channels:{self.channel_type}:notify] operator push failed"  # type: ignore[attr-defined]
+            )
+
+    async def _issue_subscribe_otp(
+        self, sender_id: str, display_name: str | None,
+    ) -> None:
+        sender = await self.storage.get_or_create_sender(  # type: ignore[attr-defined]
+            self.channel_id, sender_id, display_name=display_name,  # type: ignore[attr-defined]
+        )
+        if sender.get("authenticated"):
+            await self.send(  # type: ignore[attr-defined]
+                sender_id, "✅ You're already subscribed. Send /stop to unsubscribe.",
+            )
+            return
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        await self.storage.update_sender(  # type: ignore[attr-defined]
+            sender["id"], pending_otp=code,
+            pending_otp_expires_at=time.time() + _SUBSCRIBE_OTP_TTL_SECONDS,
+        )
+        self._push_operator_notification(
+            title=display_name or sender_id,
+            preview=f"OTP {code} — {self.channel_type} subscribe request",  # type: ignore[attr-defined]
+            kind="channel_otp",
+            extra={
+                "channel_id": self.channel_id,  # type: ignore[attr-defined]
+                "channel_type": self.channel_type,  # type: ignore[attr-defined]
+                "sender_id": sender_id,
+                "sender_name": display_name or "",
+                "otp": code,
+            },
+        )
+        await self.send(  # type: ignore[attr-defined]
+            sender_id,
+            "🔐 To subscribe, reply with the one-time code the admin gives you.",
+        )
+
+    async def _verify_subscribe_otp(self, sender: dict, text: str) -> None:
+        now = time.time()
+        pending = sender.get("pending_otp")
+        expires_at = sender.get("pending_otp_expires_at") or 0
+        code = (text or "").strip()
+
+        if pending and expires_at > now and code == str(pending):
+            await self.storage.update_sender(  # type: ignore[attr-defined]
+                sender["id"], authenticated=True,
+                pending_otp=None, pending_otp_expires_at=None,
+            )
+            await self.send(  # type: ignore[attr-defined]
+                sender["sender_id"],
+                "✅ Subscribed. You'll receive Cremind notifications here.\n"
+                "Send /stop to unsubscribe.",
+            )
+            return
+
+        if pending and expires_at <= now:
+            await self._issue_subscribe_otp(
+                sender["sender_id"], sender.get("display_name"),
+            )
+            await self.send(  # type: ignore[attr-defined]
+                sender["sender_id"],
+                "⌛ That code expired — I've sent the admin a fresh one. "
+                "Reply with the new code.",
+            )
+            return
+
+        await self.send(  # type: ignore[attr-defined]
+            sender["sender_id"],
+            "❌ Incorrect code. Reply with the one-time code the admin gave you, "
+            "or send /start to request a new one.",
+        )
+
+    async def _handle_subscribe(
+        self, sender_id: str, display_name: str | None, auth: str, arg: str,
+    ) -> None:
+        if auth == "allowlist":
+            await self.send(  # type: ignore[attr-defined]
+                sender_id,
+                "🔒 Self-subscribe is disabled on this channel. "
+                "Ask an admin to add you as a recipient.",
+            )
+            return
+
+        if auth == "passcode":
             passcode = (self.channel.get("config") or {}).get("subscribe_passcode")  # type: ignore[attr-defined]
-            if passcode and arg.strip() != str(passcode):
+            if not passcode:
+                await self.send(  # type: ignore[attr-defined]
+                    sender_id,
+                    "🔒 This channel requires a passcode to subscribe, but none "
+                    "is configured yet. Ask an admin to set one.",
+                )
+                return
+            if arg.strip() != str(passcode):
                 await self.send(  # type: ignore[attr-defined]
                     sender_id,
                     "🔒 This notification channel is passcode-protected.\n"
                     "Send `/start <passcode>` to subscribe.",
                 )
                 return
+            await self._mark_subscribed(sender_id, display_name)
+            return
+
+        if auth == "approval":
             sender = await self.storage.get_or_create_sender(  # type: ignore[attr-defined]
                 self.channel_id, sender_id, display_name=display_name,  # type: ignore[attr-defined]
             )
-            await self.storage.update_sender(sender["id"], authenticated=True)  # type: ignore[attr-defined]
+            if sender.get("authenticated"):
+                await self.send(  # type: ignore[attr-defined]
+                    sender_id,
+                    "✅ You're already subscribed. Send /stop to unsubscribe.",
+                )
+                return
+            # Notify the operator once per pending request (the sender row is
+            # already the dedupe key — a repeat /start won't create a second).
+            self._push_operator_notification(
+                title=f"Subscribe request: {self.channel_type}",  # type: ignore[attr-defined]
+                preview=(
+                    f"{display_name or sender_id} wants to subscribe to the "
+                    f"{self.channel_type} notification channel. "  # type: ignore[attr-defined]
+                    "Approve it under Settings → Channels."
+                ),
+                kind="channel_subscribe_request",
+                extra={
+                    "channel_id": self.channel_id,  # type: ignore[attr-defined]
+                    "channel_type": self.channel_type,  # type: ignore[attr-defined]
+                    "sender_id": sender_id,
+                    "sender_name": display_name or "",
+                },
+            )
             await self.send(  # type: ignore[attr-defined]
                 sender_id,
-                "✅ Subscribed. You'll receive Cremind notifications here.\n"
-                "Send /stop to unsubscribe.",
+                "⏳ Your subscription request was sent to the admin for approval. "
+                "You'll start receiving notifications once approved.",
             )
             return
+
+        if auth == "otp":
+            await self._issue_subscribe_otp(sender_id, display_name)
+            return
+
+        # auth == "open" (default)
+        await self._mark_subscribed(sender_id, display_name)
+
+    # ── inbound control commands (replaces agent dispatch in notification mode) ──
+
+    async def _handle_notification_command(
+        self, sender_id: str, display_name: str | None, text: str,
+    ) -> None:
+        cmd, arg = _parse_command(text)
+        auth = self._subscribe_auth()
 
         if cmd in _UNSUBSCRIBE_CMDS:
             sender = await self.storage.get_or_create_sender(  # type: ignore[attr-defined]
@@ -190,5 +444,19 @@ class NotificationDeliveryMixin:
             )
             return
 
-        # /help, /status, or anything else → usage.
-        await self.send(sender_id, _HELP_TEXT)  # type: ignore[attr-defined]
+        if cmd in _SUBSCRIBE_CMDS:
+            await self._handle_subscribe(sender_id, display_name, auth, arg)
+            return
+
+        # A non-command message while an OTP challenge is outstanding is the
+        # subscriber typing their code back.
+        if auth == "otp":
+            sender = await self.storage.get_or_create_sender(  # type: ignore[attr-defined]
+                self.channel_id, sender_id, display_name=display_name,  # type: ignore[attr-defined]
+            )
+            if sender.get("pending_otp") and not sender.get("authenticated"):
+                await self._verify_subscribe_otp(sender, text)
+                return
+
+        # /help, /status, or anything else → method-aware usage.
+        await self.send(sender_id, self._help_text(auth))  # type: ignore[attr-defined]

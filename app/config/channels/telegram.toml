@@ -36,8 +36,10 @@ Setup:
    Telegram session is connected). Enter it in the pairing dialog.
 4. If your account has two-step verification, you'll also be prompted
    for the cloud password.
-5. Pick an authentication mode (none / OTP / password) so unknown
-   senders are gated before the agent runs for them."""
+5. Pick an access-authentication method (open / passcode / one-time code /
+   approval / allowlist) so unknown senders are gated before the agent runs.
+   With approval or allowlist you approve each sender under Settings →
+   Channels (or `cremind channels approve`)."""
 [channel.modes.fields]
 api_id = { description = "API ID (from my.telegram.org)", type = "string", required = true }
 api_hash = { description = "API Hash (from my.telegram.org)", type = "string", secret = true, required = true }
@@ -61,7 +63,12 @@ Setup:
 
 Note: a profile can register only one Telegram channel, so choosing Notification
 replaces conversational Bot/Userbot on Telegram for this profile (use a
-different platform, e.g. WhatsApp, if you want both)."""
+different platform, e.g. WhatsApp, if you want both).
+
+Access control: pick a "Subscription authentication" method — open, passcode
+(/start <passcode>), one-time code (you relay a code per person), admin approval
+(approve each subscriber under Settings → Channels or `cremind channels approve`),
+or allowlist-only (no self-subscribe; only Target chat ids receive)."""
 [channel.modes.fields]
 bot_token = { description = "Bot API Token", type = "string", secret = true, required = true }
 target_chat_ids = { description = "Optional target chat ids (comma-separated) for groups/channels", type = "string", required = false }

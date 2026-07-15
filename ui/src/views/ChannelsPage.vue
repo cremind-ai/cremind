@@ -54,6 +54,24 @@ function openConversation(senderRow: ChannelSenderRow) {
   });
 }
 
+async function setSenderAuth(
+  channel: ChannelRow, senderRow: ChannelSenderRow, authenticated: boolean,
+) {
+  try {
+    const updated = await channelsStore.setSenderAuthenticated(
+      channel.id, senderRow.sender_id, authenticated,
+    );
+    const list = senders.value[channel.id];
+    if (list) {
+      const idx = list.findIndex((s) => s.sender_id === updated.sender_id);
+      if (idx >= 0) list[idx] = updated;
+    }
+    ElMessage.success(authenticated ? 'Subscriber approved' : 'Subscriber revoked');
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to update subscriber');
+  }
+}
+
 function displayNameFor(channel: ChannelRow): string {
   return channelsStore.catalog[channel.channel_type]?.display_name || channel.channel_type;
 }
@@ -147,14 +165,28 @@ onMounted(loadAll);
             </template>
           </ElTableColumn>
           <ElTableColumn prop="sender_id" label="ID" min-width="160" />
-          <ElTableColumn prop="authenticated" label="Auth" width="110">
+          <ElTableColumn prop="authenticated" label="Status" width="110">
             <template #default="{ row }">
               <ElTag
                 :type="row.authenticated ? 'success' : 'info'"
                 size="small" effect="plain"
               >
-                {{ row.authenticated ? 'authenticated' : 'pending' }}
+                {{ row.authenticated ? 'subscribed' : 'pending' }}
               </ElTag>
+            </template>
+          </ElTableColumn>
+          <ElTableColumn label="Subscription" width="130">
+            <template #default="{ row }">
+              <ElButton
+                v-if="!row.authenticated"
+                size="small" type="success" link
+                @click="setSenderAuth(channel, row as ChannelSenderRow, true)"
+              >Approve</ElButton>
+              <ElButton
+                v-else
+                size="small" type="danger" link
+                @click="setSenderAuth(channel, row as ChannelSenderRow, false)"
+              >Revoke</ElButton>
             </template>
           </ElTableColumn>
           <ElTableColumn label="Conversation" width="140">
