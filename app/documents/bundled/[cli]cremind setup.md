@@ -20,7 +20,12 @@ The group has two halves with different auth requirements:
   `CREMIND_TOKEN` from an admin profile.
 
 A typical first-run flow is: `cremind setup status` → `cremind setup complete`
-(which prints a JWT) → `export CREMIND_TOKEN=...` → use the rest of the CLI.
+→ use the rest of the CLI. `setup complete` also **persists** the minted
+token to `<CREMIND_SYSTEM_DIR>/tokens/<profile>.token`, so on the same host
+the CLI picks it up automatically — you do **not** need to
+`export CREMIND_TOKEN`. Later commands prompt you to pick a profile on first
+use in a terminal (or accept `--profile <name>`); see `cremind profile`.
+Exporting `CREMIND_TOKEN` is still supported and takes precedence when set.
 
 ## Finding this in the web UI
 

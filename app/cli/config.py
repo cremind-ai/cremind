@@ -14,6 +14,7 @@ from typing import Literal, Optional
 
 ENV_SERVER = "CREMIND_SERVER"
 ENV_TOKEN = "CREMIND_TOKEN"
+ENV_PROFILE = "CREMIND_PROFILE"
 ENV_OUTPUT = "OPA_OUTPUT"
 ENV_NO_COLOR = "OPA_NO_COLOR"
 
@@ -34,8 +35,9 @@ class Config:
     def require_token(self) -> None:
         if not self.token:
             raise ConfigError(
-                f"{ENV_TOKEN} is not set - obtain a JWT from your Cremind admin "
-                f"or the setup wizard and export it"
+                "no Cremind profile selected and no token available. Run in an "
+                "interactive terminal to pick a profile, pass `--profile <name>`, "
+                f"set {ENV_TOKEN}, or run `cremind setup` to create a profile."
             )
 
 
