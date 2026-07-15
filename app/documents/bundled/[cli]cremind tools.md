@@ -1,5 +1,5 @@
 ---
-description: "List and configure the **tools** the agent can call (built-in, MCP, A2A, skill, intrinsic): inspect a tool's config, enable or disable A2A/MCP tools, set tool variables (env-style key/value) or arguments (JSON), toggle a tool's sub-tools (\"leaves\"), and register a skill's long-running app as an autostart process. Use this to turn tools on or off and configure them — distinct from `cremind agents` (registering MCP/A2A servers)."
+description: "List and configure the **tools** the agent can call (built-in, MCP, A2A, skill, intrinsic): inspect a tool's config, enable or disable A2A/MCP tools, set tool variables (env-style key/value), get or set arguments (JSON), toggle a tool's sub-tools (\"leaves\"), and register a skill's long-running app as an autostart process. Use this to turn tools on or off and configure them — distinct from `cremind agents` (registering MCP/A2A servers)."
 ---
 
 # `cremind tools` — Tool & Skill Configuration
@@ -230,6 +230,36 @@ wholesale. Silent on success.
 
 ```bash
 $ cremind tools set-args mcp.shell --json '{"shells":["bash","pwsh"],"timeout_s":120}'
+```
+
+### `cremind tools get-args`
+
+**Purpose.** Show a tool's **arguments schema** and its **current saved
+argument values** — the read counterpart to `set-args`.
+
+**Syntax.**
+
+```bash
+cremind tools get-args <tool_id>
+```
+
+**Behavior.** Prints two JSON blocks: `--- arguments_schema ---` (the shape the
+tool accepts) and `--- arguments ---` (the values currently saved for the
+profile). With `--json`, returns `{"arguments_schema": ..., "arguments": ...}`.
+
+This is derived from the tool detail (`cremind tools get`) — there is no
+dedicated GET-arguments endpoint — so it reflects exactly what `tools get`
+reports under `config.arguments`.
+
+**Example.**
+
+```bash
+$ cremind tools get-args mcp.shell
+--- arguments_schema ---
+{ "type": "object", "properties": { "shells": {...}, "timeout_s": {...} } }
+
+--- arguments ---
+{ "shells": ["bash", "pwsh"], "timeout_s": 120 }
 ```
 
 ### `cremind tools leaves`

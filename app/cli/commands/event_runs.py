@@ -333,3 +333,33 @@ def event_runs_delete(
             await delete_run(client, run_id)
 
     asyncio.run(_run())
+
+
+@event_runs_app.command("cancel")
+@graceful_errors
+def event_runs_cancel(
+    ctx: typer.Context,
+    run_id: str = typer.Argument(..., help="Event-run id to cancel."),
+) -> None:
+    """Cancel a running event run (no-op if it isn't currently running)."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.event_runs import cancel_run
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> bool:
+        async with Client(cfg) as client:
+            return await cancel_run(client, run_id)
+
+    cancelled = asyncio.run(_run())
+
+    if mode.json:
+        print_json({"cancelled": cancelled})
+    else:
+        sys.stdout.write("cancelled\n" if cancelled else "run was not running\n")

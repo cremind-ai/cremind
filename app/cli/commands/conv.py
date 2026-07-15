@@ -374,6 +374,43 @@ def conv_cancel(
         sys.stdout.write("cancelled\n" if cancelled else "no active run for that id\n")
 
 
+@conv_app.command("plan-cancel")
+@graceful_errors
+def conv_plan_cancel(
+    ctx: typer.Context,
+    conv_id: str = typer.Argument(..., help="Conversation id with a pending plan."),
+) -> None:
+    """Decline a pending Plan-mode approval (without starting a run).
+
+    Use this to reject a plan the agent is waiting on your approval for. This
+    is distinct from `conv cancel`, which aborts an already-running turn.
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.conversations import cancel_plan
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+    from app.cli.output.formatting import string_field
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await cancel_plan(client, conv_id)
+
+    out = asyncio.run(_run())
+
+    if mode.json:
+        print_json(out)
+    else:
+        message_id = string_field(out, "message_id")
+        suffix = f" (message {message_id})" if message_id else ""
+        sys.stdout.write(f"declined pending plan{suffix}\n")
+
+
 @conv_app.command("memory")
 @graceful_errors
 def conv_memory(

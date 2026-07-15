@@ -275,6 +275,204 @@ def channels_notify_filter(
     typer.echo(_json.dumps(current, indent=2, ensure_ascii=False))
 
 
+def _parse_config_option(
+    config_json: Optional[str], config_kv: Optional[list[str]],
+) -> Optional[dict[str, Any]]:
+    """Parse mutually-exclusive --json / --config KEY=VALUE into a config dict.
+
+    Mirrors the parsing already used by `channels add`.
+    """
+    if config_json and config_kv:
+        typer.echo("--json and --config are mutually exclusive", err=True)
+        raise typer.Exit(code=1)
+    if config_json:
+        try:
+            parsed = _json.loads(config_json)
+        except _json.JSONDecodeError as e:
+            typer.echo(
+                f"--json: {e}\n"
+                "Hint: on Windows PowerShell prefer --config key=value.",
+                err=True,
+            )
+            raise typer.Exit(code=1) from e
+        if not isinstance(parsed, dict):
+            typer.echo("--json must be an object", err=True)
+            raise typer.Exit(code=1)
+        return parsed
+    if config_kv:
+        config: dict[str, Any] = {}
+        for kv in config_kv:
+            if "=" not in kv:
+                typer.echo(f"--config '{kv}': expected key=value", err=True)
+                raise typer.Exit(code=1)
+            k, v = kv.split("=", 1)
+            config[k] = v
+        return config
+    return None
+
+
+@channels_app.command("edit")
+@graceful_errors
+def channels_edit(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", help="Channel mode (bot|userbot|notification).",
+    ),
+    auth_mode: Optional[str] = typer.Option(
+        None, "--auth-mode", help="Auth mode (none|otp|password).",
+    ),
+    response_mode: Optional[str] = typer.Option(
+        None, "--response-mode", help="Reply detail (normal|detail).",
+    ),
+    config_json: Optional[str] = typer.Option(
+        None, "--json", help="Config patch as JSON; on PowerShell prefer --config.",
+    ),
+    config_kv: Optional[list[str]] = typer.Option(
+        None, "--config", help="Config patch as repeatable key=value.",
+    ),
+) -> None:
+    """Update a channel's settings (only the flags you pass).
+
+    `config` is merged server-side, so you can patch one field without
+    resending the rest. The main channel cannot be edited.
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import update_channel
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json, print_kv
+
+    config = _parse_config_option(config_json, config_kv)
+    fields: dict[str, Any] = {}
+    if mode is not None:
+        fields["mode"] = mode
+    if auth_mode is not None:
+        fields["auth_mode"] = auth_mode
+    if response_mode is not None:
+        fields["response_mode"] = response_mode
+    if config is not None:
+        fields["config"] = config
+    if not fields:
+        typer.echo(
+            "nothing to update — pass at least one of --mode / --auth-mode / "
+            "--response-mode / --json / --config",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    cfg: Config = ctx.obj["cfg"]
+    out_mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> Any:
+        async with Client(cfg) as client:
+            return await update_channel(client, channel_id, fields)
+
+    channel = asyncio.run(_run())
+
+    if out_mode.json:
+        print_json(channel.to_dict())
+        return
+    print_kv([
+        ("id", channel.id),
+        ("channel_type", channel.channel_type),
+        ("mode", channel.mode),
+        ("auth_mode", channel.auth_mode),
+        ("response_mode", channel.response_mode),
+        ("enabled", "true" if channel.enabled else "false"),
+        ("status", channel.status),
+    ])
+
+
+def _set_channel_enabled(ctx: typer.Context, channel_id: str, enabled: bool) -> None:
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import update_channel
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    out_mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> Any:
+        async with Client(cfg) as client:
+            return await update_channel(client, channel_id, {"enabled": enabled})
+
+    channel = asyncio.run(_run())
+    if out_mode.json:
+        print_json(channel.to_dict())
+    else:
+        state = "true" if channel.enabled else "false"
+        sys.stdout.write(f"{channel.id}: enabled={state} status={channel.status}\n")
+
+
+@channels_app.command("enable")
+@graceful_errors
+def channels_enable(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+) -> None:
+    """Enable a channel (start its adapter)."""
+    _set_channel_enabled(ctx, channel_id, True)
+
+
+@channels_app.command("disable")
+@graceful_errors
+def channels_disable(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+) -> None:
+    """Disable a channel (stop its adapter)."""
+    _set_channel_enabled(ctx, channel_id, False)
+
+
+@channels_app.command("senders")
+@graceful_errors
+def channels_senders(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+) -> None:
+    """List the senders seen on a channel (pending OTP codes are redacted)."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import list_senders
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, Table, print_json
+    from app.cli.output.formatting import bool_field, string_field
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> list[dict[str, Any]]:
+        async with Client(cfg) as client:
+            return await list_senders(client, channel_id)
+
+    senders = asyncio.run(_run())
+
+    if mode.json:
+        print_json(senders)
+        return
+    if not senders:
+        sys.stdout.write("no senders.\n")
+        return
+    table = Table(mode, "SENDER_ID", "NAME", "AUTHED", "CONVERSATION_ID", "PENDING_OTP")
+    for s in senders:
+        table.add_row(
+            string_field(s, "sender_id"),
+            string_field(s, "display_name"),
+            bool_field(s, "authenticated", False),
+            string_field(s, "conversation_id"),
+            string_field(s, "pending_otp"),
+        )
+    table.render()
+
+
 @channels_app.command("pair")
 @graceful_errors
 def channels_pair(

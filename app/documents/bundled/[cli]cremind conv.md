@@ -1,5 +1,5 @@
 ---
-description: "Manage **conversations** and stream agent replies from the terminal: create, list, fetch history, rename or change its id (`rename`, `set-id`), delete or delete-all, and `send` a message with `--mode plan|reasoning|instant` (Plan mode asks clarifying questions and writes a plan you approve before it executes), plus attach or cancel a run, inspect memory and running summary, force compaction, and per-conversation token usage. Use this to script one-shot messages and manage threads — distinct from `cremind chat` (the interactive REPL)."
+description: "Manage **conversations** and stream agent replies from the terminal: create, list, fetch history, rename or change its id (`rename`, `set-id`), delete or delete-all, and `send` a message with `--mode plan|reasoning|instant` (Plan mode asks clarifying questions and writes a plan you approve before it executes), plus attach, cancel an in-flight run, decline a pending plan (`plan-cancel`), inspect memory and running summary, force compaction, and per-conversation token usage. Use this to script one-shot messages and manage threads — distinct from `cremind chat` (the interactive REPL)."
 ---
 
 # `cremind conv` — Conversation Management and Streaming
@@ -18,7 +18,8 @@ The group splits into three concerns:
   subscriptions).
 - **Agent runs** — `send` (queue a user message and stream the agent's
   response), `attach` (subscribe to an already-running run without
-  sending anything), `cancel` (stop an in-flight run by its `run_id`).
+  sending anything), `cancel` (stop an in-flight run by its `run_id`),
+  `plan-cancel` (decline a pending Plan-mode approval without starting a run).
 - **Inspection** — `get --detail` opens a TUI that replays the full
   thinking-process trace (Thought / Action / Input / Observation /
   Response) for every agent turn. `memory` shows the conversation's
@@ -311,8 +312,10 @@ same conversation with `--mode plan`:
 4. Approve: `cremind conv send <id> "accept" --mode plan` — the agent
    executes the plan, emitting `todos` checklist updates as it goes
    (`[x]` done / `[>]` in progress / `[ ]` pending, on stderr in raw mode).
-   Decline: `cremind conv cancel <run_id>` stops an in-flight run; a later
-   "continue, please implement this plan" resumes from history.
+   Decline: `cremind conv plan-cancel <id>` rejects the pending plan without
+   starting a run (use `cremind conv cancel <run_id>` only to abort a run that
+   is already executing); a later "continue, please implement this plan"
+   resumes from history.
 
 With `--json`, the structured events are `ask_user_question`, `plan_ready`,
 and `todos`, alongside the usual `thinking` / `text` / `complete`.
@@ -456,6 +459,33 @@ cancelled
 # Cancel whatever is running in conversation c_82bc (one-liner)
 $ run=$(cremind conv list --json | jq -r '.[] | select(.id=="c_82bc") | .task_id')
 $ cremind conv cancel "$run"
+```
+
+### `cremind conv plan-cancel`
+
+**Purpose.** Decline a **pending Plan-mode approval** — reject the plan the
+agent is waiting on you to approve, *without* starting a run.
+
+**Syntax.**
+
+```bash
+cremind conv plan-cancel <conv_id>
+```
+
+**Behavior.** Takes a **conversation id** (not a run id). Declines the plan the
+agent proposed at the end of a `--mode plan` turn. Prints
+`declined pending plan (message <id>)`; with `--json`, returns the raw
+`{message_id, content}`.
+
+This is distinct from `cremind conv cancel`, which aborts a run that is already
+executing (and takes a `run_id`). Use `plan-cancel` at the approval step;
+`cancel` once the plan is running.
+
+**Example.**
+
+```bash
+$ cremind conv plan-cancel c_82bc
+declined pending plan (message m_5f21)
 ```
 
 ### `cremind conv memory`

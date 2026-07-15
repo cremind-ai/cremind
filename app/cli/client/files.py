@@ -75,6 +75,28 @@ async def upload(
     return []
 
 
+async def upload_temp(
+    client,
+    conversation_id: str,
+    files: list[tuple[str, bytes]],
+) -> list[dict[str, Any]]:
+    """Upload (basename, bytes) parts into a conversation's temp upload dir.
+
+    Unlike :func:`upload`, no server path is supplied — the destination is
+    derived server-side from the profile + ``conversation_id``. Each result
+    carries the absolute ``path`` to attach to the next message.
+    """
+    parts = [("file", (name, blob)) for name, blob in files]
+    resp = await client.upload(
+        "/api/files/upload-temp",
+        files=parts,
+        data={"conversation_id": conversation_id},
+    )
+    if isinstance(resp, dict) and isinstance(resp.get("results"), list):
+        return [r for r in resp["results"] if isinstance(r, dict)]
+    return []
+
+
 async def mkdir(client, path: str, *, conversation_id: Optional[str] = None) -> dict[str, Any]:
     body: dict[str, Any] = {"path": path}
     if conversation_id:

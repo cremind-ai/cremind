@@ -113,22 +113,45 @@ async def get_channel(client: Client, channel_id: str) -> Channel:
     raise RuntimeError("unexpected /api/channels/{id} response")
 
 
+async def update_channel(
+    client: Client, channel_id: str, fields: dict[str, Any],
+) -> Channel:
+    """PATCH a channel with the given fields (``mode`` / ``auth_mode`` /
+    ``response_mode`` / ``enabled`` / ``config``).
+
+    The server merges ``config`` into the existing config (so secrets you never
+    received aren't clobbered), validates, and restarts the adapter when
+    anything runtime-affecting changed. The ``main`` channel can't be modified.
+    """
+    resp = await client.patch_json(
+        f"/api/channels/{quote(channel_id, safe='')}",
+        fields,
+    )
+    if isinstance(resp, dict) and isinstance(resp.get("channel"), dict):
+        return Channel.from_dict(resp["channel"])
+    raise RuntimeError("unexpected /api/channels/{id} response")
+
+
 async def set_notification_filter(
     client: Client, channel_id: str, notification_filter: dict[str, Any],
 ) -> Channel:
     """PATCH ``config.notification_filter`` on a notification-mode channel.
 
-    The server merges into the existing config, validates/normalizes the filter
-    (HTTP 400 on invalid), and restarts the adapter so the new filter takes
+    Thin wrapper over :func:`update_channel`; the filter is validated/normalized
+    server-side (HTTP 400 on invalid) and the adapter restarts so it takes
     effect immediately.
     """
-    resp = await client.patch_json(
-        f"/api/channels/{quote(channel_id, safe='')}",
-        {"config": {"notification_filter": notification_filter}},
+    return await update_channel(
+        client, channel_id, {"config": {"notification_filter": notification_filter}},
     )
-    if isinstance(resp, dict) and isinstance(resp.get("channel"), dict):
-        return Channel.from_dict(resp["channel"])
-    raise RuntimeError("unexpected /api/channels/{id} response")
+
+
+async def list_senders(client: Client, channel_id: str) -> list[dict[str, Any]]:
+    """List the senders seen on a channel (``pending_otp`` is redacted)."""
+    resp = await client.get_json(f"/api/channels/{quote(channel_id, safe='')}/senders")
+    if isinstance(resp, dict) and isinstance(resp.get("senders"), list):
+        return [s for s in resp["senders"] if isinstance(s, dict)]
+    return []
 
 
 async def delete_channel(client: Client, channel_id: str) -> None:
