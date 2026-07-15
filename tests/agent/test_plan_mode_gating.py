@@ -199,11 +199,19 @@ def test_render_input_carries_plan_marker(monkeypatch):
     assert "EXECUTION phase" in r2 and r2.endswith("go")
 
 
-def test_render_input_unchanged_for_reasoning_and_instant(monkeypatch):
-    for mode in ("reasoning", "instant"):
-        agent = _build(monkeypatch, mode=mode)
-        agent._current_query = "hello world"
-        assert agent._render_input() == "hello world"
+def test_render_input_unchanged_for_reasoning(monkeypatch):
+    agent = _build(monkeypatch, mode="reasoning")
+    agent._current_query = "hello world"
+    assert agent._render_input() == "hello world"
+
+
+def test_render_input_carries_instant_marker(monkeypatch):
+    agent = _build(monkeypatch, mode="instant")
+    agent._current_query = "hello world"
+    rendered = agent._render_input()
+    assert rendered.endswith("hello world")
+    assert "Instant mode" in rendered
+    assert "AT MOST ONE" in rendered
 
 
 # ── event-run schema hiding (registration tools ABSENT from the tools block) ──

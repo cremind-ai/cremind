@@ -263,8 +263,8 @@ cremind conv send <id> <message> [--raw] [--mode plan|reasoning|instant] [--no-r
 | Flag              | Type   | Default     | Meaning                                                          |
 |-------------------|--------|-------------|------------------------------------------------------------------|
 | `--raw`           | bool   | `false`     | Plain-text streaming (no TUI). Pipe-friendly.                    |
-| `--mode`          | choice | `reasoning` | Turn mode. `plan`: the agent researches read-only, asks clarifying questions, writes a plan file for your approval, then executes it with live todo updates. `reasoning`: today's default behavior. `instant`: fastest — extended thinking is disabled for the turn. |
-| `--no-reasoning`  | bool   | `false`     | **Deprecated** alias for `--mode instant`. Note: on older releases this flag was accepted but had no effect; it now genuinely disables extended thinking. |
+| `--mode`          | choice | `reasoning` | Turn mode. `plan`: the agent researches read-only, asks clarifying questions, writes a plan file for your approval, then executes it with live todo updates. `reasoning`: today's default behavior. `instant`: fastest — extended thinking is disabled and the agent may use at most one round of tool calls before it must answer. |
+| `--no-reasoning`  | bool   | `false`     | **Deprecated** alias for `--mode instant`. Note: on older releases this flag was accepted but had no effect; it now genuinely disables extended thinking and caps tool use at one round. |
 
 The root `--json` flag overrides `--raw` and selects the JSON-per-line
 renderer.
@@ -286,7 +286,7 @@ $ cremind conv send c_82bc "Anything urgent?" --raw | tee answer.txt
 # Structured event stream
 $ cremind conv send c_82bc "Anything urgent?" --json | jq -r 'select(.type=="text").data.token'
 
-# Fastest answer, no extended thinking
+# Fastest answer: no extended thinking, at most one tool round
 $ cremind conv send c_82bc "Summarize in one sentence" --raw --mode instant
 
 # Start a plan-mode workflow (see "Plan mode over the CLI" below)
@@ -643,7 +643,7 @@ only when stdout is a TTY.
 **`--no-reasoning` prints a deprecation warning** — It is now an alias for
 `--mode instant`. Use `--mode instant` instead. Unlike older releases where
 the flag had no server-side effect, it now genuinely disables extended
-thinking for the turn.
+thinking for the turn and caps tool use at one round.
 
 **`Ctrl-C` killed the CLI but the run kept going** — Almost always
 caused by exiting before the TUI handed Ctrl-C to the cancel hook.

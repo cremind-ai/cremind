@@ -199,8 +199,10 @@ def _anthropic_tool_choice(
     """Map an OpenAI-style ``tool_choice`` to Anthropic's, honoring parallel control.
 
     Returns the ``tool_choice`` dict to send, or ``None`` to omit the field (e.g.
-    for ``"none"`` or an unrecognized value). Anthropic runs tools in parallel by
-    default, so ``disable_parallel_tool_use`` is added only when
+    for an unrecognized value). ``"none"`` maps to Anthropic's explicit
+    ``{"type": "none"}`` — tools stay attached (required when history contains
+    tool_use blocks) but the model must not call them. Anthropic runs tools in
+    parallel by default, so ``disable_parallel_tool_use`` is added only when
     ``parallel_tool_calls`` is explicitly ``False`` (``True``/``None`` leave the
     parallel-on default untouched).
     """
@@ -208,10 +210,14 @@ def _anthropic_tool_choice(
         choice: Optional[dict] = {"type": "auto"}
     elif tool_choice == "required":
         choice = {"type": "any"}
+    elif tool_choice == "none":
+        # disable_parallel_tool_use is only documented for auto/any/tool, so
+        # return before the flag is added below.
+        return {"type": "none"}
     elif isinstance(tool_choice, dict) and "function" in tool_choice:
         choice = {"type": "tool", "name": tool_choice["function"].get("name", "")}
     else:
-        choice = None  # "none" or unrecognized → don't send tool_choice
+        choice = None  # unrecognized → don't send tool_choice
     if choice is not None and parallel_tool_calls is False:
         choice["disable_parallel_tool_use"] = True
     return choice

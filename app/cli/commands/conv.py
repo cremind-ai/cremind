@@ -209,7 +209,8 @@ def conv_send(
         None, "--mode", case_sensitive=False,
         help=(
             "Turn mode: plan (research + clarifying questions + approved plan, "
-            "then execute), reasoning (default), instant (no extended thinking)."
+            "then execute), reasoning (default), instant (no extended thinking; "
+            "at most one round of tool calls)."
         ),
     ),
     no_reasoning: bool = typer.Option(

@@ -74,8 +74,9 @@ The session's turn mode is fixed at launch with `--mode` (default
 workflow — the agent asks clarifying questions, proposes a plan file, and
 waits for you to type `accept` before executing (todo checklist updates
 render in the transcript as `[x]` / `[>]` / `[ ]` blocks). `--mode instant`
-disables extended thinking for the fastest replies. The active mode is
-shown in the status bar.
+disables extended thinking and caps the turn at a single round of tool
+calls (the agent answers right after the first batch of tool results) for
+the fastest replies. The active mode is shown in the status bar.
 
 ## Behavior
 
