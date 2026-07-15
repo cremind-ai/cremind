@@ -338,6 +338,26 @@ class ChannelRegistry:
         """
         return self._adapters.get(channel_id)
 
+    def notification_adapters_for_profile(
+        self, profile: str,
+    ) -> list[BaseChannelAdapter]:
+        """Live (enabled + started) notification-mode adapters for ``profile``.
+
+        Only channels that started successfully live in ``_adapters`` — one
+        that failed to start was flipped ``enabled=False`` and is absent here
+        (see :meth:`start_for_channel`). This is the set the
+        ``send_notification`` tool can actually push to, and the basis for the
+        tool's availability gate. Snapshot with ``list(...)`` before iterating:
+        the mutating methods run under ``self._lock`` on the same loop, but
+        callers on the hot path (``ReasoningAgent.__init__``) iterate without a
+        lock, so the copy guards against a concurrent size change.
+        """
+        return [
+            a
+            for a in list(self._adapters.values())
+            if a.profile == profile and a._is_notification_mode()  # noqa: SLF001
+        ]
+
 
 _instance: ChannelRegistry | None = None
 
@@ -356,3 +376,18 @@ def get_channel_registry(storage: Any | None = None) -> ChannelRegistry:
             )
         _instance = ChannelRegistry(storage)
     return _instance
+
+
+def has_notification_channel(profile: str) -> bool:
+    """True iff ``profile`` has >=1 enabled notification-mode channel live now.
+
+    Safe to call before the registry is initialized (server still booting, or
+    CLI / test contexts with no channel subsystem): returns ``False`` instead
+    of raising, so callers on the hot path — e.g. the ``send_notification``
+    availability gate in ``ReasoningAgent.__init__`` — never crash.
+    """
+    try:
+        registry = get_channel_registry()
+    except RuntimeError:
+        return False
+    return bool(registry.notification_adapters_for_profile(profile))

@@ -176,6 +176,24 @@ async def delete_channel(client: Client, channel_id: str) -> None:
     await client.delete(f"/api/channels/{quote(channel_id, safe='')}")
 
 
+async def notify_channel(
+    client: Client, channel_id: str, message: str,
+) -> dict[str, Any]:
+    """Push an ad-hoc ``message`` OUT to a notification-mode channel.
+
+    Delivers to the channel's recipients (configured target chat IDs ∪
+    authenticated subscribers) via the running adapter, bypassing the channel's
+    notification filter. Returns ``{"delivered": bool, "recipients": int}``.
+    The server rejects non-notification channels (HTTP 400) and channels whose
+    adapter isn't running (HTTP 409).
+    """
+    resp = await client.post_json(
+        f"/api/channels/{quote(channel_id, safe='')}/notify",
+        {"message": message},
+    )
+    return resp if isinstance(resp, dict) else {}
+
+
 def channel_auth_events_path(channel_id: str) -> str:
     return f"/api/channels/{quote(channel_id, safe='')}/auth-events"
 

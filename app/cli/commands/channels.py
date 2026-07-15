@@ -279,6 +279,88 @@ def channels_notify_filter(
     typer.echo(_json.dumps(current, indent=2, ensure_ascii=False))
 
 
+@channels_app.command("send")
+@graceful_errors
+def channels_send(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id (a notification-mode channel)."),
+    message: Optional[str] = typer.Argument(
+        None, help="Message text. Omit to read from --message-file or stdin.",
+    ),
+    message_file: Optional[str] = typer.Option(
+        None, "--message-file", "-f",
+        help="Read the message from this file (use '-' for stdin). Preferred on "
+             "PowerShell, where inline quoting mangles apostrophes/quotes.",
+    ),
+) -> None:
+    """Push an ad-hoc message OUT to a notification-mode channel.
+
+    Delivers to the channel's recipients (configured target chat IDs plus
+    everyone who has /start-subscribed) via the running adapter, bypassing the
+    channel's notification filter. The channel must be in notification mode and
+    its adapter must be running.
+
+    Examples:
+      cremind channels send <id> "Deploy finished OK"
+      cremind channels send <id> --message-file note.txt
+      echo "1+1 = 2" | cremind channels send <id> -f -
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import notify_channel
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    if message is not None and message_file is not None:
+        typer.echo("pass either a message argument or --message-file, not both", err=True)
+        raise typer.Exit(code=1)
+
+    text: str
+    if message_file is not None:
+        if message_file == "-":
+            text = sys.stdin.read()
+        else:
+            try:
+                with open(message_file, encoding="utf-8") as fh:
+                    text = fh.read()
+            except OSError as e:
+                typer.echo(f"--message-file: {e}", err=True)
+                raise typer.Exit(code=1) from e
+    elif message is not None:
+        text = message
+    else:
+        # No message given anywhere — fall back to stdin (supports piping).
+        text = sys.stdin.read()
+
+    text = text.strip()
+    if not text:
+        typer.echo("message is empty — nothing to send", err=True)
+        raise typer.Exit(code=1)
+
+    cfg: Config = ctx.obj["cfg"]
+    out_mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await notify_channel(client, channel_id, text)
+
+    result = asyncio.run(_run())
+
+    if out_mode.json:
+        print_json(result)
+        return
+    recipients = int(result.get("recipients") or 0)
+    if result.get("delivered"):
+        sys.stdout.write(f"Delivered to {recipients} recipient(s).\n")
+    else:
+        sys.stdout.write(
+            "Not delivered — the channel has no recipients yet "
+            "(ask subscribers to /start, or set target chat IDs).\n"
+        )
+
+
 def _parse_config_option(
     config_json: Optional[str], config_kv: Optional[list[str]],
 ) -> Optional[dict[str, Any]]:
