@@ -407,6 +407,24 @@ _BOTH_ENABLED_PREFERENCE = (
     "functions — poll the one you started."
 )
 
+# Agent-generic (works for claude-only, codex-only, or both) and STATIC so the
+# guidance block stays byte-stable within a run. A weak orchestrator otherwise
+# invents wrong remediation ("exit plan mode in your UI") when a delegate is
+# blocked by its permission/sandbox mode; this points it at the ONE real lever —
+# the Cremind tool variable and the exact command the tool result hands back.
+_PERMISSION_PLAYBOOK = (
+    "PERMISSION/SANDBOX BLOCKS: if a coding agent's result says it could not "
+    "create or change files because of its permission mode or sandbox (e.g. it "
+    "only produced a plan, or reports \"cannot write ... while in plan mode\"), "
+    "that mode is a Cremind tool variable — there is NO UI \"plan mode\" for the "
+    "user to exit and NO agent CLI command (like `claude`) that changes it, so "
+    "never tell the user to do either. Instead relay the result's explanation, "
+    "ask the user ONCE whether to switch the mode, and only after they agree run "
+    "the exact `cremind tools set-var ...` command the result gives you through "
+    "the Shell Executor tool (this is the one coding-related shell use that IS "
+    "allowed), then re-run the coding task."
+)
+
 
 def _coding_agent_fns(tools, stem: str) -> Optional[dict]:
     """Return ``{leaf: fq_function_name}`` for an enabled coding-delegate group
@@ -447,7 +465,7 @@ def _single_agent_guidance(fns: dict, *, agent: str, extra: str) -> str:
         f"logged in, call `{status_fn}` (add probe=true for a definitive live check); "
         f"only if {agent.title()} is genuinely unavailable should you fall back to your "
         "own file/shell tools. Only genuinely non-coding tasks are exempt from this "
-        "rule."
+        "rule. " + _PERMISSION_PLAYBOOK
     )
 
 
@@ -479,7 +497,7 @@ def _both_agents_guidance(claude: dict, codex: dict) -> str:
         f"its status function (`{claude['status']}` or `{codex['status']}`, "
         "probe=true for a live check). Only if both are genuinely unavailable should "
         "you fall back to your own file/shell tools. Only genuinely non-coding tasks "
-        f"are exempt from this rule. {_BOTH_ENABLED_PREFERENCE}"
+        f"are exempt from this rule. {_PERMISSION_PLAYBOOK} {_BOTH_ENABLED_PREFERENCE}"
     )
 
 

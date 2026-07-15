@@ -1,5 +1,5 @@
 ---
-description: "The Codex built-in tool and its sandbox modes: the filesystem sandbox levels (read-only, workspace-write, full-access) come live from the installed OpenAI Codex SDK, so what each allows and how to change one, listed with cremind tools options codex. Codex runs headless so it never pauses for approval. Plus how to choose the model from the account's live model list (cremind tools options codex, or the status sub-tool's models field) and its other Tool Variables (model, sandbox, reasoning effort, OpenAI API key, codex binary path, config overrides, max concurrent tasks). Also covers whether Codex is logged in / which credential it uses (including a host `codex login` and the Cremind-managed CODEX_HOME on Windows %USERPROFILE%\\.codex), that Codex is disabled by default, and how to enable it (the codex feature / OpenAI Codex SDK). Distinct from the general `cremind tools` CLI reference and from the Claude Code tool."
+description: "The Codex built-in tool and its sandbox modes: the filesystem sandbox levels (read-only, workspace-write, full-access) come live from the installed OpenAI Codex SDK, so what each allows and how to change one, listed with cremind tools options codex. Codex runs headless so it never pauses for approval. Plus how to choose the model from the account's live model list (cremind tools options codex, or the status sub-tool's models field) and its other Tool Variables (model, sandbox, reasoning effort, OpenAI API key, codex binary path, config overrides, max concurrent tasks). Also covers whether Codex is logged in / which credential it uses (including a host `codex login` and the Cremind-managed CODEX_HOME on Windows %USERPROFILE%\\.codex), that Codex is disabled by default, and how to enable it (the codex feature / OpenAI Codex SDK). Troubleshooting a blocked run: if Codex made no changes because CODEX_SANDBOX is read-only (or the task needed to write outside the working directory under workspace-write), the fix is `cremind tools set-var codex CODEX_SANDBOX=full-access` (or workspace-write), not any UI toggle or `codex` CLI command; also covers a resumed session that returns no output (start a fresh task without session_id). Distinct from the general `cremind tools` CLI reference and from the Claude Code tool."
 ---
 
 # Codex Tool
@@ -75,6 +75,14 @@ knob, not an approval prompt. (On native Windows the OS-level sandbox is newer
 than on macOS/Linux; if a `workspace-write` task behaves unexpectedly, try
 `full-access` or run Codex under WSL2.)
 
+Two notes on how the effective sandbox is resolved: a `sandbox_mode=<value>`
+entry in `CODEX_CONFIG_OVERRIDES` also sets the sandbox and takes precedence over
+`CODEX_SANDBOX`; and an **unrecognized** `CODEX_SANDBOX` value falls back to
+`full-access` (never fails the run). Either way the value Codex actually used is
+reported back as `effective_sandbox`, and a fall-back from an unrecognized value
+is flagged with a `sandbox_coercion_note`, so what is reported never contradicts
+what ran.
+
 ### Changing the sandbox mode
 
 Three equivalent ways, all profile-scoped:
@@ -92,6 +100,33 @@ Three equivalent ways, all profile-scoped:
 
 A change takes effect on the **next** Codex task for that profile — no server
 restart is needed (the value is re-read per task).
+
+## Symptoms & troubleshooting
+
+**Codex explored but did not change anything.** If a coding task made no file
+changes, `CODEX_SANDBOX` is likely `read-only` (explore/answer only). Under
+`workspace-write` a task that needed to touch files *outside* the working
+directory can also be blocked. The sandbox is set by Cremind's `CODEX_SANDBOX`
+tool variable — there is no UI sandbox toggle for the user to flip and no `codex`
+CLI command that changes it here.
+
+Every `codex` result carries `effective_sandbox`, and when the sandbox is not
+fully autonomous it also carries a `sandbox_advisory` object with the exact fix.
+The playbook is **confirm once, then fix**: tell the user the current sandbox
+blocks changes, ask once whether to switch it, and only on their OK run — through
+the Shell Executor tool:
+
+```bash
+cremind tools set-var codex CODEX_SANDBOX=full-access
+```
+
+(or `workspace-write` to confine changes to the working directory), then re-run
+the task (reuse the `session_id` to continue).
+
+**A resumed session returned no output.** The thread may have expired or is no
+longer resumable. Do not report an empty result or ask the user what to do —
+start a **fresh** task with `run` *without* a `session_id`, repeating the full
+task brief. (The result carries `resume_produced_no_work: true` in this case.)
 
 ## Choosing a model
 

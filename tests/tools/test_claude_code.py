@@ -537,6 +537,135 @@ def test_result_message_usage_fallback(monkeypatch):
     asyncio.run(body())
 
 
+# ── permission-mode awareness in the result payloads ─────────────────────────
+def _quick_result(monkeypatch, **result_kwargs):
+    """Install a fake SDK that finishes immediately with one ResultMessage."""
+    async def produce(client):
+        yield SystemMessage(subtype="init", data={"session_id": "sess-pm"})
+        yield ResultMessage(**result_kwargs)
+
+    install_fake_sdk(monkeypatch, produce)
+
+
+def test_plan_mode_completed_run_carries_advisory(monkeypatch, tmp_path):
+    from app.tools.builtin import claude_code_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 1.0)
+    _quick_result(monkeypatch, result="Here is a plan.", num_turns=2, session_id="sess-pm")
+
+    res = asyncio.run(_run_tool(
+        prompt="optimize this", working_directory=str(tmp_path),
+        _context_id="conv-pm-1", _profile="default",
+        _variables={r.Var.PERMISSION_MODE: "plan"},
+    ))
+    sc = res.structured_content
+    assert sc["status"] == "completed"
+    assert sc["effective_permission_mode"] == "plan"
+    adv = sc["permission_advisory"]
+    assert adv["autonomy"] == "blocked"
+    assert adv["command"] == (
+        "cremind tools set-var claude_code "
+        "CLAUDE_CODE_PERMISSION_MODE=bypassPermissions"
+    )
+
+
+def test_autonomous_mode_has_no_advisory(monkeypatch, tmp_path):
+    from app.tools.builtin import claude_code_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 1.0)
+    _quick_result(monkeypatch, result="Done.", num_turns=2, session_id="sess-pm")
+
+    res = asyncio.run(_run_tool(
+        prompt="do it", working_directory=str(tmp_path),
+        _context_id="conv-pm-2", _profile="default",
+        _variables={r.Var.PERMISSION_MODE: "bypassPermissions"},
+    ))
+    sc = res.structured_content
+    assert sc["effective_permission_mode"] == "bypassPermissions"
+    assert "permission_advisory" not in sc
+
+
+def test_default_mode_when_unset(monkeypatch, tmp_path):
+    from app.tools.builtin import claude_code_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 1.0)
+    _quick_result(monkeypatch, result="Done.", num_turns=2, session_id="sess-pm")
+
+    res = asyncio.run(_run_tool(
+        prompt="do it", working_directory=str(tmp_path),
+        _context_id="conv-pm-3", _profile="default", _variables={},
+    ))
+    sc = res.structured_content
+    # Unset variable resolves to the shipped default, which is autonomous.
+    assert sc["effective_permission_mode"] == "bypassPermissions"
+    assert "permission_advisory" not in sc
+
+
+def test_empty_resume_guard_replaces_bare_empty_result(monkeypatch, tmp_path):
+    from app.tools.builtin import claude_code_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 1.0)
+    _quick_result(monkeypatch, result="", num_turns=0, session_id="sess-resume")
+
+    res = asyncio.run(_run_tool(
+        prompt="continue", working_directory=str(tmp_path),
+        _context_id="conv-pm-4", _profile="default",
+        session_id="sess-resume", _variables={},
+    ))
+    sc = res.structured_content
+    assert sc["status"] == "completed"
+    assert sc["resume_produced_no_work"] is True
+    assert sc["result"].strip()  # not a bare empty string
+    assert "without" in sc["result"].lower()
+    assert "session_id" in sc["result"]
+
+
+def test_empty_result_with_turns_passes_through(monkeypatch, tmp_path):
+    from app.tools.builtin import claude_code_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 1.0)
+    # A legitimate empty final message WITH real turns must not be rewritten.
+    _quick_result(monkeypatch, result="", num_turns=3, session_id="sess-pm")
+
+    res = asyncio.run(_run_tool(
+        prompt="do it", working_directory=str(tmp_path),
+        _context_id="conv-pm-5", _profile="default", _variables={},
+    ))
+    sc = res.structured_content
+    assert sc["result"] == ""
+    assert "resume_produced_no_work" not in sc
+
+
+def test_running_heartbeat_carries_mode_and_advisory(monkeypatch, tmp_path):
+    from app.tools.builtin import claude_code_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 0.2)
+
+    async def produce(client):
+        yield SystemMessage(subtype="init", data={"session_id": "sess-hb"})
+        await client.gate.wait()  # keep it "running" past the grace window
+        yield ResultMessage(result="done", session_id="sess-hb")
+
+    install_fake_sdk(monkeypatch, produce)
+
+    async def body():
+        run_res = await _run_tool(
+            prompt="long job", working_directory=str(tmp_path),
+            _context_id="conv-pm-6", _profile="default",
+            _variables={r.Var.PERMISSION_MODE: "plan"},
+        )
+        sc = run_res.structured_content
+        assert sc["status"] == "running"
+        assert sc["effective_permission_mode"] == "plan"
+        assert sc["permission_advisory"]["autonomy"] == "blocked"
+        # release + drain so the background task doesn't outlive the test
+        task = r.get_task(sc["task_id"])
+        task.client.gate.set()
+        await r.wait_for_task(task, 5)
+
+    asyncio.run(body())
+
+
 # ── feature + guidance wiring ─────────────────────────────────────────────────
 def test_feature_and_pip_spec():
     from app.features.manifest import FEATURES, pip_spec
@@ -564,6 +693,11 @@ def test_guidance_present_only_when_enabled():
     assert "claude_code__status" in text
     # Claude-only guidance must not leak the peer agent's functions.
     assert "codex__" not in text
+    # The permission playbook must be present and steer toward the real lever,
+    # not the wrong "exit plan mode in your UI" remediation the incident produced.
+    assert "cremind tools set-var" in text
+    assert "ask the user ONCE" in text
+    assert "plan mode" in text  # named in the negation ("no UI 'plan mode' ...")
 
 
 # ── auth-failure classification (the not-logged-in case) ──────────────────────

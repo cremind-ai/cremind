@@ -1,5 +1,5 @@
 ---
-description: "The Claude Code built-in tool and its permission mode: the permission modes (bypassPermissions, acceptEdits, default, plan, dontAsk, auto) come live from the installed Claude Agent SDK — the same modes the Claude Code CLI cycles through with Shift+Tab — so what each allows and how to change one, listed with cremind tools options claude_code. Plus how to choose the model from the account's live model list (cremind tools options claude_code, or the status sub-tool's models field) and its other Tool Variables (model, permission mode, max turns, max budget USD, Anthropic API key, CLI path, allowed/disallowed tools, max concurrent tasks). Also covers whether Claude Code is logged in / which credential it uses (including a host `claude login`), that Claude Code is disabled by default, and how to enable it (the claude_code feature / Claude Agent SDK). Distinct from the general `cremind tools` CLI reference."
+description: "The Claude Code built-in tool and its permission mode: the permission modes (bypassPermissions, acceptEdits, default, plan, dontAsk, auto) come live from the installed Claude Agent SDK — the same modes the Claude Code CLI cycles through with Shift+Tab — so what each allows and how to change one, listed with cremind tools options claude_code. Plus how to choose the model from the account's live model list (cremind tools options claude_code, or the status sub-tool's models field) and its other Tool Variables (model, permission mode, max turns, max budget USD, Anthropic API key, CLI path, allowed/disallowed tools, max concurrent tasks). Also covers whether Claude Code is logged in / which credential it uses (including a host `claude login`), that Claude Code is disabled by default, and how to enable it (the claude_code feature / Claude Agent SDK). Troubleshooting a blocked run: symptoms like Cannot write while in plan mode, approve/exit plan mode on your side, ExitPlanMode not available, or a coding task that only planned and made no changes mean CLAUDE_CODE_PERMISSION_MODE is a read-only or approval mode (plan, default, dontAsk) and the fix is `cremind tools set-var claude_code CLAUDE_CODE_PERMISSION_MODE=bypassPermissions`, not any UI toggle or `claude` CLI command; also covers a resumed session that returns no output (start a fresh task without session_id). Distinct from the general `cremind tools` CLI reference."
 ---
 
 # Claude Code Tool
@@ -76,6 +76,38 @@ Three equivalent ways, all profile-scoped:
 
 A change takes effect on the **next** Claude Code task for that profile — no
 server restart is needed (the value is re-read per task).
+
+## Symptoms & troubleshooting
+
+**Claude Code planned but did not change anything / says it cannot write.**
+Messages such as `Cannot write … while in plan mode`, "approve / exit plan mode
+on your side", "ExitPlanMode is not enabled in this context", or a completed run
+that only produced a plan mean `CLAUDE_CODE_PERMISSION_MODE` is a read-only or
+approval-gated mode (`plan`, `default`, or `dontAsk`). Cremind runs Claude Code
+**headless** — there is no interactive approver and the `ExitPlanMode` tool is
+not available — so the run cannot proceed to edits. This is **not** a "plan
+mode" in any UI, and it is **not** changed by a `claude` CLI command or by the
+user "exiting plan mode": the only lever is the Cremind tool variable above.
+
+Every `claude_code` result carries `effective_permission_mode`, and when the
+mode is not fully autonomous it also carries a `permission_advisory` object with
+the exact fix. The playbook is **confirm once, then fix**: tell the user the
+current mode blocks changes, ask once whether to switch it, and only on their OK
+run — through the Shell Executor tool:
+
+```bash
+cremind tools set-var claude_code CLAUDE_CODE_PERMISSION_MODE=bypassPermissions
+```
+
+then re-run the coding task (reuse the `session_id` to continue the session).
+`bypassPermissions` (the shipped default) runs fully autonomously; `acceptEdits`
+is a narrower option when only file edits are needed.
+
+**A resumed session returned no output (empty result, no turns).** The session
+may have expired or is no longer resumable. Do not report an empty result or ask
+the user what to do — start a **fresh** task with `run` *without* a `session_id`,
+repeating the full task brief. (The result carries `resume_produced_no_work:
+true` in this case.)
 
 ## Choosing a model
 

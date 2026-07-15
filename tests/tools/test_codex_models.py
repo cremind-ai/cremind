@@ -32,8 +32,11 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.delenv("CODEX_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(runner, "_CODEX_AUTH_PATH", tmp_path / "nope.json")
-    # Keep the managed CODEX_HOME out of the real system dir.
-    monkeypatch.setattr(runner, "_managed_codex_home", lambda: tmp_path / "codex-home")
+    # Keep the managed CODEX_HOME out of the real system dir (per-credential now).
+    monkeypatch.setattr(
+        runner, "_managed_codex_home",
+        lambda auth: tmp_path / "codex-home" / runner._cache_key(auth)[:16],
+    )
     yield
     runner._models_cache.clear()
 

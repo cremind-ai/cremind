@@ -338,17 +338,24 @@ class CodexRunTool(BuiltInTool):
         grace = min(runner._RUN_GRACE_SECONDS, _wait_cap())
         if await wait_for_task(task, grace):
             return _final_result(task)
-        return BuiltInToolResult(structured_content={
+        heartbeat: Dict[str, Any] = {
             "status": "running",
             "task_id": task.task_id,
             "session_id": task.session_id,
             "working_directory": task.cwd,
             "elapsed_seconds": task.elapsed_seconds(),
+            "effective_sandbox": task.sandbox,
             "message": (
                 "Codex is working. Call codex__wait with this task_id to get the "
                 "result; call codex__stop to abort."
             ),
-        })
+        }
+        advisory = runner._sandbox_advisory(task.sandbox)
+        if advisory is not None:
+            heartbeat["sandbox_advisory"] = advisory
+        if task.sandbox_note:
+            heartbeat["sandbox_coercion_note"] = task.sandbox_note
+        return BuiltInToolResult(structured_content=heartbeat)
 
 
 class CodexWaitTool(BuiltInTool):
@@ -395,17 +402,24 @@ class CodexWaitTool(BuiltInTool):
         wait_s = min(float(timeout) or runner._WAIT_DEFAULT_SECONDS, _wait_cap())
         if await wait_for_task(task, wait_s):
             return _final_result(task)
-        return BuiltInToolResult(structured_content={
+        heartbeat: Dict[str, Any] = {
             "status": "running",
             "task_id": task.task_id,
             "session_id": task.session_id,
             "elapsed_seconds": task.elapsed_seconds(),
             "activity_events": task.activity.total_steps if task.activity else 0,
+            "effective_sandbox": task.sandbox,
             "message": (
                 "Still working (progress is streaming to the user's Codex panel). "
                 "Call codex__wait again, or codex__stop to abort."
             ),
-        })
+        }
+        advisory = runner._sandbox_advisory(task.sandbox)
+        if advisory is not None:
+            heartbeat["sandbox_advisory"] = advisory
+        if task.sandbox_note:
+            heartbeat["sandbox_coercion_note"] = task.sandbox_note
+        return BuiltInToolResult(structured_content=heartbeat)
 
 
 class CodexStopTool(BuiltInTool):
@@ -494,12 +508,22 @@ class CodexStatusTool(BuiltInTool):
         source = credential_source(variables, profile)
         configured = source is not None
 
+        # Report the sandbox the run would ACTUALLY use (coerced + any
+        # CODEX_CONFIG_OVERRIDES sandbox_mode), so status never contradicts a run.
+        sandbox, sandbox_note = runner.resolve_sandbox(sdk, variables)
         payload: Dict[str, Any] = {
             "available": True,
             "sdk_installed": True,
             "credential_source": source,
             "credentials_configured": configured,
+            "effective_sandbox": sandbox,
         }
+        # Surface a restrictive sandbox BEFORE a coding task is started.
+        advisory = runner._sandbox_advisory(sandbox)
+        if advisory is not None:
+            payload["sandbox_advisory"] = advisory
+        if sandbox_note:
+            payload["sandbox_coercion_note"] = sandbox_note
         if configured:
             payload["message"] = (
                 f"Codex is installed and a credential is configured ({source}). "

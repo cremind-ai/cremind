@@ -409,6 +409,100 @@ def test_set_variable_model_allow_unknown_persists(tmp_path: Path, monkeypatch) 
     assert vars_["CLAUDE_CODE_MODEL"] == "my-custom-model"
 
 
+# ── masked-secret round-trip guard ──────────────────────────────────────────
+# A client (the Settings UI) reloads a secret as the mask "***" and re-submits
+# the whole variables dict on save. Persisting "***" would clobber the real
+# secret (and then get injected as a live credential). The handler must skip a
+# secret whose incoming value is the mask, leaving the stored value intact.
+
+def _vars_handler(tmp_path: Path):
+    reg = _make_registry(tmp_path)
+    state = SimpleNamespace(registry=reg)
+    return reg, _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+
+
+def test_secret_mask_does_not_clobber_stored_value(tmp_path: Path) -> None:
+    reg, handler = _vars_handler(tmp_path)
+    reg.config.set_variable(
+        "claude_code", "admin", "CLAUDE_CODE_API_KEY", "sk-real-secret", is_secret=True,
+    )
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "claude_code"},
+        body={"variables": {"CLAUDE_CODE_API_KEY": "***"}},
+    )))
+    assert resp.status_code == 200
+    vars_ = reg.config.get_variables("claude_code", "admin", include_secrets=True)
+    # The real secret survives — the mask was skipped, not written.
+    assert vars_["CLAUDE_CODE_API_KEY"] == "sk-real-secret"
+
+
+def test_secret_real_value_persists(tmp_path: Path) -> None:
+    reg, handler = _vars_handler(tmp_path)
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "claude_code"},
+        body={"variables": {"CLAUDE_CODE_API_KEY": "sk-brand-new"}},
+    )))
+    assert resp.status_code == 200
+    vars_ = reg.config.get_variables("claude_code", "admin", include_secrets=True)
+    assert vars_["CLAUDE_CODE_API_KEY"] == "sk-brand-new"
+
+
+def test_secret_empty_string_clears(tmp_path: Path) -> None:
+    reg, handler = _vars_handler(tmp_path)
+    reg.config.set_variable(
+        "claude_code", "admin", "CLAUDE_CODE_API_KEY", "sk-real-secret", is_secret=True,
+    )
+    # An explicit clear ("" — not the mask) must still write through.
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "claude_code"},
+        body={"variables": {"CLAUDE_CODE_API_KEY": ""}},
+    )))
+    assert resp.status_code == 200
+    vars_ = reg.config.get_variables("claude_code", "admin", include_secrets=True)
+    assert vars_["CLAUDE_CODE_API_KEY"] == ""
+
+
+def test_mask_skipped_while_other_vars_still_save(tmp_path: Path) -> None:
+    reg, handler = _vars_handler(tmp_path)
+    reg.config.set_variable(
+        "claude_code", "admin", "CLAUDE_CODE_API_KEY", "sk-real-secret", is_secret=True,
+    )
+    # Mixed save (the UI's real behaviour): a changed non-secret rides along with
+    # the untouched masked secret. The non-secret lands; the secret is preserved.
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "claude_code"},
+        body={"variables": {
+            "CLAUDE_CODE_API_KEY": "***",
+            "CLAUDE_CODE_MODEL": "claude-opus-4-8",
+        }},
+    )))
+    assert resp.status_code == 200
+    vars_ = reg.config.get_variables("claude_code", "admin", include_secrets=True)
+    assert vars_["CLAUDE_CODE_API_KEY"] == "sk-real-secret"
+    assert vars_["CLAUDE_CODE_MODEL"] == "claude-opus-4-8"
+
+
+def test_secret_mask_guard_codex_parity(tmp_path: Path) -> None:
+    reg = _make_registry(tmp_path)
+    codex = BuiltInToolGroup(
+        config_name="codex", display_name="Codex",
+        description="cx", functions=[_FakeLeaf()], llm=object(),
+    )
+    reg.register_builtin(codex, source="codex")
+    reg.config.set_variable(
+        "codex", "admin", "CODEX_API_KEY", "sk-codex-real", is_secret=True,
+    )
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "codex"},
+        body={"variables": {"CODEX_API_KEY": "***"}},
+    )))
+    assert resp.status_code == 200
+    vars_ = reg.config.get_variables("codex", "admin", include_secrets=True)
+    assert vars_["CODEX_API_KEY"] == "sk-codex-real"
+
+
 # ── variable options ────────────────────────────────────────────────────────
 
 def test_variable_options_route_registered(tmp_path: Path) -> None:

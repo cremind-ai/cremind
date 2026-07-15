@@ -131,6 +131,8 @@ class CodexTask:
     session_id: Optional[str] = None  # the Codex thread id
     resumed_from: Optional[str] = None
     model: Optional[str] = None
+    sandbox: Optional[str] = None  # the EFFECTIVE sandbox the run actually uses
+    sandbox_note: Optional[str] = None  # set when a configured value fell open
     runner: Optional[asyncio.Task] = None
     client: Any = None
     turn_handle: Any = None
@@ -198,10 +200,15 @@ def _enum_value(value: Any) -> str:
 
 
 # ── auth ───────────────────────────────────────────────────────────────────────
-def _managed_codex_home() -> Path:
-    """Cremind-owned ``CODEX_HOME`` used when an explicit API key is installed via
-    ``login_api_key()``, so the user's own ``~/.codex`` is never touched."""
-    home = Path(BaseConfig.CREMIND_SYSTEM_DIR) / "codex-home"
+def _managed_codex_home(auth: "CodexAuth") -> Path:
+    """Cremind-owned ``CODEX_HOME`` for an installed API key, so the user's own
+    ``~/.codex`` is never touched.
+
+    Isolated PER CREDENTIAL (a subdir keyed by the credential fingerprint) so that
+    concurrent tasks under different keys/profiles never share one ``auth.json``
+    (no cross-account bleed), and a fresh key always lands in an empty dir (a
+    failed login can't silently reuse a previous key's stored credential)."""
+    home = Path(BaseConfig.CREMIND_SYSTEM_DIR) / "codex-home" / _cache_key(auth)[:16]
     try:
         home.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -219,23 +226,37 @@ def resolve_auth(variables: dict, profile: str) -> CodexAuth:
     ``~/.codex/auth.json`` (host ``codex login``). Auth *failures* are surfaced
     later from the SDK result.
     """
-    managed = {"CODEX_HOME": str(_managed_codex_home())}
+    # Resolve the key + source first, then point CODEX_HOME at a per-credential
+    # managed dir derived from the fingerprint (see _managed_codex_home).
+    api_key: Optional[str] = None
+    source: Optional[str] = None
 
     explicit = str(variables.get(Var.API_KEY) or "").strip()
     if explicit:
-        return CodexAuth(env_overrides=managed, api_key=explicit, source="tool_variable_api_key")
-    try:
-        prof_key = BaseConfig.get_provider_api_key("openai", profile=profile)
-        if prof_key:
-            return CodexAuth(env_overrides=managed, api_key=prof_key, source="profile_openai_api_key")
-    except Exception:  # noqa: BLE001
-        logger.debug("codex: profile auth resolution failed", exc_info=True)
-    env_codex = os.environ.get("CODEX_API_KEY")
-    if env_codex:
-        return CodexAuth(env_overrides=managed, api_key=env_codex, source="env_codex_api_key")
-    env_openai = os.environ.get("OPENAI_API_KEY")
-    if env_openai:
-        return CodexAuth(env_overrides=managed, api_key=env_openai, source="env_openai_api_key")
+        api_key, source = explicit, "tool_variable_api_key"
+    if api_key is None:
+        try:
+            prof_key = BaseConfig.get_provider_api_key("openai", profile=profile)
+            if prof_key:
+                api_key, source = prof_key, "profile_openai_api_key"
+        except Exception:  # noqa: BLE001
+            logger.debug("codex: profile auth resolution failed", exc_info=True)
+    if api_key is None:
+        env_codex = os.environ.get("CODEX_API_KEY")
+        if env_codex:
+            api_key, source = env_codex, "env_codex_api_key"
+    if api_key is None:
+        env_openai = os.environ.get("OPENAI_API_KEY")
+        if env_openai:
+            api_key, source = env_openai, "env_openai_api_key"
+
+    if api_key is not None:
+        auth = CodexAuth(api_key=api_key, source=source)
+        auth.env_overrides = {"CODEX_HOME": str(_managed_codex_home(auth))}
+        return auth
+
+    # No key found — authenticate from the ambient host ``codex login`` store
+    # (``~/.codex``); do not point CODEX_HOME at the managed dir.
     source = "host_codex_login" if _read_host_codex_auth() else None
     return CodexAuth(env_overrides={}, api_key=None, source=source)
 
@@ -325,6 +346,46 @@ def _coerce_sandbox(sdk, value: Any):
     return None
 
 
+def _config_override_sandbox(variables: dict) -> Optional[str]:
+    """A ``sandbox_mode=`` entry in ``CODEX_CONFIG_OVERRIDES`` is a second lever
+    on the filesystem sandbox; return its value (or None)."""
+    for pair in _csv_pairs(variables.get(Var.CONFIG_OVERRIDES)):
+        key, _, val = pair.partition("=")
+        if key.strip() == "sandbox_mode":
+            return val.strip() or None
+    return None
+
+
+def resolve_sandbox(sdk, variables: dict) -> Tuple[str, Optional[str]]:
+    """Return ``(effective_sandbox, coercion_note)``.
+
+    ``effective_sandbox`` is the sandbox the run will ACTUALLY use, so the
+    reported ``effective_sandbox``/``sandbox_advisory`` can never contradict the
+    run: a ``sandbox_mode`` override in ``CODEX_CONFIG_OVERRIDES`` wins; otherwise
+    the ``CODEX_SANDBOX`` value coerced exactly as :func:`_coerce_sandbox` does
+    at run time (an unrecognized value silently falls open to ``full-access``).
+
+    ``coercion_note`` is set only when a non-empty configured ``CODEX_SANDBOX``
+    was unrecognized and fell open to ``full-access`` — so that silent fail-open
+    is surfaced honestly instead of being reported as an intended sandbox.
+    """
+    override = _config_override_sandbox(variables)
+    if override:
+        return override, None
+    raw = str(variables.get(Var.SANDBOX) or "").strip()
+    coerced = _coerce_sandbox(sdk, raw)
+    effective = _enum_value(coerced) if coerced is not None else (raw or "full-access")
+    note: Optional[str] = None
+    if raw and effective != raw:
+        note = (
+            f"The configured CODEX_SANDBOX '{raw}' is not a recognized sandbox, so "
+            f"Codex ran with '{effective}' (full filesystem access). Set a valid "
+            "sandbox (read-only, workspace-write, or full-access) with "
+            "`cremind tools set-var codex CODEX_SANDBOX=<value>`."
+        )
+    return effective, note
+
+
 def _coerce_effort(value: Any) -> Optional[str]:
     effort = str(value or "").strip().lower()
     return effort if effort in _REASONING_EFFORTS else None
@@ -353,17 +414,19 @@ def build_turn_kwargs(sdk, *, variables: dict) -> Dict[str, Any]:
 
 async def _login_if_needed(codex, auth: CodexAuth) -> None:
     """Install an explicit/profile/env API key into the (managed) CODEX_HOME.
-    A no-op when authenticating from a host ``codex login`` store."""
+    A no-op when authenticating from a host ``codex login`` store.
+
+    A login failure is NOT swallowed — it propagates so the caller's exception
+    handling surfaces it (classified as an auth failure where recognizable),
+    instead of silently proceeding against whatever the store already held."""
     if not auth.api_key:
         return
-    try:
-        await codex.login_api_key(auth.api_key)
-    except Exception:  # noqa: BLE001 — surfaced later as an auth failure
-        logger.debug("codex: login_api_key failed", exc_info=True)
+    await codex.login_api_key(auth.api_key)
 
 
 # ── account model listing ──────────────────────────────────────────────────────
 _MODELS_CACHE_TTL = 300.0  # seconds
+_MODELS_TIMEOUT = 15.0  # cap the app-server spawn + models() call
 # credential fingerprint -> (fetched_at, models). Errors are never cached.
 _models_cache: Dict[str, Tuple[float, List[dict]]] = {}
 
@@ -406,12 +469,24 @@ async def list_models(
             if (time.monotonic() - fetched_at) < _MODELS_CACHE_TTL:
                 return {"models": cached_models, "source": auth.source, "cached": True}
 
-    try:
+    async def _fetch():
         config = build_config(sdk, variables=variables, auth=auth, cwd=None)
         async with sdk.AsyncCodex(config) as codex:
             await _login_if_needed(codex, auth)
-            resp = await codex.models()
+            return await codex.models()
+
+    try:
+        # Bound the app-server spawn + query so a hung/slow launch can't stall the
+        # Settings variable-options hook / `cremind tools options codex` (parity
+        # with probe_auth, which already has a timeout).
+        resp = await asyncio.wait_for(_fetch(), timeout=_MODELS_TIMEOUT)
         rows = getattr(resp, "data", None) or []
+    except asyncio.TimeoutError:
+        return {
+            "models": [],
+            "error": f"Listing Codex models timed out after {int(_MODELS_TIMEOUT)}s.",
+            "source": auth.source,
+        }
     except Exception as exc:  # noqa: BLE001
         logger.debug("codex: model listing failed", exc_info=True)
         detail = f"Failed to list Codex models: {exc}"
@@ -445,6 +520,79 @@ _SANDBOX_LABELS: Dict[str, str] = {
         "Shell Executor tool)"
     ),
 }
+
+# Sandbox autonomy classification — the Codex analog of Claude Code's permission
+# mode. Kept next to _SANDBOX_LABELS so a new SDK sandbox gets a label AND a
+# classification review together.
+#   autonomous — full-access: writes anywhere, runs any command
+#   edits_only — workspace-write: writes/runs INSIDE the working directory only
+#   blocked    — read-only: explore/answer only, cannot make changes
+#   unknown    — an unrecognised sandbox value: surface it, never claim blocked
+_SANDBOX_AUTONOMOUS = frozenset({"full-access"})
+_SANDBOX_EDITS_ONLY = frozenset({"workspace-write"})
+_SANDBOX_BLOCKED = frozenset({"read-only"})
+
+_SANDBOX_WRITE_TARGET = "full-access"
+
+
+def sandbox_autonomy(mode: Optional[str]) -> str:
+    """Classify a Codex sandbox as autonomous / edits_only / blocked / unknown."""
+    if mode in _SANDBOX_AUTONOMOUS:
+        return "autonomous"
+    if mode in _SANDBOX_EDITS_ONLY:
+        return "edits_only"
+    if mode in _SANDBOX_BLOCKED:
+        return "blocked"
+    return "unknown"
+
+
+def _sandbox_advisory(mode: Optional[str]) -> Optional[Dict[str, Any]]:
+    """A 'confirm once, then fix' advisory for a Codex sandbox that may prevent
+    headless changes, or ``None`` when the sandbox is fully autonomous.
+
+    Mirrors the Claude Code permission advisory: names the real lever (Cremind's
+    ``CODEX_SANDBOX`` tool variable) and the exact ``cremind tools set-var``
+    command, and requires asking the user once before running it."""
+    autonomy = sandbox_autonomy(mode)
+    if autonomy == "autonomous":
+        return None
+    command = f"cremind tools set-var codex CODEX_SANDBOX={_SANDBOX_WRITE_TARGET}"
+    if autonomy == "edits_only":
+        warning = (
+            f"Codex ran in sandbox '{mode}', which lets it edit files and run "
+            "commands only INSIDE the working directory. If the task needed to "
+            "touch files outside the working directory and was blocked, this is why."
+        )
+    elif autonomy == "blocked":
+        warning = (
+            f"Codex ran in sandbox '{mode}', which is read-only — it can explore "
+            "and answer but CANNOT create or modify files. If the task was meant "
+            "to make changes and none were made, this is why."
+        )
+    else:  # unknown
+        warning = (
+            f"Codex ran in sandbox '{mode}', which Cremind does not recognise as a "
+            "fully-autonomous sandbox. If the task was meant to make changes but "
+            "none were made, this sandbox may be the reason."
+        )
+    return {
+        "autonomy": autonomy,
+        "warning": warning,
+        "cause": (
+            "This sandbox is set by Cremind's CODEX_SANDBOX tool variable — NOT by "
+            "Codex itself. There is no UI sandbox toggle for the user to flip and "
+            "no `codex` CLI command that changes it here."
+        ),
+        "remediation": (
+            "Tell the user Codex is in this sandbox and ask ONCE whether to switch "
+            f"it to {_SANDBOX_WRITE_TARGET} (fully autonomous; workspace-write is a "
+            "narrower option that confines changes to the working directory). Only "
+            "after they agree, run the command below with the Shell Executor tool, "
+            "then re-run the task with codex__run (reuse the session_id to "
+            "continue). Do NOT change the sandbox without asking first."
+        ),
+        "command": command,
+    }
 
 
 def list_sandbox_modes() -> Dict[str, Any]:
@@ -579,6 +727,7 @@ async def start_task(
     if sdk is None:  # pragma: no cover — leaf pre-checks this; defensive.
         raise RuntimeError(f"openai_codex not importable: {err}")
 
+    effective_sandbox, sandbox_note = resolve_sandbox(sdk, variables)
     task = CodexTask(
         task_id=uuid.uuid4().hex[:8],
         context_id=context_id,
@@ -588,6 +737,8 @@ async def start_task(
         session_id=session_id,
         resumed_from=session_id,
         model=model,
+        sandbox=effective_sandbox,
+        sandbox_note=sandbox_note,
         agent_task_id=current_task_id_var.get(),
     )
     _task_registry[task.task_id] = task
@@ -779,14 +930,29 @@ def _finalize_from_turn(task: CodexTask, turn: Any) -> None:
         task.status = "failed"
         error = getattr(turn, "error", None)
         detail = getattr(error, "message", None) or ""
-        if _looks_like_auth_error(detail):
+        # Classify from more than .message — the SDK may carry the auth reason in
+        # .code/.type — so an auth failure isn't mislabeled CodexError (and handed
+        # a misleading sandbox_advisory).
+        blob = " ".join(
+            str(x) for x in (
+                detail,
+                getattr(error, "code", None),
+                getattr(error, "type", None),
+                error,
+            ) if x
+        )
+        if _looks_like_auth_error(blob):
             task.result = _auth_failure_payload(task, detail=detail)
         else:
+            # A non-auth failure may stem from a restrictive sandbox; attach the
+            # advisory here (never on the auth path). Autonomous sandboxes yield
+            # None, which _failure_payload filters out.
             task.result = _failure_payload(
                 task,
                 error="CodexError",
                 message=f"Codex did not complete successfully. {detail}".strip(),
                 duration_ms=getattr(turn, "duration_ms", None),
+                sandbox_advisory=_sandbox_advisory(task.sandbox),
             )
         return
     task.status = "completed"
@@ -830,19 +996,40 @@ def _map_usage(usage: Any) -> Optional[Dict[str, int]]:
 
 
 def _success_payload(task: CodexTask, turn: Any) -> Dict[str, Any]:
-    return {
+    result_text = _final_response_from_items(getattr(turn, "items", None))
+    payload: Dict[str, Any] = {
         "status": "completed",
         "task_id": task.task_id,
         "session_id": task.session_id,
-        "result": _final_response_from_items(getattr(turn, "items", None)),
+        "result": result_text,
         "duration_ms": getattr(turn, "duration_ms", None),
         "usage": task.token_usage,
         "working_directory": task.cwd,
+        "effective_sandbox": task.sandbox,
         "note": (
             "To continue this coding session with a follow-up instruction, call "
             "codex__run with this session_id (the Codex thread)."
         ),
     }
+
+    # Empty-resume guard: a resumed thread that cannot be continued comes back
+    # with no final message. Codex reports no turn count, so gate on empty result
+    # AND a resume attempt so a legitimately-empty fresh completion is untouched.
+    if not result_text.strip() and task.resumed_from:
+        payload["resume_produced_no_work"] = True
+        payload["result"] = (
+            "(no output) Resuming this Codex session produced no work — the thread "
+            "may have expired or is no longer resumable. Do NOT treat this as 'the "
+            "task produced no output'. Start a fresh task with codex__run WITHOUT a "
+            "session_id, repeating the full task brief."
+        )
+
+    advisory = _sandbox_advisory(task.sandbox)
+    if advisory is not None:
+        payload["sandbox_advisory"] = advisory
+    if task.sandbox_note:
+        payload["sandbox_coercion_note"] = task.sandbox_note
+    return payload
 
 
 def _failure_payload(task: CodexTask, *, error: str, message: str, **extra: Any) -> Dict[str, Any]:
@@ -853,7 +1040,10 @@ def _failure_payload(task: CodexTask, *, error: str, message: str, **extra: Any)
         "error": error,
         "message": message,
         "working_directory": task.cwd,
+        "effective_sandbox": task.sandbox,
     }
+    if task.sandbox_note:
+        payload["sandbox_coercion_note"] = task.sandbox_note
     payload.update({k: v for k, v in extra.items() if v is not None})
     return payload
 
