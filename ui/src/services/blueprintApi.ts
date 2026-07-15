@@ -148,11 +148,7 @@ export async function listBlueprints(agentUrl: string, authToken: string): Promi
 }
 
 export async function downloadBlueprint(agentUrl: string, authToken: string, name: string): Promise<void> {
-  const res = await fetch(`${resolveBaseUrl(agentUrl)}/api/blueprints/download/${encodeURIComponent(name)}`, {
-    headers: authHeaders(authToken, false),
-  });
-  if (!res.ok) throw new Error(`Failed to download blueprint: ${res.statusText}`);
-  const blob = await res.blob();
+  const blob = await fetchBlueprintBlob(agentUrl, authToken, name);
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -161,6 +157,30 @@ export async function downloadBlueprint(agentUrl: string, authToken: string, nam
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+}
+
+/** Fetch a stored blueprint archive as a Blob (for the Publish-to-Hub upload). */
+export async function fetchBlueprintBlob(
+  agentUrl: string, authToken: string, name: string,
+): Promise<Blob> {
+  const res = await fetch(`${resolveBaseUrl(agentUrl)}/api/blueprints/download/${encodeURIComponent(name)}`, {
+    headers: authHeaders(authToken, false),
+  });
+  if (!res.ok) throw new Error(`Failed to read blueprint: ${res.statusText}`);
+  return res.blob();
+}
+
+/** Stage a blueprint downloaded from the Cremind Hub into the import wizard. */
+export async function importBlueprintFromHub(
+  agentUrl: string, authToken: string, link: string, replace = false,
+): Promise<ImportSession> {
+  const q = replace ? '?replace=true' : '';
+  const res = await fetch(`${resolveBaseUrl(agentUrl)}/api/blueprints/import/hub${q}`, {
+    method: 'POST',
+    headers: authHeaders(authToken),
+    body: JSON.stringify({ link }),
+  });
+  return jsonOrThrow(res, 'Failed to import blueprint from hub');
 }
 
 export async function deleteBlueprint(agentUrl: string, authToken: string, name: string): Promise<void> {

@@ -469,9 +469,14 @@ def get_config_routes(state: BootedState) -> list[Route]:
         the database, because doing so would create a SQLite file before
         the user has picked a backend.
         """
+        # Non-secret, storage-independent: where the Cremind Hub marketplace lives.
+        # Surfaced here (the one always-available public boot endpoint) so the SPA's
+        # "Publish to Hub" flow uses the same base URL as the backend downloader/CLI.
+        hub_url = os.environ.get("CREMIND_HUB_URL", "https://hub.cremind.io").rstrip("/")
+
         profile = request.query_params.get("profile")
         if not state.storage_ready:
-            result = {"setup_complete": False, "storage_ready": False}
+            result = {"setup_complete": False, "storage_ready": False, "hub_url": hub_url}
             if profile:
                 result["profile_exists"] = False
             return JSONResponse(result)
@@ -482,6 +487,7 @@ def get_config_routes(state: BootedState) -> list[Route]:
         result = {
             "setup_complete": setup_complete,
             "storage_ready": True,
+            "hub_url": hub_url,
         }
         if profile:
             result["profile_exists"] = await conversation_storage.profile_exists(profile)

@@ -370,29 +370,11 @@ def bp_import(
     async def _run():
         async with Client(cfg) as client:
             session = await api.upload(client, str(path), replace=replace)
-            target = session.get("target_profile") or session.get("owner")
-            if profile and profile != target:
-                raise typer.BadParameter(
-                    f"Import targets your token's profile ({target!r}), not {profile!r}. "
-                    f"Use a token for {profile!r} (create/select that profile first)."
-                )
-            plan = session.get("plan") or []
-            if dry_run:
-                return {"dry_run": True, "session": session, "target": target}
-
-            for step in plan:
-                key = step.get("key")
-                # Guard: required secrets not supplied and not skipping → stop.
-                missing = _missing_secrets(key, step, sets)
-                if missing and not skip_all:
-                    raise typer.BadParameter(
-                        f"Step {key!r} needs: {', '.join(missing)}. "
-                        f"Provide via --set or pass --skip-all."
-                    )
-                inputs = _step_inputs(key, sets, start_listeners=start_listeners, plan_step=step)
-                await api.apply_step(client, key, inputs)
-            report_resp = await api.finalize(client)
-            return {"dry_run": False, "report": report_resp.get("report"), "target": target}
+            return await _drive_wizard(
+                client, session, sets,
+                profile=profile, skip_all=skip_all,
+                start_listeners=start_listeners, dry_run=dry_run,
+            )
 
     out = asyncio.run(_run())
     if mode.json:
@@ -403,6 +385,189 @@ def bp_import(
         _print_plan(out["session"])
         return
     _print_report(out.get("report") or {})
+
+
+async def _drive_wizard(
+    client,
+    session: dict,
+    sets: dict,
+    *,
+    profile: Optional[str],
+    skip_all: bool,
+    start_listeners: bool,
+    dry_run: bool,
+) -> dict:
+    """Drive an already-staged import session to completion (shared by import/install)."""
+    import typer as _typer
+
+    from app.cli.client import blueprint as api
+
+    target = session.get("target_profile") or session.get("owner")
+    if profile and profile != target:
+        raise _typer.BadParameter(
+            f"Import targets your token's profile ({target!r}), not {profile!r}. "
+            f"Use a token for {profile!r} (create/select that profile first)."
+        )
+    plan = session.get("plan") or []
+    if dry_run:
+        return {"dry_run": True, "session": session, "target": target}
+
+    for step in plan:
+        key = step.get("key")
+        # Guard: required secrets not supplied and not skipping → stop.
+        missing = _missing_secrets(key, step, sets)
+        if missing and not skip_all:
+            raise _typer.BadParameter(
+                f"Step {key!r} needs: {', '.join(missing)}. Provide via --set or pass --skip-all."
+            )
+        inputs = _step_inputs(key, sets, start_listeners=start_listeners, plan_step=step)
+        await api.apply_step(client, key, inputs)
+    report_resp = await api.finalize(client)
+    return {"dry_run": False, "report": report_resp.get("report"), "target": target}
+
+
+@blueprint_app.command("install")
+@graceful_errors
+def bp_install(
+    ctx: typer.Context,
+    link: str = typer.Argument(
+        ..., help="Cremind Hub link (https://hub.cremind.io/blueprints/<name>) or a blueprint name."
+    ),
+    profile: Optional[str] = typer.Option(
+        None, "--profile",
+        help="Assert the import targets this profile (defaults to your token's profile).",
+    ),
+    set_: list[str] = typer.Option(
+        [], "--set", help="Provide a secret/path, e.g. --set openai.api_key=sk-... or --set skill:jira.JIRA_SITE=..."
+    ),
+    skip_all: bool = typer.Option(False, "--skip-all", help="Apply the design without missing secrets."),
+    start_listeners: bool = typer.Option(False, "--start-listeners", help="Start skill listeners now."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Download + validate + print requirements, then stop."),
+    replace: bool = typer.Option(False, "--replace", help="Abort any in-progress import first."),
+) -> None:
+    """Download a blueprint from the Cremind Hub and import it into the current profile.
+
+    Downloads + stages the blueprint server-side, then runs the same non-interactive
+    wizard as ``import`` — so all of the ``import`` flags apply.
+    """
+    import asyncio
+
+    from app.cli.client import blueprint as api
+    from app.cli.client._base import Client
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+    sets = _parse_set(set_)
+
+    async def _run():
+        async with Client(cfg) as client:
+            session = await api.import_hub(client, link, replace=replace)
+            return await _drive_wizard(
+                client, session, sets,
+                profile=profile, skip_all=skip_all,
+                start_listeners=start_listeners, dry_run=dry_run,
+            )
+
+    out = asyncio.run(_run())
+    if mode.json:
+        print_json(out)
+        return
+    if out.get("dry_run"):
+        typer.echo(f"Importing into profile: {out.get('target')}")
+        _print_plan(out["session"])
+        return
+    _print_report(out.get("report") or {})
+
+
+# ── upload (to the Cremind Hub, device-code flow) ──────────────────────────────
+
+
+@blueprint_app.command("upload")
+@graceful_errors
+def bp_upload(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Blueprint archive name on the server (see `cremind blueprint list`)."),
+    display_name: Optional[str] = typer.Option(None, "--display-name", help="Human-readable name for the Hub listing."),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Don't open the approval URL in a browser."),
+) -> None:
+    """Upload a blueprint to the Cremind Hub marketplace (stored as a draft).
+
+    Downloads the archive from your local server, then runs a browser device-code
+    approval against the Hub (log in / approve there), and uploads on your behalf. The
+    blueprint is stored as a DRAFT — publish it from its page on the Hub. No Hub
+    credentials are stored locally. Set ``CREMIND_HUB_URL`` to target a non-default hub.
+    """
+    import asyncio
+    import io
+
+    from app.cli.client import blueprint as api
+    from app.cli.client._base import Client
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json, print_kv
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+    base = name[: -len(".cremind-blueprint")] if name.endswith(".cremind-blueprint") else name
+
+    async def _run():
+        # 1. Fetch the archive bytes from the LOCAL server.
+        async with Client(cfg) as client:
+            sink = io.BytesIO()
+            await api.download(client, name, sink)
+        data = sink.getvalue()
+        if not data:
+            raise RuntimeError(f"Blueprint '{name}' is empty or not found on the server.")
+
+        # 2. Start the Hub device-code flow.
+        start = await api.publish_device_start(base, display_name or base)
+        if not mode.json:
+            typer.echo("To upload, approve this request on the Cremind Hub:")
+            print_kv([
+                ("verification_uri", start.verification_uri),
+                ("user_code", start.user_code),
+            ])
+        if not no_browser and start.verification_uri_complete:
+            import webbrowser
+
+            webbrowser.open(start.verification_uri_complete)
+
+        # 3. Poll until approved (honor interval; deny/expiry are terminal).
+        interval = start.interval or 5
+        token = ""
+        while True:
+            poll = await api.publish_device_poll(start.device_code)
+            if poll.status == "complete":
+                token = poll.publish_token
+                break
+            if poll.status == "expired":
+                raise RuntimeError("Approval expired; run `cremind blueprint upload` again.")
+            if poll.status == "denied":
+                raise RuntimeError("Upload request was denied.")
+            await asyncio.sleep(interval)
+
+        # 4. Upload with the Bearer upload token.
+        result = await api.upload_to_hub(token, name, data)
+        return result
+
+    try:
+        result = asyncio.run(_run())
+    except KeyboardInterrupt:
+        raise typer.Exit(code=130)
+
+    url = result.get("url") or ""
+    full = f"{api.hub_base()}{url}" if url else ""
+    if mode.json:
+        print_json({"ok": True, "url": url, "hub_url": full})
+        return
+    typer.echo(f"Uploaded to Cremind Hub: {full or '(see the Hub)'} — publish it there when ready.")
+    if full and not no_browser:
+        import webbrowser
+
+        webbrowser.open(full)
 
 
 def _missing_secrets(key: str, step: dict, sets: dict) -> list[str]:

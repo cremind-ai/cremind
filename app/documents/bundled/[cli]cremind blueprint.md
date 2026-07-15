@@ -1,5 +1,5 @@
 ---
-description: "Package a single profile's **design** into a portable `.cremind-blueprint` file and import it into a profile in another Cremind install — for sharing a purpose-built agent (e.g. a customer-service assistant) with others. A blueprint carries the agent persona, per-tool enable/disable and configuration, the chosen LLM provider/model selection, any settings changed from defaults (e.g. max steps 200→300), bundled user skills, registered events (schedules, file watchers, skill events), and skill event-listener processes. It contains **NO secrets** — API keys, tokens, passwords, OAuth token files, and `scripts/.env` are never included; the importer is prompted to supply the required secrets (or skip and provide them later). Export shows a checklist of only the components you actually customized. Import runs a step-by-step wizard that applies the design to the current profile (create a fresh profile first if you don't want to change an existing one) and reports what needs attention. Blueprints carry version metadata and stay compatible across Cremind versions in both directions. Distinct from `cremind backup`, which snapshots the whole system including secrets."
+description: "Package a single profile's **design** into a portable `.cremind-blueprint` file and import it into a profile in another Cremind install — for sharing a purpose-built agent (e.g. a customer-service assistant) with others. A blueprint carries the agent persona, per-tool enable/disable and configuration, the chosen LLM provider/model selection, any settings changed from defaults (e.g. max steps 200→300), bundled user skills, registered events (schedules, file watchers, skill events), and skill event-listener processes. It contains **NO secrets** — API keys, tokens, passwords, OAuth token files, and `scripts/.env` are never included; the importer is prompted to supply the required secrets (or skip and provide them later). Export shows a checklist of only the components you actually customized. Import runs a step-by-step wizard that applies the design to the current profile (create a fresh profile first if you don't want to change an existing one) and reports what needs attention. It can also upload a blueprint to the Cremind Hub marketplace with `upload` (a browser device-code approval — no hub credentials are stored locally); uploading only stores it on the hub as a draft, and you publish it from the hub web UI. It can install one from the hub by link or name with `install`. Blueprints carry version metadata and stay compatible across Cremind versions in both directions. Distinct from `cremind backup`, which snapshots the whole system including secrets."
 ---
 
 # `cremind blueprint` — Package & share a profile's design
@@ -137,6 +137,53 @@ Settings. Only one import runs at a time; a new upload with `--replace` stops
 any in-progress import you started. Stopping an import does not undo steps
 already applied and never deletes the profile — delete the profile yourself if
 you want a clean slate.
+
+## Install from the Cremind Hub
+
+Instead of a local file, you can install a blueprint straight from the Cremind
+Hub marketplace (`hub.cremind.io`) by its page link or bare name:
+
+```
+cremind blueprint install https://hub.cremind.io/blueprints/cs-agent
+cremind blueprint install cs-agent --dry-run
+cremind blueprint install cs-agent --set openai.api_key=sk-... --start-listeners
+```
+
+Cremind downloads the `.cremind-blueprint` from the hub, stages it server-side,
+and runs the **same non-interactive wizard as `import`** — so every `import`
+option applies (`--profile`, `--set`, `--skip-all`, `--start-listeners`,
+`--dry-run`, `--replace`, and the `--set` grammar above). Set `CREMIND_HUB_URL`
+to target a non-default hub (e.g. `http://localhost:8788`).
+
+## Upload to the Cremind Hub
+
+Share a blueprint by uploading it to the Cremind Hub marketplace. First export
+it (so the server has the archive), then upload by its archive name:
+
+```
+cremind blueprint export --all --name cs-agent
+cremind blueprint upload cs-agent
+```
+
+`upload` downloads the archive from your local server, then runs a **browser
+device-code approval** against the hub: it prints a verification URL + short
+code and opens the URL (unless `--no-browser`). Sign in / approve on the hub —
+if you're not logged in the hub asks you to first — and the CLI uploads on your
+behalf and prints the hub page URL. **No hub credentials are stored locally**;
+the one-time, short-lived upload token is used only for the upload.
+
+| Option | Meaning |
+| --- | --- |
+| `--display-name TEXT` | Human-readable name for the hub listing (defaults to the blueprint name). |
+| `--no-browser` | Don't auto-open the approval URL (print it instead) and don't open the result. |
+
+**Uploading only stores the blueprint on the hub as a draft** — open its hub
+page and click **Publish** to actually list it (publishing is a decision you make
+on the hub, not part of the upload). Until a hub moderator verifies it, its hub
+name carries a short suffix (e.g. `cs-agent-k3m9p2qr`). `CREMIND_HUB_URL`
+overrides the hub base (default `https://hub.cremind.io`). You can also upload in
+one click from the app's **Settings → Blueprints** page (no file handling), or
+upload the exported file on the hub website.
 
 ## Version compatibility
 

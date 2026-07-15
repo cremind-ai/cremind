@@ -1,14 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, reactive, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { Icon } from '@iconify/vue';
 import {
-  ElButton, ElCard, ElCheckbox, ElInput, ElMessage, ElMessageBox, ElTable, ElTableColumn,
+  ElButton, ElCard, ElCheckbox, ElInput, ElMessage, ElMessageBox,
+  ElRadioButton, ElRadioGroup, ElTable, ElTableColumn,
 } from 'element-plus';
 
 import { useSettingsStore } from '../stores/settings';
+import { getHubUrl } from '../services/runtimeConfig';
+import { uploadBlueprintToHub } from '../services/hubPublish';
 import {
-  deleteBlueprint, downloadBlueprint, exportBlueprint, getExportable, listBlueprints,
+  deleteBlueprint, downloadBlueprint, exportBlueprint, getExportable,
+  importBlueprintFromHub, listBlueprints,
   type BlueprintEntry, type ExportableResponse,
 } from '../services/blueprintApi';
 
@@ -31,6 +35,15 @@ const archives = ref<BlueprintEntry[]>([]);
 const loading = ref(false);
 const exporting = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
+
+// Upload to Cremind Hub (Method 2 browser hand-off).
+const hubUrl = ref('');
+const uploading = reactive<Record<string, boolean>>({});
+
+// Import mode: from a local file, or downloaded from the Cremind Hub.
+const importMode = ref<'file' | 'hub'>('file');
+const hubLink = ref('');
+const importingHub = ref(false);
 
 const availableComponents = computed(() =>
   COMPONENT_ORDER.filter(k => exportable.value?.components?.[k]?.available),
@@ -142,6 +155,58 @@ async function onDelete(entry: BlueprintEntry) {
   }
 }
 
+async function onUpload(entry: BlueprintEntry) {
+  const c = creds();
+  if (!hubUrl.value) {
+    ElMessage.error('Could not resolve the Cremind Hub URL.');
+    return;
+  }
+  uploading[entry.name] = true;
+  try {
+    await uploadBlueprintToHub({
+      agentUrl: c.url,
+      authToken: c.token,
+      hubUrl: hubUrl.value,
+      name: entry.name,
+      displayName: entry.manifest?.display_name,
+    });
+    ElMessage.success('Uploaded to Cremind Hub — open it there to publish');
+  } catch (e: any) {
+    ElMessage.error(e?.message ?? 'Upload failed');
+  } finally {
+    uploading[entry.name] = false;
+  }
+}
+
+async function onImportFromHub() {
+  const c = creds();
+  const link = hubLink.value.trim();
+  if (!link) {
+    ElMessage.warning('Enter a Cremind Hub link or blueprint name');
+    return;
+  }
+  importingHub.value = true;
+  try {
+    await importBlueprintFromHub(c.url, c.token, link, false);
+    router.push(`/${props.profile}/settings/blueprints/import`);
+  } catch (e: any) {
+    // Mirror the file-upload path: offer to replace an in-progress import.
+    if (/in progress|session_exists|session_busy|already/i.test(e?.message ?? '')) {
+      try {
+        await ElMessageBox.confirm(
+          'Another blueprint import is in progress. Replace it?', 'Confirm', { type: 'warning' },
+        );
+        await importBlueprintFromHub(c.url, c.token, link, true);
+        router.push(`/${props.profile}/settings/blueprints/import`);
+        return;
+      } catch { /* cancelled */ }
+    }
+    ElMessage.error(e?.message ?? 'Import failed');
+  } finally {
+    importingHub.value = false;
+  }
+}
+
 function pickFile() {
   fileInput.value?.click();
 }
@@ -170,6 +235,9 @@ function fmtBytes(n: number): string {
 onMounted(async () => {
   await loadExportable();
   await loadArchives();
+  try {
+    hubUrl.value = await getHubUrl(creds().url);
+  } catch { /* publish button will report if unavailable */ }
 });
 </script>
 
@@ -233,9 +301,16 @@ onMounted(async () => {
           <ElTableColumn label="Size" width="90">
             <template #default="{ row }">{{ fmtBytes(row.size_bytes) }}</template>
           </ElTableColumn>
-          <ElTableColumn label="Actions" width="170">
+          <ElTableColumn label="Actions" width="280">
             <template #default="{ row }">
               <ElButton size="small" @click="onDownload(row as BlueprintEntry)">Download</ElButton>
+              <ElButton
+                size="small" type="primary" plain
+                :loading="uploading[(row as BlueprintEntry).name]"
+                @click="onUpload(row as BlueprintEntry)"
+              >
+                Upload to Hub
+              </ElButton>
               <ElButton size="small" type="danger" plain @click="onDelete(row as BlueprintEntry)">Delete</ElButton>
             </template>
           </ElTableColumn>
@@ -249,13 +324,35 @@ onMounted(async () => {
           Import applies a blueprint's design to <strong>this profile ({{ props.profile }})</strong>.
           Create a fresh profile first if you don't want to change an existing one.
         </p>
-        <input
-          ref="fileInput" type="file" accept=".cremind-blueprint"
-          style="display:none" @change="onFileChosen"
-        />
-        <ElButton type="primary" plain @click="pickFile">
-          <Icon icon="mdi:upload" /> Choose a .cremind-blueprint file…
-        </ElButton>
+        <div class="bp-import-mode">
+          <ElRadioGroup v-model="importMode" size="small">
+            <ElRadioButton label="file">From a file</ElRadioButton>
+            <ElRadioButton label="hub">From Cremind Hub</ElRadioButton>
+          </ElRadioGroup>
+        </div>
+
+        <template v-if="importMode === 'file'">
+          <input
+            ref="fileInput" type="file" accept=".cremind-blueprint"
+            style="display:none" @change="onFileChosen"
+          />
+          <ElButton type="primary" plain @click="pickFile">
+            <Icon icon="mdi:upload" /> Choose a .cremind-blueprint file…
+          </ElButton>
+        </template>
+
+        <template v-else>
+          <div class="bp-hub-import">
+            <ElInput
+              v-model="hubLink"
+              placeholder="https://hub.cremind.io/blueprints/my-blueprint (or a blueprint name)"
+            />
+            <ElButton type="primary" :loading="importingHub" @click="onImportFromHub">
+              Import from hub
+            </ElButton>
+          </div>
+          <p class="bp-hint">Cremind downloads the blueprint from the Hub and runs the import wizard.</p>
+        </template>
       </ElCard>
     </div>
   </div>
@@ -279,4 +376,7 @@ onMounted(async () => {
 .bp-hint { color: var(--text-tertiary); font-size: 0.75rem; }
 .bp-meta { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
 .bp-warn { color: var(--el-color-warning); font-size: 0.78rem; margin: 0 0 12px 0; }
+.bp-import-mode { margin-bottom: 12px; }
+.bp-hub-import { display: flex; gap: 8px; align-items: center; }
+.bp-hint { color: var(--text-tertiary); font-size: 0.78rem; margin: 8px 0 0 0; }
 </style>
