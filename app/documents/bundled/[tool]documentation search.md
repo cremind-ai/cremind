@@ -8,6 +8,14 @@ The **Documentation Search** tool (`tool_id` `documentation_search`) is how the
 agent answers questions about Cremind, its skills, the `cremind` CLI, and any
 documents the user has added. It is always on (locked) and visible in Settings.
 
+When the returned document is a `cremind` CLI reference (a `[cli]…` doc), the
+tool prepends a short agent directive telling the assistant to **run** the
+relevant command through its Shell Executor and answer from the live output —
+rather than paraphrasing the man page or copying its example tables (which are
+illustrative, not live data). The directive is omitted when the Shell Executor's
+run-command leaf is disabled for the active profile, so the assistant is never
+told to run a command it cannot.
+
 ## Tool Variables
 
 | Variable | Type | Default | Meaning |

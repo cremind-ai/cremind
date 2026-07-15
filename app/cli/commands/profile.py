@@ -62,6 +62,47 @@ def profile_list(ctx: typer.Context) -> None:
     table.render()
 
 
+@profile_app.command("use")
+def profile_use(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Profile to activate for this terminal."),
+) -> None:
+    """Set the active profile for this terminal (remembered across commands)."""
+    from app.cli import session
+
+    if not session.has_token(name):
+        available = session.list_profiles()
+        hint = f" Available: {', '.join(available)}." if available else ""
+        typer.echo(
+            f"profile '{name}' has no token file under {session.tokens_dir()}.{hint}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    session.set_session_profile(name)
+    typer.echo(f"active profile for this terminal: {name}")
+
+
+@profile_app.command("which")
+def profile_which(ctx: typer.Context) -> None:
+    """Show the profile remembered for this terminal (if any)."""
+    from app.cli import session
+
+    current = session.get_session_profile()
+    if not current:
+        typer.echo("no profile selected for this terminal", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(current)
+
+
+@profile_app.command("clear")
+def profile_clear(ctx: typer.Context) -> None:
+    """Forget this terminal's remembered profile (next command re-prompts)."""
+    from app.cli import session
+
+    session.clear_session_profile()
+    typer.echo("cleared active profile for this terminal")
+
+
 @profile_app.command("get")
 @graceful_errors
 def profile_get(

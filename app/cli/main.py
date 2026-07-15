@@ -87,6 +87,14 @@ def _root(
         envvar="CREMIND_TOKEN",
         help="JWT bearer token for the Cremind server.",
     ),
+    profile: Optional[str] = typer.Option(
+        None,
+        "--profile",
+        "-p",
+        envvar="CREMIND_PROFILE",
+        help="Act as this profile (remembered for this terminal). "
+        "Omit to pick interactively on first use.",
+    ),
 ) -> None:
     """cremind — lightweight client for the Cremind server."""
     from app.cli.config import ConfigError, load_from_env
@@ -98,9 +106,87 @@ def _root(
         typer.echo(str(e), err=True)
         raise typer.Exit(code=1) from e
 
+    # Auto-resolve a token from the on-disk per-profile token files when the
+    # user hasn't supplied one via --token / CREMIND_TOKEN. This lets the CLI be
+    # used without exporting a JWT: on first use in a terminal we prompt for a
+    # profile (TUI picker) and remember it. `exec_shell` injects CREMIND_TOKEN,
+    # so that path keeps winning here (cfg.token is set) and is untouched.
+    if not cfg.token and _should_resolve_profile(ctx):
+        cfg = _resolve_token(cfg, profile)
+
     ctx.ensure_object(dict)
     ctx.obj["cfg"] = cfg
     ctx.obj["mode"] = OutputMode.from_config(cfg)
+
+
+# Top-level commands that never call the server — never prompt for a profile.
+_TOKEN_FREE_COMMANDS = {"version", "setup", "serve"}
+# `profile` subcommands that manage the local session and need no token.
+_PROFILE_SESSION_SUBCOMMANDS = {"use", "which", "clear"}
+
+
+def _should_resolve_profile(ctx: typer.Context) -> bool:
+    """Whether the invoked command warrants resolving a profile/token.
+
+    Skips shell-completion, bare `cremind`/`--help`, the token-free top-level
+    commands, and the local `profile use/which/clear` subcommands (so listing or
+    clearing the session never triggers the picker).
+
+    The deep subcommand under a group isn't available via the Click API at the
+    root-callback stage (its context isn't built yet), so the `profile` check
+    reads `sys.argv` — authoritative for the `cremind` entry point.
+    """
+    if ctx.resilient_parsing:  # shell completion
+        return False
+    sub = ctx.invoked_subcommand
+    if sub is None:  # bare `cremind` → help
+        return False
+    if sub in _TOKEN_FREE_COMMANDS:
+        return False
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        return False
+    if sub == "profile" and _profile_subcommand(argv) in _PROFILE_SESSION_SUBCOMMANDS:
+        return False
+    return True
+
+
+def _profile_subcommand(argv: list[str]) -> Optional[str]:
+    """The first positional token after `profile` in `argv` (its subcommand)."""
+    try:
+        idx = argv.index("profile")
+    except ValueError:
+        return None
+    for tok in argv[idx + 1 :]:
+        if not tok.startswith("-"):
+            return tok
+    return None
+
+
+def _resolve_token(cfg, explicit_profile: Optional[str]):
+    """Fill in `cfg.token` from a resolved profile's on-disk token file."""
+    import dataclasses
+
+    from app.cli import session
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    try:
+        chosen = session.resolve_profile(explicit_profile, interactive=interactive)
+    except (KeyboardInterrupt, EOFError):
+        raise typer.Exit(code=130)
+    if not chosen:
+        return cfg  # leave token empty; the command's require_token() explains
+    tok = session.read_token(chosen)
+    if not tok:
+        if explicit_profile:
+            typer.echo(
+                f"profile '{chosen}' has no token file under "
+                f"{session.tokens_dir()} — run `cremind setup` or check the name.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        return cfg
+    return dataclasses.replace(cfg, token=tok)
 
 
 @app.command()

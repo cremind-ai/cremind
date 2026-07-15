@@ -91,8 +91,10 @@ checks that depend on the registry shape.
 
 ## Troubleshooting
 
-**`CREMIND_TOKEN is required`** — The command is authenticated. Export a
-JWT (`export CREMIND_TOKEN=<jwt>`) before running it.
+**`no Cremind profile selected and no token available`** — The command is
+authenticated but no token resolved. Pick a profile interactively, pass
+`--profile <name>`, or `export CREMIND_TOKEN=<jwt>` before running it (see
+`cremind profile`).
 
 **`401 Unauthorized`** — The token has expired or does not match the
 running server. Re-mint via `cremind setup complete` or ask your admin.

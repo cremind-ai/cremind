@@ -1,18 +1,30 @@
 ---
-description: "Create, list, inspect, rename, and delete Cremind **profiles** — how to make, add, or register a new profile, remove one, and read or edit a profile's **persona** text and the assistant's **agent name** (display name). Subcommands: `create`, `list`, `get`, `delete`, `persona get/set`, `agent-name get/set`. Each profile isolates its own conversations, tool overrides, and agent registrations."
+description: "Create, list, inspect, rename, and delete Cremind **profiles**, and **choose which profile the CLI acts as without setting `CREMIND_TOKEN`** — pick a profile interactively on first use in a terminal (a type-to-filter list), or select one directly with the root `--profile` flag or `cremind profile use`, remembered per terminal. Covers making/adding/registering a new profile, removing one, reading or editing a profile's **persona** text and the assistant's **agent name** (display name), and switching the active profile. Subcommands: `use`, `which`, `clear`, `create`, `list`, `get`, `delete`, `persona get/set`, `agent-name get/set`. Each profile isolates its own conversations, tool overrides, and agent registrations."
 ---
 
-# `cremind profile` — Profile Management
+# `cremind profile` — Profile Management & Selection
 
-`cremind profile` is the CLI for managing Cremind profiles. A *profile*
-isolates a user's conversations, tool overrides, agent registrations,
-persona text, and agent name. The active profile is resolved
-server-side from the JWT in `CREMIND_TOKEN`, so most other commands implicitly
-act on that profile; `cremind profile` is the way to manage profiles
-themselves.
+`cremind profile` is the CLI for managing Cremind profiles and for
+choosing which profile the CLI acts as. A *profile* isolates a user's
+conversations, tool overrides, agent registrations, persona text, and
+agent name.
 
-The command groups together three concerns:
+**You do not need to export `CREMIND_TOKEN` to use the CLI.** The active
+profile is resolved from a per-profile JWT, and because the CLI runs on
+the server host it reads that JWT straight from
+`<CREMIND_SYSTEM_DIR>/tokens/<profile>.token`. On the **first** command in
+a terminal, the CLI prompts you to pick a profile from an interactive,
+type-to-filter list and remembers that choice **for that terminal**, so
+later commands don't ask again. You can also select a profile directly —
+without the prompt — via the root `--profile` flag or `cremind profile
+use`. An explicit `CREMIND_TOKEN` in the environment (as injected into
+`exec_shell` subprocesses) still takes precedence when set.
 
+The command groups together four concerns:
+
+- **Profile selection** — `use`, `which`, `clear`, plus the root
+  `--profile` flag. Chooses which profile subsequent commands act as, per
+  terminal.
 - **Profile lifecycle** — `list`, `get`, `create`, `delete`.
 - **Persona text** — `persona get`, `persona set`. The persona is a
   free-form Markdown blob prepended to the agent's system prompt for
@@ -50,11 +62,102 @@ cremind --json profile list          # correct
 cremind profile list --json          # WRONG — "No such option: --json"
 ```
 
-`CREMIND_TOKEN` is required for every subcommand in this group.
+The root **`--profile <name>`** / **`-p <name>`** flag (also a root flag,
+so it comes before the subcommand path) selects which profile the command
+acts as and remembers it for this terminal — see *Selecting the active
+profile* below.
+
+The lifecycle/persona/agent-name subcommands need a resolved profile (via
+the picker, `--profile`, a remembered selection, or `CREMIND_TOKEN`); the
+selection subcommands `use`/`which`/`clear` work with no token — they only
+read and write the local per-terminal selection.
+
+## Selecting the active profile
+
+Most commands act as "the current profile". The CLI resolves it in this
+order, stopping at the first that applies:
+
+1. `CREMIND_TOKEN` (or the root `--token`) — used verbatim if set. This is
+   the path `exec_shell` uses, so agent shells are unaffected.
+2. The root `--profile <name>` / `-p <name>` flag (or the
+   `CREMIND_PROFILE` env var). Sticky: it is also saved as this terminal's
+   active profile.
+3. The profile remembered for this terminal (from a previous `--profile`,
+   `profile use`, or picker choice).
+4. On an interactive terminal with several profiles: a type-to-filter
+   picker. With exactly one profile on disk it is chosen automatically.
+
+If nothing resolves (e.g. a non-interactive shell with several profiles
+and no selection), the command exits with a message pointing at
+`--profile` / `cremind setup`.
+
+### `cremind profile use`
+
+**Purpose.** Set the active profile for **this terminal**, remembered
+across later commands (no token needed).
+
+**Syntax.**
+
+```bash
+cremind profile use <profile name>
+```
+
+**Behavior.** Validates that `<profile name>` has a token file under
+`<CREMIND_SYSTEM_DIR>/tokens/`, records it as this terminal's active
+profile, and confirms on stdout. Rejected (with the available names) if
+that profile has no token file.
+
+**Example.**
+
+```bash
+$ cremind profile use admin
+active profile for this terminal: admin
+```
+
+### `cremind profile which`
+
+**Purpose.** Print the profile remembered for this terminal.
+
+**Syntax.**
+
+```bash
+cremind profile which
+```
+
+**Behavior.** Prints the active profile name, or exits non-zero with
+`no profile selected for this terminal` if none is remembered.
+
+**Example.**
+
+```bash
+$ cremind profile which
+admin
+```
+
+### `cremind profile clear`
+
+**Purpose.** Forget this terminal's remembered profile so the next
+command re-prompts (or falls back to `--profile`/`CREMIND_TOKEN`).
+
+**Syntax.**
+
+```bash
+cremind profile clear
+```
+
+**Behavior.** Removes this terminal's entry from the local selection
+state. Silent-safe; always confirms on stdout.
+
+**Example.**
+
+```bash
+$ cremind profile clear
+cleared active profile for this terminal
+```
 
 ## Subcommands
 
-`cremind profile` has six subcommand groups. Each is documented below.
+The lifecycle, persona, and agent-name subcommands follow.
 
 ### `cremind profile list`
 

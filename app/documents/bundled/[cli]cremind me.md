@@ -86,9 +86,12 @@ $ cremind me --json | jq -r '.expires_at | todate'
 
 ## Troubleshooting
 
-**`CREMIND_TOKEN is required`** — The CLI cannot mint tokens. Either export
-a token you already have (`export CREMIND_TOKEN=<jwt>`), or run
-`cremind setup complete` to mint one for the first profile.
+**`no Cremind profile selected and no token available`** — Nothing resolved a
+token. On an interactive terminal the CLI normally prompts you to pick a
+profile; in a non-interactive shell with several profiles, pass
+`--profile <name>` (or `export CREMIND_TOKEN=<jwt>`). If no profiles exist
+yet, run `cremind setup complete` to mint the first one. See
+`cremind profile` for how selection works.
 
 **`401 Unauthorized` / `token expired`** — The token has passed its
 `expires_at` timestamp. Obtain a fresh token (re-run setup, or ask your
