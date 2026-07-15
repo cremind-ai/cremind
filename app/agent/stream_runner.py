@@ -688,6 +688,23 @@ async def run_agent_to_bus(
                     "plan_mode": plan_meta,
                 }
 
+        # Agent activity (Claude Code and future coding sub-agents): stamp the
+        # latest activity snapshot so a reload restores the floating panel.
+        # Unconditional (not plan/event-gated) — the claude_code tool runs in
+        # normal reasoning turns. When the sub-agent outlives the turn, its
+        # AgentActivity.finish() later patches this message via
+        # update_message_metadata (see set_persist_target below).
+        try:
+            from app.agent import agent_activity
+            activity_snapshot = agent_activity.get_snapshot(conversation_id)
+        except Exception:  # noqa: BLE001
+            activity_snapshot = None
+        if activity_snapshot:
+            agent_message_metadata = {
+                **(agent_message_metadata or {}),
+                "agent_activity": activity_snapshot,
+            }
+
         assistant_msg_id: Optional[str] = None
         try:
             assistant_msg = await conversation_storage.add_message(
@@ -707,6 +724,16 @@ async def run_agent_to_bus(
             logger.exception(
                 f"stream_runner: failed to persist assistant message for {conversation_id}"
             )
+
+        # Register the persisted message as the activity's patch target. If the
+        # sub-agent already finished (fast task within the turn) this is a no-op;
+        # otherwise finish() patches it when the background task completes.
+        if activity_snapshot and assistant_msg_id:
+            try:
+                from app.agent import agent_activity
+                agent_activity.set_persist_target(conversation_id, assistant_msg_id)
+            except Exception:  # noqa: BLE001
+                pass
 
         # 5a. Persist the per-source usage breakdown (one row per LLM invocation:
         #     reasoning step vs. each tool/sub-agent), with frozen estimated cost.

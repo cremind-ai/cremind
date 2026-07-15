@@ -91,6 +91,12 @@ vectorstore-chroma = ["chromadb>=0.5.0"]
 # a post-install step.
 browser = ["playwright>=1.52.0"]
 
+# Claude Code delegation. The Claude Agent SDK drives Claude Code, Anthropic's
+# autonomous coding agent. The per-platform wheel bundles the Claude Code CLI
+# binary (incl. Windows amd64), so no separate npm/node install is needed. The
+# tool imports the SDK lazily inside run(), so this is never on the boot path.
+claude-code = ["claude-agent-sdk>=0.2.0"]
+
 # Document ingestion (markitdown converts office/pdf, pandas for tabular).
 documents = ["markitdown[all]>=0.1.0", "pandas>=3.0.1"]
 
@@ -126,6 +132,7 @@ all = [
     "qdrant-client>=1.9.0",
     "chromadb>=0.5.0",
     "playwright>=1.52.0",
+    "claude-agent-sdk>=0.2.0",
     "markitdown[all]>=0.1.0",
     "pandas>=3.0.1",
     "tiktoken>=0.12.0",

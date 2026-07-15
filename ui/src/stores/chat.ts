@@ -17,6 +17,7 @@ import {
   cancelPlan as apiCancelPlan,
   updateConversationTitle as apiUpdateConversationTitle,
   updateConversationId as apiUpdateConversationId,
+  fetchAgentActivity,
 } from '../services/conversationApi';
 import type { MessageRecord } from '../services/conversationApi';
 import type { ChatMode } from '../constants/chatModes';
@@ -247,6 +248,49 @@ export interface TodoState {
   updateSeq: number;
 }
 
+// ── Agent activity (Claude Code / future coding sub-agents) ─────────────────
+// Live step feed for a coding sub-agent, rendered in the floating Agent
+// Activity panel. Agent-agnostic (`agent` discriminator) so a future Codex tool
+// reuses the same store field, handler, and panel. For the USER's eyes only —
+// never fed to Cremind's LLM.
+export type AgentActivityStatus =
+  | 'running' | 'completed' | 'done' | 'failed' | 'error' | 'cancelled' | 'interrupted';
+export type AgentActivityStepKind = 'thinking' | 'tool_use' | 'text' | 'result';
+
+export interface AgentActivityStep {
+  id: string;
+  ts: number;
+  kind: AgentActivityStepKind;
+  label: string;
+  detail?: string | null;
+  status?: 'running' | 'ok' | 'error' | null;
+}
+
+export interface AgentActivitySnapshot {
+  agent: string;
+  task_id: string;
+  status: AgentActivityStatus;
+  title: string;
+  started_at: number;
+  updated_at: number;
+  steps: AgentActivityStep[];
+  total_steps: number;
+  stats?: {
+    num_turns?: number | null;
+    total_cost_usd?: number | null;
+    duration_ms?: number | null;
+    session_id?: string | null;
+  } | null;
+  error?: string | null;
+}
+
+export interface AgentActivityState extends AgentActivitySnapshot {
+  // Step ids added/resolved on the latest update — drives the highlight-fade.
+  changedIds: string[];
+  // Monotonic counter bumped on each update so the panel re-flashes.
+  updateSeq: number;
+}
+
 interface ChatState {
   messagesByConversation: Record<string, ChatMessage[]>;
   runtimes: Record<string, ConversationRuntime>;
@@ -258,6 +302,8 @@ interface ChatState {
   pendingPlanByConversation: Record<string, PendingPlan | null>;
   /** Plan-mode: live todo list per conversation. */
   todosByConversation: Record<string, TodoState | null>;
+  /** Coding sub-agent (Claude Code / future Codex) live activity per conversation. */
+  agentActivityByConversation: Record<string, AgentActivityState | null>;
   agentCard: AgentCard | null;
   agentName: string;
   isConnected: boolean;
@@ -294,6 +340,7 @@ export const useChatStore = defineStore('chat', {
     pendingQuestionByConversation: {},
     pendingPlanByConversation: {},
     todosByConversation: {},
+    agentActivityByConversation: {},
     agentCard: null,
     agentName: 'Agent',
     isConnected: false,
@@ -350,6 +397,11 @@ export const useChatStore = defineStore('chat', {
     activeTodos(state): TodoState | null {
       if (!state.activeConversationId) return null;
       return state.todosByConversation[state.activeConversationId] ?? null;
+    },
+    /** Coding sub-agent activity for the active conversation, or null. */
+    activeAgentActivity(state): AgentActivityState | null {
+      if (!state.activeConversationId) return null;
+      return state.agentActivityByConversation[state.activeConversationId] ?? null;
     },
     /**
      * Map of conversationId -> isStreaming, used by the sidebar to show
@@ -749,6 +801,69 @@ export const useChatStore = defineStore('chat', {
       }
     },
 
+    /**
+     * Restore the coding sub-agent activity panel from persisted message
+     * metadata after a reload. Scans newest-first for a message bearing
+     * `metadata.agent_activity`. When that snapshot says the task is still
+     * running, confirm against the live registry via `fetchAgentActivity`: a
+     * live snapshot is adopted (subsequent SSE events keep it fresh); a null
+     * result means the task is gone (e.g. server restart), so the panel is
+     * coerced to 'interrupted'. Panel-only — never touches message bubbles.
+     */
+    restoreAgentActivityState(conversationId: string, messages: MessageRecord[]) {
+      this.agentActivityByConversation[conversationId] = null;
+      if (!messages || !messages.length) return;
+
+      let snap: AgentActivitySnapshot | null = null;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const aa = (messages[i]?.metadata?.agent_activity ?? null) as any;
+        if (aa && typeof aa === 'object' && aa.task_id) {
+          snap = aa as AgentActivitySnapshot;
+          break;
+        }
+      }
+      if (!snap) return;
+
+      this.agentActivityByConversation[conversationId] = {
+        ...snap,
+        steps: Array.isArray(snap.steps) ? snap.steps : [],
+        changedIds: [],
+        updateSeq: 0,
+      };
+
+      if (snap.status === 'running') {
+        const settingsStore = useSettingsStore();
+        fetchAgentActivity(settingsStore.agentUrl, settingsStore.authToken, conversationId)
+          .then(live => {
+            const current = this.agentActivityByConversation[conversationId];
+            // Only act if the panel still shows the same (running) task and no
+            // live SSE event has since replaced it.
+            if (!current || current.task_id !== snap!.task_id) return;
+            if (live && live.task_id) {
+              this.agentActivityByConversation[conversationId] = {
+                ...(live as AgentActivitySnapshot),
+                steps: Array.isArray(live.steps) ? live.steps : [],
+                changedIds: [],
+                updateSeq: current.updateSeq + 1,
+              };
+            } else if (current.status === 'running') {
+              this.agentActivityByConversation[conversationId] = {
+                ...current,
+                status: 'interrupted',
+                updateSeq: current.updateSeq + 1,
+              };
+            }
+          })
+          .catch(() => {});
+      }
+    },
+
+    /** Dismiss (close) the agent activity panel for a conversation. */
+    dismissAgentActivity(conversationId: string) {
+      if (!conversationId) return;
+      this.agentActivityByConversation[conversationId] = null;
+    },
+
     // ── stream lifecycle (ref-counted) ────────────────────────────────
 
     /**
@@ -907,6 +1022,7 @@ export const useChatStore = defineStore('chat', {
       this.pendingQuestionByConversation = {};
       this.pendingPlanByConversation = {};
       this.todosByConversation = {};
+      this.agentActivityByConversation = {};
       this.error = null;
 
       if (this.isConnected) {
@@ -1023,6 +1139,7 @@ export const useChatStore = defineStore('chat', {
           // todo panel) from message metadata — SSE replay can't (the ring is
           // dropped on `complete`).
           this.restorePlanModeState(id, messages);
+          this.restoreAgentActivityState(id, messages);
         }
         this.channelIdsByConversation[id] = conversation.channel_id ?? null;
         const runtime = this.runtimes[id] ?? makeRuntime();
@@ -1063,6 +1180,7 @@ export const useChatStore = defineStore('chat', {
         if (!this.messagesByConversation[id]) {
           this.messagesByConversation[id] = messages.map(this.mapBackendMessage);
           this.restorePlanModeState(id, messages);
+          this.restoreAgentActivityState(id, messages);
         }
         this.channelIdsByConversation[id] = conversation.channel_id ?? null;
         const runtime = this.runtimes[id] ?? makeRuntime();
@@ -1419,6 +1537,31 @@ export const useChatStore = defineStore('chat', {
           return;
         }
 
+        case 'agent_activity': {
+          // Coding sub-agent (Claude Code / future Codex) live snapshot. Full
+          // snapshot semantics (idempotent under SSE replay). Panel-only — never
+          // spawns/touches a message bubble, so return before ensureAssistant.
+          // Accepted even when not streaming (a task can outlive the turn).
+          const snap = data as AgentActivitySnapshot;
+          if (!snap || !snap.task_id) return;
+          const steps: AgentActivityStep[] = Array.isArray(snap.steps) ? snap.steps : [];
+          const prev = this.agentActivityByConversation[conversationId];
+          const prevById = new Map((prev?.steps ?? []).map(s => [s.id, s]));
+          const changedIds = steps
+            .filter(s => {
+              const p = prevById.get(s.id);
+              return !p || p.status !== s.status || p.detail !== s.detail;
+            })
+            .map(s => s.id);
+          this.agentActivityByConversation[conversationId] = {
+            ...snap,
+            steps,
+            changedIds,
+            updateSeq: (prev?.updateSeq ?? 0) + 1,
+          };
+          return;
+        }
+
         case 'todos': {
           // Plan mode: a full todo snapshot. Diff against the prior list to mark
           // which items changed (drives the highlight-then-fade).
@@ -1746,6 +1889,7 @@ export const useChatStore = defineStore('chat', {
       delete this.pendingQuestionByConversation[id];
       delete this.pendingPlanByConversation[id];
       delete this.todosByConversation[id];
+      delete this.agentActivityByConversation[id];
       const settingsStore = useSettingsStore();
       if (settingsStore.profileId) {
         useNotificationsStore().clearForConversation(settingsStore.profileId, id);
@@ -1813,6 +1957,7 @@ export const useChatStore = defineStore('chat', {
         this.pendingQuestionByConversation,
         this.pendingPlanByConversation,
         this.todosByConversation,
+        this.agentActivityByConversation,
       ] as Record<string, unknown>[]) {
         if (oldId in map) {
           map[newId] = map[oldId];
@@ -1860,6 +2005,7 @@ export const useChatStore = defineStore('chat', {
       this.pendingQuestionByConversation = {};
       this.pendingPlanByConversation = {};
       this.todosByConversation = {};
+      this.agentActivityByConversation = {};
       this.error = null;
     },
 

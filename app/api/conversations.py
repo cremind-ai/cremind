@@ -249,6 +249,29 @@ def get_conversation_routes(
         messages = await conversation_storage.get_messages(conversation_id, limit=limit, offset=offset)
         return JSONResponse({"messages": messages})
 
+    async def handle_get_agent_activity(request: Request) -> JSONResponse:
+        """Return the live agent-activity snapshot for a conversation, if any.
+
+        Used only to disambiguate the reload-mid-task case: a persisted message
+        whose ``agent_activity`` says ``status: running`` may reflect a still-live
+        background sub-agent (Claude Code) or one killed by a server restart. A
+        non-null ``activity`` here means it is still live; ``null`` means it is
+        gone (the UI then coerces the panel to 'interrupted').
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile_from_request(request)
+        conversation_id = request.path_params["conversation_id"]
+        conv = await conversation_storage.get_conversation(conversation_id)
+        if not conv:
+            return JSONResponse({"error": "Conversation not found"}, status_code=404)
+        if conv.get("profile") != profile:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+        from app.agent import agent_activity
+        return JSONResponse({"activity": agent_activity.get_snapshot(conversation_id)})
+
     async def handle_get_memory(request: Request) -> JSONResponse:
         """Return this conversation's running summary (short-term) + long-term memory.
 
@@ -935,6 +958,11 @@ def get_conversation_routes(
         Route(
             "/api/conversations/{conversation_id}/usage",
             endpoint=handle_get_conversation_usage,
+            methods=["GET"],
+        ),
+        Route(
+            "/api/conversations/{conversation_id}/agent-activity",
+            endpoint=handle_get_agent_activity,
             methods=["GET"],
         ),
         Route(

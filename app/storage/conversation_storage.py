@@ -675,6 +675,30 @@ class ConversationStorage:
 
         return self._msg_to_dict(msg)
 
+    async def update_message_metadata(self, message_id: str, patch: dict) -> bool:
+        """Shallow-merge ``patch`` into a message's ``message_metadata`` JSON.
+
+        Used when a background sub-agent (e.g. Claude Code) finishes *after* its
+        message was already persisted, so the final activity snapshot lands in
+        ``message_metadata['agent_activity']`` and survives page reload. The
+        column is reassigned (not mutated in place) so SQLAlchemy flags the JSON
+        change and the UPDATE fires on both SQLite and PostgreSQL. Returns False
+        when the message row is gone.
+        """
+        await self._ensure_initialized()
+        async with self.async_session_maker.begin() as session:
+            result = await session.execute(
+                select(MessageModel).where(MessageModel.id == message_id)
+            )
+            msg = result.scalar_one_or_none()
+            if msg is None:
+                return False
+            merged = dict(msg.message_metadata or {})
+            merged.update(patch or {})
+            msg.message_metadata = merged
+            session.add(msg)
+        return True
+
     async def get_messages(self, conversation_id: str, limit: int = 100, offset: int = 0) -> list[dict]:
         await self._ensure_initialized()
         async with self.async_session_maker() as session:
