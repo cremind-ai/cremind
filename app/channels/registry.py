@@ -8,6 +8,14 @@ Adapter classes are picked by ``channel_type`` from ``_ADAPTER_CLASSES``.
 Unimplemented platforms raise :class:`ChannelNotImplemented`; the registry
 catches it, disables the channel row, and stores the message in
 ``state.last_error`` so the API can show it.
+
+On a user-initiated connect/enable (``install_if_missing=True``) the channel's
+optional SDK extras (``python-telegram-bot``, ``telethon``, ``discord.py``,
+``slack-bolt``) are pip-installed at runtime *before* the adapter starts — the
+adapters import lazily, so the install is usable in-process with no restart.
+Because the receive loop runs as a detached task, a fatal error raised inside
+``_run`` is caught by a done-callback that disables the channel the same way,
+rather than surfacing as an unretrieved-task warning.
 """
 
 from __future__ import annotations
@@ -125,12 +133,20 @@ class ChannelRegistry:
             except Exception:  # noqa: BLE001
                 logger.exception(f"channels: stop failed for {adapter.channel_id}")
 
-    async def start_for_channel(self, channel: dict) -> dict:
+    async def start_for_channel(
+        self, channel: dict, *, install_if_missing: bool = False,
+    ) -> dict:
         """Build and start an adapter for the given channel row.
 
         Returns the (possibly mutated) channel dict — on
         :class:`ChannelNotImplemented` the channel is disabled in the DB and
         the dict is updated so callers don't see a stale enabled flag.
+
+        When ``install_if_missing`` is True (user-initiated connect/enable via
+        the API/CLI), the channel's optional SDK extras are pip-installed at
+        runtime before the adapter starts. Boot (``start_all_enabled``) leaves
+        it False so a missing package can't hang server startup on pip — such a
+        boot-time failure surfaces through the ``_run`` done-callback instead.
         """
         if channel["channel_type"] == "main":
             return channel
@@ -141,41 +157,145 @@ class ChannelRegistry:
             await self.stop_for_channel(channel["id"])
 
         try:
+            if install_if_missing:
+                await self._ensure_channel_feature_installed(channel)
             adapter_cls = _resolve_adapter_class(
                 channel["channel_type"], channel.get("mode") or "bot",
             )
             adapter = adapter_cls(channel, self.storage)
             await adapter.start()
         except ChannelNotImplemented as exc:
-            await self.storage.update_channel(
-                channel["id"],
-                enabled=False,
-                state={"last_error": str(exc)},
-            )
-            channel["enabled"] = False
-            channel["state"] = {"last_error": str(exc)}
-            logger.warning(
-                f"channels: {channel['channel_type']} disabled: {exc}",
-            )
-            _notify_channel_disabled(channel, str(exc))
-            return channel
+            return await self._disable_channel(channel, str(exc))
         except Exception as exc:  # noqa: BLE001
-            await self.storage.update_channel(
-                channel["id"],
-                enabled=False,
-                state={"last_error": f"start failed: {exc}"},
-            )
-            channel["enabled"] = False
-            channel["state"] = {"last_error": f"start failed: {exc}"}
             logger.exception(
                 f"channels: start failed for {channel['channel_type']}",
             )
-            _notify_channel_disabled(channel, f"start failed: {exc}")
-            return channel
+            return await self._disable_channel(channel, f"start failed: {exc}")
 
         async with self._lock:
             self._adapters[channel["id"]] = adapter
+
+        # The receive loop runs as a detached task (BaseChannelAdapter.start
+        # uses create_task and never awaits it). Attach a done-callback so a
+        # fatal error raised *inside* ``_run`` — a missing SDK on an offline
+        # boot, a bad token, a dead Node sidecar — disables the channel with a
+        # visible ``last_error`` instead of asyncio logging "Task exception was
+        # never retrieved" and leaving a row that still reads enabled=True.
+        task = adapter._task  # noqa: SLF001
+        if task is not None:
+            task.add_done_callback(
+                lambda t, cid=channel["id"]: self._on_run_task_done(cid, t),
+            )
         return channel
+
+    async def _ensure_channel_feature_installed(self, channel: dict) -> None:
+        """Install the channel's SDK extras group if it isn't importable yet.
+
+        Runs the (blocking) pip install off the event loop. A failure raises
+        :class:`ChannelNotImplemented` so :meth:`start_for_channel`'s handler
+        disables the channel with the error. No-op for channels with no Python
+        extra (messenger/zalo/whatsapp) or whose deps are already present, so
+        the common re-connect path costs only a cheap ``find_spec`` probe.
+        """
+        from app.features.installer import install_features
+        from app.features.manifest import channel_feature_key, is_installed
+
+        key = channel_feature_key(
+            channel["channel_type"], channel.get("mode") or "bot",
+        )
+        if key is None or is_installed(key):
+            return
+        logger.info(
+            f"channels: installing '{key}' for {channel['channel_type']} "
+            f"channel_id={channel['id']}",
+        )
+        result = await asyncio.to_thread(install_features, [key])
+        if result.error or key in result.failed or not is_installed(key):
+            raise ChannelNotImplemented(
+                f"Failed to install dependencies for {channel['channel_type']}: "
+                f"{result.error or 'unknown error'}",
+            )
+        logger.info(
+            f"channels: installed '{key}' for {channel['channel_type']}",
+        )
+
+    async def _disable_channel(self, channel: dict, reason: str) -> dict:
+        """Flip a channel to ``enabled=False`` with a visible ``last_error``.
+
+        Merges ``last_error`` into the existing ``state`` so durable markers
+        (``last_update_id``, ``link_status``) survive, persists it, pushes the
+        high-priority "Channel disabled" notification, and returns the mutated
+        ``channel`` dict. Shared by the synchronous start handlers and the
+        ``_run`` done-callback.
+        """
+        state = {**(channel.get("state") or {}), "last_error": reason}
+        await self.storage.update_channel(
+            channel["id"], enabled=False, state=state,
+        )
+        channel["enabled"] = False
+        channel["state"] = state
+        logger.warning(
+            f"channels: {channel['channel_type']} disabled: {reason}",
+        )
+        _notify_channel_disabled(channel, reason)
+        return channel
+
+    def _on_run_task_done(self, channel_id: str, task: asyncio.Task) -> None:
+        """Done-callback for an adapter's detached ``_run`` task.
+
+        Deliberate stop/restart cancellation and clean exits are ignored;
+        only a genuine exception schedules the disable path. Runs
+        synchronously on the loop, so the DB write is deferred to a task.
+        """
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is None:
+            return
+        try:
+            asyncio.create_task(
+                self._handle_run_failure(channel_id, task, exc),
+                name=f"channel-run-failure:{channel_id}",
+            )
+        except RuntimeError:
+            # Event loop is closing (interpreter shutdown) — nothing to do.
+            logger.debug(
+                f"channels: run-failure handler skipped for {channel_id} "
+                "(loop closing)",
+            )
+
+    async def _handle_run_failure(
+        self, channel_id: str, task: asyncio.Task, exc: BaseException,
+    ) -> None:
+        """Disable a channel whose ``_run`` loop died with an exception."""
+        async with self._lock:
+            adapter = self._adapters.get(channel_id)
+            # Only act if the failed task is still the registered adapter's — a
+            # concurrent restart may have already replaced it with a live one.
+            if adapter is None or adapter._task is not task:  # noqa: SLF001
+                return
+            self._adapters.pop(channel_id, None)
+        # Tear the adapter down so a notification-mode channel's delivery loop
+        # and any in-flight reply forwarders don't outlive the dead receive
+        # loop (``_task`` is already done; ``stop`` handles that gracefully).
+        try:
+            await adapter.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception(f"channels: stop failed for {channel_id}")
+        channel = await self.storage.get_channel(channel_id)
+        if channel is None:
+            return
+        # An adapter that self-marked as unlinked already persisted
+        # enabled=False + link_status; don't clobber that with a generic error.
+        if (channel.get("state") or {}).get("link_status") == "unlinked":
+            return
+        logger.warning(
+            f"channels: {channel.get('channel_type')} run loop failed: {exc}",
+        )
+        await self._disable_channel(channel, f"start failed: {exc}")
 
     async def stop_for_channel(self, channel_id: str) -> None:
         async with self._lock:
@@ -187,12 +307,16 @@ class ChannelRegistry:
         except Exception:  # noqa: BLE001
             logger.exception(f"channels: stop failed for {channel_id}")
 
-    async def restart_for_channel(self, channel_id: str) -> dict | None:
+    async def restart_for_channel(
+        self, channel_id: str, *, install_if_missing: bool = False,
+    ) -> dict | None:
         await self.stop_for_channel(channel_id)
         channel = await self.storage.get_channel(channel_id)
         if not channel or not channel.get("enabled"):
             return channel
-        return await self.start_for_channel(channel)
+        return await self.start_for_channel(
+            channel, install_if_missing=install_if_missing,
+        )
 
     # ── status helpers (used by the API to decorate list responses) ──
 

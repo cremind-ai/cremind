@@ -52,8 +52,9 @@ class SlackAdapter(BaseChannelAdapter):
             from slack_bolt.async_app import AsyncApp  # type: ignore
         except ImportError as exc:
             raise ChannelNotImplemented(
-                "slack-bolt is not installed. Run `pip install slack-bolt>=1.18` "
-                "to enable Slack channels.",
+                "slack-bolt is not installed. Re-enabling this channel installs "
+                "it automatically; to install it manually run "
+                "`cremind features install channel.slack.bot`.",
             ) from exc
 
         bot_token, app_token = self._tokens()

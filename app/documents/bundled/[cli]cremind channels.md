@@ -185,6 +185,18 @@ the supplied config (whether passed as `--json` or `--config`). On
 success, the adapter is started in-process (long-poll loop for
 Telegram, etc.) and the new row is printed.
 
+**On-demand SDK install.** Telegram, Discord, and Slack ship their Python
+SDKs (`python-telegram-bot`, `telethon`, `discord.py`, `slack-bolt`) as
+optional extras that stay off disk until needed. Enabling one of those
+channels — via `add`, `enable`, or `edit` — installs its package at runtime
+before the adapter starts, the same way built-in tools like `browser` do.
+The adapters import lazily, so the channel comes up **without a server
+restart**; the first connect just takes a little longer while pip runs. If
+the install fails (offline host, etc.), the channel is left `enabled=false`
+with the reason in `state.last_error`. Messenger and Zalo (bot) need no extra
+(they use the core HTTP client); WhatsApp and the Zalo personal channel use a
+Node.js sidecar (`npm`) instead.
+
 When successful, prints a key/value summary of the row (id, type,
 mode, auth_mode, response_mode, enabled, status).
 
@@ -731,14 +743,16 @@ channel per type.
 during startup. Check `state.last_error` via `cremind channels list
 --json`; common causes are an invalid `bot_token`, a Telegram/Zalo
 userbot waiting for the verification code or QR scan in the pairing
-dialog (status flips to `running` once `ready` fires), a missing SDK for
-the platform (Discord needs `discord.py`, Slack needs `slack-bolt` —
-installed on demand by the Setup Wizard, or `pip install
-cremind[channel-discord]` / `cremind[channel-slack]`), a missing
-`node_modules/` under `app/channels/sidecars/whatsapp/` or
-`app/channels/sidecars/zalo/` (run `npm install` once, or restart to
-auto-install), Node not on PATH, or — for Messenger — the Cremind host
-not being publicly reachable so Meta's webhook can't deliver.
+dialog (status flips to `running` once `ready` fires), a platform SDK
+that couldn't be installed at connect time (Telegram/Discord/Slack
+install their package automatically on enable — a failure here is
+usually an offline host or a locked-down index; install it manually with
+`cremind features install channel.discord.bot` / `.slack.bot` /
+`.telegram.bot` / `.telegram.userbot`), a missing `node_modules/` under
+`app/channels/sidecars/whatsapp/` or `app/channels/sidecars/zalo/` (run
+`npm install` once, or restart to auto-install), Node not on PATH, or —
+for Messenger — the Cremind host not being publicly reachable so Meta's
+webhook can't deliver.
 
 **Telegram userbot keeps prompting for the code** — Either the code
 expired (Telegram codes are short-lived; the dialog will say "Code

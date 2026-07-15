@@ -45,8 +45,9 @@ class TelegramAdapter(BaseChannelAdapter):
             from telegram.request import HTTPXRequest  # type: ignore
         except ImportError as exc:
             raise ChannelNotImplemented(
-                "python-telegram-bot is not installed. "
-                "Run `pip install python-telegram-bot>=21` to enable Telegram channels.",
+                "python-telegram-bot is not installed. Re-enabling this "
+                "channel installs it automatically; to install it manually run "
+                "`cremind features install channel.telegram.bot`.",
             ) from exc
         request = HTTPXRequest(
             connection_pool_size=2,

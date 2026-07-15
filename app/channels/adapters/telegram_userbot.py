@@ -110,8 +110,9 @@ class TelegramUserbotAdapter(BaseChannelAdapter):
             from telethon import TelegramClient, events  # type: ignore
         except ImportError as exc:
             raise ChannelNotImplemented(
-                "telethon is not installed. Add `telethon>=1.36` to "
-                "pyproject.toml and reinstall.",
+                "telethon is not installed. Re-enabling this channel installs "
+                "it automatically; to install it manually run "
+                "`cremind features install channel.telegram.userbot`.",
             ) from exc
 
         try:

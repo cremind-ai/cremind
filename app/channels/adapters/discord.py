@@ -44,8 +44,9 @@ class DiscordAdapter(BaseChannelAdapter):
             import discord  # type: ignore
         except ImportError as exc:
             raise ChannelNotImplemented(
-                "discord.py is not installed. Run `pip install discord.py>=2.4` "
-                "to enable Discord channels.",
+                "discord.py is not installed. Re-enabling this channel installs "
+                "it automatically; to install it manually run "
+                "`cremind features install channel.discord.bot`.",
             ) from exc
 
         intents = discord.Intents.default()
