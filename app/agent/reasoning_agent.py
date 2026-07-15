@@ -676,12 +676,6 @@ class ReasoningAgent:
         except Exception:  # noqa: BLE001
             return {}
 
-    def _load_llm_params(self, tool_id: str) -> dict:
-        try:
-            return self.registry.config.get_llm_params(tool_id, self.profile)
-        except Exception:  # noqa: BLE001
-            return {}
-
     def _tool_arguments(self, tool_id: str) -> dict:
         """Persisted client arguments (config defaults) for a tool.
 
@@ -1440,7 +1434,6 @@ class ReasoningAgent:
 
         client_args = self._tool_arguments(tool.tool_id)
         variables = self._load_variables(tool.tool_id)
-        llm_params = self._load_llm_params(tool.tool_id)
 
         result_event: Optional[ToolResultEvent] = None
         error_event: Optional[ToolErrorEvent] = None
@@ -1452,7 +1445,6 @@ class ReasoningAgent:
                 profile=self.profile,
                 arguments=client_args,
                 variables=variables,
-                llm_params=llm_params,
             ):
                 if isinstance(ev, ToolThinkingEvent):
                     continue

@@ -70,7 +70,6 @@ from app.documents import (
 from app.documents.sync import SHARED_SCOPE
 from app.documents.watcher import DocumentWatcher
 from app.lib.embedding import LocalEmbeddings
-from app.lib.llm.factory import create_llm_provider
 from app.lib.llm.model_groups import ModelGroupManager
 from app.databases import create_database_provider, get_database_provider, set_database_provider
 from app.storage import (
@@ -175,38 +174,18 @@ async def _connect_mcp_tool(
 ):
     """Build a live MCP tool from a persisted row; fall back to a stub on failure.
 
-    Preserves startup's LLM-resolution chain: per-tool LLM override via
-    ``config.get_llm_params`` → fallback to the single configured model.
-    Honors ``full_reasoning`` and the ``stdio`` vs ``http`` transport branch.
+    The MCP adapter needs a default LLM to satisfy its build contract (it drives
+    only the cosmetic model label — MCP dispatch uses native function calling,
+    not an inner routing LLM), so we build the single configured model.
+    Honors the ``stdio`` vs ``http`` transport branch.
     """
     url = row["source"]
     owner = row["owner_profile"]
     extra = row.get("extra") or {}
-    tool_id = row["tool_id"]
 
-    def _mcp_llm_factory(profile: str) -> LLMProvider:
-        """Create an LLM for this MCP tool, respecting per-tool overrides."""
-        try:
-            _params = registry.config.get_llm_params(tool_id, profile)
-        except Exception:  # noqa: BLE001
-            _params = {}
-        if _params.get("llm_provider") or _params.get("llm_model"):
-            return create_llm_provider(
-                provider_name=_params.get("llm_provider") or BaseConfig.get_default_provider(),
-                model_name=_params.get("llm_model"),
-                config_storage=model_group_mgr.config_storage,
-                profile=profile,
-                default_reasoning_effort=_params.get("reasoning_effort"),
-            )
-        return model_group_mgr.create_llm_for_model(profile=profile)
-
-    try:
-        llm_params = registry.config.get_llm_params(tool_id, owner or "admin")
-    except Exception:
-        llm_params = {}
     llm = None
     try:
-        llm = _mcp_llm_factory(owner or "admin")
+        llm = model_group_mgr.create_llm_for_model(profile=owner or "admin")
     except Exception as e:  # noqa: BLE001
         logger.warning(f"No LLM for MCP server '{url}': {e}")
 
@@ -220,16 +199,12 @@ async def _connect_mcp_tool(
                     env=extra.get("env"),
                     llm=llm,
                     owner_profile=owner,
-                    full_reasoning=bool(llm_params.get("full_reasoning", False)),
-                    llm_factory=_mcp_llm_factory,
                 )
             else:
                 tool = await build_http_mcp_tool(
                     url=url,
                     llm=llm,
                     owner_profile=owner,
-                    full_reasoning=bool(llm_params.get("full_reasoning", False)),
-                    llm_factory=_mcp_llm_factory,
                 )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"MCP tool '{url}' unreachable: {e}")
@@ -239,7 +214,6 @@ async def _connect_mcp_tool(
             name=row["name"],
             owner_profile=owner,
             error="LLM not available" if llm is None else "Connection failed",
-            transport_type=extra.get("transport_type", "http"),
             extra=extra,
         )
     return tool
@@ -252,7 +226,6 @@ def _lazy_mcp_stub_from_row(row: dict):
         name=row["name"],
         owner_profile=row["owner_profile"],
         error=_STUB_ERR_LAZY,
-        transport_type=extra.get("transport_type", "http"),
         extra=extra,
     )
 
@@ -967,21 +940,12 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
 
                 logger.info("Post-setup: built-in tools rebound and skills synced")
 
-            def _mcp_llm_factory(tool_id: str | None = None, profile: str = "admin"):
-                """Create an LLM for an MCP tool, respecting per-tool overrides."""
-                if tool_id:
-                    try:
-                        _params = config_manager.get_llm_params(tool_id, profile)
-                    except Exception:  # noqa: BLE001
-                        _params = {}
-                    if _params.get("llm_provider") or _params.get("llm_model"):
-                        return create_llm_provider(
-                            provider_name=_params.get("llm_provider") or BaseConfig.get_default_provider(),
-                            model_name=_params.get("llm_model") or None,
-                            config_storage=config_storage,
-                            profile=profile,
-                            default_reasoning_effort=_params.get("reasoning_effort"),
-                        )
+            def _mcp_llm_factory(profile: str = "admin"):
+                """Build the default LLM for an MCP tool's adapter.
+
+                MCP dispatch uses native function calling (no inner routing
+                LLM); this only supplies the adapter's cosmetic model label.
+                """
                 try:
                     return model_group_mgr.create_llm_for_model(profile=profile)
                 except Exception as e:  # noqa: BLE001

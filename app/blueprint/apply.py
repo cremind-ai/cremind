@@ -220,8 +220,6 @@ def _apply_tool_config_bundle(mgr, tool_id: str, profile: str, entry: dict, secr
     args = cfg.get("arg") or {}
     if args:
         mgr.set_arguments(tool_id, profile, args)
-    for key, value in (cfg.get("llm") or {}).items():
-        mgr.set_llm_param(tool_id, profile, key, value)
     for key, value in (cfg.get("meta") or {}).items():
         mgr.set_meta(tool_id, profile, key, value)
     for key, value in (entry.get("variables") or {}).items():

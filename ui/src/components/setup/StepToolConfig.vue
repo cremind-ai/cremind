@@ -1,18 +1,16 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue';
-import { ElDivider } from 'element-plus';
+import { ElDivider, ElInput } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import {
-  listTools, listLLMProviders, getProviderModels,
-  type ToolStatus, type LLMProvider,
+  listTools,
+  type ToolStatus,
 } from '../../services/configApi';
 import type { JsonSchema } from '../../services/agentApi';
 import type { ProfileValue } from '../../stores/settings';
-import { useLLMModels } from '../../composables/useLLMModels';
 import ToolSkillCard from '../shared/ToolSkillCard.vue';
 import ToolVariablesForm from '../shared/ToolVariablesForm.vue';
 import ToolArgumentsForm from '../shared/ToolArgumentsForm.vue';
-import LLMParametersForm from '../shared/LLMParametersForm.vue';
 import { initVarValues, initArgValues } from '../../utils/toolItemForm';
 
 const props = defineProps<{
@@ -30,8 +28,6 @@ const emit = defineEmits<{
   'update:agentConfigs': [configs: Record<string, Record<string, string>>];
 }>();
 
-const { rebuildModelList, getFilteredModels, getReasoningOptions } = useLLMModels();
-
 interface SetupToolItem {
   name: string;
   displayName: string;
@@ -45,13 +41,8 @@ interface SetupToolItem {
   argumentsSchema: JsonSchema | null;
   argValues: Record<string, ProfileValue>;
 
-  // Agent LLM config
+  // Per-tool description override
   description: string;
-  systemPrompt: string;
-  llmProvider: string;
-  llmModel: string;
-  reasoningEffort: string;
-  fullReasoning: boolean;
 
   enabled: boolean;
   expanded: boolean;
@@ -72,7 +63,6 @@ interface SetupToolItem {
 }
 
 const items = ref<SetupToolItem[]>([]);
-const llmProviders = ref<LLMProvider[]>([]);
 const loading = ref(false);
 
 const builtinItems = computed(() => items.value.filter(i => !i.isSkill));
@@ -110,25 +100,9 @@ onMounted(async () => {
     // tool_type 'builtin' or 'skill'). /api/agents only carries a2a/mcp
     // tools and is post-storage-only, so the wizard doesn't need it.
 
-    // Load LLM providers and models
-    try {
-      const provRes = await listLLMProviders(props.agentUrl, props.token ?? '');
-      llmProviders.value = provRes.providers;
-      const providersWithModels: { name: string; display_name: string; models: any[] }[] = [];
-      for (const p of provRes.providers) {
-        try {
-          const modelRes = await getProviderModels(props.agentUrl, props.token ?? '', p.name);
-          providersWithModels.push({ name: p.name, display_name: p.display_name, models: modelRes.models });
-        } catch {
-          providersWithModels.push({ name: p.name, display_name: p.display_name, models: [] });
-        }
-      }
-      rebuildModelList(providersWithModels);
-    } catch { /* LLM providers may not be available yet */ }
-
     // Build items -- the new /api/tools response already includes everything
-    // we need (display name, required_fields, current variable values, llm
-    // overrides via config.llm, etc.).
+    // we need (display name, required_fields, current variable values,
+    // description override via config.meta, etc.).
     const existingConfigs = props.configs;
     const localTools = toolRes.tools.filter(
       (t: ToolStatus) => t.tool_type === 'builtin' || t.tool_type === 'skill',
@@ -136,7 +110,6 @@ onMounted(async () => {
     items.value = localTools.map((tool: ToolStatus) => {
       const schema = (tool.arguments_schema as JsonSchema | null) ?? null;
       const toolConf = existingConfigs[tool.tool_id] || {};
-      const llmCfg = (tool.config?.llm ?? {}) as Record<string, unknown>;
       const metaCfg = (tool.config?.meta ?? {}) as Record<string, string>;
 
       return {
@@ -149,11 +122,6 @@ onMounted(async () => {
         argValues: initArgValues(schema, tool.config?.arguments),
         // User override only.
         description: metaCfg.description || '',
-        systemPrompt: (metaCfg.system_prompt as string) || '',
-        llmProvider: (llmCfg.llm_provider as string) || '',
-        llmModel: (llmCfg.llm_model as string) || '',
-        reasoningEffort: (llmCfg.reasoning_effort as string) || '',
-        fullReasoning: !!tool.full_reasoning,
         // Locked tools can't be opted out of — force them on so the submitted
         // _enabled payload never disables them. Otherwise start from the
         // profile-independent DEFAULT (not the admin profile's resolved state),
@@ -178,13 +146,12 @@ function emitConfigs() {
   const agentConfigs: Record<string, Record<string, string>> = {};
 
   for (const item of items.value) {
-    // Tool configs: secrets, _enabled, _full_reasoning, _arg.*
+    // Tool configs: secrets, _enabled, _arg.*
     const toolConfig: Record<string, string> = {};
     for (const [key, value] of Object.entries(item.configValues)) {
       if (value) toolConfig[key] = value;
     }
     toolConfig['_enabled'] = String(item.enabled);
-    toolConfig['_full_reasoning'] = String(item.fullReasoning);
 
     // Tool arguments (stored as _arg.* keys in tool_configs)
     if (item.argumentsSchema && Object.keys(item.argValues).length > 0) {
@@ -198,14 +165,10 @@ function emitConfigs() {
       configs[item.name] = toolConfig;
     }
 
-    // Agent configs: LLM parameters (stored in mcp_server_storage)
+    // Agent configs: per-tool description override (stored in the meta scope)
     if (!item.isSkill) {
       const ac: Record<string, string> = {};
       if (item.description) ac.description = item.description;
-      if (item.systemPrompt) ac.system_prompt = item.systemPrompt;
-      if (item.llmProvider) ac.llm_provider = item.llmProvider;
-      if (item.llmModel) ac.llm_model = item.llmModel;
-      if (item.reasoningEffort) ac.reasoning_effort = item.reasoningEffort;
       if (Object.keys(ac).length > 0) {
         agentConfigs[item.name] = ac;
       }
@@ -223,7 +186,7 @@ watch(items, emitConfigs, { deep: true });
   <div class="step-tool-config">
     <h3 class="step-title">Tool Configuration</h3>
     <p class="step-description">
-      Configure built-in tools and skills. Expand each item to set variables, arguments, and LLM parameters.
+      Configure built-in tools and skills. Expand each item to set variables, arguments, and a description.
     </p>
 
     <div v-if="loading" class="loading-state">Loading tools...</div>
@@ -269,19 +232,12 @@ watch(items, emitConfigs, { deep: true });
               />
             </div>
 
-            <!-- LLM Parameters -->
+            <!-- Description override -->
             <div class="config-section">
-              <h4 class="config-section-title">LLM Parameters</h4>
-              <LLMParametersForm
-                v-model:description="item.description"
-                v-model:system-prompt="item.systemPrompt"
-                v-model:llm-provider="item.llmProvider"
-                v-model:llm-model="item.llmModel"
-                v-model:reasoning-effort="item.reasoningEffort"
-                v-model:full-reasoning="item.fullReasoning"
-                :providers="llmProviders"
-                :get-filtered-models="getFilteredModels"
-                :get-reasoning-options="getReasoningOptions"
+              <h4 class="config-section-title">Description</h4>
+              <ElInput
+                v-model="item.description"
+                placeholder="Description override (optional)"
               />
             </div>
 

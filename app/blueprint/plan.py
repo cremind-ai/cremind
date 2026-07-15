@@ -249,12 +249,42 @@ def _plan_llm(data: dict, manifest: BlueprintManifest, warnings: list[str]) -> d
 
 
 def _plan_tools(data: dict, manifest: BlueprintManifest, warnings: list[str]) -> dict:
+    from app.storage.tool_storage import get_tool_storage
+
+    ts = get_tool_storage()
     reqs: list[dict] = []
+    preview: list[dict] = []
     for tool in data.get("tools") or []:
+        tool_id = tool.get("tool_id")
         secrets = tool.get("secret_variables") or []
         if secrets:
-            reqs.append({"type": "tool_secrets", "tool_id": tool.get("tool_id"), "variables": secrets})
-    return {"requirements": reqs}
+            reqs.append({"type": "tool_secrets", "tool_id": tool_id, "variables": secrets})
+
+        # Friendly name: a2a/mcp definition, else the tools-table row (built-ins
+        # exist on the importing machine), else the raw id.
+        defn = tool.get("definition") or {}
+        row = ts.get_tool(tool_id) or {}
+        name = defn.get("name") or row.get("name") or tool_id
+
+        # Flatten the non-secret config into {key: value} for display (secret
+        # values are never in the doc; their names live in secret_variables).
+        cfg = tool.get("config") or {}
+        settings: dict = {}
+        for scope in ("arg", "llm", "meta"):
+            settings.update(cfg.get(scope) or {})
+        settings.update(tool.get("variables") or {})
+
+        preview.append(
+            {
+                "tool_id": tool_id,
+                "name": name,
+                "kind": tool.get("kind"),
+                "settings": settings,
+                "secret_variables": secrets,
+                "disabled_leaves": len(tool.get("disabled_leaves") or []),
+            }
+        )
+    return {"requirements": reqs, "preview": {"tools": preview}}
 
 
 def _plan_skills(data: dict, manifest: BlueprintManifest, warnings: list[str]) -> dict:

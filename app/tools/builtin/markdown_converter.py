@@ -6,7 +6,6 @@ CREMIND_SYSTEM_DIR/<profile>/markdown_files/ with timestamped names.
 """
 
 import os
-import platform
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict

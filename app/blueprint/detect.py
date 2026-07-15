@@ -72,16 +72,35 @@ def collect_exportable(profile: str) -> dict[str, Any]:
 
     # tools — reuse the export builder so the checklist matches exactly.
     tools_doc, _req = build_tools_doc(profile, secret_map=secret_map)
-    tool_items = [
-        {
-            "tool_id": t["tool_id"],
-            "kind": t["kind"],
-            "enabled": t.get("enabled"),
-            "has_secret_variables": bool(t.get("secret_variables")),
-            "disabled_leaves": len(t.get("disabled_leaves") or []),
-        }
-        for t in tools_doc["data"]["tools"]
-    ]
+    tool_items = []
+    for t in tools_doc["data"]["tools"]:
+        defn = t.get("definition") or {}
+        # Built-ins carry no ``definition`` block but do have a friendly
+        # name/description in the tools table — surface it so every tool
+        # displays richly (like skills), falling back to the raw id.
+        row = ts.get_tool(t["tool_id"]) or {}
+        # Count the customized (non-secret) settings so the row can show a
+        # configuration footprint — the tool analogue of a skill's size hint.
+        cfg = t.get("config") or {}
+        settings_count = (
+            len(cfg.get("arg") or {})
+            + len(cfg.get("meta") or {})
+            + len(t.get("variables") or {})
+        )
+        tool_items.append(
+            {
+                "tool_id": t["tool_id"],
+                "name": defn.get("name") or row.get("name") or t["tool_id"],
+                "kind": t["kind"],  # "builtin" | "a2a" | "mcp"
+                "description": defn.get("description") or row.get("description"),
+                "source": defn.get("source"),
+                "enabled": t.get("enabled"),
+                "settings_count": settings_count,
+                "secret_variables": t.get("secret_variables") or [],
+                "has_secret_variables": bool(t.get("secret_variables")),
+                "disabled_leaves": len(t.get("disabled_leaves") or []),
+            }
+        )
     components["tools"] = {
         "available": bool(tool_items),
         "count": len(tool_items),

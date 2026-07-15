@@ -292,7 +292,6 @@ async def spawn_from_autostart(
             # Autostart-linked processes have no expiration: while linked
             # they're meant to live as long as the registration exists.
             expire_time=float("inf"),
-            is_long_running=True,
             is_pty=is_pty,
             task_id=None,
             profile=row.get("profile") or None,

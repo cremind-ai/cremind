@@ -6,14 +6,11 @@ Each tool group lives at ``app.tools.builtin.{module_name}`` and exports:
                                          required_config, optional
                                          ``description`` / ``arguments`` /
                                          ``oauth``). The group's description
-                                         text comes from ``description`` (or
-                                         ``_make_server_instructions``), else
+                                         text comes from ``description``, else
                                          falls back to ``SERVER_NAME``.
 - ``SERVER_NAME`` (str)               -- display name in the UI
 - ``get_tools(config: dict) -> list[BuiltInTool]`` -- in-process functions
 - ``get_prepare_tools()`` (optional)  -- per-request tool customization callback
-- ``_make_server_instructions(working_dir: str)`` (optional) -- dynamic
-                                         override for the group description
 
 Registration is driven by the explicit ``_BUILTIN_MODULE_NAMES`` tuple below.
 Adding a new built-in tool means adding a module in this package, exporting
@@ -407,11 +404,9 @@ async def register_builtin_tools(
 
         server_name = getattr(module, "SERVER_NAME", module_name)
         # Group description text only (no inner-LLM steering — there is no inner
-        # routing LLM). The top-level ``description`` wins; otherwise the group
-        # falls back to ``SERVER_NAME`` at construction below.
+        # routing LLM). The top-level ``description`` is used; otherwise the
+        # group falls back to ``SERVER_NAME`` at construction below.
         instructions = tool_info.get("description") or ""
-        if hasattr(module, "_make_server_instructions"):
-            instructions = module._make_server_instructions(config["CREMIND_SYSTEM_DIR"])
 
         prepare_tools_fn = None
         if hasattr(module, "get_prepare_tools"):

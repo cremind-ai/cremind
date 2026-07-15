@@ -1063,7 +1063,6 @@ def get_config_routes(state: BootedState) -> list[Route]:
         # different settings into a single ``tool_configs[tool_id]`` dict using
         # reserved key prefixes:
         #   - ``_enabled``         -> per-profile enabled state (profile_tools)
-        #   - ``_full_reasoning``  -> LLM scope override
         #   - ``_arg.<name>``      -> tool argument
         #   - everything else      -> tool variable (env-style secret/value)
         # Route each to the right storage; otherwise these settings would be
@@ -1124,14 +1123,6 @@ def get_config_routes(state: BootedState) -> list[Route]:
                         except (KeyError, ValueError) as e:
                             logger.warning(f"Skipping _enabled for '{tool_id}': {e}")
                         continue
-                    if key == "_full_reasoning":
-                        registry.config.set_llm_param(
-                            tool_id,
-                            profile_name,
-                            "full_reasoning",
-                            str(value).lower() == "true",
-                        )
-                        continue
                     if key.startswith("_arg."):
                         arg_name = key[len("_arg.") :]
                         try:
@@ -1150,28 +1141,13 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 if arg_values:
                     registry.config.set_arguments(tool_id, profile_name, arg_values)
 
-        # Per-built-in-tool LLM overrides land in the llm scope of the new tool_configs table.
+        # Per-built-in-tool description overrides land in the meta scope of the tool_configs table.
         agent_configs = body.get("agent_configs", {})
         if registry is not None and agent_configs:
             from app.tools.ids import slugify
 
             for tool_key, config in agent_configs.items():
                 tool_id = tool_key if registry.get(tool_key) else slugify(tool_key)
-                for key in ("llm_provider", "llm_model", "reasoning_effort", "full_reasoning"):
-                    if key in config and config[key] is not None:
-                        registry.config.set_llm_param(
-                            tool_id,
-                            profile_name,
-                            key,
-                            config[key],
-                        )
-                if "system_prompt" in config and config["system_prompt"]:
-                    registry.config.set_meta(
-                        tool_id,
-                        profile_name,
-                        "system_prompt",
-                        config["system_prompt"],
-                    )
                 if "description" in config and config["description"]:
                     registry.config.set_meta(
                         tool_id,

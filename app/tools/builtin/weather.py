@@ -74,7 +74,7 @@ async def _get_current_conditions(api_key: str, location_key: str) -> Dict[str, 
         return data[0]
 
 
-async def _get_daily_forecast(api_key: str, location_key: str, days: int = 5) -> Dict[str, Any] | None:
+async def _get_daily_forecast(api_key: str, location_key: str) -> Dict[str, Any] | None:
     """Fetch daily weather forecast for a location."""
     endpoint = f"{ACCUWEATHER_BASE_URL}/forecasts/v1/daily/5day/{location_key}"
 

@@ -726,11 +726,8 @@ export interface ToolStatus {
   config: {
     arguments: Record<string, unknown>;
     variables: Record<string, string>;
-    llm: Record<string, unknown>;
     meta?: Record<string, string>;
   };
-  /** Mirrored from config.llm.full_reasoning for convenience. */
-  full_reasoning: boolean;
   arguments_schema: Record<string, unknown> | null;
   /** Optional fields surfaced by the registry: */
   url?: string;
@@ -1093,45 +1090,6 @@ export async function streamFeaturesInstall(
   };
 }
 
-/** Reset selected LLM-parameter overrides so the tool's code defaults apply.
- *
- *  Keys in {system_prompt, description} are removed from the `meta` scope;
- *  all others are removed from the `llm` scope. The adapter's child LLM is
- *  rebuilt server-side when a provider-shaping key is reset.
- */
-export async function resetToolLLMKeys(
-  agentUrl: string,
-  token: string,
-  toolId: string,
-  keys: string[]
-): Promise<{ success: boolean }> {
-  const base = resolveBaseUrl(agentUrl);
-  const res = await fetch(`${base}/api/tools/${encodeURIComponent(toolId)}/llm`, {
-    method: 'DELETE',
-    headers: authHeaders(token),
-    body: JSON.stringify({ keys }),
-  });
-  if (!res.ok) throw new Error(`Failed to reset LLM keys: ${res.statusText}`);
-  return res.json();
-}
-
-/** Set the full_reasoning LLM parameter for a built-in or MCP tool. */
-export async function setToolFullReasoning(
-  agentUrl: string,
-  token: string,
-  toolId: string,
-  fullReasoning: boolean
-): Promise<{ success: boolean }> {
-  const base = resolveBaseUrl(agentUrl);
-  const res = await fetch(`${base}/api/tools/${encodeURIComponent(toolId)}/llm`, {
-    method: 'PUT',
-    headers: authHeaders(token),
-    body: JSON.stringify({ llm: { full_reasoning: fullReasoning } }),
-  });
-  if (!res.ok) throw new Error(`Failed to set full reasoning: ${res.statusText}`);
-  return res.json();
-}
-
 // ── System Variables ──
 
 export interface SystemVar {
@@ -1360,7 +1318,7 @@ export async function listAgents(
 export async function addAgent(
   agentUrl: string,
   token: string,
-  config: { url?: string; type: string; json_config?: string; llm_provider?: string; llm_model?: string; reasoning_effort?: string; system_prompt?: string; description?: string }
+  config: { url?: string; type: string; json_config?: string; description?: string }
 ): Promise<{ success: boolean; agent: { name: string; description: string; url: string; type: string } }> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/agents`, {
@@ -1396,7 +1354,7 @@ export async function updateAgentConfig(
   agentUrl: string,
   token: string,
   agentName: string,
-  config: { llm_provider?: string | null; llm_model?: string | null; reasoning_effort?: string | null; system_prompt?: string | null; description?: string | null; full_reasoning?: boolean }
+  config: { description?: string | null }
 ): Promise<{ success: boolean }> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/agents/${encodeURIComponent(agentName)}/config`, {

@@ -232,15 +232,28 @@ onMounted(tryUploadStashed);
 
           <!-- tools -->
           <template v-else-if="currentStep.key === 'tools'">
-            <p class="bpw-hint">Some tools need secret values. Enter them or skip to set later.</p>
-            <div v-for="req in reqsOf('tools')" :key="req.tool_id" class="bpw-provider">
-              <div class="bpw-provider-name">{{ req.tool_id }}</div>
-              <div v-for="v in (req.variables || [])" :key="v" class="bpw-field">
-                <label>{{ v }}</label>
+            <p class="bpw-hint">
+              These tools will be configured on import. Enter any required secrets, or skip to add them later.
+            </p>
+            <div v-for="t in (currentStep.preview?.tools || [])" :key="t.tool_id" class="bpw-provider">
+              <div class="bpw-provider-name">
+                {{ t.name }}
+                <span class="bpw-badge">{{ t.kind === 'a2a' ? 'A2A' : t.kind === 'mcp' ? 'MCP' : 'built-in' }}</span>
+                <span v-if="t.disabled_leaves" class="bpw-badge">{{ t.disabled_leaves }} sub-tool(s) disabled</span>
+              </div>
+              <table v-if="Object.keys(t.settings || {}).length" class="bpw-table">
+                <tbody>
+                  <tr v-for="(val, key) in t.settings" :key="key">
+                    <td>{{ key }}</td><td><strong>{{ val }}</strong></td>
+                  </tr>
+                </tbody>
+              </table>
+              <div v-for="v in (t.secret_variables || [])" :key="v" class="bpw-field">
+                <label>{{ v }} <span class="bpw-badge warn">secret</span></label>
                 <ElInput
-                  :model-value="(toolSecrets[req.tool_id] || {})[v] || ''"
+                  :model-value="(toolSecrets[t.tool_id] || {})[v] || ''"
                   type="password" show-password :placeholder="v"
-                  @update:model-value="(val) => { (toolSecrets[req.tool_id] ||= {})[v] = val }"
+                  @update:model-value="(val) => { (toolSecrets[t.tool_id] ||= {})[v] = val }"
                 />
               </div>
             </div>

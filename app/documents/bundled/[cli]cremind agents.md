@@ -1,56 +1,67 @@
 ---
-description: "Register and manage external **A2A agents and MCP servers** the agent can call: `add` a server by `--url` or `--json-config`, remove it, enable or disable it per profile, retry a stub connection, run the **OAuth** authorize flow (`auth-url`) or `unlink` a stored token, and set a per-agent LLM override. Use this to connect a new MCP or A2A tool server — distinct from `cremind tools` (configuring already-registered tools) and `cremind llm` (LLM providers)."
+description: "Register and manage **MCP servers** the agent can call: `add` a server by `--url` (HTTP/SSE) or `--json-config` (VS Code-style stdio config), remove it, enable or disable it per profile, `reconnect` a stub connection, run the **OAuth** authorize flow (`auth-url`) or `unlink` a stored token, and read/set its per-profile `description` (`config get`/`config set`). Use this to connect a new MCP tool server — distinct from `cremind tools` (configuring already-registered tools) and `cremind llm` (LLM providers)."
 ---
 
-# `cremind agents` — A2A and MCP Server Registration
+# `cremind agents` — MCP Server Registration
 
 `cremind agents` (alias `cremind agent`) is the CLI for managing the external
-agents the Cremind agent can delegate to: A2A peer agents and MCP
-servers. Once registered, an agent shows up as a tool in
-`cremind tools list` (with `tool_type` of `a2a` or `mcp`), which is why
-some flags overlap between the two commands. The dividing line:
+MCP servers the Cremind agent can delegate to. Once registered, an MCP server
+shows up as a tool in `cremind tools list` (with a `tool_type` of `mcp`), which
+is why some flags overlap between the two commands. The dividing line:
 `cremind agents` handles **registration and OAuth**, while `cremind tools`
 handles **per-tool variables and arguments**.
+
+> **Note.** Earlier versions of this command also registered A2A peer agents
+> and accepted per-agent LLM overrides (`--llm-provider`, `--llm-model`,
+> `--reasoning-effort`) and a `--system-prompt`. A2A support and those
+> overrides have been removed — MCP dispatch uses the reasoning model's native
+> function calling, so a per-server LLM never actually ran. Only the
+> `description` remains as an editable per-server field.
 
 The group covers:
 
 - **Lifecycle** — `list`, `add`, `delete`.
 - **Per-profile activation** — `enable`, `disable`.
-- **Connection control** — `reconnect` for retrying stub agents that
+- **Connection control** — `reconnect` for retrying stub servers that
   failed to connect at startup.
 - **OAuth** — `auth-url` to mint the authorize URL, `unlink` to drop
   the stored OAuth token for the active profile.
-- **Per-profile config** — `config get`, `config set` for the LLM and
-  meta fields specific to MCP and A2A wrappers (system prompt,
-  description, LLM provider/model/reasoning-effort, full-reasoning).
+- **Per-profile config** — `config get`, `config set` for the per-server
+  `description`.
 
-## Two ways to register an agent
+## Two ways to register an MCP server
 
-`cremind agents add` supports two distinct registration styles, picked via
-the `--type` flag and the choice between `--url` and `--json-config`:
+`cremind agents add` supports two registration styles, picked by the choice
+between `--url` and `--json-config`:
 
-| Style                              | Command                                                          | When to use                                                                                |
-|------------------------------------|------------------------------------------------------------------|--------------------------------------------------------------------------------------------|
-| **A2A (URL)**                      | `--type a2a --url <url>`                                         | The agent speaks the A2A protocol over HTTP. Provide its public URL.                       |
-| **MCP (HTTP/SSE)**                 | `--type mcp --url <url>`                                         | The agent is an MCP server reachable over HTTP/SSE.                                        |
-| **MCP (VS Code-style JSON)**       | `--type mcp --json-config '{<json>}'`                            | The agent is a stdio MCP server, or you have an existing VS Code `mcp.json` snippet to reuse. |
+| Style                        | Command                            | When to use                                                                                   |
+|------------------------------|------------------------------------|-----------------------------------------------------------------------------------------------|
+| **HTTP / SSE**               | `--url <url>`                      | The MCP server is reachable over HTTP/SSE. Provide its URL.                                    |
+| **stdio (VS Code-style JSON)** | `--json-config '{<json>}'`       | The MCP server is a stdio subprocess, or you have an existing VS Code `mcp.json` snippet to reuse. |
 
 The JSON-config form mirrors the schema VS Code's MCP support uses, so
 you can paste in a `command` / `args` / `env` block for stdio servers.
 
 ## Finding this in the web UI
 
-Every operation in this group has a control on the **Agents** page of
+Every operation in this group has a control on the **Tools & Skills** page of
 the Cremind web UI:
 
-> **Sidebar → Agents**
+> **Sidebar → Settings → Tools & Skills**
 
-The page lists each registered agent with its type, status, URL, and
-auth state. The **+ Add agent** button opens a dialog with a type
-toggle (A2A / MCP) and either a URL field or a JSON editor — these
-match `--url` and `--json-config` respectively. Selecting an agent row
-opens a drawer with **OAuth** (matching `auth-url` / `unlink`) and
-**Config** (matching `config get` / `config set`) tabs.
+Registered MCP servers are listed under the page's **"MCP Server Remote"**
+section (alongside the "Built-in Tools" and "Skills" sections). The
+**+ Add MCP Server** button opens a dialog with a **URL** / **JSON Config**
+input-mode toggle — these match `--url` and `--json-config` respectively — plus
+a **Description** field.
+
+Each server renders as a card. Its header shows, as applicable, **Auth**
+(matching `auth-url`), **Unlink** (`unlink`), **Reconnect** (`reconnect`), and
+**Remove** (`delete`) buttons plus an enable/disable switch (`enable` /
+`disable`). Expanding a card reveals an inline **Description** field with
+**Save** / **Reset to Default** (matching `config get` / `config set`) and a
+sub-tools enable/disable list. There is no separate "Agents" page and no
+OAuth/Config tabs.
 
 ## Global flags
 
@@ -61,8 +72,8 @@ All `cremind agents` subcommands accept the root-level `--json` flag.
 
 ### `cremind agents list`
 
-**Purpose.** Show every registered A2A and MCP agent with its
-type, profile-level enabled flag, status, and URL.
+**Purpose.** Show every registered MCP server with its type, profile-level
+enabled flag, status, and URL.
 
 **Syntax.**
 
@@ -74,11 +85,11 @@ cremind agents list
 
 | Column     | Source        | Meaning                                                          |
 |------------|---------------|------------------------------------------------------------------|
-| `TOOL_ID`  | `tool_id`     | Stable id (e.g. `a2a.team-bot`, `mcp.linear`).                   |
-| `TYPE`     | `agent_type`  | `a2a` or `mcp`.                                                  |
+| `TOOL_ID`  | `tool_id`     | Stable id (e.g. `mcp.linear`, `mcp.shell`).                      |
+| `TYPE`     | `agent_type`  | `mcp`.                                                            |
 | `ENABLED`  | `enabled`     | `yes`/`no` for the active profile.                               |
 | `STATUS`   | `status_text` | Server's status string (e.g. `connected`, `auth required`).      |
-| `URL`      | `url`         | The agent's URL when applicable (blank for stdio MCP servers).   |
+| `URL`      | `url`         | The server's URL when applicable (blank for stdio servers).      |
 
 With `--json`, the underlying array is returned.
 
@@ -87,55 +98,44 @@ With `--json`, the underlying array is returned.
 ```bash
 $ cremind agents list
 TOOL_ID         TYPE  ENABLED  STATUS         URL
-a2a.team-bot    a2a   yes      connected      https://team-bot.internal/a2a
 mcp.linear      mcp   yes      auth required  https://mcp.linear.app
 mcp.shell       mcp   yes      connected
 ```
 
 ### `cremind agents add`
 
-**Purpose.** Register a new A2A or MCP server.
+**Purpose.** Register a new MCP server.
 
 **Syntax.**
 
 ```bash
-cremind agents add --type a2a --url <url> [meta/llm flags]
-cremind agents add --type mcp --url <url> [meta/llm flags]
-cremind agents add --type mcp --json-config '<json>' [meta/llm flags]
+cremind agents add --url <url> [--description <text>]
+cremind agents add --json-config '<json>' [--description <text>]
 ```
 
 **Required flags.**
 
-- `--type a2a|mcp`.
 - Exactly one of `--url <url>` or `--json-config '<json>'`.
 
-**Optional flags** (all string, default `""`):
+**Optional flags.**
 
-| Flag                  | Meaning                                                                                  |
-|-----------------------|------------------------------------------------------------------------------------------|
-| `--system-prompt`     | Prompt prepended to LLM calls made on this agent's behalf (MCP wrappers).                |
-| `--description`       | Human-friendly description shown in the UI and surfaced to the agent.                    |
-| `--llm-provider`      | LLM provider override for this agent.                                                    |
-| `--llm-model`         | LLM model override for this agent.                                                       |
-| `--reasoning-effort`  | `low` / `medium` / `high`.                                                               |
+| Flag            | Meaning                                                              |
+|-----------------|----------------------------------------------------------------------|
+| `--description` | Human-friendly description shown in the UI and surfaced to the agent. |
 
 **Behavior.** On success, prints a key-value table with `tool_id`,
 `name`, `agent_type`, `url`, and `status_text`. With `--json`, returns
-the full agent record (including any auth metadata).
+the full server record (including any auth metadata).
 
 **Examples.**
 
 ```bash
-# A2A peer
-$ cremind agents add --type a2a --url https://team-bot.internal/a2a
-
-# HTTP MCP server with a per-server prompt
-$ cremind agents add --type mcp --url https://mcp.linear.app \
-    --system-prompt "Always cite issue ids" \
+# HTTP MCP server with a description
+$ cremind agents add --url https://mcp.linear.app \
     --description "Linear issue tracker"
 
 # stdio MCP server via VS Code-style JSON
-$ cremind agents add --type mcp --json-config '{
+$ cremind agents add --json-config '{
     "command": "/usr/bin/mcp-shell",
     "args": ["--root", "/srv"],
     "env": {"SHELL_TIMEOUT": "120"}
@@ -144,8 +144,8 @@ $ cremind agents add --type mcp --json-config '{
 
 ### `cremind agents delete`
 
-**Purpose.** Unregister an A2A or MCP agent. The matching tool
-disappears from `cremind tools list`.
+**Purpose.** Unregister an MCP server. The matching tool disappears from
+`cremind tools list`.
 
 **Syntax.**
 
@@ -154,7 +154,7 @@ cremind agents delete <tool_id>
 ```
 
 **Behavior.** Silent on success. Cascades: any per-profile config,
-OAuth tokens, and live connections for the agent are dropped.
+OAuth tokens, and live connections for the server are dropped.
 
 **Example.**
 
@@ -165,7 +165,7 @@ $ cremind agents delete mcp.experimental
 ### `cremind agents enable` / `cremind agents disable`
 
 **Purpose.** Per-profile enable / disable toggle. Equivalent to the
-toggle in the agent row of the web UI.
+switch on the server's card in the web UI.
 
 **Syntax.**
 
@@ -174,7 +174,7 @@ cremind agents enable <tool_id>
 cremind agents disable <tool_id>
 ```
 
-**Behavior.** Silent on success. Profile-scoped — disabling an agent
+**Behavior.** Silent on success. Profile-scoped — disabling a server
 under one profile does not affect another. Note that this is the same
 state read by `cremind tools list`'s `ENABLED` column.
 
@@ -186,7 +186,7 @@ $ cremind agents disable mcp.linear
 
 ### `cremind agents reconnect`
 
-**Purpose.** Retry the connection for a stub agent (one that failed at
+**Purpose.** Retry the connection for a stub server (one that failed at
 startup or returned a transient error). Useful after rotating
 credentials or fixing a network issue.
 
@@ -209,7 +209,7 @@ mcp.linear  mcp  yes  connected  https://mcp.linear.app
 
 ### `cremind agents auth-url`
 
-**Purpose.** Print the OAuth authorize URL for an agent. The user
+**Purpose.** Print the OAuth authorize URL for a server. The user
 opens it in a browser to grant access; the resulting token is stored
 server-side, scoped to the active profile.
 
@@ -241,7 +241,7 @@ $ xdg-open "$(cremind agents auth-url mcp.linear)"
 
 ### `cremind agents unlink`
 
-**Purpose.** Drop the active profile's OAuth token for an agent,
+**Purpose.** Drop the active profile's OAuth token for a server,
 forcing the next call to re-authorize.
 
 **Syntax.**
@@ -263,8 +263,8 @@ mcp.linear  mcp  yes  auth required  https://mcp.linear.app
 
 ### `cremind agents config get`
 
-**Purpose.** Read the per-profile LLM and meta config for an agent —
-the same fields shown in the agent's **Config** tab in the UI.
+**Purpose.** Read the per-profile config for a server — the same
+`description` shown on the server's card in the UI.
 
 **Syntax.**
 
@@ -272,58 +272,44 @@ the same fields shown in the agent's **Config** tab in the UI.
 cremind agents config get <tool_id>
 ```
 
-**Behavior.** Pretty-prints the JSON config object. With `--json`, the
-same JSON is emitted unindented.
+**Behavior.** Pretty-prints the JSON config object (its `url` and
+`description`). With `--json`, the same JSON is emitted unindented.
 
 **Example.**
 
 ```bash
 $ cremind agents config get mcp.linear
 {
-  "llm_provider": "anthropic",
-  "llm_model": "claude-sonnet-4-6",
-  "reasoning_effort": "medium",
-  "system_prompt": "Always cite issue ids",
+  "url": "https://mcp.linear.app",
   "description": "Linear issue tracker"
 }
 ```
 
 ### `cremind agents config set`
 
-**Purpose.** Patch one or more agent config fields. Only the supplied
-flags change; everything else is left untouched.
+**Purpose.** Patch a server's `description`. Only the supplied flag
+changes; everything else is left untouched.
 
 **Syntax.**
 
 ```bash
-cremind agents config set <tool_id> [--llm-provider P] [--llm-model M] [--reasoning-effort E] [--full-reasoning true|false] [--system-prompt S] [--description D]
+cremind agents config set <tool_id> --description <text>
 ```
 
 **Flags** (at least one required):
 
-| Flag                 | Type   | Default | Meaning                                                       |
-|----------------------|--------|---------|---------------------------------------------------------------|
-| `--llm-provider`     | string | `""`    | LLM provider id.                                              |
-| `--llm-model`        | string | `""`    | Model id.                                                     |
-| `--reasoning-effort` | string | `""`    | `low` / `medium` / `high`.                                    |
-| `--full-reasoning`   | string | `""`    | `true` / `false`. Any other value is rejected client-side.    |
-| `--system-prompt`    | string | `""`    | Replace the system prompt (use `""`-like inputs to clear).    |
-| `--description`      | string | `""`    | Replace the description.                                      |
+| Flag            | Type   | Default | Meaning                     |
+|-----------------|--------|---------|-----------------------------|
+| `--description` | string | `""`    | Replace the description.    |
 
 **Behavior.** Silent on success.
 
-**Note.** This is the right command for MCP/A2A wrapper config
-(`system_prompt`, `description`, plus the LLM fields). For built-in or
-intrinsic tools, use `cremind tools set-llm` and `cremind tools set-var`.
+**Note.** This sets the MCP server's `description`. To configure a
+built-in or intrinsic tool's variables, use `cremind tools set-var` instead.
 
-**Examples.**
+**Example.**
 
 ```bash
-# Switch the per-server model and bump reasoning effort
-$ cremind agents config set mcp.linear --llm-model claude-opus-4-7 --reasoning-effort high
-
-# Clear the description (current implementation requires a non-empty value;
-# to truly clear, use the JSON API directly)
 $ cremind agents config set mcp.linear --description "Linear issue tracker (read-only)"
 ```
 
@@ -332,8 +318,7 @@ $ cremind agents config set mcp.linear --description "Linear issue tracker (read
 ### Register an MCP server, OAuth-link it, and verify
 
 ```bash
-$ cremind agents add --type mcp --url https://mcp.linear.app \
-    --description "Linear" --llm-model claude-sonnet-4-6
+$ cremind agents add --url https://mcp.linear.app --description "Linear"
 $ xdg-open "$(cremind agents auth-url mcp.linear)"
 # ... finish browser flow ...
 $ cremind agents list | grep mcp.linear
@@ -343,7 +328,7 @@ mcp.linear  mcp  yes  connected  https://mcp.linear.app
 ### Add a stdio MCP server from VS Code-style JSON
 
 ```bash
-$ cremind agents add --type mcp --json-config "$(cat <<'EOF'
+$ cremind agents add --json-config "$(cat <<'EOF'
 {
   "command": "/usr/bin/mcp-shell",
   "args": ["--root", "/srv"],
@@ -353,52 +338,42 @@ EOF
 )"
 ```
 
-### Re-authorize an agent after rotating its credentials
+### Re-authorize a server after rotating its credentials
 
 ```bash
 $ cremind agents unlink mcp.linear
 $ xdg-open "$(cremind agents auth-url mcp.linear)"
 ```
 
-### Use a heavier model for one specific agent only
+### Disable every MCP server for the active profile in one shot
 
 ```bash
-$ cremind agents config set mcp.linear --llm-model claude-opus-4-7 --reasoning-effort high
-$ cremind agents config get mcp.linear
-```
-
-### Disable every MCP agent for the active profile in one shot
-
-```bash
-$ for id in $(cremind agents list --json | jq -r '.[] | select(.agent_type=="mcp") | .tool_id'); do
+$ for id in $(cremind agents list --json | jq -r '.[].tool_id'); do
     cremind agents disable "$id"
   done
 ```
 
 ## Troubleshooting
 
-**`--type is required`** — `add` always needs the type explicitly.
-Pick `a2a` or `mcp`.
-
 **`either --url or --json-config is required`** — `add` rejects an
 empty registration. Provide one of the two.
 
-**`STATUS = auth required`** — The agent needs OAuth. Run
+**`STATUS = auth required`** — The server needs OAuth. Run
 `cremind agents auth-url <tool_id>`, open the URL, complete the flow, then
 re-check with `cremind agents list`. If the status persists, check the
 server logs — the OAuth callback may have failed.
 
 **`STATUS = connection error` after a network change** — Run
-`cremind agents reconnect <tool_id>`; if it still fails, the agent
+`cremind agents reconnect <tool_id>`; if it still fails, the server
 configuration itself is bad — re-add it with the correct URL.
 
 **`config set` rejected** — At least one config flag must be supplied.
 The CLI does not allow an empty patch.
 
 **`unlink` doesn't seem to do anything** — `unlink` is profile-scoped.
-If you are seeing the same agent's token under another profile, switch
+If you are seeing the same server's token under another profile, switch
 tokens (`CREMIND_TOKEN`) and unlink there as well.
 
-**Agent appears in `cremind tools list` but not `cremind agents list`** — Only
-`a2a` and `mcp` types are surfaced under `cremind agents`. Built-in,
-intrinsic, and skill tools are managed by `cremind tools` instead.
+**Server appears in `cremind tools list` but not `cremind agents list`** — Only
+`mcp` tools are surfaced under `cremind agents`. Built-in, intrinsic, and
+skill tools are managed by `cremind tools` instead.

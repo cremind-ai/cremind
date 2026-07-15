@@ -61,7 +61,3 @@ def is_explicit_selection(selection: str | None) -> bool:
 def get_provider(provider_id: str) -> SearchProvider:
     """Instantiate a provider by id (raises ``KeyError`` if unknown)."""
     return _PROVIDER_FACTORIES[provider_id]()
-
-
-def known_provider_ids() -> List[str]:
-    return list(_PROVIDER_FACTORIES.keys())
