@@ -58,6 +58,39 @@ DEFAULT_TOP_K = 10
 
 NO_RESULT_MESSAGE = "no relevant result found"
 
+# Bundled `cremind` CLI man pages are named ``[cli]cremind <feature>.md``; the
+# stem keeps the bracketed tag in the vector-store payload (``_clean_name`` only
+# strips it from the embedded text, not the ``name`` field), so a simple prefix
+# test identifies a CLI doc in both the vector and degraded full-scan paths.
+_CLI_DOC_PREFIX = "[cli]"
+
+# Prepended to a returned CLI-reference body so the reasoning model RUNS the
+# documented command via exec_shell instead of paraphrasing the man page (the
+# incident: the model listed providers from the doc's example table and told the
+# user to run the command). Rides the tool RESULT, not the system prompt —
+# matching the skill-load precedent in reasoning_agent.py, which keeps such
+# contextual guidance out of the (prompt-cached) system prompt. Prepended, not
+# appended, because long tool results are head-truncated. ``{fn}`` is the
+# exposed exec_shell run-leaf function name, derived at serve time.
+_CLI_EXECUTION_DIRECTIVE = (
+    "[Agent directive — run the command, don't recite the doc]\n"
+    "The document below is a `cremind` CLI reference. If the user's question can "
+    "be answered by running one of its commands, do NOT answer from the text: run "
+    "the command yourself with the `{fn}` function and report its REAL output. The "
+    "shell already has CREMIND_SERVER and CREMIND_TOKEN set for the active profile, "
+    "so the command works as-is (add --json for machine-readable output).\n"
+    "- Read-only commands (list / show / get / status / options): run them "
+    "immediately, without asking.\n"
+    "- State-changing commands (configure / set / enable / disable / create / "
+    "delete): run them when the user asked for that change; confirm first only if "
+    "the action is destructive or ambiguous.\n"
+    "- Shell sessions and tables inside the document are illustrative EXAMPLES, not "
+    "live data — never present them as this server's current state. Only real "
+    "command output is live.\n"
+    "- Operating the `cremind` CLI is NOT a coding task — never delegate it to a "
+    "coding agent.\n"
+)
+
 
 _JUDGE_SYSTEM_PROMPT = (
     "You are the Documentation Search relevance judge. Vector search has "
@@ -90,7 +123,10 @@ TOOL_CONFIG: ToolConfig = {
         "Semantically searches the user's local Markdown documentation "
         "library and returns the single most relevant document's contents, "
         "chosen by an internal LLM judge. Try it first for any factual or "
-        "how-to lookup before searching the public web."
+        "how-to lookup before searching the public web. Results are often "
+        "`cremind` CLI manual pages: use them to find the right command, then "
+        "run that command with the Shell Executor to get live answers instead "
+        "of quoting the page."
     ),
     # Visible in Settings (so its top-k can be configured) but locked on —
     # the agent must always be able to search its own documentation.
@@ -116,7 +152,10 @@ class DocumentationSearchTool(BuiltInTool):
         "has added. Given a natural-language question, this returns the body of "
         f"the single most relevant document, or \"{NO_RESULT_MESSAGE}\" when "
         "nothing matches. Use it to look things up or answer questions about how "
-        "Cremind and its skills work."
+        "Cremind and its skills work. When the result is a `cremind` CLI "
+        "reference, follow its embedded agent directive: run the relevant command "
+        "with the Exec Shell tool and report its live output instead of "
+        "paraphrasing the document."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -246,6 +285,18 @@ async def run_doc_search(
     # the vector store or content hash.
     body = resolve_system_var_tokens(body, profile)
 
+    # CLI reference docs describe live `cremind` commands. Prepend an execution
+    # directive so a weak model runs the command via exec_shell and answers from
+    # real output instead of paraphrasing the man page (and mistaking its example
+    # tables for live data). Gated on exec_shell being callable for this profile
+    # so we never instruct the impossible; prepended because long results are
+    # head-truncated. Kept as a single text item so _extract_tool_result still
+    # unwraps to a plain string.
+    if (chosen.get("name") or "").startswith(_CLI_DOC_PREFIX):
+        fn = _exec_shell_fn(profile)
+        if fn:
+            body = _CLI_EXECUTION_DIRECTIVE.format(fn=fn) + "\n" + body
+
     # Return the body of the chosen document. The adapter's
     # _extract_tool_result unwraps a single text content item to a
     # plain string, which is what the Reasoning Agent should see.
@@ -253,6 +304,37 @@ async def run_doc_search(
         content=[{"type": "text", "text": body}],
         token_usage=judge_usage,
     )
+
+
+def _exec_shell_fn(profile: str) -> Optional[str]:
+    """Exposed function name of the exec_shell run-command leaf, or ``None`` when
+    it isn't callable for ``profile`` (so we never tell the model to run a command
+    it can't).
+
+    exec_shell is ``locked`` (its group can't be disabled), but registration can
+    fail (leaving a stub group with no real leaf) and the per-leaf API path can
+    disable the ``exec_shell`` leaf — both are reflected by
+    ``leaves_for_profile``'s per-leaf ``enabled`` flags. Lazy imports avoid a
+    builtin<->registry cycle and make the registry easy to monkeypatch in tests;
+    any failure (registry not initialized in unit tests / early boot) degrades to
+    ``None`` silently. The name is derived via ``make_leaf_name`` — the same way
+    the reasoning agent derives it — so a rename re-derives instead of drifting.
+    """
+    try:
+        from app.tools.base import make_leaf_name
+        from app.tools.registry import get_tool_registry
+
+        registry = get_tool_registry()
+        payload = registry.leaves_for_profile(profile, "exec_shell")
+    except Exception:  # noqa: BLE001 - registry unavailable / group unregistered
+        return None
+    leaf_enabled = any(
+        leaf.get("leaf_name") == "exec_shell" and leaf.get("enabled")
+        for leaf in payload.get("leaves", [])
+    )
+    if not leaf_enabled:
+        return None
+    return make_leaf_name("exec_shell", "exec_shell")
 
 
 def _no_result(token_usage: Optional[Dict[str, int]] = None) -> BuiltInToolResult:
