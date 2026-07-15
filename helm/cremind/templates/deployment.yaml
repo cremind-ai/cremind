@@ -85,16 +85,19 @@ spec:
             {{- end }}
           {{- end }}
           # Container ports are informational; the proxy sidecar reaches these
-          # over the shared pod loopback. noVNC (80) is always available.
+          # over the shared pod loopback. The novnc (80) / vnc (5900) ports
+          # exist only on the desktop flavor.
           ports:
             - name: api
               containerPort: {{ .Values.cremind.apiPort }}
             - name: ui
               containerPort: {{ .Values.cremind.uiPort }}
+            {{- if .Values.desktop.enabled }}
             - name: novnc
               containerPort: 80
             - name: vnc
               containerPort: 5900
+            {{- end }}
           {{- if .Values.readinessProbe.enabled }}
           readinessProbe:
             httpGet:

@@ -69,12 +69,19 @@ export interface ServiceModeEntry {
   description_template: string;
 }
 
+export interface DockerDesktopEntry {
+  prompt: string;
+  hint: string;
+  default: boolean;
+}
+
 export interface InstallCatalog {
   schema_version?: number;
   deployments: Record<string, DeploymentEntry>;
   modes: Record<string, InstallModeEntry>;
   mode_rules: Record<string, ModeRule>;
   service_modes: Record<string, ServiceModeEntry>;
+  docker_desktop?: DockerDesktopEntry;
 }
 
 export interface InstallCatalogResponse {

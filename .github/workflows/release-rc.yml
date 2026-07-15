@@ -32,10 +32,10 @@
 #      install never sees an "Update available" for an RC whose installers
 #      haven't been built yet. Human validation has moved to a
 #      required-reviewer approval on release-prod.yml's ``approve`` job.
-#   6. Builds cremind/cremind-desktop with CREMIND_PIP_SPEC pointing at the
-#      Test PyPI wheel (e.g. ``cremind==0.0.2rc1.dev1``) and pushes it to
-#      Docker Hub. No ``:latest`` tag — release candidates never claim
-#      that role.
+#   6. Builds both image flavors (cremind/cremind-desktop and
+#      cremind/cremind) with CREMIND_PIP_SPEC pointing at the Test PyPI
+#      wheel (e.g. ``cremind==0.0.2rc1.dev1``) and pushes them to Docker
+#      Hub. No ``:latest`` tag — release candidates never claim that role.
 #
 # RC/dev tags are expected to live on a feature branch, not on main.
 # release-prod.yml's verify gate enforces "at least one validated dev
@@ -50,7 +50,7 @@
 #                          Scoped to the cremind project once it exists,
 #                          otherwise account-wide for the very first run.
 #   DOCKERHUB_USERNAME   — Docker Hub account with push rights to
-#                          cremind/cremind-desktop.
+#                          cremind/cremind-desktop AND cremind/cremind.
 #   DOCKERHUB_TOKEN      — Docker Hub PAT (Read+Write scope).
 
 name: release-rc
@@ -460,23 +460,27 @@ jobs:
             --repo "${{ github.repository }}" \
             --clobber
 
-  # Builds cremind/cremind-desktop:X.Y.ZrcN.devM against Test PyPI and
-  # pushes it to Docker Hub. Mirrors release-prod.yml's ``docker`` job;
-  # differences:
+  # Builds BOTH image flavors (cremind/cremind-desktop:X.Y.ZrcN.devM and
+  # cremind/cremind:X.Y.ZrcN.devM) against Test PyPI and pushes them to
+  # Docker Hub. Mirrors release-prod.yml's ``docker`` job; differences:
   #   - Pulls the wheel from Test PyPI (with prod PyPI as fallback index
   #     for transitive deps that only exist there).
   #   - Tag is the PEP 440 form (0.2.1rc3.dev2), i.e. the GH tag
   #     (v0.2.1rc3.dev2) with the ``v`` stripped.
   #   - Does NOT emit ``:latest``.
   #
+  # Both flavors build as sequential steps in this one job so the shared
+  # ``core`` / ``venv-builder`` stages build once — see release-prod.yml's
+  # docker job for the full rationale.
+  #
   # The wheel job's version rewrite happened on a different runner, so
   # this job's clean checkout has the un-rewritten app/__version__.py.
-  # We re-apply the rewrite before the build because Dockerfile.desktop's
+  # We re-apply the rewrite before the build because the Dockerfile's
   # SPA stage copies app/__version__.py + sync_ui_version.py to bake the
   # version into the UI bundle. Without the rewrite, the wheel from Test
   # PyPI (0.2.1rc3.dev2) and the UI (0.2.1) would disagree.
   #
-  # cache scope=desktop is shared with release-prod.yml, so a prod or
+  # cache scope=desktop/basic is shared with release-prod.yml, so a prod or
   # prior RC build's base layers are reused.
   docker:
     needs: wheel
@@ -579,7 +583,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.desktop
+          file: Dockerfile
+          target: desktop
           platforms: linux/amd64
           push: true
           provenance: false
@@ -589,11 +594,30 @@ jobs:
           cache-from: type=gha,scope=desktop
           cache-to: type=gha,scope=desktop,mode=max
 
+      # Basic flavor — reads both cache scopes, writes only its own. See
+      # release-prod.yml's docker job for the cache-scope rationale.
+      - name: Build & push cremind/cremind (basic, rc)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: basic
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: cremind/cremind:${{ needs.wheel.outputs.version }}
+          build-args: |
+            CREMIND_PIP_SPEC=${{ steps.wheel_url.outputs.url }}
+          cache-from: |
+            type=gha,scope=basic
+            type=gha,scope=desktop
+          cache-to: type=gha,scope=basic,mode=max
+
   # Packages the Helm chart and pushes it to Docker Hub as an OCI artifact.
   # ``needs: [wheel, docker]`` because the chart's appVersion == the published
-  # cremind/cremind-desktop image tag — the image must exist before a chart
-  # that references it ships. Reuses the DOCKERHUB_* secrets the docker job
-  # already uses; no new secret.
+  # image tag (both cremind/cremind-desktop and cremind/cremind share it) —
+  # the images must exist before a chart that references one ships. Reuses
+  # the DOCKERHUB_* secrets the docker job already uses; no new secret.
   #
   # Versioning: the chart ``version`` must be strict SemVer2, but RC builds use
   # the PEP 440 form (0.0.2rc1.dev1). We translate it with the SAME function the

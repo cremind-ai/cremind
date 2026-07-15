@@ -6,10 +6,12 @@
 # ``docker compose up -d`` from within the cremind container (via the
 # mounted Docker socket).
 #
-#   cremind    XFCE desktop + VNC + the Cremind agent + the SPA static
-#             server. The agent runs under the desktop session so it
-#             can drive a real GUI; observe at http://<host>:6080/vnc.html.
-#             Always started.
+#   cremind    The Cremind agent + the SPA static server. On the desktop
+#             image (cremind/cremind-desktop) it also runs an XFCE desktop
+#             + VNC so the agent can drive a real GUI, observable at
+#             http://<host>:6080/vnc.html. On the basic image
+#             (cremind/cremind) there is no desktop and the installer
+#             strips the noVNC/VNC port maps + VNC env below. Always started.
 #   postgres  Application database. Gated by ``with-postgres``;
 #             activated when the wizard picks Database = Postgres / Docker.
 #   qdrant    Vector store. Gated by ``with-qdrant``; activated when
@@ -25,23 +27,25 @@
 
 services:
   cremind:
-    # Pre-built image pulled from Docker Hub. ``release.yml`` pushes
-    # ``cremind/cremind-desktop:<version>`` and ``:latest`` for the
-    # production channel; ``release-test.yml`` pushes
-    # ``cremind/cremind-desktop:<dev-version>`` for the test channel.
-    # ``CREMIND_VERSION`` is resolved at install time by install.sh /
-    # install.ps1 against PyPI (production) or Test PyPI (test). The
-    # dev channel re-adds a ``build:`` section via
-    # docker-compose.override.yml so it can build from a local
-    # checkout instead of pulling.
-    image: cremind/cremind-desktop:${CREMIND_VERSION}
+    # Pre-built image pulled from Docker Hub. Release CI pushes both flavors
+    # (``cremind/cremind-desktop:<version>`` and ``cremind/cremind:<version>``,
+    # plus ``:latest`` on prod). ``CREMIND_IMAGE`` selects the flavor and is
+    # written into ``.env`` by install.sh / install.ps1 from the desktop-UI
+    # answer; the ``:-`` default keeps a pre-flavor ``.env`` (which lacks the
+    # key) on the desktop image. ``CREMIND_VERSION`` is resolved at install
+    # time against PyPI (production) or Test PyPI (test). The dev channel
+    # re-adds a ``build:`` section via docker-compose.override.yml so it can
+    # build from a local checkout instead of pulling.
+    image: ${CREMIND_IMAGE:-cremind/cremind-desktop}:${CREMIND_VERSION}
     ports:
       # Single public port: the merged app serves UI + API + A2A + OAuth
       # same-origin on 1515. The internal API bind (1112) is loopback-only
       # inside the container and is deliberately NOT published.
       - "${SPA_PORT:-1515}:1515"
+      # >>> desktop-only >>>
       - "${NOVNC_PORT:-6080}:80"
       - "${VNC_PORT:-5900}:5900"
+      # <<< desktop-only <<<
     environment:
       ENV: production
       HOST: 0.0.0.0
@@ -69,8 +73,10 @@ services:
       # /opt/cremind-compose below.
       CREMIND_COMPOSE_FILE: /opt/cremind-compose/docker-compose.yml
       CREMIND_COMPOSE_ENV_FILE: /opt/cremind-compose/.env
+      # >>> desktop-only >>>
       VNC_PASSWORD: ${VNC_PASSWORD}
       RESOLUTION: ${RESOLUTION:-1280x720}
+      # <<< desktop-only <<<
     volumes:
       # Cremind System Directory lives in a named Docker volume, isolated
       # from the host filesystem. Storage, tokens, profile dirs, .env,

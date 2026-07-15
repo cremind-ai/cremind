@@ -27,7 +27,7 @@ The scripts detect Docker and ask which mode you want:
 
 | Mode | What you get | When to pick it |
 |---|---|---|
-| **docker** *(recommended)* | The agent runs inside a sandboxed VNC-accessible XFCE desktop. The Setup Wizard activates Postgres, Qdrant, or ChromaDB as sibling containers on demand. You can observe what the agent is doing at `http://<host>:6080/vnc.html`. | Anytime Docker is available — the agent is isolated from your host, and per-service deployment choices are made later in the wizard. |
+| **docker** *(recommended)* | The agent runs inside a sandboxed container. A sub-question asks whether to include the VNC Desktop UI: **yes** (default) pulls `cremind/cremind-desktop` so the agent has an XFCE desktop you can observe at `http://<host>:6080/vnc.html`; **no** (`--no-desktop`) pulls the smaller headless `cremind/cremind`. Either way the Setup Wizard activates Postgres, Qdrant, or ChromaDB as sibling containers on demand. | Anytime Docker is available — the agent is isolated from your host, and per-service deployment choices are made later in the wizard. |
 | **native** | A Python venv at `~/.cremind/venv` with `cremind` and SQLite. The agent shares your desktop and home directory. | Docker isn't available, or you want a minimal install without containers. |
 
 The installer no longer asks which database or vector store to use —
@@ -38,19 +38,19 @@ shows no radio (it's local-only).
 
 ## What docker mode does
 
-1. Detect Docker, ask deployment type (local / server / custom) and host or advanced fields.
-2. Generate a random VNC password.
-3. Render [`docker-compose.yml`](templates/docker-compose.yml.tmpl) and an `.env` file (VNC password, ports, app URL, CORS) into `~/.cremind/docker/`. The Setup Wizard later appends to `COMPOSE_PROFILES` as the user activates Docker-mode services; the bundle starts with only the `cremind` container running.
+1. Detect Docker, ask deployment type (local / server / custom) and host or advanced fields, then ask whether to include the VNC Desktop UI (default yes; `--desktop` / `--no-desktop` skip the prompt). A re-install defaults to the previously-chosen flavor.
+2. Generate a random VNC password *(desktop image only)*.
+3. Render [`docker-compose.yml`](templates/docker-compose.yml.tmpl) and an `.env` file (image flavor, ports, app URL, CORS, and — for the desktop image — VNC password) into `~/.cremind/docker/`. For a basic (`--no-desktop`) install the noVNC/VNC port maps and VNC env are stripped. The Setup Wizard later appends to `COMPOSE_PROFILES` as the user activates Docker-mode services; the bundle starts with only the `cremind` container running.
 4. Per-channel image strategy:
    - `production` / `test`: resolve the latest version from PyPI / Test PyPI, then `docker compose pull` + `docker compose up -d` (no local build; a missing tag fails hard).
    - `dev`: `docker compose pull --ignore-pull-failures` for sidecars, then `docker compose up -d --build` against the local checkout via `docker-compose.override.yml`.
 5. Wait for `http://<host>:1515/health` to return 200.
-6. Open `http://<host>:1515/#/setup` in your browser.
+6. Open `http://<host>:1515/#/setup` in your browser. *(Desktop image only:* also print the noVNC URL + VNC password.*)*
 
 The bundle defines four services. Only `cremind` is started at install
 time; the others are activated by the wizard:
 
-- **cremind** — XFCE + TigerVNC + noVNC + Python 3.13 + the Cremind agent + the SPA static server. Always started. Production / test installs pull a pre-built `cremind/cremind-desktop:<version>` from Docker Hub; dev installs build from [`Dockerfile.desktop`](../Dockerfile.desktop). Mounts `/var/run/docker.sock` so the in-container wizard can `docker compose up -d` the sibling services on demand.
+- **cremind** — Python 3.13 + the Cremind agent + the SPA static server, plus (on the desktop image) XFCE + TigerVNC + noVNC. Always started. Production / test installs pull a pre-built image from Docker Hub — `cremind/cremind-desktop:<version>` (desktop) or `cremind/cremind:<version>` (basic); dev installs build the matching [`Dockerfile`](../Dockerfile) target (`desktop` / `basic`). Mounts `/var/run/docker.sock` so the in-container wizard can `docker compose up -d` the sibling services on demand.
 - **postgres** — Application DB (`postgres:16`). Activated when the wizard's Database step picks **Postgres + Docker**.
 - **qdrant** — Vector store (`qdrant/qdrant:latest`). Activated when the wizard's Embedding step picks **Qdrant + Docker**.
 - **chroma** — Vector store (`chromadb/chroma:latest`). Activated when the wizard's Embedding step picks **ChromaDB + Docker**.
@@ -115,6 +115,7 @@ container-friendly defaults) for one release; new scripts should use
 | `--allowed-origins LIST`             | (custom) Override `CORS_ALLOWED_ORIGINS`. |
 | `--wizard-preset ID`                 | (custom) Override `SETUP_WIZARD_ENV`. |
 | `--mode docker\|native`              | Skip the mode prompt. `--docker` and `--native` are aliases. |
+| `--desktop` / `--no-desktop`         | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `--unattended`; a re-install keeps the previous choice. `--no-desktop` pulls the headless `cremind/cremind`. |
 | `--no-launch`                        | Don't open the wizard at the end. |
 | `--unattended`                       | Use defaults; never prompt. Implies `--mode docker` if Docker is present. |
 | `--reinstall`                        | Wipe the existing venv (native) or regenerate compose+.env (docker). |
@@ -130,6 +131,7 @@ container-friendly defaults) for one release; new scripts should use
 | `-AllowedOrigins LIST`              | (custom) Override `CORS_ALLOWED_ORIGINS`. |
 | `-WizardPreset ID`                  | (custom) Override `SETUP_WIZARD_ENV`. |
 | `-Mode docker\|native`              | Skip the mode prompt. |
+| `-Desktop` / `-NoDesktop`           | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `-Unattended`; a re-install keeps the previous choice. `-NoDesktop` pulls the headless `cremind/cremind`. |
 | `-NoLaunch`                         | Don't open the wizard at the end. |
 | `-Unattended`                       | Use defaults; never prompt. |
 | `-Reinstall`                        | Wipe the existing venv or regenerate compose+.env. |

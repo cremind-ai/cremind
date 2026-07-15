@@ -15,6 +15,13 @@
 #                               ``container`` is accepted as a deprecated
 #                               alias for ``custom`` with container defaults.
 #   --host HOST                 Public IP/domain (server deployment only).
+#   --desktop / --no-desktop    (Docker mode) Include or skip the VNC Desktop
+#                               UI. --desktop pulls cremind/cremind-desktop
+#                               (XFCE + VNC); --no-desktop pulls the smaller
+#                               headless cremind/cremind image (no noVNC/VNC
+#                               ports). Default: desktop, including
+#                               --unattended; a re-install keeps the previous
+#                               choice unless you pass a flag.
 #   --listen-host HOST          (custom deployment) Override HOST in .env.
 #   --public-url URL            (custom deployment) Override APP_URL in .env.
 #   --allowed-origins LIST      (custom deployment) Override CORS_ALLOWED_ORIGINS.
@@ -113,6 +120,10 @@ fi
 DEPLOYMENT=""
 APP_HOST=""
 MODE=""           # docker | native (default: prompt if Docker available)
+# Docker mode only: include the VNC Desktop UI? "" = ask (default yes);
+# "1" = desktop image (cremind/cremind-desktop); "0" = basic headless image
+# (cremind/cremind). Ignored for native installs.
+DESKTOP_UI=""
 NO_LAUNCH=0
 UNATTENDED=0
 REINSTALL=0
@@ -155,6 +166,8 @@ while [ $# -gt 0 ]; do
         --mode=*)                 MODE="${1#*=}"; shift ;;
         --docker)                 MODE="docker"; shift ;;
         --native)                 MODE="native"; shift ;;
+        --desktop)                DESKTOP_UI=1; shift ;;
+        --no-desktop)             DESKTOP_UI=0; shift ;;
         --listen-host)            CUSTOM_listen_host="$2"; shift 2 ;;
         --listen-host=*)          CUSTOM_listen_host="${1#*=}"; shift ;;
         --public-url)             CUSTOM_public_url="$2"; shift 2 ;;
@@ -909,6 +922,7 @@ tui_run_bootstrap() {
             --channel "$CHANNEL" \
             --deployment "$DEPLOYMENT" \
             --mode "$MODE" \
+            --desktop "$DESKTOP_UI" \
             --version "$VERSION_SPEC" \
             --host "$APP_HOST" \
             --listen-host "$CUSTOM_listen_host" \
@@ -928,6 +942,7 @@ tui_run_bootstrap() {
             --channel "$CHANNEL" \
             --deployment "$DEPLOYMENT" \
             --mode "$MODE" \
+            --desktop "$DESKTOP_UI" \
             --version "$VERSION_SPEC" \
             --host "$APP_HOST" \
             --listen-host "$CUSTOM_listen_host" \
@@ -1133,6 +1148,55 @@ if [ "$MODE" = "docker" ] && [ "$HAS_DOCKER" -eq 0 ]; then
     exit 1
 fi
 
+# ── desktop UI (docker mode only) ─────────────────────────────────────────
+#
+# Docker installs choose an image flavor: the desktop image
+# (cremind/cremind-desktop, XFCE + VNC) or the basic headless image
+# (cremind/cremind). Default is desktop everywhere, including --unattended.
+# A re-install reads the previous choice from the existing docker/.env
+# (CREMIND_IMAGE) so an unattended re-run preserves the flavor.
+if [ "$MODE" = "docker" ] && [ -z "$DESKTOP_UI" ]; then
+    # Sticky default from a prior install: cremind/cremind → basic (0),
+    # anything else / no prior install → desktop (1).
+    desktop_default=1
+    prev_env="$CREMIND_INSTALL_DIR/docker/.env"
+    if [ -f "$prev_env" ]; then
+        prev_image="$(sed -n 's/^CREMIND_IMAGE=//p' "$prev_env" | head -n 1)"
+        [ "$prev_image" = "cremind/cremind" ] && desktop_default=0
+    fi
+
+    if [ "$UNATTENDED" -eq 1 ]; then
+        DESKTOP_UI="$desktop_default"
+    else
+        echo
+        printf '%s%s%s\n' "$BOLD" "$DOCKER_DESKTOP_PROMPT" "$RESET"
+        [ -n "$DOCKER_DESKTOP_HINT" ] && printf '  %s%s%s\n' "$DIM" "$DOCKER_DESKTOP_HINT" "$RESET"
+        if [ "$desktop_default" -eq 1 ]; then
+            yn_hint="[Y/n]"
+        else
+            yn_hint="[y/N]"
+        fi
+        while :; do
+            read -r -p "Install the VNC Desktop UI? $yn_hint: " ans </dev/tty || ans=""
+            if [ -z "$ans" ]; then
+                DESKTOP_UI="$desktop_default"; break
+            fi
+            case "$ans" in
+                [Yy]|[Yy][Ee][Ss]) DESKTOP_UI=1; break ;;
+                [Nn]|[Nn][Oo])     DESKTOP_UI=0; break ;;
+                *) warn "Please answer yes or no." ;;
+            esac
+        done
+    fi
+fi
+if [ "$MODE" = "docker" ]; then
+    if [ "$DESKTOP_UI" = "0" ]; then
+        ok "Desktop UI: no (basic headless image)"
+    else
+        ok "Desktop UI: yes (VNC desktop image)"
+    fi
+fi
+
 # ── docker install ────────────────────────────────────────────────────────
 
 # Random secret generator. /dev/urandom + tr keeps us within the printable
@@ -1140,6 +1204,18 @@ fi
 gen_secret() {
     LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24 || true
     echo
+}
+
+# Filter a rendered template on stdin: pass through unchanged for a desktop
+# install, or strip the ``# >>> desktop-only >>>`` … ``# <<< desktop-only <<<``
+# marker blocks (noVNC/VNC ports + VNC env) for a basic install. Uses POSIX
+# character classes so it works with both GNU and BSD sed (macOS).
+maybe_strip_desktop() {
+    if [ "$DESKTOP_UI" = "0" ]; then
+        sed '/^[[:space:]]*# >>> desktop-only >>>/,/^[[:space:]]*# <<< desktop-only <<</d'
+    else
+        cat
+    fi
 }
 
 # Pick the CREMIND_VERSION tag to bake into the rendered docker .env.
@@ -1255,7 +1331,18 @@ if [ "$MODE" = "docker" ]; then
         info "Regenerating $DOCKER_DIR config (templates re-render every run)"
     fi
 
-    VNC_PASSWORD="$(gen_secret)"
+    # Image flavor from the desktop-UI choice (default desktop). BUILD_TARGET
+    # selects the Dockerfile stage for the dev-channel local build; IMAGE_REPO
+    # is the Docker Hub repo written into .env as CREMIND_IMAGE.
+    if [ "$DESKTOP_UI" = "0" ]; then
+        IMAGE_REPO="cremind/cremind"
+        BUILD_TARGET="basic"
+        VNC_PASSWORD=""
+    else
+        IMAGE_REPO="cremind/cremind-desktop"
+        BUILD_TARGET="desktop"
+        VNC_PASSWORD="$(gen_secret)"
+    fi
     CREMIND_VERSION="$(resolve_version)"
 
     case "$DEPLOYMENT" in
@@ -1288,17 +1375,19 @@ if [ "$MODE" = "docker" ]; then
     # named Docker volume — isolated from the host. No path substitution
     # needed at render time; the volume is declared in the template's
     # ``volumes:`` block.
-    fetch_template "docker-compose.yml.tmpl" > "$DOCKER_DIR/docker-compose.yml"
+    fetch_template "docker-compose.yml.tmpl" | maybe_strip_desktop > "$DOCKER_DIR/docker-compose.yml"
 
     info "Writing $DOCKER_DIR/.env (secrets, do not commit)"
     fetch_template "docker.env.tmpl" \
         | sed \
+            -e "s|__CREMIND_IMAGE__|$IMAGE_REPO|g" \
             -e "s|__CREMIND_VERSION__|$CREMIND_VERSION|g" \
             -e "s|__APP_URL__|$DOCKER_APP_URL|g" \
             -e "s|__CORS_ALLOWED_ORIGINS__|$DOCKER_CORS|g" \
             -e "s|__SETUP_WIZARD_ENV__|$DOCKER_WIZARD_ENV|g" \
             -e "s|__INSTALL_MODE__|$MODE|g" \
             -e "s|__VNC_PASSWORD__|$VNC_PASSWORD|g" \
+        | maybe_strip_desktop \
         > "$DOCKER_DIR/.env"
 
     # Test channel: forward Test PyPI indices into the Dockerfile build
@@ -1332,6 +1421,7 @@ EOF
         info "Writing $DOCKER_DIR/docker-compose.override.yml (bind-mounts $REPO_ROOT at /src)"
         fetch_template "docker-compose.override.yml.tmpl" \
             | sed -e "s|__REPO_ROOT__|$REPO_ROOT|g" \
+                  -e "s|__CREMIND_BUILD_TARGET__|$BUILD_TARGET|g" \
             > "$DOCKER_DIR/docker-compose.override.yml"
     elif [ -f "$DOCKER_DIR/docker-compose.override.yml" ]; then
         info "Removing stale docker-compose.override.yml (dev-only)"
@@ -1362,7 +1452,7 @@ EOF
         info "Building cremind image and starting bundle"
         (cd "$DOCKER_DIR" && docker compose up -d --build >>"$LOG_FILE" 2>&1)
     else
-        info "Pulling cremind/cremind-desktop:$CREMIND_VERSION and sidecar images from Docker Hub"
+        info "Pulling $IMAGE_REPO:$CREMIND_VERSION and sidecar images from Docker Hub"
         # Docker Hub's CDN drops large layer downloads mid-transfer with an
         # EOF more often than you'd like. Docker caches completed layers, so
         # a retry resumes where the last attempt died — a bounded loop turns
@@ -1379,7 +1469,7 @@ EOF
                 break
             fi
             if tail -n 40 "$LOG_FILE" | grep -qE 'manifest unknown|not found|repository does not exist'; then
-                err "docker compose pull failed — cremind/cremind-desktop:$CREMIND_VERSION is not on Docker Hub. Check the version/tag, or wait for the release to finish publishing (see $LOG_FILE)."
+                err "docker compose pull failed — $IMAGE_REPO:$CREMIND_VERSION is not on Docker Hub. Check the version/tag, or wait for the release to finish publishing (see $LOG_FILE)."
                 exit 1
             fi
         done
@@ -1390,7 +1480,7 @@ EOF
             err "issue, not a missing image. Things that help:"
             err "  - Re-run this installer; Docker caches completed layers and resumes."
             err "  - Pull directly, repeating until it finishes:"
-            err "      docker pull cremind/cremind-desktop:$CREMIND_VERSION"
+            err "      docker pull $IMAGE_REPO:$CREMIND_VERSION"
             err "  - Reduce parallelism: add '\"max-concurrent-downloads\": 1' to the Docker"
             err "    daemon config (Docker Desktop -> Settings -> Docker Engine; or"
             err "    /etc/docker/daemon.json), restart Docker, and re-run."
@@ -1435,7 +1525,6 @@ EOF
     if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ]; then
         step "Setup wizard"
 
-        NOVNC_URL="http://${HEALTH_HOST}:6080/vnc.html"
         cat <<EOF
 The setup wizard is the next step. It collects your LLM API keys,
 profile name, and tool preferences, then activates the server.
@@ -1445,9 +1534,17 @@ ${BOLD}Open this URL in your browser to continue setup:${RESET}
     ${BOLD}$WIZARD_URL${RESET}
 
   ${BOLD}Cremind${RESET}:    http://${HEALTH_HOST}:1515
+EOF
+        # Desktop image only: surface the noVNC viewer + VNC password.
+        if [ "$DESKTOP_UI" != "0" ]; then
+            NOVNC_URL="http://${HEALTH_HOST}:6080/vnc.html"
+            cat <<EOF
   ${BOLD}Desktop${RESET}:    $NOVNC_URL
   ${BOLD}VNC password${RESET} (saved to $DOCKER_DIR/.env):
     $(grep '^VNC_PASSWORD=' "$DOCKER_DIR/.env" | cut -d= -f2-)
+EOF
+        fi
+        cat <<EOF
 
   Stop:    cd $DOCKER_DIR && docker compose down
   Logs:    cd $DOCKER_DIR && docker compose logs -f cremind
@@ -1519,6 +1616,12 @@ api_port = $CREDS_API_PORT
 spa_port = $CREDS_SPA_PORT
 cors_allowed_origins = "$DOCKER_CORS"
 setup_wizard_env = "$DOCKER_WIZARD_ENV"
+EOF
+    # Desktop image only: the basic image has no noVNC/VNC. Keep this in
+    # sync with app/config/credentials_file.py, which gates [desktop] the
+    # same way (see tests/config/test_credentials_file.py).
+    if [ "$DESKTOP_UI" != "0" ]; then
+        cat >> "$CREDS_FILE.tmp" <<EOF
 
 [desktop]
 novnc_url = "http://$HEALTH_HOST:$CREDS_NOVNC_PORT/vnc.html"
@@ -1527,6 +1630,7 @@ vnc_port = $CREDS_VNC_PORT
 vnc_password = "$VNC_PASSWORD"
 resolution = "$CREDS_RESOLUTION"
 EOF
+    fi
     mv "$CREDS_FILE.tmp" "$CREDS_FILE"
     chmod 600 "$CREDS_FILE"
 
@@ -1692,7 +1796,7 @@ else
     # feature groups (vector embedding, vector stores, browser, channels,
     # LLM SDKs, postgres) are installed on demand by ``app/features/``
     # when the user enables them in the wizard. The Docker desktop image
-    # pre-bakes ``cremind[all]`` instead (see ``Dockerfile.desktop``).
+    # pre-bakes ``cremind[all]`` instead (see ``Dockerfile``).
     INSTALL_SPEC=""
     INSTALL_SOURCE_LABEL=""
     case "$CHANNEL" in

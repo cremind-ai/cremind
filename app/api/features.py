@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import queue
 import threading
 from typing import Any
@@ -186,6 +187,20 @@ UI_FEATURES: tuple[str, ...] = (
 )
 
 
+def get_image_flavor() -> str | None:
+    """The Docker image flavor this container was built as, or ``None``.
+
+    Read from the ``CREMIND_IMAGE_FLAVOR`` env var baked into each image
+    (``desktop`` for cremind/cremind-desktop, ``basic`` for cremind/cremind).
+    Returns ``None`` for native installs and for pre-flavor images that
+    predate the var — the Electron client treats ``None`` as "desktop" for
+    Docker installs, which is correct because every pre-flavor image is a
+    desktop image.
+    """
+    raw = os.environ.get("CREMIND_IMAGE_FLAVOR", "").strip().lower()
+    return raw if raw in ("desktop", "basic") else None
+
+
 async def get_service_capabilities(request: Request) -> JSONResponse:
     """Per-service deployment-mode descriptor for the Setup Wizard.
 
@@ -221,6 +236,8 @@ async def get_service_capabilities(request: Request) -> JSONResponse:
         "services": payload,
         "docker_available": docker_avail,
         "install_mode": install_mode,
+        # Docker image flavor (desktop / basic / None) — see get_image_flavor.
+        "image_flavor": get_image_flavor(),
         # Tray/jumplist/dock gating list — see UI_FEATURES docstring above.
         "ui_features": list(UI_FEATURES),
     })
@@ -230,11 +247,11 @@ async def get_tray_capabilities(_request: Request) -> JSONResponse:
     """Public tray/jumplist/dock gating descriptor for the Electron main
     process.
 
-    Returns just the two fields the Electron main process needs to gate
-    its menu entries: the active install mode (drives the "Open VNC
-    Desktop" entry, shown on Docker installs only) and the list of UI
-    feature names the bundled SPA exposes (drives Process Manager /
-    Events / Channels).
+    Returns the fields the Electron main process needs to gate its menu
+    entries: the active install mode and image flavor (together drive the
+    "Open VNC Desktop" entry — shown only on Docker installs whose image is
+    the desktop flavor) and the list of UI feature names the bundled SPA
+    exposes (drives Process Manager / Events / Channels).
 
     Deliberately unauthenticated. The Electron main process can't share
     the renderer's session cookies, so the admin-gated
@@ -246,6 +263,9 @@ async def get_tray_capabilities(_request: Request) -> JSONResponse:
     """
     return JSONResponse({
         "install_mode": get_active_install_mode(),
+        # desktop / basic / None. None (native or a pre-flavor image) is
+        # treated as desktop for Docker installs by the Electron client.
+        "image_flavor": get_image_flavor(),
         "ui_features": list(UI_FEATURES),
     })
 

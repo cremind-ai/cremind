@@ -7,19 +7,36 @@ no install script runs. Storage is constrained for a clustered environment:
 embeddings are enabled, **only external/in-cluster vector stores** (Qdrant or
 ChromaDB over HTTP) — never pod-local persistent storage.
 
-The pod runs the published `cremind/cremind-desktop` image. The chart sets
+By default the pod runs the published `cremind/cremind-desktop` image. The chart sets
 `INSTALL_MODE=kubernetes` and `SETUP_WIZARD_ENV=kubernetes`, mounts
 `CREMIND_SYSTEM_DIR` and the runtime venv on PersistentVolumeClaims, and — by
 design — **never sets `CREMIND_DB_PROVIDER`** (which would skip the wizard).
+
+### Image flavor (`desktop.enabled`)
+
+`desktop.enabled` (default `true`) picks which published image the pod runs:
+
+- **`true`** → `cremind/cremind-desktop`: bundles XFCE + TigerVNC + noVNC +
+  Chrome so the agent drives a real GUI, watchable at `<service>/vnc/`.
+- **`false`** → `cremind/cremind`: the headless **basic** image (smaller, no
+  GUI). The chart then drops the `/vnc/` + `/websockify` proxy routes, the
+  novnc/vnc container ports, and the `RESOLUTION`/`VNC_PASSWORD` env — so
+  `/vnc/vnc.html` 404s and any GUI-dependent agent feature is unavailable.
+
+Both flavors ship under the same chart `appVersion`. Flipping the toggle on an
+existing release recreates the pod on the other image; the PVCs
+(system/venv/work) re-attach and the venv content is wheel-identical, so no
+re-setup is needed. To override the repository directly (wins over the toggle),
+set `image.repository`.
 
 ### Single entry point
 
 An in-pod **nginx reverse-proxy sidecar** fronts the whole workflow on **one
 port** so you never forward more than one: it routes `/api` + `/health` to the
-backend, `/vnc/` to the agent's desktop (noVNC, always on), and everything else
-to the SPA. The Service exposes only that port, and an Ingress targets it. The
-SPA calls the backend **same-origin**, so it works behind a single port-forward
-*or* a single Ingress hostname.
+backend, `/vnc/` to the agent's desktop (noVNC — desktop flavor only), and
+everything else to the SPA. The Service exposes only that port, and an Ingress
+targets it. The SPA calls the backend **same-origin**, so it works behind a
+single port-forward *or* a single Ingress hostname.
 
 ## Install
 
@@ -59,7 +76,7 @@ Reach it with a single port-forward (or an Ingress hostname):
 ```bash
 kubectl -n cremind port-forward svc/cremind 1515:80
 # UI / wizard:   http://localhost:1515/#/setup
-# agent desktop: http://localhost:1515/vnc/vnc.html
+# agent desktop: http://localhost:1515/vnc/vnc.html   (desktop flavor only)
 ```
 
 Follow the `NOTES` printed after install: open `/#/setup` and click through. With
@@ -125,9 +142,11 @@ embeddings.
 
 | Key | Default | Notes |
 |-----|---------|-------|
-| `replicaCount` | `1` | **Fixed at 1.** The chart rejects any other value (VNC = single desktop). |
-| `resources.requests` | `2` CPU, `2Gi` | Minimum guaranteed for the cremind container; the node must have it free. |
-| `image.tag` | `""` → `appVersion` | The matching `cremind-desktop` image tag. |
+| `desktop.enabled` | `true` | `true` → `cremind/cremind-desktop` (VNC desktop); `false` → `cremind/cremind` (headless basic image, drops the noVNC routes/ports/env). |
+| `replicaCount` | `1` | **Fixed at 1.** The chart rejects any other value (single-instance state; VNC = single desktop). |
+| `resources.requests` | `2` CPU, `2Gi` | Minimum guaranteed for the cremind container; the node must have it free. The basic flavor needs less. |
+| `image.repository` | `""` → auto | Auto-selected from `desktop.enabled`. Set to override with a specific repo. |
+| `image.tag` | `""` → `appVersion` | The matching image tag (both flavors share it). |
 | _(release channel)_ | auto from `image.tag` | Not a knob. `test` when the effective tag is an RC (`…rcN.devM`, i.e. the `--devel` chart), else `production`; the in-app **Updates** page reports this. Force it via `cremind.extraEnv` (`CREMIND_UPGRADE_CHANNEL`). |
 | `cremind.installMode` | `kubernetes` | Drives external-only service modes. |
 | `cremind.setupWizardEnv` | `kubernetes` | Pre-fills the wizard. |
@@ -138,9 +157,9 @@ embeddings.
 | `extraVolumes` / `extraVolumeMounts` | `[]` | Persist any additional paths (raw volume specs). |
 | `postgresql.enabled` | `true` | Bundled Bitnami PostgreSQL. |
 | `qdrant.enabled` / `chromadb.enabled` | `false` | Enable when turning on embeddings. |
-| `proxy.enabled` | `true` | nginx single-entry sidecar (UI + API + noVNC on one port). |
+| `proxy.enabled` | `true` | nginx single-entry sidecar (UI + API + noVNC on one port; noVNC routes present only on the desktop flavor). |
 | `service.port` | `80` | The one Service port (fronts the proxy). |
-| `ingress.enabled` | `false` | One hostname for everything (UI at `/`, noVNC at `/vnc/`). |
+| `ingress.enabled` | `false` | One hostname for everything (UI at `/`; noVNC at `/vnc/` on the desktop flavor). |
 
 ## How the storage constraints are enforced
 
@@ -157,18 +176,19 @@ The chart only sets `INSTALL_MODE=kubernetes`; the backend does the rest
 
 ## Single instance — scaling is not supported
 
-Cremind runs as **exactly one pod, by design**. The image bundles a VNC virtual
-desktop (XFCE + Chrome) that the agent drives, so each pod is its own
-independent desktop. Two pods would mean two divergent desktops and two agents
-fighting over the same shared database — not a scaled service. Therefore:
+Cremind runs as **exactly one pod, by design**. It owns shared state — RWO PVCs
+that attach to one node at a time, one agent against the shared database, one
+runtime venv — so two pods would fight over it, not scale it. On the desktop
+flavor each pod additionally bundles its own VNC virtual desktop (XFCE +
+Chrome), so a second pod would also mean a second divergent desktop. Therefore:
 
 - `replicaCount` is **fixed at 1** and the chart **fails to render** if you set
   anything else.
 - There is **no HorizontalPodAutoscaler** and no `autoscaling` values.
 - The Deployment uses the `Recreate` strategy, so even an upgrade never runs two
   pods at once.
-- Do **not** `kubectl scale` the Deployment — it would break the VNC model. (A
-  `helm upgrade` resets it to 1.)
+- Do **not** `kubectl scale` the Deployment — it would break the single-instance
+  model. (A `helm upgrade` resets it to 1.)
 
 State survives a pod reschedule without scaling: PostgreSQL holds the dynamic
 config (JWT signing secret, LLM keys, tool configs, profiles) and three PVCs hold

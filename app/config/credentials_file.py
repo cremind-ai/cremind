@@ -194,7 +194,8 @@ def write_credentials_file(
 
     - top-level metadata: always
     - ``[app]``: always
-    - ``[desktop]``: docker mode only
+    - ``[desktop]``: docker mode with the desktop image only (detected by a
+      ``VNC_PASSWORD`` in docker/.env; the basic image's .env has none)
     - ``[postgres]``: only when ``bootstrap.toml`` has
       ``db_provider = "postgres"``
     """
@@ -253,7 +254,11 @@ def write_credentials_file(
         "setup_wizard_env": wizard_env,
     }
 
-    if install_mode == "docker":
+    # Desktop image only: the basic image's docker/.env carries no
+    # VNC_PASSWORD (the installer strips the desktop-only block), so its
+    # presence is the flavor signal. Mirrors install.sh / install.ps1, which
+    # gate the [desktop] block the same way.
+    if install_mode == "docker" and docker_vars.get("VNC_PASSWORD"):
         novnc_port = _int_or(_DEFAULT_NOVNC_PORT, docker_vars.get("NOVNC_PORT"))
         vnc_port = _int_or(_DEFAULT_VNC_PORT, docker_vars.get("VNC_PORT"))
         health_host = _derive_health_host(api_url)

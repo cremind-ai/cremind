@@ -102,8 +102,8 @@ default    = "local"
 
 [modes.docker]
 label       = "Docker"
-description = "sandboxed VNC desktop with a bundled storage stack"
-hint        = "The agent runs inside a container with its own GUI. Observe at http://<host>:6080/vnc.html."
+description = "sandboxed container with a bundled storage stack (optional VNC desktop)"
+hint        = "The agent runs inside a container. You can add a VNC desktop so it has its own GUI (observe at http://<host>:6080/vnc.html), or install the smaller headless image."
 badge       = "recommended"
 requires    = ["docker"]
 order       = 10
@@ -123,6 +123,19 @@ order       = 20
 # sets INSTALL_MODE=kubernetes on the pod, and get_active_install_mode() accepts
 # any mode defined in [mode_rules] even without a [modes] entry, so the rule below
 # still constrains the Setup Wizard. See app/config/install_catalog.py.
+
+
+# ── Docker desktop UI sub-question ─────────────────────────────────────────
+# Asked once, only when the install mode is Docker: whether to include the
+# VNC Desktop UI. "Yes" pulls cremind/cremind-desktop (XFCE + VNC); "No"
+# pulls the smaller headless cremind/cremind image. The default is Yes
+# everywhere, including --unattended. Consumed by install.sh / install.ps1,
+# the installer TUI, and the Setup Wizard's Docker option.
+
+[docker_desktop]
+prompt  = "Install the VNC Desktop UI?"
+hint    = "Adds an XFCE desktop inside the container so you can watch the agent work at http://<host>:6080/vnc.html. Answer No to install the smaller headless image (cremind/cremind)."
+default = true
 
 
 # ── Mode rules ───────────────────────────────────────────────────────────

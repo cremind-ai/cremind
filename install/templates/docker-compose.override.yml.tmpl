@@ -13,9 +13,11 @@
 #   Dockerfile entirely).
 # - ``CREMIND_PIP_SPEC=-e /src`` switches the image build from a PyPI
 #   install to an editable install rooted at the bind-mounted checkout
-#   (see Dockerfile.desktop's --mount=type=bind). Like production, this
+#   (see the Dockerfile's --mount=type=bind). Like production, this
 #   is a thin-core install — the Setup Wizard adds optional feature
 #   groups at runtime; they persist in the ``cremind-venv`` volume.
+# - ``target`` selects which flavor to build (basic / desktop); the
+#   installer renders it from the desktop-UI answer, matching CREMIND_IMAGE.
 # - The ``__REPO_ROOT__:/src`` runtime volume keeps the editable install
 #   resolvable after the build step's bind mount is gone, and lets
 #   host-side edits show up inside the container after a restart.
@@ -23,7 +25,8 @@ services:
   cremind:
     build:
       context: "__REPO_ROOT__"
-      dockerfile: Dockerfile.desktop
+      dockerfile: Dockerfile
+      target: "__CREMIND_BUILD_TARGET__"
       args:
         CREMIND_PIP_SPEC: "-e /src"
     volumes:

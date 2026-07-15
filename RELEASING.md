@@ -2,8 +2,9 @@
 
 Cremind ships from a single git tag: the Python wheel goes to PyPI, the
 Electron installers (Windows / macOS / Linux) attach to a GitHub Release,
-and the Docker image pushes to `cremind/cremind-desktop` on Docker Hub.
-All three artifacts carry the same version number.
+and two Docker image flavors push to Docker Hub — `cremind/cremind-desktop`
+(XFCE + VNC) and `cremind/cremind` (headless basic image). All artifacts
+carry the same version number.
 
 Releases are coordinated by two roles:
 
@@ -92,9 +93,10 @@ git push origin v0.0.2rc2.dev1
 tag. It rewrites `app/__version__.py` in-CI only (never committed) to
 the PEP 440 form `0.0.2rc1.dev1` / `0.0.2rc2.dev1` (which is just the
 tag with the `v` stripped — the tag already carries PEP 440 canonical
-form), builds the wheel, uploads it to Test PyPI, builds and pushes
-`cremind/cremind-desktop:0.0.2rc1.dev1` (and `:0.0.2rc2.dev1`) to Docker
-Hub, and attaches Windows / macOS / Linux Electron installers to an
+form), builds the wheel, uploads it to Test PyPI, builds and pushes both
+image flavors (`cremind/cremind-desktop:0.0.2rc1.dev1` and
+`cremind/cremind:0.0.2rc1.dev1`, and likewise for `:0.0.2rc2.dev1`) to
+Docker Hub, and attaches Windows / macOS / Linux Electron installers to an
 auto-published GitHub prerelease. Test-channel installs see it on the
 next Check-for-updates poll. ~10–15 minutes end-to-end per PR.
 
@@ -214,9 +216,10 @@ After approval the workflow runs seven jobs:
    in `ui/`, then electron-builder publishes signed installers +
    `latest*.yml` update manifests to the same draft.
 6. **`docker`** (Ubuntu) — waits for `wheel` (PyPI must serve the new
-   version), builds `Dockerfile.desktop` with
-   `CREMIND_PIP_SPEC=cremind==0.0.2`, pushes
-   `cremind/cremind-desktop:0.0.2` + `:latest` to Docker Hub.
+   version), then builds both `Dockerfile` targets with
+   `CREMIND_PIP_SPEC=cremind==0.0.2` and pushes
+   `cremind/cremind-desktop:0.0.2` + `:latest` (desktop) and
+   `cremind/cremind:0.0.2` + `:latest` (basic) to Docker Hub.
 7. **`publish`** — promotes the draft from hidden to public, **only
    after** all of the above succeed. Half-finished releases never reach
    users.
@@ -227,8 +230,9 @@ gh run watch <run-id> --exit-status   # optional: block until done
 
 When `publish` finishes, the release is live at
 `https://github.com/cremind-ai/cremind/releases/tag/v0.0.2`. Users can
-`pip install cremind==0.0.2`, `docker pull
-cremind/cremind-desktop:latest`, or download the platform installer.
+`pip install cremind==0.0.2`, `docker pull cremind/cremind-desktop:latest`
+(or `docker pull cremind/cremind:latest` for the headless image), or
+download the platform installer.
 
 ### 9. Delete the feature branches
 
@@ -428,10 +432,13 @@ RC tags carry the **PEP 440 canonical form** verbatim with a leading
 `v` — the same string lands on GitHub, Test PyPI, and Docker Hub
 (modulo the `v`). The `.dev<M>` counter is mandatory.
 
-| Tag pattern        | PEP 440          | npm / installer       | Docker tag                            | PyPI     | Channel      |
+Both image flavors (`cremind-desktop` and `cremind`) share the Docker tag
+in each row.
+
+| Tag pattern        | PEP 440          | npm / installer       | Docker tag (both repos)               | PyPI     | Channel      |
 |--------------------|------------------|-----------------------|---------------------------------------|----------|--------------|
-| `v0.0.2rc1.dev1`   | `0.0.2rc1.dev1`  | `0.0.2-rc.1.dev.1`    | `cremind-desktop:0.0.2rc1.dev1`        | TestPyPI | `test`       |
-| `v0.0.2`           | `0.0.2`          | `0.0.2`               | `cremind-desktop:0.0.2` + `:latest`    | PyPI     | `production` |
+| `v0.0.2rc1.dev1`   | `0.0.2rc1.dev1`  | `0.0.2-rc.1.dev.1`    | `{desktop,basic}:0.0.2rc1.dev1`        | TestPyPI | `test`       |
+| `v0.0.2`           | `0.0.2`          | `0.0.2`               | `{desktop,basic}:0.0.2` + `:latest`    | PyPI     | `production` |
 
 Within a version's slate:
 - `rc<N>` indexes the PR (`rc1` for the first PR, `rc2` for the
@@ -493,10 +500,14 @@ gating is in `release-prod.yml`'s *Configure code-signing env* step.
 
 Docker Hub setup (one-time):
 
-1. Create the repo on Docker Hub: name `cremind-desktop`, namespace
-   `cremind`, visibility **Public**.
+1. Create **both** repos on Docker Hub, namespace `cremind`, visibility
+   **Public**: `cremind-desktop` (VNC desktop) and `cremind` (headless
+   basic image). **Do this before the first release that pushes them** —
+   pushing to a repo that doesn't exist yet auto-creates it with your
+   account's default visibility (usually **Private**), and user `docker
+   pull`s then fail with "repository does not exist or may require login".
 2. Create a Personal Access Token: *Account Settings → Security → New
-   Access Token*, scope **Read & Write**.
+   Access Token*, scope **Read & Write** (it covers both repos).
 3. Add `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` as GitHub repo
    secrets.
 

@@ -19,7 +19,7 @@ way back."
 Docker installs aren't covered here. The container itself is the unit
 of versioning: ``docker compose pull && up -d`` is the upgrade, and
 the migrations run on the next entrypoint pass via ``cremind db upgrade``
-(see ``install/desktop/entrypoint.sh``).
+(see ``install/docker/entrypoint.sh``).
 """
 
 from __future__ import annotations

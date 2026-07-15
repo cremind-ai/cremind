@@ -61,8 +61,8 @@
   "modes": {
     "docker": {
       "label": "Docker",
-      "description": "sandboxed VNC desktop with a bundled storage stack",
-      "hint": "The agent runs inside a container with its own GUI. Observe at http://<host>:6080/vnc.html.",
+      "description": "sandboxed container with a bundled storage stack (optional VNC desktop)",
+      "hint": "The agent runs inside a container. You can add a VNC desktop so it has its own GUI (observe at http://<host>:6080/vnc.html), or install the smaller headless image.",
       "badge": "recommended",
       "requires": [
         "docker"
@@ -76,6 +76,11 @@
       "requires": [],
       "order": 20
     }
+  },
+  "docker_desktop": {
+    "prompt": "Install the VNC Desktop UI?",
+    "hint": "Adds an XFCE desktop inside the container so you can watch the agent work at http://<host>:6080/vnc.html. Answer No to install the smaller headless image (cremind/cremind).",
+    "default": true
   },
   "mode_rules": {
     "docker": {
@@ -122,7 +127,7 @@
     }
   },
   "_meta": {
-    "sha256": "b32d2d3547d8f9ae0b3994fc509b57ef046c26b3cf4052b59ac6e296532cc5c5",
+    "sha256": "3413b5984b85868601f67c96b406a4e1042aafd4b990f6ae88e7bebc7622f40b",
     "schema_version": 1
   }
 }

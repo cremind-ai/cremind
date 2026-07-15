@@ -58,14 +58,32 @@ ServiceAccount name.
 {{- end -}}
 
 {{/*
+Image repository, auto-selected from the desktop flavor toggle unless
+explicitly overridden via image.repository:
+  image.repository set     -> that value (wins over the toggle)
+  desktop.enabled true      -> cremind/cremind-desktop
+  desktop.enabled false     -> cremind/cremind
+*/}}
+{{- define "cremind.imageRepository" -}}
+{{- if .Values.image.repository -}}
+{{- .Values.image.repository -}}
+{{- else if .Values.desktop.enabled -}}
+cremind/cremind-desktop
+{{- else -}}
+cremind/cremind
+{{- end -}}
+{{- end -}}
+
+{{/*
 Resolved image reference (registry/repository:tag), tag defaulting to appVersion.
 */}}
 {{- define "cremind.image" -}}
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
+{{- $repo := include "cremind.imageRepository" . -}}
 {{- if .Values.image.registry -}}
-{{- printf "%s/%s:%s" .Values.image.registry .Values.image.repository $tag -}}
+{{- printf "%s/%s:%s" .Values.image.registry $repo $tag -}}
 {{- else -}}
-{{- printf "%s:%s" .Values.image.repository $tag -}}
+{{- printf "%s:%s" $repo $tag -}}
 {{- end -}}
 {{- end -}}
 

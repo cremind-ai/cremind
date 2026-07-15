@@ -6,19 +6,23 @@ PostgreSQL only (SQLite is rejected), embeddings off by default, and only
 external/in-cluster vector stores.
 
 Everything is served on ONE port by the in-pod reverse proxy — the UI, the API,
-and noVNC. You never need to forward more than one port.
+{{- if .Values.desktop.enabled }} and noVNC.{{ else }} and (on the desktop flavor) noVNC.{{ end }} You never need to forward more than one port.
 
 1. Open the Setup Wizard
 {{- if .Values.ingress.enabled }}
 
    http://{{ .Values.ingress.host }}{{ .Values.ingress.path }}#/setup
+{{- if .Values.desktop.enabled }}
    (the agent's desktop is at http://{{ .Values.ingress.host }}/vnc/vnc.html)
+{{- end }}
 {{- else }}
 
    kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "cremind.fullname" . }} 1515:{{ .Values.service.port }}
 
    then browse to:  http://localhost:1515/#/setup
+{{- if .Values.desktop.enabled }}
    (the agent's desktop is at http://localhost:1515/vnc/vnc.html)
+{{- end }}
 {{- end }}
 
 2. Database step — PostgreSQL connection (pre-filled)
@@ -54,8 +58,9 @@ and noVNC. You never need to forward more than one port.
    will offer Qdrant at "cremind-qdrant:6333" or ChromaDB at
    "cremind-chromadb:8000".
 
-Single instance: this image bundles a VNC desktop, so Cremind runs as exactly
-ONE pod. replicaCount is fixed at 1 (the chart refuses any other value), there
-is no autoscaler, and `kubectl scale` is unsupported — multiple pods would mean
-multiple divergent desktops. To handle more load, give the pod more resources
-and a bigger node, not more replicas.
+Single instance: Cremind runs as exactly ONE pod — it owns shared state
+(RWO PVCs, one agent, one venv){{ if .Values.desktop.enabled }}, and the desktop flavor additionally bundles a
+single VNC desktop{{ end }}. replicaCount is fixed at 1 (the chart refuses any
+other value), there is no autoscaler, and `kubectl scale` is unsupported. To
+handle more load, give the pod more resources and a bigger node, not more
+replicas.

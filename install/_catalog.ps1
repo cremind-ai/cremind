@@ -1,6 +1,6 @@
 # AUTO-GENERATED from install/catalog.toml. Do not edit by hand.
 # Regenerate with: python install/scripts/build_catalog.py
-# Source SHA-256:  b32d2d3547d8f9ae0b3994fc509b57ef046c26b3cf4052b59ac6e296532cc5c5
+# Source SHA-256:  3413b5984b85868601f67c96b406a4e1042aafd4b990f6ae88e7bebc7622f40b
 
 $script:CatalogSchema = 1
 
@@ -74,8 +74,8 @@ $script:ModeIds = @('docker', 'native')
 $script:Modes = [ordered]@{
     'docker' = [ordered]@{
         Label       = 'Docker'
-        Description = 'sandboxed VNC desktop with a bundled storage stack'
-        Hint        = 'The agent runs inside a container with its own GUI. Observe at http://<host>:6080/vnc.html.'
+        Description = 'sandboxed container with a bundled storage stack (optional VNC desktop)'
+        Hint        = 'The agent runs inside a container. You can add a VNC desktop so it has its own GUI (observe at http://<host>:6080/vnc.html), or install the smaller headless image.'
         Badge       = 'recommended'
         Requires    = @('docker')
         Order       = 10
@@ -88,6 +88,13 @@ $script:Modes = [ordered]@{
         Requires    = @()
         Order       = 20
     }
+}
+
+# ── Docker desktop UI ──
+$script:DockerDesktop = [ordered]@{
+    Prompt  = 'Install the VNC Desktop UI?'
+    Hint    = 'Adds an XFCE desktop inside the container so you can watch the agent work at http://<host>:6080/vnc.html. Answer No to install the smaller headless image (cremind/cremind).'
+    Default = $true
 }
 
 # ── Mode rules ──

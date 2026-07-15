@@ -28,6 +28,9 @@ class TuiResult:
     deployment: str = ""
     app_host: str = ""
     mode: str = ""
+    # Docker desktop-UI choice: "" unset (let the shell decide), "1" desktop,
+    # "0" basic. Only meaningful when mode == "docker".
+    desktop: str = ""
     custom_listen_host: str = ""
     custom_public_url: str = ""
     custom_allowed_origins: str = ""
@@ -40,6 +43,7 @@ class TuiResult:
             "DEPLOYMENT": self.deployment,
             "APP_HOST": self.app_host,
             "MODE": self.mode,
+            "DESKTOP_UI": self.desktop,
             "CUSTOM_listen_host": self.custom_listen_host,
             "CUSTOM_public_url": self.custom_public_url,
             "CUSTOM_allowed_origins": self.custom_allowed_origins,

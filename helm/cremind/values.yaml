@@ -10,12 +10,32 @@ fullnameOverride: ""
 commonLabels: {}
 commonAnnotations: {}
 
+## @section Flavor
+# Which image flavor the pod runs.
+#   true  (default) -> cremind/cremind-desktop: XFCE + TigerVNC + noVNC +
+#                      Chrome. The agent drives a real GUI, observable at
+#                      <service>/vnc/. The chart wires up the noVNC proxy
+#                      routes, the novnc/vnc container ports, and the
+#                      RESOLUTION/VNC_PASSWORD env.
+#   false           -> cremind/cremind: the headless basic image (smaller,
+#                      no GUI). The chart drops the noVNC proxy routes,
+#                      those container ports, and the VNC env. GUI-dependent
+#                      agent features and the /vnc/ URL are unavailable.
+# Flipping this on an existing release recreates the pod on the other image;
+# the PVCs (system/venv/work) re-attach and the venv content is
+# wheel-identical, so no re-setup is needed.
+desktop:
+  enabled: true
+
 ## @section Cremind image
-# Reuses the published cremind/cremind-desktop image (VNC desktop + agent). The
-# `tag` defaults to the chart's appVersion (the matching image tag CI pushed).
+# By default the repository is auto-selected from `desktop.enabled`
+# (cremind/cremind-desktop or cremind/cremind). The `tag` defaults to the
+# chart's appVersion (the matching image tag CI pushed for both flavors).
 image:
   registry: docker.io
-  repository: cremind/cremind-desktop
+  # Leave empty to auto-select from desktop.enabled (recommended). Set to
+  # override with a specific repository (wins over the flavor toggle).
+  repository: ""
   # Leave empty to track .Chart.AppVersion (recommended). Override to pin.
   tag: ""
   pullPolicy: IfNotPresent
@@ -32,10 +52,12 @@ imagePullSecrets: []
 # tokens, per-profile files, and the wizard-installed venv. A rescheduled pod
 # re-attaches both and boots straight through — no re-setup.
 #
-# FIXED AT 1 — DO NOT CHANGE. The image bundles a VNC virtual desktop, so each
-# pod is its own independent desktop/agent. Running more than one would create
-# multiple divergent desktops and break the single-instance model. The chart
-# REJECTS any other value (see deployment.yaml) and ships no HorizontalPodAutoscaler.
+# FIXED AT 1 — DO NOT CHANGE. Cremind is a single-instance app: RWO PVCs
+# attach to one node at a time, and one agent owns the shared state and venv.
+# On the desktop flavor each pod is additionally its own independent VNC
+# desktop, so a second pod would diverge. Running more than one breaks the
+# single-instance model regardless of flavor. The chart REJECTS any other
+# value (see deployment.yaml) and ships no HorizontalPodAutoscaler.
 replicaCount: 1
 
 # RWO volumes can attach to one node at a time, and the single-VNC-desktop model
@@ -71,8 +93,10 @@ cremind:
   # when fronting Cremind with an Ingress domain. Where the browser can't reach it,
   # linking falls back to the `complete-link` paste.
   atlassianRedirectUri: ""        # -> CREMIND_ATLASSIAN_REDIRECT_URI (blank = image default)
-  # The desktop entrypoint requires these or it exits 1. The image already
-  # defaults them, but we set them explicitly so they're configurable.
+  # Desktop flavor only (desktop.enabled): the desktop entrypoint requires
+  # these or it exits 1. The image already defaults them, but we set them
+  # explicitly so they're configurable. They are NOT rendered into the
+  # ConfigMap when desktop.enabled is false (the basic entrypoint ignores them).
   resolution: "1280x720"         # -> RESOLUTION (must match WIDTHxHEIGHT)
   vncPassword: "changeme"        # -> VNC_PASSWORD
   # Auto-wire the PostgreSQL password into the pod (as CREMIND_POSTGRES_PASSWORD,
@@ -208,9 +232,11 @@ livenessProbe:
   failureThreshold: 30
 
 ## @section Resources (cremind container)
-# The cremind-desktop image bundles a VNC desktop (XFCE + Chrome) + Python +
-# the agent, so it needs a real allocation. Minimum guaranteed: 2 CPU + 2Gi.
-# The node must have at least this free or the single pod won't schedule.
+# The desktop flavor bundles a VNC desktop (XFCE + Chrome) + Python + the
+# agent, so it needs a real allocation. Minimum guaranteed: 2 CPU + 2Gi. The
+# node must have at least this free or the single pod won't schedule. The
+# basic flavor (desktop.enabled=false) is lighter and comfortably fits these
+# same requests — lower them if you're tight on capacity.
 resources:
   requests:
     cpu: "2"
@@ -233,8 +259,9 @@ tolerations: []
 affinity: {}
 
 # NOTE: Horizontal scaling is intentionally NOT supported. There is no
-# autoscaling section and no HorizontalPodAutoscaler — the VNC-desktop image
-# must run as exactly one pod. See replicaCount above.
+# autoscaling section and no HorizontalPodAutoscaler — Cremind must run as
+# exactly one pod (single-instance state; the desktop flavor adds the
+# single-VNC-desktop constraint). See replicaCount above.
 
 ## @section Bundled PostgreSQL (Bitnami subchart) — LOCKED ON
 # fullnameOverride pins the Service to `cremind-postgresql` regardless of the

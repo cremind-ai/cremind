@@ -10,9 +10,9 @@ data:
     # Single entry point for Cremind. The cremind container and this nginx
     # sidecar share the pod network namespace. The cremind app now serves the
     # SPA + API + A2A + OAuth as ONE single-origin app on 127.0.0.1:1515, so
-    # nginx only needs to (a) carve out noVNC/websockify on :80 and (b) forward
-    # everything else to 1515. The internal API bind (1112) is loopback-only and
-    # is NOT proxied here.
+    # nginx only needs to (a) carve out noVNC/websockify on :80 (desktop flavor
+    # only) and (b) forward everything else to 1515. The internal API bind
+    # (1112) is loopback-only and is NOT proxied here.
 
     # Standard WebSocket upgrade map (http context — conf.d is included there).
     map $http_upgrade $connection_upgrade {
@@ -27,9 +27,11 @@ data:
         # Proxy-local health for the sidecar's own probes (doesn't depend on
         # the backend being up).
         location = /healthz { return 200 "ok\n"; }
+{{- if .Values.desktop.enabled }}
 
-        # noVNC desktop viewer. websockify serves the noVNC web bundle (relative
-        # asset paths, so they resolve under /vnc/) and the VNC WebSocket on :80.
+        # noVNC desktop viewer (desktop flavor only). websockify serves the
+        # noVNC web bundle (relative asset paths, so they resolve under /vnc/)
+        # and the VNC WebSocket on :80.
         location = /vnc { return 302 /vnc/vnc.html; }
         location /vnc/ {
             proxy_pass http://127.0.0.1:80/;
@@ -53,6 +55,7 @@ data:
             proxy_read_timeout 3600s;
             proxy_send_timeout 3600s;
         }
+{{- end }}
 
         # Everything else → the single-origin cremind app on 1515: the SPA,
         # /api (REST + Server-Sent Events + the /api/processes/<pid>/ws

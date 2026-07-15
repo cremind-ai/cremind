@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router';
 import {
   ElSteps, ElStep, ElButton, ElMessage,
   ElForm, ElFormItem, ElInput, ElRadio, ElRadioGroup, ElAlert, ElTag,
-  ElSelect, ElOption,
+  ElSelect, ElOption, ElCheckbox,
 } from 'element-plus';
 import { useSettingsStore } from '../stores/settings';
 import { useConfigStore } from '../stores/config';
@@ -127,6 +127,9 @@ const detectingInstallEnv = ref(false);
 const installDeployment = ref<'local' | 'server' | 'custom'>('local');
 const installAppHost = ref('');
 const installMode = ref<'docker' | 'native'>('native');
+// Docker mode only: include the VNC Desktop UI (cremind/cremind-desktop) or
+// install the headless basic image (cremind/cremind). Default on = desktop.
+const installDesktopUi = ref(true);
 const installLog = ref<Array<{ stream: string; line: string }>>([]);
 const installing = ref(false);
 const installDone = ref(false);
@@ -321,6 +324,9 @@ async function startInstallerRun() {
       appHost:
         installDeployment.value === 'server' ? installAppHost.value.trim() : undefined,
       mode: installMode.value,
+      // Docker mode only: forward the desktop-UI toggle. Omitted for native
+      // so the script's default applies.
+      desktopUi: installMode.value === 'docker' ? installDesktopUi.value : undefined,
       customFields,
       // Pass the explicit spec only when the user picked "Specific";
       // omitting it lets the install script resolve the channel default
@@ -1450,13 +1456,24 @@ async function downloadConfigFile(format: ExportFormat) {
                      backend exists. -->
                 <template v-else>
                   <ElRadio value="docker" :disabled="installDockerDisabled">
-                    <strong>Docker</strong> — sandboxed VNC desktop with a bundled storage stack
+                    <strong>Docker</strong> — sandboxed container with a bundled storage stack (optional VNC desktop)
                   </ElRadio>
                   <ElRadio value="native">
                     <strong>Native</strong> — Python venv at <code>~/.cremind/venv</code> with embedded storage
                   </ElRadio>
                 </template>
               </ElRadioGroup>
+            </ElFormItem>
+            <!-- Docker sub-question: include the VNC Desktop UI? Shown only
+                 when Docker mode is selected. Off → the headless basic image. -->
+            <ElFormItem v-if="installMode === 'docker'">
+              <ElCheckbox v-model="installDesktopUi">
+                {{ installCatalog?.docker_desktop?.prompt ?? 'Install the VNC Desktop UI?' }}
+              </ElCheckbox>
+              <span class="installer-hint">
+                {{ installCatalog?.docker_desktop?.hint
+                  ?? 'Adds an XFCE desktop inside the container so you can watch the agent work. Uncheck to install the smaller headless image (cremind/cremind).' }}
+              </span>
             </ElFormItem>
           </ElForm>
         </div>
