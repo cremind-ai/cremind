@@ -28,6 +28,7 @@ pytest.importorskip("a2a")
 
 from app.constants import ChatCompletionTypeEnum  # noqa: E402
 from app.tools.base import Tool, ToolType  # noqa: E402
+from app.agent.usage import UsageRecord  # noqa: E402
 import app.agent.reasoning_agent as ra  # noqa: E402
 import app.tools.builtin.register_skill_event as rse  # noqa: E402
 
@@ -240,6 +241,55 @@ def test_skill_load_thinking_artifact_shows_marker(monkeypatch):
     assert skill_think
     args = json.loads(skill_think[0]["data"]["Tool_Input"])
     assert args == {"request": "Load skill 'gmail' instructions (SKILL.md)"}
+
+
+def test_thinking_artifact_carries_reasoning_token_usage(monkeypatch):
+    """Each step's thinking artifact carries the reasoning call's four-way token
+    split so the UI/CLI Thinking Process can show per-step input/cached/output
+    tokens. The numbers come from the step's DONE chunk (step 1: in=5, out=2)."""
+    skill = _FakeSkillTool("default__gmail", "gmail", full_content="BODY")
+    llm = _SkillCallLLM("default__gmail", {"request": "list my emails"})
+    agent = _build_agent(monkeypatch, llm, [skill])
+
+    chunks = _run(agent, "use gmail", history=[])
+    thinks = [c for c in chunks if c["type"] == ChatCompletionTypeEnum.THINKING_ARTIFACT]
+    skill_think = [t for t in thinks if t["data"]["Tool"] == "default__gmail"]
+    assert skill_think
+    assert skill_think[0]["data"]["Token_Usage"] == {
+        "input_tokens": 5,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 2,
+    }
+
+
+def test_reasoning_usage_for_step_is_reasoning_only_and_step_scoped():
+    """The per-step lookup returns the *reasoning* call's tokens for that exact
+    step (ignoring tool/sub-agent records with the same step_index), and None when
+    the step made no reasoning call so the UI simply omits the badge."""
+    agent = ra.ReasoningAgent.__new__(ra.ReasoningAgent)
+    agent._usage_records = [
+        UsageRecord(source_kind="reasoning", tool_id=None, label="m", provider="p",
+                    model="m", model_group=None, step_index=1,
+                    input_tokens=10, cache_read_input_tokens=4,
+                    cache_creation_input_tokens=1, output_tokens=3),
+        # Tool child-LLM usage on the same step must be ignored (reasoning-only).
+        UsageRecord(source_kind="tool", tool_id="t", label="t", provider="p",
+                    model="m", model_group=None, step_index=1,
+                    input_tokens=999, output_tokens=999),
+        UsageRecord(source_kind="reasoning", tool_id=None, label="m", provider="p",
+                    model="m", model_group=None, step_index=2,
+                    input_tokens=20, output_tokens=7),
+    ]
+    assert agent._reasoning_usage_for_step(1) == {
+        "input_tokens": 10, "cache_read_input_tokens": 4,
+        "cache_creation_input_tokens": 1, "output_tokens": 3,
+    }
+    assert agent._reasoning_usage_for_step(2) == {
+        "input_tokens": 20, "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0, "output_tokens": 7,
+    }
+    assert agent._reasoning_usage_for_step(3) is None
 
 
 # ── subscribe path ──────────────────────────────────────────────────────────

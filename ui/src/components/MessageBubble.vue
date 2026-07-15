@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, inject, ref, watch } from 'vue';
-import type { ChatMessage, FileAttachment, TerminalAttachment } from '../stores/chat';
+import type { ChatMessage, FileAttachment, TerminalAttachment, StepTokenUsage } from '../stores/chat';
+import { formatTokens } from '../utils/usageFormat';
 import { OpenTerminalKey } from '../composables/terminalTarget';
 import { createChatMarked } from '../utils/markdown';
 import vLinkBlank from '../directives/v-link-blank';
@@ -60,17 +61,23 @@ const parsedContent = computed(() => {
 });
 
 // Group per-tool thinking steps by ``step`` so parallel tool calls in one model
-// turn render together under a single "Step N".
+// turn render together under a single "Step N". Each group also carries the
+// reasoning call's token usage (``tokens``) for that step — every tool call in a
+// group shares the one reasoning call, so the first tool with usage is
+// authoritative; null for steps persisted before per-step tokens shipped.
 const thinkingGroups = computed(() => {
   const steps = props.message.thinkingSteps || [];
-  const groups: { step: number | null; tools: any[] }[] = [];
+  const groups: { step: number | null; tools: any[]; tokens: StepTokenUsage | null }[] = [];
   for (const s of steps) {
     const last = groups[groups.length - 1];
     if (last && s.step != null && last.step === s.step) {
       last.tools.push(s);
     } else {
-      groups.push({ step: s.step ?? null, tools: [s] });
+      groups.push({ step: s.step ?? null, tools: [s], tokens: null });
     }
+  }
+  for (const g of groups) {
+    g.tokens = (g.tools.find(t => t.tokenUsage)?.tokenUsage as StepTokenUsage) ?? null;
   }
   return groups;
 });
@@ -477,6 +484,24 @@ const handleThinkingClick = (event: MouseEvent) => {
                 placement="top"
               >
                 <el-card shadow="never" class="timeline-card">
+                  <div
+                    v-if="group.tokens"
+                    class="step-tokens"
+                    title="Tokens for the reasoning call that produced this step"
+                  >
+                    <span class="step-tokens-item">
+                      <span class="step-tokens-num">{{ formatTokens(group.tokens.inputTokens) }}</span> new input
+                    </span>
+                    <span v-if="group.tokens.cacheReadTokens > 0" class="step-tokens-item">
+                      <span class="step-tokens-num">{{ formatTokens(group.tokens.cacheReadTokens) }}</span> cached
+                    </span>
+                    <span v-if="group.tokens.cacheCreationTokens > 0" class="step-tokens-item">
+                      <span class="step-tokens-num">{{ formatTokens(group.tokens.cacheCreationTokens) }}</span> cache-write
+                    </span>
+                    <span class="step-tokens-item">
+                      <span class="step-tokens-num">{{ formatTokens(group.tokens.outputTokens) }}</span> output
+                    </span>
+                  </div>
                   <div v-for="(tool, tIdx) in group.tools" :key="tIdx" class="step-content">
                     <span v-if="tool.modelLabel" class="model-badge step-model">
                       {{ tool.modelLabel }}
@@ -1128,6 +1153,28 @@ const handleThinkingClick = (event: MouseEvent) => {
 .step-model {
   float: right;
   font-size: 0.75em;
+}
+
+/* Per-step reasoning-call token counts, above the step's tool calls. */
+.step-tokens {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  margin-bottom: 8px;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+}
+
+.step-tokens-item {
+  white-space: nowrap;
+}
+
+.step-tokens-num {
+  font-weight: 600;
+  color: var(--el-text-color-regular, inherit);
 }
 
 /* Timeline styles */

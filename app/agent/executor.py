@@ -194,6 +194,7 @@ class CremindAgentExecutor(AgentExecutor):
                         "tool": thinking_data.get("Tool", ""),
                         "tool_input": thinking_data.get("Tool_Input", ""),
                         "model_label": thinking_data.get("Model_Label"),
+                        "token_usage": thinking_data.get("Token_Usage"),
                     })
                 elif chunk["type"] == ChatCompletionTypeEnum.RESULT_ARTIFACT:
                     # Result is list[Part] from the reasoning agent.

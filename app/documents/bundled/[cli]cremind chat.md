@@ -10,6 +10,12 @@ the message; the agent's thinking, text tokens, and tool output stream
 in real-time. With no argument, `chat` creates a new conversation and
 starts a fresh session; with a conversation id, it resumes the thread.
 
+Each thinking step in the transcript also shows the token counts of the
+reasoning call that produced it — rendered as a `tokens (in …, cached … /
+out …)` sub-line under the step's tool. This mirrors the per-step token
+badge in the web UI's Thinking Process panel; the running per-turn total
+still appears in the status bar (see `cremind usage` for cost rollups).
+
 This is the right command when you want to *talk to* the agent. For
 scripted, one-shot interactions (pipe answer to a file, gate it on
 exit code, etc.) reach for [`cremind conv send`](%5Bcli%5Dopa%20conv.md)
