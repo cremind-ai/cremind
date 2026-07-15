@@ -70,6 +70,22 @@ def test_reasoning_model_drops_tool_and_omits_guidance(monkeypatch):
     assert "REASONING STEP" not in agent._build_instruction()
 
 
+def test_event_run_appends_events_mechanism_note(monkeypatch):
+    # The "how event runs work" note (isolated run, no shared history) is appended
+    # ONLY on event runs. On an ordinary run it is absent, so the chat/instant/plan
+    # cache prefix stays byte-identical (the note lives in EVENT_RUN_GUIDANCE, a
+    # disjoint cache population, not in SYSTEM_TEMPLATE).
+    agent = _build(monkeypatch, "fake", "fake-model")
+
+    agent._event_run = False
+    assert "this run is isolated" not in agent._build_instruction()
+
+    agent._event_run = True
+    prompt = agent._build_instruction()
+    assert "this run is isolated" in prompt
+    assert "AUTOMATED EVENT RUN" in prompt  # the note rides inside the event block
+
+
 def test_profile_and_agent_name_rendered_into_prompt(monkeypatch):
     # $CREMIND_PROFILE / $CREMIND_AGENT_NAME in SYSTEM_TEMPLATE are resolved to
     # runtime values (not left as literal tokens) when the prompt is built.
