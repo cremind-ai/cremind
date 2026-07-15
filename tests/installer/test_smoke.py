@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 
+from app.installer import __main__ as installer_main
 from app.installer import catalog, output, tui
 from app.installer.output import TuiResult, write
 
@@ -477,3 +478,37 @@ def test_handle_common_escape_declined_reshows(monkeypatch) -> None:
 def test_handle_common_passthrough_tuple() -> None:
     assert tui._handle_common(("a", "advance")) == ("a", "advance")
     assert tui._handle_common((None, "back")) == (None, "back")
+
+
+# ── __main__ cancel sentinel (uv-run eats the exit code on Ctrl+C) ──────────
+
+
+def test_main_writes_cancel_marker_on_keyboardinterrupt(tmp_path, monkeypatch) -> None:
+    out = tmp_path / "tui.out"
+
+    def _raise(**kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(installer_main.tui, "run", _raise)
+    rc = installer_main.main(["--output", str(out), "--catalog", str(CATALOG_PATH)])
+    assert rc == 1
+    assert out.read_text(encoding="utf-8").strip() == installer_main.CANCEL_MARKER
+
+
+def test_main_writes_cancel_marker_when_run_returns_none(tmp_path, monkeypatch) -> None:
+    out = tmp_path / "tui.out"
+    monkeypatch.setattr(installer_main.tui, "run", lambda **k: None)
+    rc = installer_main.main(["--output", str(out), "--catalog", str(CATALOG_PATH)])
+    assert rc == 1
+    assert installer_main.CANCEL_MARKER in out.read_text(encoding="utf-8")
+
+
+def test_main_writes_selections_on_success_without_marker(tmp_path, monkeypatch) -> None:
+    out = tmp_path / "tui.out"
+    result = TuiResult(channel="test", deployment="local", mode="docker")
+    monkeypatch.setattr(installer_main.tui, "run", lambda **k: result)
+    rc = installer_main.main(["--output", str(out), "--catalog", str(CATALOG_PATH)])
+    assert rc == 0
+    text = out.read_text(encoding="utf-8")
+    assert "CHANNEL=test" in text
+    assert installer_main.CANCEL_MARKER not in text

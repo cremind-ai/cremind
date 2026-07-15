@@ -998,6 +998,9 @@ function Invoke-InstallerTuiBootstrap {
     if ($WizardPreset)    { $tuiArgs.Add('--wizard-preset');    $tuiArgs.Add($WizardPreset) }
     if ($ElectronVersion) { $tuiArgs.Add('--electron-version'); $tuiArgs.Add($ElectronVersion) }
 
+    # Clear any stale output / cancel-sentinel from a previous run so the
+    # marker check below can't misfire on leftover content.
+    Remove-Item -LiteralPath $tuiOut -Force -ErrorAction SilentlyContinue
     Write-Info "Launching installer TUI (Enter continues, Esc cancels, Ctrl+C force-quits)"
     if ($devPython) {
         & $devPython $InstallerTuiPyz @tuiArgs
@@ -1007,7 +1010,15 @@ function Invoke-InstallerTuiBootstrap {
             python $InstallerTuiPyz @tuiArgs
     }
     $rc = $LASTEXITCODE
-    if ($rc -eq 1) {
+
+    # Trust the cancel sentinel the TUI writes on Esc/Ctrl+C over $rc:
+    # `uv run` does not reliably propagate the child's exit code on Ctrl+C
+    # (Windows returns 0), which would otherwise fall through to the legacy
+    # text prompts instead of exiting the installer.
+    $tuiCancelled = (Test-Path -LiteralPath $tuiOut) -and `
+        ((Get-Content -LiteralPath $tuiOut -Raw -ErrorAction SilentlyContinue) -match '(?m)^CREMIND_TUI_CANCELLED=1\s*$')
+    if ($tuiCancelled -or $rc -eq 1) {
+        Remove-Item -LiteralPath $tuiOut -Force -ErrorAction SilentlyContinue
         Write-Err2 "Installer cancelled."
         exit 1
     }
