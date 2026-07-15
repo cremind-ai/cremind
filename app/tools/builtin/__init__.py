@@ -461,6 +461,7 @@ async def register_builtin_tools(
             oauth_provider=oauth_provider,
             prepare_tools=prepare_tools_fn,
             llm_factory=llm_factory,
+            arguments_schema=tool_info.get("arguments"),
         )
         # ``hidden`` keeps the tool out of ``visible_for_profile`` (Settings UI
         # / GET /api/tools) while ``tools_for_profile`` still exposes it to the
@@ -476,6 +477,14 @@ async def register_builtin_tools(
         # True; declare False to start the tool disabled) — see ToolConfig.default.
         group.default_enabled = bool(tool_info.get("default", True))
         registry.register_builtin(group, source=module_name)
+
+    # Prune persisted rows for built-in modules that no longer ship (e.g. a
+    # renamed/removed module or a discarded prototype) — register_builtin is
+    # upsert-only and never cleans these up on its own.
+    try:
+        registry.purge_stale_builtin_rows(_BUILTIN_MODULE_NAMES)
+    except Exception:  # noqa: BLE001 — cleanup is best-effort, never fatal at boot
+        logger.exception("Failed to purge stale built-in tool rows")
 
 
 def refresh_builtin_tool_oauth(

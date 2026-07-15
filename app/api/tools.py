@@ -216,16 +216,35 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         schema = _schema_for_tool(tool) if tool else {}
         required_config = schema.get("tool", {}).get("required_config", {})
 
+        # Validate up front so a bad value never partially writes: reject any
+        # value that isn't a member of its field's declared ``enum``. Booleans
+        # are normalized first so a native JSON ``true`` matches an enum of
+        # ``["true", "false"]``.
+        normalized: dict[str, str] = {}
         for key, value in variables.items():
-            field_spec = required_config.get(key, {})
-            is_secret = bool(field_spec.get("secret") or _is_secret_var_name(key))
-            # Normalize native JSON booleans to lowercase strings so
-            # downstream consumers (e.g. _coerce_headless) see "true"/"false"
-            # instead of Python's str(True) -> "True".
             if isinstance(value, bool):
                 value = "true" if value else "false"
+            value = str(value)
+            enum = required_config.get(key, {}).get("enum")
+            if enum and value not in enum:
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"'{value}' is not a valid value for '{key}'. "
+                            f"Allowed values: {', '.join(map(str, enum))}."
+                        ),
+                        "key": key,
+                        "allowed": list(enum),
+                    },
+                    status_code=400,
+                )
+            normalized[key] = value
+
+        for key, value in normalized.items():
+            field_spec = required_config.get(key, {})
+            is_secret = bool(field_spec.get("secret") or _is_secret_var_name(key))
             config_manager.set_variable(
-                tool_id, profile, key, str(value), is_secret=is_secret,
+                tool_id, profile, key, value, is_secret=is_secret,
             )
 
         # Refresh OAuth client for built-in tools that just got their credentials
@@ -238,6 +257,76 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         if tool and tool.tool_type is ToolType.SKILL:
             _write_skill_env_file(tool, config_manager, profile)
 
+        publish_settings_state_changed(profile)
+        return JSONResponse({"success": True})
+
+    async def handle_set_arguments(request: Request) -> JSONResponse:
+        """Update Tool Arguments (JSON-Schema parameter values) for a tool.
+
+        Counterpart to :func:`handle_set_variables` for the ``arg`` scope. The
+        matching CLI command (``cremind tools set-args``) and its client wrapper
+        already shipped, but this route was never registered — so ``set-args``
+        used to 404. Values persist per profile and are injected into each
+        matching tool call by the reasoning agent on its next step.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        registry = state.registry
+        if registry is None:
+            return _storage_not_ready()
+        config_manager = registry.config
+        profile = _profile_from_request(request)
+        if not profile:
+            return JSONResponse({"error": "Profile is required"}, status_code=400)
+        tool_id = request.path_params["tool_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        arguments = body.get("arguments", {})
+        if not isinstance(arguments, dict):
+            return JSONResponse({"error": "'arguments' must be an object"}, status_code=400)
+
+        # Unlike variables, refuse an unknown tool: ``tool_configs.tool_id`` is a
+        # foreign key, so writing rows for a nonexistent tool would fail on
+        # Postgres. (handle_set_variables skips this check — a known looseness we
+        # do not copy here.)
+        tool = registry.get(tool_id)
+        if tool is None:
+            return JSONResponse(
+                {"error": f"Tool '{tool_id}' not found"}, status_code=404,
+            )
+
+        # Validate keys and enum membership against the tool's arguments schema
+        # (populated for built-ins now that register_builtin_tools wires it).
+        arg_schema = getattr(tool, "arguments_schema", None) or {}
+        properties = arg_schema.get("properties", {}) if isinstance(arg_schema, dict) else {}
+        for key, value in arguments.items():
+            if properties and key not in properties:
+                return JSONResponse(
+                    {
+                        "error": f"'{key}' is not a valid argument for '{tool_id}'.",
+                        "key": key,
+                        "valid_keys": list(properties.keys()),
+                    },
+                    status_code=400,
+                )
+            enum = properties.get(key, {}).get("enum") if properties else None
+            if enum and value not in enum:
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"'{value}' is not a valid value for argument '{key}'. "
+                            f"Allowed values: {', '.join(map(str, enum))}."
+                        ),
+                        "key": key,
+                        "allowed": list(enum),
+                    },
+                    status_code=400,
+                )
+
+        config_manager.set_arguments(tool_id, profile, arguments)
         publish_settings_state_changed(profile)
         return JSONResponse({"success": True})
 
@@ -511,6 +600,7 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         Route("/api/tools", handle_list_tools, methods=["GET"]),
         Route("/api/tools/{tool_id}", handle_get_tool, methods=["GET"]),
         Route("/api/tools/{tool_id}/variables", handle_set_variables, methods=["PUT"]),
+        Route("/api/tools/{tool_id}/arguments", handle_set_arguments, methods=["PUT"]),
         Route("/api/tools/{tool_id}/enabled", handle_set_enabled, methods=["PUT"]),
         Route("/api/tools/{tool_id}/leaves", handle_list_leaves, methods=["GET"]),
         Route("/api/tools/{tool_id}/leaves", handle_set_leaves, methods=["PUT"]),

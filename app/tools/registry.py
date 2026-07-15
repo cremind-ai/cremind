@@ -516,6 +516,36 @@ class ToolRegistry:
             )
         return removed
 
+    def purge_stale_builtin_rows(self, valid_sources: Iterable[str]) -> int:
+        """Remove persisted built-in rows for modules that no longer exist.
+
+        ``register_builtin`` is upsert-only, so a built-in row from a module
+        that was later renamed or removed (e.g. a discarded prototype) lingers
+        forever — invisible to the UI/agent but polluting blueprint export and
+        stranding its cascading ``profile_tools`` / ``tool_configs`` rows. This
+        deletes any BUILTIN row whose ``source`` is not a currently-shipped
+        module **and** whose ``tool_id`` isn't registered in memory (belt and
+        braces). FK ``ON DELETE CASCADE`` cleans the per-profile children.
+
+        Keyed on the compile-time module list (not the runtime-registered set)
+        so ``visible: False`` modules and import-failure stubs keep their rows.
+        Returns the number of rows deleted. Called once at startup, right after
+        ``register_builtin_tools``.
+        """
+        valid = {str(s) for s in valid_sources}
+        removed = 0
+        for row in self._storage.list_tools(tool_type=ToolType.BUILTIN.value):
+            source = row.get("source") or ""
+            tool_id = row["tool_id"]
+            if source in valid or tool_id in self._tools:
+                continue
+            self._storage.delete_tool(tool_id)
+            removed += 1
+            logger.info(
+                f"Purged stale built-in row: tool_id={tool_id}, source={source}"
+            )
+        return removed
+
     # ── profile lifecycle hooks ────────────────────────────────────────
 
     def on_profile_created(self, profile: str) -> int:
