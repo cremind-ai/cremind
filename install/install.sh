@@ -913,7 +913,7 @@ tui_run_bootstrap() {
     # shellcheck disable=SC2064
     trap "rm -f \"$tui_out\"" RETURN
 
-    info "Launching installer TUI (press Esc on the first screen to cancel)"
+    info "Launching installer TUI (Enter continues, Esc cancels, Ctrl+C force-quits)"
     local rc=0
     if [ -n "$dev_python" ]; then
         "$dev_python" "$INSTALLER_TUI_PYZ" \
