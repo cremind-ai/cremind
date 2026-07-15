@@ -281,6 +281,11 @@ export interface AgentActivitySnapshot {
     duration_ms?: number | null;
     session_id?: string | null;
   } | null;
+  // Live context usage of the delegated coding session (updates during the run).
+  usage?: {
+    context_tokens?: number | null;
+    context_window?: number | null;
+  } | null;
   error?: string | null;
 }
 

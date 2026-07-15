@@ -161,10 +161,11 @@ def _tool_item_preview(item: Any, item_type: str) -> str:
 async def apply_notification(activity: AgentActivity, notification: Any) -> None:
     """Map one Codex SDK notification to activity steps (best-effort; never raises).
 
-    Handles ``item/started`` (open a running tool step) and ``item/completed``
+    Handles ``item/started`` (open a running tool step), ``item/completed``
     (resolve a tool step, or append a text/thinking step for messages and
-    reasoning). All other notifications are ignored — deltas are noise and
-    ``turn/completed`` is owned by the runner.
+    reasoning), and ``thread/tokenUsage/updated`` (update the panel's live
+    context-usage indicator). Deltas are noise and ``turn/completed`` is owned
+    by the runner (which keeps the cost-accounting usage on the task).
     """
     try:
         method = str(getattr(notification, "method", "") or "")
@@ -183,6 +184,21 @@ async def apply_notification(activity: AgentActivity, notification: Any) -> None
                 )
         elif method == "item/completed":
             await _apply_completed(activity, _unwrap(getattr(payload, "item", None)))
+        elif method == "thread/tokenUsage/updated":
+            usage = getattr(payload, "token_usage", None)
+            last = getattr(usage, "last", None)
+            # Codex input_tokens INCLUDES cached tokens (OpenAI convention) — that
+            # total is exactly the last request's prompt size, i.e. context used.
+            # Do NOT subtract cached here (unlike the runner's cost-accounting map).
+            ctx = int(getattr(last, "input_tokens", 0) or 0)
+            if ctx > 0:
+                window = getattr(usage, "model_context_window", None)
+                await activity.update_usage(
+                    {
+                        "context_tokens": ctx,
+                        "context_window": int(window) if window else None,
+                    }
+                )
     except Exception:  # noqa: BLE001 — activity translation is best-effort
         return
 

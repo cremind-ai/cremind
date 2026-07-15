@@ -31,6 +31,8 @@ class SystemMessage:
 class AssistantMessage:
     content: list
     model: str = "claude-test"
+    usage: Optional[dict] = None
+    parent_tool_use_id: Optional[str] = None
 
 
 @dataclass
@@ -48,6 +50,7 @@ class ResultMessage:
     total_cost_usd: float = 0.01
     duration_ms: int = 1234
     usage: Optional[dict] = None
+    model_usage: Optional[dict] = None
 
 
 @dataclass
@@ -213,10 +216,15 @@ def test_fast_task_completes_in_grace_window(monkeypatch, tmp_path):
 
     async def produce(client):
         yield SystemMessage(subtype="init", data={"session_id": "sess-42"})
-        yield AssistantMessage(content=[
-            ThinkingBlock(thinking="Let me look."),
-            ToolUseBlock(id="t1", name="Read", input={"file_path": "a.py"}),
-        ])
+        yield AssistantMessage(
+            content=[
+                ThinkingBlock(thinking="Let me look."),
+                ToolUseBlock(id="t1", name="Read", input={"file_path": "a.py"}),
+            ],
+            model="claude-sonnet-4-6",
+            usage={"input_tokens": 1000, "output_tokens": 50,
+                   "cache_read_input_tokens": 120000, "cache_creation_input_tokens": 400},
+        )
         yield UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="file body")])
         yield ResultMessage(
             subtype="success", result="Done. Created a.py", is_error=False,
@@ -242,6 +250,12 @@ def test_fast_task_completes_in_grace_window(monkeypatch, tmp_path):
         "input_tokens": 10, "output_tokens": 20,
         "cache_read_input_tokens": 5, "cache_creation_input_tokens": 2,
     }
+    # Live context usage from the AssistantMessage reached the activity snapshot:
+    # prompt tokens (1000 + 120000 + 400), window resolved from the model id.
+    task = r.get_task(sc["task_id"])
+    assert task is not None
+    usage = task.activity.snapshot()["usage"]
+    assert usage == {"context_tokens": 121400, "context_window": 1000000}
 
 
 # ── slow task: handle → wait → final; usage folded exactly once ───────────────
@@ -408,6 +422,113 @@ def test_apply_sdk_message_builds_steps(monkeypatch):
         # tool_use carried the block id + running status
         assert ("tool_use", "Writing z.py", "t1", "running") in act.added
         assert act.resolved == [("t1", "ok")]
+
+    asyncio.run(body())
+
+
+class _UsageActivity:
+    """FakeActivity that records update_usage calls (and swallows steps)."""
+
+    def __init__(self):
+        self.usage = None
+        self.usage_calls = []
+
+    async def add_step(self, *, kind, label, detail=None, step_id=None, status=None):
+        return step_id or "s1"
+
+    async def resolve_step(self, step_id, *, status, detail_suffix=None):
+        return None
+
+    async def update_usage(self, usage):
+        self.usage = usage
+        self.usage_calls.append(usage)
+
+
+def test_apply_sdk_message_updates_context_usage(monkeypatch):
+    from app.tools.builtin.claude_code_activity import apply_sdk_message
+
+    async def body():
+        act = _UsageActivity()
+        await apply_sdk_message(act, AssistantMessage(
+            content=[TextBlock(text="hi")],
+            model="claude-sonnet-4-6",
+            usage={"input_tokens": 12, "cache_read_input_tokens": 100_000,
+                   "cache_creation_input_tokens": 400, "output_tokens": 50},
+        ))
+        # Prompt tokens only (output excluded); window resolved from the model id.
+        assert act.usage == {"context_tokens": 100_412, "context_window": 1_000_000}
+
+    asyncio.run(body())
+
+
+def test_context_window_resolution_fallbacks(monkeypatch):
+    from app.tools.builtin.claude_code_activity import apply_sdk_message
+
+    async def body():
+        # Dated model id → stripped to the alias id that the catalog keys.
+        dated = _UsageActivity()
+        await apply_sdk_message(dated, AssistantMessage(
+            content=[], model="claude-sonnet-4-6-20260203",
+            usage={"input_tokens": 5, "cache_read_input_tokens": 0,
+                   "cache_creation_input_tokens": 0, "output_tokens": 1},
+        ))
+        assert dated.usage == {"context_tokens": 5, "context_window": 1_000_000}
+
+        # Unknown model → tokens only, no window (UI drops the percentage).
+        unknown = _UsageActivity()
+        await apply_sdk_message(unknown, AssistantMessage(
+            content=[], model="claude-mystery-9",
+            usage={"input_tokens": 7, "cache_read_input_tokens": 0,
+                   "cache_creation_input_tokens": 0, "output_tokens": 1},
+        ))
+        assert unknown.usage == {"context_tokens": 7, "context_window": None}
+
+    asyncio.run(body())
+
+
+def test_subagent_usage_excluded(monkeypatch):
+    from app.tools.builtin.claude_code_activity import apply_sdk_message
+
+    async def body():
+        act = _UsageActivity()
+        # Task-tool subagent messages carry parent_tool_use_id — their context is
+        # separate and must not overwrite the main loop's indicator.
+        await apply_sdk_message(act, AssistantMessage(
+            content=[TextBlock(text="sub")],
+            model="claude-sonnet-4-6",
+            usage={"input_tokens": 999, "cache_read_input_tokens": 0,
+                   "cache_creation_input_tokens": 0, "output_tokens": 1},
+            parent_tool_use_id="tu_1",
+        ))
+        assert act.usage is None
+        assert act.usage_calls == []
+
+    asyncio.run(body())
+
+
+def test_result_message_usage_fallback(monkeypatch):
+    from app.tools.builtin.claude_code_activity import apply_sdk_message
+
+    async def body():
+        # No prior per-message usage → ResultMessage.usage is folded in, with the
+        # window taken from a single-model model_usage.
+        cold = _UsageActivity()
+        await apply_sdk_message(cold, ResultMessage(
+            usage={"input_tokens": 30, "cache_read_input_tokens": 10,
+                   "cache_creation_input_tokens": 0, "output_tokens": 5},
+            model_usage={"claude-sonnet-4-6": {"input_tokens": 30}},
+        ))
+        assert cold.usage == {"context_tokens": 40, "context_window": 1_000_000}
+
+        # Prior usage already set → ResultMessage does NOT overwrite it.
+        warm = _UsageActivity()
+        warm.usage = {"context_tokens": 111, "context_window": 200_000}
+        await apply_sdk_message(warm, ResultMessage(
+            usage={"input_tokens": 30, "cache_read_input_tokens": 10,
+                   "cache_creation_input_tokens": 0, "output_tokens": 5},
+        ))
+        assert warm.usage == {"context_tokens": 111, "context_window": 200_000}
+        assert warm.usage_calls == []
 
     asyncio.run(body())
 
