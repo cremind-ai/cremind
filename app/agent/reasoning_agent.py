@@ -744,6 +744,18 @@ class ReasoningAgent:
         )
         if not vision_feature_enabled(profile) and not main_can_see:
             tools = [t for t in tools if t.tool_id != "image_understanding"]
+        # ``send_notification`` pushes a message OUT to the profile's enabled
+        # notification-mode channels (Telegram, etc.). It is meaningless without
+        # at least one such channel, so withhold it entirely when the profile
+        # has none — a profile with no notification channel never sees the tool.
+        # Evaluated ONCE here from the in-memory ChannelRegistry and frozen into
+        # ``self._tools``, so the tools= schema stays byte-identical across every
+        # step of this run (matches the image_understanding gate above). Lazy
+        # import avoids an app.channels → app.events import cycle at module load;
+        # registry not yet initialized → treated as "no channel" → tool dropped.
+        from app.channels.registry import has_notification_channel
+        if not has_notification_channel(profile):
+            tools = [t for t in tools if t.tool_id != "send_notification"]
         self._tools = tools
         self._tools_by_id = {t.tool_id: t for t in self._tools}
         # Fallback-search guidance, built from the live enabled tool groups

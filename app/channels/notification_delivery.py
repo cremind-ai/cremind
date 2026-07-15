@@ -174,6 +174,29 @@ class NotificationDeliveryMixin:
                 targets.append(sid)
         return targets
 
+    async def deliver_text(self, text: str) -> int:
+        """Send raw ``text`` to every notification recipient; return the count.
+
+        The programmatic push path used by the ``send_notification`` built-in
+        tool (and the ``POST /api/channels/{id}/notify`` endpoint). Resolves
+        recipients via :meth:`_notification_recipients` (static
+        ``config.target_chat_ids`` ∪ authenticated subscribers) and fans out via
+        ``_send_chunked`` (chunking + the per-transport ``_send_text``).
+
+        Unlike the bus delivery loop this is an *explicit, user-commanded* send,
+        so it does NOT apply the channel's :class:`NotificationFilter` and does
+        NOT swallow transport errors — it lets ``_send_text`` failures propagate
+        so the caller can report a down channel honestly. Returns ``0`` (without
+        sending) for empty text or when there are no recipients.
+        """
+        text = (text or "").strip()
+        if not text:
+            return 0
+        recipients = await self._notification_recipients()
+        for target in recipients:
+            await self._send_chunked(target, text)  # type: ignore[attr-defined]
+        return len(recipients)
+
     # ── subscription authentication ──
 
     def _subscribe_auth(self) -> str:

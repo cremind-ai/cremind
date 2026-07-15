@@ -24,6 +24,10 @@ The group covers these operations:
   userbot code + 2FA) in the terminal.
 - **`notify-filter`** — Show or set the notification filter of a
   `notification`-mode channel (see **Notification mode** below).
+- **`send`** — Push a one-off, ad-hoc message out to a
+  `notification`-mode channel's subscribers (see **Notification mode**
+  below). This is the manual counterpart to the agent's
+  `send_notification` tool.
 - **`approve`** / **`revoke`** — Approve a pending subscriber (or revoke an
   existing one) on a `notification`-mode channel — the operator side of the
   `approval` subscription-auth method (see **Notification mode** below).
@@ -95,6 +99,13 @@ External channels are **inbound-only from the platform's user**:
   conversation — `POST /api/conversations/{id}/messages` returns 403
   `Read-only channel` for any conversation whose `channel_id` resolves
   to a channel with `channel_type != "main"`.
+
+This inbound-only rule is about *conversations*. A `notification`-mode
+channel has no conversation at all — it is a push-only feed — so it is
+the one case where an *operator-initiated* outbound push is allowed, via
+`cremind channels send` (or the agent's `send_notification` tool). That
+path delivers straight to subscribers and never creates or writes a
+conversation.
 
 Use `cremind conv get <id>` and `cremind conv attach <id>` to inspect channel
 conversations; use the corresponding platform (Telegram, etc.) to
@@ -375,6 +386,56 @@ $ cremind channels notify-filter e2e8...d4f1
 # Only high-priority alerts from scheduled automations, muted 22:00–07:00 local
 $ cremind channels notify-filter e2e8...d4f1 --json \
     '{"min_priority":"high","source_kinds":["schedule"],"quiet_hours":{"enabled":true,"start":"22:00","end":"07:00","allow_high":true}}'
+```
+
+### `cremind channels send`
+
+**Purpose.** Push a one-off, ad-hoc message OUT to a `notification`-mode
+channel — straight to its recipients, right now.
+
+**Syntax.**
+
+```bash
+cremind channels send <id> "<message>"
+cremind channels send <id> --message-file <path>   # or -f -  for stdin
+```
+
+**Behavior.** POSTs to `/api/channels/{id}/notify`. The message is delivered to
+the channel's recipients — the union of `config.target_chat_ids` and everyone
+who has `/start`-subscribed — via the running adapter. Unlike automatic
+notifications, this **bypasses the channel's `notification_filter`** (you asked
+for it explicitly), so quiet hours / priority / kind rules do not apply.
+
+Requirements: the channel must be in `notification` mode (HTTP 400 otherwise)
+and its adapter must be running (HTTP 409 otherwise). If the channel has no
+recipients yet, nothing is sent and the command says so — have subscribers
+`/start` the bot, or set `target_chat_ids` in config.
+
+This is the manual, operator-facing counterpart to the agent's
+`send_notification` tool: when you tell the agent "calculate X and notify me on
+Telegram", it computes the answer and calls that tool, which delivers through
+the same path.
+
+**Message input.** Provide the text as the positional argument, via
+`--message-file <path>`, or on stdin (`-f -`, or simply pipe with no positional
+argument). On Windows PowerShell, prefer `--message-file` / stdin — PowerShell
+mangles inline quotes and apostrophes when passing arguments to native binaries.
+
+**Output.** Prints `Delivered to N recipient(s).` (or a "no recipients" notice).
+`--json` at the root returns `{"delivered": <bool>, "recipients": <int>}`.
+
+**Examples.**
+
+```bash
+# Send straight from the command line
+$ cremind channels send e2e8...d4f1 "Nightly backup finished OK"
+Delivered to 2 recipient(s).
+
+# PowerShell-safe: read the body from a file
+PS> cremind channels send e2e8...d4f1 --message-file .\note.txt
+
+# Pipe from stdin
+$ echo "1 + 1 = 2" | cremind channels send e2e8...d4f1 -f -
 ```
 
 ### `cremind channels edit`

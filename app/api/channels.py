@@ -601,6 +601,78 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         }
         return JSONResponse({"sender": out})
 
+    async def handle_notify_channel(request: Request) -> JSONResponse:
+        """Push an ad-hoc message OUT to a notification-mode channel.
+
+        Body: ``{"message": "..."}``. Delivers straight to the channel's
+        recipients (configured ``target_chat_ids`` ∪ authenticated subscribers)
+        via the live adapter's ``deliver_text`` — a direct push that bypasses
+        the channel's ``NotificationFilter`` (an explicit, operator-initiated
+        send). Backs ``cremind channels send`` and mirrors the agent's
+        ``send_notification`` tool. Only valid for ``mode == "notification"``
+        channels with a running adapter.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile_from_request(request)
+        cid = request.path_params["channel_id"]
+        ch = await conversation_storage.get_channel(cid)
+        if not ch:
+            return JSONResponse({"error": "Channel not found"}, status_code=404)
+        if ch["profile"] != profile:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        if (ch.get("mode") or "") != "notification":
+            return JSONResponse(
+                {
+                    "error": "Not a notification channel",
+                    "message": (
+                        "Ad-hoc sends are only supported on channels in "
+                        "notification mode."
+                    ),
+                },
+                status_code=400,
+            )
+
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "Body must be a JSON object"}, status_code=400)
+        message = str(payload.get("message") or "").strip()
+        if not message:
+            return JSONResponse(
+                {"error": "'message' is required and cannot be empty"},
+                status_code=400,
+            )
+
+        try:
+            adapter = get_channel_registry().get_adapter(cid)
+        except RuntimeError:
+            adapter = None
+        if adapter is None:
+            return JSONResponse(
+                {
+                    "error": "Adapter not running",
+                    "message": (
+                        "The channel is not currently running, so nothing could "
+                        "be delivered."
+                    ),
+                },
+                status_code=409,
+            )
+
+        try:
+            recipients = await adapter.deliver_text(message)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(f"channels: notify send failed for {cid}")
+            return JSONResponse(
+                {"error": "Delivery failed", "message": str(exc)},
+                status_code=502,
+            )
+        return JSONResponse({"delivered": recipients > 0, "recipients": recipients})
+
     async def handle_messenger_webhook(request: Request):
         """Public Facebook Messenger webhook (GET verify + POST receive).
 
@@ -725,6 +797,11 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         Route(
             "/api/channels/{channel_id}/auth-input",
             endpoint=handle_auth_input,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/channels/{channel_id}/notify",
+            endpoint=handle_notify_channel,
             methods=["POST"],
         ),
     ]
