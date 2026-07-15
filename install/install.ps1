@@ -998,7 +998,7 @@ function Invoke-InstallerTuiBootstrap {
     if ($WizardPreset)    { $tuiArgs.Add('--wizard-preset');    $tuiArgs.Add($WizardPreset) }
     if ($ElectronVersion) { $tuiArgs.Add('--electron-version'); $tuiArgs.Add($ElectronVersion) }
 
-    Write-Info "Launching installer TUI (Esc on the first screen cancels)"
+    Write-Info "Launching installer TUI (Enter continues, Esc cancels, Ctrl+C force-quits)"
     if ($devPython) {
         & $devPython $InstallerTuiPyz @tuiArgs
     } else {
