@@ -6,9 +6,12 @@ description: "The Claude Code built-in tool and its permission mode: the permiss
 
 **Claude Code** is a built-in tool that delegates software-engineering work to
 Anthropic's autonomous coding agent through the Claude Agent SDK. When it is
-enabled, Cremind hands coding-expertise tasks (creating projects, writing,
-refactoring, debugging, reviewing, and explaining code, running and fixing
-tests) to Claude Code instead of editing files with its own shell/file tools.
+enabled, Cremind delegates ALL software-engineering work to Claude Code instead
+of using its own shell/file tools — not only creating, writing, refactoring,
+debugging, and testing code, but also reading, understanding, exploring,
+explaining, and reviewing an existing codebase. Understanding or explaining
+source code counts as a coding task, so Cremind hands it to Claude Code rather
+than opening the files itself.
 
 Its `tool_id` is `claude_code`. Coding sessions run as background tasks; the
 model starts one with `run`, polls with `wait`, aborts with `stop`, and checks

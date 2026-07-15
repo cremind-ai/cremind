@@ -60,11 +60,13 @@ TOOL_CONFIG: ToolConfig = {
     "name": "claude_code",
     "display_name": "Claude Code",
     "description": (
-        "Delegates software-engineering work to Claude Code, Anthropic's "
-        "autonomous coding agent, running in the current working directory. "
-        "Prefer it for creating projects, writing/refactoring/debugging code, "
-        "and reviewing or explaining a codebase: start a task with run, poll "
-        "long-running tasks with wait, and abort with stop."
+        "Delegates all software-engineering work to Claude Code, Anthropic's "
+        "autonomous coding agent, running in the current working directory. When "
+        "enabled, use it for ANY task involving source code or a code project — "
+        "reading, understanding, or explaining a codebase as much as creating, "
+        "writing, refactoring, debugging, or testing code — instead of your own "
+        "file/shell tools: start a task with run, poll long-running tasks with "
+        "wait, and abort with stop."
     ),
     "default": False,
     "requires_feature": "claude_code",
@@ -232,9 +234,10 @@ class ClaudeCodeRunTool(BuiltInTool):
     name: str = "run"
     description: str = (
         "Start a Claude Code coding task — an expert autonomous software-engineering "
-        "agent working in the conversation's working directory. Use it for "
-        "coding-expertise work: creating projects/apps, writing/refactoring/debugging "
-        "code, reviewing or explaining a codebase, running and fixing tests. Write "
+        "agent working in the conversation's working directory. Use it for ALL "
+        "coding work — including reading, understanding, and exploring existing "
+        "code, explaining or reviewing a codebase, creating projects/apps, "
+        "writing/refactoring/debugging code, and running and fixing tests. Write "
         "'prompt' as a complete task brief (goal, constraints, relevant paths) — "
         "Claude Code sees only that text plus the working directory, not this "
         "conversation. If the task finishes within the grace window the final result "
