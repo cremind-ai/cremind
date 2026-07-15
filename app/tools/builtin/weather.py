@@ -27,7 +27,7 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "weather",
     "display_name": "Weather",
-    "visible": True,
+    "default": False,
     "required_config": {
         Var.API_KEY: {
             "description": "AccuWeather API Key",

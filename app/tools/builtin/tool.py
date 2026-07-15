@@ -60,7 +60,7 @@ class BuiltInToolGroup(Tool):
     def __init__(
         self,
         *,
-        config_name: str,           # module stem e.g. "weather", "gg_calendar"
+        config_name: str,           # module stem e.g. "weather", "gg_places"
         display_name: str,          # SERVER_NAME
         description: str,
         functions: List[BuiltInFunction],

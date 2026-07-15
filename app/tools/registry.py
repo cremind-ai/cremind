@@ -101,16 +101,24 @@ class ToolRegistry:
         return list(self._tools.values())
 
     @staticmethod
-    def _default_enabled(tool_type: ToolType) -> bool:
+    def _default_enabled(tool: Tool) -> bool:
         """Default enabled state when no ``profile_tools`` row exists.
 
-        - builtin : on by default (always available, opt-out per profile)
+        - builtin : per-tool ``default`` flag (default on) — declared via
+                    ``TOOL_CONFIG["default"]`` (see ToolConfig.default), so a
+                    built-in can opt to start disabled.
         - skill   : on by default *for its owner profile*; invisible to other
-                    profiles (filtered in :meth:`tools_for_profile`).
+                    profiles (filtered in :meth:`tools_for_profile`). The Setup
+                    Wizard shows skills off (see :meth:`visible_for_profile`),
+                    but that is a wizard-display default only — the runtime
+                    fallback here stays on so skills imported/created outside the
+                    wizard keep working.
         - mcp     : off by default (opt-in per profile, except for the owner
                     profile which gets enabled=1 at registration)
         """
-        return tool_type in (ToolType.BUILTIN, ToolType.SKILL)
+        if tool.tool_type is ToolType.BUILTIN:
+            return tool.default_enabled
+        return tool.tool_type is ToolType.SKILL
 
     @staticmethod
     def _skill_belongs_to_profile(tool: Tool, profile: str) -> bool:
@@ -132,7 +140,7 @@ class ToolRegistry:
         explicit = self._storage.get_profile_tool_enabled(profile, tool.tool_id)
         if explicit is not None:
             return explicit
-        return self._default_enabled(tool.tool_type)
+        return self._default_enabled(tool)
 
     def tools_for_profile(self, profile: str) -> List[Tool]:
         """Return tools the reasoning agent should expose to ``profile``.
@@ -164,7 +172,7 @@ class ToolRegistry:
                 # suppresses it just like any other tool. Absent a row, the
                 # SKILL default (on) keeps it exposed.
             explicit = enabled_per_profile.get(tool.tool_id)
-            enabled = explicit if explicit is not None else self._default_enabled(tool.tool_type)
+            enabled = explicit if explicit is not None else self._default_enabled(tool)
             if enabled:
                 out.append(tool)
         return out
@@ -198,7 +206,7 @@ class ToolRegistry:
             if tool.tool_type is ToolType.SKILL and not self._skill_belongs_to_profile(tool, profile):
                 continue
             explicit = enabled_per_profile.get(tool.tool_id)
-            enabled = explicit if explicit is not None else self._default_enabled(tool.tool_type)
+            enabled = explicit if explicit is not None else self._default_enabled(tool)
             # ``locked`` tools can't be disabled, so always report them on —
             # a stale ``profile_tools`` row must not show them as off.
             if tool.locked:
@@ -212,8 +220,15 @@ class ToolRegistry:
                 # Profile-independent default (ignores any ``profile_tools``
                 # override) so callers can show pristine defaults instead of
                 # the caller's resolved state — used by the Setup Wizard when
-                # configuring a brand-new profile.
-                "default_enabled": self._default_enabled(tool.tool_type) or tool.locked,
+                # configuring a brand-new profile. Skills start OFF in the wizard
+                # (the admin opts each one in — this is a wizard-display default
+                # only; the runtime skill fallback stays on, see
+                # :meth:`_default_enabled`). Locked tools always report on;
+                # otherwise built-ins honor their per-tool ``default`` flag.
+                "default_enabled": (
+                    False if tool.tool_type is ToolType.SKILL
+                    else (True if tool.locked else self._default_enabled(tool))
+                ),
                 "arguments_schema": tool.arguments_schema,
             })
         return rows

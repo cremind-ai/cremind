@@ -33,8 +33,9 @@ def test_feature_keys_for_tool_ids_by_slug_drops_unknown_and_disabled() -> None:
 def test_feature_keys_for_tool_ids_dedupes_google() -> None:
     from app.tools.builtin import feature_keys_for_tool_ids
 
-    # gg_calendar and gg_places both map to "google" -- expect one key.
-    keys = feature_keys_for_tool_ids(["google_calendar", "google_places"])
+    # google_places is reachable by slug and by module stem; both resolve to
+    # the same tool and its "google" feature -- expect a single de-duped key.
+    keys = feature_keys_for_tool_ids(["google_places", "gg_places"])
     assert keys == ["google"]
 
 
@@ -43,7 +44,7 @@ def test_feature_keys_for_tool_ids_accepts_module_names() -> None:
 
     # Module stems work too -- some callers (e.g. internal tooling)
     # pass module names instead of slugs.
-    assert feature_keys_for_tool_ids(["gg_calendar"]) == ["google"]
+    assert feature_keys_for_tool_ids(["gg_places"]) == ["google"]
 
 
 def test_required_feature_for_tool_id_returns_single_key() -> None:
@@ -66,15 +67,18 @@ def test_catalog_row_includes_requires_feature() -> None:
     assert rows["browser"]["requires_feature"] == "browser"
     assert rows["accuweather_weather"]["requires_feature"] is None
 
-    # Runtime-only system tools and tools deliberately gated out of the
-    # Settings UI (``hidden: True`` or ``visible: False`` in TOOL_CONFIG)
-    # are NOT surfaced by the catalog API. Their requires_feature
-    # plumbing is still exercised through feature_keys_for_tool_ids /
-    # required_feature_for_tool_id (tests above), which don't filter
-    # by catalog visibility.
+    # ``google_places`` is visible-but-off-by-default (``default: False`` in
+    # TOOL_CONFIG), so it IS surfaced by the catalog -- with its "google"
+    # feature hint and its wizard toggle defaulting off.
+    assert rows["google_places"]["requires_feature"] == "google"
+    assert rows["google_places"]["default_enabled"] is False
+
+    # Runtime-only system tools deliberately gated out of the Settings UI
+    # (``hidden: True`` in TOOL_CONFIG) are NOT surfaced by the catalog API.
+    # Their requires_feature plumbing is still exercised through
+    # feature_keys_for_tool_ids / required_feature_for_tool_id (tests above),
+    # which don't filter by catalog visibility.
     assert "markdown_converter" not in rows  # hidden: True
-    assert "google_calendar" not in rows     # visible: False
-    assert "google_places" not in rows       # visible: False
     assert "sleep" not in rows               # hidden: True
 
 
@@ -83,17 +87,16 @@ def test_tool_feature_keys_from_payload_only_counts_enabled() -> None:
 
     payload = {
         "tool_configs": {
-            "browser": {"_enabled": "true"},
-            "markdown_converter": {"_enabled": "false"},  # disabled -> skipped
-            "google_calendar": {"_enabled": "TRUE"},      # case-insensitive
-            "accuweather_weather": {"_enabled": "true"},        # no requires_feature
-            "google_places": {},                           # no _enabled key
+            "browser": {"_enabled": "true"},               # -> "browser"
+            "markdown_converter": {"_enabled": "false"},   # disabled -> skipped
+            "google_places": {},                           # no _enabled key -> skipped
+            "accuweather_weather": {"_enabled": "true"},   # enabled, no requires_feature
         },
     }
     keys = _tool_feature_keys_from_payload(payload)
-    # Browser enabled, Google Calendar enabled (-> "google").
-    # Markdown Converter disabled, Google Places missing _enabled.
-    assert set(keys) == {"browser", "google"}
+    # Browser enabled -> "browser". Markdown Converter disabled and Google
+    # Places missing its _enabled key are both skipped (no "documents"/"google").
+    assert set(keys) == {"browser"}
 
 
 def test_features_required_by_setup_payload_unions_tools_with_other_sources() -> None:

@@ -31,7 +31,7 @@ class Var:
 TOOL_CONFIG: ToolConfig = {
     "name": "gg_places",
     "display_name": "Google Places",
-    "visible": False,
+    "default": False,
     # Requires the ``google`` feature (googleapiclient + google-auth). See
     # app.features.manifest.FEATURES.
     "requires_feature": "google",
