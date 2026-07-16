@@ -528,7 +528,7 @@ def get_llm_routes(state: BootedState) -> list[Route]:
                 _save_custom_registry(config_storage, profile, registry)
             # Drop any model-group assignment that pointed at this provider so it
             # doesn't leave a dangling ``custom:<slug>/model`` reference.
-            for group in ("high", "vision", "low"):
+            for group in ("high", "vision", "low", "plan"):
                 gv = config_storage.get("llm_config", f"model_group.{group}", profile=profile)
                 if gv and gv.split("/", 1)[0] == provider_name:
                     config_storage.delete("llm_config", f"model_group.{group}", profile=profile)
@@ -592,13 +592,15 @@ def get_llm_routes(state: BootedState) -> list[Route]:
 
     async def handle_get_model_groups(request: Request) -> JSONResponse:
         """Get the configured reasoning model (``high``) plus the optional
-        ``vision`` and ``low`` models, and their reasoning_effort.
+        ``vision``, ``low``, and ``plan`` models, and their reasoning_effort.
 
         ``high`` is the one model the agent reasons on. ``vision`` is an optional
         override used only by image_understanding. ``low`` is the optional
         low-performance / cheap model used for lightweight auxiliary tasks (e.g.
-        the skill-event matching gate). Both optional groups fall back to the
-        single model when unset.
+        the skill-event matching gate). ``plan`` is the optional model used during
+        plan mode's planning phase (the agent switches back to ``high`` once a
+        plan is accepted). All optional groups fall back to the single model when
+        unset.
         """
         unauth = _require_auth(request)
         if unauth is not None:
@@ -611,7 +613,7 @@ def get_llm_routes(state: BootedState) -> list[Route]:
 
         groups = {}
         reasoning_efforts: dict[str, str | None] = {}
-        for group in ("high", "vision", "low"):
+        for group in ("high", "vision", "low", "plan"):
             # SQLite first
             val = config_storage.get("llm_config", f"model_group.{group}", profile=profile)
             if not val:
@@ -660,13 +662,13 @@ def get_llm_routes(state: BootedState) -> list[Route]:
 
         model_groups = body.get("model_groups", {})
         for group, value in model_groups.items():
-            if group in ("high", "vision", "low"):
+            if group in ("high", "vision", "low", "plan"):
                 config_storage.set("llm_config", f"model_group.{group}", str(value), profile=profile)
 
         # Save reasoning_effort per group
         reasoning_efforts = body.get("reasoning_efforts", {})
         for group, value in reasoning_efforts.items():
-            if group in ("high", "vision", "low"):
+            if group in ("high", "vision", "low", "plan"):
                 if value:
                     config_storage.set("llm_config", f"model_group.{group}.reasoning_effort", str(value), profile=profile)
                 else:

@@ -307,6 +307,10 @@ def model_groups_set(
         None, "--vision",
         help="Optional provider/model id for image understanding (defaults to --model).",
     ),
+    plan: Optional[str] = typer.Option(
+        None, "--plan",
+        help="Optional provider/model id used in plan mode's planning phase (defaults to --model).",
+    ),
     vision_enabled: Optional[bool] = typer.Option(
         None, "--vision-enabled/--no-vision-enabled",
         help="Enable/disable the Specialized Vision Model feature (the image_understanding tool).",
@@ -315,7 +319,7 @@ def model_groups_set(
         None, "--default-provider", help="Default provider name."
     ),
 ) -> None:
-    """Update the configured model (and optional vision model)."""
+    """Update the configured model (and optional vision/plan models)."""
     import asyncio
 
     from app.cli.client._base import Client
@@ -329,6 +333,8 @@ def model_groups_set(
         groups["high"] = model
     if vision:
         groups["vision"] = vision
+    if plan:
+        groups["plan"] = plan
     if groups:
         body["model_groups"] = groups
     if default_provider:
@@ -338,7 +344,7 @@ def model_groups_set(
 
     if not body:
         typer.echo(
-            "at least one of --model, --vision, --vision-enabled, --default-provider is required",
+            "at least one of --model, --vision, --plan, --vision-enabled, --default-provider is required",
             err=True,
         )
         raise typer.Exit(code=1)

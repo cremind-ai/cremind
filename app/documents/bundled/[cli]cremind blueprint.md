@@ -27,7 +27,7 @@ skill files:
   - `persona` — the agent persona (system prompt) + agent name
   - `tools` — per-tool enable/disable, arguments, LLM overrides, disabled
     sub-tools, and the *names* of any secret variables (never their values)
-  - `llm` — the selected provider(s), model groups (high/vision/low),
+  - `llm` — the selected provider(s), model groups (high/vision/low/plan),
     reasoning effort, and custom-provider definitions (API keys excluded)
   - `settings` — only the settings you changed from their defaults
   - `skills` — an index of bundled/built-in skills + their configuration
