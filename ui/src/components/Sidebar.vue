@@ -11,6 +11,7 @@ import AgentCard from './AgentCard.vue';
 import NotificationList from './NotificationList.vue';
 import { openNotificationsStream, type NotificationStreamHandle } from '../services/notificationsStream';
 import { CONVERSATION_ID_REGEX } from '../services/conversationApi';
+import { listProfiles } from '../services/configApi';
 
 const route = useRoute();
 const router = useRouter();
@@ -18,6 +19,13 @@ const settingsStore = useSettingsStore();
 const chatStore = useChatStore();
 const notificationsStore = useNotificationsStore();
 const channelsStore = useChannelsStore();
+
+// Account menu (bottom-left user icon) state.
+const userMenuTriggerRef = ref<HTMLDivElement | null>(null);
+const userMenuVisible = ref(false);
+const otherProfilesExist = ref(false);
+const currentProfileName = computed(() => (route.params.profile as string) || '');
+const hasMultipleProfiles = computed(() => otherProfilesExist.value);
 
 // Lazy-load channels the first time the sidebar mounts with auth — the
 // dropdown shows "main" until they load, which is the right default.
@@ -27,6 +35,11 @@ watch(
     if (!token || !profileId) return;
     channelsStore.loadCatalog().catch(() => {});
     channelsStore.loadChannels().catch(() => {});
+    // Whether a profile beyond the always-present admin exists — gates the
+    // "Switch profile" item in the account menu.
+    listProfiles(settingsStore.agentUrl, token)
+      .then(({ profiles }) => { otherProfilesExist.value = profiles.length > 1; })
+      .catch(() => { otherProfilesExist.value = false; });
   },
   { immediate: true },
 );
@@ -310,7 +323,20 @@ const handleOpenDeveloper = () => {
   router.push({ name: 'developer', params: { profile } });
 };
 
+const handleOpenProfile = () => {
+  userMenuVisible.value = false;
+  const profile = route.params.profile as string;
+  if (!profile) return;
+  router.push({ name: 'profile-settings', params: { profile } });
+};
+
+const handleSwitchProfile = () => {
+  userMenuVisible.value = false;
+  router.push('/');
+};
+
 const handleLogout = () => {
+  userMenuVisible.value = false;
   emit('logout');
 };
 
@@ -726,13 +752,48 @@ const toggleThemeFromIcon = () => {
           <Icon icon="mdi:chevron-right" class="chevron-icon" v-if="!isCollapsed" />
         </div>
       </ElTooltip>
-      <ElTooltip content="Logout" placement="right" :show-after="300" :disabled="!isCollapsed">
-        <div class="settings-row logout-row" @click="handleLogout">
-          <Icon icon="mdi:logout" class="settings-icon" />
-          <span class="settings-label" v-if="!isCollapsed">Logout</span>
+      <!-- Account menu (replaces the old Logout row) -->
+      <ElTooltip content="Account" placement="right" :show-after="300" :disabled="!isCollapsed">
+        <div
+          ref="userMenuTriggerRef"
+          class="settings-row"
+          @click="userMenuVisible = !userMenuVisible"
+        >
+          <Icon icon="mdi:account-circle-outline" class="settings-icon" />
+          <span class="settings-label" v-if="!isCollapsed">{{ currentProfileName }}</span>
           <Icon icon="mdi:chevron-right" class="chevron-icon" v-if="!isCollapsed" />
         </div>
       </ElTooltip>
+      <ElPopover
+        :visible="userMenuVisible"
+        :virtual-ref="userMenuTriggerRef"
+        virtual-triggering
+        placement="right-end"
+        :width="200"
+        popper-class="user-menu-popover"
+        @update:visible="userMenuVisible = $event"
+      >
+        <div class="user-menu" role="menu">
+          <button type="button" role="menuitem" class="user-menu-item" @click="handleOpenProfile">
+            <Icon icon="mdi:account-outline" class="user-menu-icon" />
+            <span>Profile</span>
+          </button>
+          <button
+            v-if="hasMultipleProfiles"
+            type="button"
+            role="menuitem"
+            class="user-menu-item"
+            @click="handleSwitchProfile"
+          >
+            <Icon icon="mdi:account-switch-outline" class="user-menu-icon" />
+            <span>Switch profile</span>
+          </button>
+          <button type="button" role="menuitem" class="user-menu-item danger" @click="handleLogout">
+            <Icon icon="mdi:logout" class="user-menu-icon" />
+            <span>Logout</span>
+          </button>
+        </div>
+      </ElPopover>
     </div>
 
     <ElDialog
@@ -1127,11 +1188,6 @@ const toggleThemeFromIcon = () => {
   background: var(--hover-bg);
 }
 
-.logout-row .settings-icon,
-.logout-row .settings-label {
-  color: var(--error-color, #e74c3c);
-}
-
 .settings-icon,
 .theme-icon {
   font-size: 18px;
@@ -1213,5 +1269,50 @@ const toggleThemeFromIcon = () => {
   .sidebar.open {
     left: 0;
   }
+}
+</style>
+
+<!-- Non-scoped: the account-menu ElPopover content is teleported to <body>, so
+     scoped styles would not reach the .user-menu rows. -->
+<style>
+.user-menu-popover.el-popover.el-popper {
+  padding: 6px;
+}
+
+.user-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.user-menu .user-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  transition: background 0.15s ease;
+}
+
+.user-menu .user-menu-item:hover {
+  background: var(--hover-bg);
+}
+
+.user-menu .user-menu-item .user-menu-icon {
+  font-size: 18px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.user-menu .user-menu-item.danger,
+.user-menu .user-menu-item.danger .user-menu-icon {
+  color: var(--error-color, #e74c3c);
 }
 </style>
