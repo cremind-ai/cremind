@@ -1,5 +1,5 @@
 ---
-description: "Configure **LLM providers and models**: list and `configure` providers (add an API key), add your own **custom OpenAI-compatible providers** (name + base URL + model list) with `create-custom`, browse each provider's available models, assign the high / low / default **model groups** the agent picks from, and run the **GitHub Copilot** device-code login. Use this to add a provider (built-in or custom), choose which model the agent uses, or authenticate a provider — distinct from `cremind config` (agent behavior) and `cremind agents` (MCP/A2A servers)."
+description: "Configure **LLM providers and models**: list and `configure` providers (add an API key), add your own **custom OpenAI-compatible providers** (name + base URL + model list) with `create-custom`, browse each provider's available models, assign the high / low / plan / default **model groups** the agent picks from (including a dedicated **plan model** used in plan mode's planning phase), and run the **GitHub Copilot** device-code login. Use this to add a provider (built-in or custom), choose which model the agent uses, or authenticate a provider — distinct from `cremind config` (agent behavior) and `cremind agents` (MCP/A2A servers)."
 ---
 
 # `cremind llm` — LLM Providers, Model Groups, and Device-Code Auth
@@ -17,9 +17,11 @@ The group splits into three subcommand sets:
   Copilot, etc.) plus user-defined **custom providers** (internal name
   `custom:<slug>`) for any OpenAI-API-compatible endpoint not in the
   built-in list.
-- **`model-groups`** — read/write the `high` / `low` model assignments
-  and the default provider. The agent picks from these groups when it
-  needs a heavyweight or lightweight model.
+- **`model-groups`** — read/write the `high` / `low` / `plan` model
+  assignments and the default provider. The agent picks from these groups
+  when it needs a heavyweight or lightweight model, or a dedicated model
+  for plan mode's planning phase. (`vision` is also assignable but is
+  managed from the web UI's Specialized Vision Model toggle.)
 - **`device-code`** — start and poll the device-code OAuth flow.
   Currently used only for GitHub Copilot; the same machinery is
   reusable for any future device-code provider.
@@ -262,8 +264,8 @@ $ cremind llm providers delete-config custom:my-llm
 
 ### `cremind llm model-groups get`
 
-**Purpose.** Show the current `high` and `low` model assignments and
-the default provider.
+**Purpose.** Show the current `high`, `low`, and `plan` model
+assignments and the default provider.
 
 **Syntax.**
 
@@ -272,7 +274,9 @@ cremind llm model-groups get
 ```
 
 **Behavior.** Pretty-prints the JSON document the server returns. With
-`--json`, the same JSON is emitted unindented.
+`--json`, the same JSON is emitted unindented. Optional groups (`low`,
+`plan`, `vision`) that the user hasn't set come back as empty strings and
+fall back to the `high` model at run time.
 
 **Example.**
 
@@ -282,28 +286,30 @@ $ cremind llm model-groups get
   "default_provider": "anthropic",
   "model_groups": {
     "high": "anthropic/claude-opus-4-7",
-    "low":  "anthropic/claude-haiku-4-5-20251001"
+    "low":  "anthropic/claude-haiku-4-5-20251001",
+    "plan": "anthropic/claude-opus-4-7"
   }
 }
 ```
 
 ### `cremind llm model-groups set`
 
-**Purpose.** Update the high/low/default assignments. Each flag is
+**Purpose.** Update the high/low/plan/default assignments. Each flag is
 optional, but at least one must be supplied.
 
 **Syntax.**
 
 ```bash
-cremind llm model-groups set [--high <id>] [--low <id>] [--default-provider <name>]
+cremind llm model-groups set [--high <id>] [--low <id>] [--plan <id>] [--default-provider <name>]
 ```
 
 **Flags.**
 
 | Flag                  | Type   | Default | Meaning                                                              |
 |-----------------------|--------|---------|----------------------------------------------------------------------|
-| `--high`              | string | `""`    | Model id for the `high` group (used for heavyweight reasoning).      |
+| `--high` / `--model`  | string | `""`    | Model id for the `high` group — the single model the agent reasons on.|
 | `--low`               | string | `""`    | Model id for the `low` group (used for the skill classifier, etc.).  |
+| `--plan`              | string | `""`    | Model id for the `plan` group — used in plan mode's planning phase (research, clarifying questions, writing the plan for approval, and after a cancel). Once a plan is accepted, execution switches back to the `high` model. Defaults to the `high` model when unset. |
 | `--default-provider`  | string | `""`    | Provider name to use when no explicit provider is requested.         |
 
 **Behavior.** Only the supplied fields are sent; omitted fields keep
@@ -314,6 +320,10 @@ their existing value. Silent on success.
 ```bash
 # Bump the high group to Opus
 $ cremind llm model-groups set --high anthropic/claude-opus-4-7
+
+# Use a strong model for planning and a cheaper model for everything else
+# (planning runs on Opus; once you accept the plan, execution uses the high model)
+$ cremind llm model-groups set --high anthropic/claude-haiku-4-5-20251001 --plan anthropic/claude-opus-4-7
 
 # Switch the default provider away from Anthropic in one call
 $ cremind llm model-groups set --default-provider openai --high openai/gpt-5
@@ -436,9 +446,10 @@ openai
 **`at least one of --api-key, --auth-method, or --json is required`** —
 `providers configure` rejects empty bodies. Pass at least one flag.
 
-**`at least one of --high, --low, --default-provider is required`** —
-Same idea for `model-groups set`. Use `model-groups get` first to see
-the current values.
+**`at least one of --model, --vision, --plan, --vision-enabled, --default-provider is required`** —
+Same idea for `model-groups set` (the `high` group is set via `--model`,
+also aliased `--high`). Use `model-groups get` first to see the current
+values.
 
 **`device-code poll` hangs forever** — That is the expected behavior
 while the user has not yet completed the browser flow. Ctrl-C is safe

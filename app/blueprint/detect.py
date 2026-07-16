@@ -137,7 +137,7 @@ def collect_exportable(profile: str) -> dict[str, Any]:
             "custom_providers": custom_provider_slugs,
             "model_groups": {
                 g: llm_vals.get(f"model_group.{g}")
-                for g in ("high", "vision", "low")
+                for g in ("high", "vision", "low", "plan")
                 if llm_vals.get(f"model_group.{g}")
             },
         },

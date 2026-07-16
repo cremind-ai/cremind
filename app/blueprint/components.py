@@ -368,7 +368,7 @@ def build_llm_doc(profile: str) -> tuple[dict, list]:
                 out["enabled"] = str(en).strip().lower() in ("1", "true", "yes", "on")
         return out
 
-    model_groups = {g: _mg(g) for g in ("high", "vision", "low")}
+    model_groups = {g: _mg(g) for g in ("high", "vision", "low", "plan")}
     model_groups = {g: v for g, v in model_groups.items() if v}
 
     data = {

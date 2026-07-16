@@ -28,12 +28,14 @@ const settingsStore = useSettingsStore();
 const { rebuildModelList, allModels } = useLLMModels();
 
 const providers = ref<ProviderWithState[]>([]);
-// Main reasoning model (``high``), plus optional ``vision`` and ``low`` models.
-const modelGroups = ref<Record<string, string>>({ high: '', vision: '', low: '' });
-const reasoningEfforts = ref<Record<string, string | null>>({ high: null, low: null });
+// Main reasoning model (``high``), plus optional ``vision``, ``low``, and
+// ``plan`` models. ``plan`` is used during plan mode's planning phase.
+const modelGroups = ref<Record<string, string>>({ high: '', vision: '', low: '', plan: '' });
+const reasoningEfforts = ref<Record<string, string | null>>({ high: null, low: null, plan: null });
 const highProvider = ref('');
 const visionProvider = ref('');
 const lowProvider = ref('');
+const planProvider = ref('');
 // Specialized Vision Model feature toggle (opt-in; off by default).
 const visionEnabled = ref(false);
 const apiKeyProvider = ref('');
@@ -111,12 +113,14 @@ onMounted(async () => {
       high: groupRes.model_groups.high || '',
       vision: groupRes.model_groups.vision || '',
       low: groupRes.model_groups.low || '',
+      plan: groupRes.model_groups.plan || '',
     };
 
     // Initialize per-section providers from stored model values
     highProvider.value = extractProvider(groupRes.model_groups.high) || groupRes.default_provider || '';
     visionProvider.value = extractProvider(groupRes.model_groups.vision || '') || '';
     lowProvider.value = extractProvider(groupRes.model_groups.low || '') || '';
+    planProvider.value = extractProvider(groupRes.model_groups.plan || '') || '';
     visionEnabled.value = groupRes.vision_enabled ?? false;
 
     rebuildModelList(providers.value);
@@ -415,6 +419,31 @@ function goBack() {
             v-model:provider="highProvider"
             v-model:model="modelGroups.high"
             v-model:reasoning-effort="reasoningEfforts.high"
+          />
+        </div>
+
+        <!-- Plan Model (optional; used in plan mode's planning phase; defaults to main) -->
+        <div class="section">
+          <h2 class="section-title">Plan Model</h2>
+          <p class="section-description">
+            The model used while in plan mode — researching, asking clarifying
+            questions, and writing the plan for your approval. When you accept a
+            plan, execution automatically switches to the <strong>Model</strong>
+            above; if you cancel, planning keeps using this model. Point this at a
+            stronger, more capable model for high-quality planning while keeping
+            your main Model cheaper for the longer execution phase — so requests
+            are still fulfilled intelligently while saving a significant amount of
+            tokens. Leave empty to fall back to the main model.
+          </p>
+
+          <ModelGroupFields
+            :providers="providers"
+            :all-models="allModels"
+            clearable
+            model-placeholder="Select model (defaults to main)"
+            v-model:provider="planProvider"
+            v-model:model="modelGroups.plan"
+            v-model:reasoning-effort="reasoningEfforts.plan"
           />
         </div>
 

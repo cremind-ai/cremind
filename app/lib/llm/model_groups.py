@@ -4,13 +4,17 @@ The agent reasons on a **single configured model** (the ``high`` group, stored
 under ``model_group.high``); ``create_llm_for_model`` is the canonical accessor.
 ``main`` is an alias for it.
 
-Two **optional** auxiliary groups fall back to the single model when unset:
+Three **optional** auxiliary groups fall back to the single model when unset:
 
 - ``vision`` — used only by the ``image_understanding`` tool.
 - ``low`` — the low-performance / cheap model for lightweight auxiliary tasks
   (e.g. the skill-event matching gate and the ``documentation_search`` relevance
   judge). Generalized so future features needing a cheaper model can resolve it
   via ``create_llm_for_group("low", ...)``.
+- ``plan`` — the model used during plan mode's *planning* phase (research,
+  clarifying questions, writing the plan for approval, and after a cancel). The
+  agent switches back to the single model once the plan is accepted and
+  execution begins. Resolved via ``create_llm_for_group("plan", ...)``.
 """
 
 from typing import Optional
@@ -54,12 +58,13 @@ class ModelGroupManager:
             except Exception:
                 pass
 
-        # The dedicated "vision" and "low" groups are optional: when the user
-        # hasn't picked one they transparently fall back to the "high" group, so
-        # the dependent feature works out of the box. ``vision`` on a non-vision
+        # The dedicated "vision", "low", and "plan" groups are optional: when the
+        # user hasn't picked one they transparently fall back to the "high" group,
+        # so the dependent feature works out of the box. ``vision`` on a non-vision
         # model still surfaces a clear error at use time; ``low`` (the
-        # low-performance / cheap auxiliary model) just runs on the main model.
-        if not group_value and group in ("vision", "low"):
+        # low-performance / cheap auxiliary model) and ``plan`` (the plan-mode
+        # planning model) just run on the main model.
+        if not group_value and group in ("vision", "low", "plan"):
             return self.get_provider_and_model("high", profile=profile)
 
         if not group_value:
