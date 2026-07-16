@@ -122,9 +122,50 @@ def test_docker_mode_skips_desktop_when_vnc_placeholder_unrendered(tmp_path: Pat
         system_dir=system_dir, install_dir=install_dir,
     )
     data = toml.loads(path.read_text(encoding="utf-8"))
-    # docker/.env exists but the password placeholder is dropped — empty
-    # string surfaces as missing in the rendered file.
-    assert data["desktop"]["vnc_password"] == ""
+    # docker/.env exists but the password placeholder is dropped, so there is
+    # no VNC_PASSWORD — which now reads as a basic (headless) install: the
+    # [desktop] section is omitted entirely (mirrors the shell writers).
+    assert data["install_mode"] == "docker"
+    assert "desktop" not in data
+
+
+def _docker_env_text_basic() -> str:
+    """A basic-image (headless) docker/.env: no VNC_PASSWORD / ports / res.
+
+    Mirrors what install.sh / install.ps1 render for --no-desktop: the
+    ``# >>> desktop-only >>>`` marker block is stripped, so the noVNC/VNC
+    ports and VNC env never appear.
+    """
+    return (
+        "CREMIND_IMAGE=cremind/cremind\n"
+        "CREMIND_VERSION=1.2.3\n"
+        "APP_URL=http://example.local:1112\n"
+        "CORS_ALLOWED_ORIGINS=http://example.local:1515,http://localhost:1515\n"
+        "SETUP_WIZARD_ENV=server\n"
+        "INSTALL_MODE=docker\n"
+        "API_PORT=1112\n"
+        "SPA_PORT=1515\n"
+        "COMPOSE_PROFILES=\n"
+    )
+
+
+def test_docker_basic_image_omits_desktop_section(tmp_path: Path) -> None:
+    system_dir = tmp_path / "system"
+    install_dir = tmp_path / "install"
+    docker_dir = install_dir / "docker"
+    docker_dir.mkdir(parents=True)
+    (docker_dir / ".env").write_text(_docker_env_text_basic(), encoding="utf-8")
+    system_dir.mkdir(parents=True, exist_ok=True)
+
+    path = credentials_file.write_credentials_file(
+        system_dir=system_dir, install_dir=install_dir,
+    )
+    data = toml.loads(path.read_text(encoding="utf-8"))
+    # Still a docker install, but the headless image has no VNC → no [desktop].
+    assert data["install_mode"] == "docker"
+    assert "desktop" not in data
+    # The [app] section is still fully populated.
+    assert data["app"]["api_url"] == "http://example.local:1112"
 
 
 # ── write_credentials_file: native mode ───────────────────────────────────

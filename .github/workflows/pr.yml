@@ -7,8 +7,8 @@
 #     and upload both as PR artifacts so reviewers can download and
 #     try the build locally without waiting for an RC tag.
 #
-# Dockerfile.desktop is intentionally NOT built here. The Dockerfile's
-# pip-install RUN bind-mounts the build context at /src, but
+# The Dockerfile (either target) is intentionally NOT built here. The
+# Dockerfile's pip-install RUN bind-mounts the build context at /src, but
 # ``.dockerignore`` excludes ``dist/`` (which is correct for prod builds
 # that install from a published wheel URL via ``CREMIND_PIP_SPEC``).
 # Working around it for a PR-only docker smoke would require either

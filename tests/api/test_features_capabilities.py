@@ -122,3 +122,64 @@ def test_tray_capabilities_returns_features_without_auth(
     assert response.status_code == 200
     assert body["install_mode"] == "native"
     assert sorted(body["ui_features"]) == sorted(features_api.UI_FEATURES)
+
+
+# ── image_flavor gate (drives Electron's "Open VNC Desktop" entry) ─────────
+
+
+@pytest.mark.parametrize(
+    "env_value,expected",
+    [
+        ("desktop", "desktop"),
+        ("basic", "basic"),
+        ("DESKTOP", "desktop"),   # case-insensitive
+        ("  basic  ", "basic"),   # trimmed
+        ("garbage", None),        # unknown → None
+        ("", None),               # empty → None
+    ],
+)
+def test_get_image_flavor_normalization(
+    monkeypatch: pytest.MonkeyPatch, env_value: str, expected: str | None,
+) -> None:
+    monkeypatch.setenv("CREMIND_IMAGE_FLAVOR", env_value)
+    assert features_api.get_image_flavor() == expected
+
+
+def test_get_image_flavor_unset_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Native installs and pre-flavor images have no env var → None (the
+    Electron client treats None as desktop for Docker installs)."""
+    monkeypatch.delenv("CREMIND_IMAGE_FLAVOR", raising=False)
+    assert features_api.get_image_flavor() is None
+
+
+def test_tray_capabilities_includes_image_flavor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tray descriptor must carry ``image_flavor`` so Electron can hide
+    "Open VNC Desktop" on the basic image."""
+    _stub_state(monkeypatch, setup_complete=True)
+    monkeypatch.setattr(features_api, "get_active_install_mode", lambda: "docker")
+    monkeypatch.setenv("CREMIND_IMAGE_FLAVOR", "basic")
+
+    response = asyncio.run(features_api.get_tray_capabilities(_make_request()))
+    import json
+
+    body = json.loads(response.body)
+    assert body["image_flavor"] == "basic"
+
+
+def test_service_capabilities_includes_image_flavor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_state(monkeypatch)
+    monkeypatch.setattr(features_api, "docker_available", lambda: True)
+    monkeypatch.setattr(features_api, "get_capabilities_payload", lambda: {})
+    monkeypatch.setattr(features_api, "get_active_install_mode", lambda: "docker")
+    monkeypatch.setattr(features_api, "apply_mode_rule_to_services", lambda _p, _m: None)
+    monkeypatch.delenv("CREMIND_IMAGE_FLAVOR", raising=False)
+
+    response = asyncio.run(features_api.get_service_capabilities(_make_request()))
+    import json
+
+    body = json.loads(response.body)
+    assert body["image_flavor"] is None

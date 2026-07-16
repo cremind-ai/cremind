@@ -1,6 +1,6 @@
 # AUTO-GENERATED from install/catalog.toml. Do not edit by hand.
 # Regenerate with: python install/scripts/build_catalog.py
-# Source SHA-256:  b32d2d3547d8f9ae0b3994fc509b57ef046c26b3cf4052b59ac6e296532cc5c5
+# Source SHA-256:  3413b5984b85868601f67c96b406a4e1042aafd4b990f6ae88e7bebc7622f40b
 
 CATALOG_SCHEMA=1
 
@@ -47,8 +47,8 @@ CUSTOM_FIELD_CHOICES_wizard_preset="local docker server"
 # ── Install modes ──
 MODE_IDS="docker native"
 MODE_LABEL_docker="Docker"
-MODE_DESC_docker="sandboxed VNC desktop with a bundled storage stack"
-MODE_HINT_docker="The agent runs inside a container with its own GUI. Observe at http://<host>:6080/vnc.html."
+MODE_DESC_docker="sandboxed container with a bundled storage stack (optional VNC desktop)"
+MODE_HINT_docker="The agent runs inside a container. You can add a VNC desktop so it has its own GUI (observe at http://<host>:6080/vnc.html), or install the smaller headless image."
 MODE_BADGE_docker="recommended"
 MODE_REQUIRES_docker="docker"
 MODE_LABEL_native="Native"
@@ -56,6 +56,11 @@ MODE_DESC_native="Python venv at ~/.cremind/venv with embedded storage"
 MODE_HINT_native="Simpler, but the agent shares your desktop and home directory."
 MODE_BADGE_native=""
 MODE_REQUIRES_native=""
+
+# ── Docker desktop UI ──
+DOCKER_DESKTOP_PROMPT="Install the VNC Desktop UI?"
+DOCKER_DESKTOP_HINT="Adds an XFCE desktop inside the container so you can watch the agent work at http://<host>:6080/vnc.html. Answer No to install the smaller headless image (cremind/cremind)."
+DOCKER_DESKTOP_DEFAULT=1
 
 # ── Mode rules ──
 MODE_RULE_ALLOWED_docker="docker native"

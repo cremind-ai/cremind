@@ -211,6 +211,12 @@ let tray: Tray | null = null
 // Populated by fetchCapabilities() once the backend is reachable. Drives
 // the conditional "Open VNC Desktop" entry in the tray / jumplist / dock.
 let installMode: 'docker' | 'native' | null = null
+// The backend's Docker image flavor: 'desktop' (cremind/cremind-desktop),
+// 'basic' (cremind/cremind), or null. null means a native install OR a
+// pre-flavor image (older backend that predates CREMIND_IMAGE_FLAVOR); for
+// Docker installs we treat null as 'desktop' since every pre-flavor image
+// was a desktop image. See vncCapable().
+let imageFlavor: 'desktop' | 'basic' | null = null
 // Set of UI feature names the backend's bundled SPA exposes. Drives the
 // gating for Process Manager / Events / Channels (and future) tray /
 // jumplist / dock entries. ``null`` means the backend hasn't reported a
@@ -224,6 +230,20 @@ let uiFeatures: Set<string> | null = null
 function uiFeatureAvailable(feature: string): boolean {
   if (uiFeatures === null) return false
   return uiFeatures.has(feature)
+}
+
+// Whether to offer the "Open VNC Desktop" entry / window. Requires a Docker
+// install with a resolvable noVNC URL, AND an image flavor that isn't
+// explicitly 'basic'. A null flavor (native is already excluded by
+// installMode; here it means a pre-flavor desktop image) stays capable —
+// every pre-flavor image is a desktop image.
+function vncCapable(): boolean {
+  return (
+    installMode === 'docker' &&
+    imageFlavor !== 'basic' &&
+    Boolean(runtimeConfig.agentUrl) &&
+    vncUrlFromAgentUrl(runtimeConfig.agentUrl) !== null
+  )
 }
 
 // App version handler
@@ -657,6 +677,10 @@ type InstallerRunPayload = {
   deployment: 'local' | 'server' | 'custom'
   appHost?: string
   mode: 'docker' | 'native'
+  /** Docker mode only: include the VNC Desktop UI (cremind/cremind-desktop)
+   *  or install the headless basic image (cremind/cremind). Undefined ⇒ let
+   *  the install script decide (default desktop / previous choice on re-run). */
+  desktopUi?: boolean
   /** Advanced .env overrides for the `custom` deployment. Keys mirror
    *  install/catalog.toml's deployments.custom.advanced_fields[].key. */
   customFields?: {
@@ -958,6 +982,12 @@ async function runInstaller(
     '--no-launch',
   ]
   if (payload.appHost) args.push('--host', payload.appHost)
+  // Docker desktop-UI choice. Only meaningful for docker mode; pass it
+  // explicitly both ways when the wizard asked, rather than relying on the
+  // script's default, so the user's answer wins over the sticky default.
+  if (payload.mode === 'docker' && payload.desktopUi !== undefined) {
+    args.push(payload.desktopUi ? '--desktop' : '--no-desktop')
+  }
   // Forward custom-deployment overrides so the install scripts skip
   // their interactive prompts. Empty values are dropped so the scripts'
   // catalog defaults take effect for fields the user didn't fill in.
@@ -1001,6 +1031,8 @@ async function runInstaller(
       if (a === '--deployment')       return ['-Deployment']
       if (a === '--host')             return ['-AppHost']
       if (a === '--mode')             return ['-Mode']
+      if (a === '--desktop')          return ['-Desktop']
+      if (a === '--no-desktop')       return ['-NoDesktop']
       if (a === '--unattended')       return ['-Unattended']
       if (a === '--no-launch')        return ['-NoLaunch']
       if (a === '--channel')          return ['-Channel']
@@ -1545,6 +1577,7 @@ function fetchCapabilities(): Promise<void> {
     }
     if (!runtimeConfig.agentUrl) {
       installMode = null
+      imageFlavor = null
       uiFeatures = null
       finish()
       return
@@ -1573,9 +1606,13 @@ function fetchCapabilities(): Promise<void> {
         try {
           const parsed = JSON.parse(body) as {
             install_mode?: 'docker' | 'native' | null
+            image_flavor?: 'desktop' | 'basic' | null
             ui_features?: string[]
           }
           installMode = parsed.install_mode ?? null
+          // Absent (older backend) → null → treated as desktop for Docker
+          // installs by vncCapable(). Only an explicit 'basic' hides VNC.
+          imageFlavor = parsed.image_flavor ?? null
           // Distinguish "field absent" (older backend, fall back to
           // hide-gated) from "field present but empty" (backend says
           // it ships none of these features — also hide). Either way
@@ -1630,7 +1667,7 @@ function rebuildJumpList(): void {
   }
 
   const items: Electron.JumpListItem[] = []
-  if (runtimeConfig.agentUrl && installMode === 'docker' && vncUrlFromAgentUrl(runtimeConfig.agentUrl)) {
+  if (vncCapable()) {
     items.push(mkTask('vnc', 'Open VNC Desktop', 'Open the Cremind desktop VNC viewer'))
   }
   if (runtimeConfig.agentUrl) {
@@ -1660,7 +1697,7 @@ function rebuildJumpList(): void {
 function rebuildTrayMenu(): void {
   if (!tray) return
   const items: Electron.MenuItemConstructorOptions[] = []
-  if (runtimeConfig.agentUrl && installMode === 'docker' && vncUrlFromAgentUrl(runtimeConfig.agentUrl)) {
+  if (vncCapable()) {
     items.push({ label: 'Open VNC Desktop', click: () => { createAppWindow('vnc') } })
   }
   if (runtimeConfig.agentUrl) {
@@ -1687,7 +1724,7 @@ function rebuildDockMenu(): void {
   const dock = app.dock
   if (!dock) return
   const items: Electron.MenuItemConstructorOptions[] = []
-  if (runtimeConfig.agentUrl && installMode === 'docker' && vncUrlFromAgentUrl(runtimeConfig.agentUrl)) {
+  if (vncCapable()) {
     items.push({ label: 'Open VNC Desktop', click: () => { createAppWindow('vnc') } })
   }
   if (runtimeConfig.agentUrl) {
@@ -1717,9 +1754,11 @@ function createTray(): void {
 function createAppWindow(target: WindowKind): BrowserWindow {
   if (target === 'vnc') {
     const vncUrl = vncUrlFromAgentUrl(runtimeConfig.agentUrl)
-    if (!vncUrl) {
+    if (!vncUrl || !vncCapable()) {
       // Shouldn't reach here — the tray/jumplist gating hides the entry
-      // when there's no agentUrl. Belt-and-suspenders: fall back to main.
+      // unless vncCapable() (Docker install, non-basic image, resolvable
+      // noVNC URL). Belt-and-suspenders: fall back to main if a stale
+      // jumplist entry or a basic install requests it anyway.
       return createAppWindow('main')
     }
     const w = new BrowserWindow({

@@ -44,6 +44,9 @@ data:
   PORT: {{ .Values.cremind.apiPort | quote }}
   CREMIND_UI_PORT: {{ .Values.cremind.uiPort | quote }}
   CREMIND_SYSTEM_DIR: {{ .Values.cremind.systemDir | quote }}
-  # Required by the desktop entrypoint (it exits 1 without a valid RESOLUTION).
+  {{- if .Values.desktop.enabled }}
+  # Desktop flavor only: the desktop entrypoint exits 1 without a valid
+  # RESOLUTION. The basic image's entrypoint ignores both, so we omit them.
   RESOLUTION: {{ .Values.cremind.resolution | quote }}
   VNC_PASSWORD: {{ .Values.cremind.vncPassword | quote }}
+  {{- end }}

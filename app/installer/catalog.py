@@ -51,9 +51,19 @@ class Mode:
 
 
 @dataclass(frozen=True)
+class DockerDesktop:
+    """The Docker desktop-UI sub-question (asked only when mode == docker)."""
+
+    prompt: str = "Install the VNC Desktop UI?"
+    hint: str = ""
+    default: bool = True
+
+
+@dataclass(frozen=True)
 class Catalog:
     deployments: tuple[Deployment, ...] = ()
     modes: tuple[Mode, ...] = ()
+    docker_desktop: DockerDesktop = DockerDesktop()
 
     def deployment(self, deployment_id: str) -> Deployment | None:
         for d in self.deployments:
@@ -114,4 +124,15 @@ def load(path: str | Path) -> Catalog:
             )
         )
 
-    return Catalog(deployments=tuple(deployments), modes=tuple(modes))
+    dd_raw = data.get("docker_desktop", {}) or {}
+    docker_desktop = DockerDesktop(
+        prompt=dd_raw.get("prompt", DockerDesktop.prompt),
+        hint=dd_raw.get("hint", ""),
+        default=bool(dd_raw.get("default", True)),
+    )
+
+    return Catalog(
+        deployments=tuple(deployments),
+        modes=tuple(modes),
+        docker_desktop=docker_desktop,
+    )

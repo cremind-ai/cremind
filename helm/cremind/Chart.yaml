@@ -6,8 +6,10 @@ description: >-
   optionally connects to in-cluster Qdrant / ChromaDB for embeddings.
 type: application
 # version  = the chart packaging version (strict SemVer2).
-# appVersion = the published cremind/cremind-desktop image tag (PEP 440, e.g.
-#              0.0.2 or 0.0.2rc1.dev1). CI stamps BOTH from app/__version__.py
+# appVersion = the published image tag (PEP 440, e.g. 0.0.2 or 0.0.2rc1.dev1).
+#              Both flavors — cremind/cremind-desktop and cremind/cremind —
+#              share this tag; desktop.enabled picks which one the pod runs.
+#              CI stamps BOTH version and appVersion from app/__version__.py
 #              via `helm package --version <semver2> --app-version <pep440>`
 #              (see .github/workflows/release-*.yml). The placeholders below
 #              are only used for local `helm template`/`lint`.

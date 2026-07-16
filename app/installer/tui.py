@@ -348,6 +348,32 @@ def screen_mode(state: TuiResult, ctx: "Context") -> ScreenResult:
     return replace(state, mode=value or ""), "advance"
 
 
+def screen_desktop(state: TuiResult, ctx: "Context") -> ScreenResult:
+    # Only relevant for Docker installs — the desktop UI is a container image
+    # flavor. Native installs share the host desktop and skip this.
+    if state.mode != "docker":
+        return state, "advance"
+    if state.desktop:
+        return state, "advance"
+
+    dd = ctx.catalog.docker_desktop
+    text = dd.prompt
+    if dd.hint:
+        text += f"\n\n{dd.hint}"
+    value, action = _radio(
+        title="Cremind · Desktop UI",
+        text=text,
+        values=[
+            ("1", "Yes — include the VNC Desktop UI (recommended)"),
+            ("0", "No — headless basic image (cremind/cremind)"),
+        ],
+        default="1" if dd.default else "0",
+    )
+    if action != "advance":
+        return state, action
+    return replace(state, desktop=value or ""), "advance"
+
+
 def screen_confirm(state: TuiResult, ctx: "Context") -> ScreenResult:
     version_label = state.version_spec or "(latest on channel)"
     if state.channel == "dev":
@@ -359,6 +385,8 @@ def screen_confirm(state: TuiResult, ctx: "Context") -> ScreenResult:
         ("Deployment", state.deployment),
         ("Mode", state.mode),
     ]
+    if state.mode == "docker":
+        rows.append(("Desktop UI", "yes" if state.desktop != "0" else "no (basic image)"))
     if state.deployment == "server" and state.app_host:
         rows.append(("Host", state.app_host))
     if state.deployment == "custom":
@@ -407,6 +435,7 @@ _SCREENS: list[Callable[[TuiResult, Context], ScreenResult]] = [
     screen_server_host,
     screen_custom_fields,
     screen_mode,
+    screen_desktop,
     screen_confirm,
 ]
 
@@ -443,6 +472,7 @@ def run(
                 deployment=initial.deployment,
                 app_host=initial.app_host,
                 mode=initial.mode,
+                desktop=initial.desktop,
                 custom_listen_host=initial.custom_listen_host,
                 custom_public_url=initial.custom_public_url,
                 custom_allowed_origins=initial.custom_allowed_origins,

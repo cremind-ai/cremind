@@ -151,6 +151,14 @@ def render_bash(catalog: dict[str, Any], digest: str) -> str:
         add(_bash_var_name("MODE_REQUIRES", m_id) + "=" + _bash_quote(" ".join(requires)))
     add("")
 
+    # Docker desktop-UI sub-question (asked only when mode == docker).
+    dd = catalog.get("docker_desktop", {})
+    add("# ── Docker desktop UI ──")
+    add("DOCKER_DESKTOP_PROMPT=" + _bash_quote(dd.get("prompt", "")))
+    add("DOCKER_DESKTOP_HINT=" + _bash_quote(dd.get("hint", "")))
+    add("DOCKER_DESKTOP_DEFAULT=" + ("1" if dd.get("default", True) else "0"))
+    add("")
+
     # Mode rules
     rules = catalog.get("mode_rules", {})
     add("# ── Mode rules ──")
@@ -254,6 +262,16 @@ def render_powershell(catalog: dict[str, Any], digest: str) -> str:
             add("        Requires    = @()")
         add(f"        Order       = {int(body.get('order', 999))}")
         add("    }")
+    add("}")
+    add("")
+
+    # Docker desktop-UI sub-question (asked only when mode == docker).
+    dd = catalog.get("docker_desktop", {})
+    add("# ── Docker desktop UI ──")
+    add("$script:DockerDesktop = [ordered]@{")
+    add(f"    Prompt  = {_ps_quote(dd.get('prompt', ''))}")
+    add(f"    Hint    = {_ps_quote(dd.get('hint', ''))}")
+    add(f"    Default = ${'true' if dd.get('default', True) else 'false'}")
     add("}")
     add("")
 

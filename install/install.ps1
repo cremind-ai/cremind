@@ -36,6 +36,15 @@
 .PARAMETER WizardPreset
     (custom deployment) Override SETUP_WIZARD_ENV in .env.
 
+.PARAMETER Desktop
+    (Docker mode) Include the VNC Desktop UI — pulls cremind/cremind-desktop
+    (XFCE + VNC). Default when neither -Desktop nor -NoDesktop is given.
+
+.PARAMETER NoDesktop
+    (Docker mode) Skip the VNC Desktop UI — pulls the smaller headless
+    cremind/cremind image (no noVNC/VNC ports). A re-install keeps the
+    previous choice unless you pass a flag. Setting both flags is an error.
+
 .PARAMETER NoLaunch
     Skip opening the setup wizard at the end.
 
@@ -105,6 +114,11 @@ param(
     [string] $AllowedOrigins = '',
     [string] $WizardPreset = '',
     [ValidateSet('','docker','native')] [string] $Mode = '',
+    # Docker mode only: include the VNC Desktop UI? -Desktop pulls
+    # cremind/cremind-desktop; -NoDesktop pulls the headless cremind/cremind.
+    # Neither set = ask (default desktop). Setting both is an error.
+    [switch] $Desktop,
+    [switch] $NoDesktop,
     [switch] $NoLaunch,
     [switch] $Unattended,
     [switch] $Reinstall,
@@ -560,6 +574,13 @@ if ($AutoInstallPython -and $NoAutoInstallPython) {
 if ($Unattended -and -not $AutoInstallPython -and -not $NoAutoInstallPython) {
     $AutoInstallPython = $true
 }
+# Docker desktop-UI tri-state derived from the -Desktop / -NoDesktop switches:
+# '' = ask (default desktop), '1' = desktop image, '0' = basic image.
+if ($Desktop -and $NoDesktop) {
+    Write-Err2 "-Desktop and -NoDesktop are mutually exclusive"
+    exit 2
+}
+$DesktopUi = if ($Desktop) { '1' } elseif ($NoDesktop) { '0' } else { '' }
 
 # ── paths ─────────────────────────────────────────────────────────────────
 
@@ -968,6 +989,7 @@ function Invoke-InstallerTuiBootstrap {
     if ($Channel)         { $tuiArgs.Add('--channel');          $tuiArgs.Add($Channel) }
     if ($Deployment)      { $tuiArgs.Add('--deployment');       $tuiArgs.Add($Deployment) }
     if ($Mode)            { $tuiArgs.Add('--mode');             $tuiArgs.Add($Mode) }
+    if ($DesktopUi)       { $tuiArgs.Add('--desktop');          $tuiArgs.Add($DesktopUi) }
     if ($Version)         { $tuiArgs.Add('--version');          $tuiArgs.Add($Version) }
     if ($AppHost)         { $tuiArgs.Add('--host');             $tuiArgs.Add($AppHost) }
     if ($ListenHost)      { $tuiArgs.Add('--listen-host');      $tuiArgs.Add($ListenHost) }
@@ -1007,6 +1029,7 @@ function Invoke-InstallerTuiBootstrap {
                     'DEPLOYMENT'           { if (-not $Deployment)     { Set-Variable -Scope Script Deployment $v } }
                     'APP_HOST'             { if (-not $AppHost)        { Set-Variable -Scope Script AppHost $v } }
                     'MODE'                 { if (-not $Mode)           { Set-Variable -Scope Script Mode $v } }
+                    'DESKTOP_UI'           { if (-not $DesktopUi)      { Set-Variable -Scope Script DesktopUi $v } }
                     'CUSTOM_listen_host'   { if (-not $ListenHost)     { Set-Variable -Scope Script ListenHost $v } }
                     'CUSTOM_public_url'    { if (-not $PublicUrl)      { Set-Variable -Scope Script PublicUrl $v } }
                     'CUSTOM_allowed_origins' { if (-not $AllowedOrigins) { Set-Variable -Scope Script AllowedOrigins $v } }
@@ -1177,6 +1200,54 @@ if ($Mode -eq 'docker' -and -not $HasDocker) {
     exit 1
 }
 
+# ── desktop UI (docker mode only) ─────────────────────────────────────────
+#
+# Docker installs choose an image flavor: the desktop image
+# (cremind/cremind-desktop, XFCE + VNC) or the basic headless image
+# (cremind/cremind). Default is desktop everywhere, including -Unattended.
+# A re-install reads the previous choice from the existing docker\.env
+# (CREMIND_IMAGE) so an unattended re-run preserves the flavor.
+if ($Mode -eq 'docker' -and -not $DesktopUi) {
+    $desktopDefault = '1'
+    $prevEnv = Join-Path (Join-Path $CremindInstallDir 'docker') '.env'
+    if (Test-Path -LiteralPath $prevEnv) {
+        $prevImageLine = Get-Content -LiteralPath $prevEnv | Where-Object { $_ -like 'CREMIND_IMAGE=*' } | Select-Object -First 1
+        if ($prevImageLine -and ($prevImageLine -replace '^CREMIND_IMAGE=', '').Trim() -eq 'cremind/cremind') {
+            $desktopDefault = '0'
+        }
+    }
+
+    if ($Unattended) {
+        $DesktopUi = $desktopDefault
+    } else {
+        Write-Host ""
+        Write-Host $script:DockerDesktop.Prompt -ForegroundColor White
+        if ($script:DockerDesktop.Hint) {
+            Write-Host ("  $($script:DockerDesktop.Hint)") -ForegroundColor DarkGray
+        }
+        $ynHint = if ($desktopDefault -eq '1') { '[Y/n]' } else { '[y/N]' }
+        while (-not $DesktopUi) {
+            $ans = Read-Host "Install the VNC Desktop UI? $ynHint"
+            if (-not $ans) {
+                $DesktopUi = $desktopDefault
+            } elseif ($ans -match '^(y|yes)$') {
+                $DesktopUi = '1'
+            } elseif ($ans -match '^(n|no)$') {
+                $DesktopUi = '0'
+            } else {
+                Write-Warn2 "Please answer yes or no."
+            }
+        }
+    }
+}
+if ($Mode -eq 'docker') {
+    if ($DesktopUi -eq '0') {
+        Write-Ok "Desktop UI: no (basic headless image)"
+    } else {
+        Write-Ok "Desktop UI: yes (VNC desktop image)"
+    }
+}
+
 # ── docker install ────────────────────────────────────────────────────────
 
 # Random secret generator. ``RNGCryptoServiceProvider`` would be the
@@ -1185,6 +1256,23 @@ if ($Mode -eq 'docker' -and -not $HasDocker) {
 # the user controls and can rotate.
 function New-Secret {
     -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 24 | ForEach-Object { [char]$_ })
+}
+
+function Remove-DesktopOnly {
+    # Strip the ``# >>> desktop-only >>>`` … ``# <<< desktop-only <<<`` marker
+    # blocks (noVNC/VNC ports + VNC env) from a rendered template so a basic
+    # (headless) install carries no dead VNC config. Operates on the single
+    # multi-line string Get-TemplateContent returns; a line filter (not a
+    # multi-line -replace) sidesteps regex/CRLF escaping pitfalls.
+    param([string] $Text)
+    $inBlock = $false
+    $out = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in ($Text -split '\r?\n')) {
+        if ($line -match '^\s*#\s*>>> desktop-only >>>') { $inBlock = $true; continue }
+        if ($line -match '^\s*#\s*<<< desktop-only <<<') { $inBlock = $false; continue }
+        if (-not $inBlock) { $out.Add($line) }
+    }
+    return ($out -join "`n")
 }
 
 function Resolve-CremindVersion {
@@ -1293,7 +1381,18 @@ if ($Mode -eq 'docker') {
         Write-Info "Regenerating $DockerDir config (templates re-render every run)"
     }
 
-    $VncPwd      = New-Secret
+    # Image flavor from the desktop-UI choice (default desktop). $BuildTarget
+    # selects the Dockerfile stage for the dev-channel local build; $ImageRepo
+    # is the Docker Hub repo written into .env as CREMIND_IMAGE.
+    if ($DesktopUi -eq '0') {
+        $ImageRepo   = 'cremind/cremind'
+        $BuildTarget = 'basic'
+        $VncPwd      = ''
+    } else {
+        $ImageRepo   = 'cremind/cremind-desktop'
+        $BuildTarget = 'desktop'
+        $VncPwd      = New-Secret
+    }
     $CremindVer   = Resolve-CremindVersion
 
     switch ($Deployment) {
@@ -1326,16 +1425,20 @@ if ($Mode -eq 'docker') {
     # named Docker volume — isolated from the host. No path substitution
     # needed at render time; the volume is declared in the template's
     # ``volumes:`` block.
-    Get-TemplateContent 'docker-compose.yml.tmpl' | Set-Content -Path $ComposeFile -Encoding utf8
+    $composeContent = Get-TemplateContent 'docker-compose.yml.tmpl'
+    if ($DesktopUi -eq '0') { $composeContent = Remove-DesktopOnly $composeContent }
+    $composeContent | Set-Content -Path $ComposeFile -Encoding utf8
 
     Write-Info "Writing $EnvDocker (secrets, do not commit)"
     $rendered = (Get-TemplateContent 'docker.env.tmpl') `
+        -replace '__CREMIND_IMAGE__',  $ImageRepo `
         -replace '__CREMIND_VERSION__', $CremindVer `
         -replace '__APP_URL__',        $DockerAppUrl `
         -replace '__CORS_ALLOWED_ORIGINS__', $DockerCors `
         -replace '__SETUP_WIZARD_ENV__', $DockerWizardEnv `
         -replace '__INSTALL_MODE__',   $Mode `
         -replace '__VNC_PASSWORD__',   $VncPwd
+    if ($DesktopUi -eq '0') { $rendered = Remove-DesktopOnly $rendered }
     $rendered | Set-Content -Path $EnvDocker -Encoding utf8
 
     # Test channel: forward Test PyPI indices into the Dockerfile build
@@ -1369,7 +1472,8 @@ if ($Mode -eq 'docker') {
         $RepoRootCompose = $RepoRoot -replace '\\', '/'
         Write-Info "Writing $OverrideFile (bind-mounts $RepoRoot at /src)"
         $overrideRendered = (Get-TemplateContent 'docker-compose.override.yml.tmpl') `
-            -replace '__REPO_ROOT__', $RepoRootCompose
+            -replace '__REPO_ROOT__', $RepoRootCompose `
+            -replace '__CREMIND_BUILD_TARGET__', $BuildTarget
         $overrideRendered | Set-Content -Path $OverrideFile -Encoding utf8
     } elseif (Test-Path $OverrideFile) {
         Write-Info "Removing stale docker-compose.override.yml (dev-only)"
@@ -1406,7 +1510,7 @@ if ($Mode -eq 'docker') {
                 throw "docker compose up failed (see $LogFile)"
             }
         } else {
-            Write-Info "Pulling cremind/cremind-desktop:$CremindVer and sidecar images from Docker Hub"
+            Write-Info "Pulling ${ImageRepo}:$CremindVer and sidecar images from Docker Hub"
             # Docker Hub's CDN drops large layer downloads mid-transfer with
             # an EOF more often than you'd like. Docker caches completed
             # layers, so a retry resumes where the last attempt died — a
@@ -1424,7 +1528,7 @@ if ($Mode -eq 'docker') {
                 if ($LASTEXITCODE -eq 0) { $pulled = $true; break }
                 $recent = (Get-Content -Path $LogFile -Tail 40 -ErrorAction SilentlyContinue) -join "`n"
                 if ($recent -match 'manifest unknown|not found|repository does not exist|manifest for .* not found') {
-                    throw "docker compose pull failed — cremind/cremind-desktop:$CremindVer is not on Docker Hub. Check the version/tag, or wait for the release to finish publishing (see $LogFile)."
+                    throw "docker compose pull failed — ${ImageRepo}:$CremindVer is not on Docker Hub. Check the version/tag, or wait for the release to finish publishing (see $LogFile)."
                 }
             }
             if (-not $pulled) {
@@ -1435,7 +1539,7 @@ dropping (look for 'EOF' / 'failed to copy' in $LogFile) — a network issue,
 not a missing image. Things that help:
   - Re-run this installer; Docker caches completed layers and resumes.
   - Pull directly, repeating until it finishes:
-      docker pull cremind/cremind-desktop:$CremindVer
+      docker pull ${ImageRepo}:$CremindVer
   - Reduce parallelism: Docker Desktop -> Settings -> Docker Engine, add
       "max-concurrent-downloads": 1
     then Apply & Restart and re-run. (Most effective when one big layer
@@ -1484,9 +1588,6 @@ not a missing image. Things that help:
     if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
         Write-Step "Setup wizard"
 
-        $NoVncUrl  = "http://${HealthHost}:6080/vnc.html"
-        $StoredVnc = (Get-Content $EnvDocker | Where-Object { $_ -like 'VNC_PASSWORD=*' } | Select-Object -First 1) -replace '^VNC_PASSWORD=', ''
-
         Write-Host @"
 The setup wizard is the next step. It collects your LLM API keys,
 profile name, and tool preferences, then activates the server.
@@ -1496,9 +1597,18 @@ Open this URL in your browser to continue setup:
     $WizardUrl
 
   Cremind     : http://${HealthHost}:1515
+"@
+        # Desktop image only: surface the noVNC viewer + VNC password.
+        if ($DesktopUi -ne '0') {
+            $NoVncUrl  = "http://${HealthHost}:6080/vnc.html"
+            $StoredVnc = (Get-Content $EnvDocker | Where-Object { $_ -like 'VNC_PASSWORD=*' } | Select-Object -First 1) -replace '^VNC_PASSWORD=', ''
+            Write-Host @"
   Desktop     : $NoVncUrl
   VNC password (saved to $EnvDocker):
     $StoredVnc
+"@
+        }
+        Write-Host @"
 
   Stop:    cd $DockerDir; docker compose down
   Logs:    cd $DockerDir; docker compose logs -f cremind
@@ -1534,7 +1644,7 @@ Open this URL in your browser to continue setup:
     $CredsResolution = _Get-DockerEnvVal 'RESOLUTION'; if (-not $CredsResolution) { $CredsResolution = '1280x720' }
     $SpaUrl = $DockerAppUrl -replace ':\d+$', ":$CredsSpaPort"
     Write-Info "Writing $CredsFile (consolidated credentials)"
-    @"
+    $credsText = @"
 # Cremind service credentials and connection info.
 # Auto-generated by the installer and the Setup Wizard.
 # Postgres credentials reflect the last successful wizard
@@ -1556,6 +1666,12 @@ api_port = $CredsApiPort
 spa_port = $CredsSpaPort
 cors_allowed_origins = "$DockerCors"
 setup_wizard_env = "$DockerWizardEnv"
+"@
+    # Desktop image only: the basic image has no noVNC/VNC. Keep this in
+    # sync with app/config/credentials_file.py, which gates [desktop] the
+    # same way (see tests/config/test_credentials_file.py).
+    if ($DesktopUi -ne '0') {
+        $credsText += @"
 
 [desktop]
 novnc_url = "http://${HealthHost}:$CredsNoVncPort/vnc.html"
@@ -1563,7 +1679,9 @@ novnc_port = $CredsNoVncPort
 vnc_port = $CredsVncPort
 vnc_password = "$VncPwd"
 resolution = "$CredsResolution"
-"@ | Set-Content -Path $CredsFile -Encoding utf8
+"@
+    }
+    $credsText | Set-Content -Path $CredsFile -Encoding utf8
 
     if ($Channel -eq 'test') {
         Write-Ok "Done. Welcome to Cremind (test build)."
@@ -1747,7 +1865,7 @@ if ($Channel -eq 'dev') {
     # feature groups (vector embedding, vector stores, browser, channels,
     # LLM SDKs, postgres) are installed on demand by ``app/features/``
     # when the user enables them in the wizard. The Docker desktop image
-    # pre-bakes ``cremind[all]`` instead (see ``Dockerfile.desktop``).
+    # pre-bakes ``cremind[all]`` instead (see ``Dockerfile``).
     $InstallSpec = $null
     $InstallSourceLabel = ''
     switch ($Channel) {

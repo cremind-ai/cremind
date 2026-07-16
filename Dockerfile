@@ -1,0 +1,340 @@
+# Cremind Docker image — one multi-target build produces two flavors:
+#
+#   --target basic    → cremind/cremind          (headless: core app only)
+#   --target desktop  → cremind/cremind-desktop   (basic + a VNC-accessible
+#                       XFCE desktop so the agent can drive a real GUI —
+#                       Chromium, file managers, arbitrary apps — observable
+#                       via noVNC at :6080)
+#
+# A bare ``docker build .`` (no --target) builds ``desktop`` because it is
+# the LAST stage in the file — this preserves the historical default for
+# any caller that doesn't pass a target (e.g. the dev compose override
+# until it opts into ``target:``).
+#
+# ── Stage graph (diamond) ─────────────────────────────────────────────────
+#
+#   uv            pinned uv/uvx binaries (COPY source only)
+#   spa-builder   builds the SPA (referenced by neither final; kept for
+#                 parity / future use — BuildKit skips it when unreferenced)
+#   core          ubuntu:24.04 + python3.13 + uv + docker CLI + shared env
+#   desktop-deps  core + XFCE + TigerVNC + noVNC + Chrome (version-INDEPENDENT)
+#   venv-builder  core + the cremind wheel → /opt/cremind-baseline/venv
+#   basic         core         + venv + entrypoint     (target)
+#   desktop       desktop-deps + venv + entrypoint     (target, LAST)
+#
+# ── Layer-ordering rationale (cache correctness) ──────────────────────────
+# The wheel is installed exactly ONCE, in ``venv-builder``, and COPY'd into
+# both finals. It is therefore a *sibling* of the desktop apt layers, never
+# a descendant — so bumping ``CREMIND_PIP_SPEC`` (every release) invalidates
+# only ``venv-builder``'s pip RUN and the two small ``COPY --from`` layers.
+# The ~2GB of xfce/chrome/vnc apt downloads live in ``core`` + ``desktop-deps``
+# (parents of the wheel, not children) and are never re-pulled on a version
+# bump. The entrypoint COPY lives in the finals (not core) so editing
+# entrypoint.sh also never busts the apt caches.
+#
+# Build args:
+#
+#   CREMIND_PIP_SPEC            — what to ``pip install`` for the backend.
+#                                Default ``cremind`` is the thin core
+#                                (filesystem watching ships in core, so
+#                                no extras needed at this stage); the
+#                                Setup Wizard installs the optional
+#                                feature groups at runtime (deps land in
+#                                the ``cremind-venv`` volume so they
+#                                persist across container recreation).
+#                                Override to ``cremind==X.Y.Z`` in CI for
+#                                deterministic image builds, ``-e /src``
+#                                for an editable checkout, or
+#                                ``cremind[all]==X.Y.Z`` if you want a
+#                                fully-baked image with no wizard
+#                                install step.
+#   CREMIND_PIP_INDEX_URL       — optional pip primary index. Empty (the
+#                                default) means use pip's default
+#                                (production PyPI). Set to
+#                                ``https://test.pypi.org/simple/`` to
+#                                build a test image.
+#   CREMIND_PIP_EXTRA_INDEX_URL — optional pip fallback index. When using
+#                                Test PyPI as the primary, set this to
+#                                ``https://pypi.org/simple/`` so transitive
+#                                dependencies that only live on prod PyPI
+#                                still resolve.
+#   RESOLUTION                 — VNC framebuffer geometry (desktop flavor
+#                                only; passed to vncserver). Larger =
+#                                higher network/CPU cost; 1280x720 is the
+#                                comfort default.
+
+# ── uv binaries (pinned) ──────────────────────────────────────────────────
+# uv is the Python package/project manager that built-in skills use to run
+# their helper scripts (``uv run scripts/<...>.py``). Pull its prebuilt
+# static binaries from Astral's official image. ``UV_VERSION`` sits in the
+# global scope so it can parameterize this stage's FROM (overridable with
+# ``--build-arg UV_VERSION=…``); BuildKit forbids variable expansion in a
+# bare ``COPY --from``, hence the dedicated stage copied from in ``core``.
+ARG UV_VERSION=0.11.19
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
+# ── Stage: build the SPA ──────────────────────────────────────────────────
+FROM node:20-bookworm-slim AS spa-builder
+
+# python3 is needed by ui/package.json's ``preweb:build`` hook, which
+# runs scripts/sync_ui_version.py to copy app/__version__.py into
+# ui/package.json before vite builds.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Install deps first (their own layer) so source-only edits don't bust the
+# npm cache. ``npm ci`` is lockfile-strict for reproducible builds.
+COPY ui/package.json ui/package-lock.json ./ui/
+RUN cd ui && npm ci
+
+# sync_ui_version.py expects the host repo layout (REPO_ROOT/app,
+# REPO_ROOT/scripts, REPO_ROOT/ui) — mirror it under /build so the
+# preweb:build hook can resolve both files.
+COPY app/__version__.py ./app/__version__.py
+COPY scripts/sync_ui_version.py ./scripts/sync_ui_version.py
+COPY ui/ ./ui/
+
+RUN cd ui && npm run web:build && npm run build:renderer
+
+# ``web:build`` outputs to ``ui/dist-web/`` (per vite.config.web.ts). The
+# runtimeConfig helper resolves the agent URL from window.location at
+# runtime, so a single build works for both local and remote access —
+# no per-deploy ``VITE_AGENT_URL`` baking required.
+#
+# ``build:renderer`` outputs to ``ui/dist/`` (per vite.config.ts, with
+# __IS_ELECTRON__: true). The cremind server serves it under
+# /electron-renderer/ — the path the Electron shell loads after pivoting
+# from its asar bundle. Without this bundle the shell would land on the
+# web bundle (__IS_ELECTRON__: false) and lose the custom titlebar / drag
+# region.
+
+# ── Stage: core (shared by both flavors) ──────────────────────────────────
+# Everything a running cremind backend needs that is INDEPENDENT of the
+# desktop stack: python, uv, the docker CLI, and the shared runtime env.
+FROM ubuntu:24.04 AS core
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# Shared prerequisites. software-properties-common + gpg drive the
+# deadsnakes PPA and the Docker apt repo below; the rest (curl/wget/
+# ca-certificates/netcat/nano/sudo) are used by the agent's exec_shell and
+# by the desktop layer, so they belong in the shared base.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl wget ca-certificates gpg \
+        software-properties-common sudo nano \
+        netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python 3.13 from deadsnakes (Ubuntu 24.04 ships 3.12 by default) ──────
+RUN add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+           python3.13 python3.13-venv python3.13-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── uv (Python package & project manager) ─────────────────────────────────
+# Built-in skills run their helper scripts via ``uv run scripts/<...>.py``
+# (e.g. the gmail / gcalendar event listeners spawned by the autostart
+# runner), so ``uv`` must be on PATH for the agent's exec_shell. Copy the
+# prebuilt static binaries from the pinned ``uv`` stage (defined above) into
+# /usr/local/bin so they're on PATH for root (the only user).
+COPY --from=uv /uv /uvx /usr/local/bin/
+RUN uv --version
+
+# ── Docker CLI + compose plugin (client only — no daemon) ────────────────
+# The Setup Wizard's Docker provisioner shells out to ``docker compose``
+# to bring up postgres / qdrant / chroma sidecars. The compose file
+# itself bind-mounts the host's ``/var/run/docker.sock`` into this
+# container, so the CLI installed here talks to the host's daemon
+# (NOT a daemon inside the container).
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && chmod a+r /etc/apt/keyrings/docker.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+        > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+           docker-ce-cli docker-compose-plugin \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── shared runtime env ─────────────────────────────────────────────────────
+# ``PATH`` points at the runtime venv path; the entrypoint seeds it from
+# baseline before any ``cremind`` binary is invoked.
+#
+# Playwright browser binaries are no longer pre-installed — the ``browser``
+# feature is optional and the wizard installs both the Python wheel and the
+# chromium runtime when the user enables it. ``PLAYWRIGHT_BROWSERS_PATH``
+# parks the cache inside the working-dir volume so it persists across
+# container recreation.
+ENV PATH="/opt/cremind/venv/bin:${PATH}" \
+    CREMIND_SYSTEM_DIR=/root/.cremind \
+    CREMIND_UI_PORT=1515 \
+    HOST=0.0.0.0 \
+    PORT=1112 \
+    PLAYWRIGHT_BROWSERS_PATH=/root/.cremind/playwright-browsers
+
+WORKDIR /root/.cremind
+
+# ── Stage: desktop-deps (core + the VNC desktop stack) ────────────────────
+# Everything the desktop flavor adds. This stage is VERSION-INDEPENDENT (it
+# never references the wheel), so a cremind version bump never re-downloads
+# any of these ~2GB of packages. Mirrors ubuntu-vnc-desktop/Dockerfile so
+# we don't depend on an unpublished upstream tag.
+FROM core AS desktop-deps
+
+RUN apt-get update && apt-get install -y \
+        xfce4 xfce4-goodies \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tigervnc-standalone-server tigervnc-common tigervnc-tools \
+        novnc websockify \
+        autocutsel \
+        dbus-x11 \
+        fonts-liberation fonts-noto fonts-noto-cjk fonts-noto-color-emoji \
+        adwaita-icon-theme hicolor-icon-theme gnome-icon-theme \
+        elementary-xfce-icon-theme \
+        gtk2-engines-pixbuf gtk2-engines-murrine \
+        librsvg2-common dmz-cursor-theme \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+    && rm /tmp/chrome.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+# Patch Chrome's desktop entry so it launches as root inside the container.
+RUN sed -i 's|^Exec=/usr/bin/google-chrome-stable|Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage|g' \
+        /usr/share/applications/google-chrome.desktop
+
+RUN mkdir -p /root/.config/xfce4/xfconf/xfce-perchannel-xml && \
+    printf '%s\n' \
+        '<?xml version="1.0" encoding="UTF-8"?>' \
+        '<channel name="xsettings" version="1.0">' \
+        '  <property name="Net" type="empty">' \
+        '    <property name="IconThemeName" type="string" value="elementary-xfce-dark"/>' \
+        '    <property name="ThemeName" type="string" value="Adwaita-dark"/>' \
+        '  </property>' \
+        '</channel>' \
+        > /root/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml
+
+RUN mkdir -p /root/.vnc && \
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'unset SESSION_MANAGER' \
+        'unset DBUS_SESSION_BUS_ADDRESS' \
+        'export XKL_XMODMAP_DISABLE=1' \
+        'autocutsel -fork' \
+        'autocutsel -selection PRIMARY -fork' \
+        'exec dbus-launch --exit-with-session startxfce4' \
+        > /root/.vnc/xstartup && \
+    chmod +x /root/.vnc/xstartup
+
+# ── Stage: venv-builder (the cremind wheel, built once) ───────────────────
+# Default is bare ``cremind``: core ships watchdog so filesystem watching
+# (documents sync, skills hot-reload, file-browser SSE, the
+# ``register_file_watcher`` built-in tool) is available on first boot
+# without an extras pin. The Setup Wizard installs the remaining optional
+# feature groups (embeddings, vectorstores, browser, channels, LLM SDKs,
+# postgres) at runtime as the user enables them.
+FROM core AS venv-builder
+
+ARG CREMIND_PIP_SPEC="cremind"
+ARG CREMIND_PIP_INDEX_URL=""
+ARG CREMIND_PIP_EXTRA_INDEX_URL=""
+
+# We build the venv into ``/opt/cremind-baseline/venv`` instead of
+# ``/opt/cremind/venv`` because the latter is volume-mounted at runtime
+# (compose ``cremind-venv``) so the user's wizard-installed extras
+# persist across container recreation. The entrypoint seeds the volume
+# from this baseline on first boot.
+#
+# Without the volume, every ``docker compose down && up`` (which
+# replaces the container) would wipe the runtime pip installs and
+# force the user back through the wizard.
+#
+# PIP_INDEX_URL / PIP_EXTRA_INDEX_URL are pip's own env vars; setting
+# them inline scopes the override to this RUN step so the final image
+# carries no lingering ENV PIP_* (anything ``pip install``ed at runtime
+# goes back to default PyPI). Empty values are equivalent to "unset".
+# ``--pre`` is unconditional: a no-op for stable releases, required for
+# test (rcN) versions pinned via CREMIND_PIP_SPEC.
+#
+# ``--mount=type=bind,target=/src`` exposes the build context at /src
+# for the duration of this RUN step only. It's a no-op when
+# CREMIND_PIP_SPEC resolves from PyPI (prod / test channel), and lets dev
+# installs pass ``-e /src`` so pip can read pyproject.toml from the
+# checkout without baking the source into the image.
+#
+# ``$CREMIND_PIP_SPEC`` is intentionally unquoted: dev passes ``-e /src``
+# (two tokens), and prod passes ``cremind==X.Y.Z`` (one token, no spaces).
+# Quoting would collapse the dev form into a single argument and pip
+# would reject ``-e /src`` as an invalid requirement spec.
+RUN --mount=type=bind,target=/src,rw \
+    python3.13 -m venv /opt/cremind-baseline/venv \
+    && /opt/cremind-baseline/venv/bin/pip install --upgrade pip \
+    && PIP_INDEX_URL="$CREMIND_PIP_INDEX_URL" \
+       PIP_EXTRA_INDEX_URL="$CREMIND_PIP_EXTRA_INDEX_URL" \
+       /opt/cremind-baseline/venv/bin/pip install --pre $CREMIND_PIP_SPEC
+
+# ── Stage: basic (target) — headless cremind/cremind ──────────────────────
+FROM core AS basic
+
+COPY --from=venv-builder /opt/cremind-baseline/venv /opt/cremind-baseline/venv
+
+# ── entrypoint ────────────────────────────────────────────────────────────
+# One shared entrypoint drives both flavors; it starts the VNC/noVNC
+# services only when CREMIND_IMAGE_FLAVOR=desktop (baked below).
+#
+# The SPA is *not* COPYed into a separate image location. The wheel carries
+# ``app/static/ui/`` and ``app/static/ui-electron/`` as build artifacts
+# (see pyproject.toml [tool.hatch.build.targets.wheel]), pip installs them
+# into ``site-packages``, and the running ``cremind serve`` reads from
+# there. That makes the SPA upgrade in lockstep with the backend whenever
+# the in-app updater pip-installs a new wheel. Resolution is handled in
+# ``app/server.py:_build_ui_server`` and prefers the wheel-bundled path.
+COPY install/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# CREMIND_IMAGE_FLAVOR is the single flavor signal: the entrypoint gates the
+# VNC stack on it, and the backend surfaces it on
+# /api/services/tray-capabilities so the Electron shell can hide the "Open
+# VNC Desktop" menu on this flavor.
+ENV CREMIND_IMAGE_FLAVOR=basic
+
+# 1112 backend (loopback), 1515 SPA. No VNC ports on the basic flavor.
+# EXPOSE is documentation only — the compose ``-p`` mapping is what
+# actually forwards the port.
+EXPOSE 1112 1515
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+# ── Stage: desktop (target, LAST) — cremind/cremind-desktop ───────────────
+# Bare ``docker build .`` with no --target lands here (last stage), matching
+# the historical default before the split.
+FROM desktop-deps AS desktop
+
+COPY --from=venv-builder /opt/cremind-baseline/venv /opt/cremind-baseline/venv
+
+COPY install/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENV CREMIND_IMAGE_FLAVOR=desktop \
+    VNC_PASSWORD=changeme \
+    RESOLUTION=1280x720
+
+# 1112 backend, 1515 SPA, 5900 raw VNC, 80 noVNC web. The compose file
+# maps 80 → 6080 on the host so it doesn't conflict with the host's real
+# port 80. OAuth consent redirects (Google/Atlassian/A2A) are captured on the
+# backend's own /api/oauth/*/callback routes (port 1112), so no separate
+# callback port is needed.
+EXPOSE 1112 1515 5900 80
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

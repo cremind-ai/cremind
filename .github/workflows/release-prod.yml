@@ -7,8 +7,9 @@
 #   - Windows NSIS installer + latest.yml
 #   - macOS DMG + latest-mac.yml
 #   - Linux AppImage + latest-linux.yml
-# Plus, pushed to Docker Hub:
-#   - cremind/cremind-desktop:X.Y.Z and cremind/cremind-desktop:latest
+# Plus, pushed to Docker Hub (both image flavors, same tag):
+#   - cremind/cremind-desktop:X.Y.Z + :latest  (XFCE + VNC desktop)
+#   - cremind/cremind:X.Y.Z + :latest          (headless basic image)
 #
 # Flow:
 #   1. ``prepare-draft`` creates a draft GitHub Release with auto-generated
@@ -20,9 +21,10 @@
 #      in ui/. electron-builder with ``releaseType: "draft"`` uploads each
 #      platform's installer + update manifest to the same draft.
 #   4. ``docker`` waits for ``wheel`` (PyPI must serve the new wheel),
-#      then builds Dockerfile.desktop with CREMIND_PIP_SPEC=cremind==X.Y.Z
-#      and pushes cremind/cremind-desktop:X.Y.Z + :latest to Docker Hub.
-#      BuildKit GHA cache keeps the heavy base layers warm across releases.
+#      then builds both Dockerfile targets with CREMIND_PIP_SPEC=cremind==X.Y.Z
+#      and pushes cremind/cremind-desktop:X.Y.Z + :latest and
+#      cremind/cremind:X.Y.Z + :latest to Docker Hub. BuildKit GHA cache
+#      keeps the heavy base layers warm across releases.
 #   5. ``publish`` promotes the draft only after wheel AND every electron
 #      matrix job AND docker succeed. Half-finished releases never reach
 #      users.
@@ -30,7 +32,7 @@
 # Required repo secrets:
 #   PYPI_API_TOKEN       — for PyPI publish.
 #   DOCKERHUB_USERNAME   — Docker Hub account with push rights to
-#                          cremind/cremind-desktop.
+#                          cremind/cremind-desktop AND cremind/cremind.
 #   DOCKERHUB_TOKEN      — Docker Hub PAT (Read+Write scope).
 #   GITHUB_TOKEN         — auto-provided; used by electron-builder + gh CLI.
 # Optional (for code signing):
@@ -400,18 +402,23 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run build -- --publish always
 
-  # Builds cremind/cremind-desktop and pushes it to Docker Hub. Runs in
-  # parallel with ``electron`` (no shared artifacts) but depends on
-  # ``wheel`` because the image's ``RUN pip install cremind==X.Y.Z`` must
-  # resolve against PyPI — see Dockerfile.desktop's CREMIND_PIP_SPEC arg.
+  # Builds BOTH image flavors from the one multi-target Dockerfile and
+  # pushes them to Docker Hub:
+  #   --target desktop → cremind/cremind-desktop  (XFCE + VNC + Chrome)
+  #   --target basic   → cremind/cremind          (headless core)
+  # Runs in parallel with ``electron`` (no shared artifacts) but depends on
+  # ``wheel`` because each image's ``RUN pip install cremind==X.Y.Z`` must
+  # resolve against PyPI — see the Dockerfile's CREMIND_PIP_SPEC arg.
   #
-  # The expensive base layers (Ubuntu + XFCE + Chrome + Python 3.13 +
-  # Docker CLI) are cached via BuildKit's GHA cache (scope=desktop),
-  # shared with release-rc.yml so an RC build right before a prod
-  # build can be a near-instant rebuild of only the final pip layer.
-  # Docker Hub deduplicates layer blobs by digest, so re-pushing the
-  # cached base layers under a new tag is a no-op for storage and
-  # uploads only the small (~50MB) per-version pip layer.
+  # The two builds run as sequential steps in ONE job so they share a single
+  # Buildx builder: the ``core`` and ``venv-builder`` stages build exactly
+  # once (the second build hits the local layer store) and the ``core``
+  # layer digests are identical across both images, so Docker Hub dedups
+  # the shared blobs. The expensive base layers (Ubuntu + Python 3.13 +
+  # Docker CLI, plus XFCE + Chrome for desktop) are cached via BuildKit's
+  # GHA cache (scope=desktop / scope=basic), shared with release-rc.yml so
+  # an RC build right before a prod build can be a near-instant rebuild of
+  # only the final pip layer.
   docker:
     needs: [verify, prepare-draft, wheel]
     runs-on: ubuntu-latest
@@ -468,7 +475,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.desktop
+          file: Dockerfile
+          target: desktop
           platforms: linux/amd64
           push: true
           provenance: false
@@ -480,10 +488,34 @@ jobs:
           cache-from: type=gha,scope=desktop
           cache-to: type=gha,scope=desktop,mode=max
 
+      # Basic flavor. Reads BOTH cache scopes so the shared ``core`` /
+      # ``venv-builder`` layers just built for desktop are reused (they
+      # converge to the same digests), and only writes its own scope so the
+      # two builds never race on a single cache export.
+      - name: Build & push cremind/cremind (basic)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: basic
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            cremind/cremind:${{ needs.verify.outputs.version }}
+            cremind/cremind:latest
+          build-args: |
+            CREMIND_PIP_SPEC=cremind==${{ needs.verify.outputs.version }}
+          cache-from: |
+            type=gha,scope=basic
+            type=gha,scope=desktop
+          cache-to: type=gha,scope=basic,mode=max
+
   # Packages the Helm chart and pushes it to Docker Hub as an OCI artifact.
   # ``needs: [approve, prepare-draft, docker]`` — runs only after the human
-  # approval gate and after the cremind/cremind-desktop:X.Y.Z image the chart
-  # references has been pushed. Production versions are already bare X.Y.Z, so
+  # approval gate and after the images the chart references (both
+  # cremind/cremind-desktop:X.Y.Z and cremind/cremind:X.Y.Z share the tag)
+  # have been pushed. Production versions are already bare X.Y.Z, so
   # the chart ``version`` and ``appVersion`` are both X.Y.Z (valid SemVer2 —
   # no translation needed). Reuses the DOCKERHUB_* secrets; no new secret.
   helm:

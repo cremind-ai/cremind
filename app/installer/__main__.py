@@ -31,6 +31,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--channel", default="", choices=["", "production", "test", "dev"])
     p.add_argument("--deployment", default="")
     p.add_argument("--mode", default="")
+    p.add_argument(
+        "--desktop",
+        default="",
+        choices=["", "1", "0"],
+        help="Docker desktop-UI choice: 1 desktop, 0 basic, empty = ask.",
+    )
     p.add_argument("--version", default="", dest="version_spec")
     p.add_argument("--host", default="", dest="app_host")
     p.add_argument("--listen-host", default="", dest="custom_listen_host")
@@ -68,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
         deployment=args.deployment,
         app_host=args.app_host,
         mode=args.mode,
+        desktop=args.desktop,
         custom_listen_host=args.custom_listen_host,
         custom_public_url=args.custom_public_url,
         custom_allowed_origins=args.custom_allowed_origins,

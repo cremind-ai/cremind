@@ -1,22 +1,28 @@
 #!/bin/bash
-# Entrypoint for cremind/cremind-desktop.
+# Entrypoint for the cremind Docker images — shared by both flavors:
 #
-# Starts four services and waits on all of them. If any of them dies the
-# entrypoint exits, and Docker's restart policy brings the container
-# back up — that's the supervision strategy. We keep it deliberately
-# minimal (no supervisord, no s6) because the cost of getting one
-# wrong outweighs the value at this scale.
+#   cremind/cremind          (basic)   CREMIND_IMAGE_FLAVOR=basic
+#   cremind/cremind-desktop  (desktop)  CREMIND_IMAGE_FLAVOR=desktop
+#
+# On the DESKTOP flavor it starts the VNC/noVNC stack and then the
+# backend; on the BASIC flavor it skips straight to the backend (there is
+# no X server, no vncserver binary, no noVNC). Either way it waits on all
+# started services — if any of them dies the entrypoint exits, and
+# Docker's restart policy brings the container back up. We keep supervision
+# deliberately minimal (no supervisord, no s6) because the cost of getting
+# one wrong outweighs the value at this scale.
 #
 # Order of operations:
 #
-#   1. Set the VNC password and clean stale lock files.
-#   2. Start the X server (TigerVNC display :0) and websockify (noVNC web).
+#   0. Seed the runtime venv from the baked baseline (both flavors).
+#   1. (desktop only) Set the VNC password and clean stale lock files.
+#   2. (desktop only) Start the X server (TigerVNC display :0) and
+#      websockify (noVNC web) and export DISPLAY=:0.
 #   3. Run ``cremind db upgrade`` so a fresh DB gets the schema and an
 #      existing one picks up new migrations on every restart.
-#   4. Start ``cremind serve`` (DISPLAY=:0 so the agent can drive the desktop).
-#      One app serves the single public origin on :1515 (SPA + API + A2A +
-#      OAuth) plus an internal loopback API on :1112 (CREMIND_UI_DIR points at
-#      the stage-1 SPA build).
+#   4. Start ``cremind serve``. One app serves the single public origin on
+#      :1515 (SPA + API + A2A + OAuth) plus an internal loopback API on
+#      :1112. On desktop, DISPLAY=:0 lets the agent drive the desktop.
 #   5. ``wait -n`` exits as soon as any background job dies; Docker
 #      then restarts the whole container.
 #
@@ -28,6 +34,11 @@
 
 set -e
 
+# The flavor baked into the image. Unset defaults to ``desktop`` so a
+# hand-run of this script inside a pre-flavor image (which had no
+# CREMIND_IMAGE_FLAVOR) keeps its historical behavior.
+CREMIND_IMAGE_FLAVOR="${CREMIND_IMAGE_FLAVOR:-desktop}"
+
 # ── Diagnostics ──────────────────────────────────────────────────────────
 #
 # Every container start and stop emits a timestamped banner to stderr so
@@ -35,7 +46,7 @@ set -e
 # and when it exited. The in-app upgrade flow depends on the container
 # actually restarting after the upgrade runner SIGTERMs ``cremind serve``;
 # these banners are how we verify (or refute) that the restart happened.
-echo "[entrypoint] starting PID=$$ at $(date -Is)" >&2
+echo "[entrypoint] starting PID=$$ flavor=$CREMIND_IMAGE_FLAVOR at $(date -Is)" >&2
 trap 'echo "[entrypoint] exiting with code $? at $(date -Is)" >&2' EXIT
 
 # ── 0. Seed /opt/cremind/venv from baseline ───────────────────────────────
@@ -81,34 +92,36 @@ if [ ! -x /opt/cremind/venv/bin/cremind ]; then
         | xargs -r sed -i "s|/opt/cremind-baseline/venv|/opt/cremind/venv|g"
 fi
 
-# ── 1. VNC setup ──────────────────────────────────────────────────────────
+# ── 1 & 2. VNC setup + X server + noVNC (desktop flavor only) ─────────────
+#
+# The basic image has no tigervnc/novnc/websockify installed and sets no
+# VNC_PASSWORD/RESOLUTION env, so this whole block is skipped there.
+if [ "$CREMIND_IMAGE_FLAVOR" = "desktop" ]; then
+    if [[ ! "$RESOLUTION" =~ ^[0-9]+x[0-9]+$ ]]; then
+        echo "ERROR: RESOLUTION must be WIDTHxHEIGHT (e.g., 1280x720)" >&2
+        exit 1
+    fi
 
-if [[ ! "$RESOLUTION" =~ ^[0-9]+x[0-9]+$ ]]; then
-    echo "ERROR: RESOLUTION must be WIDTHxHEIGHT (e.g., 1280x720)" >&2
-    exit 1
+    mkdir -p /root/.vnc
+    echo "$VNC_PASSWORD" | vncpasswd -f > /root/.vnc/passwd
+    chmod 600 /root/.vnc/passwd
+
+    rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 2>/dev/null || true
+
+    echo "[entrypoint] starting vncserver at $RESOLUTION..."
+    vncserver :0 -geometry "$RESOLUTION" -depth 24 -localhost no
+
+    echo "[entrypoint] starting websockify on :80..."
+    # Foreground (no -D) so it shows up as a child of this script and ``wait``
+    # can reap it. Backgrounded with & for the same reason.
+    websockify --web=/usr/share/novnc/ 80 localhost:5900 \
+        > /var/log/websockify.log 2>&1 &
+
+    # DISPLAY is what makes the rest of the children GUI-capable. The agent
+    # inherits this and can run Chromium, file managers, anything that
+    # expects an X server.
+    export DISPLAY=:0
 fi
-
-mkdir -p /root/.vnc
-echo "$VNC_PASSWORD" | vncpasswd -f > /root/.vnc/passwd
-chmod 600 /root/.vnc/passwd
-
-rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 2>/dev/null || true
-
-# ── 2. X server + noVNC ──────────────────────────────────────────────────
-
-echo "[entrypoint] starting vncserver at $RESOLUTION..."
-vncserver :0 -geometry "$RESOLUTION" -depth 24 -localhost no
-
-echo "[entrypoint] starting websockify on :80..."
-# Foreground (no -D) so it shows up as a child of this script and ``wait``
-# can reap it. Backgrounded with & for the same reason.
-websockify --web=/usr/share/novnc/ 80 localhost:5900 \
-    > /var/log/websockify.log 2>&1 &
-
-# DISPLAY is what makes the rest of the children GUI-capable. The agent
-# inherits this and can run Chromium, file managers, anything that
-# expects an X server.
-export DISPLAY=:0
 
 # ── 3. Schema migration ──────────────────────────────────────────────────
 
@@ -132,22 +145,22 @@ fi
 # ── 4. Cremind backend (now also serves the SPA on :CREMIND_UI_PORT) ───────
 
 # ``cremind serve`` opens two listeners in the same process: the API on
-# :PORT and the SPA on :CREMIND_UI_PORT (set in the Dockerfile env to
-# /opt/cremind-ui from the spa-builder stage). Hash routing means
-# StaticFiles' ``html=True`` fallback to index.html covers every
-# client-side route — no rewrite rules needed.
+# :PORT and the SPA on :CREMIND_UI_PORT. Hash routing means StaticFiles'
+# ``html=True`` fallback to index.html covers every client-side route —
+# no rewrite rules needed.
 echo "[entrypoint] starting cremind serve (public :${CREMIND_UI_PORT:-1515}, internal API :$PORT)..."
 # tee to both the container's stdout (so ``docker logs`` surfaces
 # startup crashes — without this, an import error or missing-dep
 # failure would die into /var/log/cremind.log and the container would
-# silently restart-loop) and the on-disk log file (so a VNC user can
-# tail it from a terminal inside the desktop session).
+# silently restart-loop) and the on-disk log file (so a user can tail
+# it from a terminal, or a VNC user from inside the desktop session).
 cremind serve --host "$HOST" --port "$PORT" 2>&1 \
     | tee /var/log/cremind.log &
 
 # ── 5. Watchdog ───────────────────────────────────────────────────────────
 
-cat <<EOF
+if [ "$CREMIND_IMAGE_FLAVOR" = "desktop" ]; then
+    cat <<EOF
 ================================================================
  Cremind-Desktop ready.
    Cremind      : http://<host>:1515  (UI + API — single public port)
@@ -155,6 +168,14 @@ cat <<EOF
    Resolution   : $RESOLUTION
 ================================================================
 EOF
+else
+    cat <<EOF
+================================================================
+ Cremind ready.
+   Cremind      : http://<host>:1515  (UI + API — single public port)
+================================================================
+EOF
+fi
 
 # Exit on the first child failure so Docker's restart policy can recover.
 # Without ``wait -n`` we'd silently keep running with a dead service.

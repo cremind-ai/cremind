@@ -70,6 +70,17 @@ def test_output_round_trip_simple(tmp_path: Path) -> None:
     # Unset slots are written as empty strings so the shell guards keep working.
     assert parsed["APP_HOST"] == ""
     assert parsed["CUSTOM_listen_host"] == ""
+    # DESKTOP_UI is emitted so install.sh / install.ps1 can source it.
+    assert parsed["DESKTOP_UI"] == ""
+
+
+def test_output_round_trip_desktop_ui(tmp_path: Path) -> None:
+    result = TuiResult(mode="docker", desktop="0")
+    target = tmp_path / "tui.out"
+    write(result, target)
+
+    parsed = _parse_sourced(target.read_text(encoding="utf-8"))
+    assert parsed["DESKTOP_UI"] == "0"
 
 
 def test_output_round_trip_quotes_special_chars(tmp_path: Path) -> None:
@@ -120,6 +131,10 @@ def test_catalog_loads_real_file() -> None:
 
     mode_ids = [m.id for m in cat.modes]
     assert mode_ids == ["docker", "native"]
+
+    # The docker desktop-UI sub-question is present and defaults to True.
+    assert cat.docker_desktop.prompt
+    assert cat.docker_desktop.default is True
 
 
 # ── screen short-circuit (no dialog should open) ─────────────────────────
@@ -234,6 +249,20 @@ def test_screen_mode_short_circuits_when_set(loaded_catalog: catalog.Catalog) ->
     assert new_state.mode == "docker"
 
 
+def test_screen_desktop_skips_when_not_docker(loaded_catalog: catalog.Catalog) -> None:
+    state = TuiResult(mode="native")
+    new_state, action = tui.screen_desktop(state, _ctx(loaded_catalog))
+    assert action == "advance"
+    assert new_state.desktop == ""
+
+
+def test_screen_desktop_short_circuits_when_set(loaded_catalog: catalog.Catalog) -> None:
+    state = TuiResult(mode="docker", desktop="0")
+    new_state, action = tui.screen_desktop(state, _ctx(loaded_catalog))
+    assert action == "advance"
+    assert new_state.desktop == "0"
+
+
 def test_run_with_all_values_prepopulated(loaded_catalog: catalog.Catalog) -> None:
     """End-to-end: every screen short-circuits, run() returns to confirm.
 
@@ -246,6 +275,7 @@ def test_run_with_all_values_prepopulated(loaded_catalog: catalog.Catalog) -> No
         version_spec="0.2.1",
         deployment="local",
         mode="docker",
+        desktop="1",
     )
     # Strip the confirm screen so the test doesn't open a dialog.
     original = tui._SCREENS
