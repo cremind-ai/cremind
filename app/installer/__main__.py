@@ -16,9 +16,26 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from app.installer import catalog, tui
 from app.installer.output import TuiResult, write
+
+# Written into the --output file when the user cancels. ``uv run`` does not
+# reliably propagate the child's exit code on Ctrl+C (Windows: it treats the
+# interrupt as a clean stop and returns 0), so the shell front-ends cannot
+# depend on exit code 1 to detect a cancel. They inspect the output file for
+# this sentinel instead — see tui_run_bootstrap (install.sh) /
+# Invoke-InstallerTuiBootstrap (install.ps1).
+CANCEL_MARKER = "CREMIND_TUI_CANCELLED=1"
+
+
+def _write_cancel_marker(path: str) -> None:
+    """Best-effort: record cancellation for the shell regardless of exit code."""
+    try:
+        Path(path).write_text(CANCEL_MARKER + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -90,10 +107,12 @@ def main(argv: list[str] | None = None) -> int:
             electron_version=args.electron_version,
         )
     except KeyboardInterrupt:
+        _write_cancel_marker(args.output)
         print("installer: cancelled.", file=sys.stderr)
         return 1
 
     if result is None:
+        _write_cancel_marker(args.output)
         return 1
 
     try:
