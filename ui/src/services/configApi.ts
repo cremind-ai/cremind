@@ -513,6 +513,7 @@ export interface CustomProviderModel {
   id: string;
   display_name: string;
   vision: boolean;
+  audio: boolean;
   supports_reasoning: boolean;
   input_price_per_1m: number | null;
   output_price_per_1m: number | null;
@@ -539,6 +540,7 @@ export interface LLMModel {
   cache_write_price_per_1m?: number | null;
   reasoning_effort?: string[];
   vision?: boolean;
+  audio?: boolean;
 }
 
 export async function listLLMProviders(
@@ -659,7 +661,7 @@ export async function pollDeviceCode(
 export async function getModelGroups(
   agentUrl: string,
   token: string
-): Promise<{ model_groups: Record<string, string>; default_provider: string; reasoning_efforts: Record<string, string | null>; vision_enabled: boolean }> {
+): Promise<{ model_groups: Record<string, string>; default_provider: string; reasoning_efforts: Record<string, string | null>; vision_enabled: boolean; audio_enabled: boolean }> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/llm/model-groups`, {
     headers: authHeaders(token),
@@ -675,12 +677,14 @@ export async function updateModelGroups(
   defaultProvider?: string,
   reasoningEfforts?: Record<string, string | null>,
   visionEnabled?: boolean,
+  audioEnabled?: boolean,
 ): Promise<{ success: boolean }> {
   const base = resolveBaseUrl(agentUrl);
   const body: Record<string, unknown> = { model_groups: modelGroups };
   if (defaultProvider) body.default_provider = defaultProvider;
   if (reasoningEfforts) body.reasoning_efforts = reasoningEfforts;
   if (visionEnabled !== undefined) body.vision_enabled = visionEnabled;
+  if (audioEnabled !== undefined) body.audio_enabled = audioEnabled;
   const res = await fetch(`${base}/api/llm/model-groups`, {
     method: 'PUT',
     headers: authHeaders(token),

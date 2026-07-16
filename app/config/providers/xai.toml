@@ -39,6 +39,7 @@ group_hint = "low"
 supports_reasoning = true
 prompt_cache = true
 vision = true
+audio = true
 input_price_per_1m = 0.20
 output_price_per_1m = 0.50
 cache_read_price_per_1m = 0.05    # published flat cached-input rate

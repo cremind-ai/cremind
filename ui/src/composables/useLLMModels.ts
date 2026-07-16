@@ -7,6 +7,7 @@ export interface ModelOption {
   provider: string;
   reasoning_effort?: string[];
   vision?: boolean;
+  audio?: boolean;
 }
 
 export function useLLMModels() {
@@ -24,6 +25,7 @@ export function useLLMModels() {
           provider: p.name,
           reasoning_effort: m.reasoning_effort,
           vision: m.vision,
+          audio: m.audio,
         });
       }
     }
@@ -44,10 +46,19 @@ export function useLLMModels() {
     );
   }
 
+  // Audio-capable models only (optionally scoped to one provider). Used by the
+  // dedicated Audio model selector so users pick a model that can actually
+  // process audio input.
+  function getAudioModels(providerName?: string): ModelOption[] {
+    return allModels.value.filter(
+      (m) => m.audio && (!providerName || m.provider === providerName),
+    );
+  }
+
   function getReasoningOptions(modelValue: string): string[] {
     const model = allModels.value.find((m) => m.value === modelValue);
     return model?.reasoning_effort || [];
   }
 
-  return { allModels, rebuildModelList, getFilteredModels, getVisionModels, getReasoningOptions };
+  return { allModels, rebuildModelList, getFilteredModels, getVisionModels, getAudioModels, getReasoningOptions };
 }

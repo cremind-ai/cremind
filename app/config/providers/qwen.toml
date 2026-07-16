@@ -97,3 +97,18 @@ input_price_per_1m = 0.65
 output_price_per_1m = 3.25
 cache_read_price_per_1m = 0.065   # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# Qwen Omni: multimodal model — accepts audio (and image) input alongside text
+# via the `input_audio` content part in OpenAI-compatible chat completions.
+[[models]]
+id = "qwen3-omni-flash"
+context_window = 65536
+display_name = "Qwen3 Omni Flash"
+group_hint = "low"
+prompt_cache = true
+vision = true
+audio = true
+input_price_per_1m = 0.20
+output_price_per_1m = 0.60
+cache_read_price_per_1m = 0.02    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee

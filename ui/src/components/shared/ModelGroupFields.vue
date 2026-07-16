@@ -5,8 +5,8 @@ import type { ModelOption } from '../../composables/useLLMModels';
 
 /**
  * Provider / Model / (optional) Reasoning-Effort picker for a single LLM model
- * group (``high`` / ``low`` / ``vision``). Shared by the Settings → LLM
- * Providers page and the Setup Wizard's LLM step so both stay consistent.
+ * group (``high`` / ``low`` / ``vision`` / ``audio``). Shared by the Settings →
+ * LLM Providers page and the Setup Wizard's LLM step so both stay consistent.
  *
  * ``allModels`` is passed in rather than pulled from ``useLLMModels`` because
  * that composable holds per-call state — a child instance would see an empty
@@ -25,7 +25,9 @@ const props = withDefaults(defineProps<{
   reasoningEffort?: string | null;
   /** Restrict the model list to vision-capable models. */
   useVision?: boolean;
-  /** Allow clearing provider/model (optional groups: low, vision). */
+  /** Restrict the model list to audio-capable models. */
+  useAudio?: boolean;
+  /** Allow clearing provider/model (optional groups: low, vision, audio). */
   clearable?: boolean;
   /** Render the Reasoning Effort row when the selected model supports it. */
   showReasoning?: boolean;
@@ -33,6 +35,7 @@ const props = withDefaults(defineProps<{
 }>(), {
   reasoningEffort: null,
   useVision: false,
+  useAudio: false,
   clearable: false,
   showReasoning: true,
   modelPlaceholder: 'Select model',
@@ -55,6 +58,11 @@ const filteredModels = computed<ModelOption[]>(() => {
   if (props.useVision) {
     return props.allModels.filter(
       (m) => m.vision && (!props.provider || m.provider === props.provider),
+    );
+  }
+  if (props.useAudio) {
+    return props.allModels.filter(
+      (m) => m.audio && (!props.provider || m.provider === props.provider),
     );
   }
   if (!props.provider) return props.allModels;

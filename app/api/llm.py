@@ -112,7 +112,8 @@ _PRICE_FIELDS = (
 def _normalize_custom_models(raw_models) -> list[dict]:
     """Coerce user-supplied model rows into the stored shape.
 
-    Each stored model carries: ``id``, ``display_name``, a ``vision`` flag, a
+    Each stored model carries: ``id``, ``display_name``, a ``vision`` flag, an
+    ``audio`` flag (audio input support), a
     ``supports_reasoning`` flag (whether the model supports reasoning effort),
     the derived ``reasoning_effort`` levels it exposes, and the optional
     per-1M-token prices in :data:`_PRICE_FIELDS` (present only when the user
@@ -142,6 +143,7 @@ def _normalize_custom_models(raw_models) -> list[dict]:
             "display_name": str(raw.get("display_name") or mid).strip(),
             "group_hint": "high",
             "vision": bool(raw.get("vision", False)),
+            "audio": bool(raw.get("audio", False)),
             "supports_reasoning": supports_reasoning,
             "reasoning_effort": list(_REASONING_EFFORTS) if supports_reasoning else [],
         }
@@ -185,6 +187,7 @@ def _custom_model_response(model: dict) -> dict:
         "display_name": model.get("display_name", model["id"]),
         "group_hint": model.get("group_hint", "high"),
         "vision": bool(model.get("vision", False)),
+        "audio": bool(model.get("audio", False)),
     }
     for key in _PRICE_FIELDS:
         entry[key] = model.get(key)
@@ -528,7 +531,7 @@ def get_llm_routes(state: BootedState) -> list[Route]:
                 _save_custom_registry(config_storage, profile, registry)
             # Drop any model-group assignment that pointed at this provider so it
             # doesn't leave a dangling ``custom:<slug>/model`` reference.
-            for group in ("high", "vision", "low", "plan"):
+            for group in ("high", "vision", "audio", "low", "plan"):
                 gv = config_storage.get("llm_config", f"model_group.{group}", profile=profile)
                 if gv and gv.split("/", 1)[0] == provider_name:
                     config_storage.delete("llm_config", f"model_group.{group}", profile=profile)
@@ -592,10 +595,11 @@ def get_llm_routes(state: BootedState) -> list[Route]:
 
     async def handle_get_model_groups(request: Request) -> JSONResponse:
         """Get the configured reasoning model (``high``) plus the optional
-        ``vision``, ``low``, and ``plan`` models, and their reasoning_effort.
+        ``vision``, ``audio``, ``low``, and ``plan`` models, and their reasoning_effort.
 
         ``high`` is the one model the agent reasons on. ``vision`` is an optional
-        override used only by image_understanding. ``low`` is the optional
+        override used only by image_understanding; ``audio`` is an optional
+        override used only by audio_understanding. ``low`` is the optional
         low-performance / cheap model used for lightweight auxiliary tasks (e.g.
         the skill-event matching gate). ``plan`` is the optional model used during
         plan mode's planning phase (the agent switches back to ``high`` once a
@@ -613,7 +617,7 @@ def get_llm_routes(state: BootedState) -> list[Route]:
 
         groups = {}
         reasoning_efforts: dict[str, str | None] = {}
-        for group in ("high", "vision", "low", "plan"):
+        for group in ("high", "vision", "audio", "low", "plan"):
             # SQLite first
             val = config_storage.get("llm_config", f"model_group.{group}", profile=profile)
             if not val:
@@ -639,11 +643,16 @@ def get_llm_routes(state: BootedState) -> list[Route]:
         ve_raw = config_storage.get("llm_config", "model_group.vision.enabled", profile=profile)
         vision_enabled = str(ve_raw).strip().lower() in {"1", "true", "yes", "on"}
 
+        # Specialized Audio Model feature toggle (opt-in; unset reads as off).
+        ae_raw = config_storage.get("llm_config", "model_group.audio.enabled", profile=profile)
+        audio_enabled = str(ae_raw).strip().lower() in {"1", "true", "yes", "on"}
+
         return JSONResponse({
             "model_groups": groups,
             "default_provider": default_provider,
             "reasoning_efforts": reasoning_efforts,
             "vision_enabled": vision_enabled,
+            "audio_enabled": audio_enabled,
         })
 
     async def handle_update_model_groups(request: Request) -> JSONResponse:
@@ -662,13 +671,13 @@ def get_llm_routes(state: BootedState) -> list[Route]:
 
         model_groups = body.get("model_groups", {})
         for group, value in model_groups.items():
-            if group in ("high", "vision", "low", "plan"):
+            if group in ("high", "vision", "audio", "low", "plan"):
                 config_storage.set("llm_config", f"model_group.{group}", str(value), profile=profile)
 
         # Save reasoning_effort per group
         reasoning_efforts = body.get("reasoning_efforts", {})
         for group, value in reasoning_efforts.items():
-            if group in ("high", "vision", "low", "plan"):
+            if group in ("high", "vision", "audio", "low", "plan"):
                 if value:
                     config_storage.set("llm_config", f"model_group.{group}.reasoning_effort", str(value), profile=profile)
                 else:
@@ -685,6 +694,14 @@ def get_llm_routes(state: BootedState) -> list[Route]:
             config_storage.set(
                 "llm_config", "model_group.vision.enabled",
                 "true" if vision_enabled else "false", profile=profile,
+            )
+
+        # Specialized Audio Model feature toggle (mirrors vision_enabled).
+        audio_enabled = body.get("audio_enabled")
+        if audio_enabled is not None:
+            config_storage.set(
+                "llm_config", "model_group.audio.enabled",
+                "true" if audio_enabled else "false", profile=profile,
             )
 
         from app.events.settings_state_bus import publish_settings_state_changed

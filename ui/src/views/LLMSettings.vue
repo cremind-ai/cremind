@@ -28,16 +28,18 @@ const settingsStore = useSettingsStore();
 const { rebuildModelList, allModels } = useLLMModels();
 
 const providers = ref<ProviderWithState[]>([]);
-// Main reasoning model (``high``), plus optional ``vision``, ``low``, and
-// ``plan`` models. ``plan`` is used during plan mode's planning phase.
-const modelGroups = ref<Record<string, string>>({ high: '', vision: '', low: '', plan: '' });
+// Main reasoning model (``high``), plus optional ``vision``, ``audio``, ``low``,
+// and ``plan`` models. ``plan`` is used during plan mode's planning phase.
+const modelGroups = ref<Record<string, string>>({ high: '', vision: '', audio: '', low: '', plan: '' });
 const reasoningEfforts = ref<Record<string, string | null>>({ high: null, low: null, plan: null });
 const highProvider = ref('');
 const visionProvider = ref('');
+const audioProvider = ref('');
 const lowProvider = ref('');
 const planProvider = ref('');
-// Specialized Vision Model feature toggle (opt-in; off by default).
+// Specialized Vision / Audio Model feature toggles (opt-in; off by default).
 const visionEnabled = ref(false);
+const audioEnabled = ref(false);
 const apiKeyProvider = ref('');
 const loading = ref(false);
 const saving = ref(false);
@@ -112,6 +114,7 @@ onMounted(async () => {
     modelGroups.value = {
       high: groupRes.model_groups.high || '',
       vision: groupRes.model_groups.vision || '',
+      audio: groupRes.model_groups.audio || '',
       low: groupRes.model_groups.low || '',
       plan: groupRes.model_groups.plan || '',
     };
@@ -119,9 +122,11 @@ onMounted(async () => {
     // Initialize per-section providers from stored model values
     highProvider.value = extractProvider(groupRes.model_groups.high) || groupRes.default_provider || '';
     visionProvider.value = extractProvider(groupRes.model_groups.vision || '') || '';
+    audioProvider.value = extractProvider(groupRes.model_groups.audio || '') || '';
     lowProvider.value = extractProvider(groupRes.model_groups.low || '') || '';
     planProvider.value = extractProvider(groupRes.model_groups.plan || '') || '';
     visionEnabled.value = groupRes.vision_enabled ?? false;
+    audioEnabled.value = groupRes.audio_enabled ?? false;
 
     rebuildModelList(providers.value);
     reasoningEfforts.value = groupRes.reasoning_efforts || { high: null };
@@ -326,6 +331,7 @@ async function saveModelGroups() {
       derivedDefaultProvider,
       reasoningEfforts.value,
       visionEnabled.value,
+      audioEnabled.value,
     );
     ElMessage.success('Model groups updated');
   } catch (e) {
@@ -490,6 +496,33 @@ function goBack() {
             model-placeholder="Select vision model (defaults to main)"
             v-model:provider="visionProvider"
             v-model:model="modelGroups.vision"
+          />
+        </div>
+
+        <!-- Specialized Audio Model (optional, opt-in) -->
+        <div class="section">
+          <div class="section-title-row">
+            <h2 class="section-title">Specialized Audio Model (Audio Understanding)</h2>
+            <ElSwitch v-model="audioEnabled" />
+          </div>
+          <p class="section-description">
+            When off (default), audio is understood by your main model if it supports audio input.
+            Turn this on to use a separate, dedicated audio model — useful when your main model
+            can't process audio. Only audio-capable models are listed (e.g. OpenAI GPT Audio, Google
+            Gemini, Mistral Voxtral, Qwen Omni); Anthropic models have no audio input. Leave the model
+            empty to fall back to the main model.
+          </p>
+
+          <ModelGroupFields
+            v-if="audioEnabled"
+            :providers="providers"
+            :all-models="allModels"
+            :use-audio="true"
+            :show-reasoning="false"
+            clearable
+            model-placeholder="Select audio model (defaults to main)"
+            v-model:provider="audioProvider"
+            v-model:model="modelGroups.audio"
           />
         </div>
 

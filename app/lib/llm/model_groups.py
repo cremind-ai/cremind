@@ -4,9 +4,10 @@ The agent reasons on a **single configured model** (the ``high`` group, stored
 under ``model_group.high``); ``create_llm_for_model`` is the canonical accessor.
 ``main`` is an alias for it.
 
-Three **optional** auxiliary groups fall back to the single model when unset:
+Four **optional** auxiliary groups fall back to the single model when unset:
 
 - ``vision`` — used only by the ``image_understanding`` tool.
+- ``audio`` — used only by the ``audio_understanding`` tool.
 - ``low`` — the low-performance / cheap model for lightweight auxiliary tasks
   (e.g. the skill-event matching gate and the ``documentation_search`` relevance
   judge). Generalized so future features needing a cheaper model can resolve it
@@ -58,13 +59,13 @@ class ModelGroupManager:
             except Exception:
                 pass
 
-        # The dedicated "vision", "low", and "plan" groups are optional: when the
-        # user hasn't picked one they transparently fall back to the "high" group,
-        # so the dependent feature works out of the box. ``vision`` on a non-vision
-        # model still surfaces a clear error at use time; ``low`` (the
-        # low-performance / cheap auxiliary model) and ``plan`` (the plan-mode
-        # planning model) just run on the main model.
-        if not group_value and group in ("vision", "low", "plan"):
+        # The dedicated "vision", "audio", "low", and "plan" groups are optional:
+        # when the user hasn't picked one they transparently fall back to the
+        # "high" group, so the dependent feature works out of the box.
+        # ``vision``/``audio`` on a model that can't see/hear still surface a clear
+        # error at use time; ``low`` (the low-performance / cheap auxiliary model)
+        # and ``plan`` (the plan-mode planning model) just run on the main model.
+        if not group_value and group in ("vision", "audio", "low", "plan"):
             return self.get_provider_and_model("high", profile=profile)
 
         if not group_value:
@@ -139,6 +140,15 @@ class ModelGroupManager:
             if vision_feature_enabled(profile):
                 return self.create_llm_for_group("vision", profile=profile)
             return self.create_llm_for_model(profile=profile)
+        # ``audio_understanding`` mirrors image_understanding: the Specialized
+        # Audio Model toggle decides which model runs it — the dedicated ``audio``
+        # model (feature ON, itself falling back to the single model) or the single
+        # configured model directly (feature OFF, bypassing a stale ``audio`` group).
+        if "audio_understanding" in name:
+            from app.config import audio_feature_enabled
+            if audio_feature_enabled(profile):
+                return self.create_llm_for_group("audio", profile=profile)
+            return self.create_llm_for_model(profile=profile)
         # The documentation_search relevance judge is a lightweight LLM-as-judge
         # (name+description only, structured tool-call output, no bodies/history) —
         # exactly the cheap auxiliary task the low-performance group exists for.
@@ -169,6 +179,29 @@ class ModelGroupManager:
         except Exception:  # noqa: BLE001 — unconfigured/missing model → treat as unavailable
             return False
         return model_supports_vision(provider, model, profile=profile)
+
+    def audio_understanding_available(self, profile: str | None = None) -> bool:
+        """Whether the ``audio_understanding`` tool should be exposed for ``profile``.
+
+        Mirrors :meth:`image_understanding_available`: audio understanding reaches
+        a model only through this tool, so the tool is available whenever the model
+        that *would* run it can accept audio.
+
+        - feature ON  → always (a dedicated audio model handles audio; a model that
+          can't hear surfaces a clean runtime error rather than silently missing).
+        - feature OFF → only when the main model itself supports audio input (it
+          runs audio understanding directly).
+
+        Hidden only when the feature is off *and* the main model is audio-less.
+        """
+        from app.config import audio_feature_enabled, model_supports_audio
+        if audio_feature_enabled(profile):
+            return True
+        try:
+            provider, model = self.get_provider_and_model("high", profile=profile)
+        except Exception:  # noqa: BLE001 — unconfigured/missing model → treat as unavailable
+            return False
+        return model_supports_audio(provider, model, profile=profile)
 
     def _get_group_reasoning_effort(self, group: str, profile: str | None = None) -> Optional[str]:
         """Look up the user's selected reasoning_effort for a model group from SQLite."""

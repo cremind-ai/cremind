@@ -1,5 +1,5 @@
 ---
-description: "Configure **LLM providers and models**: list and `configure` providers (add an API key), add your own **custom OpenAI-compatible providers** (name + base URL + model list) with `create-custom`, browse each provider's available models, assign the high / low / plan / default **model groups** the agent picks from (including a dedicated **plan model** used in plan mode's planning phase), and run the **GitHub Copilot** device-code login. Use this to add a provider (built-in or custom), choose which model the agent uses, or authenticate a provider — distinct from `cremind config` (agent behavior) and `cremind agents` (MCP/A2A servers)."
+description: "Configure **LLM providers and models**: list and `configure` providers (add an API key), add your own **custom OpenAI-compatible providers** (name + base URL + model list) with `create-custom`, browse each provider's available models, assign the high / low / plan / vision / audio / default **model groups** the agent picks from (including a dedicated **plan model** for plan mode, a **vision model** for image_understanding, and an **audio model** for audio_understanding, each with a feature toggle), and run the **GitHub Copilot** device-code login. Use this to add a provider (built-in or custom), choose which model the agent uses, enable the Specialized Vision/Audio Model, or authenticate a provider — distinct from `cremind config` (agent behavior) and `cremind agents` (MCP/A2A servers)."
 ---
 
 # `cremind llm` — LLM Providers, Model Groups, and Device-Code Auth
@@ -20,8 +20,11 @@ The group splits into three subcommand sets:
 - **`model-groups`** — read/write the `high` / `low` / `plan` model
   assignments and the default provider. The agent picks from these groups
   when it needs a heavyweight or lightweight model, or a dedicated model
-  for plan mode's planning phase. (`vision` is also assignable but is
-  managed from the web UI's Specialized Vision Model toggle.)
+  for plan mode's planning phase. (`vision` and `audio` are also
+  assignable — used by the `image_understanding` and `audio_understanding`
+  tools respectively — each with its own `--vision-enabled` / `--audio-enabled`
+  feature toggle, also managed from the web UI's Specialized Vision/Audio Model
+  toggles.)
 - **`device-code`** — start and poll the device-code OAuth flow.
   Currently used only for GitHub Copilot; the same machinery is
   reusable for any future device-code provider.
@@ -300,7 +303,9 @@ optional, but at least one must be supplied.
 **Syntax.**
 
 ```bash
-cremind llm model-groups set [--high <id>] [--low <id>] [--plan <id>] [--default-provider <name>]
+cremind llm model-groups set [--high <id>] [--low <id>] [--plan <id>] \
+  [--vision <id>] [--audio <id>] [--vision-enabled/--no-vision-enabled] \
+  [--audio-enabled/--no-audio-enabled] [--default-provider <name>]
 ```
 
 **Flags.**
@@ -310,6 +315,10 @@ cremind llm model-groups set [--high <id>] [--low <id>] [--plan <id>] [--default
 | `--high` / `--model`  | string | `""`    | Model id for the `high` group — the single model the agent reasons on.|
 | `--low`               | string | `""`    | Model id for the `low` group (used for the skill classifier, etc.).  |
 | `--plan`              | string | `""`    | Model id for the `plan` group — used in plan mode's planning phase (research, clarifying questions, writing the plan for approval, and after a cancel). Once a plan is accepted, execution switches back to the `high` model. Defaults to the `high` model when unset. |
+| `--vision`            | string | `""`    | Model id for the `vision` group — used by the `image_understanding` tool. Defaults to the `high` model when unset. |
+| `--audio`             | string | `""`    | Model id for the `audio` group — used by the `audio_understanding` tool. Defaults to the `high` model when unset. |
+| `--vision-enabled` / `--no-vision-enabled` | bool | unset | Enable/disable the Specialized Vision Model feature (exposes the `image_understanding` tool through the `vision` group). |
+| `--audio-enabled` / `--no-audio-enabled` | bool | unset | Enable/disable the Specialized Audio Model feature (exposes the `audio_understanding` tool through the `audio` group). |
 | `--default-provider`  | string | `""`    | Provider name to use when no explicit provider is requested.         |
 
 **Behavior.** Only the supplied fields are sent; omitted fields keep
@@ -327,6 +336,9 @@ $ cremind llm model-groups set --high anthropic/claude-haiku-4-5-20251001 --plan
 
 # Switch the default provider away from Anthropic in one call
 $ cremind llm model-groups set --default-provider openai --high openai/gpt-5
+
+# Turn on the Specialized Audio Model feature and point it at an audio-capable model
+$ cremind llm model-groups set --audio-enabled --audio openai/gpt-audio
 ```
 
 ### `cremind llm device-code start`
@@ -446,7 +458,7 @@ openai
 **`at least one of --api-key, --auth-method, or --json is required`** —
 `providers configure` rejects empty bodies. Pass at least one flag.
 
-**`at least one of --model, --vision, --plan, --vision-enabled, --default-provider is required`** —
+**`at least one of --model, --vision, --audio, --plan, --vision-enabled, --audio-enabled, --default-provider is required`** —
 Same idea for `model-groups set` (the `high` group is set via `--model`,
 also aliased `--high`). Use `model-groups get` first to see the current
 values.

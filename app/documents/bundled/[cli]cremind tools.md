@@ -87,6 +87,7 @@ get its full variable list, allowed values, defaults, and CLI recipes:
 | Web Search | `web_search` | *Web Search Tool* | provider (enum), safe-search (enum), Parallel API key |
 | Web Fetch | `web_fetch` | *Web Fetch Tool* | `WEB_FETCH_MAX_CHARS` |
 | Image Understanding | `image_understanding` | *Image Understanding Tool* | max image bytes / dimension |
+| Audio Understanding | `audio_understanding` | *Audio Understanding Tool* | max audio bytes |
 | Google Places | `google_places` | *Google Places Tool* | Maps API key; lat/long arguments |
 | AccuWeather Weather | `accuweather_weather` | *AccuWeather Weather Tool* | AccuWeather API key |
 | Documentation Search | `documentation_search` | *Documentation Search Tool* | `DEFAULT_TOP_K` |

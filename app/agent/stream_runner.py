@@ -70,8 +70,9 @@ def _append_attachments_note(
         "(Pass these paths to the tools EXACTLY as written above — they are "
         "absolute paths; do not shorten them, strip the home/drive prefix, or "
         "convert them to relative paths. Read or convert a file with the "
-        "system_file tools, or understand an image's visual content with the "
-        "image_understanding tool. If the user asks to keep or save a file, use "
+        "system_file tools, understand an image's visual content with the "
+        "image_understanding tool, or understand an audio clip's content with "
+        "the audio_understanding tool. If the user asks to keep or save a file, use "
         "the system_file move_file tool to move it into their working directory "
         "(or copy_file to keep a copy).)"
     )
