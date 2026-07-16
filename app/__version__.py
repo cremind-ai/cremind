@@ -15,5 +15,5 @@ next time Alembic introduces a migration that genuinely requires a minimum
 schema version, not before.
 """
 
-__version__ = "0.0.11"
+__version__ = "0.0.12"
 MIN_SUPPORTED_UPGRADE_FROM = "0.0.0"
