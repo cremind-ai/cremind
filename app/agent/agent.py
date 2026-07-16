@@ -55,17 +55,37 @@ class CremindAgent:
 
     # ── runners ─────────────────────────────────────────────────────────
 
-    def _ensure_runner(self, profile: str) -> LLMProvider:
-        """Create (or re-create) the LLM provider for ``profile`` from current config."""
+    def _ensure_setup(self, profile: str) -> ModelGroupManager:
+        """Lazily create the model-group manager and assert setup is complete.
+
+        Shared guard for both the main-model and plan-model resolution paths so
+        they surface the same "run the setup wizard first" error.
+        """
         if self._model_group_mgr is None:
             self._model_group_mgr = ModelGroupManager(get_dynamic_config_storage())
-
         if not self._model_group_mgr.config_storage.is_setup_complete():
             raise ValueError("LLM provider is not configured. Run the setup wizard first.")
+        return self._model_group_mgr
 
-        runner = self._model_group_mgr.create_llm_for_model(profile=profile)
+    def _ensure_runner(self, profile: str) -> LLMProvider:
+        """Create (or re-create) the LLM provider for ``profile`` from current config."""
+        mgr = self._ensure_setup(profile)
+        runner = mgr.create_llm_for_model(profile=profile)
         self._runners[profile] = runner
         return runner
+
+    def plan_llm(self, profile: str) -> LLMProvider:
+        """Return the profile's plan-mode LLM (the ``plan`` model group).
+
+        Used during plan mode's planning phase — research, clarifying questions,
+        writing the plan for approval, and after a cancel. Resolves the optional
+        ``plan`` group, transparently falling back to the single configured model
+        when the user hasn't picked a dedicated planning model. Deliberately does
+        *not* write ``self._runners`` so it can't leak into the main reasoning /
+        execution path (which uses :meth:`_ensure_runner`).
+        """
+        mgr = self._ensure_setup(profile)
+        return mgr.create_llm_for_group("plan", profile=profile)
 
     def auxiliary_llm(self, profile: str) -> LLMProvider:
         """Return the profile's LLM for auxiliary calls (compaction, etc.).
@@ -158,7 +178,17 @@ class CremindAgent:
             yield {"type": ChatCompletionTypeEnum.DONE, "data": msg}
             return
 
-        runner = self._ensure_runner(profile)
+        # Plan mode's planning phase runs on the dedicated Plan Model; once the
+        # user accepts the plan (plan_phase == "execute") we switch to the single
+        # configured model for the longer execution phase. A cancel keeps the run
+        # in the "planning" phase, so it correctly stays on the Plan Model. Every
+        # other mode (reasoning/instant, events) uses the single model as before.
+        # The Plan Model falls back to the single model when the user hasn't
+        # configured one, so this is a no-op for installs that don't use it.
+        if mode == "plan" and plan_phase != "execute":
+            runner = self.plan_llm(profile)
+        else:
+            runner = self._ensure_runner(profile)
         reasoning_agent = ReasoningAgent(
             llm=runner,
             registry=self.registry,
