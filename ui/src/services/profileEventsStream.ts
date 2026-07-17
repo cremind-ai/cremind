@@ -1,21 +1,25 @@
 /**
  * Multiplexed per-profile SSE subscriber.
  *
- * Combines notifications, conversations-list, and per-conversation
- * streaming events into one underlying SSE per authenticated profile.
- * Chrome's HTTP/1.1 6-per-host cap was being saturated by chat tabs'
- * long-lived streams (one per active conversation), stalling later
- * requests with "Provisional headers are shown" once multiple tabs
- * were open. Multiplexing collapses everything to a single shared
- * connection per origin via `createSharedStream`, regardless of how
- * many tabs or conversations are active.
+ * Combines notifications, conversations-list, per-conversation streaming
+ * events, and the settings-state / processes / embedding-state streams
+ * into one underlying SSE per authenticated profile. Chrome's HTTP/1.1
+ * 6-per-host cap was being saturated by these long-lived streams,
+ * stalling later requests with "Provisional headers are shown" once
+ * multiple tabs were open. Multiplexing collapses everything to a single
+ * shared connection per origin via `createSharedStream`, regardless of
+ * how many tabs, conversations, or feature pages are active.
  *
- * The embedding-state stream stays separate — it is intentionally
- * unauthenticated to support the pre-token setup wizard, while this
- * endpoint is auth-gated.
+ * The standalone endpoints still exist (the CLI consumes them, and the
+ * embedding one is intentionally unauthenticated so the pre-token setup
+ * wizard can subscribe before this auth-gated stream is reachable). The
+ * embeddingStatus store picks the multiplexed source when a token is
+ * present and falls back to the standalone stream otherwise.
  */
 
 import type { ConversationSummary } from './conversationApi';
+import type { EmbeddingStateSnapshot } from './embeddingStateStream';
+import type { ProcessRow } from './processApi';
 import type { EventNotificationEntry } from './skillEventsApi';
 import {
   createSharedStream,
@@ -36,6 +40,9 @@ export interface ConversationStreamEvent {
 type NotifCallback = (entry: EventNotificationEntry) => void;
 type ConvsCallback = (snap: ConversationsListSnapshot) => void;
 type ConvEventCallback = (event: ConversationStreamEvent) => void;
+type SettingsCallback = (e: { ts: number }) => void;
+type ProcessesCallback = (rows: ProcessRow[]) => void;
+type EmbeddingCallback = (snap: EmbeddingStateSnapshot) => void;
 
 interface NotifFrame { event: 'notification'; data: EventNotificationEntry; }
 interface ConvsFrame { event: 'conversations-list'; data: ConversationsListSnapshot; }
@@ -43,8 +50,18 @@ interface ConvEventFrame {
   event: 'conversation-event';
   data: { conversation_id: string; seq?: number; type: string; data: any };
 }
+interface SettingsStateFrame { event: 'settings-state'; data: Record<string, never>; }
+interface ProcessesFrame { event: 'processes'; data: { processes?: ProcessRow[] }; }
+interface EmbeddingFrame { event: 'embedding-state'; data: EmbeddingStateSnapshot; }
 interface ReadyFrame { event: 'ready'; data: Record<string, never>; }
-type ProfileEventsFrame = NotifFrame | ConvsFrame | ConvEventFrame | ReadyFrame;
+type ProfileEventsFrame =
+  | NotifFrame
+  | ConvsFrame
+  | ConvEventFrame
+  | SettingsStateFrame
+  | ProcessesFrame
+  | EmbeddingFrame
+  | ReadyFrame;
 
 /**
  * Per-conversation rolling buffer so a late `subscribeConversation`
@@ -67,7 +84,19 @@ interface Connection {
   notifSubs: Set<NotifCallback>;
   convsSubs: Set<ConvsCallback>;
   convSubs: Map<string, Set<ConvEventCallback>>;
+  settingsSubs: Set<SettingsCallback>;
+  processesSubs: Set<ProcessesCallback>;
+  embeddingSubs: Set<EmbeddingCallback>;
   lastSnapshot: ConversationsListSnapshot | null;
+  // Last folded-in snapshots, replayed to late subscribers so a component
+  // mounting after connect renders immediately instead of waiting for the
+  // next mutation. Mirror `lastSnapshot` for the conversations list.
+  lastProcesses: ProcessRow[] | null;
+  lastEmbedding: EmbeddingStateSnapshot | null;
+  // Whether at least one settings-state frame has been seen on this
+  // connection — gates the synthetic late-subscriber ping (see
+  // subscribeSettingsState).
+  settingsPinged: boolean;
   notifCursor: number;
   convBuffers: Map<string, ConversationStreamEvent[]>;
   // Conversations that produced at least one event since the last `ready`
@@ -151,6 +180,12 @@ function openProfileEventsRaw(
                 onEvent({ event: 'conversations-list', data: data as ConversationsListSnapshot });
               } else if (eventName === 'conversation-event') {
                 onEvent({ event: 'conversation-event', data });
+              } else if (eventName === 'settings-state') {
+                onEvent({ event: 'settings-state', data: {} });
+              } else if (eventName === 'processes') {
+                onEvent({ event: 'processes', data });
+              } else if (eventName === 'embedding-state') {
+                onEvent({ event: 'embedding-state', data: data as EmbeddingStateSnapshot });
               } else if (eventName === 'ready') {
                 onEvent({ event: 'ready', data: {} });
               }
@@ -227,6 +262,23 @@ function dispatchFrame(conn: Connection, frame: ProfileEventsFrame) {
         try { cb(event); } catch (e) { console.warn('[profileEventsStream] conv sub threw', e); }
       }
     }
+  } else if (frame.event === 'settings-state') {
+    conn.settingsPinged = true;
+    const payload = { ts: Date.now() };
+    for (const cb of conn.settingsSubs) {
+      try { cb(payload); } catch (e) { console.warn('[profileEventsStream] settings sub threw', e); }
+    }
+  } else if (frame.event === 'processes') {
+    const rows = frame.data.processes ?? [];
+    conn.lastProcesses = rows;
+    for (const cb of conn.processesSubs) {
+      try { cb(rows); } catch (e) { console.warn('[profileEventsStream] processes sub threw', e); }
+    }
+  } else if (frame.event === 'embedding-state') {
+    conn.lastEmbedding = frame.data;
+    for (const cb of conn.embeddingSubs) {
+      try { cb(frame.data); } catch (e) { console.warn('[profileEventsStream] embedding sub threw', e); }
+    }
   } else if (frame.event === 'ready') {
     // The replay phase of a (re)connect just ended. The backend replays the
     // full ring of every *active* conversation before emitting `ready`, so
@@ -268,7 +320,13 @@ function ensureConnection(
       notifSubs: new Set(),
       convsSubs: new Set(),
       convSubs: new Map(),
+      settingsSubs: new Set(),
+      processesSubs: new Set(),
+      embeddingSubs: new Set(),
       lastSnapshot: null,
+      lastProcesses: null,
+      lastEmbedding: null,
+      settingsPinged: false,
       notifCursor: sinceMs,
       convBuffers: new Map(),
       convSeenSinceReady: new Set(),
@@ -295,6 +353,9 @@ function maybeClose(key: string, conn: Connection) {
     conn.notifSubs.size > 0
     || conn.convsSubs.size > 0
     || conn.convSubs.size > 0
+    || conn.settingsSubs.size > 0
+    || conn.processesSubs.size > 0
+    || conn.embeddingSubs.size > 0
   ) return;
   if (conn.shared) conn.shared.close();
   connections.delete(key);
@@ -374,6 +435,81 @@ export function subscribeConversation(
       if (!set) return;
       set.delete(onEvent);
       if (set.size === 0) conn.convSubs.delete(conversationId);
+      maybeClose(key, conn);
+    },
+  };
+}
+
+export function subscribeSettingsState(
+  agentUrl: string,
+  authToken: string,
+  onChange: SettingsCallback,
+): ProfileEventsSubHandle {
+  // These folded-in subscribers don't consume notifications, but they may
+  // be the ones that open the shared connection (e.g. embedding-state is
+  // App-level and mounts on non-chat pages where no notification sub
+  // exists). Seed the notification cursor at "now" so opening the stream
+  // doesn't trigger a full notification-buffer replay the notifications
+  // subscriber never wanted (Sidebar itself opens with since=Date.now()).
+  const { conn, key } = ensureConnection(agentUrl, authToken, undefined, Date.now());
+  conn.settingsSubs.add(onChange);
+  // A late joiner gets one synthetic ping so it triggers its initial
+  // refetch even though the backend's connect-time ping already fired for
+  // an earlier subscriber. The FIRST subscriber does not get one here — it
+  // rides the backend's own connect-time ping (see dispatchFrame), so the
+  // `settingsPinged` gate prevents a double initial ping.
+  if (conn.settingsPinged) {
+    try { onChange({ ts: Date.now() }); } catch (e) {
+      console.warn('[profileEventsStream] settings late-ping threw', e);
+    }
+  }
+  return {
+    close() {
+      conn.settingsSubs.delete(onChange);
+      maybeClose(key, conn);
+    },
+  };
+}
+
+export function subscribeProcesses(
+  agentUrl: string,
+  authToken: string,
+  onSnapshot: ProcessesCallback,
+): ProfileEventsSubHandle {
+  // See subscribeSettingsState — seed the cursor at "now" so opening the
+  // shared connection here never replays the notification buffer.
+  const { conn, key } = ensureConnection(agentUrl, authToken, undefined, Date.now());
+  conn.processesSubs.add(onSnapshot);
+  if (conn.lastProcesses) {
+    try { onSnapshot(conn.lastProcesses); } catch (e) {
+      console.warn('[profileEventsStream] processes late-replay threw', e);
+    }
+  }
+  return {
+    close() {
+      conn.processesSubs.delete(onSnapshot);
+      maybeClose(key, conn);
+    },
+  };
+}
+
+export function subscribeEmbeddingState(
+  agentUrl: string,
+  authToken: string,
+  onState: EmbeddingCallback,
+): ProfileEventsSubHandle {
+  // See subscribeSettingsState — seed the cursor at "now" so opening the
+  // shared connection here never replays the notification buffer.
+  const { conn, key } = ensureConnection(agentUrl, authToken, undefined, Date.now());
+  conn.embeddingSubs.add(onState);
+  if (conn.lastEmbedding) {
+    try { onState(conn.lastEmbedding); } catch (e) {
+      console.warn('[profileEventsStream] embedding late-replay threw', e);
+    }
+  }
+  return {
+    close() {
+      conn.embeddingSubs.delete(onState);
       maybeClose(key, conn);
     },
   };

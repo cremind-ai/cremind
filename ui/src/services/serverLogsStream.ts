@@ -9,7 +9,14 @@
  * Mirrors {@link openProcessesStream}: EventSource cannot send
  * Authorization headers, so we use fetch + ReadableStream and parse SSE
  * frames manually. Reconnects with exponential backoff are transparent.
+ *
+ * Shared across browser tabs by `createSharedStream`, so multiple
+ * Developer-page tabs of the same origin hold only one connection — a
+ * raw per-tab stream would multiply against Chrome's HTTP/1.1
+ * 6-per-origin cap.
  */
+
+import { createSharedStream, type SharedStreamHandle, type SharedStreamRawHandle } from './sharedStream';
 
 export interface LogEntry {
   ts: string;
@@ -23,9 +30,7 @@ interface LogFrame {
   data?: LogEntry;
 }
 
-export interface ServerLogsStreamHandle {
-  close(): void;
-}
+export type ServerLogsStreamHandle = SharedStreamHandle;
 
 function resolveBaseUrl(agentUrl: string): string {
   if (agentUrl.startsWith('http://') || agentUrl.startsWith('https://')) {
@@ -34,13 +39,12 @@ function resolveBaseUrl(agentUrl: string): string {
   return `${window.location.origin}${agentUrl}`;
 }
 
-export function openServerLogsStream(
+function openServerLogsStreamRaw(
   agentUrl: string,
   authToken: string,
-  onLog: (entry: LogEntry) => void,
-  onReady?: () => void,
-  onError?: (err: unknown) => void,
-): ServerLogsStreamHandle {
+  onFrame: (frame: LogFrame) => void,
+  onError: (err: unknown) => void,
+): SharedStreamRawHandle {
   const controller = new AbortController();
   let closed = false;
   let attempt = 0;
@@ -92,12 +96,11 @@ export function openServerLogsStream(
             if (dataLines.length === 0) continue;
 
             try {
+              // Forward the whole frame (log AND ready) through the shared
+              // channel so the `ready` marker lands in the leader's ring
+              // buffer and reaches late-joining followers.
               const payload = JSON.parse(dataLines.join('\n')) as LogFrame;
-              if (payload.type === 'log' && payload.data) {
-                onLog(payload.data);
-              } else if (payload.type === 'ready') {
-                onReady?.();
-              }
+              onFrame(payload);
             } catch (err) {
               console.warn('[serverLogsStream] bad frame:', dataLines, err);
             }
@@ -106,7 +109,7 @@ export function openServerLogsStream(
         return;
       } catch (err: unknown) {
         if (closed || (err as { name?: string })?.name === 'AbortError') return;
-        onError?.(err);
+        onError(err);
         const wait = backoffs[Math.min(attempt, backoffs.length - 1)];
         attempt += 1;
         console.warn(`[serverLogsStream] reconnecting in ${wait}ms after error:`, err);
@@ -122,6 +125,57 @@ export function openServerLogsStream(
       if (closed) return;
       closed = true;
       controller.abort();
+    },
+  };
+}
+
+export function openServerLogsStream(
+  agentUrl: string,
+  authToken: string,
+  onLog: (entry: LogEntry) => void,
+  onReady?: () => void,
+  onError?: (err: unknown) => void,
+): ServerLogsStreamHandle {
+  // The backend emits exactly one `ready` after its ~500-record backfill.
+  // On a busy server that marker can scroll out of the leader's ring
+  // before a late follower joins, so it would never see one — fire a
+  // synthetic `ready` after a short grace period as a fallback. The
+  // Developer page only uses `ready` for a "streaming" flag + one
+  // scroll-to-bottom, so a synthesized marker is benign.
+  let readyFired = false;
+  let readyTimer: ReturnType<typeof setTimeout> | null = null;
+  const fireReady = () => {
+    if (readyFired) return;
+    readyFired = true;
+    if (readyTimer !== null) { clearTimeout(readyTimer); readyTimer = null; }
+    try { onReady?.(); } catch (e) { console.warn('[serverLogsStream] onReady threw', e); }
+  };
+  readyTimer = setTimeout(fireReady, 1500);
+
+  const handle = createSharedStream<LogFrame>({
+    // Namespace by token so an admin tab (leader) never broadcasts admin's
+    // logs to a different profile's follower. Mirrors processesStream.
+    key: `cremind:server-logs:${authToken || 'anon'}`,
+    // Strictly greater than the backend ring (_RING_CAP = 500) so a late
+    // follower's replay from the leader covers at least the backend
+    // backfill, `ready` marker included.
+    bufferSize: 600,
+    openRaw: (handleEvent, handleError) =>
+      openServerLogsStreamRaw(agentUrl, authToken, handleEvent, handleError),
+    onEvent: (frame) => {
+      if (frame.type === 'log' && frame.data) {
+        onLog(frame.data);
+      } else if (frame.type === 'ready') {
+        fireReady();
+      }
+    },
+    onError,
+  });
+
+  return {
+    close() {
+      if (readyTimer !== null) { clearTimeout(readyTimer); readyTimer = null; }
+      handle.close();
     },
   };
 }
