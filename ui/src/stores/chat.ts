@@ -468,7 +468,18 @@ export const useChatStore = defineStore('chat', {
       try {
         this.error = null;
         const client = await getA2AClient();
-        this.agentCard = await client.getAgentCard();
+        const card = await client.getAgentCard();
+        // If the session was torn down while this request was in flight — a
+        // 401 → logout clears the auth token (see services/sessionExpiry.ts) —
+        // do NOT mark the store connected. Leaving isConnected=true here
+        // strands the next login: App.vue's route-change reconnect is gated on
+        // !isConnected, so it would skip connect() and the conversation list
+        // would never reload until a full page refresh.
+        if (!useSettingsStore().authToken) {
+          this.isConnected = false;
+          return;
+        }
+        this.agentCard = card;
         this.agentName = this.agentCard.name || 'Agent';
         this.isConnected = true;
         console.log('✓ Connected to agent:', this.agentName);
