@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import EventRunStatusTag from '../EventRunStatusTag.vue';
+import TaskRuleMenu from './TaskRuleMenu.vue';
 import { useEventRunsStore } from '../../../stores/eventRuns';
 import { formatTokensCompact, formatUsd } from '../../../utils/usageFormat';
 import { formatDurationMs, formatRelative, runDuration } from '../../../utils/duration';
 import { accentColor, sourceKindIcon } from './boardTypes';
-import type { BoardSubscription } from './boardTypes';
+import type { BoardSubscription, RuleActionPayload } from './boardTypes';
 import type { EventRun } from '../../../services/eventRunsApi';
 
 const props = defineProps<{
@@ -16,9 +17,17 @@ const props = defineProps<{
   now: number;
   /** Show the clickable event chip (hidden when already filtered to one event). */
   showEventChip?: boolean;
+  listenerRunning?: boolean;
 }>();
 
-const emit = defineEmits<{ (e: 'filter-event', key: string): void }>();
+const emit = defineEmits<{
+  (e: 'filter-event', key: string): void;
+  (e: 'rule-action', payload: RuleActionPayload): void;
+}>();
+
+// Keep the hover action bar visible while the (teleported) rule menu is open —
+// moving the pointer onto the menu un-hovers the card.
+const menuOpen = ref(false);
 
 const store = useEventRunsStore();
 
@@ -125,7 +134,7 @@ async function confirmDelete() {
       <span class="rc-metric">{{ formatUsd(run.usage.total_usd) }}</span>
     </div>
 
-    <div class="rc-actions">
+    <div class="rc-actions" :class="{ pinned: menuOpen }">
       <button
         v-if="run.status === 'running'"
         type="button"
@@ -156,6 +165,13 @@ async function confirmDelete() {
       <button type="button" class="rc-act" title="Open run" @click.stop="open">
         <Icon icon="mdi:open-in-app" />
       </button>
+      <TaskRuleMenu
+        v-if="sub"
+        :sub="sub"
+        :listener-running="listenerRunning"
+        @select="(a) => emit('rule-action', { action: a, sub: sub! })"
+        @open-change="(v) => (menuOpen = v)"
+      />
     </div>
   </article>
 </template>
@@ -257,7 +273,8 @@ async function confirmDelete() {
   border-radius: 6px;
   box-shadow: var(--el-box-shadow-light);
 }
-.run-card:hover .rc-actions { display: flex; }
+.run-card:hover .rc-actions,
+.rc-actions.pinned { display: flex; }
 .rc-act {
   border: 1px solid var(--border-color);
   background: var(--bg-color);

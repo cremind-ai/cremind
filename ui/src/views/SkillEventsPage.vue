@@ -5,15 +5,11 @@ import { goBackToChat } from '../utils/backToChat';
 import {
   ElBadge,
   ElButton,
-  ElDialog,
   ElEmpty,
-  ElInput,
   ElMessage,
   ElMessageBox,
-  ElOption,
   ElRadioButton,
   ElRadioGroup,
-  ElSelect,
   ElTable,
   ElTableColumn,
   ElTag,
@@ -21,16 +17,11 @@ import {
 } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
-import { useChatStore } from '../stores/chat';
 import { useEventRunsStore } from '../stores/eventRuns';
 import {
   deleteSubscription,
-  getSkillEvents,
-  simulateEvent,
   startListener,
-  updateSubscription,
   type ListenerStatus,
-  type SkillEventDeclaration,
   type SkillEventSubscription,
 } from '../services/skillEventsApi';
 import {
@@ -43,13 +34,14 @@ import ScheduleEventsSection from '../components/ScheduleEventsSection.vue';
 import CollapsibleSection from '../components/CollapsibleSection.vue';
 import EventRunHistory from '../components/events/EventRunHistory.vue';
 import EventRunDetailDrawer from '../components/events/EventRunDetailDrawer.vue';
+import SkillEventEditDialog from '../components/events/SkillEventEditDialog.vue';
+import SkillEventSimulateDialog from '../components/events/SkillEventSimulateDialog.vue';
 import TasksBoard from '../components/events/tasks/TasksBoard.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
 const route = useRoute();
 const settings = useSettingsStore();
-const chatStore = useChatStore();
 const eventRuns = useEventRunsStore();
 
 const subscriptions = ref<SkillEventSubscription[]>([]);
@@ -57,28 +49,8 @@ const listenerByName = ref<Record<string, ListenerStatus>>({});
 const loading = ref(false);
 const errorMessage = ref('');
 
-const simulateOpen = ref(false);
-const simulateTarget = ref<SkillEventSubscription | null>(null);
-const simulateFilename = ref('');
-const simulateContent = ref('');
-
-// ── edit dialog ────────────────────────────────────────────────────────────
-const editOpen = ref(false);
-const editBusy = ref(false);
-const editTarget = ref<SkillEventSubscription | null>(null);
-const editEventType = ref('');
-const editAction = ref('');
-const editTriggerOptions = ref<SkillEventDeclaration[]>([]);
-
-// Always include the current trigger, even if the skill no longer declares it
-// or the discovery call fails, so the dropdown never loses the saved value.
-const editTriggerNames = computed(() => {
-  const names = editTriggerOptions.value.map(e => e.name).filter(Boolean);
-  if (editEventType.value && !names.includes(editEventType.value)) {
-    names.unshift(editEventType.value);
-  }
-  return names;
-});
+const skillEditDialog = ref<InstanceType<typeof SkillEventEditDialog> | null>(null);
+const skillSimulateDialog = ref<InstanceType<typeof SkillEventSimulateDialog> | null>(null);
 
 const sortedSubs = computed(() =>
   [...subscriptions.value].sort((a, b) => b.created_at - a.created_at),
@@ -194,76 +166,11 @@ async function confirmDelete(row: SkillEventSubscription) {
 }
 
 function openSimulate(row: SkillEventSubscription) {
-  simulateTarget.value = row;
-  simulateFilename.value = '';
-  simulateContent.value = '';
-  simulateOpen.value = true;
+  skillSimulateDialog.value?.open(row);
 }
 
-async function openEditSkill(row: SkillEventSubscription) {
-  editTarget.value = row;
-  editEventType.value = row.event_type;
-  editAction.value = row.action;
-  editTriggerOptions.value = [{ name: row.event_type }];
-  editOpen.value = true;
-  try {
-    const info = await getSkillEvents(settings.agentUrl, settings.authToken, row.skill_name);
-    if (info.events && info.events.length) editTriggerOptions.value = info.events;
-  } catch {
-    // Discovery failed — keep the current trigger as the only option.
-  }
-}
-
-async function submitEditSkill() {
-  if (!editTarget.value) return;
-  if (!editEventType.value.trim()) { ElMessage.warning('Trigger is required'); return; }
-  if (!editAction.value.trim()) { ElMessage.warning('Action is required'); return; }
-  editBusy.value = true;
-  try {
-    await updateSubscription(settings.agentUrl, settings.authToken, editTarget.value.id, {
-      event_type: editEventType.value,
-      action: editAction.value.trim(),
-    });
-    ElMessage.success('Subscription updated');
-    editOpen.value = false;
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : String(err));
-  } finally {
-    editBusy.value = false;
-  }
-}
-
-async function fireSimulate() {
-  if (!simulateTarget.value) return;
-  if (!simulateContent.value.trim()) {
-    ElMessage.warning('Content is required.');
-    return;
-  }
-  // Open an SSE subscription to the target conversation BEFORE we fire
-  // so the agent run streams into its bucket in real time even though we
-  // are not currently viewing the conversation. The 'streaming' tracker
-  // is auto-removed by the chat store when the run emits 'complete' or
-  // 'error', so we don't have to clean up here.
-  const targetCid = simulateTarget.value.conversation_id;
-  if (targetCid) {
-    chatStore.trackConversation(targetCid, 'streaming');
-  }
-  try {
-    const result = await simulateEvent(
-      settings.agentUrl,
-      settings.authToken,
-      simulateTarget.value.id,
-      simulateContent.value,
-      simulateFilename.value,
-    );
-    ElMessage.success(`Event fired — wrote ${result.path}`);
-    simulateOpen.value = false;
-  } catch (err) {
-    if (targetCid) {
-      chatStore.untrackConversation(targetCid, 'streaming');
-    }
-    ElMessage.error(err instanceof Error ? err.message : String(err));
-  }
+function openEditSkill(row: SkillEventSubscription) {
+  skillEditDialog.value?.open(row);
 }
 
 async function startListenerFor(skillName: string) {
@@ -399,63 +306,10 @@ function onViewChange(mode: string | number | boolean | undefined) {
       </ElTableColumn>
     </ElTable>
 
-    <ElDialog v-model="editOpen" title="Edit skill event" width="560px">
-      <p class="dialog-info" v-if="editTarget">
-        Editing the subscription for <strong>{{ editTarget.skill_name }}</strong>.
-      </p>
-      <div class="sim-field">
-        <label class="sim-label">Trigger</label>
-        <ElSelect v-model="editEventType" placeholder="Select a trigger" style="width:100%">
-          <ElOption v-for="name in editTriggerNames" :key="name" :label="name" :value="name" />
-        </ElSelect>
-      </div>
-      <div class="sim-field">
-        <label class="sim-label">Action</label>
-        <ElInput
-          v-model="editAction"
-          type="textarea"
-          :rows="6"
-          placeholder="Natural-language instruction the assistant runs when the event fires."
-        />
-      </div>
-      <template #footer>
-        <ElButton @click="editOpen = false">Cancel</ElButton>
-        <ElButton type="primary" :loading="editBusy" @click="submitEditSkill">Save</ElButton>
-      </template>
-    </ElDialog>
+    <SkillEventEditDialog ref="skillEditDialog" />
     </CollapsibleSection>
 
-    <ElDialog v-model="simulateOpen" title="Simulate event" width="640px">
-      <p class="dialog-info" v-if="simulateTarget">
-        Fires <strong>{{ simulateTarget.event_type }}</strong> for
-        <strong>{{ simulateTarget.skill_name }}</strong>.
-        The file is written into the watched events folder; the watchdog picks
-        it up just like a real event and deletes it after dispatch.
-      </p>
-      <div class="sim-field">
-        <label class="sim-label">File name</label>
-        <ElInput
-          v-model="simulateFilename"
-          placeholder="optional — e.g. my-test.md (auto-named if blank)"
-        />
-        <p class="sim-hint">
-          Path components are stripped. <code>.md</code> is appended if missing.
-        </p>
-      </div>
-      <div class="sim-field">
-        <label class="sim-label">File content</label>
-        <ElInput
-          v-model="simulateContent"
-          type="textarea"
-          :rows="14"
-          placeholder="The exact bytes that will be written to the .md file. Format depends on the skill — e.g. an imap-email event uses YAML frontmatter + markdown body."
-        />
-      </div>
-      <template #footer>
-        <ElButton @click="simulateOpen = false">Cancel</ElButton>
-        <ElButton type="primary" @click="fireSimulate">Fire</ElButton>
-      </template>
-    </ElDialog>
+    <SkillEventSimulateDialog ref="skillSimulateDialog" />
 
     <FileWatcherSection :profile="profile" />
 
@@ -576,35 +430,4 @@ function onViewChange(mode: string | number | boolean | undefined) {
   font-size: 0.8125rem;
 }
 
-.dialog-info {
-  margin: 0 0 12px 0;
-  color: var(--text-secondary);
-  font-size: 0.875rem;
-  line-height: 1.5;
-}
-
-.sim-field {
-  margin-bottom: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.sim-label {
-  font-size: 0.8125rem;
-  color: var(--text-secondary);
-  font-weight: 500;
-}
-
-.sim-hint {
-  margin: 0;
-  font-size: 0.75rem;
-  color: var(--text-tertiary);
-}
-
-.sim-hint code {
-  background: var(--surface-color);
-  padding: 1px 4px;
-  border-radius: 3px;
-}
 </style>
