@@ -10,6 +10,7 @@ import App from './App.vue'
 import router from './router'
 import { useSettingsStore } from './stores/settings'
 import { installExternalLinkInterceptor } from './utils/externalLinks'
+import { handleUnauthorized, shouldHandle401 } from './services/sessionExpiry'
 
 document.title = __IS_ELECTRON__ ? 'Cremind App' : 'Cremind Web UI'
 
@@ -90,8 +91,37 @@ async function maybePivotToBackend(): Promise<boolean> {
   return true
 }
 
+// Global 401 handler. Any backend API/SSE/A2A call that comes back 401 (an
+// expired or invalidated token mid-session) ejects the user to the profile
+// selector with a ``?redirect=`` back to where they were. Wrapping
+// ``window.fetch`` is the single chokepoint that covers every service module,
+// the fetch-based SSE readers, and the A2A transport at once — there is no
+// central HTTP client. Installed after ``maybePivotToBackend``'s unauthenticated
+// boot probes (``/health``, ``/electron-renderer``) and before mount, so it
+// deterministically wraps mount-time SSE opens and the lazily-built A2A fetch
+// factory without touching those probes.
+function installUnauthorizedInterceptor() {
+  if (typeof window === 'undefined' || !window.fetch) return
+  const orig = window.fetch.bind(window)
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const res = await orig(input, init)
+    if (res.status === 401) {
+      try {
+        const raw = input instanceof Request ? input.url : String(input)
+        const url = new URL(raw, window.location.href)
+        if (shouldHandle401(url)) handleUnauthorized()
+      } catch {
+        // URL parsing or the handler must never break the underlying fetch.
+      }
+    }
+    return res
+  }
+}
+
 async function boot() {
   if (await maybePivotToBackend()) return  // navigation in flight; do not mount.
+
+  installUnauthorizedInterceptor()
 
   const app = createApp(App)
   const pinia = createPinia()

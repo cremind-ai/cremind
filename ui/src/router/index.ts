@@ -295,7 +295,7 @@ router.beforeEach((to) => {
 // want to see after an upgrade.
 const JUST_UPDATED_GRACE_MS = 30000;
 
-function withinJustUpdatedGrace(): boolean {
+export function withinJustUpdatedGrace(): boolean {
   try {
     const raw = sessionStorage.getItem('cremind:just_updated');
     if (!raw) return false;
@@ -321,7 +321,9 @@ router.beforeEach((to) => {
     if (withinJustUpdatedGrace()) {
       return true;
     }
-    return { path: `/login/${profile}`, replace: true };
+    // Capture where the user was headed so LoginPage can return them there
+    // after they authenticate (mirrors the global 401 → ``/?redirect=`` flow).
+    return { path: `/login/${profile}`, query: { redirect: to.fullPath }, replace: true };
   }
   settingsStore.activateProfile(profile);
   return true;
