@@ -13,6 +13,7 @@ import { Icon } from '@iconify/vue';
 import { useEventRunsStore } from '../../stores/eventRuns';
 import EventRunStatusTag from './EventRunStatusTag.vue';
 import { formatTimestamp, formatTokensCompact, formatUsd } from '../../utils/usageFormat';
+import { runDuration } from '../../utils/duration';
 import type { EventRun, EventRunSourceKind } from '../../services/eventRunsApi';
 
 const props = defineProps<{
@@ -28,16 +29,6 @@ const loadingMore = computed(() => store.isLoadingMore(props.sourceKind, props.s
 
 function open(run: EventRun) {
   store.openRun(run.id);
-}
-
-function duration(run: EventRun): string {
-  if (!run.finished_at || !run.created_at) return '';
-  const ms = run.finished_at - run.created_at;
-  if (ms < 1000) return '<1s';
-  const s = Math.round(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  return `${m}m ${s % 60}s`;
 }
 
 async function confirmDelete(run: EventRun) {
@@ -103,7 +94,7 @@ function loadOlder() {
           <template #default="{ row }">{{ formatUsd(row.usage.total_usd) }}</template>
         </ElTableColumn>
         <ElTableColumn label="Duration" width="90" align="right">
-          <template #default="{ row }">{{ duration(row as EventRun) }}</template>
+          <template #default="{ row }">{{ runDuration(row as EventRun) }}</template>
         </ElTableColumn>
         <ElTableColumn label="" width="120" align="right">
           <template #default="{ row }">

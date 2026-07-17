@@ -22,7 +22,7 @@ import time
 import uuid
 from typing import Any, Optional
 
-from sqlalchemy import case, delete, func, select, update
+from sqlalchemy import and_, case, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from app.databases import DatabaseProvider, get_database_provider
@@ -226,13 +226,47 @@ class EventRunStorage:
                 .where(EventRunModel.profile == profile)
                 .group_by(EventRunModel.source_kind, EventRunModel.subscription_id)
             )).all()
+
+            # Status of the most-recent run per rule. Done as a max-then-join
+            # rather than a window function so it runs on both SQLite and
+            # PostgreSQL; a created_at tie just resolves to either row, which is
+            # harmless for a "last outcome" hint.
+            latest = (
+                select(
+                    EventRunModel.source_kind.label("sk"),
+                    EventRunModel.subscription_id.label("sub_id"),
+                    func.max(EventRunModel.created_at).label("m"),
+                )
+                .where(EventRunModel.profile == profile)
+                .group_by(EventRunModel.source_kind, EventRunModel.subscription_id)
+                .subquery()
+            )
+            status_rows = (await session.execute(
+                select(
+                    EventRunModel.source_kind,
+                    EventRunModel.subscription_id,
+                    EventRunModel.status,
+                ).join(
+                    latest,
+                    and_(
+                        EventRunModel.source_kind == latest.c.sk,
+                        EventRunModel.subscription_id == latest.c.sub_id,
+                        EventRunModel.created_at == latest.c.m,
+                    ),
+                )
+            )).all()
+        last_status_by_key = {
+            f"{sk}:{sub_id}": status for sk, sub_id, status in status_rows
+        }
         out: dict[str, dict[str, Any]] = {}
         for sk, sub_id, count, running, pending, last_at in rows:
-            out[f"{sk}:{sub_id}"] = {
+            key = f"{sk}:{sub_id}"
+            out[key] = {
                 "run_count": int(count or 0),
                 "active_count": int(running or 0),
                 "pending_count": int(pending or 0),
                 "last_run_at": float(last_at) if last_at is not None else None,
+                "last_status": last_status_by_key.get(key),
             }
         return out
 

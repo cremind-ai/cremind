@@ -17,6 +17,7 @@ import {
   listEventRuns,
   getEventRun,
   deleteEventRun,
+  cancelEventRun,
   type EventRun,
   type EventRunSourceKind,
 } from '../services/eventRunsApi';
@@ -53,6 +54,21 @@ export const useEventRunsStore = defineStore('eventRuns', {
   getters: {
     activeRun(state): EventRun | null {
       return state.activeRunId ? state.runsById[state.activeRunId] ?? null : null;
+    },
+
+    /**
+     * Runs in the most-recent admin snapshot, server order (newest first).
+     * The Tasks board reads ONLY this — never all of `runsById`, which retains
+     * runs the server has since pruned (it is never told about deletions) and
+     * would grow an unbounded ghost set.
+     */
+    snapshotRuns(state): EventRun[] {
+      const out: EventRun[] = [];
+      for (const id of state.snapshotIds) {
+        const r = state.runsById[id];
+        if (r) out.push(r);
+      }
+      return out;
     },
 
     /** All known runs for a subscription (snapshot + older pages), newest first. */
@@ -136,6 +152,15 @@ export const useEventRunsStore = defineStore('eventRuns', {
 
     openRun(id: string) {
       this.activeRunId = id;
+    },
+
+    /**
+     * Request cancellation of a running run. The status flip arrives via the
+     * next admin snapshot, so we don't optimistically mutate here.
+     */
+    async cancelRun(id: string): Promise<void> {
+      const settings = useSettingsStore();
+      await cancelEventRun(settings.agentUrl, settings.authToken, id);
     },
 
     /** Open a run by id, fetching it if not already in the store (deep links). */

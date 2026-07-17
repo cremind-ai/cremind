@@ -87,11 +87,16 @@ def test_subscription_summaries(tmp_path: Path, monkeypatch) -> None:
 
     async def run():
         await _make_run(cs, ers, us, "subA", status="completed")
+        # Sleep so the pending run's created_at is strictly later — it is the
+        # "most recent" run whose status last_status must report.
+        await asyncio.sleep(0.01)
         await _make_run(cs, ers, us, "subA", status="pending")
         summaries = await ers.subscription_summaries("p1")
         s = summaries["schedule:subA"]
         assert s["run_count"] == 2
         assert s["pending_count"] == 1
         assert s["active_count"] == 0
+        assert s["last_run_at"] is not None
+        assert s["last_status"] == "pending"
 
     asyncio.run(run())
