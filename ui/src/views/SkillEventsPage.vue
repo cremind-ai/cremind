@@ -11,6 +11,8 @@ import {
   ElMessage,
   ElMessageBox,
   ElOption,
+  ElRadioButton,
+  ElRadioGroup,
   ElSelect,
   ElTable,
   ElTableColumn,
@@ -41,6 +43,7 @@ import ScheduleEventsSection from '../components/ScheduleEventsSection.vue';
 import CollapsibleSection from '../components/CollapsibleSection.vue';
 import EventRunHistory from '../components/events/EventRunHistory.vue';
 import EventRunDetailDrawer from '../components/events/EventRunDetailDrawer.vue';
+import TasksBoard from '../components/events/tasks/TasksBoard.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -283,8 +286,14 @@ function listenerLabel(skillName: string): { running: boolean; text: string } {
   return { running: false, text: 'never started' };
 }
 
-function formatDate(ms: number): string {
-  return new Date(ms * 1000).toLocaleString();
+// NB: skill-event subscription `created_at` is epoch SECONDS (unlike EventRun
+// timestamps, which are ms), hence the ×1000. Param name kept for the callers.
+function formatDate(seconds: number): string {
+  return new Date(seconds * 1000).toLocaleString();
+}
+
+function onViewChange(mode: string | number | boolean | undefined) {
+  settings.setEventsViewMode(mode === 'tasks' ? 'tasks' : 'events');
 }
 </script>
 
@@ -295,10 +304,25 @@ function formatDate(ms: number): string {
         <Icon icon="mdi:arrow-left" />
       </button>
       <h2>Events</h2>
+      <ElRadioGroup
+        :model-value="settings.eventsViewMode"
+        size="small"
+        @change="(v: any) => onViewChange(v)"
+      >
+        <ElRadioButton value="events">
+          <Icon icon="mdi:table" /> Events
+        </ElRadioButton>
+        <ElRadioButton value="tasks">
+          <Icon icon="mdi:view-column-outline" /> Tasks
+        </ElRadioButton>
+      </ElRadioGroup>
     </header>
 
     <p v-if="errorMessage" class="error-banner">{{ errorMessage }}</p>
 
+    <TasksBoard v-if="settings.eventsViewMode === 'tasks'" :profile="profile" />
+
+    <template v-else>
     <CollapsibleSection title="Skill Events" icon="mdi:lightning-bolt-outline" :count="sortedSubs.length">
     <p class="page-blurb">
       Each subscription re-runs its conversation with the saved <em>action</em> whenever a new
@@ -436,8 +460,9 @@ function formatDate(ms: number): string {
     <FileWatcherSection :profile="profile" />
 
     <ScheduleEventsSection :profile="profile" />
+    </template>
 
-    <!-- Run-detail drawer (hosted once; opened from any section's child table). -->
+    <!-- Run-detail drawer (hosted once; opened from any section or the board). -->
     <EventRunDetailDrawer />
   </div>
 </template>

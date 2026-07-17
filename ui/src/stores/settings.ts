@@ -72,6 +72,13 @@ export const useSettingsStore = defineStore('settings', () => {
   // Default true unless explicitly turned off.
   const usageChipHover = ref(localStorage.getItem('usage_chip_hover') !== 'false');
 
+  // Events page view: the classic tables ('events') vs. the Tasks Kanban board
+  // ('tasks'). Presentation-only, so global (not per-profile) like the sidebar
+  // state. Validated on read so a stray key can never blank the page.
+  const eventsViewMode = ref<'events' | 'tasks'>(
+    localStorage.getItem('events_view_mode') === 'tasks' ? 'tasks' : 'events',
+  );
+
   // Active profile ID (the currently-used profile for this tab session)
   const profileId = ref(localStorage.getItem('profile_id') || '');
 
@@ -193,6 +200,11 @@ export const useSettingsStore = defineStore('settings', () => {
     localStorage.setItem('usage_chip_hover', String(value));
   }
 
+  function setEventsViewMode(mode: 'events' | 'tasks') {
+    eventsViewMode.value = mode;
+    localStorage.setItem('events_view_mode', mode);
+  }
+
   function setProfileId(id: string) {
     profileId.value = id;
   }
@@ -226,6 +238,7 @@ export const useSettingsStore = defineStore('settings', () => {
     theme,
     sidebarCollapsed,
     usageChipHover,
+    eventsViewMode,
     profileId,
     authToken,
     workingDir,
@@ -234,6 +247,7 @@ export const useSettingsStore = defineStore('settings', () => {
     setTheme,
     setSidebarCollapsed,
     setUsageChipHover,
+    setEventsViewMode,
     setProfileId,
     setAuthToken,
     // Per-profile token management

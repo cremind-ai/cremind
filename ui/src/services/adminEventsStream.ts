@@ -15,15 +15,26 @@
  * tabs `createSharedStream` collapses it to a single connection per origin.
  */
 
+import { ref } from 'vue';
 import type { FileWatcherSubscription } from './fileWatchersApi';
 import type { ListenerStatus, SkillEventSubscription } from './skillEventsApi';
 import type { ScheduleEventSubscription } from './calendarApi';
-import type { EventRun } from './eventRunsApi';
+import type { EventRun, EventRunStatus } from './eventRunsApi';
 import {
   createSharedStream,
   type SharedStreamHandle,
   type SharedStreamRawHandle,
 } from './sharedStream';
+
+/**
+ * Live connection state of the shared admin SSE, so views can warn when their
+ * data may be stale. Tracked by the leader tab's raw loop (§ openAdminEventsRaw);
+ * follower tabs stay `idle` (they receive frames over BroadcastChannel and have
+ * no raw loop of their own). `idle` before the first connect and after close —
+ * neither warrants a "stale" banner, only `reconnecting` does.
+ */
+export type AdminStreamStatus = 'idle' | 'connected' | 'reconnecting';
+export const adminEventsStatus = ref<AdminStreamStatus>('idle');
 
 export interface SkillEventsAdminSnapshot {
   subscriptions: SkillEventSubscription[];
@@ -44,6 +55,9 @@ export interface EventRunSubscriptionSummary {
   active_count: number;
   pending_count: number;
   last_run_at: number | null;
+  // Status of the most-recent run of this rule (whole-table, survives snapshot
+  // aging). Optional so an older server that doesn't send it degrades cleanly.
+  last_status?: EventRunStatus | null;
 }
 
 export interface EventRunsAdminSnapshot {
@@ -116,6 +130,7 @@ function openAdminEventsRaw(
           throw new Error(`SSE failed: ${res.status} ${res.statusText}`);
         }
         attempt = 0;
+        adminEventsStatus.value = 'connected';
 
         const reader = res.body.getReader();
         const decoder = new TextDecoder('utf-8');
@@ -172,6 +187,7 @@ function openAdminEventsRaw(
         return;
       } catch (err: any) {
         if (closed || err?.name === 'AbortError') return;
+        adminEventsStatus.value = 'reconnecting';
         const wait = backoffs[Math.min(attempt, backoffs.length - 1)];
         attempt += 1;
         console.warn(`[adminEventsStream] reconnecting in ${wait}ms after error:`, err);
@@ -187,6 +203,7 @@ function openAdminEventsRaw(
       if (closed) return;
       closed = true;
       controller.abort();
+      adminEventsStatus.value = 'idle';
     },
   };
 }
