@@ -1,17 +1,19 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
-import { useRouter } from 'vue-router';
+import { useRouter, useRoute } from 'vue-router';
 import { ElInput, ElButton, ElAlert } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { checkSetupStatus, resetOrphanedSetup } from '../services/configApi';
 import { fetchMe } from '../services/agentApi';
+import { safeRedirectTarget } from '../utils/loginRedirect';
 
 const props = defineProps<{
   profile: string;
 }>();
 
 const router = useRouter();
+const route = useRoute();
 const settingsStore = useSettingsStore();
 
 const token = ref('');
@@ -53,10 +55,12 @@ async function handleLogin() {
       error.value = `This token belongs to profile '${me.profile}', not '${props.profile}'`;
       return;
     }
-    // Save token per-profile, activate, and navigate to chat
+    // Save token per-profile, activate, and navigate. Return the user to the
+    // page they were ejected from (``?redirect=``, validated to this profile),
+    // falling back to chat.
     settingsStore.setTokenForProfile(props.profile, token.value.trim());
     settingsStore.activateProfile(props.profile);
-    router.push(`/${props.profile}`);
+    router.push(safeRedirectTarget(route.query.redirect, props.profile) ?? `/${props.profile}`);
   } catch (e) {
     error.value = 'Invalid or expired token';
   } finally {

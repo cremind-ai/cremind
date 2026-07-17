@@ -6,6 +6,7 @@ import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { checkSetupStatus, listPublicProfileNames, resetOrphanedSetup } from '../services/configApi';
 import { fetchMe } from '../services/agentApi';
+import { safeRedirectTarget } from '../utils/loginRedirect';
 
 // During a backend restart (typical immediately post-upgrade) the
 // /api/config/setup-status endpoint can briefly return
@@ -30,6 +31,10 @@ const settingsStore = useSettingsStore();
 // the router falls through to this selector; once the user picks one
 // we honor the hint instead of dumping them on chat.
 function destinationFor(profile: string): string {
+  // A global 401 (expired token) redirects here as ``/?redirect=<prev page>``.
+  // Honor it — validated to the same profile — before the window hint below.
+  const redirect = safeRedirectTarget(route.query.redirect, profile);
+  if (redirect) return redirect;
   const hint = route.query.cremind_window;
   if (hint === 'settings') return `/${profile}/settings`;
   if (hint === 'processes') return `/${profile}/processes`;
