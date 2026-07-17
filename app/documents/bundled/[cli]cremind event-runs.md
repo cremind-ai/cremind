@@ -22,8 +22,8 @@ A run moves through these statuses:
 | Status      | Meaning                                                              |
 |-------------|---------------------------------------------------------------------|
 | `running`   | The agent is actively working the trigger.                          |
-| `pending`   | The run paused to ask **you** a question — reply to resume it.       |
-| `completed` | The run finished on its own.                                         |
+| `pending`   | The run paused to ask **you** a question, **or ended with an unfinished task list** — reply to resume/continue it. |
+| `completed` | The run finished with every task in its todo list completed (a run that drove no todo list completes when its turn ends). |
 | `failed`    | The run errored out (see the `error` field via `show`).             |
 | `cancelled` | The run was cancelled (e.g. deleted while running).                 |
 

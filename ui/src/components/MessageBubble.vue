@@ -13,6 +13,7 @@ import { useTerminalPanelStore } from '../stores/terminalPanel';
 import { getProcess } from '../services/processApi';
 import { ElMessage } from 'element-plus';
 import MessageUsageChip from './MessageUsageChip.vue';
+import TodoChip from './plan/TodoChip.vue';
 
 const props = defineProps<{
   message: ChatMessage;
@@ -285,6 +286,12 @@ const hasCarouselContent = computed(
   () => fileAttachments.value.length > 0 || terminalAttachments.value.length > 0,
 );
 
+// The per-turn plan/todo chip lives in the carousel (always first). Shown on a
+// completed agent turn that drove a todo list.
+const showTodoChip = computed(
+  () => !isUser.value && !props.message.isStreaming && !!props.message.planTodos?.length,
+);
+
 const terminalPanel = useTerminalPanelStore();
 // A surrounding surface (e.g. the event-run drawer) can provide its own
 // terminal-open handler; otherwise fall back to the global Workspace panel.
@@ -544,8 +551,14 @@ const handleThinkingClick = (event: MouseEvent) => {
         </div>
 
       <!-- File attachments carousel (bottom of bubble) -->
-      <div v-if="hasCarouselContent" class="file-carousel-section">
+      <div v-if="hasCarouselContent || showTodoChip" class="file-carousel-section">
         <div class="file-carousel">
+          <!-- Plan/todo snapshot chip: always first, ahead of file/terminal chips. -->
+          <TodoChip
+            v-if="showTodoChip"
+            :message="message"
+            :conversation-id="conversationId"
+          />
           <div
             v-for="term in terminalAttachments"
             :key="`term-${term.processId}`"
@@ -1284,6 +1297,7 @@ const handleThinkingClick = (event: MouseEvent) => {
 
 .file-carousel {
   display: flex;
+  align-items: center;
   gap: 8px;
   overflow-x: auto;
   padding-bottom: 4px;

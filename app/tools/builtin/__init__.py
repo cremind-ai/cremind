@@ -504,7 +504,29 @@ async def register_builtin_tools(
         # ``default`` sets the wizard/runtime default enabled state (default
         # True; declare False to start the tool disabled) — see ToolConfig.default.
         group.default_enabled = bool(tool_info.get("default", True))
-        registry.register_builtin(group, source=module_name)
+        # Isolate per-module registration failures. Previously an exception here
+        # (e.g. a DB UNIQUE-constraint trip from a mangled tool_id) propagated
+        # out of this loop and was swallowed by the caller's single try/except,
+        # silently aborting registration for every module that comes AFTER the
+        # failing one in ``_BUILTIN_MODULE_NAMES`` — that took out the plan-mode
+        # tools (ask_user_question / write_plan / update_todos) sitting behind
+        # request_user_input. Contain it: log, substitute a stub, and continue.
+        try:
+            registry.register_builtin(group, source=module_name)
+        except Exception as e:  # noqa: BLE001
+            logger.exception(f"Failed to register built-in '{module_name}': {e}")
+            try:
+                _register_stub_group(
+                    registry,
+                    module_name=module_name,
+                    server_name=server_name,
+                    payload=_StubErrorPayload(kind="RegistrationError", detail=str(e)),
+                )
+            except Exception:  # noqa: BLE001 — never let cleanup abort the loop
+                logger.exception(
+                    f"Also failed to register stub for built-in '{module_name}'"
+                )
+            continue
 
     # Prune persisted rows for built-in modules that no longer ship (e.g. a
     # renamed/removed module or a discarded prototype) — register_builtin is

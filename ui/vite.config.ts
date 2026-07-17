@@ -38,6 +38,7 @@ export default defineConfig(({ mode, command }) => {
     define: {
       __IS_ELECTRON__: true,
       __APP_VERSION__: JSON.stringify(pkg.version),
+      __BUILT_AT__: JSON.stringify(new Date().toISOString()),
       __CREMIND_INSTALL_CHANNEL__: JSON.stringify(installChannel),
     },
     server: {

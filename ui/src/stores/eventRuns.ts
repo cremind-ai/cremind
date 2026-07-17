@@ -12,6 +12,7 @@ import { useSettingsStore } from './settings';
 import { useChatStore } from './chat';
 import { useTerminalPanelStore } from './terminalPanel';
 import { useUsageStore } from './usage';
+import { useTodoPanelsStore } from './todoPanels';
 import {
   listEventRuns,
   getEventRun,
@@ -160,11 +161,13 @@ export const useEventRunsStore = defineStore('eventRuns', {
       const settings = useSettingsStore();
       await deleteEventRun(settings.agentUrl, settings.authToken, id);
       // Coordinate teardown with the other stores.
+      try { useTodoPanelsStore().closeForEventRun(id); } catch { /* noop */ }
       if (run?.conversation_id) {
         const cid = run.conversation_id;
         try { useChatStore().forceCloseStream(cid); } catch { /* noop */ }
         try { useTerminalPanelStore().forgetConversation(cid); } catch { /* noop */ }
         try { useUsageStore().invalidateConversation(cid); } catch { /* noop */ }
+        try { useTodoPanelsStore().closeForConversation(cid); } catch { /* noop */ }
       }
       if (this.activeRunId === id) this.activeRunId = null;
       delete this.runsById[id];
