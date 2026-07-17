@@ -22,7 +22,7 @@ from app.utils.logger import logger
 from app.utils.task_context import current_task_id_var
 
 
-SERVER_NAME = "RequestUserInput"
+SERVER_NAME = "Request User Input"
 
 
 TOOL_CONFIG: ToolConfig = {

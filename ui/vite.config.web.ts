@@ -15,6 +15,7 @@ export default defineConfig(({ mode }) => {
     define: {
       __IS_ELECTRON__: false,
       __APP_VERSION__: JSON.stringify(pkg.version),
+      __BUILT_AT__: JSON.stringify(new Date().toISOString()),
     },
     build: {
       outDir: 'dist-web',

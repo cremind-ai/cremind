@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia';
 import { ElNotification } from 'element-plus';
-import { h } from 'vue';
+import { h, nextTick } from 'vue';
 import router from '../router';
 import { getA2AClient, getApiOrigin } from '../services/a2aClient';
 import { useSettingsStore } from './settings';
@@ -30,6 +30,8 @@ import {
   openConversationsListStream,
   type ConversationsListStreamHandle,
 } from '../services/conversationsListStream';
+import { useTodoPanelsStore, livePanelKey } from './todoPanels';
+import { normalizeTodos, allTodosCompleted } from '../utils/todos';
 import type { AgentCard, Part, TaskState } from '@a2a-js/sdk';
 
 // Non-reactive per-conversation state for the live SSE subscription. Kept
@@ -46,6 +48,12 @@ interface StreamScratch {
   handle: ConversationStreamHandle;
   seqSeen: Set<number>;
   currentTextPart: string;
+  // Latest todo snapshot received DURING the current run (null until the run
+  // calls update_todos). Reset on run start; consumed on `complete` to stamp
+  // the assistant bubble's `planTodos`. Kept per-run (not read from
+  // todosByConversation, which survives across turns for resume) so a later
+  // non-todo turn never inherits a stale snapshot.
+  todosThisRun: TodoItem[] | null;
   // Active tracker reasons. The handle is closed only when this set empties.
   trackers: Set<TrackReason>;
 }
@@ -139,6 +147,11 @@ export interface ChatMessage {
   // Non-default turn mode this user message was sent with (plan | instant),
   // shown as a chip on the bubble. Undefined for reasoning (the default).
   mode?: ChatMode;
+  // Plan-mode / event-run todo snapshot for THIS completed turn — drives the
+  // per-turn todo chip. Set from `metadata.plan_mode` on reload and stashed
+  // live on `complete`. Absent on turns that never drove a todo list.
+  planTodos?: TodoItem[];
+  planStage?: 'executing' | 'completed';
 }
 
 export interface ObservationPart {
@@ -808,22 +821,27 @@ export const useChatStore = defineStore('chat', {
       for (let i = messages.length - 1; i >= 0; i--) {
         const pm = (messages[i]?.metadata?.plan_mode ?? null) as any;
         if (pm && typeof pm === 'object' && Array.isArray(pm.todos)) {
-          const items: TodoItem[] = pm.todos.map((t: any, j: number) => ({
-            id: String(t.id ?? `t${j}`),
-            content: t.content ?? '',
-            status:
-              t.status === 'in_progress' || t.status === 'completed'
-                ? t.status
-                : 'pending',
-          }));
-          const allDone =
-            items.length > 0 && items.every(t => t.status === 'completed');
+          const items: TodoItem[] = normalizeTodos(pm.todos);
+          const allDone = allTodosCompleted(items);
           if (items.length && !allDone) {
             this.todosByConversation[conversationId] = {
               items,
               changedIds: [],
               updateSeq: 0,
             };
+            // Reopen the live floating panel for an in-progress plan, but only
+            // for the conversation the user is actually viewing — this also runs
+            // when the event-run drawer loads a hidden run's history, and
+            // auto-popping windows for runs merely being browsed would be noise.
+            if (conversationId === this.activeConversationId) {
+              useTodoPanelsStore().upsertPanel({
+                key: livePanelKey(conversationId),
+                source: 'live',
+                conversationId,
+                title: 'Tasks',
+                todos: items,
+              });
+            }
           }
           break;
         }
@@ -918,6 +936,7 @@ export const useChatStore = defineStore('chat', {
           handle: { close: () => {} },
           seqSeen: new Set<number>(),
           currentTextPart: '',
+          todosThisRun: null,
           trackers,
         };
         streamScratch.set(conversationId, init);
@@ -977,6 +996,7 @@ export const useChatStore = defineStore('chat', {
       for (const id of Array.from(streamScratch.keys())) {
         this.forceCloseStream(id);
       }
+      useTodoPanelsStore().closeAll();
       this.isConnected = false;
       this.agentCard = null;
       this.agentName = 'Agent';
@@ -1052,6 +1072,7 @@ export const useChatStore = defineStore('chat', {
       this.pendingPlanByConversation = {};
       this.todosByConversation = {};
       this.agentActivityByConversation = {};
+      useTodoPanelsStore().closeAll();
       this.error = null;
 
       if (this.isConnected) {
@@ -1348,6 +1369,7 @@ export const useChatStore = defineStore('chat', {
           this.pendingPlanByConversation[conversationId] = null;
           // A new run is starting; reset stream-local state.
           scratch.currentTextPart = '';
+          scratch.todosThisRun = null;
           runtime.streamingAssistantId = undefined;
           runtime.isStreaming = true;
           this.trackConversation(conversationId, 'streaming');
@@ -1376,6 +1398,7 @@ export const useChatStore = defineStore('chat', {
           this.pendingQuestionByConversation[conversationId] = null;
           this.pendingPlanByConversation[conversationId] = null;
           scratch.currentTextPart = '';
+          scratch.todosThisRun = null;
           runtime.streamingAssistantId = undefined;
           runtime.isStreaming = true;
           this.trackConversation(conversationId, 'streaming');
@@ -1595,16 +1618,7 @@ export const useChatStore = defineStore('chat', {
         case 'todos': {
           // Plan mode: a full todo snapshot. Diff against the prior list to mark
           // which items changed (drives the highlight-then-fade).
-          const items: TodoItem[] = (Array.isArray(data.todos) ? data.todos : []).map(
-            (t: any, i: number) => ({
-              id: String(t.id ?? `t${i}`),
-              content: t.content ?? '',
-              status:
-                t.status === 'in_progress' || t.status === 'completed'
-                  ? t.status
-                  : 'pending',
-            }),
-          );
+          const items: TodoItem[] = normalizeTodos(data.todos);
           const prev = this.todosByConversation[conversationId];
           const prevById = new Map((prev?.items ?? []).map(t => [t.id, t]));
           const changedIds = items
@@ -1618,6 +1632,23 @@ export const useChatStore = defineStore('chat', {
             changedIds,
             updateSeq: (prev?.updateSeq ?? 0) + 1,
           };
+          // Remember this run's latest snapshot so `complete` can stamp the
+          // bubble's chip without a refetch.
+          scratch.todosThisRun = items;
+          // Mirror into a live floating panel for this conversation. Applies to
+          // event-run conversations too (the frame carries event_run_id/run_title)
+          // — but the panel only ever RENDERS inside that run's drawer, because
+          // FloatingTodoLayer filters strictly by the viewed conversation. So a
+          // silent background firing populates the store without showing anything
+          // until the user opens the run.
+          useTodoPanelsStore().upsertPanel({
+            key: livePanelKey(conversationId),
+            source: data.event_run_id ? 'event-run' : 'live',
+            conversationId,
+            eventRunId: data.event_run_id ? String(data.event_run_id) : undefined,
+            title: data.run_title || 'Tasks',
+            todos: items,
+          });
           return;
         }
 
@@ -1663,9 +1694,47 @@ export const useChatStore = defineStore('chat', {
           runtime.isSummarizing = false;
           runtime.streamingAssistantId = undefined;
           scratch.currentTextPart = '';
+          // This run drove a todo list: stamp the snapshot onto the assistant
+          // bubble so a per-turn chip appears immediately (no reload needed).
+          // `backendId` was just recorded above, so the chip's key
+          // (`msg:<server-id>`) matches what a later reload produces.
+          if (scratch.todosThisRun && scratch.todosThisRun.length) {
+            const runTodos = scratch.todosThisRun;
+            if (message) {
+              message.planTodos = runTodos;
+              message.planStage = allTodosCompleted(runTodos) ? 'completed' : 'executing';
+            }
+            // Reconcile the live floating panel with the run's outcome.
+            const liveKey = livePanelKey(conversationId);
+            const panels = useTodoPanelsStore();
+            if (allTodosCompleted(runTodos)) {
+              // Done — collapse the panel toward the chip that's about to render
+              // on the final bubble (the reopen affordance). If that conversation
+              // isn't being viewed, the chip isn't in the DOM → a plain exit.
+              const assistantId =
+                typeof data.assistant_id === 'string' ? data.assistant_id : undefined;
+              nextTick(() => {
+                let toward: { x: number; y: number } | null = null;
+                if (assistantId) {
+                  const el = document.querySelector(
+                    `[data-todo-chip="${CSS.escape(assistantId)}"]`,
+                  );
+                  if (el) {
+                    const r = el.getBoundingClientRect();
+                    toward = { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+                  }
+                }
+                panels.closePanel(liveKey, { toward });
+              });
+            } else {
+              // Partial (stop/interrupt): keep the panel, stop the spinner.
+              panels.markStopped(liveKey);
+            }
+          }
+          scratch.todosThisRun = null;
           // Plan mode: once every todo is completed the plan is done — clear the
-          // panel. A partial list survives a stop/interrupt so the panel shows
-          // where execution halted (resumable via "continue").
+          // per-conversation snapshot (drives the legacy `activeTodos` getter
+          // and the resume heuristic). A partial list survives a stop/interrupt.
           {
             const todos = this.todosByConversation[conversationId];
             if (
@@ -1854,6 +1923,17 @@ export const useChatStore = defineStore('chat', {
 
       const isRejectedTrigger = msg.metadata?.kind === 'rejected_trigger';
 
+      // Per-turn todo snapshot for the chip (plan mode + event runs). Only agent
+      // turns that actually drove a non-empty list get one; partial "executing"
+      // snapshots are kept (a "2/5" chip is useful resume history).
+      let planTodos: TodoItem[] | undefined;
+      let planStage: 'executing' | 'completed' | undefined;
+      const pm = (msg.metadata as any)?.plan_mode;
+      if (msg.role === 'agent' && pm && typeof pm === 'object' && Array.isArray(pm.todos) && pm.todos.length) {
+        planTodos = normalizeTodos(pm.todos);
+        planStage = pm.stage === 'completed' ? 'completed' : 'executing';
+      }
+
       return {
         id: msg.id,
         role: msg.role === 'agent' ? 'assistant' : 'user',
@@ -1872,6 +1952,8 @@ export const useChatStore = defineStore('chat', {
         mode: msg.metadata?.mode && msg.metadata.mode !== 'reasoning'
           ? (msg.metadata.mode as ChatMode)
           : undefined,
+        planTodos,
+        planStage,
       };
     },
 
@@ -1921,6 +2003,7 @@ export const useChatStore = defineStore('chat', {
       delete this.pendingPlanByConversation[id];
       delete this.todosByConversation[id];
       delete this.agentActivityByConversation[id];
+      useTodoPanelsStore().closeForConversation(id);
       const settingsStore = useSettingsStore();
       if (settingsStore.profileId) {
         useNotificationsStore().clearForConversation(settingsStore.profileId, id);
@@ -1995,6 +2078,7 @@ export const useChatStore = defineStore('chat', {
           delete map[oldId];
         }
       }
+      useTodoPanelsStore().remapConversation(oldId, newId);
       if (this.activeConversationId === oldId) {
         this.activeConversationId = newId;
       }
@@ -2037,6 +2121,7 @@ export const useChatStore = defineStore('chat', {
       this.pendingPlanByConversation = {};
       this.todosByConversation = {};
       this.agentActivityByConversation = {};
+      useTodoPanelsStore().closeAll();
       this.error = null;
     },
 

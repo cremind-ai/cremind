@@ -8,6 +8,7 @@ import { checkSetupStatus } from './services/configApi';
 import { PROFILE_ROUTES, CHAT_ROUTES } from './router/profileRoutes';
 import Sidebar from './components/Sidebar.vue';
 import UpdateBanner from './components/UpdateBanner.vue';
+import FloatingTodoLayer from './components/plan/FloatingTodoLayer.vue';
 
 const route = useRoute();
 const router = useRouter();
@@ -29,6 +30,7 @@ const currentProfile = computed(() => {
 const showSidebar = computed(() => {
   return (route.name === 'chat' || route.name === 'conversation') && !!currentProfile.value;
 });
+
 
 // Global vector-embedding busy gate. While a reload/rebuild is in
 // flight, the agent refuses to run and embedding-dependent features
@@ -214,6 +216,10 @@ const handleLogout = () => {
         </transition>
       </router-view>
     </main>
+
+    <!-- Floating multi-window todo panels (plan mode + event runs). Always
+         mounted; it self-scopes to the viewed conversation / open run drawer. -->
+    <FloatingTodoLayer />
 
     <!-- Vector embedding busy gate -->
     <div v-if="embeddingBusy" class="embedding-overlay">

@@ -215,6 +215,14 @@ class ToolRegistry:
         # per-profile state (profile_tools + tool_configs) survives via
         # ON UPDATE CASCADE.
         self._displace_persisted_collision(tool_id, claimant_name=tool.name)
+        # Self-heal a built-in whose slug changed between releases: a persisted
+        # row keyed by this (tool_type, source) but under a DIFFERENT tool_id
+        # (because the tool's display name — hence its slug — was renamed) would
+        # make the upsert below INSERT a new tool_id and trip the
+        # UNIQUE(tool_type, source) index. Migrate the stale row to the new slug
+        # so the upsert takes the UPDATE path; per-profile state follows via
+        # ON UPDATE CASCADE (same guarantee as _displace_persisted_collision).
+        self._migrate_renamed_builtin(tool_id, source=source or tool_id, name=tool.name)
         tool.tool_id = tool_id
         self._tools[tool_id] = tool
         self._storage.upsert_tool(
@@ -269,6 +277,37 @@ class ToolRegistry:
             f"persisted {existing_type} tool '{displaced_name}'. "
             f"Renamed displaced tool to '{new_id}' (per-profile state preserved)."
         )
+
+    def _migrate_renamed_builtin(self, tool_id: str, *, source: str, name: str) -> None:
+        """If a built-in row exists for ``source`` under a different tool_id,
+        migrate it to ``tool_id`` (the tool's display name / slug changed).
+
+        Without this, ``upsert_tool`` would INSERT the new tool_id and violate
+        the ``UNIQUE(tool_type, source)`` index against the stale row, aborting
+        registration. Per-profile rows follow the primary-key rename via
+        ``ON UPDATE CASCADE``. Best-effort: if the rename can't happen (target id
+        already held by another row), drop the stale row so the upsert inserts
+        cleanly rather than crashing the whole boot.
+        """
+        prior = self._storage.find_tool_by_source(ToolType.BUILTIN.value, source)
+        if prior is None or prior["tool_id"] == tool_id:
+            return
+        old_id = prior["tool_id"]
+        if self._storage.rename_tool(old_id, tool_id):
+            moved = self._tools.pop(old_id, None)
+            if moved is not None:
+                moved.tool_id = tool_id
+                self._tools[tool_id] = moved
+            logger.warning(
+                f"Built-in '{name}' slug changed ('{old_id}' -> '{tool_id}'); "
+                f"migrated persisted row (per-profile state preserved)."
+            )
+        else:
+            logger.warning(
+                f"Could not migrate renamed built-in row '{old_id}' -> '{tool_id}'; "
+                f"deleting the stale row so registration can proceed."
+            )
+            self._storage.delete_tool(old_id)
 
     # ── mcp registration (persisted, profile_tools backfilled) ──
 

@@ -170,7 +170,13 @@ conversation — the only history an event run ever builds up). Do not use
 can reasonably proceed.
 If your action is a multi-step procedure, maintain a live todo list with
 `update_todos` (pass the FULL list every call, one item in_progress at a time)
-so progress is visible; it does not end your turn.
+so progress is visible; it does not end your turn. The run is only marked
+COMPLETED when every todo item is completed — an unfinished list leaves it
+pending for you to continue. So before you finish, reconcile the list with a
+final `update_todos` in which every item is `completed`: mark items you actually
+did, and also mark items that turned out not to apply (e.g. a conditional
+notification step skipped because there was nothing to send) as `completed` —
+do not leave them pending when the run is genuinely done.
 '''
 
 
@@ -1085,6 +1091,23 @@ class ReasoningAgent:
                     "Work read-only; ask your clarifying questions with "
                     "`ask_user_question`, then call `write_plan` and stop.]"
                 )
+            return f"{marker}\n\n{self._current_query}"
+        # Event runs always run in reasoning mode (plan mode is force-disabled for
+        # them), so this is the only marker they get. EVENT_RUN_GUIDANCE already
+        # asks for a todo list, but it sits at the tail of a long appended system
+        # block that weaker models skip; repeat the ask adjacent to the task —
+        # same rationale as the plan/instant markers above. Volatile turn input,
+        # so it never fragments the cached prefix.
+        if getattr(self, "_event_run", False):
+            marker = (
+                "[Automated event run: if this action is a multi-step procedure, "
+                "maintain a live todo list with `update_todos` — seed the full list "
+                "first, then keep exactly one item in_progress and update it as you "
+                "complete each step. It does not end your turn. End only after a "
+                "final `update_todos` shows EVERY item completed (mark "
+                "not-applicable steps completed too); an unfinished list keeps the "
+                "run pending instead of completed.]"
+            )
             return f"{marker}\n\n{self._current_query}"
         return self._current_query
 

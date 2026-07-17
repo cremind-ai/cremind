@@ -13,7 +13,6 @@ import RightPanel from '../components/RightPanel.vue';
 import ResizableDivider from '../components/ResizableDivider.vue';
 import ConversationMemoryPanel from '../components/ConversationMemoryPanel.vue';
 import ConversationUsagePanel from '../components/ConversationUsagePanel.vue';
-import TodoPanel from '../components/plan/TodoPanel.vue';
 import AgentActivityPanel from '../components/agent/AgentActivityPanel.vue';
 import PlanBanner from '../components/plan/PlanBanner.vue';
 import PlanApprovalDialog from '../components/plan/PlanApprovalDialog.vue';
@@ -295,10 +294,9 @@ const cancelPlan = async () => {
       />
 
       <div
-        v-if="chatStore.activeTodos || chatStore.activeAgentActivity"
+        v-if="chatStore.activeAgentActivity"
         class="floating-panels"
       >
-        <TodoPanel v-if="chatStore.activeTodos" :state="chatStore.activeTodos" />
         <AgentActivityPanel
           v-if="chatStore.activeAgentActivity"
           :state="chatStore.activeAgentActivity"
@@ -375,10 +373,10 @@ const cancelPlan = async () => {
   overflow: hidden;
 }
 
-/* Floating stack for the Todo + Agent Activity panels (both may show at once,
-   e.g. an approved plan whose execution delegates a coding task to Claude
-   Code). Absolutely positioned top-right of the chat column; the child panels
-   are static so they stack vertically without overlapping. */
+/* Floating stack for the Agent Activity panel. Absolutely positioned top-right
+   of the chat column. (The todo panels moved to the app-global
+   FloatingTodoLayer window manager, which supports multiple overlapping
+   panels + per-turn history chips.) */
 .floating-panels {
   position: absolute;
   top: 12px;

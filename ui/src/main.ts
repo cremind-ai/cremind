@@ -13,6 +13,11 @@ import { installExternalLinkInterceptor } from './utils/externalLinks'
 
 document.title = __IS_ELECTRON__ ? 'Cremind App' : 'Cremind Web UI'
 
+// Bundle fingerprint — one glance at the console tells you whether this tab is
+// running the freshly-built SPA or a stale cached one (an SPA tab never
+// refetches index.html on its own).
+console.info(`[cremind-ui] build ${__BUILT_AT__} · v${__APP_VERSION__}`)
+
 // Route clicked external links to the OS browser instead of a new Electron
 // window. Installed at module scope (not in a component) so it survives the
 // file:// → backend pivot reload below, which re-executes this module, and so

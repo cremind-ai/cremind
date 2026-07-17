@@ -244,6 +244,12 @@ async def run_agent_to_bus(
             )
         except Exception:  # noqa: BLE001
             logger.exception(f"stream_runner: failed to mark event run running for {event_run_id}")
+        # Carry an unfinished todo list from the previous turn into this turn's
+        # registry so a "reply to continue" turn that never calls update_todos
+        # still finalizes as 'pending' (not falsely 'completed'). A continuation
+        # that finishes the work overwrites this via update_todos. No-op on the
+        # first (trigger) turn — there is no prior plan-bearing message.
+        await _seed_event_run_todos(conversation_storage, conversation_id, run_id)
 
     # Capture conversation context up front. We allow get_conversation to
     # fail (e.g. transient DB hiccup) without aborting the run -- the agent
@@ -552,7 +558,24 @@ async def run_agent_to_bus(
                     evt = chunk.get("data") or {}
                     evt_name = evt.get("event")
                     if evt_name:
-                        await bus.publish(conversation_id, evt_name, evt.get("data") or {})
+                        evt_data = dict(evt.get("data") or {})
+                        # Event runs execute in a hidden per-firing conversation
+                        # that the UI never opens directly, so their ``todos``
+                        # frames would otherwise carry no way to tell an
+                        # event-run panel apart from a normal chat one. Stamp the
+                        # frame with the run id + a human title so the client can
+                        # open an independent, self-describing floating panel per
+                        # firing (rides the replay ring too, so late-connecting
+                        # clients still identify an in-flight run). Chat plan-mode
+                        # frames are untouched — the branch is gated on
+                        # ``event_run_id``.
+                        if event_run_id and evt_name == "todos":
+                            evt_data["event_run_id"] = event_run_id
+                            evt_data["run_title"] = title
+                            evt_data["run_source"] = (
+                                (user_message_metadata or {}).get("source")
+                            )
+                        await bus.publish(conversation_id, evt_name, evt_data)
 
                 elif ctype in (
                     ChatCompletionTypeEnum.DONE,
@@ -826,7 +849,21 @@ async def run_agent_to_bus(
             elif pending_q:
                 run_status = "pending"
             else:
-                run_status = "completed"
+                # A run only completes when its todo list (if it drove one) is
+                # fully done. An incomplete list leaves the run 'pending' so it
+                # stays non-terminal (survives restarts, never auto-pruned) and
+                # can be resumed by replying in the run's chat — the same
+                # continuation path as a request_user_input pause.
+                _todos = plan_state.get_todos(run_id) or []
+                _done = sum(1 for t in _todos if t.get("status") == "completed")
+                if _todos and _done < len(_todos):
+                    run_status = "pending"
+                    pending_q = (
+                        f"Run ended with {_done} of {len(_todos)} tasks completed "
+                        "— reply here to continue the remaining work."
+                    )
+                else:
+                    run_status = "completed"
             is_terminal = run_status != "pending"
             try:
                 from app.storage import get_event_run_storage
@@ -842,6 +879,14 @@ async def run_agent_to_bus(
                     increment_turn=True,
                     mark_finished=is_terminal,
                 )
+                # ``run_row`` was read before the write above, so its
+                # pending_question is stale; sync it so the pending notification
+                # below shows this turn's actual prompt (the incomplete-todos
+                # message or the request_user_input question).
+                if run_row is not None:
+                    run_row["pending_question"] = (
+                        pending_q if run_status == "pending" else None
+                    )
             except Exception:  # noqa: BLE001
                 logger.exception(f"stream_runner: failed to finalize event run {event_run_id}")
             run_state.clear(run_id)
@@ -898,6 +943,41 @@ async def run_agent_to_bus(
 def make_run_id(conversation_id: str, kind: str = "msg") -> str:
     """Generate a unified run id. ``kind`` is purely informational (``msg`` or ``event``)."""
     return f"{kind}:{conversation_id}:{uuid.uuid4()}"
+
+
+async def _seed_event_run_todos(
+    conversation_storage: Any, conversation_id: str, run_id: str,
+) -> None:
+    """Seed the plan registry from the last persisted *incomplete* todo snapshot.
+
+    An event run can span multiple turns (left 'pending' with unfinished todos,
+    then resumed by a user reply). The per-run registry is cleared each turn, so
+    without this a continuation turn that doesn't call ``update_todos`` would look
+    like an empty list and finalize as 'completed'. Mirrors ``_compute_plan_phase``'s
+    newest-first scan; no-op on the first (trigger) turn and when the last snapshot
+    is already fully completed.
+    """
+    from app.agent import plan_state
+    try:
+        msgs = await conversation_storage.get_messages_after(
+            conversation_id, -1, limit=50, newest_first=True,
+        )
+    except Exception:  # noqa: BLE001
+        return
+    for msg in reversed(msgs or []):
+        if msg.get("role") != "agent":
+            continue
+        meta = msg.get("metadata")
+        pm = meta.get("plan_mode") if isinstance(meta, dict) else None
+        if not isinstance(pm, dict):
+            continue
+        todos = pm.get("todos") or []
+        if todos and not all(
+            isinstance(t, dict) and t.get("status") == "completed" for t in todos
+        ):
+            plan_state.set_todos(run_id, todos)
+        # The most recent plan-bearing agent message decides; stop scanning.
+        return
 
 
 async def _compute_plan_phase(
