@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import { Icon } from '@iconify/vue';
+import TaskRuleMenu from './TaskRuleMenu.vue';
 import { useEventRunsStore } from '../../../stores/eventRuns';
 import { formatRelative } from '../../../utils/duration';
 import { formatTimestamp } from '../../../utils/usageFormat';
 import { accentColor } from './boardTypes';
-import type { BoardSubscription } from './boardTypes';
+import type { BoardSubscription, RuleActionPayload } from './boardTypes';
 import type { ListenerStatus } from '../../../services/skillEventsApi';
 import type { EventRunSubscriptionSummary } from '../../../services/adminEventsStream';
 import type { EventRunStatus } from '../../../services/eventRunsApi';
@@ -17,11 +18,22 @@ const props = defineProps<{
   now: number;
 }>();
 
-const emit = defineEmits<{ (e: 'filter-event', key: string): void }>();
+const emit = defineEmits<{
+  (e: 'filter-event', key: string): void;
+  (e: 'rule-action', payload: RuleActionPayload): void;
+}>();
 
 const store = useEventRunsStore();
 
 const accent = computed(() => accentColor(props.entry.key));
+
+// Completed / cancelled one-time schedules still show as rules (parity with the
+// table), but muted and sorted last by the board.
+const terminal = computed(
+  () =>
+    props.entry.kind === 'schedule' &&
+    (props.entry.scheduleStatus === 'completed' || props.entry.scheduleStatus === 'cancelled'),
+);
 
 const openable = computed(() =>
   store.runsForSubscription(props.entry.kind, props.entry.id),
@@ -103,7 +115,7 @@ function open() {
 <template>
   <article
     class="idle-card"
-    :class="{ clickable: openable.length > 0 }"
+    :class="{ clickable: openable.length > 0, terminal }"
     :style="{ borderLeftColor: accent }"
     @click="open"
   >
@@ -117,6 +129,12 @@ function open() {
       >
         {{ entry.title }}
       </button>
+      <span class="ic-spacer" />
+      <TaskRuleMenu
+        :sub="entry"
+        :listener-running="listener?.running ?? false"
+        @select="(a) => emit('rule-action', { action: a, sub: entry })"
+      />
     </div>
 
     <p class="ic-action" :title="entry.action">{{ entry.action }}</p>
@@ -125,6 +143,14 @@ function open() {
       <Icon :icon="state.icon" />
       <span>{{ state.text }}</span>
       <span v-if="state.detail" class="ic-detail">· {{ state.detail }}</span>
+      <button
+        v-if="entry.kind === 'skill_event' && !listener?.running"
+        type="button"
+        class="ic-start"
+        @click.stop="emit('rule-action', { action: 'start-listener', sub: entry })"
+      >
+        Start
+      </button>
     </p>
 
     <div class="ic-foot">
@@ -138,6 +164,7 @@ function open() {
         </span>
       </template>
       <span v-else>No runs yet</span>
+      <span v-if="summary?.pending_count" class="ic-waiting">· {{ summary.pending_count }} waiting</span>
     </div>
   </article>
 </template>
@@ -153,12 +180,14 @@ function open() {
 }
 .idle-card.clickable { cursor: pointer; }
 .idle-card.clickable:hover { border-color: var(--primary-color); }
+.idle-card.terminal { opacity: 0.72; }
 
 .ic-top {
   display: flex;
   align-items: center;
   gap: 6px;
 }
+.ic-spacer { flex: 1; }
 .ic-src {
   font-size: 0.95rem;
   color: var(--text-secondary);
@@ -201,6 +230,17 @@ function open() {
 .ic-state.tone-warn { color: var(--warning-color, #e6a23c); }
 .ic-state.tone-muted { color: var(--text-tertiary); }
 .ic-detail { color: var(--text-tertiary); }
+.ic-start {
+  border: none;
+  background: transparent;
+  padding: 0;
+  margin-left: 2px;
+  font: inherit;
+  font-size: 0.75rem;
+  color: var(--primary-color);
+  cursor: pointer;
+}
+.ic-start:hover { text-decoration: underline; }
 
 .ic-foot {
   margin-top: 6px;
@@ -223,4 +263,5 @@ function open() {
   border-radius: 50%;
   display: inline-block;
 }
+.ic-waiting { color: var(--warning-color, #e6a23c); }
 </style>

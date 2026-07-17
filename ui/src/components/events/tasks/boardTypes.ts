@@ -66,12 +66,15 @@ export interface SkillBoardSubscription extends BoardSubscriptionBase {
   kind: 'skill_event';
   skillName: string;
   eventType: string;
+  /** The raw subscription, so rule actions can open the edit/simulate dialogs. */
+  raw: SkillEventSubscription;
 }
 
 export interface FileWatcherBoardSubscription extends BoardSubscriptionBase {
   kind: 'file_watcher';
   armed: boolean;
   rootPath: string;
+  raw: FileWatcherSubscription;
 }
 
 export interface ScheduleBoardSubscription extends BoardSubscriptionBase {
@@ -79,12 +82,27 @@ export interface ScheduleBoardSubscription extends BoardSubscriptionBase {
   nextFireAtMs: number | null;
   rrule: string | null;
   scheduleStatus: ScheduleEventSubscription['status'];
+  raw: ScheduleEventSubscription;
 }
 
 export type BoardSubscription =
   | SkillBoardSubscription
   | FileWatcherBoardSubscription
   | ScheduleBoardSubscription;
+
+/** Rule-level actions a card's kebab menu can request; handled by TasksBoard. */
+export type RuleAction =
+  | 'edit'
+  | 'simulate'
+  | 'start-listener'
+  | 'toggle-pause'
+  | 'open-conversation'
+  | 'delete';
+
+export interface RuleActionPayload {
+  action: RuleAction;
+  sub: BoardSubscription;
+}
 
 export function fromSkillEvent(s: SkillEventSubscription): SkillBoardSubscription {
   return {
@@ -98,6 +116,7 @@ export function fromSkillEvent(s: SkillEventSubscription): SkillBoardSubscriptio
     icon: sourceKindIcon('skill_event'),
     skillName: s.skill_name,
     eventType: s.event_type,
+    raw: s,
   };
 }
 
@@ -113,6 +132,7 @@ export function fromFileWatcher(s: FileWatcherSubscription): FileWatcherBoardSub
     icon: sourceKindIcon('file_watcher'),
     armed: s.armed,
     rootPath: s.root_path,
+    raw: s,
   };
 }
 
@@ -129,5 +149,6 @@ export function fromSchedule(s: ScheduleEventSubscription): ScheduleBoardSubscri
     nextFireAtMs: s.next_fire_at != null ? s.next_fire_at * 1000 : null,
     rrule: s.rrule,
     scheduleStatus: s.status,
+    raw: s,
   };
 }

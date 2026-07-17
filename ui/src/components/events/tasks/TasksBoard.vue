@@ -1,29 +1,48 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from 'vue';
-import { ElEmpty, ElInput, ElOption, ElSelect } from 'element-plus';
+import { useRouter } from 'vue-router';
+import { ElEmpty, ElInput, ElMessage, ElMessageBox, ElOption, ElSelect } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import TaskBoardColumn from './TaskBoardColumn.vue';
 import TaskRunCard from './TaskRunCard.vue';
 import TaskEventGroup from './TaskEventGroup.vue';
 import TaskIdleCard from './TaskIdleCard.vue';
+import SkillEventEditDialog from '../SkillEventEditDialog.vue';
+import SkillEventSimulateDialog from '../SkillEventSimulateDialog.vue';
+import FileWatcherEditDialog from '../FileWatcherEditDialog.vue';
+import ScheduleEventDialog from '../../ScheduleEventDialog.vue';
 import {
   fromFileWatcher,
   fromSchedule,
   fromSkillEvent,
   sourceKindIcon,
   type BoardSubscription,
+  type RuleActionPayload,
 } from './boardTypes';
 import { useEventRunsStore } from '../../../stores/eventRuns';
+import { useSettingsStore } from '../../../stores/settings';
 import { useAdminSubscriptions } from '../../../composables/useAdminSubscriptions';
 import { useNow } from '../../../composables/useNow';
 import { adminEventsStatus } from '../../../services/adminEventsStream';
+import { deleteSubscription, startListener } from '../../../services/skillEventsApi';
+import { deleteFileWatcher } from '../../../services/fileWatchersApi';
+import { deleteCalendarEvent, setScheduleEventStatus } from '../../../services/calendarApi';
 import type { EventRun, EventRunSourceKind } from '../../../services/eventRunsApi';
 
 const props = defineProps<{ profile: string }>();
 
+const router = useRouter();
 const store = useEventRunsStore();
+const settings = useSettingsStore();
 const { skillSubs, listeners, fileWatchers, schedules, loading } = useAdminSubscriptions();
 const { now } = useNow();
+
+// Rule-edit / simulate dialogs, hosted by the board (the table sections keep
+// their own independent instances for Events mode).
+const skillEditDialog = ref<InstanceType<typeof SkillEventEditDialog> | null>(null);
+const skillSimulateDialog = ref<InstanceType<typeof SkillEventSimulateDialog> | null>(null);
+const fwEditDialog = ref<InstanceType<typeof FileWatcherEditDialog> | null>(null);
+const scheduleDialog = ref<InstanceType<typeof ScheduleEventDialog> | null>(null);
 
 const TERMINAL: EventRun['status'][] = ['completed', 'failed', 'cancelled'];
 const KINDS: { value: EventRunSourceKind; label: string; icon: string }[] = [
@@ -144,22 +163,27 @@ const activeKeys = computed(() => {
   return s;
 });
 
+// A schedule that has run its course (completed / cancelled) — kept visible for
+// parity with the table, but muted and sorted to the bottom.
+function isTerminalRule(e: BoardSubscription): boolean {
+  return e.kind === 'schedule' && (e.scheduleStatus === 'completed' || e.scheduleStatus === 'cancelled');
+}
+
 const idleEntries = computed(() => {
   const q = search.value.trim().toLowerCase();
   return allSubs.value
     .filter((e) => {
       if (!activeKinds[e.kind]) return false;
       if (eventFilter.value && e.key !== eventFilter.value) return false;
+      // Rules with an active run live in Running/Needs input, not here.
       if (activeKeys.value.has(e.key)) return false;
-      // Only surface schedules that can still fire (or are paused); completed /
-      // cancelled schedules live in Done via their terminal runs.
-      if (e.kind === 'schedule' && !(e.scheduleStatus === 'active' || e.scheduleStatus === 'paused')) {
-        return false;
-      }
       if (q && !`${e.title} ${e.action}`.toLowerCase().includes(q)) return false;
       return true;
     })
     .sort((a, b) => {
+      // Terminal schedules sink to the bottom.
+      const t = Number(isTerminalRule(a)) - Number(isTerminalRule(b));
+      if (t) return t;
       const an = a.kind === 'schedule' && a.scheduleStatus === 'active' ? a.nextFireAtMs : null;
       const bn = b.kind === 'schedule' && b.scheduleStatus === 'active' ? b.nextFireAtMs : null;
       if (an != null && bn != null) return an - bn;
@@ -173,6 +197,89 @@ const boardEmpty = computed(
   () => !loading.value && allSubs.value.length === 0 && profileRuns.value.length === 0,
 );
 const showChip = computed(() => !eventFilter.value);
+
+function listenerRunning(sub: BoardSubscription | null): boolean {
+  return sub?.kind === 'skill_event' ? !!listeners.value[sub.skillName]?.running : false;
+}
+
+async function handleRuleAction({ action, sub }: RuleActionPayload) {
+  switch (action) {
+    case 'edit':
+      if (sub.kind === 'skill_event') skillEditDialog.value?.open(sub.raw);
+      else if (sub.kind === 'file_watcher') fwEditDialog.value?.open(sub.raw);
+      else scheduleDialog.value?.openEditSubscription(sub.raw);
+      break;
+    case 'simulate':
+      if (sub.kind === 'skill_event') skillSimulateDialog.value?.open(sub.raw);
+      break;
+    case 'start-listener':
+      if (sub.kind === 'skill_event') {
+        try {
+          await startListener(settings.agentUrl, settings.authToken, sub.skillName);
+          ElMessage.success(`${sub.skillName} listener started`);
+        } catch (err) {
+          ElMessage.error(err instanceof Error ? err.message : String(err));
+        }
+      }
+      break;
+    case 'toggle-pause':
+      if (sub.kind === 'schedule') {
+        const next = sub.scheduleStatus === 'paused' ? 'active' : 'paused';
+        try {
+          await setScheduleEventStatus(settings.agentUrl, settings.authToken, sub.id, next);
+          ElMessage.success(next === 'paused' ? 'Schedule paused' : 'Schedule resumed');
+        } catch (err) {
+          ElMessage.error(err instanceof Error ? err.message : String(err));
+        }
+      }
+      break;
+    case 'open-conversation':
+      if (sub.conversationId) {
+        router.push({
+          name: 'conversation',
+          params: { profile: props.profile, conversationId: sub.conversationId },
+        });
+      }
+      break;
+    case 'delete':
+      await deleteRule(sub);
+      break;
+  }
+}
+
+async function deleteRule(sub: BoardSubscription) {
+  const copy =
+    sub.kind === 'skill_event'
+      ? `Delete subscription for ${sub.skillName} → ${sub.eventType}?`
+      : sub.kind === 'file_watcher'
+        ? `Delete file watcher '${sub.title}' on ${sub.rootPath}?`
+        : `Delete schedule event '${sub.title}'?`;
+  try {
+    await ElMessageBox.confirm(copy, 'Confirm delete', {
+      confirmButtonText: 'Delete',
+      cancelButtonText: 'Cancel',
+      type: 'warning',
+    });
+  } catch {
+    return; // cancelled
+  }
+  try {
+    if (sub.kind === 'skill_event') {
+      await deleteSubscription(settings.agentUrl, settings.authToken, sub.id);
+      ElMessage.success('Subscription deleted');
+    } else if (sub.kind === 'file_watcher') {
+      await deleteFileWatcher(settings.agentUrl, settings.authToken, sub.id);
+      ElMessage.success('File watcher deleted');
+    } else {
+      await deleteCalendarEvent(settings.agentUrl, settings.authToken, sub.id);
+      ElMessage.success('Schedule event deleted');
+    }
+    // Don't leave the filter pill pointing at a rule that no longer exists.
+    if (eventFilter.value === sub.key) eventFilter.value = null;
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : String(err));
+  }
+}
 </script>
 
 <template>
@@ -221,10 +328,10 @@ const showChip = computed(() => !eventFilter.value);
 
     <div v-else class="board-cols">
       <TaskBoardColumn
-        title="Upcoming"
+        title="Events"
         icon="mdi:calendar-arrow-right"
         :count="idleEntries.length"
-        empty="No idle events."
+        empty="No events."
       >
         <TransitionGroup name="board-card" tag="div" class="col-list">
           <TaskIdleCard
@@ -235,6 +342,7 @@ const showChip = computed(() => !eventFilter.value);
             :summary="store.summaryForSubscription(e.kind, e.id)"
             :now="now"
             @filter-event="(k) => (eventFilter = k)"
+            @rule-action="handleRuleAction"
           />
         </TransitionGroup>
       </TaskBoardColumn>
@@ -254,7 +362,9 @@ const showChip = computed(() => !eventFilter.value);
             :sub="subsByKey.get(keyOf(r)) ?? null"
             :now="now"
             :show-event-chip="showChip"
+            :listener-running="listenerRunning(subsByKey.get(keyOf(r)) ?? null)"
             @filter-event="(k) => (eventFilter = k)"
+            @rule-action="handleRuleAction"
           />
         </TransitionGroup>
       </TaskBoardColumn>
@@ -274,7 +384,9 @@ const showChip = computed(() => !eventFilter.value);
             :sub="subsByKey.get(keyOf(r)) ?? null"
             :now="now"
             :show-event-chip="showChip"
+            :listener-running="listenerRunning(subsByKey.get(keyOf(r)) ?? null)"
             @filter-event="(k) => (eventFilter = k)"
+            @rule-action="handleRuleAction"
           />
         </TransitionGroup>
       </TaskBoardColumn>
@@ -310,7 +422,9 @@ const showChip = computed(() => !eventFilter.value);
             :runs="g.runs"
             :now="now"
             :force-expanded="!!eventFilter"
+            :listener-running="listenerRunning(g.sub)"
             @filter-event="(k) => (eventFilter = k)"
+            @rule-action="handleRuleAction"
           />
         </TransitionGroup>
         <p v-if="doneGroups.length" class="done-note">
@@ -318,6 +432,12 @@ const showChip = computed(() => !eventFilter.value);
         </p>
       </TaskBoardColumn>
     </div>
+
+    <!-- Rule-edit / simulate dialogs, opened by handleRuleAction. -->
+    <SkillEventEditDialog ref="skillEditDialog" />
+    <SkillEventSimulateDialog ref="skillSimulateDialog" />
+    <FileWatcherEditDialog ref="fwEditDialog" />
+    <ScheduleEventDialog ref="scheduleDialog" />
   </div>
 </template>
 
