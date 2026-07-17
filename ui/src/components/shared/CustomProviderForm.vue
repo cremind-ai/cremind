@@ -16,9 +16,10 @@ import type { CustomProviderModel } from '../../services/configApi';
  * owns the actual API call, validation messaging, and reload.
  *
  * Per model the user declares the capabilities the app can't infer for an
- * arbitrary endpoint: whether it accepts images (Vision), whether it supports
- * Reasoning Effort (enables the effort selector + skips the injected
- * think-tool), and its per-1M-token prices (drives cost tracking).
+ * arbitrary endpoint: whether it accepts images (Vision), whether it accepts
+ * audio (Audio), whether it supports Reasoning Effort (enables the effort
+ * selector + skips the injected think-tool), and its per-1M-token prices
+ * (drives cost tracking).
  */
 const props = withDefaults(defineProps<{
   mode: 'create' | 'edit';
@@ -42,7 +43,7 @@ const models = ref<CustomProviderModel[]>([]);
 
 function emptyModel(): CustomProviderModel {
   return {
-    id: '', display_name: '', vision: false, supports_reasoning: false,
+    id: '', display_name: '', vision: false, audio: false, supports_reasoning: false,
     input_price_per_1m: null, output_price_per_1m: null,
     cache_read_price_per_1m: null, cache_write_price_per_1m: null,
   };
@@ -58,6 +59,7 @@ function loadFromProvider() {
       id: m.id,
       display_name: m.display_name || m.id,
       vision: !!m.vision,
+      audio: !!m.audio,
       // The models API surfaces reasoning_effort only for reasoning-capable
       // models, so its presence is the round-trip signal for the checkbox.
       supports_reasoning: !!(m.reasoning_effort && m.reasoning_effort.length),
@@ -102,6 +104,7 @@ function submit() {
       id: m.id.trim(),
       display_name: (m.display_name || m.id).trim(),
       vision: !!m.vision,
+      audio: !!m.audio,
       supports_reasoning: !!m.supports_reasoning,
       input_price_per_1m: m.input_price_per_1m,
       output_price_per_1m: m.output_price_per_1m,
@@ -168,6 +171,10 @@ function submit() {
               <label class="fld fld-check">
                 <span class="fld-label">Vision</span>
                 <ElCheckbox v-model="m.vision">Accepts images</ElCheckbox>
+              </label>
+              <label class="fld fld-check">
+                <span class="fld-label">Audio</span>
+                <ElCheckbox v-model="m.audio">Accepts audio</ElCheckbox>
               </label>
               <label class="fld fld-check">
                 <span class="fld-label">Reasoning Effort</span>

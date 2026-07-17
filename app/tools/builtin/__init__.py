@@ -58,6 +58,7 @@ _BUILTIN_MODULE_NAMES: tuple[str, ...] = (
     "exec_shell",
     "markdown_converter",
     "image_understanding",
+    "audio_understanding",
     "system_file",
     "weather",
     "gg_places",

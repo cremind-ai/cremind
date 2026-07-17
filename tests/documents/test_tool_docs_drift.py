@@ -26,6 +26,7 @@ DOC_MAP = {
     "web_search": "[tool]web search",
     "web_fetch": "[tool]web fetch",
     "image_understanding": "[tool]image understanding",
+    "audio_understanding": "[tool]audio understanding",
     "gg_places": "[tool]google places",
     "weather": "[tool]accuweather weather",
     "documentation_search": "[tool]documentation search",

@@ -27,7 +27,7 @@ providers_app = typer.Typer(
 )
 model_groups_app = typer.Typer(
     name="model-groups",
-    help="Read or write the configured model (and optional vision model).",
+    help="Read or write the configured model (and optional vision/audio models).",
     no_args_is_help=True,
 )
 device_code_app = typer.Typer(
@@ -186,13 +186,13 @@ def providers_create_custom(
     ),
     model: Optional[list[str]] = typer.Option(
         None, "--model",
-        help="A model id to expose (repeatable). Defaults to tier=high, no vision/reasoning.",
+        help="A model id to expose (repeatable). Defaults to tier=high, no vision/audio/reasoning.",
     ),
     models_json: Optional[str] = typer.Option(
         None, "--models-json",
         help="Model list as a JSON array of "
-             "{id, display_name?, group_hint?, vision?, supports_reasoning?} objects "
-             "(for per-model tier/vision/reasoning).",
+             "{id, display_name?, group_hint?, vision?, audio?, supports_reasoning?} objects "
+             "(for per-model tier/vision/audio/reasoning).",
     ),
 ) -> None:
     """Add a custom OpenAI-compatible provider with a manually specified model list."""
@@ -307,6 +307,10 @@ def model_groups_set(
         None, "--vision",
         help="Optional provider/model id for image understanding (defaults to --model).",
     ),
+    audio: Optional[str] = typer.Option(
+        None, "--audio",
+        help="Optional provider/model id for audio understanding (defaults to --model).",
+    ),
     plan: Optional[str] = typer.Option(
         None, "--plan",
         help="Optional provider/model id used in plan mode's planning phase (defaults to --model).",
@@ -315,11 +319,15 @@ def model_groups_set(
         None, "--vision-enabled/--no-vision-enabled",
         help="Enable/disable the Specialized Vision Model feature (the image_understanding tool).",
     ),
+    audio_enabled: Optional[bool] = typer.Option(
+        None, "--audio-enabled/--no-audio-enabled",
+        help="Enable/disable the Specialized Audio Model feature (the audio_understanding tool).",
+    ),
     default_provider: Optional[str] = typer.Option(
         None, "--default-provider", help="Default provider name."
     ),
 ) -> None:
-    """Update the configured model (and optional vision/plan models)."""
+    """Update the configured model (and optional vision/audio/plan models)."""
     import asyncio
 
     from app.cli.client._base import Client
@@ -333,6 +341,8 @@ def model_groups_set(
         groups["high"] = model
     if vision:
         groups["vision"] = vision
+    if audio:
+        groups["audio"] = audio
     if plan:
         groups["plan"] = plan
     if groups:
@@ -341,10 +351,13 @@ def model_groups_set(
         body["default_provider"] = default_provider
     if vision_enabled is not None:
         body["vision_enabled"] = vision_enabled
+    if audio_enabled is not None:
+        body["audio_enabled"] = audio_enabled
 
     if not body:
         typer.echo(
-            "at least one of --model, --vision, --plan, --vision-enabled, --default-provider is required",
+            "at least one of --model, --vision, --audio, --plan, "
+            "--vision-enabled, --audio-enabled, --default-provider is required",
             err=True,
         )
         raise typer.Exit(code=1)

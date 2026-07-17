@@ -146,6 +146,69 @@ def vision_feature_enabled(profile: str | None = None) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _audio_overrides() -> set[str]:
+    """Models force-flagged audio-input-capable via the ``CREMIND_AUDIO_MODELS``
+    env var (comma-separated ``provider/model`` or bare ``model`` ids).
+
+    Escape hatch for custom / dynamic / proxy models (ollama, vllm, litellm,
+    OpenAI-compatible gateways) whose catalog entries are illustrative and may
+    not list the actual audio-capable model the user runs. Mirrors
+    ``_vision_overrides``.
+    """
+    raw = os.environ.get("CREMIND_AUDIO_MODELS", "")
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def model_supports_audio(provider_name: str, model_name: str, profile: str | None = None) -> bool:
+    """Return True if ``model_name`` is flagged audio-input-capable for its provider.
+
+    Looks up the ``audio`` flag on the matching ``[[models]]`` entry in the
+    provider catalog. Unknown models (not listed — e.g. a custom or dynamic
+    model) default to False so the audio tool raises a clean, actionable error
+    rather than letting the request fail opaquely at the provider API. The
+    ``CREMIND_AUDIO_MODELS`` env var can force-enable a specific model.
+
+    Passing ``profile`` lets a per-profile ``custom:<slug>`` provider's stored
+    ``audio`` flag be honored (see ``resolve_catalog``). Mirrors
+    ``model_supports_vision``.
+    """
+    if not provider_name or not model_name:
+        return False
+    model = model_name
+    prefix = f"{provider_name}/"
+    if model.startswith(prefix):
+        model = model[len(prefix):]
+
+    overrides = _audio_overrides()
+    if f"{provider_name}/{model}" in overrides or model in overrides:
+        return True
+
+    catalog = resolve_catalog(provider_name, profile)
+    for entry in catalog.get("models", []) or []:
+        if isinstance(entry, dict) and entry.get("id") == model:
+            return bool(entry.get("audio", False))
+    return False
+
+
+def audio_feature_enabled(profile: str | None = None) -> bool:
+    """Whether the Specialized Audio Model feature is enabled for ``profile``.
+
+    The feature is opt-in: when on, audio understanding is routed through the
+    dedicated ``audio`` model group and the ``audio_understanding`` tool is
+    exposed to the agent (and listed in Settings → Tools). When off (the
+    default — an unset flag reads as False), the tool is withheld entirely
+    unless the main model itself accepts audio.
+
+    Reads the ``model_group.audio.enabled`` flag from ``llm_config`` (written
+    via the model-groups API). Stored as ``"true"``/``"false"``; coerced with an
+    explicit truthy set so the string ``"false"`` is correctly falsy. Mirrors
+    ``vision_feature_enabled``.
+    """
+    from app.config.settings import get_dynamic
+    raw = get_dynamic("llm_config", "model_group.audio.enabled", profile=profile)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def model_supports_prompt_cache(provider_name: str, model_name: str) -> bool:
     """Return True if ``model_name`` is flagged prompt-cache-capable for its provider.
 

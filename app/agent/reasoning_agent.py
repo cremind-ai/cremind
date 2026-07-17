@@ -41,7 +41,9 @@ from a2a.types import DataPart, Part, TextPart
 from app.agent.usage import UsageRecord
 from app.utils.formatting import dict_to_text
 from app.config import (
+    audio_feature_enabled,
     model_parallel_tool_calls,
+    model_supports_audio,
     model_supports_reasoning,
     model_supports_vision,
     vision_feature_enabled,
@@ -762,6 +764,19 @@ class ReasoningAgent:
         )
         if not vision_feature_enabled(profile) and not main_can_see:
             tools = [t for t in tools if t.tool_id != "image_understanding"]
+        # Audio understanding only ever happens through the ``audio_understanding``
+        # tool, gated identically to image_understanding above: the Specialized
+        # Audio Model toggle picks which model runs it. Expose the tool whenever
+        # the feature is on, or (when off) only if the main model itself accepts
+        # audio; withhold it only when off AND the main model can't hear (mirrored
+        # in Settings → Tools).
+        main_can_hear = model_supports_audio(
+            getattr(self.llm, "provider_name", "") or "",
+            getattr(self.llm, "model_name", "") or "",
+            profile=profile,
+        )
+        if not audio_feature_enabled(profile) and not main_can_hear:
+            tools = [t for t in tools if t.tool_id != "audio_understanding"]
         # ``send_notification`` pushes a message OUT to the profile's enabled
         # notification-mode channels (Telegram, etc.). It is meaningless without
         # at least one such channel, so withhold it entirely when the profile

@@ -100,6 +100,20 @@ output_price_per_1m = 14.00
 cache_read_price_per_1m = 0.175   # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
+# Audio-input model: accepts spoken audio (plus text) in chat completions via
+# the OpenAI `input_audio` content part. Text/audio only — not a vision model.
+[[models]]
+id = "gpt-audio"
+display_name = "GPT Audio"
+context_window = 128000
+group_hint = "low"
+prompt_cache = true
+audio = true
+input_price_per_1m = 2.50
+output_price_per_1m = 10.00
+cache_read_price_per_1m = 0.25    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
 # Previous-generation models still supported in the API
 [[models]]
 id = "gpt-4.1"

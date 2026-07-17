@@ -115,6 +115,18 @@ def _convert_messages(messages: List[ChatCompletionMessageParam]):
                                         "data": b64,
                                     },
                                 })
+                        elif part.get("type") == "input_audio":
+                            # Anthropic's Messages API has no audio input block.
+                            # The audio_understanding tool's capability gate
+                            # (model_supports_audio) already prevents audio from
+                            # reaching an Anthropic model, so this part should
+                            # never arrive here — drop it defensively (rather than
+                            # crashing or mis-mapping) instead of forwarding a
+                            # content type the API would reject.
+                            logger.warning(
+                                "[anthropic] dropping unsupported input_audio "
+                                "content part (Anthropic has no audio input)"
+                            )
                 if blocks:
                     anthropic_msgs.append({"role": "user", "content": blocks})
             continue

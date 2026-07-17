@@ -61,3 +61,17 @@ group_hint = "high"
 prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
+
+# Nemotron Omni: multimodal reasoning model — natively ingests audio (and image /
+# video) input alongside text and reasons over it via chat completions.
+[[models]]
+id = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+context_window = 131072
+display_name = "Nemotron 3 Nano Omni 30B"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = false
+vision = true
+audio = true
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00

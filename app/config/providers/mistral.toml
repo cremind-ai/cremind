@@ -53,6 +53,20 @@ output_price_per_1m = 0.30
 cache_read_price_per_1m = 0.01    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
+# Voxtral: audio-input model — accepts spoken audio (plus text) in chat
+# completions via the `input_audio` content part. Not a vision model.
+[[models]]
+id = "voxtral-small-latest"
+context_window = 32768
+display_name = "Voxtral Small"
+group_hint = "high"
+prompt_cache = true
+audio = true
+input_price_per_1m = 0.10
+output_price_per_1m = 0.30
+cache_read_price_per_1m = 0.01    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
 [[models]]
 id = "codestral-latest"
 context_window = 262144

@@ -21,8 +21,9 @@ const emit = defineEmits<{
 const { rebuildModelList, allModels } = useLLMModels();
 
 const providers = ref<ProviderWithState[]>([]);
-// Main reasoning model (``high``), plus optional Low-Performance (``low``) and
-// Vision (``vision``) groups — mirrors Settings → LLM Providers.
+// Main reasoning model (``high``), plus optional Low-Performance (``low``),
+// Vision (``vision``), and Audio (``audio``) groups — mirrors Settings → LLM
+// Providers.
 const highProvider = ref(extractProvider(props.config['model_group.high']) || props.config.default_provider || 'groq');
 const modelGroupHigh = ref(props.config['model_group.high'] || '');
 const reasoningEffortHigh = ref<string | null>(props.config['model_group.high.reasoning_effort'] || null);
@@ -32,6 +33,9 @@ const reasoningEffortLow = ref<string | null>(props.config['model_group.low.reas
 const visionProvider = ref(extractProvider(props.config['model_group.vision']) || '');
 const modelGroupVision = ref(props.config['model_group.vision'] || '');
 const visionEnabled = ref(props.config['model_group.vision.enabled'] === 'true');
+const audioProvider = ref(extractProvider(props.config['model_group.audio']) || '');
+const modelGroupAudio = ref(props.config['model_group.audio'] || '');
+const audioEnabled = ref(props.config['model_group.audio.enabled'] === 'true');
 const apiKeyProvider = ref('');
 const loading = ref(false);
 
@@ -108,6 +112,9 @@ function emitConfig() {
   if (modelGroupVision.value) config['model_group.vision'] = modelGroupVision.value;
   // Always emit the vision feature toggle so turning it off also persists.
   config['model_group.vision.enabled'] = String(visionEnabled.value);
+  if (modelGroupAudio.value) config['model_group.audio'] = modelGroupAudio.value;
+  // Always emit the audio feature toggle so turning it off also persists.
+  config['model_group.audio.enabled'] = String(audioEnabled.value);
 
   for (const p of providers.value) {
     // Emit auth_method selection
@@ -139,6 +146,7 @@ watch(
     highProvider, modelGroupHigh, reasoningEffortHigh,
     lowProvider, modelGroupLow, reasoningEffortLow,
     visionProvider, modelGroupVision, visionEnabled,
+    audioProvider, modelGroupAudio, audioEnabled,
   ],
   emitConfig,
 );
@@ -226,6 +234,28 @@ watch(providers, emitConfig, { deep: true });
             model-placeholder="Select vision model (defaults to main)"
             v-model:provider="visionProvider"
             v-model:model="modelGroupVision"
+          />
+        </div>
+
+        <div class="group-block">
+          <div class="group-title-row">
+            <p class="step-description" style="margin: 0;">
+              <strong>Specialized Audio Model (optional).</strong> Turn on to use a
+              dedicated audio model for audio understanding when your main model
+              can't process audio. Leave empty to fall back to the main model.
+            </p>
+            <ElSwitch v-model="audioEnabled" />
+          </div>
+          <ModelGroupFields
+            v-if="audioEnabled"
+            :providers="providers"
+            :all-models="allModels"
+            :use-audio="true"
+            :show-reasoning="false"
+            clearable
+            model-placeholder="Select audio model (defaults to main)"
+            v-model:provider="audioProvider"
+            v-model:model="modelGroupAudio"
           />
         </div>
       </div>

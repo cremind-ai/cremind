@@ -63,6 +63,7 @@ supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 vision = true
+audio = true
 input_price_per_1m = 1.25
 output_price_per_1m = 10.00
 cache_read_price_per_1m = 0.125   # Gemini: 0.10x input

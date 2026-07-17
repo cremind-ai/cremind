@@ -673,10 +673,11 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
             def _builtin_llm_factory(tool_id: str, profile: str):
                 """Create the child LLM for a built-in tool's internal LLM step.
 
-                The single configured model, except ``image_understanding`` which
-                resolves the optional vision model (``create_llm_for_tool``).
-                ``tool_id`` may be a module name (boot) or a slug (runtime
-                refresh) — both contain ``image_understanding`` for that tool.
+                The single configured model, except ``image_understanding`` /
+                ``audio_understanding`` which resolve the optional vision / audio
+                models respectively (``create_llm_for_tool``). ``tool_id`` may be
+                a module name (boot) or a slug (runtime refresh) — both contain
+                the tool's substring.
                 """
                 return model_group_mgr.create_llm_for_tool(tool_id, profile=profile)
 

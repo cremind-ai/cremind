@@ -117,6 +117,12 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         mgr = getattr(state, "model_group_mgr", None)
         if mgr is not None and not mgr.image_understanding_available(profile):
             rows = [r for r in rows if r["tool_id"] != "image_understanding"]
+        # Same rule for ``audio_understanding``: available iff the model that would
+        # run it can accept audio (dedicated audio model when the Specialized Audio
+        # Model feature is on, otherwise the main model). Hidden only when the
+        # feature is off AND the main model can't hear.
+        if mgr is not None and not mgr.audio_understanding_available(profile):
+            rows = [r for r in rows if r["tool_id"] != "audio_understanding"]
         enriched: list[dict] = []
         for row in rows:
             tool = registry.get(row["tool_id"])
