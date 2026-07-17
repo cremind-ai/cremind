@@ -7,6 +7,12 @@ declare const __IS_ELECTRON__: boolean;
 // scripts/sync_ui_version.py and exposed via Vite ``define``).
 declare const __APP_VERSION__: string;
 
+// Build-time ISO timestamp of when this bundle was compiled. Logged at boot
+// (src/main.ts) so "which bundle is this tab running?" is answerable at a glance
+// — a stale SPA tab never refetches index.html on its own, so this is the
+// definitive staleness signal.
+declare const __BUILT_AT__: string;
+
 // Build-time install channel — which Cremind release stream the bundled
 // installer points at. ``npm run dev`` → ``"dev"``; ``npm run build``
 // → ``"production"``; ``npm run build:test`` → ``"test"``. Computed in

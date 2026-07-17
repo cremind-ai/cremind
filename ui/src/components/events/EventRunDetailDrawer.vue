@@ -12,6 +12,7 @@ import { Icon } from '@iconify/vue';
 import { useEventRunsStore } from '../../stores/eventRuns';
 import { useChatStore } from '../../stores/chat';
 import { useTerminalPanelStore } from '../../stores/terminalPanel';
+import { useTodoPanelsStore, livePanelKey } from '../../stores/todoPanels';
 import ChatWindow from '../ChatWindow.vue';
 import MessageInput from '../MessageInput.vue';
 import RightPanel from '../RightPanel.vue';
@@ -27,6 +28,7 @@ const COLLAPSED_WORKSPACE_WIDTH = 36;
 const store = useEventRunsStore();
 const chat = useChatStore();
 const terminalPanel = useTerminalPanelStore();
+const todoPanels = useTodoPanelsStore();
 
 const run = computed(() => store.activeRun);
 const open = computed({
@@ -77,6 +79,10 @@ let trackedCid: string | null = null;
 watch(cid, async (id, prev) => {
   if (prev && prev !== id) {
     chat.untrackConversation(prev, 'manual');
+    // Drop the previous run's floating panel (drawer closed or switched runs).
+    // The layer scopes by conversation so it would stop rendering anyway; this
+    // keeps the store tidy and lets a reopen re-seed cleanly.
+    todoPanels.closeForConversation(prev);
   }
   if (id) {
     chat.trackConversation(id, 'manual');
@@ -88,15 +94,58 @@ watch(cid, async (id, prev) => {
     if (rt && run.value?.run_id && !rt.currentTaskId) {
       rt.currentTaskId = run.value.run_id;
     }
+    seedRunPanel(id);
   } else {
     terminalPanel.setFocusConversation(null);
     trackedCid = null;
   }
 }, { immediate: true });
 
+// Show the run's floating todo panel immediately on open. Event runs are silent
+// — nothing renders until the user opens the run here (FloatingTodoLayer scopes
+// panels to the viewed conversation). A running firing keeps updating live via
+// the chat store's `todos` handler (same `live:<cid>` key); a finished run seeds
+// its completed snapshot from the transcript.
+function seedRunPanel(id: string) {
+  const r = run.value;
+  const key = livePanelKey(id);
+  const live = chat.todosByConversation[id];
+  if (live && live.items.length) {
+    todoPanels.upsertPanel({
+      key,
+      source: 'event-run',
+      conversationId: id,
+      eventRunId: r?.id,
+      title: r?.label || 'Event run',
+      todos: live.items,
+    });
+    if (!chat.runtimes[id]?.isStreaming) todoPanels.markStopped(key);
+    return;
+  }
+  const msgs = chat.messagesByConversation[id] ?? [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m.role === 'assistant' && m.planTodos && m.planTodos.length) {
+      todoPanels.upsertPanel({
+        key,
+        source: 'event-run',
+        conversationId: id,
+        eventRunId: r?.id,
+        messageId: m.backendId ?? m.id,
+        title: r?.label || 'Event run',
+        todos: m.planTodos,
+      });
+      if (m.planStage === 'completed') todoPanels.markCompleted(key);
+      else todoPanels.markStopped(key);
+      break;
+    }
+  }
+}
+
 function onClose() {
   if (trackedCid) {
     chat.untrackConversation(trackedCid, 'manual');
+    todoPanels.closeForConversation(trackedCid);
     trackedCid = null;
   }
   // Release the workspace focus so the main chat page shows its own
