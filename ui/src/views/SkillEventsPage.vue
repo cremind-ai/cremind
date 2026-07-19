@@ -33,6 +33,7 @@ import FileWatcherSection from '../components/FileWatcherSection.vue';
 import ScheduleEventsSection from '../components/ScheduleEventsSection.vue';
 import CollapsibleSection from '../components/CollapsibleSection.vue';
 import EventRunHistory from '../components/events/EventRunHistory.vue';
+import EventIdChip from '../components/events/EventIdChip.vue';
 import EventRunDetailDrawer from '../components/events/EventRunDetailDrawer.vue';
 import SkillEventEditDialog from '../components/events/SkillEventEditDialog.vue';
 import SkillEventSimulateDialog from '../components/events/SkillEventSimulateDialog.vue';
@@ -211,9 +212,11 @@ function onViewChange(mode: string | number | boolean | undefined) {
         <Icon icon="mdi:arrow-left" />
       </button>
       <h2>Events</h2>
+      <span class="view-label">View</span>
       <ElRadioGroup
         :model-value="settings.eventsViewMode"
         size="small"
+        aria-label="Events view mode"
         @change="(v: any) => onViewChange(v)"
       >
         <ElRadioButton value="events">
@@ -246,7 +249,12 @@ function onViewChange(mode: string | number | boolean | undefined) {
           <EventRunHistory source-kind="skill_event" :subscription-id="row.id" />
         </template>
       </ElTableColumn>
-      <ElTableColumn prop="skill_name" label="Skill" min-width="120" />
+      <ElTableColumn label="Skill" min-width="120">
+        <template #default="{ row }">
+          <div>{{ row.skill_name }}</div>
+          <EventIdChip :id="row.id" kind="event" />
+        </template>
+      </ElTableColumn>
       <ElTableColumn label="Trigger" min-width="120">
         <template #default="{ row }">
           {{ row.event_type }}
@@ -342,6 +350,11 @@ function onViewChange(mode: string | number | boolean | undefined) {
   flex: 1;
   font-size: 1.25rem;
   color: var(--text-primary);
+}
+
+.view-label {
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
 }
 
 .icon-button {

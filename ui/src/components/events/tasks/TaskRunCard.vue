@@ -3,6 +3,7 @@ import { computed, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import EventRunStatusTag from '../EventRunStatusTag.vue';
+import EventIdChip from '../EventIdChip.vue';
 import TaskRuleMenu from './TaskRuleMenu.vue';
 import { useEventRunsStore } from '../../../stores/eventRuns';
 import { formatTokensCompact, formatUsd } from '../../../utils/usageFormat';
@@ -132,6 +133,7 @@ async function confirmDelete() {
       <span class="rc-spacer" />
       <span class="rc-metric">{{ formatTokensCompact(run.usage.total_tokens) }}</span>
       <span class="rc-metric">{{ formatUsd(run.usage.total_usd) }}</span>
+      <EventIdChip :id="run.id" kind="run" size="xs" class="rc-id" />
     </div>
 
     <div class="rc-actions" :class="{ pinned: menuOpen }">
@@ -258,8 +260,10 @@ async function confirmDelete() {
   gap: 8px;
   font-size: 0.6875rem;
   color: var(--text-tertiary);
+  flex-wrap: wrap;
 }
 .rc-wait { color: var(--warning-color, #e6a23c); }
+.rc-id { flex-shrink: 0; }
 .rc-metric { font-variant-numeric: tabular-nums; }
 
 .rc-actions {

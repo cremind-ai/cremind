@@ -1,5 +1,5 @@
 ---
-description: "View and manage **event runs** — the per-trigger execution history of automatic event rules (skill, file-watcher, schedule). Each fired trigger runs in its own isolated conversation with a status (running/pending/completed/failed/cancelled) and token usage; reply to runs pending your input, cancel a running run, and inspect or delete run history."
+description: "View and manage **event runs** — the per-trigger execution history of automatic event rules (skill, file-watcher, schedule). Each fired trigger runs in its own isolated conversation with a status (running/pending/completed/failed/cancelled) and token usage; reply to runs pending your input, cancel a running run, and inspect or delete run history. Resolve an **event id / run id** copied from the web UI's Events page with `show` to report details about that run, or `reply`/`cancel`/`delete` to act on it."
 ---
 
 # `cremind event-runs` — Event Run History
@@ -35,6 +35,19 @@ Each event rule on the Events page has a run-history child table (matching
 `event-runs list --subscription <id>`), and clicking a run opens the
 run-detail drawer (matching `event-runs show`). The reply box on a pending
 run's drawer corresponds to `event-runs reply`.
+
+Every run — as a row in the run-history table, a card in the Tasks board view,
+and in the run-detail drawer header — displays its id (first 8 characters)
+labeled **"Run"**, with a copy icon that copies the full id. That copied id is
+the exact `<run_id>` that `show`, `reply`, `delete`, and `cancel` accept, so a
+user who pastes one ("what is event id `…`?", especially if they quote the
+"Run" label) can be answered directly with `event-runs show <id>`. Rule
+rows/cards instead show an id labeled **"Event"** — the originating
+subscription, which is what `event-runs list --subscription <id>` filters by and
+which the rule command groups (`skill-events`/`file-watchers`/`calendar`) edit.
+The "Run" vs "Event" label on the chip is the reliable way to tell which kind a
+pasted id is. IDs copied from the web UI are always the full UUID (unlike the
+CLI table's truncated display), so they can be passed straight through.
 
 ## Global flags
 

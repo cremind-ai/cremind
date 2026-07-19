@@ -19,6 +19,7 @@ import RightPanel from '../RightPanel.vue';
 import ResizableDivider from '../ResizableDivider.vue';
 import ConversationUsagePanel from '../ConversationUsagePanel.vue';
 import EventRunStatusTag from './EventRunStatusTag.vue';
+import EventIdChip from './EventIdChip.vue';
 import { OpenTerminalKey } from '../../composables/terminalTarget';
 import { formatTimestamp, formatTokensCompact, formatUsd } from '../../utils/usageFormat';
 
@@ -237,7 +238,8 @@ async function deleteRun() {
           </div>
         </div>
         <div class="run-meta">
-          <span>Fired {{ formatTimestamp(run.created_at) }}</span>
+          <span class="run-id-meta"><EventIdChip :id="run.id" kind="run" /></span>
+          <span>· Fired {{ formatTimestamp(run.created_at) }}</span>
           <span v-if="run.finished_at">· Finished {{ formatTimestamp(run.finished_at) }}</span>
           <span>· {{ formatTokensCompact(run.usage.total_tokens) }} tokens</span>
           <span>· {{ formatUsd(run.usage.total_usd) }}</span>
@@ -339,6 +341,11 @@ async function deleteRun() {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+}
+.run-id-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 .run-cwd {
   max-width: 320px;

@@ -2,6 +2,7 @@
 import { computed } from 'vue';
 import { Icon } from '@iconify/vue';
 import TaskRuleMenu from './TaskRuleMenu.vue';
+import EventIdChip from '../EventIdChip.vue';
 import { useEventRunsStore } from '../../../stores/eventRuns';
 import { formatRelative } from '../../../utils/duration';
 import { formatTimestamp } from '../../../utils/usageFormat';
@@ -165,6 +166,7 @@ function open() {
       </template>
       <span v-else>No runs yet</span>
       <span v-if="summary?.pending_count" class="ic-waiting">· {{ summary.pending_count }} waiting</span>
+      <EventIdChip :id="entry.id" kind="event" size="xs" class="ic-id" />
     </div>
   </article>
 </template>
@@ -264,4 +266,5 @@ function open() {
   display: inline-block;
 }
 .ic-waiting { color: var(--warning-color, #e6a23c); }
+.ic-id { margin-left: auto; }
 </style>

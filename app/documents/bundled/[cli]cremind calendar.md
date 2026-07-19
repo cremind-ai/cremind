@@ -34,6 +34,14 @@ Two surfaces back this command group:
 > **Sidebar → Events → Schedule Events** — the raw subscription checklist
 > (`schedule list`) with its pause/resume/cancel controls (`schedule status`).
 
+Each schedule event on the Events page displays its id (first 8 characters)
+labeled **"Event"**, with a copy icon that copies the full id — the exact
+`<id>` that `cremind calendar edit` and `cremind calendar delete` accept, and
+that `cremind event-runs list --subscription <id>` filters run history by. When
+a user pastes such an id ("edit event `…`") use it directly. Ids labeled
+**"Run"** on the same page are individual firings — those go to `cremind
+event-runs`, not here.
+
 Changes made from the CLI show up live on both pages (they share the same
 admin SSE stream).
 

@@ -43,7 +43,14 @@ The Events page renders two sections: **Skill Events** at the top and
 with select/toggle/tag controls for Triggers, Target, Extensions, and
 Recursive — the same fields as `cremind file-watchers edit`) and a
 **Delete** button; both propagate live through the same admin SSE stream
-that powers `cremind file-watchers stream`. There is no "register" button
+that powers `cremind file-watchers stream`. Each row (and each rule card in
+the Tasks board view) also displays its id (first 8 characters) labeled
+**"Event"**, with a copy icon that copies the full id — the exact `<id>` that
+`cremind file-watchers edit` / `delete` accept and that
+`cremind event-runs list --subscription <id>` filters by; when a user pastes
+such an id, use it directly. Ids labeled **"Run"** on the same page are
+individual firings handled by `cremind event-runs`, not this group. There is no
+"register" button
 in the UI — subscriptions are created either by the assistant via the
 `register_file_watcher` builtin tool (e.g. "when a python file changes in
 the 'Lee' directory, notify me") or from the CLI with
