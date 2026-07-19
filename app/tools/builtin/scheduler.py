@@ -25,7 +25,7 @@ timezone localization (signalled by ``timezone: "pending"`` in the output).
 This module is the home of the **scheduler** tool group. The single ``scheduler``
 function below (the schedule parser / normalizer) is always exposed. When the
 per-profile *Calendar & Schedule* feature is enabled, this group additionally
-exposes action subtools (create / list / update / cancel schedule events) — see
+exposes action subtools (create / list / edit / cancel schedule events) — see
 :mod:`app.tools.builtin.scheduler_actions` and the ``get_prepare_tools`` gate.
 """
 
@@ -497,7 +497,9 @@ class SchedulerTool(BuiltInTool):
                 "normalized the time. To actually register the task you MUST now "
                 "call `schedule_create` with this output and a complete `action`; "
                 "do not tell the user it is scheduled until schedule_create "
-                "returns OK."
+                "returns OK. If this parse is to CHANGE an existing event's time "
+                "or recurrence, call `schedule_edit` with that event's id instead "
+                "of schedule_create (never cancel and recreate)."
                 if feature_on else
                 "PARSED ONLY — nothing is scheduled yet; this tool just "
                 "normalized the time."
@@ -511,7 +513,7 @@ def get_tools(config: dict) -> list[BuiltInTool]:
     """Return tool instances for this server.
 
     Always includes the ``scheduler`` parser. The Calendar & Schedule action
-    subtools (create/list/update/cancel schedule events) are appended here and
+    subtools (create/list/edit/cancel schedule events) are appended here and
     gated per-request by :func:`get_prepare_tools` against the profile's
     ``calendar_schedule_enabled`` flag, so when the feature is OFF the agent
     only ever sees the parser (today's behavior).
