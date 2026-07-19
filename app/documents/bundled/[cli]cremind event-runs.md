@@ -46,8 +46,10 @@ rows/cards instead show an id labeled **"Event"** — the originating
 subscription, which is what `event-runs list --subscription <id>` filters by and
 which the rule command groups (`skill-events`/`file-watchers`/`calendar`) edit.
 The "Run" vs "Event" label on the chip is the reliable way to tell which kind a
-pasted id is. IDs copied from the web UI are always the full UUID (unlike the
-CLI table's truncated display), so they can be passed straight through.
+pasted id is. Both the web-UI copy icon and `event-runs list` show the full
+UUID, so a listed or copied id can be passed straight to `show` / `reply` /
+`delete` / `cancel` (the lookup is an exact match — a shortened id won't
+resolve).
 
 ## Global flags
 
@@ -75,12 +77,12 @@ cremind event-runs list [--kind <source>] [--subscription <id>]
 | `--status`       | all     | Filter by status: `running`, `pending`, `completed`, `failed`, or `cancelled`.                        |
 | `--limit`        | `50`    | Maximum runs to return (server caps at 200).                                                          |
 
-Renders a `FIRED / STATUS / LABEL / TOKENS / COST / TURNS / RUN ID` table. The
+Renders a `RUN ID / FIRED / STATUS / LABEL / TOKENS / COST / TURNS` table. The
 `STATUS` column is color-coded (pending is highlighted). `FIRED` is the local
 time the trigger fired. `COST` is the run's estimated dollar cost and `TOKENS`
-its total token count. `RUN ID` is a **shortened** run id — pass `--json` to
-get the full id you feed to `show` / `reply` / `delete`. A `shown / total`
-footer follows the table; an empty result prints `no event runs match.`.
+its total token count. `RUN ID` is the **full** run id — copy it straight into
+`show` / `reply` / `delete` / `cancel`. A `shown / total` footer follows the
+table; an empty result prints `no event runs match.`.
 
 With `--json`, returns the raw `{runs: [...], total: N}` object (each run in the
 full RunJSON shape, with full ids and the complete usage breakdown).
@@ -97,7 +99,7 @@ $ cremind event-runs list --status pending
 # Recent schedule/calendar-triggered runs
 $ cremind event-runs list --kind schedule --limit 20
 
-# All runs from one file-watcher subscription (grab the full id with --json)
+# All runs from one file-watcher subscription, as JSON for scripting
 $ cremind event-runs list --subscription fw_a3f1 --json | jq '.runs[].status'
 ```
 
@@ -191,14 +193,12 @@ cancelled
 
 ```bash
 $ cremind event-runs list --status pending
-FIRED                STATUS   LABEL              TOKENS  COST     TURNS  RUN ID
-2026-07-03 09:12:04  pending  Archive old PRs    18422   $0.0412  2      3f9c2a10
+RUN ID                                FIRED                STATUS   LABEL            TOKENS  COST     TURNS
+3f9c2a10-7b1e-4c2d-9a3f-0b1c2d3e4f5b  2026-07-03 09:12:04  pending  Archive old PRs  18422   $0.0412  2
 ...
-# Grab the full id and read the question
-$ cremind event-runs list --status pending --json | jq -r '.runs[0].id, .runs[0].pending_question'
-3f9c2a10-...-b1
-"Archive all 7 stale PRs, or only the ones with no activity in 90 days?"
-$ cremind event-runs reply 3f9c2a10-...-b1 "only the ones with no activity in 90 days"
+# The RUN ID is the full id — read the pending question with `show`, then answer
+$ cremind event-runs show 3f9c2a10-7b1e-4c2d-9a3f-0b1c2d3e4f5b
+$ cremind event-runs reply 3f9c2a10-7b1e-4c2d-9a3f-0b1c2d3e4f5b "only the ones with no activity in 90 days"
 ```
 
 ### Audit what a schedule fired last week and read one transcript
@@ -211,9 +211,10 @@ $ cremind conv get c_82bc          # the run's transcript
 
 ## Troubleshooting
 
-**`run not found` on `show` / `reply`** — The `RUN ID` shown by `list` is
-**truncated**. Pass `--json` to `list` and copy the full `id`, then use that.
-Runs are also profile-scoped: you can only see your own profile's runs.
+**`run not found` on `show` / `reply`** — The id must be the **full** run id;
+the lookup is an exact match, so a shortened id won't resolve. `event-runs list`
+prints the full `RUN ID` (as does `--json`'s `id`) — copy it straight from
+there. Runs are also profile-scoped: you can only see your own profile's runs.
 
 **`reply` says "no conversation yet"** — The run hasn't started a conversation
 (it may still be initializing or it failed before one was created). There's

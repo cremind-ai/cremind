@@ -82,12 +82,6 @@ def _fmt_usd(value: Any) -> str:
         return ""
 
 
-def _short(value: Any, width: int = 8) -> str:
-    """First ``width`` characters of an id (full ids come from `--json`)."""
-    s = "" if value is None else str(value)
-    return s[:width]
-
-
 def _status_cell(mode, status: str) -> str:
     """Colorize a status for the rich table (plain when piped / --no-color)."""
     from app.cli.output.console import is_tty
@@ -154,17 +148,17 @@ def event_runs_list(
         sys.stdout.write("no event runs match.\n")
         return
 
-    table = Table(mode, "FIRED", "STATUS", "LABEL", "TOKENS", "COST", "TURNS", "RUN ID")
+    table = Table(mode, "RUN ID", "FIRED", "STATUS", "LABEL", "TOKENS", "COST", "TURNS")
     for r in runs:
         usage = r.get("usage") if isinstance(r.get("usage"), dict) else {}
         table.add_row(
+            string_field(r, "id"),
             _fmt_ts(r.get("created_at")),
             _status_cell(mode, string_field(r, "status")),
             string_field(r, "label"),
             string_field(usage, "total_tokens"),
             _fmt_usd(usage.get("total_usd")),
             string_field(r, "turn_count"),
-            _short(r.get("id")),
         )
     table.render()
 
@@ -177,7 +171,7 @@ def event_runs_list(
 @graceful_errors
 def event_runs_show(
     ctx: typer.Context,
-    run_id: str = typer.Argument(..., help="Event-run id (from `event-runs list --json`)."),
+    run_id: str = typer.Argument(..., help="Event-run id (from `event-runs list`)."),
 ) -> None:
     """Show one event run in detail (status, usage, pending question, error)."""
     import asyncio
