@@ -48,7 +48,7 @@ def file_watchers_list(ctx: typer.Context) -> None:
 
     table = Table(
         mode,
-        "ID", "NAME", "PATH", "TRIGGERS", "TARGET", "EXTENSIONS", "ARMED", "CONV_TITLE",
+        "ID", "NAME", "PATH", "TRIGGERS", "TARGET", "EXTENSIONS", "ARMED", "PAUSED", "CONV_TITLE",
     )
     for s in subs:
         table.add_row(
@@ -59,6 +59,7 @@ def file_watchers_list(ctx: typer.Context) -> None:
             string_field(s, "target_kind"),
             string_field(s, "extensions"),
             bool_field(s, "armed", False),
+            bool_field(s, "paused", False),
             string_field(s, "conversation_title"),
         )
     table.render()
@@ -85,6 +86,50 @@ def file_watchers_delete(
             await delete_file_watcher(client, watcher_id)
 
     asyncio.run(_run())
+
+
+def _set_file_watcher_paused(ctx: typer.Context, watcher_id: str, paused: bool) -> None:
+    """Shared body for the pause/resume twins — PATCH the ``paused`` flag."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.file_watchers import update_file_watcher
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json, print_map
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await update_file_watcher(client, watcher_id, {"paused": paused})
+
+    watcher = asyncio.run(_run())
+    if mode.json:
+        print_json(watcher)
+    else:
+        print_map(watcher)
+
+
+@file_watchers_app.command("pause")
+@graceful_errors
+def file_watchers_pause(
+    ctx: typer.Context,
+    watcher_id: str = typer.Argument(..., help="Watcher id."),
+) -> None:
+    """Pause a file watcher — retained but stops firing runs."""
+    _set_file_watcher_paused(ctx, watcher_id, True)
+
+
+@file_watchers_app.command("resume")
+@graceful_errors
+def file_watchers_resume(
+    ctx: typer.Context,
+    watcher_id: str = typer.Argument(..., help="Watcher id."),
+) -> None:
+    """Resume a paused file watcher."""
+    _set_file_watcher_paused(ctx, watcher_id, False)
 
 
 @file_watchers_app.command("register")

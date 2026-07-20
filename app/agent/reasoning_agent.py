@@ -1335,6 +1335,7 @@ class ReasoningAgent:
         ("system_file", "register_file_watcher"),
         ("system_file", "delete_file_watcher"),
         ("scheduler", "schedule_create"),
+        ("scheduler", "schedule_edit"),
         ("scheduler", "schedule_cancel"),
     })
 

@@ -66,13 +66,18 @@ export interface SkillBoardSubscription extends BoardSubscriptionBase {
   kind: 'skill_event';
   skillName: string;
   eventType: string;
+  /** Paused subscriptions are retained but skipped at dispatch. */
+  paused: boolean;
   /** The raw subscription, so rule actions can open the edit/simulate dialogs. */
   raw: SkillEventSubscription;
 }
 
 export interface FileWatcherBoardSubscription extends BoardSubscriptionBase {
   kind: 'file_watcher';
+  /** Runtime: whether an OS observer covers the root (not a pause). */
   armed: boolean;
+  /** Paused subscriptions are retained but skipped at dispatch. */
+  paused: boolean;
   rootPath: string;
   raw: FileWatcherSubscription;
 }
@@ -116,6 +121,7 @@ export function fromSkillEvent(s: SkillEventSubscription): SkillBoardSubscriptio
     icon: sourceKindIcon('skill_event'),
     skillName: s.skill_name,
     eventType: s.event_type,
+    paused: !!s.paused,
     raw: s,
   };
 }
@@ -131,9 +137,19 @@ export function fromFileWatcher(s: FileWatcherSubscription): FileWatcherBoardSub
     createdAtMs: (s.created_at || 0) * 1000,
     icon: sourceKindIcon('file_watcher'),
     armed: s.armed,
+    paused: !!s.paused,
     rootPath: s.root_path,
     raw: s,
   };
+}
+
+/**
+ * Multi-fire vs one-time. Skill events and file watchers always fire
+ * repeatedly; a schedule is recurring iff it carries an rrule. Recurring
+ * events keep their card in the EVENTS column even while a run is active.
+ */
+export function isRecurring(e: BoardSubscription): boolean {
+  return e.kind !== 'schedule' || !!e.rrule;
 }
 
 export function fromSchedule(s: ScheduleEventSubscription): ScheduleBoardSubscription {

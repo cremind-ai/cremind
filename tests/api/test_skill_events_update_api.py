@@ -120,6 +120,22 @@ def test_update_rejects_empty_action(tmp_path: Path, monkeypatch) -> None:
     assert resp.status_code == 400
 
 
+def test_update_paused_round_trip(tmp_path: Path, monkeypatch) -> None:
+    store = _setup(tmp_path, monkeypatch)
+    row = _seed_sub(store)
+    assert row["paused"] is False  # created un-paused
+    handler = _handler("/api/skill-events/{id}", "PATCH")
+
+    resp = asyncio.run(handler(_req(path_params={"id": row["id"]}, body={"paused": True})))
+    out = _body(resp)
+    assert out["paused"] is True
+    assert store.get(row["id"])["paused"] is True  # persisted + serialized
+
+    # Resume clears it.
+    resp = asyncio.run(handler(_req(path_params={"id": row["id"]}, body={"paused": False})))
+    assert _body(resp)["paused"] is False
+
+
 def test_update_forbidden_other_profile(tmp_path: Path, monkeypatch) -> None:
     store = _setup(tmp_path, monkeypatch)
     row = _seed_sub(store, profile="p2")

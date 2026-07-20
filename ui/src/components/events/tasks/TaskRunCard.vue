@@ -1,33 +1,29 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import EventRunStatusTag from '../EventRunStatusTag.vue';
-import TaskRuleMenu from './TaskRuleMenu.vue';
+import EventIdChip from '../EventIdChip.vue';
 import { useEventRunsStore } from '../../../stores/eventRuns';
 import { formatTokensCompact, formatUsd } from '../../../utils/usageFormat';
 import { formatDurationMs, formatRelative, runDuration } from '../../../utils/duration';
 import { accentColor, sourceKindIcon } from './boardTypes';
-import type { BoardSubscription, RuleActionPayload } from './boardTypes';
+import type { BoardSubscription } from './boardTypes';
 import type { EventRun } from '../../../services/eventRunsApi';
 
 const props = defineProps<{
   run: EventRun;
+  // Only used for the card's icon/title fallbacks; rule/event actions (pause,
+  // edit, delete the rule) live on the EVENTS-column card, not here.
   sub: BoardSubscription | null;
   now: number;
   /** Show the clickable event chip (hidden when already filtered to one event). */
   showEventChip?: boolean;
-  listenerRunning?: boolean;
 }>();
 
 const emit = defineEmits<{
   (e: 'filter-event', key: string): void;
-  (e: 'rule-action', payload: RuleActionPayload): void;
 }>();
-
-// Keep the hover action bar visible while the (teleported) rule menu is open —
-// moving the pointer onto the menu un-hovers the card.
-const menuOpen = ref(false);
 
 const store = useEventRunsStore();
 
@@ -132,9 +128,10 @@ async function confirmDelete() {
       <span class="rc-spacer" />
       <span class="rc-metric">{{ formatTokensCompact(run.usage.total_tokens) }}</span>
       <span class="rc-metric">{{ formatUsd(run.usage.total_usd) }}</span>
+      <EventIdChip :id="run.id" kind="run" size="xs" class="rc-id" />
     </div>
 
-    <div class="rc-actions" :class="{ pinned: menuOpen }">
+    <div class="rc-actions">
       <button
         v-if="run.status === 'running'"
         type="button"
@@ -165,13 +162,6 @@ async function confirmDelete() {
       <button type="button" class="rc-act" title="Open run" @click.stop="open">
         <Icon icon="mdi:open-in-app" />
       </button>
-      <TaskRuleMenu
-        v-if="sub"
-        :sub="sub"
-        :listener-running="listenerRunning"
-        @select="(a) => emit('rule-action', { action: a, sub: sub! })"
-        @open-change="(v) => (menuOpen = v)"
-      />
     </div>
   </article>
 </template>
@@ -258,8 +248,10 @@ async function confirmDelete() {
   gap: 8px;
   font-size: 0.6875rem;
   color: var(--text-tertiary);
+  flex-wrap: wrap;
 }
 .rc-wait { color: var(--warning-color, #e6a23c); }
+.rc-id { flex-shrink: 0; }
 .rc-metric { font-variant-numeric: tabular-nums; }
 
 .rc-actions {
@@ -273,8 +265,7 @@ async function confirmDelete() {
   border-radius: 6px;
   box-shadow: var(--el-box-shadow-light);
 }
-.run-card:hover .rc-actions,
-.rc-actions.pinned { display: flex; }
+.run-card:hover .rc-actions { display: flex; }
 .rc-act {
   border: 1px solid var(--border-color);
   background: var(--bg-color);

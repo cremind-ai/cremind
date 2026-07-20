@@ -23,6 +23,7 @@ import {
 } from '../services/adminEventsStream';
 import CollapsibleSection from './CollapsibleSection.vue';
 import EventRunHistory from './events/EventRunHistory.vue';
+import EventIdChip from './events/EventIdChip.vue';
 import FileWatcherEditDialog from './events/FileWatcherEditDialog.vue';
 
 const props = defineProps<{ profile: string }>();
@@ -155,7 +156,12 @@ function formatDate(seconds: number): string {
           <EventRunHistory source-kind="file_watcher" :subscription-id="row.id" />
         </template>
       </ElTableColumn>
-      <ElTableColumn prop="name" label="Name" min-width="140" />
+      <ElTableColumn label="Name" min-width="140">
+        <template #default="{ row }">
+          <div>{{ row.name }}</div>
+          <EventIdChip :id="row.id" kind="event" />
+        </template>
+      </ElTableColumn>
       <ElTableColumn label="Path" min-width="240">
         <template #default="{ row }">
           <ElTooltip :content="row.root_path" placement="top">

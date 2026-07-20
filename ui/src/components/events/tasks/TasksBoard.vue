@@ -15,6 +15,7 @@ import {
   fromFileWatcher,
   fromSchedule,
   fromSkillEvent,
+  isRecurring,
   sourceKindIcon,
   type BoardSubscription,
   type RuleActionPayload,
@@ -24,8 +25,8 @@ import { useSettingsStore } from '../../../stores/settings';
 import { useAdminSubscriptions } from '../../../composables/useAdminSubscriptions';
 import { useNow } from '../../../composables/useNow';
 import { adminEventsStatus } from '../../../services/adminEventsStream';
-import { deleteSubscription, startListener } from '../../../services/skillEventsApi';
-import { deleteFileWatcher } from '../../../services/fileWatchersApi';
+import { deleteSubscription, startListener, updateSubscription } from '../../../services/skillEventsApi';
+import { deleteFileWatcher, updateFileWatcher } from '../../../services/fileWatchersApi';
 import { deleteCalendarEvent, setScheduleEventStatus } from '../../../services/calendarApi';
 import type { EventRun, EventRunSourceKind } from '../../../services/eventRunsApi';
 
@@ -163,27 +164,29 @@ const activeKeys = computed(() => {
   return s;
 });
 
-// A schedule that has run its course (completed / cancelled) — kept visible for
-// parity with the table, but muted and sorted to the bottom.
+// A schedule that has run its course (completed / cancelled) — will never fire
+// again, so it is dropped from the EVENTS column entirely (its runs still show
+// under Done). Recurring rules that exhaust their recurrence-end also land here.
 function isTerminalRule(e: BoardSubscription): boolean {
   return e.kind === 'schedule' && (e.scheduleStatus === 'completed' || e.scheduleStatus === 'cancelled');
 }
 
+// EVENTS column membership: show a rule iff it can still fire (NOT terminal) AND
+// it is either recurring (multi-fire rules stay put even while a run is active,
+// so you pause the event from here) or one-time with no active run (a one-time
+// event lives in Running/Done while/after its single fire).
 const idleEntries = computed(() => {
   const q = search.value.trim().toLowerCase();
   return allSubs.value
     .filter((e) => {
       if (!activeKinds[e.kind]) return false;
       if (eventFilter.value && e.key !== eventFilter.value) return false;
-      // Rules with an active run live in Running/Needs input, not here.
-      if (activeKeys.value.has(e.key)) return false;
+      if (isTerminalRule(e)) return false;
+      if (!isRecurring(e) && activeKeys.value.has(e.key)) return false;
       if (q && !`${e.title} ${e.action}`.toLowerCase().includes(q)) return false;
       return true;
     })
     .sort((a, b) => {
-      // Terminal schedules sink to the bottom.
-      const t = Number(isTerminalRule(a)) - Number(isTerminalRule(b));
-      if (t) return t;
       const an = a.kind === 'schedule' && a.scheduleStatus === 'active' ? a.nextFireAtMs : null;
       const bn = b.kind === 'schedule' && b.scheduleStatus === 'active' ? b.nextFireAtMs : null;
       if (an != null && bn != null) return an - bn;
@@ -197,10 +200,6 @@ const boardEmpty = computed(
   () => !loading.value && allSubs.value.length === 0 && profileRuns.value.length === 0,
 );
 const showChip = computed(() => !eventFilter.value);
-
-function listenerRunning(sub: BoardSubscription | null): boolean {
-  return sub?.kind === 'skill_event' ? !!listeners.value[sub.skillName]?.running : false;
-}
 
 async function handleRuleAction({ action, sub }: RuleActionPayload) {
   switch (action) {
@@ -223,14 +222,20 @@ async function handleRuleAction({ action, sub }: RuleActionPayload) {
       }
       break;
     case 'toggle-pause':
-      if (sub.kind === 'schedule') {
-        const next = sub.scheduleStatus === 'paused' ? 'active' : 'paused';
-        try {
+      try {
+        if (sub.kind === 'schedule') {
+          const next = sub.scheduleStatus === 'paused' ? 'active' : 'paused';
           await setScheduleEventStatus(settings.agentUrl, settings.authToken, sub.id, next);
-          ElMessage.success(next === 'paused' ? 'Schedule paused' : 'Schedule resumed');
-        } catch (err) {
-          ElMessage.error(err instanceof Error ? err.message : String(err));
+          ElMessage.success(next === 'paused' ? 'Event paused' : 'Event resumed');
+        } else if (sub.kind === 'skill_event') {
+          await updateSubscription(settings.agentUrl, settings.authToken, sub.id, { paused: !sub.paused });
+          ElMessage.success(sub.paused ? 'Event resumed' : 'Event paused');
+        } else if (sub.kind === 'file_watcher') {
+          await updateFileWatcher(settings.agentUrl, settings.authToken, sub.id, { paused: !sub.paused });
+          ElMessage.success(sub.paused ? 'Event resumed' : 'Event paused');
         }
+      } catch (err) {
+        ElMessage.error(err instanceof Error ? err.message : String(err));
       }
       break;
     case 'open-conversation':
@@ -362,9 +367,7 @@ async function deleteRule(sub: BoardSubscription) {
             :sub="subsByKey.get(keyOf(r)) ?? null"
             :now="now"
             :show-event-chip="showChip"
-            :listener-running="listenerRunning(subsByKey.get(keyOf(r)) ?? null)"
             @filter-event="(k) => (eventFilter = k)"
-            @rule-action="handleRuleAction"
           />
         </TransitionGroup>
       </TaskBoardColumn>
@@ -384,9 +387,7 @@ async function deleteRule(sub: BoardSubscription) {
             :sub="subsByKey.get(keyOf(r)) ?? null"
             :now="now"
             :show-event-chip="showChip"
-            :listener-running="listenerRunning(subsByKey.get(keyOf(r)) ?? null)"
             @filter-event="(k) => (eventFilter = k)"
-            @rule-action="handleRuleAction"
           />
         </TransitionGroup>
       </TaskBoardColumn>
@@ -422,9 +423,7 @@ async function deleteRule(sub: BoardSubscription) {
             :runs="g.runs"
             :now="now"
             :force-expanded="!!eventFilter"
-            :listener-running="listenerRunning(g.sub)"
             @filter-event="(k) => (eventFilter = k)"
-            @rule-action="handleRuleAction"
           />
         </TransitionGroup>
         <p v-if="doneGroups.length" class="done-note">

@@ -437,6 +437,9 @@ def get_file_watcher_routes() -> list[Route]:
             if name:
                 fields["name"] = name
 
+        if "paused" in body:
+            fields["paused"] = bool(body.get("paused"))
+
         if not fields:
             return JSONResponse({**existing, "armed": get_file_watcher_manager().is_armed(existing)})
 

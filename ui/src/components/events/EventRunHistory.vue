@@ -12,6 +12,7 @@ import {
 import { Icon } from '@iconify/vue';
 import { useEventRunsStore } from '../../stores/eventRuns';
 import EventRunStatusTag from './EventRunStatusTag.vue';
+import EventIdChip from './EventIdChip.vue';
 import { formatTimestamp, formatTokensCompact, formatUsd } from '../../utils/usageFormat';
 import { runDuration } from '../../utils/duration';
 import type { EventRun, EventRunSourceKind } from '../../services/eventRunsApi';
@@ -60,7 +61,10 @@ function loadOlder() {
     <template v-else>
       <ElTable :data="runs" size="small" row-key="id" @row-click="open" class="run-table">
         <ElTableColumn label="Fired" width="170">
-          <template #default="{ row }">{{ formatTimestamp(row.created_at) }}</template>
+          <template #default="{ row }">
+            <div>{{ formatTimestamp(row.created_at) }}</div>
+            <EventIdChip :id="row.id" kind="run" />
+          </template>
         </ElTableColumn>
         <ElTableColumn label="Status" width="140">
           <template #default="{ row }">

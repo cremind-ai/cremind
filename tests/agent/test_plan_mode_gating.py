@@ -147,6 +147,7 @@ def test_planning_phase_blocks_mutating_leaves(monkeypatch):
     assert agent._is_plan_blocked_leaf(_leaf("exec_shell", "exec_shell")) is True
     assert agent._is_plan_blocked_leaf(_leaf("system_file", "write_file")) is True
     assert agent._is_plan_blocked_leaf(_leaf("scheduler", "schedule_create")) is True
+    assert agent._is_plan_blocked_leaf(_leaf("scheduler", "schedule_edit")) is True
     # ...while read-only leaves (research) stay allowed.
     assert agent._is_plan_blocked_leaf(_leaf("system_file", "read_file")) is False
     assert agent._is_plan_blocked_leaf(_leaf("system_file", "grep_files")) is False
@@ -172,8 +173,9 @@ def test_event_run_blocks_registration_leaves(monkeypatch):
     # Event-CREATION leaves are refused inside an event run...
     assert agent._is_event_blocked_leaf(_leaf("scheduler", "schedule_create")) is True
     assert agent._is_event_blocked_leaf(_leaf("system_file", "register_file_watcher")) is True
-    # ...but DE-registration leaves stay allowed (they can't storm).
+    # ...but DE-registration and in-place edit leaves stay allowed (they can't storm).
     assert agent._is_event_blocked_leaf(_leaf("scheduler", "schedule_cancel")) is False
+    assert agent._is_event_blocked_leaf(_leaf("scheduler", "schedule_edit")) is False
     assert agent._is_event_blocked_leaf(_leaf("system_file", "delete_file_watcher")) is False
 
 

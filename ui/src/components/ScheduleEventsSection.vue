@@ -24,6 +24,7 @@ import {
 } from '../services/adminEventsStream';
 import CollapsibleSection from './CollapsibleSection.vue';
 import EventRunHistory from './events/EventRunHistory.vue';
+import EventIdChip from './events/EventIdChip.vue';
 import ScheduleEventDialog from './ScheduleEventDialog.vue';
 
 const props = defineProps<{ profile: string }>();
@@ -163,7 +164,12 @@ async function confirmDelete(row: ScheduleEventSubscription) {
           <EventRunHistory source-kind="schedule" :subscription-id="row.id" />
         </template>
       </ElTableColumn>
-      <ElTableColumn prop="title" label="Title" min-width="160" />
+      <ElTableColumn label="Title" min-width="160">
+        <template #default="{ row }">
+          <div>{{ row.title }}</div>
+          <EventIdChip :id="row.id" kind="event" />
+        </template>
+      </ElTableColumn>
       <ElTableColumn label="Schedule" min-width="180">
         <template #default="{ row }">
           <ElTag size="small" :type="row.rrule ? 'success' : 'info'" class="sched-tag">

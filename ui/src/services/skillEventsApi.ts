@@ -29,6 +29,7 @@ export interface SkillEventSubscription {
   event_type: string;
   action: string;
   created_at: number;
+  paused: boolean;
 }
 
 export interface SkillEventDeclaration {
@@ -113,7 +114,7 @@ export async function updateSubscription(
   agentUrl: string,
   token: string,
   id: string,
-  fields: { event_type?: string; action?: string },
+  fields: { event_type?: string; action?: string; paused?: boolean },
 ): Promise<SkillEventSubscription> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/skill-events/${encodeURIComponent(id)}`, {

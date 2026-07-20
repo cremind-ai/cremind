@@ -33,6 +33,7 @@ export interface FileWatcherSubscription {
   extensions: string;        // comma-joined ".py,.md" (empty = all)
   action: string;
   armed: boolean;
+  paused: boolean;
   created_at: number;
 }
 
@@ -55,6 +56,7 @@ export interface FileWatcherUpdatePayload {
   extensions?: string[];
   recursive?: boolean;
   action?: string;
+  paused?: boolean;
 }
 
 export async function listFileWatchers(

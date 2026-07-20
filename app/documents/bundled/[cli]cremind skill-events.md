@@ -1,10 +1,10 @@
 ---
-description: "Subscribe to and manage **skill events and notifications**: `list`, `edit`, or `delete` a skill's event subscriptions for the active profile, `simulate` an event by dropping a markdown file in the watched folder, `stream` events and `notifications` over SSE, browse the events a skill declares (`events <skill>`), and check or start its listener daemon (`listener-status`, `listener-start`). Use this for events emitted by installed skills — distinct from filesystem (`cremind file-watchers`) and time (`cremind calendar`) events."
+description: "Subscribe to and manage **skill events and notifications**: `list`, `edit`, `pause`, `resume`, or `delete` a skill's event subscriptions for the active profile, `simulate` an event by dropping a markdown file in the watched folder, `stream` events and `notifications` over SSE, browse the events a skill declares (`events <skill>`), and check or start its listener daemon (`listener-status`, `listener-start`). Given an **event id / subscription id** copied from the web UI's Events page, use it here with `edit`, `pause`, `resume`, `delete`, or `simulate` to answer questions about that event or change it. `pause` keeps a subscription but stops it firing (`resume` re-enables it) without touching the skill's shared listener. Use this for events emitted by installed skills — distinct from filesystem (`cremind file-watchers`) and time (`cremind calendar`) events."
 ---
 
 # `cremind skill-events` — Skill Event Subscriptions and Notifications
 
-`cremind skill-events` (alias `cremind events`) is the CLI for managing the
+`cremind skill-events` is the CLI for managing the
 event-driven side of Cremind skills. A *skill* (declared by a
 `SKILL.md`) can declare *events* it watches for; when an event fires,
 it can spawn a conversation, run a script, or notify the user. This
@@ -18,10 +18,13 @@ something — with `cremind event-runs` (`cremind event-runs list --kind skill`)
 
 The group covers four orthogonal concerns:
 
-- **Subscriptions** — `list`, `edit`, `delete`. Each subscription binds an
-  event type to a skill (and optionally to a conversation); `edit` changes
-  the trigger (validated against the skill's declared events) and/or the
-  action.
+- **Subscriptions** — `list`, `edit`, `pause`, `resume`, `delete`. Each
+  subscription binds an event type to a skill (and optionally to a
+  conversation); `edit` changes the trigger (validated against the skill's
+  declared events) and/or the action. `pause <id>` retains the subscription
+  but stops it firing runs (it's skipped at dispatch); `resume <id>` re-enables
+  it. Pausing one subscription never stops the skill's shared listener, so its
+  sibling subscriptions keep firing.
 - **Live streaming** — `stream` (admin-wide snapshot) and
   `notifications` (per-profile notifications) emit Server-Sent Events
   until interrupted with Ctrl-C.
@@ -48,6 +51,18 @@ dialog whose Trigger is a dropdown of the skill's declared events, plus an
 Action editor — the same fields as `cremind skill-events edit`) and a
 **Simulate** button on each subscription row that opens a small editor for
 the markdown body (matching `cremind skill-events simulate`).
+
+Every subscription row (and every rule card in the Tasks board view) displays
+its id — the first 8 characters, labeled **"Event"**, with a copy icon that
+copies the full id. That copied id is exactly the `<id>` that `edit`, `delete`,
+and `simulate` accept, so when a user pastes one ("what is event id
+`3f9c2a10-…`?" or "edit event `3f9c2a10-…`") use it directly. The Events page
+also shows ids labeled **"Run"** — those are *executions* of an event, not the
+event itself; they belong to `cremind event-runs` (`show`/`reply`/`cancel`),
+not to this group. If an id labeled "Event" doesn't match a skill-event
+subscription, it may be a **file-watcher** (`cremind file-watchers list`) or a
+**schedule** event (`cremind calendar events`) — the Events page shows all of
+those.
 
 ## Streaming output format
 

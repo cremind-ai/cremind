@@ -158,6 +158,23 @@ def test_update_rejects_empty_action(tmp_path: Path, monkeypatch) -> None:
     assert mgr.armed == []
 
 
+def test_update_paused_round_trip(tmp_path: Path, monkeypatch) -> None:
+    store, mgr = _setup(tmp_path, monkeypatch)
+    row = _seed_watcher(store)
+    assert row["paused"] is False  # created un-paused
+    handler = _handler("/api/file-watchers/{id}", "PATCH")
+
+    resp = asyncio.run(handler(_req(path_params={"id": row["id"]}, body={"paused": True})))
+    out = _body(resp)
+    assert out["paused"] is True
+    assert store.get(row["id"])["paused"] is True  # persisted + serialized
+    # Pausing keeps the observer (dispatch is what's gated); no disarm.
+    assert mgr.disarmed == []
+
+    resp = asyncio.run(handler(_req(path_params={"id": row["id"]}, body={"paused": False})))
+    assert _body(resp)["paused"] is False
+
+
 def test_update_forbidden_other_profile(tmp_path: Path, monkeypatch) -> None:
     store, mgr = _setup(tmp_path, monkeypatch)
     row = _seed_watcher(store, profile="p2")
