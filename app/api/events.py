@@ -208,10 +208,11 @@ def get_event_routes() -> list[Route]:
     async def handle_update(request: Request) -> JSONResponse:
         """Edit an existing skill-event subscription (Events-page / CLI edits).
 
-        Only ``event_type`` (the trigger) and ``action`` are editable. A changed
-        trigger is validated against the events the skill declares in its
-        ``SKILL.md`` (same rule as the ``subscribe`` path). No watcher re-arm is
-        needed — the blanket per-profile watch resolves triggers on fan-out. The
+        ``event_type`` (the trigger), ``action``, and ``paused`` are editable. A
+        changed trigger is validated against the events the skill declares in its
+        ``SKILL.md`` (same rule as the ``subscribe`` path). ``paused`` retains the
+        subscription but skips it at dispatch. No watcher re-arm is needed — the
+        blanket per-profile watch resolves triggers on fan-out. The
         self-containment gate is not run here (consistent with manual paths).
         """
         unauth = _require_auth(request)
@@ -267,6 +268,9 @@ def get_event_routes() -> list[Route]:
                     status_code=400,
                 )
             fields["event_type"] = event_type
+
+        if "paused" in body:
+            fields["paused"] = bool(body.get("paused"))
 
         if not fields:
             return JSONResponse(existing)

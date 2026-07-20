@@ -48,7 +48,7 @@ def skill_events_list(ctx: typer.Context) -> None:
         print_json(subs)
         return
 
-    table = Table(mode, "ID", "SKILL", "EVENT_TYPE", "CONVERSATION", "CONV_TITLE")
+    table = Table(mode, "ID", "SKILL", "EVENT_TYPE", "CONVERSATION", "CONV_TITLE", "PAUSED")
     for s in subs:
         table.add_row(
             string_field(s, "id"),
@@ -56,6 +56,7 @@ def skill_events_list(ctx: typer.Context) -> None:
             string_field(s, "event_type"),
             string_field(s, "conversation_id"),
             string_field(s, "conversation_title"),
+            "yes" if s.get("paused") else "",
         )
     table.render()
 
@@ -81,6 +82,50 @@ def skill_events_delete(
             await delete_skill_event_subscription(client, sub_id)
 
     asyncio.run(_run())
+
+
+def _set_skill_event_paused(ctx: typer.Context, sub_id: str, paused: bool) -> None:
+    """Shared body for the pause/resume twins — PATCH the ``paused`` flag."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.skill_events import update_skill_event_subscription
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json, print_map
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await update_skill_event_subscription(client, sub_id, {"paused": paused})
+
+    sub = asyncio.run(_run())
+    if mode.json:
+        print_json(sub)
+    else:
+        print_map(sub)
+
+
+@skill_events_app.command("pause")
+@graceful_errors
+def skill_events_pause(
+    ctx: typer.Context,
+    sub_id: str = typer.Argument(..., help="Subscription id."),
+) -> None:
+    """Pause a skill event subscription — retained but stops firing runs."""
+    _set_skill_event_paused(ctx, sub_id, True)
+
+
+@skill_events_app.command("resume")
+@graceful_errors
+def skill_events_resume(
+    ctx: typer.Context,
+    sub_id: str = typer.Argument(..., help="Subscription id."),
+) -> None:
+    """Resume a paused skill event subscription."""
+    _set_skill_event_paused(ctx, sub_id, False)
 
 
 @skill_events_app.command("edit")

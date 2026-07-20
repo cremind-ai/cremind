@@ -42,6 +42,7 @@ class FileWatcherSubscriptionStorage(SyncStorageBase):
             "extensions": row["extensions"] or "",
             "action": row["action"],
             "created_at": row["created_at"],
+            "paused": bool(row["paused"]),
         }
 
     def get(self, id: str) -> Optional[Dict[str, Any]]:
@@ -118,16 +119,16 @@ class FileWatcherSubscriptionStorage(SyncStorageBase):
                 text(
                     "INSERT INTO file_watcher_subscriptions "
                     "(id, conversation_id, profile, name, root_path, recursive, "
-                    "target_kind, event_types, extensions, action, created_at) "
+                    "target_kind, event_types, extensions, action, created_at, paused) "
                     "VALUES (:id, :conversation_id, :profile, :name, :root_path, :recursive, "
-                    ":target_kind, :event_types, :extensions, :action, :created_at)"
+                    ":target_kind, :event_types, :extensions, :action, :created_at, :paused)"
                 ),
                 {
                     "id": new_id, "conversation_id": conversation_id, "profile": profile,
                     "name": name, "root_path": root_path,
                     "recursive": bool(recursive), "target_kind": target_kind,
                     "event_types": event_types, "extensions": extensions or None,
-                    "action": action, "created_at": now,
+                    "action": action, "created_at": now, "paused": False,
                 },
             )
         return {
@@ -142,13 +143,14 @@ class FileWatcherSubscriptionStorage(SyncStorageBase):
             "extensions": extensions or "",
             "action": action,
             "created_at": now,
+            "paused": False,
         }
 
     # Columns a caller may edit (manual Events-page / CLI edits). Excludes
     # identity/bookkeeping columns (id, conversation_id, profile, created_at).
     _EDITABLE = {
         "name", "root_path", "recursive", "target_kind", "event_types",
-        "extensions", "action",
+        "extensions", "action", "paused",
     }
 
     def update_fields(self, id: str, **fields: Any) -> Optional[Dict[str, Any]]:

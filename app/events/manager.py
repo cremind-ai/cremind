@@ -152,6 +152,10 @@ class _ProfileEventHandler(FileSystemEventHandler):
             return
         from app.events import run_dispatcher
         for sub in subs:
+            if sub.get("paused"):
+                # Paused subscriptions are retained but skipped; the shared
+                # listener keeps firing for this skill's other subscriptions.
+                continue
             try:
                 await run_dispatcher.dispatch_skill_event(sub=sub, content=content)
             except Exception:  # noqa: BLE001

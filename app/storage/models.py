@@ -428,6 +428,9 @@ class SkillEventSubscriptionModel(Base):
     event_type: Mapped[str] = mapped_column(String(128), nullable=False)
     action: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    # When true the subscription is retained but skipped at dispatch (paused by
+    # the user); the skill's shared listener keeps running for its siblings.
+    paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class FileWatcherSubscriptionModel(Base):
@@ -460,6 +463,10 @@ class FileWatcherSubscriptionModel(Base):
     extensions: Mapped[str | None] = mapped_column(String(256), nullable=True)
     action: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    # When true the watch stays registered but its events are skipped at
+    # dispatch (paused by the user). Distinct from the runtime-only ``armed``
+    # flag (whether an OS observer covers the root).
+    paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class ScheduleEventSubscriptionModel(Base):

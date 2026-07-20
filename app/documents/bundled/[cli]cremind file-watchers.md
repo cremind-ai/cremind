@@ -1,5 +1,5 @@
 ---
-description: "Watch the **filesystem** and trigger the agent when files change: register a directory watch (relative to `CREMIND_USER_WORKING_DIR` or absolute), filtered by event type (created / modified / deleted / moved), target kind (file / folder), and file extensions; `list`, `edit`, and `delete` watcher subscriptions for the active profile; and tail admin snapshots over SSE. Use this to run the agent when a file is added, edited, or removed — filesystem events, unlike time-based `cremind calendar` or skill events."
+description: "Watch the **filesystem** and trigger the agent when files change: register a directory watch (relative to `CREMIND_USER_WORKING_DIR` or absolute), filtered by event type (created / modified / deleted / moved), target kind (file / folder), and file extensions; `list`, `edit`, `pause`, `resume`, and `delete` watcher subscriptions for the active profile; and tail admin snapshots over SSE. `pause` keeps a watcher but stops it firing (`resume` re-enables it). Use this to run the agent when a file is added, edited, or removed — filesystem events, unlike time-based `cremind calendar` or skill events."
 ---
 
 # `cremind file-watchers` — Filesystem Watch Subscriptions
@@ -19,10 +19,14 @@ something — with `cremind event-runs` (`cremind event-runs list --kind file-wa
 
 The group covers three orthogonal concerns:
 
-- **Subscriptions** — `list`, `register`, `edit`, `delete`. Each
-  subscription binds a directory + filter set to a conversation-scoped
-  action; `edit` changes any of those fields on an existing watcher and
-  re-arms its Observer.
+- **Subscriptions** — `list`, `register`, `edit`, `pause`, `resume`,
+  `delete`. Each subscription binds a directory + filter set to a
+  conversation-scoped action; `edit` changes any of those fields on an
+  existing watcher and re-arms its Observer. `pause <id>` retains the watcher
+  but skips its events at dispatch (`resume <id>` re-enables it); because
+  observers are shared per watched root, pausing one watcher never stops the
+  observer serving that root's other watchers. Note `pause` is distinct from
+  the runtime `ARMED` flag (whether an OS observer covers the root).
 - **Live streaming** — `stream` emits a Server-Sent Events feed of the
   current admin snapshot whenever any subscription is created, deleted,
   or its arm-state changes. Runs until interrupted with Ctrl-C.

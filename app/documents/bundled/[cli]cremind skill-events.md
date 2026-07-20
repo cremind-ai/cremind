@@ -1,5 +1,5 @@
 ---
-description: "Subscribe to and manage **skill events and notifications**: `list`, `edit`, or `delete` a skill's event subscriptions for the active profile, `simulate` an event by dropping a markdown file in the watched folder, `stream` events and `notifications` over SSE, browse the events a skill declares (`events <skill>`), and check or start its listener daemon (`listener-status`, `listener-start`). Given an **event id / subscription id** copied from the web UI's Events page, use it here with `edit`, `delete`, or `simulate` to answer questions about that event or change it. Use this for events emitted by installed skills — distinct from filesystem (`cremind file-watchers`) and time (`cremind calendar`) events."
+description: "Subscribe to and manage **skill events and notifications**: `list`, `edit`, `pause`, `resume`, or `delete` a skill's event subscriptions for the active profile, `simulate` an event by dropping a markdown file in the watched folder, `stream` events and `notifications` over SSE, browse the events a skill declares (`events <skill>`), and check or start its listener daemon (`listener-status`, `listener-start`). Given an **event id / subscription id** copied from the web UI's Events page, use it here with `edit`, `pause`, `resume`, `delete`, or `simulate` to answer questions about that event or change it. `pause` keeps a subscription but stops it firing (`resume` re-enables it) without touching the skill's shared listener. Use this for events emitted by installed skills — distinct from filesystem (`cremind file-watchers`) and time (`cremind calendar`) events."
 ---
 
 # `cremind skill-events` — Skill Event Subscriptions and Notifications
@@ -18,10 +18,13 @@ something — with `cremind event-runs` (`cremind event-runs list --kind skill`)
 
 The group covers four orthogonal concerns:
 
-- **Subscriptions** — `list`, `edit`, `delete`. Each subscription binds an
-  event type to a skill (and optionally to a conversation); `edit` changes
-  the trigger (validated against the skill's declared events) and/or the
-  action.
+- **Subscriptions** — `list`, `edit`, `pause`, `resume`, `delete`. Each
+  subscription binds an event type to a skill (and optionally to a
+  conversation); `edit` changes the trigger (validated against the skill's
+  declared events) and/or the action. `pause <id>` retains the subscription
+  but stops it firing runs (it's skipped at dispatch); `resume <id>` re-enables
+  it. Pausing one subscription never stops the skill's shared listener, so its
+  sibling subscriptions keep firing.
 - **Live streaming** — `stream` (admin-wide snapshot) and
   `notifications` (per-profile notifications) emit Server-Sent Events
   until interrupted with Ctrl-C.

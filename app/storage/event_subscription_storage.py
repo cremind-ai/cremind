@@ -34,6 +34,7 @@ class EventSubscriptionStorage(SyncStorageBase):
             "event_type": row["event_type"],
             "action": row["action"],
             "created_at": row["created_at"],
+            "paused": bool(row["paused"]),
         }
 
     def get(self, id: str) -> Optional[Dict[str, Any]]:
@@ -110,13 +111,13 @@ class EventSubscriptionStorage(SyncStorageBase):
             conn.execute(
                 text(
                     "INSERT INTO skill_event_subscriptions "
-                    "(id, conversation_id, profile, skill_name, event_type, action, created_at) "
-                    "VALUES (:id, :conversation_id, :profile, :skill_name, :event_type, :action, :created_at)"
+                    "(id, conversation_id, profile, skill_name, event_type, action, created_at, paused) "
+                    "VALUES (:id, :conversation_id, :profile, :skill_name, :event_type, :action, :created_at, :paused)"
                 ),
                 {
                     "id": new_id, "conversation_id": conversation_id, "profile": profile,
                     "skill_name": skill_name, "event_type": event_type, "action": action,
-                    "created_at": now,
+                    "created_at": now, "paused": False,
                 },
             )
         return {
@@ -127,12 +128,13 @@ class EventSubscriptionStorage(SyncStorageBase):
             "event_type": event_type,
             "action": action,
             "created_at": now,
+            "paused": False,
         }
 
     # Columns a caller may edit (manual Events-page / CLI edits). skill_name is
     # not editable (the subscription is pinned to its skill); identity and
     # created_at are excluded.
-    _EDITABLE = {"event_type", "action"}
+    _EDITABLE = {"event_type", "action", "paused"}
 
     def update_fields(self, id: str, **fields: Any) -> Optional[Dict[str, Any]]:
         """Patch editable columns. Returns the refreshed row (or None if absent).

@@ -307,6 +307,10 @@ class _SharedHandler(FileSystemEventHandler):
             return
         matched = 0
         for sub in subs:
+            if sub.get("paused"):
+                # Retained but skipped; the shared per-root observer keeps
+                # serving this root's other subscriptions.
+                continue
             if not self._passes_filter(sub, payload):
                 continue
             matched += 1
