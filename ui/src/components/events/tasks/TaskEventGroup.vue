@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import TaskRunCard from './TaskRunCard.vue';
-import type { BoardSubscription, RuleActionPayload } from './boardTypes';
+import type { BoardSubscription } from './boardTypes';
 import type { EventRun } from '../../../services/eventRunsApi';
 
 const props = defineProps<{
@@ -11,12 +11,10 @@ const props = defineProps<{
   now: number;
   /** When the whole board is filtered to one event, never collapse. */
   forceExpanded?: boolean;
-  listenerRunning?: boolean;
 }>();
 
 const emit = defineEmits<{
   (e: 'filter-event', key: string): void;
-  (e: 'rule-action', payload: RuleActionPayload): void;
 }>();
 
 const expanded = ref(false);
@@ -33,9 +31,7 @@ const extra = computed(() => Math.max(0, props.runs.length - 1));
       :run="run"
       :sub="sub"
       :now="now"
-      :listener-running="listenerRunning"
       @filter-event="(k) => emit('filter-event', k)"
-      @rule-action="(p) => emit('rule-action', p)"
     />
     <button
       v-if="!expandedEffective && extra > 0"

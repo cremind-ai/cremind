@@ -28,14 +28,6 @@ const store = useEventRunsStore();
 
 const accent = computed(() => accentColor(props.entry.key));
 
-// Completed / cancelled one-time schedules still show as rules (parity with the
-// table), but muted and sorted last by the board.
-const terminal = computed(
-  () =>
-    props.entry.kind === 'schedule' &&
-    (props.entry.scheduleStatus === 'completed' || props.entry.scheduleStatus === 'cancelled'),
-);
-
 const openable = computed(() =>
   store.runsForSubscription(props.entry.kind, props.entry.id),
 );
@@ -76,11 +68,13 @@ const state = computed<StateLine>(() => {
     return { text: 'Scheduled', tone: 'ok', icon: 'mdi:clock-outline' };
   }
   if (e.kind === 'file_watcher') {
+    if (e.paused) return { text: 'Paused', tone: 'warn', icon: 'mdi:pause-circle-outline' };
     return e.armed
       ? { text: 'Watching', tone: 'ok', icon: 'mdi:eye-outline' }
       : { text: 'Disarmed', tone: 'muted', icon: 'mdi:eye-off-outline' };
   }
   // skill_event
+  if (e.paused) return { text: 'Paused', tone: 'warn', icon: 'mdi:pause-circle-outline' };
   const l = listener.value;
   if (l?.running) return { text: 'Listening', tone: 'ok', icon: 'mdi:access-point' };
   if (l?.last_heartbeat) return { text: 'Listener down', tone: 'warn', icon: 'mdi:access-point-off' };
@@ -116,7 +110,7 @@ function open() {
 <template>
   <article
     class="idle-card"
-    :class="{ clickable: openable.length > 0, terminal }"
+    :class="{ clickable: openable.length > 0 }"
     :style="{ borderLeftColor: accent }"
     @click="open"
   >
@@ -182,7 +176,6 @@ function open() {
 }
 .idle-card.clickable { cursor: pointer; }
 .idle-card.clickable:hover { border-color: var(--primary-color); }
-.idle-card.terminal { opacity: 0.72; }
 
 .ic-top {
   display: flex;

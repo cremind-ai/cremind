@@ -26,9 +26,12 @@ const scheduleActionable = computed(
     props.sub.kind === 'schedule' &&
     (props.sub.scheduleStatus === 'active' || props.sub.scheduleStatus === 'paused'),
 );
-const isPaused = computed(
-  () => props.sub.kind === 'schedule' && props.sub.scheduleStatus === 'paused',
-);
+// Whether the rule is currently paused, per kind: schedule uses its status;
+// skill/file carry a persisted `paused` flag.
+const isPaused = computed(() => {
+  if (props.sub.kind === 'schedule') return props.sub.scheduleStatus === 'paused';
+  return props.sub.paused;
+});
 
 function onCommand(cmd: RuleAction) {
   emit('select', cmd);
@@ -55,6 +58,10 @@ function onCommand(cmd: RuleAction) {
           <ElDropdownItem command="simulate">
             <Icon icon="mdi:flask-outline" /> Simulate
           </ElDropdownItem>
+          <ElDropdownItem command="toggle-pause">
+            <Icon :icon="isPaused ? 'mdi:play' : 'mdi:pause'" />
+            {{ isPaused ? 'Resume' : 'Pause' }}
+          </ElDropdownItem>
           <ElDropdownItem v-if="!listenerRunning" command="start-listener">
             <Icon icon="mdi:play" /> Start listener
           </ElDropdownItem>
@@ -70,6 +77,10 @@ function onCommand(cmd: RuleAction) {
         <template v-else-if="sub.kind === 'file_watcher'">
           <ElDropdownItem command="edit">
             <Icon icon="mdi:pencil-outline" /> Edit event
+          </ElDropdownItem>
+          <ElDropdownItem command="toggle-pause">
+            <Icon :icon="isPaused ? 'mdi:play' : 'mdi:pause'" />
+            {{ isPaused ? 'Resume' : 'Pause' }}
           </ElDropdownItem>
           <ElDropdownItem command="open-conversation">
             <Icon icon="mdi:forum-outline" /> Open conversation
