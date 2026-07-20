@@ -29,7 +29,7 @@ Tables
 import uuid
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, false
 from sqlalchemy.orm import Mapped, mapped_column
 
 from a2a.server.models import Base
@@ -430,7 +430,12 @@ class SkillEventSubscriptionModel(Base):
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     # When true the subscription is retained but skipped at dispatch (paused by
     # the user); the skill's shared listener keeps running for its siblings.
-    paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # ``server_default`` so tables built straight from this metadata (fresh
+    # installs via create_all, and raw inserts that omit the column) get the
+    # default without an ORM round-trip.
+    paused: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
 
 
 class FileWatcherSubscriptionModel(Base):
@@ -465,8 +470,11 @@ class FileWatcherSubscriptionModel(Base):
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     # When true the watch stays registered but its events are skipped at
     # dispatch (paused by the user). Distinct from the runtime-only ``armed``
-    # flag (whether an OS observer covers the root).
-    paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # flag (whether an OS observer covers the root). ``server_default`` so
+    # create_all-built tables and raw inserts that omit the column get it.
+    paused: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
 
 
 class ScheduleEventSubscriptionModel(Base):
