@@ -31,6 +31,7 @@ from starlette.routing import Route
 
 from app.calendar import feature as calendar_feature
 from app.calendar.provider import get_calendar_provider
+from app.config.timezone import resolve_tzinfo
 from app.events import get_schedule_manager
 from app.events.schedule_events_admin_bus import get_schedule_events_admin_stream_bus
 from app.storage import get_conversation_storage
@@ -91,9 +92,14 @@ async def build_schedule_events_admin_snapshot(profile: str) -> Dict[str, Any]:
     }
 
 
-def _default_range() -> tuple[str, str]:
-    """Current month +/- a week, as ISO strings — a sensible default window."""
-    now = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+def _default_range(profile: Optional[str] = None) -> tuple[str, str]:
+    """Current month +/- a week, as ISO strings — a sensible default window.
+
+    "Today" is taken in the profile's configured zone (see app/config/timezone.py)
+    so the default grid centers on the user's local month, not the server's.
+    """
+    now = datetime.now(resolve_tzinfo(profile)).replace(
+        tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
     start = (now.replace(day=1) - timedelta(days=7))
     end = now + timedelta(days=45)
     fmt = "%Y-%m-%dT%H:%M:%S"
@@ -161,7 +167,7 @@ def get_calendar_routes(conversation_storage=None) -> list[Route]:
         if unauth is not None:
             return unauth
         profile = _profile_from_request(request)
-        d_start, d_end = _default_range()
+        d_start, d_end = _default_range(profile)
         rng_start = _norm_range(request.query_params.get("from"), d_start)
         rng_end = _norm_range(request.query_params.get("to"), d_end)
         events = get_calendar_provider(profile).list_occurrences(profile, rng_start, rng_end)

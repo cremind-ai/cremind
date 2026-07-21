@@ -77,6 +77,12 @@ cremind:
   apiPort: 1112                  # -> PORT (backend API)
   uiPort: 1515                   # -> CREMIND_UI_PORT (SPA / Setup Wizard)
   systemDir: /root/.cremind      # -> CREMIND_SYSTEM_DIR (PVC mount; image default)
+  # Timezone -> CREMIND_TIMEZONE: the boot default wall-clock zone the scheduler
+  # fires time-based events in and the agent reports for "what time is it". The
+  # image runs in UTC, so LEAVE THIS BLANK and schedules fire in UTC. Set an IANA
+  # name (e.g. "Asia/Ho_Chi_Minh", "America/New_York") to change it cluster-wide.
+  # A per-profile "system.timezone" set in Settings → Config overrides this.
+  timezone: ""                   # -> CREMIND_TIMEZONE (blank = image OS zone, UTC)
   # APP_URL — the externally-reachable base URL. The A2A agent card advertises
   # it as the JSON-RPC endpoint the UI connects to, so it MUST match how you
   # open Cremind in the browser. Leave blank to auto-derive: the Ingress URL

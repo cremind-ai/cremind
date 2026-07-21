@@ -6,8 +6,13 @@ these are pure-logic tests (no DB, no network, no Google)."""
 from __future__ import annotations
 
 import types
+from zoneinfo import ZoneInfo
 
 import app.calendar.provider as P
+
+# The mirror helpers now take an explicit zone (was the OS-local zone). These
+# pure-logic tests pin UTC so naive<->offset conversions are deterministic.
+_UTC = ZoneInfo("UTC")
 
 
 # ── pure helpers ─────────────────────────────────────────────────────────────
@@ -15,7 +20,7 @@ import app.calendar.provider as P
 def test_event_body_recurring():
     body = P._google_event_body(
         title="Standup", dtstart="2026-06-22T09:00:00", duration_minutes=30,
-        rrule="FREQ=DAILY", action="check email",
+        rrule="FREQ=DAILY", action="check email", tz=_UTC,
     )
     assert body["summary"] == "Standup"
     assert body["recurrence"] == ["RRULE:FREQ=DAILY"]
@@ -26,7 +31,7 @@ def test_event_body_recurring():
 def test_event_body_no_action_no_recurrence():
     body = P._google_event_body(
         title="Dentist", dtstart="2026-06-22T15:00:00", duration_minutes=60,
-        rrule=None, action="",
+        rrule=None, action="", tz=_UTC,
     )
     assert "recurrence" not in body
     assert "Cremind event" in body["description"]
@@ -35,20 +40,20 @@ def test_event_body_no_action_no_recurrence():
 def test_event_body_with_action_notes_command():
     body = P._google_event_body(
         title="Standup", dtstart="2026-06-22T09:00:00", duration_minutes=30,
-        rrule=None, action="join the call",
+        rrule=None, action="join the call", tz=_UTC,
     )
     assert "Cremind action: join the call" in body["description"]
 
 
 def test_google_dt_to_local_iso_allday():
-    assert P._google_dt_to_local_iso({"date": "2026-06-22"}) == "2026-06-22T00:00:00"
+    assert P._google_dt_to_local_iso({"date": "2026-06-22"}, _UTC) == "2026-06-22T00:00:00"
 
 
 def test_event_body_all_day_uses_date_range():
     # 3-day trip = 3*1440 minutes, midnight start -> Google date-only, end EXCLUSIVE.
     body = P._google_event_body(
         title="Trip", dtstart="2026-06-22T00:00:00", duration_minutes=3 * 1440,
-        rrule=None, action="", all_day=True,
+        rrule=None, action="", all_day=True, tz=_UTC,
     )
     assert body["start"] == {"date": "2026-06-22"}
     assert body["end"] == {"date": "2026-06-25"}  # start + 3 days, exclusive
@@ -79,7 +84,7 @@ def test_occurrence_match_surfaces_cremind_fields():
     row = {"id": "row1", "title": "Cremind Standup", "action": "do x",
            "schedule_kind": "recurrence", "rrule": "FREQ=DAILY",
            "status": "active", "source": "agent", "conversation_id": "c1"}
-    occ = P._google_event_to_occurrence(ev, row)
+    occ = P._google_event_to_occurrence(ev, row, _UTC)
     assert occ["subscription_id"] == "row1"
     assert occ["title"] == "Cremind Standup"
     assert occ["action"] == "do x"
@@ -90,7 +95,7 @@ def test_occurrence_no_match_is_readonly_google():
     ev = {"id": "g2", "summary": "Lunch",
           "start": {"dateTime": "2026-06-22T12:00:00+00:00"},
           "end": {"dateTime": "2026-06-22T13:00:00+00:00"}}
-    occ = P._google_event_to_occurrence(ev, None)
+    occ = P._google_event_to_occurrence(ev, None, _UTC)
     assert occ["subscription_id"] is None
     assert occ["source"] == "google"
     assert occ["read_only"] is True

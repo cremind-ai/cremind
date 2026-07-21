@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.calendar import recurrence as R
 from app.calendar.feature import is_enabled as feature_enabled
+from app.config.timezone import resolve_tzinfo
 from app.storage import get_schedule_event_storage
 from app.utils.logger import logger
 
@@ -200,14 +201,17 @@ class ScheduleManager:
         next_fire_at = sub.get("next_fire_at")
         if next_fire_at is None:
             return
-        occurrence_dt = R.from_epoch(float(next_fire_at))
+        # Naive wall-clock <-> epoch must go through the profile's configured
+        # zone, not the process OS zone (which is UTC on a Docker/VPS install).
+        tz = resolve_tzinfo(sub["profile"])
+        occurrence_dt = R.from_epoch(float(next_fire_at), tz)
         fired_iso = R.format_local(occurrence_dt)
 
         # Advance the rolling pointer FIRST so a slow agent run can't double-fire.
         # Catch-up policy: base the next search at max(this occurrence, now) so a
         # server that was down through several occurrences fires once and resumes
         # on the next *future* slot rather than replaying the whole backlog.
-        now_dt = R.from_epoch(time.time())
+        now_dt = R.from_epoch(time.time(), tz)
         base = occurrence_dt if occurrence_dt >= now_dt else now_dt
         nxt = R.next_occurrence_after(
             rrule=sub.get("rrule"),
@@ -217,7 +221,7 @@ class ScheduleManager:
         )
         occurrences_fired = int(sub.get("occurrences_fired", 0)) + 1
         if nxt is not None:
-            new_epoch = R.to_epoch(nxt)
+            new_epoch = R.to_epoch(nxt, tz)
             store.update_next_fire(sub_id, next_fire_at=new_epoch, occurrences_fired=occurrences_fired)
             self._arm(sub_id, new_epoch)
         else:

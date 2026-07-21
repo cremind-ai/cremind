@@ -231,7 +231,7 @@ async def _execute(job: Dict[str, Any]) -> None:
     # ── Create the hidden per-run conversation + run row ───────────────────
     try:
         conv = await conversation_storage.create_conversation(
-            profile=profile, title=_run_title(label), kind="event_run",
+            profile=profile, title=_run_title(label, profile), kind="event_run",
         )
         conversation_id = conv["id"]
     except Exception:  # noqa: BLE001
@@ -311,9 +311,10 @@ async def _execute(job: Dict[str, Any]) -> None:
         _publish_runs_changed(profile)
 
 
-def _run_title(label: str) -> str:
+def _run_title(label: str, profile: Optional[str] = None) -> str:
     from datetime import datetime
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    from app.config.timezone import resolve_tzinfo
+    stamp = datetime.now(resolve_tzinfo(profile)).strftime("%Y-%m-%d %H:%M")
     base = (label or "Event run").strip()
     return f"{base} · {stamp}"[:256]
 

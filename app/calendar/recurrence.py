@@ -19,7 +19,7 @@ string (it needs UTC ``Z`` for timed series) and applied here as a cutoff.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, tzinfo
 from typing import List, Optional
 
 from app.utils.logger import logger
@@ -43,13 +43,25 @@ def format_local(dt: datetime) -> str:
     return dt.strftime(_FMT)
 
 
-def to_epoch(dt: datetime) -> float:
-    """Naive local wall-clock -> epoch seconds (interpreted in local zone)."""
-    return dt.timestamp()
+def _os_local_tz() -> tzinfo:
+    """The process's OS-local zone — the backward-compatible default when no
+    explicit ``tz`` is threaded in (keeps un-updated callers behaving as before).
+    """
+    return datetime.now().astimezone().tzinfo  # type: ignore[return-value]
 
 
-def from_epoch(epoch: float) -> datetime:
-    return datetime.fromtimestamp(epoch)
+def to_epoch(dt: datetime, tz: Optional[tzinfo] = None) -> float:
+    """Naive wall-clock -> epoch seconds, interpreting ``dt`` in ``tz``.
+
+    ``tz`` is the configured system zone (see :mod:`app.config.timezone`);
+    when omitted it falls back to the OS-local zone for backward compatibility.
+    """
+    return dt.replace(tzinfo=tz or _os_local_tz()).timestamp()
+
+
+def from_epoch(epoch: float, tz: Optional[tzinfo] = None) -> datetime:
+    """Epoch seconds -> naive wall-clock in ``tz`` (OS-local when omitted)."""
+    return datetime.fromtimestamp(epoch, tz or _os_local_tz()).replace(tzinfo=None)
 
 
 # ── rrule helpers ────────────────────────────────────────────────────────────

@@ -49,6 +49,8 @@ def _serialize_schema() -> dict:
                 entry["step"] = field.step
             if field.enum is not None:
                 entry["enum"] = list(field.enum)
+            if field.format is not None:
+                entry["format"] = field.format
             fields[field_name] = entry
         groups[group_name] = {
             "label": group.label,
