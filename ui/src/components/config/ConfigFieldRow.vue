@@ -3,6 +3,7 @@ import { computed } from 'vue';
 import { ElInput, ElInputNumber, ElSwitch, ElSelect, ElOption, ElButton, ElTag } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import type { UserConfigField } from '../../services/configApi';
+import TimezoneField from './TimezoneField.vue';
 
 const props = defineProps<{
   fieldKey: string;
@@ -29,18 +30,6 @@ const isModified = computed(() => {
 
 const fieldLabel = computed(() => props.field.label || formatLabel(props.fieldKey));
 const fieldDefault = computed(() => formatValue(props.defaultValue));
-
-/** IANA zones for a `format: 'timezone'` field, with the "auto" sentinel first. */
-const timezoneOptions = computed<string[]>(() => {
-  let zones: string[] = [];
-  try {
-    const supported = (Intl as unknown as { supportedValuesOf?: (k: string) => string[] }).supportedValuesOf;
-    if (typeof supported === 'function') zones = supported('timeZone');
-  } catch {
-    zones = [];
-  }
-  return ['auto', ...zones];
-});
 
 function formatLabel(key: string): string {
   return key
@@ -105,21 +94,11 @@ function handleEnum(val: string) {
       >
         <ElOption v-for="opt in field.enum" :key="opt" :label="opt" :value="opt" />
       </ElSelect>
-      <ElSelect
+      <TimezoneField
         v-else-if="field.format === 'timezone'"
-        :model-value="displayValue as string"
-        filterable
-        size="small"
-        class="timezone-input"
+        :model-value="(displayValue as string) ?? 'auto'"
         @update:model-value="handleString"
-      >
-        <ElOption
-          v-for="tz in timezoneOptions"
-          :key="tz"
-          :label="tz === 'auto' ? 'Auto (inherit / server default)' : tz"
-          :value="tz"
-        />
-      </ElSelect>
+      />
       <ElInput
         v-else
         :model-value="displayValue as string"
@@ -168,7 +147,6 @@ function handleEnum(val: string) {
 .field-control { display: flex; align-items: center; gap: 8px; }
 .number-input { width: 140px; }
 .enum-input { width: 160px; }
-.timezone-input { width: 220px; }
 .string-input { width: 220px; }
 .reset-btn { color: var(--text-secondary); }
 .reset-btn:hover { color: var(--primary-color); }

@@ -5,10 +5,21 @@ time regardless of the process OS zone (UTC on a Docker/VPS install).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import app.calendar.recurrence as R
+
+
+def test_to_epoch_with_fixed_offset_zone():
+    # A fixed-offset zone (the UTC-offset format) round-trips like an IANA zone.
+    dt = datetime(2026, 7, 22, 9, 0, 0)
+    tz = timezone(timedelta(hours=7))  # +07:00
+    epoch = R.to_epoch(dt, tz)
+    # 09:00 at +07:00 == 02:00 UTC.
+    assert epoch == datetime(2026, 7, 22, 2, 0, 0, tzinfo=timezone.utc).timestamp()
+    back = R.from_epoch(epoch, tz)
+    assert back.tzinfo is None and back == dt
 
 
 def test_to_epoch_interprets_naive_in_given_zone():

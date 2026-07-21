@@ -232,7 +232,17 @@ uses to fire time-based events and the agent uses to answer "what time is it".
 
 | Key               | UI label | Type   | Default | Range | Meaning                                                                                  |
 |-------------------|----------|--------|---------|-------|------------------------------------------------------------------------------------------|
-| `system.timezone` | Timezone | string | `auto`  | IANA name or `auto` | Wall-clock zone for schedules and clock reads. An IANA name (e.g. `Asia/Tokyo`, `America/New_York`, `UTC`) pins it. `auto` means: inherit the **admin** profile's zone if you have never set your own; else the `CREMIND_TIMEZONE` env var; else the server's OS zone. Setting your own value stops the admin default from applying to you. |
+| `system.timezone` | Timezone | string | `auto`  | IANA name, UTC offset, or `auto` | Wall-clock zone for schedules and clock reads, given as **either** an IANA name (e.g. `Asia/Tokyo`, `America/New_York`, `UTC`) **or** a whole-hour UTC offset (e.g. `+07:00`, `-05:00`) — pick one format. `auto` means: inherit the **admin** profile's zone if you have never set your own; else the `CREMIND_TIMEZONE` env var; else the server's OS zone. Setting your own value stops the admin default from applying to you. |
+
+**Two formats (IANA name or UTC offset).** On the Config page the Timezone field
+has a format toggle: choose **IANA name** (a searchable zone list, with DST
+handled automatically) or **UTC offset** (a fixed offset like `+07:00`, no DST).
+The two are mutually exclusive — the stored value is one or the other. From the
+CLI, just pass whichever form you want: `cremind config set system.timezone
+Asia/Tokyo` or `cremind config set system.timezone +07:00`. Offsets are
+**whole hours only** — `+HH:00` / `-HH:00` (also written `UTC+07:00`, `+0800`,
+`Z`), range-checked to `[-12:00, +14:00]`; a partial-hour offset like `+05:30`
+is rejected.
 
 **Timezone resolution (why local ≠ VPS).** With `auto`, a profile that has
 never set its own zone follows the admin profile's `system.timezone`; if the
@@ -240,7 +250,7 @@ admin also leaves it `auto`, Cremind falls back to the `CREMIND_TIMEZONE`
 environment variable, and finally to the server's OS timezone. A Docker/VPS
 install runs in UTC by default, which is why schedules there fire in UTC until
 you set this — set the admin profile's zone (or `CREMIND_TIMEZONE`) to your
-local zone. An invalid IANA name is rejected by `cremind config set`.
+local zone. An invalid IANA name or offset is rejected by `cremind config set`.
 
 ### Group `agent` — Reasoning Agent
 
@@ -337,6 +347,9 @@ $ cremind config get
 $ cremind config set system.timezone Asia/Ho_Chi_Minh
 $ cremind config get system.timezone
 Asia/Ho_Chi_Minh
+
+# Or express it as a fixed UTC offset instead of an IANA name:
+$ cremind config set system.timezone +07:00
 
 # Revert to auto (inherit admin / CREMIND_TIMEZONE / OS zone)
 $ cremind config reset system.timezone

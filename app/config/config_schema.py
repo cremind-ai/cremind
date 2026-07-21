@@ -84,19 +84,19 @@ class Field:
             if self.enum and value not in self.enum:
                 raise ValueError(f"Value {value!r} not in enum {self.enum}")
         elif self.format == "timezone":
-            # Accept the "auto" sentinel (inherit/OS-detect); otherwise the
-            # value must be a resolvable IANA zone name.
-            text = str(value).strip()
-            if text.lower() != "auto":
-                from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+            # Accept the "auto" sentinel (inherit/OS-detect), a resolvable IANA
+            # zone name, OR a UTC offset (e.g. "+07:00"). Delegated to the same
+            # validator the resolver uses so the UI/CLI accept exactly what the
+            # scheduler can interpret. Local import avoids an import cycle
+            # (app.config.timezone imports app.config.settings).
+            from app.config.timezone import is_valid_timezone
 
-                try:
-                    ZoneInfo(text)
-                except (ZoneInfoNotFoundError, ValueError, KeyError, ModuleNotFoundError) as exc:
-                    raise ValueError(
-                        f"{text!r} is not a valid IANA timezone name "
-                        "(e.g. 'Asia/Tokyo', 'America/New_York', 'UTC') or 'auto'"
-                    ) from exc
+            if not is_valid_timezone(value):
+                raise ValueError(
+                    f"{str(value)!r} is not a valid IANA timezone name "
+                    "(e.g. 'Asia/Tokyo', 'America/New_York', 'UTC'), a whole-hour "
+                    "UTC offset (e.g. '+07:00', '-05:00'), or 'auto'"
+                )
 
 
 @dataclass(frozen=True)
@@ -122,8 +122,9 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
                 format="timezone",
                 label="Timezone",
                 description=(
-                    "IANA timezone name (e.g. 'Asia/Tokyo', 'America/New_York', "
-                    "'UTC') used to interpret schedules and clock reads. Leave as "
+                    "Zone used to interpret schedules and clock reads, given as "
+                    "either an IANA name (e.g. 'Asia/Tokyo', 'America/New_York', "
+                    "'UTC') or a whole-hour UTC offset (e.g. '+07:00', '-05:00'). Leave as "
                     "'auto' to auto-detect: profiles that have never set their own "
                     "zone inherit the admin profile's; if the admin hasn't set one "
                     "either, the CREMIND_TIMEZONE environment variable is used, and "
