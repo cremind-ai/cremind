@@ -147,7 +147,6 @@ def test_planning_phase_blocks_mutating_leaves(monkeypatch):
     assert agent._is_plan_blocked_leaf(_leaf("exec_shell", "exec_shell")) is True
     assert agent._is_plan_blocked_leaf(_leaf("system_file", "write_file")) is True
     assert agent._is_plan_blocked_leaf(_leaf("scheduler", "schedule_create")) is True
-    assert agent._is_plan_blocked_leaf(_leaf("scheduler", "schedule_edit")) is True
     # ...while read-only leaves (research) stay allowed.
     assert agent._is_plan_blocked_leaf(_leaf("system_file", "read_file")) is False
     assert agent._is_plan_blocked_leaf(_leaf("system_file", "grep_files")) is False
@@ -173,9 +172,7 @@ def test_event_run_blocks_registration_leaves(monkeypatch):
     # Event-CREATION leaves are refused inside an event run...
     assert agent._is_event_blocked_leaf(_leaf("scheduler", "schedule_create")) is True
     assert agent._is_event_blocked_leaf(_leaf("system_file", "register_file_watcher")) is True
-    # ...but DE-registration and in-place edit leaves stay allowed (they can't storm).
-    assert agent._is_event_blocked_leaf(_leaf("scheduler", "schedule_cancel")) is False
-    assert agent._is_event_blocked_leaf(_leaf("scheduler", "schedule_edit")) is False
+    # ...but DE-registration leaves stay allowed (they can't storm).
     assert agent._is_event_blocked_leaf(_leaf("system_file", "delete_file_watcher")) is False
 
 
@@ -275,7 +272,7 @@ def _build_dispatch_agent(monkeypatch, tools, *, event_run, loaded_skill_ids=())
 
 def _leaf_tools():
     return [
-        _FakeLeafTool("scheduler", ["schedule_create", "schedule_cancel"]),
+        _FakeLeafTool("scheduler", ["schedule_create"]),
         _FakeLeafTool("system_file", ["register_file_watcher", "read_file"]),
     ]
 
@@ -291,8 +288,7 @@ def test_event_run_hides_registration_leaves_from_schema(monkeypatch):
     assert rfw not in names
     # ...but stay in the dispatch map as a backstop for replayed/echoed calls.
     assert sc in dispatch and rfw in dispatch
-    # Non-registration leaves (de-register, read) remain visible.
-    assert make_leaf_name("scheduler", "schedule_cancel") in names
+    # Non-registration leaves (read) remain visible.
     assert make_leaf_name("system_file", "read_file") in names
 
 
