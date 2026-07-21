@@ -502,8 +502,9 @@ class SchedulerTool(BuiltInTool):
                 "call `schedule_create` with this output and a complete `action`; "
                 "do not tell the user it is scheduled until schedule_create "
                 "returns OK. If this parse is to CHANGE an existing event's time "
-                "or recurrence, call `schedule_edit` with that event's id instead "
-                "of schedule_create (never cancel and recreate)."
+                "or recurrence, do NOT call schedule_create — edit it in place "
+                "with the `cremind calendar edit <id>` CLI command instead (never "
+                "cancel and recreate; see the calendar documentation)."
                 if feature_on else
                 "PARSED ONLY — nothing is scheduled yet; this tool just "
                 "normalized the time."
@@ -516,11 +517,12 @@ class SchedulerTool(BuiltInTool):
 def get_tools(config: dict) -> list[BuiltInTool]:
     """Return tool instances for this server.
 
-    Always includes the ``scheduler`` parser. The Calendar & Schedule action
-    subtools (create/list/edit/cancel schedule events) are appended here and
-    gated per-request by :func:`get_prepare_tools` against the profile's
-    ``calendar_schedule_enabled`` flag, so when the feature is OFF the agent
-    only ever sees the parser (today's behavior).
+    Always includes the ``scheduler`` parser. The Calendar & Schedule
+    ``schedule_create`` action is appended here and gated per-request by
+    :func:`get_prepare_tools` against the profile's ``calendar_schedule_enabled``
+    flag, so when the feature is OFF the agent only ever sees the parser (today's
+    behavior). Listing/editing/cancelling existing events is done via the
+    ``cremind calendar`` CLI, not a tool.
     """
     tools: list[BuiltInTool] = [SchedulerTool()]
     try:

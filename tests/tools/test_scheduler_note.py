@@ -53,8 +53,8 @@ def test_booking_note_names_schedule_create_when_feature_on(monkeypatch):
     note = out["registration_note"]
     assert "schedule_create" in note
     assert "nothing is scheduled yet" in note.lower()
-    # Points the model at the in-place edit path so it doesn't cancel+recreate.
-    assert "schedule_edit" in note
+    # Points the model at the CLI edit path so it doesn't cancel+recreate.
+    assert "cremind calendar edit" in note
 
 
 def test_booking_note_omits_schedule_create_when_feature_off(monkeypatch):

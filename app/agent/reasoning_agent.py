@@ -1301,10 +1301,11 @@ class ReasoningAgent:
     # tools prefix) but their EXECUTION is blocked anywhere inside an event-run
     # conversation (the trigger turn AND later reply turns) to stop recursive
     # event storms — an action that registers another event would re-register on
-    # every fire. De-registration leaves (schedule_cancel, delete_file_watcher)
-    # are intentionally NOT listed: they can't storm, and an event action may
-    # legitimately cancel/remove a schedule or watcher. Matched on the bare leaf
-    # name + owning tool_id (the model emits the namespaced
+    # every fire. De-registration leaves (e.g. delete_file_watcher) are
+    # intentionally NOT listed: they can't storm, and an event action may
+    # legitimately remove a watcher (cancelling a schedule is done via the
+    # ``cremind calendar`` CLI, not a tool). Matched on the bare leaf name +
+    # owning tool_id (the model emits the namespaced
     # ``system_file__register_file_watcher``, but the dispatch entry carries the
     # bare ``register_file_watcher`` in ``entry[2]``).
     _EVENT_BLOCKED_LEAVES: frozenset = frozenset({
@@ -1335,8 +1336,6 @@ class ReasoningAgent:
         ("system_file", "register_file_watcher"),
         ("system_file", "delete_file_watcher"),
         ("scheduler", "schedule_create"),
-        ("scheduler", "schedule_edit"),
-        ("scheduler", "schedule_cancel"),
     })
 
     def _is_plan_blocked_leaf(self, entry) -> bool:
