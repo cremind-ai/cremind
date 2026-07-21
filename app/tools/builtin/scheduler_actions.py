@@ -22,6 +22,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from app.config.timezone import resolve_tzinfo
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
 from app.utils.logger import logger
 
@@ -200,7 +201,7 @@ class ScheduleCreateTool(BuiltInTool):
         if rrule:
             from app.calendar import recurrence as _R
             try:
-                now = datetime.now().replace(microsecond=0)
+                now = datetime.now(resolve_tzinfo(profile)).replace(tzinfo=None, microsecond=0)
                 if _R.parse_local(dtstart) < now:
                     until = (
                         arguments.get("recurrence_end_value")

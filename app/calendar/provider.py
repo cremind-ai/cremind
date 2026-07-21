@@ -20,12 +20,13 @@ that is always the internal one.
 from __future__ import annotations
 
 import abc
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
 from typing import Any, Dict, List, Optional
 
 import httpx
 
 from app.calendar import recurrence as R
+from app.config.timezone import resolve_tzinfo
 from app.storage import get_schedule_event_storage
 from app.utils.logger import logger
 
@@ -35,8 +36,10 @@ DEFAULT_DURATION_MINUTES = 30
 _MULTIDAY_LOOKBACK_DAYS = 30
 
 
-def _now() -> datetime:
-    return datetime.now().replace(microsecond=0)
+def _now(tz: Optional[tzinfo] = None) -> datetime:
+    """Current naive wall-clock in ``tz`` (the configured system zone), or the
+    OS-local zone when ``tz`` is omitted."""
+    return datetime.now(tz).replace(tzinfo=None, microsecond=0)
 
 
 # ── Mapping the `scheduler` parser result -> row insert specs ───────────────
@@ -171,17 +174,22 @@ class InternalCalendarProvider(CalendarProvider):
         from app.events import get_schedule_manager
         return get_schedule_manager()
 
-    def _seed_next_fire_at(self, *, schedule_kind: str, dtstart: str, rrule: Optional[str],
+    def _seed_next_fire_at(self, *, profile: str, schedule_kind: str, dtstart: str, rrule: Optional[str],
                            recurrence_end_type: Optional[str], recurrence_end_value: Optional[str]) -> Optional[float]:
         """Compute the initial rolling-pointer epoch, or None if the event is
-        wholly in the past (a one-shot whose time has passed)."""
-        now = _now()
+        wholly in the past (a one-shot whose time has passed).
+
+        ``dtstart`` is naive wall-clock; "now" and the naive->epoch bridge are
+        interpreted in the profile's configured zone (see app/config/timezone.py).
+        """
+        tz = resolve_tzinfo(profile)
+        now = _now(tz)
         until = recurrence_end_value if recurrence_end_type == "until" else None
         if rrule:
             occ = R.first_occurrence_on_or_after(rrule=rrule, dtstart=dtstart, moment=now, until=until)
-            return R.to_epoch(occ) if occ else None
+            return R.to_epoch(occ, tz) if occ else None
         start = R.parse_local(dtstart)
-        return R.to_epoch(start) if start >= now else None
+        return R.to_epoch(start, tz) if start >= now else None
 
     def create_event(
         self,
@@ -201,6 +209,7 @@ class InternalCalendarProvider(CalendarProvider):
         timezone: Optional[str] = None,
     ) -> Dict[str, Any]:
         next_fire_at = self._seed_next_fire_at(
+            profile=profile,
             schedule_kind=schedule_kind, dtstart=dtstart, rrule=rrule,
             recurrence_end_type=recurrence_end_type, recurrence_end_value=recurrence_end_value,
         )
@@ -269,6 +278,7 @@ class InternalCalendarProvider(CalendarProvider):
         if timing_keys & set(fields.keys()):
             merged = {**existing, **fields}
             new_next = self._seed_next_fire_at(
+                profile=existing["profile"],
                 schedule_kind=merged.get("schedule_kind", "instant"),
                 dtstart=merged["dtstart"], rrule=merged.get("rrule"),
                 recurrence_end_type=merged.get("recurrence_end_type"),
@@ -297,6 +307,7 @@ class InternalCalendarProvider(CalendarProvider):
             # Resume: re-seed the pointer from now so a long-paused rule lands on
             # its next future occurrence rather than a stale past one.
             next_fire_at = self._seed_next_fire_at(
+                profile=existing["profile"],
                 schedule_kind=existing.get("schedule_kind", "instant"),
                 dtstart=existing["dtstart"], rrule=existing.get("rrule"),
                 recurrence_end_type=existing.get("recurrence_end_type"),
@@ -393,13 +404,14 @@ def google_supports_rrule(rrule: Optional[str]) -> bool:
     return not any(f"FREQ={f}" in up for f in _GOOGLE_UNSUPPORTED_FREQS)
 
 
-def _to_rfc3339_local(naive_iso: str) -> str:
-    """Naive local wall-clock ISO -> RFC3339 with the machine's UTC offset."""
-    return R.parse_local(naive_iso).astimezone().isoformat()
+def _to_rfc3339_local(naive_iso: str, tz: tzinfo) -> str:
+    """Naive wall-clock ISO -> RFC3339 with the configured zone's UTC offset."""
+    return R.parse_local(naive_iso).replace(tzinfo=tz).isoformat()
 
 
-def _google_dt_to_local_iso(g: Optional[Dict[str, Any]]) -> Optional[str]:
-    """A Google event start/end ({dateTime|date}) -> naive local 'YYYY-MM-DDTHH:MM:SS'."""
+def _google_dt_to_local_iso(g: Optional[Dict[str, Any]], tz: tzinfo) -> Optional[str]:
+    """A Google event start/end ({dateTime|date}) -> naive 'YYYY-MM-DDTHH:MM:SS'
+    in the configured zone."""
     if not g:
         return None
     dt_str = g.get("dateTime")
@@ -409,7 +421,7 @@ def _google_dt_to_local_iso(g: Optional[Dict[str, Any]]) -> Optional[str]:
         except ValueError:
             return None
         if dt.tzinfo is not None:
-            dt = dt.astimezone().replace(tzinfo=None)
+            dt = dt.astimezone(tz).replace(tzinfo=None)
         return R.format_local(dt)
     if g.get("date"):
         return f"{g['date']}T00:00:00"
@@ -418,7 +430,7 @@ def _google_dt_to_local_iso(g: Optional[Dict[str, Any]]) -> Optional[str]:
 
 def _google_event_body(
     *, title: str, dtstart: str, duration_minutes: int, rrule: Optional[str],
-    action: str, all_day: bool = False,
+    action: str, tz: tzinfo, all_day: bool = False,
 ) -> Dict[str, Any]:
     """Build a Google Calendar event body for a Cremind schedule event mirror."""
     start_dt = R.parse_local(dtstart)
@@ -437,8 +449,8 @@ def _google_event_body(
     else:
         body = {
             "summary": title or "Cremind event",
-            "start": {"dateTime": start_dt.astimezone().isoformat()},
-            "end": {"dateTime": end_dt.astimezone().isoformat()},
+            "start": {"dateTime": start_dt.replace(tzinfo=tz).isoformat()},
+            "end": {"dateTime": end_dt.replace(tzinfo=tz).isoformat()},
         }
     if rrule:
         body["recurrence"] = [f"RRULE:{rrule}"]
@@ -447,15 +459,15 @@ def _google_event_body(
     return body
 
 
-def _google_event_to_occurrence(ev: Dict[str, Any], match_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _google_event_to_occurrence(ev: Dict[str, Any], match_row: Optional[Dict[str, Any]], tz: tzinfo) -> Dict[str, Any]:
     """Map a (single-instance) Google event to the UI occurrence dict.
 
     When the event was mirrored from a Cremind schedule (``match_row`` found via
     ``external_event_id``), surface the Cremind fields so it stays editable;
     otherwise it's a pure Google event rendered read-only.
     """
-    start = _google_dt_to_local_iso(ev.get("start"))
-    end = _google_dt_to_local_iso(ev.get("end")) or start
+    start = _google_dt_to_local_iso(ev.get("start"), tz)
+    end = _google_dt_to_local_iso(ev.get("end"), tz) or start
     g_recurring = bool(ev.get("recurringEventId") or ev.get("recurrence"))
     # Google marks an all-day event with date-only start/end (no dateTime).
     g_all_day = bool((ev.get("start") or {}).get("date"))
@@ -536,6 +548,7 @@ class GoogleCalendarProvider(CalendarProvider):
             duration_minutes=row.get("duration_minutes", DEFAULT_DURATION_MINUTES),
             rrule=row.get("rrule"),
             action=row.get("action", ""), all_day=row.get("all_day", False),
+            tz=resolve_tzinfo(self._profile),
         )
 
     # ── CRUD (internal row is the source of truth for triggering) ───────
@@ -600,12 +613,13 @@ class GoogleCalendarProvider(CalendarProvider):
     def list_occurrences(self, profile: str, range_start: str, range_end: str) -> List[Dict[str, Any]]:
         rows = self._store.list_by_profile(profile)
         by_gid = {r["external_event_id"]: r for r in rows if r.get("external_event_id")}
+        tz = resolve_tzinfo(profile)
         try:
             data = self._request(
                 "GET", f"/calendars/{self.CALENDAR_ID}/events",
                 params={
-                    "timeMin": _to_rfc3339_local(range_start),
-                    "timeMax": _to_rfc3339_local(range_end),
+                    "timeMin": _to_rfc3339_local(range_start, tz),
+                    "timeMax": _to_rfc3339_local(range_end, tz),
                     "singleEvents": "true",
                     "orderBy": "startTime",
                     "maxResults": "250",
@@ -619,7 +633,7 @@ class GoogleCalendarProvider(CalendarProvider):
             if ev.get("status") == "cancelled":
                 continue
             match = by_gid.get(ev.get("recurringEventId") or "") or by_gid.get(ev.get("id") or "")
-            occ = _google_event_to_occurrence(ev, match)
+            occ = _google_event_to_occurrence(ev, match, tz)
             if occ.get("start"):
                 out.append(occ)
         # Merge local-only Cremind events (never mirrored to Google) so they still

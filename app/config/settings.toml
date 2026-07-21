@@ -36,6 +36,13 @@ persist_path = ""         # mode = "persistent" only; defaults to <system_dir>/s
 
 # ── Settings → Config defaults (per-profile, overridable in the UI) ──
 
+[system]
+# Wall-clock zone the scheduler and clock use. "auto" = inherit the admin
+# profile's zone (for profiles that never set their own), else the
+# CREMIND_TIMEZONE env var, else the server's OS zone. Set an IANA name
+# (e.g. "Asia/Tokyo") to pin it. See app/config/timezone.py.
+timezone = "auto"
+
 [agent]
 max_steps = 200
 max_llm_retries = 2

@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import Any, Dict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from app.config.timezone import resolve_tzinfo
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
 from app.types import ToolConfig
 from app.utils.logger import logger
@@ -103,8 +104,12 @@ class GetCurrentTimeTool(BuiltInTool):
             now = base.astimezone(tzinfo) if base else datetime.now(tzinfo)
             tz_label = tz_name
         else:
-            now = (base if base else datetime.now()).astimezone()
-            tz_label = now.tzname() or "local"
+            # No explicit zone: use the profile's configured system timezone
+            # (falls back through admin/env/OS — see app/config/timezone.py),
+            # not the raw process OS zone (which is UTC on a Docker/VPS install).
+            tzinfo = resolve_tzinfo(arguments.get("_profile"))
+            now = base.astimezone(tzinfo) if base else datetime.now(tzinfo)
+            tz_label = getattr(tzinfo, "key", None) or now.tzname() or "local"
 
         response_data = {
             "iso": now.isoformat(timespec="seconds"),

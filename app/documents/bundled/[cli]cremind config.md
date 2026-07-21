@@ -1,5 +1,5 @@
 ---
-description: "Inspect, override, and reset **per-profile agent settings** with `cremind config schema`, `get`, `set`, and `reset`: tune the reasoning-agent loop (max steps, retries, temperature, max tokens, steps history, prompt caching, reasoning-trace replay), conversation compaction, tool-result truncation, and long-term memory. Use this to change how the agent behaves for a profile — distinct from `cremind llm` (which models/providers) and `cremind tools` (per-tool config)."
+description: "Inspect, override, and reset **per-profile agent settings** with `cremind config schema`, `get`, `set`, and `reset`: set the system timezone used by the scheduler and clock, and tune the reasoning-agent loop (max steps, retries, temperature, max tokens, steps history, prompt caching, reasoning-trace replay), conversation compaction, tool-result truncation, and long-term memory. Use this to change how the agent behaves for a profile — including which timezone schedules fire in — distinct from `cremind llm` (which models/providers) and `cremind tools` (per-tool config)."
 ---
 
 # `cremind config` — Per-Profile Settings Reference
@@ -11,8 +11,13 @@ freely switch between the two: anything you change in the CLI shows up
 on that page, and anything you change there is visible to `cremind config
 get`.
 
-The settings are grouped into four areas:
+The settings are grouped into five areas:
 
+- **System** — install-level preferences. The **timezone** sets the
+  wall-clock zone the scheduler fires time-based events in and the agent
+  reports for "what time is it". Leave it as `auto` to inherit the admin
+  profile's zone (for profiles that never set their own), then the
+  `CREMIND_TIMEZONE` environment variable, then the server's OS zone.
 - **Reasoning Agent** — iteration limits and per-call LLM parameters
   for the agent loop that drives every conversation turn, plus the
   prompt-cache and reasoning-trace-replay switches.
@@ -41,10 +46,11 @@ of the Cremind web UI. The path is:
 The Config page is a vertical stack of cards, one card per group, in
 this order:
 
-1. **Reasoning Agent** — the `agent.*` keys.
-2. **Conversation Compaction** — the `compaction.*` keys.
-3. **Tool Result Truncation** — the `tool_result.*` keys.
-4. **Memory** — the `memory.*` keys.
+1. **System** — the `system.*` keys (timezone).
+2. **Reasoning Agent** — the `agent.*` keys.
+3. **Conversation Compaction** — the `compaction.*` keys.
+4. **Tool Result Truncation** — the `tool_result.*` keys.
+5. **Memory** — the `memory.*` keys.
 
 Inside each card, every row shows the field's label, a one-line
 description, the current default, and a type-appropriate input — a
@@ -217,11 +223,40 @@ The defaults shown below are the values that apply when no override
 has been set. Run `cremind config schema --json` to confirm the live
 values for your installation.
 
+### Group `system` — System
+
+Install-level preferences. The timezone sets the wall-clock zone the scheduler
+uses to fire time-based events and the agent uses to answer "what time is it".
+
+**Settings → Config card:** **System** (the first card on the page).
+
+| Key               | UI label | Type   | Default | Range | Meaning                                                                                  |
+|-------------------|----------|--------|---------|-------|------------------------------------------------------------------------------------------|
+| `system.timezone` | Timezone | string | `auto`  | IANA name, UTC offset, or `auto` | Wall-clock zone for schedules and clock reads, given as **either** an IANA name (e.g. `Asia/Tokyo`, `America/New_York`, `UTC`) **or** a whole-hour UTC offset (e.g. `+07:00`, `-05:00`) — pick one format. `auto` means: inherit the **admin** profile's zone if you have never set your own; else the `CREMIND_TIMEZONE` env var; else the server's OS zone. Setting your own value stops the admin default from applying to you. |
+
+**Two formats (IANA name or UTC offset).** On the Config page the Timezone field
+has a format toggle: choose **IANA name** (a searchable zone list, with DST
+handled automatically) or **UTC offset** (a fixed offset like `+07:00`, no DST).
+The two are mutually exclusive — the stored value is one or the other. From the
+CLI, just pass whichever form you want: `cremind config set system.timezone
+Asia/Tokyo` or `cremind config set system.timezone +07:00`. Offsets are
+**whole hours only** — `+HH:00` / `-HH:00` (also written `UTC+07:00`, `+0800`,
+`Z`), range-checked to `[-12:00, +14:00]`; a partial-hour offset like `+05:30`
+is rejected.
+
+**Timezone resolution (why local ≠ VPS).** With `auto`, a profile that has
+never set its own zone follows the admin profile's `system.timezone`; if the
+admin also leaves it `auto`, Cremind falls back to the `CREMIND_TIMEZONE`
+environment variable, and finally to the server's OS timezone. A Docker/VPS
+install runs in UTC by default, which is why schedules there fire in UTC until
+you set this — set the admin profile's zone (or `CREMIND_TIMEZONE`) to your
+local zone. An invalid IANA name or offset is rejected by `cremind config set`.
+
 ### Group `agent` — Reasoning Agent
 
 Controls the agent loop's iteration limits and per-call LLM parameters.
 
-**Settings → Config card:** **Reasoning Agent** (the first card on the
+**Settings → Config card:** **Reasoning Agent** (the second card on the
 page).
 
 | Key                            | UI label              | Type    | Default | Range          | Meaning                                                                             |
@@ -247,7 +282,7 @@ headless, and event runs that have no popup. A deterministic floor always clamps
 the assembled prompt to the model's window, so it can **never overflow**, even
 when compaction is disabled.
 
-**Settings → Config card:** **Conversation Compaction** (the second card on
+**Settings → Config card:** **Conversation Compaction** (the third card on
 the page).
 
 | Key                                   | UI label                    | Type    | Default  | Range           | Meaning                                                                                  |
@@ -268,7 +303,7 @@ Limits applied to tool observations when they are re-sent to the reasoning
 LLM. The full result is always stored in the database and shown in the web UI;
 only the copy fed back into the next reasoning prompt is shortened.
 
-**Settings → Config card:** **Tool Result Truncation** (the third card on
+**Settings → Config card:** **Tool Result Truncation** (the fourth card on
 the page).
 
 | Key                          | UI label                       | Type    | Default | Range           | Meaning                                                                                  |
@@ -287,7 +322,7 @@ summary at the compaction fold (so it **requires Compaction enabled**). When
 Vector Embedding is on, facts are stored in the vector store and retrieved by
 relevance; otherwise they live in a small size-capped queue. Off by default.
 
-**Settings → Config card:** **Memory** (the fourth card on the page).
+**Settings → Config card:** **Memory** (the fifth card on the page).
 
 | Key                              | UI label                   | Type    | Default | Range    | Meaning                                                                                  |
 |----------------------------------|----------------------------|---------|---------|----------|------------------------------------------------------------------------------------------|
@@ -302,6 +337,22 @@ relevance; otherwise they live in a small size-capped queue. Off by default.
 
 ```bash
 $ cremind config get
+```
+
+### Set the timezone schedules fire in (fixes UTC on a VPS)
+
+```bash
+# Set the admin profile's zone — other profiles that never set their own
+# inherit it. Do this on the admin profile after a Docker/VPS install.
+$ cremind config set system.timezone Asia/Ho_Chi_Minh
+$ cremind config get system.timezone
+Asia/Ho_Chi_Minh
+
+# Or express it as a fixed UTC offset instead of an IANA name:
+$ cremind config set system.timezone +07:00
+
+# Revert to auto (inherit admin / CREMIND_TIMEZONE / OS zone)
+$ cremind config reset system.timezone
 ```
 
 ### Raise the step ceiling for long tasks

@@ -369,6 +369,9 @@ export async function updateServerConfig(
 
 export type UserConfigFieldType = 'number' | 'string' | 'boolean' | 'enum';
 
+/** Optional semantic format hint for a `string` field (e.g. a timezone picker). */
+export type UserConfigFieldFormat = 'timezone';
+
 export interface UserConfigField {
   type: UserConfigFieldType;
   default?: unknown;
@@ -378,6 +381,7 @@ export interface UserConfigField {
   max?: number;
   step?: number;
   enum?: string[];
+  format?: UserConfigFieldFormat;
 }
 
 export interface UserConfigGroup {

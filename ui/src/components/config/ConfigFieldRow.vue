@@ -3,6 +3,7 @@ import { computed } from 'vue';
 import { ElInput, ElInputNumber, ElSwitch, ElSelect, ElOption, ElButton, ElTag } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import type { UserConfigField } from '../../services/configApi';
+import TimezoneField from './TimezoneField.vue';
 
 const props = defineProps<{
   fieldKey: string;
@@ -93,6 +94,11 @@ function handleEnum(val: string) {
       >
         <ElOption v-for="opt in field.enum" :key="opt" :label="opt" :value="opt" />
       </ElSelect>
+      <TimezoneField
+        v-else-if="field.format === 'timezone'"
+        :model-value="(displayValue as string) ?? 'auto'"
+        @update:model-value="handleString"
+      />
       <ElInput
         v-else
         :model-value="displayValue as string"

@@ -24,6 +24,11 @@ from typing import Any, Literal
 
 FieldType = Literal["number", "string", "boolean", "enum"]
 
+#: Optional semantic format hint for a ``string`` field. ``"timezone"`` makes
+#: :meth:`Field.validate` reject anything that is not a valid IANA zone name (or
+#: the sentinel ``"auto"``), and lets the UI render a timezone picker.
+FieldFormat = Literal["timezone"]
+
 
 @dataclass(frozen=True)
 class Field:
@@ -37,6 +42,7 @@ class Field:
     max: float | None = None
     step: float | None = None
     enum: tuple[str, ...] | None = None
+    format: FieldFormat | None = None
 
     def coerce(self, raw: Any) -> Any:
         """Convert a raw stored value (string from SQLite, or native from TOML) to the declared type."""
@@ -77,6 +83,20 @@ class Field:
         elif self.type == "enum":
             if self.enum and value not in self.enum:
                 raise ValueError(f"Value {value!r} not in enum {self.enum}")
+        elif self.format == "timezone":
+            # Accept the "auto" sentinel (inherit/OS-detect), a resolvable IANA
+            # zone name, OR a UTC offset (e.g. "+07:00"). Delegated to the same
+            # validator the resolver uses so the UI/CLI accept exactly what the
+            # scheduler can interpret. Local import avoids an import cycle
+            # (app.config.timezone imports app.config.settings).
+            from app.config.timezone import is_valid_timezone
+
+            if not is_valid_timezone(value):
+                raise ValueError(
+                    f"{str(value)!r} is not a valid IANA timezone name "
+                    "(e.g. 'Asia/Tokyo', 'America/New_York', 'UTC'), a whole-hour "
+                    "UTC offset (e.g. '+07:00', '-05:00'), or 'auto'"
+                )
 
 
 @dataclass(frozen=True)
@@ -89,6 +109,31 @@ class ConfigGroup:
 
 
 CONFIG_SCHEMA: dict[str, ConfigGroup] = {
+    "system": ConfigGroup(
+        label="System",
+        description=(
+            "Install-level preferences. The timezone sets the wall-clock zone "
+            "the scheduler uses to fire time-based events and the agent uses to "
+            "answer \"what time is it\"."
+        ),
+        fields={
+            "timezone": Field(
+                type="string", default_toml="system.timezone",
+                format="timezone",
+                label="Timezone",
+                description=(
+                    "Zone used to interpret schedules and clock reads, given as "
+                    "either an IANA name (e.g. 'Asia/Tokyo', 'America/New_York', "
+                    "'UTC') or a whole-hour UTC offset (e.g. '+07:00', '-05:00'). Leave as "
+                    "'auto' to auto-detect: profiles that have never set their own "
+                    "zone inherit the admin profile's; if the admin hasn't set one "
+                    "either, the CREMIND_TIMEZONE environment variable is used, and "
+                    "finally the server's OS timezone. Setting your own value stops "
+                    "the admin default from applying to you."
+                ),
+            ),
+        },
+    ),
     "agent": ConfigGroup(
         label="Reasoning Agent",
         description="Controls the agent loop's iteration limits and per-call LLM parameters.",

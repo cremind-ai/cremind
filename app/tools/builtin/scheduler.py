@@ -32,6 +32,7 @@ exposes action subtools (create / list / edit / cancel schedule events) — see
 from datetime import datetime
 from typing import Any, Dict
 
+from app.config.timezone import resolve_tzinfo
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
 from app.types import ToolConfig
 from app.utils.logger import logger
@@ -461,8 +462,11 @@ class SchedulerTool(BuiltInTool):
 
         # Current datetime as ISO string. ``_now`` is a test/caller override
         # (matches the ``_``-prefixed injected-key convention); otherwise use the
-        # naive local wall-clock, as the source library expects.
-        current_date_str = arguments.get("_now") or datetime.now().isoformat()
+        # naive wall-clock in the profile's configured zone (not the process OS
+        # zone, which is UTC on a Docker/VPS install), as the source library expects.
+        current_date_str = arguments.get("_now") or (
+            datetime.now(resolve_tzinfo(arguments.get("_profile"))).replace(tzinfo=None).isoformat()
+        )
 
         try:
             result = compute_schedule(arguments, current_date_str)
