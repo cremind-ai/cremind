@@ -12,10 +12,14 @@ import {
   stopProcess,
   type ProcessStatus,
 } from '../services/processApi';
+import { closeTerminal, openTerminalSocket } from '../services/terminalApi';
 
 const props = defineProps<{
   pid: string;
   showHeader?: boolean;
+  // 'process' (default) = agent exec_shell process; 'terminal' = user-created
+  // interactive shell (different WS endpoint + close-terminates semantics).
+  kind?: 'process' | 'terminal';
 }>();
 
 const settings = useSettingsStore();
@@ -153,11 +157,13 @@ async function connect() {
 
   try {
     intentionalClose = false;
-    ws = openProcessSocket(settings.agentUrl, settings.authToken, props.pid);
+    ws = props.kind === 'terminal'
+      ? openTerminalSocket(settings.agentUrl, settings.authToken, props.pid)
+      : openProcessSocket(settings.agentUrl, settings.authToken, props.pid);
   } catch (err) {
     status.value = 'disconnected';
     ElMessage.error(
-      'Failed to open process stream: ' +
+      'Failed to open terminal stream: ' +
       (err instanceof Error ? err.message : String(err)),
     );
     return;
@@ -184,8 +190,19 @@ async function connect() {
       command.value = (data.command as string) || '';
       workingDir.value = (data.working_dir as string) || '';
       isPty.value = Boolean(data.is_pty);
+      const prevStatus = status.value;
       status.value = (data.status as ProcessStatus) || 'running';
       exitCode.value = (data.exit_code as number | null) ?? null;
+      // For a user terminal, the shell exiting (e.g. the user typed `exit`)
+      // ends the session — mark it in the scrollback so the dead tab reads
+      // clearly. The tab stays until the user closes it.
+      if (
+        props.kind === 'terminal'
+        && status.value === 'exited'
+        && prevStatus !== 'exited'
+      ) {
+        term?.write('\r\n\x1b[2m[session ended]\x1b[0m\r\n');
+      }
     } else if (t === 'overflow') {
       ElMessage.warning('Output buffer overflowed — some chunks were dropped.');
     }
@@ -263,7 +280,11 @@ watch(
 
 
 async function confirmStop() {
-  await stopProcess(settings.agentUrl, settings.authToken, props.pid);
+  if (props.kind === 'terminal') {
+    await closeTerminal(settings.agentUrl, settings.authToken, props.pid);
+  } else {
+    await stopProcess(settings.agentUrl, settings.authToken, props.pid);
+  }
   status.value = 'exited';
 }
 

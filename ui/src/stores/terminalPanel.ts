@@ -1,6 +1,12 @@
 import { defineStore } from 'pinia';
 import { useChatStore, type TerminalAttachment } from './chat';
+import { useSettingsStore } from './settings';
+import { listTerminals, spawnTerminal } from '../services/terminalApi';
 import type { FileWatchEvent } from '../services/filesApi';
+
+// Guards restoreTerminals() to a single run per page load (module scope: the
+// SPA loads this module once).
+let _terminalsRestored = false;
 
 const WIDTH_STORAGE_KEY = 'terminalPanelWidth';
 const SPLIT_RATIO_STORAGE_KEY = 'rightPanelSplitRatio';
@@ -173,6 +179,59 @@ export const useTerminalPanelStore = defineStore('terminalPanel', {
       }
       this._setScopeActive(attachment.processId);
       this.minimized = false;
+    },
+
+    // Spawn a new user-created interactive terminal on the backend and open it
+    // as a tab. Independent of the agent — see services/terminalApi.ts. Opens
+    // in the workspace's current cwd. Throws on failure (e.g. the per-profile
+    // cap) so the caller can surface a message.
+    async newTerminal() {
+      const settings = useSettingsStore();
+      const row = await spawnTerminal(settings.agentUrl, settings.authToken, {
+        cwd: this.cwd || undefined,
+      });
+      this.openTerminal({
+        processId: row.terminal_id,
+        command: row.shell,
+        commandShort: row.title,
+        workingDirectory: row.working_dir,
+        pty: true,
+        kind: 'terminal',
+      });
+    },
+
+    // Re-attach user terminals that survived a page reload. Runs once per page
+    // load. Pushes tabs directly into the global list (not via openTerminal, so
+    // it never forces the panel open) and swallows all errors — a failed
+    // restore should never block startup.
+    async restoreTerminals() {
+      if (_terminalsRestored) return;
+      _terminalsRestored = true;
+      try {
+        const settings = useSettingsStore();
+        if (!settings.authToken) return;
+        const { terminals } = await listTerminals(
+          settings.agentUrl, settings.authToken,
+        );
+        for (const row of terminals) {
+          if (this.globalTerminals.find(t => t.processId === row.terminal_id)) {
+            continue;
+          }
+          this.globalTerminals.push({
+            processId: row.terminal_id,
+            command: row.shell,
+            commandShort: row.title,
+            workingDirectory: row.working_dir,
+            pty: true,
+            kind: 'terminal',
+          });
+        }
+        if (this.globalActivePid === null && this.globalTerminals.length > 0) {
+          this.globalActivePid = this.globalTerminals[0].processId;
+        }
+      } catch {
+        /* restore is best-effort */
+      }
     },
 
     setActive(pid: string) {

@@ -379,6 +379,12 @@ async def _do_shutdown() -> None:
         await get_channel_registry().stop_all()
     except Exception:  # noqa: BLE001
         logger.exception("Error stopping channel adapters during shutdown")
+    try:
+        from app.api.terminals import close_all_terminals
+
+        await close_all_terminals()
+    except Exception:  # noqa: BLE001
+        logger.exception("Error closing user terminals during shutdown")
 
 
 async def _on_shutdown() -> None:

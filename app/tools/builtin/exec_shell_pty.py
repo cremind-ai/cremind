@@ -359,6 +359,7 @@ class _WindowsPtyProcess(PtyProcess):
 async def _spawn_unix_pty(
     command: str, working_dir: str, cols: int, rows: int, system: str,
     extra_env: Optional[dict[str, str]] = None,
+    argv: Optional[list[str]] = None,
 ) -> PtyProcess:
     import fcntl
     import pty
@@ -366,6 +367,9 @@ async def _spawn_unix_pty(
     import termios
 
     shell, flags = _pty_shell_for(system)
+    # ``argv`` overrides the default ``[shell, *flags, command]`` so callers can
+    # launch a bare interactive login shell (no ``-c``). Default path unchanged.
+    spawn_argv = argv if argv is not None else [shell, *flags, command]
     master_fd, slave_fd = pty.openpty()
     try:
         winsize = struct.pack("HHHH", rows, cols, 0, 0)
@@ -383,7 +387,7 @@ async def _spawn_unix_pty(
             env.update(extra_env)
 
         proc = await asyncio.create_subprocess_exec(
-            shell, *flags, command,
+            *spawn_argv,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
@@ -403,6 +407,7 @@ async def _spawn_unix_pty(
 async def _spawn_windows_pty(
     command: str, working_dir: str, cols: int, rows: int, system: str,
     extra_env: Optional[dict[str, str]] = None,
+    argv: Optional[list[str]] = None,
 ) -> PtyProcess:
     try:
         import winpty  # type: ignore  # PyPI package: `pywinpty`; import name: `winpty`
@@ -422,11 +427,13 @@ async def _spawn_windows_pty(
     env["PYTHONUNBUFFERED"] = "1"
     if extra_env:
         env.update(extra_env)
-    argv = [shell, *flags, command]
+    # ``argv`` overrides the default ``[shell, *flags, command]`` so callers can
+    # launch a bare interactive shell (no ``-Command``). Default path unchanged.
+    spawn_argv = argv if argv is not None else [shell, *flags, command]
 
     def _spawn():
         return winpty.PtyProcess.spawn(
-            argv, cwd=working_dir, env=env, dimensions=(rows, cols),
+            spawn_argv, cwd=working_dir, env=env, dimensions=(rows, cols),
         )
 
     pty_proc = await loop.run_in_executor(None, _spawn)
@@ -446,6 +453,46 @@ async def _spawn_command_pty(
     if system == "Windows":
         return await _spawn_windows_pty(command, working_dir, cols, rows, system, extra_env=extra_env)
     return await _spawn_unix_pty(command, working_dir, cols, rows, system, extra_env=extra_env)
+
+
+# ---------------------------------------------------------------------------
+# Bare interactive shell (used by the on-demand user-terminal feature, not the
+# agent's exec_shell tool). Launches a login/interactive shell with no
+# ``-c``/``-Command`` so the user drives it live over the terminal WebSocket.
+# ---------------------------------------------------------------------------
+
+def _interactive_shell_argv(system: str) -> list[str]:
+    """Return the argv for a bare interactive shell on the given OS."""
+    if system == "Windows":
+        # Keep the user's PowerShell profile — this is their terminal (unlike
+        # exec_shell's ``-NoProfile``, which sandboxes agent commands).
+        return ["powershell.exe", "-NoLogo"]
+    # A PTY slave is a tty, so bash enters interactive mode on its own; honour
+    # the user's login shell when set.
+    return [os.environ.get("SHELL") or "/bin/bash"]
+
+
+async def spawn_interactive_shell_pty(
+    working_dir: str, cols: int = 80, rows: int = 24,
+    system: Optional[str] = None,
+    extra_env: Optional[dict[str, str]] = None,
+) -> tuple[PtyProcess, str]:
+    """Spawn a bare interactive shell under a PTY.
+
+    Returns ``(proc, shell_name)``. No RTK rewrite (there is no command to
+    rewrite) and no classifier — the caller streams I/O straight to the UI.
+    """
+    system = system or _SYSTEM
+    argv = _interactive_shell_argv(system)
+    if system == "Windows":
+        proc = await _spawn_windows_pty(
+            "", working_dir, cols, rows, system, extra_env=extra_env, argv=argv,
+        )
+    else:
+        proc = await _spawn_unix_pty(
+            "", working_dir, cols, rows, system, extra_env=extra_env, argv=argv,
+        )
+    return proc, os.path.basename(argv[0])
 
 
 # ---------------------------------------------------------------------------
