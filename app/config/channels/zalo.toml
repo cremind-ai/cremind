@@ -31,7 +31,7 @@ label = "Personal account"
 implemented = true
 setup_kind = "qr"
 instructions = """Runs under your own Zalo account, auto-replying to DMs on your behalf
-(ported from OpenClaw's zca-js integration). Pairs by QR scan — no token to paste.
+via the unofficial zca-js library. Pairs by QR scan — no token to paste.
 
 ⚠️ **Unofficial and use at your own risk.** Automating a personal Zalo account
 relies on a reverse-engineered client and **may violate Zalo's terms and result

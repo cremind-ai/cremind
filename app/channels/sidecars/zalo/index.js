@@ -33,7 +33,7 @@ import minimist from 'minimist';
 import { WebSocketServer } from 'ws';
 import { Zalo } from 'zca-js';
 
-// zca-js LoginQRCallbackEventType (see OpenClaw zca-constants.ts).
+// zca-js LoginQRCallbackEventType values.
 const QR_GENERATED = 0;
 const QR_EXPIRED = 1;
 const QR_SCANNED = 2;

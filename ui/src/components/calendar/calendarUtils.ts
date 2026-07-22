@@ -7,11 +7,11 @@
  */
 import type { CalendarOccurrence } from '../../services/calendarApi';
 
-export type CalView = 'month' | 'week' | 'day' | 'agenda';
+export type CalView = 'month' | 'week' | 'day' | 'agenda' | 'year';
 export type CalEvent = CalendarOccurrence;
 
 export const DOW_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
+export const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
   'August', 'September', 'October', 'November', 'December'];
 
 export function pad(n: number): string { return String(n).padStart(2, '0'); }
@@ -44,6 +44,9 @@ export function addDays(d: Date, n: number): Date {
 }
 export function addMonths(d: Date, n: number): Date {
   return new Date(d.getFullYear(), d.getMonth() + n, 1);
+}
+export function addYears(d: Date, n: number): Date {
+  return new Date(d.getFullYear() + n, d.getMonth(), 1);
 }
 export function sameDay(a: Date, b: Date): boolean { return isoDate(a) === isoDate(b); }
 export function isToday(d: Date): boolean { return sameDay(d, new Date()); }
@@ -78,6 +81,10 @@ export function viewRange(view: CalView, anchor: Date): { from: string; to: stri
     const s = startOfDay(anchor);
     return { from: isoDateTime(s), to: `${isoDate(addDays(s, 60))}T23:59:59` };
   }
+  if (view === 'year') {
+    const y = anchor.getFullYear();
+    return { from: `${y}-01-01T00:00:00`, to: `${y}-12-31T23:59:59` };
+  }
   const g = monthGrid(anchor);
   return { from: isoDateTime(g[0]), to: `${isoDate(g[41])}T23:59:59` };
 }
@@ -94,6 +101,7 @@ export function titleFor(view: CalView, anchor: Date): string {
     const right = b.toLocaleDateString(undefined, sameMonth ? { day: 'numeric', year: 'numeric' } : { month: 'short', day: 'numeric', year: 'numeric' });
     return `${left} – ${right}`;
   }
+  if (view === 'year') return String(anchor.getFullYear());
   return `${MONTHS[anchor.getMonth()]} ${anchor.getFullYear()}`;
 }
 
@@ -101,6 +109,7 @@ export function navigate(view: CalView, anchor: Date, delta: number): Date {
   if (view === 'day') return addDays(anchor, delta);
   if (view === 'week') return addDays(anchor, delta * 7);
   if (view === 'agenda') return addDays(anchor, delta * 30);
+  if (view === 'year') return addYears(anchor, delta);
   return addMonths(anchor, delta);
 }
 
@@ -111,6 +120,29 @@ export function isMultiDayOrAllDay(ev: CalEvent): boolean {
   if (ev.all_day) return true;
   const s = parseLocal(ev.start), e = parseLocal(ev.end);
   return !sameDay(s, e) && (e.getTime() - s.getTime()) >= 12 * 3600 * 1000;
+}
+
+/** Number of events touching each day, keyed by `isoDate`. Timed/single-day
+ *  events count on their start day; multi-day/all-day events count on every day
+ *  they cover. Used by the year view to place a per-day dot. */
+export function countByDay(events: CalEvent[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  const bump = (d: Date) => { const k = isoDate(d); counts.set(k, (counts.get(k) ?? 0) + 1); };
+  for (const ev of events) {
+    const s = startOfDay(parseLocal(ev.start));
+    if (isMultiDayOrAllDay(ev)) {
+      let e = startOfDay(parseLocal(ev.end));
+      // a 00:00 end on the following day means the event ends the previous day
+      const eRaw = parseLocal(ev.end);
+      if (eRaw.getHours() === 0 && eRaw.getMinutes() === 0 && e.getTime() > s.getTime()) {
+        e = addDays(e, -1);
+      }
+      for (let d = s; d.getTime() <= e.getTime(); d = addDays(d, 1)) bump(d);
+    } else {
+      bump(s);
+    }
+  }
+  return counts;
 }
 
 export function minutesOfDay(d: Date): number { return d.getHours() * 60 + d.getMinutes(); }
