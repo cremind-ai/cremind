@@ -18,11 +18,10 @@ wire format differs end to end; the closest in-repo model is
 than the openai SDK, to keep exact control over the unofficial backend's
 required headers and over mid-stream transient-error detection.
 
-Backend quirks reproduced from the reference implementation (9router
-``open-sse/executors/codex.js``): ``store`` forced false, ``stream`` forced true,
-non-empty ``instructions`` required, ``system`` role rewritten to ``developer``,
-server-generated item ids stripped, sampling params dropped, and a strict body
-key allowlist applied last.
+Backend quirks required by the ChatGPT Codex Responses endpoint: ``store``
+forced false, ``stream`` forced true, non-empty ``instructions`` required,
+``system`` role rewritten to ``developer``, server-generated item ids stripped,
+sampling params dropped, and a strict body key allowlist applied last.
 
 Known limitation: the encrypted reasoning items the backend returns are not
 threaded back across turns (Cremind's persisted history is chat.completions

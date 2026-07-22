@@ -9,9 +9,8 @@ It is deliberately dependency-light — ``httpx`` + stdlib only, no imports from
 ``app.server`` / ``app.api`` — so both the API flow layer
 (:mod:`app.api.llm_codex_flow`) and the transport provider can import it.
 
-Protocol constants and quirks are copied from the reference implementation in
-9router (``open-sse/providers/registry/codex.js`` +
-``open-sse/services/tokenRefresh/providers.js``):
+The protocol constants and quirks below match the ChatGPT Codex CLI's OAuth
+flow (the OpenAI ``auth.openai.com`` client):
 
 * the authorize query is built manually so the scope's spaces encode as ``%20``
   (not ``+``), matching the Codex CLI;
@@ -47,7 +46,7 @@ import httpx
 
 from app.utils.logger import logger
 
-# ── protocol constants (from 9router codex registry) ───────────────────────
+# ── protocol constants (ChatGPT Codex OAuth client) ────────────────────────
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -56,7 +55,7 @@ CODEX_CALLBACK_PORT = 1455
 CODEX_REDIRECT_URI = f"http://localhost:{CODEX_CALLBACK_PORT}/auth/callback"
 
 # Refresh 5 days before expiry; also proactively re-refresh once a token is more
-# than 8 days old (matches 9router's refreshLeadMs / maxRefreshAgeMs).
+# than 8 days old.
 REFRESH_LEAD_S = 5 * 86400
 MAX_REFRESH_AGE_S = 8 * 86400
 
