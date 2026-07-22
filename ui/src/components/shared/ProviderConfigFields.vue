@@ -2,8 +2,8 @@
 import { ref, computed } from 'vue';
 import { ElForm, ElFormItem, ElInput, ElTag, ElButton, ElRadioGroup, ElRadio, ElMessage } from 'element-plus';
 import { Icon } from '@iconify/vue';
-import type { LLMProvider, LLMModel, ProviderConfigField, AuthMethod } from '../../services/configApi';
-import { startDeviceCodeFlow, pollDeviceCode } from '../../services/configApi';
+import type { LLMProvider, LLMModel, ProviderConfigField, AuthMethod, CodexOAuthStart } from '../../services/configApi';
+import { startDeviceCodeFlow, pollDeviceCode, startCodexOAuth, getCodexOAuthStatus, completeCodexOAuth, cancelCodexOAuth } from '../../services/configApi';
 import { useSettingsStore } from '../../stores/settings';
 import { useCopyToClipboard } from '../../composables/useCopyToClipboard';
 
@@ -20,10 +20,15 @@ const props = withDefaults(defineProps<{
   showConfiguredBadge?: boolean;
   showSaveButtons?: boolean;
   saving?: boolean;
+  // Browser-OAuth methods ("Sign in with ChatGPT") capture tokens server-side,
+  // which needs an existing profile — so the flow is offered only from Settings,
+  // not the setup wizard (which leaves this false and shows a hint instead).
+  allowBrowserOauth?: boolean;
 }>(), {
   showConfiguredBadge: false,
   showSaveButtons: false,
   saving: false,
+  allowBrowserOauth: false,
 });
 
 const emit = defineEmits<{
@@ -67,6 +72,119 @@ const isDeviceCode = computed(() =>
   activeAuthMethod.value?.kind === 'device_code'
 );
 
+const isBrowserOAuth = computed(() =>
+  activeAuthMethod.value?.kind === 'oauth'
+);
+
+// Codex "Sign in with ChatGPT" flow state
+const codexData = ref<CodexOAuthStart | null>(null);
+const codexPolling = ref(false);
+const codexComplete = ref(false);
+const codexEmail = ref<string | null>(null);
+const codexPlan = ref<string | null>(null);
+const codexLoading = ref(false);
+const codexPasteOpen = ref(false);
+const codexPasteUrl = ref('');
+const codexPasteSubmitting = ref(false);
+let codexPollTimer: ReturnType<typeof setTimeout> | null = null;
+let codexDeadline = 0;
+
+function resetCodexState(cancel = false) {
+  if (cancel && codexData.value?.state) {
+    cancelCodexOAuth(settingsStore.agentUrl, settingsStore.authToken, codexData.value.state);
+  }
+  if (codexPollTimer) { clearTimeout(codexPollTimer); codexPollTimer = null; }
+  codexData.value = null;
+  codexPolling.value = false;
+  codexComplete.value = false;
+  codexEmail.value = null;
+  codexPlan.value = null;
+  codexPasteOpen.value = false;
+  codexPasteUrl.value = '';
+}
+
+async function startCodexLogin() {
+  codexLoading.value = true;
+  resetCodexState();
+  try {
+    const data = await startCodexOAuth(settingsStore.agentUrl, settingsStore.authToken);
+    codexData.value = data;
+    codexPasteOpen.value = !data.listener_active;
+    // Open the consent page in the system browser (where the ChatGPT session
+    // lives). Under Electron this routes cross-origin links out of the app.
+    const opener = (window as unknown as { cremind?: { openExternal?: (u: string) => void } }).cremind?.openExternal;
+    if (opener) opener(data.authorize_url);
+    else window.open(data.authorize_url, '_blank', 'noopener');
+    codexPolling.value = true;
+    codexDeadline = Date.now() + (data.expires_in || 600) * 1000;
+    pollCodexStatus(data.state);
+  } catch (e) {
+    ElMessage.error(`Failed to start ChatGPT sign-in: ${e instanceof Error ? e.message : 'Unknown error'}`);
+  } finally {
+    codexLoading.value = false;
+  }
+}
+
+function applyCodexResult(status: string, email?: string | null, plan?: string | null): boolean {
+  if (status === 'complete') {
+    codexPolling.value = false;
+    codexComplete.value = true;
+    codexEmail.value = email ?? null;
+    codexPlan.value = plan ?? null;
+    props.provider.configured = true;
+    if (codexPollTimer) { clearTimeout(codexPollTimer); codexPollTimer = null; }
+    ElMessage.success(`Signed in to ChatGPT${email ? ` as ${email}` : ''}`);
+    return true;
+  }
+  return false;
+}
+
+async function pollCodexStatus(state: string) {
+  if (!codexPolling.value) return;
+  if (Date.now() > codexDeadline) {
+    codexPolling.value = false;
+    ElMessage.warning('Sign-in timed out. Please try again.');
+    return;
+  }
+  try {
+    const res = await getCodexOAuthStatus(settingsStore.agentUrl, settingsStore.authToken, state);
+    if (applyCodexResult(res.status, res.email, res.plan_type)) return;
+    if (res.status === 'error') {
+      codexPolling.value = false;
+      ElMessage.error(`Sign-in failed: ${res.error || 'unknown error'}`);
+      codexPasteOpen.value = true;
+      return;
+    }
+    if (res.status === 'expired') {
+      codexPolling.value = false;
+      ElMessage.warning('Sign-in request expired. Please start again.');
+      resetCodexState();
+      return;
+    }
+    codexPollTimer = setTimeout(() => pollCodexStatus(state), 2000);
+  } catch {
+    codexPollTimer = setTimeout(() => pollCodexStatus(state), 2000);
+  }
+}
+
+async function submitPastedUrl() {
+  if (!codexData.value?.state || !codexPasteUrl.value.trim()) return;
+  codexPasteSubmitting.value = true;
+  try {
+    const res = await completeCodexOAuth(
+      settingsStore.agentUrl, settingsStore.authToken,
+      codexPasteUrl.value.trim(), codexData.value.state,
+    );
+    if (!applyCodexResult(res.status, res.email, res.plan_type)) {
+      ElMessage.error(`Sign-in failed: ${res.error || 'could not complete from the pasted URL'}`);
+    }
+  } catch (e) {
+    ElMessage.error(`Failed to complete sign-in: ${e instanceof Error ? e.message : 'Unknown error'}`);
+  } finally {
+    codexPasteSubmitting.value = false;
+  }
+}
+
 const isConfigured = computed(() => {
   const am = activeAuthMethod.value;
   if (!am) {
@@ -75,6 +193,7 @@ const isConfigured = computed(() => {
   }
   if (am.kind === 'none') return true;
   if (am.kind === 'device_code') return props.provider.configured || deviceCodeComplete.value;
+  if (am.kind === 'oauth') return props.provider.configured || codexComplete.value;
   return Object.entries(am.fields).every(([key, field]) => {
     if (!field.required) return true;
     return field.configured || !!props.provider.authFieldValues[key];
@@ -88,6 +207,8 @@ function onAuthMethodChange(methodId: string) {
   deviceCodeComplete.value = false;
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   deviceCodePolling.value = false;
+  // Reset (and cancel) any in-flight Codex OAuth flow when switching away.
+  resetCodexState(true);
 }
 
 async function startDeviceLogin() {
@@ -226,8 +347,78 @@ async function pollForToken(deviceCode: string, interval: number) {
         </div>
       </template>
 
+      <!-- Browser OAuth flow (e.g. OpenAI "Sign in with ChatGPT") -->
+      <template v-else-if="isBrowserOAuth">
+        <div v-if="!allowBrowserOauth" class="no-auth-info">
+          Sign in with ChatGPT is available from Settings → LLM Providers after setup.
+          Finish setup with another method (e.g. API Key), then sign in later.
+        </div>
+
+        <template v-else>
+          <div v-if="codexComplete" class="device-code-done">
+            Signed in{{ codexEmail ? ` as ${codexEmail}` : '' }}{{ codexPlan ? ` (${codexPlan})` : '' }}.
+          </div>
+
+          <div v-else-if="!codexData" class="device-code-start">
+            <ElButton type="primary" :loading="codexLoading" @click="startCodexLogin" size="small">
+              Sign in with ChatGPT
+            </ElButton>
+          </div>
+
+          <div v-else class="device-code-active">
+            <div class="device-code-step">
+              <span class="device-code-label">Link:</span>
+              <a :href="codexData.authorize_url" target="_blank" rel="noopener" class="device-code-link">
+                Open ChatGPT sign-in
+              </a>
+              <button
+                type="button"
+                class="copy-icon-btn"
+                :class="{ copied: isCopied('codex-url') }"
+                :title="isCopied('codex-url') ? 'Copied!' : 'Copy link'"
+                @click="copyValue(codexData.authorize_url, 'codex-url')"
+              >
+                <Icon :icon="isCopied('codex-url') ? 'mdi:check' : 'mdi:content-copy'" />
+              </button>
+            </div>
+            <div v-if="codexPolling" class="device-code-status">
+              <span class="polling-indicator">Waiting for authorization...</span>
+            </div>
+
+            <div class="codex-paste">
+              <a href="#" class="codex-paste-toggle" @click.prevent="codexPasteOpen = !codexPasteOpen">
+                {{ codexPasteOpen ? 'Hide' : 'Having trouble? Paste the redirect URL' }}
+              </a>
+              <div v-if="codexPasteOpen" class="codex-paste-body">
+                <p v-if="codexData.listener_error" class="codex-paste-hint">{{ codexData.listener_error }}</p>
+                <p v-else class="codex-paste-hint">
+                  After approving, copy the URL from your browser's address bar (it starts with
+                  http://localhost:1455/) and paste it here.
+                </p>
+                <ElInput
+                  v-model="codexPasteUrl"
+                  type="textarea"
+                  :rows="2"
+                  placeholder="http://localhost:1455/auth/callback?code=...&state=..."
+                />
+                <ElButton
+                  type="primary"
+                  size="small"
+                  :loading="codexPasteSubmitting"
+                  :disabled="!codexPasteUrl.trim()"
+                  style="margin-top: 6px;"
+                  @click="submitPastedUrl"
+                >
+                  Complete sign-in
+                </ElButton>
+              </div>
+            </div>
+          </div>
+        </template>
+      </template>
+
       <!-- Regular fields for non-device-code, non-none auth methods -->
-      <template v-else-if="activeAuthMethod && activeAuthMethod.kind !== 'none' && !isDeviceCode">
+      <template v-else-if="activeAuthMethod && activeAuthMethod.kind !== 'none' && !isDeviceCode && !isBrowserOAuth">
         <ElForm label-position="top" size="small" class="config-fields-form">
           <ElFormItem
             v-for="(field, key) in activeAuthMethod.fields"
@@ -454,6 +645,21 @@ async function pollForToken(deviceCode: string, interval: number) {
   font-size: 0.85rem;
   color: var(--success-color, #67c23a);
   padding: 8px 0;
+}
+
+.codex-paste { margin-top: 10px; }
+.codex-paste-toggle {
+  font-size: 0.8rem;
+  color: var(--primary-color, #409eff);
+  text-decoration: none;
+}
+.codex-paste-toggle:hover { text-decoration: underline; }
+.codex-paste-body { margin-top: 8px; }
+.codex-paste-hint {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  margin: 0 0 6px;
+  line-height: 1.4;
 }
 
 .remove-config-row {

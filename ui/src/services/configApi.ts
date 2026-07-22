@@ -662,6 +662,80 @@ export async function pollDeviceCode(
   return res.json();
 }
 
+// ── Codex OAuth Flow ("Sign in with ChatGPT" for the OpenAI provider) ──
+
+export interface CodexOAuthStart {
+  authorize_url: string;
+  state: string;
+  redirect_uri: string;
+  listener_active: boolean;
+  listener_error?: string | null;
+  expires_in: number;
+}
+
+export interface CodexOAuthStatus {
+  status: 'pending' | 'complete' | 'error' | 'expired';
+  email?: string | null;
+  plan_type?: string | null;
+  account_id?: string | null;
+  error?: string;
+}
+
+export async function startCodexOAuth(
+  agentUrl: string,
+  token: string
+): Promise<CodexOAuthStart> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/llm/auth/codex/start`, {
+    method: 'POST',
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(`Failed to start ChatGPT sign-in: ${res.statusText}`);
+  return res.json();
+}
+
+export async function getCodexOAuthStatus(
+  agentUrl: string,
+  token: string,
+  state: string
+): Promise<CodexOAuthStatus> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/llm/auth/codex/status?state=${encodeURIComponent(state)}`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(`Failed to check sign-in status: ${res.statusText}`);
+  return res.json();
+}
+
+export async function completeCodexOAuth(
+  agentUrl: string,
+  token: string,
+  redirectUrl: string,
+  state?: string
+): Promise<CodexOAuthStatus> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/llm/auth/codex/complete`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ redirect_url: redirectUrl, state }),
+  });
+  if (!res.ok) throw new Error(`Failed to complete sign-in: ${res.statusText}`);
+  return res.json();
+}
+
+export async function cancelCodexOAuth(
+  agentUrl: string,
+  token: string,
+  state: string
+): Promise<void> {
+  const base = resolveBaseUrl(agentUrl);
+  await fetch(`${base}/api/llm/auth/codex/cancel`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ state }),
+  }).catch(() => { /* best-effort cleanup */ });
+}
+
 export async function getModelGroups(
   agentUrl: string,
   token: string

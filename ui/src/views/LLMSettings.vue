@@ -194,9 +194,14 @@ async function saveProvider(provider: ProviderWithState) {
 
   // If using auth_methods (new flow)
   if (provider.auth_methods && provider.auth_methods.length > 0) {
+    const activeMethod = provider.auth_methods.find(m => m.id === provider.selectedAuthMethod);
+    // Browser-OAuth methods ("Sign in with ChatGPT") persist their auth_method
+    // server-side only when the flow completes and tokens are captured. Saving a
+    // bare auth_method here would flip the active method to a not-yet-signed-in
+    // state, so skip the PUT entirely for oauth methods.
+    if (activeMethod?.kind === 'oauth') return;
     config.auth_method = provider.selectedAuthMethod;
     // Include field values for the selected auth method
-    const activeMethod = provider.auth_methods.find(m => m.id === provider.selectedAuthMethod);
     if (activeMethod) {
       for (const [key, value] of Object.entries(provider.authFieldValues)) {
         if (value && key in activeMethod.fields) {
@@ -403,6 +408,7 @@ function goBack() {
                 :show-configured-badge="true"
                 :show-save-buttons="true"
                 :saving="saving"
+                :allow-browser-oauth="true"
                 @save-provider="saveProvider(selectedApiKeyProvider!)"
                 @save-key="saveProviderKey(selectedApiKeyProvider!)"
                 @save-config="saveProviderConfig(selectedApiKeyProvider!)"
