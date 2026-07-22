@@ -117,6 +117,11 @@ export interface TerminalAttachment {
   commandShort: string;
   workingDirectory?: string;
   pty?: boolean;
+  // 'process' (or undefined) = an agent exec_shell process, streamed and
+  // controlled via the Process Manager API. 'terminal' = a user-created
+  // interactive shell (the "New terminal" button), streamed via the
+  // terminals API; closing its tab terminates the shell.
+  kind?: 'process' | 'terminal';
 }
 
 export interface ChatMessage {

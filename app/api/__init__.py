@@ -13,6 +13,7 @@ from app.api.file_watchers import get_file_watcher_routes
 from app.api.files import get_file_routes
 from app.api.oauth2 import get_oauth2_routes
 from app.api.processes import get_process_routes
+from app.api.terminals import get_terminal_routes
 from app.api.profiles import get_profile_routes
 from app.api.embedding_stream import get_embedding_stream_routes
 from app.api.logs_stream import get_logs_stream_routes
@@ -74,6 +75,7 @@ def get_api_routes(
     routes.extend(get_channel_routes(conversation_storage))
     routes.extend(get_user_config_routes(config_storage))
     routes.extend(get_process_routes())
+    routes.extend(get_terminal_routes())
     routes.extend(get_event_routes())
     routes.extend(get_event_run_routes())
     routes.extend(get_file_watcher_routes())

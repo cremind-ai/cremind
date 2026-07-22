@@ -2,12 +2,32 @@
 import { computed } from 'vue';
 import { Icon } from '@iconify/vue';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
+import { useSettingsStore } from '../stores/settings';
+import { closeTerminal } from '../services/terminalApi';
+import type { TerminalAttachment } from '../stores/chat';
 import TerminalSession from './TerminalSession.vue';
 
 const panel = useTerminalPanelStore();
+const settings = useSettingsStore();
 
 const tabs = computed(() => panel.openTerminals);
 const activePid = computed(() => panel.activePid);
+const activeTab = computed(() =>
+  tabs.value.find(t => t.processId === activePid.value),
+);
+
+function handleClose(term: TerminalAttachment) {
+  // A user-created terminal owns a real backend shell — closing its tab
+  // terminates it. Agent (exec_shell) tabs just detach; stopping is separate.
+  if (term.kind === 'terminal') {
+    closeTerminal(settings.agentUrl, settings.authToken, term.processId).catch(
+      () => {
+        /* already gone / offline — the tab still closes below */
+      },
+    );
+  }
+  panel.closeTab(term.processId);
+}
 </script>
 
 <template>
@@ -29,7 +49,7 @@ const activePid = computed(() => panel.activePid);
             class="tab-close"
             role="button"
             :aria-label="`Close ${term.commandShort}`"
-            @click.stop="panel.closeTab(term.processId)"
+            @click.stop="handleClose(term)"
           >
             <Icon icon="mdi:close" />
           </span>
@@ -42,6 +62,7 @@ const activePid = computed(() => panel.activePid);
           v-if="activePid"
           :key="activePid"
           :pid="activePid"
+          :kind="activeTab?.kind || 'process'"
           :show-header="false"
         />
       </keep-alive>

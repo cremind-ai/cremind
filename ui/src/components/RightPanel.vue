@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { Icon } from '@iconify/vue';
-import { ElTooltip } from 'element-plus';
+import { ElMessage, ElTooltip } from 'element-plus';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
 import FileTreePanel from './FileTreePanel.vue';
 import TerminalPanel from './TerminalPanel.vue';
@@ -9,11 +9,31 @@ import HorizontalResizableDivider from './HorizontalResizableDivider.vue';
 
 const panel = useTerminalPanelStore();
 const splitContainer = ref<HTMLElement | null>(null);
+const creatingTerminal = ref(false);
 
 const showTerminal = computed(() => panel.openTerminals.length > 0);
 const topFlex = computed(() =>
   showTerminal.value ? `0 0 ${panel.splitRatio * 100}%` : '1 1 auto',
 );
+
+async function onNewTerminal() {
+  if (creatingTerminal.value) return;
+  creatingTerminal.value = true;
+  try {
+    await panel.newTerminal();
+  } catch (err) {
+    ElMessage.error(
+      err instanceof Error ? err.message : 'Failed to open a new terminal.',
+    );
+  } finally {
+    creatingTerminal.value = false;
+  }
+}
+
+// Re-attach any user terminals that survived a page reload.
+onMounted(() => {
+  panel.restoreTerminals();
+});
 </script>
 
 <template>
@@ -30,6 +50,15 @@ const topFlex = computed(() =>
       <div class="right-panel-header">
         <Icon icon="mdi:dock-right" class="header-icon" />
         <span class="header-title">Workspace</span>
+        <ElTooltip content="New terminal" placement="bottom" :show-after="300">
+          <button
+            class="header-action"
+            :disabled="creatingTerminal"
+            @click="onNewTerminal"
+          >
+            <Icon icon="mdi:console-line" />
+          </button>
+        </ElTooltip>
         <ElTooltip content="Collapse panel" placement="bottom" :show-after="300">
           <button class="header-action" @click="panel.setCollapsed(true)">
             <Icon icon="mdi:chevron-double-right" />
@@ -103,6 +132,14 @@ const topFlex = computed(() =>
 .header-action:hover {
   color: #e5e7eb;
   background: #1e293b;
+}
+.header-action:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.header-action:disabled:hover {
+  color: #94a3b8;
+  background: transparent;
 }
 .right-panel-body {
   flex: 1 1 auto;
