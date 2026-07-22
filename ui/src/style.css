@@ -29,8 +29,8 @@
   --warning-color: #f59e0b;
   
   --sidebar-bg: #ffffff;
-  --sidebar-width: 280px;
-  --sidebar-width-collapsed: 64px;
+  --rail-width: 52px;
+  --conversations-panel-width: 256px;
   --hover-bg: #f1f5f9;
   
   /* Element Plus Overrides - Light */

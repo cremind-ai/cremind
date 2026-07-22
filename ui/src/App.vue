@@ -6,7 +6,8 @@ import { useSettingsStore } from './stores/settings';
 import { useEmbeddingStatusStore } from './stores/embeddingStatus';
 import { checkSetupStatus } from './services/configApi';
 import { PROFILE_ROUTES, CHAT_ROUTES } from './router/profileRoutes';
-import Sidebar from './components/Sidebar.vue';
+import NavRail from './components/NavRail.vue';
+import ConversationsPanel from './components/ConversationsPanel.vue';
 import UpdateBanner from './components/UpdateBanner.vue';
 import FloatingTodoLayer from './components/plan/FloatingTodoLayer.vue';
 
@@ -26,8 +27,15 @@ const currentProfile = computed(() => {
   return (route.params.profile as string) || '';
 });
 
-// Check if we should show the sidebar (only on chat page with a profile)
-const showSidebar = computed(() => {
+// The nav rail is persistent across every profile-scoped page so navigation
+// is always one click away. The conversations panel only renders on the chat
+// pages (and only when the user hasn't collapsed it).
+const showRail = computed(() => {
+  const name = route.name as string;
+  return !!name && PROFILE_ROUTES.has(name) && !!currentProfile.value;
+});
+
+const showConversations = computed(() => {
   return (route.name === 'chat' || route.name === 'conversation') && !!currentProfile.value;
 });
 
@@ -169,12 +177,6 @@ const handleNewChat = () => {
   }
 };
 
-const handleOpenSettings = () => {
-  if (currentProfile.value) {
-    router.push(`/${currentProfile.value}/settings`);
-  }
-};
-
 const handleLogout = () => {
   const profile = currentProfile.value;
   if (profile) {
@@ -200,12 +202,13 @@ const handleLogout = () => {
 
   <!-- Main App Layout -->
   <div class="app-layout" :class="{ 'has-titlebar': isElectron }">
-    <!-- Sidebar -->
-    <Sidebar
-      v-if="showSidebar"
+    <!-- Persistent icon rail (all profile pages) -->
+    <NavRail v-if="showRail" @logout="handleLogout" />
+
+    <!-- Conversation history panel (chat pages, unless collapsed) -->
+    <ConversationsPanel
+      v-if="showConversations && !settingsStore.conversationsPanelCollapsed"
       @newChat="handleNewChat"
-      @openSettings="handleOpenSettings"
-      @logout="handleLogout"
     />
 
     <!-- Main Content Area -->

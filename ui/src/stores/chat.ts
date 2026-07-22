@@ -351,6 +351,11 @@ interface ChatState {
   isConnected: boolean;
   error: string | null;
   conversations: SavedConversation[];
+  /** True once the conversation list has resolved at least once this profile
+   *  session (first SSE snapshot or first REST load). Drives the panel's
+   *  skeleton-vs-empty distinction: before this we show loading skeletons,
+   *  after it an empty list means genuinely no conversations. */
+  conversationsLoaded: boolean;
   activeConversationId: string | null;
   /** Conversation list filter — channel_type ('main', 'telegram', etc.). */
   channelFilter: string;
@@ -388,6 +393,7 @@ export const useChatStore = defineStore('chat', {
     isConnected: false,
     error: null,
     conversations: [],
+    conversationsLoaded: false,
     activeConversationId: null,
     channelFilter: 'main',
     channelIdsByConversation: {},
@@ -997,9 +1003,17 @@ export const useChatStore = defineStore('chat', {
     // ── connection management ─────────────────────────────────────────
 
     async connect() {
-      await this.fetchAgentCard();
-      await this.loadConversations();
-      this.subscribeConversationsList();
+      try {
+        await this.fetchAgentCard();
+        await this.loadConversations();
+        this.subscribeConversationsList();
+      } finally {
+        // Clear the panel's loading skeleton once a connect attempt settles,
+        // success or failure — a failed fetchAgentCard (backend unreachable)
+        // aborts before loadConversations, so without this the skeleton would
+        // never resolve. On failure the panel falls through to an empty list.
+        this.conversationsLoaded = true;
+      }
     },
 
     disconnect() {
@@ -1050,6 +1064,7 @@ export const useChatStore = defineStore('chat', {
           for (const c of snap.conversations) {
             this.channelIdsByConversation[c.id] = c.channel_id ?? null;
           }
+          this.conversationsLoaded = true;
         },
       );
     },
@@ -1078,6 +1093,7 @@ export const useChatStore = defineStore('chat', {
       this.runtimes = {};
       this.activeConversationId = null;
       this.conversations = [];
+      this.conversationsLoaded = false;
       this.channelIdsByConversation = {};
       this.pendingQuestionByConversation = {};
       this.pendingPlanByConversation = {};
@@ -1135,6 +1151,7 @@ export const useChatStore = defineStore('chat', {
         for (const c of conversations) {
           this.channelIdsByConversation[c.id] = c.channel_id ?? null;
         }
+        this.conversationsLoaded = true;
       } catch (e) {
         console.error('Failed to load conversations:', e);
       }
@@ -2041,8 +2058,8 @@ export const useChatStore = defineStore('chat', {
      * Rename a conversation's id. Rekeys all per-conversation local state
      * (messages, runtimes, notifications) so the UI continues to render the
      * thread under its new id without a reload. Re-routing the URL is the
-     * caller's responsibility (see Sidebar.vue) so route navigation stays
-     * with the component.
+     * caller's responsibility (see ConversationsPanel.vue) so route navigation
+     * stays with the component.
      */
     async changeConversationId(oldId: string, newId: string, newTitle?: string) {
       if (oldId.startsWith('temp-')) {

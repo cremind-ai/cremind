@@ -3,6 +3,7 @@ import { computed } from 'vue';
 import { Icon } from '@iconify/vue';
 import { useNotificationsStore, type NotificationEntry } from '../stores/notifications';
 import { useSettingsStore } from '../stores/settings';
+import { formatRelativeTime } from '../utils/relativeTime';
 
 const emit = defineEmits<{
   select: [conversationId: string];
@@ -46,17 +47,7 @@ const handleMarkAllSeen = () => {
   if (settings.profileId) notifications.markAllSeen(settings.profileId);
 };
 
-const formatTime = (ts: number): string => {
-  const diff = Date.now() - ts;
-  const sec = Math.floor(diff / 1000);
-  if (sec < 60) return `${sec}s ago`;
-  const min = Math.floor(sec / 60);
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  const day = Math.floor(hr / 24);
-  return `${day}d ago`;
-};
+const formatTime = (ts: number): string => formatRelativeTime(ts);
 </script>
 
 <template>
