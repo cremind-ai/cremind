@@ -65,8 +65,15 @@ export const useSettingsStore = defineStore('settings', () => {
     (localStorage.getItem('theme') as 'light' | 'dark') || 'light'
   );
 
-  // Sidebar collapsed state
-  const sidebarCollapsed = ref(localStorage.getItem('sidebar_collapsed') === 'true');
+  // Conversations panel collapsed state (two-rail sidebar). The narrow icon
+  // rail always stays; only the conversation-history panel collapses. Seeded
+  // from the legacy ``sidebar_collapsed`` key (the old single-sidebar collapse
+  // flag) so a user who kept the old sidebar collapsed for space keeps the
+  // closest equivalent — a hidden panel with the rail still visible.
+  const conversationsPanelCollapsed = ref(
+    (localStorage.getItem('conversations_panel_collapsed')
+      ?? localStorage.getItem('sidebar_collapsed')) === 'true',
+  );
 
   // Usage chip: open its explanation popover on hover (default) vs. on click.
   // Default true unless explicitly turned off.
@@ -190,9 +197,9 @@ export const useSettingsStore = defineStore('settings', () => {
     localStorage.setItem('theme', newTheme);
   }
 
-  function setSidebarCollapsed(value: boolean) {
-    sidebarCollapsed.value = value;
-    localStorage.setItem('sidebar_collapsed', String(value));
+  function setConversationsPanelCollapsed(value: boolean) {
+    conversationsPanelCollapsed.value = value;
+    localStorage.setItem('conversations_panel_collapsed', String(value));
   }
 
   function setUsageChipHover(value: boolean) {
@@ -236,7 +243,7 @@ export const useSettingsStore = defineStore('settings', () => {
     agentUrl,
     setAgentUrl: setAgentUrlAction,
     theme,
-    sidebarCollapsed,
+    conversationsPanelCollapsed,
     usageChipHover,
     eventsViewMode,
     profileId,
@@ -245,7 +252,7 @@ export const useSettingsStore = defineStore('settings', () => {
     isElectron,
     setAutoConnect,
     setTheme,
-    setSidebarCollapsed,
+    setConversationsPanelCollapsed,
     setUsageChipHover,
     setEventsViewMode,
     setProfileId,
