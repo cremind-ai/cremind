@@ -15,6 +15,7 @@ import {
 import CalendarMonthView from '../components/calendar/CalendarMonthView.vue';
 import CalendarTimeGridView from '../components/calendar/CalendarTimeGridView.vue';
 import CalendarAgendaView from '../components/calendar/CalendarAgendaView.vue';
+import CalendarYearView from '../components/calendar/CalendarYearView.vue';
 import ScheduleEventDialog from '../components/ScheduleEventDialog.vue';
 import {
   type CalView, viewRange, titleFor, navigate, weekDays, startOfDay,
@@ -86,6 +87,7 @@ function prev() { anchor.value = navigate(view.value, anchor.value, -1); }
 function next() { anchor.value = navigate(view.value, anchor.value, 1); }
 function goToday() { anchor.value = startOfDay(new Date()); }
 function openDay(day: Date) { anchor.value = startOfDay(day); view.value = 'day'; }
+function openMonth(month: Date) { anchor.value = startOfDay(month); view.value = 'month'; }
 
 watch([view, anchor, enabled], () => { loadEvents(); });
 
@@ -195,6 +197,7 @@ function openEdit(ev: CalendarOccurrence) { scheduleDialog.value?.openEdit(ev); 
         </div>
         <div class="toolbar-right">
           <ElRadioGroup :model-value="view" @change="(v: any) => setView(v)" size="small">
+            <ElRadioButton value="year">Year</ElRadioButton>
             <ElRadioButton value="month">Month</ElRadioButton>
             <ElRadioButton value="week">Week</ElRadioButton>
             <ElRadioButton value="day">Day</ElRadioButton>
@@ -215,6 +218,10 @@ function openEdit(ev: CalendarOccurrence) { scheduleDialog.value?.openEdit(ev); 
       <CalendarTimeGridView
         v-else-if="view === 'day'" :days="dayCols" :events="events"
         @select="openEdit" @create="(dt) => openCreate(dt)"
+      />
+      <CalendarYearView
+        v-else-if="view === 'year'" :anchor="anchor" :events="events"
+        @open-day="openDay" @open-month="openMonth"
       />
       <CalendarAgendaView v-else :events="events" @select="openEdit" />
     </template>

@@ -1,8 +1,7 @@
 """Zalo Bot API adapter (long-polling).
 
-Ports OpenClaw's ``extensions/zalo`` (a hand-rolled REST client over the
-official Zalo bot platform) to Python using the core ``httpx`` dependency — no
-Zalo SDK is required. Each adapter owns one :class:`ZaloBotClient` and runs a
+A hand-rolled REST client over the official Zalo bot platform, written in
+Python using the core ``httpx`` dependency — no Zalo SDK is required. Each adapter owns one :class:`ZaloBotClient` and runs a
 ``getUpdates`` long-poll loop in :meth:`_run`.
 
 Serves conversational ``bot`` mode and push-only ``notification`` mode over the
@@ -11,7 +10,7 @@ same bot transport (the notification behavior itself lives in
 class). The Zalo personal-account transport is the separate
 :class:`app.channels.adapters.zalo_userbot.ZaloUserbotAdapter`.
 
-Zalo Bot API quirks (mirrored from OpenClaw):
+Zalo Bot API quirks:
     - Base URL ``https://bot-api.zaloplatforms.com``, path ``/bot{token}/{method}``,
       every call is ``POST`` + JSON.
     - The bot token is shaped ``<numeric_id>:<secret>`` and embedded in the path.

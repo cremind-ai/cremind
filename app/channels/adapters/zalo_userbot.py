@@ -1,8 +1,7 @@
 """Zalo personal-account adapter via a ``zca-js`` Node sidecar.
 
 Zalo's personal (non-bot) account has no first-party API; the practical
-integration — ported from OpenClaw's ``extensions/zalouser`` — drives a
-logged-in Zalo Web session through the unofficial
+integration drives a logged-in Zalo Web session through the unofficial
 :pypi-js:`zca-js` library, paired via QR scan. This adapter spawns a Node
 sidecar (``app/channels/sidecars/zalo/``) that owns the ``zca-js`` session and
 bridges its events to this Python adapter over a localhost WebSocket, exactly

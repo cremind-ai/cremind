@@ -157,7 +157,6 @@ const toggleExpand = () => {
   font-size: 16px;
   flex-shrink: 0;
   position: relative;
-  overflow: hidden;
 }
 
 .agent-avatar-img {
@@ -165,17 +164,19 @@ const toggleExpand = () => {
   height: 100%;
   object-fit: contain;
   display: block;
+  border-radius: 50%;
 }
 
 .avatar-status-dot {
   position: absolute;
   bottom: -1px;
   right: -1px;
-  width: 10px;
-  height: 10px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--danger-color);
-  border: 2px solid var(--surface-color);
+  border: 1.5px solid var(--surface-color);
+  z-index: 1;
 }
 
 .avatar-status-dot.connected {
