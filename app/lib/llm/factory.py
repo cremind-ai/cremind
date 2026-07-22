@@ -133,15 +133,21 @@ def create_llm_provider(
 
     elif provider_name == "openai":
         if auth_method == "codex_oauth":
-            api_key = _get_config_value("openai", "oauth_token", config_storage, profile=profile)
-            if not api_key:
-                raise ValueError("OpenAI OAuth token is not configured")
+            # "Sign in with ChatGPT": requests go to the ChatGPT Codex backend,
+            # not api.openai.com. The provider fetches/refreshes the OAuth token
+            # lazily per request via codex_auth.get_valid_access_token, so we
+            # hand it the config store + profile rather than a token here.
+            from .openai_codex import CodexLLMProvider
+            provider = CodexLLMProvider(
+                config_storage=config_storage, profile=profile,
+                model_name=model, default_reasoning_effort=default_reasoning_effort,
+            )
         else:
             api_key = _get_api_key("openai", config_storage, profile=profile)
             if not api_key:
                 raise ValueError("OpenAI API key is not configured")
-        from .openai import OpenAILLMProvider
-        provider = OpenAILLMProvider(api_key=api_key, model_name=model, default_reasoning_effort=default_reasoning_effort)
+            from .openai import OpenAILLMProvider
+            provider = OpenAILLMProvider(api_key=api_key, model_name=model, default_reasoning_effort=default_reasoning_effort)
 
     elif provider_name == "ollama":
         from .ollama import OllamaLLMProvider

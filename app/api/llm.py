@@ -229,6 +229,24 @@ def _custom_provider_entry(name: str, defn: dict, configured: bool) -> dict:
     }
 
 
+def _models_for_auth_method(catalog: dict, auth_method: str | None) -> list[dict]:
+    """Filter a catalog's models to those visible for ``auth_method``.
+
+    A model entry may declare ``auth_methods = ["api_key", ...]`` to restrict it
+    to specific auth methods (e.g. OpenAI's Codex OAuth serves a different model
+    set than the API-key path). A model with no ``auth_methods`` key is visible
+    for every method — keeping every other provider's catalog unchanged.
+    """
+    models = catalog.get("models", []) or []
+    if not auth_method:
+        return models
+    return [
+        m for m in models
+        if not (isinstance(m, dict) and m.get("auth_methods"))
+        or auth_method in m.get("auth_methods", [])
+    ]
+
+
 def get_llm_routes(state: BootedState) -> list[Route]:
     """LLM provider + model-group routes.
 
@@ -313,6 +331,12 @@ def get_llm_routes(state: BootedState) -> list[Route]:
                 if am["id"] == active_auth_method:
                     if am["kind"] == "none":
                         configured = True
+                    elif am["kind"] == "oauth":
+                        # Browser-OAuth methods carry no manually-entered fields,
+                        # so an ``all(...)`` over an empty field set would be
+                        # vacuously true. "Configured" means a token was captured
+                        # — the access token lands in ``<provider>.oauth_token``.
+                        configured = bool(_stored(f"{name}.oauth_token"))
                     else:
                         configured = all(
                             f_spec["configured"]
@@ -343,7 +367,7 @@ def get_llm_routes(state: BootedState) -> list[Route]:
                 "requires_api_key": requires_key,
                 "requires_service_account": requires_sa,
                 "configured": configured,
-                "model_count": len(catalog.get("models", [])),
+                "model_count": len(_models_for_auth_method(catalog, active_auth_method)),
                 "auth_methods": auth_methods_response,
                 "active_auth_method": active_auth_method,
             }
@@ -404,9 +428,28 @@ def get_llm_routes(state: BootedState) -> list[Route]:
                 status_code=404,
             )
 
+        # Filter by the active auth method (some providers, e.g. OpenAI's Codex
+        # OAuth, serve a different model set than the API-key path). A ?auth_method
+        # query overrides so the setup wizard can preview a method's models before
+        # saving; otherwise fall back to the stored method, then the catalog default.
+        active = request.query_params.get("auth_method")
+        if not active:
+            config_storage = state.config_storage
+            if config_storage is not None:
+                profile = getattr(request.user, "username", "") or ""
+                try:
+                    active = config_storage.get("llm_config", f"{provider_name}.auth_method", profile=profile)
+                except Exception:  # noqa: BLE001
+                    active = None
+        if not active:
+            for am in normalize_provider_auth_methods(catalog.get("provider", {})):
+                if am.get("is_default"):
+                    active = am["id"]
+                    break
+
         return JSONResponse({
             "provider": catalog.get("provider", {}),
-            "models": catalog.get("models", []),
+            "models": _models_for_auth_method(catalog, active),
         })
 
     async def handle_update_provider(request: Request) -> JSONResponse:
@@ -497,9 +540,27 @@ def get_llm_routes(state: BootedState) -> list[Route]:
             str_value = value if isinstance(value, str) else json.dumps(value)
             config_storage.set("llm_config", full_key, str_value, is_secret=is_secret, profile=profile)
 
+        # Switching auth method can change the visible model set (e.g. OpenAI's
+        # Codex OAuth vs API key). Clear any model-group assignment that now
+        # points at a model this method can't serve, so a stale selection can't
+        # silently 4xx at request time. Report which groups were cleared so the
+        # UI can prompt a re-selection.
+        cleared_model_groups: list[str] = []
+        if "auth_method" in body:
+            visible_ids = {
+                m.get("id") for m in _models_for_auth_method(catalog, body.get("auth_method"))
+                if isinstance(m, dict)
+            }
+            prefix = f"{provider_name}/"
+            for group in ("high", "vision", "audio", "low", "plan"):
+                gv = config_storage.get("llm_config", f"model_group.{group}", profile=profile)
+                if gv and gv.startswith(prefix) and gv[len(prefix):] not in visible_ids:
+                    config_storage.delete("llm_config", f"model_group.{group}", profile=profile)
+                    cleared_model_groups.append(group)
+
         from app.events.settings_state_bus import publish_settings_state_changed
         publish_settings_state_changed(profile)
-        return JSONResponse({"success": True})
+        return JSONResponse({"success": True, "cleared_model_groups": cleared_model_groups})
 
     async def handle_delete_provider(request: Request) -> JSONResponse:
         """Remove all stored configuration for a provider."""
@@ -788,6 +849,84 @@ def get_llm_routes(state: BootedState) -> list[Route]:
             logger.error(f"Device code poll failed: {e}")
             return JSONResponse({"error": str(e)}, status_code=502)
 
+    async def handle_codex_oauth_start(request: Request) -> JSONResponse:
+        """Begin the OpenAI Codex 'Sign in with ChatGPT' browser flow.
+
+        Mints PKCE state and (for a local install) starts a loopback listener on
+        port 1455 to catch the redirect. Returns the authorize URL plus whether
+        the listener is active — when it isn't (port busy, remote server), the
+        client falls back to pasting the redirect URL.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        config_storage = state.config_storage
+        if config_storage is None:
+            return _storage_not_ready()
+        profile = getattr(request.user, "username", "") or ""
+        from app.api import llm_codex_flow
+        try:
+            result = await llm_codex_flow.start_flow(config_storage, profile)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Codex OAuth start failed: {e}")
+            return JSONResponse({"error": str(e)}, status_code=502)
+        return JSONResponse(result)
+
+    async def handle_codex_oauth_status(request: Request) -> JSONResponse:
+        """Report the status of a pending Codex sign-in flow (polled by the UI)."""
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        if state.config_storage is None:
+            return _storage_not_ready()
+        profile = getattr(request.user, "username", "") or ""
+        st = request.query_params.get("state", "")
+        from app.api.oauth_callback import _STATE_RE
+        if not st or not _STATE_RE.match(st):
+            return JSONResponse({"error": "valid state is required"}, status_code=400)
+        from app.api import llm_codex_flow
+        return JSONResponse(llm_codex_flow.get_flow_status(st, profile))
+
+    async def handle_codex_oauth_complete(request: Request) -> JSONResponse:
+        """Complete a Codex sign-in from a pasted redirect URL (remote/port-busy
+        fallback). Always 200 with a ``{status: complete|error}`` body so the UI
+        can surface the message rather than a bare HTTP error."""
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        if state.config_storage is None:
+            return _storage_not_ready()
+        profile = getattr(request.user, "username", "") or ""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        redirect_url = str(body.get("redirect_url") or "")
+        state_hint = body.get("state")
+        from app.api import llm_codex_flow
+        result = await llm_codex_flow.complete_from_redirect_url(
+            profile, redirect_url, str(state_hint) if state_hint else None,
+        )
+        return JSONResponse(result)
+
+    async def handle_codex_oauth_cancel(request: Request) -> JSONResponse:
+        """Abandon a pending Codex sign-in flow and free the loopback listener."""
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        if state.config_storage is None:
+            return _storage_not_ready()
+        profile = getattr(request.user, "username", "") or ""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        st = str(body.get("state") or "")
+        from app.api import llm_codex_flow
+        if st:
+            await llm_codex_flow.cancel_flow(st, profile)
+        return JSONResponse({"success": True})
+
     return [
         Route("/api/llm/providers", handle_list_providers, methods=["GET"]),
         Route("/api/llm/providers/custom", handle_create_custom_provider, methods=["POST"]),
@@ -798,4 +937,8 @@ def get_llm_routes(state: BootedState) -> list[Route]:
         Route("/api/llm/model-groups", handle_update_model_groups, methods=["PUT"]),
         Route("/api/llm/auth/device-code/start", handle_device_code_start, methods=["POST"]),
         Route("/api/llm/auth/device-code/poll", handle_device_code_poll, methods=["POST"]),
+        Route("/api/llm/auth/codex/start", handle_codex_oauth_start, methods=["POST"]),
+        Route("/api/llm/auth/codex/status", handle_codex_oauth_status, methods=["GET"]),
+        Route("/api/llm/auth/codex/complete", handle_codex_oauth_complete, methods=["POST"]),
+        Route("/api/llm/auth/codex/cancel", handle_codex_oauth_cancel, methods=["POST"]),
     ]

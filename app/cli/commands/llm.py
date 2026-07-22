@@ -35,9 +35,15 @@ device_code_app = typer.Typer(
     help="GitHub Copilot device-code authentication flow.",
     no_args_is_help=True,
 )
+codex_oauth_app = typer.Typer(
+    name="codex-oauth",
+    help="Sign in with ChatGPT (Codex OAuth) for the OpenAI provider.",
+    no_args_is_help=True,
+)
 llm_app.add_typer(providers_app, name="providers")
 llm_app.add_typer(model_groups_app, name="model-groups")
 llm_app.add_typer(device_code_app, name="device-code")
+llm_app.add_typer(codex_oauth_app, name="codex-oauth")
 
 
 # ── providers ─────────────────────────────────────────────────────────────
@@ -459,6 +465,139 @@ def device_code_poll(
         print_kv([("status", "complete"), ("access_token", resp.access_token)])
     else:
         sys.stdout.write("complete (token stored server-side)\n")
+
+
+# ── codex-oauth ────────────────────────────────────────────────────────────
+
+@codex_oauth_app.command("login")
+@graceful_errors
+def codex_oauth_login(
+    ctx: typer.Context,
+    no_browser: bool = typer.Option(
+        False, "--no-browser", help="Don't try to open the sign-in URL automatically."
+    ),
+) -> None:
+    """Sign in with ChatGPT for the OpenAI provider.
+
+    Starts the browser OAuth flow. On a local install the redirect is captured
+    automatically (poll until complete); if the loopback listener can't run
+    (port busy, remote server), you'll be prompted to paste the redirect URL.
+    """
+    import asyncio
+    import webbrowser
+
+    from app.cli.client._base import Client
+    from app.cli.client.llm import (
+        codex_oauth_complete as _complete,
+        codex_oauth_start as _start,
+        codex_oauth_status as _status,
+    )
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json, print_kv
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run():
+        async with Client(cfg) as client:
+            start = await _start(client)
+            typer.echo(f"Open this URL to sign in with ChatGPT:\n  {start.authorize_url}\n")
+            if not no_browser:
+                try:
+                    webbrowser.open(start.authorize_url)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if start.listener_active:
+                typer.echo("Waiting for authorization (Ctrl-C to cancel)...")
+                deadline = time.monotonic() + max(start.expires_in, 60)
+                while time.monotonic() < deadline:
+                    st = await _status(client, start.state)
+                    if st.status == "complete":
+                        return st
+                    if st.status == "error":
+                        raise RuntimeError(f"sign-in failed: {st.error}")
+                    if st.status == "expired":
+                        raise RuntimeError("sign-in request expired; run login again")
+                    await asyncio.sleep(2)
+                raise RuntimeError("sign-in timed out; run login again")
+
+            # Listener unavailable → paste-the-redirect-URL fallback.
+            if start.listener_error:
+                typer.echo(start.listener_error)
+            if not sys.stdin.isatty() or mode.json:
+                raise RuntimeError(
+                    "automatic capture unavailable; run "
+                    "`cremind llm codex-oauth complete <redirect_url>` with the URL "
+                    "from your browser after approving."
+                )
+            redirect_url = typer.prompt(
+                "After approving, paste the full redirect URL (http://localhost:1455/...)"
+            )
+            st = await _complete(client, redirect_url.strip(), start.state)
+            if st.status != "complete":
+                raise RuntimeError(f"sign-in failed: {st.error}")
+            return st
+
+    try:
+        resp = asyncio.run(_run())
+    except RuntimeError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
+    except KeyboardInterrupt:
+        raise typer.Exit(code=130)
+
+    if mode.json:
+        print_json(resp.to_dict())
+        return
+    print_kv([
+        ("status", "complete"),
+        ("email", resp.email or "(unknown)"),
+        ("plan", resp.plan_type or "(unknown)"),
+    ])
+
+
+@codex_oauth_app.command("complete")
+@graceful_errors
+def codex_oauth_complete_cmd(
+    ctx: typer.Context,
+    redirect_url: str = typer.Argument(
+        ..., help="The full redirect URL from the browser (http://localhost:1455/...)."
+    ),
+    state: Optional[str] = typer.Option(
+        None, "--state", help="The state value from `codex-oauth login` (cross-checked if given)."
+    ),
+) -> None:
+    """Complete a sign-in from a pasted redirect URL (remote / scripted setups)."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.llm import codex_oauth_complete as _complete
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json, print_kv
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run():
+        async with Client(cfg) as client:
+            return await _complete(client, redirect_url.strip(), state)
+
+    resp = asyncio.run(_run())
+    if resp.status != "complete":
+        typer.echo(f"sign-in failed: {resp.error}", err=True)
+        raise typer.Exit(code=1)
+
+    if mode.json:
+        print_json(resp.to_dict())
+        return
+    print_kv([
+        ("status", "complete"),
+        ("email", resp.email or "(unknown)"),
+        ("plan", resp.plan_type or "(unknown)"),
+    ])
 
 
 def _num_field(d: dict[str, Any], key: str) -> str:

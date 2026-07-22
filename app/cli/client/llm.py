@@ -138,3 +138,88 @@ async def device_code_poll(client: Client, device_code: str) -> DeviceCodePoll:
     if not isinstance(data, dict):
         raise RuntimeError("unexpected device-code/poll response")
     return DeviceCodePoll.from_dict(data)
+
+
+# ── Codex OAuth flow ("Sign in with ChatGPT" for the OpenAI provider) ───────
+
+@dataclass(frozen=True)
+class CodexOAuthStart:
+    authorize_url: str
+    state: str
+    redirect_uri: str
+    listener_active: bool
+    listener_error: str
+    expires_in: int
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "CodexOAuthStart":
+        return cls(
+            authorize_url=str(d.get("authorize_url") or ""),
+            state=str(d.get("state") or ""),
+            redirect_uri=str(d.get("redirect_uri") or ""),
+            listener_active=bool(d.get("listener_active") or False),
+            listener_error=str(d.get("listener_error") or ""),
+            expires_in=int(d.get("expires_in") or 0),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "authorize_url": self.authorize_url,
+            "state": self.state,
+            "redirect_uri": self.redirect_uri,
+            "listener_active": self.listener_active,
+            "listener_error": self.listener_error,
+            "expires_in": self.expires_in,
+        }
+
+
+@dataclass(frozen=True)
+class CodexOAuthStatus:
+    status: str
+    email: str
+    plan_type: str
+    account_id: str
+    error: str
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "CodexOAuthStatus":
+        return cls(
+            status=str(d.get("status") or ""),
+            email=str(d.get("email") or ""),
+            plan_type=str(d.get("plan_type") or ""),
+            account_id=str(d.get("account_id") or ""),
+            error=str(d.get("error") or ""),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "email": self.email,
+            "plan_type": self.plan_type,
+            "account_id": self.account_id,
+            "error": self.error,
+        }
+
+
+async def codex_oauth_start(client: Client) -> CodexOAuthStart:
+    data = await client.post_json("/api/llm/auth/codex/start")
+    if not isinstance(data, dict):
+        raise RuntimeError("unexpected codex/start response")
+    return CodexOAuthStart.from_dict(data)
+
+
+async def codex_oauth_status(client: Client, state: str) -> CodexOAuthStatus:
+    data = await client.get_json(f"/api/llm/auth/codex/status?state={quote(state, safe='')}")
+    if not isinstance(data, dict):
+        raise RuntimeError("unexpected codex/status response")
+    return CodexOAuthStatus.from_dict(data)
+
+
+async def codex_oauth_complete(client: Client, redirect_url: str, state: str | None = None) -> CodexOAuthStatus:
+    body: dict[str, Any] = {"redirect_url": redirect_url}
+    if state:
+        body["state"] = state
+    data = await client.post_json("/api/llm/auth/codex/complete", body)
+    if not isinstance(data, dict):
+        raise RuntimeError("unexpected codex/complete response")
+    return CodexOAuthStatus.from_dict(data)

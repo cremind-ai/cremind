@@ -1,5 +1,5 @@
 ---
-description: "Configure **LLM providers and models**: list and `configure` providers (add an API key), add your own **custom OpenAI-compatible providers** (name + base URL + model list) with `create-custom`, browse each provider's available models, assign the high / low / plan / vision / audio / default **model groups** the agent picks from (including a dedicated **plan model** for plan mode, a **vision model** for image_understanding, and an **audio model** for audio_understanding, each with a feature toggle), and run the **GitHub Copilot** device-code login. Use this to add a provider (built-in or custom), choose which model the agent uses, enable the Specialized Vision/Audio Model, or authenticate a provider — distinct from `cremind config` (agent behavior) and `cremind agents` (MCP/A2A servers)."
+description: "Configure **LLM providers and models**: list and `configure` providers (add an API key), add your own **custom OpenAI-compatible providers** (name + base URL + model list) with `create-custom`, browse each provider's available models, assign the high / low / plan / vision / audio / default **model groups** the agent picks from (including a dedicated **plan model** for plan mode, a **vision model** for image_understanding, and an **audio model** for audio_understanding, each with a feature toggle), run the **GitHub Copilot** device-code login, and **Sign in with ChatGPT** (Codex OAuth) for the OpenAI provider via `codex-oauth login` — a browser sign-in that routes requests through your ChatGPT plan's Codex backend instead of an API key. Use this to add a provider (built-in or custom), choose which model the agent uses, enable the Specialized Vision/Audio Model, or authenticate a provider — distinct from `cremind config` (agent behavior) and `cremind agents` (MCP/A2A servers)."
 ---
 
 # `cremind llm` — LLM Providers, Model Groups, and Device-Code Auth
@@ -28,6 +28,12 @@ The group splits into three subcommand sets:
 - **`device-code`** — start and poll the device-code OAuth flow.
   Currently used only for GitHub Copilot; the same machinery is
   reusable for any future device-code provider.
+- **`codex-oauth`** — "Sign in with ChatGPT" (Codex OAuth) for the OpenAI
+  provider. `login` opens a browser sign-in and captures the tokens
+  (locally, via a loopback listener on port 1455) or accepts a pasted
+  redirect URL (`complete`) for remote installs. When this is the OpenAI
+  provider's active auth method, requests run against ChatGPT's Codex
+  backend under your plan — a different model list from the API-key models.
 
 Provider configuration values like API keys are stored server-side and
 never exposed back to the CLI in subsequent reads — they show up only
@@ -46,7 +52,10 @@ configured, the active auth method, and the model count (mirroring
 `cremind llm providers configure`, and the **Model groups** section at the
 top of the page matches `cremind llm model-groups get/set`. The
 **Sign in with GitHub Copilot** button kicks off the same device-code
-flow that `cremind llm device-code start` runs.
+flow that `cremind llm device-code start` runs. On the **OpenAI** card,
+selecting the **Sign in with ChatGPT** auth method shows a button that
+runs the same Codex OAuth flow as `cremind llm codex-oauth login` (with a
+"paste the redirect URL" fallback matching `codex-oauth complete`).
 
 ## Global flags
 
@@ -408,6 +417,92 @@ $ cremind llm device-code poll 4fe...e8c
 complete (token stored server-side)
 ```
 
+### `cremind llm codex-oauth login`
+
+**Purpose.** Sign in with ChatGPT (Codex OAuth) for the OpenAI provider,
+so the agent can use your ChatGPT plan's Codex backend instead of an API
+key. This sets the OpenAI provider's active auth method to Codex OAuth
+and stores the access/refresh tokens server-side (auto-refreshed).
+
+**Syntax.**
+
+```bash
+cremind llm codex-oauth login [--no-browser]
+```
+
+**Flags.**
+
+| Flag           | Type | Default | Meaning                                              |
+|----------------|------|---------|------------------------------------------------------|
+| `--no-browser` | bool | `false` | Don't attempt to open the sign-in URL automatically. |
+
+**Behavior.** Prints the ChatGPT sign-in URL (and tries to open it in
+your browser unless `--no-browser`). On a **local** install the backend
+captures the redirect automatically on port 1455 and the command polls
+every 2 s until sign-in completes, then prints the account email and
+plan. If the loopback listener can't run — **port 1455 is busy** (e.g. the
+Codex CLI is mid-login) or the server is **remote** (Docker/K8s, where the
+browser's `localhost` isn't the server) — the command prints the reason
+and prompts you to paste the full redirect URL from your browser's
+address bar. Ctrl-C aborts cleanly. With `--json`, the final status
+object is printed.
+
+**Example.**
+
+```bash
+$ cremind llm codex-oauth login
+Open this URL to sign in with ChatGPT:
+  https://auth.openai.com/oauth/authorize?...
+
+Waiting for authorization (Ctrl-C to cancel)...
+status  complete
+email   you@example.com
+plan    plus
+```
+
+### `cremind llm codex-oauth complete`
+
+**Purpose.** Finish a Codex sign-in from a redirect URL you copied out of
+the browser — for remote installs or scripted setups where the automatic
+loopback capture isn't available.
+
+**Syntax.**
+
+```bash
+cremind llm codex-oauth complete <redirect_url> [--state <state>]
+```
+
+**Arguments** (required):
+
+- `<redirect_url>` — The full URL your browser landed on after approving
+  access (starts with `http://localhost:1455/auth/callback?...`). It may
+  fail to load in the browser — that's fine; only the URL matters.
+
+**Flags.**
+
+| Flag      | Type   | Default | Meaning                                                           |
+|-----------|--------|---------|-------------------------------------------------------------------|
+| `--state` | string | `""`    | The `state` value from `codex-oauth login` (cross-checked if set).|
+
+**Behavior.** Exchanges the code server-side and stores the tokens. Prints
+the account email + plan on success; exits non-zero with the error message
+otherwise. A given sign-in request is only valid for ~10 minutes.
+
+**Example (remote install).**
+
+```bash
+# On the (remote) server:
+$ cremind llm codex-oauth login --no-browser
+Open this URL to sign in with ChatGPT:
+  https://auth.openai.com/oauth/authorize?...
+Port 1455 is already in use ...  # or: automatic capture unavailable
+# Open the URL in YOUR browser, approve, copy the address bar, then:
+$ cremind llm codex-oauth complete 'http://localhost:1455/auth/callback?code=...&state=...'
+status  complete
+email   you@example.com
+plan    pro
+```
+
 ## Worked examples
 
 ### Bootstrap Anthropic and verify the model list
@@ -476,3 +571,22 @@ the provider but could not enumerate its models, usually because the
 key is wrong or the provider was unreachable when the worker last ran.
 Re-run `providers configure` with a known-good key, then refresh the
 list.
+
+**`codex-oauth login` says port 1455 is in use** — Another process holds
+the loopback port (often the Codex CLI mid-login). Close it and retry, or
+paste the redirect URL when prompted / via `codex-oauth complete`.
+
+**`codex-oauth` — "automatic capture unavailable"** — The server is remote
+(Docker/K8s), so the browser's `localhost:1455` can't reach it. Open the
+printed URL in your browser, approve, then run `codex-oauth complete` with
+the URL from the address bar.
+
+**`Unknown or expired sign-in request`** — A sign-in request lives ~10
+minutes and is dropped if the server restarts. Run `codex-oauth login`
+again to start a fresh one.
+
+**Codex sign-in worked but requests fail with "sign-in has expired"** —
+The refresh token was revoked or expired (e.g. after a long offline
+period), or you previously pasted a raw access token (which has no refresh
+token). Run `cremind llm codex-oauth login` again. Signing out is
+`cremind llm providers delete-config openai`.
