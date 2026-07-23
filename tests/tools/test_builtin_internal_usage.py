@@ -64,11 +64,12 @@ def test_select_best_candidate_returns_index_and_usage():
         function_calls=[{"name": "select_document", "arguments": {"index": 0}}],
         tokens={"input_tokens": 42, "output_tokens": 3},
     )
-    idx, usage = asyncio.run(ds._select_best_candidate(
+    idx, usage, errored = asyncio.run(ds._select_best_candidate(
         llm=llm, query="how to write a skill",
         candidates=[{"name": "a", "description": "d"}],
     ))
     assert idx == 0
+    assert errored is False
     assert usage["input_tokens"] == 42
     assert usage["output_tokens"] == 3
 
@@ -78,11 +79,32 @@ def test_select_best_candidate_returns_usage_on_no_match():
         function_calls=[{"name": "no_relevant_result", "arguments": {}}],
         tokens={"input_tokens": 30, "output_tokens": 1},
     )
-    idx, usage = asyncio.run(ds._select_best_candidate(
+    idx, usage, errored = asyncio.run(ds._select_best_candidate(
         llm=llm, query="q", candidates=[{"name": "a", "description": "d"}],
     ))
     assert idx is None
+    assert errored is False  # legitimate no-match, not a judge error
     assert usage["input_tokens"] == 30  # cost is attributed even on no-match
+
+
+def test_select_best_candidate_flags_judge_error():
+    """A judge LLM that raises (e.g. an incompatible judge model 400ing) reports
+    ``errored=True`` so the caller can tell it apart from a genuine no-match."""
+
+    class _RaisingLLM:
+        provider_name = "fake"
+        model_name = "fake-mini"
+        model_label = "fake/fake-mini"
+
+        async def chat_completion(self, **kwargs):
+            raise RuntimeError("codex request failed (400): model not supported")
+            yield  # pragma: no cover — makes this an async generator
+
+    idx, usage, errored = asyncio.run(ds._select_best_candidate(
+        llm=_RaisingLLM(), query="q", candidates=[{"name": "a", "description": "d"}],
+    ))
+    assert idx is None
+    assert errored is True
 
 
 def _patch_docsearch_service(monkeypatch, *, body="BODY: how to write a skill"):

@@ -9,7 +9,11 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from app.api._auth import require_auth_or_setup_mode
-from app.config import load_all_provider_catalogs, load_provider_catalog
+from app.config import (
+    load_all_provider_catalogs,
+    load_provider_catalog,
+    models_for_auth_method,
+)
 from app.config.provider_auth import normalize_provider_auth_methods
 from app.lib.llm.factory import SUPPORTED_LLM_PROVIDERS
 from app.runtime import BootedState
@@ -229,22 +233,10 @@ def _custom_provider_entry(name: str, defn: dict, configured: bool) -> dict:
     }
 
 
-def _models_for_auth_method(catalog: dict, auth_method: str | None) -> list[dict]:
-    """Filter a catalog's models to those visible for ``auth_method``.
-
-    A model entry may declare ``auth_methods = ["api_key", ...]`` to restrict it
-    to specific auth methods (e.g. OpenAI's Codex OAuth serves a different model
-    set than the API-key path). A model with no ``auth_methods`` key is visible
-    for every method — keeping every other provider's catalog unchanged.
-    """
-    models = catalog.get("models", []) or []
-    if not auth_method:
-        return models
-    return [
-        m for m in models
-        if not (isinstance(m, dict) and m.get("auth_methods"))
-        or auth_method in m.get("auth_methods", [])
-    ]
+# Filtering models by auth method now lives in ``app.config`` so it can be shared
+# with ``app.lib.llm`` (the model-group reconciler) without an ``api ← lib`` cycle.
+# Kept as a module-local alias so existing call sites need no change.
+_models_for_auth_method = models_for_auth_method
 
 
 def get_llm_routes(state: BootedState) -> list[Route]:
@@ -547,16 +539,10 @@ def get_llm_routes(state: BootedState) -> list[Route]:
         # UI can prompt a re-selection.
         cleared_model_groups: list[str] = []
         if "auth_method" in body:
-            visible_ids = {
-                m.get("id") for m in _models_for_auth_method(catalog, body.get("auth_method"))
-                if isinstance(m, dict)
-            }
-            prefix = f"{provider_name}/"
-            for group in ("high", "vision", "audio", "low", "plan"):
-                gv = config_storage.get("llm_config", f"model_group.{group}", profile=profile)
-                if gv and gv.startswith(prefix) and gv[len(prefix):] not in visible_ids:
-                    config_storage.delete("llm_config", f"model_group.{group}", profile=profile)
-                    cleared_model_groups.append(group)
+            from app.lib.llm.model_group_reconcile import reconcile_model_groups_for_auth
+            cleared_model_groups = reconcile_model_groups_for_auth(
+                config_storage, provider_name, body.get("auth_method"), profile,
+            )
 
         from app.events.settings_state_bus import publish_settings_state_changed
         publish_settings_state_changed(profile)

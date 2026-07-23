@@ -398,6 +398,20 @@ class CodexLLMProvider(LLMProvider):
             raise AgentException(Status.LLM_CHAT_COMPLETION_ERROR, detail)
         if status >= 500 or any(m in text.lower() for m in _RETRYABLE_MARKERS):
             raise CodexTransientError(f"codex backend {status}: {text[:200]}")
+        if status == 400 and "not supported when using codex" in text.lower():
+            # The configured model isn't served by the signed-in ChatGPT plan's
+            # Codex backend (a different, restricted model set from the API-key
+            # path). Turn the raw 400 into an actionable message instead of a
+            # cryptic RuntimeError buried in a traceback. Not retryable.
+            raise AgentException(
+                Status.LLM_CHAT_COMPLETION_ERROR,
+                (
+                    f"The model '{self.model_name}' isn't available on your ChatGPT "
+                    f"plan's Codex backend. Open Settings → LLM Providers and pick a "
+                    f"Codex-eligible model (e.g. a GPT-5.x model) for this model "
+                    f"group, or switch the OpenAI provider to the API-key auth method."
+                ),
+            )
         # Other 4xx: let the outer handler route context-overflow specially.
         raise RuntimeError(f"codex request failed ({status}): {text[:300]}")
 

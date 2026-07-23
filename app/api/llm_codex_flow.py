@@ -289,6 +289,25 @@ async def complete_flow(state: str, code: str) -> Dict[str, Any]:
     pend["email"] = creds.email
     pend["plan_type"] = creds.plan_type
     pend["account_id"] = creds.account_id
+    # Switching OpenAI to the Codex backend changes the servable model set. Clear
+    # any model group left pointing at an API-key-only model (e.g. a stale
+    # ``model_group.low = openai/gpt-4.1-mini``) so it falls back to the high group
+    # instead of 4xx-ing at request time — the same reconciliation the Settings
+    # provider PATCH performs. Non-fatal: a cleanup failure must not undo a
+    # successful sign-in (the resolution-time guard in ModelGroupManager also
+    # self-heals any residual stale value).
+    try:
+        from app.lib.llm.model_group_reconcile import reconcile_model_groups_for_auth
+        cleared = reconcile_model_groups_for_auth(
+            config_storage, "openai", "codex_oauth", profile,
+        )
+        if cleared:
+            logger.info(
+                f"[codex-flow] cleared stale model group(s) after ChatGPT "
+                f"sign-in (profile={profile}): {cleared}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[codex-flow] model-group reconciliation failed: {exc}")
     try:
         from app.events.settings_state_bus import publish_settings_state_changed
         publish_settings_state_changed(profile)

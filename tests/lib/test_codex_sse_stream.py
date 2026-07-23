@@ -158,6 +158,15 @@ def test_raise_http_error_classification():
         p._raise_http_error(503, "server_is_overloaded")
     with pytest.raises(RuntimeError):
         p._raise_http_error(400, "some other 4xx")
+    # A "model not supported" 400 is turned into an actionable AgentException that
+    # names the model — not a cryptic RuntimeError buried in a traceback.
+    p.model_name = "gpt-4.1-mini"
+    body = ('{"detail":"The \'gpt-4.1-mini\' model is not supported when using '
+            'Codex with a ChatGPT account."}')
+    with pytest.raises(AgentException) as ei2:
+        p._raise_http_error(400, body)
+    assert ei2.value.code == Status.LLM_CHAT_COMPLETION_ERROR
+    assert "gpt-4.1-mini" in str(ei2.value)
 
 
 # ── non-streaming collect ───────────────────────────────────────────────────

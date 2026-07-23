@@ -90,3 +90,79 @@ def test_documentation_search_falls_back_to_high_when_low_unset(monkeypatch):
     # No model_group.low configured → judge transparently uses the main model.
     mgr.create_llm_for_tool("documentation_search")
     assert (captured["provider"], captured["model"]) == ("anthropic", "claude-opus-4-8")
+
+
+# --- auth-method eligibility guard (self-heal) ------------------------------
+# A stored group value may point at a model the provider's ACTIVE auth method
+# can't serve (e.g. a stale ``low = openai/gpt-4.1-mini`` after "Sign in with
+# ChatGPT"). Optional groups fall back to ``high``; ``high`` itself raises.
+
+
+def test_low_falls_back_to_high_when_auth_incompatible():
+    mgr = ModelGroupManager(_FakeConfig({
+        "model_group.high": "github-copilot/gpt-4.1",   # no per-model auth_methods → ok
+        "model_group.low": "openai/gpt-4.1-mini",        # api_key-only → 400s on Codex
+        "openai.auth_method": "codex_oauth",
+    }))
+    # Incompatible low self-heals to the high group instead of resolving the
+    # doomed openai/gpt-4.1-mini.
+    assert mgr.get_provider_and_model("low") == ("github-copilot", "gpt-4.1")
+
+
+def test_documentation_search_falls_back_when_low_incompatible(monkeypatch):
+    # Direct reproduction of the reported bug: the doc-search judge must not be
+    # built on an auth-incompatible model.
+    captured = _capture_provider_and_model(monkeypatch)
+    mgr = ModelGroupManager(_FakeConfig({
+        "model_group.high": "github-copilot/gpt-4.1",
+        "model_group.low": "openai/gpt-4.1-mini",
+        "openai.auth_method": "codex_oauth",
+    }))
+    mgr.create_llm_for_tool("documentation_search")
+    assert (captured["provider"], captured["model"]) == ("github-copilot", "gpt-4.1")
+
+
+def test_codex_eligible_low_is_left_intact():
+    mgr = ModelGroupManager(_FakeConfig({
+        "model_group.high": "github-copilot/gpt-4.1",
+        "model_group.low": "openai/gpt-5.4-mini",   # dual auth → valid under Codex
+        "openai.auth_method": "codex_oauth",
+    }))
+    assert mgr.get_provider_and_model("low") == ("openai", "gpt-5.4-mini")
+
+
+def test_high_incompatible_auth_raises_setup_required():
+    from app.lib.llm.exceptions import SetupRequiredError
+
+    mgr = ModelGroupManager(_FakeConfig({
+        "model_group.high": "openai/gpt-4.1-mini",   # api_key-only under Codex
+        "openai.auth_method": "codex_oauth",
+    }))
+    # high never falls back (would mask a broken main model / risk recursion).
+    try:
+        mgr.get_provider_and_model("high")
+    except SetupRequiredError as err:
+        assert getattr(err, "code", None) == "model_auth_incompatible"
+    else:  # pragma: no cover
+        raise AssertionError("expected SetupRequiredError for incompatible high group")
+
+
+def test_low_incompatible_but_api_key_ok():
+    # openai on api_key: gpt-4.1-mini is fine — the guard must not over-fire.
+    mgr = ModelGroupManager(_FakeConfig({
+        "model_group.high": "github-copilot/gpt-4.1",
+        "model_group.low": "openai/gpt-4.1-mini",
+        "openai.auth_method": "api_key",
+    }))
+    assert mgr.get_provider_and_model("low") == ("openai", "gpt-4.1-mini")
+
+
+def test_other_provider_not_regressed():
+    # No openai involvement → nothing to check; groups resolve unchanged.
+    mgr = ModelGroupManager(_FakeConfig({
+        "model_group.high": "anthropic/claude-opus-4-8",
+        "model_group.low": "anthropic/claude-haiku-4-5-20251001",
+        "openai.auth_method": "codex_oauth",
+    }))
+    assert mgr.get_provider_and_model("low") == ("anthropic", "claude-haiku-4-5-20251001")
+    assert mgr.get_provider_and_model("high") == ("anthropic", "claude-opus-4-8")
