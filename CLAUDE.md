@@ -9,6 +9,10 @@ for the release pipeline.
 Do not create new branches without permission. Before creating a branch for a
 new feature, consult the user first and get their explicit go-ahead.
 
+## Debugging on the local dev environment
+
+To debug errors in Cremind, read the log file `logs/app.log`.
+
 ## When you add, modify, or remove a feature
 
 Two checks are mandatory for every feature change. Both are easy to forget and

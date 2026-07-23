@@ -7,10 +7,11 @@ and strict ``normalize_notification_filter`` validation.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import app.channels.notification_filter as nf
 from app.channels.notification_filter import (
     NotificationFilter,
     default_filter,
@@ -189,3 +190,22 @@ def test_format_notification_includes_title_and_preview():
     assert "Backed up 3 files" in out
     assert "❌" in out  # failure emoji
     assert "🔴" in out  # high-priority marker
+
+
+def test_format_notification_footer_uses_profile_timezone(monkeypatch):
+    # created_at=0 is 1970-01-01 00:00 UTC; in a +7 zone that is 07:00. The
+    # footer must render in the profile's resolved zone, not the OS process zone
+    # (which is UTC on the Docker/VPS image — the reported bug rendered 00:00).
+    monkeypatch.setattr(nf, "resolve_tzinfo", lambda profile: timezone(timedelta(hours=7)))
+    out = format_notification(
+        _entry(kind="event_run_completed", source_kind="schedule", created_at=0, profile="admin")
+    )
+    assert "_Schedule · 07:00_" in out
+
+
+def test_format_notification_footer_falls_back_gracefully_without_profile(monkeypatch):
+    # No profile on the entry → resolve_tzinfo(None) still yields a usable zone;
+    # the footer must render a HH:MM string rather than crash or come out empty.
+    monkeypatch.setattr(nf, "resolve_tzinfo", lambda profile: timezone.utc)
+    out = format_notification(_entry(source_kind="schedule", created_at=0))
+    assert "_Schedule · 00:00_" in out

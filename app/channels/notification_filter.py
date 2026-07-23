@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from app.config.timezone import resolve_tzinfo
 
 # ── Vocabulary ────────────────────────────────────────────────────────────────
 
@@ -374,7 +376,7 @@ def format_notification(entry: dict) -> str:
     source = _SOURCE_LABEL.get(entry.get("source_kind") or "")
     if source:
         meta_parts.append(source)
-    ts = _format_time(entry.get("created_at"))
+    ts = _format_time(entry.get("created_at"), resolve_tzinfo(entry.get("profile")))
     if ts:
         meta_parts.append(ts)
     if meta_parts:
@@ -383,10 +385,13 @@ def format_notification(entry: dict) -> str:
     return "\n".join(lines)
 
 
-def _format_time(created_at: Any) -> str:
+def _format_time(created_at: Any, tz: tzinfo | None = None) -> str:
     try:
-        # created_at is epoch milliseconds (time.time() * 1000).
-        return datetime.fromtimestamp(float(created_at) / 1000).strftime("%H:%M")
+        # created_at is epoch milliseconds (time.time() * 1000). ``tz`` is the
+        # profile's resolved zone (see resolve_tzinfo); None falls back to the OS
+        # process zone (UTC on Docker/VPS), which is exactly the bug this avoids
+        # when a caller passes the profile zone.
+        return datetime.fromtimestamp(float(created_at) / 1000, tz=tz).strftime("%H:%M")
     except (TypeError, ValueError, OSError):
         return ""
 
