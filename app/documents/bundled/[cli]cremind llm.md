@@ -424,6 +424,14 @@ so the agent can use your ChatGPT plan's Codex backend instead of an API
 key. This sets the OpenAI provider's active auth method to Codex OAuth
 and stores the access/refresh tokens server-side (auto-refreshed).
 
+The Codex backend serves a **different, restricted model set** from the
+API-key path (only GPT-5.x-class models). On successful sign-in, any model
+group (`high` / `low` / `plan` / …) still pointing at an API-key-only
+OpenAI model (e.g. `openai/gpt-4.1-mini`) is **auto-cleared** so it falls
+back to the `high` model instead of failing at request time. Pick a
+Codex-eligible model with `model-groups set` if you want a dedicated
+`low`/`plan` model under Codex.
+
 **Syntax.**
 
 ```bash
@@ -590,3 +598,12 @@ The refresh token was revoked or expired (e.g. after a long offline
 period), or you previously pasted a raw access token (which has no refresh
 token). Run `cremind llm codex-oauth login` again. Signing out is
 `cremind llm providers delete-config openai`.
+
+**`documentation_search` (or another auxiliary tool) returns nothing after
+signing in with ChatGPT** — A model group was still pointing at an
+API-key-only OpenAI model (e.g. `low = openai/gpt-4.1-mini`) that the Codex
+backend rejects (`the '<model>' model is not supported when using Codex
+with a ChatGPT account`). Sign-in now auto-clears such groups, and the
+resolver self-heals a stale value by falling back to the `high` model, so
+this should no longer happen. If you want a dedicated cheap model under
+Codex, run e.g. `cremind llm model-groups set --low openai/gpt-5.4-mini`.

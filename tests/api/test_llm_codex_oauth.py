@@ -199,6 +199,30 @@ def test_complete_success_persists_tokens(monkeypatch):
     assert storage.get("llm_config", "openai.oauth_account_id") == "acc-9"
 
 
+def test_complete_reconciles_stale_model_group(monkeypatch):
+    """Signing in with ChatGPT must clear a model group left pointing at an
+    API-key-only OpenAI model (the origin of the documentation_search bug)."""
+    async def _fake_exchange(code, verifier):
+        return {"access_token": "AT", "refresh_token": "RT", "expires_in": 3600,
+                "id_token": _make_jwt({"account_id": "acc-1"})}
+    monkeypatch.setattr(ca, "exchange_code", _fake_exchange)
+    import app.events.settings_state_bus as bus
+    monkeypatch.setattr(bus, "publish_settings_state_changed", lambda p: None)
+
+    storage = FakeConfigStorage()
+    storage.set("llm_config", "model_group.high", "github-copilot/gpt-4.1")
+    storage.set("llm_config", "model_group.low", "openai/gpt-4.1-mini")  # api_key-only
+    h = _handlers(storage, monkeypatch)
+    state = _register_pending(storage)
+    url = f"http://localhost:1455/auth/callback?code=THECODE&state={state}"
+    resp = asyncio.run(h[("/api/llm/auth/codex/complete", "POST")](
+        _make_request(body={"redirect_url": url, "state": state})))
+    assert _body(resp)["status"] == "complete"
+    # Stale incompatible low is cleared (falls back to high); high is untouched.
+    assert storage.get("llm_config", "model_group.low") is None
+    assert storage.get("llm_config", "model_group.high") == "github-copilot/gpt-4.1"
+
+
 def test_complete_bare_query_accepted(monkeypatch):
     async def _fake_exchange(code, verifier):
         return {"access_token": "AT", "refresh_token": "RT", "expires_in": 3600,

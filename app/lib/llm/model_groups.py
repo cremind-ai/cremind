@@ -20,11 +20,13 @@ Four **optional** auxiliary groups fall back to the single model when unset:
 
 from typing import Optional
 
+from app.config import model_supports_auth_method
 from app.config import settings as dynaconf_settings
 from app.storage.dynamic_config_storage import DynamicConfigStorage
+from app.utils.logger import logger
 from .base import LLMProvider
 from .exceptions import SetupRequiredError
-from .factory import create_llm_provider
+from .factory import _get_auth_method, create_llm_provider
 
 
 class ModelGroupManager:
@@ -80,7 +82,55 @@ class ModelGroupManager:
                 settings_label="LLM Providers",
             )
 
-        return self._parse_group_value(group_value)
+        provider_name, model_name = self._parse_group_value(group_value)
+
+        # Auth-method eligibility guard (self-heal). A stored group value may point
+        # at a model the provider's ACTIVE auth method can't serve — e.g. after
+        # "Sign in with ChatGPT" a stale ``model_group.low = openai/gpt-4.1-mini``
+        # 400s on the Codex backend, which made ``documentation_search`` return
+        # "no relevant result found". The OAuth/Settings paths reconcile at
+        # switch time, but pre-existing, CLI-set, and blueprint-imported values
+        # don't re-run that — so recover here too. Only fires when a model
+        # DECLARES incompatible ``auth_methods`` (today only OpenAI does), so no
+        # other provider regresses.
+        if not self._model_auth_compatible(provider_name, model_name, profile):
+            if group in ("vision", "audio", "low", "plan"):
+                logger.warning(
+                    "[model_groups] %s group model %s/%s is not eligible for the "
+                    "active auth method; falling back to the high group.",
+                    group, provider_name, model_name,
+                )
+                return self.get_provider_and_model("high", profile=profile)
+            raise SetupRequiredError(
+                (
+                    f"The model '{provider_name}/{model_name}' can't be used with "
+                    f"the active auth method for '{provider_name}'. Open Settings → "
+                    f"LLM Providers and choose a compatible model for the "
+                    f"{group.capitalize()} group (e.g. a GPT-5.x Codex model), or "
+                    f"switch the provider to the API-key auth method."
+                ),
+                code="model_auth_incompatible",
+                settings_path="/settings/llm",
+                settings_label="LLM Providers",
+            )
+
+        return provider_name, model_name
+
+    def _model_auth_compatible(
+        self, provider_name: str, model_name: str, profile: str | None
+    ) -> bool:
+        """Whether ``model_name`` can run under ``provider_name``'s ACTIVE auth
+        method. Reuses ``factory._get_auth_method`` (the single source of truth
+        for the active method) and the permissive ``model_supports_auth_method``
+        catalog check — so an unset auth method or a model that declares no
+        ``auth_methods`` is always treated as compatible.
+        """
+        auth_method = _get_auth_method(provider_name, self.config_storage, profile=profile)
+        if not auth_method:
+            return True
+        return model_supports_auth_method(
+            provider_name, model_name, auth_method, profile=profile
+        )
 
     def get_default_provider(self, profile: str | None = None) -> str:
         """Get the default LLM provider name."""

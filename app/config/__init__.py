@@ -209,6 +209,61 @@ def audio_feature_enabled(profile: str | None = None) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def models_for_auth_method(catalog: dict, auth_method: str | None) -> list[dict]:
+    """Filter a provider catalog's models to those visible for ``auth_method``.
+
+    A model entry may declare ``auth_methods = ["api_key", ...]`` to restrict it
+    to specific auth methods (e.g. OpenAI's Codex OAuth serves a different model
+    set than the API-key path). A model with no ``auth_methods`` key is visible
+    for every method — keeping every other provider's catalog unchanged.
+
+    Pure (catalog dict + auth string) so it can live here, importable by both the
+    API layer and ``app.lib.llm`` without an ``api ← lib`` import cycle.
+    """
+    models = catalog.get("models", []) or []
+    if not auth_method:
+        return models
+    return [
+        m for m in models
+        if not (isinstance(m, dict) and m.get("auth_methods"))
+        or auth_method in m.get("auth_methods", [])
+    ]
+
+
+def model_supports_auth_method(
+    provider_name: str,
+    model_name: str,
+    auth_method: str | None,
+    profile: str | None = None,
+) -> bool:
+    """Return True if ``model_name`` can be served under ``auth_method``.
+
+    Permissive default (opposite of ``model_supports_vision``): a model that
+    declares no ``auth_methods`` — the norm, only ``openai.toml`` sets them — or
+    that isn't listed in its catalog is treated as usable. Returns False only
+    when a model *declares* ``auth_methods`` and ``auth_method`` isn't among them
+    (e.g. OpenAI ``gpt-4.1-mini`` is ``api_key``-only and can't run on the Codex
+    ``codex_oauth`` backend). A blank provider/model/auth is treated as usable so
+    callers that can't determine the active method never over-block.
+
+    Passing ``profile`` lets a per-profile ``custom:<slug>`` provider's stored
+    catalog be honored (see ``resolve_catalog``).
+    """
+    if not provider_name or not model_name or not auth_method:
+        return True
+    model = model_name
+    prefix = f"{provider_name}/"
+    if model.startswith(prefix):
+        model = model[len(prefix):]
+
+    catalog = resolve_catalog(provider_name, profile)
+    for entry in catalog.get("models", []) or []:
+        if isinstance(entry, dict) and entry.get("id") == model:
+            declared = entry.get("auth_methods")
+            return True if not declared else (auth_method in declared)
+    return True  # unknown / unlisted model → don't block
+
+
 def model_supports_prompt_cache(provider_name: str, model_name: str) -> bool:
     """Return True if ``model_name`` is flagged prompt-cache-capable for its provider.
 

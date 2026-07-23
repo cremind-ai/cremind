@@ -265,10 +265,17 @@ async def run_doc_search(
         )
         return _no_result()
 
-    chosen_index, judge_usage = await _select_best_candidate(
+    chosen_index, judge_usage, judge_errored = await _select_best_candidate(
         llm=llm, query=query, candidates=candidates, log_label=log_label,
     )
     if chosen_index is None:
+        # A judge *error* (e.g. the configured judge model is incompatible with
+        # the provider's auth method) is reported distinctly from a genuine
+        # no-match, so the reasoning agent doesn't read a broken judge as "no doc
+        # matched". Never returns a document on error (the judge exists precisely
+        # to reject off-topic top hits, so a blind top-1 fallback would be wrong).
+        if judge_errored:
+            return _judge_unavailable(token_usage=judge_usage)
         return _no_result(token_usage=judge_usage)
 
     chosen = candidates[chosen_index]
@@ -347,14 +354,35 @@ def _no_result(token_usage: Optional[Dict[str, int]] = None) -> BuiltInToolResul
     )
 
 
+def _judge_unavailable(token_usage: Optional[Dict[str, int]] = None) -> BuiltInToolResult:
+    """Distinct result for when the relevance judge LLM *errored* (as opposed to a
+    genuine no-match). Carries ``error: True`` so the reasoning agent treats it as
+    a transient/config failure to surface or retry — not as a definitive "no
+    documentation matched". Never returns a document body.
+    """
+    return BuiltInToolResult(
+        structured_content={
+            "message": (
+                "Documentation search is temporarily unavailable: the relevance "
+                "judge could not run (check the 'low' model group is compatible "
+                "with the active LLM provider auth method)."
+            ),
+            "relevant": False,
+            "error": True,
+        },
+        token_usage=token_usage,
+    )
+
+
 async def _select_best_candidate(
     *,
     llm,
     query: str,
     candidates: List[Dict[str, Any]],
     log_label: str = "documentation_search",
-) -> Tuple[Optional[int], Dict[str, int]]:
-    """Run the LLM judge over ``candidates`` and return ``(index, token_usage)``.
+) -> Tuple[Optional[int], Dict[str, int], bool]:
+    """Run the LLM judge over ``candidates`` and return ``(index, token_usage,
+    errored)``.
 
     The judge MUST decide by calling one of two function tools:
     ``select_document(index)`` or ``no_relevant_result()``. The first element is
@@ -363,7 +391,11 @@ async def _select_best_candidate(
     response). The second element is the four-way token usage the judge call
     consumed — captured off the terminal ``DONE`` chunk and returned in every case
     (even no-match / error) so the caller can attribute the cost; all-zero when the
-    call errored before producing usage.
+    call errored before producing usage. The third element is ``True`` only when
+    the judge LLM call itself *errored* (e.g. the configured judge model is
+    incompatible with the provider's auth method) — as opposed to a legitimate
+    no-match — so the caller can tell a broken judge apart from "no doc matched"
+    instead of reporting both as the same "no relevant result found".
     """
     judge_tools = _build_judge_tools(num_candidates=len(candidates))
     user_message = _format_judge_prompt(query=query, candidates=candidates)
@@ -414,7 +446,7 @@ async def _select_best_candidate(
     except Exception:  # noqa: BLE001
         logger.exception("[documentation_search] judge LLM call failed")
         _log("error:judge-llm-failed")
-        return None, token_usage
+        return None, token_usage, True
 
     if not function_calls:
         logger.warning(
@@ -422,7 +454,7 @@ async def _select_best_candidate(
             "treating as no-match"
         )
         _log("no-match:no-tool-call")
-        return None, token_usage
+        return None, token_usage, False
 
     call = function_calls[0]
     name = call.get("name") or ""
@@ -435,7 +467,7 @@ async def _select_best_candidate(
 
     if name == _NO_MATCH_TOOL_NAME:
         _log("no_relevant_result")
-        return None, token_usage
+        return None, token_usage, False
 
     if name == _SELECT_TOOL_NAME:
         raw_index = args.get("index") if isinstance(args, dict) else None
@@ -447,23 +479,23 @@ async def _select_best_candidate(
                 f"{raw_index!r}"
             )
             _log(f"no-match:non-integer-index:{raw_index!r}")
-            return None, token_usage
+            return None, token_usage, False
         if 0 <= idx < len(candidates):
             _log(f"select:{candidates[idx].get('name', '')}[{idx}]")
-            return idx, token_usage
+            return idx, token_usage, False
         logger.warning(
             f"[documentation_search] judge index {idx} out of range "
             f"(have {len(candidates)} candidates)"
         )
         _log(f"no-match:index-out-of-range:{idx}")
-        return None, token_usage
+        return None, token_usage, False
 
     logger.warning(
         f"[documentation_search] judge called unknown tool {name!r}; "
         "treating as no-match"
     )
     _log(f"no-match:unknown-tool:{name!r}")
-    return None, token_usage
+    return None, token_usage, False
 
 
 def _build_judge_tools(*, num_candidates: int) -> List[Dict[str, Any]]:
