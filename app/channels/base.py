@@ -66,13 +66,27 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         self._task: asyncio.Task | None = None
         # Notification-mode delivery loop (mode == "notification" only).
         self._notif_task: asyncio.Task | None = None
-        # Per-sender in-flight forwarder tasks. Used both to (a) ack the user
-        # when a second message arrives while we're still processing the first
-        # ("busy ack" — the closest a bot can come to blocking input on
-        # platforms that don't expose that), and (b) serialize forwarders for
-        # the same sender so a new forwarder doesn't accidentally absorb the
-        # tail of the previous run's events from the shared stream bus.
+        # Per-sender in-flight forwarder tasks. Used both to (a) detect that a
+        # turn is still being processed when a second message arrives (the
+        # channel analog of the web UI's blocked send button), and (b) serialize
+        # forwarders for the same sender so a new forwarder doesn't accidentally
+        # absorb the tail of the previous run's events from the shared stream
+        # bus. A message that arrives while a turn is in flight is acked with a
+        # cosmetic "I'm thinking…" and dropped (never dispatched).
         self._inflight: dict[str, asyncio.Task] = {}
+        # Senders we've already sent the "I'm thinking…" busy ack to for the
+        # current in-flight period, so a burst of mid-turn messages produces a
+        # single ack rather than one per message. Cleared in ``_clear_inflight``.
+        self._busy_acked: set[str] = set()
+        # Per-sender locks that make the busy-check → dispatch decision in
+        # ``_handle_inbound`` atomic. Transports may spawn one ``_handle_inbound``
+        # task per inbound message (e.g. Telegram), so two messages arriving in
+        # the same poll batch could otherwise both pass the ``_inflight`` check
+        # before either registers a forwarder. Kept for the adapter's lifetime
+        # (one small lock per distinct sender, like ``_access_requested``); not
+        # pruned because a task may hold a reference across the acquire boundary,
+        # so removing an "unlocked" entry could hand out two parallel locks.
+        self._inbound_locks: dict[str, asyncio.Lock] = {}
 
         # Sender ids we've already raised an operator "access request"
         # notification for (``approval`` conversational auth), to avoid
@@ -357,17 +371,34 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
 
     # ── inbound flow ──
 
+    def _inbound_lock(self, sender_id: str) -> asyncio.Lock:
+        """Return (lazily creating) the per-sender inbound lock.
+
+        Safe without synchronization: the event loop is single-threaded and
+        there is no ``await`` between the lookup and the assignment.
+        """
+        lock = self._inbound_locks.get(sender_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._inbound_locks[sender_id] = lock
+        return lock
+
     async def _handle_inbound(
         self, sender_id: str, display_name: str | None, text: str,
     ) -> None:
         """Route an inbound platform message into Cremind.
 
-        If a previous run is still in flight for this sender, send a brief
-        "still working" ack and **await** that run before dispatching the
-        new one. Awaiting matters for correctness, not just UX: the
-        forwarder subscribes to the conversation's stream bus immediately,
-        and starting a new forwarder while the prior run is still
-        publishing would cause it to consume the tail of the wrong run.
+        If a previous run is still in flight for this sender, the message is
+        the channel analog of a second submit while the web UI's send button
+        is disabled: we reply once with a cosmetic "I'm thinking…" ack and
+        **drop** it — it is never dispatched, so it's never persisted, never
+        shown in the web UI, and never enters the model's history. Only the
+        user's own message and the ack remain visible on the channel.
+
+        Dropping also satisfies the forwarder-serialization invariant for
+        free: because we never dispatch a second run while the first is still
+        publishing, a new forwarder can never absorb the tail of the wrong
+        run on the shared stream bus.
         """
         text = (text or "").strip()
         if not text:
@@ -400,22 +431,25 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             await self._handle_access_gate(sender, auth, text)
             return
 
-        # Busy ack + serialize-per-sender. Both the ack and the await cover
-        # the case where the user fires two questions back-to-back.
-        inflight = self._inflight.get(sender_id)
-        if inflight is not None and not inflight.done():
-            await self.send(
-                sender_id,
-                "⏳ Still working on your previous message — I'll handle this one next.",
-            )
-            try:
-                await inflight
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                # Whatever happened to the previous run, we're free to
-                # dispatch the new one now.
-                pass
+        # Busy handling: if a turn is still in flight for this sender, drop the
+        # new message (see the method docstring) and ack once per busy period.
+        # The per-sender lock makes the check → dispatch atomic so two messages
+        # racing in from the same poll batch can't both get dispatched.
+        async with self._inbound_lock(sender_id):
+            inflight = self._inflight.get(sender_id)
+            if inflight is not None and not inflight.done():
+                if sender_id not in self._busy_acked:
+                    self._busy_acked.add(sender_id)
+                    await self.send(sender_id, "I'm thinking…")
+                logger.debug(
+                    f"[channels:{self.channel_type}] dropped mid-turn message "
+                    f"channel_id={self.channel_id} from={sender_id}"
+                )
+                return
 
-        await self._dispatch_to_agent(conversation_id, sender_id, display_name, text)
+            await self._dispatch_to_agent(
+                conversation_id, sender_id, display_name, text,
+            )
 
     async def _ensure_conversation(self, sender: dict, display_name: str | None) -> str:
         """Return the conversation id for this sender, creating one if absent."""
@@ -605,6 +639,8 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             # message may have replaced us before we observed our completion.
             if self._inflight.get(sender_id) is task:
                 self._inflight.pop(sender_id, None)
+                # Busy period over: allow the next mid-turn burst to ack again.
+                self._busy_acked.discard(sender_id)
 
         forwarder.add_done_callback(_clear_inflight)
 
