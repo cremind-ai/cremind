@@ -42,6 +42,16 @@ services:
       # same-origin on 1515. The internal API bind (1112) is loopback-only
       # inside the container and is deliberately NOT published.
       - "${SPA_PORT:-1515}:1515"
+      # Callback port for "Sign in with ChatGPT" (Codex OAuth). OpenAI's
+      # redirect URI is hard-coded to http://localhost:1455/auth/callback and
+      # cannot be configured, so the browser can only hand the authorization
+      # code to Cremind if that exact host port reaches the container. Bound to
+      # 127.0.0.1 on the host: it is a short-lived loopback callback, never
+      # something to expose beyond this machine. If you need host port 1455 for
+      # something else (e.g. a host-side `codex` CLI login), set
+      # CODEX_CALLBACK_PORT to a free port in .env — sign-in then falls back to
+      # pasting the redirect URL, which always works.
+      - "127.0.0.1:${CODEX_CALLBACK_PORT:-1455}:1455"
       # >>> desktop-only >>>
       - "${NOVNC_PORT:-6080}:80"
       - "${VNC_PORT:-5900}:5900"

@@ -670,6 +670,12 @@ export interface CodexOAuthStart {
   redirect_uri: string;
   listener_active: boolean;
   listener_error?: string | null;
+  // How the server is deployed, and — for containerized installs — what that
+  // deployment needs before the browser can reach the callback listener
+  // (a published port under Docker, a port-forward under Kubernetes).
+  // `capture_hint` is null when capture is unconditional (native installs).
+  deployment?: 'native' | 'docker' | 'kubernetes';
+  capture_hint?: string | null;
   expires_in: number;
 }
 

@@ -838,10 +838,12 @@ def get_llm_routes(state: BootedState) -> list[Route]:
     async def handle_codex_oauth_start(request: Request) -> JSONResponse:
         """Begin the OpenAI Codex 'Sign in with ChatGPT' browser flow.
 
-        Mints PKCE state and (for a local install) starts a loopback listener on
-        port 1455 to catch the redirect. Returns the authorize URL plus whether
-        the listener is active — when it isn't (port busy, remote server), the
-        client falls back to pasting the redirect URL.
+        Mints PKCE state and starts the port-1455 callback listener. Returns the
+        authorize URL, whether the listener bound (``listener_active``), and —
+        separately — the ``deployment`` plus a ``capture_hint`` describing what
+        that deployment needs for the browser to actually reach the listener
+        (a published port under Docker, a port-forward under Kubernetes). The
+        client falls back to pasting the redirect URL whenever either is in doubt.
         """
         unauth = _require_auth(request)
         if unauth is not None:

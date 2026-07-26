@@ -18,7 +18,7 @@ api_key = { description = "OpenAI API Key", type = "string", secret = true, requ
 id = "codex_oauth"
 label = "Sign in with ChatGPT"
 hint = "Browser sign-in with your ChatGPT account (Plus/Pro/Team)"
-instructions = "Click Sign in with ChatGPT and approve access in your browser. Cremind captures the redirect on this machine (port 1455) and stores the tokens automatically. If that can't work (remote/Docker install, or port 1455 is in use), paste the full redirect URL from your browser's address bar instead. Requests then run against ChatGPT's Codex backend under your plan — a different model list from the API-key models."
+instructions = "Click Sign in with ChatGPT and approve access in your browser. OpenAI always redirects to localhost:1455, so Cremind listens there and stores the tokens automatically. Docker installs need that port published and Kubernetes installs need it port-forwarded (the sign-in panel spells out the exact command for your install); where neither is possible — an Ingress or any remote URL — paste the full redirect URL from your browser's address bar instead, or run 'cremind llm codex-oauth login' from your own machine. Requests then run against ChatGPT's Codex backend under your plan — a different model list from the API-key models."
 kind = "oauth"
 # No `fields` table: the browser flow captures the tokens; there is nothing to
 # type. Tokens are stored server-side under ``openai.oauth_*`` keys.

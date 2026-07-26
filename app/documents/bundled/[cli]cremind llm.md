@@ -30,10 +30,11 @@ The group splits into three subcommand sets:
   reusable for any future device-code provider.
 - **`codex-oauth`** — "Sign in with ChatGPT" (Codex OAuth) for the OpenAI
   provider. `login` opens a browser sign-in and captures the tokens
-  (locally, via a loopback listener on port 1455) or accepts a pasted
-  redirect URL (`complete`) for remote installs. When this is the OpenAI
-  provider's active auth method, requests run against ChatGPT's Codex
-  backend under your plan — a different model list from the API-key models.
+  automatically — port 1455 is listened on by both the server and, for
+  remote servers, the CLI itself — or `complete` accepts a redirect URL
+  you pasted. When this is the OpenAI provider's active auth method,
+  requests run against ChatGPT's Codex backend under your plan — a
+  different model list from the API-key models.
 
 Provider configuration values like API keys are stored server-side and
 never exposed back to the CLI in subsequent reads — they show up only
@@ -445,15 +446,31 @@ cremind llm codex-oauth login [--no-browser]
 | `--no-browser` | bool | `false` | Don't attempt to open the sign-in URL automatically. |
 
 **Behavior.** Prints the ChatGPT sign-in URL (and tries to open it in
-your browser unless `--no-browser`). On a **local** install the backend
-captures the redirect automatically on port 1455 and the command polls
-every 2 s until sign-in completes, then prints the account email and
-plan. If the loopback listener can't run — **port 1455 is busy** (e.g. the
-Codex CLI is mid-login) or the server is **remote** (Docker/K8s, where the
-browser's `localhost` isn't the server) — the command prints the reason
-and prompts you to paste the full redirect URL from your browser's
-address bar. Ctrl-C aborts cleanly. With `--json`, the final status
-object is printed.
+your browser unless `--no-browser`), then waits for the redirect.
+
+OpenAI hard-codes the redirect to `http://localhost:1455/auth/callback`,
+where `localhost` means **the machine running the browser**. The command
+therefore listens on two fronts at once and finishes on whichever fires:
+
+- **Locally** — the CLI binds port 1455 on *your* machine. This is what
+  makes a **remote server** (VPS behind an Ingress, K8s, Docker) work
+  automatically: the code is caught here and relayed to the server.
+- **Server-side** — the backend's own listener, reported by
+  `listener_active`. On a native install it already owns port 1455 (so the
+  local bind above simply fails, which is fine and expected).
+
+The command polls every 2 s until either side completes, then prints the
+account email and plan. If the server is containerized, its `capture_hint`
+is echoed first — telling you what that deployment needs for the *server*
+listener to be reachable (a published port under Docker, an extra
+`1455:1455` port-forward under Kubernetes); you can ignore it when the CLI
+captures locally. If **neither** side can listen — port 1455 is busy on
+both (e.g. the Codex CLI is mid-login) — the command prints the reason and
+prompts you to paste the full redirect URL from your browser's address bar.
+Approving on a *different* machine than the one running this command also
+falls back to pasting: Ctrl-C, then use `codex-oauth complete`. Ctrl-C
+aborts cleanly at any point. With `--json`, the final status object is
+printed (and paste-prompting is skipped — use `codex-oauth complete`).
 
 **Example.**
 
@@ -471,8 +488,9 @@ plan    plus
 ### `cremind llm codex-oauth complete`
 
 **Purpose.** Finish a Codex sign-in from a redirect URL you copied out of
-the browser — for remote installs or scripted setups where the automatic
-loopback capture isn't available.
+the browser — for scripted setups, or when you approved on a different
+machine than the one that ran `codex-oauth login`, so neither listener saw
+the redirect.
 
 **Syntax.**
 
@@ -496,20 +514,26 @@ cremind llm codex-oauth complete <redirect_url> [--state <state>]
 the account email + plan on success; exits non-zero with the error message
 otherwise. A given sign-in request is only valid for ~10 minutes.
 
-**Example (remote install).**
+**Example (approved on another machine).**
 
 ```bash
-# On the (remote) server:
+# Run over SSH on the server, but you approve in a browser on your laptop —
+# so neither the server's listener nor a local one ever sees the redirect:
 $ cremind llm codex-oauth login --no-browser
 Open this URL to sign in with ChatGPT:
   https://auth.openai.com/oauth/authorize?...
-Port 1455 is already in use ...  # or: automatic capture unavailable
-# Open the URL in YOUR browser, approve, copy the address bar, then:
+Waiting for authorization (Ctrl-C to cancel)...
+^C
+# Approve in the laptop browser, copy the address bar, then (on the server):
 $ cremind llm codex-oauth complete 'http://localhost:1455/auth/callback?code=...&state=...'
 status  complete
 email   you@example.com
 plan    pro
 ```
+
+Simpler alternative: point the CLI at the remote server from your **laptop**
+(`cremind llm codex-oauth login` with the profile/token for that server).
+The CLI's local listener catches the redirect and no pasting is needed.
 
 ## Worked examples
 
@@ -581,13 +605,29 @@ Re-run `providers configure` with a known-good key, then refresh the
 list.
 
 **`codex-oauth login` says port 1455 is in use** — Another process holds
-the loopback port (often the Codex CLI mid-login). Close it and retry, or
-paste the redirect URL when prompted / via `codex-oauth complete`.
+the port (often the Codex CLI mid-login). Close it and retry, or paste the
+redirect URL when prompted / via `codex-oauth complete`.
 
-**`codex-oauth` — "automatic capture unavailable"** — The server is remote
-(Docker/K8s), so the browser's `localhost:1455` can't reach it. Open the
-printed URL in your browser, approve, then run `codex-oauth complete` with
-the URL from the address bar.
+**`codex-oauth` — "automatic capture unavailable"** — Neither the server
+nor the CLI could bind port 1455. Open the printed URL in your browser,
+approve, then run `codex-oauth complete` with the URL from the address bar.
+
+**Sign-in from the web UI just waits forever on a Docker or K8s install** —
+The server's listener bound fine *inside* the container, but the browser's
+`localhost:1455` never reaches it. Fix the transport, or sidestep it:
+
+- **Docker** — publish the port. Recent installs already carry
+  `- "127.0.0.1:1455:1455"` in the cremind service's `ports`; older ones
+  need it added, then `docker compose up -d`.
+- **Kubernetes** — forward it: `kubectl -n <ns> port-forward svc/cremind
+  1515:80 1455:1455`.
+- **Ingress / any remote URL** — there is no port to forward. Paste the
+  redirect URL into the UI's "Having trouble?" box, or run
+  `cremind llm codex-oauth login` from your own machine (the CLI captures
+  the redirect locally and relays it).
+
+The UI shows the matching hint and pre-opens the paste box on these
+installs, so it no longer waits silently.
 
 **`Unknown or expired sign-in request`** — A sign-in request lives ~10
 minutes and is dropped if the server restarts. Run `codex-oauth login`

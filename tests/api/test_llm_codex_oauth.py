@@ -12,6 +12,7 @@ import asyncio
 import base64
 import json
 import socket
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
@@ -89,7 +90,13 @@ def _free_port() -> int:
 
 
 @pytest.fixture(autouse=True)
-def _reset_flow():
+def _reset_flow(monkeypatch):
+    # Pin deployment detection to "native" for every test unless it says
+    # otherwise — CI itself may run inside a container, which would otherwise
+    # flip the bind host and the capture hint under the tests' feet.
+    monkeypatch.delenv("INSTALL_MODE", raising=False)
+    monkeypatch.delenv("VNC_PASSWORD", raising=False)
+    monkeypatch.setattr(flow, "_CONTAINER_MARKER", Path("/nonexistent/.dockerenv"))
     flow._pending.clear()
     asyncio.run(flow.stop_listener())
     yield
@@ -114,7 +121,7 @@ def test_start_requires_storage(monkeypatch):
 
 
 def test_start_success_registers_state(monkeypatch):
-    async def _fake_listener(port):
+    async def _fake_listener(port, host):
         return True, None
     monkeypatch.setattr(flow, "_start_listener", _fake_listener)
     h = _handlers(FakeConfigStorage(), monkeypatch)
@@ -128,7 +135,7 @@ def test_start_success_registers_state(monkeypatch):
 
 
 def test_start_listener_bind_failure_still_succeeds(monkeypatch):
-    async def _fake_listener(port):
+    async def _fake_listener(port, host):
         return False, "Port 1455 is already in use"
     monkeypatch.setattr(flow, "_start_listener", _fake_listener)
     h = _handlers(FakeConfigStorage(), monkeypatch)
@@ -136,6 +143,78 @@ def test_start_listener_bind_failure_still_succeeds(monkeypatch):
     assert data["listener_active"] is False
     assert "1455" in data["listener_error"]
     assert data["authorize_url"]  # flow still usable via paste fallback
+
+
+# ── deployment awareness (bind host + capture hint) ─────────────────────────
+
+@pytest.fixture
+def _capture_bind(monkeypatch):
+    """Record the (port, host) the flow tries to bind, reporting success."""
+    seen: dict[str, Any] = {}
+
+    async def _fake_listener(port, host):
+        seen["port"], seen["host"] = port, host
+        return True, None
+
+    monkeypatch.setattr(flow, "_start_listener", _fake_listener)
+    return seen
+
+
+def _start_under_mode(monkeypatch, h, mode: Optional[str]) -> dict:
+    """Run start_flow with INSTALL_MODE set to ``mode`` (unset when ``None``).
+    The autouse fixture already neutralizes the container-marker fallback."""
+    if mode is not None:
+        monkeypatch.setenv("INSTALL_MODE", mode)
+    return _body(asyncio.run(h[("/api/llm/auth/codex/start", "POST")](_make_request())))
+
+
+def test_start_native_binds_loopback_without_hint(monkeypatch, _capture_bind):
+    h = _handlers(FakeConfigStorage(), monkeypatch)
+    data = _start_under_mode(monkeypatch, h, None)
+    assert data["deployment"] == "native"
+    assert data["capture_hint"] is None
+    assert _capture_bind["host"] == "127.0.0.1"
+
+
+def test_start_docker_binds_all_interfaces_with_hint(monkeypatch, _capture_bind):
+    h = _handlers(FakeConfigStorage(), monkeypatch)
+    data = _start_under_mode(monkeypatch, h, "docker")
+    assert data["deployment"] == "docker"
+    # docker-proxy forwards to the container's bridge address, not its loopback.
+    assert _capture_bind["host"] == "0.0.0.0"
+    assert "docker-compose.yml" in data["capture_hint"]
+    assert "1455" in data["capture_hint"]
+
+
+def test_start_kubernetes_keeps_loopback_and_tells_user_to_forward(monkeypatch, _capture_bind):
+    h = _handlers(FakeConfigStorage(), monkeypatch)
+    data = _start_under_mode(monkeypatch, h, "kubernetes")
+    assert data["deployment"] == "kubernetes"
+    # kubectl port-forward dials the pod's loopback, so don't widen the bind.
+    assert _capture_bind["host"] == "127.0.0.1"
+    assert "port-forward" in data["capture_hint"]
+    assert "1455:1455" in data["capture_hint"]
+
+
+def test_capture_hint_suppressed_when_listener_did_not_bind(monkeypatch):
+    """A bind failure already has its own message; don't stack two on the user."""
+    async def _fake_listener(port, host):
+        return False, "Port 1455 is already in use"
+    monkeypatch.setattr(flow, "_start_listener", _fake_listener)
+    monkeypatch.setenv("INSTALL_MODE", "docker")
+    h = _handlers(FakeConfigStorage(), monkeypatch)
+    data = _body(asyncio.run(h[("/api/llm/auth/codex/start", "POST")](_make_request())))
+    assert data["deployment"] == "docker"
+    assert data["capture_hint"] is None
+    assert data["listener_error"]
+
+
+def test_unknown_install_mode_falls_back_to_native(monkeypatch, _capture_bind):
+    """get_active_install_mode() rejects modes absent from the catalog."""
+    h = _handlers(FakeConfigStorage(), monkeypatch)
+    data = _start_under_mode(monkeypatch, h, "nonsense-mode")
+    assert data["deployment"] == "native"
+    assert data["capture_hint"] is None
 
 
 # ── status ────────────────────────────────────────────────────────────────

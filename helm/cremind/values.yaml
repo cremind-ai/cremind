@@ -76,6 +76,12 @@ cremind:
   host: "0.0.0.0"                # -> HOST
   apiPort: 1112                  # -> PORT (backend API)
   uiPort: 1515                   # -> CREMIND_UI_PORT (SPA / Setup Wizard)
+  # Callback port for "Sign in with ChatGPT" (Codex OAuth). NOT configurable in
+  # practice — OpenAI hard-codes the redirect to http://localhost:1455 — but
+  # named here so the Service port and container port stay in one place. The
+  # backend binds it on the pod's loopback only for the ~10 minutes a sign-in is
+  # pending; `kubectl port-forward` reaches it there. See the README.
+  codexCallbackPort: 1455
   systemDir: /root/.cremind      # -> CREMIND_SYSTEM_DIR (PVC mount; image default)
   # Timezone -> CREMIND_TIMEZONE: the boot default wall-clock zone the scheduler
   # fires time-based events in and the agent reports for "what time is it". The

@@ -92,6 +92,11 @@ spec:
               containerPort: {{ .Values.cremind.apiPort }}
             - name: ui
               containerPort: {{ .Values.cremind.uiPort }}
+            # Transient Codex OAuth callback listener (bound only while a
+            # "Sign in with ChatGPT" flow is pending). Declared so the Service's
+            # codex-oauth port resolves for `kubectl port-forward svc/...`.
+            - name: codex-oauth
+              containerPort: {{ .Values.cremind.codexCallbackPort }}
             {{- if .Values.desktop.enabled }}
             - name: novnc
               containerPort: 80

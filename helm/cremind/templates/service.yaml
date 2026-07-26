@@ -18,3 +18,16 @@ spec:
       port: {{ .Values.service.port }}
       targetPort: {{ if .Values.proxy.enabled }}http{{ else }}ui{{ end }}
       protocol: TCP
+    # Codex OAuth ("Sign in with ChatGPT") callback. Deliberately NOT behind
+    # the proxy: OpenAI hard-codes the redirect to http://localhost:1455, so
+    # the only way the browser can deliver the code is a port-forward that
+    # lands on the backend's own 1455 listener:
+    #   kubectl -n <ns> port-forward svc/<name> 1515:80 1455:1455
+    # Listed here purely so `port-forward svc/...` can resolve it; nothing
+    # routes to it otherwise, and the listener only exists for the ~10 minutes
+    # a sign-in is pending. Ingress-only installs must paste the redirect URL
+    # (or run `cremind llm codex-oauth login` locally).
+    - name: codex-oauth
+      port: {{ .Values.cremind.codexCallbackPort }}
+      targetPort: {{ .Values.cremind.codexCallbackPort }}
+      protocol: TCP

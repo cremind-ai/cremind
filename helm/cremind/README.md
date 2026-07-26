@@ -34,9 +34,12 @@ set `image.repository`.
 An in-pod **nginx reverse-proxy sidecar** fronts the whole workflow on **one
 port** so you never forward more than one: it routes `/api` + `/health` to the
 backend, `/vnc/` to the agent's desktop (noVNC — desktop flavor only), and
-everything else to the SPA. The Service exposes only that port, and an Ingress
-targets it. The SPA calls the backend **same-origin**, so it works behind a
-single port-forward *or* a single Ingress hostname.
+everything else to the SPA. That is the only port an Ingress targets, and the SPA
+calls the backend **same-origin**, so everyday use works behind a single
+port-forward *or* a single Ingress hostname. (The Service declares one other
+port, `1455`, which carries no application traffic — it exists so a port-forward
+can reach the transient Codex OAuth callback listener; see
+[Sign in with ChatGPT](#sign-in-with-chatgpt-codex-oauth).)
 
 ## Install
 
@@ -85,6 +88,34 @@ password, which is auto-wired into the pod from the generated Secret (via
 `secretKeyRef`) and used server-side, so you **leave the password blank and just
 click Next** (the Docker-Compose-like "everything is wired" experience). You only
 type credentials when using an external PostgreSQL without `cremind.postgresPasswordSecret`.
+
+### Sign in with ChatGPT (Codex OAuth)
+
+The OpenAI provider's **Sign in with ChatGPT** uses OpenAI's Codex OAuth client,
+whose redirect URI is hard-coded to `http://localhost:1455/auth/callback` and
+**cannot be changed** — not by this chart, not by an Ingress. The backend
+therefore opens a short-lived listener on port `1455` inside the pod while a
+sign-in is pending, and the browser has to be able to reach *that*.
+
+`kubectl port-forward` dials the pod's loopback, so forwarding `1455` alongside
+the UI port is all it takes:
+
+```bash
+kubectl -n cremind port-forward svc/cremind 1515:80 1455:1455
+```
+
+Then sign in from Settings → LLM Providers → OpenAI; the redirect is captured
+automatically. Without the second port the sign-in page simply waits until it
+times out.
+
+**Reaching Cremind through an Ingress instead?** There is no port to forward, so
+use either fallback — both complete the exchange server-side:
+
+- Approve in the browser, copy the `http://localhost:1455/auth/callback?...` URL
+  out of the address bar (the page itself won't load — only the URL matters), and
+  paste it into the **"Having trouble? Paste the redirect URL"** box; or
+- run `cremind llm codex-oauth login` on your own machine against the cluster —
+  the CLI binds `1455` locally, catches the redirect there, and relays the code.
 
 ## Bundled dependencies
 
@@ -159,6 +190,7 @@ embeddings.
 | `qdrant.enabled` / `chromadb.enabled` | `false` | Enable when turning on embeddings. |
 | `proxy.enabled` | `true` | nginx single-entry sidecar (UI + API + noVNC on one port; noVNC routes present only on the desktop flavor). |
 | `service.port` | `80` | The one Service port (fronts the proxy). |
+| `cremind.codexCallbackPort` | `1455` | Codex OAuth callback. Not really a knob — OpenAI hard-codes `localhost:1455`. Exposed as a second Service port purely so `port-forward svc/… 1455:1455` resolves; see [Sign in with ChatGPT](#sign-in-with-chatgpt-codex-oauth). |
 | `ingress.enabled` | `false` | One hostname for everything (UI at `/`; noVNC at `/vnc/` on the desktop flavor). |
 
 ## How the storage constraints are enforced

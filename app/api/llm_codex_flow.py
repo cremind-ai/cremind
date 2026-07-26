@@ -2,16 +2,30 @@
 
 OpenAI's Codex OAuth client has a **fixed** redirect URI —
 ``http://localhost:1455/auth/callback`` — so the authorization ``code`` can only
-be captured by a listener bound to port 1455 on the machine running the browser.
-For a local (native) install that is this backend, so ``start_flow`` spins up a
-tiny loopback HTTP server on ``127.0.0.1:1455`` that catches the redirect,
-exchanges the code, and stores the tokens.
+be captured by something listening on port 1455 *of the machine running the
+browser*. ``start_flow`` spins up a tiny HTTP server on port 1455 that catches
+the redirect, exchanges the code, and stores the tokens.
 
-When that listener can't run — the port is busy (e.g. the Codex CLI is mid-login)
-or the server is remote (Docker/K8s, where the browser's ``localhost`` isn't the
-server) — ``start_flow`` still succeeds with ``listener_active=False`` and the UI
-falls back to letting the user paste the redirect URL, which
-``complete_from_redirect_url`` finishes server-side.
+Whether the browser can actually reach that listener depends on the deployment:
+
+* **native** — the backend runs on the same machine as the browser, so a
+  ``127.0.0.1`` bind is exactly right and capture is automatic.
+* **docker** — the listener binds ``0.0.0.0`` inside the container so the
+  published ``127.0.0.1:1455:1455`` mapping (see
+  ``install/templates/docker-compose.yml.tmpl``) can reach it. docker-proxy
+  forwards to the container's *eth0*, never its loopback, so a ``127.0.0.1``
+  bind would be unreachable even with the mapping in place.
+* **kubernetes** — ``kubectl port-forward`` dials the pod's loopback, so the
+  ``127.0.0.1`` bind is reachable as soon as the user forwards 1455 alongside
+  1515. Ingress-only access can't work (the redirect URI is not configurable).
+
+Because a bind that *succeeds* says nothing about whether the browser can reach
+it, ``start_flow`` also returns ``deployment`` and a ``capture_hint`` telling the
+client what the deployment needs — without it a containerized install polls
+silently until the TTL. When capture genuinely can't happen the user pastes the
+redirect URL, which ``complete_from_redirect_url`` finishes server-side; the
+``cremind`` CLI additionally binds 1455 on the *client* machine and relays the
+code through that same endpoint.
 
 State lives only in-process (a restart drops in-flight flows, like the Calendar
 connect flow). Nothing here is persisted except, on success, the token rows
@@ -21,8 +35,10 @@ written by :func:`app.lib.llm.codex_auth.persist_token_response`.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from app.api.oauth_callback import _STATE_RE
@@ -76,7 +92,84 @@ def _prune() -> None:
         _pending.pop(state, None)
 
 
-# ── loopback listener ──────────────────────────────────────────────────────
+# ── deployment awareness ───────────────────────────────────────────────────
+
+_HINT_DOCKER = (
+    "This is a Docker install, so automatic capture needs host port "
+    f"{codex_auth.CODEX_CALLBACK_PORT} mapped into the container. Recent installs "
+    "publish it already; if sign-in just keeps waiting, add "
+    f'\'- "127.0.0.1:{codex_auth.CODEX_CALLBACK_PORT}:{codex_auth.CODEX_CALLBACK_PORT}"\' '
+    "to the cremind service's ports in docker-compose.yml, run "
+    "'docker compose up -d', and start again. If you opened this page from a "
+    "different machine than the Docker host, the mapping can't help — paste the "
+    "redirect URL below instead."
+)
+_HINT_KUBERNETES = (
+    "This is a Kubernetes install, so automatic capture needs port "
+    f"{codex_auth.CODEX_CALLBACK_PORT} forwarded too: 'kubectl -n <namespace> "
+    f"port-forward svc/cremind 1515:80 {codex_auth.CODEX_CALLBACK_PORT}:"
+    f"{codex_auth.CODEX_CALLBACK_PORT}'. If you reach Cremind through an Ingress "
+    "instead, paste the redirect URL below — or run 'cremind llm codex-oauth "
+    "login' from your own machine, which captures the redirect locally."
+)
+
+
+# Last-resort "are we in a container?" signal, used only when INSTALL_MODE is
+# absent. Module-level so tests can point it somewhere that doesn't exist
+# instead of patching Path.exists globally.
+_CONTAINER_MARKER = Path("/.dockerenv")
+
+
+def _detect_deployment() -> str:
+    """Return ``native`` | ``docker`` | ``kubernetes`` for the running install.
+
+    ``INSTALL_MODE`` is authoritative (compose writes ``docker``, the Helm chart
+    writes ``kubernetes``). Only when it is absent — an older Docker ``.env``
+    predating the key — do we fall back to the container marker, mirroring the
+    heuristics in :mod:`app.api.config`.
+    """
+    try:
+        from app.config.install_catalog import get_active_install_mode
+        mode = (get_active_install_mode() or "").strip().lower()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[codex-flow] install-mode lookup failed: {exc}")
+        mode = ""
+    if mode in ("docker", "kubernetes"):
+        return mode
+    if not mode and (os.environ.get("VNC_PASSWORD") or _CONTAINER_MARKER.exists()):
+        return "docker"
+    return "native"
+
+
+def _bind_host(deployment: str) -> str:
+    """Interface the callback listener binds on for ``deployment``.
+
+    Docker needs ``0.0.0.0`` because docker-proxy forwards a published port to
+    the container's bridge address, not its loopback. Native and Kubernetes stay
+    on loopback — the browser (native) and ``kubectl port-forward`` (Kubernetes)
+    both reach it there, and binding wider would expose the callback to the LAN
+    or the pod network for the flow's lifetime.
+    """
+    return "0.0.0.0" if deployment == "docker" else "127.0.0.1"
+
+
+def _capture_hint(deployment: str) -> Optional[str]:
+    """What this deployment needs for the browser to reach the listener.
+
+    ``None`` on native installs, where it always can. A non-``None`` hint does
+    *not* mean capture will fail — the port mapping / port-forward may well be in
+    place — only that it depends on something outside this process, so the client
+    should surface the paste fallback up front rather than after a silent
+    10-minute wait.
+    """
+    if deployment == "docker":
+        return _HINT_DOCKER
+    if deployment == "kubernetes":
+        return _HINT_KUBERNETES
+    return None
+
+
+# ── callback listener ──────────────────────────────────────────────────────
 
 def _http_response(status_line: str, html: str) -> bytes:
     body = html.encode("utf-8")
@@ -90,7 +183,7 @@ def _http_response(status_line: str, html: str) -> bytes:
 
 
 async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    """Serve one loopback callback request. Never raises out — a crash here would
+    """Serve one callback request. Never raises out — a crash here would
     take down the serving task."""
     try:
         data = b""
@@ -128,7 +221,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         if error:
             _mark_error(state, (params.get("error_description") or [error])[0])
         elif not state or not _STATE_RE.match(state) or not code:
-            logger.warning("[codex-flow] loopback callback with missing/invalid state or code")
+            logger.warning("[codex-flow] callback with missing/invalid state or code")
         else:
             result = await complete_flow(state, code)
             ok = result.get("status") == "complete"
@@ -136,7 +229,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         writer.write(_http_response("200 OK", _SUCCESS_HTML if ok else _ERROR_HTML))
         await writer.drain()
     except Exception as exc:  # noqa: BLE001
-        logger.error(f"[codex-flow] loopback handler error: {exc}")
+        logger.error(f"[codex-flow] callback handler error: {exc}")
     finally:
         try:
             writer.close()
@@ -144,18 +237,18 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             pass
 
 
-async def _start_listener(port: int) -> tuple[bool, Optional[str]]:
-    """Start (or reuse) the loopback listener. Returns ``(active, error)``."""
+async def _start_listener(port: int, host: str = "127.0.0.1") -> Tuple[bool, Optional[str]]:
+    """Start (or reuse) the callback listener. Returns ``(active, error)``."""
     global _listener, _listener_port, _listener_timeout_task
     if _listener is not None:
         return True, None
     try:
-        _listener = await asyncio.start_server(_handle_client, "127.0.0.1", port)
+        _listener = await asyncio.start_server(_handle_client, host, port)
         _listener_port = port
     except OSError as exc:
         _listener = None
         _listener_port = None
-        logger.info(f"[codex-flow] could not bind 127.0.0.1:{port}: {exc}")
+        logger.info(f"[codex-flow] could not bind {host}:{port}: {exc}")
         return False, (
             f"Port {port} is already in use (the Codex CLI may be signing in). "
             "Complete sign-in by pasting the redirect URL instead."
@@ -169,7 +262,7 @@ async def _start_listener(port: int) -> tuple[bool, Optional[str]]:
         await stop_listener()
 
     _listener_timeout_task = asyncio.ensure_future(_timeout())
-    logger.info(f"[codex-flow] loopback listener bound on 127.0.0.1:{port}")
+    logger.info(f"[codex-flow] callback listener bound on {host}:{port}")
     return True, None
 
 
@@ -203,8 +296,9 @@ async def _maybe_stop_listener() -> None:
 # ── public flow API ────────────────────────────────────────────────────────
 
 async def start_flow(config_storage, profile: str, *, port: int = codex_auth.CODEX_CALLBACK_PORT) -> Dict[str, Any]:
-    """Begin a sign-in flow: register PKCE state and start the loopback listener."""
+    """Begin a sign-in flow: register PKCE state and start the callback listener."""
     _prune()
+    deployment = _detect_deployment()
     verifier, challenge = codex_auth.generate_pkce()
     state = codex_auth.generate_state()
     _pending[state] = {
@@ -218,13 +312,17 @@ async def start_flow(config_storage, profile: str, *, port: int = codex_auth.COD
         "plan_type": None,
         "account_id": None,
     }
-    listener_active, listener_error = await _start_listener(port)
+    listener_active, listener_error = await _start_listener(port, _bind_host(deployment))
     return {
         "authorize_url": codex_auth.build_authorize_url(state, challenge),
         "state": state,
         "redirect_uri": codex_auth.CODEX_REDIRECT_URI,
         "listener_active": listener_active,
         "listener_error": listener_error,
+        # What the browser needs in order to *reach* the listener. Distinct from
+        # ``listener_active``, which only reports whether the bind succeeded.
+        "deployment": deployment,
+        "capture_hint": _capture_hint(deployment) if listener_active else None,
         "expires_in": int(_PENDING_TTL),
     }
 
@@ -256,7 +354,7 @@ def _mark_error(state: str, message: str) -> None:
 
 
 async def complete_flow(state: str, code: str) -> Dict[str, Any]:
-    """Exchange ``code`` for tokens and persist them. Shared by the loopback
+    """Exchange ``code`` for tokens and persist them. Shared by the callback
     listener and the paste-URL endpoint. Records the outcome on the pending
     entry so a UI poll can observe it; never raises."""
     pend = _pending.get(state)
@@ -314,7 +412,7 @@ async def complete_flow(state: str, code: str) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"[codex-flow] settings-state publish failed: {exc}")
     logger.info(f"[codex-flow] ChatGPT sign-in complete for profile={profile} email={creds.email}")
-    # Detached: if called from inside the loopback connection handler, awaiting
+    # Detached: if called from inside the callback connection handler, awaiting
     # stop_listener here would deadlock (wait_closed waits for this handler).
     _schedule(_maybe_stop_listener())
     return {

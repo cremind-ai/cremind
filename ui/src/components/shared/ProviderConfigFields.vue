@@ -109,7 +109,11 @@ async function startCodexLogin() {
   try {
     const data = await startCodexOAuth(settingsStore.agentUrl, settingsStore.authToken);
     codexData.value = data;
-    codexPasteOpen.value = !data.listener_active;
+    // Open the paste fallback up front whenever automatic capture isn't
+    // guaranteed: the bind failed, OR the server is containerized and capture
+    // depends on a port mapping / port-forward we can't verify from here.
+    // Polling continues either way — if capture does work, this box is moot.
+    codexPasteOpen.value = !data.listener_active || !!data.capture_hint;
     // Open the consent page in the system browser (where the ChatGPT session
     // lives). Under Electron this routes cross-origin links out of the app.
     const opener = (window as unknown as { cremind?: { openExternal?: (u: string) => void } }).cremind?.openExternal;
@@ -391,6 +395,7 @@ async function pollForToken(deviceCode: string, interval: number) {
               </a>
               <div v-if="codexPasteOpen" class="codex-paste-body">
                 <p v-if="codexData.listener_error" class="codex-paste-hint">{{ codexData.listener_error }}</p>
+                <p v-else-if="codexData.capture_hint" class="codex-paste-hint">{{ codexData.capture_hint }}</p>
                 <p v-else class="codex-paste-hint">
                   After approving, copy the URL from your browser's address bar (it starts with
                   http://localhost:1455/) and paste it here.

@@ -479,9 +479,10 @@ def codex_oauth_login(
 ) -> None:
     """Sign in with ChatGPT for the OpenAI provider.
 
-    Starts the browser OAuth flow. On a local install the redirect is captured
-    automatically (poll until complete); if the loopback listener can't run
-    (port busy, remote server), you'll be prompted to paste the redirect URL.
+    Starts the browser OAuth flow and captures the redirect automatically from
+    whichever side can see it: this machine (the CLI binds port 1455 locally, so
+    a remote or containerized server still works) or the server's own listener.
+    If neither can, you'll be prompted to paste the redirect URL.
     """
     import asyncio
     import webbrowser
@@ -492,6 +493,7 @@ def codex_oauth_login(
         codex_oauth_start as _start,
         codex_oauth_status as _status,
     )
+    from app.cli.codex_listener import LocalCallbackListener
     from app.cli.config import Config
     from app.cli.output import OutputMode, print_json, print_kv
 
@@ -499,31 +501,96 @@ def codex_oauth_login(
     mode: OutputMode = ctx.obj["mode"]
     cfg.require_token()
 
+    async def _poll_server(client, state: str, deadline: float):
+        """Watch the server-side listener. ``None`` when the deadline passes."""
+        while time.monotonic() < deadline:
+            st = await _status(client, state)
+            if st.status == "complete":
+                return st
+            if st.status == "error":
+                raise RuntimeError(f"sign-in failed: {st.error}")
+            if st.status == "expired":
+                raise RuntimeError("sign-in request expired; run login again")
+            await asyncio.sleep(2)
+        return None
+
+    async def _capture_locally(client, listener, state: str):
+        """Wait for the redirect on this machine, then relay it to the server."""
+        result = await listener.wait()
+        if result.error:
+            raise RuntimeError(f"sign-in failed: {result.error}")
+        st = await _complete(client, result.redirect_url, state)
+        if st.status != "complete":
+            raise RuntimeError(f"sign-in failed: {st.error}")
+        return st
+
     async def _run():
         async with Client(cfg) as client:
             start = await _start(client)
             typer.echo(f"Open this URL to sign in with ChatGPT:\n  {start.authorize_url}\n")
+            if start.capture_hint:
+                typer.echo(f"{start.capture_hint}\n")
             if not no_browser:
                 try:
                     webbrowser.open(start.authorize_url)
                 except Exception:  # noqa: BLE001
                     pass
 
-            if start.listener_active:
-                typer.echo("Waiting for authorization (Ctrl-C to cancel)...")
-                deadline = time.monotonic() + max(start.expires_in, 60)
-                while time.monotonic() < deadline:
-                    st = await _status(client, start.state)
-                    if st.status == "complete":
-                        return st
-                    if st.status == "error":
-                        raise RuntimeError(f"sign-in failed: {st.error}")
-                    if st.status == "expired":
-                        raise RuntimeError("sign-in request expired; run login again")
-                    await asyncio.sleep(2)
-                raise RuntimeError("sign-in timed out; run login again")
+            # Bind 1455 here, on the machine running the browser. Against a
+            # remote or containerized server this is the only thing the browser
+            # can reach; on a native install the server already holds the port,
+            # the bind fails, and its own listener does the job. Race whichever
+            # of the two are live.
+            listener = LocalCallbackListener(start.state)
+            local_active = await listener.start()
+            try:
+                if local_active or start.listener_active:
+                    typer.echo("Waiting for authorization (Ctrl-C to cancel)...")
+                    if local_active and not start.listener_active:
+                        typer.echo(
+                            "  (capturing on this machine — approve in a browser here, "
+                            "not on another host)"
+                        )
+                    deadline = time.monotonic() + max(start.expires_in, 60)
+                    tasks = []
+                    if local_active:
+                        tasks.append(asyncio.ensure_future(
+                            _capture_locally(client, listener, start.state)))
+                    if start.listener_active:
+                        tasks.append(asyncio.ensure_future(
+                            _poll_server(client, start.state, deadline)))
+                    try:
+                        done, _ = await asyncio.wait(
+                            tasks,
+                            timeout=max(deadline - time.monotonic(), 1.0),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        # A branch that failed must not mask a sibling that
+                        # succeeded, so collect errors and report one only if
+                        # nothing came back complete.
+                        failure = None
+                        for task in done:
+                            try:
+                                st = task.result()
+                            except Exception as exc:  # noqa: BLE001
+                                failure = failure or exc
+                                continue
+                            if st is not None:
+                                return st
+                        if failure is not None:
+                            raise failure
+                    finally:
+                        for task in tasks:
+                            task.cancel()
+                    raise RuntimeError(
+                        "sign-in timed out. If you approved on a different machine, run "
+                        "`cremind llm codex-oauth complete <redirect_url>` with the URL from "
+                        "that browser's address bar; otherwise run login again."
+                    )
+            finally:
+                listener.close()
 
-            # Listener unavailable → paste-the-redirect-URL fallback.
+            # Nothing could capture the redirect → paste-it-yourself fallback.
             if start.listener_error:
                 typer.echo(start.listener_error)
             if not sys.stdin.isatty() or mode.json:

@@ -150,6 +150,12 @@ class CodexOAuthStart:
     listener_active: bool
     listener_error: str
     expires_in: int
+    # How the server is deployed (native/docker/kubernetes) and, for the
+    # containerized ones, what that deployment needs before a browser can reach
+    # the server's callback listener. Empty on native installs. Defaulted so an
+    # older server that doesn't send them still parses.
+    deployment: str = ""
+    capture_hint: str = ""
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "CodexOAuthStart":
@@ -160,6 +166,8 @@ class CodexOAuthStart:
             listener_active=bool(d.get("listener_active") or False),
             listener_error=str(d.get("listener_error") or ""),
             expires_in=int(d.get("expires_in") or 0),
+            deployment=str(d.get("deployment") or ""),
+            capture_hint=str(d.get("capture_hint") or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -170,6 +178,8 @@ class CodexOAuthStart:
             "listener_active": self.listener_active,
             "listener_error": self.listener_error,
             "expires_in": self.expires_in,
+            "deployment": self.deployment,
+            "capture_hint": self.capture_hint,
         }
 
 
