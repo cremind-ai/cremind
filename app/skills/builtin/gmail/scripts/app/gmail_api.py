@@ -1,66 +1,26 @@
 """Thin wrapper over the Gmail API (googleapiclient).
 
-Only the verbs the skill needs: profile/watch (event plane), and
-list/get/send/reply/history (actions + incremental sync). All calls
-use the local user's own access token — the relay is never involved here.
+Sending is the only capability the shared Cremind OAuth client can offer: every
+Gmail scope that reads a mailbox — including headers-only metadata — is
+"restricted" by Google, as are the watch/history APIs behind push notifications.
+So there is no event plane here, and ``list``/``get`` only work for a caller who
+brought their own credentials (see cli.py).
+
+All calls use the local user's own access token — the relay is never involved.
 """
 from __future__ import annotations
 
 import base64
 from email.mime.text import MIMEText
-from email.utils import formataddr
 from typing import Any
 
-GMAIL_SCOPE_HINT = "https://www.googleapis.com/auth/gmail.readonly (+ gmail.send)"
+GMAIL_SCOPE_HINT = "https://www.googleapis.com/auth/gmail.send"
 
 
 def build_service(creds):
     from googleapiclient.discovery import build
 
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
-
-
-# --- event plane ---
-
-def get_profile(svc) -> dict[str, Any]:
-    return svc.users().getProfile(userId="me").execute()
-
-
-def watch(svc, topic_name: str) -> dict[str, Any]:
-    body = {
-        "topicName": topic_name,
-        "labelIds": ["INBOX"],
-        "labelFilterBehavior": "INCLUDE",
-    }
-    return svc.users().watch(userId="me", body=body).execute()
-
-
-def stop_watch(svc) -> None:
-    svc.users().stop(userId="me").execute()
-
-
-def list_history(svc, start_history_id: str) -> list[dict[str, Any]]:
-    """Return history records (messageAdded in INBOX) since start_history_id."""
-    records: list[dict[str, Any]] = []
-    page_token = None
-    while True:
-        resp = (
-            svc.users()
-            .history()
-            .list(
-                userId="me",
-                startHistoryId=start_history_id,
-                historyTypes=["messageAdded"],
-                labelId="INBOX",
-                pageToken=page_token,
-            )
-            .execute()
-        )
-        records.extend(resp.get("history", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return records
 
 
 # --- actions ---
@@ -81,6 +41,18 @@ def get_message(svc, message_id: str, *, fmt: str = "full") -> dict[str, Any]:
 
 def _mime_to_raw(msg: MIMEText) -> str:
     return base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+
+
+def compose_reply_subject(subject: str) -> str:
+    """Prefix ``Re: `` unless the subject already carries it.
+
+    Matching subjects are part of how mail clients group a thread, so this runs on
+    every reply — including the send-only path that has no original to copy from.
+    """
+    clean = (subject or "").strip()
+    if not clean:
+        return "Re:"
+    return clean if clean.lower().startswith("re:") else f"Re: {clean}"
 
 
 def send_message(
@@ -113,13 +85,16 @@ def send_message(
 
 
 def reply_message(svc, *, message_id: str, body: str, cc: list[str] | None = None, bcc: list[str] | None = None) -> dict[str, Any]:
-    """Reply in-thread to an existing message (looked up by Gmail message id)."""
+    """Reply in-thread to an existing message, looked up by Gmail message id.
+
+    **Requires a Gmail read scope** for the lookup, so it only works with
+    bring-your-own credentials. The send-only path builds the same headers from
+    values the caller supplies (see ``cli.cmd_reply``).
+    """
     original = get_message(svc, message_id, fmt="metadata")
     headers = {h["name"].lower(): h["value"] for h in original.get("payload", {}).get("headers", [])}
     rfc_msg_id = headers.get("message-id", "")
-    subject = headers.get("subject", "")
-    if subject and not subject.lower().startswith("re:"):
-        subject = f"Re: {subject}"
+    subject = compose_reply_subject(headers.get("subject", ""))
     reply_to = headers.get("reply-to") or headers.get("from") or ""
     extra = {}
     if rfc_msg_id:

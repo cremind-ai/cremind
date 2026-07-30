@@ -5,7 +5,6 @@
 #   "google-api-python-client>=2.0",
 #   "google-auth>=2.0",
 #   "google-auth-oauthlib>=1.0",
-#   "websocket-client>=1.6",
 # ]
 # ///
 import sys

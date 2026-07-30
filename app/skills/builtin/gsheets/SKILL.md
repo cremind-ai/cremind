@@ -37,7 +37,15 @@ stored only on this machine** (`scripts/.google_token.json`). Runs via `uv`
 > **Execution-only skill.** Google offers no push API for spreadsheet content, so
 > this skill has no event listener. To be notified when a spreadsheet changes,
 > subscribe to the **gdrive** skill's `file_changed` event (it carries the file's
-> `mime_type`, so you can filter to spreadsheets).
+> `mime_type`, so you can filter to spreadsheets). Drive events only cover files
+> the user granted to Cremind, so grant the spreadsheet first:
+> `gdrive grant --file <url>`, **Settings → Google Drive**, or
+> `cremind drive grant --file <url>`.
+
+> **Finding a spreadsheet.** There is no search-by-name anywhere in Cremind — that
+> needed whole-Drive access, which Cremind no longer requests. Ask the user to paste
+> the spreadsheet **URL or id**; this skill reaches any spreadsheet they own from
+> that alone, with no Drive grant involved.
 
 ## How it works
 
@@ -130,8 +138,10 @@ uv run scripts/__main__.py clear --spreadsheet ABC123 --range 'Data!A2:C'
 ## Not in this skill (v1)
 - No cell formatting, add/delete-tab, or chart operations (the `batchUpdate`
   surface) — read/write values and create workbooks only.
-- No listing of spreadsheets — that is a Drive operation; use the **gdrive** skill
-  (`list --mime-type application/vnd.google-apps.spreadsheet`).
+- No listing or search of spreadsheets — that needed whole-Drive access, which
+  Cremind no longer requests. Ask the user for the URL/id. `gdrive list
+  --mime-type application/vnd.google-apps.spreadsheet` shows only spreadsheets
+  already granted to Cremind or created by it.
 
 ## Troubleshooting
 - `The string is missing the terminator: "` (PowerShell) or `--values must be a JSON

@@ -102,6 +102,13 @@ const routes = [
     },
   },
   {
+    path: '/:profile/settings/google-drive',
+    name: 'google-drive-settings',
+    component: () => import('../views/GoogleDriveSettings.vue'),
+    props: true,
+    meta: { title: 'Google Drive Access' },
+  },
+  {
     path: '/:profile/settings/backup',
     name: 'backup-settings',
     component: () => import('../views/BackupSettings.vue'),

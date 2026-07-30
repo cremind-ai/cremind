@@ -44,8 +44,8 @@ is an operating manual the future agent reads and follows.
 - **Built-in names are reserved.** Built-in skills are re-copied into every
   profile on each boot, overwriting any directory with the same name. A user
   skill that reuses a built-in name (`caldav-calendar`, `confluence`,
-  `gcalendar`, `gmail`, `homeassistant`, `imap-email`, `jira`, `skill-creator`)
-  will be clobbered. Never reuse one. `scripts/validate.py` catches this because
+  `gcalendar`, `gdocs`, `gdrive`, `gmail`, `gsheets`, `homeassistant`,
+  `imap-email`, `jira`, `skill-creator`) will be clobbered. Never reuse one. `scripts/validate.py` catches this because
   the built-ins are siblings in the same directory.
 - **Duplicate names shadow silently.** If two directories declare the same
   frontmatter `name`, the first one scanned wins and the other never appears —

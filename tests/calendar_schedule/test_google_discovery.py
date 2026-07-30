@@ -12,7 +12,9 @@ _WELL_KNOWN = {
             "authClientId": "doc-client.apps.googleusercontent.com",
             "scopes": ["openid", "email"],
             "resources": [
-                {"resource": "gmail", "scopes": ["openid", "email", "gmail.readonly"]},
+                {"resource": "gmail", "scopes": [
+                    "openid", "email", "https://www.googleapis.com/auth/gmail.send",
+                ]},
                 {"resource": "calendar", "scopes": [
                     "openid", "email", "https://www.googleapis.com/auth/calendar.events",
                 ]},

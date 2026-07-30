@@ -7,12 +7,7 @@ from dotenv import load_dotenv
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 PROJECT_DIR = SCRIPTS_DIR.parent
 ENV_PATH = SCRIPTS_DIR / ".env"
-EVENTS_DIR = PROJECT_DIR / "events"
-NEW_EMAIL_DIR = EVENTS_DIR / "new_email"
 TOKEN_PATH = SCRIPTS_DIR / ".google_token.json"
-STATE_FILE = SCRIPTS_DIR / ".listener_state.json"
-HEARTBEAT_FILE = SCRIPTS_DIR / ".listener_heartbeat"
-LOCK_FILE = SCRIPTS_DIR / ".listener.lock"
 
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
@@ -31,11 +26,11 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
 # (standalone CLI) or the manual ``complete-link`` paste (non-loopback APP_URL).
 OAUTH_REDIRECT_URI = os.environ.get("CREMIND_OAUTH_REDIRECT_URI", "").strip() or None
 
-# Bounded recent sync size when the Gmail historyId is too old (offline > ~7 days).
-CATCHUP_MAX = int(os.environ.get("CATCHUP_MAX", "25"))
-
-# Re-call users.watch() this often (Google requires <= 7 days; daily recommended).
-WATCH_RENEW_INTERVAL = int(os.environ.get("WATCH_RENEW_INTERVAL", str(20 * 60 * 60)))
+# Space-separated scopes to request at ``link``, overriding whatever
+# cremind-connect advertises. Only useful with your own OAuth client: it is how a
+# bring-your-own-credentials user asks for a Gmail read scope, which the shared
+# client cannot request (Google classes every mailbox-reading scope as restricted).
+GOOGLE_SCOPES = os.environ.get("GOOGLE_SCOPES", "").strip()
 
 
 def setup_logging(level: str | int = "INFO") -> logging.Logger:

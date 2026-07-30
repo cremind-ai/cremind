@@ -228,6 +228,63 @@ async def resync_profile_skills(profile: str, registry: ToolRegistry) -> dict[st
     return skills
 
 
+# Files that a builtin skill used to ship and no longer does, per skill directory.
+# ``copytree`` overwrites but never deletes, so without this an upgraded profile
+# keeps running code the release removed — for gmail that means a listener whose
+# Pub/Sub event plane no longer exists. Never list per-profile state here (.env,
+# tokens, .listener_state.json, heartbeats, locks, events/): those are the user's,
+# and are left in place to go quietly unused.
+_OBSOLETE_BUILTIN_FILES: dict[str, tuple[str, ...]] = {
+    # Gmail is send-only: reading a mailbox needs a Google "restricted" scope, and
+    # so does the watch/history API the listener was built on. Email events come
+    # from the imap-email skill now.
+    "gmail": (
+        "scripts/event_listener.py",
+        "scripts/app/listener.py",
+        "scripts/app/google/relay_client.py",
+    ),
+}
+
+# Skills whose long-running listener was retired: any autostart row still points at
+# a command that no longer exists, so it must be deregistered or every boot logs a
+# spawn failure and notifies the user.
+_RETIRED_LISTENER_SKILLS: tuple[str, ...] = ("gmail",)
+
+
+def _remove_obsolete_files(profile: str, dir_name: str, dst: Path) -> None:
+    for rel in _OBSOLETE_BUILTIN_FILES.get(dir_name, ()):
+        target = dst / rel
+        try:
+            target.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.debug(f"could not remove obsolete {target}: {exc}")
+
+
+async def _retire_listener_autostarts(profile: str) -> None:
+    """Stop and deregister autostart rows for skills that lost their listener.
+
+    An autostart row stores the literal command, so a row created when gmail still
+    had a listener would try to spawn a deleted script on every boot and notify the
+    user of the failure. ``teardown_processes_for_dir`` matches on working_dir and
+    no-ops when nothing is registered, so this is safe to run unconditionally.
+    """
+    for dir_name in _RETIRED_LISTENER_SKILLS:
+        directory = profile_skills_dir(profile) / dir_name
+        if not directory.is_dir():
+            continue
+        try:
+            from app.tools.builtin.exec_shell_autostart import teardown_processes_for_dir
+
+            result = await teardown_processes_for_dir(directory, profile=profile)
+            if result.get("removed_autostart"):
+                logger.info(
+                    f"Retired the {dir_name} listener autostart for profile '{profile}' "
+                    f"({result['removed_autostart']} row(s))"
+                )
+        except Exception as exc:  # noqa: BLE001 - never block boot on cleanup
+            logger.debug(f"listener retirement for {dir_name} skipped: {exc}")
+
+
 def sync_builtin_skills_into_profile(profile: str) -> list[str]:
     """Copy every builtin skill directory into the profile's skills dir.
 
@@ -235,6 +292,9 @@ def sync_builtin_skills_into_profile(profile: str) -> list[str]:
     accidental deletions and tampering are repaired. Directories in the
     profile's skills folder that do NOT correspond to a builtin are left
     untouched (those are user-authored skills).
+
+    Files a builtin no longer ships are deleted afterwards (see
+    ``_OBSOLETE_BUILTIN_FILES``), because ``copytree`` cannot do it.
 
     Returns the list of skill directory names that did not exist in the
     profile before this call (i.e. first-time installs for this profile).
@@ -251,9 +311,11 @@ def sync_builtin_skills_into_profile(profile: str) -> list[str]:
         if not src.is_dir():
             continue
         dst = target_root / src.name
-        if not dst.exists():
+        pre_existing = dst.exists()
+        if not pre_existing:
             newly_added.append(src.name)
         shutil.copytree(src, dst, dirs_exist_ok=True)
+        _remove_obsolete_files(profile, src.name, dst)
 
     logger.info(f"Synced builtin skills into {target_root}")
     return newly_added
@@ -279,6 +341,8 @@ async def initialize_profile_skills(
     if not skills_dir.is_dir():
         logger.warning(f"Skills dir not ready for '{profile}': {skills_dir}")
         return None
+
+    await _retire_listener_autostarts(profile)
 
     skills = scan_skills(skills_dir)
     _notify_first_add_long_running(profile, skills, newly_added_dirs)

@@ -5,7 +5,11 @@ channels.stop + incremental changes.list(pageToken).
 Actions: list / get / download (get_media) / export (Google-native) / upload /
 mkdir / update (rename, trash, restore) / move.
 All calls use the local user's own token — the relay is never involved here.
-Scoped to https://www.googleapis.com/auth/drive.
+
+Scoped to https://www.googleapis.com/auth/drive.file, so every call here is
+confined to files the user granted through the picker plus files this app created.
+``list_files`` therefore returns that set rather than the whole Drive, and any
+by-id call can fail with 403/404 for a file that was never granted (see errors.py).
 """
 from __future__ import annotations
 

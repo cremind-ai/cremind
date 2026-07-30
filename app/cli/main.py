@@ -36,6 +36,7 @@ from app.cli.commands.agents import agents_app
 from app.cli.commands.backup import backup_app
 from app.cli.commands.blueprint import blueprint_app
 from app.cli.commands.calendar import calendar_app
+from app.cli.commands.drive import drive_app
 from app.cli.commands.channels import channels_app
 from app.cli.commands.clean import clean_app
 from app.cli.commands.config import config_app
@@ -221,6 +222,7 @@ app.add_typer(channels_app, name="channels")
 app.add_typer(clean_app, name="clean")
 app.add_typer(files_app, name="files")
 app.add_typer(calendar_app, name="calendar")
+app.add_typer(drive_app, name="drive")
 app.add_typer(file_watchers_app, name="file-watchers")
 app.add_typer(skill_events_app, name="skill-events")
 app.add_typer(event_runs_app, name="event-runs")

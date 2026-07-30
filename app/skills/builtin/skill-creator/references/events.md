@@ -128,8 +128,8 @@ scripts/event_listener.py` from the skill directory). It must:
 - **Baseline on first run.** On the very first start, record the current cursor
   (latest id / timestamp / history marker) and emit **nothing** for pre-existing
   items. Emitting the entire backlog as "new" events on first run is the classic
-  bug — it floods the user's conversations. Built-ins (gmail, jira, …) all
-  baseline.
+  bug — it floods the user's conversations. Built-ins (imap-email, gdrive, jira, …)
+  all baseline.
 - **Bounded catch-up.** On later starts, emit what genuinely changed while
   offline, but cap it — never replay an unbounded backlog.
 - **Deduplicate.** At-least-once sources deliver duplicates; track emitted ids so

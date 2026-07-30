@@ -10,6 +10,10 @@ ENV_PATH = SCRIPTS_DIR / ".env"
 EVENTS_DIR = PROJECT_DIR / "events"
 FILE_CHANGED_DIR = EVENTS_DIR / "file_changed"
 TOKEN_PATH = SCRIPTS_DIR / ".google_token.json"
+# Provenance for files granted through the picker. Not authoritative — under
+# drive.file the reachable set is whatever files.list returns; this only records
+# how a file was reached so the UI can say "you picked this" vs "Cremind made this".
+GRANTS_PATH = SCRIPTS_DIR / ".drive_grants.json"
 STATE_FILE = SCRIPTS_DIR / ".listener_state.json"
 HEARTBEAT_FILE = SCRIPTS_DIR / ".listener_heartbeat"
 LOCK_FILE = SCRIPTS_DIR / ".listener.lock"

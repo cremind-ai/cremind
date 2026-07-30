@@ -1,6 +1,9 @@
-"""argparse CLI for the gdrive skill: link + file search/download/upload/organize
-verbs. The persistent listener (event_listener.py) establishes the changes.watch
-channel automatically; there is no manual watch verb here."""
+"""argparse CLI for the gdrive skill: link + grant + file listing/download/upload/
+organize verbs. The persistent listener (event_listener.py) establishes the
+changes.watch channel automatically; there is no manual watch verb here.
+
+Access is per-file: Cremind reaches only files it created and files the user
+picked via ``grant`` (see grant.py). There is no whole-Drive search."""
 from __future__ import annotations
 
 import argparse
@@ -11,11 +14,11 @@ import re
 import sys
 from typing import Any
 
-from . import config, drive_api, formatter
+from . import config, drive_api, errors, formatter, grant
 from .google import auth
 from .google.discovery import Discovery, DiscoveryError
 
-_FALLBACK_SCOPES = ["openid", "email", "https://www.googleapis.com/auth/drive"]
+_FALLBACK_SCOPES = ["openid", "email", "https://www.googleapis.com/auth/drive.file"]
 
 # Match a Drive file/folder id in common URL shapes, or accept a bare id.
 _URL_PATTERNS = [
@@ -120,7 +123,49 @@ def cmd_status(_args) -> Any:
         data = auth.load_account(config.TOKEN_PATH)
     except auth.AuthError:
         return {"linked": False}
-    return {"linked": True, "email": data.get("email"), "account_key": data.get("account_key"), "scopes": data.get("scopes")}
+    granted = data.get("scopes") or []
+    out: dict[str, Any] = {
+        "linked": True,
+        "email": data.get("email"),
+        "account_key": data.get("account_key"),
+        "scopes": granted,
+        "access_model": "per-file (drive.file): granted files + files Cremind created",
+    }
+    try:
+        _, _, expected = _resolve_client()
+    except SystemExit:
+        expected = list(_FALLBACK_SCOPES)
+    out["expected_scopes"] = expected
+    if errors.scopes_are_stale(granted):
+        out["scopes_stale"] = True
+        out["hint"] = (
+            "This account is linked with the old whole-Drive scope, which is no longer "
+            "issued. Re-run `link` to move to per-file access, then use `grant` to pick "
+            "the files Cremind should reach. You can also revoke the old broad access at "
+            "https://myaccount.google.com/connections"
+        )
+    return out
+
+
+def cmd_grant(args) -> Any:
+    client_id, client_secret, _scopes = _resolve_client()
+    file_ids = [_extract_id(v) for v in (args.file or [])]
+    return grant.run_grant(
+        token_path=config.TOKEN_PATH,
+        grants_path=config.GRANTS_PATH,
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=config.OAUTH_REDIRECT_URI,
+        build_service=drive_api.build_service,
+        get_file=drive_api.get_file,
+        list_files=drive_api.list_files,
+        file_ids=file_ids or None,
+        allow_multiple=not args.single,
+        allow_folders=not args.no_folders,
+        mime_types=[m.strip() for m in (args.mime_types or "").split(",") if m.strip()] or None,
+        wait=not args.no_wait,
+        timeout=args.timeout,
+    )
 
 
 def _build_query(args) -> str | None:
@@ -276,7 +321,33 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("status", help="show link status").set_defaults(func=cmd_status)
 
-    sp = sub.add_parser("list", help="list/search files")
+    sp = sub.add_parser(
+        "grant",
+        help="let the user pick Drive files to share with Cremind (Google file picker)",
+    )
+    sp.add_argument(
+        "--file",
+        action="append",
+        help="pre-select a specific file id or URL (repeatable); use when the user "
+             "already named a file Cremind cannot reach yet",
+    )
+    sp.add_argument("--single", action="store_true", help="allow only one file to be picked")
+    sp.add_argument(
+        "--no-folders", action="store_true", help="hide folders from the picker"
+    )
+    sp.add_argument("--mime-types", dest="mime_types", help="comma-separated mimeType filter")
+    sp.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="print the picker URL and exit instead of waiting for the user to finish",
+    )
+    sp.add_argument("--timeout", type=float, default=600.0, help="seconds to wait (default 600)")
+    sp.set_defaults(func=cmd_grant)
+
+    sp = sub.add_parser(
+        "list",
+        help="list the files Cremind can reach (granted via `grant` + files it created)",
+    )
     sp.add_argument("--query", help="raw Drive q= expression (combined with the other filters)")
     sp.add_argument("--name", help="name contains this substring")
     sp.add_argument("--folder", help="parent folder id or URL")
@@ -330,12 +401,37 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _target_file_id(args) -> str:
+    """The file a failing command was aimed at, for the not-granted message."""
+    for attr in ("id", "parent", "folder"):
+        value = getattr(args, attr, None)
+        if value:
+            return _extract_id(value)
+    return ""
+
+
 def main(argv: list[str] | None = None) -> int:
+    from googleapiclient.errors import HttpError
+
     args = build_parser().parse_args(argv)
     try:
         result = args.func(args)
     except auth.AuthError as e:
         print(json.dumps({"error": str(e)}), file=sys.stderr)
         return 2
+    except HttpError as e:
+        status = errors.http_status(e)
+        if status not in (403, 404):
+            raise
+        stale = False
+        try:
+            stale = errors.scopes_are_stale(auth.load_account(config.TOKEN_PATH).get("scopes"))
+        except auth.AuthError:
+            pass
+        return errors.emit(
+            errors.not_granted_payload(
+                file_id=_target_file_id(args), status=status, stale_scopes=stale
+            )
+        )
     _emit(result, args)
     return 0

@@ -269,6 +269,16 @@ def run() -> None:
                 log.warning("%s — waiting; will start automatically once linked", e)
                 announced = True
             _shutdown.wait(timeout=5)
+        except Exception as e:
+            # A refresh token stops working when the user revokes access or when
+            # Google retires the grant it was issued under (e.g. the whole-Drive
+            # scope this skill no longer requests). Neither self-heals, so say what
+            # to do instead of looping on a traceback.
+            if "invalid_grant" in str(e):
+                log.error("Google rejected the stored refresh token (invalid_grant). "
+                          "Re-run `uv run scripts/__main__.py link`, then re-grant files.")
+                raise SystemExit(1)
+            raise
     if data is None:
         return  # shutdown requested before the account was linked
 

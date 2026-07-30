@@ -1,4 +1,13 @@
-"""argparse CLI for the gmail skill: link + message verbs + watch helpers."""
+"""argparse CLI for the gmail skill: link + send/reply.
+
+Send-only by default: the shared Cremind OAuth client requests
+``gmail.send`` and nothing that can read a mailbox. Reading, searching, and
+new-mail events come from the **imap-email** skill instead.
+
+``list``/``search``/``get`` remain implemented but are gated on the granted
+scopes, so they light up for a user who brings their own Google OAuth client and
+asks for read scopes via ``GOOGLE_SCOPES``.
+"""
 from __future__ import annotations
 
 import argparse
@@ -9,6 +18,11 @@ from typing import Any
 from . import config, formatter, gmail_api
 from .google import auth
 from .google.discovery import Discovery, DiscoveryError
+
+READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+
+_FALLBACK_SCOPES = ["openid", "email", SEND_SCOPE]
 
 
 def _resolve_client() -> tuple[str, str, list[str]]:
@@ -24,14 +38,57 @@ def _resolve_client() -> tuple[str, str, list[str]]:
     client_secret = config.GOOGLE_CLIENT_SECRET or creds.get("clientSecret", "")
     if not client_id:
         raise SystemExit("No GOOGLE_CLIENT_ID (set it in scripts/.env or ensure cremind-connect is reachable).")
+    # GOOGLE_SCOPES lets a bring-your-own-credentials user request read scopes
+    # their own OAuth client is allowed to ask for. It wins over discovery, which
+    # only ever advertises the shared client's send-only set.
+    if config.GOOGLE_SCOPES:
+        scopes = config.GOOGLE_SCOPES.split()
     if not scopes:
-        scopes = [
-            "openid",
-            "email",
-            "https://www.googleapis.com/auth/gmail.readonly",
-            "https://www.googleapis.com/auth/gmail.send",
-        ]
+        scopes = list(_FALLBACK_SCOPES)
     return client_id, client_secret, scopes
+
+
+def _granted_scopes() -> list[str]:
+    try:
+        return list(auth.load_account(config.TOKEN_PATH).get("scopes") or [])
+    except auth.AuthError:
+        return []
+
+
+def _require_scope(scope: str, verb: str) -> None:
+    """Fail with a route to the alternative instead of a Google 403."""
+    if scope in _granted_scopes():
+        return
+    print(
+        json.dumps(
+            {
+                "error": "scope_not_granted",
+                "required_scope": scope,
+                "verb": verb,
+                "message": (
+                    f"'{verb}' needs the {scope} scope, which Cremind's shared Google "
+                    "client does not request: every Gmail scope that can read a mailbox "
+                    "is classed 'restricted' by Google and requires a paid annual "
+                    "security assessment."
+                ),
+                "use_instead": (
+                    "Read, search, and receive email with the imap-email skill "
+                    "(IMAP/SMTP with an app password). On Gmail accounts it accepts the "
+                    "same search grammar, and its message_id values feed "
+                    "'gmail reply --in-reply-to'."
+                ),
+                "or_bring_your_own": (
+                    "To use this verb, supply your own Google OAuth client: set "
+                    "GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_SCOPES (including "
+                    f"{scope}) in scripts/.env, then re-run link. See the Cremind docs: "
+                    "Setup -> Bring your own Google credentials."
+                ),
+            },
+            indent=2,
+        ),
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 
 def _svc():
@@ -87,7 +144,28 @@ def cmd_status(_args) -> Any:
         data = auth.load_account(config.TOKEN_PATH)
     except auth.AuthError:
         return {"linked": False}
-    return {"linked": True, "email": data.get("email"), "account_key": data.get("account_key"), "scopes": data.get("scopes")}
+    granted = list(data.get("scopes") or [])
+    out: dict[str, Any] = {
+        "linked": True,
+        "email": data.get("email"),
+        "account_key": data.get("account_key"),
+        "scopes": granted,
+        "can_send": SEND_SCOPE in granted,
+        "can_read": READ_SCOPE in granted,
+    }
+    try:
+        _, _, expected = _resolve_client()
+    except SystemExit:
+        expected = list(_FALLBACK_SCOPES)
+    out["expected_scopes"] = expected
+    if set(granted) - set(expected):
+        out["stale_scopes"] = True
+        out["hint"] = (
+            "This account was linked with scopes Cremind no longer requests. It keeps "
+            "working until Google retires the grant; re-run link to move to the current "
+            "set, and use the imap-email skill for reading email."
+        )
+    return out
 
 
 def _rows_for_ids(svc, ids: list[str], detail: str) -> list[dict[str, Any]]:
@@ -100,18 +178,21 @@ def _rows_for_ids(svc, ids: list[str], detail: str) -> list[dict[str, Any]]:
 
 
 def cmd_list(args) -> Any:
+    _require_scope(READ_SCOPE, "list")
     svc = _svc()
     ids = gmail_api.list_messages(svc, query=args.query, max_results=args.max_results, label_ids=["INBOX"])
     return _rows_for_ids(svc, ids, args.detail)
 
 
 def cmd_search(args) -> Any:
+    _require_scope(READ_SCOPE, "search")
     svc = _svc()
     ids = gmail_api.list_messages(svc, query=args.query, max_results=args.max_results)
     return _rows_for_ids(svc, ids, args.detail)
 
 
 def cmd_get(args) -> Any:
+    _require_scope(READ_SCOPE, "get")
     svc = _svc()
     return formatter.parse_message(gmail_api.get_message(svc, args.id, fmt="full"))
 
@@ -136,23 +217,44 @@ def cmd_send(args) -> Any:
 
 
 def cmd_reply(args) -> Any:
+    """Reply in-thread.
+
+    Two modes. The default takes the threading headers from the caller, because
+    ``gmail.send`` cannot look the original message up — every Gmail read scope is
+    restricted. Mail clients thread on ``In-Reply-To``/``References`` plus a
+    matching subject, which is exactly what the imap-email skill's ``message_id``
+    supplies, so no Gmail thread id is needed.
+
+    ``--id`` keeps the old lookup-based path for accounts that do hold a read
+    scope (bring-your-own credentials).
+    """
     svc = _svc()
-    res = gmail_api.reply_message(svc, message_id=args.id, body=_read_body(args), cc=args.cc, bcc=args.bcc)
+    if args.id:
+        _require_scope(READ_SCOPE, "reply --id")
+        res = gmail_api.reply_message(
+            svc, message_id=args.id, body=_read_body(args), cc=args.cc, bcc=args.bcc
+        )
+        return {"sent": True, "id": res.get("id"), "thread_id": res.get("threadId")}
+
+    if not (args.to and args.subject and args.in_reply_to):
+        raise SystemExit(
+            "reply needs either --id (requires a Gmail read scope) or "
+            "--to/--subject/--in-reply-to. Get the original's Message-ID from the "
+            "imap-email skill (`get --message-id ...` or a new_email event's "
+            "`message_id`)."
+        )
+    references = args.references or args.in_reply_to
+    res = gmail_api.send_message(
+        svc,
+        to=args.to,
+        subject=gmail_api.compose_reply_subject(args.subject),
+        body=_read_body(args),
+        cc=args.cc,
+        bcc=args.bcc,
+        thread_id=args.thread_id,
+        headers={"In-Reply-To": args.in_reply_to, "References": references},
+    )
     return {"sent": True, "id": res.get("id"), "thread_id": res.get("threadId")}
-
-
-def cmd_watch(_args) -> Any:
-    disc = Discovery(config.CREMIND_CONNECT_URL)
-    creds, _ = auth.get_credentials(config.TOKEN_PATH)
-    svc = gmail_api.build_service(creds)
-    res = gmail_api.watch(svc, disc.gmail_topic())
-    return {"watching": True, "history_id": res.get("historyId"), "expiration": res.get("expiration")}
-
-
-def cmd_unwatch(_args) -> Any:
-    svc = _svc()
-    gmail_api.stop_watch(svc)
-    return {"watching": False}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -173,19 +275,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("status", help="show link status").set_defaults(func=cmd_status)
 
-    sp = sub.add_parser("list", help="list INBOX messages")
+    sp = sub.add_parser(
+        "list", help="list INBOX messages (needs a read scope: bring-your-own credentials)"
+    )
     sp.add_argument("--query")
     sp.add_argument("--max-results", type=int, default=10, dest="max_results")
     sp.add_argument("--detail", choices=["summary", "full"], default="summary")
     sp.set_defaults(func=cmd_list)
 
-    sp = sub.add_parser("search", help="search all mail")
+    sp = sub.add_parser(
+        "search", help="search all mail (needs a read scope: bring-your-own credentials)"
+    )
     sp.add_argument("--query", required=True)
     sp.add_argument("--max-results", type=int, default=10, dest="max_results")
     sp.add_argument("--detail", choices=["summary", "full"], default="summary")
     sp.set_defaults(func=cmd_search)
 
-    sp = sub.add_parser("get", help="get a message by id")
+    sp = sub.add_parser(
+        "get", help="get a message by id (needs a read scope: bring-your-own credentials)"
+    )
     sp.add_argument("--id", required=True)
     sp.set_defaults(func=cmd_get)
 
@@ -198,16 +306,36 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--body-file", dest="body_file")
     sp.set_defaults(func=cmd_send)
 
-    sp = sub.add_parser("reply", help="reply in-thread to a message id")
-    sp.add_argument("--id", required=True)
+    sp = sub.add_parser(
+        "reply",
+        help="reply in-thread using the original's Message-ID (from the imap-email skill)",
+    )
+    sp.add_argument("--to", action="append", help="recipient(s) — the original sender")
+    sp.add_argument("--subject", help="the original subject ('Re: ' is added if missing)")
+    sp.add_argument(
+        "--in-reply-to",
+        dest="in_reply_to",
+        help="the original RFC822 Message-ID, e.g. <abc@mail.example.com>",
+    )
+    sp.add_argument(
+        "--references",
+        help="References header (defaults to --in-reply-to)",
+    )
+    sp.add_argument(
+        "--thread-id",
+        dest="thread_id",
+        help="Gmail thread id, if you already have one (optional; headers thread on their own)",
+    )
+    sp.add_argument(
+        "--id",
+        help="Gmail message id to reply to (needs a read scope: bring-your-own credentials)",
+    )
     sp.add_argument("--cc", action="append")
     sp.add_argument("--bcc", action="append")
     sp.add_argument("--body")
     sp.add_argument("--body-file", dest="body_file")
     sp.set_defaults(func=cmd_reply)
 
-    sub.add_parser("watch", help="establish the Gmail watch once").set_defaults(func=cmd_watch)
-    sub.add_parser("unwatch", help="stop the Gmail watch").set_defaults(func=cmd_unwatch)
     return p
 
 

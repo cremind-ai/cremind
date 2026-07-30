@@ -1,6 +1,6 @@
 ---
 name: gmail
-description: Read, search, send, and reply to Gmail messages via OAuth2, and receive new-email events in real time. Authorizes through the Cremind Connect service (no GCP setup); tokens stay on this machine. A persistent listener uses Gmail watch + Pub/Sub (via the relay) and drops new INBOX messages as markdown.
+description: Send Gmail messages and in-thread replies via OAuth2, using the send-only gmail.send scope. Authorizes through the Cremind Connect service (no GCP setup); tokens stay on this machine. Reading email, searching it, and receiving new-email events are NOT available here - use the imap-email skill for all of those. The list, search, and get verbs work only with bring-your-own Google credentials.
 metadata:
   environment_variables:
     - name: CREMIND_CONNECT_URL
@@ -19,33 +19,42 @@ metadata:
       secret: true
       type: string
       default: ''
-  events:
-    event_type:
-      - name: new_email
-        description: A new email arrived in the Gmail INBOX
-  long_running_app:
-    command: uv run scripts/event_listener.py
-    description: Persistent Gmail listener. Maintains the Gmail watch, subscribes to the Cremind Connect relay, and drops new INBOX messages as markdown.
+    - name: GOOGLE_SCOPES
+      description: Space-separated OAuth scopes to request at link. Only useful with your own OAuth client - it is how a bring-your-own-credentials user asks for a Gmail read scope.
+      required: false
+      type: string
+      default: ''
 ---
 
 # gmail
 
-**Purpose:** Python CLI + event listener for Gmail over OAuth2. Authorization goes
+**Purpose:** Python CLI for **sending** Gmail over OAuth2. Authorization goes
 through the **Cremind Connect** service (`connect.cremind.io`) so you never touch
 GCP. The OAuth code→token exchange happens locally (loopback PKCE); **tokens are
 stored only on this machine** (`scripts/.google_token.json`) and the relay never
 sees them. Runs via `uv` (PEP 723 inline metadata).
 
-## How it works (token-less relay)
+## Send-only — read email with imap-email
 
-- **Actions** (list/send/…) call the Gmail API directly with your local token.
-- **Events**: the listener calls Gmail `users.watch()` into the org's Pub/Sub
-  topic (from the relay's discovery doc), then connects a WebSocket to the relay
-  and proves account control with a short-lived Google **ID token**. When mail
-  arrives, the relay sends a content-free `resync` nudge; the listener then runs
-  `history.list()` locally and writes the new message to `events/new_email/`.
-- The same account linked in two Cremind apps receives events in **both** — the
-  relay fans out to every connected app for that account.
+This skill holds `https://www.googleapis.com/auth/gmail.send` and nothing more.
+It **cannot** read, search, or list mail, and there are no new-email events.
+
+That is not an oversight: Google classes *every* Gmail scope that can return
+message content as "restricted" — including headers-only metadata — and the
+watch/history APIs behind push notifications accept only those scopes. Restricted
+scopes require a recurring paid third-party security assessment, so Cremind's
+shared OAuth client does not request any.
+
+**To read, search, or react to email, use the `imap-email` skill** (IMAP/SMTP with
+an app password). It covers everything this skill dropped:
+
+| You need to… | Use |
+|---|---|
+| List or search mail | `imap-email` `list` (on Gmail accounts it accepts Gmail's own search grammar) |
+| Read one message | `imap-email` `get --message-id <id>` |
+| React to new mail | `imap-email`'s `new_email` events |
+| Send mail | **this skill** (`send`) or `imap-email` `send` |
+| Reply in-thread | **this skill** (`reply`, see below) or `imap-email` `reply` |
 
 ## Setup
 
@@ -58,6 +67,7 @@ Set any of these in `scripts/.env` (or via the Settings UI) **only to override**
 CREMIND_CONNECT_URL=https://connect.cremind.io   # optional; this is the default
 GOOGLE_CLIENT_ID=                                # optional; otherwise fetched from cremind-connect
 GOOGLE_CLIENT_SECRET=                            # optional; otherwise fetched from cremind-connect
+GOOGLE_SCOPES=                                   # optional; only with your own OAuth client
 ```
 
 Then link the account:
@@ -81,80 +91,92 @@ Run `uv run scripts/__main__.py <subcommand>`. Output is JSON (human-readable on
 | Subcommand | Required | Optional |
 |---|---|---|
 | `link` | — | `--no-browser` |
+| `complete-link` | `--response` | — |
 | `status` | — | — |
-| `list` | — | `--query`, `--max-results` (10), `--detail summary\|full` |
-| `search` | `--query` | `--max-results` (10), `--detail summary\|full` |
-| `get` | `--id` | — |
 | `send` | `--to` (repeatable), `--subject` | `--cc`, `--bcc` (repeatable), `--body`/`--body-file`/stdin |
-| `reply` | `--id` | `--cc`, `--bcc`, body via `--body`/`--body-file`/stdin |
-| `watch` | — | (establish the Gmail watch once; the listener does this automatically) |
-| `unwatch` | — | — |
+| `reply` | `--to`, `--subject`, `--in-reply-to` | `--references`, `--thread-id`, `--cc`, `--bcc`, body via `--body`/`--body-file`/stdin |
+| `list` **(BYO only)** | — | `--query`, `--max-results` (10), `--detail summary\|full` |
+| `search` **(BYO only)** | `--query` | `--max-results` (10), `--detail summary\|full` |
+| `get` **(BYO only)** | `--id` | — |
 
-`--id` is the Gmail message id (from `list`/`search`). `--query` uses Gmail search syntax (e.g. `from:alice newer_than:7d`).
+**BYO only** = requires a Gmail read scope, which only a bring-your-own Google
+OAuth client can request. Without one these exit with code 2 and a
+`scope_not_granted` error pointing at imap-email.
+
+### Replying in-thread
+
+`reply` takes the threading headers from you, because it cannot look the original
+message up:
+
+```bash
+uv run scripts/__main__.py reply \
+  --to alice@example.com \
+  --subject "Lunch?" \
+  --in-reply-to "<CABc123@mail.gmail.com>" \
+  --body "Sounds good."
+```
+
+- `--in-reply-to` is the original's **RFC822 Message-ID**. Get it from the
+  imap-email skill: the `message_id` field of a `new_email` event, or of
+  `imap-email get --message-id ...`.
+- `--references` defaults to `--in-reply-to`; pass the full chain if you have it.
+- `Re: ` is added to the subject automatically when missing.
+- `--thread-id` is optional. Mail clients thread on the headers plus a matching
+  subject, so replies group correctly without it; there is no way to discover a
+  Gmail thread id under send-only anyway.
+
+`--id` still works on a bring-your-own-credentials account with a read scope,
+looking the original up the old way.
 
 ## Examples
 ```bash
 uv run scripts/__main__.py status
-uv run scripts/__main__.py list --max-results 5
-uv run scripts/__main__.py search --query "from:boss is:unread"
-uv run scripts/__main__.py get --id 1923abc...
 uv run scripts/__main__.py send --to a@b.com --subject "Hi" --body "Hello there"
-uv run scripts/__main__.py reply --id 1923abc... --body "Thanks!"
+uv run scripts/__main__.py reply --to a@b.com --subject "Hi" \
+  --in-reply-to "<CABc123@mail.gmail.com>" --body "Thanks!"
 ```
 
-## Event listener
-```bash
-uv run scripts/event_listener.py
-```
-Behavior:
-- **Baseline on first run**: records the current `historyId`; emits nothing for existing mail.
-- **Live**: on each relay `resync` nudge, runs incremental `history.list()` and writes new INBOX messages to `events/new_email/<YYYY-MM-DDTHH-MM-SS> <subject>.md`.
-- **Catch-up**: on startup it also syncs anything that arrived while offline.
-- **Watch renewal**: re-calls `users.watch()` well within Google's 7-day limit.
-- **Offline > ~7 days**: if the `historyId` is too old, the cursor is reset and the bounded gap is not replayed (by design — no full-mailbox dump).
-- **State**: `scripts/.listener_state.json` (gitignored). Shutdown on SIGINT/SIGTERM.
+## Bring your own Google credentials
 
-### Event markdown schema
-```markdown
----
-id: "1923abc..."
-thread_id: "1923a..."
-message_id: "<CABc...@mail.gmail.com>"
-from: "Alice <alice@example.com>"
-to: "you@gmail.com"
-cc: ""
-subject: "Lunch?"
-date: "Fri, 06 Jun 2026 09:00:00 +0000"
-labels: ["INBOX", "UNREAD"]
-event_type: "new_email"
-received_at: "2026-06-06T09:00:05+00:00"
----
+Creating your own Google Cloud project and OAuth client falls under Google's
+personal-use exception (fewer than 100 users), which needs neither verification
+nor a security assessment — so you *can* request read scopes there. Set
+`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and
+`GOOGLE_SCOPES="openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send"`
+in `scripts/.env`, then re-run `link`. `status` will then show `can_read: true`
+and the read verbs work.
 
-<plain-text body>
-```
+Two caveats: set your OAuth app's publishing status to **Production without
+submitting for verification** ("Testing" expires refresh tokens after 7 days and
+silently breaks automation), and note that new-email **events** still won't work —
+the Cremind relay only accepts ID tokens issued to the shared client. See the
+Cremind docs, *Setup → Bring your own Google credentials*.
 
 ## Troubleshooting
 - `Account not linked` → run `uv run scripts/__main__.py link`.
-- `No GOOGLE_CLIENT_SECRET available` → cremind-connect must be reachable (it serves the secret), or set it in `scripts/.env` to override.
+- `scope_not_granted` (exit 2) → that verb needs a read scope. Use the
+  `imap-email` skill, or bring your own credentials (above).
+- `No GOOGLE_CLIENT_SECRET available` → cremind-connect must be reachable (it
+  serves the secret), or set it in `scripts/.env` to override.
 - `Google did not return a refresh token` → revoke at <https://myaccount.google.com/permissions> and re-link.
-- No events arriving → confirm the listener is running, that `link` used `openid email` scopes, and that the relay is reachable (`curl $CREMIND_CONNECT_URL/.well-known/cremind-connect`).
-- Restricted scopes: while the org's consent screen is in "Testing", only added test users can link.
+- `stale_scopes: true` in `status` → the account was linked with scopes Cremind no
+  longer requests. It keeps working until Google retires the grant; re-run `link`
+  to move to the current set.
+- A reply didn't thread → check `--in-reply-to` carries the full Message-ID
+  including the angle brackets, and that the subject matches the original.
 
 ## Module layout
 ```
 gmail/
 ├── SKILL.md
-├── events/new_email/                 # markdown drop-zone
 └── scripts/
     ├── .env                          # optional overrides (creds fetched from cremind-connect by default)
     ├── __main__.py                   # CLI entry
-    ├── event_listener.py             # listener entry
     ├── tests/test_account_key.py     # cross-repo routing-key parity test
     └── app/
         ├── config.py                 # env + paths + logging
-        ├── gmail_api.py              # Gmail API wrapper (watch/history/list/get/send/...)
+        ├── gmail_api.py              # Gmail API wrapper (send/reply; read verbs for BYO)
         ├── formatter.py              # message parsing + markdown
-        ├── listener.py               # watch lifecycle + relay client + incremental sync
         ├── cli.py                    # argparse + dispatch
-        └── google/                   # shared: account_key, discovery, auth (PKCE), relay_client
+        └── google/                   # shared: account_key, discovery, auth (PKCE)
 ```

@@ -65,7 +65,8 @@ skill directory must not be read with System File):
   hyphen-separated, filesystem-safe.
 - **Check for collisions first:** run `ls ..`. A sibling with that name means it's
   taken. Built-in skill names (`caldav-calendar`, `confluence`, `gcalendar`,
-  `gmail`, `homeassistant`, `imap-email`, `jira`, `skill-creator`) are **reserved**
+  `gdocs`, `gdrive`, `gmail`, `gsheets`, `homeassistant`, `imap-email`, `jira`,
+  `skill-creator`) are **reserved**
   — Cremind re-copies built-ins over any same-named dir on every boot. Never
   overwrite an existing directory.
 

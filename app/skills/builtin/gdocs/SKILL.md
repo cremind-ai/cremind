@@ -1,6 +1,6 @@
 ---
 name: gdocs
-description: Read Google Docs as markdown or plain text, create documents, append text, and find-and-replace across a document via OAuth2. Authorizes through the Cremind Connect service (no GCP setup); tokens stay on this machine. Accepts document URLs or ids. Execution-only — to search/list documents or watch for changes, use the gdrive skill.
+description: Read Google Docs as markdown or plain text, create documents, append text, and find-and-replace across a document via OAuth2. Authorizes through the Cremind Connect service (no GCP setup); tokens stay on this machine. Accepts document URLs or ids and reaches any document the user owns from a URL alone, with no Drive access needed. Execution-only — for file-level change events on a document, use the gdrive skill. There is no search-by-name; ask the user for the URL or id.
 metadata:
   environment_variables:
     - name: CREMIND_CONNECT_URL
@@ -32,8 +32,14 @@ stored only on this machine** (`scripts/.google_token.json`). Runs via `uv`
 > **Execution-only skill.** Google offers no push API for document content, so
 > this skill has no event listener. To be notified when a document changes,
 > subscribe to the **gdrive** skill's `file_changed` event (it carries the file's
-> `mime_type`, so you can filter to Docs). To list/search documents, use gdrive
-> (`list --mime-type application/vnd.google-apps.document`).
+> `mime_type`, so you can filter to Docs). Drive events only cover files the user
+> granted to Cremind, so grant the document first: `gdrive grant --file <url>`,
+> **Settings → Google Drive**, or `cremind drive grant --file <url>`.
+
+> **Finding a document.** There is no search-by-name anywhere in Cremind — that
+> needed whole-Drive access, which Cremind no longer requests. Ask the user to paste
+> the document **URL or id**; this skill reaches any document they own from that
+> alone, with no Drive grant involved.
 
 ## How it works
 

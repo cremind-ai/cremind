@@ -50,6 +50,12 @@ const allCards: SettingsCard[] = [
     route: 'channels',
   },
   {
+    title: 'Google Drive Access',
+    description: 'Grant Cremind access to individual Drive files and see which ones it can open',
+    icon: 'mdi:google-drive',
+    route: 'google-drive',
+  },
+  {
     title: 'Profiles',
     description: 'Manage user profiles and reconfigure the system',
     icon: 'mdi:account-group',

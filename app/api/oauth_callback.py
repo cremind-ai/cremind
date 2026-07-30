@@ -148,6 +148,32 @@ async def _handle_google_calendar_callback(request: Request) -> HTMLResponse:
     return HTMLResponse(_SUCCESS_HTML, status_code=200)
 
 
+async def _handle_google_drive_callback(request: Request) -> HTMLResponse:
+    """Record which Drive files the user picked in the Google Picker.
+
+    Unlike every other callback here, nothing is exchanged: the per-file grant
+    lands with Google the moment the user approves, so this redirect is only how
+    we learn *which* files were picked (``picked_file_ids``). If it never arrives —
+    a remote install whose APP_URL the browser can't reach — the grant still holds
+    and the Drive page discovers the files by diffing what is reachable.
+    """
+    params = request.query_params
+    state = params.get("state", "")
+    if not _STATE_RE.match(state):
+        logger.warning("[oauth-callback] google-drive callback with missing/invalid state")
+        return HTMLResponse(_ERROR_HTML, status_code=400)
+    try:
+        from app.drive.grant_flow import record_redirect
+        outcome = record_redirect(request.url.query)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[oauth-callback] google-drive picker response ignored: {exc}")
+        return HTMLResponse(_ERROR_HTML, status_code=200)
+    if outcome.get("status") == "error":
+        return HTMLResponse(_ERROR_HTML, status_code=200)
+    logger.info(f"[oauth-callback] google-drive picker captured for state={state[:6]}…")
+    return HTMLResponse(_SUCCESS_HTML, status_code=200)
+
+
 def get_oauth_callback_routes() -> list[Route]:
     """Backend OAuth callback routes. Registered PRE-storage in app/server.py so a
     consent redirect can't 404 while an account-link is in flight. Mounted under
@@ -157,5 +183,9 @@ def get_oauth_callback_routes() -> list[Route]:
         Route(
             "/api/oauth/google-calendar/callback",
             methods=["GET"], endpoint=_handle_google_calendar_callback,
+        ),
+        Route(
+            "/api/oauth/google-drive/callback",
+            methods=["GET"], endpoint=_handle_google_drive_callback,
         ),
     ]
