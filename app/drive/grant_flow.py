@@ -244,7 +244,8 @@ def poll_status(profile: str, state: str) -> Dict[str, Any]:
         return {"status": pend["status"], "files": [], "error": str(exc)}
 
     added = sorted(now_ids - set(pend["before"]))
-    ids = pend["picked"] or added
+    picked = list(pend["picked"])
+    ids = picked or added
     files: List[Dict[str, Any]] = []
     for fid in ids:
         meta = skill_token.get_file(profile, fid)
@@ -254,12 +255,13 @@ def poll_status(profile: str, state: str) -> Dict[str, Any]:
     if files:
         skill_token.record_grants(profile, files)
         pend["status"] = "completed"
-        # Fold the new files into the baseline so a later poll of the same round
-        # does not re-report them as freshly added.
+        # Consume the round's findings so polling again reports only what is new
+        # since: fold the files into the baseline and drop the captured picks.
         pend["before"] = now_ids
+        pend["picked"] = []
     result: Dict[str, Any] = {"status": pend["status"], "files": files}
-    if pend["picked"] and len(files) < len(pend["picked"]):
-        result["unverified"] = [fid for fid in pend["picked"] if fid not in {f["id"] for f in files}]
+    if picked and len(files) < len(picked):
+        result["unverified"] = [fid for fid in picked if fid not in {f["id"] for f in files}]
         result["note"] = (
             "Some picked files could not be read back. Confirm the approval used the "
             "linked Google account."

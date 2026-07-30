@@ -111,6 +111,14 @@ def test_a_second_poll_does_not_re_report_the_same_files(monkeypatch):
     assert gf.poll_status("alice", state)["files"] == []
 
 
+def test_a_second_poll_does_not_re_report_captured_picks(monkeypatch):
+    _wire(monkeypatch)
+    state = gf.start("alice")["state"]
+    gf.record_redirect(f"state={state}&code=c&picked_file_ids=f1")
+    assert len(gf.poll_status("alice", state)["files"]) == 1
+    assert gf.poll_status("alice", state)["files"] == []
+
+
 def test_denied_consent_is_reported(monkeypatch):
     _wire(monkeypatch)
     state = gf.start("alice")["state"]
