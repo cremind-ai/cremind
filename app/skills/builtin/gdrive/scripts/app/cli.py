@@ -51,17 +51,32 @@ _EXT_BY_MIME = {
 
 def _resolve_client() -> tuple[str, str, list[str]]:
     disc = Discovery(config.CREMIND_CONNECT_URL)
+    creds: dict[str, Any] = {}
+    disc_error: DiscoveryError | None = None
     try:
         creds = disc.credentials()
     except DiscoveryError as e:
-        raise SystemExit(f"Could not reach cremind-connect at {config.CREMIND_CONNECT_URL}: {e}")
+        # Not fatal on its own: a bring-your-own-credentials user supplies the
+        # client themselves and never needs cremind-connect for this. Only report
+        # it if we actually end up without a client id.
+        disc_error = e
     try:
         scopes = disc.scopes("drive")
     except DiscoveryError:
         scopes = []
+    # GOOGLE_SCOPES lets a bring-your-own-credentials user request scopes their own
+    # OAuth client is allowed to ask for — notably whole-Drive, which the shared
+    # client cannot request (Google classes it restricted). It wins over discovery,
+    # which only ever advertises the shared client's per-file set.
+    if config.GOOGLE_SCOPES:
+        scopes = config.GOOGLE_SCOPES.split()
     client_id = config.GOOGLE_CLIENT_ID or creds.get("clientId", "")
     client_secret = config.GOOGLE_CLIENT_SECRET or creds.get("clientSecret", "")
     if not client_id:
+        if disc_error is not None:
+            raise SystemExit(
+                f"Could not reach cremind-connect at {config.CREMIND_CONNECT_URL}: {disc_error}"
+            )
         raise SystemExit("No GOOGLE_CLIENT_ID (set it in scripts/.env or ensure cremind-connect is reachable).")
     if not scopes:
         scopes = list(_FALLBACK_SCOPES)
@@ -136,7 +151,9 @@ def cmd_status(_args) -> Any:
     except SystemExit:
         expected = list(_FALLBACK_SCOPES)
     out["expected_scopes"] = expected
-    if errors.scopes_are_stale(granted):
+    if errors.LEGACY_DRIVE_SCOPE in expected:
+        out["access_model"] = "whole-Drive (bring-your-own credentials)"
+    if errors.scopes_are_stale(granted, expected):
         out["scopes_stale"] = True
         out["hint"] = (
             "This account is linked with the old whole-Drive scope, which is no longer "
@@ -425,7 +442,13 @@ def main(argv: list[str] | None = None) -> int:
             raise
         stale = False
         try:
-            stale = errors.scopes_are_stale(auth.load_account(config.TOKEN_PATH).get("scopes"))
+            _, _, expected = _resolve_client()
+        except SystemExit:
+            expected = list(_FALLBACK_SCOPES)
+        try:
+            stale = errors.scopes_are_stale(
+                auth.load_account(config.TOKEN_PATH).get("scopes"), expected
+            )
         except auth.AuthError:
             pass
         return errors.emit(

@@ -19,6 +19,11 @@ metadata:
       secret: true
       type: string
       default: ''
+    - name: GOOGLE_SCOPES
+      description: Space-separated OAuth scopes to request at link. Only useful with your own OAuth client - it is how a bring-your-own-credentials user asks for whole-Drive access.
+      required: false
+      type: string
+      default: ''
   events:
     event_type:
       - name: file_changed
@@ -84,6 +89,7 @@ override**:
 CREMIND_CONNECT_URL=https://connect.cremind.io   # optional; this is the default
 GOOGLE_CLIENT_ID=                                # optional; otherwise fetched from cremind-connect
 GOOGLE_CLIENT_SECRET=                            # optional; otherwise fetched from cremind-connect
+GOOGLE_SCOPES=                                   # optional; only with your own OAuth client
 WATCH_RENEW_INTERVAL=21600                       # optional; watch renewal seconds (default 6h)
 ```
 
@@ -240,9 +246,33 @@ The listener needs no attention: its saved `pageToken` stays valid and the feed
 simply narrows to granted files. If the listener logs `invalid_grant`, the stored
 refresh token is dead — re-link.
 
+## Bring your own Google credentials
+
+Whole-Drive access is only unavailable because Google would charge the org a
+recurring security assessment for it. Your *own* Google Cloud project falls under
+Google's personal-use exception (fewer than 100 users), which needs no
+verification and no assessment — so you can request the broad scope there. Set in
+`scripts/.env`:
+
+```
+GOOGLE_CLIENT_ID=<your desktop client id>
+GOOGLE_CLIENT_SECRET=<your desktop client secret>
+GOOGLE_SCOPES=openid email https://www.googleapis.com/auth/drive
+```
+
+then re-run `link`. `list` then searches your whole Drive, every file is readable
+by id, and `grant` becomes unnecessary. `status` reports the wider access model
+and will not ask you to re-link.
+
+Set your OAuth app's publishing status to **Production without submitting for
+verification** — "Testing" expires refresh tokens after 7 days and silently breaks
+automation. Note that `file_changed` **events stop working** under your own
+client: the Cremind relay only accepts ID tokens issued to the shared client. See
+the Cremind docs, *Setup → Bring your own Google credentials*.
+
 ## Not in this skill (v1)
 - **No whole-Drive search or monitoring** — impossible under per-file access; see
-  the access model above.
+  the access model above (unless you bring your own credentials).
 - **No hard delete** — `trash` is reversible; permanent deletion is intentionally
   omitted as the one unrecoverable action.
 - **No sharing / permissions** — changing who can access a file is high-risk and

@@ -83,6 +83,14 @@ def test_stale_scope_detection():
     assert errors.scopes_are_stale(None) is False
 
 
+def test_whole_drive_is_not_stale_when_it_was_requested():
+    # A bring-your-own-credentials user holds the broad scope deliberately, so
+    # telling them to re-link would be wrong.
+    assert errors.scopes_are_stale([_LEGACY], ["openid", "email", _LEGACY]) is False
+    # Asking for per-file but holding the old broad grant is the real stale case.
+    assert errors.scopes_are_stale([_LEGACY], ["openid", "email", DRIVE_FILE_SCOPE]) is True
+
+
 def test_http_status_extraction():
     class Resp:
         status = 404

@@ -31,6 +31,12 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
 # (standalone CLI) or the manual ``complete-link`` paste (non-loopback APP_URL).
 OAUTH_REDIRECT_URI = os.environ.get("CREMIND_OAUTH_REDIRECT_URI", "").strip() or None
 
+# Space-separated scopes to request at ``link``, overriding whatever
+# cremind-connect advertises. Only useful with your own OAuth client: it is how a
+# bring-your-own-credentials user asks for whole-Drive access, which the shared
+# client cannot request (Google classes that scope as restricted).
+GOOGLE_SCOPES = os.environ.get("GOOGLE_SCOPES", "").strip()
+
 # Drive changes.watch channels last up to a week; renew every ~6 hours (matching
 # gcalendar) to stay well within any documented expiration.
 WATCH_RENEW_INTERVAL = int(os.environ.get("WATCH_RENEW_INTERVAL", str(6 * 60 * 60)))

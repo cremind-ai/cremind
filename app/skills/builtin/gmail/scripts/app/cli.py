@@ -27,16 +27,26 @@ _FALLBACK_SCOPES = ["openid", "email", SEND_SCOPE]
 
 def _resolve_client() -> tuple[str, str, list[str]]:
     disc = Discovery(config.CREMIND_CONNECT_URL)
+    creds: dict[str, Any] = {}
+    scopes: list[str] = []
+    disc_error: DiscoveryError | None = None
     try:
         creds = disc.credentials()
         scopes = disc.scopes("gmail")
     except DiscoveryError as e:
-        raise SystemExit(f"Could not reach cremind-connect at {config.CREMIND_CONNECT_URL}: {e}")
+        # Not fatal on its own: a bring-your-own-credentials user supplies the
+        # client themselves and never needs cremind-connect for this. Only report
+        # it if we actually end up without a client id.
+        disc_error = e
     # Env (scripts/.env) overrides win; otherwise use the values cremind-connect
     # serves, so the org can rotate the client id/secret without a client update.
     client_id = config.GOOGLE_CLIENT_ID or creds.get("clientId", "")
     client_secret = config.GOOGLE_CLIENT_SECRET or creds.get("clientSecret", "")
     if not client_id:
+        if disc_error is not None:
+            raise SystemExit(
+                f"Could not reach cremind-connect at {config.CREMIND_CONNECT_URL}: {disc_error}"
+            )
         raise SystemExit("No GOOGLE_CLIENT_ID (set it in scripts/.env or ensure cremind-connect is reachable).")
     # GOOGLE_SCOPES lets a bring-your-own-credentials user request read scopes
     # their own OAuth client is allowed to ask for. It wins over discovery, which

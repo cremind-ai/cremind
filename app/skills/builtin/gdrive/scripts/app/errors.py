@@ -77,7 +77,17 @@ def emit(payload: dict[str, Any]) -> int:
     return EXIT_NOT_GRANTED
 
 
-def scopes_are_stale(granted: list[str] | None) -> bool:
-    """True when a linked account predates the per-file migration."""
+def scopes_are_stale(
+    granted: list[str] | None, expected: list[str] | None = None
+) -> bool:
+    """True when a linked account predates the per-file migration.
+
+    ``expected`` guards against a false alarm for bring-your-own credentials: a
+    user whose own OAuth client legitimately requests whole-Drive holds the legacy
+    scope on purpose, so only flag it when per-file access is what we asked for.
+    """
     scopes = set(granted or [])
-    return LEGACY_DRIVE_SCOPE in scopes and DRIVE_FILE_SCOPE not in scopes
+    if LEGACY_DRIVE_SCOPE not in scopes or DRIVE_FILE_SCOPE in scopes:
+        return False
+    want = set(expected) if expected is not None else {DRIVE_FILE_SCOPE}
+    return LEGACY_DRIVE_SCOPE not in want
