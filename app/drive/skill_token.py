@@ -32,6 +32,10 @@ LEGACY_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 SKILL_DIR_NAME = "gdrive"
 _TOKEN_REL = Path("scripts") / ".google_token.json"
 _GRANTS_REL = Path("scripts") / ".drive_grants.json"
+_ENV_REL = Path("scripts") / ".env"
+
+# Mirrors the skill's own fallback, used when cremind-connect is unreachable.
+DRIVE_SCOPES_FALLBACK = ["openid", "email", DRIVE_FILE_SCOPE]
 
 _FILE_FIELDS = "id,name,mimeType,modifiedTime,webViewLink,iconLink,size,trashed"
 
@@ -71,22 +75,82 @@ def read_token(profile: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def scopes_are_stale(scopes: Optional[List[str]]) -> bool:
-    """True when the account still holds the retired whole-Drive grant."""
+def _env_override(profile: str, key: str) -> str:
+    """Read one variable out of the installed skill's ``scripts/.env``.
+
+    That file is the skill's only config channel (the app materializes it from the
+    saved variables on boot), so it is also the truest picture of what the skill
+    would do on its next run.
+    """
+    base = skill_dir(profile)
+    if base is None:
+        return ""
+    path = base / _ENV_REL
+    if not path.is_file():
+        return ""
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            if name.strip() == key:
+                return value.strip().strip("'\"")
+    except OSError:
+        return ""
+    return ""
+
+
+def expected_scopes(profile: str) -> List[str]:
+    """The scopes the gdrive skill would request at its next ``link``.
+
+    Resolved the same way the skill resolves them — env override first, then
+    what cremind-connect advertises, then the built-in fallback — because any
+    other answer would let this disagree with the skill's own ``status``.
+    """
+    override = _env_override(profile, "GOOGLE_SCOPES")
+    if override:
+        return override.split()
+    from app.calendar import google_discovery
+
+    return google_discovery.resource_scopes("drive", DRIVE_SCOPES_FALLBACK)
+
+
+def scopes_are_stale(
+    scopes: Optional[List[str]], expected: Optional[List[str]] = None
+) -> bool:
+    """True when a linked account predates the per-file migration.
+
+    Holding the whole-Drive scope is only "stale" if per-file access is what we
+    would now ask for. Two cases legitimately hold the broad scope on purpose: a
+    bring-your-own-credentials user who requested it, and any install made before
+    cremind-connect starts advertising the narrower set. Comparing against
+    ``expected`` keeps both of them out of the warning, and keeps this answer
+    identical to the skill's own.
+    """
     granted = set(scopes or [])
-    return LEGACY_DRIVE_SCOPE in granted and DRIVE_FILE_SCOPE not in granted
+    if LEGACY_DRIVE_SCOPE not in granted or DRIVE_FILE_SCOPE in granted:
+        return False
+    want = set(expected) if expected is not None else {DRIVE_FILE_SCOPE}
+    return LEGACY_DRIVE_SCOPE not in want
 
 
 def status(profile: str) -> Dict[str, Any]:
     data = read_token(profile)
     if not data:
-        return {"linked": False, "email": None, "scopes": [], "scopes_stale": False}
+        return {
+            "linked": False, "email": None, "scopes": [],
+            "expected_scopes": [], "scopes_stale": False,
+        }
     scopes = data.get("scopes") or []
+    want = expected_scopes(profile)
     return {
         "linked": True,
         "email": data.get("email"),
         "scopes": scopes,
-        "scopes_stale": scopes_are_stale(scopes),
+        "expected_scopes": want,
+        "scopes_stale": scopes_are_stale(scopes, want),
+        "whole_drive": LEGACY_DRIVE_SCOPE in set(scopes),
     }
 
 

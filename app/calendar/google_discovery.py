@@ -86,18 +86,27 @@ def _provider(doc: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def calendar_scopes() -> list[str]:
+def resource_scopes(resource: str, fallback: list[str]) -> list[str]:
+    """Scopes cremind-connect advertises for one Google resource.
+
+    This is what a skill would request at ``link``, so callers can compare it
+    against what an account was actually granted.
+    """
     try:
         prov = _provider(document())
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"[google_discovery] scopes lookup fell back: {exc}")
-        return list(CALENDAR_SCOPES_FALLBACK)
+        return list(fallback)
     for r in prov.get("resources", []):
-        if r.get("resource") == "calendar":
+        if r.get("resource") == resource:
             scopes = r.get("scopes") or []
             if scopes:
                 return list(scopes)
-    return list(prov.get("scopes") or CALENDAR_SCOPES_FALLBACK)
+    return list(prov.get("scopes") or fallback)
+
+
+def calendar_scopes() -> list[str]:
+    return resource_scopes("calendar", CALENDAR_SCOPES_FALLBACK)
 
 
 def google_client() -> Dict[str, Any]:

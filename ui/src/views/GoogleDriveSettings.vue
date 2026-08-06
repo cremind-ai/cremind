@@ -204,7 +204,11 @@ onUnmounted(() => { stopPolling(); });
             <Icon icon="mdi:google-drive" class="row-icon" />
             <div class="grow">
               <strong>{{ status?.email || 'Linked' }}</strong>
-              <p class="muted">Per-file access — granted files plus files Cremind created.</p>
+              <p class="muted">
+                {{ status?.whole_drive
+                  ? 'Whole-Drive access — every file is reachable, so no grants are needed.'
+                  : 'Per-file access — granted files plus files Cremind created.' }}
+              </p>
             </div>
             <ElButton :loading="granting" type="primary" @click="onGrant">
               Grant access

@@ -24,11 +24,15 @@ export interface DriveStatus {
   linked: boolean;
   email: string | null;
   scopes: string[];
+  expected_scopes: string[];
   scopes_stale: boolean;
+  /** True when the token still carries the broad scope, so every file is reachable. */
+  whole_drive?: boolean;
   local_capture: boolean;
   capture_hint: string | null;
   revoke_url: string;
   hint?: string;
+  access_note?: string;
 }
 
 export interface DriveFile {

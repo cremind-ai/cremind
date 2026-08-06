@@ -41,11 +41,20 @@ def skill(tmp_path, monkeypatch):
     return scripts
 
 
-def test_status_reports_the_linked_account(skill):
+def test_status_reports_the_linked_account(skill, monkeypatch):
+    # Pin discovery so the test never depends on what the live broker serves.
+    monkeypatch.setattr(
+        "app.calendar.google_discovery.resource_scopes",
+        lambda resource, fallback: ["openid", "email", DRIVE_FILE],
+    )
     out = st.status("alice")
     assert out == {
-        "linked": True, "email": "user@example.com",
-        "scopes": [DRIVE_FILE, "openid", "email"], "scopes_stale": False,
+        "linked": True,
+        "email": "user@example.com",
+        "scopes": [DRIVE_FILE, "openid", "email"],
+        "expected_scopes": ["openid", "email", DRIVE_FILE],
+        "scopes_stale": False,
+        "whole_drive": False,
     }
 
 
@@ -61,6 +70,66 @@ def test_stale_scope_detection():
     assert st.scopes_are_stale([LEGACY, DRIVE_FILE]) is False
     assert st.scopes_are_stale([DRIVE_FILE]) is False
     assert st.scopes_are_stale(None) is False
+
+
+def test_whole_drive_is_not_stale_when_it_is_what_we_asked_for():
+    """The warning must not fire while the broker still advertises whole-Drive.
+
+    Two real cases hold the broad scope on purpose: an install predating the
+    broker deploy, and bring-your-own credentials. Telling either to re-link
+    would re-grant the same scope and change nothing.
+    """
+    broker_still_broad = ["openid", "email", LEGACY]
+    assert st.scopes_are_stale([LEGACY], broker_still_broad) is False
+    per_file = ["openid", "email", DRIVE_FILE]
+    assert st.scopes_are_stale([LEGACY], per_file) is True
+
+
+def test_status_agrees_with_the_skill_and_reports_whole_drive(skill, monkeypatch):
+    path = skill / ".google_token.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["scopes"] = ["openid", "email", LEGACY]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    # Broker has not been redeployed yet, so it still asks for the broad scope.
+    monkeypatch.setattr(
+        "app.calendar.google_discovery.resource_scopes",
+        lambda resource, fallback: ["openid", "email", LEGACY],
+    )
+    out = st.status("alice")
+    assert out["whole_drive"] is True
+    assert out["scopes_stale"] is False, "must not ask for a re-link that changes nothing"
+
+    # Once the broker serves the narrow set, the same token IS stale.
+    monkeypatch.setattr(
+        "app.calendar.google_discovery.resource_scopes",
+        lambda resource, fallback: ["openid", "email", DRIVE_FILE],
+    )
+    assert st.status("alice")["scopes_stale"] is True
+
+
+def test_env_override_wins_over_discovery(skill, monkeypatch):
+    (skill / ".env").write_text(
+        f"GOOGLE_CLIENT_ID=byo\nGOOGLE_SCOPES=openid email {LEGACY}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        "app.calendar.google_discovery.resource_scopes",
+        lambda resource, fallback: ["openid", "email", DRIVE_FILE],
+    )
+    assert st.expected_scopes("alice") == ["openid", "email", LEGACY]
+    # A bring-your-own user who asked for whole-Drive is not stale.
+    assert st.scopes_are_stale([LEGACY], st.expected_scopes("alice")) is False
+
+
+def test_env_override_tolerates_quotes_comments_and_absence(skill, monkeypatch):
+    monkeypatch.setattr(
+        "app.calendar.google_discovery.resource_scopes",
+        lambda resource, fallback: list(fallback),
+    )
+    assert st.expected_scopes("alice") == st.DRIVE_SCOPES_FALLBACK
+    (skill / ".env").write_text(
+        '# a comment\nGOOGLE_SCOPES="openid email drive.x"\nOTHER=1\n', encoding="utf-8"
+    )
+    assert st.expected_scopes("alice") == ["openid", "email", "drive.x"]
 
 
 def test_unexpired_access_token_is_reused(skill):
