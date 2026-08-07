@@ -1,6 +1,6 @@
 ---
 name: gdrive
-description: Read, download, upload, organize (move/rename/folders), and trash/restore Google Drive files via OAuth2, and receive file-change events in real time. Access is per-file - Cremind reaches only files the user picked through the Google file picker (the grant command) plus files Cremind created; there is no whole-Drive search. Authorizes through the Cremind Connect service (no GCP setup); tokens stay on this machine. Downloads export Google Docs as markdown and Sheets as xlsx.
+description: Read, download, upload, organize (move/rename/folders), and trash/restore Google Drive files via OAuth2, and receive file-change events in real time. How much of Drive is reachable depends on how the account was linked - run `status` and read its access_model field. By default access is per-file (only files the user picked through the Google file picker via the grant command, plus files Cremind created); an account linked with bring-your-own Google credentials reaches the whole Drive and can search it. Authorizes through the Cremind Connect service (no GCP setup); tokens stay on this machine. Downloads export Google Docs as markdown and Sheets as xlsx.
 metadata:
   environment_variables:
     - name: CREMIND_CONNECT_URL
@@ -43,8 +43,17 @@ and the relay never sees them. Runs via `uv` (PEP 723 inline metadata).
 
 ## Access model — read this first
 
-Cremind holds the `https://www.googleapis.com/auth/drive.file` scope. It reaches
-**only**:
+**Two different access models exist. Run `status` and read its `access_model`
+field before you reason about what is reachable** — the rules below differ
+completely, and assuming the wrong one wastes steps.
+
+```bash
+uv run scripts/__main__.py status
+```
+
+### A. Per-file access (default: `.../auth/drive.file`)
+
+`access_model` starts with `"per-file (drive.file)"`. Cremind reaches **only**:
 
 1. files the user explicitly picked through Google's file picker (the `grant`
    command below), and
@@ -62,10 +71,61 @@ What this scope cannot do, at all:
   or run `grant` so they can pick it.
 - **No whole-Drive monitoring.** The listener only sees changes to granted files.
 
-Sheets and Docs are different: the **gsheets** and **gdocs** skills read and write
-any spreadsheet/document the user owns straight from a URL or id, with no Drive
-grant at all. Prefer those for in-place content work; you only need gdrive (and a
-grant) for Drive-level operations — download/export, move, rename, trash.
+### B. Whole-Drive access (bring-your-own credentials: `.../auth/drive`)
+
+`access_model: "whole-Drive (bring-your-own credentials)"`. The user supplied
+their own Google OAuth client (see *Bring your own Google credentials* below).
+Then: `list` **is** a real whole-Drive search, every file is reachable by id, and
+`grant` is unnecessary and should not be run. A 403/404 here means the file
+really is missing or belongs to someone else — not a missing grant.
+
+Sheets and Docs are different under either model: the **gsheets** and **gdocs**
+skills read and write any spreadsheet/document the user owns straight from a URL
+or id, with no Drive grant at all. Prefer those for in-place content work; you
+only need gdrive (and, under model A, a grant) for Drive-level operations —
+download/export, move, rename, trash.
+
+## Common tasks
+
+### "What files/folders do I have access to?"
+
+1. `status` → read `access_model`.
+2. **Per-file (A):** the granted + created set is usually small and `list` shows
+   all of it — that list *is* the answer:
+   ```bash
+   uv run scripts/__main__.py list --compact --max-results 50
+   ```
+3. **Whole-Drive (B):** the literal answer is "your entire Drive". Do not try to
+   enumerate it. Show the top level and offer to filter or search:
+   ```bash
+   uv run scripts/__main__.py list --compact --folder root --max-results 50
+   ```
+
+Either way: one `list` call answers this. Report what came back, note the
+`access_model` in your answer, and stop.
+
+### Finding a specific file
+
+Under B, filter server-side rather than listing everything:
+`list --name "<substring>" --compact`, or `--mime-type`, or `--folder <id|url>`.
+Under A, `--name` only filters the already-reachable set; if it is not there, ask
+the user for the URL or run `grant`.
+
+## Working rules (avoid wasted steps)
+
+- **`list` is paginated.** A response carries `count`, and `next_page_token` when
+  more exist. Pass it back via `--page-token` **only if the user asked for more** —
+  otherwise present the first page and say more are available.
+- **Use `--compact` for any overview.** Full output is ~11 fields per file and
+  large listings get truncated by the agent runtime before you see them. Compact
+  output is id/name/type/modified_time; use `info --id <id>` when you need the
+  rest for one specific file.
+- **A truncated result is not a failed command.** Re-running the same `list`,
+  redirecting it to a file, or re-sorting it returns the same thing. Narrow the
+  query instead (`--compact`, a smaller `--max-results`, `--name`, `--folder`).
+- **This document is the whole contract.** Never read, grep, or import the Python
+  under `scripts/` to work out what a command does — run `<subcommand> --help`
+  if a flag is unclear.
 
 ## How it works (token-less relay)
 
@@ -149,7 +209,7 @@ Run `uv run scripts/__main__.py <subcommand>`. Output is JSON.
 | `complete-link` | `--response` | — |
 | `status` | — | — |
 | `grant` | — | `--file` (repeatable id/URL), `--single`, `--no-folders`, `--mime-types`, `--no-wait`, `--timeout` (600) |
-| `list` | — | `--query` (raw Drive q=), `--name`, `--folder`, `--mime-type`, `--trashed`, `--max-results` (50), `--page-token`, `--order-by` (`modifiedTime desc`) |
+| `list` | — | `--compact`, `--query` (raw Drive q=), `--name`, `--folder`, `--mime-type`, `--trashed`, `--max-results` (50), `--page-token`, `--order-by` (`modifiedTime desc`) |
 | `info` | `--id` | — |
 | `download` | `--id`, `--out` | `--mime` (export MIME override) |
 | `upload` | `--file` | `--name`, `--parent`, `--mime` |
@@ -163,9 +223,15 @@ All `--id`/`--folder`/`--parent` flags accept a bare id or a full Drive/Docs URL
 `--out` may be a file path or a directory (the file name + extension is derived
 automatically).
 
-`list` searches only what Cremind can already reach, so `--name` is a filter over
-that set — not a way to find a file in the user's Drive. `move` needs the
-**destination folder** granted too, not just the file.
+Under **per-file access** `list` searches only what Cremind can already reach, so
+`--name` is a filter over that set — not a way to find a file in the user's
+Drive, and `move` needs the **destination folder** granted too, not just the
+file. Under **whole-Drive access** `list` is a genuine Drive-wide search and
+those caveats do not apply.
+
+`list` returns `{count, files[], next_page_token?}`. `--compact` reduces each
+file to `id`/`name`/`type`/`modified_time` — prefer it for anything the user
+just wants to see, and reach for `info --id` when one file needs full metadata.
 
 ### Downloads & exports
 Google-native files are **exported** with sensible defaults:

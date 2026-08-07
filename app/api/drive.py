@@ -65,13 +65,8 @@ def get_drive_routes() -> List[Route]:
         payload["local_capture"] = grant_flow.capture_is_local()
         payload["capture_hint"] = grant_flow.capture_hint()
         payload["revoke_url"] = "https://myaccount.google.com/connections"
-        if payload.get("whole_drive"):
-            # Granting individual files is pointless when the token already reaches
-            # everything, so say so rather than inviting a no-op.
-            payload["access_note"] = (
-                "This account holds whole-Drive access, so Cremind can already reach every "
-                "file — granting individual files is not needed."
-            )
+        # access_model / access_note come from skill_token so every client
+        # describes the same account the same way.
         if payload["scopes_stale"]:
             payload["hint"] = (
                 "This account is linked with the old whole-Drive scope, which Cremind "

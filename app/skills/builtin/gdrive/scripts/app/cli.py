@@ -2,8 +2,11 @@
 organize verbs. The persistent listener (event_listener.py) establishes the
 changes.watch channel automatically; there is no manual watch verb here.
 
-Access is per-file: Cremind reaches only files it created and files the user
-picked via ``grant`` (see grant.py). There is no whole-Drive search."""
+Access is per-file by default: Cremind reaches only files it created and files
+the user picked via ``grant`` (see grant.py), and there is no whole-Drive search.
+An account linked with bring-your-own credentials at the wider
+``.../auth/drive`` scope reaches the whole Drive instead — ``status`` reports
+which of the two applies (``access_model``)."""
 from __future__ import annotations
 
 import argparse
@@ -200,6 +203,21 @@ def _build_query(args) -> str | None:
     return " and ".join(clauses) if clauses else None
 
 
+def _compact_file(f: dict[str, Any]) -> dict[str, Any]:
+    """One listed file as 4 fields instead of 11.
+
+    A full page of ``parse_file`` output is large enough that the agent runtime
+    clamps it mid-payload, so an overview listing ("what can I reach?") is best
+    served by ids, names and types only. ``info --id`` gets the rest.
+    """
+    return {
+        "id": f.get("id", ""),
+        "name": f.get("name", ""),
+        "type": formatter.mime_label(f.get("mime_type", "")),
+        "modified_time": f.get("modified_time", ""),
+    }
+
+
 def cmd_list(args) -> Any:
     svc = _svc()
     resp = drive_api.list_files(
@@ -210,7 +228,9 @@ def cmd_list(args) -> Any:
         page_token=args.page_token,
     )
     files = [formatter.parse_file(f) for f in resp.get("files", []) or []]
-    out: dict[str, Any] = {"files": files}
+    if getattr(args, "compact", False):
+        files = [_compact_file(f) for f in files]
+    out: dict[str, Any] = {"count": len(files), "files": files}
     if resp.get("nextPageToken"):
         out["next_page_token"] = resp["nextPageToken"]
     return out
@@ -373,6 +393,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-results", type=int, default=50, dest="max_results")
     sp.add_argument("--page-token", dest="page_token")
     sp.add_argument("--order-by", dest="order_by", default="modifiedTime desc")
+    sp.add_argument(
+        "--compact",
+        action="store_true",
+        help="emit only id/name/type/modified_time per file (use for overviews)",
+    )
     sp.set_defaults(func=cmd_list)
 
     sp = sub.add_parser("info", help="file metadata")

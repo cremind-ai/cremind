@@ -1,9 +1,11 @@
 """`cremind drive ...` — grant Cremind access to individual Google Drive files.
 
-Cremind holds per-file Drive access (the ``drive.file`` scope), so it reaches only
-files the user picked through Google's file picker plus files it created itself.
-These commands drive that picker and show what is currently reachable — the
-terminal counterpart of the **Settings -> Google Drive** page.
+By default Cremind holds per-file Drive access (the ``drive.file`` scope), so it
+reaches only files the user picked through Google's file picker plus files it
+created itself. An account linked with bring-your-own Google credentials holds
+whole-Drive access instead, and needs no grants at all — ``status`` reports which
+applies. These commands drive that picker and show what is currently reachable —
+the terminal counterpart of the **Settings -> Google Drive** page.
 
 Linking the Google account itself belongs to the ``gdrive`` skill (it owns the
 OAuth token); this only grants files on an already-linked account.
@@ -36,7 +38,13 @@ def _print_status(out: dict[str, Any]) -> None:
         )
         return
     sys.stdout.write(f"Linked as {out.get('email') or 'unknown account'}\n")
-    sys.stdout.write("Access: per-file (granted files + files Cremind created)\n")
+    # Reporting "per-file" for an account that holds whole-Drive would send the
+    # user (and the agent reading this output) hunting for grants that are neither
+    # needed nor possible. The label is computed server-side so this, the settings
+    # page, and the API cannot describe the same account differently.
+    sys.stdout.write(f"Access: {out.get('access_model', 'unknown')}\n")
+    if out.get("access_note"):
+        sys.stdout.write(f"{out['access_note']}\n")
     if out.get("scopes_stale"):
         sys.stdout.write(f"\nAction needed: {out.get('hint', '')}\n")
 
@@ -100,6 +108,7 @@ def drive_files(
             "No Drive files are reachable yet. Run 'cremind drive grant' to pick some.\n"
         )
         return
+    sys.stdout.write(f"{len(files)} file(s)\n")
     table = Table(["NAME", "TYPE", "MODIFIED", "ID"])
     for f in files:
         table.add_row([

@@ -71,7 +71,11 @@ retry = 2
 
 [tool_result]
 enabled = true
-max_tokens = 1000
+# Per-tool-result clamp on what reaches the model's context. Sized so a typical
+# CLI JSON page survives whole — a clip that lands mid-payload reads to the model
+# as a broken command and costs several wasted retry steps. Results that still
+# exceed it are marked as truncated rather than cut silently.
+max_tokens = 4000
 preserve_recent = 1
 head_tokens = 200
 tail_tokens = 200

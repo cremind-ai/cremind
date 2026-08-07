@@ -28,6 +28,8 @@ export interface DriveStatus {
   scopes_stale: boolean;
   /** True when the token still carries the broad scope, so every file is reachable. */
   whole_drive?: boolean;
+  /** Server-computed label: which access model this account has, and why. */
+  access_model?: string;
   local_capture: boolean;
   capture_hint: string | null;
   revoke_url: string;

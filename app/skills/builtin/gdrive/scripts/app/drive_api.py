@@ -6,10 +6,15 @@ Actions: list / get / download (get_media) / export (Google-native) / upload /
 mkdir / update (rename, trash, restore) / move.
 All calls use the local user's own token — the relay is never involved here.
 
-Scoped to https://www.googleapis.com/auth/drive.file, so every call here is
-confined to files the user granted through the picker plus files this app created.
-``list_files`` therefore returns that set rather than the whole Drive, and any
-by-id call can fail with 403/404 for a file that was never granted (see errors.py).
+Reach depends on how the account was linked — run the CLI's ``status`` and read
+its ``access_model`` field:
+
+- ``.../auth/drive.file`` (default): calls are confined to files the user granted
+  through the picker plus files this app created, so ``list_files`` returns that
+  set rather than the whole Drive and any by-id call can fail with 403/404 for a
+  file that was never granted (see errors.py).
+- ``.../auth/drive`` (bring-your-own credentials): the same calls cover the
+  user's whole Drive, and ``list_files`` is a real Drive-wide search.
 """
 from __future__ import annotations
 

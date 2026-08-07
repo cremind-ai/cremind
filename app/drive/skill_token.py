@@ -147,12 +147,60 @@ def scopes_are_stale(
     return LEGACY_DRIVE_SCOPE not in want
 
 
+def uses_own_client(profile: str) -> bool:
+    """Whether this account was linked with the user's own OAuth client.
+
+    Holding whole-Drive does not imply it: the shared client also requests the
+    broad scope until cremind-connect is redeployed, and any account linked before
+    that keeps it. Deciding by scope alone would tell a user they configured
+    something they never touched.
+    """
+    if _env_override(profile, "GOOGLE_CLIENT_ID"):
+        return True
+    mine = token_client_id(profile)
+    if not mine:
+        return False
+    try:
+        from app.calendar import google_discovery
+
+        shared = str(google_discovery.google_client().get("client_id") or "")
+    except Exception as exc:  # noqa: BLE001 - unreachable broker proves nothing
+        logger.debug(f"[drive] shared-client lookup failed: {exc}")
+        return False
+    return bool(shared) and mine != shared
+
+
+def access_model(profile: str, scopes: List[str]) -> Dict[str, str]:
+    """One authoritative description of what this account can reach, and why.
+
+    Returned from here rather than phrased separately by the CLI, the settings
+    page, and the API, so the three cannot describe the same account differently.
+    """
+    if LEGACY_DRIVE_SCOPE not in set(scopes):
+        return {
+            "access_model": "per-file (granted files + files Cremind created)",
+            "access_note": "",
+        }
+    if uses_own_client(profile):
+        why = "your own Google credentials"
+    else:
+        why = "the shared Cremind client still requests it"
+    return {
+        "access_model": f"whole-Drive ({why})",
+        "access_note": (
+            "Every file in this Drive is already reachable, so granting individual "
+            "files adds nothing."
+        ),
+    }
+
+
 def status(profile: str) -> Dict[str, Any]:
     data = read_token(profile)
     if not data:
         return {
             "linked": False, "email": None, "scopes": [],
             "expected_scopes": [], "scopes_stale": False,
+            "whole_drive": False, "access_model": "not linked", "access_note": "",
         }
     scopes = data.get("scopes") or []
     want = expected_scopes(profile)
@@ -163,6 +211,7 @@ def status(profile: str) -> Dict[str, Any]:
         "expected_scopes": want,
         "scopes_stale": scopes_are_stale(scopes, want),
         "whole_drive": LEGACY_DRIVE_SCOPE in set(scopes),
+        **access_model(profile, scopes),
     }
 
 

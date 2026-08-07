@@ -257,12 +257,12 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
             "enabled": Field(
                 type="boolean", default_toml="tool_result.enabled",
                 label="Enabled",
-                description="When on, older tool observations are shortened to a head/tail excerpt before being included in the next reasoning prompt.",
+                description="When on, a tool observation longer than the threshold below is shortened before being included in the next reasoning prompt.",
             ),
             "max_tokens": Field(
                 type="number", default_toml="tool_result.max_tokens",
                 label="Per-observation token threshold",
-                description="An older observation longer than this many tokens is replaced with a head excerpt + truncation marker + tail excerpt.",
+                description="An observation longer than this many tokens is cut to its first N tokens and marked as truncated, so the model knows the command succeeded and the rest was dropped by Cremind. Raise it if agents keep re-running commands whose output does not fit.",
                 min=100, max=200000,
             ),
             "preserve_recent": Field(

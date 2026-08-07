@@ -1,13 +1,16 @@
 ---
-description: "Grant Cremind access to individual **Google Drive files** and list the Drive files it can reach. Cremind holds **per-file** Drive access (the `drive.file` OAuth scope), so it can only open files the user explicitly picked through Google's file picker plus files Cremind created — knowing a Drive link is never enough, and there is no whole-Drive search. Use this when a Drive file returns a 403/404, when the user pastes a Drive URL Cremind cannot read, or to review which files have been granted."
+description: "Grant Cremind access to individual **Google Drive files**, list the Drive files it can reach, and check which Drive access model this account uses. By default Cremind holds **per-file** access (the `drive.file` OAuth scope), so it can only open files the user explicitly picked through Google's file picker plus files Cremind created — knowing a Drive link is never enough and there is no whole-Drive search. An account linked with bring-your-own Google credentials holds **whole-Drive** access instead, where every file is reachable and grants are unnecessary; `cremind drive status` reports which applies, so run it before concluding a file is out of reach. Use this when a Drive file returns a 403/404, when the user pastes a Drive URL Cremind cannot read, when asked what Drive files Cremind can see, or to review which files have been granted."
 ---
 
-# `cremind drive` — per-file Google Drive access
+# `cremind drive` — Google Drive access
 
-`cremind drive` grants and inspects **per-file** Google Drive access.
+`cremind drive` grants and inspects Google Drive access.
 
-Cremind requests only the `https://www.googleapis.com/auth/drive.file` scope. It
-therefore reaches **only**:
+**Run `cremind drive status` first** — there are two access models and they lead
+to opposite conclusions:
+
+**Per-file (default).** Cremind requests only the
+`https://www.googleapis.com/auth/drive.file` scope, so it reaches **only**:
 
 1. files the user explicitly picked through Google's file picker, and
 2. files Cremind itself created.
@@ -15,6 +18,18 @@ therefore reaches **only**:
 **Knowing a file's id or URL is never enough.** A file that was never granted
 returns 403/404 from every Drive call, and Google does not distinguish "not
 granted" from "does not exist". The fix is a grant, never a retry.
+
+**Whole-Drive.** The token holds the wider `.../auth/drive` scope. Every file is
+reachable, `files` is a real whole-Drive listing, and `grant` is unnecessary — do
+not run it. A 403/404 here means the file genuinely is missing, not ungranted.
+
+Two different situations produce this, and `status` names which one in its
+`Access:` line — do not assume the user configured anything:
+
+- *"the shared Cremind client still requests it"* — the default for an account
+  linked before Cremind narrowed its scopes. Nothing was configured by the user.
+- *"your own Google credentials"* — the user really did supply their own OAuth
+  client.
 
 Linking the Google account itself belongs to the **gdrive skill** (it owns the
 OAuth token). These commands grant files on an already-linked account. If
@@ -31,7 +46,7 @@ gdrive skill first.
 
 | Command | Arguments | What it does |
 |---|---|---|
-| `status` | — | Link state, the granted account, and whether a re-link is needed |
+| `status` | — | Link state, the granted account, **which access model applies**, and whether a re-link is needed |
 | `files` | `--page-token`, `--page-size` (50) | Lists the Drive files Cremind can reach |
 | `grant` | `--file`, `--single`, `--no-folders`, `--mime-type`, `--no-browser`, `--print-only`, `--timeout` (600) | Opens the file picker so the user grants files |
 | `grant-complete` | `<redirect-url>` | Finishes a grant from the URL the browser landed on |
@@ -42,10 +57,14 @@ gdrive skill first.
 cremind drive status
 ```
 
-Reports the linked Google account and the access model. When the account was
-linked before per-file access existed, `scopes_stale` is true and the output says
-to re-link: ask the agent to run the gdrive skill's `link` verb, then grant files
-again. Old grants are not lost by re-linking.
+Reports the linked Google account and the access model — `Access: per-file ...`
+or `Access: whole-Drive (...)` with the reason in parentheses. **Check this before
+answering "what can Cremind reach?" or deciding a file needs a grant**, and quote
+the reason as given rather than inferring one.
+
+When the account was linked before per-file access existed, `scopes_stale` is
+true and the output says to re-link: ask the agent to run the gdrive skill's
+`link` verb, then grant files again. Old grants are not lost by re-linking.
 
 ### `files`
 
@@ -55,8 +74,14 @@ cremind drive files --page-size 100 --json
 ```
 
 This is the authoritative list — it asks Google what the token can see, so it
-reflects exactly what Cremind can open. An empty list means nothing has been
-granted yet.
+reflects exactly what Cremind can open. Under per-file access an empty list means
+nothing has been granted yet; under whole-Drive access this is a page of the
+user's Drive, so present the first page and mention that more exist rather than
+paging through everything.
+
+Results are paginated: the output ends with a `--page-token` hint when more
+files are available. A page that looks short is not an error — pass the token
+only if the user asked for more.
 
 ### `grant`
 
@@ -102,13 +127,16 @@ Settings → Google Drive or `cremind drive grant --file <id>`) and stop the run
 
 ## What per-file access cannot do
 
+These limits apply when `status` reports **per-file** access; under whole-Drive
+access none of them do.
+
 - **No whole-Drive search.** `files` lists the granted set, not the user's Drive.
   To act on a file the user names, ask for the URL or run `grant`.
 - **No whole-Drive monitoring.** The gdrive skill's `file_changed` events cover
   granted files only.
 - **No finding a Sheet or Doc by name.** Ask for the URL or id — the **gsheets**
   and **gdocs** skills read and write any file the user owns from a URL alone,
-  with no Drive grant needed at all.
+  with no Drive grant needed at all (under either access model).
 
 ## Troubleshooting
 

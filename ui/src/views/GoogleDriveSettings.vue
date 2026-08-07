@@ -205,9 +205,8 @@ onUnmounted(() => { stopPolling(); });
             <div class="grow">
               <strong>{{ status?.email || 'Linked' }}</strong>
               <p class="muted">
-                {{ status?.whole_drive
-                  ? 'Whole-Drive access — every file is reachable, so no grants are needed.'
-                  : 'Per-file access — granted files plus files Cremind created.' }}
+                Access: {{ status?.access_model }}<template v-if="status?.access_note">
+                  — {{ status.access_note }}</template>
               </p>
             </div>
             <ElButton :loading="granting" type="primary" @click="onGrant">

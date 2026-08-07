@@ -55,6 +55,8 @@ def test_status_reports_the_linked_account(skill, monkeypatch):
         "expected_scopes": ["openid", "email", DRIVE_FILE],
         "scopes_stale": False,
         "whole_drive": False,
+        "access_model": "per-file (granted files + files Cremind created)",
+        "access_note": "",
     }
 
 
@@ -196,6 +198,71 @@ def test_list_files_includes_shared_drives(skill, monkeypatch):
     assert seen["supportsAllDrives"] == "true"
     assert seen["includeItemsFromAllDrives"] == "true"
     assert seen["corpora"] == "allDrives"
+
+
+def test_whole_drive_is_not_attributed_to_credentials_the_user_never_supplied(
+    skill, monkeypatch
+):
+    """The shared client also requests whole-Drive until the broker is redeployed.
+
+    Labelling that "bring-your-own credentials" tells the user they configured
+    something they never touched — and the agent then repeats it.
+    """
+    path = skill / ".google_token.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["scopes"] = ["openid", "email", LEGACY]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    # Token was minted with the shared client — same id the broker serves.
+    monkeypatch.setattr(
+        "app.calendar.google_discovery.google_client", lambda: {"client_id": "cid"}
+    )
+    monkeypatch.setattr(
+        "app.calendar.google_discovery.resource_scopes",
+        lambda resource, fallback: ["openid", "email", LEGACY],
+    )
+    out = st.status("alice")
+    assert out["whole_drive"] is True
+    assert "shared Cremind client" in out["access_model"]
+    assert "your own" not in out["access_model"]
+    assert out["access_note"]
+
+
+def test_a_genuinely_byo_account_is_labelled_as_such(skill, monkeypatch):
+    path = skill / ".google_token.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.update({"scopes": ["openid", "email", LEGACY], "client_id": "my-own-client"})
+    path.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(
+        "app.calendar.google_discovery.google_client", lambda: {"client_id": "cid"}
+    )
+    monkeypatch.setattr(
+        "app.calendar.google_discovery.resource_scopes",
+        lambda resource, fallback: ["openid", "email", LEGACY],
+    )
+    assert "your own Google credentials" in st.status("alice")["access_model"]
+
+
+def test_an_env_supplied_client_counts_as_byo(skill, monkeypatch):
+    (skill / ".env").write_text("GOOGLE_CLIENT_ID=mine\n", encoding="utf-8")
+    assert st.uses_own_client("alice") is True
+
+
+def test_an_unreachable_broker_never_claims_byo(skill, monkeypatch):
+    def boom():
+        raise RuntimeError("offline")
+    monkeypatch.setattr("app.calendar.google_discovery.google_client", boom)
+    # Cannot prove the client differs, so must not assert the user configured one.
+    assert st.uses_own_client("alice") is False
+
+
+def test_per_file_access_model_has_no_note(skill, monkeypatch):
+    monkeypatch.setattr(
+        "app.calendar.google_discovery.resource_scopes",
+        lambda resource, fallback: ["openid", "email", DRIVE_FILE],
+    )
+    out = st.status("alice")
+    assert out["access_model"].startswith("per-file")
+    assert out["access_note"] == ""
 
 
 def test_token_client_id_prefers_what_the_token_was_minted_with(skill):

@@ -282,6 +282,19 @@ _MEMORY_SNAPSHOT_LIMIT = 50
 # memory would bust the prompt cache. A process restart is the only refresh.
 _LONG_TERM_MEMORY_SNAPSHOT: dict[str, str] = {}
 
+# Appended to a tool result the ``tool_result.max_tokens`` clamp actually cut.
+# Without it the model sees output that simply stops mid-token and reads it as a
+# failed command, then burns steps re-running it.
+_TOOL_RESULT_TRUNCATION_NOTICE = (
+    "\n\n[... output truncated here: it exceeded {max_tokens} tokens, and only "
+    "the beginning is shown. The command itself SUCCEEDED — re-running it "
+    "unchanged, redirecting it to a file, or inspecting the tool's source code "
+    "will not reveal the rest. To see more, narrow the output instead: apply "
+    "filters, lower a --max-results/--limit flag, request a compact or "
+    "summary format, or page through results. If what is shown already answers "
+    "the user, just answer and say the list was truncated.]"
+)
+
 
 def _format_memory_block(facts: list[str]) -> str:
     """Render durable facts as the ``{long_term_memory}`` section, or "" for none.
@@ -1822,7 +1835,16 @@ class ReasoningAgent:
         """
         text = observation_text or "No result"
         if truncate and self._tool_result_enabled:
-            text = truncate_to_tokens(text, self._tool_result_max_tokens)
+            clamped = truncate_to_tokens(text, self._tool_result_max_tokens)
+            if clamped != text:
+                # A clip with no marker reads to the model as broken command
+                # output, and it retries the same call (redirect to a file,
+                # re-sort, --help, read the tool's source) chasing the missing
+                # tail. Say so, and say what to do instead.
+                clamped += _TOOL_RESULT_TRUNCATION_NOTICE.format(
+                    max_tokens=self._tool_result_max_tokens
+                )
+            text = clamped
         self._turn_messages.append({
             "role": "tool",
             "tool_call_id": call_id,
