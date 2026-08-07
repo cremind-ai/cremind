@@ -101,6 +101,18 @@ def _env_override(profile: str, key: str) -> str:
     return ""
 
 
+def token_client_id(profile: str) -> str:
+    """The OAuth client the linked token was minted with.
+
+    A grant attaches to the (app, user) pair, so a Picker request must name this
+    client or the grant lands on one the skill's token cannot use. The skill takes
+    the client from its own ``scripts/.env`` first, so this can legitimately differ
+    from what the broker serves.
+    """
+    data = read_token(profile)
+    return str((data or {}).get("client_id") or "")
+
+
 def expected_scopes(profile: str) -> List[str]:
     """The scopes the gdrive skill would request at its next ``link``.
 
@@ -217,6 +229,14 @@ def list_files(
         "orderBy": "modifiedTime desc",
         "q": "trashed = false",
         "spaces": "drive",
+        # A picked file can live in a shared drive, and Google's defaults
+        # (corpora=user, includeItemsFromAllDrives=false) would omit it — leaving a
+        # granted file readable by id yet missing from the list that is supposed to
+        # be authoritative, and invisible to the grant-round diff. Mirrors the
+        # skill's own files.list call.
+        "supportsAllDrives": "true",
+        "includeItemsFromAllDrives": "true",
+        "corpora": "allDrives",
         "fields": f"nextPageToken,files({_FILE_FIELDS})",
     }
     if page_token:

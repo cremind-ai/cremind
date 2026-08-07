@@ -170,6 +170,46 @@ def test_missing_refresh_token_is_an_actionable_error(skill):
         st.access_token("alice")
 
 
+def test_list_files_includes_shared_drives(skill, monkeypatch):
+    """A picked file can live in a shared drive; Google omits those by default.
+
+    Without these flags a granted file is readable by id yet missing from the list
+    that is meant to be authoritative — and invisible to the grant-round diff.
+    """
+    seen: dict = {}
+
+    class FakeResp:
+        status_code = 200
+        def raise_for_status(self): return None
+        def json(self): return {"files": []}
+
+    class FakeClient:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url, params=None, headers=None):
+            seen.update(params or {})
+            return FakeResp()
+
+    monkeypatch.setattr(st.httpx, "Client", FakeClient)
+    st.list_files("alice")
+    assert seen["supportsAllDrives"] == "true"
+    assert seen["includeItemsFromAllDrives"] == "true"
+    assert seen["corpora"] == "allDrives"
+
+
+def test_token_client_id_prefers_what_the_token_was_minted_with(skill):
+    # A bring-your-own client id lives in the token, not in the broker's response.
+    assert st.token_client_id("alice") == "cid"
+
+
+def test_token_client_id_is_blank_without_a_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "app.skills.sync.profile_skills_dir", lambda profile: tmp_path / profile / "skills"
+    )
+    assert st.token_client_id("nobody") == ""
+
+
 def test_list_files_maps_the_drive_payload(skill, monkeypatch):
     class FakeResp:
         status_code = 200

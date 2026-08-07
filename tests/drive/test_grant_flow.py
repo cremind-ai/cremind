@@ -70,6 +70,42 @@ def test_start_requires_a_linked_account(monkeypatch):
         gf.start("alice")
 
 
+def test_picker_uses_the_client_the_token_was_minted_with(monkeypatch):
+    """A grant attaches to the (app, user) pair.
+
+    Requesting it under a different client than the token holds would land the
+    grant somewhere the skill cannot use — the bring-your-own-credentials case,
+    where the skill takes its client from its own scripts/.env.
+    """
+    _wire(monkeypatch)
+    monkeypatch.setattr(gf.skill_token, "token_client_id", lambda profile: "byo-client")
+    out = gf.start("alice")
+    params = parse_qs(urlparse(out["authorize_url"]).query)
+    assert params["client_id"] == ["byo-client"]
+
+
+def test_picker_falls_back_to_the_broker_client_for_older_tokens(monkeypatch):
+    _wire(monkeypatch)
+    monkeypatch.setattr(gf.skill_token, "token_client_id", lambda profile: "")
+    out = gf.start("alice")
+    params = parse_qs(urlparse(out["authorize_url"]).query)
+    assert params["client_id"] == ["cid"]
+
+
+def test_unavailable_broker_is_only_fatal_without_a_token_client(monkeypatch):
+    _wire(monkeypatch)
+    def boom():
+        raise RuntimeError("connect unreachable")
+    monkeypatch.setattr(gf.google_discovery, "google_client", boom)
+    # The token names its own client, so the broker is not needed at all.
+    monkeypatch.setattr(gf.skill_token, "token_client_id", lambda profile: "byo-client")
+    assert gf.start("alice")["state"]
+    # Without one, the broker failure is genuinely the cause and must surface.
+    monkeypatch.setattr(gf.skill_token, "token_client_id", lambda profile: "")
+    with pytest.raises(gf.DriveGrantError, match="OAuth client"):
+        gf.start("alice")
+
+
 def test_redirect_uri_is_always_loopback(monkeypatch):
     """Google's Desktop client type rejects non-loopback redirects outright."""
     _wire(monkeypatch, app_url="https://cremind.example.com")

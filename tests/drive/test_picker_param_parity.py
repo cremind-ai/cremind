@@ -30,9 +30,15 @@ _SKILL_SCRIPTS = (
 # repo's. Mount it under a private name so its relative imports still resolve.
 _ALIAS = "gdrive_skill_under_test"
 
-# Parameters that legitimately differ: the backend routes consent through its own
-# callback and tracks rounds with its own state, while the skill waits on the
-# shared OAuth inbox. Everything else must match exactly.
+# Parameters that legitimately differ per layer: the backend routes consent through
+# its own callback and tracks rounds with its own state, while the skill waits on
+# the shared OAuth inbox. Everything else must match exactly.
+#
+# ``client_id`` is NOT exempt as a free choice — both layers must name the client
+# the linked token was minted with, which is what
+# ``test_grant_flow.test_picker_uses_the_client_the_token_was_minted_with`` pins.
+# It only sits here because these two builders are called with different sources
+# for that one value.
 _CONTEXT_PARAMS = {"client_id", "redirect_uri", "state", "login_hint"}
 # The skill exchanges the code only as a fallback, so it always sends a PKCE
 # challenge; the backend never redeems the code and sends none.

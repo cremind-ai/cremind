@@ -145,10 +145,17 @@ def start(
             "Google Drive is not linked yet. Ask the agent to link the gdrive skill "
             "first, then grant files."
         )
-    try:
-        client = google_discovery.google_client()
-    except Exception as exc:  # noqa: BLE001
-        raise DriveGrantError(f"could not obtain the Google OAuth client: {exc}") from exc
+    # The grant must be requested with the client the linked token was minted with:
+    # it attaches to the (app, user) pair, so naming a different client would land
+    # the grant somewhere this token cannot use it. The skill resolves its client
+    # from its own scripts/.env first, so prefer what it actually stored and fall
+    # back to the broker only when the token predates that field.
+    client_id = skill_token.token_client_id(profile)
+    if not client_id:
+        try:
+            client_id = google_discovery.google_client()["client_id"]
+        except Exception as exc:  # noqa: BLE001
+            raise DriveGrantError(f"could not obtain the Google OAuth client: {exc}") from exc
 
     try:
         before = skill_token.reachable_ids(profile)
@@ -168,7 +175,7 @@ def start(
     }
     _prune()
     params = build_picker_params(
-        client_id=client["client_id"],
+        client_id=client_id,
         redirect=redirect,
         state=state,
         file_ids=file_ids,
