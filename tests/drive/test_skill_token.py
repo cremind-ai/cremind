@@ -44,8 +44,8 @@ def skill(tmp_path, monkeypatch):
 def test_status_reports_the_linked_account(skill, monkeypatch):
     # Pin discovery so the test never depends on what the live broker serves.
     monkeypatch.setattr(
-        "app.calendar.google_discovery.resource_scopes",
-        lambda resource, fallback: ["openid", "email", DRIVE_FILE],
+        "app.calendar.google_discovery.resource_scopes_or_none",
+        lambda resource: ["openid", "email", DRIVE_FILE],
     )
     out = st.status("alice")
     assert out == {
@@ -53,6 +53,7 @@ def test_status_reports_the_linked_account(skill, monkeypatch):
         "email": "user@example.com",
         "scopes": [DRIVE_FILE, "openid", "email"],
         "expected_scopes": ["openid", "email", DRIVE_FILE],
+        "expected_resolved": True,
         "scopes_stale": False,
         "whole_drive": False,
         "access_model": "per-file (granted files + files Cremind created)",
@@ -68,10 +69,34 @@ def test_status_when_not_linked(tmp_path, monkeypatch):
 
 
 def test_stale_scope_detection():
-    assert st.scopes_are_stale([LEGACY]) is True
-    assert st.scopes_are_stale([LEGACY, DRIVE_FILE]) is False
-    assert st.scopes_are_stale([DRIVE_FILE]) is False
-    assert st.scopes_are_stale(None) is False
+    assert st.scopes_are_stale([LEGACY], [DRIVE_FILE]) is True
+    assert st.scopes_are_stale([LEGACY, DRIVE_FILE], [DRIVE_FILE]) is False
+    assert st.scopes_are_stale([DRIVE_FILE], [DRIVE_FILE]) is False
+    assert st.scopes_are_stale(None, [DRIVE_FILE]) is False
+
+
+def test_an_unknown_advertisement_never_claims_stale():
+    """No ``expected`` means the broker could not be asked — that proves nothing.
+
+    The remedy for staleness is a re-link, which permanently narrows a whole-Drive
+    account, so a broker outage must never produce the warning.
+    """
+    assert st.scopes_are_stale([LEGACY], None) is False
+    assert st.scopes_are_stale([LEGACY]) is False
+
+
+def test_an_unreachable_broker_never_claims_stale(skill, monkeypatch):
+    (skill / ".google_token.json").write_text(
+        '{"email": "user@example.com", "scopes": ["' + LEGACY + '"]}', encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        "app.calendar.google_discovery.resource_scopes_or_none", lambda resource: None
+    )
+    out = st.status("alice")
+    assert out["scopes_stale"] is False
+    assert out["expected_resolved"] is False
+    # The display value still falls back so the field is never blank.
+    assert out["expected_scopes"] == st.DRIVE_SCOPES_FALLBACK
 
 
 def test_whole_drive_is_not_stale_when_it_is_what_we_asked_for():
@@ -94,8 +119,8 @@ def test_status_agrees_with_the_skill_and_reports_whole_drive(skill, monkeypatch
     path.write_text(json.dumps(data), encoding="utf-8")
     # Broker has not been redeployed yet, so it still asks for the broad scope.
     monkeypatch.setattr(
-        "app.calendar.google_discovery.resource_scopes",
-        lambda resource, fallback: ["openid", "email", LEGACY],
+        "app.calendar.google_discovery.resource_scopes_or_none",
+        lambda resource: ["openid", "email", LEGACY],
     )
     out = st.status("alice")
     assert out["whole_drive"] is True
@@ -103,8 +128,8 @@ def test_status_agrees_with_the_skill_and_reports_whole_drive(skill, monkeypatch
 
     # Once the broker serves the narrow set, the same token IS stale.
     monkeypatch.setattr(
-        "app.calendar.google_discovery.resource_scopes",
-        lambda resource, fallback: ["openid", "email", DRIVE_FILE],
+        "app.calendar.google_discovery.resource_scopes_or_none",
+        lambda resource: ["openid", "email", DRIVE_FILE],
     )
     assert st.status("alice")["scopes_stale"] is True
 
@@ -114,8 +139,8 @@ def test_env_override_wins_over_discovery(skill, monkeypatch):
         f"GOOGLE_CLIENT_ID=byo\nGOOGLE_SCOPES=openid email {LEGACY}\n", encoding="utf-8"
     )
     monkeypatch.setattr(
-        "app.calendar.google_discovery.resource_scopes",
-        lambda resource, fallback: ["openid", "email", DRIVE_FILE],
+        "app.calendar.google_discovery.resource_scopes_or_none",
+        lambda resource: ["openid", "email", DRIVE_FILE],
     )
     assert st.expected_scopes("alice") == ["openid", "email", LEGACY]
     # A bring-your-own user who asked for whole-Drive is not stale.
@@ -124,8 +149,8 @@ def test_env_override_wins_over_discovery(skill, monkeypatch):
 
 def test_env_override_tolerates_quotes_comments_and_absence(skill, monkeypatch):
     monkeypatch.setattr(
-        "app.calendar.google_discovery.resource_scopes",
-        lambda resource, fallback: list(fallback),
+        "app.calendar.google_discovery.resource_scopes_or_none",
+        lambda resource: None,
     )
     assert st.expected_scopes("alice") == st.DRIVE_SCOPES_FALLBACK
     (skill / ".env").write_text(
@@ -217,8 +242,8 @@ def test_whole_drive_is_not_attributed_to_credentials_the_user_never_supplied(
         "app.calendar.google_discovery.google_client", lambda: {"client_id": "cid"}
     )
     monkeypatch.setattr(
-        "app.calendar.google_discovery.resource_scopes",
-        lambda resource, fallback: ["openid", "email", LEGACY],
+        "app.calendar.google_discovery.resource_scopes_or_none",
+        lambda resource: ["openid", "email", LEGACY],
     )
     out = st.status("alice")
     assert out["whole_drive"] is True
@@ -236,8 +261,8 @@ def test_a_genuinely_byo_account_is_labelled_as_such(skill, monkeypatch):
         "app.calendar.google_discovery.google_client", lambda: {"client_id": "cid"}
     )
     monkeypatch.setattr(
-        "app.calendar.google_discovery.resource_scopes",
-        lambda resource, fallback: ["openid", "email", LEGACY],
+        "app.calendar.google_discovery.resource_scopes_or_none",
+        lambda resource: ["openid", "email", LEGACY],
     )
     assert "your own Google credentials" in st.status("alice")["access_model"]
 
@@ -257,8 +282,8 @@ def test_an_unreachable_broker_never_claims_byo(skill, monkeypatch):
 
 def test_per_file_access_model_has_no_note(skill, monkeypatch):
     monkeypatch.setattr(
-        "app.calendar.google_discovery.resource_scopes",
-        lambda resource, fallback: ["openid", "email", DRIVE_FILE],
+        "app.calendar.google_discovery.resource_scopes_or_none",
+        lambda resource: ["openid", "email", DRIVE_FILE],
     )
     out = st.status("alice")
     assert out["access_model"].startswith("per-file")

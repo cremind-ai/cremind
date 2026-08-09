@@ -50,7 +50,7 @@ an app password). It covers everything this skill dropped:
 
 | You need to… | Use |
 |---|---|
-| List or search mail | `imap-email` `list` (on Gmail accounts it accepts Gmail's own search grammar) |
+| List or search mail | `imap-email` `list` (one folder) or `search` (all mail) — on Gmail accounts both accept Gmail's own search grammar |
 | Read one message | `imap-email` `get --message-id <id>` |
 | React to new mail | `imap-email`'s `new_email` events |
 | Send mail | **this skill** (`send`) or `imap-email` `send` |
@@ -161,7 +161,11 @@ Cremind docs, *Setup → Bring your own Google credentials*.
 - `Google did not return a refresh token` → revoke at <https://myaccount.google.com/permissions> and re-link.
 - `stale_scopes: true` in `status` → the account was linked with scopes Cremind no
   longer requests. It keeps working until Google retires the grant; re-run `link`
-  to move to the current set.
+  to move to the current set. Re-linking is **one-way on the shared client** —
+  read scopes cannot be re-granted there, so bring your own client with
+  `GOOGLE_SCOPES` (above) first if you want to keep them.
+- `expected_unresolved: true` in `status` → cremind-connect was unreachable, so the
+  stale-scope check was skipped. Not a problem to fix; just don't advise a re-link.
 - A reply didn't thread → check `--in-reply-to` carries the full Message-ID
   including the angle brackets, and that the subject matches the original.
 

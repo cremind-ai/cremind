@@ -276,7 +276,9 @@ def run() -> None:
             # to do instead of looping on a traceback.
             if "invalid_grant" in str(e):
                 log.error("Google rejected the stored refresh token (invalid_grant). "
-                          "Re-run `uv run scripts/__main__.py link`, then re-grant files.")
+                          "Re-run `uv run scripts/__main__.py link` — the new link is "
+                          "per-file; whole-Drive cannot be restored on the shared "
+                          "client — then re-grant files.")
                 raise SystemExit(1)
             raise
     if data is None:

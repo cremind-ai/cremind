@@ -86,23 +86,37 @@ def _provider(doc: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def resource_scopes(resource: str, fallback: list[str]) -> list[str]:
-    """Scopes cremind-connect advertises for one Google resource.
+def resource_scopes_or_none(resource: str) -> list[str] | None:
+    """Scopes cremind-connect advertises for one resource, or ``None`` if unknown.
 
-    This is what a skill would request at ``link``, so callers can compare it
-    against what an account was actually granted.
+    Distinguishing "the broker says per-file" from "we could not ask" matters
+    whenever the answer is used to judge an existing account rather than to build
+    a request: a fallback that looks like a real answer turns every broker outage
+    into a false "your access is out of date" warning.
     """
     try:
         prov = _provider(document())
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"[google_discovery] scopes lookup fell back: {exc}")
-        return list(fallback)
+        logger.warning(f"[google_discovery] scopes lookup failed: {exc}")
+        return None
     for r in prov.get("resources", []):
         if r.get("resource") == resource:
             scopes = r.get("scopes") or []
             if scopes:
                 return list(scopes)
-    return list(prov.get("scopes") or fallback)
+    return list(prov.get("scopes") or []) or None
+
+
+def resource_scopes(resource: str, fallback: list[str]) -> list[str]:
+    """Scopes cremind-connect advertises for one Google resource.
+
+    This is what a skill would request at ``link``, so callers can compare it
+    against what an account was actually granted. Falls back rather than failing,
+    because linking must still work when the broker is briefly unreachable — use
+    :func:`resource_scopes_or_none` when a guess would be worse than no answer.
+    """
+    scopes = resource_scopes_or_none(resource)
+    return list(scopes) if scopes else list(fallback)
 
 
 def calendar_scopes() -> list[str]:

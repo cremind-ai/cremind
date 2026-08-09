@@ -113,6 +113,22 @@ def token_client_id(profile: str) -> str:
     return str((data or {}).get("client_id") or "")
 
 
+def expected_scopes_or_none(profile: str) -> Optional[List[str]]:
+    """What the gdrive skill would request at its next ``link``, if we can tell.
+
+    ``None`` means cremind-connect could not be asked. That is deliberately not
+    the same as "it advertises per-file": telling a user to re-link — which is
+    irreversible on the shared client — because the broker was briefly down would
+    be the most expensive false alarm this module can produce.
+    """
+    override = _env_override(profile, "GOOGLE_SCOPES")
+    if override:
+        return override.split()
+    from app.calendar import google_discovery
+
+    return google_discovery.resource_scopes_or_none("drive")
+
+
 def expected_scopes(profile: str) -> List[str]:
     """The scopes the gdrive skill would request at its next ``link``.
 
@@ -120,12 +136,7 @@ def expected_scopes(profile: str) -> List[str]:
     what cremind-connect advertises, then the built-in fallback — because any
     other answer would let this disagree with the skill's own ``status``.
     """
-    override = _env_override(profile, "GOOGLE_SCOPES")
-    if override:
-        return override.split()
-    from app.calendar import google_discovery
-
-    return google_discovery.resource_scopes("drive", DRIVE_SCOPES_FALLBACK)
+    return expected_scopes_or_none(profile) or list(DRIVE_SCOPES_FALLBACK)
 
 
 def scopes_are_stale(
@@ -139,12 +150,16 @@ def scopes_are_stale(
     cremind-connect starts advertising the narrower set. Comparing against
     ``expected`` keeps both of them out of the warning, and keeps this answer
     identical to the skill's own.
+
+    ``expected`` of ``None`` means the advertisement could not be read, which
+    proves nothing — so nothing is stale.
     """
     granted = set(scopes or [])
     if LEGACY_DRIVE_SCOPE not in granted or DRIVE_FILE_SCOPE in granted:
         return False
-    want = set(expected) if expected is not None else {DRIVE_FILE_SCOPE}
-    return LEGACY_DRIVE_SCOPE not in want
+    if expected is None:
+        return False
+    return LEGACY_DRIVE_SCOPE not in set(expected)
 
 
 def uses_own_client(profile: str) -> bool:
@@ -199,16 +214,19 @@ def status(profile: str) -> Dict[str, Any]:
     if not data:
         return {
             "linked": False, "email": None, "scopes": [],
-            "expected_scopes": [], "scopes_stale": False,
+            "expected_scopes": [], "scopes_stale": False, "expected_resolved": False,
             "whole_drive": False, "access_model": "not linked", "access_note": "",
         }
     scopes = data.get("scopes") or []
-    want = expected_scopes(profile)
+    want = expected_scopes_or_none(profile)
     return {
         "linked": True,
         "email": data.get("email"),
         "scopes": scopes,
-        "expected_scopes": want,
+        # Display keeps showing the fallback so the field is never empty, but the
+        # staleness verdict is computed from the truthful value.
+        "expected_scopes": want or list(DRIVE_SCOPES_FALLBACK),
+        "expected_resolved": want is not None,
         "scopes_stale": scopes_are_stale(scopes, want),
         "whole_drive": LEGACY_DRIVE_SCOPE in set(scopes),
         **access_model(profile, scopes),

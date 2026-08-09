@@ -76,11 +76,19 @@ def test_not_granted_payload_flags_a_stale_link():
 
 
 def test_stale_scope_detection():
-    assert errors.scopes_are_stale([_LEGACY]) is True
-    assert errors.scopes_are_stale([_LEGACY, DRIVE_FILE_SCOPE]) is False
-    assert errors.scopes_are_stale([DRIVE_FILE_SCOPE]) is False
-    assert errors.scopes_are_stale([]) is False
-    assert errors.scopes_are_stale(None) is False
+    per_file = ["openid", "email", DRIVE_FILE_SCOPE]
+    assert errors.scopes_are_stale([_LEGACY], per_file) is True
+    assert errors.scopes_are_stale([_LEGACY, DRIVE_FILE_SCOPE], per_file) is False
+    assert errors.scopes_are_stale([DRIVE_FILE_SCOPE], per_file) is False
+    assert errors.scopes_are_stale([], per_file) is False
+    assert errors.scopes_are_stale(None, per_file) is False
+
+
+def test_an_unreachable_broker_never_flags_stale():
+    # No ``expected`` means discovery could not answer. Acting on that guess would
+    # push the user into a re-link that permanently drops whole-Drive access.
+    assert errors.scopes_are_stale([_LEGACY], None) is False
+    assert errors.scopes_are_stale([_LEGACY]) is False
 
 
 def test_whole_drive_is_not_stale_when_it_was_requested():

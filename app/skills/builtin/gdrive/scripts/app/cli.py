@@ -86,6 +86,46 @@ def _resolve_client() -> tuple[str, str, list[str]]:
     return client_id, client_secret, scopes
 
 
+def _expected_scopes() -> tuple[list[str], bool]:
+    """``(scopes, resolved)`` — what the next ``link`` would request.
+
+    ``resolved`` is False when cremind-connect could not be asked and the fallback
+    is a guess. A guess must never drive the staleness warning: its remedy is
+    re-linking, which permanently narrows a whole-Drive account, so a broker
+    outage would otherwise talk users into an irreversible downgrade.
+    """
+    if config.GOOGLE_SCOPES:
+        return config.GOOGLE_SCOPES.split(), True
+    try:
+        scopes = Discovery(config.CREMIND_CONNECT_URL).scopes("drive")
+    except DiscoveryError:
+        return list(_FALLBACK_SCOPES), False
+    if not scopes:
+        return list(_FALLBACK_SCOPES), False
+    return list(scopes), True
+
+
+def _uses_own_client(token_client_id: str) -> bool:
+    """Whether this account was linked with the user's own OAuth client.
+
+    Mirrors the backend's ``skill_token.uses_own_client``. An env-supplied client
+    id proves bring-your-own outright; otherwise the token's client is compared
+    against the one cremind-connect advertises. An unreachable broker proves
+    nothing, so it never claims bring-your-own it cannot demonstrate — the wrong
+    attribution would tell a user they configured something they did not.
+    """
+    if config.GOOGLE_CLIENT_ID:
+        return True
+    if not token_client_id:
+        return False
+    try:
+        disc = Discovery(config.CREMIND_CONNECT_URL)
+        shared = str(disc.credentials().get("clientId") or "") or disc.client_id()
+    except DiscoveryError:
+        return False
+    return bool(shared) and token_client_id != shared
+
+
 def _svc():
     creds, _ = auth.get_credentials(config.TOKEN_PATH)
     return drive_api.build_service(creds)
@@ -142,27 +182,51 @@ def cmd_status(_args) -> Any:
     except auth.AuthError:
         return {"linked": False}
     granted = data.get("scopes") or []
+    # What this account can reach is decided by the scopes it was GRANTED, never
+    # by the scopes a future `link` would request: between setting GOOGLE_SCOPES
+    # and re-linking, the two disagree, and trusting the latter would tell the
+    # agent it has whole-Drive while every call still 404s.
+    whole_drive = errors.LEGACY_DRIVE_SCOPE in set(granted)
+    if whole_drive:
+        why = (
+            "bring-your-own credentials"
+            if _uses_own_client(str(data.get("client_id") or ""))
+            else "the shared Cremind client still requests it"
+        )
+        access_model = f"whole-Drive ({why})"
+    else:
+        access_model = "per-file (drive.file): granted files + files Cremind created"
     out: dict[str, Any] = {
         "linked": True,
         "email": data.get("email"),
         "account_key": data.get("account_key"),
         "scopes": granted,
-        "access_model": "per-file (drive.file): granted files + files Cremind created",
+        "access_model": access_model,
     }
-    try:
-        _, _, expected = _resolve_client()
-    except SystemExit:
-        expected = list(_FALLBACK_SCOPES)
+    expected, resolved = _expected_scopes()
     out["expected_scopes"] = expected
-    if errors.LEGACY_DRIVE_SCOPE in expected:
-        out["access_model"] = "whole-Drive (bring-your-own credentials)"
+    if not resolved:
+        # Say so rather than reasoning from a guess — see _expected_scopes.
+        out["expected_unresolved"] = True
+        return out
     if errors.scopes_are_stale(granted, expected):
         out["scopes_stale"] = True
         out["hint"] = (
             "This account is linked with the old whole-Drive scope, which is no longer "
-            "issued. Re-run `link` to move to per-file access, then use `grant` to pick "
-            "the files Cremind should reach. You can also revoke the old broad access at "
-            "https://myaccount.google.com/connections"
+            "issued. Re-running `link` moves it to per-file access — one-way on the "
+            "shared Cremind client, which can never be granted whole-Drive again. To "
+            "keep whole-Drive, set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / "
+            "GOOGLE_SCOPES in scripts/.env (bring your own client) before re-linking. "
+            "After re-linking, use `grant` to pick the files Cremind should reach; the "
+            "old broad access can be revoked at https://myaccount.google.com/connections"
+        )
+    elif errors.LEGACY_DRIVE_SCOPE in expected and not whole_drive:
+        # GOOGLE_SCOPES asks for whole-Drive but this token predates that: the
+        # widening only takes effect at the next consent.
+        out["hint"] = (
+            "This install requests whole-Drive, but the linked token is still per-file. "
+            "Re-run `link` to re-consent at the wider scope; until then use `grant` for "
+            "any file Cremind cannot reach."
         )
     return out
 
@@ -466,12 +530,12 @@ def main(argv: list[str] | None = None) -> int:
         if status not in (403, 404):
             raise
         stale = False
+        expected, resolved = _expected_scopes()
         try:
-            _, _, expected = _resolve_client()
-        except SystemExit:
-            expected = list(_FALLBACK_SCOPES)
-        try:
-            stale = errors.scopes_are_stale(
+            # An unresolved advertisement cannot prove staleness, and this message
+            # goes straight to the agent — a wrong "re-link first" here sends it
+            # down an irreversible path instead of the grant it actually needs.
+            stale = resolved and errors.scopes_are_stale(
                 auth.load_account(config.TOKEN_PATH).get("scopes"), expected
             )
         except auth.AuthError:

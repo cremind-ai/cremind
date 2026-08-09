@@ -58,6 +58,24 @@ def _resolve_client() -> tuple[str, str, list[str]]:
     return client_id, client_secret, scopes
 
 
+def _expected_scopes() -> tuple[list[str], bool]:
+    """``(scopes, resolved)`` — what the next ``link`` would request.
+
+    ``resolved`` is False when cremind-connect could not be asked and the fallback
+    is a guess. A guess must never drive the stale-scope warning: acting on it
+    means re-linking, which drops the read scope for good on the shared client.
+    """
+    if config.GOOGLE_SCOPES:
+        return config.GOOGLE_SCOPES.split(), True
+    try:
+        scopes = Discovery(config.CREMIND_CONNECT_URL).scopes("gmail")
+    except DiscoveryError:
+        return list(_FALLBACK_SCOPES), False
+    if not scopes:
+        return list(_FALLBACK_SCOPES), False
+    return list(scopes), True
+
+
 def _granted_scopes() -> list[str]:
     try:
         return list(auth.load_account(config.TOKEN_PATH).get("scopes") or [])
@@ -163,17 +181,21 @@ def cmd_status(_args) -> Any:
         "can_send": SEND_SCOPE in granted,
         "can_read": READ_SCOPE in granted,
     }
-    try:
-        _, _, expected = _resolve_client()
-    except SystemExit:
-        expected = list(_FALLBACK_SCOPES)
+    expected, resolved = _expected_scopes()
     out["expected_scopes"] = expected
+    if not resolved:
+        # Say so rather than reasoning from a guess — see _expected_scopes.
+        out["expected_unresolved"] = True
+        return out
     if set(granted) - set(expected):
         out["stale_scopes"] = True
         out["hint"] = (
-            "This account was linked with scopes Cremind no longer requests. It keeps "
-            "working until Google retires the grant; re-run link to move to the current "
-            "set, and use the imap-email skill for reading email."
+            "This account was linked with scopes the shared Cremind Google client no "
+            "longer requests. It keeps working until Google retires the grant. "
+            "Re-running `link` moves it to the current send-only set — one-way on the "
+            "shared client — after which reading email needs the imap-email skill. To "
+            "keep read scopes, set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / "
+            "GOOGLE_SCOPES in scripts/.env (bring your own client) before re-linking."
         )
     return out
 

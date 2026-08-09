@@ -46,7 +46,10 @@ def _print_status(out: dict[str, Any]) -> None:
     if out.get("access_note"):
         sys.stdout.write(f"{out['access_note']}\n")
     if out.get("scopes_stale"):
-        sys.stdout.write(f"\nAction needed: {out.get('hint', '')}\n")
+        # "Note", not "Action needed": the account keeps working until Google
+        # retires the grant, and the suggested action is irreversible — urgency
+        # here would push users into a one-way downgrade they cannot undo.
+        sys.stdout.write(f"\nNote: {out.get('hint', '')}\n")
 
 
 @drive_app.command("status")

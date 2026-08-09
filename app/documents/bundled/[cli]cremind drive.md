@@ -64,7 +64,15 @@ the reason as given rather than inferring one.
 
 When the account was linked before per-file access existed, `scopes_stale` is
 true and the output says to re-link: ask the agent to run the gdrive skill's
-`link` verb, then grant files again. Old grants are not lost by re-linking.
+`link` verb, then grant files again. **Re-linking is one-way on the shared
+Cremind client** — it trades whole-Drive access for per-file access permanently,
+and every file that was reachable before must then be granted individually. To
+keep whole-Drive access, bring your own Google OAuth client (set `GOOGLE_SCOPES`
+in the gdrive skill settings) *before* re-linking.
+
+`expected_resolved: false` means cremind-connect could not be reached, so what
+the next link would request is unknown. `scopes_stale` is never set in that
+state — do not tell the user to re-link on the strength of a guess.
 
 ### `files`
 
@@ -141,7 +149,9 @@ access none of them do.
 ## Troubleshooting
 
 - `Google Drive is not linked` → ask the agent to link the gdrive skill.
-- `scopes_stale: true` → re-link the gdrive skill, then re-grant.
+- `scopes_stale: true` → re-link the gdrive skill, then re-grant. One-way on the
+  shared client: whole-Drive cannot be restored after the re-link (bring your own
+  client with `GOOGLE_SCOPES` first to keep it).
 - A picked file still unreadable → the approval may have used a different Google
   account than the linked one; `status` shows which email is linked.
 - Grant seems to do nothing on a remote install → use `grant-complete`, or run

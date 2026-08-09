@@ -68,10 +68,17 @@ def get_drive_routes() -> List[Route]:
         # access_model / access_note come from skill_token so every client
         # describes the same account the same way.
         if payload["scopes_stale"]:
+            # Say what re-linking costs. On the shared client the whole-Drive scope
+            # can never be issued again, so a user who follows this without knowing
+            # that cannot undo it.
             payload["hint"] = (
-                "This account is linked with the old whole-Drive scope, which Cremind "
-                "no longer requests. Ask the agent to re-link the gdrive skill, then "
-                "grant the files Cremind should reach."
+                "This account still holds the old whole-Drive access, which Cremind no "
+                "longer requests. Re-linking moves it to per-file access — and on the "
+                "shared Cremind client that is one-way: whole-Drive can never be granted "
+                "again. To keep whole-Drive, configure your own Google OAuth client and "
+                "GOOGLE_SCOPES in the gdrive skill settings before re-linking. Otherwise "
+                "ask the agent to re-link the gdrive skill, then grant the files Cremind "
+                "should reach."
             )
         return JSONResponse(payload)
 

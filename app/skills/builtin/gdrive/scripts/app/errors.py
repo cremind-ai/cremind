@@ -27,6 +27,14 @@ LEGACY_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 
 # Distinct from the exit code used for auth failures, so callers can tell
 # "not linked" from "linked but this file was never granted".
+#
+# CONTRACT WITH THE BACKEND: an unattended run cannot complete a browser consent,
+# so the agent is told to notify and stop — which on its own would leave the run
+# reporting success. ``stream_runner._detect_drive_not_granted`` therefore scans
+# tool output for the literal ``"drive_file_not_granted"`` marker, the ``file_id``
+# key, and a non-zero exit code, and finalizes the event run as failed. Renaming
+# any of the three silently disarms that. ``tests/agent/test_drive_not_granted_
+# finalize.py`` builds its fixtures from this module to keep the two honest.
 EXIT_NOT_GRANTED = 3
 
 
@@ -66,8 +74,10 @@ def not_granted_payload(
         payload["scopes_stale"] = True
         payload["message"] += (
             " This account is still linked with the old whole-Drive scope, which is no "
-            "longer issued. Re-link first (`uv run scripts/__main__.py link`), then grant "
-            "the file."
+            "longer issued. Re-link first (`uv run scripts/__main__.py link`) — note "
+            "that on the shared Cremind client this permanently moves the account to "
+            "per-file access — then grant the file. To keep whole-Drive instead, set "
+            "GOOGLE_SCOPES with your own OAuth client in scripts/.env before re-linking."
         )
     return payload
 
@@ -85,9 +95,14 @@ def scopes_are_stale(
     ``expected`` guards against a false alarm for bring-your-own credentials: a
     user whose own OAuth client legitimately requests whole-Drive holds the legacy
     scope on purpose, so only flag it when per-file access is what we asked for.
+
+    ``expected`` of ``None`` means we could not find out what is requested, which
+    proves nothing — so nothing is stale. Mirrors the backend's
+    ``app.drive.skill_token.scopes_are_stale``.
     """
     scopes = set(granted or [])
     if LEGACY_DRIVE_SCOPE not in scopes or DRIVE_FILE_SCOPE in scopes:
         return False
-    want = set(expected) if expected is not None else {DRIVE_FILE_SCOPE}
-    return LEGACY_DRIVE_SCOPE not in want
+    if expected is None:
+        return False
+    return LEGACY_DRIVE_SCOPE not in set(expected)

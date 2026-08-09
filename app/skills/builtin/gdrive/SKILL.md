@@ -71,13 +71,23 @@ What this scope cannot do, at all:
   or run `grant` so they can pick it.
 - **No whole-Drive monitoring.** The listener only sees changes to granted files.
 
-### B. Whole-Drive access (bring-your-own credentials: `.../auth/drive`)
+### B. Whole-Drive access (`.../auth/drive`)
 
-`access_model: "whole-Drive (bring-your-own credentials)"`. The user supplied
-their own Google OAuth client (see *Bring your own Google credentials* below).
-Then: `list` **is** a real whole-Drive search, every file is reachable by id, and
-`grant` is unnecessary and should not be run. A 403/404 here means the file
-really is missing or belongs to someone else — not a missing grant.
+`access_model` starts with `"whole-Drive"` and names the reason in parentheses:
+
+- `whole-Drive (bring-your-own credentials)` — the user supplied their own Google
+  OAuth client (see *Bring your own Google credentials* below).
+- `whole-Drive (the shared Cremind client still requests it)` — the account was
+  linked before Cremind narrowed its scopes. The user configured nothing; do not
+  tell them they chose this.
+
+Either way: `list` **is** a real whole-Drive search, every file is reachable by
+id, and `grant` is unnecessary and should not be run. A 403/404 here means the
+file really is missing or belongs to someone else — not a missing grant.
+
+`access_model` always reflects the scopes the account was **granted**, so it is
+safe to reason from. If `status` also reports a `hint` about re-linking, that is
+about a *future* consent and does not change what is reachable right now.
 
 Sheets and Docs are different under either model: the **gsheets** and **gdocs**
 skills read and write any spreadsheet/document the user owns straight from a URL
@@ -308,6 +318,15 @@ uv run scripts/__main__.py link      # re-consents at the new, smaller scope
 uv run scripts/__main__.py grant     # pick the files Cremind should keep reaching
 ```
 
+**This migration is one-way on the shared Cremind client.** Google no longer
+issues the whole-Drive scope to it, so once re-linked there is no route back
+except bringing your own credentials (next section). Decide before re-linking,
+and set `GOOGLE_SCOPES` first if you want to keep whole-Drive. Say this plainly
+when you suggest a re-link — the user cannot undo it.
+
+If `status` reports `expected_unresolved: true`, cremind-connect was unreachable
+and there is no staleness verdict to act on. Do not suggest re-linking then.
+
 The listener needs no attention: its saved `pageToken` stays valid and the feed
 simply narrows to granted files. If the listener logs `invalid_grant`, the stored
 refresh token is dead — re-link.
@@ -353,7 +372,10 @@ the Cremind docs, *Setup → Bring your own Google credentials*.
 - `drive_file_not_granted` (exit 3) → the file was never granted, or doesn't
   exist. Interactive: run `grant --file <id>` and show the user the URL.
   Unattended: notify and stop (see above).
-- `scopes_stale: true` in `status` → re-link, then re-grant (see migration above).
+- `scopes_stale: true` in `status` → re-link, then re-grant (see migration above;
+  it is one-way on the shared client).
+- `expected_unresolved: true` in `status` → cremind-connect was unreachable, so the
+  staleness check was skipped. Not a problem to fix; just don't advise a re-link.
 - `No GOOGLE_CLIENT_SECRET available` → cremind-connect must be reachable (it
   serves the secret), or set it in `scripts/.env` to override.
 - A picked file still unreadable → confirm the user approved with the **linked**
