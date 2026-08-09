@@ -227,6 +227,52 @@ class UsageStorage:
             }
         return out
 
+    async def rollup_by_conversation(
+        self, conversation_ids: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Token + cost totals per conversation, keyed by ``conversation_id``.
+
+        One ``GROUP BY conversation_id`` over ``usage_records`` (the pair index
+        ``ix_usage_records_conv_msg`` covers the filter), mirroring
+        :meth:`rollup_by_event_run`. Feeds the channels admin page's per-sender
+        usage column, so a handful of ids is the normal case. Returns only
+        conversations that have at least one usage row.
+
+        Totals survive a history wipe: clearing a conversation's messages leaves
+        its usage rows attached to the conversation (only ``message_id`` is
+        cleared), which is exactly why the summary keeps counting.
+        """
+        if not conversation_ids:
+            return {}
+        async with self.async_session_maker() as session:
+            stmt = (
+                select(
+                    UsageRecordModel.conversation_id,
+                    func.coalesce(func.sum(UsageRecordModel.input_tokens), 0),
+                    func.coalesce(func.sum(UsageRecordModel.cache_read_input_tokens), 0),
+                    func.coalesce(func.sum(UsageRecordModel.cache_creation_input_tokens), 0),
+                    func.coalesce(func.sum(UsageRecordModel.output_tokens), 0),
+                    func.sum(UsageRecordModel.total_usd),
+                    func.count(func.distinct(UsageRecordModel.message_id)),
+                )
+                .where(UsageRecordModel.conversation_id.in_(conversation_ids))
+                .group_by(UsageRecordModel.conversation_id)
+            )
+            rows = (await session.execute(stmt)).all()
+        out: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            it, cr, cc, ot = int(r[1]), int(r[2]), int(r[3]), int(r[4])
+            out[r[0]] = {
+                "input_tokens": it,
+                "cache_read_input_tokens": cr,
+                "cache_creation_input_tokens": cc,
+                "output_tokens": ot,
+                "total_tokens": it + cr + cc + ot,
+                "total_usd": float(r[5]) if r[5] is not None else 0.0,
+                "request_count": int(r[6]),
+            }
+        return out
+
     # ── dashboard reads (optional profile / time-range scope) ────────────────
 
     async def totals(

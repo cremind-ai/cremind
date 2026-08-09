@@ -1,5 +1,5 @@
 ---
-description: "Create, list, inspect, rename, and delete Cremind **profiles**, and **choose which profile the CLI acts as without setting `CREMIND_TOKEN`** — pick a profile interactively on first use in a terminal (a type-to-filter list), or select one directly with the root `--profile` flag or `cremind profile use`, remembered per terminal. Covers making/adding/registering a new profile, removing one, reading or editing a profile's **persona** text and the assistant's **agent name** (display name), and switching the active profile. Subcommands: `use`, `which`, `clear`, `create`, `list`, `get`, `delete`, `persona get/set`, `agent-name get/set`. Each profile isolates its own conversations, tool overrides, and agent registrations."
+description: "Create, list, inspect, rename, and delete Cremind **profiles**, and **choose which profile the CLI acts as without setting `CREMIND_TOKEN`** — pick a profile interactively on first use in a terminal (a type-to-filter list), or select one directly with the root `--profile` flag or `cremind profile use`, remembered per terminal. Covers making/adding/registering a new profile, removing one, reading or editing a profile's **persona** text (who the agent is), its **standing instructions** (task directives the agent must follow in every conversation, e.g. registering new channel users in a sheet), and the assistant's **agent name** (display name), plus switching the active profile. Subcommands: `use`, `which`, `clear`, `create`, `list`, `get`, `delete`, `persona get/set`, `instructions get/set`, `agent-name get/set`. Each profile isolates its own conversations, tool overrides, and agent registrations."
 ---
 
 # `cremind profile` — Profile Management & Selection
@@ -20,7 +20,7 @@ without the prompt — via the root `--profile` flag or `cremind profile
 use`. An explicit `CREMIND_TOKEN` in the environment (as injected into
 `exec_shell` subprocesses) still takes precedence when set.
 
-The command groups together four concerns:
+The command groups together five concerns:
 
 - **Profile selection** — `use`, `which`, `clear`, plus the root
   `--profile` flag. Chooses which profile subsequent commands act as, per
@@ -28,7 +28,14 @@ The command groups together four concerns:
 - **Profile lifecycle** — `list`, `get`, `create`, `delete`.
 - **Persona text** — `persona get`, `persona set`. The persona is a
   free-form Markdown blob prepended to the agent's system prompt for
-  that profile.
+  that profile. It describes **who the agent is**: personality, tone,
+  background, what it can do.
+- **Standing instructions** — `instructions get`, `instructions set`. A
+  second free-form Markdown blob, injected into the same system prompt as
+  its own `STANDING INSTRUCTIONS` section. It describes **what the agent
+  must do**: task directives to follow in every conversation. Keeping
+  these out of the persona is deliberate — persona is identity,
+  instructions are standing work. Empty by default.
 - **Agent name** — `agent-name get`, `agent-name set`. The display name
   the assistant goes by for that profile — shown in the chat header and
   in the `@`-mention menu when more than one profile is reachable.
@@ -44,11 +51,12 @@ the Cremind web UI:
 
 > **Sidebar → Profiles**
 
-The page shows one row per profile with edit/delete buttons. Selecting
-a profile opens a detail panel with two fields — **Persona** (a Markdown
-editor matching `cremind profile persona set`) and **Agent name** (a
-single-line input matching `cremind profile agent-name set`). Anything you
-change here is immediately visible to `cremind profile get`.
+The page shows one row per profile with edit/delete buttons, plus editor
+sections matching this command group — **Agent name** (a single-line input
+matching `cremind profile agent-name set`), **PERSONA.md** (a Markdown
+editor matching `cremind profile persona set`), and **INSTRUCTIONS.md**
+directly below it (matching `cremind profile instructions set`). Anything
+you change here is immediately visible to `cremind profile get`.
 
 ## Global flags
 
@@ -185,8 +193,9 @@ guest
 
 ### `cremind profile get`
 
-**Purpose.** Show a profile's persona text and agent name together.
-This is the equivalent of opening the profile's detail panel in the UI.
+**Purpose.** Show a profile's persona text, standing instructions, and
+agent name together. This is the equivalent of opening the profile's
+detail panel in the UI.
 
 **Syntax.**
 
@@ -200,8 +209,11 @@ cremind profile get <profile name>
 
 **Behavior.** Prints a header with `name` and `agent_name`, a blank
 line, and the literal `--- persona ---` separator followed by the full
-persona Markdown. With `--json`, emits a single object with keys
-`name`, `persona`, and `agent_name`.
+persona Markdown. When the profile has standing instructions, an
+`--- instructions ---` section follows; it is omitted entirely when they
+are empty. With `--json`, emits a single object with keys `name`,
+`persona`, `instructions`, and `agent_name` (`instructions` is `""` when
+unset).
 
 **Example.**
 
@@ -212,6 +224,10 @@ agent_name  Ada
 
 --- persona ---
 You are an Cremind admin assistant. Prefer crisp, direct replies.
+
+--- instructions ---
+When a new user messages a channel, check the 'Active-User' sheet and
+add a row for them if they are missing.
 ```
 
 ### `cremind profile create`
@@ -357,6 +373,82 @@ EOF
 $ cremind profile persona get admin > /tmp/persona.md
 $ $EDITOR /tmp/persona.md
 $ cremind profile persona set admin < /tmp/persona.md
+```
+
+### `cremind profile instructions get`
+
+**Purpose.** Print just the standing-instructions text — useful for
+piping into a file, an editor, or a diff.
+
+**Syntax.**
+
+```bash
+cremind profile instructions get <profile name>
+```
+
+**Arguments** (required):
+
+- `<profile name>` — Profile whose instructions should be printed.
+
+**Behavior.** Writes the instructions to stdout verbatim. A profile that
+has never set any prints nothing (empty output is normal, not an error).
+With `--json`, wraps it as `{"content": "..."}`.
+
+**Example.**
+
+```bash
+$ cremind profile instructions get admin > admin.instructions.md
+```
+
+### `cremind profile instructions set`
+
+**Purpose.** Replace the standing instructions for a profile in one
+shot. Same inline-or-stdin shape as `persona set`.
+
+**Syntax.**
+
+```bash
+cremind profile instructions set <profile name> <content>   # inline text
+cremind profile instructions set <profile name>             # reads from stdin
+```
+
+**Arguments.** Order matters — the profile **name comes first**:
+
+- `<profile name>` (required) — Profile whose instructions are being
+  overwritten.
+- `<content>` (optional) — The instructions text. If given, it is used
+  verbatim (quote multi-line text). If omitted, the text is read from
+  stdin until EOF. Providing no text — an interactive terminal, an empty
+  pipe, or `< /dev/null` — is an error: the command prints a usage hint
+  and exits non-zero rather than silently wiping the instructions.
+
+**Behavior.** Replaces the previous instructions wholesale (no
+patch/append mode). Silent on success. To deliberately clear them, pass
+an explicit empty argument: `cremind profile instructions set <profile
+name> ""`. The text becomes a `STANDING INSTRUCTIONS` section in the
+agent's system prompt for that profile, alongside — but separate from —
+the persona; it takes effect on the next run, with no restart needed.
+
+**Driving this non-interactively (agents / scripts).** Identical to
+`persona set`: prefer the inline argument for short text, or the stdin
+form with an explicit EOF (`exec_shell_input` with `close_stdin=true`)
+for multi-line content with `$`, backticks, or quotes.
+
+**Examples.**
+
+```bash
+# Inline
+$ cremind profile instructions set admin "Always reply in the user's language."
+
+# From a heredoc — the typical multi-directive case
+$ cremind profile instructions set admin <<'EOF'
+When a new user messages one of this profile's channels, look them up in
+the 'Active-User' Google Sheet. If they are not there yet, append a row
+with their channel, sender id, display name, and today's date.
+EOF
+
+# Clear them
+$ cremind profile instructions set admin ""
 ```
 
 ### `cremind profile agent-name get`

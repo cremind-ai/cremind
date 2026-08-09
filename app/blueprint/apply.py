@@ -148,6 +148,7 @@ def apply_settings(session: ImportSession, inputs: dict, deps: Deps) -> dict:
 
 def apply_persona(session: ImportSession, inputs: dict, deps: Deps) -> dict:
     from app.utils.agent_name import write_agent_name
+    from app.utils.instructions import write_instructions_file
     from app.utils.persona import write_persona_file
 
     data = load_component(session.payload_dir, "persona") or {}
@@ -157,6 +158,12 @@ def apply_persona(session: ImportSession, inputs: dict, deps: Deps) -> dict:
     if persona is not None:
         write_persona_file(profile, persona)
         applied.append("persona")
+    # Absent key = a blueprint exported before standing instructions existed:
+    # leave whatever the target profile already has. An explicit "" clears them.
+    instructions = data.get("instructions_markdown")
+    if instructions is not None:
+        write_instructions_file(profile, instructions)
+        applied.append("instructions")
     agent_name = (data.get("agent_name") or "").strip()
     if agent_name:
         write_agent_name(profile, agent_name)

@@ -16,6 +16,7 @@ from app.storage.conversation_storage import ConversationStorage
 from app.tools import ToolRegistry
 from app.utils import logger
 from app.utils.agent_name import read_agent_name, write_agent_name
+from app.utils.instructions import read_instructions_file, write_instructions_file
 from app.utils.persona import ensure_persona_file, read_persona_file, write_persona_file
 
 
@@ -217,6 +218,34 @@ def get_profile_routes(
             logger.error(f"Error writing persona for '{profile_name}': {e}")
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    async def handle_get_instructions(request: Request) -> JSONResponse:
+        profile_name, err = _require_own_profile(request)
+        if err is not None:
+            return err
+        try:
+            return JSONResponse({"content": read_instructions_file(profile_name)})
+        except Exception as e:
+            logger.error(f"Error reading instructions for '{profile_name}': {e}")
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    async def handle_update_instructions(request: Request) -> JSONResponse:
+        profile_name, err = _require_own_profile(request)
+        if err is not None:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        content = body.get("content")
+        if content is None:
+            return JSONResponse({"error": "'content' field is required"}, status_code=400)
+        try:
+            write_instructions_file(profile_name, content)
+            return JSONResponse({"success": True})
+        except Exception as e:
+            logger.error(f"Error writing instructions for '{profile_name}': {e}")
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     async def handle_list_agent_names(request: Request) -> JSONResponse:
         """Agent names for every visible profile — feeds the chat ``@`` menu."""
         unauth = _require_auth(request)
@@ -279,6 +308,14 @@ def get_profile_routes(
         Route(
             path="/api/profiles/{profile_name}/persona",
             methods=["PUT"], endpoint=handle_update_persona,
+        ),
+        Route(
+            path="/api/profiles/{profile_name}/instructions",
+            methods=["GET"], endpoint=handle_get_instructions,
+        ),
+        Route(
+            path="/api/profiles/{profile_name}/instructions",
+            methods=["PUT"], endpoint=handle_update_instructions,
         ),
         Route(
             path="/api/profiles/{profile_name}/agent-name",

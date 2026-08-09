@@ -2,11 +2,12 @@
 import { ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { goBackToChat } from '../utils/backToChat';
-import { ElButton, ElCard, ElEmpty, ElMessage, ElTable, ElTableColumn, ElTag } from 'element-plus';
+import { ElButton, ElCard, ElEmpty, ElMessage, ElMessageBox, ElTable, ElTableColumn, ElTag } from 'element-plus';
 import { Icon } from '@iconify/vue';
 
 import { useChannelsStore, MAIN_CHANNEL_TYPE } from '../stores/channels';
 import type { ChannelRow, ChannelSenderRow } from '../services/channelApi';
+import { formatTokens, formatTokensCompact, formatUsd } from '../utils/usageFormat';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -64,11 +65,58 @@ async function setSenderAuth(
     const list = senders.value[channel.id];
     if (list) {
       const idx = list.findIndex((s) => s.sender_id === updated.sender_id);
-      if (idx >= 0) list[idx] = updated;
+      // The PATCH response carries no usage totals — keep the ones we loaded,
+      // otherwise approving someone blanks their Usage cell until a refetch.
+      if (idx >= 0) list[idx] = { ...updated, usage: list[idx].usage };
     }
     ElMessage.success(authenticated ? 'Subscriber approved' : 'Subscriber revoked');
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : 'Failed to update subscriber');
+  }
+}
+
+const clearing = ref<string | null>(null);
+
+/** Tooltip detail behind the compact Usage cell. */
+function usageTooltip(senderRow: ChannelSenderRow): string {
+  const u = senderRow.usage;
+  if (!u) return '';
+  return [
+    `Input: ${formatTokens(u.input_tokens)}`,
+    `Cache read: ${formatTokens(u.cache_read_input_tokens)}`,
+    `Cache write: ${formatTokens(u.cache_creation_input_tokens)}`,
+    `Output: ${formatTokens(u.output_tokens)}`,
+    `Requests: ${formatTokens(u.request_count)}`,
+    `Cost: ${formatUsd(u.total_usd)}`,
+  ].join(' · ');
+}
+
+async function clearSenderHistory(channel: ChannelRow, senderRow: ChannelSenderRow) {
+  const who = senderRow.display_name || senderRow.sender_id;
+  try {
+    await ElMessageBox.confirm(
+      `Permanently delete every message in ${who}'s conversation? `
+      + 'They keep the same conversation — their next message continues in it — '
+      + 'and the token usage totals shown here are kept.',
+      'Clear history',
+      { type: 'warning', confirmButtonText: 'Clear history', cancelButtonText: 'Cancel', confirmButtonClass: 'el-button--danger' },
+    );
+  } catch {
+    return; // dismissed
+  }
+  clearing.value = senderRow.sender_id;
+  try {
+    const res = await channelsStore.clearSenderHistory(channel.id, senderRow.sender_id);
+    ElMessage.success(
+      res.cleared_messages > 0
+        ? `Cleared ${res.cleared_messages} message${res.cleared_messages === 1 ? '' : 's'}`
+        : 'No messages to clear',
+    );
+    senders.value[channel.id] = await channelsStore.fetchSenders(channel.id);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to clear history');
+  } finally {
+    clearing.value = null;
   }
 }
 
@@ -175,6 +223,15 @@ onMounted(loadAll);
               </ElTag>
             </template>
           </ElTableColumn>
+          <ElTableColumn label="Usage" width="150">
+            <template #default="{ row }">
+              <span v-if="row.usage" class="usage-cell" :title="usageTooltip(row as ChannelSenderRow)">
+                {{ formatTokensCompact(row.usage.total_tokens) }} tok
+                <span class="usage-cost">{{ formatUsd(row.usage.total_usd) }}</span>
+              </span>
+              <span v-else class="muted">—</span>
+            </template>
+          </ElTableColumn>
           <ElTableColumn label="Subscription" width="130">
             <template #default="{ row }">
               <ElButton
@@ -189,13 +246,19 @@ onMounted(loadAll);
               >Revoke</ElButton>
             </template>
           </ElTableColumn>
-          <ElTableColumn label="Conversation" width="140">
+          <ElTableColumn label="Conversation" width="190">
             <template #default="{ row }">
-              <ElButton
-                v-if="row.conversation_id"
-                size="small" link
-                @click="openConversation(row as ChannelSenderRow)"
-              >Open</ElButton>
+              <template v-if="row.conversation_id">
+                <ElButton
+                  size="small" link
+                  @click="openConversation(row as ChannelSenderRow)"
+                >Open</ElButton>
+                <ElButton
+                  size="small" type="danger" link
+                  :loading="clearing === row.sender_id"
+                  @click="clearSenderHistory(channel, row as ChannelSenderRow)"
+                >Clear history</ElButton>
+              </template>
               <span v-else class="muted">—</span>
             </template>
           </ElTableColumn>
@@ -234,4 +297,6 @@ onMounted(loadAll);
 .chevron { font-size: 20px; color: var(--text-tertiary); }
 .senders { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border-color); }
 .muted { color: var(--text-tertiary); font-size: 0.85rem; }
+.usage-cell { font-size: 0.85rem; white-space: nowrap; cursor: default; }
+.usage-cost { color: var(--text-secondary); margin-left: 6px; }
 </style>

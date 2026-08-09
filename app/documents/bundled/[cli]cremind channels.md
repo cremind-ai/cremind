@@ -1,5 +1,5 @@
 ---
-description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders`, run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), set a channel's push-notification filter with `notify-filter`, push an ad-hoc message out to a notification channel with `send`, `approve`/`revoke` who may subscribe to a notification channel, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). All channels gate access with the same per-channel **authentication** method — open, passcode, one-time code (`otp`), admin approval, or allowlist — controlling who may chat (bot/userbot) or subscribe (notification); `approve`/`revoke` authorize individual senders and work in every mode. A notification channel can also receive one-off messages you send with `cremind channels send` — the same delivery the agent's `send_notification` tool uses when you ask it to 'notify me on Telegram'. Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
+description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders` with their token usage, wipe one subscriber's conversation history with `clear-history`, run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), set a channel's push-notification filter with `notify-filter`, push an ad-hoc message out to a notification channel with `send`, `approve`/`revoke` who may subscribe to a notification channel, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). All channels gate access with the same per-channel **authentication** method — open, passcode, one-time code (`otp`), admin approval, or allowlist — controlling who may chat (bot/userbot) or subscribe (notification); `approve`/`revoke` authorize individual senders and work in every mode. A notification channel can also receive one-off messages you send with `cremind channels send` — the same delivery the agent's `send_notification` tool uses when you ask it to 'notify me on Telegram'. Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
 ---
 
 # `cremind channels` — External Messaging Channel Management
@@ -121,10 +121,12 @@ of the Cremind web UI:
 
 The Settings page exposes the **Add Channel** flow (mirroring `cremind
 channels add`); the sidebar Channels page lists channels with their
-runtime status and per-sender authentication state (mirroring `cremind
-channels list` plus the `senders` API the CLI doesn't expose). The
-sidebar's conversation-list channel selector mirrors `cremind conv list
---channel <type>`.
+runtime status and, when a channel is expanded, one row per subscriber
+showing authentication state, that subscriber's **token usage and cost**,
+and per-row **Approve**/**Revoke**, **Open**, and **Clear history**
+actions (mirroring `cremind channels list`, `senders`,
+`approve`/`revoke`, and `clear-history`). The sidebar's conversation-list
+channel selector mirrors `cremind conv list --channel <type>`.
 
 ## Global flags
 
@@ -495,7 +497,8 @@ e2e8...d4f1: enabled=false status=stopped
 
 ### `cremind channels senders`
 
-**Purpose.** List the senders (remote users) seen on a channel.
+**Purpose.** List the senders (remote users) seen on a channel, with each
+one's token usage.
 
 **Syntax.**
 
@@ -503,16 +506,24 @@ e2e8...d4f1: enabled=false status=stopped
 cremind channels senders <id>
 ```
 
-**Behavior.** Prints a `SENDER_ID / NAME / AUTHED / CONVERSATION_ID / PENDING_OTP`
-table (any active OTP code is redacted to `***`). `--json` returns the raw
-sender rows. Prints `no senders.` when the channel hasn't seen any.
+**Behavior.** Prints a
+`SENDER_ID / NAME / AUTHED / TOKENS / COST_USD / CONVERSATION_ID / PENDING_OTP`
+table (any active OTP code is redacted to `***`). `TOKENS` and `COST_USD`
+are that sender's cumulative totals across their conversation — the same
+numbers the conversation's usage panel shows, rolled up so you don't have
+to open each conversation; both are blank for a sender with no recorded
+usage yet. `--json` returns the raw sender rows, each with a `usage`
+object (`input_tokens`, `cache_read_input_tokens`,
+`cache_creation_input_tokens`, `output_tokens`, `total_tokens`,
+`total_usd`, `request_count`) or `null`. Prints `no senders.` when the
+channel hasn't seen any.
 
 **Example.**
 
 ```bash
 $ cremind channels senders e2e8...d4f1
-SENDER_ID    NAME        AUTHED  CONVERSATION_ID  PENDING_OTP
-84986664411  Lee Nguyen  yes     c_92bc
+SENDER_ID    NAME        AUTHED  TOKENS   COST_USD  CONVERSATION_ID  PENDING_OTP
+84986664411  Lee Nguyen  yes     124,908  0.2841    c_92bc
 ```
 
 ### `cremind channels approve` / `cremind channels revoke`
@@ -556,6 +567,57 @@ $ cremind channels approve e2e8...d4f1 84986664411
 $ cremind channels revoke e2e8...d4f1 84986664411
 84986664411: revoked on channel e2e8...d4f1
 ```
+
+### `cremind channels clear-history`
+
+**Purpose.** Wipe one subscriber's conversation history on a channel —
+the per-user equivalent of clearing a chat, without touching anyone else
+on that channel.
+
+**Syntax.**
+
+```bash
+cremind channels clear-history <channel_id> <sender_id> [--yes]
+```
+
+**Behavior.** Deletes every message in that sender's conversation but
+**keeps the conversation itself**. Three consequences worth knowing:
+
+- The sender's next message continues in the same conversation (a fresh
+  one is *not* created), so their conversation id and any automations
+  homed on it stay valid.
+- Their token/cost totals in `cremind channels senders` and on the web
+  Channels page **survive** the wipe — usage is attributed to the
+  conversation, not to the messages.
+- Skill events, file watchers, and schedules the sender registered stay
+  armed. Clearing chat history is not a way to disarm automations.
+
+Queued-but-unstarted turns, the live replay buffer, and the wiped turns'
+plan files are dropped along with the messages. If the subscriber has a
+run in progress the command fails with a 409 — wait for it to finish.
+Sender ids come from `cremind channels senders <channel_id>`; a sender
+who has never spoken has no conversation and the command reports that
+without failing.
+
+**Confirmation.** Prompts before deleting. `--yes` / `-y` skips the
+prompt; **non-interactively (scripts, `exec_shell`) `--yes` is required**
+— without it the command explains what it would delete and exits 1
+rather than guessing.
+
+**Example.**
+
+```bash
+$ cremind channels clear-history e2e8...d4f1 84986664411 --yes
+84986664411: cleared 42 message(s) from conversation c_92bc
+
+# Usage totals are still there afterwards
+$ cremind channels senders e2e8...d4f1
+SENDER_ID    NAME        AUTHED  TOKENS   COST_USD  CONVERSATION_ID  PENDING_OTP
+84986664411  Lee Nguyen  yes     124,908  0.2841    c_92bc
+```
+
+The web UI's Channels page exposes the same action as a **Clear history**
+button on each subscriber row.
 
 ### `cremind channels pair`
 

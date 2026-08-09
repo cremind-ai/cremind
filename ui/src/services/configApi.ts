@@ -1325,6 +1325,35 @@ export async function updatePersona(
   return res.json();
 }
 
+export async function getInstructions(
+  agentUrl: string,
+  token: string,
+  profileName: string
+): Promise<{ content: string }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/profiles/${encodeURIComponent(profileName)}/instructions`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(`Failed to load instructions: ${res.statusText}`);
+  return res.json();
+}
+
+export async function updateInstructions(
+  agentUrl: string,
+  token: string,
+  profileName: string,
+  content: string
+): Promise<{ success: boolean }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/profiles/${encodeURIComponent(profileName)}/instructions`, {
+    method: 'PUT',
+    headers: authHeaders(token),
+    body: JSON.stringify({ content }),
+  });
+  if (!res.ok) throw new Error(`Failed to update instructions: ${res.statusText}`);
+  return res.json();
+}
+
 // ── Agent name ──
 
 export interface AgentNameEntry {

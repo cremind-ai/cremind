@@ -1,4 +1,4 @@
-"""`cremind profile ...` — manage Cremind profiles, persona, and agent name.
+"""`cremind profile ...` — manage Cremind profiles, persona, instructions, agent name.
 
 Mirrors `cli/cmd/profile.go`.
 """
@@ -15,12 +15,17 @@ from app.cli.commands._helpers import graceful_errors
 
 profile_app = typer.Typer(
     name="profile",
-    help="Manage Cremind profiles, persona, and agent name.",
+    help="Manage Cremind profiles, persona, standing instructions, and agent name.",
     no_args_is_help=True,
 )
 persona_app = typer.Typer(
     name="persona",
     help="Manage a profile's persona text.",
+    no_args_is_help=True,
+)
+instructions_app = typer.Typer(
+    name="instructions",
+    help="Manage a profile's standing instructions (task directives, not persona).",
     no_args_is_help=True,
 )
 agent_name_app = typer.Typer(
@@ -29,6 +34,7 @@ agent_name_app = typer.Typer(
     no_args_is_help=True,
 )
 profile_app.add_typer(persona_app, name="persona")
+profile_app.add_typer(instructions_app, name="instructions")
 profile_app.add_typer(agent_name_app, name="agent-name")
 
 
@@ -109,11 +115,11 @@ def profile_get(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Profile name."),
 ) -> None:
-    """Show details for a profile (persona + agent name)."""
+    """Show details for a profile (persona + instructions + agent name)."""
     import asyncio
 
     from app.cli.client._base import Client
-    from app.cli.client.profiles import get_agent_name, get_persona
+    from app.cli.client.profiles import get_agent_name, get_instructions, get_persona
     from app.cli.config import Config
     from app.cli.output import OutputMode, print_json, print_kv
 
@@ -121,18 +127,20 @@ def profile_get(
     mode: OutputMode = ctx.obj["mode"]
     cfg.require_token()
 
-    async def _run() -> tuple[str, str]:
+    async def _run() -> tuple[str, str, str]:
         async with Client(cfg) as client:
             persona = await get_persona(client, name)
+            instructions = await get_instructions(client, name)
             agent_name = await get_agent_name(client, name)
-            return persona, agent_name
+            return persona, instructions, agent_name
 
-    persona, agent_name = asyncio.run(_run())
+    persona, instructions, agent_name = asyncio.run(_run())
 
     if mode.json:
         print_json({
             "name": name,
             "persona": persona,
+            "instructions": instructions,
             "agent_name": agent_name,
         })
         return
@@ -142,6 +150,12 @@ def profile_get(
     sys.stdout.write(persona)
     if not persona.endswith("\n"):
         sys.stdout.write("\n")
+    # Omitted entirely when unset — most profiles have no standing instructions.
+    if instructions.strip():
+        sys.stdout.write("\n--- instructions ---\n")
+        sys.stdout.write(instructions)
+        if not instructions.endswith("\n"):
+            sys.stdout.write("\n")
 
 
 @profile_app.command("create")
@@ -264,6 +278,82 @@ def persona_set(
     async def _run() -> None:
         async with Client(cfg) as client:
             await set_persona(client, name, body)
+
+    asyncio.run(_run())
+
+
+@instructions_app.command("get")
+@graceful_errors
+def instructions_get(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Profile name."),
+) -> None:
+    """Print a profile's standing instructions to stdout."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.profiles import get_instructions
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> str:
+        async with Client(cfg) as client:
+            return await get_instructions(client, name)
+
+    instructions = asyncio.run(_run())
+
+    if mode.json:
+        print_json({"content": instructions})
+    else:
+        sys.stdout.write(instructions)
+
+
+@instructions_app.command("set")
+@graceful_errors
+def instructions_set(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Profile name."),
+    content: Optional[str] = typer.Argument(
+        None,
+        help="Instructions text. If omitted, read from stdin (file redirect, heredoc, or pipe).",
+    ),
+) -> None:
+    """Replace a profile's standing instructions from an argument or stdin."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.profiles import set_instructions
+    from app.cli.config import Config
+
+    cfg: Config = ctx.obj["cfg"]
+    cfg.require_token()
+
+    if content is not None:
+        body = content
+    else:
+        usage = (
+            "instructions set: provide the instructions text. Usage: "
+            "`cremind profile instructions set <name> <text>` "
+            "(or `cremind profile instructions set <name> < file.md`)."
+        )
+        if sys.stdin.isatty():
+            typer.echo(usage, err=True)
+            raise typer.Exit(code=1)
+        body = sys.stdin.read()
+        if not body.strip():
+            # Empty pipe / `< /dev/null` / exec_shell's stdin auto-EOF: same
+            # guard as `persona set` — don't silently wipe the instructions.
+            # A deliberate clear stays possible: `instructions set <name> ""`.
+            typer.echo(usage, err=True)
+            raise typer.Exit(code=1)
+
+    async def _run() -> None:
+        async with Client(cfg) as client:
+            await set_instructions(client, name, body)
 
     asyncio.run(_run())
 

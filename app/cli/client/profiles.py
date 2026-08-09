@@ -41,6 +41,20 @@ async def set_persona(client: Client, name: str, content: str) -> None:
     )
 
 
+async def get_instructions(client: Client, name: str) -> str:
+    resp = await client.get_json(f"/api/profiles/{quote(name, safe='')}/instructions")
+    if isinstance(resp, dict):
+        return str(resp.get("content") or "")
+    return ""
+
+
+async def set_instructions(client: Client, name: str, content: str) -> None:
+    await client.put_json(
+        f"/api/profiles/{quote(name, safe='')}/instructions",
+        {"content": content},
+    )
+
+
 async def get_agent_name(client: Client, name: str) -> str:
     resp = await client.get_json(f"/api/profiles/{quote(name, safe='')}/agent-name")
     if isinstance(resp, dict):

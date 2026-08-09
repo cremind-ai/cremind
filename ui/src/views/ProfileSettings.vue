@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router';
 import { ElInput, ElButton, ElMessage, ElTable, ElTableColumn, ElPopconfirm, ElAlert, ElDialog, ElCheckbox, ElCheckboxGroup } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
-import { listProfiles, deleteProfile, reconfigure, getPersona, updatePersona, getAgentName, setAgentName } from '../services/configApi';
+import { listProfiles, deleteProfile, reconfigure, getPersona, updatePersona, getInstructions, updateInstructions, getAgentName, setAgentName } from '../services/configApi';
 import { cleanProfileData, CLEAN_GROUPS, type CleanScope } from '../services/cleanApi';
 
 const props = defineProps<{ profile: string }>();
@@ -37,6 +37,11 @@ const savingAgentName = ref(false);
 const personaContent = ref('');
 const loadingPersona = ref(false);
 const savingPersona = ref(false);
+
+// INSTRUCTIONS.md content (loaded from backend)
+const instructionsContent = ref('');
+const loadingInstructions = ref(false);
+const savingInstructions = ref(false);
 
 async function loadAgentName() {
   loadingAgentName.value = true;
@@ -89,11 +94,35 @@ async function savePersona() {
   }
 }
 
+async function loadInstructions() {
+  loadingInstructions.value = true;
+  try {
+    const res = await getInstructions(settingsStore.agentUrl, settingsStore.authToken, props.profile);
+    instructionsContent.value = res.content;
+  } catch {
+    ElMessage.error('Failed to load INSTRUCTIONS.md');
+  } finally {
+    loadingInstructions.value = false;
+  }
+}
+
+async function saveInstructions() {
+  savingInstructions.value = true;
+  try {
+    await updateInstructions(settingsStore.agentUrl, settingsStore.authToken, props.profile, instructionsContent.value);
+    ElMessage.success('INSTRUCTIONS.md saved');
+  } catch {
+    ElMessage.error('Failed to save INSTRUCTIONS.md');
+  } finally {
+    savingInstructions.value = false;
+  }
+}
+
 // Profile name validation regex: lowercase, numbers, hyphens, underscores
 const PROFILE_NAME_RE = /^[a-z0-9_-]+$/;
 
 onMounted(async () => {
-  await Promise.all([loadProfiles(), loadAgentName(), loadPersona()]);
+  await Promise.all([loadProfiles(), loadAgentName(), loadPersona(), loadInstructions()]);
 });
 
 async function loadProfiles() {
@@ -259,6 +288,31 @@ function goBack() { router.push(`/${props.profile}/settings`); }
           style="font-family: monospace;"
         />
         <ElButton type="primary" :loading="savingPersona" @click="savePersona" style="margin-top: 12px;">
+          <Icon icon="mdi:content-save" style="margin-right: 6px;" /> Save
+        </ElButton>
+      </div>
+
+      <!-- INSTRUCTIONS.md -->
+      <div class="section">
+        <h2 class="section-title">
+          <Icon icon="mdi:clipboard-text-outline" class="section-icon" /> INSTRUCTIONS.md
+        </h2>
+        <p class="section-desc">
+          Standing directives the agent follows in every conversation — while the persona above says
+          <em>who</em> the agent is, this says <em>what it must do</em> (for example: "when a new user
+          messages a channel, check the Active-User sheet and register them"). Leave it empty for none.
+          Stored on the server at <code>&lt;working_dir&gt;/{{ profile }}/INSTRUCTIONS.md</code>.
+        </p>
+        <div v-if="loadingInstructions" class="loading-state">Loading...</div>
+        <ElInput
+          v-else
+          v-model="instructionsContent"
+          type="textarea"
+          :autosize="{ minRows: 4, maxRows: 16 }"
+          placeholder="Each time a new user messages a channel, check the 'Active-User' sheet..."
+          style="font-family: monospace;"
+        />
+        <ElButton type="primary" :loading="savingInstructions" @click="saveInstructions" style="margin-top: 12px;">
           <Icon icon="mdi:content-save" style="margin-right: 6px;" /> Save
         </ElButton>
       </div>

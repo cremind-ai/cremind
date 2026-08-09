@@ -260,6 +260,73 @@ def _terminal_payloads(observation_parts: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
+async def _resolve_message_origin(
+    conversation_storage: Any,
+    conv: Optional[dict],
+    conversation_id: str,
+    *,
+    event_run: bool,
+) -> Optional[dict]:
+    """Describe where this conversation's user messages come from.
+
+    Returns ``{"source": "web_ui"}``, a ``{"source": "channel", ...}`` dict
+    carrying the channel and sender identity, or ``None`` when there is nothing
+    useful to say. The agent renders it as a system-prompt section so a persona
+    or standing instruction can key off WHO is talking.
+
+    Derived from the CONVERSATION row rather than the turn's metadata on
+    purpose. Every conversation has a channel (web chats bind to the profile's
+    hidden ``main`` channel), so the answer is constant for the whole
+    conversation — whereas per-turn metadata would flip to "web" the moment an
+    operator typed into a channel sender's conversation from the web composer,
+    fragmenting the cached system prefix and losing the sender's identity.
+
+    Event runs get ``None``: their trigger is already described by
+    ``EVENT_RUN_GUIDANCE`` plus the trigger message, and they form a disjoint
+    prompt-cache population.
+    """
+    if event_run or not conv:
+        return None
+    try:
+        channel_id = conv.get("channel_id")
+        channel = (
+            await conversation_storage.get_channel(channel_id) if channel_id else None
+        )
+        # No channel row, or the profile's hidden catch-all → the Web UI/CLI.
+        if not channel or channel.get("channel_type") == "main":
+            return {"source": "web_ui"}
+
+        channel_type = channel.get("channel_type")
+        channel_name = channel_type
+        try:
+            from app.config import load_channel_catalog
+            catalog = load_channel_catalog(channel_type) or {}
+            channel_name = (
+                (catalog.get("channel") or {}).get("display_name") or channel_type
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                f"stream_runner: no catalog display name for {channel_type}",
+                exc_info=True,
+            )
+
+        sender = await conversation_storage.get_sender_by_conversation(conversation_id)
+        return {
+            "source": "channel",
+            "channel_id": channel_id,
+            "channel_type": channel_type,
+            "channel_name": channel_name,
+            "sender_id": (sender or {}).get("sender_id"),
+            "sender_display_name": (sender or {}).get("display_name"),
+        }
+    except Exception:  # noqa: BLE001
+        # Never fail a run over prompt garnish — omit the section instead.
+        logger.exception(
+            f"stream_runner: failed to resolve message origin for {conversation_id}"
+        )
+        return None
+
+
 # ── unified runner ──────────────────────────────────────────────────────────
 
 
@@ -348,6 +415,10 @@ async def run_agent_to_bus(
         )
     context_id = (conv or {}).get("context_id") or conversation_id
     title = (conv or {}).get("title") or "Untitled Chat"
+
+    message_origin = await _resolve_message_origin(
+        conversation_storage, conv, conversation_id, event_run=event_run,
+    )
 
     # Plan mode: decide the phase for this turn from the request + the
     # conversation's persisted plan state (see _compute_plan_phase).
@@ -574,6 +645,7 @@ async def run_agent_to_bus(
                 event_run=event_run,
                 mode=mode,
                 plan_phase=plan_phase,
+                message_origin=message_origin,
             ):
                 ctype = chunk.get("type")
 

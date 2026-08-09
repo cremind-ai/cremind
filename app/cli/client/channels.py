@@ -172,6 +172,22 @@ async def set_sender_authenticated(
     raise RuntimeError("unexpected /api/channels/{id}/senders/{sender} response")
 
 
+async def clear_sender_history(
+    client: Client, channel_id: str, sender_id: str,
+) -> dict[str, Any]:
+    """Wipe one subscriber's conversation history, keeping the conversation.
+
+    Their next message continues in the same conversation, and the per-sender
+    token/cost totals (attributed by conversation) survive. Returns
+    ``{"conversation_id", "cleared_messages"}``.
+    """
+    resp = await client.delete(
+        f"/api/channels/{quote(channel_id, safe='')}"
+        f"/senders/{quote(sender_id, safe='')}/messages",
+    )
+    return resp if isinstance(resp, dict) else {}
+
+
 async def delete_channel(client: Client, channel_id: str) -> None:
     await client.delete(f"/api/channels/{quote(channel_id, safe='')}")
 

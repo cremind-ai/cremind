@@ -541,9 +541,25 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         if ch["profile"] != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
         senders = await conversation_storage.list_senders(cid)
+        # Token/cost totals per sender, so the admin page can show usage inline
+        # instead of making the operator open each conversation's stats panel.
+        # One grouped query over the senders' conversations; best-effort, since
+        # a usage-table hiccup must not break subscriber management.
+        usage_by_conv: dict[str, dict] = {}
+        conv_ids = [s["conversation_id"] for s in senders if s.get("conversation_id")]
+        if conv_ids:
+            try:
+                from app.storage import get_usage_storage
+                usage_by_conv = await get_usage_storage().rollup_by_conversation(conv_ids)
+            except Exception:  # noqa: BLE001
+                logger.exception("channels: failed to roll up sender usage")
         # Redact any active OTP code from the list response.
         redacted = [
-            {**s, "pending_otp": _REDACTED if s.get("pending_otp") else None}
+            {
+                **s,
+                "pending_otp": _REDACTED if s.get("pending_otp") else None,
+                "usage": usage_by_conv.get(s.get("conversation_id")),
+            }
             for s in senders
         ]
         return JSONResponse({"senders": redacted})
@@ -600,6 +616,91 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
             "pending_otp": _REDACTED if updated.get("pending_otp") else None,
         }
         return JSONResponse({"sender": out})
+
+    async def handle_clear_sender_history(request: Request) -> JSONResponse:
+        """Wipe one channel subscriber's conversation history.
+
+        Deletes every message in the sender's conversation but KEEPS the
+        conversation row, so their next message continues in the same
+        conversation and the per-sender usage totals (attributed by
+        conversation) survive the wipe.
+
+        Deliberately lighter than deleting a conversation: the sender's skill
+        events, file watchers, and schedules stay armed — they are homed on the
+        surviving conversation row, and silently disarming someone's automations
+        as a side effect of clearing chat history would be wrong. Only the
+        message-bound artifacts go: queued turns, the replay buffer, plan files.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile_from_request(request)
+        cid = request.path_params["channel_id"]
+        sid = request.path_params["sender_id"]
+        ch = await conversation_storage.get_channel(cid)
+        if not ch:
+            return JSONResponse({"error": "Channel not found"}, status_code=404)
+        if ch["profile"] != profile:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+        senders = await conversation_storage.list_senders(cid)
+        sender = next((s for s in senders if s.get("sender_id") == sid), None)
+        if sender is None:
+            return JSONResponse({"error": "Sender not found"}, status_code=404)
+
+        conv_id = sender.get("conversation_id")
+        if not conv_id:
+            # Never spoke, or their conversation was already removed — nothing
+            # to clear, and saying so is friendlier than a 404.
+            return JSONResponse(
+                {"success": True, "conversation_id": None, "cleared_messages": 0}
+            )
+
+        from app.events import queue as event_queue
+        from app.events.stream_bus import get_event_stream_bus
+
+        bus = get_event_stream_bus()
+        if bus.is_active(conv_id):
+            return JSONResponse(
+                {
+                    "error": (
+                        "This subscriber has a run in progress. Wait for it to "
+                        "finish before clearing their history."
+                    ),
+                },
+                status_code=409,
+            )
+
+        # Queued-but-unstarted turns captured the pre-wipe history; drop them
+        # along with the replay buffer and the wiped turns' plan files.
+        try:
+            event_queue.discard_queue(conv_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(f"channels: failed to discard queue for {conv_id}")
+        try:
+            await bus.discard(conv_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(f"channels: failed to discard stream bus for {conv_id}")
+        try:
+            from app.utils.plans_dir import remove_conversation_plans
+            remove_conversation_plans(profile, conv_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(f"channels: failed to remove plans for {conv_id}")
+
+        cleared = await conversation_storage.clear_conversation_messages(conv_id)
+
+        try:
+            from app.events.conversations_list_bus import publish_conversations_changed
+            publish_conversations_changed(profile)
+        except Exception:  # noqa: BLE001
+            logger.exception("channels: failed to publish conversations changed")
+
+        logger.info(
+            f"channels: cleared {cleared} message(s) for sender {sid} on channel {cid}"
+        )
+        return JSONResponse(
+            {"success": True, "conversation_id": conv_id, "cleared_messages": cleared}
+        )
 
     async def handle_notify_channel(request: Request) -> JSONResponse:
         """Push an ad-hoc message OUT to a notification-mode channel.
@@ -783,6 +884,11 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
             "/api/channels/{channel_id}/senders/{sender_id}",
             endpoint=handle_set_sender_authenticated,
             methods=["PATCH"],
+        ),
+        Route(
+            "/api/channels/{channel_id}/senders/{sender_id}/messages",
+            endpoint=handle_clear_sender_history,
+            methods=["DELETE"],
         ),
         Route(
             "/api/channels/{channel_id}/qr",

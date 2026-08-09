@@ -58,6 +58,17 @@ export interface ChannelRow {
   updated_at: number;
 }
 
+/** Token + cost totals for one subscriber's conversation. */
+export interface ChannelSenderUsage {
+  input_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  total_usd: number;
+  request_count: number;
+}
+
 export interface ChannelSenderRow {
   id: string;
   channel_id: string;
@@ -67,6 +78,8 @@ export interface ChannelSenderRow {
   pending_otp: string | null;
   pending_otp_expires_at: number | null;
   conversation_id: string | null;
+  /** Null when the subscriber has no recorded usage yet. */
+  usage?: ChannelSenderUsage | null;
   created_at: number;
   updated_at: number;
 }
@@ -290,6 +303,26 @@ export async function setSenderAuthenticated(
   }
   const data = await res.json();
   return data.sender;
+}
+
+/**
+ * Wipe a subscriber's conversation history. The messages go; the conversation
+ * itself stays, so their next message continues in it and the usage totals
+ * shown on this page survive the wipe. 409s while a run is in progress.
+ */
+export async function clearSenderHistory(
+  agentUrl: string, authToken: string, channelId: string, senderId: string,
+): Promise<{ conversation_id: string | null; cleared_messages: number }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/channels/${encodeURIComponent(channelId)}/senders/${encodeURIComponent(senderId)}/messages`,
+    { method: 'DELETE', headers: authHeaders(authToken) },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Failed to clear history: ${res.statusText}`);
+  }
+  return res.json();
 }
 
 /**

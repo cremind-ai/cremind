@@ -133,10 +133,12 @@ def _is_empty_config(bundle: dict[str, Any]) -> bool:
 
 def build_persona_doc(profile: str) -> tuple[dict, list]:
     from app.utils.agent_name import read_agent_name
+    from app.utils.instructions import read_instructions_file
     from app.utils.persona import read_persona_file
 
     data = {
         "persona_markdown": read_persona_file(profile),
+        "instructions_markdown": read_instructions_file(profile),
         "agent_name": read_agent_name(profile),
     }
     return _doc("persona", data), []

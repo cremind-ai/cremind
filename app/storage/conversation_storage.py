@@ -9,7 +9,7 @@ from app.databases import DatabaseProvider, get_database_provider
 from app.storage.migrations import ensure_at_head
 from app.storage.models import (
     ChannelModel, ChannelSenderModel, ConversationModel,
-    MessageModel, ProfileModel,
+    MessageModel, ProfileModel, UsageRecordModel,
 )
 from app.utils.logger import logger
 
@@ -427,6 +427,51 @@ class ConversationStorage:
             )
             return result.rowcount > 0
 
+    async def clear_conversation_messages(self, conversation_id: str) -> int:
+        """Delete every message in a conversation, keeping the conversation row.
+
+        The "wipe a channel user's history" primitive: the sender keeps the same
+        conversation (their next message continues in it rather than spawning a
+        fresh one), and because the usage rows stay attached to the conversation
+        the per-sender token totals survive the wipe — only their ``message_id``
+        back-reference is dropped, since the messages themselves are gone.
+
+        Compaction state is reset to the fresh-conversation sentinel, otherwise
+        the stale watermark would exclude the first new messages from the tail.
+
+        Returns the number of messages deleted.
+        """
+        await self._ensure_initialized()
+        async with self.async_session_maker.begin() as session:
+            # Detach usage rows from the messages being removed. The FK is
+            # ON DELETE SET NULL and SQLite runs with foreign_keys=ON, but do it
+            # explicitly (same convention as delete_conversation's message purge).
+            await session.execute(
+                update(UsageRecordModel)
+                .where(UsageRecordModel.conversation_id == conversation_id)
+                .values(message_id=None)
+            )
+            result = await session.execute(
+                delete(MessageModel).where(
+                    MessageModel.conversation_id == conversation_id
+                )
+            )
+            await session.execute(
+                update(ConversationModel)
+                .where(ConversationModel.id == conversation_id)
+                .values(
+                    compaction_watermark=-1,
+                    compaction_summary=None,
+                    compaction_last_compacted_at=None,
+                    updated_at=time.time() * 1000,
+                )
+            )
+            cleared = result.rowcount or 0
+        logger.info(
+            f"[storage] cleared {cleared} message(s) from conversation {conversation_id}"
+        )
+        return cleared
+
     async def delete_all_conversations(self, profile: str) -> int:
         """Delete all *chat* conversations for a profile.
 
@@ -607,6 +652,23 @@ class ConversationStorage:
                 .order_by(ChannelSenderModel.created_at.asc())
             )
             return [self._sender_to_dict(s) for s in result.scalars().all()]
+
+    async def get_sender_by_conversation(self, conversation_id: str) -> dict | None:
+        """Return the channel sender whose current conversation this is, if any.
+
+        A sender owns at most one conversation at a time (``_ensure_conversation``
+        in the channel adapter), so this is the reverse of that link and is used
+        to tell the agent WHO it is talking to. Web-UI conversations have no
+        sender and return ``None``.
+        """
+        await self._ensure_initialized()
+        async with self.async_session_maker() as session:
+            row = (await session.execute(
+                select(ChannelSenderModel).where(
+                    ChannelSenderModel.conversation_id == conversation_id,
+                )
+            )).scalars().first()
+            return self._sender_to_dict(row) if row else None
 
     async def update_sender(self, sender_row_id: str, **fields) -> dict | None:
         await self._ensure_initialized()

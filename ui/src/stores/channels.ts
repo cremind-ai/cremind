@@ -8,6 +8,7 @@ import {
   deleteChannel as apiDeleteChannel,
   fetchChannelSenders,
   setSenderAuthenticated as apiSetSenderAuthenticated,
+  clearSenderHistory as apiClearSenderHistory,
   type ChannelCatalogEntry,
   type ChannelRow,
   type ChannelSenderRow,
@@ -125,6 +126,14 @@ export const useChannelsStore = defineStore('channels', {
       const settings = useSettingsStore();
       return apiSetSenderAuthenticated(
         settings.agentUrl, settings.authToken, channelId, senderId, authenticated,
+      );
+    },
+    async clearSenderHistory(
+      channelId: string, senderId: string,
+    ): Promise<{ conversation_id: string | null; cleared_messages: number }> {
+      const settings = useSettingsStore();
+      return apiClearSenderHistory(
+        settings.agentUrl, settings.authToken, channelId, senderId,
       );
     },
     setFilter(filter: string) {

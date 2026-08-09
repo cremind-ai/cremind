@@ -20,6 +20,7 @@ def _persona_customized(profile: str) -> tuple[bool, dict]:
     from pathlib import Path
 
     from app.utils.agent_name import default_agent_name, read_agent_name
+    from app.utils.instructions import read_instructions_file
     from app.utils.persona import PERSONA_FILENAME, read_persona_file
 
     persona = read_persona_file(profile)
@@ -33,10 +34,15 @@ def _persona_customized(profile: str) -> tuple[bool, dict]:
     agent_name = read_agent_name(profile)
     name_changed = agent_name != default_agent_name(profile)
     persona_changed = _norm(persona) != _norm(template)
+    # Standing instructions have no template: any non-empty text is a
+    # customization, and they ride along in the same "persona" component.
+    instructions = read_instructions_file(profile)
+    instructions_changed = bool(_norm(instructions))
 
-    return (persona_changed or name_changed), {
+    return (persona_changed or name_changed or instructions_changed), {
         "agent_name": agent_name,
         "persona_chars": len(persona),
+        "instructions_chars": len(instructions),
     }
 
 

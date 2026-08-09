@@ -67,6 +67,7 @@ from app.skills.scanner import generate_dir_tree
 from app.types import ReasoningStreamResponseType
 from app.utils.common import truncate_to_tokens
 from app.utils.context_storage import clear_context, get_context, set_context
+from app.utils.instructions import read_instructions_file
 from app.utils.logger import logger
 from app.utils.message_tokens import resolve_system_var_tokens
 from app.utils.persona import read_persona_file
@@ -110,7 +111,7 @@ absolute path on disk), do NOT refuse or ask them to move it: call
 switch there first, then read or act. The directory must already exist.
 Active profile: $CREMIND_PROFILE
 Your name: $CREMIND_AGENT_NAME
-{long_term_memory}
+{message_origin}{long_term_memory}{standing_instructions}
 You are a capable assistant. Fulfil the user's request by calling the available
 tools (functions) when you need to act or fetch information, then reply to the
 user in plain text. Call a tool ONLY when it is actually needed; when you have
@@ -309,6 +310,61 @@ def _format_memory_block(facts: list[str]) -> str:
     return (
         "\nLONG-TERM MEMORY (durable facts about the user, remembered across past "
         "conversations):\n" + body + "\n"
+    )
+
+
+def _format_message_origin_block(origin: Optional[dict]) -> str:
+    """Render where this conversation's user messages come from, or "" for none.
+
+    Self-wrapped ``'\\n...\\n'`` (like ``_format_memory_block``) so it drops into
+    the template's identity block and collapses to a single blank line when
+    absent — profiles/runs with no origin get a byte-identical prompt.
+
+    The facts are derived from the CONVERSATION row (see ``stream_runner``), not
+    from per-turn metadata, so the block is constant for the whole conversation
+    and cannot fragment the prompt-cache prefix.
+    """
+    if not origin:
+        return ""
+    source = origin.get("source")
+    if source == "web_ui":
+        return (
+            "\nMESSAGE SOURCE: this conversation's user messages come from the "
+            "Web UI — the operator is chatting with you directly.\n"
+        )
+    if source != "channel":
+        return ""
+    channel_name = origin.get("channel_name") or origin.get("channel_type") or "unknown"
+    lines = [
+        "",
+        "MESSAGE SOURCE: this conversation's user messages arrive over an "
+        "external channel, NOT the Web UI.",
+        f"- Channel: {channel_name} (type: {origin.get('channel_type')}, "
+        f"id: {origin.get('channel_id')})",
+    ]
+    sender_id = origin.get("sender_id")
+    if sender_id:
+        display = origin.get("sender_display_name") or sender_id
+        lines.append(f"- Sender: {display} (platform sender id: {sender_id})")
+    lines.append(
+        "This identifies WHO is talking to you. When your persona or standing "
+        "instructions depend on the sender's identity, use these values.",
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _format_standing_instructions_block(text: str) -> str:
+    """Render a profile's INSTRUCTIONS.md as its own section, or "" when blank.
+
+    Persona says who the agent is; this says what it must do. Self-wrapped like
+    the sibling blocks above so an empty file changes nothing.
+    """
+    body = (text or "").strip()
+    if not body:
+        return ""
+    return (
+        "\nSTANDING INSTRUCTIONS (operator-configured directives for this "
+        "profile; follow them whenever they apply):\n" + body + "\n"
     )
 
 
@@ -658,6 +714,13 @@ class ReasoningAgent:
     # direct ``_build_instruction`` calls (tests) from tripping on a missing attr.
     _long_term_memory_block: str = ""
 
+    # Frozen message-origin section (Web UI vs which channel + which sender);
+    # ``__init__`` renders it once per run from conversation-constant facts, so
+    # it never varies between the steps of a run. Class-level default keeps
+    # ``__new__`` construction and direct ``_build_instruction`` calls (tests)
+    # from tripping on a missing attribute.
+    _message_origin_block: str = ""
+
     # Turn mode + plan phase. Class-level defaults keep ``__new__`` construction
     # (tests) and direct ``_build_instruction`` calls from tripping on a missing
     # attribute; a normal run always sets them in ``__init__``.
@@ -676,11 +739,17 @@ class ReasoningAgent:
         event_run: bool = False,
         mode: str = "reasoning",
         plan_phase: Optional[str] = None,
+        message_origin: Optional[dict] = None,
     ):
         self.llm = llm
         self.registry = registry
         self.profile = profile
         self.reasoning = reasoning
+        # Where this conversation's user messages come from (Web UI vs a channel
+        # + the sender's identity). Derived from the conversation row upstream,
+        # so it is constant for the whole run: render it ONCE here rather than
+        # per step, keeping the cached system prefix byte-stable.
+        self._message_origin_block = _format_message_origin_block(message_origin)
         # Per-request turn mode ("reasoning" | "instant" | "plan") and, for plan
         # mode, the phase ("planning" | "execute") computed server-side.
         self._mode = mode
@@ -1042,6 +1111,13 @@ class ReasoningAgent:
             search_guidance=self._search_guidance,
             coding_delegation_guidance=getattr(self, "_coding_delegation_guidance", ""),
             long_term_memory=self._long_term_memory_block,
+            message_origin=self._message_origin_block,
+            # Re-read per call, exactly like the persona above: the operator can
+            # edit standing instructions between runs and the next run picks them
+            # up. Blank/missing file renders "", leaving the prompt untouched.
+            standing_instructions=_format_standing_instructions_block(
+                read_instructions_file(self.profile),
+            ),
         )
         # Render `$CREMIND_*` system-variable tokens (e.g. $CREMIND_PROFILE,
         # $CREMIND_AGENT_NAME) across the whole prompt -- persona body AND the

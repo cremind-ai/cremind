@@ -248,10 +248,12 @@ async def _clean_oauth_tokens(profile: str, deps: Deps) -> int:
 
 
 async def _clean_skills(profile: str, deps: Deps) -> dict[str, Any]:
-    """Identity → defaults: reset PERSONA.md to the template and every built-in
-    skill to its shipped default, and remove user-added skills."""
+    """Identity → defaults: reset PERSONA.md to the template, drop the profile's
+    standing instructions, reset every built-in skill to its shipped default, and
+    remove user-added skills."""
     detail: dict[str, Any] = {
-        "persona_reset": False, "builtins_reset": 0, "user_skills_removed": 0,
+        "persona_reset": False, "instructions_reset": False,
+        "builtins_reset": 0, "user_skills_removed": 0,
     }
 
     # persona: unlink then re-copy the shipped template
@@ -263,6 +265,15 @@ async def _clean_skills(profile: str, deps: Deps) -> dict[str, Any]:
         detail["persona_reset"] = True
     except Exception:  # noqa: BLE001
         logger.exception("clean: persona reset failed")
+
+    # standing instructions: no template to restore — the default is "none",
+    # so removing the file IS the reset.
+    try:
+        from app.utils.instructions import _profile_instructions_path
+        await asyncio.to_thread(_unlink, _profile_instructions_path(profile))
+        detail["instructions_reset"] = True
+    except Exception:  # noqa: BLE001
+        logger.exception("clean: instructions reset failed")
 
     # skills: drop user skills, re-copy every shipped built-in, then resync registry
     try:

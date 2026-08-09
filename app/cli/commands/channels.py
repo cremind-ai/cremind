@@ -549,12 +549,20 @@ def channels_senders(
     if not senders:
         sys.stdout.write("no senders.\n")
         return
-    table = Table(mode, "SENDER_ID", "NAME", "AUTHED", "CONVERSATION_ID", "PENDING_OTP")
+    table = Table(
+        mode, "SENDER_ID", "NAME", "AUTHED", "TOKENS", "COST_USD",
+        "CONVERSATION_ID", "PENDING_OTP",
+    )
     for s in senders:
+        usage = s.get("usage") or {}
+        tokens = usage.get("total_tokens")
+        cost = usage.get("total_usd")
         table.add_row(
             string_field(s, "sender_id"),
             string_field(s, "display_name"),
             bool_field(s, "authenticated", False),
+            f"{int(tokens):,}" if isinstance(tokens, (int, float)) else "",
+            f"{float(cost):.4f}" if isinstance(cost, (int, float)) else "",
             string_field(s, "conversation_id"),
             string_field(s, "pending_otp"),
         )
@@ -615,6 +623,66 @@ def channels_revoke(
 ) -> None:
     """Revoke a subscriber so they stop receiving notifications."""
     _set_sender_authenticated(ctx, channel_id, sender_id, False)
+
+
+@channels_app.command("clear-history")
+@graceful_errors
+def channels_clear_history(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    sender_id: str = typer.Argument(..., help="Sender id (from `channels senders`)."),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the confirmation prompt.",
+    ),
+) -> None:
+    """Delete every message in one subscriber's conversation.
+
+    The conversation itself is kept: the subscriber's next message continues in
+    it, and their token/cost totals in `channels senders` survive the wipe.
+    Fails with a 409 while that subscriber has a run in progress.
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import clear_sender_history
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    out_mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    if not yes:
+        prompt = (
+            f"Delete all messages in {sender_id}'s conversation on channel "
+            f"{channel_id}? (usage totals are kept)"
+        )
+        if not sys.stdin.isatty():
+            # Non-interactive (scripts, exec_shell): never guess on a
+            # destructive action — make the caller opt in explicitly.
+            typer.echo(
+                f"{prompt} Re-run with --yes to confirm.", err=True,
+            )
+            raise typer.Exit(code=1)
+        if not typer.confirm(prompt):
+            raise typer.Exit(code=1)
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await clear_sender_history(client, channel_id, sender_id)
+
+    result = asyncio.run(_run())
+    if out_mode.json:
+        print_json(result)
+        return
+    cleared = result.get("cleared_messages", 0)
+    conv = result.get("conversation_id")
+    if not conv:
+        sys.stdout.write(f"{sender_id}: no conversation to clear\n")
+        return
+    sys.stdout.write(
+        f"{sender_id}: cleared {cleared} message(s) from conversation {conv}\n"
+    )
 
 
 @channels_app.command("pair")

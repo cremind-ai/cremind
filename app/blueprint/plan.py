@@ -203,6 +203,7 @@ def _plan_settings(data: dict, manifest: BlueprintManifest, warnings: list[str])
 
 def _plan_persona(data: dict, manifest: BlueprintManifest, warnings: list[str]) -> dict:
     persona = data.get("persona_markdown") or ""
+    instructions = data.get("instructions_markdown") or ""
     return {
         "kind": "notify",
         "requirements": [],
@@ -210,6 +211,8 @@ def _plan_persona(data: dict, manifest: BlueprintManifest, warnings: list[str]) 
             "agent_name": data.get("agent_name"),
             "persona_chars": len(persona),
             "persona_excerpt": persona[:600],
+            "instructions_chars": len(instructions),
+            "instructions_excerpt": instructions[:600],
         },
     }
 
