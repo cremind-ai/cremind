@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 import os
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -139,6 +140,89 @@ def _serialize_observation(observation_parts: List[Any]) -> List[Dict[str, Any]]
         elif isinstance(obs_part, dict):
             serialized.append(obs_part)
     return serialized
+
+
+# The gdrive skill's structured error for a file it was never granted. It exits
+# EXIT_NOT_GRANTED (3) and prints this JSON to stderr; see
+# app/skills/builtin/gdrive/scripts/app/errors.py, which pins the marker, the
+# ``file_id`` key and the exit code as a contract with this detector.
+_DRIVE_NOT_GRANTED_MARKER = "drive_file_not_granted"
+_DRIVE_FILE_ID_RE = re.compile(r'"file_id"\s*:\s*"([^"]*)"')
+
+
+def _detect_drive_not_granted(serialized_parts: List[Dict[str, Any]]) -> Optional[str]:
+    """An actionable error when a tool result carries gdrive's not-granted payload.
+
+    Per-file Drive access means an automation can hit a file nobody granted, and
+    the agent is told to notify-and-stop rather than open a consent URL no one is
+    there to complete. That leaves the run *looking* successful, so the runner has
+    to recognise the failure itself — an unattended run that quietly did nothing
+    is the worst outcome available.
+
+    The marker alone is not enough: an agent that merely reads gdrive's own source
+    or docs would echo it. Requiring a non-zero exit code alongside keeps that from
+    registering as a failure. Returns ``None`` when the observation is clean.
+
+    The payload is ~1 KB, comfortably under the tool-result truncation limit, so
+    the marker and file id survive intact.
+    """
+    for part in serialized_parts:
+        if not isinstance(part, dict):
+            continue
+        data = part.get("data")
+        if isinstance(data, dict):
+            stderr = str(data.get("stderr") or "")
+            if _DRIVE_NOT_GRANTED_MARKER in stderr and data.get("return_code") not in (0, None):
+                match = _DRIVE_FILE_ID_RE.search(stderr)
+                return _drive_not_granted_message(match.group(1) if match else "")
+        text_body = part.get("text")
+        if isinstance(text_body, str) and _DRIVE_NOT_GRANTED_MARKER in text_body:
+            match = _DRIVE_FILE_ID_RE.search(text_body)
+            return _drive_not_granted_message(match.group(1) if match else "")
+    return None
+
+
+def _drive_not_granted_message(file_id: str) -> str:
+    target = f"Google Drive file '{file_id}'" if file_id else "a Google Drive file"
+    flag = file_id or "<id>"
+    return (
+        f"This automation needed {target}, which has not been granted to Cremind "
+        "(Cremind holds per-file Drive access). Grant it with "
+        f"`cremind drive grant --file {flag}` or in Settings -> Google Drive, then run "
+        "the automation again."
+    )
+
+
+def _event_run_final_status(
+    *,
+    cancelled: bool,
+    errored: bool,
+    pending_question: Optional[str],
+    todos: List[Dict[str, Any]],
+    drive_not_granted_error: Optional[str],
+) -> tuple[str, Optional[str]]:
+    """Decide an event run's terminal status. Returns ``(status, pending_question)``.
+
+    Precedence: cancelled -> errored -> pending -> not-granted -> completed.
+    Pending outranks the not-granted failure deliberately: a pending run keeps a
+    live continuation channel, so the user can grant the file and reply to resume,
+    whereas failing it would clear that pending state and strand the work.
+    """
+    if cancelled:
+        return "cancelled", pending_question
+    if errored:
+        return "failed", pending_question
+    if pending_question:
+        return "pending", pending_question
+    done = sum(1 for t in todos if t.get("status") == "completed")
+    if todos and done < len(todos):
+        return "pending", (
+            f"Run ended with {done} of {len(todos)} tasks completed "
+            "— reply here to continue the remaining work."
+        )
+    if drive_not_granted_error:
+        return "failed", pending_question
+    return "completed", pending_question
 
 
 def _terminal_payloads(observation_parts: List[Any]) -> List[Dict[str, Any]]:
@@ -356,6 +440,10 @@ async def run_agent_to_bus(
     collected_llm_messages: list | None = None
     errored = False
     cancelled = False
+    # Set when an unattended run touches a Drive file nobody granted. Kept apart
+    # from ``errored``: the turn itself did not blow up, so chat-side behaviour is
+    # unchanged — only the event-run row and its notification reflect the failure.
+    drive_not_granted_error: str | None = None
     # The id of this turn's just-persisted user/trigger message, captured below.
     # Passed to compaction so the current turn (sent separately as the volatile
     # input) is excluded from the rebuilt history tail.
@@ -515,6 +603,13 @@ async def run_agent_to_bus(
                         result_data.get("Result") or result_data.get("Observation") or []
                     )
                     serialized_result = _serialize_observation(result_parts)
+
+                    # Only unattended runs need this: an interactive turn can just
+                    # show the agent's own explanation and let the user grant the
+                    # file there and then. Keep the first hit — the earliest
+                    # ungranted file is the one that derailed the run.
+                    if event_run_id and drive_not_granted_error is None:
+                        drive_not_granted_error = _detect_drive_not_granted(serialized_result)
 
                     await bus.publish(conversation_id, "result", {
                         "step": result_data.get("Step"),
@@ -841,29 +936,18 @@ async def run_agent_to_bus(
         run_row: dict | None = None
         if event_run_id:
             from app.events import run_state
-            pending_q = run_state.get_pending(run_id)
-            if cancelled:
-                run_status = "cancelled"
-            elif errored:
-                run_status = "failed"
-            elif pending_q:
-                run_status = "pending"
-            else:
-                # A run only completes when its todo list (if it drove one) is
-                # fully done. An incomplete list leaves the run 'pending' so it
-                # stays non-terminal (survives restarts, never auto-pruned) and
-                # can be resumed by replying in the run's chat — the same
-                # continuation path as a request_user_input pause.
-                _todos = plan_state.get_todos(run_id) or []
-                _done = sum(1 for t in _todos if t.get("status") == "completed")
-                if _todos and _done < len(_todos):
-                    run_status = "pending"
-                    pending_q = (
-                        f"Run ended with {_done} of {len(_todos)} tasks completed "
-                        "— reply here to continue the remaining work."
-                    )
-                else:
-                    run_status = "completed"
+            # A run only completes when its todo list (if it drove one) is fully
+            # done. An incomplete list leaves the run 'pending' so it stays
+            # non-terminal (survives restarts, never auto-pruned) and can be
+            # resumed by replying in the run's chat — the same continuation path
+            # as a request_user_input pause.
+            run_status, pending_q = _event_run_final_status(
+                cancelled=cancelled,
+                errored=errored,
+                pending_question=run_state.get_pending(run_id),
+                todos=plan_state.get_todos(run_id) or [],
+                drive_not_granted_error=drive_not_granted_error,
+            )
             is_terminal = run_status != "pending"
             try:
                 from app.storage import get_event_run_storage
@@ -874,7 +958,7 @@ async def run_agent_to_bus(
                     status=run_status,
                     run_id=run_id,
                     pending_question=pending_q if run_status == "pending" else None,
-                    error=(final_text if errored else None),
+                    error=(final_text if errored else drive_not_granted_error),
                     clear_pending=is_terminal,
                     increment_turn=True,
                     mark_finished=is_terminal,
