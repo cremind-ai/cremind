@@ -422,7 +422,7 @@ const handleSubmitEditConversation = async () => {
     <!-- Shared row-action menu. -->
     <ElPopover
       :visible="menuConvId !== null"
-      :virtual-ref="menuTriggerEl"
+      :virtual-ref="menuTriggerEl ?? undefined"
       virtual-triggering
       placement="bottom-end"
       :width="160"

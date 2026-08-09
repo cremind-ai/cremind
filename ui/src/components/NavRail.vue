@@ -311,7 +311,7 @@ onBeforeUnmount(closeNotificationsStream);
       </div>
       <ElPopover
         :visible="agentPopoverVisible"
-        :virtual-ref="agentTriggerRef"
+        :virtual-ref="agentTriggerRef ?? undefined"
         virtual-triggering
         placement="right-start"
         :width="260"
@@ -387,7 +387,7 @@ onBeforeUnmount(closeNotificationsStream);
 
     <ElPopover
       :visible="bellPopoverVisible"
-      :virtual-ref="notificationsTriggerRef"
+      :virtual-ref="notificationsTriggerRef ?? undefined"
       virtual-triggering
       placement="right-end"
       :width="320"
@@ -410,7 +410,7 @@ onBeforeUnmount(closeNotificationsStream);
         </ElTooltip>
         <ElPopover
           :visible="morePopoverVisible"
-          :virtual-ref="moreTriggerRef"
+          :virtual-ref="moreTriggerRef ?? undefined"
           virtual-triggering
           placement="right-end"
           :width="200"
@@ -467,7 +467,7 @@ onBeforeUnmount(closeNotificationsStream);
       </ElTooltip>
       <ElPopover
         :visible="userMenuVisible"
-        :virtual-ref="userMenuTriggerRef"
+        :virtual-ref="userMenuTriggerRef ?? undefined"
         virtual-triggering
         placement="right-end"
         :width="200"
