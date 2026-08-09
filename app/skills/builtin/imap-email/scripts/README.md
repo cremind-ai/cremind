@@ -42,9 +42,12 @@ Run from the skill root. Every command prints JSON to stdout (pipe-friendly); hu
 # List recent inbox messages (default detail=summary)
 uv run scripts/__main__.py list --max-results 10
 
-# Filtered list
+# Filtered list (one folder — INBOX unless --category says otherwise)
 uv run scripts/__main__.py list --query "alice invoice" --since 2026-04-01 --before 2026-04-30
 uv run scripts/__main__.py list --detail title_only
+
+# Search the whole mailbox (every tab plus archived mail)
+uv run scripts/__main__.py search --query "from:alice has:attachment"
 
 # Full content of one email (body included)
 uv run scripts/__main__.py get --message-id "<abc@mail.example.com>"
@@ -73,6 +76,7 @@ uv run scripts/__main__.py trash --message-id "<abc@mail.example.com>"
 | Subcommand | Required | Optional |
 |---|---|---|
 | `list` | — | `--max-results N` (10), `--query STR`, `--detail title_only\|summary\|full` (summary), `--category primary\|promotions\|social\|updates\|forums\|spam\|all` (primary), `--since YYYY-MM-DD`, `--before YYYY-MM-DD` |
+| `search` | `--query STR` | `--max-results N` (10), `--detail title_only\|summary\|full` (summary), `--since YYYY-MM-DD`, `--before YYYY-MM-DD` |
 | `list-sent` | — | `--max-results N` (10), `--since`, `--before` |
 | `send` | `--to` (repeatable), `--subject` | `--cc` (repeatable), `--bcc` (repeatable), `--body` / `--body-file` / stdin |
 | `reply` | `--message-id`, body (via `--body`/`--body-file`/stdin) | `--cc`, `--bcc` |
@@ -81,13 +85,17 @@ uv run scripts/__main__.py trash --message-id "<abc@mail.example.com>"
 
 Global: `--json` to force JSON output even on a TTY.
 
+`search` is `list` pinned to the whole mailbox: it forces `--category all` (the
+`\All` folder, no Gmail category token) and requires a query, which is what the
+old Gmail `search` verb did. Use `list` when you mean one folder.
+
 ### Provider-aware behavior
 
 The CLI auto-detects Gmail at login (via the `X-GM-EXT-1` IMAP capability) and branches where Gmail differs from standard IMAP:
 
 | Behavior | Gmail | Other IMAP providers |
 |---|---|---|
-| `--query` | passed through `X-GM-RAW` → full Gmail search grammar (`from:`, `has:attachment`, `before:`, etc.) | each whitespace-separated term matched with IMAP `TEXT` (headers + body) |
+| `--query` (`list` / `search`) | passed through `X-GM-RAW` → full Gmail search grammar (`from:`, `has:attachment`, `before:`, etc.) | each whitespace-separated term matched with IMAP `TEXT` (headers + body) |
 | `--category primary\|promotions\|...` | filters by Gmail category tab | ignored (always INBOX) |
 | `--category spam` / `all` | selects `\Junk` / `\All` folders | selects `\Junk` / `\All` if the server advertises them, else INBOX |
 | `trash` | atomic `+X-GM-LABELS \Trash` | COPY to `\Trash` folder + set `\Deleted` + EXPUNGE |
@@ -144,7 +152,7 @@ Notes:
 - **`IMAP login failed ... AUTHENTICATIONFAILED`** — most providers require an App Password (not the account's web login password) when 2FA is enabled. Generate one from your provider's security settings.
 - **Listener processes nothing** — baseline is working as designed; send yourself a new email and wait up to `POLL_INTERVAL` seconds. Inspect `scripts/.listener_state.json` to see the current `last_seen_uid`.
 - **Listener logs `UIDVALIDITY changed`** — the server rebuilt the mailbox index (rare). Listener rebaselines automatically; a few in-flight messages may be missed during the switchover.
-- **`list --category primary` returns nothing** (Gmail only) — the account may have category tabs disabled. The CLI automatically retries without the category filter; if you still see nothing, try `--category all`.
+- **`list --category primary` returns nothing** (Gmail only) — the account may have category tabs disabled. The CLI automatically retries without the category filter; if you still see nothing, try `--category all` or the `search` verb (which always covers all mail).
 - **`No Sent folder advertised by this IMAP server`** — the server didn't return a `\Sent` special-use mailbox in its LIST response. Some older/self-hosted servers need this enabled. Your sent messages will still send, but `list-sent` and the auto-APPEND-to-Sent behavior need a Sent folder to target.
 - **`No Trash folder advertised by this IMAP server`** — same root cause, but affects `trash`. Enable `SPECIAL-USE` on your server, or contact your admin.
 - **HTML-only marketing emails look noisy** — the stdlib HTML-to-text stripper is intentionally simple. Use `get --message-id ...` if you need the raw HTML (`body_html` field in JSON output).
@@ -167,7 +175,7 @@ imap-email/
         ├── search.py                # build IMAP SEARCH criteria (Gmail X-GM-RAW vs standard TEXT)
         ├── message.py               # RFC822 parse + outgoing message/reply builders
         ├── formatter.py             # list rows + event markdown rendering
-        ├── operations.py            # verbs: list / list-sent / send / reply / trash / get
+        ├── operations.py            # verbs: list / search / list-sent / send / reply / trash / get
         ├── listener.py              # polling loop, state file, reconnect, event writer
         └── cli.py                   # argparse builder + dispatch
 ```

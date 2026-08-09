@@ -104,6 +104,7 @@ Run `uv run scripts/__main__.py <subcommand>`. Output is JSON (or human-readable
 | Subcommand | Required | Optional |
 |---|---|---|
 | `list` | — | `--max-results` (10), `--query`, `--detail title_only\|summary\|full`, `--category primary\|promotions\|social\|updates\|forums\|spam\|all`, `--since/--before YYYY-MM-DD` |
+| `search` | `--query` | `--max-results` (10), `--detail title_only\|summary\|full`, `--since/--before YYYY-MM-DD` |
 | `list-sent` | — | `--max-results`, `--since`, `--before` |
 | `send` | `--to` (repeatable), `--subject` | `--cc`, `--bcc` (repeatable), `--body`/`--body-file`/stdin |
 | `reply` | `--message-id`, body | `--cc`, `--bcc` |
@@ -114,10 +115,16 @@ Run `uv run scripts/__main__.py <subcommand>`. Output is JSON (or human-readable
 
 ### Searching
 
+Use **`search`** to look through the whole mailbox and **`list`** to look at one
+folder. `search --query "..."` is `list` pinned to All Mail: it covers every
+category tab plus everything archived, and requires a query. `list --query "..."`
+searches only the folder `--category` selected (INBOX by default), which is what
+you want for "what's in my inbox right now".
+
 `--query` on a **Gmail** server accepts Gmail's full search grammar (it is passed
-through as `X-GM-RAW`), so `--query "from:alice newer_than:7d is:unread"` works as
-it would in the Gmail UI. On other servers each whitespace-separated term becomes
-an IMAP `TEXT` search across headers and body.
+through as `X-GM-RAW`), so `search --query "from:alice newer_than:7d is:unread"`
+works as it would in the Gmail UI. On other servers each whitespace-separated term
+becomes an IMAP `TEXT` search across headers and body.
 
 ### Sending a Gmail reply through the gmail skill
 
@@ -155,7 +162,8 @@ to `events/new_email/<subject>.md`.
   when 2FA is on. See the table above.
 - `Missing required env var(s): USERNAME` on Windows → set `USERNAME` in `.env` or
   the Settings UI (see the Windows note above).
-- `--category primary` empty on Gmail → tabs disabled; CLI auto-retries without filter; try `--category all`.
+- `--category primary` empty on Gmail → tabs disabled; CLI auto-retries without filter; try `--category all`, or use `search` (which always covers all mail).
+- Expected mail missing from `list` → it is probably archived or in another tab; `search --query "..."` covers the whole mailbox.
 - HTML-only email noisy → use `get` for raw HTML (`body_html` in JSON).
 - No events arriving → confirm the listener is running (`cremind skill-events
   listener-start imap-email`) and that the heartbeat file is fresh.

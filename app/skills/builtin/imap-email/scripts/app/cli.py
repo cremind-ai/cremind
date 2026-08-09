@@ -96,6 +96,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--since", default=None, help="YYYY-MM-DD")
     sp.add_argument("--before", default=None, help="YYYY-MM-DD")
 
+    # search — `list` pinned to the whole mailbox. Deliberately offers no
+    # --category: the point of the verb is that it never narrows to a tab or to
+    # INBOX, which is what the old Gmail `search` did.
+    sp = sub.add_parser("search", help="search all mail (whole mailbox, not just the inbox)")
+    sp.add_argument(
+        "--query",
+        required=True,
+        help="Search text. On Gmail: full Gmail syntax (e.g. 'from:alice has:attachment'). "
+        "On standard IMAP: each whitespace-separated term is matched against headers + body.",
+    )
+    sp.add_argument("--max-results", type=int, default=10)
+    sp.add_argument("--detail", choices=["title_only", "summary", "full"], default="summary")
+    sp.add_argument("--since", default=None, help="YYYY-MM-DD")
+    sp.add_argument("--before", default=None, help="YYYY-MM-DD")
+
     # list-sent
     sp = sub.add_parser("list-sent", help="list emails from sent folder")
     sp.add_argument("--max-results", type=int, default=10)
@@ -139,12 +154,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     _warn_if_listener_not_running()
 
     try:
-        if args.command == "list":
+        if args.command in ("list", "search"):
+            # `search` is `list` over the whole mailbox: category "all" selects the
+            # All Mail folder and drops the Gmail category token, which is exactly
+            # the old Gmail `search` behaviour.
             rows = operations.list_emails(
                 max_results=args.max_results,
                 query=args.query,
                 detail=args.detail,
-                category=args.category,
+                category="all" if args.command == "search" else args.category,
                 since=args.since,
                 before=args.before,
             )
