@@ -250,6 +250,17 @@ _OBSOLETE_BUILTIN_FILES: dict[str, tuple[str, ...]] = {
 # spawn failure and notifies the user.
 _RETIRED_LISTENER_SKILLS: tuple[str, ...] = ("gmail",)
 
+# ``(old_skill_dir, new_skill_dir, event_type)`` for events whose producer moved to
+# another skill. Subscriptions to the old skill are orphaned by the move — the skill
+# no longer declares the event, so nothing can ever fire them and the Events page
+# still lists them as live. Each entry is repaired once, at boot.
+_REPOINTED_EVENT_SUBSCRIPTIONS: tuple[tuple[str, str, str], ...] = (
+    # Gmail's push listener is gone (reading a mailbox needs a Google "restricted"
+    # scope). imap-email declares the same ``new_email`` event and its markdown
+    # carries the same headers, so the user's action text still applies.
+    ("gmail", "imap-email", "new_email"),
+)
+
 
 def _remove_obsolete_files(profile: str, dir_name: str, dst: Path) -> None:
     for rel in _OBSOLETE_BUILTIN_FILES.get(dir_name, ()):
@@ -283,6 +294,76 @@ async def _retire_listener_autostarts(profile: str) -> None:
                 )
         except Exception as exc:  # noqa: BLE001 - never block boot on cleanup
             logger.debug(f"listener retirement for {dir_name} skipped: {exc}")
+
+
+def _repoint_orphaned_event_subscriptions(profile: str) -> None:
+    """Move subscriptions off skills that no longer produce their event.
+
+    One-shot by construction: the rewrite empties the set the query matches, so
+    every later boot finds nothing and the notification fires exactly once.
+
+    The rows are paused rather than re-armed — the successor skill normally needs
+    credentials before its listener runs, and silently resuming an automation
+    against a half-configured skill is worse than leaving it visibly paused.
+    """
+    from app.tools.ids import slugify
+
+    for old_dir, new_dir, event_type in _REPOINTED_EVENT_SUBSCRIPTIONS:
+        try:
+            from app.storage import get_event_subscription_storage
+
+            store = get_event_subscription_storage()
+            # Dispatch looks subscriptions up by the canonical ``<profile>__<slug>``
+            # tool id; older rows may still hold the bare directory name.
+            old_slug = slugify(old_dir)
+            ids = store.repoint_skill(
+                profile=profile,
+                old_skill_names=[f"{profile}__{old_slug}", old_slug, old_dir],
+                new_skill_name=f"{profile}__{slugify(new_dir)}",
+                event_type=event_type,
+                pause=True,
+            )
+            if not ids:
+                continue
+            logger.info(
+                f"Re-pointed {len(ids)} '{old_dir}' {event_type} subscription(s) to "
+                f"'{new_dir}' for profile '{profile}' (paused pending setup)"
+            )
+            _notify_repointed_subscriptions(profile, new_dir, len(ids))
+        except Exception as exc:  # noqa: BLE001 - never block boot on cleanup
+            logger.debug(f"event-subscription repoint for {old_dir} skipped: {exc}")
+
+
+def _notify_repointed_subscriptions(profile: str, new_dir: str, count: int) -> None:
+    """Tell the user their automations moved, and what to do to revive them.
+
+    ``skill_register_required`` is reused deliberately: the notification list
+    deep-links that kind straight to the skill's pane in Settings → Tools &
+    Skills, which is exactly where the missing credentials are entered.
+    """
+    try:
+        from app.events.notifications_buffer import get_event_notifications
+        from app.events.skill_events_admin_bus import get_skill_events_admin_stream_bus
+
+        get_event_notifications().push(
+            profile=profile,
+            conversation_id="",
+            conversation_title=f"Email automations moved to {new_dir}",
+            message_preview=(
+                f"{count} email automation(s) that used the gmail skill were moved to "
+                f"{new_dir} and paused — Cremind's shared Google client can no longer "
+                "read Gmail. Configure the skill (USERNAME, PASSWORD app password, "
+                "IMAP_HOST, SMTP_HOST) in Settings → Tools & Skills, make sure its "
+                "listener is registered, then resume the automations on the Events page."
+            ),
+            kind="skill_register_required",
+            priority="high",
+            extra={"skill_id": new_dir, "skill_name": new_dir},
+        )
+        # Rebuild the Events page for anyone watching it right now.
+        get_skill_events_admin_stream_bus().publish(profile, {})
+    except Exception:  # noqa: BLE001
+        logger.exception(f"Failed to notify profile '{profile}' about re-pointed subscriptions")
 
 
 def sync_builtin_skills_into_profile(profile: str) -> list[str]:
@@ -343,6 +424,7 @@ async def initialize_profile_skills(
         return None
 
     await _retire_listener_autostarts(profile)
+    _repoint_orphaned_event_subscriptions(profile)
 
     skills = scan_skills(skills_dir)
     _notify_first_add_long_running(profile, skills, newly_added_dirs)

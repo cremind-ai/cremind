@@ -12,7 +12,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from app.databases import DatabaseProvider
 from app.storage._sync_base import SyncStorageBase
@@ -153,6 +153,57 @@ class EventSubscriptionStorage(SyncStorageBase):
                 params,
             )
         return self.get(id)
+
+    def repoint_skill(
+        self,
+        *,
+        profile: str,
+        old_skill_names: List[str],
+        new_skill_name: str,
+        event_type: Optional[str] = None,
+        pause: bool = True,
+    ) -> List[str]:
+        """Boot-time repair: move subscriptions from a retired skill to its successor.
+
+        Deliberately bypasses :attr:`_EDITABLE` — ``skill_name`` is pinned for
+        user-facing edits precisely so a subscription cannot drift off its skill,
+        but when a *builtin* stops declaring an event its rows are orphaned: they
+        list as active forever and can never fire. Only a direct rewrite can
+        rescue them, so this method exists for that one caller
+        (``app.skills.sync``) and is not exposed through the API.
+
+        Pausing is the point, not a side effect: the successor skill usually needs
+        setup before its events flow, so the row is preserved (action text intact)
+        and left for the user to resume rather than silently re-armed.
+
+        Returns the ids of the rows rewritten — empty when there is nothing to do,
+        which is what makes a repeated boot a no-op.
+        """
+        if not old_skill_names:
+            return []
+        select_sql = (
+            "SELECT id FROM skill_event_subscriptions "
+            "WHERE profile = :profile AND skill_name IN :names"
+        )
+        params: Dict[str, Any] = {"profile": profile, "names": list(old_skill_names)}
+        if event_type is not None:
+            select_sql += " AND event_type = :event_type"
+            params["event_type"] = event_type
+        select_stmt = text(select_sql).bindparams(bindparam("names", expanding=True))
+
+        with self._engine.begin() as conn:
+            ids = [r["id"] for r in conn.execute(select_stmt, params).mappings().fetchall()]
+            if not ids:
+                return []
+            update_stmt = text(
+                "UPDATE skill_event_subscriptions "
+                "SET skill_name = :new_skill_name, paused = :paused WHERE id IN :ids"
+            ).bindparams(bindparam("ids", expanding=True))
+            conn.execute(
+                update_stmt,
+                {"new_skill_name": new_skill_name, "paused": bool(pause), "ids": ids},
+            )
+        return ids
 
     def delete(self, id: str) -> bool:
         with self._engine.begin() as conn:
