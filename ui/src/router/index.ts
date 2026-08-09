@@ -232,6 +232,23 @@ const routes = [
   },
 ];
 
+// PROFILE_ROUTES has to name every ``/:profile`` route (see the comment on the
+// set itself). Forgetting one is invisible when you navigate in from another
+// profile page — the token is already active — and only breaks on a hard reload
+// or a pasted URL, which is the easiest kind of bug to ship. Fail loudly in dev.
+if (import.meta.env.DEV) {
+  const missing = routes
+    .filter((r) => r.path.startsWith('/:profile') && !PROFILE_ROUTES.has(String(r.name)))
+    .map((r) => String(r.name));
+  if (missing.length) {
+    console.error(
+      `[router] profile-scoped route(s) missing from PROFILE_ROUTES: ${missing.join(', ')}.`
+      + ' Add them in router/profileRoutes.ts, or their views will render without an'
+      + ' auth token on reload.',
+    );
+  }
+}
+
 const router = createRouter({
   history: createWebHashHistory(),
   routes,

@@ -108,6 +108,7 @@ export const SETTINGS_ITEM: NavItem = {
     'tools-skills-settings',
     'user-config-settings',
     'embedding-settings',
+    'google-drive-settings',
     'backup-settings',
     'blueprint-settings',
     'blueprint-import',

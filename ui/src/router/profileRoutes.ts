@@ -1,3 +1,11 @@
+// Every route whose path starts with ``/:profile`` must be listed here. This set
+// is what activates the per-profile auth token before the view renders (see the
+// beforeEach guard in router/index.ts), redirects to login when the profile has
+// no token, and shows the nav rail. A profile-scoped route left out of it still
+// renders — but with an empty ``authToken`` on a hard reload or a pasted URL, so
+// every API call the view makes short-circuits and the page reports an empty
+// state. The Google Drive page shipped that way and said "Not linked" on every
+// reload. router/index.ts logs a console error in dev if a route forgets.
 export const PROFILE_ROUTES = new Set([
   'chat',
   'conversation',
@@ -6,6 +14,7 @@ export const PROFILE_ROUTES = new Set([
   'tools-skills-settings',
   'user-config-settings',
   'embedding-settings',
+  'google-drive-settings',
   'profile-settings',
   'channels-settings',
   'backup-settings',

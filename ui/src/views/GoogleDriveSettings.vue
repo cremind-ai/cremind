@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import {
   ElButton, ElCard, ElInput, ElMessage, ElTable, ElTableColumn, ElTag,
@@ -17,7 +17,11 @@ const router = useRouter();
 const settings = useSettingsStore();
 
 const loading = ref(true);
+// null until the server has actually answered. "Not linked" is only ever
+// rendered from a real answer — never from a request we skipped or that failed,
+// which would tell the user their account is unlinked when it isn't.
 const status = ref<DriveStatus | null>(null);
+const statusError = ref('');
 const files = ref<DriveFile[]>([]);
 const filesMessage = ref('');
 const nextPageToken = ref<string | null>(null);
@@ -28,6 +32,10 @@ const grantUrl = ref('');
 const captureHint = ref('');
 const fileRef = ref('');
 const pastedRedirect = ref('');
+// Set when polling gives up (timeout, denial, or a state the server forgot).
+// The banner has to survive that — it carries the picker link and the paste box,
+// which is exactly what the user needs at the moment we stop waiting for them.
+const manualHint = ref('');
 
 // Polling a grant round: the grant lands with Google on approval, so the server
 // discovers it by re-listing reachable files even when the redirect never
@@ -53,12 +61,21 @@ function shortType(mime: string): string {
   return mime.split('/').pop() || mime;
 }
 
-async function loadStatus() {
-  if (!settings.agentUrl || !settings.authToken) return;
+async function loadStatus(): Promise<boolean> {
+  // The token lives only in the Pinia store, and on a reload (or a pasted URL)
+  // this view mounts before App.vue's onMounted — Vue runs children first. The
+  // router guard normally activates it for us; do it here too so the page never
+  // depends on that ordering.
+  if (!settings.authToken && props.profile) settings.activateProfile(props.profile);
+  if (!settings.agentUrl || !settings.authToken) return false;
   try {
     status.value = await getDriveStatus(settings.agentUrl, settings.authToken);
+    statusError.value = '';
+    return true;
   } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : String(err));
+    statusError.value = err instanceof Error ? err.message : String(err);
+    ElMessage.error(statusError.value);
+    return false;
   }
 }
 
@@ -70,13 +87,20 @@ async function loadFiles(pageToken?: string) {
   nextPageToken.value = page.next_page_token ?? null;
 }
 
+// Activating the profile inside ``loadStatus`` writes ``authToken``, which trips
+// the watcher below — without this guard the first load would run twice.
+let refreshing = false;
+
 async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
   loading.value = true;
   try {
-    await loadStatus();
+    if (!(await loadStatus())) return;
     if (linked.value) await loadFiles();
   } finally {
     loading.value = false;
+    refreshing = false;
   }
 }
 
@@ -93,6 +117,7 @@ function finishGrant(count: number) {
   grantUrl.value = '';
   captureHint.value = '';
   pastedRedirect.value = '';
+  manualHint.value = '';
   fileRef.value = '';
   if (popup && !popup.closed) popup.close();
   popup = null;
@@ -102,12 +127,27 @@ function finishGrant(count: number) {
   void loadFiles();
 }
 
+/** Stop waiting, but keep the banner (and its picker link + paste box) on screen. */
+function giveUpWaiting(hint: string) {
+  stopPolling();
+  granting.value = false;
+  manualHint.value = hint;
+}
+
 async function onGrant() {
   if (!settings.agentUrl || !settings.authToken) return;
+  // Open the window FIRST, synchronously in the click handler. The authorize URL
+  // does not exist yet, but an await before window.open spends the user-gesture
+  // token and the browser blocks the popup — so open a blank one now and navigate
+  // it once the server answers. Same pattern as services/hubPublish.ts.
+  popup = window.open('about:blank', 'cremind-google-drive', 'width=620,height=700');
   granting.value = true;
+  manualHint.value = '';
   const refs = fileRef.value.trim() ? [fileRef.value.trim()] : undefined;
   const started = await startDriveGrant(settings.agentUrl, settings.authToken, { fileIds: refs });
   if (started.error || !started.authorize_url || !started.state) {
+    if (popup && !popup.closed) popup.close();
+    popup = null;
     granting.value = false;
     ElMessage.warning(started.message || 'Could not start a Drive grant.');
     return;
@@ -115,26 +155,43 @@ async function onGrant() {
   grantState.value = started.state;
   grantUrl.value = started.authorize_url;
   captureHint.value = started.capture_hint || '';
-  popup = window.open(started.authorize_url, 'cremind-google-drive', 'width=620,height=700');
+  if (popup && !popup.closed) {
+    popup.location.href = started.authorize_url;
+  } else {
+    ElMessage.warning('The browser blocked the Google window — use "open it here" below.');
+  }
 
   let polls = 0;
   pollTimer = window.setInterval(async () => {
     polls += 1;
     if (polls > MAX_POLLS) {
-      stopPolling();
-      granting.value = false;
-      ElMessage.warning('Timed out waiting for the file picker. Try again, or paste the redirect URL.');
+      giveUpWaiting(
+        'Timed out waiting for the file picker. If you already approved, paste the URL '
+        + 'your browser landed on below — or open the picker again.',
+      );
       return;
     }
     try {
       const out = await getDriveGrant(settings.agentUrl, settings.authToken, grantState.value);
       if (out.status === 'error') {
-        stopPolling();
-        granting.value = false;
-        ElMessage.warning(out.error || 'The Google consent was denied.');
+        giveUpWaiting(
+          `${out.error || 'The Google consent was denied.'} You can open the picker again to retry.`,
+        );
         return;
       }
-      if (out.status === 'completed' && out.files.length) finishGrant(out.files.length);
+      if (out.status === 'unknown' || out.status === 'timeout') {
+        // The server forgot this round (in-flight grants live in memory, so a
+        // restart drops them). Pasting cannot help — only a fresh round can.
+        giveUpWaiting(
+          'The server no longer recognizes this grant round — it may have restarted. '
+          + 'Cancel and click "Grant access" to start a new one.',
+        );
+        return;
+      }
+      if (out.status === 'completed' && out.files.length) {
+        if (out.note) ElMessage.warning(out.note);
+        finishGrant(out.files.length);
+      }
     } catch {
       // A transient poll failure is not fatal; the next tick retries.
     }
@@ -165,6 +222,11 @@ function onCancelGrant() {
 }
 
 onMounted(() => { void refresh(); });
+// A token arriving after mount (login flow, session refresh) means the first
+// load ran without one — retry once it lands.
+watch(() => settings.authToken, (token, previous) => {
+  if (token && !previous) void refresh();
+});
 onUnmounted(() => { stopPolling(); });
 </script>
 
@@ -187,6 +249,29 @@ onUnmounted(() => { stopPolling(); });
 
       <ElCard class="section" shadow="never">
         <div v-if="loading" class="muted">Loading…</div>
+        <template v-else-if="statusError">
+          <div class="row">
+            <Icon icon="mdi:alert-circle-outline" class="row-icon" />
+            <div class="grow">
+              <strong>Couldn't check your Drive access</strong>
+              <p class="muted">{{ statusError }}</p>
+            </div>
+            <ElButton @click="refresh">Retry</ElButton>
+          </div>
+        </template>
+        <template v-else-if="!status">
+          <div class="row">
+            <Icon icon="mdi:account-alert-outline" class="row-icon" />
+            <div class="grow">
+              <strong>Session not ready</strong>
+              <p class="muted">
+                This page couldn't reach the server with your profile's session.
+                Sign in to <code>{{ profile }}</code> again, then reopen it.
+              </p>
+            </div>
+            <ElButton @click="refresh">Retry</ElButton>
+          </div>
+        </template>
         <template v-else-if="!linked">
           <div class="row">
             <Icon icon="mdi:link-off" class="row-icon" />
@@ -227,11 +312,17 @@ onUnmounted(() => { stopPolling(); });
             />
           </div>
 
-          <div v-if="granting" class="banner">
+          <div v-if="granting || manualHint" class="banner">
             <div class="grow">
-              <p>
+              <p v-if="granting">
                 Waiting for you to pick files in the Google window. If it didn't open,
                 <a :href="grantUrl" target="_blank" rel="noopener">open it here</a>.
+              </p>
+              <p v-else>
+                {{ manualHint }}
+                <a v-if="grantUrl" :href="grantUrl" target="_blank" rel="noopener">
+                  Open the picker
+                </a>
               </p>
               <p v-if="captureHint" class="muted">{{ captureHint }}</p>
               <div class="paste-row">

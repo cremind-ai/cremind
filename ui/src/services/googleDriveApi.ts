@@ -26,6 +26,9 @@ export interface DriveStatus {
   scopes: string[];
   expected_scopes: string[];
   scopes_stale: boolean;
+  /** False when cremind-connect was unreachable, so expected_scopes is a guess
+   *  and scopes_stale was not computed. */
+  expected_resolved?: boolean;
   /** True when the token still carries the broad scope, so every file is reachable. */
   whole_drive?: boolean;
   /** Server-computed label: which access model this account has, and why. */

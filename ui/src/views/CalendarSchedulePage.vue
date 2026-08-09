@@ -102,15 +102,28 @@ function goBack() { goBackToChat(router, props.profile); }
 
 // ── Google connect ───────────────────────────────────────────────────────
 async function onConnectGoogle() {
+  // Open the window FIRST, synchronously — an await before window.open spends the
+  // user-gesture token and the browser blocks the popup. The authorize URL does
+  // not exist yet, so navigate the blank window once the server answers.
+  const authWindow = window.open('about:blank', 'cremind-google-oauth', 'width=520,height=640');
   connecting.value = true;
   try {
     const res = await connectGoogleCalendar(settings.agentUrl, settings.authToken);
     if (res.error || !res.authorize_url) {
+      if (authWindow && !authWindow.closed) authWindow.close();
       connecting.value = false;
       ElMessage.warning(res.message || 'Google Calendar connect is unavailable.');
       return;
     }
-    window.open(res.authorize_url, 'cremind-google-oauth', 'width=520,height=640');
+    if (authWindow && !authWindow.closed) {
+      authWindow.location.href = res.authorize_url;
+    } else {
+      connecting.value = false;
+      ElMessage.warning(
+        'The browser blocked the Google window — allow pop-ups for this site and try again.',
+      );
+      return;
+    }
     const started = Date.now();
     const poll = window.setInterval(async () => {
       await loadSettings();
