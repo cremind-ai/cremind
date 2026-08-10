@@ -244,6 +244,24 @@ async function deleteRun() {
           <span>· {{ formatTokensCompact(run.usage.total_tokens) }} tokens</span>
           <span>· {{ formatUsd(run.usage.total_usd) }}</span>
           <span v-if="cwd" class="run-cwd" :title="cwd">· cwd: {{ cwd }}</span>
+          <!-- One-shot task runs owe their result to the chat that registered
+               the rule; say whether that hand-over has happened. -->
+          <span
+            v-if="run.deliver_to_origin"
+            class="run-delivery"
+            :class="{ owed: !run.origin_delivered_at }"
+            :title="
+              run.origin_delivered_at
+                ? 'This task result was delivered back into the conversation that was waiting for it.'
+                : 'This task result has not reached its conversation yet.'
+            "
+          >
+            ·
+            <Icon
+              :icon="run.origin_delivered_at ? 'mdi:reply' : 'mdi:progress-clock'"
+            />
+            {{ run.origin_delivered_at ? 'Result delivered' : 'Delivery pending' }}
+          </span>
         </div>
       </div>
 
@@ -353,6 +371,13 @@ async function deleteRun() {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.run-delivery {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+}
+.run-delivery.owed { color: var(--warning-color, #e6a23c); }
 .pending-banner {
   margin: 8px 16px 0;
   width: auto;

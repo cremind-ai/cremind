@@ -137,6 +137,8 @@ async def register_skill_events(
     triggers: List[str],
     action: str,
     request_context: str = "",
+    task: bool = False,
+    timeout_minutes: Any = None,
 ) -> str:
     """Subscribe a conversation to one or more of a skill's declared events.
 
@@ -145,6 +147,11 @@ async def register_skill_events(
     caller to the exact skill whose tool was invoked, so there is no active-skill
     ambiguity. Returns a human-readable confirmation (or error) string that the
     agent appends as the tool result.
+
+    With ``task=True`` the subscription becomes a ONE-SHOT EVENT TASK: it waits
+    for the next matching event, runs once, delivers the outcome back into the
+    registering conversation, then terminates. ``timeout_minutes`` bounds that
+    wait (see :mod:`app.events.task_policy`).
     """
     profile = (profile or "").strip()
     context_id = (context_id or "").strip()
@@ -175,6 +182,29 @@ async def register_skill_events(
         return "trigger is required (non-empty array of event names)."
     if not action:
         return "action is required."
+
+    # Event-task validation before anything is created or any LLM gate runs, so
+    # a malformed call costs nothing and leaves no half-registered state.
+    from app.events.task_policy import format_timeout_clause, resolve_task_timeout
+
+    task = bool(task)
+    timeout_at, timeout_error = resolve_task_timeout(timeout_minutes, task=task)
+    if timeout_error:
+        return timeout_error
+    if task and len(triggers) != 1:
+        # One logical wait must not fan out into N rows: they terminate
+        # independently, so the losers would still be armed after the flow moved
+        # on and would eventually inject a stale result into a finished
+        # conversation. Two genuine waits are two deliberate calls.
+        trig_list = ", ".join(f"'{t}'" for t in triggers)
+        return (
+            f"`task: true` registers ONE awaited outcome, so it needs exactly "
+            f"one `trigger` (you passed {len(triggers)}: {trig_list}). Nothing "
+            "was registered. Re-call with the single event you are waiting for "
+            "— or, if you genuinely need to wait on several independent "
+            "outcomes, make one `subscribe` call per event; each becomes its own "
+            "task and delivers its own result."
+        )
 
     canonical_skill_id = skill_id
     source_dir_str = skill_source
@@ -222,10 +252,12 @@ async def register_skill_events(
     check = await gate_registration_action(
         profile=profile, action=action, request_context=request_context,
         tool_name="this skill's subscribe", conversation_id=conversation_id,
+        task=task,
     )
     if check is not None:
         return build_rejection_message(
-            tool_name="this skill's subscribe", missing=check.missing, reason=check.reason,
+            tool_name="this skill's subscribe", missing=check.missing,
+            reason=check.reason, task=task,
         )
 
     # Persist + watch using the canonical tool_id so every entry agrees
@@ -242,6 +274,8 @@ async def register_skill_events(
                 skill_name=canonical_skill_id,
                 event_type=trigger,
                 action=action,
+                task=task,
+                timeout_at=timeout_at,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("register_skill_events: insert failed")
@@ -263,7 +297,20 @@ async def register_skill_events(
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"register_skill_events: admin-bus publish failed: {exc}")
 
-    if len(triggers) == 1:
+    if task:
+        # Single trigger guaranteed above.
+        confirmation = (
+            f"Registered a one-shot TASK on the '{triggers[0]}' event of skill "
+            f"'{canonical_skill_id}' (id {rows[0]['id']}). It waits for the next "
+            f"such event{format_timeout_clause(timeout_at, timeout_minutes)}, runs "
+            f"\"{action}\" once in a background conversation, delivers the "
+            "outcome back into THIS conversation as a new turn, then stops "
+            "itself. Nothing else is needed from you about it: register any "
+            "further tasks now, then END YOUR TURN with a short message telling "
+            "the user exactly what you are waiting for. Do not sleep, poll, or "
+            "re-check."
+        )
+    elif len(triggers) == 1:
         t = triggers[0]
         confirmation = (
             f"Subscribed this conversation to the '{t}' event of skill "

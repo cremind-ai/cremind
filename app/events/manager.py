@@ -156,6 +156,10 @@ class _ProfileEventHandler(FileSystemEventHandler):
                 # Paused subscriptions are retained but skipped; the shared
                 # listener keeps firing for this skill's other subscriptions.
                 continue
+            if sub.get("task") and sub.get("task_status") != "active":
+                # A spent one-shot task. The dispatcher's atomic claim is the
+                # real guard; skipping here just avoids queueing dead work.
+                continue
             try:
                 await run_dispatcher.dispatch_skill_event(sub=sub, content=content)
             except Exception:  # noqa: BLE001

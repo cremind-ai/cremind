@@ -154,7 +154,24 @@ def _build_check_tools() -> List[Dict[str, Any]]:
     ]
 
 
-def _format_check_prompt(action: str, request_context: str) -> str:
+# Appended for EVENT TASKS only, and to the USER message so the cached system
+# prompt stays byte-identical for the standing-registration case. A task action
+# is a "find out X and report it" instruction: its output is routed back to the
+# waiting conversation automatically, so a checker that expects the action to
+# say who to notify would reject perfectly good task actions.
+_TASK_NOTE = (
+    "\n\nTASK NOTE: this ACTION belongs to a ONE-SHOT TASK. It runs once and its "
+    "output is returned automatically to the conversation that registered it, "
+    "which then continues the user's flow. Judge it as a 'find out X and report "
+    "it' instruction: it is self-contained if the executing agent can obtain and "
+    "report the outcome from the ACTION text plus the event that triggered it. "
+    "Do NOT flag it for failing to notify the user, for not saying where to send "
+    "the result, or for not naming the waiting conversation — delivery is "
+    "automatic."
+)
+
+
+def _format_check_prompt(action: str, request_context: str, *, task: bool = False) -> str:
     ctx = (request_context or "").strip()
     if len(ctx) > _REQUEST_CONTEXT_MAX_CHARS:
         ctx = ctx[:_REQUEST_CONTEXT_MAX_CHARS] + " …[truncated]"
@@ -165,6 +182,7 @@ def _format_check_prompt(action: str, request_context: str) -> str:
         "ONLY to spot concrete values the ACTION relies on but omits):\n"
         f"{ctx or '(not available)'}\n\n"
         f"Call {_TOOL_NAME} with your decision."
+        + (_TASK_NOTE if task else "")
     )
 
 
@@ -201,6 +219,7 @@ async def check_action_self_contained(
     llm,
     action: str,
     request_context: str = "",
+    task: bool = False,
 ) -> ActionCheckResult:
     """Decide whether ``action`` can be executed later with no other context.
 
@@ -212,7 +231,10 @@ async def check_action_self_contained(
     tools = _build_check_tools()
     messages = [
         {"role": "system", "content": _CHECK_SYSTEM_PROMPT},
-        {"role": "user", "content": _format_check_prompt(action, request_context)},
+        {
+            "role": "user",
+            "content": _format_check_prompt(action, request_context, task=task),
+        },
     ]
 
     function_calls: List[Dict[str, Any]] = []
@@ -267,9 +289,18 @@ async def check_action_self_contained(
     )
 
 
-def build_rejection_message(*, tool_name: str, missing: List[str], reason: str) -> str:
+def build_rejection_message(
+    *, tool_name: str, missing: List[str], reason: str, task: bool = False,
+) -> str:
     """The observation returned to the model when a registration is rejected."""
     detail = "; ".join(missing).strip() or (reason.strip() or "a referenced value")
+    task_note = (
+        "\nBecause this is a one-shot task, `action` only needs to say what to "
+        "look at and what to report back — the result returns to this "
+        "conversation automatically, so no delivery or notification step is "
+        "required."
+        if task else ""
+    )
     return (
         "Registration rejected: the action is not self-contained. When it fires "
         "it runs in a FRESH conversation with no access to this one, so "
@@ -280,6 +311,7 @@ def build_rejection_message(*, tool_name: str, missing: List[str], reason: str) 
         "inline every concrete value verbatim (full URLs, email addresses, file "
         "paths, IDs, search criteria). If you do not have a concrete value, ask "
         "the user for it instead of retrying."
+        f"{task_note}"
     )
 
 
@@ -334,6 +366,7 @@ async def gate_registration_action(
     request_context: str = "",
     tool_name: str,
     conversation_id: Optional[str] = None,
+    task: bool = False,
 ) -> Optional[ActionCheckResult]:
     """Run the self-containment gate before persisting a registration.
 
@@ -341,6 +374,10 @@ async def gate_registration_action(
     rewritten; returns ``None`` when the action passes OR when the gate
     fail-opens (no LLM available, timeout, or any error). Callers reject only on
     a non-``None`` result.
+
+    ``task`` marks a one-shot EVENT TASK, whose action reports back to the
+    waiting conversation automatically — the checker is told not to expect a
+    delivery step (see :data:`_TASK_NOTE`).
     """
     action = (action or "").strip()
     if not action:
@@ -361,7 +398,7 @@ async def gate_registration_action(
     try:
         result = await asyncio.wait_for(
             check_action_self_contained(
-                llm=llm, action=action, request_context=request_context,
+                llm=llm, action=action, request_context=request_context, task=task,
             ),
             timeout=_CHECK_TIMEOUT_S,
         )

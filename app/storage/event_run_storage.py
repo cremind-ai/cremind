@@ -22,7 +22,7 @@ import time
 import uuid
 from typing import Any, Optional
 
-from sqlalchemy import and_, case, delete, func, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from app.databases import DatabaseProvider, get_database_provider
@@ -59,18 +59,32 @@ class EventRunStorage:
         profile: str,
         source_kind: str,
         subscription_id: str,
-        conversation_id: str,
+        conversation_id: str | None,
         label: str,
         action: str,
         trigger_payload: dict[str, Any] | None = None,
         run_id: str | None = None,
         history_cap: int = 50,
+        origin_conversation_id: str | None = None,
+        deliver_to_origin: bool = False,
+        status: str = "running",
+        error: str | None = None,
+        finished: bool = False,
     ) -> dict[str, Any]:
-        """Insert a new ``running`` run and prune the rule's terminal history.
+        """Insert a new run and prune the rule's terminal history.
 
         Returns ``{"run": <row dict>, "pruned_conversation_ids": [...]}``. The
         caller must discard the pruned conversations' queue/stream state and
         delete those conversations (usage rows survive, see module docstring).
+
+        ``origin_conversation_id`` is the conversation that registered the rule,
+        frozen here because the rule row is editable and deletable. With
+        ``deliver_to_origin`` set (an EVENT TASK run) the final answer is
+        injected back into it when the run reaches a terminal status.
+
+        ``status``/``error``/``finished`` default to a live ``running`` run;
+        they exist so a task that times out before ever firing can be recorded
+        as an already-terminal run and ride the same delivery path.
         """
         now = time.time() * 1000
         rid = str(uuid.uuid4())
@@ -81,13 +95,18 @@ class EventRunStorage:
             subscription_id=subscription_id,
             conversation_id=conversation_id,
             run_id=run_id,
-            status="running",
+            status=status,
             label=label or "",
             action=action or "",
             trigger_payload=trigger_payload,
+            pending_question=None,
+            error=error,
             turn_count=0,
             created_at=now,
             updated_at=now,
+            finished_at=now if finished else None,
+            origin_conversation_id=origin_conversation_id,
+            deliver_to_origin=bool(deliver_to_origin),
         )
         pruned: list[str] = []
         async with self.async_session_maker.begin() as session:
@@ -101,6 +120,13 @@ class EventRunStorage:
                         EventRunModel.source_kind == source_kind,
                         EventRunModel.subscription_id == subscription_id,
                         EventRunModel.status.in_(TERMINAL_STATUSES),
+                        # Never prune a task result that has not reached its
+                        # origin conversation yet — the boot sweep still owes
+                        # that delivery, and pruning would strand the flow.
+                        or_(
+                            EventRunModel.deliver_to_origin.is_(False),
+                            EventRunModel.origin_delivered_at.isnot(None),
+                        ),
                     )
                     .order_by(EventRunModel.created_at.desc())
                     .offset(history_cap)
@@ -150,6 +176,80 @@ class EventRunStorage:
             await session.execute(
                 update(EventRunModel).where(EventRunModel.id == run_id_pk).values(**values)
             )
+
+    # ── event-task delivery ───────────────────────────────────────────────
+
+    async def claim_delivery(self, run_id_pk: str) -> bool:
+        """Claim the right to deliver this run's result to its origin chat.
+
+        The conditional ``origin_delivered_at IS NULL`` is the exactly-once
+        lock. It covers three races at once: the live terminal hook vs the boot
+        sweep, two boot sweeps, and a run that reaches a terminal status twice
+        (someone replies inside a finished run's mini-chat). Returns ``True``
+        only for the caller that must actually inject the turn.
+        """
+        async with self.async_session_maker.begin() as session:
+            result = await session.execute(
+                update(EventRunModel)
+                .where(
+                    EventRunModel.id == run_id_pk,
+                    EventRunModel.deliver_to_origin.is_(True),
+                    EventRunModel.origin_delivered_at.is_(None),
+                    EventRunModel.status.in_(TERMINAL_STATUSES),
+                )
+                .values(origin_delivered_at=time.time() * 1000)
+            )
+            return (result.rowcount or 0) > 0
+
+    async def clear_delivery_claim(self, run_id_pk: str) -> None:
+        """Release a delivery claim whose injection failed, so the sweep retries."""
+        async with self.async_session_maker.begin() as session:
+            await session.execute(
+                update(EventRunModel)
+                .where(EventRunModel.id == run_id_pk)
+                .values(origin_delivered_at=None)
+            )
+
+    async def list_undelivered_task_runs(
+        self, profile: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Terminal task runs whose result never reached the origin chat.
+
+        The boot sweep's work list: a crash between the terminal status write
+        and the injection leaves exactly these rows behind.
+        """
+        conds = [
+            EventRunModel.deliver_to_origin.is_(True),
+            EventRunModel.origin_delivered_at.is_(None),
+            EventRunModel.status.in_(TERMINAL_STATUSES),
+        ]
+        if profile:
+            conds.append(EventRunModel.profile == profile)
+        async with self.async_session_maker() as session:
+            rows = (await session.execute(
+                select(EventRunModel).where(*conds).order_by(EventRunModel.created_at.asc())
+            )).scalars().all()
+        return [self._row_to_dict(r) for r in rows]
+
+    async def has_live_run_for_subscription(
+        self, source_kind: str, subscription_id: str,
+    ) -> bool:
+        """True if the rule has a run that is still running/pending or undelivered."""
+        async with self.async_session_maker() as session:
+            n = (await session.execute(
+                select(func.count()).select_from(EventRunModel).where(
+                    EventRunModel.source_kind == source_kind,
+                    EventRunModel.subscription_id == subscription_id,
+                    or_(
+                        EventRunModel.status.in_(ACTIVE_STATUSES),
+                        and_(
+                            EventRunModel.deliver_to_origin.is_(True),
+                            EventRunModel.origin_delivered_at.is_(None),
+                        ),
+                    ),
+                )
+            )).scalar_one()
+        return int(n or 0) > 0
 
     # ── reads ─────────────────────────────────────────────────────────────
 
@@ -324,6 +424,10 @@ class EventRunStorage:
 
         ``pending`` runs are left as-is — their reply path is DB-backed and
         survives a restart, so they remain answerable. Returns the count fixed.
+
+        An interrupted EVENT TASK run keeps ``deliver_to_origin`` here, so the
+        boot delivery sweep still reports the failure into the conversation
+        that was waiting on it rather than leaving the flow hanging.
         """
         async with self.async_session_maker.begin() as session:
             result = await session.execute(
@@ -362,6 +466,9 @@ class EventRunStorage:
             "created_at": r.created_at,
             "updated_at": r.updated_at,
             "finished_at": r.finished_at,
+            "origin_conversation_id": r.origin_conversation_id,
+            "deliver_to_origin": bool(r.deliver_to_origin),
+            "origin_delivered_at": r.origin_delivered_at,
         }
 
 

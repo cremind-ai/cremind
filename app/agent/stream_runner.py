@@ -646,6 +646,7 @@ async def run_agent_to_bus(
                 mode=mode,
                 plan_phase=plan_phase,
                 message_origin=message_origin,
+                task_chain_depth=int((trigger_event or {}).get("task_chain_depth") or 0),
             ):
                 ctype = chunk.get("type")
 
@@ -1006,6 +1007,7 @@ async def run_agent_to_bus(
         #     otherwise the turn completed / failed / was cancelled. Written
         #     before 'complete' so subscribers see a consistent status.
         run_row: dict | None = None
+        task_delivery: str | None = None
         if event_run_id:
             from app.events import run_state
             # A run only completes when its todo list (if it drove one) is fully
@@ -1052,6 +1054,28 @@ async def run_agent_to_bus(
             except Exception:  # noqa: BLE001
                 pass
 
+            # 6d. Event TASK delivery. When this run belongs to a one-shot task,
+            #     its result goes back to the conversation that registered it so
+            #     the agent there continues the flow. Hooked here rather than in
+            #     the dispatcher because a task run that parked as 'pending' and
+            #     was answered later terminates from a different call stack —
+            #     this is the one place every terminal path passes through.
+            #     A no-op (one cheap read) for ordinary event runs.
+            if is_terminal:
+                try:
+                    from app.events.event_task_delivery import on_run_terminal
+                    task_delivery = await on_run_terminal(
+                        event_run_id=event_run_id,
+                        profile=profile,
+                        status=run_status,
+                        final_text=final_text,
+                        error=(final_text if errored else drive_not_granted_error),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        f"stream_runner: event task delivery failed for {event_run_id}"
+                    )
+
         # 7. Terminal event so subscribers can flip isStreaming=false.
         await bus.publish(conversation_id, "complete", {
             "assistant_id": assistant_msg_id,
@@ -1062,9 +1086,15 @@ async def run_agent_to_bus(
         # 8. Optional notification. Event runs deep-link to the run detail
         #    (drawer) via event_run_id and use run-specific kinds; ordinary
         #    skill/schedule/file runs on chat conversations keep the plain kinds.
+        #    An event TASK whose result was just delivered raises none: the
+        #    origin conversation is about to run its own turn and notify from
+        #    there, and two notifications for one outcome read as a duplicate.
         if publish_notification:
             try:
-                if event_run_id:
+                from app.events.event_task_delivery import SUPPRESSES_RUN_NOTIFICATION
+                if task_delivery in SUPPRESSES_RUN_NOTIFICATION:
+                    pass
+                elif event_run_id:
                     _push_event_run_notification(
                         profile=profile,
                         conversation_id=conversation_id,

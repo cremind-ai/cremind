@@ -32,7 +32,7 @@ def skill_events_list(ctx: typer.Context) -> None:
     from app.cli.client.skill_events import list_skill_event_subscriptions
     from app.cli.config import Config
     from app.cli.output import OutputMode, Table, print_json
-    from app.cli.output.formatting import string_field
+    from app.cli.output.formatting import epoch_seconds_field, string_field
 
     cfg: Config = ctx.obj["cfg"]
     mode: OutputMode = ctx.obj["mode"]
@@ -48,7 +48,10 @@ def skill_events_list(ctx: typer.Context) -> None:
         print_json(subs)
         return
 
-    table = Table(mode, "ID", "SKILL", "EVENT_TYPE", "CONVERSATION", "CONV_TITLE", "PAUSED")
+    table = Table(
+        mode, "ID", "SKILL", "EVENT_TYPE", "CONVERSATION", "CONV_TITLE",
+        "PAUSED", "TASK", "TIMEOUT",
+    )
     for s in subs:
         table.add_row(
             string_field(s, "id"),
@@ -57,6 +60,9 @@ def skill_events_list(ctx: typer.Context) -> None:
             string_field(s, "conversation_id"),
             string_field(s, "conversation_title"),
             "yes" if s.get("paused") else "",
+            # TASK shows the one-shot lifecycle (blank for standing rules).
+            (s.get("task_status") or "active") if s.get("task") else "",
+            epoch_seconds_field(s.get("timeout_at")),
         )
     table.render()
 
@@ -141,6 +147,17 @@ def skill_events_edit(
         None, "--action",
         help="New natural-language instruction the assistant runs on the event.",
     ),
+    timeout: Optional[int] = typer.Option(
+        None, "--timeout",
+        help=(
+            "One-shot tasks only: minutes from now before the task gives up and "
+            "reports back that its event never fired."
+        ),
+    ),
+    no_timeout: bool = typer.Option(
+        False, "--no-timeout",
+        help="One-shot tasks only: clear the deadline (wait indefinitely).",
+    ),
 ) -> None:
     """Edit a skill event subscription (only the flags you pass are changed)."""
     import asyncio
@@ -149,16 +166,28 @@ def skill_events_edit(
     from app.cli.client.skill_events import update_skill_event_subscription
     from app.cli.config import Config
     from app.cli.output import OutputMode, print_json, print_kv
-    from app.cli.output.formatting import string_field
+    from app.cli.output.formatting import epoch_seconds_field, string_field
+
+    if timeout is not None and no_timeout:
+        typer.echo("--timeout and --no-timeout are mutually exclusive", err=True)
+        raise typer.Exit(code=1)
 
     fields: dict[str, Any] = {}
     if trigger is not None:
         fields["event_type"] = trigger
     if action is not None:
         fields["action"] = action
+    if timeout is not None:
+        fields["timeout_minutes"] = timeout
+    elif no_timeout:
+        fields["timeout_minutes"] = None
 
     if not fields:
-        typer.echo("nothing to update — pass --trigger and/or --action", err=True)
+        typer.echo(
+            "nothing to update — pass --trigger, --action, --timeout "
+            "or --no-timeout",
+            err=True,
+        )
         raise typer.Exit(code=1)
 
     cfg: Config = ctx.obj["cfg"]
@@ -174,13 +203,17 @@ def skill_events_edit(
     if mode.json:
         print_json(out)
         return
-    print_kv([
+    rows = [
         ("id", string_field(out, "id")),
         ("skill_name", string_field(out, "skill_name")),
         ("event_type", string_field(out, "event_type")),
         ("action", string_field(out, "action")),
         ("conversation_id", string_field(out, "conversation_id")),
-    ])
+    ]
+    if out.get("task"):
+        rows.append(("task_status", string_field(out, "task_status")))
+        rows.append(("timeout_at", epoch_seconds_field(out.get("timeout_at"))))
+    print_kv(rows)
 
 
 @skill_events_app.command("simulate")
@@ -193,7 +226,11 @@ def skill_events_simulate(
         help="Optional filename (defaults to a unique simulate-*.md).",
     ),
 ) -> None:
-    """Drop a markdown file into the watched events folder (dev tool)."""
+    """Drop a markdown file into the watched events folder (dev tool).
+
+    Simulating a ONE-SHOT TASK consumes its single firing, so the real event
+    will no longer trigger it — the server says so and it is echoed here.
+    """
     import asyncio
 
     from app.cli.client._base import Client
@@ -204,11 +241,14 @@ def skill_events_simulate(
     cfg.require_token()
     body = sys.stdin.read()
 
-    async def _run() -> None:
+    async def _run() -> dict[str, Any]:
         async with Client(cfg) as client:
-            await simulate_skill_event(client, sub_id, body, filename)
+            return await simulate_skill_event(client, sub_id, body, filename)
 
-    asyncio.run(_run())
+    out = asyncio.run(_run())
+    warning = (out or {}).get("task_warning")
+    if warning:
+        typer.echo(f"warning: {warning}", err=True)
 
 
 @skill_events_app.command("events")

@@ -16,10 +16,13 @@ from sqlalchemy import bindparam, text
 
 from app.databases import DatabaseProvider
 from app.storage._sync_base import SyncStorageBase
+from app.storage._task_subscription import TaskSubscriptionMixin
 
 
-class EventSubscriptionStorage(SyncStorageBase):
+class EventSubscriptionStorage(TaskSubscriptionMixin, SyncStorageBase):
     """Sync storage for skill_event_subscriptions."""
+
+    _TASK_TABLE = "skill_event_subscriptions"
 
     def __init__(self, provider: DatabaseProvider | None = None):
         super().__init__(provider)
@@ -35,6 +38,10 @@ class EventSubscriptionStorage(SyncStorageBase):
             "action": row["action"],
             "created_at": row["created_at"],
             "paused": bool(row["paused"]),
+            "task": bool(row["task"]),
+            "task_status": row["task_status"],
+            "timeout_at": row["timeout_at"],
+            "completed_at": row["completed_at"],
         }
 
     def get(self, id: str) -> Optional[Dict[str, Any]]:
@@ -98,26 +105,39 @@ class EventSubscriptionStorage(SyncStorageBase):
         skill_name: str,
         event_type: str,
         action: str,
+        task: bool = False,
+        timeout_at: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Append a new subscription row.
 
         Multiple subscriptions for the same (conversation, skill, event_type)
         are allowed and will run sequentially in created_at order when the
         event fires.
+
+        ``task=True`` makes this an EVENT TASK — a one-shot whose run result is
+        delivered back into ``conversation_id``; it starts at
+        ``task_status='active'`` and is consumed by :meth:`claim_task_fire`.
+        ``timeout_at`` (epoch seconds) is only meaningful for a task.
         """
         new_id = str(uuid.uuid4())
         now = time.time()
+        task = bool(task)
+        task_status = "active" if task else None
+        timeout_at = float(timeout_at) if (task and timeout_at is not None) else None
         with self._engine.begin() as conn:
             conn.execute(
                 text(
                     "INSERT INTO skill_event_subscriptions "
-                    "(id, conversation_id, profile, skill_name, event_type, action, created_at, paused) "
-                    "VALUES (:id, :conversation_id, :profile, :skill_name, :event_type, :action, :created_at, :paused)"
+                    "(id, conversation_id, profile, skill_name, event_type, action, created_at, "
+                    "paused, task, task_status, timeout_at, completed_at) "
+                    "VALUES (:id, :conversation_id, :profile, :skill_name, :event_type, :action, "
+                    ":created_at, :paused, :task, :task_status, :timeout_at, NULL)"
                 ),
                 {
                     "id": new_id, "conversation_id": conversation_id, "profile": profile,
                     "skill_name": skill_name, "event_type": event_type, "action": action,
                     "created_at": now, "paused": False,
+                    "task": task, "task_status": task_status, "timeout_at": timeout_at,
                 },
             )
         return {
@@ -129,12 +149,18 @@ class EventSubscriptionStorage(SyncStorageBase):
             "action": action,
             "created_at": now,
             "paused": False,
+            "task": task,
+            "task_status": task_status,
+            "timeout_at": timeout_at,
+            "completed_at": None,
         }
 
     # Columns a caller may edit (manual Events-page / CLI edits). skill_name is
     # not editable (the subscription is pinned to its skill); identity and
-    # created_at are excluded.
-    _EDITABLE = {"event_type", "action", "paused"}
+    # created_at are excluded. ``task``/``task_status``/``completed_at`` are
+    # excluded too: task-ness is immutable, and the lifecycle columns are only
+    # ever moved by the atomic claim helpers below (never by a PATCH).
+    _EDITABLE = {"event_type", "action", "paused", "timeout_at"}
 
     def update_fields(self, id: str, **fields: Any) -> Optional[Dict[str, Any]]:
         """Patch editable columns. Returns the refreshed row (or None if absent).

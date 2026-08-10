@@ -319,7 +319,10 @@ def _build_watcher_agent(monkeypatch):
 
 def test_event_run_blocks_register_file_watcher(monkeypatch) -> None:
     agent, tool = _build_watcher_agent(monkeypatch)
+    # A real event run carries BOTH flags (the dispatcher passes a trigger_event
+    # and event_run=True). ``_event_run`` is the one that blocks unconditionally.
     agent._triggered_by_event = True
+    agent._event_run = True
 
     async def _run():
         return [c async for c in agent.run("watch this folder", history_messages=[])]
@@ -332,6 +335,26 @@ def test_event_run_blocks_register_file_watcher(monkeypatch) -> None:
     roles = [m["role"] for m in agent._turn_messages]
     assert roles[:2] == ["assistant", "tool"]
     assert "not allowed from inside an event-triggered run" in agent._turn_messages[1]["content"]
+
+
+def test_task_continuation_turn_blocks_standing_file_watcher(monkeypatch) -> None:
+    """A turn continuing an event task may not register a STANDING watcher.
+
+    ``_triggered_by_event`` without ``_event_run`` is the event-task
+    continuation turn: an ordinary chat turn resuming a flow. It may register
+    one more one-shot task, but a standing rule would re-register itself on
+    every future result.
+    """
+    agent, tool = _build_watcher_agent(monkeypatch)
+    agent._triggered_by_event = True  # _event_run stays False
+
+    async def _run():
+        return [c async for c in agent.run("watch this folder", history_messages=[])]
+
+    asyncio.run(_run())
+
+    assert tool.calls == []
+    assert "only ONE-SHOT TASKS" in agent._turn_messages[1]["content"]
 
 
 def test_normal_run_allows_register_file_watcher(monkeypatch) -> None:
@@ -414,6 +437,7 @@ def _build_scheduler_agent(monkeypatch):
 def test_event_run_blocks_schedule_create(monkeypatch) -> None:
     agent, tool = _build_scheduler_agent(monkeypatch)
     agent._triggered_by_event = True
+    agent._event_run = True
 
     async def _run():
         return [c async for c in agent.run("schedule this", history_messages=[])]
@@ -426,6 +450,79 @@ def test_event_run_blocks_schedule_create(monkeypatch) -> None:
     roles = [m["role"] for m in agent._turn_messages]
     assert roles[:2] == ["assistant", "tool"]
     assert "not allowed from inside an event-triggered run" in agent._turn_messages[1]["content"]
+
+
+def test_task_continuation_turn_allows_one_shot_schedule(monkeypatch) -> None:
+    """A turn continuing an event task MAY register one more one-shot task.
+
+    This is the chaining case ("reply to the customer, wait for their answer,
+    then follow up"): the scripted call has no rrule and a default duration, so
+    it is a one-shot instant event — an event task — and must go through.
+    """
+    agent, tool = _build_scheduler_agent(monkeypatch)
+    agent._triggered_by_event = True  # _event_run stays False
+
+    async def _run():
+        async for _ in agent.run("schedule this", history_messages=[]):
+            pass
+
+    asyncio.run(_run())
+    assert tool.calls == [{
+        "leaf": "schedule_create",
+        "args": {"title": "t", "dtstart": "2026-07-10T09:00:00", "action": "do x"},
+    }]
+
+
+def test_task_chain_depth_cap_stops_a_runaway_wait_loop(monkeypatch) -> None:
+    """A wait→continue→wait flow could otherwise self-perpetuate forever.
+
+    The cap is dispatch-time only (it never reaches the prompt), so it costs no
+    prompt cache — but past the limit even a one-shot task is refused and the
+    assistant has to hand back to the user.
+    """
+    from app.events.task_policy import MAX_TASK_CHAIN_DEPTH
+
+    agent, tool = _build_scheduler_agent(monkeypatch)
+    agent._triggered_by_event = True
+    agent._task_chain_depth = MAX_TASK_CHAIN_DEPTH
+
+    async def _run():
+        return [c async for c in agent.run("schedule this", history_messages=[])]
+
+    asyncio.run(_run())
+    assert tool.calls == []
+    assert "already chained" in agent._turn_messages[1]["content"]
+
+
+def test_a_task_continuation_turn_still_sees_the_registration_tools(monkeypatch) -> None:
+    """The tools block must be byte-identical to an ordinary chat turn's.
+
+    The continuation turn is the first turn that is event-TRIGGERED while living
+    in a normal chat conversation. Gating the schema on that (rather than on the
+    conversation-constant event-run flag) would both bust the chat's cached
+    prefix mid-conversation AND hide the very tools this turn is allowed to call.
+    """
+    def _specs(**flags):
+        agent, _ = _build_scheduler_agent(monkeypatch)
+        agent._current_query = "schedule this"
+        for k, v in flags.items():
+            setattr(agent, k, v)
+        return agent._build_tools_and_dispatch()
+
+    chat_specs, _ = _specs()
+    cont_specs, _ = _specs(_triggered_by_event=True)
+
+    assert cont_specs == chat_specs
+    assert any(
+        s["function"]["name"] == "scheduler__schedule_create" for s in cont_specs
+    )
+
+    # An event run is a separate cache population and DOES hide them.
+    run_specs, run_dispatch = _specs(_triggered_by_event=True, _event_run=True)
+    assert run_specs == []
+    # ...but the dispatch entry survives, so a replayed call is refused, not
+    # answered with "Unknown tool".
+    assert "scheduler__schedule_create" in run_dispatch
 
 
 def test_normal_run_allows_schedule_create(monkeypatch) -> None:

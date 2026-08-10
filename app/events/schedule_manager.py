@@ -4,10 +4,12 @@ Schedule trigger engine).
 The clock-based sibling of :class:`app.events.file_watcher_manager.FileWatcherManager`.
 Where that mounts watchdog observers, this maintains a single in-memory min-heap
 keyed by ``next_fire_at`` and one asyncio task that sleeps until the earliest
-due time. When a rule fires it either raises a reminder notification
-(reminder-only rows) or enqueues an agent run on the per-conversation queue, then
-**advances the rolling pointer** to the following occurrence — so an open-ended
-recurrence is one durable row, never an exploding set of registrations.
+due time. When a rule fires it dispatches an agent run into a hidden per-trigger
+conversation (:mod:`app.events.run_dispatcher`), then **advances the rolling
+pointer** to the following occurrence — so an open-ended recurrence is one
+durable row, never an exploding set of registrations. A one-shot has no next
+occurrence: it is claimed (``active`` → ``completed``) before dispatch, which is
+also what makes an agent-created one-time event safe as an EVENT TASK.
 
 Lazy invalidation: each heap entry carries a sequence number; ``arm``/``refresh``
 bump the latest sequence for a subscription, so stale heap entries are recognized
@@ -225,12 +227,22 @@ class ScheduleManager:
             store.update_next_fire(sub_id, next_fire_at=new_epoch, occurrences_fired=occurrences_fired)
             self._arm(sub_id, new_epoch)
         else:
-            store.set_status(sub_id, "completed", next_fire_at=None)
-            store.update_next_fire(sub_id, next_fire_at=None, occurrences_fired=occurrences_fired)
+            # Last (or only) occurrence: the row is spent. Claimed atomically so
+            # a duplicate heap entry or a cancel racing this fire cannot dispatch
+            # twice — which for a one-shot EVENT TASK would deliver two results
+            # into the conversation waiting on it.
+            if not store.claim_one_shot(sub_id, occurrences_fired=occurrences_fired):
+                logger.info(
+                    f"ScheduleManager: {sub_id} was already consumed elsewhere — "
+                    "dropping duplicate fire"
+                )
+                return
 
-        # Deliver the trigger: ALWAYS run the action in the registering
-        # conversation. When no explicit action was set, the title is the
-        # command (e.g. "tắt đèn hiên"), so the agent still executes it.
+        # Deliver the trigger: the action runs in a hidden per-trigger
+        # conversation (see app.events.run_dispatcher). When no explicit action
+        # was set, the title is the command (e.g. "tắt đèn hiên"), so the agent
+        # still executes it. An agent-created one-time event is an EVENT TASK:
+        # its run result is delivered back into the registering conversation.
         action = (sub.get("action") or "").strip() or (sub.get("title") or "").strip()
         payload = {
             "title": sub.get("title", ""),

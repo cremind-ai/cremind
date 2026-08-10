@@ -370,6 +370,12 @@ async def _do_shutdown() -> None:
     except Exception:  # noqa: BLE001
         logger.exception("Error stopping skill event manager during shutdown")
     try:
+        from app.events.task_timeout_manager import get_task_timeout_manager
+
+        get_task_timeout_manager().stop()
+    except Exception:  # noqa: BLE001
+        logger.exception("Error stopping task timeout manager during shutdown")
+    try:
         stop_all_watchers()
     except Exception:  # noqa: BLE001
         logger.exception("Error stopping skill watchers during shutdown")
@@ -883,6 +889,20 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
                 get_schedule_manager().start(loop)
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to start schedule manager")
+
+            # 7f-bis. Event tasks. First hand back any one-shot result a crash
+            # stranded (boot recovery in 6b has already flipped interrupted runs
+            # to 'failed', which is what makes them deliverable), then start the
+            # deadline sweep so a task whose event never fires still reports
+            # back instead of hanging its conversation forever.
+            try:
+                from app.events.event_task_delivery import sweep_undelivered
+                from app.events.task_timeout_manager import get_task_timeout_manager
+
+                await sweep_undelivered()
+                get_task_timeout_manager().start(loop)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to start event task delivery/timeout")
 
             # 7g. Temporary chat-upload pruner — periodically removes idle
             # per-conversation upload folders so the temp tree never grows

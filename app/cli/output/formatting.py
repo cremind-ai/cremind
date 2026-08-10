@@ -27,3 +27,19 @@ def bool_field(d: dict[str, Any], key: str, fallback: bool = False) -> str:
     if key in d and isinstance(d[key], bool):
         return "yes" if d[key] else "no"
     return "yes" if fallback else "no"
+
+
+def epoch_seconds_field(value: Any) -> str:
+    """Render an epoch-SECONDS timestamp as local ``YYYY-MM-DD HH:MM``, else "".
+
+    Subscription tables store seconds; event runs store milliseconds (see
+    ``_fmt_ts`` in the event-runs command) — do not mix the two.
+    """
+    if not value:
+        return ""
+    try:
+        from datetime import datetime
+
+        return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""

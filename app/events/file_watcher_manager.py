@@ -311,6 +311,10 @@ class _SharedHandler(FileSystemEventHandler):
                 # Retained but skipped; the shared per-root observer keeps
                 # serving this root's other subscriptions.
                 continue
+            if sub.get("task") and sub.get("task_status") != "active":
+                # A spent one-shot task. The dispatcher's atomic claim is the
+                # real guard; skipping here just avoids queueing dead work.
+                continue
             if not self._passes_filter(sub, payload):
                 continue
             matched += 1

@@ -74,6 +74,16 @@ def _fmt_ts(value: Any) -> str:
         return ""
 
 
+def _delivery_cell(run: dict[str, Any]) -> str:
+    """Whether this run owes its result to a waiting conversation, and if it paid.
+
+    Blank for an ordinary event run — only EVENT TASK runs deliver back.
+    """
+    if not run.get("deliver_to_origin"):
+        return ""
+    return "yes" if run.get("origin_delivered_at") else "pending"
+
+
 def _fmt_usd(value: Any) -> str:
     """Render a cost figure like `cremind usage` does — a plain dollar amount."""
     try:
@@ -148,7 +158,10 @@ def event_runs_list(
         sys.stdout.write("no event runs match.\n")
         return
 
-    table = Table(mode, "RUN ID", "FIRED", "STATUS", "LABEL", "TOKENS", "COST", "TURNS")
+    table = Table(
+        mode, "RUN ID", "FIRED", "STATUS", "LABEL", "TOKENS", "COST", "TURNS",
+        "DELIVERED",
+    )
     for r in runs:
         usage = r.get("usage") if isinstance(r.get("usage"), dict) else {}
         table.add_row(
@@ -159,6 +172,7 @@ def event_runs_list(
             string_field(usage, "total_tokens"),
             _fmt_usd(usage.get("total_usd")),
             string_field(r, "turn_count"),
+            _delivery_cell(r),
         )
     table.render()
 
@@ -215,6 +229,9 @@ def event_runs_show(
         ("updated", _fmt_ts(run.get("updated_at"))),
         ("finished", _fmt_ts(run.get("finished_at"))),
     ]
+    if run.get("deliver_to_origin"):
+        rows.append(("origin_conversation_id", string_field(run, "origin_conversation_id")))
+        rows.append(("result_delivered", _fmt_ts(run.get("origin_delivered_at")) or "pending"))
     pending = run.get("pending_question")
     if pending:
         rows.append(("pending_question", str(pending)))
@@ -240,6 +257,9 @@ def event_runs_show(
         sys.stdout.write(f"\nTranscript:  cremind conv get {conv_id}\n")
         if string_field(run, "status") == "pending" or pending:
             sys.stdout.write(f'Reply:       cremind event-runs reply {run_pk} "..."\n')
+    origin_id = string_field(run, "origin_conversation_id")
+    if run.get("deliver_to_origin") and origin_id:
+        sys.stdout.write(f"Delivered to: cremind conv get {origin_id}\n")
 
 
 @event_runs_app.command("reply")

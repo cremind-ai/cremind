@@ -58,6 +58,16 @@ export interface EventRun {
   created_at: number; // epoch ms
   updated_at: number; // epoch ms
   finished_at: number | null; // epoch ms
+  /**
+   * EVENT TASK delivery. A task run owes its result to the conversation that
+   * registered the rule: `origin_conversation_id` is that conversation and
+   * `origin_delivered_at` (epoch ms) is when the continuation turn was
+   * injected — null while the hand-over is still owed. Blank/false on ordinary
+   * event runs, which report only via notifications.
+   */
+  origin_conversation_id: string | null;
+  deliver_to_origin: boolean;
+  origin_delivered_at: number | null; // epoch ms
 }
 
 export interface ListEventRunsQuery {

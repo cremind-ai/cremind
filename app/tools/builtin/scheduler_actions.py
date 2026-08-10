@@ -28,6 +28,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from app.config.timezone import resolve_tzinfo
+from app.events.task_policy import schedule_kind_for
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
 from app.utils.logger import logger
 
@@ -256,6 +257,18 @@ class ScheduleCreateTool(BuiltInTool):
         from app.calendar.provider import get_calendar_provider, google_supports_rrule
         provider = get_calendar_provider(profile)
 
+        # A one-time instant event IS an EVENT TASK: the user asked for "do this
+        # at that moment and tell me", which is a wait, not a standing rule — so
+        # its result comes back to this conversation instead of only appearing in
+        # notifications. Longer/all-day one-shots are calendar blocks (schedule
+        # kind 'interval'), not awaited outcomes.
+        schedule_kind = schedule_kind_for(
+            rrule=rrule, all_day=all_day, duration_minutes=duration_minutes,
+        )
+        # No conversation context (e.g. the reserved __schedule__ owner) means
+        # nowhere to deliver, so such a row must not claim to be a task.
+        is_task = bool(context_id) and schedule_kind == "instant"
+
         # Google Calendar can't store sub-daily recurrences (hourly/minutely). When
         # Google is the active provider, warn instead of silently creating a
         # reminder that never shows on the user's Google Calendar — unless they've
@@ -288,6 +301,7 @@ class ScheduleCreateTool(BuiltInTool):
             profile=profile, action=action,
             request_context=get_context(context_id or "", "_current_query", "") or "",
             tool_name="schedule_create", conversation_id=conversation_id,
+            task=is_task,
         )
         if check is not None:
             return BuiltInToolResult(structured_content={
@@ -295,7 +309,8 @@ class ScheduleCreateTool(BuiltInTool):
                 "error": "action_not_self_contained",
                 "missing": check.missing,
                 "message": build_rejection_message(
-                    tool_name="schedule_create", missing=check.missing, reason=check.reason,
+                    tool_name="schedule_create", missing=check.missing,
+                    reason=check.reason, task=is_task,
                 ),
             })
 
@@ -306,7 +321,8 @@ class ScheduleCreateTool(BuiltInTool):
                 title=title,
                 action=action,
                 source="agent",
-                schedule_kind=("recurrence" if rrule else ("interval" if duration_minutes > 30 else "instant")),
+                task=is_task,
+                schedule_kind=schedule_kind,
                 dtstart=dtstart,
                 duration_minutes=duration_minutes,
                 all_day=all_day,
@@ -325,7 +341,29 @@ class ScheduleCreateTool(BuiltInTool):
             })
 
         _publish_changed(profile)
-        when = "recurring" if rrule else "one-time"
+        # Read task-ness back from the stored row: the provider refuses to stamp
+        # one that can never fire (a dtstart already in the past), and promising
+        # the model a result that will never arrive is the one failure this
+        # feature must not have.
+        created_task = bool(row.get("task"))
+        if created_task:
+            message = (
+                f"Created the one-shot TASK '{title}' (id {row['id']}) for "
+                f"{dtstart}. It fires once, runs its action in a background "
+                "conversation, and then delivers the outcome back into THIS "
+                "conversation as a new turn — so you can continue from there. Do "
+                "NOT wait, sleep, or poll for it: finish this turn now and tell "
+                "the user what you are waiting for. To cancel before it fires: "
+                f"`cremind calendar schedule status {row['id']} cancelled`."
+            )
+        else:
+            when = "recurring" if rrule else "one-time"
+            message = (
+                f"Created a {when} scheduled action '{title}' starting {dtstart}. "
+                "Each firing runs in its own background conversation; the results "
+                "do NOT come back to this chat — the user sees them on the Events "
+                "page and in notifications."
+            )
         return BuiltInToolResult(structured_content={
             "ok": True,
             "id": row["id"],
@@ -335,7 +373,8 @@ class ScheduleCreateTool(BuiltInTool):
             "rrule": rrule,
             "next_fire_at": row.get("next_fire_at"),
             "status": row.get("status"),
-            "message": f"Created a {when} scheduled action '{title}' starting {dtstart}.",
+            "task": created_task,
+            "message": message,
         })
 
 

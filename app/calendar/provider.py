@@ -207,6 +207,7 @@ class InternalCalendarProvider(CalendarProvider):
         recurrence_end_type: Optional[str] = None,
         recurrence_end_value: Optional[str] = None,
         timezone: Optional[str] = None,
+        task: bool = False,
     ) -> Dict[str, Any]:
         next_fire_at = self._seed_next_fire_at(
             profile=profile,
@@ -215,6 +216,11 @@ class InternalCalendarProvider(CalendarProvider):
         )
         # A past one-shot is stored as a completed calendar record (never fires).
         status = "active" if next_fire_at is not None else "completed"
+        # EVENT TASK: an agent-created one-shot whose result returns to the
+        # registering conversation. The caller decides (it knows whether a real
+        # conversation is waiting); a row that will never fire cannot be a task,
+        # or the conversation would wait on a delivery that never comes.
+        task = bool(task) and status == "active" and not rrule
         # Every schedule event runs an action; when none is given, the title is
         # the command (so a bare "tắt đèn hiên" still executes).
         action = (action or "").strip() or (title or "").strip()
@@ -234,12 +240,14 @@ class InternalCalendarProvider(CalendarProvider):
             timezone=timezone,
             status=status,
             source=source,
+            task=task,
         )
         if status == "active":
             self._manager().arm(row)
         logger.info(
             f"[calendar] created schedule event {row['id']} title={title!r} "
-            f"kind={schedule_kind} rrule={rrule!r} next_fire_at={next_fire_at} status={status}"
+            f"kind={schedule_kind} rrule={rrule!r} next_fire_at={next_fire_at} "
+            f"status={status} task={task}"
         )
         return row
 
@@ -273,6 +281,14 @@ class InternalCalendarProvider(CalendarProvider):
         existing = self._store.get(event_id)
         if existing is None:
             return None
+        # An EVENT TASK is a promise to a conversation that is waiting for its
+        # one result. Turning it into a recurrence would silently void that
+        # promise (a recurring rule never reports back), so refuse the edit and
+        # let the caller create a separate recurring event instead.
+        if existing.get("task") and (
+            fields.get("rrule") or fields.get("schedule_kind") == "recurrence"
+        ):
+            raise ValueError("task_recurrence_conflict")
         # If timing-relevant fields changed, recompute the rolling pointer.
         timing_keys = {"dtstart", "rrule", "recurrence_end_type", "recurrence_end_value"}
         if timing_keys & set(fields.keys()):
@@ -302,6 +318,12 @@ class InternalCalendarProvider(CalendarProvider):
         existing = self._store.get(event_id)
         if existing is None:
             return None
+        # Pausing an EVENT TASK is a trap: resuming re-seeds the pointer from
+        # now, so a one-shot whose moment passed while paused would flip to
+        # 'completed' without ever firing — and the conversation waiting on it
+        # would never hear back. Cancel or delete it instead.
+        if existing.get("task") and status == "paused":
+            raise ValueError("task_pause_unsupported")
         next_fire_at = existing.get("next_fire_at")
         if status == "active":
             # Resume: re-seed the pointer from now so a long-paused rule lands on
@@ -376,6 +398,7 @@ class InternalCalendarProvider(CalendarProvider):
                     "rrule": sub.get("rrule"),
                     "status": sub.get("status"),
                     "source": sub.get("source"),
+                    "task": bool(sub.get("task")),
                     "conversation_id": sub.get("conversation_id"),
                     "start": R.format_local(occ),
                     "end": R.format_local(end),
@@ -482,6 +505,7 @@ def _google_event_to_occurrence(ev: Dict[str, Any], match_row: Optional[Dict[str
             "rrule": match_row.get("rrule"),
             "status": match_row.get("status", "active"),
             "source": match_row.get("source", "agent"),
+            "task": bool(match_row.get("task")),
             "conversation_id": match_row.get("conversation_id"),
             "start": start,
             "end": end,
@@ -497,6 +521,9 @@ def _google_event_to_occurrence(ev: Dict[str, Any], match_row: Optional[Dict[str
         "rrule": None,
         "status": "active",
         "source": "google",
+        # A pure Google event has no Cremind subscription row, so it can never
+        # be a task.
+        "task": False,
         "conversation_id": None,
         "start": start,
         "end": end,

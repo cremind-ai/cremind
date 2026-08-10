@@ -357,7 +357,7 @@ def schedule_list(ctx: typer.Context) -> None:
     if mode.json:
         print_json(subs)
         return
-    table = Table(mode, "ID", "TITLE", "KIND", "START", "STATUS", "CONV_TITLE")
+    table = Table(mode, "ID", "TITLE", "KIND", "START", "STATUS", "TASK", "CONV_TITLE")
     for s in subs:
         table.add_row(
             string_field(s, "id"),
@@ -365,6 +365,8 @@ def schedule_list(ctx: typer.Context) -> None:
             string_field(s, "schedule_kind"),
             string_field(s, "dtstart"),
             string_field(s, "status"),
+            # TASK marks a one-shot whose result returns to its conversation.
+            "yes" if s.get("task") else "",
             string_field(s, "conversation_title"),
         )
     table.render()

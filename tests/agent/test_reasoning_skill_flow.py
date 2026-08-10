@@ -425,7 +425,10 @@ def test_event_triggered_subscribe_is_refused(monkeypatch):
         {"subscribe": {"trigger": ["issue_created"], "action": "summarize the issue"}},
     )
     agent = _build_agent(monkeypatch, llm, [jira])
+    # A real event run carries BOTH flags; ``_event_run`` is what locks the whole
+    # conversation against registration (see the reply-turn test below).
     agent._triggered_by_event = True
+    agent._event_run = True
 
     chunks = _run(agent, "subscribe to jira issues", history=[])
     trace = _done(chunks)["llm_messages"]
@@ -437,6 +440,65 @@ def test_event_triggered_subscribe_is_refused(monkeypatch):
     # Leading phrase only: _build_agent caps tool results at a tiny token budget
     # (proving results are truncated); the full refusal survives the real 1000-tok cap.
     assert "Subscriptions cannot be created" in trace[1]["content"]
+
+
+def test_task_continuation_turn_standing_subscribe_is_refused(monkeypatch):
+    # An event-task continuation turn (_triggered_by_event without _event_run) is
+    # an ordinary chat turn resuming a flow. It may register one more ONE-SHOT
+    # task, but a standing subscription would re-register on every result.
+    called = {"n": 0}
+
+    async def fake_register(**kwargs):  # pragma: no cover - must NOT be called
+        called["n"] += 1
+        return "SUBSCRIBED OK"
+
+    monkeypatch.setattr(rse, "register_skill_events", fake_register)
+
+    jira = _FakeSkillTool("default__jira", "jira",
+                          events=[{"name": "issue_created", "description": "new issue"}])
+    llm = _SkillCallLLM(
+        "default__jira",
+        {"subscribe": {"trigger": ["issue_created"], "action": "summarize the issue"}},
+    )
+    agent = _build_agent(monkeypatch, llm, [jira])
+    agent._triggered_by_event = True  # _event_run stays False
+
+    trace = _done(_run(agent, "subscribe to jira issues", history=[]))["llm_messages"]
+    assert called["n"] == 0
+    # Leading phrase only — _build_agent caps tool results at a tiny token budget.
+    assert "This turn was started by" in trace[1]["content"]
+
+
+def test_task_continuation_turn_allows_task_subscribe(monkeypatch):
+    # The chaining case: the same continuation turn registering a one-shot task
+    # (task=true, single trigger) must go through, and the task flags must reach
+    # register_skill_events.
+    seen: dict = {}
+
+    async def fake_register(**kwargs):
+        seen.update(kwargs)
+        return "TASK REGISTERED"
+
+    monkeypatch.setattr(rse, "register_skill_events", fake_register)
+
+    jira = _FakeSkillTool("default__jira", "jira",
+                          events=[{"name": "issue_created", "description": "new issue"}])
+    llm = _SkillCallLLM(
+        "default__jira",
+        {"subscribe": {
+            "trigger": ["issue_created"],
+            "action": "report the issue key and status",
+            "task": True,
+            "timeout_minutes": 120,
+        }},
+    )
+    agent = _build_agent(monkeypatch, llm, [jira])
+    agent._triggered_by_event = True
+
+    _run(agent, "wait for the next jira issue", history=[])
+    assert seen.get("task") is True
+    assert seen.get("timeout_minutes") == 120
+    assert seen.get("triggers") == ["issue_created"]
 
 
 def test_event_run_reply_turn_subscribe_is_refused(monkeypatch):

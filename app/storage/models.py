@@ -436,6 +436,26 @@ class SkillEventSubscriptionModel(Base):
     paused: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
+    # ── Event task (one-shot) fields ────────────────────────────────────────
+    # When true this row is an EVENT TASK: it waits for the NEXT matching event
+    # only, runs once in a hidden event-run conversation, delivers that run's
+    # result back into ``conversation_id`` as a new turn, then terminates.
+    # Immutable after insert (a standing rule never becomes a task, or vice
+    # versa). ``server_default`` for create_all-built tables / raw inserts.
+    task: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    # Task lifecycle, NULL for standing subscriptions:
+    # active -> triggered (claimed at fire) -> completed | cancelled
+    # active -> timed_out (deadline passed before any fire)
+    # The active->{triggered,timed_out} flip is an atomic conditional UPDATE —
+    # it is what makes a task fire exactly once under concurrent triggers.
+    task_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Epoch SECONDS (this table's convention) after which an unfired task gives
+    # up and delivers a "timed out" result. NULL = wait indefinitely.
+    timeout_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Epoch seconds stamped when ``task_status`` reaches a terminal value.
+    completed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class FileWatcherSubscriptionModel(Base):
@@ -475,6 +495,16 @@ class FileWatcherSubscriptionModel(Base):
     paused: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
+    # ── Event task (one-shot) fields ────────────────────────────────────────
+    # Same semantics as SkillEventSubscriptionModel: a task watcher fires on the
+    # FIRST matching event, delivers its run's result back into
+    # ``conversation_id``, then terminates. See that model for the lifecycle.
+    task: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    task_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    timeout_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    completed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class ScheduleEventSubscriptionModel(Base):
@@ -522,6 +552,16 @@ class ScheduleEventSubscriptionModel(Base):
     occurrences_fired: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")  # active|completed|cancelled|paused
     source: Mapped[str] = mapped_column(String(16), nullable=False, default="agent")  # agent|manual
+    # EVENT TASK: an agent-created one-shot (``rrule`` NULL, ``schedule_kind``
+    # ``instant``) whose run result is delivered back into ``conversation_id``.
+    # Stamped explicitly at create rather than derived, so a later PATCH that
+    # adds an ``rrule`` can be REFUSED instead of silently voiding the promised
+    # delivery, and so blueprint replays never re-stamp a restored row.
+    # ``status`` already carries the lifecycle (active → completed at fire), so
+    # there is no separate task_status here.
+    task: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     # Set when mirrored to an external provider (e.g. "google"); reserved for Phase 2.
     external_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     external_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
@@ -592,6 +632,25 @@ class EventRunModel(Base):
     created_at: Mapped[float] = mapped_column(Float, nullable=False)  # epoch ms
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)  # epoch ms
     finished_at: Mapped[float | None] = mapped_column(Float, nullable=True)  # epoch ms
+    # ── Event task delivery ─────────────────────────────────────────────────
+    # The conversation that REGISTERED the rule, frozen at fire time (the rule
+    # row is editable and deletable). Recorded for every run; only acted on when
+    # ``deliver_to_origin``. A real FK (SET NULL) so rename-repointing covers it
+    # and a deleted origin degrades to "notification only" instead of dangling.
+    origin_conversation_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    # True when this run belongs to an EVENT TASK: on reaching a terminal status
+    # its final answer is injected into ``origin_conversation_id`` as a new turn.
+    deliver_to_origin: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    # Epoch MS (this table's convention — subscriptions use seconds) of the
+    # delivery. Claimed with a conditional UPDATE (``IS NULL``), which is what
+    # makes delivery exactly-once across the live hook, the boot sweep, and a
+    # run that reaches a terminal status twice (a late reply into a finished run).
+    origin_delivered_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     __table_args__ = (
         Index("ix_event_runs_sub", "source_kind", "subscription_id", "created_at"),

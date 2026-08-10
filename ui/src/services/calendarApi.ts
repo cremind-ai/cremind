@@ -37,6 +37,12 @@ export interface ScheduleEventSubscription {
   occurrences_fired: number;
   status: 'active' | 'completed' | 'cancelled' | 'paused';
   source: 'agent' | 'manual';
+  /**
+   * One-shot EVENT TASK: an agent-created one-time event whose result is
+   * delivered back into `conversation_id`. Tasks cannot be paused or given a
+   * recurrence (the server rejects both).
+   */
+  task: boolean;
   created_at: number;
   updated_at: number;
 }
@@ -51,6 +57,8 @@ export interface CalendarOccurrence {
   rrule: string | null;
   status: string;
   source: string;
+  /** One-shot task whose result returns to `conversation_id`. */
+  task: boolean;
   conversation_id: string | null;
   start: string; // naive-local ISO
   end: string;

@@ -66,7 +66,7 @@ The app runs `upgrade head` automatically on boot (`ensure_at_head()` in
 migration will break existing installs on upgrade.
 
 - Migrations live in `app/alembic/versions/` (current head:
-  `20260627_llm_messages`).
+  `20260810_event_tasks`).
 - Generate and **hand-review** the migration following the checklist in
   [RELEASING.md](RELEASING.md) → **Schema change**: prefer additive changes,
   split destructive changes across two releases, backfill **inside** the

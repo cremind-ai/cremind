@@ -207,6 +207,19 @@ def get_file_watcher_routes() -> list[Route]:
                 status_code=400,
             )
 
+        # Event task (one-shot, result returns to the owning conversation).
+        from app.events.task_policy import resolve_task_timeout
+
+        task = bool(body.get("task"))
+        timeout_at, timeout_error = resolve_task_timeout(
+            body.get("timeout_minutes"), task=task,
+        )
+        if timeout_error:
+            return JSONResponse(
+                {"error": "invalid_timeout", "message": timeout_error},
+                status_code=400,
+            )
+
         target_kind = (body.get("target_kind") or "any").strip().lower()
         if target_kind not in _VALID_TARGET_KINDS:
             return JSONResponse(
@@ -309,6 +322,8 @@ def get_file_watcher_routes() -> list[Route]:
             event_types=",".join(triggers),
             extensions=",".join(extensions),
             action=action,
+            task=task,
+            timeout_at=timeout_at,
         )
 
         armed = False
@@ -345,7 +360,17 @@ def get_file_watcher_routes() -> list[Route]:
         except Exception:
             return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
+        from app.api._task_patch import apply_timeout_patch, terminal_task_error
+
+        finished = terminal_task_error(existing)
+        if finished is not None:
+            return JSONResponse(finished[0], status_code=finished[1])
+
         fields: Dict[str, Any] = {}
+
+        rejected = apply_timeout_patch(body, existing, fields)
+        if rejected is not None:
+            return JSONResponse(rejected[0], status_code=rejected[1])
 
         if "action" in body:
             action = (body.get("action") or "").strip()

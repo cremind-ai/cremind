@@ -496,6 +496,16 @@ class SchedulerTool(BuiltInTool):
                     feature_on = is_enabled(profile)
                 except Exception:  # noqa: BLE001
                     feature_on = False
+            # A one-time (instant) event registers as an EVENT TASK, so the
+            # model must know its outcome comes back as a later turn — otherwise
+            # it tries to wait for it inside this turn.
+            task_note = (
+                " A one-time event you register is a TASK: it fires once and its "
+                "outcome is delivered back into this conversation as a later "
+                "turn — so register it, then end your turn; never wait or poll "
+                "for it."
+                if schedule_kind == "instant" else ""
+            )
             result["registration_note"] = (
                 "PARSED ONLY — nothing is scheduled yet. This tool just "
                 "normalized the time. To actually register the task you MUST now "
@@ -505,6 +515,7 @@ class SchedulerTool(BuiltInTool):
                 "or recurrence, do NOT call schedule_create — edit it in place "
                 "with the `cremind calendar edit <id>` CLI command instead (never "
                 "cancel and recreate; see the calendar documentation)."
+                + task_note
                 if feature_on else
                 "PARSED ONLY — nothing is scheduled yet; this tool just "
                 "normalized the time."

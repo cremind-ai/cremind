@@ -7,7 +7,7 @@
 // conversion happens HERE, once, so every consumer downstream sees ms only.
 
 import type { EventRunSourceKind } from '../../../services/eventRunsApi';
-import type { SkillEventSubscription } from '../../../services/skillEventsApi';
+import type { EventTaskStatus, SkillEventSubscription } from '../../../services/skillEventsApi';
 import type { FileWatcherSubscription } from '../../../services/fileWatchersApi';
 import type { ScheduleEventSubscription } from '../../../services/calendarApi';
 
@@ -60,6 +60,16 @@ interface BoardSubscriptionBase {
   conversationId: string;
   createdAtMs: number;
   icon: string;
+  /**
+   * A ONE-SHOT EVENT TASK: fires once, hands its result back to
+   * `conversationId`, then ends. Named `eventTask*` rather than `task*` because
+   * this board already calls every rule+run pair a "task".
+   */
+  eventTask: boolean;
+  /** Task lifecycle; null for a standing rule (and for schedules, which use `scheduleStatus`). */
+  eventTaskStatus: EventTaskStatus | null;
+  /** Task deadline (epoch ms), null when it waits indefinitely or is not a task. */
+  eventTaskTimeoutAtMs: number | null;
 }
 
 export interface SkillBoardSubscription extends BoardSubscriptionBase {
@@ -122,6 +132,9 @@ export function fromSkillEvent(s: SkillEventSubscription): SkillBoardSubscriptio
     skillName: s.skill_name,
     eventType: s.event_type,
     paused: !!s.paused,
+    eventTask: !!s.task,
+    eventTaskStatus: s.task_status ?? null,
+    eventTaskTimeoutAtMs: s.timeout_at != null ? s.timeout_at * 1000 : null,
     raw: s,
   };
 }
@@ -139,16 +152,21 @@ export function fromFileWatcher(s: FileWatcherSubscription): FileWatcherBoardSub
     armed: s.armed,
     paused: !!s.paused,
     rootPath: s.root_path,
+    eventTask: !!s.task,
+    eventTaskStatus: s.task_status ?? null,
+    eventTaskTimeoutAtMs: s.timeout_at != null ? s.timeout_at * 1000 : null,
     raw: s,
   };
 }
 
 /**
- * Multi-fire vs one-time. Skill events and file watchers always fire
- * repeatedly; a schedule is recurring iff it carries an rrule. Recurring
- * events keep their card in the EVENTS column even while a run is active.
+ * Multi-fire vs one-time. A ONE-SHOT EVENT TASK is one-time in any family; a
+ * standing skill event or file watcher always fires repeatedly, and a schedule
+ * is recurring iff it carries an rrule. Recurring events keep their card in the
+ * EVENTS column even while a run is active.
  */
 export function isRecurring(e: BoardSubscription): boolean {
+  if (e.eventTask) return false;
   return e.kind !== 'schedule' || !!e.rrule;
 }
 
@@ -165,6 +183,11 @@ export function fromSchedule(s: ScheduleEventSubscription): ScheduleBoardSubscri
     nextFireAtMs: s.next_fire_at != null ? s.next_fire_at * 1000 : null,
     rrule: s.rrule,
     scheduleStatus: s.status,
+    eventTask: !!s.task,
+    // A schedule's lifecycle already lives in ``status``; there is no separate
+    // task_status column for it.
+    eventTaskStatus: null,
+    eventTaskTimeoutAtMs: null,
     raw: s,
   };
 }

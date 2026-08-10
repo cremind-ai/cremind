@@ -49,6 +49,7 @@ class ScheduleEventSubscriptionStorage(SyncStorageBase):
             "occurrences_fired": int(row["occurrences_fired"]),
             "status": row["status"],
             "source": row["source"],
+            "task": bool(row["task"]),
             "external_provider": row["external_provider"],
             "external_event_id": row["external_event_id"],
             "created_at": row["created_at"],
@@ -125,6 +126,7 @@ class ScheduleEventSubscriptionStorage(SyncStorageBase):
         timezone: Optional[str] = None,
         status: str = "active",
         source: str = "agent",
+        task: bool = False,
         external_provider: Optional[str] = None,
         external_event_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -148,6 +150,7 @@ class ScheduleEventSubscriptionStorage(SyncStorageBase):
             "occurrences_fired": 0,
             "status": status,
             "source": source,
+            "task": bool(task),
             "external_provider": external_provider,
             "external_event_id": external_event_id,
             "created_at": now,
@@ -160,15 +163,38 @@ class ScheduleEventSubscriptionStorage(SyncStorageBase):
                     "(id, conversation_id, profile, title, action, all_day, "
                     "schedule_kind, dtstart, duration_minutes, rrule, recurrence_end_type, "
                     "recurrence_end_value, timezone, next_fire_at, occurrences_fired, "
-                    "status, source, external_provider, external_event_id, created_at, updated_at) "
+                    "status, source, task, external_provider, external_event_id, created_at, updated_at) "
                     "VALUES (:id, :conversation_id, :profile, :title, :action, :all_day, "
                     ":schedule_kind, :dtstart, :duration_minutes, :rrule, :recurrence_end_type, "
                     ":recurrence_end_value, :timezone, :next_fire_at, :occurrences_fired, "
-                    ":status, :source, :external_provider, :external_event_id, :created_at, :updated_at)"
+                    ":status, :source, :task, :external_provider, :external_event_id, :created_at, :updated_at)"
                 ),
                 params,
             )
         return params
+
+    def claim_one_shot(self, id: str, *, occurrences_fired: int) -> bool:
+        """Atomically consume a one-shot schedule row's single firing.
+
+        The conditional ``status = 'active'`` is what stops a duplicate fire (a
+        heap replay, a manual simulate, a race with a cancel) from dispatching
+        an event task twice. Returns ``True`` only for the winning caller; a
+        loser must drop its trigger.
+
+        Standing/recurring rows keep using :meth:`update_next_fire` — they roll
+        the pointer forward instead of terminating.
+        """
+        with self._engine.begin() as conn:
+            cur = conn.execute(
+                text(
+                    "UPDATE schedule_event_subscriptions "
+                    "SET status = 'completed', next_fire_at = NULL, "
+                    "occurrences_fired = :o, updated_at = :u "
+                    "WHERE id = :id AND status = 'active'"
+                ),
+                {"o": int(occurrences_fired), "u": time.time(), "id": id},
+            )
+            return (cur.rowcount or 0) > 0
 
     def update_next_fire(
         self, id: str, *, next_fire_at: Optional[float], occurrences_fired: int,

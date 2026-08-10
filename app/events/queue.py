@@ -62,6 +62,7 @@ async def _worker(conversation_id: str) -> None:
                     agent_message_metadata=item.get("agent_message_metadata"),
                     attachments=item.get("attachments"),
                     push_user_message=item.get("push_user_message", True),
+                    trigger_event=item.get("trigger_event"),
                     publish_notification=item.get("publish_notification", False),
                     update_title_from_query=item.get("update_title_from_query", True),
                     event_run_id=item.get("event_run_id"),
@@ -113,6 +114,7 @@ async def enqueue_user_message(
     agent_message_metadata: Optional[Dict[str, Any]] = None,
     attachments: Optional[List[Dict[str, Any]]] = None,
     push_user_message: bool = True,
+    trigger_event: Optional[Dict[str, Any]] = None,
     update_title_from_query: bool = True,
     event_run_id: Optional[str] = None,
     event_run: bool = False,
@@ -129,6 +131,11 @@ async def enqueue_user_message(
     ``event_run_id`` / ``event_run`` are set when the conversation is a hidden
     event-run conversation (a reply to a pending run) so the run's status and
     usage update and the ``request_user_input`` tool stays available.
+
+    ``trigger_event`` (with ``push_user_message=False``) turns the item into a
+    system-injected turn rendered as a structured agent bubble instead of a fake
+    user message — how an EVENT TASK's result re-enters the conversation that
+    was waiting for it (see :mod:`app.events.event_task_delivery`).
     """
     queue = _ensure_worker(conversation_id)
     await queue.put({
@@ -145,6 +152,7 @@ async def enqueue_user_message(
         "agent_message_metadata": agent_message_metadata,
         "attachments": attachments,
         "push_user_message": push_user_message,
+        "trigger_event": trigger_event,
         "update_title_from_query": update_title_from_query,
         "event_run_id": event_run_id,
         "event_run": event_run,

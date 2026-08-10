@@ -38,14 +38,20 @@ async def simulate_skill_event(
     sub_id: str,
     content: str,
     filename: str = "",
-) -> None:
+) -> dict[str, Any]:
+    """Drop a synthetic event file. Returns the server's payload.
+
+    The payload carries ``task_warning`` when the target is a one-shot task,
+    because simulating one really consumes its single firing.
+    """
     body: dict[str, str] = {"content": content}
     if filename:
         body["filename"] = filename
-    await client.post_json(
+    resp = await client.post_json(
         f"/api/skill-events/{quote(sub_id, safe='')}/simulate",
         body,
     )
+    return resp if isinstance(resp, dict) else {}
 
 
 async def list_skill_events(client: Client, skill: str) -> dict[str, Any]:

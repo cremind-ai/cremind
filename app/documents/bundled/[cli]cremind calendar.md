@@ -1,5 +1,5 @@
 ---
-description: "Create, edit, and delete **scheduled and recurring events, reminders, and timers** (one-off or RRULE-recurring) that fire an agent action at a set time; enable or disable the per-profile **Calendar & Schedule** feature, connect or disconnect **Google Calendar**, and pause/resume/cancel schedule subscriptions. Use this to set a reminder, schedule a recurring task, or link a Google calendar — time-based triggers, unlike filesystem or skill events."
+description: "Create, edit, and delete **scheduled and recurring events, reminders, and timers** (one-off or RRULE-recurring) that fire an agent action at a set time; enable or disable the per-profile **Calendar & Schedule** feature, connect or disconnect **Google Calendar**, and pause/resume/cancel schedule subscriptions. Use this to set a reminder, schedule a recurring task, or link a Google calendar — time-based triggers, unlike filesystem or skill events. `schedule list` also shows which one-time events are **event tasks** (created by the assistant to wait for a moment, delivering their result back into the conversation that is waiting); tasks cannot be paused or made recurring."
 ---
 
 # `cremind calendar` — Calendar & Schedule
@@ -188,8 +188,16 @@ asks you to confirm; `cremind calendar add` just keeps it local.)
 cremind calendar schedule list
 ```
 
-Renders an `ID / TITLE / KIND / START / STATUS / CONV_TITLE` table; `--json`
-returns the `subscriptions` array.
+Renders an `ID / TITLE / KIND / START / STATUS / TASK / CONV_TITLE` table;
+`--json` returns the `subscriptions` array.
+
+`TASK` is `yes` for a **one-time event task**: an event the assistant created
+while working, for a moment the conversation is waiting on ("check the build at
+16:00 and tell me"). When it fires, the result is delivered back into that
+conversation as a new turn so the assistant can continue, and the row flips to
+`completed`. Recurring events and events you add yourself (from the calendar UI
+or `cremind calendar add`) are never tasks — their runs surface as
+notifications and on the Events page instead.
 
 ### `cremind calendar schedule status`
 
@@ -201,6 +209,14 @@ cremind calendar schedule status <id> active|paused|cancelled
 
 Prints the updated event. Any value other than `active`/`paused`/`cancelled`
 is rejected.
+
+**Tasks cannot be paused** (`400 task_pause_unsupported`). Resuming re-seeds an
+event's fire time from *now*, so a one-time task whose moment passed while
+paused would silently never fire and the conversation waiting for it would
+never hear back. Cancel or delete it instead. For the same reason,
+`cremind calendar edit` refuses to add an `--rrule` to a task
+(`400 task_recurrence_conflict`): a recurring rule never reports back. Create a
+separate recurring event if that is what you want.
 
 ## Worked examples
 
@@ -217,8 +233,9 @@ $ cremind calendar add --title "Inbox triage" --at 2026-07-01T08:00:00 \
 
 ```bash
 $ cremind calendar schedule list
-ID        TITLE          KIND        START                STATUS   CONV_TITLE
-se_4a1f   Inbox triage   recurrence  2026-07-01T08:00:00  active   Schedule
+ID        TITLE          KIND        START                STATUS   TASK  CONV_TITLE
+se_4a1f   Inbox triage   recurrence  2026-07-01T08:00:00  active         Schedule
+se_9b02   Check CI       instant     2026-08-10T16:00:00  active   yes   Release 2.4
 $ cremind calendar schedule status se_4a1f paused
 $ cremind calendar schedule status se_4a1f active
 ```

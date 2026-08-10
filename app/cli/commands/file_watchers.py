@@ -20,6 +20,25 @@ file_watchers_app = typer.Typer(
 )
 
 
+def _watcher_kv(out: dict[str, Any], string_field, bool_field, epoch_seconds_field):
+    """The key/value rows printed after a register or edit."""
+    rows = [
+        ("id", string_field(out, "id")),
+        ("name", string_field(out, "name")),
+        ("root_path", string_field(out, "root_path")),
+        ("event_types", string_field(out, "event_types")),
+        ("target_kind", string_field(out, "target_kind")),
+        ("extensions", string_field(out, "extensions")),
+        ("recursive", bool_field(out, "recursive", True)),
+        ("armed", bool_field(out, "armed", False)),
+    ]
+    if out.get("task"):
+        rows.append(("task_status", string_field(out, "task_status")))
+        rows.append(("timeout_at", epoch_seconds_field(out.get("timeout_at"))))
+    rows.append(("conversation_id", string_field(out, "conversation_id")))
+    return rows
+
+
 @file_watchers_app.command("list")
 @graceful_errors
 def file_watchers_list(ctx: typer.Context) -> None:
@@ -30,7 +49,7 @@ def file_watchers_list(ctx: typer.Context) -> None:
     from app.cli.client.file_watchers import list_file_watchers
     from app.cli.config import Config
     from app.cli.output import OutputMode, Table, print_json
-    from app.cli.output.formatting import bool_field, string_field
+    from app.cli.output.formatting import bool_field, epoch_seconds_field, string_field
 
     cfg: Config = ctx.obj["cfg"]
     mode: OutputMode = ctx.obj["mode"]
@@ -48,7 +67,8 @@ def file_watchers_list(ctx: typer.Context) -> None:
 
     table = Table(
         mode,
-        "ID", "NAME", "PATH", "TRIGGERS", "TARGET", "EXTENSIONS", "ARMED", "PAUSED", "CONV_TITLE",
+        "ID", "NAME", "PATH", "TRIGGERS", "TARGET", "EXTENSIONS", "ARMED", "PAUSED",
+        "TASK", "TIMEOUT", "CONV_TITLE",
     )
     for s in subs:
         table.add_row(
@@ -60,6 +80,9 @@ def file_watchers_list(ctx: typer.Context) -> None:
             string_field(s, "extensions"),
             bool_field(s, "armed", False),
             bool_field(s, "paused", False),
+            # TASK shows the one-shot lifecycle (blank for standing watchers).
+            (s.get("task_status") or "active") if s.get("task") else "",
+            epoch_seconds_field(s.get("timeout_at")),
             string_field(s, "conversation_title"),
         )
     table.render()
@@ -168,6 +191,21 @@ def file_watchers_register(
         None, "--conversation",
         help="Existing conversation id to bind to (a new one is created if blank).",
     ),
+    task: bool = typer.Option(
+        False, "--task",
+        help=(
+            "Register a ONE-SHOT task: fires on the first matching event, "
+            "delivers its result back into the bound conversation, then removes "
+            "itself (instead of watching forever)."
+        ),
+    ),
+    timeout: Optional[int] = typer.Option(
+        None, "--timeout",
+        help=(
+            "Requires --task: minutes to wait before giving up and reporting "
+            "that the event never fired (default 7 days)."
+        ),
+    ),
 ) -> None:
     """Register a new file watcher subscription."""
     import asyncio
@@ -176,13 +214,20 @@ def file_watchers_register(
     from app.cli.client.file_watchers import create_file_watcher
     from app.cli.config import Config
     from app.cli.output import OutputMode, print_json, print_kv
-    from app.cli.output.formatting import bool_field, string_field
+    from app.cli.output.formatting import bool_field, epoch_seconds_field, string_field
 
     if not action:
         typer.echo("--action is required", err=True)
         raise typer.Exit(code=1)
+    if timeout is not None and not task:
+        typer.echo("--timeout requires --task", err=True)
+        raise typer.Exit(code=1)
 
     body: dict[str, Any] = {"action": action}
+    if task:
+        body["task"] = True
+        if timeout is not None:
+            body["timeout_minutes"] = timeout
     if path:
         body["path"] = path
     if name:
@@ -210,17 +255,7 @@ def file_watchers_register(
     if mode.json:
         print_json(out)
         return
-    print_kv([
-        ("id", string_field(out, "id")),
-        ("name", string_field(out, "name")),
-        ("root_path", string_field(out, "root_path")),
-        ("event_types", string_field(out, "event_types")),
-        ("target_kind", string_field(out, "target_kind")),
-        ("extensions", string_field(out, "extensions")),
-        ("recursive", bool_field(out, "recursive", True)),
-        ("armed", bool_field(out, "armed", False)),
-        ("conversation_id", string_field(out, "conversation_id")),
-    ])
+    print_kv(_watcher_kv(out, string_field, bool_field, epoch_seconds_field))
 
 
 @file_watchers_app.command("edit")
@@ -251,6 +286,17 @@ def file_watchers_edit(
         None, "--action",
         help="New natural-language instruction the assistant runs on each event.",
     ),
+    timeout: Optional[int] = typer.Option(
+        None, "--timeout",
+        help=(
+            "One-shot tasks only: minutes from now before the task gives up and "
+            "reports back that its event never fired."
+        ),
+    ),
+    no_timeout: bool = typer.Option(
+        False, "--no-timeout",
+        help="One-shot tasks only: clear the deadline (wait indefinitely).",
+    ),
 ) -> None:
     """Edit a file watcher (only the flags you pass are changed)."""
     import asyncio
@@ -259,7 +305,11 @@ def file_watchers_edit(
     from app.cli.client.file_watchers import update_file_watcher
     from app.cli.config import Config
     from app.cli.output import OutputMode, print_json, print_kv
-    from app.cli.output.formatting import bool_field, string_field
+    from app.cli.output.formatting import bool_field, epoch_seconds_field, string_field
+
+    if timeout is not None and no_timeout:
+        typer.echo("--timeout and --no-timeout are mutually exclusive", err=True)
+        raise typer.Exit(code=1)
 
     fields: dict[str, Any] = {}
     if path is not None:
@@ -276,6 +326,10 @@ def file_watchers_edit(
         fields["recursive"] = recursive
     if action is not None:
         fields["action"] = action
+    if timeout is not None:
+        fields["timeout_minutes"] = timeout
+    elif no_timeout:
+        fields["timeout_minutes"] = None
 
     if not fields:
         typer.echo("nothing to update — pass at least one field flag", err=True)
@@ -294,17 +348,7 @@ def file_watchers_edit(
     if mode.json:
         print_json(out)
         return
-    print_kv([
-        ("id", string_field(out, "id")),
-        ("name", string_field(out, "name")),
-        ("root_path", string_field(out, "root_path")),
-        ("event_types", string_field(out, "event_types")),
-        ("target_kind", string_field(out, "target_kind")),
-        ("extensions", string_field(out, "extensions")),
-        ("recursive", bool_field(out, "recursive", True)),
-        ("armed", bool_field(out, "armed", False)),
-        ("conversation_id", string_field(out, "conversation_id")),
-    ])
+    print_kv(_watcher_kv(out, string_field, bool_field, epoch_seconds_field))
 
 
 @file_watchers_app.command("stream")

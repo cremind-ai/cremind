@@ -1,5 +1,5 @@
 ---
-description: "Watch the **filesystem** and trigger the agent when files change: register a directory watch (relative to `CREMIND_USER_WORKING_DIR` or absolute), filtered by event type (created / modified / deleted / moved), target kind (file / folder), and file extensions; `list`, `edit`, `pause`, `resume`, and `delete` watcher subscriptions for the active profile; and tail admin snapshots over SSE. `pause` keeps a watcher but stops it firing (`resume` re-enables it). Use this to run the agent when a file is added, edited, or removed — filesystem events, unlike time-based `cremind calendar` or skill events."
+description: "Watch the **filesystem** and trigger the agent when files change: register a directory watch (relative to `CREMIND_USER_WORKING_DIR` or absolute), filtered by event type (created / modified / deleted / moved), target kind (file / folder), and file extensions; `list`, `edit`, `pause`, `resume`, and `delete` watcher subscriptions for the active profile; and tail admin snapshots over SSE. `pause` keeps a watcher but stops it firing (`resume` re-enables it). Supports **one-shot event tasks** via `register --task [--timeout <minutes>]`: the watcher fires on the FIRST matching event, delivers its result back into the conversation waiting for it, then terminates — for \"run this, wait for the output file, then continue\" flows. Use this to run the agent when a file is added, edited, or removed — filesystem events, unlike time-based `cremind calendar` or skill events."
 ---
 
 # `cremind file-watchers` — Filesystem Watch Subscriptions
@@ -154,7 +154,7 @@ profile.
 cremind file-watchers list
 ```
 
-**Behavior.** Renders an eight-column table:
+**Behavior.** Renders a table:
 
 | Column        | Source              | Meaning                                                                    |
 |---------------|---------------------|----------------------------------------------------------------------------|
@@ -165,18 +165,22 @@ cremind file-watchers list
 | `TARGET`      | `target_kind`       | `file`, `folder`, or `any`.                                                |
 | `EXTENSIONS`  | `extensions`        | Comma-joined like `.py,.md`. Empty = match all extensions.                 |
 | `ARMED`       | `armed`             | `yes` if a live watchdog Observer covers this row, `no` otherwise.         |
+| `PAUSED`      | `paused`            | `yes` when retained but not firing.                                        |
+| `TASK`        | `task_status`       | Blank for a standing watcher. For a one-shot task: `active` (still waiting), `triggered` (its run is in flight), `completed`, `cancelled`, or `timed_out`. |
+| `TIMEOUT`     | `timeout_at`        | A task's deadline, local time. Blank means it waits indefinitely.          |
 | `CONV_TITLE`  | `conversation_title`| Title of the conversation the subscription routes events into.             |
 
 With `--json`, returns the underlying array (which also includes
-`recursive`, `action`, `conversation_id`, `profile`, and `created_at`).
+`recursive`, `action`, `conversation_id`, `profile`, `task`, and `created_at`).
 
 **Example.**
 
 ```bash
 $ cremind file-watchers list
-ID         NAME      PATH                              TRIGGERS                          TARGET  EXTENSIONS  ARMED  CONV_TITLE
-fw_a3f1    py-only   C:\Users\me\Documents\Lee         created,modified                  file    .py         yes    Lee Watcher
-fw_8c20    inbox     C:\Users\me\Documents\inbox       created                           file    .pdf        yes    PDF Inbox
+ID         NAME      PATH                          TRIGGERS          TARGET  EXTENSIONS  ARMED  PAUSED  TASK    TIMEOUT           CONV_TITLE
+fw_a3f1    py-only   C:\Users\me\Documents\Lee     created,modified  file    .py         yes    no                                Lee Watcher
+fw_8c20    inbox     C:\Users\me\Documents\inbox   created           file    .pdf        yes    no                                PDF Inbox
+fw_51dd    err-log   C:\Users\me\app\logs          created           file    .log        yes    no      active  2026-08-10 12:30  Debug --disk
 ```
 
 ### `cremind file-watchers delete`
@@ -217,6 +221,7 @@ cremind file-watchers register --action "<instruction>"
                            [--ext <csv>]
                            [--recursive=true|false]
                            [--conversation <id>]
+                           [--task [--timeout <minutes>]]
 ```
 
 **Flags.**
@@ -231,12 +236,23 @@ cremind file-watchers register --action "<instruction>"
 | `--ext`          | string | `""` (match all)                     | Comma-separated extensions (`.py,.md` or `py,md` — leading dot added automatically). File events only; folder events bypass this.|
 | `--recursive`    | bool   | `true`                               | Watch subdirectories recursively.                                                                                                |
 | `--conversation` | string | new conversation                     | Bind to an existing conversation id. If omitted, a fresh conversation is created with title `File Watcher: <name>`.              |
+| `--task`         | flag   | off                                  | Register a ONE-SHOT task: it fires on the FIRST matching event, delivers its result back into the bound conversation, then terminates. |
+| `--timeout`      | int    | 10080 (7 days) with `--task`         | Minutes to wait before giving up and reporting that the event never fired. 1–43200 (30 days). Requires `--task`.                 |
 
 **Behavior.** POSTs the registration to the server. On success, prints
 a key-value table with the new subscription's `id`, `name`, resolved
 `root_path`, `event_types`, `target_kind`, `extensions`, `recursive`,
-`armed` flag, and `conversation_id`. With `--json`, returns the full
-JSON payload.
+`armed` flag, and `conversation_id` (plus `task_status` and `timeout_at`
+for a task). With `--json`, returns the full JSON payload.
+
+**Standing watcher vs one-shot task.** Without `--task` the watcher handles
+every future matching event, indefinitely, and its runs never report back to
+the bound conversation — they surface as notifications and on the Events page.
+With `--task` it is a *wait*: the first matching event fires it once, that run's
+result is delivered into the bound conversation as a new turn (so the assistant
+there continues whatever it was waiting to finish), and the watcher removes
+itself. Use it for "run this, wait for the output file, then continue" flows;
+use a standing watcher for "whenever a file lands here, handle it".
 
 If `armed` comes back `no`, the subscription was saved but no live
 Observer is running for it (typically a transient I/O error). Restart
@@ -307,6 +323,7 @@ cremind file-watchers edit <id>
                        [--ext <csv>]
                        [--recursive | --no-recursive]
                        [--action "<instruction>"]
+                       [--timeout <minutes> | --no-timeout]
 ```
 
 **Flags.** Same meanings and validation as `register` (`--path` is
@@ -322,6 +339,13 @@ subset of `created,modified,deleted,moved`; `--target` must be
   leaves the current value.
 - There is no `--conversation` flag — a watcher stays bound to its
   original conversation.
+- `--timeout <minutes>` / `--no-timeout` apply only to one-shot tasks:
+  they move or clear the deadline (measured from now). Passing either on a
+  standing watcher returns `400 not_a_task`; the two are mutually exclusive.
+- A task that has already finished (`completed`, `cancelled`, `timed_out`) is
+  read-only history — editing it returns `409 task_finished`. Delete it
+  instead if you no longer want the record. There is no `--task` flag here:
+  task-ness is fixed at registration.
 
 **Behavior.** PATCHes `/api/file-watchers/{id}`. On success prints the
 same key-value table as `register` (including the refreshed `armed`
@@ -338,6 +362,9 @@ $ cremind file-watchers edit fw_a3f1 --ext "" --action "log every change to the 
 
 # Repoint a watcher at a different directory
 $ cremind file-watchers edit fw_a3f1 --path Projects/active
+
+# Give a waiting one-shot task another 30 minutes
+$ cremind file-watchers edit fw_51dd --timeout 30
 ```
 
 ### `cremind file-watchers stream`

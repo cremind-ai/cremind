@@ -267,7 +267,23 @@ def get_calendar_routes(conversation_storage=None) -> list[Route]:
         fields = {k: v for k, v in body.items() if k in allowed}
         if "dtstart" in fields and fields["dtstart"]:
             fields["dtstart"] = _norm_range(str(fields["dtstart"]), str(fields["dtstart"]))
-        row = provider.update_event(event_id, **fields)
+        try:
+            row = provider.update_event(event_id, **fields)
+        except ValueError as exc:
+            if str(exc) == "task_recurrence_conflict":
+                return JSONResponse(
+                    {
+                        "error": "task_recurrence_conflict",
+                        "message": (
+                            "This one-time event is a task bound to the "
+                            "conversation waiting for its result, so recurrence "
+                            "cannot be added — create a separate recurring event "
+                            "instead."
+                        ),
+                    },
+                    status_code=400,
+                )
+            raise
         publish_schedule_events_admin_changed(profile)
         return JSONResponse({"ok": True, "event": row})
 
@@ -311,7 +327,24 @@ def get_calendar_routes(conversation_storage=None) -> list[Route]:
         provider = get_calendar_provider(profile)
         if not any(s["id"] == event_id for s in provider.list_subscriptions(profile)):
             return JSONResponse({"error": "Not found"}, status_code=404)
-        row = provider.set_status(event_id, status)
+        try:
+            row = provider.set_status(event_id, status)
+        except ValueError as exc:
+            if str(exc) == "task_pause_unsupported":
+                return JSONResponse(
+                    {
+                        "error": "task_pause_unsupported",
+                        "message": (
+                            "A one-time task cannot be paused: resuming re-seeds "
+                            "its fire time, so a moment that passed while paused "
+                            "would silently never fire and the waiting "
+                            "conversation would never hear back. Cancel or delete "
+                            "it instead."
+                        ),
+                    },
+                    status_code=400,
+                )
+            raise
         publish_schedule_events_admin_changed(profile)
         return JSONResponse({"ok": True, "event": row})
 

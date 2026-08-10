@@ -231,7 +231,17 @@ def get_event_routes() -> list[Route]:
         except Exception:
             return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
+        from app.api._task_patch import apply_timeout_patch, terminal_task_error
+
+        finished = terminal_task_error(existing)
+        if finished is not None:
+            return JSONResponse(finished[0], status_code=finished[1])
+
         fields: Dict[str, Any] = {}
+
+        rejected = apply_timeout_patch(body, existing, fields)
+        if rejected is not None:
+            return JSONResponse(rejected[0], status_code=rejected[1])
 
         if "action" in body:
             action = (body.get("action") or "").strip()
@@ -342,7 +352,16 @@ def get_event_routes() -> list[Route]:
             return JSONResponse(
                 {"error": "write_failed", "message": str(exc)}, status_code=500,
             )
-        return JSONResponse({"ok": True, "path": str(file_path)})
+        payload: Dict[str, Any] = {"ok": True, "path": str(file_path)}
+        # Simulating a one-shot task really consumes it — the dispatcher cannot
+        # tell a synthetic trigger from a real one, and a dry-run mode would test
+        # something other than what happens in production. Say so plainly.
+        if existing.get("task") and existing.get("task_status") == "active":
+            payload["task_warning"] = (
+                "This is a one-shot task: the simulated event consumes its single "
+                "firing, so the real event will no longer trigger it."
+            )
+        return JSONResponse(payload)
 
     async def handle_skill_events(request: Request) -> JSONResponse:
         unauth = _require_auth(request)

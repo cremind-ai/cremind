@@ -1,5 +1,5 @@
 ---
-description: "View and manage **event runs** — the per-trigger execution history of automatic event rules (skill, file-watcher, schedule). Each fired trigger runs in its own isolated conversation with a status (running/pending/completed/failed/cancelled) and token usage; reply to runs pending your input, cancel a running run, and inspect or delete run history. Resolve an **event id / run id** copied from the web UI's Events page with `show` to report details about that run, or `reply`/`cancel`/`delete` to act on it."
+description: "View and manage **event runs** — the per-trigger execution history of automatic event rules (skill, file-watcher, schedule). Each fired trigger runs in its own isolated conversation with a status (running/pending/completed/failed/cancelled) and token usage; reply to runs pending your input, cancel a running run, and inspect or delete run history. Resolve an **event id / run id** copied from the web UI's Events page with `show` to report details about that run, or `reply`/`cancel`/`delete` to act on it. Runs belonging to **one-shot event tasks** also show where their result was delivered — the conversation that was waiting on the outcome — via the `DELIVERED` column and the `origin_conversation_id` field."
 ---
 
 # `cremind event-runs` — Event Run History
@@ -77,12 +77,18 @@ cremind event-runs list [--kind <source>] [--subscription <id>]
 | `--status`       | all     | Filter by status: `running`, `pending`, `completed`, `failed`, or `cancelled`.                        |
 | `--limit`        | `50`    | Maximum runs to return (server caps at 200).                                                          |
 
-Renders a `RUN ID / FIRED / STATUS / LABEL / TOKENS / COST / TURNS` table. The
-`STATUS` column is color-coded (pending is highlighted). `FIRED` is the local
-time the trigger fired. `COST` is the run's estimated dollar cost and `TOKENS`
-its total token count. `RUN ID` is the **full** run id — copy it straight into
-`show` / `reply` / `delete` / `cancel`. A `shown / total` footer follows the
-table; an empty result prints `no event runs match.`.
+Renders a `RUN ID / FIRED / STATUS / LABEL / TOKENS / COST / TURNS / DELIVERED`
+table. The `STATUS` column is color-coded (pending is highlighted). `FIRED` is
+the local time the trigger fired. `COST` is the run's estimated dollar cost and
+`TOKENS` its total token count. `RUN ID` is the **full** run id — copy it
+straight into `show` / `reply` / `delete` / `cancel`. A `shown / total` footer
+follows the table; an empty result prints `no event runs match.`.
+
+`DELIVERED` is blank for an ordinary event run. It is filled in only for a
+**one-shot event task**, whose result is handed back to the conversation that
+was waiting for it: `yes` once that turn has been injected, `pending` while the
+hand-over is still owed (a run interrupted by a restart is delivered by a sweep
+on the next boot, so `pending` should not persist).
 
 With `--json`, returns the raw `{runs: [...], total: N}` object (each run in the
 full RunJSON shape, with full ids and the complete usage breakdown).
@@ -118,9 +124,20 @@ updated / finished timestamps, and — when present — the `pending_question` a
 (`input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`,
 `output_tokens`, `total_tokens`, `total_usd`, `request_count`).
 
+For a **one-shot event task** run the panel adds `origin_conversation_id` (the
+conversation waiting for the result) and `result_delivered` (when the
+continuation turn was injected, or `pending`).
+
 When the run has a `conversation_id`, the panel also prints hints to view the
 transcript (`cremind conv get <conversation_id>`) and, for a pending run, to
-reply (`cremind event-runs reply <run-id> "..."`).
+reply (`cremind event-runs reply <run-id> "..."`); a task run additionally
+prints where its result went (`cremind conv get <origin_conversation_id>`).
+
+**Timed-out tasks appear here too.** A task whose event never fired before its
+deadline is recorded as a `failed` run with no transcript
+(`conversation_id` empty, `error` explaining the deadline passed) — the action
+never ran, but the waiting conversation was still told, so the flow is not left
+hanging.
 
 With `--json`, returns the raw RunJSON object.
 

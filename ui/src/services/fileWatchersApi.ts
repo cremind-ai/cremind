@@ -5,6 +5,8 @@
  * agent URL and attaches a Bearer token from settings.
  */
 
+import type { EventTaskStatus } from './skillEventsApi';
+
 function resolveBaseUrl(agentUrl: string): string {
   if (agentUrl.startsWith('http://') || agentUrl.startsWith('https://')) {
     return agentUrl;
@@ -35,6 +37,11 @@ export interface FileWatcherSubscription {
   armed: boolean;
   paused: boolean;
   created_at: number;
+  /** One-shot task: fires once, returns its result to `conversation_id`, ends. */
+  task: boolean;
+  task_status: EventTaskStatus | null;
+  timeout_at: number | null;   // epoch SECONDS (event runs use ms)
+  completed_at: number | null; // epoch seconds
 }
 
 export interface FileWatcherCreatePayload {
@@ -46,6 +53,9 @@ export interface FileWatcherCreatePayload {
   recursive?: boolean;
   action: string;
   conversation_id?: string;
+  task?: boolean;
+  /** Only with `task`: minutes to wait before reporting that nothing fired. */
+  timeout_minutes?: number;
 }
 
 export interface FileWatcherUpdatePayload {
@@ -57,6 +67,8 @@ export interface FileWatcherUpdatePayload {
   recursive?: boolean;
   action?: string;
   paused?: boolean;
+  /** Tasks only: minutes from now, or null to wait indefinitely. */
+  timeout_minutes?: number | null;
 }
 
 export async function listFileWatchers(

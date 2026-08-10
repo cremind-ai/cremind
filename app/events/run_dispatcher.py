@@ -85,6 +85,7 @@ async def dispatch_skill_event(*, sub: Dict[str, Any], content: str) -> None:
         "subscription_id": sub["id"],
         "profile": sub["profile"],
         "registering_conversation_id": sub.get("conversation_id"),
+        "task": bool(sub.get("task")),
         "label": f"{skill_name}:{event_type}" if skill_name else event_type,
         "action": action,
         "query": query,
@@ -123,6 +124,7 @@ async def dispatch_file_watcher_event(*, sub: Dict[str, Any], payload: Dict[str,
         "subscription_id": sub["id"],
         "profile": sub["profile"],
         "registering_conversation_id": sub.get("conversation_id"),
+        "task": bool(sub.get("task")),
         "label": sub.get("name") or "File watcher",
         "action": action,
         "query": query,
@@ -154,6 +156,9 @@ async def dispatch_schedule_event(
         "subscription_id": sub["id"],
         "profile": sub["profile"],
         "registering_conversation_id": sub.get("conversation_id"),
+        # Schedules are claimed by ScheduleManager._fire before dispatch (the
+        # rolling pointer IS the claim), so no further claim happens here.
+        "task": bool(sub.get("task")),
         "label": sub.get("title") or action or "Schedule",
         "action": action,
         "query": query,
@@ -197,6 +202,19 @@ async def _execute(job: Dict[str, Any]) -> None:
     source_kind = job["source_kind"]
     subscription_id = job["subscription_id"]
     label = job["label"]
+    is_task = bool(job.get("task"))
+    origin_conversation_id = job.get("registering_conversation_id")
+
+    # ── Event task: is this one-shot still armed? ──────────────────────────
+    # Cheap pre-check before the (LLM-backed) gate — a late trigger for a task
+    # that already fired should not cost a gate call. The authoritative claim
+    # happens after the gate; see below.
+    if is_task and not _task_still_armed(source_kind, subscription_id):
+        logger.info(
+            f"[event_run] task {source_kind}:{subscription_id} already spent — "
+            "dropping late trigger"
+        )
+        return
 
     # ── Matching gate (skill events only) ──────────────────────────────────
     gate = job.get("gate")
@@ -228,6 +246,18 @@ async def _execute(job: Dict[str, Any]) -> None:
             )
             return
 
+    # ── Event task: consume the single firing (atomic) ─────────────────────
+    # After the gate on purpose: a gate-rejected event never happened as far as
+    # the user is concerned, so it must not spend the task's one shot. A losing
+    # claim means a concurrent trigger (or the timeout sweep) got there first.
+    if is_task and not _claim_task(source_kind, subscription_id):
+        logger.info(
+            f"[event_run] task {source_kind}:{subscription_id} claimed elsewhere — "
+            "dropping duplicate trigger"
+        )
+        return
+    deliver_to_origin = is_task and bool(origin_conversation_id)
+
     # ── Create the hidden per-run conversation + run row ───────────────────
     try:
         conv = await conversation_storage.create_conversation(
@@ -236,6 +266,7 @@ async def _execute(job: Dict[str, Any]) -> None:
         conversation_id = conv["id"]
     except Exception:  # noqa: BLE001
         logger.exception("[event_run] failed to create run conversation")
+        _revert_task_claim(is_task, source_kind, subscription_id)
         return
 
     store = get_event_run_storage()
@@ -249,10 +280,13 @@ async def _execute(job: Dict[str, Any]) -> None:
             action=job.get("action", ""),
             trigger_payload=job.get("trigger_payload"),
             history_cap=run_history_cap(),
+            origin_conversation_id=origin_conversation_id,
+            deliver_to_origin=deliver_to_origin,
         )
     except Exception:  # noqa: BLE001
         logger.exception("[event_run] failed to create run row")
         await _discard_conversation(conversation_id)
+        _revert_task_claim(is_task, source_kind, subscription_id)
         return
 
     event_run_id = created["run"]["id"]
@@ -272,9 +306,15 @@ async def _execute(job: Dict[str, Any]) -> None:
 
     # Best-effort platform forwarding: if the rule was registered from an
     # external channel, mirror the run's reply back to that platform.
-    await _maybe_forward_to_channel(
-        conversation_storage, job.get("registering_conversation_id"), conversation_id,
-    )
+    #
+    # Skipped for event tasks: their result is about to re-enter the origin
+    # conversation as a continuation turn, and THAT turn forwards to the
+    # platform. Mirroring here too would send the platform user both the raw
+    # run output and the continuation — two messages for one outcome.
+    if not deliver_to_origin:
+        await _maybe_forward_to_channel(
+            conversation_storage, origin_conversation_id, conversation_id,
+        )
 
     # ── Run the agent in the hidden conversation ───────────────────────────
     from app.agent.stream_runner import make_run_id, run_agent_to_bus
@@ -309,6 +349,71 @@ async def _execute(job: Dict[str, Any]) -> None:
         except Exception:  # noqa: BLE001
             logger.exception("[event_run] failed to mark run failed")
         _publish_runs_changed(profile)
+        # The run never reached stream_runner's terminal hook, so report the
+        # failure to the waiting conversation from here instead — a task that
+        # cannot start must not leave its origin flow hanging.
+        if deliver_to_origin:
+            try:
+                from app.events.event_task_delivery import on_run_terminal
+                await on_run_terminal(
+                    event_run_id=event_run_id, profile=profile, status="failed",
+                    error="Run failed to start",
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("[event_run] task failure delivery failed")
+
+
+# ── event-task claim helpers ────────────────────────────────────────────────
+#
+# Only skill-event and file-watcher tasks are claimed here. A schedule task is
+# already consumed by ``ScheduleManager._fire`` (it flips the row to completed
+# before dispatching), so re-claiming it would always lose.
+
+
+def _task_subscription_storage(source_kind: str) -> Any:
+    from app.storage import get_event_subscription_storage, get_file_watcher_storage
+
+    if source_kind == "skill_event":
+        return get_event_subscription_storage()
+    if source_kind == "file_watcher":
+        return get_file_watcher_storage()
+    return None
+
+
+def _task_still_armed(source_kind: str, subscription_id: str) -> bool:
+    storage = _task_subscription_storage(source_kind)
+    if storage is None:
+        return True
+    try:
+        sub = storage.get(subscription_id)
+    except Exception:  # noqa: BLE001
+        logger.exception(f"[event_run] failed to re-read task {subscription_id}")
+        return True  # fail open; the claim below is the real guard
+    return bool(sub) and sub.get("task_status") == "active"
+
+
+def _claim_task(source_kind: str, subscription_id: str) -> bool:
+    storage = _task_subscription_storage(source_kind)
+    if storage is None:
+        return True
+    try:
+        return storage.claim_task_fire(subscription_id)
+    except Exception:  # noqa: BLE001
+        logger.exception(f"[event_run] failed to claim task {subscription_id}")
+        return False
+
+
+def _revert_task_claim(is_task: bool, source_kind: str, subscription_id: str) -> None:
+    """Re-arm a task whose run could not be created, so its trigger isn't lost."""
+    if not is_task:
+        return
+    storage = _task_subscription_storage(source_kind)
+    if storage is None:
+        return
+    try:
+        storage.revert_task_claim(subscription_id)
+    except Exception:  # noqa: BLE001
+        logger.exception(f"[event_run] failed to re-arm task {subscription_id}")
 
 
 def _run_title(label: str, profile: Optional[str] = None) -> str:

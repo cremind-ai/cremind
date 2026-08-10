@@ -47,6 +47,29 @@ interface StateLine {
 
 const state = computed<StateLine>(() => {
   const e = props.entry;
+  // A ONE-SHOT EVENT TASK's own lifecycle outranks its family's normal state:
+  // "Waiting once" / "Timed out" is what the user needs to see, not "Watching".
+  if (e.eventTask && e.kind !== 'schedule') {
+    switch (e.eventTaskStatus) {
+      case 'active':
+        return {
+          text: 'Waiting once',
+          detail: e.eventTaskTimeoutAtMs
+            ? `gives up ${formatTimestamp(e.eventTaskTimeoutAtMs)}`
+            : undefined,
+          tone: e.paused ? 'warn' : 'ok',
+          icon: 'mdi:timer-sand',
+        };
+      case 'triggered':
+        return { text: 'Fired — running', tone: 'ok', icon: 'mdi:play-circle-outline' };
+      case 'timed_out':
+        return { text: 'Timed out', tone: 'warn', icon: 'mdi:timer-off-outline' };
+      case 'cancelled':
+        return { text: 'Cancelled', tone: 'muted', icon: 'mdi:cancel' };
+      case 'completed':
+        return { text: 'Done', tone: 'muted', icon: 'mdi:check-circle-outline' };
+    }
+  }
   if (e.kind === 'schedule') {
     if (e.scheduleStatus === 'paused') {
       return { text: 'Paused', tone: 'warn', icon: 'mdi:pause-circle-outline' };
@@ -124,6 +147,13 @@ function open() {
       >
         {{ entry.title }}
       </button>
+      <span
+        v-if="entry.eventTask"
+        class="ic-oneshot"
+        title="One-shot task: fires once, returns its result to the conversation that registered it, then ends."
+      >
+        one-shot
+      </span>
       <span class="ic-spacer" />
       <TaskRuleMenu
         :sub="entry"
@@ -203,6 +233,18 @@ function open() {
   white-space: nowrap;
 }
 .ic-event:hover { color: var(--primary-color); text-decoration: underline; }
+
+.ic-oneshot {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--fill-color, rgba(128, 128, 128, 0.12));
+  color: var(--text-tertiary);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
 
 .ic-action {
   margin: 6px 0 0;

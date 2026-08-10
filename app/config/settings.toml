@@ -91,3 +91,4 @@ long_term_retrieve_limit = 10  # top-K long-term facts retrieved from the vector
 # hidden conversation, in parallel. These are process-global engine knobs.
 max_parallel_runs = 5          # max simultaneous event-triggered agent runs (server-wide)
 run_history_cap = 50           # run records kept per event rule; older terminal runs are pruned automatically
+task_timeout_sweep_seconds = 30  # how often to expire one-shot event tasks that never fired

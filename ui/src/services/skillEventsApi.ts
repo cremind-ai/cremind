@@ -20,6 +20,14 @@ function authHeaders(token: string): Record<string, string> {
   return headers;
 }
 
+/** Lifecycle of a one-shot event task. `null` for a standing subscription. */
+export type EventTaskStatus =
+  | 'active'      // armed, waiting for its single occurrence
+  | 'triggered'   // fired; its run is in flight
+  | 'completed'   // result delivered back to the origin conversation
+  | 'cancelled'
+  | 'timed_out';  // the awaited event never happened before the deadline
+
 export interface SkillEventSubscription {
   id: string;
   conversation_id: string;
@@ -30,6 +38,11 @@ export interface SkillEventSubscription {
   action: string;
   created_at: number;
   paused: boolean;
+  /** One-shot task: fires once, returns its result to `conversation_id`, ends. */
+  task: boolean;
+  task_status: EventTaskStatus | null;
+  timeout_at: number | null;   // epoch SECONDS (event runs use ms)
+  completed_at: number | null; // epoch seconds
 }
 
 export interface SkillEventDeclaration {
@@ -114,7 +127,13 @@ export async function updateSubscription(
   agentUrl: string,
   token: string,
   id: string,
-  fields: { event_type?: string; action?: string; paused?: boolean },
+  fields: {
+    event_type?: string;
+    action?: string;
+    paused?: boolean;
+    /** Tasks only: minutes from now, or null to wait indefinitely. */
+    timeout_minutes?: number | null;
+  },
 ): Promise<SkillEventSubscription> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/skill-events/${encodeURIComponent(id)}`, {

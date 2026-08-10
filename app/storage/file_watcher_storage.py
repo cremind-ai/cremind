@@ -20,10 +20,13 @@ from sqlalchemy import text
 
 from app.databases import DatabaseProvider
 from app.storage._sync_base import SyncStorageBase
+from app.storage._task_subscription import TaskSubscriptionMixin
 
 
-class FileWatcherSubscriptionStorage(SyncStorageBase):
+class FileWatcherSubscriptionStorage(TaskSubscriptionMixin, SyncStorageBase):
     """Sync storage for file_watcher_subscriptions."""
+
+    _TASK_TABLE = "file_watcher_subscriptions"
 
     def __init__(self, provider: DatabaseProvider | None = None):
         super().__init__(provider)
@@ -43,6 +46,10 @@ class FileWatcherSubscriptionStorage(SyncStorageBase):
             "action": row["action"],
             "created_at": row["created_at"],
             "paused": bool(row["paused"]),
+            "task": bool(row["task"]),
+            "task_status": row["task_status"],
+            "timeout_at": row["timeout_at"],
+            "completed_at": row["completed_at"],
         }
 
     def get(self, id: str) -> Optional[Dict[str, Any]]:
@@ -111,17 +118,31 @@ class FileWatcherSubscriptionStorage(SyncStorageBase):
         event_types: str,
         extensions: str,
         action: str,
+        task: bool = False,
+        timeout_at: Optional[float] = None,
     ) -> Dict[str, Any]:
+        """Append a new watcher row.
+
+        ``task=True`` makes this an EVENT TASK — a one-shot that fires on the
+        FIRST matching event and delivers its run result back into
+        ``conversation_id``. ``timeout_at`` (epoch seconds) only applies to a
+        task. See :class:`app.storage._task_subscription.TaskSubscriptionMixin`.
+        """
         new_id = str(uuid.uuid4())
         now = time.time()
+        task = bool(task)
+        task_status = "active" if task else None
+        timeout_at = float(timeout_at) if (task and timeout_at is not None) else None
         with self._engine.begin() as conn:
             conn.execute(
                 text(
                     "INSERT INTO file_watcher_subscriptions "
                     "(id, conversation_id, profile, name, root_path, recursive, "
-                    "target_kind, event_types, extensions, action, created_at, paused) "
+                    "target_kind, event_types, extensions, action, created_at, paused, "
+                    "task, task_status, timeout_at, completed_at) "
                     "VALUES (:id, :conversation_id, :profile, :name, :root_path, :recursive, "
-                    ":target_kind, :event_types, :extensions, :action, :created_at, :paused)"
+                    ":target_kind, :event_types, :extensions, :action, :created_at, :paused, "
+                    ":task, :task_status, :timeout_at, NULL)"
                 ),
                 {
                     "id": new_id, "conversation_id": conversation_id, "profile": profile,
@@ -129,6 +150,7 @@ class FileWatcherSubscriptionStorage(SyncStorageBase):
                     "recursive": bool(recursive), "target_kind": target_kind,
                     "event_types": event_types, "extensions": extensions or None,
                     "action": action, "created_at": now, "paused": False,
+                    "task": task, "task_status": task_status, "timeout_at": timeout_at,
                 },
             )
         return {
@@ -144,13 +166,19 @@ class FileWatcherSubscriptionStorage(SyncStorageBase):
             "action": action,
             "created_at": now,
             "paused": False,
+            "task": task,
+            "task_status": task_status,
+            "timeout_at": timeout_at,
+            "completed_at": None,
         }
 
     # Columns a caller may edit (manual Events-page / CLI edits). Excludes
-    # identity/bookkeeping columns (id, conversation_id, profile, created_at).
+    # identity/bookkeeping columns (id, conversation_id, profile, created_at)
+    # and the event-task lifecycle columns (task-ness is immutable;
+    # task_status/completed_at move only via the atomic claim helpers).
     _EDITABLE = {
         "name", "root_path", "recursive", "target_kind", "event_types",
-        "extensions", "action", "paused",
+        "extensions", "action", "paused", "timeout_at",
     }
 
     def update_fields(self, id: str, **fields: Any) -> Optional[Dict[str, Any]]:

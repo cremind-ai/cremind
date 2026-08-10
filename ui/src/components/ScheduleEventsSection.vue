@@ -200,6 +200,15 @@ async function confirmDelete(row: ScheduleEventSubscription) {
       <ElTableColumn label="Status" min-width="100">
         <template #default="{ row }">
           <ElTag :type="statusType(row.status)" size="small">{{ row.status }}</ElTag>
+          <ElTag
+            v-if="row.task"
+            size="small"
+            type="info"
+            class="task-tag"
+            title="One-shot task: fires once, returns its result to the conversation that registered it, then ends."
+          >
+            one-shot
+          </ElTag>
         </template>
       </ElTableColumn>
       <ElTableColumn label="Source" min-width="90">
@@ -216,8 +225,13 @@ async function confirmDelete(row: ScheduleEventSubscription) {
           >
             <Icon icon="mdi:pencil-outline" /> Edit
           </ElButton>
+          <!-- A one-shot task cannot be paused: resuming re-seeds its fire time
+               from now, so a moment that passed while paused would silently
+               never fire and the conversation waiting on it would never hear
+               back. The server rejects it too; hiding the button avoids
+               offering an action that always fails. -->
           <ElButton
-            v-if="row.status === 'active' || row.status === 'paused'"
+            v-if="!row.task && (row.status === 'active' || row.status === 'paused')"
             size="small"
             @click="togglePause(row as ScheduleEventSubscription)"
           >
@@ -299,5 +313,8 @@ async function confirmDelete(row: ScheduleEventSubscription) {
 .muted {
   color: var(--text-tertiary);
   font-size: 0.8125rem;
+}
+.task-tag {
+  margin-left: 4px;
 }
 </style>

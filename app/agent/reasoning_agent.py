@@ -52,6 +52,11 @@ from app.config.settings import get_user_working_directory
 from app.config.user_config import resolve_agent_config, resolve_memory_config
 from app.constants import ChatCompletionTypeEnum
 from app.constants.status import Status
+from app.events.task_policy import (
+    TASK_TIMEOUT_DEFAULT_MINUTES,
+    TASK_TIMEOUT_MAX_MINUTES,
+    TASK_TIMEOUT_MIN_MINUTES,
+)
 from app.lib.exception import AgentException
 from app.lib.llm.base import LLMProvider, is_context_overflow
 from app.tools import (
@@ -178,6 +183,38 @@ final `update_todos` in which every item is `completed`: mark items you actually
 did, and also mark items that turned out not to apply (e.g. a conditional
 notification step skipped because there was nothing to send) as `completed` —
 do not leave them pending when the run is genuinely done.
+You also cannot register anything from here — no subscription, schedule, watcher,
+or one-shot event task; if the action seems to need one, do that work now and
+report the outcome instead.
+'''
+
+
+# Appended to every NON-event-run turn's system prompt. Teaches the one thing the
+# tool descriptions cannot: that "do X, wait for the outcome, then do Y" is a
+# real, supported shape, and that the way to serve it is to register a one-shot
+# task and END the turn — not to sleep, poll, or re-check in a loop. Appended
+# (not a template slot) and gated on the conversation-constant ``_event_run``
+# flag, so a chat conversation's cached system prefix stays byte-stable.
+EVENT_TASKS_GUIDANCE = '''
+
+EVENT TASKS — WAITING FOR SOMETHING TO HAPPEN: When a request has the shape "do
+X, wait for the outcome, then do Y", do X now, register a ONE-SHOT TASK for the
+outcome, and END YOUR TURN. Never sleep, poll, or re-check in a loop.
+- waiting for a skill event (an email reply, a webhook, a new item) -> that
+  skill's `subscribe` with `task: true`, exactly ONE `trigger`, and an optional
+  `timeout_minutes`;
+- waiting for a file to appear or change -> `register_file_watcher` with
+  `task: true` (+ optional `timeout_minutes`);
+- waiting for a moment in time -> `schedule_create` with no `rrule`: every
+  one-time event you create is already a task.
+A task runs its `action` once in a background conversation, then its result — or
+a "timed out" notice — is delivered back HERE as a new turn, and the task stops
+itself. So write `action` to EXTRACT and REPORT what you need in order to
+continue; do NOT ask it to notify the user, you will do that here. You may
+register several tasks in one turn; when you are done, finish with a short
+message naming exactly what you are waiting for. Use a STANDING subscription (no
+`task`) or a recurring schedule ONLY when the user wants every future occurrence
+handled indefinitely — those never report back to this conversation.
 '''
 
 
@@ -727,6 +764,10 @@ class ReasoningAgent:
     _mode: str = "reasoning"
     _plan_phase: Optional[str] = None
 
+    # Event-task chain depth (see ``__init__``). Same class-level-default
+    # rationale as above.
+    _task_chain_depth: int = 0
+
     def __init__(
         self,
         llm: LLMProvider,
@@ -740,6 +781,7 @@ class ReasoningAgent:
         mode: str = "reasoning",
         plan_phase: Optional[str] = None,
         message_origin: Optional[dict] = None,
+        task_chain_depth: int = 0,
     ):
         self.llm = llm
         self.registry = registry
@@ -786,6 +828,10 @@ class ReasoningAgent:
         # Dispatch-time refusal (``_is_event_blocked_leaf`` / ``_handle_skill_call``)
         # stays as a backstop for replayed-history or hallucinated calls.
         self._triggered_by_event = triggered_by_event
+        # How many event tasks this flow has already chained (carried on the
+        # trigger payload of each continuation turn). Dispatch-time only — it
+        # never reaches the prompt — so capping runaway chains costs no cache.
+        self._task_chain_depth = int(task_chain_depth or 0)
         # The ``reasoning`` think-tool exists only to give models WITHOUT native
         # step-by-step reasoning a place to think before acting. Drop it (and
         # skip its system-prompt guidance) for models that reason natively.
@@ -1132,6 +1178,11 @@ class ReasoningAgent:
         # tolerates skeleton agents built via ``__new__`` in tests.
         if getattr(self, "_event_run", False):
             resolved = resolved + EVENT_RUN_GUIDANCE
+        else:
+            # The exact complement: a chat conversation can register one-shot
+            # tasks, an event run cannot. Same conversation-constant gate, so
+            # each population's cached prefix stays byte-stable.
+            resolved = resolved + EVENT_TASKS_GUIDANCE
         # Plan-mode guidance is likewise appended (not a template slot) so
         # reasoning/instant runs render byte-identical. Plan runs are their own
         # cache population and this block is stable across a plan phase's turns.
@@ -1249,6 +1300,40 @@ class ReasoningAgent:
                         "concrete value verbatim (full URLs, email addresses, "
                         "file paths, IDs, criteria) — never write 'the provided "
                         "X' or 'the X above'."
+                    ),
+                },
+                "task": {
+                    "type": "boolean",
+                    "description": (
+                        "Set true to make this a ONE-SHOT TASK instead of a "
+                        "standing subscription: it waits for the NEXT matching "
+                        "event only, runs `action` once in the background, "
+                        "delivers the outcome back into THIS conversation as a "
+                        "new turn (where you continue the user's flow), then "
+                        "stops itself. Use it whenever the request has a 'do X, "
+                        "wait for the outcome, then do Y' shape (send the email "
+                        "and wait for the reply; open the PR and wait for CI). "
+                        "Requires EXACTLY ONE `trigger`. Leave it off only for a "
+                        "standing rule that must handle EVERY future occurrence "
+                        "indefinitely — a standing rule's runs never report back "
+                        "here. With task=true, write `action` so it EXTRACTS and "
+                        "REPORTS the outcome you need (e.g. 'read the reply and "
+                        "report the decision and any date proposed'); do NOT ask "
+                        "it to notify the user — you do that here when the "
+                        "result arrives."
+                    ),
+                },
+                "timeout_minutes": {
+                    "type": "integer",
+                    "minimum": TASK_TIMEOUT_MIN_MINUTES,
+                    "maximum": TASK_TIMEOUT_MAX_MINUTES,
+                    "description": (
+                        "Only valid together with task=true: give up after this "
+                        "many minutes if the event never fires. On timeout a "
+                        "'timed out' result is delivered back into this "
+                        "conversation, so the flow is never left hanging. Omit "
+                        f"for the default ({TASK_TIMEOUT_DEFAULT_MINUTES} = 7 "
+                        "days). Never send it without task=true."
                     ),
                 },
             },
@@ -1380,7 +1465,7 @@ class ReasoningAgent:
                 # automations. Keep the dispatch entry as a backstop (a replayed or
                 # hallucinated call is still gracefully refused, not "Unknown tool");
                 # drop only the schema so the model isn't offered the tool.
-                if not self._is_event_blocked_leaf(("leaf", tool, fs.leaf_name)):
+                if not self._is_event_hidden_leaf(("leaf", tool, fs.leaf_name)):
                     specs.append(fs.schema)
                 dispatch[fs.name] = ("leaf", tool, fs.leaf_name)
 
@@ -1402,12 +1487,75 @@ class ReasoningAgent:
         ("scheduler", "schedule_create"),
     })
 
-    def _is_event_blocked_leaf(self, entry) -> bool:
+    def _is_registration_leaf(self, entry) -> bool:
         return (
-            (self._triggered_by_event or getattr(self, "_event_run", False))
-            and bool(entry)
+            bool(entry)
             and entry[0] == "leaf"
             and (entry[1].tool_id, entry[2]) in self._EVENT_BLOCKED_LEAVES
+        )
+
+    def _is_event_hidden_leaf(self, entry) -> bool:
+        """Whether to omit a registration leaf's SCHEMA from the tools block.
+
+        Gated on ``_event_run`` alone — a conversation-constant flag — and
+        deliberately NOT on ``_triggered_by_event``, which is now True on
+        ordinary chat turns too (an event task's result re-enters the chat as a
+        trigger turn). Keying the tools block on a turn-varying flag would
+        fragment the cached prefix mid-conversation AND hide the very tools such
+        a turn is allowed to call.
+        """
+        return getattr(self, "_event_run", False) and self._is_registration_leaf(entry)
+
+    def _is_event_blocked_leaf(self, entry, args: Optional[Dict[str, Any]] = None) -> bool:
+        """Whether to REFUSE a registration leaf at dispatch (schema stays exposed).
+
+        - inside an event run → always refused (an automation must not create
+          automations);
+        - on an ordinary chat turn → never refused;
+        - on a turn started by an event-task result → only ONE-SHOT TASKS are
+          allowed. That is what lets a flow wait again ("reply to the customer,
+          wait for their next mail") while a standing automation — which would
+          re-register on every single result — stays blocked.
+        """
+        if not self._is_registration_leaf(entry):
+            return False
+        if getattr(self, "_event_run", False):
+            return True
+        if not self._triggered_by_event:
+            return False
+        from app.events.task_policy import MAX_TASK_CHAIN_DEPTH, is_task_registration
+        if self._task_chain_depth >= MAX_TASK_CHAIN_DEPTH:
+            return True
+        return not is_task_registration(entry[1].tool_id, entry[2], args or {})
+
+    def _registration_refusal(self) -> str:
+        """The tool result for a registration this turn is not allowed to make."""
+        if getattr(self, "_event_run", False):
+            return (
+                "Registering a new event or automation (schedule, file watcher, "
+                "or skill subscription) is not allowed from inside an "
+                "event-triggered run — this prevents recursive event storms "
+                "where an action keeps creating more events. That includes "
+                "one-shot event tasks. Do the work now with the tools you have "
+                "and report the outcome in your final answer."
+            )
+        from app.events.task_policy import MAX_TASK_CHAIN_DEPTH
+        if self._task_chain_depth >= MAX_TASK_CHAIN_DEPTH:
+            return (
+                f"This flow has already chained {self._task_chain_depth} event "
+                "tasks, which is the limit — nothing was registered. Finish now "
+                "and tell the user where things stand; if more waiting is needed "
+                "they can ask again in a new message."
+            )
+        return (
+            "This turn was started by an event-task result, so it may register "
+            "only ONE-SHOT TASKS — a recurring or standing automation would "
+            "re-register itself on every future result. Nothing was created. To "
+            "wait for one more outcome, register a task instead: "
+            "`schedule_create` with no `rrule` (and no `end`/`all_day`, duration "
+            "under 30 minutes), or `register_file_watcher` with `task: true`. If "
+            "the user really wants a permanent automation, finish this turn and "
+            "tell them to ask for it in a new message."
         )
 
     # Mutating leaves refused (at dispatch, schema still exposed) during the plan
@@ -1634,7 +1782,7 @@ class ReasoningAgent:
             leaf_calls = [
                 (c, n, a, e) for (c, n, a, e) in resolved
                 if e and e[0] == "leaf"
-                and not self._is_event_blocked_leaf(e)
+                and not self._is_event_blocked_leaf(e, a)
                 and not self._is_plan_blocked_leaf(e)
             ]
             outcomes: Dict[str, "_LeafOutcome"] = {}
@@ -1656,14 +1804,8 @@ class ReasoningAgent:
                     async for item in self._handle_skill_call(entry[1], args, call_id, step_no):
                         yield item
                     continue
-                if self._is_event_blocked_leaf(entry):
-                    obs = (
-                        "Registering a new event or automation (schedule, file "
-                        "watcher, or skill subscription) is not allowed from "
-                        "inside an event-triggered run — this prevents recursive "
-                        "event storms where an action keeps creating more events. "
-                        "Ignoring this request."
-                    )
+                if self._is_event_blocked_leaf(entry, args):
+                    obs = self._registration_refusal()
                     self._append_tool_result(call_id, obs, fn_name=name)
                     yield self._result_artifact(
                         step_no, call_id, [Part(root=TextPart(text=obs))]
@@ -2061,17 +2203,49 @@ class ReasoningAgent:
             # it there (trigger turn AND reply turns): subscribing during an event
             # run risks a recursive event storm (event → reasoning → subscribe →
             # event → …).
-            if self._triggered_by_event or getattr(self, "_event_run", False):
+            #
+            # A turn started by an EVENT-TASK RESULT is different: it is an
+            # ordinary chat turn continuing a flow, and that flow may legitimately
+            # need to wait once more ("reply to the customer, then wait for their
+            # next mail"). One-shot tasks are therefore allowed there; a standing
+            # subscription is not, since it would re-register on every result.
+            sub_args = args.get("subscribe") or {}
+            if getattr(self, "_event_run", False):
                 obs = (
                     "Subscriptions cannot be created from inside an "
                     "event-triggered run (this prevents recursive event loops). "
-                    "Ignoring this subscribe request."
+                    "That includes one-shot event tasks. Do the work now with the "
+                    "tools you have and report the outcome in your final answer."
                 )
                 self._append_tool_result(call_id, obs, fn_name=tool.tool_id)
                 yield self._result_artifact(
                     step_no, call_id, [Part(root=TextPart(text=obs))]
                 )
                 return
+            if self._triggered_by_event:
+                from app.events.task_policy import (
+                    MAX_TASK_CHAIN_DEPTH, is_task_subscribe_args,
+                )
+                if self._task_chain_depth >= MAX_TASK_CHAIN_DEPTH:
+                    obs = self._registration_refusal()
+                elif not is_task_subscribe_args(sub_args):
+                    obs = (
+                        "This turn was started by an event-task result, so it may "
+                        "register only ONE-SHOT TASKS. A standing subscription "
+                        "would fire forever, so nothing was created. Re-call "
+                        "`subscribe` with `task: true`, exactly one `trigger`, and "
+                        "an optional `timeout_minutes` if you need to wait for one "
+                        "more occurrence; otherwise finish your turn and answer "
+                        "the user."
+                    )
+                else:
+                    obs = None
+                if obs is not None:
+                    self._append_tool_result(call_id, obs, fn_name=tool.tool_id)
+                    yield self._result_artifact(
+                        step_no, call_id, [Part(root=TextPart(text=obs))]
+                    )
+                    return
             # Registration is a mutation; the plan PLANNING phase is read-only
             # (mirrors _PLAN_BLOCKED_LEAVES for the leaf tools). A subscribe is a
             # "skill" dispatch entry, not a "leaf", so that gate can't catch it —
@@ -2093,15 +2267,16 @@ class ReasoningAgent:
                 register_skill_events,
                 _normalize_triggers,
             )
-            sub = args.get("subscribe") or {}
             obs = await register_skill_events(
                 profile=self.profile,
                 context_id=self.context_id or "",
                 skill_id=tool.tool_id,
                 skill_source=str(dir_path),
-                triggers=_normalize_triggers(sub.get("trigger")),
-                action=(sub.get("action") or "").strip(),
+                triggers=_normalize_triggers(sub_args.get("trigger")),
+                action=(sub_args.get("action") or "").strip(),
                 request_context=self._current_query or "",
+                task=bool(sub_args.get("task")),
+                timeout_minutes=sub_args.get("timeout_minutes"),
             )
             self._append_tool_result(call_id, obs, fn_name=tool.tool_id)
             yield self._result_artifact(step_no, call_id, [Part(root=TextPart(text=obs))])

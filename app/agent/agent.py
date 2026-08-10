@@ -144,6 +144,7 @@ class CremindAgent:
         mode: str = "reasoning",
         plan_phase: str | None = None,
         message_origin: dict | None = None,
+        task_chain_depth: int = 0,
     ) -> AsyncGenerator[ReasoningStreamResponseType, None]:
         logger.debug(f"Running CremindAgent with query: {query} and profile: {profile}")
 
@@ -203,6 +204,9 @@ class CremindAgent:
             # Web UI vs which channel + which sender. Callers that don't know
             # (e.g. the A2A executor) pass nothing and the prompt is unchanged.
             message_origin=message_origin,
+            # How many event tasks this flow already chained — caps runaway
+            # wait-continue-wait loops at dispatch time.
+            task_chain_depth=task_chain_depth,
         )
 
         async for result in reasoning_agent.run(query, task_history):

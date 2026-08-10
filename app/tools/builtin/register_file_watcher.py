@@ -26,6 +26,13 @@ from typing import Any, Dict, List, Optional
 
 from app.config.settings import get_user_working_directory
 from app.events import get_file_watcher_manager
+from app.events.task_policy import (
+    TASK_TIMEOUT_DEFAULT_MINUTES,
+    TASK_TIMEOUT_MAX_MINUTES,
+    TASK_TIMEOUT_MIN_MINUTES,
+    format_timeout_clause,
+    resolve_task_timeout,
+)
 from app.storage import get_file_watcher_storage
 from app.tools.builtin.base import BuiltInTool, BuiltInToolResult
 from app.utils.logger import logger
@@ -136,7 +143,10 @@ class RegisterFileWatcherTool(BuiltInTool):
         "automatically. Example: 'when a python file changes in MyDocs, notify "
         "me' → path='MyDocs', triggers=['modified','created'], "
         "target_kind='file', extensions=['.py'], action='notify the user about "
-        "the change'."
+        "the change'. Add `task: true` instead when the user is waiting for ONE "
+        "specific file event before the conversation can continue (a report to "
+        "land, an export to finish, an error log to be written): the watcher "
+        "then fires once and its outcome comes back to this chat."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -216,6 +226,38 @@ class RegisterFileWatcherTool(BuiltInTool):
                     "'the provided X' or 'the X above'."
                 ),
             },
+            "task": {
+                "type": "boolean",
+                "description": (
+                    "Set true to make this a ONE-SHOT TASK instead of a standing "
+                    "watcher: it fires on the FIRST matching event only, runs "
+                    "`action` once in the background, delivers the outcome back "
+                    "into THIS conversation as a new turn (where you continue "
+                    "the user's flow), then removes itself. Use it whenever the "
+                    "request has a 'do X, wait for the file, then do Y' shape "
+                    "(run the job and wait for its output; trigger the bug and "
+                    "wait for the error log). Leave it off only for a standing "
+                    "rule that must handle EVERY future occurrence indefinitely "
+                    "— a standing rule's runs never report back here. With "
+                    "task=true, write `action` so it EXTRACTS and REPORTS what "
+                    "you need (e.g. 'read the log and report the error and stack "
+                    "trace'); do NOT ask it to notify the user — you do that "
+                    "here when the result arrives."
+                ),
+            },
+            "timeout_minutes": {
+                "type": "integer",
+                "minimum": TASK_TIMEOUT_MIN_MINUTES,
+                "maximum": TASK_TIMEOUT_MAX_MINUTES,
+                "description": (
+                    "Only valid together with task=true: give up after this many "
+                    "minutes if no matching file event happens. On timeout a "
+                    "'timed out' result is delivered back into this "
+                    "conversation, so the flow is never left hanging. Omit for "
+                    f"the default ({TASK_TIMEOUT_DEFAULT_MINUTES} = 7 days). "
+                    "Never send it without task=true."
+                ),
+            },
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -231,6 +273,8 @@ class RegisterFileWatcherTool(BuiltInTool):
         extensions_raw = arguments.get("extensions")
         recursive = arguments.get("recursive")
         action: str = (arguments.get("action") or "").strip()
+        task = bool(arguments.get("task"))
+        timeout_minutes = arguments.get("timeout_minutes")
 
         if not profile:
             return _err(
@@ -242,6 +286,12 @@ class RegisterFileWatcherTool(BuiltInTool):
             )
         if not action:
             return _err("action is required.")
+
+        # Event-task validation up front, so a malformed call costs nothing and
+        # leaves nothing half-registered.
+        timeout_at, timeout_error = resolve_task_timeout(timeout_minutes, task=task)
+        if timeout_error:
+            return _err(timeout_error)
 
         target_kind = str(target_kind_raw).strip().lower()
         if target_kind not in _VALID_TARGET_KINDS:
@@ -322,10 +372,12 @@ class RegisterFileWatcherTool(BuiltInTool):
             profile=profile, action=action,
             request_context=get_context(context_id or "", "_current_query", "") or "",
             tool_name="register_file_watcher", conversation_id=conversation_id,
+            task=task,
         )
         if check is not None:
             return _err(build_rejection_message(
-                tool_name="register_file_watcher", missing=check.missing, reason=check.reason,
+                tool_name="register_file_watcher", missing=check.missing,
+                reason=check.reason, task=task,
             ))
 
         # Persist subscription row.
@@ -341,6 +393,8 @@ class RegisterFileWatcherTool(BuiltInTool):
                 event_types=",".join(triggers),
                 extensions=",".join(extensions),
                 action=action,
+                task=task,
+                timeout_at=timeout_at,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("register_file_watcher: insert failed")
@@ -371,12 +425,27 @@ class RegisterFileWatcherTool(BuiltInTool):
             else "files and folders"
         )
         recursive_summary = "recursively" if recursive_flag else "non-recursively"
-        confirmation = (
-            f"Registered file watcher '{name}' (ID: {row['id']}) on "
-            f"{resolved_path} ({recursive_summary}). Triggers: {triggers_list}. "
-            f"Watching {target_summary} ({ext_summary}). "
-            f"When a matching event fires, I'll run: {action}."
-        )
+        if task:
+            confirmation = (
+                f"Registered a one-shot TASK watcher '{name}' (ID: {row['id']}) "
+                f"on {resolved_path} ({recursive_summary}). It fires on the "
+                f"FIRST matching {triggers_list} event ({target_summary}, "
+                f"{ext_summary})"
+                f"{format_timeout_clause(timeout_at, timeout_minutes)}, runs "
+                f"\"{action}\" once in a background conversation, delivers the "
+                "outcome back into THIS conversation as a new turn, then removes "
+                "itself. Register any further tasks now, then END YOUR TURN with "
+                "a short message telling the user exactly what you are waiting "
+                "for. Do not sleep, poll, or re-check. (To cancel early: "
+                f"delete_file_watcher id={row['id']}.)"
+            )
+        else:
+            confirmation = (
+                f"Registered file watcher '{name}' (ID: {row['id']}) on "
+                f"{resolved_path} ({recursive_summary}). Triggers: {triggers_list}. "
+                f"Watching {target_summary} ({ext_summary}). "
+                f"When a matching event fires, I'll run: {action}."
+            )
         if not armed:
             confirmation += (
                 "\n\nNote: the subscription was saved but the watcher could "
@@ -401,12 +470,26 @@ class RegisterFileWatcherTool(BuiltInTool):
                 "extensions": extensions,
                 "action": action,
                 "armed": armed,
+                "task": task,
+                "timeout_at": timeout_at,
             },
         )
 
 
 def _err(message: str) -> BuiltInToolResult:
     return BuiltInToolResult(content=[{"type": "text", "text": message}])
+
+
+def _format_deadline(timeout_at: Any) -> str:
+    """Local ``YYYY-MM-DD HH:MM`` for a task deadline, or "" when there is none."""
+    if not timeout_at:
+        return ""
+    try:
+        from datetime import datetime
+
+        return datetime.fromtimestamp(float(timeout_at)).strftime("%Y-%m-%d %H:%M")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _format_subscription_line(idx: int, sub: Dict[str, Any]) -> str:
@@ -417,9 +500,19 @@ def _format_subscription_line(idx: int, sub: Dict[str, Any]) -> str:
     armed_marker = "armed" if sub.get("armed") else "not armed"
     title = sub.get("conversation_title")
     title_part = f" [chat: {title}]" if title else ""
+    # Surface task-ness so the assistant can answer "what are you waiting for?"
+    # straight from a list call.
+    mode_line = ""
+    if sub.get("task"):
+        deadline = _format_deadline(sub.get("timeout_at"))
+        mode_line = (
+            f"   mode: one-shot task ({sub.get('task_status') or 'active'})"
+            f"{f'; times out {deadline}' if deadline else ''}\n"
+        )
     return (
         f"{idx}. {sub.get('name')!r} (id: {sub.get('id')}){title_part}\n"
         f"   path: {sub.get('root_path')}{recursive_marker}\n"
+        f"{mode_line}"
         f"   triggers: {triggers}; target: {target_kind}; "
         f"extensions: {extensions}; status: {armed_marker}\n"
         f"   action: {sub.get('action')}"
