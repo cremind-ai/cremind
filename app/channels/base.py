@@ -735,12 +735,14 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
     async def _forward_reply(self, conversation_id: str, sender_id: str) -> None:
         """Forward an in-progress agent run from the stream bus to the platform.
 
-        ``response_mode == "detail"`` sends each ReAct step as its own
-        markdown-formatted bubble (Thought → Action → Observation), then the
-        final answer as one or more bubbles, so the user sees progress while
-        the run is still executing instead of waiting for one giant message
-        at the end. ``"normal"`` only sends the final answer (still chunked
-        when long).
+        ``response_mode == "detail"`` sends the run's trigger header (for an
+        event-driven run) and each ReAct step as its own markdown-formatted
+        bubble (Thought → Action → Observation), then the final answer as one
+        or more bubbles, so the user sees progress while the run is still
+        executing instead of waiting for one giant message at the end.
+        ``"normal"`` sends ONLY the final answer (still chunked when long) —
+        no trigger header, no steps: everything else is Cremind's internals,
+        and a platform user who asked for just the answer reads them as noise.
 
         Each bubble is sent through :meth:`send` which already isolates
         per-message exceptions, so a transient failure on one bubble can't
@@ -816,10 +818,14 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 f"conv={conversation_id}"
             )
             if etype == "event_trigger_message":
-                # Skill-event trigger header: the formatted Trigger/Action/
-                # Content block already produced by stream_runner. Send it as
-                # its own bubble so the platform user sees what triggered the
-                # run (mirrors the agent bubble in the web UI).
+                # The formatted Trigger/Action/Content block stream_runner
+                # produced for this run. It explains what set the run off, which
+                # belongs with the reasoning steps — so it goes out only in
+                # detail mode, alongside them. On "Final answer only" the user
+                # asked for the answer and nothing else; a block of Trigger:/
+                # Action:/Content: scaffolding reads as a glitch, not an answer.
+                if not detail:
+                    return False
                 content = data.get("content") or ""
                 if content:
                     logger.info(

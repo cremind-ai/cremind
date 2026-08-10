@@ -242,8 +242,12 @@ function handleSubmit() {
         <ElFormItem v-else label="Reply detail">
           <ElRadioGroup v-model="dialogResponseMode">
             <ElRadioButton value="normal">Final answer only</ElRadioButton>
-            <ElRadioButton value="detail">Include thinking</ElRadioButton>
+            <ElRadioButton value="detail">Answer with steps</ElRadioButton>
           </ElRadioGroup>
+          <p class="field-hint">
+            "Answer with steps" also sends each step as it happens — what
+            triggered the run and what the assistant did along the way.
+          </p>
         </ElFormItem>
       </ElForm>
     </div>
@@ -265,5 +269,11 @@ function handleSubmit() {
 .instructions pre {
   margin: 0; white-space: pre-wrap; font-family: inherit;
   font-size: 0.85rem; color: var(--text-secondary);
+}
+.field-hint {
+  margin: 4px 0 0;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  color: var(--text-tertiary);
 }
 </style>

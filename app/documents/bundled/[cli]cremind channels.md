@@ -54,7 +54,7 @@ Each row returned by `list` looks like:
 | `channel_type`     | `telegram` \| `whatsapp` \| `discord` \| `slack` \| `messenger` \| `zalo`. Unique per profile (you can't register two Telegrams).  |
 | `mode`             | `bot` (a separate bot account replies — Telegram/Discord/Slack/Zalo bot, Messenger Page bot), `userbot` (your own account auto-replies — WhatsApp and Zalo personal via QR pairing), or `notification` (push-only: no conversation; forwards Cremind's automation/event notifications to the chat with a configurable filter). |
 | `auth_mode`        | **Legacy** per-sender gate (`none` \| `otp` \| `password`), superseded by the unified `config.subscribe_auth` (see **Access authentication** below). Still read for back-compat on channels created before unification (`password`→`passcode`, `otp`→`otp`, `none`→`open`); new channels set `subscribe_auth` and leave this `none`. |
-| `response_mode`    | `normal` (final answer only) or `detail` (also stream Thinking-Process step bubbles).                                    |
+| `response_mode`    | `normal` — the platform user receives ONLY the final answer. `detail` — they also receive, as separate bubbles while the run executes, what triggered it (for event-driven runs) and each Thinking-Process step. Everything beyond the answer is Cremind's own working, so `normal` sends none of it. |
 | `enabled`          | `true`/`false`. Disabling stops the in-process adapter without deleting the row.                                          |
 | `status`           | `running` / `stopped` — derived live from the registry, not stored.                                                       |
 | `config`           | Platform-specific. Secret fields (`bot_token`, `password`, etc.) are redacted in `list`/`get` responses.                  |
@@ -154,7 +154,7 @@ cremind channels list
 | `TYPE`     | `channel_type`   | `telegram` / `whatsapp` / etc.                         |
 | `MODE`     | `mode`           | `bot` / `userbot` / `notification`.                    |
 | `AUTH`     | `auth_mode`      | `none` / `otp` / `password`.                           |
-| `REPLY`    | `response_mode`  | `normal` (final answer) / `detail` (with thinking).    |
+| `REPLY`    | `response_mode`  | `normal` (final answer only) / `detail` (with steps).  |
 | `ENABLED`  | `enabled`        | `true`/`false`.                                        |
 | `STATUS`   | (live)           | `running` / `stopped` — derived from the registry.     |
 
