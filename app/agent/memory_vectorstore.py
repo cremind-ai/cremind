@@ -149,6 +149,45 @@ def retrieve_long_term(
         return []
 
 
+def forget_conversation(*, agent: Any, profile: str, conversation_id: str) -> int:
+    """Delete the facts learned from one conversation; return the count removed.
+
+    The vector-store counterpart of
+    ``MemoryStorage.delete_by_source_conversation``. Both are needed because
+    storage is an either/or: with embedding enabled, facts are written *only*
+    here and the DB queue stays empty, so a DB-only purge would leave every fact
+    the agent learned from a deleted channel client in place — and long-term
+    recall is filtered by profile alone, so those facts would be served back
+    into an unrelated conversation's prompt.
+
+    Points are matched on the ``source_conversation_id`` payload written by
+    :func:`store_long_term`. Filtering on ``profile`` as well keeps a stray id
+    from reaching another profile's collection. Facts with no recorded source,
+    and facts from other conversations, are left alone.
+    """
+    if not conversation_id or not vector_long_term_available(agent):
+        return 0
+    vs = agent.vector_store
+    coll = _collection_name(profile)
+    selector = {"profile": profile, "source_conversation_id": conversation_id}
+    try:
+        if not vs.collection_exists(coll):
+            return 0
+        # Count first: delete_texts reports nothing, and the caller shows the
+        # operator how many facts were forgotten.
+        matched = vs.list_all_points(coll, with_vectors=False, filter=selector)
+        if not matched:
+            return 0
+        vs.delete_texts(collection_name=coll, filter=selector)
+        return len(matched)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            f"[memory] vector forget_conversation failed for profile={profile} "
+            f"conversation={conversation_id}"
+        )
+        return 0
+
+
 def list_long_term(*, agent: Any, profile: str, limit: int = 50) -> list[dict[str, Any]]:
     """Enumerate stored long-term facts (newest ``limit``) for the memory panel.
 

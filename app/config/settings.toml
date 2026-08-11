@@ -43,6 +43,14 @@ persist_path = ""         # mode = "persistent" only; defaults to <system_dir>/s
 # (e.g. "Asia/Tokyo") to pin it. See app/config/timezone.py.
 timezone = "auto"
 
+[channels]
+# Ask for approval before the agent messages a channel client. ON keeps the
+# preview-then-approve flow; OFF lets sends go straight out (what unattended
+# automations need — they cannot answer a prompt). Per-client overrides live on
+# channel_senders.send_confirmation, and cold contacts always ask regardless.
+# See app/channels/send_policy.py.
+confirm_before_send = true
+
 [agent]
 max_steps = 200
 max_llm_retries = 2

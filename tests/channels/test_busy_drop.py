@@ -41,6 +41,10 @@ class _Storage:
     async def get_conversation(self, conv_id):
         return {"id": conv_id}
 
+    async def ensure_sender_conversation(self, sender, profile, channel_id,
+                                         display_name=None):
+        return sender["conversation_id"]
+
     async def get_messages(self, conversation_id):
         # Empty history → _dispatch_to_agent skips the history-building block
         # (and thus replay_reasoning_enabled / user config) entirely.

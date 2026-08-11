@@ -254,9 +254,7 @@ class NotificationDeliveryMixin:
     async def _mark_subscribed(
         self, sender_id: str, display_name: str | None,
     ) -> None:
-        sender = await self.storage.get_or_create_sender(  # type: ignore[attr-defined]
-            self.channel_id, sender_id, display_name=display_name,  # type: ignore[attr-defined]
-        )
+        sender = await self._upsert_sender(sender_id, display_name)  # type: ignore[attr-defined]
         await self.storage.update_sender(  # type: ignore[attr-defined]
             sender["id"], authenticated=True,
             pending_otp=None, pending_otp_expires_at=None,
@@ -289,9 +287,7 @@ class NotificationDeliveryMixin:
     async def _issue_subscribe_otp(
         self, sender_id: str, display_name: str | None,
     ) -> None:
-        sender = await self.storage.get_or_create_sender(  # type: ignore[attr-defined]
-            self.channel_id, sender_id, display_name=display_name,  # type: ignore[attr-defined]
-        )
+        sender = await self._upsert_sender(sender_id, display_name)  # type: ignore[attr-defined]
         if sender.get("authenticated"):
             await self.send(  # type: ignore[attr-defined]
                 sender_id, "✅ You're already subscribed. Send /stop to unsubscribe.",
@@ -385,9 +381,7 @@ class NotificationDeliveryMixin:
             return
 
         if auth == "approval":
-            sender = await self.storage.get_or_create_sender(  # type: ignore[attr-defined]
-                self.channel_id, sender_id, display_name=display_name,  # type: ignore[attr-defined]
-            )
+            sender = await self._upsert_sender(sender_id, display_name)  # type: ignore[attr-defined]
             if sender.get("authenticated"):
                 await self.send(  # type: ignore[attr-defined]
                     sender_id,
@@ -434,9 +428,7 @@ class NotificationDeliveryMixin:
         auth = self._subscribe_auth()
 
         if cmd in _UNSUBSCRIBE_CMDS:
-            sender = await self.storage.get_or_create_sender(  # type: ignore[attr-defined]
-                self.channel_id, sender_id, display_name=display_name,  # type: ignore[attr-defined]
-            )
+            sender = await self._upsert_sender(sender_id, display_name)  # type: ignore[attr-defined]
             await self.storage.update_sender(sender["id"], authenticated=False)  # type: ignore[attr-defined]
             await self.send(  # type: ignore[attr-defined]
                 sender_id,
@@ -451,9 +443,7 @@ class NotificationDeliveryMixin:
         # A non-command message while an OTP challenge is outstanding is the
         # subscriber typing their code back.
         if auth == "otp":
-            sender = await self.storage.get_or_create_sender(  # type: ignore[attr-defined]
-                self.channel_id, sender_id, display_name=display_name,  # type: ignore[attr-defined]
-            )
+            sender = await self._upsert_sender(sender_id, display_name)  # type: ignore[attr-defined]
             if sender.get("pending_otp") and not sender.get("authenticated"):
                 await self._verify_subscribe_otp(sender, text)
                 return

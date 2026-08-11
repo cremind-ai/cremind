@@ -142,6 +142,19 @@ def replay_reasoning_enabled(profile: str) -> bool:
         return False
 
 
+def confirm_before_send_enabled(profile: str) -> bool:
+    """Whether the agent must get approval before messaging a channel client.
+
+    Safe accessor for the send path — never raises, and falls back to ``True``:
+    if the setting cannot be read, the conservative answer is to ask, since the
+    alternative is silently messaging real people.
+    """
+    try:
+        return bool(get_user_config("channels.confirm_before_send", profile))
+    except Exception:  # noqa: BLE001
+        return True
+
+
 @dataclass(frozen=True)
 class CompactionConfig:
     """Snapshot of the conversation-compaction tunables for one profile."""

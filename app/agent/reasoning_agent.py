@@ -920,9 +920,16 @@ class ReasoningAgent:
         # step of this run (matches the image_understanding gate above). Lazy
         # import avoids an app.channels → app.events import cycle at module load;
         # registry not yet initialized → treated as "no channel" → tool dropped.
-        from app.channels.registry import has_notification_channel
+        from app.channels.registry import has_any_channel, has_notification_channel
         if not has_notification_channel(profile):
             tools = [t for t in tools if t.tool_id != "send_notification"]
+        # ``send_channel_message`` messages the profile's own channel CLIENTS
+        # (individually or in bulk), so its gate is wider than the one above:
+        # any live channel of any mode can carry a direct send, since every
+        # adapter implements the same per-recipient ``_send_text``. Same
+        # once-per-run evaluation and same registry-missing fallback.
+        if not has_any_channel(profile):
+            tools = [t for t in tools if t.tool_id != "send_channel_message"]
         self._tools = tools
         self._tools_by_id = {t.tool_id: t for t in self._tools}
         # Fallback-search guidance, built from the live enabled tool groups

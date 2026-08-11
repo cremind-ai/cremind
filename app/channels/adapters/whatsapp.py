@@ -53,6 +53,29 @@ _SIDECAR_DIR = Path(__file__).resolve().parents[1] / "sidecars" / "whatsapp"
 _SIDECAR_INDEX = _SIDECAR_DIR / "index.js"
 _PORT_HEADER = "WS_PORT="
 
+# How long to wait for the sidecar's correlated answer to a send / resolve.
+# Generous: Baileys may be mid-reconnect, and a false "timed out" would cost a
+# direct-send recipient their history entry (see ``send_strict``).
+_ACK_TIMEOUT = 20.0
+
+_PN_SUFFIX = "@s.whatsapp.net"
+_LID_SUFFIX = "@lid"
+
+
+def _normalize_lid(value: str | None) -> str | None:
+    """Return a linked-identity alias in canonical full-JID form, or ``None``.
+
+    Baileys has returned the ``lid`` both bare and suffixed across versions, and
+    the two forms must not both end up in the ``wa_lid`` column: the inbound
+    adoption lookup is an exact match, so a stored bare id would silently never
+    match an incoming ``<id>@lid`` and the contact would fork in two. Normalize
+    on the way in so there is only ever one shape in the database.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text if text.endswith(_LID_SUFFIX) else f"{text}{_LID_SUFFIX}"
+
 
 class WhatsappAdapter(BaseChannelAdapter):
     """In-process WhatsApp adapter that delegates platform IO to a Node sidecar."""
@@ -62,6 +85,11 @@ class WhatsappAdapter(BaseChannelAdapter):
         self._proc: asyncio.subprocess.Process | None = None
         self._ws: Any = None
         self._send_lock = asyncio.Lock()
+        # Correlation id -> future awaiting the sidecar's answer. Sends and
+        # phone resolutions are request/response over one WebSocket, so the
+        # reply loop resolves the future the caller is parked on.
+        self._pending: dict[str, asyncio.Future] = {}
+        self._request_seq = 0
 
     # ── lifecycle (overrides _run; start/stop are inherited) ──
 
@@ -93,12 +121,101 @@ class WhatsappAdapter(BaseChannelAdapter):
     # ── platform IO (called by the base class) ──
 
     async def _send_text(self, sender_id: str, text: str) -> None:
+        """Send one message and wait for the sidecar to confirm it went out.
+
+        Writing the frame only proves it reached the local Node process, which
+        is why this awaits a correlated ``send_ack``: an unpaired session or a
+        rejected JID must surface as an exception, not as a silent success that
+        the direct-send path would record in someone's conversation history.
+        Confirmation means WhatsApp's servers accepted the message — not that
+        it was delivered to the recipient's device.
+        """
         if self._ws is None:
             raise ChannelAuthError("WhatsApp sidecar not connected")
-        async with self._send_lock:
-            await self._ws.send(json.dumps({
-                "kind": "send", "sender_id": sender_id, "text": text,
-            }))
+        request_id, fut = self._new_request()
+        try:
+            async with self._send_lock:
+                await self._ws.send(json.dumps({
+                    "kind": "send", "sender_id": sender_id, "text": text,
+                    "request_id": request_id,
+                }))
+            reply = await asyncio.wait_for(fut, timeout=_ACK_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            raise ChannelAuthError(
+                f"WhatsApp sidecar did not confirm the send within "
+                f"{_ACK_TIMEOUT:.0f}s (recipient {sender_id})",
+            ) from exc
+        finally:
+            self._pending.pop(request_id, None)
+        if not reply.get("ok"):
+            raise ChannelAuthError(
+                f"WhatsApp send failed: {reply.get('error') or 'unknown error'}",
+            )
+
+    async def resolve_phone(self, phone: str) -> dict:
+        """Look up ``phone`` on WhatsApp — ``{exists, jid, lid}``.
+
+        Used before cold-messaging a number nobody has messaged us from: it
+        answers whether the number is on WhatsApp at all (so we don't create a
+        contact and a history entry for a send that will never land) and
+        returns the canonical JID plus the ``@lid`` alias the contact may reply
+        from. Raises on transport failure; ``exists=False`` is a normal answer.
+        """
+        if self._ws is None:
+            raise ChannelAuthError("WhatsApp sidecar not connected")
+        digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+        if not digits:
+            return {"exists": False, "jid": None, "lid": None}
+        request_id, fut = self._new_request()
+        try:
+            async with self._send_lock:
+                await self._ws.send(json.dumps({
+                    "kind": "resolve", "phone": digits, "request_id": request_id,
+                }))
+            reply = await asyncio.wait_for(fut, timeout=_ACK_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            raise ChannelAuthError(
+                f"WhatsApp sidecar did not answer the number lookup within "
+                f"{_ACK_TIMEOUT:.0f}s",
+            ) from exc
+        finally:
+            self._pending.pop(request_id, None)
+        if not reply.get("ok"):
+            raise ChannelAuthError(
+                f"WhatsApp number lookup failed: {reply.get('error') or 'unknown error'}",
+            )
+        return {
+            "exists": bool(reply.get("exists")),
+            "jid": reply.get("jid") or f"{digits}{_PN_SUFFIX}",
+            "lid": _normalize_lid(reply.get("lid")),
+        }
+
+    def _new_request(self) -> tuple[str, asyncio.Future]:
+        """Register and return a (request_id, future) pair for one round trip."""
+        self._request_seq += 1
+        request_id = f"r{self._request_seq}"
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = fut
+        return request_id, fut
+
+    def _resolve_pending(self, msg: dict) -> bool:
+        """Complete the future waiting on this frame's ``request_id``."""
+        request_id = msg.get("request_id")
+        if not request_id:
+            return False
+        fut = self._pending.pop(request_id, None)
+        if fut is None or fut.done():
+            return True
+        fut.set_result(msg)
+        return True
+
+    def _derive_phone(self, sender_id: str) -> str | None:
+        """WhatsApp pn-JIDs carry the contact's number; ``@lid`` ones don't."""
+        sid = (sender_id or "").strip()
+        if not sid.endswith(_PN_SUFFIX):
+            return None
+        digits = sid[: -len(_PN_SUFFIX)]
+        return digits if digits.isdigit() else None
 
     async def _send_typing(self, sender_id: str) -> None:
         if self._ws is None:
@@ -285,15 +402,53 @@ class WhatsappAdapter(BaseChannelAdapter):
                     reason="logged_out_remote",
                     detail="WhatsApp linked-device session was logged out from your phone.",
                 )
+        elif kind == "send_ack":
+            self._resolve_pending(msg)
+        elif kind == "resolve_result":
+            self._resolve_pending(msg)
         elif kind == "send_error":
-            logger.warning(
-                f"whatsapp[{self.channel_id}]: send_error — "
-                f"sender={msg.get('sender_id')} err={msg.get('error')}",
-            )
+            # Correlated failures belong to whoever is awaiting them; an
+            # uncorrelated one (legacy fire-and-forget send) only gets logged.
+            if not self._resolve_pending({**msg, "ok": False}):
+                logger.warning(
+                    f"whatsapp[{self.channel_id}]: send_error — "
+                    f"sender={msg.get('sender_id')} err={msg.get('error')}",
+                )
         elif kind == "error":
             logger.warning(
                 f"whatsapp[{self.channel_id}]: sidecar error — {msg.get('error')}",
             )
+
+    async def _upsert_sender(
+        self, sender_id: str, display_name: str | None,
+    ) -> dict:
+        """Upsert the sender, adopting a cold-contact row when the ``@lid`` matches.
+
+        Multi-device WhatsApp may deliver this person's messages from an opaque
+        ``<id>@lid`` JID even though we first reached them at
+        ``<digits>@s.whatsapp.net`` (a direct-send cold contact records the
+        ``@lid`` alias precisely so we can recognise this). Creating a fresh row
+        would give the same human a second contact and a second conversation,
+        losing the history of what we already sent them — so re-point the
+        existing row at the identity they actually write from.
+        """
+        sid = (sender_id or "").strip()
+        if sid.endswith(_LID_SUFFIX):
+            # Look up the alias exactly as it is stored — full JID form, the
+            # same shape ``_normalize_lid`` wrote at registration.
+            existing = await self.storage.get_sender_by_wa_lid(self.channel_id, sid)
+            if existing and existing["sender_id"] != sid:
+                logger.info(
+                    f"whatsapp[{self.channel_id}]: adopting cold-contact row "
+                    f"{existing['sender_id']} -> {sid} (lid match)",
+                )
+                updated = await self.storage.update_sender(
+                    existing["id"], sender_id=sid,
+                    **({"display_name": display_name} if display_name else {}),
+                )
+                if updated:
+                    return updated
+        return await super()._upsert_sender(sender_id, display_name)
 
     async def _handle_inbound_safe(
         self, sender_id: str, display_name: str | None, text: str,
@@ -308,6 +463,13 @@ class WhatsappAdapter(BaseChannelAdapter):
         proc = self._proc
         self._ws = None
         self._proc = None
+        # Fail anyone parked on a round trip: the sidecar is going away, so no
+        # ack is ever coming and waiting out the timeout would be pointless.
+        pending = list(self._pending.items())
+        self._pending.clear()
+        for _, fut in pending:
+            if not fut.done():
+                fut.set_result({"ok": False, "error": "sidecar shut down"})
         if ws is not None:
             try:
                 await ws.close()

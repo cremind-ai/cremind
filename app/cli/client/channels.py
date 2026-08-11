@@ -154,22 +154,83 @@ async def list_senders(client: Client, channel_id: str) -> list[dict[str, Any]]:
     return []
 
 
+async def update_sender(
+    client: Client, channel_id: str, sender_id: str, fields: dict[str, Any],
+) -> dict[str, Any]:
+    """PATCH one channel sender. ``fields`` may carry ``authenticated``/``phone``.
+
+    The sender must already exist (they've contacted the channel, or a direct
+    send reached them), else the server 404s — so a typo can't seed a junk row.
+    """
+    resp = await client.patch_json(
+        f"/api/channels/{quote(channel_id, safe='')}/senders/{quote(sender_id, safe='')}",
+        fields,
+    )
+    if isinstance(resp, dict) and isinstance(resp.get("sender"), dict):
+        return resp["sender"]
+    raise RuntimeError("unexpected /api/channels/{id}/senders/{sender} response")
+
+
 async def set_sender_authenticated(
     client: Client, channel_id: str, sender_id: str, authenticated: bool,
 ) -> dict[str, Any]:
     """Approve (``authenticated=True``) or revoke a channel subscriber.
 
     Backs ``cremind channels approve/revoke`` — the operator side of the
-    ``approval`` subscription-auth method for notification channels. The sender
-    must already exist (they've contacted the channel), else the server 404s.
+    ``approval`` subscription-auth method for notification channels.
     """
-    resp = await client.patch_json(
-        f"/api/channels/{quote(channel_id, safe='')}/senders/{quote(sender_id, safe='')}",
-        {"authenticated": authenticated},
+    return await update_sender(
+        client, channel_id, sender_id, {"authenticated": authenticated},
     )
-    if isinstance(resp, dict) and isinstance(resp.get("sender"), dict):
-        return resp["sender"]
-    raise RuntimeError("unexpected /api/channels/{id}/senders/{sender} response")
+
+
+async def set_sender_phone(
+    client: Client, channel_id: str, sender_id: str, phone: str | None,
+) -> dict[str, Any]:
+    """Record (or clear, with ``None``) a contact's phone number.
+
+    Backs ``cremind channels set-phone``. This is the deliberate-overwrite
+    path: automatic derivation only ever fills an empty number, so correcting a
+    mapping by hand has to go through here.
+    """
+    return await update_sender(client, channel_id, sender_id, {"phone": phone})
+
+
+async def set_sender_confirmation(
+    client: Client, channel_id: str, sender_id: str, mode: str | None,
+) -> dict[str, Any]:
+    """Set this client's confirmation override: ``"required"``, ``"skip"``, ``None``.
+
+    ``None`` clears the override so the client inherits the profile's "confirm
+    before messaging clients" setting. Backs ``cremind channels set-confirm``.
+    """
+    return await update_sender(
+        client, channel_id, sender_id, {"send_confirmation": mode},
+    )
+
+
+async def send_channel_message(
+    client: Client, channel_id: str, recipients: list[dict[str, Any]],
+    message: str | None = None, dry_run: bool = True,
+    default_country_code: str | None = None,
+) -> dict[str, Any]:
+    """Message specific clients on a channel — one or many.
+
+    Unlike :func:`notify_channel` (which broadcasts to the channel's own
+    subscribers), this addresses named individuals by platform sender id or
+    phone number and records each delivered message in that client's
+    conversation. ``dry_run`` defaults to True: it resolves the recipients and
+    reports who *would* be messaged without sending anything.
+    """
+    payload: dict[str, Any] = {"recipients": recipients, "dry_run": dry_run}
+    if message is not None:
+        payload["message"] = message
+    if default_country_code:
+        payload["default_country_code"] = default_country_code
+    resp = await client.post_json(
+        f"/api/channels/{quote(channel_id, safe='')}/message", payload,
+    )
+    return resp if isinstance(resp, dict) else {}
 
 
 async def clear_sender_history(
@@ -184,6 +245,23 @@ async def clear_sender_history(
     resp = await client.delete(
         f"/api/channels/{quote(channel_id, safe='')}"
         f"/senders/{quote(sender_id, safe='')}/messages",
+    )
+    return resp if isinstance(resp, dict) else {}
+
+
+async def delete_sender(
+    client: Client, channel_id: str, sender_id: str,
+) -> dict[str, Any]:
+    """Delete a channel client outright — as if they had never messaged.
+
+    The full-erasure counterpart of :func:`clear_sender_history`: removes their
+    conversation and messages, the automations homed on it, their contact
+    details and their access state, so a later message arrives as a first
+    contact. Returns ``{"conversation_id", "deleted_messages", ...}``.
+    """
+    resp = await client.delete(
+        f"/api/channels/{quote(channel_id, safe='')}"
+        f"/senders/{quote(sender_id, safe='')}",
     )
     return resp if isinstance(resp, dict) else {}
 

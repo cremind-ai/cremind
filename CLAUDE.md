@@ -66,7 +66,9 @@ The app runs `upgrade head` automatically on boot (`ensure_at_head()` in
 migration will break existing installs on upgrade.
 
 - Migrations live in `app/alembic/versions/` (current head:
-  `20260810_event_tasks`).
+  `20260812_sender_confirm`). Revision ids must be **≤ 32 chars** —
+  `alembic_version.version_num` is `VARCHAR(32)`, which Postgres enforces and
+  SQLite silently truncates (`tests/storage/test_migrations_graph.py` guards it).
 - Generate and **hand-review** the migration following the checklist in
   [RELEASING.md](RELEASING.md) → **Schema change**: prefer additive changes,
   split destructive changes across two releases, backfill **inside** the

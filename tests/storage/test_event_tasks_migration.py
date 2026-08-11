@@ -174,8 +174,15 @@ def test_event_tasks_migration_sqlite(tmp_path: Path, monkeypatch) -> None:
         assert run[1] is None and run[2] is None
 
 
-def test_migration_head_matches_the_new_revision(tmp_path: Path, monkeypatch) -> None:
-    """A missed ``down_revision`` chain would leave installs stuck at the old head."""
+def test_migration_reaches_the_current_head(tmp_path: Path, monkeypatch) -> None:
+    """A missed ``down_revision`` chain would leave installs stuck at the old head.
+
+    The expected head is read from the migration tree rather than hard-coded:
+    the property under test is that an install at ``20260720_event_paused``
+    upgrades all the way to the tip, whatever the tip currently is. Pinning a
+    literal here would fail every time a later feature adds a migration, which
+    is noise, not a signal about this one.
+    """
     provider = SqliteDatabaseProvider(str(tmp_path / "head.db"))
 
     import app.databases as dbs
@@ -186,7 +193,9 @@ def test_migration_head_matches_the_new_revision(tmp_path: Path, monkeypatch) ->
     _build_old_db(provider)
     mig.upgrade("head")
 
+    expected = mig.heads()
+    assert len(expected) == 1, f"expected a single head, got {expected}"
     with provider.sync_engine().connect() as c:
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == (
-            "20260810_event_tasks"
-        )
+        assert c.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar() == expected[0]

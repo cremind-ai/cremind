@@ -41,6 +41,23 @@ _OTP_TTL_SECONDS = 600  # 10 minutes
 _MAX_MESSAGE_CHARS = 3500
 
 
+class PartialSendError(Exception):
+    """A chunked send failed after some chunks had already been delivered.
+
+    Raised by :meth:`BaseChannelAdapter.send_strict`. The recipient saw
+    ``sent_chunks`` messages before the failure, which the caller needs to know:
+    recording nothing would leave the transcript claiming a message the person
+    actually received was never sent.
+    """
+
+    def __init__(self, sent_chunks: int, cause: Exception) -> None:
+        super().__init__(
+            f"delivery failed after {sent_chunks} chunk(s): {cause}",
+        )
+        self.sent_chunks = sent_chunks
+        self.cause = cause
+
+
 class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
     """Lifecycle + inbound handling shared across all channel adapters.
 
@@ -195,6 +212,49 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             logger.exception(
                 f"channels[{self.channel_type}]: send to {sender_id} failed",
             )
+
+    async def send_strict(self, sender_id: str, text: str) -> int:
+        """Chunked send that RAISES on the first failure. Returns chunks sent.
+
+        The strict counterpart of :meth:`send` + :meth:`_send_chunked`. Those
+        swallow transport errors on purpose — a reply stream shouldn't be
+        abandoned because one bubble failed — but the direct-send path
+        (:mod:`app.channels.direct_send`) reports per-recipient outcomes and
+        only records a message in the client's conversation history once it
+        really went out, so it needs the error, not a log line.
+
+        A long message goes out as several platform messages, so failure is not
+        all-or-nothing: if an early chunk landed and a later one didn't, the
+        recipient really did see part of it. That case raises
+        :class:`PartialSendError` carrying the count, so the caller can record
+        what was actually delivered instead of pretending nothing was.
+        """
+        text = (text or "").strip()
+        if not text:
+            return 0
+        sent = 0
+        for chunk in _split_for_messaging(text, _MAX_MESSAGE_CHARS):
+            try:
+                await self._send_text(sender_id, chunk)
+            except Exception as exc:  # noqa: BLE001
+                if sent:
+                    raise PartialSendError(sent, exc) from exc
+                raise
+            sent += 1
+        return sent
+
+    def _derive_phone(self, sender_id: str) -> str | None:
+        """Return the contact's phone (canonical digits) implied by ``sender_id``.
+
+        Default: ``None`` — on most platforms the sender id is an opaque
+        account id that says nothing about the person's number. WhatsApp
+        overrides this because its ``<digits>@s.whatsapp.net`` JIDs *are* the
+        phone number, which is what lets a spreadsheet of numbers resolve to
+        known contacts. Platform-derived values are authoritative enough to
+        backfill an empty column (see ``get_or_create_sender``), never to
+        overwrite one.
+        """
+        return None
 
     # ── auth-event pub/sub (consumed by the API's /auth-events SSE) ──
 
@@ -383,6 +443,35 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             self._inbound_locks[sender_id] = lock
         return lock
 
+    def forget_sender(self, sender_id: str) -> None:
+        """Drop every trace of ``sender_id`` from this adapter's live state.
+
+        The DB side of deleting a channel client is only half the job: this
+        adapter also holds per-sender state in memory, and leaving it behind
+        would make the "as if they had never written" promise false in visible
+        ways — a stale busy flag suppressing their next "I'm thinking…" ack, or
+        a remembered access request meaning the operator never gets a fresh
+        approval notification when they come back.
+
+        Called by the delete-client endpoint after the rows are gone. Safe to
+        call for a sender this adapter has never seen.
+        """
+        # A forwarder for a deleted conversation has nowhere to publish and
+        # would write into rows that no longer exist; drop it.
+        task = self._inflight.pop(sender_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._busy_acked.discard(sender_id)
+        self._access_requested.discard(sender_id)
+        # Only reclaim the lock when nobody holds it. A task can be parked on
+        # ``acquire`` with a reference to this exact object, so removing a held
+        # lock would hand the next caller a second one and break the mutual
+        # exclusion the entry exists for (see ``__init__``). A held lock is
+        # simply left to be reused, which is harmless.
+        lock = self._inbound_locks.get(sender_id)
+        if lock is not None and not lock.locked():
+            self._inbound_locks.pop(sender_id, None)
+
     async def _handle_inbound(
         self, sender_id: str, display_name: str | None, text: str,
     ) -> None:
@@ -415,9 +504,7 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             await self._handle_notification_command(sender_id, display_name, text)
             return
 
-        sender = await self.storage.get_or_create_sender(
-            self.channel_id, sender_id, display_name=display_name,
-        )
+        sender = await self._upsert_sender(sender_id, display_name)
 
         conversation_id = await self._ensure_conversation(sender, display_name)
 
@@ -451,21 +538,29 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 conversation_id, sender_id, display_name, text,
             )
 
+    async def _upsert_sender(
+        self, sender_id: str, display_name: str | None,
+    ) -> dict:
+        """Upsert the sender row for an inbound message.
+
+        Wraps ``get_or_create_sender`` so every transport also contributes any
+        phone number its sender id encodes (see :meth:`_derive_phone`), which
+        is what lets the direct-send path later address this contact by number.
+        The ``phone`` kwarg is only passed when there is one to contribute, so
+        transports that encode no number call through exactly as before.
+        """
+        phone = self._derive_phone(sender_id)
+        extra = {"phone": phone} if phone else {}
+        return await self.storage.get_or_create_sender(
+            self.channel_id, sender_id, display_name=display_name, **extra,
+        )
+
     async def _ensure_conversation(self, sender: dict, display_name: str | None) -> str:
         """Return the conversation id for this sender, creating one if absent."""
-        conv_id = sender.get("conversation_id")
-        if conv_id:
-            existing = await self.storage.get_conversation(conv_id)
-            if existing:
-                return conv_id
-        title = display_name or sender["sender_id"]
-        conv = await self.storage.create_conversation(
-            profile=self.profile,
-            title=title[:120] if title else "Untitled Chat",
-            channel_id=self.channel_id,
+        return await self.storage.ensure_sender_conversation(
+            sender, profile=self.profile, channel_id=self.channel_id,
+            display_name=display_name,
         )
-        await self.storage.update_sender(sender["id"], conversation_id=conv["id"])
-        return conv["id"]
 
     # ── auth gates ──
 

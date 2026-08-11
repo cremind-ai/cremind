@@ -361,6 +361,296 @@ def channels_send(
         )
 
 
+@channels_app.command("message")
+@graceful_errors
+def channels_message(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id to send through."),
+    message: Optional[str] = typer.Argument(
+        None, help="Shared message text. Omit to read from --message-file or stdin.",
+    ),
+    to: Optional[list[str]] = typer.Option(
+        None, "--to",
+        help="Recipient: platform sender id or international phone number. "
+             "Repeat for several recipients.",
+    ),
+    recipients_file: Optional[str] = typer.Option(
+        None, "--recipients-file",
+        help="Read recipients from a JSON file (use '-' for stdin): a list of "
+             'strings, or of objects {"to", "message"?, "name"?}. Use this for '
+             "per-recipient personalisation.",
+    ),
+    message_file: Optional[str] = typer.Option(
+        None, "--message-file", "-f",
+        help="Read the shared message from this file (use '-' for stdin). "
+             "Preferred on PowerShell, where inline quoting mangles apostrophes.",
+    ),
+    country_code: Optional[str] = typer.Option(
+        None, "--country-code",
+        help='Country code (e.g. "84") used to expand numbers written in '
+             "national form with a leading 0.",
+    ),
+    send: bool = typer.Option(
+        False, "--send",
+        help="Actually deliver. Without this the command only previews who "
+             "would be messaged.",
+    ),
+) -> None:
+    """Message specific clients on a channel — one or many.
+
+    Unlike `channels send` (which broadcasts to a notification channel's own
+    subscribers), this addresses named individuals by platform sender id or
+    phone number, and records each delivered message in that client's
+    conversation so the agent sees it later.
+
+    Previews by default: it resolves every recipient and prints who would be
+    messaged, who has never been contacted before, and what failed to resolve.
+    Add --send to deliver. Only WhatsApp can message someone who has never
+    written first.
+
+    Examples:
+      cremind channels message <id> "Thanks for trying our product!" --to +84901234567
+      cremind channels message <id> "Thanks!" --to +84901234567 --to +84907654321 --send
+      cremind channels message <id> --recipients-file thankyou.json --send
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import send_channel_message
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, Table, print_json
+    from app.cli.output.formatting import string_field
+
+    if to and recipients_file:
+        typer.echo("pass either --to or --recipients-file, not both", err=True)
+        raise typer.Exit(code=1)
+    if message is not None and message_file is not None:
+        typer.echo("pass either a message argument or --message-file, not both", err=True)
+        raise typer.Exit(code=1)
+
+    recipients: list[dict[str, Any]] = []
+    if recipients_file is not None:
+        raw = sys.stdin.read() if recipients_file == "-" else None
+        if raw is None:
+            try:
+                with open(recipients_file, encoding="utf-8") as fh:
+                    raw = fh.read()
+            except OSError as e:
+                typer.echo(f"--recipients-file: {e}", err=True)
+                raise typer.Exit(code=1) from e
+        try:
+            parsed = _json.loads(raw)
+        except ValueError as e:
+            typer.echo(f"--recipients-file: invalid JSON: {e}", err=True)
+            raise typer.Exit(code=1) from e
+        if not isinstance(parsed, list):
+            typer.echo("--recipients-file: expected a JSON list", err=True)
+            raise typer.Exit(code=1)
+        for item in parsed:
+            if isinstance(item, str):
+                recipients.append({"to": item})
+            elif isinstance(item, dict):
+                recipients.append(item)
+            else:
+                typer.echo(
+                    "--recipients-file: each entry must be a string or an object",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+    elif to:
+        recipients = [{"to": t} for t in to]
+    else:
+        typer.echo("give recipients with --to or --recipients-file", err=True)
+        raise typer.Exit(code=1)
+
+    text: Optional[str]
+    if message_file is not None:
+        if message_file == "-":
+            text = sys.stdin.read()
+        else:
+            try:
+                with open(message_file, encoding="utf-8") as fh:
+                    text = fh.read()
+            except OSError as e:
+                typer.echo(f"--message-file: {e}", err=True)
+                raise typer.Exit(code=1) from e
+    else:
+        text = message
+    text = text.strip() if text else None
+    # A shared message is optional only when every recipient brings its own.
+    if not text and not all(r.get("message") for r in recipients):
+        typer.echo(
+            "no message text — pass one as an argument, via --message-file, or "
+            "on every recipient in --recipients-file",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    cfg: Config = ctx.obj["cfg"]
+    out_mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await send_channel_message(
+                client, channel_id, recipients, message=text,
+                dry_run=not send, default_country_code=country_code,
+            )
+
+    result = asyncio.run(_run())
+
+    if out_mode.json:
+        print_json(result)
+        raise typer.Exit(code=1 if int(result.get("failed") or 0) else 0)
+
+    rows = result.get("results") or []
+    table = Table(out_mode, "TO", "STATUS", "CHANNEL", "SENDER_ID", "NEW", "DETAIL")
+    for r in rows:
+        table.add_row(
+            string_field(r, "to"),
+            string_field(r, "status"),
+            string_field(r, "channel_type"),
+            string_field(r, "sender_id"),
+            "yes" if r.get("new_contact") else "",
+            string_field(r, "detail") or string_field(r, "error"),
+        )
+    table.render()
+
+    failed = int(result.get("failed") or 0)
+    if result.get("dry_run"):
+        sys.stdout.write(
+            f"\nPreview only — nothing sent. {result.get('resolved') or 0} of "
+            f"{len(rows)} recipient(s) resolved"
+            + (f", {result['new_contacts']} never contacted before"
+               if result.get("new_contacts") else "")
+            + ". Re-run with --send to deliver.\n"
+        )
+    else:
+        sys.stdout.write(
+            f"\nSent {result.get('sent') or 0}, failed {failed}.\n"
+        )
+    if result.get("aborted"):
+        sys.stdout.write(
+            "Aborted early after repeated delivery failures on this channel.\n"
+        )
+    if failed:
+        raise typer.Exit(code=1)
+
+
+@channels_app.command("set-phone")
+@graceful_errors
+def channels_set_phone(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    sender_id: str = typer.Argument(..., help="Sender id (from `channels senders`)."),
+    phone: Optional[str] = typer.Argument(
+        None, help="Phone number in international form, e.g. +84901234567.",
+    ),
+    clear: bool = typer.Option(False, "--clear", help="Remove the stored number."),
+) -> None:
+    """Record a contact's phone number so `channels message` can reach them by it.
+
+    WhatsApp contacts get this automatically (their sender id is the number);
+    everywhere else the mapping has to come from you. This is also the only way
+    to *correct* a stored number — automatic derivation never overwrites one.
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import set_sender_phone
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    if clear and phone:
+        typer.echo("pass either a phone number or --clear, not both", err=True)
+        raise typer.Exit(code=1)
+    if not clear and not phone:
+        typer.echo("give a phone number, or --clear to remove it", err=True)
+        raise typer.Exit(code=1)
+
+    cfg: Config = ctx.obj["cfg"]
+    out_mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await set_sender_phone(
+                client, channel_id, sender_id, None if clear else phone,
+            )
+
+    sender = asyncio.run(_run())
+    if out_mode.json:
+        print_json(sender)
+        return
+    stored = sender.get("phone")
+    sys.stdout.write(
+        f"{sender.get('sender_id')}: phone "
+        + (f"set to {stored}\n" if stored else "cleared\n")
+    )
+
+
+@channels_app.command("set-confirm")
+@graceful_errors
+def channels_set_confirm(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    sender_id: str = typer.Argument(..., help="Sender id (from `channels senders`)."),
+    mode: str = typer.Argument(
+        ...,
+        help="'default' (inherit the profile setting), 'always' (always ask "
+             "before messaging this client), or 'never' (send directly).",
+    ),
+) -> None:
+    """Choose whether the agent must ask before messaging one client.
+
+    The profile-wide default lives in Settings → Config → Channels ("Confirm
+    before messaging clients", `cremind config set channels.confirm_before_send`).
+    This overrides it for a single client:
+
+      never   — the agent messages them without stopping to ask. This is what
+                lets an unattended automation reach a pre-approved client
+                instead of stalling on a prompt nobody can answer.
+      always  — keep asking for this client even if the profile setting is off.
+      default — clear the override and inherit the profile setting.
+
+    Someone who has never messaged the channel always prompts, whatever is set.
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import set_sender_confirmation
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    wanted = (mode or "").strip().lower()
+    choices = {"default": None, "always": "required", "never": "skip"}
+    if wanted not in choices:
+        typer.echo(
+            f"mode must be one of {', '.join(choices)} (got {mode!r})", err=True,
+        )
+        raise typer.Exit(code=1)
+
+    cfg: Config = ctx.obj["cfg"]
+    out_mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await set_sender_confirmation(
+                client, channel_id, sender_id, choices[wanted],
+            )
+
+    sender = asyncio.run(_run())
+    if out_mode.json:
+        print_json(sender)
+        return
+    stored = sender.get("send_confirmation")
+    label = {"required": "always ask", "skip": "send directly"}.get(
+        stored or "", "inherit the profile setting",
+    )
+    sys.stdout.write(f"{sender.get('sender_id')}: {label}\n")
+
+
 def _parse_config_option(
     config_json: Optional[str], config_kv: Optional[list[str]],
 ) -> Optional[dict[str, Any]]:
@@ -550,8 +840,8 @@ def channels_senders(
         sys.stdout.write("no senders.\n")
         return
     table = Table(
-        mode, "SENDER_ID", "NAME", "AUTHED", "TOKENS", "COST_USD",
-        "CONVERSATION_ID", "PENDING_OTP",
+        mode, "SENDER_ID", "NAME", "PHONE", "AUTHED", "CONFIRM", "TOKENS",
+        "COST_USD", "CONVERSATION_ID", "PENDING_OTP",
     )
     for s in senders:
         usage = s.get("usage") or {}
@@ -560,7 +850,12 @@ def channels_senders(
         table.add_row(
             string_field(s, "sender_id"),
             string_field(s, "display_name"),
+            string_field(s, "phone"),
             bool_field(s, "authenticated", False),
+            # Blank means "inherit the profile setting" — the common case.
+            {"required": "always", "skip": "never"}.get(
+                s.get("send_confirmation") or "", "",
+            ),
             f"{int(tokens):,}" if isinstance(tokens, (int, float)) else "",
             f"{float(cost):.4f}" if isinstance(cost, (int, float)) else "",
             string_field(s, "conversation_id"),
@@ -683,6 +978,74 @@ def channels_clear_history(
     sys.stdout.write(
         f"{sender_id}: cleared {cleared} message(s) from conversation {conv}\n"
     )
+
+
+@channels_app.command("forget")
+@graceful_errors
+def channels_forget(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    sender_id: str = typer.Argument(..., help="Sender id (from `channels senders`)."),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the confirmation prompt.",
+    ),
+) -> None:
+    """Delete a channel client completely — as if they had never messaged.
+
+    Removes their conversation and every message in it, the automations homed on
+    it, their contact details and phone, and their access approval. If they write
+    again they arrive as a brand-new client and must pass the channel's access
+    check from scratch.
+
+    Recorded token usage and cost stay in the account totals but stop being
+    attributed to anyone. Fails with a 409 while that client has a run in
+    progress. This cannot be undone — use `clear-history` instead to wipe only
+    their messages and keep the person.
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import delete_sender
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    out_mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    if not yes:
+        prompt = (
+            f"Completely delete client {sender_id} from channel {channel_id}? "
+            "Their conversation, messages, automations, contact details and "
+            "access approval are all removed. This cannot be undone."
+        )
+        if not sys.stdin.isatty():
+            # Non-interactive (scripts, exec_shell): never guess on a
+            # destructive action — make the caller opt in explicitly.
+            typer.echo(f"{prompt} Re-run with --yes to confirm.", err=True)
+            raise typer.Exit(code=1)
+        if not typer.confirm(prompt):
+            raise typer.Exit(code=1)
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await delete_sender(client, channel_id, sender_id)
+
+    result = asyncio.run(_run())
+    if out_mode.json:
+        print_json(result)
+        return
+    deleted = result.get("deleted_messages", 0)
+    sys.stdout.write(f"{sender_id}: deleted from channel {channel_id}\n")
+    if deleted:
+        sys.stdout.write(f"  removed {deleted} message(s)\n")
+    if result.get("forgot_memories"):
+        sys.stdout.write(
+            f"  forgot {result['forgot_memories']} long-term memory entr"
+            f"{'y' if result['forgot_memories'] == 1 else 'ies'}\n"
+        )
+    if result.get("unsubscribed_target"):
+        sys.stdout.write("  removed from the channel's target chat IDs\n")
 
 
 @channels_app.command("pair")

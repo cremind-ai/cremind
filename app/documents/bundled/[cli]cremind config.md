@@ -1,5 +1,5 @@
 ---
-description: "Inspect, override, and reset **per-profile agent settings** with `cremind config schema`, `get`, `set`, and `reset`: set the system timezone used by the scheduler and clock, and tune the reasoning-agent loop (max steps, retries, temperature, max tokens, steps history, prompt caching, reasoning-trace replay), conversation compaction, tool-result truncation, and long-term memory. Use this to change how the agent behaves for a profile — including which timezone schedules fire in — distinct from `cremind llm` (which models/providers) and `cremind tools` (per-tool config)."
+description: "Inspect, override, and reset **per-profile agent settings** with `cremind config schema`, `get`, `set`, and `reset`: set the system timezone used by the scheduler and clock, choose whether the agent must ask for approval before messaging channel clients (`channels.confirm_before_send` — turn it off so unattended automations can send without stopping to ask; individual clients can be overridden with `cremind channels set-confirm`), and tune the reasoning-agent loop (max steps, retries, temperature, max tokens, steps history, prompt caching, reasoning-trace replay), conversation compaction, tool-result truncation, and long-term memory. Use this to change how the agent behaves for a profile — including which timezone schedules fire in — distinct from `cremind llm` (which models/providers) and `cremind tools` (per-tool config)."
 ---
 
 # `cremind config` — Per-Profile Settings Reference
@@ -47,10 +47,11 @@ The Config page is a vertical stack of cards, one card per group, in
 this order:
 
 1. **System** — the `system.*` keys (timezone).
-2. **Reasoning Agent** — the `agent.*` keys.
-3. **Conversation Compaction** — the `compaction.*` keys.
-4. **Tool Result Truncation** — the `tool_result.*` keys.
-5. **Memory** — the `memory.*` keys.
+2. **Channels** — the `channels.*` keys.
+3. **Reasoning Agent** — the `agent.*` keys.
+4. **Conversation Compaction** — the `compaction.*` keys.
+5. **Tool Result Truncation** — the `tool_result.*` keys.
+6. **Memory** — the `memory.*` keys.
 
 Inside each card, every row shows the field's label, a one-line
 description, the current default, and a type-appropriate input — a
@@ -251,6 +252,43 @@ environment variable, and finally to the server's OS timezone. A Docker/VPS
 install runs in UTC by default, which is why schedules there fire in UTC until
 you set this — set the admin profile's zone (or `CREMIND_TIMEZONE`) to your
 local zone. An invalid IANA name or offset is rejected by `cremind config set`.
+
+### Group `channels` — Channels
+
+How the agent behaves when it messages the people who talk to you through a
+channel (Telegram, WhatsApp, …).
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `channels.confirm_before_send` | boolean | `true` | Ask for your approval before the agent sends a message to a channel client. |
+
+**Why you would turn it off.** With it on, the agent resolves the recipients,
+shows you who each one is, and waits — right when you are watching, wrong when
+you are not. An unattended automation (a scheduled job, an event rule) has
+nobody to answer the prompt, so it parks itself *pending* instead of sending.
+Setting this to `false` lets those sends go straight out:
+
+```bash
+cremind config set channels.confirm_before_send false
+cremind config reset channels.confirm_before_send    # back to asking
+```
+
+**Per-client overrides beat this setting**, so you usually do not need to turn it
+off globally — exempt just the clients you have already decided about:
+
+```bash
+cremind channels set-confirm <channel_id> <sender_id> never    # send directly
+cremind channels set-confirm <channel_id> <sender_id> always   # always ask
+cremind channels set-confirm <channel_id> <sender_id> default  # inherit this key
+```
+
+**Always confirmed regardless.** A recipient who has never messaged the channel
+(e.g. a phone number WhatsApp would cold-contact) is always previewed, whatever
+this key says — they have no client record to exempt, and it is the send most
+likely to be going to the wrong person.
+
+This key only affects the agent's `send_channel_message` tool. `cremind channels
+message` is unaffected: there `--send` is itself your approval.
 
 ### Group `agent` — Reasoning Agent
 

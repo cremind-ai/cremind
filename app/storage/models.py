@@ -248,6 +248,31 @@ class ChannelSenderModel(Base):
     ``conversation_id`` uses ``ON DELETE SET NULL`` (instead of CASCADE) so
     deleting a single conversation doesn't drop the sender's auth/OTP state.
     Channel deletion still cascades both rows away via ``channel_id``.
+
+    ``phone`` / ``wa_lid`` back the direct-send feature (see
+    :mod:`app.channels.direct_send`), which addresses recipients by phone
+    number as well as by platform id:
+
+    - ``phone`` is the contact's number in canonical digits-only form (E.164
+      without the ``+``). It is derived automatically where the platform
+      exposes it (WhatsApp ``<digits>@s.whatsapp.net`` sender ids, see
+      ``BaseChannelAdapter._derive_phone``) and can otherwise be filled in by
+      the operator — a phone the platform never told us is the only way to
+      address a Telegram/Slack/Discord contact by number.
+    - ``wa_lid`` is the WhatsApp *linked-identity* alias (``<id>@lid``) for a
+      contact we cold-messaged by phone. Multi-device WhatsApp lets the same
+      human reply from an opaque ``@lid`` JID, which would otherwise create a
+      second sender row and split the conversation; the inbound path adopts
+      this row instead when the ``@lid`` matches.
+
+    ``send_confirmation`` is this client's override of the profile's
+    "confirm before messaging clients" setting: ``NULL`` inherits it,
+    ``"skip"`` lets the agent message them without asking (the point being that
+    an unattended automation can reach a pre-approved client), ``"required"``
+    keeps asking even when the profile setting is off. A nullable mode string
+    rather than a boolean because there is no fourth state to invent and
+    ``NULL`` has to stay distinguishable from "explicitly false" — see
+    :mod:`app.channels.send_policy`.
     """
 
     __tablename__ = "channel_senders"
@@ -258,6 +283,9 @@ class ChannelSenderModel(Base):
     )
     sender_id: Mapped[str] = mapped_column(String(256), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    wa_lid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    send_confirmation: Mapped[str | None] = mapped_column(String(16), nullable=True)
     authenticated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     pending_otp: Mapped[str | None] = mapped_column(String(16), nullable=True)
     pending_otp_expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)

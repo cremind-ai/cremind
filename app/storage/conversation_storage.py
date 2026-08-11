@@ -612,8 +612,17 @@ class ConversationStorage:
 
     async def get_or_create_sender(
         self, channel_id: str, sender_id: str, display_name: str | None = None,
+        phone: str | None = None, wa_lid: str | None = None,
     ) -> dict:
-        """Return the sender row (creating it if absent). Refreshes display_name."""
+        """Return the sender row (creating it if absent). Refreshes display_name.
+
+        ``phone`` / ``wa_lid`` are **fill-if-empty**: they populate a row that
+        has none, but never overwrite a value already there. Both arrive from
+        platform derivation (a WhatsApp ``<digits>@s.whatsapp.net`` sender id
+        *is* the phone) or from a direct-send cold contact, and a stale
+        auto-derivation must not clobber a mapping the operator corrected by
+        hand. Deliberate overwrites go through :meth:`update_sender`.
+        """
         await self._ensure_initialized()
         now = time.time() * 1000
         async with self.async_session_maker.begin() as session:
@@ -629,6 +638,8 @@ class ConversationStorage:
                     channel_id=channel_id,
                     sender_id=sender_id,
                     display_name=display_name,
+                    phone=phone or None,
+                    wa_lid=wa_lid or None,
                     authenticated=False,
                     pending_otp=None,
                     pending_otp_expires_at=None,
@@ -638,10 +649,65 @@ class ConversationStorage:
                 )
                 session.add(row)
                 await session.flush()
-            elif display_name and row.display_name != display_name:
-                row.display_name = display_name
-                row.updated_at = now
+            else:
+                if display_name and row.display_name != display_name:
+                    row.display_name = display_name
+                    row.updated_at = now
+                if phone and not row.phone:
+                    row.phone = phone
+                    row.updated_at = now
+                if wa_lid and not row.wa_lid:
+                    row.wa_lid = wa_lid
+                    row.updated_at = now
             return self._sender_to_dict(row)
+
+    async def get_sender_by_wa_lid(self, channel_id: str, wa_lid: str) -> dict | None:
+        """Return the sender on ``channel_id`` carrying this WhatsApp ``@lid``.
+
+        Used by the WhatsApp inbound path to recognise that a message from an
+        opaque ``<id>@lid`` JID is the same human we previously cold-messaged
+        at ``<digits>@s.whatsapp.net``, so the reply lands in the existing
+        conversation instead of forking a second sender row.
+        """
+        await self._ensure_initialized()
+        if not wa_lid:
+            return None
+        async with self.async_session_maker() as session:
+            row = (await session.execute(
+                select(ChannelSenderModel).where(
+                    ChannelSenderModel.channel_id == channel_id,
+                    ChannelSenderModel.wa_lid == wa_lid,
+                )
+            )).scalars().first()
+            return self._sender_to_dict(row) if row else None
+
+    async def ensure_sender_conversation(
+        self, sender: dict, profile: str, channel_id: str,
+        display_name: str | None = None,
+    ) -> str:
+        """Return this sender's conversation id, creating one if absent.
+
+        The per-sender conversation is a forward pointer on the sender row
+        (``channel_senders.conversation_id``), so this is find-or-create for
+        that link. Lives here rather than on the adapter because the
+        direct-send path (:mod:`app.channels.direct_send`) needs the same
+        find-or-create when the agent messages someone *first*;
+        ``BaseChannelAdapter._ensure_conversation`` delegates here so both
+        paths share one implementation.
+        """
+        conv_id = sender.get("conversation_id")
+        if conv_id:
+            existing = await self.get_conversation(conv_id)
+            if existing:
+                return conv_id
+        title = display_name or sender.get("display_name") or sender["sender_id"]
+        conv = await self.create_conversation(
+            profile=profile,
+            title=title[:120] if title else "Untitled Chat",
+            channel_id=channel_id,
+        )
+        await self.update_sender(sender["id"], conversation_id=conv["id"])
+        return conv["id"]
 
     async def list_senders(self, channel_id: str) -> list[dict]:
         await self._ensure_initialized()
@@ -685,6 +751,30 @@ class ConversationStorage:
                 select(ChannelSenderModel).where(ChannelSenderModel.id == sender_row_id)
             )).scalar_one_or_none()
             return self._sender_to_dict(row) if row else None
+
+    async def delete_sender(self, sender_row_id: str) -> bool:
+        """Delete one channel sender row outright. Returns False if it was gone.
+
+        This drops everything Cremind remembers *about the person on the
+        channel*: their display name and phone, their WhatsApp alias, and their
+        access state (``authenticated`` plus any outstanding OTP challenge).
+        Their conversation is a separate row and is not touched here — the
+        caller deletes it first, because the conversation carries the messages
+        and the automations homed on it and needs the full teardown sequence
+        (see ``app.reset._conversations.cleanup_conversation_dependents``).
+
+        After this, the next inbound message from that person is
+        indistinguishable from a first-ever contact: a fresh sender row, a
+        fresh conversation, and the channel's access gate applied from scratch.
+        """
+        await self._ensure_initialized()
+        async with self.async_session_maker.begin() as session:
+            result = await session.execute(
+                delete(ChannelSenderModel).where(
+                    ChannelSenderModel.id == sender_row_id,
+                )
+            )
+            return result.rowcount > 0
 
     # ── Message CRUD ──
 
@@ -938,6 +1028,9 @@ class ConversationStorage:
             "channel_id": s.channel_id,
             "sender_id": s.sender_id,
             "display_name": s.display_name,
+            "phone": getattr(s, "phone", None),
+            "wa_lid": getattr(s, "wa_lid", None),
+            "send_confirmation": getattr(s, "send_confirmation", None),
             "authenticated": bool(s.authenticated),
             "pending_otp": s.pending_otp,
             "pending_otp_expires_at": s.pending_otp_expires_at,

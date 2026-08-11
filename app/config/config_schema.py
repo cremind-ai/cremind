@@ -134,6 +134,29 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
             ),
         },
     ),
+    "channels": ConfigGroup(
+        label="Channels",
+        description=(
+            "How the agent behaves when it messages the people who talk to you "
+            "through a channel (Telegram, WhatsApp, ...)."
+        ),
+        fields={
+            "confirm_before_send": Field(
+                type="boolean", default_toml="channels.confirm_before_send",
+                label="Confirm before messaging clients",
+                description=(
+                    "Ask for your approval before the agent sends a message to a "
+                    "channel client: it shows you who each recipient resolves to "
+                    "and waits. Turn this off to let sends go straight out, which "
+                    "is what unattended automations need — a scheduled job cannot "
+                    "answer a confirmation prompt and will stall waiting for one. "
+                    "Two cases still ask regardless: a client you have explicitly "
+                    "set to \"Always ask\" on the Channels page, and anyone who "
+                    "has never messaged this channel before."
+                ),
+            ),
+        },
+    ),
     "agent": ConfigGroup(
         label="Reasoning Agent",
         description="Controls the agent loop's iteration limits and per-call LLM parameters.",

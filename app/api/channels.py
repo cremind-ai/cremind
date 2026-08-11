@@ -565,14 +565,30 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         return JSONResponse({"senders": redacted})
 
     async def handle_set_sender_authenticated(request: Request) -> JSONResponse:
-        """Approve or revoke a channel subscriber (operator action).
+        """Update a channel subscriber (operator action).
 
-        Body: ``{"authenticated": bool}``. Backs the "Approve"/"Revoke"
-        controls in the Subscribers UI and ``cremind channels approve/revoke``
-        for notification channels using ``approval`` subscription auth — but is
-        mode-agnostic (it just flips the sender's ``authenticated`` flag). The
-        sender must already exist (i.e. they have contacted the channel);
-        returns 404 otherwise, so a typo can't seed a junk row.
+        Body: any non-empty subset of ``{"authenticated": bool, "phone":
+        str|null, "send_confirmation": "required"|"skip"|null}``.
+        ``authenticated`` backs the "Approve"/"Revoke" controls in
+        the Subscribers UI and ``cremind channels approve/revoke`` for
+        notification channels using ``approval`` subscription auth — but is
+        mode-agnostic (it just flips the sender's flag).
+
+        ``phone`` records the contact's number so direct sends can address them
+        from a list of phone numbers (``cremind channels set-phone``). It is
+        the only path allowed to *overwrite* a number — automatic derivation
+        only ever fills an empty one — because a corrected mapping must be able
+        to win, while a bad auto-derivation must not silently re-route someone's
+        messages. Pass ``null`` to clear it.
+
+        ``send_confirmation`` is this client's override of the profile's "confirm
+        before messaging clients" setting: ``"skip"`` lets the agent message them
+        without stopping to ask (so an unattended automation can reach them),
+        ``"required"`` keeps asking even when the profile setting is off, and
+        ``null`` inherits. See :mod:`app.channels.send_policy`.
+
+        The sender must already exist (i.e. they have contacted the channel or
+        been messaged); returns 404 otherwise, so a typo can't seed a junk row.
         """
         unauth = _require_auth(request)
         if unauth is not None:
@@ -590,10 +606,76 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
             body = await request.json()
         except Exception:  # noqa: BLE001
             return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        authed = body.get("authenticated") if isinstance(body, dict) else None
-        if not isinstance(authed, bool):
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "Body must be a JSON object"}, status_code=400)
+
+        fields: dict[str, Any] = {}
+        authed = body.get("authenticated")
+        if authed is not None:
+            if not isinstance(authed, bool):
+                return JSONResponse(
+                    {"error": "'authenticated' must be a boolean"},
+                    status_code=400,
+                )
+            # Approving clears any outstanding OTP challenge so a stale code
+            # can't later be replayed; revoking just drops the subscription.
+            fields["authenticated"] = authed
+            if authed:
+                fields["pending_otp"] = None
+                fields["pending_otp_expires_at"] = None
+
+        if "phone" in body:
+            raw_phone = body.get("phone")
+            if raw_phone in (None, ""):
+                fields["phone"] = None
+            else:
+                from app.channels.direct_send import normalize_phone
+
+                normalized = normalize_phone(str(raw_phone))
+                if not normalized:
+                    return JSONResponse(
+                        {
+                            "error": "Invalid phone number",
+                            "message": (
+                                "Give the number in international form, e.g. "
+                                "+84901234567."
+                            ),
+                        },
+                        status_code=400,
+                    )
+                fields["phone"] = normalized
+
+        if "send_confirmation" in body:
+            raw_mode = body.get("send_confirmation")
+            if raw_mode in (None, ""):
+                # Back to inheriting the profile's confirmation setting.
+                fields["send_confirmation"] = None
+            else:
+                from app.channels.send_policy import CONFIRM_VALUES, normalize_override
+
+                normalized = normalize_override(raw_mode)
+                if normalized is None:
+                    return JSONResponse(
+                        {
+                            "error": "Invalid send_confirmation",
+                            "message": (
+                                "Use one of "
+                                f"{', '.join(repr(v) for v in CONFIRM_VALUES)}, "
+                                "or null to inherit the profile setting."
+                            ),
+                        },
+                        status_code=400,
+                    )
+                fields["send_confirmation"] = normalized
+
+        if not fields:
             return JSONResponse(
-                {"error": "'authenticated' (boolean) is required"},
+                {
+                    "error": (
+                        "Nothing to update: pass 'authenticated', 'phone' "
+                        "and/or 'send_confirmation'"
+                    )
+                },
                 status_code=400,
             )
 
@@ -602,12 +684,6 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         if sender is None:
             return JSONResponse({"error": "Sender not found"}, status_code=404)
 
-        # Approving clears any outstanding OTP challenge so a stale code can't
-        # later be replayed; revoking just drops the subscription.
-        fields: dict[str, Any] = {"authenticated": authed}
-        if authed:
-            fields["pending_otp"] = None
-            fields["pending_otp_expires_at"] = None
         updated = await conversation_storage.update_sender(sender["id"], **fields)
         if updated is None:
             return JSONResponse({"error": "Sender not found"}, status_code=404)
@@ -702,6 +778,97 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
             {"success": True, "conversation_id": conv_id, "cleared_messages": cleared}
         )
 
+    async def handle_delete_sender(request: Request) -> JSONResponse:
+        """Delete a channel client outright — as if they had never written.
+
+        The full-erasure counterpart of ``handle_clear_sender_history``, which
+        deliberately keeps the person and their automations and only wipes
+        messages. This removes everything:
+
+        - their conversation, with every message in it, plus the automations
+          homed on it (skill events, file watchers, schedules) — disarmed in
+          the live managers, not merely dropped from the DB — and the run rows,
+          queued turns, replay buffer and plan files that hung off it;
+        - the sender row itself: display name, phone, WhatsApp alias, and their
+          access state (``authenticated`` and any outstanding OTP);
+        - this adapter's in-memory state for them (busy flag, access-request
+          memo, inbound lock).
+
+        Afterwards their next message is a genuine first contact: new sender
+        row, new conversation, access gate applied from scratch. Usage rows are
+        an exception and survive by design — their conversation FK is
+        ``ON DELETE SET NULL``, so historical spend stays in the account
+        totals; it simply stops being attributed to anyone.
+
+        Refuses with 409 while a run is in progress, rather than deleting rows
+        out from under a live turn.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile_from_request(request)
+        cid = request.path_params["channel_id"]
+        sid = request.path_params["sender_id"]
+        ch = await conversation_storage.get_channel(cid)
+        if not ch:
+            return JSONResponse({"error": "Channel not found"}, status_code=404)
+        if ch["profile"] != profile:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+        senders = await conversation_storage.list_senders(cid)
+        sender = next((s for s in senders if s.get("sender_id") == sid), None)
+        if sender is None:
+            return JSONResponse({"error": "Sender not found"}, status_code=404)
+
+        conv_id = sender.get("conversation_id")
+        if conv_id:
+            from app.events.stream_bus import get_event_stream_bus
+
+            if get_event_stream_bus().is_active(conv_id):
+                return JSONResponse(
+                    {
+                        "error": (
+                            "This client has a run in progress. Wait for it to "
+                            "finish before deleting them."
+                        ),
+                    },
+                    status_code=409,
+                )
+
+        # A stopped adapter holds no in-memory state, so not having one is fine.
+        try:
+            adapter = get_channel_registry().get_adapter(cid)
+        except RuntimeError:
+            adapter = None
+
+        from app.reset._senders import delete_sender_completely
+
+        summary = await delete_sender_completely(
+            conversation_storage, channel=ch, sender=sender, adapter=adapter,
+        )
+        if not summary.get("deleted"):
+            return JSONResponse({"error": "Sender not found"}, status_code=404)
+
+        try:
+            from app.api.events import publish_skill_events_admin_changed
+            from app.api.file_watchers import publish_file_watchers_admin_changed
+            from app.events.conversations_list_bus import publish_conversations_changed
+            publish_conversations_changed(profile)
+            publish_skill_events_admin_changed(profile)
+            publish_file_watchers_admin_changed(profile)
+        except Exception:  # noqa: BLE001
+            logger.exception("channels: failed to publish change events")
+
+        return JSONResponse({"success": True, **summary})
+
+    async def handle_sender_detail_dispatch(request: Request) -> JSONResponse:
+        """Dispatch /api/channels/{id}/senders/{sender_id} by HTTP method."""
+        if request.method == "PATCH":
+            return await handle_set_sender_authenticated(request)
+        if request.method == "DELETE":
+            return await handle_delete_sender(request)
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
     async def handle_notify_channel(request: Request) -> JSONResponse:
         """Push an ad-hoc message OUT to a notification-mode channel.
 
@@ -773,6 +940,89 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
                 status_code=502,
             )
         return JSONResponse({"delivered": recipients > 0, "recipients": recipients})
+
+    async def handle_send_channel_message(request: Request) -> JSONResponse:
+        """Message specific clients on this channel — one or many.
+
+        Body: ``{"recipients": [{"to", "message"?, "name"?}, ...], "message"?,
+        "dry_run"?, "default_country_code"?}``. Unlike ``/notify`` (which
+        broadcasts to the channel's own subscribers), this addresses named
+        individuals by platform sender id or phone number, registers anyone the
+        platform lets us contact cold, and records each delivered message in
+        that client's conversation. Backs ``cremind channels message`` and
+        mirrors the agent's ``send_channel_message`` tool.
+
+        ``dry_run`` defaults to TRUE: the caller has to ask for a live send
+        explicitly, so a mistyped list costs a preview rather than a hundred
+        messages to real people.
+
+        Per-recipient failures come back inside a 200 with their own status —
+        the request succeeded, some recipients didn't. Only a malformed request
+        or a dead adapter is an HTTP error.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile_from_request(request)
+        cid = request.path_params["channel_id"]
+        ch = await conversation_storage.get_channel(cid)
+        if not ch:
+            return JSONResponse({"error": "Channel not found"}, status_code=404)
+        if ch["profile"] != profile:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "Body must be a JSON object"}, status_code=400)
+
+        from app.channels import direct_send
+
+        try:
+            recipients = direct_send.normalize_recipients(payload.get("recipients"))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+        dry_run = payload.get("dry_run")
+        dry_run = True if dry_run is None else bool(dry_run)
+
+        try:
+            adapter = get_channel_registry().get_adapter(cid)
+        except RuntimeError:
+            adapter = None
+        if adapter is None:
+            return JSONResponse(
+                {
+                    "error": "Adapter not running",
+                    "message": (
+                        "The channel is not currently running, so nothing could "
+                        "be delivered."
+                    ),
+                },
+                status_code=409,
+            )
+
+        try:
+            summary = await direct_send.send_direct_messages(
+                adapters=[adapter],
+                storage=conversation_storage,
+                recipients=recipients,
+                message=payload.get("message"),
+                default_country_code=payload.get("default_country_code"),
+                dry_run=dry_run,
+                initiated_by="api",
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(f"channels: direct send failed for {cid}")
+            return JSONResponse(
+                {"error": "Delivery failed", "message": str(exc)},
+                status_code=502,
+            )
+        return JSONResponse(summary)
 
     async def handle_messenger_webhook(request: Request):
         """Public Facebook Messenger webhook (GET verify + POST receive).
@@ -882,8 +1132,8 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         ),
         Route(
             "/api/channels/{channel_id}/senders/{sender_id}",
-            endpoint=handle_set_sender_authenticated,
-            methods=["PATCH"],
+            endpoint=handle_sender_detail_dispatch,
+            methods=["PATCH", "DELETE"],
         ),
         Route(
             "/api/channels/{channel_id}/senders/{sender_id}/messages",
@@ -908,6 +1158,11 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         Route(
             "/api/channels/{channel_id}/notify",
             endpoint=handle_notify_channel,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/channels/{channel_id}/message",
+            endpoint=handle_send_channel_message,
             methods=["POST"],
         ),
     ]

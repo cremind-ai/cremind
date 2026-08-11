@@ -26,12 +26,15 @@ def _handler(store, path: str, method: str) -> Callable:
     raise AssertionError(f"{method} {path} not registered")
 
 
-def _req(username="p1", path_params=None, body=None):
+def _req(username="p1", path_params=None, body=None, method="PATCH"):
     async def _json():
         if body is None:
             raise ValueError("no body")
         return body
+    # The sender-detail route is a method dispatcher (PATCH updates the sender,
+    # DELETE removes the client), so a fake request needs a method like a real one.
     return SimpleNamespace(
+        method=method,
         user=SimpleNamespace(is_authenticated=True, username=username),
         path_params=path_params or {},
         json=_json,

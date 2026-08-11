@@ -81,6 +81,7 @@ _BUILTIN_MODULE_NAMES: tuple[str, ...] = (
     "write_plan",
     "update_todos",
     "send_notification",
+    "send_channel_message",
 )
 
 

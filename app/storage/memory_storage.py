@@ -117,6 +117,30 @@ class MemoryStorage:
             )
         return int(result.rowcount or 0)
 
+    async def delete_by_source_conversation(
+        self, profile: str, conversation_id: str,
+    ) -> int:
+        """Forget the facts learned from one conversation; returns the row count.
+
+        ``source_conversation_id`` is deliberately not a foreign key, so deleting
+        a conversation leaves its durable facts standing — the right default,
+        since a fact about the user outlives the chat that revealed it. Deleting
+        a channel *client* is the case where that default is wrong: a fact the
+        profile only holds because that person said it is a trace of them, and
+        "as if they had never messaged" has to include it. Scoped by profile as
+        well as conversation so a stray id can't reach another profile's rows.
+        """
+        if not conversation_id:
+            return 0
+        async with self.async_session_maker.begin() as session:
+            result = await session.execute(
+                delete(LongTermMemoryModel).where(
+                    LongTermMemoryModel.profile == profile,
+                    LongTermMemoryModel.source_conversation_id == conversation_id,
+                )
+            )
+        return int(result.rowcount or 0)
+
     # ── eviction helpers ───────────────────────────────────────────────────
 
     @staticmethod

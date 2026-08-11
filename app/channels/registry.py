@@ -358,6 +358,18 @@ class ChannelRegistry:
             if a.profile == profile and a._is_notification_mode()  # noqa: SLF001
         ]
 
+    def adapters_for_profile(self, profile: str) -> list[BaseChannelAdapter]:
+        """Live (enabled + started) adapters for ``profile``, **any mode**.
+
+        The any-mode counterpart of :meth:`notification_adapters_for_profile`.
+        Direct sends (:mod:`app.channels.direct_send`) address one individual
+        client, which works on bot and userbot channels just as well as on
+        notification ones — the mode only decides how *inbound* is handled, and
+        every adapter implements the same ``_send_text(sender_id, text)``.
+        Same snapshot rationale as the notification variant.
+        """
+        return [a for a in list(self._adapters.values()) if a.profile == profile]
+
 
 _instance: ChannelRegistry | None = None
 
@@ -391,3 +403,19 @@ def has_notification_channel(profile: str) -> bool:
     except RuntimeError:
         return False
     return bool(registry.notification_adapters_for_profile(profile))
+
+
+def has_any_channel(profile: str) -> bool:
+    """True iff ``profile`` has >=1 enabled channel of ANY mode live now.
+
+    Backs the ``send_channel_message`` availability gate the same way
+    :func:`has_notification_channel` backs ``send_notification`` — and is
+    equally safe to call before the registry exists (returns ``False``).
+    Messaging an individual client works on every mode, so this gate is
+    deliberately wider than the notification-only one.
+    """
+    try:
+        registry = get_channel_registry()
+    except RuntimeError:
+        return False
+    return bool(registry.adapters_for_profile(profile))

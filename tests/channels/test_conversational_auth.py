@@ -54,6 +54,14 @@ class _Storage:
         self._c += 1
         return {"id": f"conv{self._c}"}
 
+    async def ensure_sender_conversation(self, sender, profile, channel_id,
+                                         display_name=None):
+        if sender.get("conversation_id"):
+            return sender["conversation_id"]
+        conv = await self.create_conversation(profile, "t", channel_id)
+        await self.update_sender(sender["id"], conversation_id=conv["id"])
+        return conv["id"]
+
 
 class _ConvAdapter(BaseChannelAdapter):
     def __init__(self, channel, storage):

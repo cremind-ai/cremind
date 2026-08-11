@@ -15,9 +15,17 @@
  *      sessions survive restarts.
  *   4. Events flow parent <-> sidecar as JSON frames:
  *        sidecar -> parent:  {kind: "qr"|"ready"|"incoming"|"disconnected"
- *                             |"send_error"|"error", ...}
- *        parent -> sidecar:  {kind: "send", sender_id, text}
+ *                             |"send_ack"|"send_error"|"resolve_result"
+ *                             |"error", ...}
+ *        parent -> sidecar:  {kind: "send", sender_id, text, request_id?}
+ *                            {kind: "resolve", phone, request_id}
  *                            {kind: "logout"}
+ *
+ *      A "send" carrying a request_id is answered with exactly one
+ *      {kind: "send_ack", request_id} or {kind: "send_error", request_id, error}
+ *      so the parent can await real delivery to WhatsApp's servers instead of
+ *      assuming a write to this socket succeeded. Sends without a request_id
+ *      keep the old fire-and-forget behaviour (errors are still reported).
  *
  * Auth-state on disk is unique per (profile, channel-id) so multiple
  * profiles can each have their own WhatsApp without collision.
@@ -193,7 +201,16 @@ async function startSocket() {
 
 async function handleControl(msg) {
   if (!sock) {
-    emit({ kind: 'send_error', sender_id: msg.sender_id, error: 'sidecar not ready' });
+    // Answer on the same correlation id the caller is waiting on, so a
+    // request never hangs until its timeout just because we aren't paired yet.
+    const kind = msg.kind === 'resolve' ? 'resolve_result' : 'send_error';
+    emit({
+      kind,
+      request_id: msg.request_id,
+      sender_id: msg.sender_id,
+      ok: false,
+      error: 'sidecar not ready',
+    });
     return;
   }
   if (msg.kind === 'send') {
@@ -201,8 +218,44 @@ async function handleControl(msg) {
     const jid = senderId.includes('@') ? senderId : `${senderId}@s.whatsapp.net`;
     try {
       await sock.sendMessage(jid, { text: String(msg.text || '') });
+      if (msg.request_id) {
+        emit({ kind: 'send_ack', request_id: msg.request_id, sender_id: msg.sender_id, ok: true });
+      }
     } catch (e) {
-      emit({ kind: 'send_error', sender_id: msg.sender_id, error: String(e && e.message || e) });
+      emit({
+        kind: 'send_error',
+        request_id: msg.request_id,
+        sender_id: msg.sender_id,
+        error: String(e && e.message || e),
+      });
+    }
+  } else if (msg.kind === 'resolve') {
+    // Does this phone number have a WhatsApp account, and what is its
+    // canonical JID? ``onWhatsApp`` runs a USync query that also returns the
+    // contact's ``@lid`` alias — the identity multi-device WhatsApp may use
+    // when they reply — so the parent can record both and avoid forking a
+    // second sender row later.
+    const phone = String(msg.phone || '').replace(/[^0-9]/g, '');
+    try {
+      const rows = await sock.onWhatsApp(`${phone}@s.whatsapp.net`);
+      const hit = (rows || [])[0];
+      emit({
+        kind: 'resolve_result',
+        request_id: msg.request_id,
+        ok: true,
+        phone,
+        exists: !!(hit && hit.exists),
+        jid: (hit && hit.jid) || null,
+        lid: (hit && hit.lid) || null,
+      });
+    } catch (e) {
+      emit({
+        kind: 'resolve_result',
+        request_id: msg.request_id,
+        ok: false,
+        phone,
+        error: String(e && e.message || e),
+      });
     }
   } else if (msg.kind === 'typing') {
     const senderId = String(msg.sender_id || '');

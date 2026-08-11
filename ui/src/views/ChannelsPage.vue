@@ -2,7 +2,7 @@
 import { ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { goBackToChat } from '../utils/backToChat';
-import { ElButton, ElCard, ElEmpty, ElMessage, ElMessageBox, ElTable, ElTableColumn, ElTag } from 'element-plus';
+import { ElButton, ElCard, ElEmpty, ElMessage, ElMessageBox, ElOption, ElSelect, ElTable, ElTableColumn, ElTag } from 'element-plus';
 import { Icon } from '@iconify/vue';
 
 import { useChannelsStore, MAIN_CHANNEL_TYPE } from '../stores/channels';
@@ -76,6 +76,7 @@ async function setSenderAuth(
 }
 
 const clearing = ref<string | null>(null);
+const deleting = ref<string | null>(null);
 
 /** Tooltip detail behind the compact Usage cell. */
 function usageTooltip(senderRow: ChannelSenderRow): string {
@@ -120,6 +121,75 @@ async function clearSenderHistory(channel: ChannelRow, senderRow: ChannelSenderR
   }
 }
 
+/** Per-client override of "confirm before messaging clients". */
+async function setSenderConfirmation(
+  channel: ChannelRow, senderRow: ChannelSenderRow,
+  mode: 'required' | 'skip' | null,
+) {
+  const previous = senderRow.send_confirmation ?? null;
+  const list = senders.value[channel.id];
+  const idx = list ? list.findIndex((s) => s.sender_id === senderRow.sender_id) : -1;
+  // Optimistic: the ElSelect has already moved, so show the new value and put it
+  // back if the server refuses.
+  if (idx >= 0 && list) list[idx] = { ...list[idx], send_confirmation: mode };
+  try {
+    const updated = await channelsStore.setSenderConfirmation(
+      channel.id, senderRow.sender_id, mode,
+    );
+    // The PATCH response carries no usage totals — keep the ones we loaded.
+    if (idx >= 0 && list) list[idx] = { ...updated, usage: list[idx].usage };
+    ElMessage.success(
+      mode === 'skip'
+        ? 'Messages to this client will send directly'
+        : mode === 'required'
+          ? 'This client will always be confirmed'
+          : 'This client now follows the profile setting',
+    );
+  } catch (e) {
+    if (idx >= 0 && list) {
+      list[idx] = { ...list[idx], send_confirmation: previous };
+    }
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to update client');
+  }
+}
+
+async function deleteSender(channel: ChannelRow, senderRow: ChannelSenderRow) {
+  const who = senderRow.display_name || senderRow.sender_id;
+  try {
+    await ElMessageBox.confirm(
+      `Completely delete ${who} from Cremind? This removes their conversation `
+      + 'and every message in it, any automations they set up, their phone and '
+      + 'contact details, and their access approval — if they write again they '
+      + 'arrive as a brand-new client. Recorded usage and cost stay in your '
+      + 'account totals but stop being attributed to anyone. '
+      + 'This cannot be undone.',
+      'Delete client',
+      {
+        type: 'error',
+        confirmButtonText: 'Delete client',
+        cancelButtonText: 'Cancel',
+        confirmButtonClass: 'el-button--danger',
+      },
+    );
+  } catch {
+    return; // dismissed
+  }
+  deleting.value = senderRow.sender_id;
+  try {
+    const res = await channelsStore.deleteSender(channel.id, senderRow.sender_id);
+    ElMessage.success(
+      res.deleted_messages > 0
+        ? `Deleted ${who} and ${res.deleted_messages} message${res.deleted_messages === 1 ? '' : 's'}`
+        : `Deleted ${who}`,
+    );
+    senders.value[channel.id] = await channelsStore.fetchSenders(channel.id);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to delete client');
+  } finally {
+    deleting.value = null;
+  }
+}
+
 function displayNameFor(channel: ChannelRow): string {
   return channelsStore.catalog[channel.channel_type]?.display_name || channel.channel_type;
 }
@@ -130,6 +200,14 @@ function iconFor(channel: ChannelRow): string {
 
 function goSettings() {
   router.push(`/${props.profile}/settings/channels`);
+}
+
+/** Deep-link to the profile-wide confirmation switch (highlights the group). */
+function goConfirmSetting() {
+  router.push({
+    path: `/${props.profile}/settings/config`,
+    query: { section: 'channels' },
+  });
 }
 
 function goBack() {
@@ -201,6 +279,14 @@ onMounted(loadAll);
       </div>
 
       <div v-if="expanded === channel.id" class="senders">
+        <p class="senders-hint">
+          "Confirm before send" decides whether the agent asks you before
+          messaging that client. The default for every client comes from
+          <a href="#" @click.prevent="goConfirmSetting()">Settings → Config → Channels</a>;
+          set a client to "Send directly" so automations can reach them without
+          stopping to ask. Someone who has never messaged this channel is always
+          confirmed.
+        </p>
         <ElTable
           :data="senders[channel.id] || []"
           empty-text="No senders yet"
@@ -213,6 +299,12 @@ onMounted(loadAll);
             </template>
           </ElTableColumn>
           <ElTableColumn prop="sender_id" label="ID" min-width="160" />
+          <ElTableColumn prop="phone" label="Phone" width="150">
+            <template #default="{ row }">
+              <span v-if="row.phone">+{{ row.phone }}</span>
+              <span v-else class="muted">—</span>
+            </template>
+          </ElTableColumn>
           <ElTableColumn prop="authenticated" label="Status" width="110">
             <template #default="{ row }">
               <ElTag
@@ -221,6 +313,21 @@ onMounted(loadAll);
               >
                 {{ row.authenticated ? 'subscribed' : 'pending' }}
               </ElTag>
+            </template>
+          </ElTableColumn>
+          <ElTableColumn label="Confirm before send" width="170">
+            <template #default="{ row }">
+              <ElSelect
+                :model-value="row.send_confirmation ?? ''"
+                size="small"
+                @update:model-value="(v: any) => setSenderConfirmation(
+                  channel, row as ChannelSenderRow, v === '' ? null : v,
+                )"
+              >
+                <ElOption label="Profile default" value="" />
+                <ElOption label="Always ask" value="required" />
+                <ElOption label="Send directly" value="skip" />
+              </ElSelect>
             </template>
           </ElTableColumn>
           <ElTableColumn label="Usage" width="150">
@@ -246,7 +353,7 @@ onMounted(loadAll);
               >Revoke</ElButton>
             </template>
           </ElTableColumn>
-          <ElTableColumn label="Conversation" width="190">
+          <ElTableColumn label="Actions" min-width="250">
             <template #default="{ row }">
               <template v-if="row.conversation_id">
                 <ElButton
@@ -259,7 +366,15 @@ onMounted(loadAll);
                   @click="clearSenderHistory(channel, row as ChannelSenderRow)"
                 >Clear history</ElButton>
               </template>
-              <span v-else class="muted">—</span>
+              <!-- Deleting the client is offered even for someone with no
+                   conversation yet: a pending or revoked contact still has a
+                   sender record, and removing it is exactly how you undo an
+                   unwanted first contact. -->
+              <ElButton
+                size="small" type="danger" link
+                :loading="deleting === row.sender_id"
+                @click="deleteSender(channel, row as ChannelSenderRow)"
+              >Delete</ElButton>
             </template>
           </ElTableColumn>
         </ElTable>
@@ -296,6 +411,14 @@ onMounted(loadAll);
 .channel-error { font-size: 0.85rem; color: var(--el-color-danger); margin-top: 4px; }
 .chevron { font-size: 20px; color: var(--text-tertiary); }
 .senders { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border-color); }
+.senders-hint {
+  margin: 0 0 10px;
+  color: var(--text-tertiary);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+.senders-hint a { color: var(--el-color-primary); text-decoration: none; }
+.senders-hint a:hover { text-decoration: underline; }
 .muted { color: var(--text-tertiary); font-size: 0.85rem; }
 .usage-cell { font-size: 0.85rem; white-space: nowrap; cursor: default; }
 .usage-cost { color: var(--text-secondary); margin-left: 6px; }

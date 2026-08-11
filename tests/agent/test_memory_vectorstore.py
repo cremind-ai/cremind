@@ -24,6 +24,7 @@ class _FakeVectorStore:
         self.created: list[tuple] = []
         self.query_results: list[dict] = []  # returned for retrieve (limit > 1)
         self.dedup_hits: list[dict] = []      # returned for the dedup probe (limit == 1)
+        self.deleted_filters: list[dict | None] = []
 
     def collection_exists(self, name):
         return self._exists
@@ -40,7 +41,28 @@ class _FakeVectorStore:
         return self.dedup_hits if limit == 1 else self.query_results
 
     def list_all_points(self, collection_name, with_vectors=False, filter=None):
-        return self.points
+        # Honour the payload filter like a real store, so callers that select a
+        # subset of points (e.g. one conversation's facts) are exercised
+        # honestly rather than handed everything.
+        if not filter:
+            return list(self.points)
+        return [
+            p for p in self.points
+            if all((p.get("payload") or {}).get(k) == v for k, v in filter.items())
+        ]
+
+    def delete_texts(self, collection_name, ids=None, filter=None, **kwargs):
+        self.deleted_filters.append(filter)
+        keep = []
+        for p in self.points:
+            payload = p.get("payload") or {}
+            matches_filter = bool(filter) and all(
+                payload.get(k) == v for k, v in filter.items()
+            )
+            matches_id = bool(ids) and p.get("id") in set(ids)
+            if not (matches_filter or matches_id):
+                keep.append(p)
+        self.points = keep
 
 
 class _FakeAgent:
@@ -105,3 +127,80 @@ def test_noop_when_query_empty(monkeypatch):
     _enable(monkeypatch)
     agent = _FakeAgent(_FakeVectorStore(existing=True))
     assert mv.retrieve_long_term(agent=agent, profile="admin", query_text="  ") == []
+
+
+# ── forgetting one conversation's facts ────────────────────────────────────
+#
+# This is what makes "delete this channel client" honest in embedding-on mode:
+# long-term recall is filtered by profile alone, so a fact left behind here
+# resurfaces in an unrelated conversation's prompt.
+
+
+def _seeded(monkeypatch, *, profile="admin"):
+    _enable(monkeypatch)
+    vs = _FakeVectorStore(existing=True)
+    agent = _FakeAgent(vs)
+    mv.store_long_term(
+        agent=agent, profile=profile, conversation_id="c-client",
+        facts=["Client is Lee", "Client lives at 12 X St"],
+    )
+    mv.store_long_term(
+        agent=agent, profile=profile, conversation_id="c-owner",
+        facts=["Owner prefers metric units"],
+    )
+    return vs, agent
+
+
+def test_forget_conversation_removes_only_that_conversations_facts(monkeypatch):
+    vs, agent = _seeded(monkeypatch)
+
+    removed = mv.forget_conversation(
+        agent=agent, profile="admin", conversation_id="c-client",
+    )
+
+    assert removed == 2
+    assert [p["payload"]["text"] for p in vs.points] == ["Owner prefers metric units"]
+    # And the delete was scoped by profile as well as conversation.
+    assert vs.deleted_filters == [
+        {"profile": "admin", "source_conversation_id": "c-client"},
+    ]
+
+
+def test_forget_conversation_is_zero_when_nothing_matches(monkeypatch):
+    vs, agent = _seeded(monkeypatch)
+    assert mv.forget_conversation(
+        agent=agent, profile="admin", conversation_id="c-nobody",
+    ) == 0
+    assert len(vs.points) == 3
+    assert vs.deleted_filters == []  # no pointless delete call
+
+
+def test_forget_conversation_ignores_other_profiles(monkeypatch):
+    vs, agent = _seeded(monkeypatch)
+    assert mv.forget_conversation(
+        agent=agent, profile="other", conversation_id="c-client",
+    ) == 0
+    assert len(vs.points) == 3
+
+
+def test_forget_conversation_needs_a_conversation_id(monkeypatch):
+    vs, agent = _seeded(monkeypatch)
+    assert mv.forget_conversation(agent=agent, profile="admin", conversation_id="") == 0
+    assert len(vs.points) == 3
+
+
+def test_forget_conversation_noop_when_embedding_disabled(monkeypatch):
+    vs, agent = _seeded(monkeypatch)
+    monkeypatch.setattr(mv.BaseConfig, "is_embedding_enabled", classmethod(lambda cls: False))
+    assert mv.forget_conversation(
+        agent=agent, profile="admin", conversation_id="c-client",
+    ) == 0
+    assert len(vs.points) == 3  # left for the DB path to handle
+
+
+def test_forgotten_facts_stop_being_listed_back(monkeypatch):
+    """The point of the delete: recall must no longer surface them."""
+    vs, agent = _seeded(monkeypatch)
+    mv.forget_conversation(agent=agent, profile="admin", conversation_id="c-client")
+    listed = [e["content"] for e in mv.list_long_term(agent=agent, profile="admin")]
+    assert listed == ["Owner prefers metric units"]

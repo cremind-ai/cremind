@@ -1,5 +1,5 @@
 ---
-description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders` with their token usage, wipe one subscriber's conversation history with `clear-history`, run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), set a channel's push-notification filter with `notify-filter`, push an ad-hoc message out to a notification channel with `send`, `approve`/`revoke` who may subscribe to a notification channel, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). All channels gate access with the same per-channel **authentication** method — open, passcode, one-time code (`otp`), admin approval, or allowlist — controlling who may chat (bot/userbot) or subscribe (notification); `approve`/`revoke` authorize individual senders and work in every mode. A notification channel can also receive one-off messages you send with `cremind channels send` — the same delivery the agent's `send_notification` tool uses when you ask it to 'notify me on Telegram'. Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
+description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders` with their token usage, wipe one subscriber's conversation history with `clear-history`, delete a client completely with `forget` (as if they had never messaged — conversation, messages, automations, contact details and access all removed), run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), set a channel's push-notification filter with `notify-filter`, push an ad-hoc message out to a notification channel with `send`, send a direct message to specific individual clients — one person or a bulk list, addressed by platform id or **phone number** — with `message`, record a contact's phone number with `set-phone`, decide per client whether the agent must ask before messaging them with `set-confirm` (the profile-wide default is `channels.confirm_before_send` in Settings → Config → Channels; turn it off so unattended automations can send without stopping to ask), `approve`/`revoke` who may subscribe to a notification channel, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). All channels gate access with the same per-channel **authentication** method — open, passcode, one-time code (`otp`), admin approval, or allowlist — controlling who may chat (bot/userbot) or subscribe (notification); `approve`/`revoke` authorize individual senders and work in every mode. A notification channel can also receive one-off messages you send with `cremind channels send` — the same delivery the agent's `send_notification` tool uses when you ask it to 'notify me on Telegram'. Separately, `cremind channels message` sends to **named individuals** rather than to subscribers: give it sender ids or phone numbers (one `--to`, or a JSON list for a bulk campaign such as thanking every customer in a spreadsheet), and each delivered message is saved into that client's own conversation so the agent has the context later; it previews by default and only sends with `--send`, and only WhatsApp can message someone who has never written first. Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
 ---
 
 # `cremind channels` — External Messaging Channel Management
@@ -28,6 +28,20 @@ The group covers these operations:
   `notification`-mode channel's subscribers (see **Notification mode**
   below). This is the manual counterpart to the agent's
   `send_notification` tool.
+- **`message`** — Send a message to **specific individual clients** on a
+  channel — one person or a bulk list, addressed by platform sender id or
+  phone number. Previews by default; `--send` delivers. This is the manual
+  counterpart to the agent's `send_channel_message` tool.
+- **`set-phone`** — Record (or clear) a contact's phone number so `message`
+  can reach them by it.
+- **`set-confirm`** — Decide whether the agent must ask you before messaging
+  one client: `never` (send directly — what automations need), `always`, or
+  `default` to inherit the profile setting.
+- **`clear-history`** — Wipe one client's messages, keeping the person and
+  their automations.
+- **`forget`** — Delete a client **completely**, as if they had never
+  messaged: conversation, messages, automations, contact details and access
+  approval all go. Irreversible.
 - **`approve`** / **`revoke`** — Approve a pending subscriber (or revoke an
   existing one) on a `notification`-mode channel — the operator side of the
   `approval` subscription-auth method (see **Notification mode** below).
@@ -440,6 +454,200 @@ PS> cremind channels send e2e8...d4f1 --message-file .\note.txt
 $ echo "1 + 1 = 2" | cremind channels send e2e8...d4f1 -f -
 ```
 
+### `cremind channels message`
+
+**Purpose.** Send a message to **specific individual clients** on a channel —
+one person or a bulk list — addressed by platform sender id or phone number.
+
+This is the targeted counterpart of `send`: `send` broadcasts to a notification
+channel's subscribers, while `message` writes to named people (your customers,
+not you). It is the manual counterpart to the agent's `send_channel_message`
+tool.
+
+**Syntax.**
+
+```bash
+cremind channels message <id> "<message>" --to <id-or-phone> [--to ...]
+cremind channels message <id> --recipients-file <path.json> [--send]
+cremind channels message <id> --message-file <path> --to <id-or-phone> --send
+```
+
+**Previews by default.** Without `--send` nothing is delivered: every recipient
+is resolved and reported, so you can see who would be messaged, who has never
+been contacted before, and which entries failed to resolve. Add `--send` to
+deliver. This CLI behaviour is fixed — `--send` is your approval, so it is not
+affected by any setting.
+
+The agent's tool asks for approval too, but there it is **configurable**: the
+profile-wide *Confirm before messaging clients* setting
+(`channels.confirm_before_send`, default on) plus per-client overrides from
+`cremind channels set-confirm`. Turn it off, or exempt individual clients, so an
+unattended automation can send without stopping to ask — someone who has never
+messaged the channel is always confirmed regardless.
+
+**Addressing.** `--to` takes a platform sender id (Telegram numeric id,
+WhatsApp JID, Slack `U…`, Discord id, …) or a phone number. Resolution is
+exact, never fuzzy — an ambiguous recipient is reported rather than guessed:
+
+1. An exact sender-id match among the channel's known contacts.
+2. A stored phone number (`channels senders` PHONE column, set automatically
+   for WhatsApp or by `channels set-phone`).
+3. For WhatsApp, the number's own JID (`<digits>@s.whatsapp.net`).
+4. A cold send — only on WhatsApp, and only after checking the number really
+   has a WhatsApp account.
+
+Phone numbers must be international (`+84901234567`). A national-format number
+with a leading `0` is ambiguous without a country, so it needs
+`--country-code 84`.
+
+**Who can be reached.** Only WhatsApp can message someone who has never written
+first. Telegram bots, Messenger and Zalo bots cannot start conversations (the
+platforms forbid it) and those recipients come back as errors naming what would
+work instead. A successful cold send registers the person as a contact with
+their own conversation, but leaves them **unauthenticated** — on a channel with
+subscription auth, their reply still has to pass your access gate.
+
+**History.** Every delivered message is saved into that client's conversation as
+an agent message, so later turns (and the web UI) show what was already sent to
+them. A message that failed to send is not recorded.
+
+**Bulk sends.** Max 100 recipients per call. Sends are sequential and paced per
+platform (WhatsApp deliberately slowly — bursts of unsolicited messages are what
+gets numbers banned), and the run aborts early if 5 consecutive sends fail.
+
+**Recipient file.** `--recipients-file` reads a JSON list (use `-` for stdin) of
+strings, or of objects for per-recipient personalisation:
+
+```json
+[
+  {"to": "+84901234567", "name": "Lee",  "message": "Thanks for trying it, Lee!"},
+  {"to": "+84907654321", "name": "Minh"},
+  "84900000000"
+]
+```
+
+Entries without their own `message` fall back to the shared message argument.
+
+**Message input.** Provide the shared text as the positional argument, via
+`--message-file <path>`, or on stdin. On Windows PowerShell prefer
+`--message-file` / `--recipients-file` — PowerShell mangles inline quotes and
+apostrophes when passing arguments to native binaries.
+
+**Output.** A `TO / STATUS / CHANNEL / SENDER_ID / NEW / DETAIL` table, then a
+summary line. `STATUS` is `would_send` (preview), `sent`, `failed`, or `skipped`
+(after an early abort). Exit code 1 if any recipient failed. `--json` at the
+root returns `{"dry_run", "sent", "failed", "results": [...]}`.
+
+**Examples.**
+
+```bash
+# Preview first — who would actually get this?
+$ cremind channels message e2e8...d4f1 "Thanks for trying our product!" \
+    --to +84901234567 --to +84907654321
+TO             STATUS      CHANNEL   SENDER_ID                  NEW  DETAIL
++84901234567   would_send  whatsapp  84901234567@s.whatsapp.net
++84907654321   would_send  whatsapp  84907654321@s.whatsapp.net  yes
+
+Preview only — nothing sent. 2 of 2 recipient(s) resolved, 1 never contacted
+before. Re-run with --send to deliver.
+
+# Looks right — deliver it
+$ cremind channels message e2e8...d4f1 "Thanks for trying our product!" \
+    --to +84901234567 --to +84907654321 --send
+
+# Personalised bulk campaign from a file
+$ cremind channels message e2e8...d4f1 --recipients-file thankyou.json --send
+
+# Vietnamese numbers written in national form
+$ cremind channels message e2e8...d4f1 "Cảm ơn bạn!" --to 0901234567 --country-code 84
+```
+
+### `cremind channels set-confirm`
+
+**Purpose.** Choose whether the agent must ask you before it messages **one**
+client — overriding the profile-wide default for that person.
+
+**Syntax.**
+
+```bash
+cremind channels set-confirm <channel_id> <sender_id> <default|always|never>
+```
+
+**Why this exists.** By default the agent previews a send and waits for your
+approval, which is right when you are sitting there and wrong when you are not:
+a scheduled automation has nobody to answer the prompt, so it parks itself
+pending instead of sending. Marking the clients you have already decided about
+as `never` lets those sends go straight out while everyone else still gets the
+preview.
+
+**Modes.**
+
+| Mode | Effect |
+|---|---|
+| `never` | Send directly — no approval needed for this client. |
+| `always` | Always ask about this client, even if the profile setting is off. |
+| `default` | Clear the override and inherit the profile setting. |
+
+**The profile-wide default** is *Confirm before messaging clients* under
+Settings → Config → Channels, or:
+
+```bash
+cremind config set channels.confirm_before_send false   # send without asking
+cremind config get channels.confirm_before_send
+```
+
+**Always confirmed regardless.** A recipient who has never messaged the channel
+(e.g. a phone number from a spreadsheet that WhatsApp would cold-contact) is
+always previewed, whatever the profile setting and whatever any override says —
+they have no client record to exempt, and it is the send most likely to be going
+to the wrong person.
+
+**Output.** Prints the resulting stance for that client. The current value shows
+in the `CONFIRM` column of `cremind channels senders` (blank = inherit).
+
+**Example.**
+
+```bash
+$ cremind channels set-confirm e2e8...d4f1 84986664411 never
+84986664411: send directly
+
+$ cremind channels senders e2e8...d4f1
+SENDER_ID    NAME        PHONE        AUTHED  CONFIRM  TOKENS   COST_USD  CONVERSATION_ID  PENDING_OTP
+84986664411  Lee Nguyen  84986664411  yes     never    124,908  0.2841    c_92bc
+```
+
+The web UI's Channels page exposes the same choice as a **Confirm before send**
+dropdown on each client row.
+
+### `cremind channels set-phone`
+
+**Purpose.** Record (or clear) a contact's phone number, so `cremind channels
+message` — and the agent — can reach them by number instead of platform id.
+
+**Syntax.**
+
+```bash
+cremind channels set-phone <id> <sender_id> <phone>
+cremind channels set-phone <id> <sender_id> --clear
+```
+
+**Behavior.** PATCHes `/api/channels/{id}/senders/{sender_id}` with the
+normalized number. WhatsApp contacts are filled in automatically (their sender
+id *is* the number); everywhere else the mapping has to come from you, because
+no platform tells Cremind a chat partner's phone number.
+
+This is also the only way to **correct** a stored number: automatic derivation
+only ever fills an empty one, so a mapping you fixed by hand always wins. The
+number must be in international form (HTTP 400 otherwise). The sender must
+already exist — find them with `cremind channels senders <id>`.
+
+**Example.**
+
+```bash
+$ cremind channels set-phone e2e8...d4f1 123456789 +84901234567
+123456789: phone set to 84901234567
+```
+
 ### `cremind channels edit`
 
 **Purpose.** Update a channel's settings — mode, auth mode, response mode,
@@ -507,8 +715,11 @@ cremind channels senders <id>
 ```
 
 **Behavior.** Prints a
-`SENDER_ID / NAME / AUTHED / TOKENS / COST_USD / CONVERSATION_ID / PENDING_OTP`
-table (any active OTP code is redacted to `***`). `TOKENS` and `COST_USD`
+`SENDER_ID / NAME / PHONE / AUTHED / CONFIRM / TOKENS / COST_USD /
+CONVERSATION_ID / PENDING_OTP` table (any active OTP code is redacted to `***`). `PHONE` is the
+contact's number where Cremind knows it — derived automatically for WhatsApp,
+otherwise set with `cremind channels set-phone` — and is what lets
+`cremind channels message` address them from a list of numbers. `TOKENS` and `COST_USD`
 are that sender's cumulative totals across their conversation — the same
 numbers the conversation's usage panel shows, rolled up so you don't have
 to open each conversation; both are blank for a sender with no recorded
@@ -522,8 +733,8 @@ channel hasn't seen any.
 
 ```bash
 $ cremind channels senders e2e8...d4f1
-SENDER_ID    NAME        AUTHED  TOKENS   COST_USD  CONVERSATION_ID  PENDING_OTP
-84986664411  Lee Nguyen  yes     124,908  0.2841    c_92bc
+SENDER_ID    NAME        PHONE        AUTHED  CONFIRM  TOKENS   COST_USD  CONVERSATION_ID  PENDING_OTP
+84986664411  Lee Nguyen  84986664411  yes              124,908  0.2841    c_92bc
 ```
 
 ### `cremind channels approve` / `cremind channels revoke`
@@ -618,6 +829,66 @@ SENDER_ID    NAME        AUTHED  TOKENS   COST_USD  CONVERSATION_ID  PENDING_OTP
 
 The web UI's Channels page exposes the same action as a **Clear history**
 button on each subscriber row.
+
+### `cremind channels forget`
+
+**Purpose.** Delete a channel client **completely** — return Cremind to the
+state it would be in if that person had never messaged. The full-erasure
+counterpart of `clear-history`, which deliberately keeps the person and only
+wipes their messages.
+
+**Syntax.**
+
+```bash
+cremind channels forget <channel_id> <sender_id> [--yes]
+```
+
+**Behavior.** Removes everything the client left behind:
+
+- their **conversation** and every message in it;
+- the **automations homed on it** — skill events, file watchers and schedules —
+  disarmed in the live managers, not merely dropped from the database, along
+  with their run history, queued turns, replay buffer and plan files;
+- files they **uploaded** into that conversation;
+- long-term memory entries the agent learned **from that conversation** (facts
+  the profile holds for other reasons are untouched);
+- the **sender record** itself: display name, phone, WhatsApp alias, and their
+  access state (`authenticated` plus any outstanding OTP);
+- their entry in the channel's `target_chat_ids`, if they were also a static
+  notification recipient — otherwise they would keep receiving pushes after
+  being deleted;
+- the running adapter's in-memory state for them, so nothing about them
+  survives until the next restart.
+
+Afterwards their next message is a genuine first contact: a new sender row, a
+new conversation, and the channel's access check applied from scratch.
+
+**What survives, by design.** Recorded token usage and cost stay in the account
+totals — the tokens really were spent — but their conversation link is nulled,
+so the spend is no longer attributed to anyone and nothing identifying remains.
+Use `cremind usage` to see account-level totals.
+
+Fails with a 409 while that client has a run in progress; wait for it to finish.
+
+**Confirmation.** Prompts before deleting. `--yes` / `-y` skips the prompt;
+**non-interactively (scripts, `exec_shell`) `--yes` is required** — without it
+the command explains what it would delete and exits 1 rather than guessing.
+
+**Example.**
+
+```bash
+$ cremind channels forget e2e8...d4f1 84986664411 --yes
+84986664411: deleted from channel e2e8...d4f1
+  removed 42 message(s)
+  forgot 2 long-term memory entries
+
+# They are gone from the subscriber list entirely
+$ cremind channels senders e2e8...d4f1
+no senders.
+```
+
+The web UI's Channels page exposes the same action as a **Delete** button on
+each client row.
 
 ### `cremind channels pair`
 

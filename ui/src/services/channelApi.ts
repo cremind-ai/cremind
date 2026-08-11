@@ -74,6 +74,20 @@ export interface ChannelSenderRow {
   channel_id: string;
   sender_id: string;
   display_name: string | null;
+  /**
+   * Contact's number in canonical digits (E.164 without '+'), when known.
+   * Derived automatically for WhatsApp (its sender ids are phone-based);
+   * elsewhere it is set by the operator via `cremind channels set-phone`, and
+   * it is what lets a direct send address someone from a list of numbers.
+   */
+  phone: string | null;
+  /** WhatsApp linked-identity alias, used to recognise `@lid` replies. */
+  wa_lid?: string | null;
+  /**
+   * This client's override of the profile's "confirm before messaging clients"
+   * setting: `'skip'` sends directly, `'required'` always asks, `null` inherits.
+   */
+  send_confirmation: 'required' | 'skip' | null;
   authenticated: boolean;
   pending_otp: string | null;
   pending_otp_expires_at: number | null;
@@ -306,6 +320,35 @@ export async function setSenderAuthenticated(
 }
 
 /**
+ * Override (or clear) whether the agent must ask before messaging this client.
+ *
+ * `'skip'` lets it send directly — what an unattended automation needs;
+ * `'required'` keeps asking even when the profile setting is off; `null`
+ * inherits the profile setting. Someone who has never messaged the channel is
+ * always confirmed regardless.
+ */
+export async function setSenderConfirmation(
+  agentUrl: string, authToken: string, channelId: string,
+  senderId: string, mode: 'required' | 'skip' | null,
+): Promise<ChannelSenderRow> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/channels/${encodeURIComponent(channelId)}/senders/${encodeURIComponent(senderId)}`,
+    {
+      method: 'PATCH',
+      headers: authHeaders(authToken),
+      body: JSON.stringify({ send_confirmation: mode }),
+    },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Failed to update client: ${res.statusText}`);
+  }
+  const data = await res.json();
+  return data.sender;
+}
+
+/**
  * Wipe a subscriber's conversation history. The messages go; the conversation
  * itself stays, so their next message continues in it and the usage totals
  * shown on this page survive the wipe. 409s while a run is in progress.
@@ -321,6 +364,30 @@ export async function clearSenderHistory(
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.error || `Failed to clear history: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+/**
+ * Delete a channel client outright — as if they had never messaged Cremind.
+ *
+ * Unlike `clearSenderHistory` (which keeps the person and only wipes their
+ * messages), this removes their conversation, the automations homed on it, and
+ * the sender record itself including their access state. Their next message
+ * arrives as a genuine first contact. Recorded usage totals survive but stop
+ * being attributed to anyone. 409s while a run is in progress.
+ */
+export async function deleteSender(
+  agentUrl: string, authToken: string, channelId: string, senderId: string,
+): Promise<{ conversation_id: string | null; deleted_messages: number }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/channels/${encodeURIComponent(channelId)}/senders/${encodeURIComponent(senderId)}`,
+    { method: 'DELETE', headers: authHeaders(authToken) },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Failed to delete client: ${res.statusText}`);
   }
   return res.json();
 }

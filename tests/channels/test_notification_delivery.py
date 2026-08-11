@@ -189,6 +189,13 @@ class _SubAdapter(NotificationDeliveryMixin):
     async def _send_chunked(self, target, text):
         self.chunked.append((target, text))
 
+    async def _upsert_sender(self, sender_id, display_name):
+        # Stands in for BaseChannelAdapter's version (which also contributes any
+        # phone number the transport's sender id encodes).
+        return await self.storage.get_or_create_sender(
+            self.channel_id, sender_id, display_name=display_name,
+        )
+
     def _push_operator_notification(self, **kwargs):  # capture instead of pushing
         self.pushed.append(kwargs)
 
