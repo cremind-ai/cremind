@@ -15,9 +15,10 @@ To debug errors in Cremind, read the log file `logs/app.log`.
 
 ## When you add, modify, or remove a feature
 
-Two checks are mandatory for every feature change. Both are easy to forget and
-either leaves users broken on upgrade or leaves the CLI and its docs out of
-sync with the app.
+Three checks are mandatory for every feature change. All three are easy to
+forget: skipping the first leaves the CLI and its docs out of sync with the app,
+skipping the second leaves users broken on upgrade, and skipping the third leaks
+one profile's data into another's.
 
 ### 1. Does it need CLI support? Keep the CLI and its bundled doc in sync.
 
@@ -81,3 +82,13 @@ migration will break existing installs on upgrade.
 - Only bump `MIN_SUPPORTED_UPGRADE_FROM` in
   [app/__version__.py](app/__version__.py) when explicitly dropping support for
   older versions.
+
+### 3. Does it affect the profile design? Cremind runs on independent profiles.
+
+A profile is Cremind's tenant identity, and profiles are independent — one
+profile's data, config, credentials and automations are invisible to every
+other. So check where a new feature's state belongs: per-profile (the default,
+keyed by `profile` everywhere — DB rows, on-disk dirs, in-memory registries),
+system-wide, or an admin-set default that profiles inherit. State that ends up
+process-global works on a single-profile dev box and cross-contaminates as soon
+as a second profile exists, so test with two profiles, not just `admin`.
