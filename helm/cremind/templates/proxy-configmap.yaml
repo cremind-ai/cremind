@@ -20,9 +20,25 @@ data:
         ''      close;
     }
 
+    # An Ingress terminates TLS in front of us, so this sidecar only ever sees
+    # plain http on its own port — $scheme would tell the app "http" even when
+    # the browser is on https. Trust the edge's X-Forwarded-Proto when there is
+    # one, and fall back to our own scheme for the bare `port-forward` case.
+    map $http_x_forwarded_proto $forwarded_proto {
+        default $http_x_forwarded_proto;
+        ''      $scheme;
+    }
+
     server {
         listen {{ .Values.proxy.port }};
         server_name _;
+
+        # Emit relative Location headers. With the default (on), nginx expands a
+        # redirect into $scheme://$host:{{ .Values.proxy.port }}/… — leaking the
+        # internal port and downgrading https to http behind an Ingress. Relative
+        # redirects resolve against whatever origin the browser used, so they are
+        # correct for both the Ingress host and `port-forward`.
+        absolute_redirect off;
 
         # Proxy-local health for the sidecar's own probes (doesn't depend on
         # the backend being up).
@@ -67,7 +83,7 @@ data:
             proxy_http_version 1.1;
             proxy_set_header Host $host;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-Proto $forwarded_proto;
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection $connection_upgrade;
             proxy_buffering off;
