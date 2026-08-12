@@ -48,6 +48,17 @@ def _app_url_base() -> Optional[str]:
     return url
 
 
+def _resolve_google_redirect_uri(_profile: Optional[str]) -> Optional[str]:
+    """Browser-facing Google OAuth redirect for the Google skills:
+    ``<APP_URL>`` + :data:`_OAUTH_CALLBACK_PATH`. Emitted only for a loopback
+    APP_URL (Desktop-client constraint); otherwise omitted so the skill falls
+    back to the manual ``complete-link`` paste."""
+    base = _app_url_base()
+    if not base or not _LOOPBACK_APP_URL_RE.match(base):
+        return None
+    return base + _OAUTH_CALLBACK_PATH
+
+
 def _load_cremind_token(profile: Optional[str]) -> Optional[str]:
     """Read the per-profile CREMIND_TOKEN from ``<CREMIND_SYSTEM_DIR>/tokens/<profile>.token``.
 
@@ -135,6 +146,17 @@ SYSTEM_VARS: list[SystemVarSpec] = [
         resolve=_load_cremind_token,
         description="Per-profile Cremind token; omitted when missing.",
         secret=True,
+    ),
+    SystemVarSpec(
+        name="CREMIND_OAUTH_REDIRECT_URI",
+        resolve=_resolve_google_redirect_uri,
+        description=(
+            "Browser-facing Google OAuth redirect for the Google skills "
+            "(<APP_URL>/api/oauth/callback). The skill advertises it and the "
+            "backend captures the consent redirect into the oauth_inbox; omitted "
+            "for non-loopback APP_URL (Desktop clients only accept loopback) so "
+            "the skill uses the manual complete-link paste."
+        ),
     ),
 ]
 
