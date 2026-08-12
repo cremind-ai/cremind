@@ -246,6 +246,26 @@ class ScheduleEventSubscriptionStorage(SyncStorageBase):
             )
         return self.get(id)
 
+    def clear_external_refs(self, profile: str, *, provider: str = "google") -> int:
+        """Forget where ``profile``'s events were mirrored. Returns rows cleared.
+
+        Called when the connected Google account changes: the stored ids belong to
+        the previous account, where they are unusable — Google no longer returns
+        them (so the calendar view would hide events that are still firing) and
+        PATCH/DELETE against them 404. Cleared rows are local-only again: they
+        render through the internal merge and re-mirror on the next edit.
+        """
+        with self._engine.begin() as conn:
+            cur = conn.execute(
+                text(
+                    "UPDATE schedule_event_subscriptions "
+                    "SET external_provider = NULL, external_event_id = NULL, updated_at = :u "
+                    "WHERE profile = :p AND external_provider = :prov"
+                ),
+                {"u": time.time(), "p": profile, "prov": provider},
+            )
+            return cur.rowcount or 0
+
     def delete(self, id: str) -> bool:
         with self._engine.begin() as conn:
             cur = conn.execute(

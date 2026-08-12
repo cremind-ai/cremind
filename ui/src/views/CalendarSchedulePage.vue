@@ -29,6 +29,10 @@ const settings = useSettingsStore();
 const enabled = ref(false);
 const googleConnected = ref(false);
 const googleEmail = ref<string | null>(null);
+// 'skill' = linked in chat via the gcalendar skill, which owns that credential:
+// this page reports it and stays out of the way (no connect, no disconnect).
+const googleSource = ref<'skill' | 'app' | null>(null);
+const skillManaged = computed(() => googleSource.value === 'skill');
 const connecting = ref(false);
 const settingsLoaded = ref(false);
 const busy = ref(false);
@@ -51,6 +55,7 @@ async function loadSettings() {
     enabled.value = s.enabled;
     googleConnected.value = s.google_connected;
     googleEmail.value = s.google_email ?? null;
+    googleSource.value = s.google_source ?? null;
   } catch (err) {
     errorMessage.value = err instanceof Error ? err.message : String(err);
   } finally {
@@ -140,6 +145,14 @@ async function onConnectGoogle() {
     ElMessage.error(err instanceof Error ? err.message : String(err));
   }
 }
+function onSkillManagedClick() {
+  ElMessage.info(
+    `Linked through the gcalendar skill${googleEmail.value ? ` as ${googleEmail.value}` : ''}. ` +
+    'Ask in chat to re-link it, or disable the gcalendar skill to connect a different ' +
+    'account here.',
+  );
+}
+
 async function onDisconnectGoogle() {
   try {
     await ElMessageBox.confirm(
@@ -149,7 +162,7 @@ async function onDisconnectGoogle() {
   } catch { return; }
   try {
     await disconnectGoogleCalendar(settings.agentUrl, settings.authToken);
-    googleConnected.value = false; googleEmail.value = null;
+    googleConnected.value = false; googleEmail.value = null; googleSource.value = null;
     ElMessage.success('Disconnected Google Calendar');
     await loadEvents();
   } catch (err) { ElMessage.error(err instanceof Error ? err.message : String(err)); }
@@ -171,7 +184,17 @@ function openEdit(ev: CalendarOccurrence) { scheduleDialog.value?.openEdit(ev); 
       <div class="spacer" />
       <div class="header-actions">
         <ElTooltip
-          v-if="!googleConnected"
+          v-if="skillManaged"
+          :content="(googleEmail || 'Connected') + ' — linked through the gcalendar skill, which this calendar follows. Re-link or disable that skill to change accounts.'"
+          placement="bottom"
+        >
+          <ElButton type="success" plain @click="onSkillManagedClick">
+            <Icon icon="mdi:google" class="btn-ic" />{{ googleEmail || 'Connected' }}
+            <span class="via-skill">· via gcalendar skill</span>
+          </ElButton>
+        </ElTooltip>
+        <ElTooltip
+          v-else-if="!googleConnected"
           content="Connect Google Calendar (Calendar access only) so the calendar reads your Google events and your Cremind reminders appear there too. Until then, the built-in system calendar is fully functional."
           placement="bottom"
         >
@@ -252,6 +275,7 @@ function openEdit(ev: CalendarOccurrence) { scheduleDialog.value?.openEdit(ev); 
 .header-actions { display: flex; align-items: center; gap: 16px; }
 .btn-ic { margin-right: 6px; }
 .btn-ic-r { margin-left: 6px; opacity: .7; }
+.via-skill { margin-left: 6px; opacity: .75; font-size: .8125rem; }
 .switch-wrap { display: flex; align-items: center; gap: 8px; }
 .switch-label { color: var(--text-secondary); font-size: .875rem; }
 .icon-button { background: none; border: none; cursor: pointer; font-size: 1.25rem; color: var(--text-primary); display: flex; align-items: center; }

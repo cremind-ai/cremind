@@ -1,5 +1,6 @@
 """Tests for backend-native Google OAuth: authorize URL, callback exchange,
-per-profile token storage, and refresh — all with httpx + storage mocked."""
+per-profile token storage, refresh, and which of the two possible Google
+credentials wins — all with httpx + storage mocked."""
 
 from __future__ import annotations
 
@@ -32,6 +33,23 @@ def _id_token(email: str) -> str:
     return f"hdr.{payload}.sig"
 
 
+_NO_SKILL = {
+    "linked": False, "enabled": False, "effective": False,
+    "email": None, "scopes": [], "account_key": None,
+}
+
+
+def _skill(monkeypatch, *, effective: bool, email: str | None = None, token: str | None = None):
+    """Pretend the gcalendar skill is (or is not) linked, without a filesystem."""
+    monkeypatch.setattr(
+        ga.skill_token, "status",
+        lambda profile: {**_NO_SKILL, "linked": effective, "enabled": effective,
+                         "effective": effective, "email": email},
+    )
+    monkeypatch.setattr(ga.skill_token, "is_effective", lambda profile: effective)
+    monkeypatch.setattr(ga.skill_token, "access_token", lambda profile: token)
+
+
 def _wire(monkeypatch):
     store = FakeStorage()
     monkeypatch.setattr(ga, "get_auth_client_storage", lambda: store)
@@ -40,6 +58,9 @@ def _wire(monkeypatch):
         lambda: {"client_id": "cid", "client_secret": "csecret", "scopes": ["openid", "email", "cal"]},
     )
     monkeypatch.setattr(ga.BaseConfig, "APP_URL", "http://localhost:1515", raising=False)
+    # No gcalendar skill link unless a test says so — and never a real one read off
+    # the developer's own machine.
+    _skill(monkeypatch, effective=False)
     ga._pending.clear()
     return store
 
@@ -128,3 +149,105 @@ def test_disconnect_clears_tokens(monkeypatch):
         store.save_token(ga.AGENT_NAME, "carol", "v", agent_type=ga.AGENT_TYPE, token_kind=kind)
     ga.disconnect("carol")
     assert ga.status("carol")["connected"] is False
+
+
+# ── which credential wins ───────────────────────────────────────────────────
+
+def _connect_app(store, profile="dave", *, meta=None):
+    """Put an app-connected credential in place, as complete_callback would."""
+    store.save_token(ga.AGENT_NAME, profile, "APP-AT", agent_type=ga.AGENT_TYPE, token_kind=ga.ACCESS_TOKEN)
+    store.save_token(ga.AGENT_NAME, profile, "APP-RT", agent_type=ga.AGENT_TYPE, token_kind=ga.REFRESH_TOKEN)
+    store.save_token(
+        ga.AGENT_NAME, profile,
+        json.dumps(meta or {"email": None, "expiry": time.time() + 3600,
+                            "scopes": ga.CALENDAR_SCOPES, "connection_id": "c1"}),
+        agent_type=ga.AGENT_TYPE, token_kind=ga.META_KIND,
+    )
+
+
+def test_the_skill_link_wins_over_a_credential_connected_on_the_page(monkeypatch):
+    """Linking in chat is meant to be enough, even if the page connected earlier."""
+    store = _wire(monkeypatch)
+    _connect_app(store)
+    _skill(monkeypatch, effective=True, email="linked@example.com", token="SKILL-AT")
+
+    st = ga.status("dave")
+    assert st == {"connected": True, "email": "linked@example.com", "source": ga.SOURCE_SKILL}
+    assert ga.get_access_token("dave") == "SKILL-AT"
+
+
+def test_disabling_the_skill_falls_back_to_the_page_credential(monkeypatch):
+    """The dormant rows are kept precisely so this works."""
+    store = _wire(monkeypatch)
+    _connect_app(store)
+    _skill(monkeypatch, effective=False)
+
+    st = ga.status("dave")
+    assert st["connected"] is True and st["source"] == ga.SOURCE_APP
+    assert ga.get_access_token("dave") == "APP-AT"
+
+
+def test_an_unusable_skill_token_never_falls_back_to_the_other_account(monkeypatch):
+    """Silently writing this profile's events into a different Google account
+    would be worse than degrading to the internal calendar."""
+    store = _wire(monkeypatch)
+    _connect_app(store)
+    _skill(monkeypatch, effective=True, email="linked@example.com", token=None)
+
+    assert ga.status("dave")["source"] == ga.SOURCE_SKILL
+    assert ga.get_access_token("dave") is None
+
+
+def test_a_broken_skill_check_cannot_break_the_page_credential(monkeypatch):
+    store = _wire(monkeypatch)
+    _connect_app(store)
+
+    def boom(_profile):
+        raise RuntimeError("skills storage not ready")
+
+    monkeypatch.setattr(ga.skill_token, "status", boom)
+    monkeypatch.setattr(ga.skill_token, "is_effective", boom)
+    assert ga.status("dave")["source"] == ga.SOURCE_APP
+    assert ga.get_access_token("dave") == "APP-AT"
+
+
+def test_no_credential_at_all_reports_no_source(monkeypatch):
+    _wire(monkeypatch)
+    assert ga.status("nobody") == {"connected": False, "email": None, "source": None}
+    assert ga.get_access_token("nobody") is None
+
+
+def test_connect_records_an_identity_for_mirror_tracking(monkeypatch):
+    """This flow has no email scope, so a random id per connect is the identity."""
+    store = _wire(monkeypatch)
+    monkeypatch.setattr(ga, "_post_token", lambda data: {
+        "access_token": "AT", "refresh_token": "RT", "expires_in": 3600,
+    })
+    url = ga.build_authorize_url("erin")
+    ga.complete_callback(parse_qs(urlparse(url).query)["state"][0], "code")
+
+    meta = json.loads(store.get_token(ga.AGENT_NAME, "erin", agent_type=ga.AGENT_TYPE, token_kind=ga.META_KIND))
+    assert meta["connection_id"]
+    assert ga.effective_identity("erin") == {"source": ga.SOURCE_APP, "key": meta["connection_id"]}
+
+    # A reconnect is a different identity, which is how an account swap is noticed.
+    url2 = ga.build_authorize_url("erin")
+    ga.complete_callback(parse_qs(urlparse(url2).query)["state"][0], "code")
+    assert ga.effective_identity("erin")["key"] != meta["connection_id"]
+
+
+def test_the_skill_identity_is_the_linked_address(monkeypatch):
+    store = _wire(monkeypatch)
+    _connect_app(store, "frank")
+    _skill(monkeypatch, effective=True, email="linked@example.com", token="SKILL-AT")
+    assert ga.effective_identity("frank") == {"source": ga.SOURCE_SKILL, "key": "linked@example.com"}
+
+
+def test_the_mirror_target_survives_disconnect(monkeypatch):
+    """It describes events still sitting in someone's calendar, so it must."""
+    store = _wire(monkeypatch)
+    _connect_app(store, "gina")
+    ga.write_mirror_target("gina", "app:c1")
+    ga.disconnect("gina")
+    assert ga.status("gina")["connected"] is False
+    assert ga.read_mirror_target("gina") == "app:c1"

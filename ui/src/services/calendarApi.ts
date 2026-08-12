@@ -70,6 +70,12 @@ export interface CalendarSettings {
   enabled: boolean;
   google_connected: boolean;
   google_email?: string | null;
+  /**
+   * Where the connected credential comes from: 'skill' means the gcalendar skill's
+   * link owns it (connect/disconnect belong to the skill, not this page), 'app'
+   * means it was connected here.
+   */
+  google_source?: 'skill' | 'app' | null;
   provider?: string;
 }
 

@@ -1,5 +1,5 @@
 ---
-description: "Create, edit, and delete **scheduled and recurring events, reminders, and timers** (one-off or RRULE-recurring) that fire an agent action at a set time; enable or disable the per-profile **Calendar & Schedule** feature, connect or disconnect **Google Calendar**, and pause/resume/cancel schedule subscriptions. Use this to set a reminder, schedule a recurring task, or link a Google calendar — time-based triggers, unlike filesystem or skill events. `schedule list` also shows which one-time events are **event tasks** (created by the assistant to wait for a moment, delivering their result back into the conversation that is waiting); tasks cannot be paused or made recurring."
+description: "Create, edit, and delete **scheduled and recurring events, reminders, and timers** (one-off or RRULE-recurring) that fire an agent action at a set time; enable or disable the per-profile **Calendar & Schedule** feature, connect or disconnect **Google Calendar**, and pause/resume/cancel schedule subscriptions. Use this to set a reminder, schedule a recurring task, or link a Google calendar — time-based triggers, unlike filesystem or skill events. Also reports **which Google account the calendar is using and where it came from** (`google_source`: the gcalendar skill's link, which takes precedence, or one connected here) — consult this when asked why the calendar shows the wrong account or why connecting Google here is refused. `schedule list` also shows which one-time events are **event tasks** (created by the assistant to wait for a moment, delivering their result back into the conversation that is waiting); tasks cannot be paused or made recurring."
 ---
 
 # `cremind calendar` — Calendar & Schedule
@@ -60,7 +60,16 @@ All `cremind calendar` subcommands accept the root-level `--json` flag.
 cremind calendar settings
 ```
 
-Prints `enabled`, `google_connected`, `google_email`, and `provider`.
+Prints `enabled`, `google_connected`, `google_email`, `google_source`, and
+`provider`.
+
+`google_source` says **which** Google credential is in play:
+
+| Value    | Meaning                                                                     |
+|----------|-----------------------------------------------------------------------------|
+| `skill`  | Linked through the **gcalendar skill**. That link drives the calendar, and `google_email` is the linked address. |
+| `app`    | Connected with `google connect` (or the page's button). No address — this flow requests no email scope. |
+| empty    | Not connected; the built-in system calendar is in use.                      |
 
 ### `cremind calendar enable` / `cremind calendar disable`
 
@@ -170,6 +179,26 @@ access; the OAuth callback completes the link server-side (same pattern as
 or the Google client isn't configured) it returns `409 unavailable`.
 `disconnect` drops the stored token.
 
+**The gcalendar skill's link wins.** Linking a Google account through the
+`gcalendar` skill (in chat: `uv run scripts/__main__.py link`) also gives the
+Calendar & Schedule feature that account — one link, both places, no second
+consent screen. While that link is in force (`google_source: skill`):
+
+- `google connect` returns **`409 skill_managed`** rather than mint a credential
+  the skill's link would immediately shadow. To change accounts, re-link the
+  skill or disable it.
+- `google disconnect` clears only the account connected *here*; the skill's link
+  keeps driving the calendar, and the command says so.
+
+Disabling the gcalendar skill (or resetting it, which deletes its token) hands
+the calendar back to whatever `google connect` connected, or to the built-in
+system calendar if nothing was.
+
+Only one account is ever in effect. When the effective account changes, Cremind
+forgets where it had mirrored this profile's events — their Google copies live in
+the old account and can no longer be reached — so those events show as
+Cremind-only until their next edit, which re-creates them in the new account.
+
 While connected, new events are mirrored to Google Calendar, and the `events`
 view merges your Google events with Cremind-managed ones. **Sub-daily
 recurrences** (hourly / every-few-minutes, e.g. `FREQ=HOURLY`) are the one
@@ -249,6 +278,16 @@ for this profile. Run `cremind calendar enable` first.
 public URL or the Google client. Google Calendar connect needs the
 cremind-connect Google client and a reachable public server URL; see the
 Calendar & Schedule setup docs.
+
+**`409 skill_managed` on `google connect`** — This profile is already linked to
+Google through the **gcalendar skill**, and that link is what the calendar uses.
+Connecting a second account here would have no effect. Re-link the skill to
+switch accounts, or disable the gcalendar skill to connect one here instead.
+`cremind calendar settings` shows which account is in force.
+
+**The Calendar & Schedule page shows a different account than expected** — Check
+`google_source`. `skill` means the gcalendar skill's link is in force and takes
+precedence over anything connected on the page.
 
 **Created an event but it never fires** — Confirm `cremind calendar settings`
 shows `enabled: true` (disabling the feature disarms events) and that

@@ -137,6 +137,9 @@ def get_calendar_routes(conversation_storage=None) -> list[Route]:
             "enabled": calendar_feature.is_enabled(profile),
             "google_connected": bool(g.get("connected")),
             "google_email": g.get("email"),
+            # "skill" (linked via the gcalendar skill, which the UI must not offer
+            # to connect or disconnect), "app" (connected on this page), or null.
+            "google_source": g.get("source"),
             "provider": getattr(provider, "name", "internal"),
         })
 
@@ -356,6 +359,22 @@ def get_calendar_routes(conversation_storage=None) -> list[Route]:
             return unauth
         profile = _profile_from_request(request)
         from app.calendar import google_auth
+        current = google_auth.status(profile)
+        if current.get("source") == google_auth.SOURCE_SKILL:
+            # Connecting here would mint a credential the skill's link immediately
+            # shadows, i.e. a consent screen that changes nothing.
+            who = current.get("email") or "a Google account"
+            return JSONResponse(
+                {
+                    "error": "skill_managed",
+                    "message": (
+                        f"Google Calendar is already linked through the gcalendar "
+                        f"skill ({who}), and that link drives this calendar. To use a "
+                        "different account, re-link or disable the gcalendar skill."
+                    ),
+                },
+                status_code=409,
+            )
         url = google_auth.build_authorize_url(profile)
         if not url:
             return JSONResponse(
@@ -377,9 +396,26 @@ def get_calendar_routes(conversation_storage=None) -> list[Route]:
             return unauth
         profile = _profile_from_request(request)
         from app.calendar import google_auth
+        # Read the source first: disconnect only removes the rows this page owns.
+        was_skill = google_auth.status(profile).get("source") == google_auth.SOURCE_SKILL
         google_auth.disconnect(profile)
         publish_schedule_events_admin_changed(profile)
-        return JSONResponse({"ok": True, "google_connected": False})
+        if was_skill:
+            # Still connected — via the skill. Clearing the page's dormant rows is
+            # allowed (it is the only way to drop a stale second account), but
+            # saying "disconnected" would be a lie.
+            after = google_auth.status(profile)
+            return JSONResponse({
+                "ok": True,
+                "google_connected": bool(after.get("connected")),
+                "google_source": after.get("source"),
+                "message": (
+                    "Cleared the account connected on this page. The gcalendar skill's "
+                    "link still drives this calendar — re-link or disable the skill to "
+                    "change it."
+                ),
+            })
+        return JSONResponse({"ok": True, "google_connected": False, "google_source": None})
 
     # Live updates are delivered on the multiplexed /api/admin/events-stream as
     # a ``schedule-events`` frame (see app/api/admin_stream.py) — no separate SSE

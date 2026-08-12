@@ -1,9 +1,8 @@
 """Backend-native Google OAuth for per-profile Calendar access.
 
-Unlike the gmail/gcalendar *skills* (subprocesses that hold a single shared file
-token and never expose creds to the backend), this runs the OAuth Authorization
-Code + PKCE flow **in the backend** and stores per-profile access/refresh tokens
-in the ``auth_tokens`` table (``app/utils/client_storage.py``) — so the per-profile
+This runs the OAuth Authorization Code + PKCE flow **in the backend** and stores
+per-profile access/refresh tokens in the ``auth_tokens`` table
+(``app/utils/client_storage.py``) — so the per-profile
 :class:`GoogleCalendarProvider` can call the Calendar REST API directly.
 
 The OAuth *client* (id/secret) + calendar scopes still come from cremind-connect
@@ -15,6 +14,14 @@ Flow:
 2. Google redirects to ``/api/oauth/google-calendar/callback`` (app/api/oauth_callback.py),
    which calls ``complete_callback(state, code)`` to exchange + persist tokens.
 3. ``get_access_token(profile)`` returns a valid access token, refreshing on demand.
+
+**Two sources, one effective account.** The ``gcalendar`` skill links a Google
+account of its own, in chat, and that link *wins* while it is usable
+(:mod:`app.calendar.skill_token` — read-only, in-memory refresh). Linking once
+there is therefore enough for the whole app, and the page stops asking. The rows
+this module stores stay put as a dormant fallback: disabling or unlinking the
+skill brings them back, and with neither the calendar runs on the internal
+provider. ``status()`` reports which source is in play as ``source``.
 
 Synchronous (httpx.Client): the one-time connect/callback briefly block, and the
 provider's per-load calls match the codebase's sync-storage-in-async-handler style.
@@ -33,7 +40,7 @@ from urllib.parse import urlencode
 import httpx
 
 from app.config.settings import BaseConfig
-from app.calendar import google_discovery
+from app.calendar import google_discovery, skill_token
 from app.utils.client_storage import (
     ACCESS_TOKEN,
     REFRESH_TOKEN,
@@ -55,7 +62,15 @@ CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 # auth_tokens row coordinates for the per-profile Google Calendar tokens.
 AGENT_NAME = "google_calendar"
 AGENT_TYPE = "google"
-META_KIND = "google_meta"  # JSON {email, expiry, scopes}
+META_KIND = "google_meta"  # JSON {email, expiry, scopes, connection_id}
+# Which account this profile's mirrored events were last written to, as
+# "<source>:<key>". Survives disconnect on purpose: it describes events that are
+# still sitting in someone's Google calendar.
+MIRROR_TARGET_KIND = "google_mirror_target"
+
+# Where the effective credential came from (``status()["source"]``).
+SOURCE_SKILL = "skill"  # the gcalendar skill's link (wins)
+SOURCE_APP = "app"  # connected on the Calendar & Schedule page
 
 # Pending consent flows keyed by OAuth ``state``: {profile, verifier, redirect_uri, ts}.
 _pending: Dict[str, Dict[str, Any]] = {}
@@ -195,14 +210,45 @@ def complete_callback(state: str, code: str) -> Dict[str, Any]:
     storage.save_token(AGENT_NAME, profile, access, agent_type=AGENT_TYPE, token_kind=ACCESS_TOKEN)
     if refresh:
         storage.save_token(AGENT_NAME, profile, refresh, agent_type=AGENT_TYPE, token_kind=REFRESH_TOKEN)
-    meta = {"email": email, "expiry": time.time() + expires_in, "scopes": CALENDAR_SCOPES}
+    meta = {
+        "email": email,
+        "expiry": time.time() + expires_in,
+        "scopes": CALENDAR_SCOPES,
+        # This flow requests no email scope, so there is no address to identify the
+        # account by. A fresh id per connect is enough for what the identity is
+        # used for: noticing that the calendar is now acting as someone else.
+        "connection_id": secrets.token_hex(8),
+    }
     storage.save_token(AGENT_NAME, profile, json.dumps(meta), agent_type=AGENT_TYPE, token_kind=META_KIND)
     logger.info(f"[google_auth] connected Google Calendar for profile={profile} email={email}")
     return {"profile": profile, "email": email}
 
 
+def _skill_effective(profile: str) -> bool:
+    """Whether the gcalendar skill's link should be used for ``profile``.
+
+    Wrapped so that nothing about the skill — an unreadable file, storage not yet
+    initialized — can break a credential lookup that would otherwise work.
+    """
+    try:
+        return skill_token.is_effective(profile)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[google_auth] gcalendar skill check failed for profile={profile}: {exc}")
+        return False
+
+
 def get_access_token(profile: str) -> Optional[str]:
     """Return a valid access token for ``profile``, refreshing when expired."""
+    if _skill_effective(profile):
+        # Deliberately no fallback to the rows below when the skill's token cannot
+        # be used: it is very likely a *different* Google account, and quietly
+        # writing this profile's events into it would be worse than the calendar
+        # degrading to the internal provider (which is what None does).
+        try:
+            return skill_token.access_token(profile)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[google_auth] gcalendar token unusable for profile={profile}: {exc}")
+            return None
     storage = get_auth_client_storage()
     access = storage.get_token(AGENT_NAME, profile, agent_type=AGENT_TYPE, token_kind=ACCESS_TOKEN)
     if not access:
@@ -236,18 +282,85 @@ def get_access_token(profile: str) -> Optional[str]:
 
 
 def status(profile: str) -> Dict[str, Any]:
-    """``{connected, email}`` for ``profile``."""
+    """``{connected, email, source}`` for ``profile``.
+
+    ``source`` is ``"skill"`` when the gcalendar skill's link is driving the
+    calendar, ``"app"`` when this module's own rows are, else None. Only the skill
+    path can report an address — the page's flow never asks for one.
+    """
+    try:
+        sk = skill_token.status(profile)
+        if sk.get("effective"):
+            return {"connected": True, "email": sk.get("email"), "source": SOURCE_SKILL}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[google_auth] gcalendar skill status failed for profile={profile}: {exc}")
     try:
         storage = get_auth_client_storage()
         access = storage.get_token(AGENT_NAME, profile, agent_type=AGENT_TYPE, token_kind=ACCESS_TOKEN)
         meta = _load_meta(storage, profile)
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"[google_auth] status lookup failed: {exc}")
-        return {"connected": False, "email": None}
-    return {"connected": bool(access), "email": meta.get("email")}
+        return {"connected": False, "email": None, "source": None}
+    return {
+        "connected": bool(access),
+        "email": meta.get("email"),
+        "source": SOURCE_APP if access else None,
+    }
+
+
+# ── mirror-target identity ───────────────────────────────────────────────────
+# Mirrored schedule events carry the *other* side's event id. These let the
+# provider notice that the effective account changed, so it can drop ids that
+# now point into a calendar this profile no longer talks to.
+
+def effective_identity(profile: str) -> Optional[Dict[str, str]]:
+    """Which Google account the calendar is acting as, as ``{source, key}``.
+
+    None when not connected. The skill path keys on the linked address; the app
+    path has none, so it keys on the ``connection_id`` minted at connect time.
+    """
+    st = status(profile)
+    if not st.get("connected"):
+        return None
+    source = str(st.get("source") or "")
+    if source == SOURCE_SKILL:
+        return {"source": source, "key": str(st.get("email") or "unknown")}
+    try:
+        meta = _load_meta(get_auth_client_storage(), profile)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[google_auth] identity lookup failed for profile={profile}: {exc}")
+        return None
+    return {"source": SOURCE_APP, "key": str(meta.get("connection_id") or "legacy")}
+
+
+def read_mirror_target(profile: str) -> Optional[str]:
+    """The ``"<source>:<key>"`` this profile's event mirrors were written to."""
+    try:
+        raw = get_auth_client_storage().get_token(
+            AGENT_NAME, profile, agent_type=AGENT_TYPE, token_kind=MIRROR_TARGET_KIND
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[google_auth] mirror target read failed for profile={profile}: {exc}")
+        return None
+    return raw or None
+
+
+def write_mirror_target(profile: str, fingerprint: str) -> None:
+    try:
+        get_auth_client_storage().save_token(
+            AGENT_NAME, profile, fingerprint, agent_type=AGENT_TYPE, token_kind=MIRROR_TARGET_KIND
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[google_auth] mirror target write failed for profile={profile}: {exc}")
 
 
 def disconnect(profile: str) -> None:
+    """Drop this module's rows for ``profile``.
+
+    ``MIRROR_TARGET_KIND`` deliberately survives: events mirrored into that
+    account are still sitting there, and the record is what lets a later connect
+    recognize whether it is the same one.
+    """
     storage = get_auth_client_storage()
     for kind in (ACCESS_TOKEN, REFRESH_TOKEN, META_KIND):
         try:

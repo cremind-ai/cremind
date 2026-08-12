@@ -8,11 +8,26 @@ from __future__ import annotations
 import types
 from zoneinfo import ZoneInfo
 
+import pytest
+
 import app.calendar.provider as P
 
 # The mirror helpers now take an explicit zone (was the OS-local zone). These
 # pure-logic tests pin UTC so naive<->offset conversions are deterministic.
 _UTC = ZoneInfo("UTC")
+
+# Captured before the autouse fixture below stubs the module attribute, so the
+# reconcile tests can exercise the real thing.
+_reconcile = P._reconcile_mirror_target
+
+
+@pytest.fixture(autouse=True)
+def no_ambient_reconcile(monkeypatch):
+    """Constructing the provider reconciles its mirror target, which reads the
+    profile's credentials. Keep that off the ambient DB/filesystem; the tests that
+    exercise it call it directly with everything stubbed."""
+    monkeypatch.setattr(P, "_reconcile_mirror_target", lambda profile: None)
+    P._mirror_identity_seen.clear()
 
 
 # ── pure helpers ─────────────────────────────────────────────────────────────
@@ -249,6 +264,133 @@ def test_create_event_mirrors_supported_recurrence(monkeypatch):
     )
     assert seen.get("method") == "POST"
     assert row.get("external_event_id") == "gnew"
+
+
+def test_editing_an_unmirrored_event_puts_it_back_on_the_calendar(monkeypatch):
+    """After an account switch a row has no Google copy; an edit re-creates it.
+
+    Without this the event would stay invisible on the connected calendar forever,
+    even though it keeps firing.
+    """
+    rows = [{
+        "id": "row2", "external_event_id": None, "title": "Local reminder",
+        "schedule_kind": "instant", "rrule": None, "status": "active",
+        "dtstart": "2026-06-22T10:00:00", "duration_minutes": 30,
+    }]
+    gp = _provider_with(rows)
+    gp._internal.update_event = lambda event_id, **f: {**rows[0], **f}
+    seen = {}
+
+    def fake_request(method, path, **kw):
+        seen["method"], seen["path"] = method, path
+        return {"id": "gremirrored"}
+
+    monkeypatch.setattr(gp, "_request", fake_request)
+    row = gp.update_event("row2", title="Local reminder v2")
+    assert seen["method"] == "POST", "no Google id to PATCH, so it must be created"
+    assert row["external_event_id"] == "gremirrored"
+
+
+def test_a_cancelled_event_is_not_re_mirrored(monkeypatch):
+    rows = [{
+        "id": "row3", "external_event_id": None, "title": "Done", "rrule": None,
+        "status": "cancelled", "dtstart": "2026-06-22T10:00:00", "duration_minutes": 30,
+    }]
+    gp = _provider_with(rows)
+    gp._internal.update_event = lambda event_id, **f: {**rows[0], **f}
+
+    def boom(*a, **k):
+        raise AssertionError("must not put a cancelled event on the calendar")
+
+    monkeypatch.setattr(gp, "_request", boom)
+    assert gp.update_event("row3", title="Done")["external_event_id"] is None
+
+
+# ── mirror-target reconcile (account switch) ────────────────────────────────
+
+def _fake_google_auth(monkeypatch, ga):
+    """Swap the module ``_reconcile_mirror_target`` imports.
+
+    It uses ``from app.calendar import google_auth``, which resolves through the
+    package's attribute — so patching sys.modules would be ignored.
+    """
+    import app.calendar as calendar_pkg
+
+    monkeypatch.setattr(calendar_pkg, "google_auth", ga)
+
+
+def _wire_reconcile(monkeypatch, *, identity, recorded):
+    """Stub the identity/record/clear seam and report what the code did."""
+    calls = {"cleared": [], "written": []}
+    _fake_google_auth(monkeypatch, types.SimpleNamespace(
+        effective_identity=lambda profile: identity,
+        read_mirror_target=lambda profile: recorded,
+        write_mirror_target=lambda profile, fp: calls["written"].append(fp),
+    ))
+    store = types.SimpleNamespace(
+        clear_external_refs=lambda profile, **kw: (calls["cleared"].append(profile), 2)[1]
+    )
+    monkeypatch.setattr(P, "get_schedule_event_storage", lambda: store)
+    P._mirror_identity_seen.clear()
+    return calls
+
+
+def test_switching_accounts_drops_the_stale_mirror_ids(monkeypatch):
+    """Ids from the previous account are unusable: Google never returns them (so
+    the event would silently vanish from a calendar it is still firing on) and
+    every PATCH/DELETE against them 404s."""
+    calls = _wire_reconcile(
+        monkeypatch, identity={"source": "skill", "key": "new@example.com"},
+        recorded="app:c1",
+    )
+    _reconcile("p")
+    assert calls["cleared"] == ["p"]
+    assert calls["written"] == ["skill:new@example.com"]
+
+
+def test_the_same_account_leaves_working_mirrors_alone(monkeypatch):
+    calls = _wire_reconcile(
+        monkeypatch, identity={"source": "skill", "key": "same@example.com"},
+        recorded="skill:same@example.com",
+    )
+    _reconcile("p")
+    assert calls["cleared"] == [] and calls["written"] == []
+
+
+def test_an_unrecorded_target_is_adopted_without_clearing(monkeypatch):
+    """Installs that mirrored before this record existed: we cannot tell whether
+    the account changed, and guessing wrong would throw away working mirrors."""
+    calls = _wire_reconcile(
+        monkeypatch, identity={"source": "app", "key": "c9"}, recorded=None,
+    )
+    _reconcile("p")
+    assert calls["cleared"] == []
+    assert calls["written"] == ["app:c9"]
+
+
+def test_reconcile_runs_once_per_account_per_process(monkeypatch):
+    calls = _wire_reconcile(
+        monkeypatch, identity={"source": "app", "key": "c9"}, recorded="app:c8",
+    )
+    for _ in range(3):
+        _reconcile("p")
+    assert calls["cleared"] == ["p"], "one clear, not one per request"
+
+
+def test_reconcile_does_nothing_when_not_connected(monkeypatch):
+    calls = _wire_reconcile(monkeypatch, identity=None, recorded="app:c1")
+    _reconcile("p")
+    assert calls["cleared"] == [] and calls["written"] == []
+
+
+def test_a_reconcile_failure_never_blocks_the_calendar(monkeypatch):
+    def boom(_profile):
+        raise RuntimeError("storage down")
+
+    _fake_google_auth(monkeypatch, types.SimpleNamespace(
+        effective_identity=boom, read_mirror_target=boom, write_mirror_target=boom
+    ))
+    _reconcile("p")  # must not raise
 
 
 # ── route presence ──────────────────────────────────────────────────────────

@@ -292,8 +292,9 @@ def calendar_delete(
 def google_connect(ctx: typer.Context) -> None:
     """Print the Google Calendar authorize URL to open in a browser."""
     import asyncio
+    import json as _json
 
-    from app.cli.client._base import Client
+    from app.cli.client._base import APIError, Client
     from app.cli.client.calendar import google_connect as _connect
     from app.cli.config import Config
     from app.cli.output import OutputMode, print_json
@@ -306,7 +307,21 @@ def google_connect(ctx: typer.Context) -> None:
         async with Client(cfg) as client:
             return await _connect(client)
 
-    url = asyncio.run(_run())
+    try:
+        url = asyncio.run(_run())
+    except APIError as e:
+        # A 409 carries the reason (already linked via the gcalendar skill, or no
+        # usable public URL); the generic handler would print only the error code.
+        detail: Any = None
+        if e.raw:
+            try:
+                detail = _json.loads(e.raw)
+            except (ValueError, TypeError):
+                detail = None
+        if isinstance(detail, dict) and detail.get("message"):
+            sys.stderr.write(str(detail["message"]) + "\n")
+            raise typer.Exit(code=1) from e
+        raise
     if mode.json:
         print_json({"authorize_url": url})
     else:
@@ -316,21 +331,31 @@ def google_connect(ctx: typer.Context) -> None:
 @google_app.command("disconnect")
 @graceful_errors
 def google_disconnect(ctx: typer.Context) -> None:
-    """Disconnect Google Calendar for this profile."""
+    """Disconnect the Google account connected on the Calendar & Schedule page.
+
+    A link made through the gcalendar skill is not touched — it belongs to the
+    skill, and it keeps driving the calendar.
+    """
     import asyncio
 
     from app.cli.client._base import Client
     from app.cli.client.calendar import google_disconnect as _disconnect
     from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
 
     cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
     cfg.require_token()
 
-    async def _run() -> None:
+    async def _run() -> dict[str, Any]:
         async with Client(cfg) as client:
-            await _disconnect(client)
+            return await _disconnect(client)
 
-    asyncio.run(_run())
+    out = asyncio.run(_run())
+    if mode.json:
+        print_json(out)
+    elif out.get("message"):
+        sys.stdout.write(f"{out['message']}\n")
 
 
 @schedule_app.command("list")

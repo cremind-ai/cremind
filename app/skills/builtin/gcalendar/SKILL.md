@@ -84,6 +84,15 @@ uv run scripts/__main__.py status
 (`--no-browser` only affects the standalone fallback used when the Cremind
 backend isn't running; under the app the URL is always printed for the user.)
 
+**One link covers the Calendar & Schedule page too.** While this skill is linked
+and enabled, the app's **Calendar & Schedule** feature uses this same account —
+its own "Connect Google" button disappears and shows the linked address instead.
+So there is no second consent to walk the user through: tell them the calendar
+page is already connected. Re-running `link` switches both at once. If the user
+wants the calendar page on a *different* account, they must disable this skill
+first (`cremind calendar settings` reports which account is in force as
+`google_source`).
+
 ## CLI Commands
 Run `uv run scripts/__main__.py <subcommand>`. Output is JSON.
 

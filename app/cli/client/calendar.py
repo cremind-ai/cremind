@@ -62,8 +62,9 @@ async def google_connect(client) -> str:
     return ""
 
 
-async def google_disconnect(client) -> None:
-    await client.post_json("/api/calendar/google/disconnect")
+async def google_disconnect(client) -> dict[str, Any]:
+    resp = await client.post_json("/api/calendar/google/disconnect")
+    return resp if isinstance(resp, dict) else {}
 
 
 async def list_subscriptions(client) -> list[dict[str, Any]]:

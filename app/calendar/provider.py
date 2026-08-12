@@ -532,12 +532,62 @@ def _google_event_to_occurrence(ev: Dict[str, Any], match_row: Optional[Dict[str
     }
 
 
+# The account each profile's mirrors were last seen going to, so the recording and
+# clearing below happen once per switch rather than on every request.
+_mirror_identity_seen: Dict[str, str] = {}
+
+
+def _reconcile_mirror_target(profile: str) -> None:
+    """Drop mirror ids that belong to a Google account we no longer talk to.
+
+    The effective account can change under a profile now that the gcalendar skill
+    can take over the credential, and it could always change via
+    disconnect/reconnect. A mirrored row keeps the *old* account's event id, which
+    afterwards is unusable in both directions: Google never returns it, so
+    :meth:`GoogleCalendarProvider.list_occurrences` would silently hide an event
+    that is still firing, and every PATCH/DELETE against it 404s. Clearing the
+    columns makes those rows local-only — visible again through the merge, and
+    re-mirrored on their next edit.
+
+    Never raises: a bookkeeping problem must not stop the calendar from loading.
+    """
+    from app.calendar import google_auth
+
+    try:
+        identity = google_auth.effective_identity(profile)
+        if not identity:
+            return
+        fingerprint = f"{identity['source']}:{identity['key']}"
+        if _mirror_identity_seen.get(profile) == fingerprint:
+            return
+        recorded = google_auth.read_mirror_target(profile)
+        # An absent record — an install that mirrored before this bookkeeping
+        # existed — is not evidence of a change, so it is adopted as-is. Clearing on
+        # a guess would throw away mirrors that work.
+        if recorded and recorded != fingerprint:
+            cleared = get_schedule_event_storage().clear_external_refs(profile)
+            logger.info(
+                f"[google] calendar account changed for profile={profile} "
+                f"({recorded.split(':', 1)[0]} -> {identity['source']}); cleared {cleared} "
+                "stale Google event id(s) — those events re-mirror on their next edit"
+            )
+        if recorded != fingerprint:
+            google_auth.write_mirror_target(profile, fingerprint)
+        _mirror_identity_seen[profile] = fingerprint
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[google] mirror-target reconcile skipped for profile={profile}: {exc}")
+
+
 class GoogleCalendarProvider(CalendarProvider):
     """Google-backed provider. Wraps the internal provider so Cremind's trigger
     engine still owns firing: every create/update/delete mutates the internal
     schedule-event row (ScheduleManager fires it) AND mirrors to Google (so it
     shows on the user's calendar). Reads come from Google so the view reflects
     the whole calendar; mirrored events reconcile back via ``external_event_id``.
+
+    Which Google account it acts as is decided by :mod:`app.calendar.google_auth`
+    — the gcalendar skill's link when there is one, else the credential connected
+    on the Calendar & Schedule page.
     """
 
     name = "google"
@@ -548,6 +598,7 @@ class GoogleCalendarProvider(CalendarProvider):
         self._profile = profile
         self._internal = InternalCalendarProvider()
         self._store = self._internal._store
+        _reconcile_mirror_target(profile)
 
     def is_connected(self) -> bool:
         from app.calendar import google_auth
@@ -578,6 +629,20 @@ class GoogleCalendarProvider(CalendarProvider):
             tz=resolve_tzinfo(self._profile),
         )
 
+    def _mirror_create(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Create the Google copy of ``row`` and record its id. Never raises."""
+        try:
+            ev = self._request("POST", f"/calendars/{self.CALENDAR_ID}/events", json_body=self._mirror_body(row))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[google] mirror create failed (event still fires locally): {exc}")
+            return row
+        gid = ev.get("id")
+        if not gid:
+            return row
+        return self._store.update_fields(
+            row["id"], external_provider="google", external_event_id=gid
+        ) or row
+
     # ── CRUD (internal row is the source of truth for triggering) ───────
     def create_event(self, **kwargs: Any) -> Dict[str, Any]:
         row = self._internal.create_event(**kwargs)
@@ -589,20 +654,13 @@ class GoogleCalendarProvider(CalendarProvider):
                 "kept local-only (Google Calendar can't store it)"
             )
             return row
-        try:
-            ev = self._request("POST", f"/calendars/{self.CALENDAR_ID}/events", json_body=self._mirror_body(row))
-            gid = ev.get("id")
-            if gid:
-                updated = self._store.update_fields(row["id"], external_provider="google", external_event_id=gid)
-                if updated:
-                    row = updated
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[google] mirror create failed (event still fires locally): {exc}")
-        return row
+        return self._mirror_create(row)
 
     def update_event(self, event_id: str, **fields: Any) -> Optional[Dict[str, Any]]:
         row = self._internal.update_event(event_id, **fields)
-        if row and row.get("external_event_id") and google_supports_rrule(row.get("rrule")):
+        if not row or not google_supports_rrule(row.get("rrule")):
+            return row
+        if row.get("external_event_id"):
             try:
                 self._request(
                     "PATCH", f"/calendars/{self.CALENDAR_ID}/events/{row['external_event_id']}",
@@ -610,6 +668,11 @@ class GoogleCalendarProvider(CalendarProvider):
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"[google] mirror update failed: {exc}")
+        elif row.get("status") == "active":
+            # No Google copy: never mirrored (created while disconnected, or the
+            # POST failed), or the id was dropped because the account changed. An
+            # edit is the natural moment to put it back on the calendar.
+            row = self._mirror_create(row)
         return row
 
     def delete_event(self, event_id: str) -> bool:
