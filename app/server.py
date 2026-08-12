@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import os
 
-import jwt
 import uvicorn
 from starlette.applications import Starlette
 from starlette.authentication import (
@@ -59,6 +58,7 @@ from app.api.system import get_system_routes
 from app.api.tools import get_tool_routes
 from app.api.upgrade import get_upgrade_routes
 from app.api.version import get_version_routes
+from app.auth import verify_token
 from app.config.bootstrap import bootstrap_exists
 from app.config.settings import BaseConfig, set_dynamic_config_storage
 from app.runtime import BootedState, get_state
@@ -118,7 +118,12 @@ _pending_return_urls: dict[tuple[str, str], str] = {}
 
 
 class JWTAuthBackend(AuthenticationBackend):
-    """JWT auth with signature verification (secret resolved per request)."""
+    """JWT auth with signature + revocation verification (secret per request).
+
+    The single chokepoint for every HTTP route: the per-module ``_require_auth``
+    helpers scattered across ``app/api`` all just read the ``request.user`` this
+    populates.
+    """
 
     def __init__(self, secret_provider, algorithms=None):
         self.secret_provider = secret_provider
@@ -130,14 +135,14 @@ class JWTAuthBackend(AuthenticationBackend):
             return None
         secret = self.secret_provider()
         if not secret:
+            # Setup mode — no secret exists yet, so everyone is anonymous.
             return None
         token = auth_header.split("Bearer ", 1)[1]
-        try:
-            payload = jwt.decode(token, secret, algorithms=self.algorithms)
-            return AuthCredentials(["authenticated"]), SimpleUser(payload.get("sub", "anonymous"))
-        except jwt.InvalidTokenError as e:
-            logger.warning(f"[auth] JWT decode failed on {conn.url.path}: {e}")
+        payload = verify_token(token, secret=secret)
+        if payload is None:
+            logger.warning(f"[auth] rejected token on {conn.url.path}")
             return None
+        return AuthCredentials(["authenticated"]), SimpleUser(payload.get("sub", "anonymous"))
 
 
 class JWTCallContextBuilder(CallContextBuilder):
@@ -152,12 +157,15 @@ class JWTCallContextBuilder(CallContextBuilder):
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer ") and secret:
             token = auth_header.split("Bearer ", 1)[1]
-            try:
-                payload = jwt.decode(token, secret, algorithms=["HS256"])
+            # Defence in depth: A2AAuthGuard has already 401'd an invalid or
+            # revoked token by the time this runs. Re-checking here keeps the
+            # profile we hand the agent from ever coming out of a dead token.
+            payload = verify_token(token, secret=secret)
+            if payload is not None:
                 state["profile"] = payload.get("profile", "")
                 state["sub"] = payload.get("sub", "")
-            except jwt.InvalidTokenError as e:
-                logger.warning(f"[auth] CallContextBuilder JWT decode failed: {e}")
+            else:
+                logger.warning("[auth] CallContextBuilder rejected the bearer token")
         return ServerCallContext(state=state)
 
 

@@ -8,12 +8,11 @@ The ``CREMIND_TOKEN`` value is the same JWT the caller used to authenticate,
 so echoing it back is not a privacy escalation.
 """
 
-import jwt
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from app.config.settings import BaseConfig
+from app.auth import verify_token
 from app.config.system_vars import SYSTEM_VARS
 
 
@@ -24,13 +23,11 @@ async def list_system_vars(request: Request) -> JSONResponse:
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return JSONResponse({"error": "Invalid authorization header"}, status_code=401)
-    try:
-        payload = jwt.decode(
-            auth_header.split("Bearer ", 1)[1],
-            BaseConfig.get_jwt_secret(),
-            algorithms=["HS256"],
-        )
-    except jwt.InvalidTokenError:
+    # Full validation, not just a decode: ``CREMIND_TOKEN``'s resolver reads the
+    # on-disk token file, so a revoked-token holder reaching this route would
+    # otherwise be handed its own freshly-rotated replacement.
+    payload = verify_token(auth_header.split("Bearer ", 1)[1])
+    if payload is None:
         return JSONResponse({"error": "Invalid token"}, status_code=401)
     profile = payload.get("profile") or payload.get("sub") or ""
 

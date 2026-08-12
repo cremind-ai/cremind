@@ -21,6 +21,7 @@ from app.api.logs_stream import get_logs_stream_routes
 from app.api.profile_events import get_profile_events_routes
 from app.api.settings_stream import get_settings_stream_routes
 from app.api.system_vars import get_system_vars_routes
+from app.api.auth import get_auth_routes
 from app.api.tokens import get_token_routes
 from app.api.usage import get_usage_routes
 from app.api.user_config import get_user_config_routes
@@ -68,6 +69,7 @@ def get_api_routes(
         drop_profile_embeddings=drop_profile_embeddings,
     ))
     routes.extend(get_token_routes())
+    routes.extend(get_auth_routes(conversation_storage))
     routes.extend(get_system_vars_routes())
     routes.extend(get_file_routes())
     routes.extend(get_conversation_routes(

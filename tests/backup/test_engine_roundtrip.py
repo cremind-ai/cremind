@@ -49,8 +49,14 @@ def _populate(system_dir: Path):
     now = time.time()
     eng = get_database_provider().sync_engine()
     with eng.begin() as c:
+        # A non-zero token_serial: the restored token must be minted at the
+        # serial the archive carries, not at 0 — otherwise every re-minted
+        # recovery token is rejected on sight as revoked.
         c.execute(
-            text("INSERT INTO profiles (id, name, created_at, updated_at) VALUES ('p1','admin',:t,:t)"),
+            text(
+                "INSERT INTO profiles (id, name, created_at, updated_at, token_serial) "
+                "VALUES ('p1','admin',:t,:t,5)"
+            ),
             {"t": now},
         )
         c.execute(
@@ -147,6 +153,8 @@ def _do_roundtrip(restore_env, tmp_path, passphrase):
     tok = (dst / "tokens" / "admin.token").read_text(encoding="utf-8").strip()
     decoded = _jwt.decode(tok, _DST_SECRET, algorithms=["HS256"])
     assert decoded["sub"] == "admin"
+    # ...and at the archived generation, so it validates against the restored row.
+    assert decoded["tsr"] == 5
     with pytest.raises(_jwt.InvalidTokenError):
         _jwt.decode(tok, _SRC_SECRET, algorithms=["HS256"])
 

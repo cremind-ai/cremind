@@ -29,7 +29,7 @@ Tables
 import uuid
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, false
+from sqlalchemy import JSON, Boolean, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, false, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from a2a.server.models import Base
@@ -42,6 +42,15 @@ class ProfileModel(Base):
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+    # Session-token generation counter. Mirrored into every minted JWT as the
+    # ``tsr`` claim and compared on every decode (see :mod:`app.auth.serial`), so
+    # bumping it revokes every token previously issued to this profile. A
+    # DB-level ``server_default`` is required, not just the ORM ``default``:
+    # ``app/utils/client_storage.py`` inserts the ``__server__`` pseudo-profile
+    # with raw SQL that names only the four columns above.
+    token_serial: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
 
 
 class ChannelModel(Base):

@@ -1217,11 +1217,12 @@ def get_config_routes(state: BootedState) -> list[Route]:
 
         token, expires_at = _generate_token(jwt_secret, profile_name)
 
-        # Persist token to disk for recovery
-        tokens_dir = Path(BaseConfig.CREMIND_SYSTEM_DIR) / "tokens"
-        tokens_dir.mkdir(parents=True, exist_ok=True)
-        token_file = tokens_dir / f"{profile_name}.token"
-        token_file.write_text(token, encoding="utf-8")
+        # Persist token to disk for recovery. Goes through the shared writer so
+        # setup gets the same atomic replace + 0600 as ``cremind auth
+        # regenerate`` — other processes read this file live.
+        from app.auth import write_token_file
+
+        token_file = write_token_file(profile_name, token)
         logger.info(f"Token saved to {token_file}")
 
         # Bind built-in tool LLMs, (re)sync skills, and reconcile documents for

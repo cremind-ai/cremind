@@ -555,6 +555,10 @@ def _reissue_profile_tokens(engine, target_system_dir: str, secret: str) -> None
     fresh recovery token signed with THIS installation's secret, so the token
     files stay valid for CLI use / login-by-paste. Best-effort per profile — a
     single failure must never abort the restore.
+
+    Each token is minted at the serial the **restored** row carries, read from
+    the restore engine rather than the live one. Minting at 0 instead would
+    produce tokens that every decode site rejects on sight.
     """
     from sqlalchemy import text
 
@@ -562,16 +566,27 @@ def _reissue_profile_tokens(engine, target_system_dir: str, secret: str) -> None
 
     try:
         with engine.connect() as conn:
-            names = [r[0] for r in conn.execute(text("SELECT name FROM profiles"))]
+            try:
+                rows = [
+                    (r[0], int(r[1] or 0))
+                    for r in conn.execute(text("SELECT name, token_serial FROM profiles"))
+                ]
+            except Exception:  # noqa: BLE001
+                # Archive predates the revocation column. Migrations run later
+                # (``ensure_at_head`` from ConversationStorage.initialize), and
+                # they backfill these rows to 0 — which is what we mint at.
+                rows = [
+                    (r[0], 0) for r in conn.execute(text("SELECT name FROM profiles"))
+                ]
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[backup:restore] could not list profiles to re-mint tokens: {e}")
         return
 
     tokens_dir = Path(target_system_dir) / "tokens"
-    for name in names:
+    for name, serial in rows:
         try:
             tokens_dir.mkdir(parents=True, exist_ok=True)
-            token, _exp = BaseConfig.mint_token(name, secret=secret)
+            token, _exp = BaseConfig.mint_token(name, secret=secret, serial=serial)
             (tokens_dir / f"{name}.token").write_text(token, encoding="utf-8")
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[backup:restore] could not re-mint token for profile {name!r}: {e}")

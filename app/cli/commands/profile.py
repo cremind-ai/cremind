@@ -80,7 +80,8 @@ def profile_use(
         available = session.list_profiles()
         hint = f" Available: {', '.join(available)}." if available else ""
         typer.echo(
-            f"profile '{name}' has no token file under {session.tokens_dir()}.{hint}",
+            f"profile '{name}' has no token file under {session.tokens_dir()}.{hint}"
+            f" Mint one with `cremind auth regenerate --local --profile {name}`.",
             err=True,
         )
         raise typer.Exit(code=1)

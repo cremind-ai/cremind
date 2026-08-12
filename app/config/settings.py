@@ -389,15 +389,25 @@ class BaseConfig:
 
     @classmethod
     def mint_token(
-        cls, profile: str, secret: str | None = None, hours: int | None = None
+        cls,
+        profile: str,
+        secret: str | None = None,
+        hours: int | None = None,
+        serial: int | None = None,
     ) -> tuple[str, str]:
         """Mint an HS256 session JWT for a profile. Returns (token, expires_at).
 
         Single source of truth for the session-token claim shape, shared by the
-        setup wizard (``app/api/config.py``) and the restore engine
+        setup wizard (``app/api/config.py``), the rotation helper
+        (``app/auth/tokens.py``) and the restore engine
         (``app/backup/engine.py``, which re-mints token files under the local
         secret). ``secret`` defaults to the live installation secret; ``hours``
         defaults to ``JWT_EXPIRATION_HOURS``.
+
+        ``serial`` is the profile's revocation counter, carried as the ``tsr``
+        claim; it defaults to the profile's current value. Pass it explicitly
+        when the authoritative value doesn't come from the live DB — restore
+        reads it out of the archive.
         """
         import jwt
         from datetime import datetime, timedelta, timezone
@@ -405,10 +415,22 @@ class BaseConfig:
         key = secret or cls.get_jwt_secret()
         if hours is None:
             hours = cls.JWT_EXPIRATION_HOURS
+        if serial is None:
+            # Imported in-body (like ``jwt`` above): app.auth.serial reaches
+            # into the DB layer, and this module has to stay importable during
+            # setup mode and in unit tests where no provider exists — hence the
+            # fallback to 0, which is what an un-rotated profile is at anyway.
+            try:
+                from app.auth.serial import current_serial
+
+                serial = current_serial(profile)
+            except Exception:  # noqa: BLE001
+                serial = 0
         now = datetime.now(timezone.utc)
         payload = {
             "sub": profile,
             "profile": profile,
+            "tsr": int(serial),
             "iat": now,
             "exp": now + timedelta(hours=hours),
         }

@@ -23,11 +23,24 @@ def require_auth(request: Request) -> JSONResponse | None:
     return None
 
 
+def is_admin(request: Request) -> bool:
+    """Whether the caller is the ``admin`` profile.
+
+    The boolean form of :func:`require_admin`, for routes that need to *branch*
+    on admin-ness (e.g. "your own profile, or any profile if you're admin")
+    rather than reject outright.
+    """
+    return (
+        getattr(request.user, "is_authenticated", False)
+        and getattr(request.user, "username", "") == "admin"
+    )
+
+
 def require_admin(request: Request) -> JSONResponse | None:
     unauth = require_auth(request)
     if unauth is not None:
         return unauth
-    if getattr(request.user, "username", "") != "admin":
+    if not is_admin(request):
         return JSONResponse(
             {"error": "Admin profile required"}, status_code=403,
         )

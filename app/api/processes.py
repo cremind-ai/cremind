@@ -17,13 +17,12 @@ import json
 import time
 from typing import Any, Dict, Optional
 
-import jwt
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from app.config.settings import BaseConfig
+from app.auth import verify_token
 from app.storage import get_autostart_storage
 from app.tools.builtin.exec_shell import (
     list_processes,
@@ -61,19 +60,16 @@ def _require_auth(request: Request) -> Optional[JSONResponse]:
 
 
 def _decode_ws_token(token: str) -> Optional[Dict[str, Any]]:
-    """Decode the JWT used for WebSocket auth.
+    """Decode and validate the JWT used for WebSocket auth.
 
-    Mirrors ``JWTAuthBackend.authenticate``.  Returns the decoded payload
-    (a dict) on success, ``None`` on any failure.  Callers should treat
-    any ``None`` result as "close with 1008".
+    WebSockets bypass ``AuthenticationMiddleware`` entirely, so this is a real
+    gate, not a convenience — signature, expiry, and revocation all have to be
+    checked here. Returns the decoded payload on success, ``None`` on any
+    failure; callers should treat ``None`` as "close with 1008".
+
+    ``app/api/terminals.py`` imports this too — keep both paths on one helper.
     """
-    secret = BaseConfig.get_jwt_secret()
-    if not secret or not token:
-        return None
-    try:
-        return jwt.decode(token, secret, algorithms=["HS256"])
-    except jwt.InvalidTokenError:
-        return None
+    return verify_token(token)
 
 
 def get_process_routes() -> list:

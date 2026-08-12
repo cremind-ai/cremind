@@ -11,6 +11,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from app.api.config import PROFILE_NAME_PATTERN
+from app.auth import delete_token_file
 from app.skills import initialize_profile_skills, teardown_profile_skills
 from app.storage.conversation_storage import ConversationStorage
 from app.tools import ToolRegistry
@@ -160,6 +161,17 @@ def get_profile_routes(
             if not success:
                 return JSONResponse(
                     {"error": f"Profile '{profile_name}' not found"}, status_code=404,
+                )
+
+            # Drop the profile's token file. Not just tidiness: the serial that
+            # backs revocation lives on the profile row, so recreating a profile
+            # of the same name restarts it at 0 — and an orphaned token file
+            # from the *old* profile would then validate against the new one.
+            try:
+                delete_token_file(profile_name)
+            except Exception:  # noqa: BLE001 — never block the delete
+                logger.exception(
+                    f"Could not remove the token file for deleted profile '{profile_name}'"
                 )
 
             # Stop the watcher, drop the profile's skill rows, and remove the

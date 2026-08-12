@@ -33,6 +33,7 @@ from app.cli.commands import serve as serve_cmd
 from app.cli.commands import system_vars as system_vars_cmd
 from app.cli.commands import usage as usage_cmd
 from app.cli.commands.agents import agents_app
+from app.cli.commands.auth import auth_app
 from app.cli.commands.backup import backup_app
 from app.cli.commands.blueprint import blueprint_app
 from app.cli.commands.calendar import calendar_app
@@ -118,24 +119,35 @@ def _root(
     ctx.ensure_object(dict)
     ctx.obj["cfg"] = cfg
     ctx.obj["mode"] = OutputMode.from_config(cfg)
+    # The raw root --profile / CREMIND_PROFILE. Commands that need the profile
+    # *name* rather than a resolved token — notably `auth --local`, which runs
+    # with no token at all — read it from here.
+    ctx.obj["profile"] = profile
 
 
 # Top-level commands that never call the server — never prompt for a profile.
 _TOKEN_FREE_COMMANDS = {"version", "setup", "serve"}
 # `profile` subcommands that manage the local session and need no token.
 _PROFILE_SESSION_SUBCOMMANDS = {"use", "which", "clear"}
+# `auth` subcommands that must run without a usable token. `show` only reads a
+# token file. (`--local` is handled separately — it's a flag, not a subcommand.)
+# These are recovery paths: resolving a token here, and hard-failing when there
+# isn't one, is exactly what must not happen.
+_AUTH_TOKEN_FREE_SUBCOMMANDS = {"show"}
 
 
 def _should_resolve_profile(ctx: typer.Context) -> bool:
     """Whether the invoked command warrants resolving a profile/token.
 
     Skips shell-completion, bare `cremind`/`--help`, the token-free top-level
-    commands, and the local `profile use/which/clear` subcommands (so listing or
-    clearing the session never triggers the picker).
+    commands, the local `profile use/which/clear` subcommands (so listing or
+    clearing the session never triggers the picker), and the `auth` recovery
+    paths (`auth show`, and anything with `--local`) — those exist precisely for
+    when there is no usable token to resolve.
 
     The deep subcommand under a group isn't available via the Click API at the
-    root-callback stage (its context isn't built yet), so the `profile` check
-    reads `sys.argv` — authoritative for the `cremind` entry point.
+    root-callback stage (its context isn't built yet), so the group checks read
+    `sys.argv` — authoritative for the `cremind` entry point.
     """
     if ctx.resilient_parsing:  # shell completion
         return False
@@ -147,15 +159,22 @@ def _should_resolve_profile(ctx: typer.Context) -> bool:
     argv = sys.argv[1:]
     if "-h" in argv or "--help" in argv:
         return False
-    if sub == "profile" and _profile_subcommand(argv) in _PROFILE_SESSION_SUBCOMMANDS:
+    if sub == "profile" and _group_subcommand(argv, "profile") in _PROFILE_SESSION_SUBCOMMANDS:
         return False
+    if sub == "auth":
+        # `--local` is a valueless bool flag and `auth` takes no positional
+        # arguments, so a bare membership test can't false-positive on a value.
+        if "--local" in argv:
+            return False
+        if _group_subcommand(argv, "auth") in _AUTH_TOKEN_FREE_SUBCOMMANDS:
+            return False
     return True
 
 
-def _profile_subcommand(argv: list[str]) -> Optional[str]:
-    """The first positional token after `profile` in `argv` (its subcommand)."""
+def _group_subcommand(argv: list[str], group: str) -> Optional[str]:
+    """The first positional token after `group` in `argv` (its subcommand)."""
     try:
-        idx = argv.index("profile")
+        idx = argv.index(group)
     except ValueError:
         return None
     for tok in argv[idx + 1 :]:
@@ -181,8 +200,9 @@ def _resolve_token(cfg, explicit_profile: Optional[str]):
     if not tok:
         if explicit_profile:
             typer.echo(
-                f"profile '{chosen}' has no token file under "
-                f"{session.tokens_dir()} — run `cremind setup` or check the name.",
+                f"profile '{chosen}' has no token file under {session.tokens_dir()} — "
+                f"run `cremind auth regenerate --local --profile {chosen}` to mint one, "
+                "or `cremind setup`, or check the name.",
                 err=True,
             )
             raise typer.Exit(code=1)
@@ -214,6 +234,7 @@ app.command(
 )(usage_cmd.usage)
 
 app.add_typer(profile_app, name="profile")
+app.add_typer(auth_app, name="auth")
 app.add_typer(conv_app, name="conv")
 app.add_typer(tools_app, name="tools")
 app.add_typer(llm_app, name="llm")

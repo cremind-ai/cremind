@@ -983,6 +983,11 @@ class ConversationStorage:
 
     @staticmethod
     def _profile_to_dict(profile: ProfileModel) -> dict:
+        # Deliberately omits ``token_serial``: this feeds ``GET /api/profiles``
+        # *and* ``handle_list_profile_names``, which is a public unauthenticated
+        # route (the login-screen dropdown). Read the serial through
+        # ``app.auth.serial`` instead — ``GET /api/auth/status`` exposes it to
+        # the profile's own authenticated caller.
         return {
             "id": profile.id,
             "name": profile.name,

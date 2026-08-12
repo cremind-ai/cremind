@@ -91,6 +91,57 @@ def has_token(profile: str) -> bool:
     return read_token(profile) is not None
 
 
+def write_token(profile: str, token: str) -> Path:
+    """Write ``<system_dir>/tokens/<profile>.token`` atomically; 0600 on POSIX.
+
+    Returns the path written. Used after ``cremind auth regenerate`` so this
+    host's credential store matches the token just minted — without it a
+    rotation locks the CLI that performed it out of the server.
+
+    Atomicity matters because other processes read this file live (every
+    ``cremind`` command, and every ``exec_shell`` spawn): the token goes to a
+    sibling temp file, is chmod'ed while it still has a non-token name, then
+    ``os.replace``'d onto the final path (atomic on POSIX and Windows). The temp
+    name deliberately does not end in ``.token``, so a concurrent
+    :func:`list_profiles` can never surface a half-written profile.
+
+    Unlike :func:`_save_sessions`, failures are **not** swallowed: the caller has
+    just rotated the profile's serial, so the previous token is already dead — a
+    silent write failure would leave the user with no working credential and no
+    indication why.
+    """
+    if not profile:
+        raise ValueError("profile is required")
+    if not token:
+        raise ValueError("token is required")
+
+    directory = tokens_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    if os.name == "posix":
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass  # best-effort; a shared dir is not fatal
+
+    path = directory / f"{profile}{_TOKEN_SUFFIX}"
+    tmp = directory / f".{profile}{_TOKEN_SUFFIX}.tmp"
+    try:
+        tmp.write_text(token, encoding="utf-8")
+        if os.name == "posix":
+            # Before the rename, so the token is never briefly world-readable
+            # under its final name. On Windows os.chmod only toggles the
+            # read-only bit, which would be misleading — skip it there.
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
 # ── per-terminal session state ─────────────────────────────────────────────
 
 
