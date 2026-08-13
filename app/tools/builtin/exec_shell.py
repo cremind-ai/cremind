@@ -21,6 +21,7 @@ import json
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import time
 import uuid as _uuid
@@ -65,29 +66,44 @@ def _shell_for(system: str) -> tuple[str, str]:
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 
-def _kill_process_tree(pid: Optional[int]) -> None:
+def _kill_process_tree(pid: Optional[int], *, timeout: float = 15.0) -> None:
     """Forcibly terminate *pid* and all of its descendants.
 
     ``Process.terminate()`` only signals the spawned shell, not the grandchild
     it launched (e.g. ``pwsh -> uv run -> python``). That grandchild can hold
-    open file handles inside a skill directory (``scripts/.listener.lock`` on
-    Windows), which then blocks ``shutil.rmtree`` and keeps a single-instance
+    open file handles inside a skill directory (``scripts/.listener.lock``),
+    which then blocks ``shutil.rmtree`` on Windows and keeps a single-instance
     listener's lock held so it can't be re-registered. Killing the whole tree
     releases those handles.
 
-    Windows uses ``taskkill /T /F``; POSIX relies on the caller's
-    ``stop_process`` (terminate/kill of the leader) plus the fact that an open
-    file does not prevent directory removal on Unix.
+    Windows uses ``taskkill /T /F``. POSIX kills the process *group*: children
+    are spawned with ``start_new_session=True`` (see ``_spawn_command``) so the
+    leader is a group leader and one ``killpg`` reaches ``uv run -> python``
+    too. Falls back to signalling the leader alone if the group is gone.
+
+    ``timeout`` bounds the Windows ``taskkill`` call — the shutdown reap runs
+    inside a hard time budget and can't afford the default here.
     """
     if not pid:
         return
     if os.name != "nt":
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        except OSError:
+            # No process group (spawned before this behaviour, or already
+            # reaped) — fall back to the leader.
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
         return
     try:
         subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"],
             capture_output=True,
-            timeout=15,
+            timeout=timeout,
             creationflags=_CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
@@ -429,6 +445,17 @@ async def _spawn_command(
             stderr=asyncio.subprocess.PIPE,
             cwd=working_dir,
             env=env,
+            # Own process group, so _kill_process_tree can killpg the whole
+            # `bash -> uv run -> python` chain. Without it, terminating the
+            # leader strands the grandchild, which then keeps holding a skill
+            # listener's .listener.lock across a server restart.
+            #
+            # Trade-off: these children no longer sit in the server's foreground
+            # process group, so a terminal Ctrl+C stops reaching them
+            # incidentally. The explicit reap in stop_all_managed_processes()
+            # covers that — and covers SIGTERM / `docker stop`, where the group
+            # broadcast never happened in the first place.
+            start_new_session=True,
         )
     return proc
 
@@ -1485,6 +1512,59 @@ async def stop_processes_for_profile(
             continue
         stopped += 1
     return stopped
+
+
+async def stop_all_managed_processes(*, kill_timeout: float = 2.0) -> int:
+    """Kill every managed subprocess, across all profiles. Returns the count.
+
+    Called from the server's shutdown hook. Without it, autostart-spawned
+    children outlive the server: nothing persists their pids, so the next boot
+    can't see them, and a skill listener orphaned this way keeps holding
+    ``scripts/.listener.lock`` — which is exactly why gcalendar's autostart
+    would then fail every retry with "another listener is already running".
+
+    Deliberately leaner than :func:`stop_process`: no log draining, no state
+    files, no bus publishing. The process is exiting, and ``_do_shutdown`` runs
+    under a hard time budget (``SHUTDOWN_TIMEOUT_S``), so this only does the one
+    thing that must happen — release the OS resources — and does it for all
+    processes concurrently.
+    """
+    entries = list(_process_registry.items())
+    if not entries:
+        return 0
+
+    def _kill(info: "ProcessInfo") -> None:
+        process = info.process
+        pid = getattr(process, "pid", None)
+        try:
+            if process.returncode is None:
+                _kill_process_tree(pid, timeout=kill_timeout)
+        except Exception:  # noqa: BLE001
+            logger.warning(f"shutdown: kill tree failed for pid {pid}", exc_info=True)
+        try:
+            if process.returncode is None:
+                process.terminate()
+        except (ProcessLookupError, OSError):
+            pass
+        except Exception:  # noqa: BLE001
+            logger.warning(f"shutdown: terminate failed for pid {pid}", exc_info=True)
+
+    # taskkill/killpg are blocking calls; run them off the event loop so one
+    # slow kill doesn't serialize the rest.
+    await asyncio.gather(
+        *(asyncio.to_thread(_kill, info) for _, info in entries),
+        return_exceptions=True,
+    )
+
+    for process_id, info in entries:
+        state = info.log_writer_state
+        if state and state.task:
+            state.stopped = True
+            state.task.cancel()
+        _process_registry.pop(process_id, None)
+
+    logger.info(f"shutdown: stopped {len(entries)} managed process(es)")
+    return len(entries)
 
 
 # ---------------------------------------------------------------------------

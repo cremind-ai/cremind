@@ -43,6 +43,30 @@ from app.utils.logger import logger
 _URL_PREFIXES = ("http://", "https://", "ftp://", "file://", "git@", "ssh://", "git+")
 
 
+class _AlreadyRunning(str):
+    """Sentinel returned in :func:`spawn_from_autostart`'s error slot.
+
+    A subclass of ``str`` so the existing ``if error:`` call sites keep working
+    and it still logs/serializes readably, while callers that care can test
+    ``error is ALREADY_RUNNING`` instead of re-matching stderr text.
+    """
+
+    __slots__ = ()
+
+
+ALREADY_RUNNING = _AlreadyRunning("listener already running")
+
+# Every lock-based skill listener (gcalendar, gdrive, jira) prints this exact
+# phrase and exits 1 when it can't take scripts/.listener.lock. That isn't a
+# failure to spawn — it means the work is already being done — so it must not be
+# retried or escalated into a high-priority alert.
+_ALREADY_RUNNING_MARKER = "is already running for this skill"
+
+
+def _is_already_running(*streams: str) -> bool:
+    return any(_ALREADY_RUNNING_MARKER in (s or "").lower() for s in streams)
+
+
 def normalize_command_paths(command: str, working_dir: str) -> str:
     """Rewrite relative path tokens in *command* to use the OS-native separator.
 
@@ -83,15 +107,17 @@ def _is_under(candidate: str, root: Path) -> bool:
     return cp == root or root in cp.parents
 
 
-async def teardown_processes_for_dir(directory: Path, *, profile: Optional[str]) -> dict:
-    """Stop every long-running process bound to *directory* and drop its autostart row.
+async def stop_processes_for_dir(directory: Path, *, profile: Optional[str]) -> list:
+    """Stop every long-running process bound to *directory*; return their ids.
 
-    Called before a skill directory is deleted or reset: a running listener
-    holds OS file handles inside the directory (which blocks ``rmtree`` on
-    Windows), and a lingering autostart registration would respawn the process
-    from a directory that is gone or has been reset.
+    The kill half of :func:`teardown_processes_for_dir`, separated so callers
+    that are about to *respawn* a listener can reclaim the old one without also
+    deleting its autostart registration.
 
-    Returns ``{"stopped": [pid], "removed_autostart": int}``.
+    Killing the whole tree matters here: the tracked leader is a shell wrapper,
+    and it's the ``uv run -> python`` grandchild that holds
+    ``scripts/.listener.lock``. Signalling only the leader would leave the lock
+    held and the very next spawn would exit "already running".
     """
     root = directory.resolve()
 
@@ -106,6 +132,21 @@ async def teardown_processes_for_dir(directory: Path, *, profile: Optional[str])
             await stop_process(pid, profile=info.profile or (profile or ""))
         except Exception:  # noqa: BLE001
             logger.warning(f"stop_process failed for {pid}", exc_info=True)
+    return [pid for pid, _ in matched]
+
+
+async def teardown_processes_for_dir(directory: Path, *, profile: Optional[str]) -> dict:
+    """Stop every long-running process bound to *directory* and drop its autostart row.
+
+    Called before a skill directory is deleted or reset: a running listener
+    holds OS file handles inside the directory (which blocks ``rmtree`` on
+    Windows), and a lingering autostart registration would respawn the process
+    from a directory that is gone or has been reset.
+
+    Returns ``{"stopped": [pid], "removed_autostart": int}``.
+    """
+    root = directory.resolve()
+    stopped = await stop_processes_for_dir(directory, profile=profile)
 
     removed = 0
     try:
@@ -118,9 +159,9 @@ async def teardown_processes_for_dir(directory: Path, *, profile: Optional[str])
     except Exception:  # noqa: BLE001
         logger.warning("autostart cleanup failed during skill teardown", exc_info=True)
 
-    if matched or removed:
+    if stopped or removed:
         publish_process_list_changed(profile)
-    return {"stopped": [pid for pid, _ in matched], "removed_autostart": removed}
+    return {"stopped": stopped, "removed_autostart": removed}
 
 
 async def _sanity_check(proc, delay: float = 2.0) -> Optional[int]:
@@ -239,6 +280,20 @@ async def spawn_from_autostart(
             stdout, stderr = ("", "")
             if not is_pty:
                 stdout, stderr = await _drain_early_output(proc)
+            if _is_already_running(stdout, stderr):
+                # Another live process already holds this listener's lock —
+                # nothing to fix and nothing to retry, since every attempt would
+                # hit the same held lock.
+                logger.info(
+                    f"autostart[{row.get('id')}]: listener already running; "
+                    f"leaving the existing process in place"
+                )
+                if is_pty:
+                    try:
+                        proc.close_master()  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+                return None, ALREADY_RUNNING
             detail_parts = [f"exit code {early_rc}"]
             if stderr:
                 detail_parts.append(f"stderr: {stderr}")
@@ -311,7 +366,12 @@ async def spawn_from_autostart(
 async def _spawn_one(storage: AutostartStorage, row: Dict[str, Any]) -> None:
     process_id, error = await spawn_from_autostart(row)
     try:
-        if error:
+        if error is ALREADY_RUNNING:
+            # Not a failure: the listener this row describes is already up (an
+            # orphan from a previous run, or a manually started copy). Clear any
+            # stale error so the row doesn't keep showing as failed.
+            storage.clear_error(row["id"])
+        elif error:
             storage.set_error(row["id"], error)
             # Spawn failed at boot — the row will surface in list_processes
             # as ``failed_to_autostart``; push the change so the UI lights it

@@ -398,17 +398,26 @@ records an autostart row. Idempotent: a second call against an
 already-running listener returns the existing process and autostart
 ids without duplicating.
 
+A listener the server already tracks for that skill is stopped first, so this
+acts as a restart. If a listener is running that the server does *not* track —
+typically one orphaned by an earlier server run, which still holds the skill's
+single-instance lock — the command reports `status: already running` and
+succeeds without starting a second copy. That is a success, not an error: the
+listener the caller wanted is up.
+
 Prints a key-value table:
 
 | Row             | Meaning                                                    |
 |-----------------|------------------------------------------------------------|
-| `process_id`    | Live process id (use with `cremind proc attach`).              |
+| `status`        | `started`, or `already running` when an untracked copy holds the lock. |
+| `process_id`    | Live process id (use with `cremind proc attach`). Absent when already running. |
 | `autostart_id`  | Autostart registration id (use with `cremind proc autostart delete` to undo). |
 
 **Example.**
 
 ```bash
 $ cremind skill-events listener-start daily-brief
+status        started
 process_id    p_9d72
 autostart_id  a_8c14
 ```

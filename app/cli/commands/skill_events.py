@@ -405,7 +405,16 @@ def skill_events_listener_start(
     if mode.json:
         print_json(out)
         return
+    if out.get("already_running"):
+        # The listener is up but this server didn't spawn it (typically orphaned
+        # by an earlier run), so there's no process_id to show. Still a success.
+        print_kv([
+            ("status", "already running"),
+            ("autostart_id", str(out.get("autostart_id", ""))),
+        ])
+        return
     print_kv([
+        ("status", "started"),
         ("process_id", string_field(out, "process_id")),
         ("autostart_id", str(out.get("autostart_id", ""))),
     ])

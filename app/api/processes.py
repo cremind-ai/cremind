@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from starlette.requests import Request
@@ -38,7 +39,11 @@ from app.tools.builtin.exec_shell import (
 )
 from app.events.processes_bus import get_processes_stream_bus
 from starlette.responses import StreamingResponse
-from app.tools.builtin.exec_shell_autostart import spawn_from_autostart
+from app.tools.builtin.exec_shell_autostart import (
+    ALREADY_RUNNING,
+    spawn_from_autostart,
+    stop_processes_for_dir,
+)
 from app.utils.logger import logger
 
 
@@ -406,7 +411,16 @@ def get_process_routes() -> list:
             return JSONResponse({"error": "Not found"}, status_code=404)
         if profile and row.get("profile") and row["profile"] != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
+        # Reclaim any live process still bound to this row's directory, so a
+        # re-run replaces the old listener instead of colliding with its lock.
+        working_dir = row.get("working_dir")
+        if working_dir:
+            await stop_processes_for_dir(Path(working_dir), profile=profile)
         process_id, error = await spawn_from_autostart(row)
+        if error is ALREADY_RUNNING:
+            storage.clear_error(autostart_id)
+            publish_process_list_changed(profile)
+            return JSONResponse({"ok": True, "already_running": True})
         if error:
             storage.set_error(autostart_id, error)
             publish_process_list_changed(profile)

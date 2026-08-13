@@ -34,7 +34,11 @@ from app.storage import (
     get_event_subscription_storage,
 )
 from app.tools.builtin.exec_shell import publish_process_list_changed
-from app.tools.builtin.exec_shell_autostart import spawn_from_autostart
+from app.tools.builtin.exec_shell_autostart import (
+    ALREADY_RUNNING,
+    spawn_from_autostart,
+    stop_processes_for_dir,
+)
 from app.tools.builtin.register_skill_event import _resolve_skill_source
 from app.utils.logger import logger
 
@@ -413,7 +417,21 @@ def get_event_routes() -> list[Route]:
                 is_pty=False,
             )
             publish_process_list_changed(profile)
+        # A listener this server already tracks for the same directory would
+        # hold scripts/.listener.lock and make the new spawn exit immediately.
+        # Reclaim it first so Start behaves as a restart.
+        await stop_processes_for_dir(Path(scripts_dir), profile=profile)
         process_id, error = await spawn_from_autostart(row)
+        if error is ALREADY_RUNNING:
+            # An untracked copy holds the lock (typically orphaned by a previous
+            # server run). The listener IS running, so this is a success, not a
+            # spawn failure — reporting 400 here is what made the UI look broken.
+            autostart_storage.clear_error(row["id"])
+            publish_process_list_changed(profile)
+            publish_skill_events_admin_changed(profile)
+            return JSONResponse(
+                {"ok": True, "already_running": True, "autostart_id": row["id"]}
+            )
         if error:
             autostart_storage.set_error(row["id"], error)
             publish_process_list_changed(profile)

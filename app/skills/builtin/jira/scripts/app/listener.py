@@ -14,6 +14,7 @@ Architecture (token-less relay):
 """
 from __future__ import annotations
 
+import atexit
 import errno
 import json
 import os
@@ -21,6 +22,7 @@ import re
 import secrets
 import signal
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -56,6 +58,40 @@ def _install_signal_handlers() -> None:
 
 
 _instance_lock = None  # held open for the process lifetime to enforce single-instance
+
+
+# Liveness marker polled by the Events page (GET /api/skills/<name>/listener-status).
+# The server calls the listener down once this file goes stale, so refresh well
+# inside its window: 30s against the server's 90s, same ratio imap-email uses.
+_HEARTBEAT_INTERVAL_S = 30.0
+_last_heartbeat = 0.0
+
+
+def _touch_heartbeat(force: bool = False) -> None:
+    """Refresh the liveness marker, at most once per _HEARTBEAT_INTERVAL_S.
+
+    The relay wait loop ticks twice a second, so the throttle keeps this from
+    becoming a syscall storm. ``force`` bypasses it for the first beat, so the
+    UI flips to "running" as soon as the listener is up rather than 30s later.
+    """
+    global _last_heartbeat
+    now = time.monotonic()
+    if not force and (now - _last_heartbeat) < _HEARTBEAT_INTERVAL_S:
+        return
+    _last_heartbeat = now
+    try:
+        config.HEARTBEAT_FILE.touch()
+    except OSError as e:
+        log.debug("failed to touch heartbeat: %s", e)
+
+
+def _remove_heartbeat() -> None:
+    """Drop the marker on a clean exit, so the UI reports stopped immediately
+    instead of waiting out the staleness window."""
+    try:
+        config.HEARTBEAT_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _acquire_single_instance() -> bool:
@@ -385,6 +421,13 @@ def run() -> None:
             "exiting to avoid duplicate event files", config.LOCK_FILE
         )
         raise SystemExit(1)
+    # We hold the lock, so this process IS the listener for this skill.
+    # atexit rather than a bare call at the end of run(): every exit path
+    # after this point (discovery SystemExit, the shutdown-while-waiting
+    # return, an unhandled exception) must clear the marker, or the UI
+    # keeps calling a dead listener healthy until the file goes stale.
+    _touch_heartbeat(force=True)
+    atexit.register(_remove_heartbeat)
     for _name in config.EVENT_NAMES:
         config.event_dir(_name).mkdir(parents=True, exist_ok=True)
 
@@ -399,6 +442,7 @@ def run() -> None:
             if not announced:
                 log.warning("%s — waiting; will start automatically once linked", e)
                 announced = True
+            _touch_heartbeat()  # alive, just waiting to be linked
             _shutdown.wait(timeout=5)
     if data is None:
         return
@@ -442,6 +486,7 @@ def run() -> None:
     try:
         while relay_thread.is_alive() and not _shutdown.is_set():
             relay_thread.join(timeout=0.5)
+            _touch_heartbeat()
     except KeyboardInterrupt:
         pass
     _shutdown.set()

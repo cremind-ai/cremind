@@ -394,6 +394,17 @@ async def _do_shutdown() -> None:
     except Exception:  # noqa: BLE001
         logger.exception("Error stopping channel adapters during shutdown")
     try:
+        from app.tools.builtin.exec_shell import stop_all_managed_processes
+
+        # Sub-bounded on purpose: a wedged taskkill/killpg must not eat the
+        # whole SHUTDOWN_TIMEOUT_S budget and stall a container restart. Skipping
+        # a kill only costs us an orphan — the thing we already tolerate today.
+        await asyncio.wait_for(stop_all_managed_processes(), timeout=3.0)
+    except asyncio.TimeoutError:
+        logger.warning("Timed out stopping managed processes during shutdown")
+    except Exception:  # noqa: BLE001
+        logger.exception("Error stopping managed processes during shutdown")
+    try:
         from app.api.terminals import close_all_terminals
 
         await close_all_terminals()
