@@ -137,6 +137,51 @@ def apply_max_tokens(
         params["max_tokens"] = max_tokens
 
 
+# ---------------------------------------------------------------------------
+# reasoning_effort vs function tools
+# ---------------------------------------------------------------------------
+#
+# Some models reject an explicit ``reasoning_effort`` when function tools are
+# attached, on Chat Completions specifically:
+#
+#   Function tools with reasoning_effort are not supported for gpt-5.4-mini in
+#   /v1/chat/completions. To use function tools, use /v1/responses or set
+#   reasoning_effort to 'none'.
+#
+# Verified against the live API: with tools attached, *omitting* the parameter
+# is accepted, as is ``'none'``. We omit rather than send ``'none'`` — omitting
+# leaves the model reasoning at its own default, whereas ``'none'`` would switch
+# reasoning off altogether. Omitting also avoids assuming ``'none'`` is a valid
+# enum value on whatever endpoint we're actually talking to.
+#
+# Purely adaptive, with no model-name list: the restriction is per-model and
+# per-endpoint (gpt-5.4-mini has it, its larger siblings may not), so we learn it
+# from the one rejected request and memoize.
+
+_TOOLS_REASONING_CONFLICT_MARKERS = (
+    "function tools with reasoning_effort",
+    "reasoning_effort are not supported",
+)
+
+_tools_reasoning_conflict_seen: set[tuple[str, str]] = set()
+
+
+def is_tools_reasoning_effort_conflict(err: Any) -> bool:
+    """Best-effort detection of the 'tools + reasoning_effort' 400."""
+    text = str(err or "").lower()
+    return bool(text) and any(m in text for m in _TOOLS_REASONING_CONFLICT_MARKERS)
+
+
+def drops_reasoning_effort_with_tools(endpoint: Optional[str], model_name: str) -> bool:
+    """Whether this endpoint+model rejects reasoning_effort alongside tools."""
+    return _memo_key(endpoint, model_name) in _tools_reasoning_conflict_seen
+
+
+def remember_tools_reasoning_conflict(endpoint: Optional[str], model_name: str) -> None:
+    """Record that this endpoint+model rejected reasoning_effort with tools."""
+    _tools_reasoning_conflict_seen.add(_memo_key(endpoint, model_name))
+
+
 def _openai_cached_tokens(usage: Any, prompt: int) -> int:
     """Extract the cached-prompt-token count from an OpenAI-style ``usage`` object.
 

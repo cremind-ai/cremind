@@ -19,10 +19,13 @@ from openai.types import ResponseFormatJSONObject, ResponseFormatJSONSchema, Res
 from .base import (
     LLMProvider,
     apply_max_tokens,
+    drops_reasoning_effort_with_tools,
     is_context_overflow,
+    is_tools_reasoning_effort_conflict,
     is_unsupported_max_tokens,
     openai_usage_breakdown,
     remember_max_completion_tokens,
+    remember_tools_reasoning_conflict,
 )
 
 
@@ -69,6 +72,7 @@ class OpenAILLMProvider(LLMProvider):
         max_attempts = (retry or 0) + 1
         attempt = 0
         renamed_max_tokens = False
+        dropped_reasoning_effort = False
         while True:
             function_calling: List[FunctionCallingResponseType] = []
             content_total = ""
@@ -97,6 +101,13 @@ class OpenAILLMProvider(LLMProvider):
                     params["response_format"] = response_format
                 if self.default_reasoning_effort is not None:
                     _re = reasoning_effort if reasoning_effort is not None else self.default_reasoning_effort
+                    # Some models reject an explicit effort when tools are
+                    # attached; omitting it is accepted and leaves the model
+                    # reasoning at its own default.
+                    if tools and drops_reasoning_effort_with_tools(
+                        self._max_tokens_endpoint, self.model_name
+                    ):
+                        _re = None
                     if _re:
                         params["reasoning_effort"] = _re
                 if tools:
@@ -182,6 +193,23 @@ class OpenAILLMProvider(LLMProvider):
                         f"retrying with max_completion_tokens"
                     )
                     continue
+                if is_tools_reasoning_effort_conflict(err) and not dropped_reasoning_effort:
+                    # This model won't take an explicit reasoning_effort while
+                    # function tools are attached. Memo it and retry without the
+                    # parameter — also off-budget, since the identical request
+                    # would fail identically. Warn rather than info: the user's
+                    # configured effort is being silently dropped for tool calls.
+                    dropped_reasoning_effort = True
+                    remember_tools_reasoning_conflict(
+                        self._max_tokens_endpoint, self.model_name
+                    )
+                    logger.warning(
+                        f"[llm:openai] {self.model_name} rejects reasoning_effort "
+                        f"when function tools are attached; dropping it for "
+                        f"tool-bearing requests (the model still reasons at its "
+                        f"own default). Use /v1/responses for explicit control."
+                    )
+                    continue
                 attempt += 1
                 if attempt >= max_attempts:
                     raise AgentException(Status.LLM_CHAT_COMPLETION_ERROR, str(err))
@@ -206,6 +234,7 @@ class OpenAILLMProvider(LLMProvider):
         max_attempts = (retry or 0) + 1
         attempt = 0
         renamed_max_tokens = False
+        dropped_reasoning_effort = False
         while True:
             function_calling: List[Dict[str, str]] = []
             function_calling_tokens = 0
@@ -231,6 +260,13 @@ class OpenAILLMProvider(LLMProvider):
                     params["response_format"] = response_format
                 if self.default_reasoning_effort is not None:
                     _re = reasoning_effort if reasoning_effort is not None else self.default_reasoning_effort
+                    # Some models reject an explicit effort when tools are
+                    # attached; omitting it is accepted and leaves the model
+                    # reasoning at its own default.
+                    if tools and drops_reasoning_effort_with_tools(
+                        self._max_tokens_endpoint, self.model_name
+                    ):
+                        _re = None
                     if _re:
                         params["reasoning_effort"] = _re
                 if tools:
@@ -305,6 +341,23 @@ class OpenAILLMProvider(LLMProvider):
                     logger.info(
                         f"[llm:openai] {self.model_name} rejected max_tokens; "
                         f"retrying with max_completion_tokens"
+                    )
+                    continue
+                if is_tools_reasoning_effort_conflict(err) and not dropped_reasoning_effort:
+                    # This model won't take an explicit reasoning_effort while
+                    # function tools are attached. Memo it and retry without the
+                    # parameter — also off-budget, since the identical request
+                    # would fail identically. Warn rather than info: the user's
+                    # configured effort is being silently dropped for tool calls.
+                    dropped_reasoning_effort = True
+                    remember_tools_reasoning_conflict(
+                        self._max_tokens_endpoint, self.model_name
+                    )
+                    logger.warning(
+                        f"[llm:openai] {self.model_name} rejects reasoning_effort "
+                        f"when function tools are attached; dropping it for "
+                        f"tool-bearing requests (the model still reasons at its "
+                        f"own default). Use /v1/responses for explicit control."
                     )
                     continue
                 attempt += 1
