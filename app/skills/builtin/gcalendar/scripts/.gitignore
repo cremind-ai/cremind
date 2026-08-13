@@ -4,5 +4,7 @@
 .listener_state.json
 .listener_state.json.tmp
 .listener_heartbeat
+.drive_grants.json
+.listener.lock
 __pycache__/
 *.pyc

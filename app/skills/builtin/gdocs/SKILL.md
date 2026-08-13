@@ -34,7 +34,7 @@ stored only on this machine** (`scripts/.google_token.json`). Runs via `uv`
 > subscribe to the **gdrive** skill's `file_changed` event (it carries the file's
 > `mime_type`, so you can filter to Docs). Drive events only cover files the user
 > granted to Cremind, so grant the document first: `gdrive grant --file <url>`,
-> **Settings → Google Drive**, or `cremind drive grant --file <url>`.
+> **Settings → GSuite**, or `cremind drive grant --file <url>`.
 
 > **Finding a document.** There is no search-by-name anywhere in Cremind — that
 > needed whole-Drive access, which Cremind no longer requests. Ask the user to paste
@@ -81,6 +81,7 @@ Run `uv run scripts/__main__.py <subcommand>`. Output is JSON.
 | `link` | — | `--no-browser` |
 | `complete-link` | `--response` | — |
 | `status` | — | — |
+| `unlink` | — | `--no-revoke`, `--yes`, `--keep-siblings`, `--dry-run` |
 | `create` | `--title` | `--text` / `--file` (initial content; else stdin) |
 | `read` | `--id` | `--format markdown\|text\|json` (default markdown) |
 | `info` | `--id` | — |
@@ -88,6 +89,33 @@ Run `uv run scripts/__main__.py <subcommand>`. Output is JSON.
 | `replace` | `--id`, `--find`, `--replace-with` | `--match-case` |
 
 `--id` accepts a bare document id or a full document URL.
+
+
+## Unlinking a Google account
+
+`unlink` is the inverse of `link`: it revokes Cremind's access at Google, then
+deletes the local credentials.
+
+```bash
+uv run scripts/__main__.py unlink              # revoke at Google, then wipe locally
+uv run scripts/__main__.py unlink --dry-run    # report what it would do, change nothing
+uv run scripts/__main__.py unlink --no-revoke  # wipe locally, leave the grant live
+```
+
+- If the revoke fails, the local credentials are **still** deleted — Cremind can no
+  longer use the account either way — and the result carries `revoked: false` with
+  an `action_required` pointing at <https://myaccount.google.com/connections>.
+  Re-running does **not** help: the refresh token is the only thing that can revoke
+  a grant, and it has just been deleted.
+- **Google revokes per app, not per skill.** Every Cremind Google skill shares one
+  OAuth client, so a sibling skill linked to the same address loses access too.
+  Those are listed under `siblings` and their now-dead tokens are cleaned up as
+  well; `--keep-siblings` leaves them in place.
+- Unlinking when nothing is linked succeeds (`unlinked: false`,
+  `reason: "not_linked"`), so it is safe to repeat.
+- `scripts/.env` is preserved — it holds configuration, not credentials.
+- Operators can do the same across every Google skill at once with
+  `cremind google unlink --all`.
 
 ## Markdown extraction
 

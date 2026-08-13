@@ -192,7 +192,7 @@ Grants are permanent until the user revokes Cremind at
 <https://myaccount.google.com/connections> (which removes **all** of them —
 Google has no per-file revoke). They survive token refresh and re-linking.
 
-The user can also grant files without you: **Settings → Google Drive** in the web
+The user can also grant files without you: **Settings → GSuite** in the web
 UI, or `cremind drive grant --file <url>` in the terminal.
 
 ## Unattended runs (event runs, schedules, file watchers)
@@ -204,7 +204,7 @@ shorter — the command gets backgrounded and abandoned while your run stalls.
 When an unattended run hits a file Cremind cannot reach:
 
 1. Send the user a notification naming the file and asking them to grant it
-   (Settings → Google Drive, or `cremind drive grant --file <id>`).
+   (Settings → GSuite, or `cremind drive grant --file <id>`).
 2. **Stop the run.** Do not retry, do not wait, do not open a consent URL.
 
 Every 403/404 from this skill returns both an `interactive_fix` and an
@@ -218,6 +218,7 @@ Run `uv run scripts/__main__.py <subcommand>`. Output is JSON.
 | `link` | — | `--no-browser` |
 | `complete-link` | `--response` | — |
 | `status` | — | — |
+| `unlink` | — | `--no-revoke`, `--yes`, `--keep-siblings`, `--dry-run` |
 | `grant` | — | `--file` (repeatable id/URL), `--single`, `--no-folders`, `--mime-types`, `--no-wait`, `--timeout` (600) |
 | `list` | — | `--compact`, `--query` (raw Drive q=), `--name`, `--folder`, `--mime-type`, `--trashed`, `--max-results` (50), `--page-token`, `--order-by` (`modifiedTime desc`) |
 | `info` | `--id` | — |
@@ -256,6 +257,39 @@ Google-native files are **exported** with sensible defaults:
 Binary/uploaded files download as-is. **Export size limit:** Google caps
 `files.export` at ~10 MB; larger Docs/Sheets exports will fail — request a smaller
 range/format or download a binary copy.
+
+
+## Unlinking a Google account
+
+`unlink` is the inverse of `link`: it revokes Cremind's access at Google, then
+deletes the local credentials.
+
+```bash
+uv run scripts/__main__.py unlink              # revoke at Google, then wipe locally
+uv run scripts/__main__.py unlink --dry-run    # report what it would do, change nothing
+uv run scripts/__main__.py unlink --no-revoke  # wipe locally, leave the grant live
+```
+
+- If the revoke fails, the local credentials are **still** deleted — Cremind can no
+  longer use the account either way — and the result carries `revoked: false` with
+  an `action_required` pointing at <https://myaccount.google.com/connections>.
+  Re-running does **not** help: the refresh token is the only thing that can revoke
+  a grant, and it has just been deleted.
+- **Google revokes per app, not per skill.** Every Cremind Google skill shares one
+  OAuth client, so a sibling skill linked to the same address loses access too.
+  Those are listed under `siblings` and their now-dead tokens are cleaned up as
+  well; `--keep-siblings` leaves them in place.
+- Unlinking when nothing is linked succeeds (`unlinked: false`,
+  `reason: "not_linked"`), so it is safe to repeat.
+- `scripts/.env` is preserved — it holds configuration, not credentials.
+- Operators can do the same across every Google skill at once with
+  `cremind google unlink --all`.
+- The Google push channel is closed **before** the revoke, because stopping it
+  needs a live credential. **Stop the listener first**: it rewrites the token file
+  after any successful refresh, so it can resurrect what this deletes. `unlink`
+  reports `listener_running: true` when it detects one.
+- **Every per-file grant dies with the grant, permanently.** Re-linking does not
+  restore them — the user has to `grant` the files again.
 
 ## Event listener
 ```bash

@@ -1,6 +1,6 @@
 """Per-file Google Drive access API.
 
-Backs the Settings -> Google Drive page and the ``cremind drive`` CLI:
+Backs the Settings -> GSuite page and the ``cremind drive`` CLI:
 
 - ``GET  /api/drive/status``           — link state, granted scopes, staleness.
 - ``GET  /api/drive/files``            — the files Cremind can actually reach.
@@ -11,8 +11,10 @@ Backs the Settings -> Google Drive page and the ``cremind drive`` CLI:
 
 Drive access itself lives with the gdrive skill (it owns the OAuth token); this
 layer only reads that token and drives the Picker. There is no revoke endpoint
-because Google offers no per-file revoke — the UI points at the user's Google
-account connections page, which removes Cremind's access wholesale.
+*here* because Google offers no per-file revoke — giving access back means
+unlinking the account wholesale, which belongs to :mod:`app.api.google`
+(``POST /api/google/accounts/gdrive/unlink``). ``revoke_url`` stays in the status
+payload as the do-it-by-hand fallback.
 """
 
 from __future__ import annotations

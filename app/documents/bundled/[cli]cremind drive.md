@@ -38,9 +38,11 @@ gdrive skill first.
 
 ## Finding this in the web UI
 
-> **Sidebar → Settings → Google Drive** — the same status, the **Grant access**
-> button (`grant`), the granted-file table (`files`), and the paste-the-redirect
-> fallback (`grant-complete`).
+> **Sidebar → Settings → GSuite**, the **Google Drive file access** group — the
+> same status, the **Grant access** button (`grant`), the granted-file table
+> (`files`), and the paste-the-redirect fallback (`grant-complete`). The
+> **Accounts** group above it is where the Google account itself is unlinked
+> (`cremind google unlink gdrive`).
 
 ## Commands
 
@@ -112,9 +114,12 @@ redirect fails and nothing is detected, the command offers to take the URL the
 browser landed on; `--json` and non-interactive runs are told to use
 `grant-complete` instead.
 
-Grants are permanent until the user revokes Cremind at
-<https://myaccount.google.com/connections>, which removes **all** of them —
-Google offers no per-file revoke, so neither does this command.
+Grants are permanent until Cremind's Drive access is revoked, which removes
+**all** of them at once — Google offers no per-file revoke, so neither does this
+command. Use **`cremind google unlink gdrive`** to do that (it revokes at Google
+*and* clears the local credential); <https://myaccount.google.com/connections> is
+the manual fallback. Either way the grants are gone for good: re-linking does not
+restore them, so the user has to pick the files again.
 
 ### `grant-complete`
 
@@ -131,7 +136,7 @@ here.
 **Never start a grant from an event run, scheduled run, or file watcher.** It
 waits for a browser consent nobody will complete. When an unattended run hits a
 file Cremind cannot reach, notify the user (name the file and point them at
-Settings → Google Drive or `cremind drive grant --file <id>`) and stop the run.
+Settings → GSuite or `cremind drive grant --file <id>`) and stop the run.
 
 ## What per-file access cannot do
 

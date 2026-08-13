@@ -5,7 +5,7 @@ reaches only files the user picked through Google's file picker plus files it
 created itself. An account linked with bring-your-own Google credentials holds
 whole-Drive access instead, and needs no grants at all — ``status`` reports which
 applies. These commands drive that picker and show what is currently reachable —
-the terminal counterpart of the **Settings -> Google Drive** page.
+the terminal counterpart of the **Settings -> GSuite** page.
 
 Linking the Google account itself belongs to the ``gdrive`` skill (it owns the
 OAuth token); this only grants files on an already-linked account.

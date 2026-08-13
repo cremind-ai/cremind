@@ -267,6 +267,17 @@ def _refresh(profile: str, data: Dict[str, Any]) -> str:
     return access
 
 
+def forget_access_token(profile: str) -> None:
+    """Drop ``profile``'s cached access token.
+
+    Load-bearing after an unlink: :func:`access_token` consults this cache
+    *before* reading the token file, and the entry is not pinned to an account, so
+    a deleted link would otherwise keep serving a working token for up to an hour
+    — with full access if the revoke at Google also failed.
+    """
+    _access_cache.pop(profile, None)
+
+
 def access_token(profile: str) -> str:
     """A usable access token for ``profile``, refreshed in memory as needed."""
     cached = _access_cache.get(profile)

@@ -48,6 +48,7 @@ from app.cli.commands.event_runs import event_runs_app
 from app.cli.commands.features import features_app
 from app.cli.commands.file_watchers import file_watchers_app
 from app.cli.commands.files import files_app
+from app.cli.commands.google import google_app
 from app.cli.commands.llm import llm_app
 from app.cli.commands.logs import logs_app
 from app.cli.commands.processes import proc_app
@@ -244,6 +245,7 @@ app.add_typer(clean_app, name="clean")
 app.add_typer(files_app, name="files")
 app.add_typer(calendar_app, name="calendar")
 app.add_typer(drive_app, name="drive")
+app.add_typer(google_app, name="google")
 app.add_typer(file_watchers_app, name="file-watchers")
 app.add_typer(skill_events_app, name="skill-events")
 app.add_typer(event_runs_app, name="event-runs")

@@ -20,6 +20,7 @@ import ScheduleEventDialog from '../components/ScheduleEventDialog.vue';
 import {
   type CalView, viewRange, titleFor, navigate, weekDays, startOfDay,
 } from '../components/calendar/calendarUtils';
+import { unlinkGoogleSkill } from '../services/googleApi';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -145,12 +146,47 @@ async function onConnectGoogle() {
     ElMessage.error(err instanceof Error ? err.message : String(err));
   }
 }
-function onSkillManagedClick() {
-  ElMessage.info(
-    `Linked through the gcalendar skill${googleEmail.value ? ` as ${googleEmail.value}` : ''}. ` +
-    'Ask in chat to re-link it, or disable the gcalendar skill to connect a different ' +
-    'account here.',
-  );
+/**
+ * The badge is what a user clicks after noticing the *wrong* Google account, so it
+ * has to offer the fix rather than describe it. Re-linking still belongs in chat
+ * (the skill owns the consent flow), but unlinking can happen right here.
+ */
+async function onSkillManagedClick() {
+  const who = googleEmail.value ? ` as ${googleEmail.value}` : '';
+  try {
+    await ElMessageBox.confirm(
+      `This calendar is linked through the gcalendar skill${who}.\n\n` +
+      'Unlinking revokes Cremind\'s access at Google and deletes the stored ' +
+      'credentials. The calendar falls back to the Google account connected on this ' +
+      'page, or to the built-in system calendar if there is none — your scheduled ' +
+      'events keep firing either way, and events already mirrored into Google stay ' +
+      'there. The gcalendar listener stops and is deregistered.\n\n' +
+      'To use a different account, unlink here and then ask in chat to link the ' +
+      'gcalendar skill again.',
+      'Unlink the gcalendar skill?',
+      {
+        confirmButtonText: 'Unlink the gcalendar skill',
+        cancelButtonText: 'Close',
+        type: 'warning',
+      },
+    );
+  } catch { return; }
+  try {
+    const result = await unlinkGoogleSkill(settings.agentUrl, settings.authToken, 'gcalendar');
+    // A failed revoke or a surviving credential file needs to outlive a toast.
+    if (result.still_linked || (result.revoke_attempted && !result.revoked)) {
+      ElMessageBox.alert(result.message, 'Google Calendar: action needed', {
+        confirmButtonText: 'OK',
+        type: result.still_linked ? 'error' : 'warning',
+      });
+    } else if (result.unlinked) {
+      ElMessage.success('Unlinked the gcalendar skill');
+    }
+    await loadSettings();
+    await loadEvents();
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : String(err));
+  }
 }
 
 async function onDisconnectGoogle() {

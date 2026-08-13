@@ -99,7 +99,9 @@ Run `uv run scripts/__main__.py <subcommand>`. Output is JSON.
 | Subcommand | Required | Optional |
 |---|---|---|
 | `link` | — | `--no-browser` |
+| `complete-link` | `--response` | — |
 | `status` | — | — |
+| `unlink` | — | `--no-revoke`, `--yes`, `--keep-siblings`, `--dry-run` |
 | `list` | — | `--calendar`, `--since YYYY-MM-DD`, `--before YYYY-MM-DD`, `--query`, `--max-results` (50) |
 | `get` | `--id` | `--calendar` |
 | `create` | `--summary`, `--start`, `--end` | `--location`, `--description`, `--attendees a@b` (repeatable), `--all-day`, `--calendar` |
@@ -109,6 +111,41 @@ Run `uv run scripts/__main__.py <subcommand>`. Output is JSON.
 
 `--start` / `--end` accept ISO 8601 (`2026-06-10T09:00:00+07:00`) or `YYYY-MM-DD`
 for all-day events. All-day `--end` is inclusive (converted to RFC 5545 exclusive on write).
+
+
+## Unlinking a Google account
+
+`unlink` is the inverse of `link`: it revokes Cremind's access at Google, then
+deletes the local credentials.
+
+```bash
+uv run scripts/__main__.py unlink              # revoke at Google, then wipe locally
+uv run scripts/__main__.py unlink --dry-run    # report what it would do, change nothing
+uv run scripts/__main__.py unlink --no-revoke  # wipe locally, leave the grant live
+```
+
+- If the revoke fails, the local credentials are **still** deleted — Cremind can no
+  longer use the account either way — and the result carries `revoked: false` with
+  an `action_required` pointing at <https://myaccount.google.com/connections>.
+  Re-running does **not** help: the refresh token is the only thing that can revoke
+  a grant, and it has just been deleted.
+- **Google revokes per app, not per skill.** Every Cremind Google skill shares one
+  OAuth client, so a sibling skill linked to the same address loses access too.
+  Those are listed under `siblings` and their now-dead tokens are cleaned up as
+  well; `--keep-siblings` leaves them in place.
+- Unlinking when nothing is linked succeeds (`unlinked: false`,
+  `reason: "not_linked"`), so it is safe to repeat.
+- `scripts/.env` is preserved — it holds configuration, not credentials.
+- Operators can do the same across every Google skill at once with
+  `cremind google unlink --all`.
+- The Google push channel is closed **before** the revoke, because stopping it
+  needs a live credential. **Stop the listener first**: it rewrites the token file
+  after any successful refresh, so it can resurrect what this deletes. `unlink`
+  reports `listener_running: true` when it detects one.
+- When the skill's link is what drives the app's **Calendar & Schedule** page, this
+  hands the page back to its own Google credential, or to the built-in system
+  calendar if it has none. Scheduled events keep firing either way, and events
+  already mirrored into Google stay there.
 
 ## Examples
 ```bash

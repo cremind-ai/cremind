@@ -160,6 +160,17 @@ def status(profile: str) -> Dict[str, Any]:
     }
 
 
+def forget_access_token(profile: str) -> None:
+    """Drop ``profile``'s cached access token.
+
+    Already inert after an unlink — :func:`access_token` reads the file first and
+    the entry is pinned to its account — but "wipe local state" should not leave a
+    plaintext Google token resident in memory. Mirrors
+    :func:`app.drive.skill_token.forget_access_token`, where it *is* load-bearing.
+    """
+    _access_cache.pop(profile, None)
+
+
 def _account(data: Dict[str, Any]) -> str:
     """An identity for the linked account, to pin cached tokens to it.
 

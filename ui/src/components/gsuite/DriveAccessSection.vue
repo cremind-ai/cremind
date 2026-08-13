@@ -1,19 +1,27 @@
 <script setup lang="ts">
+/**
+ * Per-file Google Drive access, as a section of Settings -> GSuite.
+ *
+ * Cremind holds the `drive.file` scope, so the "granted files" list is whatever
+ * Google says the token can reach — there is no local grant registry to keep in
+ * sync. Unlinking the account is **not** here: the Accounts section above owns that
+ * for every Google skill uniformly, and two buttons doing the same thing on one
+ * page is worse than one. What stays here is the Drive-specific reason it matters —
+ * that Google offers no per-file revoke.
+ */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
-import { useRouter } from 'vue-router';
 import {
   ElButton, ElCard, ElInput, ElMessage, ElTable, ElTableColumn, ElTag,
 } from 'element-plus';
 import { Icon } from '@iconify/vue';
-import { useSettingsStore } from '../stores/settings';
+import { useSettingsStore } from '../../stores/settings';
 import {
   cancelDriveGrant, completeDriveGrant, getDriveGrant, getDriveStatus,
   listDriveFiles, startDriveGrant,
   type DriveFile, type DriveStatus,
-} from '../services/googleDriveApi';
+} from '../../services/googleDriveApi';
 
 const props = defineProps<{ profile: string }>();
-const router = useRouter();
 const settings = useSettingsStore();
 
 const loading = ref(true);
@@ -47,10 +55,6 @@ let popup: Window | null = null;
 
 const linked = computed(() => status.value?.linked === true);
 const stale = computed(() => status.value?.scopes_stale === true);
-
-function goBack() {
-  router.push(`/${props.profile}/settings`);
-}
 
 function shortType(mime: string): string {
   if (!mime) return '';
@@ -228,186 +232,179 @@ watch(() => settings.authToken, (token, previous) => {
   if (token && !previous) void refresh();
 });
 onUnmounted(() => { stopPolling(); });
+
+// The Accounts section owns unlinking, so the page tells us to reload after one:
+// our cached status would otherwise still name an account that is gone.
+async function reload() {
+  status.value = null;
+  files.value = [];
+  await refresh();
+}
+defineExpose({ reload });
 </script>
 
 <template>
-  <div class="drive-page">
-    <div class="drive-container">
-      <div class="drive-header">
-        <button class="back-btn" @click="goBack">
-          <Icon icon="mdi:arrow-left" /> Back to Settings
-        </button>
-        <h1 class="drive-title">Google Drive Access</h1>
-        <p class="drive-subtitle">
-          Cremind has <strong>per-file</strong> Drive access: it can only open files you
-          pick here, plus files it creates itself. Pasting a Drive link is not enough —
-          the file has to be granted. Spreadsheets and documents are different: the
-          gsheets and gdocs skills read and write those straight from a URL, with no
-          grant needed.
-        </p>
-      </div>
+  <div class="drive-section">
+    <p class="group-note">
+      Cremind has <strong>per-file</strong> Drive access: it can only open files you
+      pick here, plus files it creates itself. Pasting a Drive link is not enough —
+      the file has to be granted. Spreadsheets and documents are different: the
+      gsheets and gdocs skills read and write those straight from a URL, with no
+      grant needed.
+    </p>
 
-      <ElCard class="section" shadow="never">
-        <div v-if="loading" class="muted">Loading…</div>
-        <template v-else-if="statusError">
-          <div class="row">
-            <Icon icon="mdi:alert-circle-outline" class="row-icon" />
-            <div class="grow">
-              <strong>Couldn't check your Drive access</strong>
-              <p class="muted">{{ statusError }}</p>
-            </div>
-            <ElButton @click="refresh">Retry</ElButton>
+    <ElCard class="section" shadow="never">
+      <div v-if="loading" class="muted">Loading…</div>
+      <template v-else-if="statusError">
+        <div class="row">
+          <Icon icon="mdi:alert-circle-outline" class="row-icon" />
+          <div class="grow">
+            <strong>Couldn't check your Drive access</strong>
+            <p class="muted">{{ statusError }}</p>
           </div>
-        </template>
-        <template v-else-if="!status">
-          <div class="row">
-            <Icon icon="mdi:account-alert-outline" class="row-icon" />
-            <div class="grow">
-              <strong>Session not ready</strong>
-              <p class="muted">
-                This page couldn't reach the server with your profile's session.
-                Sign in to <code>{{ profile }}</code> again, then reopen it.
-              </p>
-            </div>
-            <ElButton @click="refresh">Retry</ElButton>
-          </div>
-        </template>
-        <template v-else-if="!linked">
-          <div class="row">
-            <Icon icon="mdi:link-off" class="row-icon" />
-            <div>
-              <strong>Not linked</strong>
-              <p class="muted">
-                Ask the agent to link the <code>gdrive</code> skill to your Google
-                account, then come back to grant files.
-              </p>
-            </div>
-          </div>
-        </template>
-        <template v-else>
-          <div class="row">
-            <Icon icon="mdi:google-drive" class="row-icon" />
-            <div class="grow">
-              <strong>{{ status?.email || 'Linked' }}</strong>
-              <p class="muted">
-                Access: {{ status?.access_model }}<template v-if="status?.access_note">
-                  — {{ status.access_note }}</template>
-              </p>
-            </div>
-            <ElButton :loading="granting" type="primary" @click="onGrant">
-              Grant access
-            </ElButton>
-          </div>
-
-          <div v-if="stale" class="banner warn">
-            <Icon icon="mdi:alert" />
-            <span>{{ status?.hint }}</span>
-          </div>
-
-          <div class="grant-row">
-            <ElInput
-              v-model="fileRef"
-              placeholder="Optional: paste a Drive link to pre-select that file"
-              clearable
-            />
-          </div>
-
-          <div v-if="granting || manualHint" class="banner">
-            <div class="grow">
-              <p v-if="granting">
-                Waiting for you to pick files in the Google window. If it didn't open,
-                <a :href="grantUrl" target="_blank" rel="noopener">open it here</a>.
-              </p>
-              <p v-else>
-                {{ manualHint }}
-                <a v-if="grantUrl" :href="grantUrl" target="_blank" rel="noopener">
-                  Open the picker
-                </a>
-              </p>
-              <p v-if="captureHint" class="muted">{{ captureHint }}</p>
-              <div class="paste-row">
-                <ElInput
-                  v-model="pastedRedirect"
-                  placeholder="…or paste the URL your browser landed on"
-                  clearable
-                  @keyup.enter="onPasteRedirect"
-                />
-                <ElButton :disabled="!pastedRedirect.trim()" @click="onPasteRedirect">
-                  Use URL
-                </ElButton>
-              </div>
-            </div>
-            <ElButton text @click="onCancelGrant">Cancel</ElButton>
-          </div>
-        </template>
-      </ElCard>
-
-      <ElCard v-if="linked && !loading" class="section" shadow="never">
-        <template #header>
-          <div class="card-head">
-            <span>Files Cremind can open</span>
-            <ElButton text size="small" @click="() => loadFiles()">
-              <Icon icon="mdi:refresh" /> Refresh
-            </ElButton>
-          </div>
-        </template>
-
-        <p v-if="filesMessage" class="muted">{{ filesMessage }}</p>
-        <p v-else-if="!files.length" class="muted">
-          Nothing granted yet. Use <strong>Grant access</strong> above to pick files.
-        </p>
-        <ElTable v-else :data="files" size="small" style="width: 100%">
-          <ElTableColumn prop="name" label="Name" min-width="220" />
-          <ElTableColumn label="Type" width="130">
-            <template #default="{ row }">{{ shortType(row.mime_type) }}</template>
-          </ElTableColumn>
-          <ElTableColumn label="Granted via" width="120">
-            <template #default="{ row }">
-              <ElTag v-if="row.origin === 'picker'" size="small" type="success">Picked</ElTag>
-              <ElTag v-else size="small" type="info">Created</ElTag>
-            </template>
-          </ElTableColumn>
-          <ElTableColumn label="" width="60">
-            <template #default="{ row }">
-              <a v-if="row.web_view_link" :href="row.web_view_link" target="_blank" rel="noopener">
-                <Icon icon="mdi:open-in-new" />
-              </a>
-            </template>
-          </ElTableColumn>
-        </ElTable>
-        <div v-if="nextPageToken" class="more-row">
-          <ElButton text size="small" @click="() => loadFiles(nextPageToken!)">Load more</ElButton>
+          <ElButton @click="refresh">Retry</ElButton>
         </div>
-      </ElCard>
+      </template>
+      <template v-else-if="!status">
+        <div class="row">
+          <Icon icon="mdi:account-alert-outline" class="row-icon" />
+          <div class="grow">
+            <strong>Session not ready</strong>
+            <p class="muted">
+              This page couldn't reach the server with your profile's session.
+              Sign in to <code>{{ profile }}</code> again, then reopen it.
+            </p>
+          </div>
+          <ElButton @click="refresh">Retry</ElButton>
+        </div>
+      </template>
+      <template v-else-if="!linked">
+        <div class="row">
+          <Icon icon="mdi:link-off" class="row-icon" />
+          <div>
+            <strong>Not linked</strong>
+            <p class="muted">
+              Ask the agent to link the <code>gdrive</code> skill to your Google
+              account, then come back to grant files.
+            </p>
+          </div>
+        </div>
+      </template>
+      <template v-else>
+        <div class="row">
+          <Icon icon="mdi:google-drive" class="row-icon" />
+          <div class="grow">
+            <strong>{{ status?.email || 'Linked' }}</strong>
+            <p class="muted">
+              Access: {{ status?.access_model }}<template v-if="status?.access_note">
+                — {{ status.access_note }}</template>
+            </p>
+          </div>
+          <ElButton :loading="granting" type="primary" @click="onGrant">
+            Grant access
+          </ElButton>
+        </div>
 
-      <ElCard v-if="linked && !loading" class="section" shadow="never">
-        <template #header><span>Revoking access</span></template>
-        <p class="muted">
-          Google offers no per-file revoke. Removing Cremind at
-          <a :href="status?.revoke_url" target="_blank" rel="noopener">your Google
-          account connections</a> revokes <strong>every</strong> file grant at once,
-          and unlinks the account.
-        </p>
-      </ElCard>
-    </div>
+        <div v-if="stale" class="banner warn">
+          <Icon icon="mdi:alert" />
+          <span>{{ status?.hint }}</span>
+        </div>
+
+        <div class="grant-row">
+          <ElInput
+            v-model="fileRef"
+            placeholder="Optional: paste a Drive link to pre-select that file"
+            clearable
+          />
+        </div>
+
+        <div v-if="granting || manualHint" class="banner">
+          <div class="grow">
+            <p v-if="granting">
+              Waiting for you to pick files in the Google window. If it didn't open,
+              <a :href="grantUrl" target="_blank" rel="noopener">open it here</a>.
+            </p>
+            <p v-else>
+              {{ manualHint }}
+              <a v-if="grantUrl" :href="grantUrl" target="_blank" rel="noopener">
+                Open the picker
+              </a>
+            </p>
+            <p v-if="captureHint" class="muted">{{ captureHint }}</p>
+            <div class="paste-row">
+              <ElInput
+                v-model="pastedRedirect"
+                placeholder="…or paste the URL your browser landed on"
+                clearable
+                @keyup.enter="onPasteRedirect"
+              />
+              <ElButton :disabled="!pastedRedirect.trim()" @click="onPasteRedirect">
+                Use URL
+              </ElButton>
+            </div>
+          </div>
+          <ElButton text @click="onCancelGrant">Cancel</ElButton>
+        </div>
+      </template>
+    </ElCard>
+
+    <ElCard v-if="linked && !loading" class="section" shadow="never">
+      <template #header>
+        <div class="card-head">
+          <span>Files Cremind can open</span>
+          <ElButton text size="small" @click="() => loadFiles()">
+            <Icon icon="mdi:refresh" /> Refresh
+          </ElButton>
+        </div>
+      </template>
+
+      <p v-if="filesMessage" class="muted">{{ filesMessage }}</p>
+      <p v-else-if="!files.length" class="muted">
+        Nothing granted yet. Use <strong>Grant access</strong> above to pick files.
+      </p>
+      <ElTable v-else :data="files" size="small" style="width: 100%">
+        <ElTableColumn prop="name" label="Name" min-width="220" />
+        <ElTableColumn label="Type" width="130">
+          <template #default="{ row }">{{ shortType(row.mime_type) }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="Granted via" width="120">
+          <template #default="{ row }">
+            <ElTag v-if="row.origin === 'picker'" size="small" type="success">Picked</ElTag>
+            <ElTag v-else size="small" type="info">Created</ElTag>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="" width="60">
+          <template #default="{ row }">
+            <a v-if="row.web_view_link" :href="row.web_view_link" target="_blank" rel="noopener">
+              <Icon icon="mdi:open-in-new" />
+            </a>
+          </template>
+        </ElTableColumn>
+      </ElTable>
+      <div v-if="nextPageToken" class="more-row">
+        <ElButton text size="small" @click="() => loadFiles(nextPageToken!)">Load more</ElButton>
+      </div>
+    </ElCard>
+
+    <ElCard v-if="linked && !loading" class="section" shadow="never">
+      <template #header><span>Giving access back</span></template>
+      <p class="muted">
+        Google offers no per-file revoke, so there is no way to hand back a single
+        file. <strong>Unlinking the account</strong> — under Accounts above — revokes
+        every file grant at once, and re-linking does not bring them back, so the
+        files have to be picked again. Removing Cremind at
+        <a :href="status?.revoke_url" target="_blank" rel="noopener">your Google
+        account connections</a> does the Google half by hand, if you would rather.
+      </p>
+    </ElCard>
   </div>
 </template>
 
 <style scoped>
-.drive-page {
-  width: 100%; height: 100%; overflow-y: auto; background: var(--bg-color);
-  padding: 24px; box-sizing: border-box;
+.group-note {
+  color: var(--text-secondary); font-size: 0.875rem; margin: 0 0 16px;
+  max-width: 640px;
 }
-.drive-container { max-width: 860px; margin: 0 auto; }
-.drive-header { margin-bottom: 24px; }
-.back-btn {
-  display: flex; align-items: center; gap: 6px; background: none; border: none;
-  color: var(--text-secondary); cursor: pointer; font-size: 0.875rem;
-  padding: 4px 0; margin-bottom: 16px;
-}
-.back-btn:hover { color: var(--primary-color); }
-.drive-title { font-size: 1.5rem; font-weight: 700; color: var(--text-primary); margin: 0 0 4px; }
-.drive-subtitle { color: var(--text-secondary); font-size: 0.875rem; margin: 0; max-width: 640px; }
 .section { margin-bottom: 16px; }
 .card-head { display: flex; align-items: center; justify-content: space-between; }
 .row { display: flex; align-items: center; gap: 12px; }

@@ -66,7 +66,7 @@ def not_granted_payload(
             "If this is an event, scheduled, or otherwise unattended run: do NOT run "
             "`grant` — no one can complete the browser consent and the run would stall. "
             f"Send the user a notification asking them to grant access to '{file_id}' "
-            "(Settings -> Google Drive in the web UI, or `cremind drive grant --file "
+            "(Settings -> GSuite in the web UI, or `cremind drive grant --file "
             f"{file_id}`), then stop this run."
         ),
     }

@@ -174,6 +174,91 @@ def cmd_replace(args) -> Any:
     return {"replaced": True, "id": doc_id, "occurrences_changed": result["occurrences_changed"]}
 
 
+def _confirm_unlink(preview: dict[str, Any], *, revoke: bool) -> bool:
+    """Ask before destroying a link — but only when a human can answer.
+
+    Requires **both** streams to be terminals: a tty stdout with piped stdin makes
+    ``input()`` raise ``EOFError``. Under the agent both are pipes, so this returns
+    True and the caller proceeds — ``--yes`` is implied for non-interactive runs.
+    The prompt goes to stderr so stdout stays pure JSON.
+    """
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return True
+    lines = [f"Unlink {preview.get('email') or 'the linked account'} from this skill?"]
+    lines.append(
+        "  - revokes Cremind's access at Google"
+        if revoke
+        else "  - leaves the grant live at Google (--no-revoke)"
+    )
+    lines.append("  - deletes the local credentials; re-linking needs a fresh Google consent")
+    siblings = [str(s.get("skill")) for s in preview.get("siblings") or []]
+    if siblings and revoke:
+        lines.append(
+            "  - Google lists Cremind as ONE app, so this also ends the grant for: "
+            + ", ".join(siblings)
+        )
+    if preview.get("listener_running"):
+        lines.append(
+            "  - a listener is running for this skill; stop it first, or it may rewrite "
+            "the token file after this deletes it"
+        )
+    if preview.get("will_remove"):
+        lines.append("  - removes: " + ", ".join(preview["will_remove"]))
+    print("\n".join(lines), file=sys.stderr, flush=True)
+    print("Type 'y' to continue: ", end="", file=sys.stderr, flush=True)
+    try:
+        return input().strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+def cmd_unlink(args) -> Any:
+    """Revoke Cremind's Google access and delete the stored credentials.
+
+    Succeeds when nothing is linked, so it is safe to repeat.
+    """
+    preview = auth.unlink_preview(config.TOKEN_PATH)
+    if args.dry_run:
+        return preview
+    if not preview["linked"]:
+        return {"ok": True, "unlinked": False, "reason": "not_linked"}
+    if not args.yes and not _confirm_unlink(preview, revoke=not args.no_revoke):
+        return {"ok": True, "unlinked": False, "reason": "cancelled"}
+    return auth.unlink(
+        token_path=config.TOKEN_PATH,
+        revoke_at_google=not args.no_revoke,
+        clean_siblings=not args.keep_siblings,
+    )
+
+
+def _add_unlink_parser(sub) -> None:
+    sp = sub.add_parser(
+        "unlink", help="revoke Cremind's Google access and delete the local token"
+    )
+    sp.add_argument(
+        "--no-revoke",
+        action="store_true",
+        dest="no_revoke",
+        help="wipe local credentials only; leave the grant live at Google",
+    )
+    sp.add_argument(
+        "--yes", action="store_true", help="skip the confirmation prompt (implied when not a TTY)"
+    )
+    sp.add_argument(
+        "--keep-siblings",
+        action="store_true",
+        dest="keep_siblings",
+        help="do not clean up other skills' tokens for the same Google account",
+    )
+    sp.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="report what unlink would do, changing nothing",
+    )
+    sp.set_defaults(func=cmd_unlink)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="gdocs", description="Google Docs via OAuth (cremind-connect).")
     p.add_argument("--json", action="store_true", help="force JSON output")
@@ -191,6 +276,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_complete_link)
 
     sub.add_parser("status", help="show link status").set_defaults(func=cmd_status)
+
+    _add_unlink_parser(sub)
 
     sp = sub.add_parser("create", help="create a new document (optional initial text)")
     sp.add_argument("--title", required=True)

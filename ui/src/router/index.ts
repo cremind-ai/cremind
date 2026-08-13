@@ -1,4 +1,7 @@
-import { createRouter, createWebHashHistory, type RouteLocationNormalized } from 'vue-router';
+import {
+  createRouter, createWebHashHistory,
+  type RouteLocationGeneric, type RouteLocationNormalized,
+} from 'vue-router';
 import ChatView from '../views/ChatView.vue';
 import { useSettingsStore } from '../stores/settings';
 import { PROFILE_ROUTES } from './profileRoutes';
@@ -102,11 +105,20 @@ const routes = [
     },
   },
   {
-    path: '/:profile/settings/google-drive',
-    name: 'google-drive-settings',
-    component: () => import('../views/GoogleDriveSettings.vue'),
+    path: '/:profile/settings/gsuite',
+    name: 'gsuite-settings',
+    component: () => import('../views/GSuiteSettings.vue'),
     props: true,
-    meta: { title: 'Google Drive Access' },
+    meta: { title: 'GSuite' },
+  },
+  {
+    // Shipped as its own page before Drive access and Google accounts were merged
+    // into GSuite, so bookmarks and older docs still point here.
+    path: '/:profile/settings/google-drive',
+    redirect: (to: RouteLocationGeneric) => ({
+      name: 'gsuite-settings',
+      params: { profile: to.params.profile },
+    }),
   },
   {
     path: '/:profile/settings/backup',

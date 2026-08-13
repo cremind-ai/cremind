@@ -280,3 +280,18 @@ def cancel(profile: str, state: str) -> None:
     pend = _pending.get(state)
     if pend and pend["profile"] == profile:
         _pending.pop(state, None)
+
+
+def abandon_rounds(profile: str) -> int:
+    """Drop every in-flight Picker round belonging to ``profile``. Returns the count.
+
+    Called when the gdrive link is torn down: a surviving round would keep polling
+    :func:`poll_status`, which diffs ``reachable_ids`` against a token that no
+    longer exists. Rounds are keyed by OAuth ``state`` with the profile inside the
+    value, so this filters rather than clearing the whole dict — another profile's
+    round must be untouched.
+    """
+    doomed = [state for state, pend in _pending.items() if pend.get("profile") == profile]
+    for state in doomed:
+        _pending.pop(state, None)
+    return len(doomed)

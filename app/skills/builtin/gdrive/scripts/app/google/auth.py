@@ -16,8 +16,11 @@ import os
 import re
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, urlparse
 
 from .account_key import account_key_for
@@ -29,6 +32,23 @@ os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 GOOGLE_AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
+# Ends the whole grant for the (OAuth client, account) pair — see unlink().
+GOOGLE_REVOKE_URI = "https://oauth2.googleapis.com/revoke"
+GOOGLE_CONNECTIONS_URL = "https://myaccount.google.com/connections"
+
+# Files inside ``scripts/`` that exist only because an account is linked, and so
+# go when it is unlinked. Named here, in the copy shared by every Google skill, so
+# no skill has to pass its own list — names a given skill never creates are
+# harmless no-ops. Deliberately NOT here: ``.env`` (user config), ``.listener.lock``
+# (a live OS lock; deleting it breaks the single-instance guard and fails on
+# Windows while held), and ``.listener_heartbeat`` (not credential-derived).
+CREDENTIAL_FILES = (
+    ".google_token.json",
+    ".google_token.json.tmp",
+    ".listener_state.json",
+    ".listener_state.json.tmp",
+    ".drive_grants.json",
+)
 
 # The OAuth ``state`` is a URL-safe token minted by oauthlib. It becomes an inbox
 # filename, so accept only this charset/length — the guard against path traversal
@@ -58,6 +78,19 @@ class TokenStore:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.replace(tmp, self.path)
+
+    def clear(self) -> None:
+        """Remove the token file **and** the atomic-write temp beside it.
+
+        The temp matters: ``save`` writes it and only then ``os.replace``s it into
+        place, so a crash between the two leaves a complete credential set on disk
+        under a different name. "No credentials left behind" has to mean both.
+        """
+        for path in (self.path, self.path.with_suffix(self.path.suffix + ".tmp")):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _decode_jwt_payload(token: str) -> dict[str, Any]:
@@ -359,3 +392,360 @@ def fresh_id_token(token_path: Path) -> str:
     if not id_token:
         raise AuthError("could not obtain a fresh id_token")
     return id_token
+
+
+# ── unlink ──────────────────────────────────────────────────────────────────
+# Undoing ``link``: revoke Cremind's grant at Google, then delete the local
+# credentials. The two halves are deliberately asymmetric. Deleting the token is
+# what makes this machine safe, so it happens whatever the revoke did; but the
+# refresh token is the *only* thing that can revoke a grant, so once it is gone
+# revoking becomes permanently impossible — which is why a failed revoke tells the
+# user to remove Cremind at ``GOOGLE_CONNECTIONS_URL`` rather than to try again.
+
+
+def _post_form(url: str, fields: dict[str, str], *, timeout: float) -> tuple[int, str]:
+    """POST an ``x-www-form-urlencoded`` body. Returns ``(status, body)``.
+
+    The single network seam in the unlink path — tests replace this. Uses
+    ``urllib`` rather than ``requests`` because this module's *module-level*
+    imports are deliberately stdlib-only (see the docstring: the Google libraries
+    are lazy so ``account_key``/``discovery`` work without them installed).
+    """
+    body = urllib.parse.urlencode(fields).encode("ascii")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            # Cloudflare blocks the default Python-urllib agent.
+            "User-Agent": "cremind-skill/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return int(getattr(resp, "status", 200) or 200), resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return int(exc.code), exc.read().decode("utf-8", "replace")
+
+
+def revoke_token(token: str, *, timeout: float = 15.0) -> tuple[bool, str]:
+    """Revoke a Google grant. Returns ``(revoked, status)``.
+
+    ``status`` is one of ``"revoked"``, ``"already_revoked"``, ``"http_<code>: …"``
+    or ``"network: …"``.
+
+    A ``400 invalid_token`` counts as **revoked**: Google returns it for a token it
+    has already forgotten, so there is nothing left to revoke. Calling that a
+    failure would make a benign re-run — and every revoke after the first when
+    several skills share one grant — look like a problem.
+    """
+    if not token:
+        return False, "no_token"
+    try:
+        status, body = _post_form(GOOGLE_REVOKE_URI, {"token": token}, timeout=timeout)
+    except (urllib.error.URLError, OSError) as exc:
+        return False, f"network: {exc}"
+    if status == 200:
+        return True, "revoked"
+    if status == 400:
+        error = ""
+        try:
+            parsed = json.loads(body)
+            error = str(parsed.get("error") or "") if isinstance(parsed, dict) else ""
+        except (ValueError, TypeError):
+            error = ""
+        if error == "invalid_token" or "invalid_token" in body:
+            return True, "already_revoked"
+    return False, f"http_{status}: {body[:300]}"
+
+
+def listener_is_running(lock_path: Path | None) -> bool:
+    """Whether another process holds the skill's single-instance listener lock.
+
+    A live listener rewrites the token file after any successful refresh, so it can
+    resurrect what we are about to delete. We only *report* it — refusing would
+    leave the credentials on disk, which is the worse outcome. Mirrors the
+    listener's own guard, but releases the lock immediately and never deletes the
+    file.
+    """
+    if lock_path is None:
+        return False
+    try:
+        handle = open(lock_path, "a+")
+    except OSError:
+        return False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return True
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return False
+        import fcntl
+
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        handle.close()
+
+
+def _account_identity(entry: dict[str, Any]) -> str:
+    """A canonical account id for grant comparison.
+
+    ``account_key`` is what ``link`` records; deriving it from the address is the
+    fallback for a hand-edited or pre-``account_key`` token file.
+    """
+    key = str(entry.get("account_key") or "")
+    if key:
+        return key.lower()
+    email = str(entry.get("email") or "")
+    return account_key_for("google", email).lower() if email else ""
+
+
+def find_sibling_accounts(token_path: Path, data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Other skills in this profile holding the SAME Google grant.
+
+    Google revokes per (OAuth client, account), not per skill — all the Cremind
+    Google skills share one client — so revoking here also ends the grant for every
+    sibling linked to the same address.
+
+    ``token_path`` is ``<skills root>/<skill>/scripts/.google_token.json``, so
+    ``parents[2]`` is the skills root. That holds in a profile
+    (``<system>/<profile>/skills``) and in the source tree (``app/skills/builtin``)
+    alike. Directories are globbed rather than hardcoded, so a sixth Google skill
+    is covered without touching this.
+    """
+    client_id = str(data.get("client_id") or "")
+    account = _account_identity(data)
+    if not client_id or not account:
+        return []
+    try:
+        resolved = token_path.resolve()
+        root = resolved.parents[2]
+        own = resolved.parents[1].name
+    except (OSError, IndexError):
+        return []
+
+    siblings: list[dict[str, Any]] = []
+    try:
+        candidates = sorted(p for p in root.iterdir() if p.is_dir())
+    except OSError:
+        return []
+    for directory in candidates:
+        if directory.name == own:
+            continue
+        path = directory / "scripts" / ".google_token.json"
+        try:
+            if not path.is_file() or path.resolve() == resolved:
+                continue
+        except OSError:
+            continue
+        other = TokenStore(path).load()
+        if not other or str(other.get("client_id") or "") != client_id:
+            continue
+        if _account_identity(other) != account:
+            continue
+        siblings.append(
+            {
+                "skill": directory.name,
+                "path": str(path),
+                "email": other.get("email"),
+                "account_key": other.get("account_key"),
+            }
+        )
+    return siblings
+
+
+def _sweep(directory: Path, extra_paths: Iterable[Path] = ()) -> tuple[list[str], list[str]]:
+    """Delete the credential-derived files in ``directory``. ``(removed, failed)``."""
+    removed: list[str] = []
+    failed: list[str] = []
+    targets = [directory / name for name in CREDENTIAL_FILES]
+    targets.extend(Path(p) for p in extra_paths)
+    for path in targets:
+        try:
+            if not path.exists():
+                continue
+            path.unlink()
+            removed.append(path.name)
+        except OSError as exc:
+            failed.append(f"{path.name}: {exc}")
+    return removed, failed
+
+
+def _sweep_event_payloads(project_dir: Path) -> tuple[list[str], list[str]]:
+    """Delete the event payloads a listener wrote for the linked account.
+
+    ``events/<type>/*.md`` hold calendar entries / file names read out of the
+    account being unlinked, so they go with it rather than sitting on disk under an
+    account Cremind can no longer reach. This is a delete-only drop zone by
+    design — the event manager consumes and removes each file — so the only cost is
+    discarding an event that had not been processed yet.
+
+    A no-op for the skills that have no listener, which is what lets this live in
+    the copy shared by all five.
+    """
+    removed: list[str] = []
+    failed: list[str] = []
+    events = project_dir / "events"
+    if not events.is_dir():
+        return removed, failed
+    try:
+        payloads = sorted(events.glob("*/*.md"))
+    except OSError:
+        return removed, failed
+    for path in payloads:
+        name = f"events/{path.parent.name}/{path.name}"
+        try:
+            path.unlink()
+            removed.append(name)
+        except OSError as exc:
+            failed.append(f"{name}: {exc}")
+    return removed, failed
+
+
+def unlink_preview(token_path: Path, *, lock_path: Path | None = None) -> dict[str, Any]:
+    """What :func:`unlink` would do. Read-only: no network, no mutation.
+
+    Used to build the confirmation prompt, so a user is told which sibling skills
+    go with this one before they answer.
+    """
+    data = TokenStore(token_path).load()
+    running = listener_is_running(lock_path)
+    if not data:
+        return {
+            "linked": False, "email": None, "account_key": None,
+            "siblings": [], "siblings_unknown": False,
+            "listener_running": running, "will_remove": [],
+        }
+    present = [
+        name for name in CREDENTIAL_FILES if (token_path.parent / name).exists()
+    ]
+    return {
+        "linked": True,
+        "email": data.get("email"),
+        "account_key": data.get("account_key"),
+        "siblings": find_sibling_accounts(token_path, data),
+        "siblings_unknown": not data.get("client_id"),
+        "listener_running": running,
+        "will_remove": present,
+    }
+
+
+def unlink(
+    *,
+    token_path: Path,
+    revoke_at_google: bool = True,
+    before_revoke: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+    clean_siblings: bool = True,
+    lock_path: Path | None = None,
+    extra_paths: Iterable[Path] = (),
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Revoke Cremind's Google access and delete the local credentials.
+
+    Idempotent: unlinking something that is not linked succeeds (and still sweeps
+    any derived files a previous life left behind), so it never raises
+    :class:`AuthError` and never exits non-zero for that.
+
+    ``before_revoke`` is the per-skill seam — gcalendar and gdrive pass a callable
+    that closes their Google push channel, which needs a live credential and so has
+    to run before the revoke. Its return value lands under ``pre_revoke``; if it
+    raises, that is recorded and the wipe continues, because a channel we could not
+    close must never leave credentials on disk.
+    """
+    directory = token_path.parent
+    result: dict[str, Any] = {
+        "ok": True,
+        "unlinked": False,
+        "listener_running": listener_is_running(lock_path),
+    }
+
+    data = TokenStore(token_path).load()
+    if not data:
+        removed, failed = _sweep(directory, extra_paths)
+        payloads, payload_failed = _sweep_event_payloads(directory.parent)
+        removed.extend(payloads)
+        failed.extend(payload_failed)
+        result.update({"reason": "not_linked", "removed": removed})
+        if failed:
+            result["warnings"] = failed
+        return result
+
+    result["email"] = data.get("email")
+    result["account_key"] = data.get("account_key")
+    siblings = find_sibling_accounts(token_path, data) if clean_siblings or revoke_at_google else []
+    if not data.get("client_id"):
+        result["siblings_unknown"] = True
+
+    if before_revoke is not None:
+        try:
+            extra = before_revoke(data)
+            if extra:
+                result["pre_revoke"] = extra
+        except Exception as exc:  # noqa: BLE001 - never block the wipe
+            result["pre_revoke_error"] = str(exc)
+
+    if revoke_at_google:
+        token = str(data.get("refresh_token") or "") or str(data.get("access_token") or "")
+        revoked, status = revoke_token(token, timeout=timeout)
+        result["revoked"] = revoked
+        result["revoke_status"] = status
+        if not revoked:
+            result["revoke_error"] = status
+            result["action_required"] = (
+                f"Remove Cremind's access manually at {GOOGLE_CONNECTIONS_URL} — the "
+                "token needed to revoke it has been deleted, so re-running this cannot "
+                "help."
+            )
+    else:
+        result["revoked"] = False
+        result["revoke_status"] = "skipped"
+
+    # One deleter, so every removal is reported. ``_sweep`` already covers the
+    # token and its ``.tmp`` by name, but they are named explicitly too so a skill
+    # whose TOKEN_PATH is ever renamed cannot silently stop being wiped. Repeats
+    # are harmless: the second pass sees the file gone and skips it.
+    removed, failed = _sweep(
+        directory,
+        [token_path, token_path.with_suffix(token_path.suffix + ".tmp"), *extra_paths],
+    )
+    payloads, payload_failed = _sweep_event_payloads(directory.parent)
+    removed.extend(payloads)
+    failed.extend(payload_failed)
+    result["removed"] = removed
+    if failed:
+        result["warnings"] = failed
+    result["unlinked"] = not token_path.exists()
+    result["ok"] = result["unlinked"]
+
+    # Siblings are only cleaned when we actually revoked: their tokens are then
+    # provably dead, and leaving them makes `status` claim linked while every call
+    # fails invalid_grant. With --no-revoke their grant is still live, so deleting
+    # their credentials would be pure destruction.
+    reported: list[dict[str, Any]] = []
+    for sibling in siblings:
+        entry = dict(sibling)
+        if clean_siblings and result.get("revoked"):
+            sibling_dir = Path(sibling["path"]).parent
+            state = TokenStore(sibling_dir / ".listener_state.json").load() or {}
+            entry["orphaned_watch"] = bool(state.get("channel_id"))
+            sibling_removed, sibling_failed = _sweep(sibling_dir)
+            sibling_payloads, sibling_payload_failed = _sweep_event_payloads(sibling_dir.parent)
+            entry["removed"] = sibling_removed + sibling_payloads
+            entry["cleaned"] = True
+            if sibling_failed or sibling_payload_failed:
+                entry["warnings"] = sibling_failed + sibling_payload_failed
+        else:
+            entry["cleaned"] = False
+        reported.append(entry)
+    if reported:
+        result["siblings"] = reported
+    return result

@@ -306,4 +306,9 @@ Google Calendar.
 - `cremind event-runs` — the per-firing run history: each time a schedule event
   fires it runs in its own isolated conversation with a status and token usage,
   viewable (and replyable, when pending) here.
+- `cremind google` — the Google account links behind the Google Suite skills.
+  Note the distinction: `calendar google disconnect` clears the credential
+  connected on **this page**, while `cremind google unlink gcalendar` removes the
+  **gcalendar skill's** link — and when the skill's link is what drives the
+  calendar (`google_source: skill`), that is the one to use.
 - `app/api/calendar.py` — the Calendar & Schedule API these commands wrap.

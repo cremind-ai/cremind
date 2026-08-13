@@ -188,7 +188,7 @@ def _drive_not_granted_message(file_id: str) -> str:
     return (
         f"This automation needed {target}, which has not been granted to Cremind "
         "(Cremind holds per-file Drive access). Grant it with "
-        f"`cremind drive grant --file {flag}` or in Settings -> Google Drive, then run "
+        f"`cremind drive grant --file {flag}` or in Settings -> GSuite, then run "
         "the automation again."
     )
 
