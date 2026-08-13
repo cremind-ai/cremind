@@ -20,6 +20,10 @@ def _wire(monkeypatch, *, linked=True, reachable=None, app_url="http://localhost
         lambda: {"client_id": "cid", "client_secret": "csecret", "scopes": []},
     )
     monkeypatch.setattr(gf.BaseConfig, "APP_URL", app_url, raising=False)
+    # Both feed redirect_uri(); a developer machine exporting either would skew
+    # every redirect assertion below, so start from a known-empty environment.
+    monkeypatch.delenv("CREMIND_OAUTH_REDIRECT_URI", raising=False)
+    monkeypatch.delenv("CREMIND_UI_PORT", raising=False)
     monkeypatch.setattr(
         gf.skill_token, "status",
         lambda profile: {
@@ -109,7 +113,9 @@ def test_unavailable_broker_is_only_fatal_without_a_token_client(monkeypatch):
 def test_redirect_uri_is_always_loopback(monkeypatch):
     """Google's Desktop client type rejects non-loopback redirects outright."""
     _wire(monkeypatch, app_url="https://cremind.example.com")
-    assert gf.redirect_uri().startswith("http://localhost")
+    # Exact, not startswith: a portless "http://localhost" is loopback too, and
+    # asserting only the prefix is what let :80 ship (see the test below).
+    assert gf.redirect_uri() == "http://localhost:1515" + gf.CALLBACK_PATH
     assert gf.capture_is_local() is False
     assert gf.capture_hint()  # the UI must warn that the final redirect will fail
 
@@ -117,6 +123,83 @@ def test_redirect_uri_is_always_loopback(monkeypatch):
     assert gf.redirect_uri() == "http://localhost:1515/api/oauth/google-drive/callback"
     assert gf.capture_is_local() is True
     assert gf.capture_hint() is None
+
+
+def test_portless_public_app_url_never_emits_portless_localhost(monkeypatch):
+    """A K8s Ingress APP_URL carries no port; :80 is a dead redirect everywhere.
+
+    ``urlsplit("https://host").port`` is None (the scheme's implicit 443 is never
+    returned), so scraping the port alone used to yield "http://localhost".
+    """
+    _wire(monkeypatch, app_url="https://test.cremind.io")
+    assert gf.redirect_uri() == "http://localhost:1515" + gf.CALLBACK_PATH
+
+    monkeypatch.setenv("CREMIND_UI_PORT", "8080")
+    assert gf.redirect_uri() == "http://localhost:8080" + gf.CALLBACK_PATH
+
+
+def test_ui_port_zero_or_garbage_falls_back_to_1515(monkeypatch):
+    """0 = loopback-only behind an external proxy, so it names no reachable port."""
+    _wire(monkeypatch, app_url="https://test.cremind.io")
+    for value in ("0", "not-a-port", ""):
+        monkeypatch.setenv("CREMIND_UI_PORT", value)
+        assert gf.redirect_uri() == "http://localhost:1515" + gf.CALLBACK_PATH
+
+
+def test_pinned_loopback_oauth_redirect_sets_the_drive_port(monkeypatch):
+    """The operator's pin for the sibling skills flow names the forwarded port.
+
+    One port-forward serves both callbacks, so honouring the pin is what makes
+    capture work on a domain-fronted install.
+    """
+    _wire(monkeypatch, app_url="https://test.cremind.io")
+    monkeypatch.setenv("CREMIND_OAUTH_REDIRECT_URI", "http://localhost:1515/api/oauth/callback")
+    assert gf.redirect_uri() == "http://localhost:1515" + gf.CALLBACK_PATH
+
+    monkeypatch.setenv("CREMIND_OAUTH_REDIRECT_URI", "http://127.0.0.1:9999/api/oauth/callback")
+    assert gf.redirect_uri() == "http://127.0.0.1:9999" + gf.CALLBACK_PATH
+
+    # The pin outranks a port scraped from APP_URL: it is the address an operator
+    # has actually arranged to be reachable.
+    _wire(monkeypatch, app_url="http://192.168.1.50:8080")
+    monkeypatch.setenv("CREMIND_OAUTH_REDIRECT_URI", "http://localhost:1515/api/oauth/callback")
+    assert gf.redirect_uri() == "http://localhost:1515" + gf.CALLBACK_PATH
+
+
+def test_non_loopback_pin_is_ignored(monkeypatch):
+    """Honouring it would turn an uncaptured redirect into a hard Google error."""
+    _wire(monkeypatch, app_url="https://test.cremind.io")
+    monkeypatch.setenv(
+        "CREMIND_OAUTH_REDIRECT_URI", "https://test.cremind.io/api/oauth/callback"
+    )
+    assert gf.redirect_uri() == "http://localhost:1515" + gf.CALLBACK_PATH
+
+
+def test_docker_server_mode_keeps_the_app_url_port(monkeypatch):
+    """A remapped publish (-p 8080:1515) is reachable on APP_URL's port, not the
+    container's own, so the scrape must still win over the bind-port fallback."""
+    _wire(monkeypatch, app_url="http://192.168.1.50:8080")
+    monkeypatch.setenv("CREMIND_UI_PORT", "1515")
+    assert gf.redirect_uri() == "http://localhost:8080" + gf.CALLBACK_PATH
+
+
+def test_malformed_app_url_port_falls_back_instead_of_raising(monkeypatch):
+    """urlsplit(...).port raises on a bad port; start() must not die on it."""
+    _wire(monkeypatch, app_url="http://bad-host:not-a-port")
+    assert gf.redirect_uri() == "http://localhost:1515" + gf.CALLBACK_PATH
+    assert gf.capture_is_local() is False
+
+
+def test_authorize_url_carries_the_pinned_loopback_redirect(monkeypatch):
+    """End to end on the K8s shape: Ingress APP_URL + the operator's pin."""
+    _wire(monkeypatch, app_url="https://test.cremind.io")
+    monkeypatch.setenv("CREMIND_OAUTH_REDIRECT_URI", "http://localhost:1515/api/oauth/callback")
+    out = gf.start("alice")
+    params = parse_qs(urlparse(out["authorize_url"]).query)
+    assert params["redirect_uri"] == ["http://localhost:1515" + gf.CALLBACK_PATH]
+    assert out["local_capture"] is False
+    # The hint has to name the origin the user must keep forwarded.
+    assert "http://localhost:1515" in out["capture_hint"]
 
 
 def test_captured_redirect_reports_picked_files(monkeypatch):

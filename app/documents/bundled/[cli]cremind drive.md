@@ -161,3 +161,9 @@ access none of them do.
   account than the linked one; `status` shows which email is linked.
 - Grant seems to do nothing on a remote install → use `grant-complete`, or run
   `cremind drive grant` from the machine with the browser.
+- On a remote install the redirect always targets `http://localhost:<port>` —
+  Google's Desktop client accepts no other kind of address. If a port-forward or
+  tunnel already makes that address reach this server from the user's machine
+  (e.g. `kubectl port-forward`), keeping it running while they approve captures
+  the redirect automatically, with no `grant-complete` paste. `grant` prints the
+  exact address it will use.

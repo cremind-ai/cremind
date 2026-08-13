@@ -24,6 +24,7 @@ in-flight grants, which costs the user one extra click and never corrupts state.
 
 from __future__ import annotations
 
+import os
 import secrets
 import time
 from typing import Any, Dict, List, Optional
@@ -46,8 +47,11 @@ _PENDING_TTL = 900.0
 _HINT_UNREACHABLE_REDIRECT = (
     "After you approve, your browser may show a connection error on the final "
     "redirect — that is expected on this install and does not undo the grant. "
-    "Return here and refresh; the files you picked will be listed. To avoid the "
-    "error entirely, run 'cremind drive grant' from your own machine."
+    "Return here and refresh; the files you picked will be listed. The redirect "
+    "targets {origin}: if a port-forward or tunnel makes that address reach this "
+    "server from your machine (e.g. kubectl port-forward), keep it running while "
+    "you approve and the redirect is captured automatically. Otherwise run "
+    "'cremind drive grant' from your own machine."
 )
 
 
@@ -55,35 +59,91 @@ class DriveGrantError(RuntimeError):
     pass
 
 
+def _loopback_origin(url: str) -> Optional[str]:
+    """``host[:port]`` when ``url`` names a loopback origin, else ``None``.
+
+    A malformed URL — including a non-numeric or out-of-range port, which makes
+    ``urlsplit(...).port`` raise — reads as "not loopback" rather than blowing up
+    the caller.
+    """
+    try:
+        parts = urlsplit((url or "").strip())
+        if parts.hostname not in ("localhost", "127.0.0.1"):
+            return None
+        port = parts.port
+    except ValueError:
+        return None
+    return f"{parts.hostname}:{port}" if port else parts.hostname
+
+
+def _fallback_port() -> int:
+    """The public bind port (``CREMIND_UI_PORT``), defaulting to 1515.
+
+    ``0`` means "serve loopback-only behind an external proxy" (see
+    ``app/server.py``) and so names no reachable port; that and an unparseable
+    value both fall back to 1515, the port every documented port-forward uses
+    (``kubectl port-forward svc/cremind 1515:80``).
+    """
+    try:
+        port = int(os.environ.get("CREMIND_UI_PORT", "").strip())
+    except ValueError:
+        return 1515
+    return port if port > 0 else 1515
+
+
 def redirect_uri() -> str:
     """Loopback callback URL for the Picker redirect.
 
     Google's *Desktop* client type accepts loopback redirects only — a real
     hostname is rejected outright — so this always names loopback even when
-    ``APP_URL`` is a public address. On such installs the browser cannot reach the
-    callback and capture simply does not happen; the grant still lands and
-    ``poll_status`` finds the files by diffing. Using the deployment's own port
-    keeps capture working wherever the UI is served over loopback.
+    ``APP_URL`` is a public address. On such installs the browser may still reach
+    us through a port-forward or tunnel, so name the loopback origin most likely
+    to work, in order: the operator's pinned ``CREMIND_OAUTH_REDIRECT_URI`` (when
+    itself loopback — it is the sibling Google-skills redirect, so a forward that
+    serves one serves both), then ``APP_URL``'s own explicit port, then the public
+    bind port. Never portless: a port-less public ``APP_URL`` (a K8s Ingress) must
+    not degrade to ``http://localhost`` (:80), which no deployment serves.
+
+    Capture is best-effort either way — the grant lands when the user approves, so
+    a redirect that never arrives costs only the file list, which ``poll_status``
+    recovers by diffing.
     """
     base = (BaseConfig.APP_URL or "").strip().rstrip("/")
-    parts = urlsplit(base) if base else None
-    port = f":{parts.port}" if parts and parts.port else ""
-    if parts and parts.hostname in ("localhost", "127.0.0.1"):
-        return f"http://{parts.hostname}{port}{CALLBACK_PATH}"
-    return f"http://localhost{port or ''}{CALLBACK_PATH}"
+    local = _loopback_origin(base)
+    if local:
+        return f"http://{local}{CALLBACK_PATH}"
+
+    pinned_raw = os.environ.get("CREMIND_OAUTH_REDIRECT_URI", "").strip()
+    pinned = _loopback_origin(pinned_raw)
+    if pinned:
+        return f"http://{pinned}{CALLBACK_PATH}"
+    if pinned_raw:
+        logger.debug(
+            "[drive] CREMIND_OAUTH_REDIRECT_URI is not a loopback origin; ignoring "
+            "it for the Picker redirect (Desktop clients accept loopback only)"
+        )
+
+    try:
+        app_port = urlsplit(base).port if base else None
+    except ValueError:
+        app_port = None
+    return f"http://localhost:{app_port or _fallback_port()}{CALLBACK_PATH}"
 
 
 def capture_is_local() -> bool:
-    """Whether the browser can reach our callback (i.e. APP_URL is loopback)."""
-    base = (BaseConfig.APP_URL or "").strip()
-    if not base:
-        return False
-    parts = urlsplit(base)
-    return parts.hostname in ("localhost", "127.0.0.1")
+    """Whether the browser can reach our callback (i.e. APP_URL is loopback).
+
+    Shares :func:`_loopback_origin` with :func:`redirect_uri` so the two always
+    agree on what counts as loopback — including a malformed port, where the
+    redirect falls back to another port and capture therefore is *not* local.
+    """
+    return _loopback_origin(BaseConfig.APP_URL or "") is not None
 
 
 def capture_hint() -> Optional[str]:
-    return None if capture_is_local() else _HINT_UNREACHABLE_REDIRECT
+    if capture_is_local():
+        return None
+    return _HINT_UNREACHABLE_REDIRECT.format(origin=redirect_uri()[: -len(CALLBACK_PATH)])
 
 
 def build_picker_params(
