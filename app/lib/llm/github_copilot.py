@@ -89,5 +89,10 @@ class GitHubCopilotLLMProvider(OpenAILLMProvider):
         }
         self.openai = AsyncOpenAI(**kwargs)
         self.model_name = model_name
+        self.base_url = kwargs["base_url"]
+        # Copilot proxies OpenAI model ids but is not the OpenAI API, so the
+        # family sniff stays off — it adapts only if the endpoint rejects
+        # ``max_tokens`` (see OpenAILLMProvider).
+        self._max_tokens_endpoint = kwargs["base_url"]
         self.default_reasoning_effort = default_reasoning_effort
         self.encoder = encoding_for_model("gpt-4o")  # Fallback

@@ -15,10 +15,21 @@ from app.utils import logger
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolUnionParam, ChatCompletionNamedToolChoiceParam
 from openai.types import ResponseFormatJSONObject, ResponseFormatJSONSchema, ResponseFormatText
 
-from .base import LLMProvider, openai_usage_breakdown
+from .base import (
+    LLMProvider,
+    apply_max_tokens,
+    is_unsupported_max_tokens,
+    openai_usage_breakdown,
+    remember_max_completion_tokens,
+)
 
 
 class GroqLLMProvider(LLMProvider):
+    # Memo key for the max_tokens/max_completion_tokens adaptation. Constant:
+    # Groq serves a single endpoint. Class-level so partially-constructed
+    # instances still resolve it.
+    _max_tokens_endpoint: str = "groq"
+
     def __init__(self, api_key: str, model_name: str, default_reasoning_effort: Optional[str] = None):
         self.openai = OpenAI(api_key=api_key)
         self.model_name = model_name
@@ -40,10 +51,11 @@ class GroqLLMProvider(LLMProvider):
         retry: Optional[int] = None,
         args: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[ChatCompletionStreamResponseType, None]:
-        last_error: Any = None
-
         logger.debug(f"[llm:groq] chat_completion_stream model={self.model_name}")
-        for attempt in range((retry or 0) + 1):
+        max_attempts = (retry or 0) + 1
+        attempt = 0
+        renamed_max_tokens = False
+        while True:
             function_calling: List[FunctionCallingResponseType] = []
             content_total = ""
             usage = None
@@ -54,14 +66,17 @@ class GroqLLMProvider(LLMProvider):
                     "messages": messages,
                     "stream": True,
                 }
-                if temperature:
+                if temperature is not None:
                     params["temperature"] = temperature
                 if top_p:
                     params["top_p"] = top_p
                 if stop:
                     params["stop"] = stop
-                if max_tokens:
-                    params["max_tokens"] = max_tokens
+                apply_max_tokens(
+                    params, max_tokens,
+                    endpoint=self._max_tokens_endpoint,
+                    model_name=self.model_name,
+                )
                 if response_format:
                     params["response_format"] = response_format
                 if self.default_reasoning_effort is not None:
@@ -148,10 +163,24 @@ class GroqLLMProvider(LLMProvider):
 
                 return  # success
             except Exception as err:
-                last_error = err
-                if attempt == (retry or 0):
+                if is_unsupported_max_tokens(err) and not renamed_max_tokens:
+                    # This endpoint wants `max_completion_tokens` (GPT-5 /
+                    # o-series semantics). Memo it so later requests get the
+                    # name right first time, then retry now — off-budget,
+                    # since this isn't the failure the caller planned for.
+                    renamed_max_tokens = True
+                    remember_max_completion_tokens(
+                        self._max_tokens_endpoint, self.model_name
+                    )
+                    logger.info(
+                        f"[llm:groq] {self.model_name} rejected max_tokens; "
+                        f"retrying with max_completion_tokens"
+                    )
+                    continue
+                attempt += 1
+                if attempt >= max_attempts:
                     raise AgentException(Status.LLM_CHAT_COMPLETION_ERROR, str(err))
-                await asyncio.sleep(0.5 * (attempt + 1))
+                await asyncio.sleep(0.5 * attempt)
 
     async def chat_completion(
         self,
@@ -168,9 +197,11 @@ class GroqLLMProvider(LLMProvider):
         retry: Optional[int] = None,
         args: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[ChatCompletionStreamResponseType, None]:
-        last_error: Any = None
         logger.debug(f"[llm:groq] chat_completion model={self.model_name}")
-        for attempt in range((retry or 0) + 1):
+        max_attempts = (retry or 0) + 1
+        attempt = 0
+        renamed_max_tokens = False
+        while True:
             function_calling: List[Dict[str, str]] = []
             function_calling_tokens = 0
             try:
@@ -179,14 +210,17 @@ class GroqLLMProvider(LLMProvider):
                     "messages": messages,
                     "stream": False,
                 }
-                if temperature:
+                if temperature is not None:
                     params["temperature"] = temperature
                 if top_p:
                     params["top_p"] = top_p
                 if stop:
                     params["stop"] = stop
-                if max_tokens:
-                    params["max_tokens"] = max_tokens
+                apply_max_tokens(
+                    params, max_tokens,
+                    endpoint=self._max_tokens_endpoint,
+                    model_name=self.model_name,
+                )
                 if response_format:
                     params["response_format"] = response_format
                 if self.default_reasoning_effort is not None:
@@ -265,8 +299,22 @@ class GroqLLMProvider(LLMProvider):
 
                 return  # success
             except Exception as err:
-                last_error = err
                 logger.error(err)
-                if attempt == (retry or 0):
+                if is_unsupported_max_tokens(err) and not renamed_max_tokens:
+                    # This endpoint wants `max_completion_tokens` (GPT-5 /
+                    # o-series semantics). Memo it so later requests get the
+                    # name right first time, then retry now — off-budget,
+                    # since this isn't the failure the caller planned for.
+                    renamed_max_tokens = True
+                    remember_max_completion_tokens(
+                        self._max_tokens_endpoint, self.model_name
+                    )
+                    logger.info(
+                        f"[llm:groq] {self.model_name} rejected max_tokens; "
+                        f"retrying with max_completion_tokens"
+                    )
+                    continue
+                attempt += 1
+                if attempt >= max_attempts:
                     raise AgentException(Status.LLM_CHAT_COMPLETION_ERROR, str(err))
-                await asyncio.sleep(0.5 * (attempt + 1))
+                await asyncio.sleep(0.5 * attempt)

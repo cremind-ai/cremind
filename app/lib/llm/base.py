@@ -37,6 +37,106 @@ def is_context_overflow(err: Any) -> bool:
     return bool(text) and any(marker in text for marker in _CONTEXT_OVERFLOW_MARKERS)
 
 
+# ---------------------------------------------------------------------------
+# max_tokens vs max_completion_tokens
+# ---------------------------------------------------------------------------
+#
+# OpenAI's GPT-5 and o-series reject ``max_tokens`` on Chat Completions with a
+# 400 and tell you to send ``max_completion_tokens`` instead. Every provider
+# that speaks the OpenAI wire format inherits the problem, including gateways
+# that proxy those model ids under a vendor prefix. Two layers handle it:
+#
+#   1. :func:`uses_max_completion_tokens` recognizes the known families by name,
+#      so the common case costs no wasted round-trip.
+#   2. :func:`is_unsupported_max_tokens` + :func:`remember_max_completion_tokens`
+#      adapt at runtime for ids we can't recognize (custom deployments, proxy
+#      slugs, models that don't exist yet): the first request 400s, we memo the
+#      endpoint+model, and every request after that uses the right name.
+
+_MAX_COMPLETION_TOKEN_FAMILIES = ("gpt-5", "o1", "o3", "o4")
+
+_UNSUPPORTED_MAX_TOKENS_MARKERS = (
+    "max_completion_tokens",
+    "'max_tokens' is not supported",
+    '"max_tokens" is not supported',
+)
+
+
+def _bare_model_id(model_name: str) -> str:
+    """Strip a gateway's ``vendor/`` prefix off a model id.
+
+    OpenRouter/LiteLLM/AI-Gateway route the same models as ``openai/gpt-5.4``,
+    so family matching has to run on the last path segment.
+    """
+    return (model_name or "").strip().lower().rsplit("/", 1)[-1]
+
+
+def uses_max_completion_tokens(model_name: str) -> bool:
+    """Whether ``model_name`` belongs to a family that rejects ``max_tokens``."""
+    model = _bare_model_id(model_name)
+    return any(
+        model == fam or model.startswith(fam + "-") or model.startswith(fam + ".")
+        for fam in _MAX_COMPLETION_TOKEN_FAMILIES
+    )
+
+
+def is_unsupported_max_tokens(err: Any) -> bool:
+    """Best-effort detection of the 'use max_completion_tokens instead' 400."""
+    text = str(err or "").lower()
+    return bool(text) and any(m in text for m in _UNSUPPORTED_MAX_TOKENS_MARKERS)
+
+
+# Endpoints+models observed to require ``max_completion_tokens``. Module-level
+# on purpose: ``create_llm_provider`` doesn't cache, so a fresh provider object
+# is built per agent — a per-instance flag would re-pay the failed request on
+# every turn. Keyed by (endpoint, model) since the same model id can behave
+# differently behind different gateways.
+_max_completion_tokens_seen: set[tuple[str, str]] = set()
+
+
+def _memo_key(endpoint: Optional[str], model_name: str) -> tuple[str, str]:
+    return ((endpoint or "").rstrip("/"), (model_name or "").strip().lower())
+
+
+def needs_max_completion_tokens(
+    endpoint: Optional[str], model_name: str, *, sniff_family: bool = False
+) -> bool:
+    """Whether this endpoint+model must be sent ``max_completion_tokens``.
+
+    ``sniff_family`` should only be set by callers talking to **OpenAI itself**,
+    where the family naming is authoritative. Gateways, proxies and local
+    OpenAI-compatible servers (OpenRouter, LiteLLM, Ollama, vLLM, …) accept
+    ``max_tokens`` for the models they serve regardless of the id, and some
+    reject the newer name — so for those we change nothing until the endpoint
+    actually rejects a request, then adapt via the memo.
+    """
+    if sniff_family and uses_max_completion_tokens(model_name):
+        return True
+    return _memo_key(endpoint, model_name) in _max_completion_tokens_seen
+
+
+def remember_max_completion_tokens(endpoint: Optional[str], model_name: str) -> None:
+    """Record that this endpoint+model rejected ``max_tokens``."""
+    _max_completion_tokens_seen.add(_memo_key(endpoint, model_name))
+
+
+def apply_max_tokens(
+    params: Dict[str, Any],
+    max_tokens: Optional[int],
+    *,
+    endpoint: Optional[str],
+    model_name: str,
+    sniff_family: bool = False,
+) -> None:
+    """Set the max-output-tokens request param under whichever name applies."""
+    if not max_tokens:
+        return
+    if needs_max_completion_tokens(endpoint, model_name, sniff_family=sniff_family):
+        params["max_completion_tokens"] = max_tokens
+    else:
+        params["max_tokens"] = max_tokens
+
+
 def _openai_cached_tokens(usage: Any, prompt: int) -> int:
     """Extract the cached-prompt-token count from an OpenAI-style ``usage`` object.
 
