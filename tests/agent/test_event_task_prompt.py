@@ -90,6 +90,18 @@ def test_the_block_explains_when_NOT_to_use_a_task():
     assert "every future occurrence" in EVENT_TASKS_GUIDANCE
 
 
+def test_the_block_teaches_both_ways_a_result_comes_back():
+    """A result arrives as a turn, or as a notice mid-turn — never silently.
+
+    The model has to know the second shape exists, or it reads a notice as
+    noise; and it has to know ignoring one is safe, or it derails a good turn
+    to chase an irrelevant result.
+    """
+    assert "get_event_task_results" in EVENT_TASKS_GUIDANCE
+    assert "nothing needs\npolling" in EVENT_TASKS_GUIDANCE.replace("  ", " ")
+    assert "the moment your turn ends" in EVENT_TASKS_GUIDANCE
+
+
 def test_the_prompt_is_byte_stable_across_renders(monkeypatch):
     """Any per-render variation would bust the cached prefix on every turn."""
     agent = _skeleton(monkeypatch, event_run=False)

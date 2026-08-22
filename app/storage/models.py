@@ -684,10 +684,21 @@ class EventRunModel(Base):
         Boolean, nullable=False, default=False, server_default=false()
     )
     # Epoch MS (this table's convention — subscriptions use seconds) of the
-    # delivery. Claimed with a conditional UPDATE (``IS NULL``), which is what
+    # hand-over. Claimed with a conditional UPDATE (``IS NULL``), which is what
     # makes delivery exactly-once across the live hook, the boot sweep, and a
     # run that reaches a terminal status twice (a late reply into a finished run).
+    # NULL also means "waiting in the origin's inbox": a result that landed while
+    # the origin was mid-turn takes no claim until it is actually handed over.
     origin_delivered_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # HOW the claimed result was handed over. Descriptive only — never a
+    # predicate, so no query has to learn about it:
+    #   "injected" — delivered as a continuation turn in the origin chat
+    #   "read"     — the agent pulled it mid-turn via get_event_task_results
+    #   "skipped"  — claimed but deliberately not delivered (cancelled / origin gone)
+    #   NULL       — not handed over yet, or delivered before this column existed
+    # Without it the Events page and CLI say "delivered" for a result that never
+    # produced a turn, which is unexplainable to a user looking for it.
+    origin_delivery_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     __table_args__ = (
         Index("ix_event_runs_sub", "source_kind", "subscription_id", "created_at"),

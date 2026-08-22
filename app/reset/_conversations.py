@@ -77,6 +77,13 @@ async def cleanup_conversation_dependents(
         await get_event_stream_bus().discard(conversation_id)
     except Exception:  # noqa: BLE001
         logger.debug("bus.discard failed during conv clean", exc_info=True)
+    try:
+        # Pending event-task notices + the run binding. The durable rows are
+        # handled by the FK (SET NULL) and closed out by the boot sweep.
+        from app.events import task_result_inbox
+        task_result_inbox.discard(conversation_id)
+    except Exception:  # noqa: BLE001
+        logger.debug("task inbox discard failed during conv clean", exc_info=True)
     # Remove any saved Plan-mode files for this conversation (best-effort).
     try:
         from app.utils.plans_dir import remove_conversation_plans

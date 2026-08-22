@@ -1,5 +1,5 @@
 ---
-description: "View and manage **event runs** — the per-trigger execution history of automatic event rules (skill, file-watcher, schedule). Each fired trigger runs in its own isolated conversation with a status (running/pending/completed/failed/cancelled) and token usage; reply to runs pending your input, cancel a running run, and inspect or delete run history. Resolve an **event id / run id** copied from the web UI's Events page with `show` to report details about that run, or `reply`/`cancel`/`delete` to act on it. Runs belonging to **one-shot event tasks** also show where their result was delivered — the conversation that was waiting on the outcome — via the `DELIVERED` column and the `origin_conversation_id` field."
+description: "View and manage **event runs** — the per-trigger execution history of automatic event rules (skill, file-watcher, schedule). Each fired trigger runs in its own isolated conversation with a status (running/pending/completed/failed/cancelled) and token usage; reply to runs pending your input, cancel a running run, and inspect or delete run history. Resolve an **event id / run id** copied from the web UI's Events page with `show` to report details about that run, or `reply`/`cancel`/`delete` to act on it. Runs belonging to **one-shot event tasks** also show where their result was delivered — the conversation that was waiting on the outcome — via the `DELIVERED` column and the `origin_conversation_id` field, including whether that conversation received it as a new turn (`injected`), its assistant read it mid-reasoning (`read`), or it is still waiting (`pending`)."
 ---
 
 # `cremind event-runs` — Event Run History
@@ -86,9 +86,18 @@ follows the table; an empty result prints `no event runs match.`.
 
 `DELIVERED` is blank for an ordinary event run. It is filled in only for a
 **one-shot event task**, whose result is handed back to the conversation that
-was waiting for it: `yes` once that turn has been injected, `pending` while the
-hand-over is still owed (a run interrupted by a restart is delivered by a sweep
-on the next boot, so `pending` should not persist).
+was waiting for it, and it says *how* that happened:
+
+| Value      | Meaning                                                                     |
+|------------|-----------------------------------------------------------------------------|
+| `pending`  | Still waiting in that conversation's inbox — the hand-over is owed. A run interrupted by a restart is delivered by a sweep on the next boot, so this should not persist. |
+| `injected` | The waiting conversation received it as a new turn.                          |
+| `read`     | Its assistant pulled the result mid-reasoning, so it was folded into a turn that was already running — expect no separate turn for it. |
+| `skipped`  | Deliberately not delivered: the run was cancelled, or the waiting conversation no longer exists. |
+| `yes`      | Delivered by an older build, before the mode was recorded.                    |
+
+`read` is the one worth knowing about: it is why a delivered result can leave no
+turn of its own in the conversation.
 
 With `--json`, returns the raw `{runs: [...], total: N}` object (each run in the
 full RunJSON shape, with full ids and the complete usage breakdown).

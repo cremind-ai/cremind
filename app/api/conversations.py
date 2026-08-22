@@ -629,6 +629,11 @@ def get_conversation_routes(
 
             event_queue.discard_queue(conversation_id)
             await bus.discard(conversation_id)
+            # Event-task notices are keyed by conversation id, so the old key is
+            # now dead. (The durable rows keep the OLD origin_conversation_id —
+            # a pre-existing gap in the rename path, not introduced here.)
+            from app.events import task_result_inbox
+            task_result_inbox.discard(conversation_id)
 
             # Apply any non-id, non-title fields (e.g., task_id) that were
             # included in the same body.

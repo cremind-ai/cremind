@@ -61,13 +61,18 @@ export interface EventRun {
   /**
    * EVENT TASK delivery. A task run owes its result to the conversation that
    * registered the rule: `origin_conversation_id` is that conversation and
-   * `origin_delivered_at` (epoch ms) is when the continuation turn was
-   * injected — null while the hand-over is still owed. Blank/false on ordinary
-   * event runs, which report only via notifications.
+   * `origin_delivered_at` (epoch ms) is when it was handed over — null while
+   * the result is still waiting in that conversation's inbox.
+   * `origin_delivery_mode` says HOW: 'injected' (arrived as its own turn),
+   * 'read' (the assistant pulled it mid-reasoning, so there is no separate
+   * turn to look for), 'skipped' (cancelled, or the conversation is gone), or
+   * null on rows delivered before the mode was recorded. Blank/false on
+   * ordinary event runs, which report only via notifications.
    */
   origin_conversation_id: string | null;
   deliver_to_origin: boolean;
   origin_delivered_at: number | null; // epoch ms
+  origin_delivery_mode: 'injected' | 'read' | 'skipped' | null;
 }
 
 export interface ListEventRunsQuery {

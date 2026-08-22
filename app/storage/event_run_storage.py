@@ -202,13 +202,57 @@ class EventRunStorage:
             return (result.rowcount or 0) > 0
 
     async def clear_delivery_claim(self, run_id_pk: str) -> None:
-        """Release a delivery claim whose injection failed, so the sweep retries."""
+        """Release a delivery claim whose hand-over failed, so it is retried.
+
+        Two callers only, both releasing a claim *they themselves* took moments
+        earlier: an injection whose enqueue raised, and a mid-turn read that was
+        cancelled before the text reached the model. Never call this for a row a
+        sibling claimed — that would resurrect an already-delivered result and
+        re-deliver it on every boot.
+        """
         async with self.async_session_maker.begin() as session:
             await session.execute(
                 update(EventRunModel)
                 .where(EventRunModel.id == run_id_pk)
-                .values(origin_delivered_at=None)
+                .values(origin_delivered_at=None, origin_delivery_mode=None)
             )
+
+    async def set_delivery_mode(self, run_id_pk: str, mode: str) -> None:
+        """Record HOW a claimed result was handed over (descriptive only)."""
+        async with self.async_session_maker.begin() as session:
+            await session.execute(
+                update(EventRunModel)
+                .where(EventRunModel.id == run_id_pk)
+                .values(origin_delivery_mode=mode)
+            )
+
+    async def list_pending_for_origin(
+        self, origin_conversation_id: str,
+    ) -> list[dict[str, Any]]:
+        """A conversation's pending-results inbox, oldest first.
+
+        The same predicate as :meth:`list_undelivered_task_runs`, sliced by
+        origin: a terminal task run that has not been handed over yet *is* the
+        inbox entry — parking a result writes nothing, because the terminal
+        status write already put the row in this set.
+
+        ``cancelled`` is deliberately excluded. A cancelled run is a deliberate
+        kill from the Events page, and v1 terminates it quietly; surfacing "your
+        task was cancelled" here would regress that. Such rows are claimed and
+        marked ``skipped`` by :func:`on_run_terminal` (or the boot sweep), never
+        read and never injected.
+        """
+        conds = [
+            EventRunModel.origin_conversation_id == origin_conversation_id,
+            EventRunModel.deliver_to_origin.is_(True),
+            EventRunModel.origin_delivered_at.is_(None),
+            EventRunModel.status.in_(("completed", "failed")),
+        ]
+        async with self.async_session_maker() as session:
+            rows = (await session.execute(
+                select(EventRunModel).where(*conds).order_by(EventRunModel.created_at.asc())
+            )).scalars().all()
+        return [self._row_to_dict(r) for r in rows]
 
     async def list_undelivered_task_runs(
         self, profile: str | None = None,
@@ -469,6 +513,7 @@ class EventRunStorage:
             "origin_conversation_id": r.origin_conversation_id,
             "deliver_to_origin": bool(r.deliver_to_origin),
             "origin_delivered_at": r.origin_delivered_at,
+            "origin_delivery_mode": r.origin_delivery_mode,
         }
 
 

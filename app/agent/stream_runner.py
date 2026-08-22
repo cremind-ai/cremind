@@ -37,6 +37,7 @@ from a2a.types import DataPart, FilePart, Part
 
 from app.agent.usage import reconcile
 from app.constants import ChatCompletionTypeEnum
+from app.events import task_result_inbox
 from app.events.notifications_buffer import get_event_notifications
 from app.events.stream_bus import get_event_stream_bus
 from app.lib.llm.exceptions import SetupRequiredError
@@ -521,6 +522,20 @@ async def run_agent_to_bus(
     current_turn_msg_id: Optional[str] = None
 
     try:
+        # 0. Claim this conversation as mid-turn for event-task delivery. A task
+        #    result that lands from here until the ``finally`` parks in the
+        #    conversation's inbox (a notice on the agent's next tool result)
+        #    instead of queueing a turn behind this one, where it would stay
+        #    invisible until this turn ended.
+        #
+        #    FIRST statement inside the try — and unbound FIRST in the finally —
+        #    so a binding exists only across a stretch that is guaranteed to be
+        #    torn down. (``bus.is_active`` cannot serve this: start_run sits
+        #    outside the try, so a stale True is reachable, and under an
+        #    is_active fork a stale flag would park every later result for this
+        #    conversation with no turn-end flush to rescue it.)
+        task_result_inbox.bind_run(run_id, conversation_id)
+
         # 1. Persist the trigger / user message and announce it on the bus.
         #    For skill events we render the trigger as an *agent* bubble with
         #    a structured Trigger/Action/Content block so a reload can tell
@@ -1116,6 +1131,10 @@ async def run_agent_to_bus(
             except Exception:  # noqa: BLE001
                 logger.exception("stream_runner: failed to push notification")
     finally:
+        # Release the event-task binding FIRST: from here on this conversation
+        # is idle, so a task result landing mid-teardown delivers itself rather
+        # than parking with nobody left to read it.
+        task_result_inbox.unbind_run(run_id)
         _running_runs.pop(run_id, None)
         # Clear the plan-mode registry unconditionally (event runs clear
         # run_state above only for event runs; the plan registry must never leak
@@ -1124,6 +1143,29 @@ async def run_agent_to_bus(
         if ctx_token is not None:
             current_task_id_var.reset(ctx_token)
         await bus.end_run(conversation_id)
+
+        # Turn-end reconciliation. Any task result that landed while this turn
+        # was running and the agent chose not to read is injected NOW, as one
+        # coalesced continuation turn — so a waiting flow can never stall on the
+        # agent ignoring a notice, and the notice stays a safe optimisation.
+        #
+        # In the ``finally`` (not after step 8) so an errored or cancelled turn
+        # still reconciles; a flush interrupted here simply leaves the marker
+        # set and the next turn on this conversation retries. The in-memory
+        # ``has_pending`` gate keeps a DB query off every ordinary turn end.
+        if not event_run and task_result_inbox.has_pending(conversation_id):
+            try:
+                from app.events.event_task_delivery import flush_origin_inbox
+                await flush_origin_inbox(
+                    conversation_id=conversation_id, profile=profile,
+                    reason="turn_end",
+                )
+                task_result_inbox.reset(conversation_id)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "stream_runner: turn-end task-result flush failed for "
+                    f"{conversation_id}"
+                )
 
 
 def make_run_id(conversation_id: str, kind: str = "msg") -> str:

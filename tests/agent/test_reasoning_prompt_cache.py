@@ -65,3 +65,23 @@ def test_input_is_query_only_no_memory_injection(monkeypatch):
     # The volatile input is just the query — no injected memory block.
     rendered = agent._render_input()
     assert rendered == "hello there"
+
+
+def test_the_inbox_reader_is_gated_on_a_conversation_constant_flag():
+    """The tools block must not vary with what is waiting in the inbox.
+
+    ``get_event_task_results`` is exposed to chat turns and withheld from event
+    runs — the same shape as ``request_user_input``, and for the same reason:
+    both populations keep a byte-identical tools prefix for a whole
+    conversation. Gating on something turn-varying (say, "only when a result is
+    waiting") would re-send the tools block mid-conversation and drop the cache
+    hit rate, which is exactly the regression that made event runs 29%.
+    """
+    import inspect
+
+    src = inspect.getsource(ra.ReasoningAgent.__init__)
+    gate = src[src.index('t.tool_id != "get_event_task_results"') - 400:]
+    assert "if event_run:" in gate.split('t.tool_id != "get_event_task_results"')[0]
+    # Nothing about the inbox's CONTENTS may reach the gate.
+    assert "has_pending" not in src
+    assert "list_pending_for_origin" not in src

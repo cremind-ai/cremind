@@ -46,6 +46,39 @@ const cwd = computed(() => {
   return terminalPanel.cwdByConversation[id] ?? '';
 });
 
+// One-shot task delivery, three ways. A result the assistant READ was folded
+// into a turn that was already running, so a user looking for "the turn where
+// the result arrived" would never find one — hence its own wording.
+const deliveryLabel = computed(() => {
+  const r = run.value;
+  if (!r?.origin_delivered_at) return 'Delivery pending';
+  if (r.origin_delivery_mode === 'read') return 'Result read by the assistant';
+  if (r.origin_delivery_mode === 'skipped') return 'Delivery skipped';
+  return 'Result delivered';
+});
+const deliveryIcon = computed(() => {
+  const r = run.value;
+  if (!r?.origin_delivered_at) return 'mdi:progress-clock';
+  if (r.origin_delivery_mode === 'read') return 'mdi:eye-check';
+  if (r.origin_delivery_mode === 'skipped') return 'mdi:cancel';
+  return 'mdi:reply';
+});
+const deliveryHint = computed(() => {
+  const r = run.value;
+  if (!r?.origin_delivered_at) {
+    return 'This task result is still waiting in its conversation’s inbox.';
+  }
+  if (r.origin_delivery_mode === 'read') {
+    return 'The assistant read this result while it was already working, so it '
+      + 'was used inside that turn rather than arriving as a new one.';
+  }
+  if (r.origin_delivery_mode === 'skipped') {
+    return 'This result was deliberately not delivered — the run was cancelled, '
+      + 'or the conversation waiting for it no longer exists.';
+  }
+  return 'This task result was delivered back into the conversation that was waiting for it.';
+});
+
 const usagePanelOpen = ref(false);
 
 // Maximized reveals the full RightPanel workspace (file tree + terminal), like
@@ -245,22 +278,18 @@ async function deleteRun() {
           <span>· {{ formatUsd(run.usage.total_usd) }}</span>
           <span v-if="cwd" class="run-cwd" :title="cwd">· cwd: {{ cwd }}</span>
           <!-- One-shot task runs owe their result to the chat that registered
-               the rule; say whether that hand-over has happened. -->
+               the rule; say whether that hand-over happened, and how. "Read"
+               is the one that needs saying: the result was folded into a turn
+               that was already running, so there is no separate turn to find. -->
           <span
             v-if="run.deliver_to_origin"
             class="run-delivery"
             :class="{ owed: !run.origin_delivered_at }"
-            :title="
-              run.origin_delivered_at
-                ? 'This task result was delivered back into the conversation that was waiting for it.'
-                : 'This task result has not reached its conversation yet.'
-            "
+            :title="deliveryHint"
           >
             ·
-            <Icon
-              :icon="run.origin_delivered_at ? 'mdi:reply' : 'mdi:progress-clock'"
-            />
-            {{ run.origin_delivered_at ? 'Result delivered' : 'Delivery pending' }}
+            <Icon :icon="deliveryIcon" />
+            {{ deliveryLabel }}
           </span>
         </div>
       </div>

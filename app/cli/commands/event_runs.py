@@ -75,13 +75,23 @@ def _fmt_ts(value: Any) -> str:
 
 
 def _delivery_cell(run: dict[str, Any]) -> str:
-    """Whether this run owes its result to a waiting conversation, and if it paid.
+    """Whether this run owes its result to a waiting conversation, and how it paid.
 
     Blank for an ordinary event run — only EVENT TASK runs deliver back.
+    ``pending`` means the result is still waiting in that conversation's inbox.
+    Otherwise the mode says what actually happened, which is what explains a
+    delivered result that produced no visible turn:
+
+      injected  the waiting conversation got it as a new turn
+      read      its agent pulled it mid-reasoning, so it is inside that turn
+      skipped   the run was cancelled, or the waiting conversation is gone
+      yes       delivered before modes were recorded (older rows)
     """
     if not run.get("deliver_to_origin"):
         return ""
-    return "yes" if run.get("origin_delivered_at") else "pending"
+    if not run.get("origin_delivered_at"):
+        return "pending"
+    return str(run.get("origin_delivery_mode") or "yes")
 
 
 def _fmt_usd(value: Any) -> str:
@@ -232,6 +242,9 @@ def event_runs_show(
     if run.get("deliver_to_origin"):
         rows.append(("origin_conversation_id", string_field(run, "origin_conversation_id")))
         rows.append(("result_delivered", _fmt_ts(run.get("origin_delivered_at")) or "pending"))
+        mode = run.get("origin_delivery_mode")
+        if mode:
+            rows.append(("delivery", str(mode)))
     pending = run.get("pending_question")
     if pending:
         rows.append(("pending_question", str(pending)))

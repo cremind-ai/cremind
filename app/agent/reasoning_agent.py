@@ -208,13 +208,20 @@ outcome, and END YOUR TURN. Never sleep, poll, or re-check in a loop.
 - waiting for a moment in time -> `schedule_create` with no `rrule`: every
   one-time event you create is already a task.
 A task runs its `action` once in a background conversation, then its result — or
-a "timed out" notice — is delivered back HERE as a new turn, and the task stops
-itself. So write `action` to EXTRACT and REPORT what you need in order to
+a "timed out" notice — comes back to THIS conversation and the task stops itself.
+How it comes back depends on what you are doing when it lands: if nothing is
+running here it arrives on its own as a new turn; if it lands while a turn is
+still running you get a short notice on one of your tool results naming the task
+and whether it succeeded, and you decide — call `get_event_task_results` to read
+it now if it changes your next step, or keep working and it is handed to you as a
+new turn the moment your turn ends. Either way nothing is lost and nothing needs
+polling. So write `action` to EXTRACT and REPORT what you need in order to
 continue; do NOT ask it to notify the user, you will do that here. You may
-register several tasks in one turn; when you are done, finish with a short
-message naming exactly what you are waiting for. Use a STANDING subscription (no
-`task`) or a recurring schedule ONLY when the user wants every future occurrence
-handled indefinitely — those never report back to this conversation.
+register several tasks in one turn; results that land together are handed over
+together. When you are done, finish with a short message naming exactly what you
+are waiting for. Use a STANDING subscription (no `task`) or a recurring schedule
+ONLY when the user wants every future occurrence handled indefinitely — those
+never report back to this conversation.
 '''
 
 
@@ -767,6 +774,9 @@ class ReasoningAgent:
     # Event-task chain depth (see ``__init__``). Same class-level-default
     # rationale as above.
     _task_chain_depth: int = 0
+    # Step that already carried an event-task inbox notice; reset per turn in
+    # ``run``. Same class-level-default rationale as above.
+    _notice_step: int = -1
 
     def __init__(
         self,
@@ -855,6 +865,15 @@ class ReasoningAgent:
         # cache hits, and it's stable across an event run's own turns.
         if not event_run:
             tools = [t for t in tools if t.tool_id != "request_user_input"]
+        # ``get_event_task_results`` is the mirror image: it reads the results of
+        # one-shot event tasks that finished while THIS conversation was busy.
+        # An event run has no inbox of its own and cannot register tasks, so the
+        # tool is withheld there and exposed on every chat turn — the same
+        # conversation-CONSTANT shape as the gate above, which is what keeps the
+        # tools prefix byte-stable within a conversation (a turn-varying gate,
+        # e.g. "only when the inbox is non-empty", would fragment the cache).
+        if event_run:
+            tools = [t for t in tools if t.tool_id != "get_event_task_results"]
         # Plan-mode tools are exposed only on plan runs, and only in the matching
         # phase (mirrors the request_user_input gate above). Withholding them
         # everywhere else keeps reasoning/instant chat runs byte-identical to
@@ -1531,9 +1550,38 @@ class ReasoningAgent:
         if not self._triggered_by_event:
             return False
         from app.events.task_policy import MAX_TASK_CHAIN_DEPTH, is_task_registration
-        if self._task_chain_depth >= MAX_TASK_CHAIN_DEPTH:
+        if self._effective_chain_depth() >= MAX_TASK_CHAIN_DEPTH:
             return True
         return not is_task_registration(entry[1].tool_id, entry[2], args or {})
+
+    def _effective_chain_depth(self) -> int:
+        """How deep this flow's wait chain is, counting results read mid-turn.
+
+        ``_task_chain_depth`` arrives on the trigger event, so a turn that
+        instead PULLED its result with ``get_event_task_results`` carries no
+        depth at all — and a wait → read → register → wait loop would restart
+        the counter on every hop, escaping the cap entirely. Reading the depth
+        the tool recorded closes that.
+
+        Dispatch-time only — it never reaches the prompt — so consulting a
+        turn-varying registry here costs no prompt cache. Note the caller checks
+        ``_triggered_by_event`` first, so a plain user-initiated turn keeps full
+        registration rights even if it read a result: the cap exists to stop
+        UNATTENDED ping-pong, and a present human resets that concern.
+        """
+        depth = int(getattr(self, "_task_chain_depth", 0) or 0)
+        try:
+            from app.events import task_result_inbox
+            from app.utils.task_context import current_task_id_var
+
+            run_id = current_task_id_var.get()
+            if run_id:
+                consumed = task_result_inbox.consumed_depth(run_id)
+                if consumed:
+                    depth = max(depth, consumed + 1)
+        except Exception:  # noqa: BLE001
+            pass
+        return depth
 
     def _registration_refusal(self) -> str:
         """The tool result for a registration this turn is not allowed to make."""
@@ -1547,9 +1595,10 @@ class ReasoningAgent:
                 "and report the outcome in your final answer."
             )
         from app.events.task_policy import MAX_TASK_CHAIN_DEPTH
-        if self._task_chain_depth >= MAX_TASK_CHAIN_DEPTH:
+        chain_depth = self._effective_chain_depth()
+        if chain_depth >= MAX_TASK_CHAIN_DEPTH:
             return (
-                f"This flow has already chained {self._task_chain_depth} event "
+                f"This flow has already chained {chain_depth} event "
                 "tasks, which is the limit — nothing was registered. Finish now "
                 "and tell the user where things stand; if more waiting is needed "
                 "they can ask again in a new message."
@@ -1591,6 +1640,16 @@ class ReasoningAgent:
             and (entry[1].tool_id, entry[2]) in self._PLAN_BLOCKED_LEAVES
         )
 
+    # Leaves whose result must reach the model whole, exempt from the per-tool
+    # token clamp (same rationale as a skill load, which passes truncate=False).
+    # An event-task result the agent pulled early must not come back SHORTER
+    # than the same result would if it simply let the turn end and took the
+    # injected turn instead — that would make reading strictly worse than
+    # ignoring the notice.
+    _UNCLAMPED_LEAVES: frozenset = frozenset({
+        ("get_event_task_results", "get_event_task_results"),
+    })
+
     # ── main entry point ──────────────────────────────────────────────
 
     async def run(
@@ -1604,6 +1663,9 @@ class ReasoningAgent:
         self._turn_messages = []
         self._final_answer_text = ""
         self.current_step_count = 0
+        # Step number that already carried an event-task inbox notice (-1 = none
+        # this turn), so parallel calls in one step append it exactly once.
+        self._notice_step = -1
         # A skill is "loaded" iff its SKILL.md load call is still in the replayed
         # history (it drops out once compaction folds it past the watermark). Mirror
         # the derived set into ContextStorage for change_working_directory.
@@ -1800,6 +1862,16 @@ class ReasoningAgent:
                 ])
                 outcomes = {o.call_id: o for o in gathered}
 
+            # A step that pulled the inbox has already been handed everything
+            # waiting; a sibling tool emitted earlier in call order must not
+            # carry a notice for rows this very step just drained.
+            if any(
+                e is not None and e[0] == "leaf"
+                and (e[1].tool_id, e[2]) in self._UNCLAMPED_LEAVES
+                for (_c, _n, _a, e) in resolved
+            ):
+                self._notice_step = step_no
+
             # Emit results + append the role:"tool" messages in call order.
             for call_id, name, args, entry in resolved:
                 if entry is None:
@@ -1836,7 +1908,10 @@ class ReasoningAgent:
                     continue
                 for status_chunk in outcome.status_chunks:
                     yield status_chunk
-                self._append_tool_result(call_id, outcome.tool_text, fn_name=name)
+                self._append_tool_result(
+                    call_id, outcome.tool_text, fn_name=name,
+                    truncate=(entry[1].tool_id, entry[2]) not in self._UNCLAMPED_LEAVES,
+                )
                 yield self._result_artifact(step_no, call_id, outcome.parts)
 
             # Event run parked pending: the agent called request_user_input this
@@ -2070,11 +2145,68 @@ class ReasoningAgent:
                     max_tokens=self._tool_result_max_tokens
                 )
             text = clamped
+        # Event-task inbox notice. AFTER the clamp (the truncation-notice
+        # precedent just above): a notice clipped off the tail is a notice the
+        # model never sees. Outside the ``if truncate`` block on purpose, so it
+        # also rides a skill load — a long SKILL.md read is exactly the kind of
+        # step during which a result lands — and installs with tool-result
+        # capping switched off.
+        text += self._drain_inbox_notice()
         self._turn_messages.append({
             "role": "tool",
             "tool_call_id": call_id,
             "content": text,
         })
+
+    def _drain_inbox_notice(self) -> str:
+        """Tell the agent, mid-turn, that an awaited task result has landed.
+
+        Rides the tool result rather than the system prompt (the
+        documentation_search precedent): the prompt is the cached prefix, and
+        this is per-turn news. Once per step even when several tools ran in
+        parallel — the model reads a step's results together, so repeating it
+        would be noise.
+
+        Best-effort by design. A step with no tool call never reaches here and
+        the notice is simply never shown; the turn-end flush then injects the
+        result as its own turn. The notice is an optimisation, that flush is the
+        guarantee — which is what lets this channel be lossy and in-memory.
+
+        Phrased in the past tense and free of "you are mid-turn": this text is
+        persisted with the tool message and replayed inside later turns, where
+        any present-tense framing would have become false.
+        """
+        if getattr(self, "_event_run", False):
+            return ""
+        step = getattr(self, "current_step_count", 0)
+        if getattr(self, "_notice_step", -1) == step:
+            return ""
+        try:
+            from app.events import task_result_inbox
+            from app.utils.task_context import current_task_id_var
+
+            run_id = current_task_id_var.get()
+            notices = task_result_inbox.drain_notices(run_id or "")
+        except Exception:  # noqa: BLE001
+            return ""
+        if not notices:
+            return ""
+        self._notice_step = step
+
+        lines = "\n".join(
+            f"- {n.get('label') or 'event task'} — {n.get('status_word') or 'finished'}"
+            for n in notices
+        )
+        return (
+            f"\n\n[Event task results waiting — {len(notices)}]\n"
+            "A one-shot task you registered finished while this turn was "
+            f"running:\n{lines}\n"
+            "Call `get_event_task_results` now (no arguments) if these outcomes "
+            "change what you should do next — answering without them risks a "
+            "stale answer. If they are irrelevant to what you are doing right "
+            "now, keep working: every waiting result is delivered automatically "
+            "as a new turn as soon as this turn ends."
+        )
 
     # ── skills ─────────────────────────────────────────────────────────
 
@@ -2233,7 +2365,10 @@ class ReasoningAgent:
                 from app.events.task_policy import (
                     MAX_TASK_CHAIN_DEPTH, is_task_subscribe_args,
                 )
-                if self._task_chain_depth >= MAX_TASK_CHAIN_DEPTH:
+                # Effective depth, not the raw trigger depth: a turn that pulled
+                # its result with get_event_task_results carries none, and would
+                # otherwise chain skill tasks without limit.
+                if self._effective_chain_depth() >= MAX_TASK_CHAIN_DEPTH:
                     obs = self._registration_refusal()
                 elif not is_task_subscribe_args(sub_args):
                     obs = (

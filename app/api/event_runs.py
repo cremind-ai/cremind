@@ -66,11 +66,15 @@ def _run_json(run: Dict[str, Any], usage: Dict[str, Any] | None) -> Dict[str, An
         "created_at": run.get("created_at"),
         "updated_at": run.get("updated_at"),
         "finished_at": run.get("finished_at"),
-        # Event tasks: which conversation is waiting for this run's result, and
-        # whether it has been handed over yet (epoch ms, null = still owed).
+        # Event tasks: which conversation is waiting for this run's result,
+        # whether it has been handed over yet (epoch ms, null = still waiting in
+        # that conversation's inbox), and HOW it was handed over —
+        # "injected" (arrived as a turn) | "read" (the agent pulled it mid-turn)
+        # | "skipped" (cancelled / origin gone) | null (pre-dates the column).
         "origin_conversation_id": run.get("origin_conversation_id"),
         "deliver_to_origin": bool(run.get("deliver_to_origin")),
         "origin_delivered_at": run.get("origin_delivered_at"),
+        "origin_delivery_mode": run.get("origin_delivery_mode"),
     }
 
 

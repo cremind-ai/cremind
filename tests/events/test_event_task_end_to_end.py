@@ -247,3 +247,67 @@ def test_a_standing_subscription_keeps_firing_and_stays_out_of_the_chat(tmp_path
     assert len(messages) == before              # nothing injected into the chat
     assert sub["task"] is False
     assert sub["task_status"] is None
+
+
+def test_a_result_landing_mid_turn_waits_and_then_arrives_when_the_turn_ends(
+    tmp_path, monkeypatch,
+):
+    """Example 3, the mid-flight case: the chat is busy when the task finishes.
+
+    The old behaviour queued the continuation behind the running turn, where the
+    agent could not see it. Now it parks — no claim, no queued turn — a notice
+    waits for the agent's next tool result, and whatever it did not read is
+    injected the moment the turn ends. Both halves are checked here with the
+    real dispatcher, storages and delivery module.
+    """
+    cs, ers, subs, agent = _setup(tmp_path, monkeypatch)
+    from app.events import task_result_inbox
+
+    async def _scenario():
+        chat = await cs.get_or_create_conversation(profile="p1", context_id="ctx-1")
+        await register_skill_events(
+            profile="p1", context_id="ctx-1", skill_id="imap-email",
+            skill_source=str(tmp_path / "imap-email"), triggers=["new-mail"],
+            action="read the reply and report the customer's decision",
+            request_context="", task=True,
+        )
+        before = len(await cs.get_messages(chat["id"]))
+
+        # The chat is mid-turn when the mail lands.
+        task_result_inbox.bind_run("msg:chat:live", chat["id"])
+        await _deliver_mail(subs, "From: ABC\n\nApproved — deliver on the 21st.")
+        await _drain()
+
+        runs, _ = await ers.list(profile="p1")
+        parked = {
+            "queued_nothing": len(await cs.get_messages(chat["id"])) == before,
+            "unclaimed": runs[0]["origin_delivered_at"] is None,
+            "notices": task_result_inbox.drain_notices("msg:chat:live"),
+            "pending": await ers.list_pending_for_origin(chat["id"]),
+        }
+
+        # The turn ends without the agent having read it.
+        task_result_inbox.unbind_run("msg:chat:live")
+        from app.events.event_task_delivery import flush_origin_inbox
+        await flush_origin_inbox(
+            conversation_id=chat["id"], profile="p1", reason="turn_end",
+        )
+        await _drain()
+
+        return parked, await cs.get_messages(chat["id"]), before, subs.list_by_profile("p1")[0]
+
+    parked, messages, before, sub = asyncio.run(_scenario())
+
+    # While the turn ran: nothing queued, nothing claimed, but the agent was told.
+    assert parked["queued_nothing"], "a result must not queue behind the live turn"
+    assert parked["unclaimed"], "parking takes no claim — the row IS the inbox entry"
+    assert len(parked["notices"]) == 1
+    assert parked["notices"][0]["status_word"] == "completed"
+    assert len(parked["pending"]) == 1
+
+    # After it ended: the result arrived as its own turn, and the task is spent.
+    new_messages = messages[before:]
+    assert new_messages, "the parked result never arrived"
+    assert _ANSWER in new_messages[0]["content"]
+    assert _ANSWER in agent.queries[1]
+    assert sub["task_status"] == "completed"
