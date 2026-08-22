@@ -236,8 +236,8 @@ dev = [
     # without these, `cremind serve` hard-crashes at boot the moment the
     # configured 'high' model group resolves to a provider whose SDK is absent
     # (e.g. github-copilot, which wraps the openai SDK). The `openai` group also
-    # backs every OpenAI-compatible third-party (github-copilot, deepseek,
-    # mistral, …), so these three cover the dedicated-SDK providers a dev is
+    # backs every OpenAI-compatible third-party (github-copilot, mistral,
+    # moonshot, …), so these three cover the dedicated-SDK providers a dev is
     # likely to configure locally.
     "anthropic>=0.52.0",
     "openai>=2.6.0",

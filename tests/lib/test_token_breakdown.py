@@ -72,9 +72,9 @@ def test_breakdown_none_usage_all_none():
     }
 
 
-def test_breakdown_deepseek_style_cache_hit_field():
-    # DeepSeek reports cached prompt tokens via top-level prompt_cache_hit_tokens
-    # (no prompt_tokens_details).
+def test_breakdown_toplevel_cache_hit_field():
+    # Some OpenAI-compatible endpoints report cached prompt tokens via a
+    # top-level prompt_cache_hit_tokens (no prompt_tokens_details).
     usage = SimpleNamespace(prompt_tokens=1000, completion_tokens=50, prompt_cache_hit_tokens=800)
     b = openai_usage_breakdown(usage)
     assert b["input_tokens"] == 200

@@ -132,8 +132,8 @@ FEATURES: dict[str, Feature] = {
         extras=("llm-groq",),
         probes=("groq", "tiktoken"),
     ),
-    # Umbrella for every OpenAI-compatible third-party (chutes, deepseek,
-    # mistral, moonshot, ...). They route through ``app.lib.llm.openai`` so
+    # Umbrella for every OpenAI-compatible third-party (chutes, mistral,
+    # moonshot, qwen, ...). They route through ``app.lib.llm.openai`` so
     # ``llm-openai`` is the only group required.
     "llm.openai_compatible": Feature(
         key="llm.openai_compatible",

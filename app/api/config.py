@@ -170,8 +170,8 @@ def _features_required_by_setup_payload(body: dict) -> list[str]:
     for provider in providers_in_use:
         feature = LLM_PROVIDER_TO_FEATURE.get(provider)
         if feature is None:
-            # Generic OpenAI-compatible third-parties (chutes, deepseek,
-            # mistral, ...). They all use the openai SDK so the
+            # Generic OpenAI-compatible third-parties (chutes, mistral,
+            # moonshot, ...). They all use the openai SDK so the
             # ``llm-openai`` group is the right one to install.
             feature = "llm.openai_compatible"
         if feature in FEATURES:

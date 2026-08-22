@@ -65,8 +65,8 @@ _UNSUPPORTED_MAX_TOKENS_MARKERS = (
 def _bare_model_id(model_name: str) -> str:
     """Strip a gateway's ``vendor/`` prefix off a model id.
 
-    OpenRouter/LiteLLM/AI-Gateway route the same models as ``openai/gpt-5.4``,
-    so family matching has to run on the last path segment.
+    LiteLLM/AI-Gateway route the same models as ``openai/gpt-5.4``, so family
+    matching has to run on the last path segment.
     """
     return (model_name or "").strip().lower().rsplit("/", 1)[-1]
 
@@ -105,7 +105,7 @@ def needs_max_completion_tokens(
 
     ``sniff_family`` should only be set by callers talking to **OpenAI itself**,
     where the family naming is authoritative. Gateways, proxies and local
-    OpenAI-compatible servers (OpenRouter, LiteLLM, Ollama, vLLM, …) accept
+    OpenAI-compatible servers (LiteLLM, AI-Gateway, Ollama, vLLM, …) accept
     ``max_tokens`` for the models they serve regardless of the id, and some
     reject the newer name — so for those we change nothing until the endpoint
     actually rejects a request, then adapt via the memo.
@@ -186,13 +186,15 @@ def _openai_cached_tokens(usage: Any, prompt: int) -> int:
     """Extract the cached-prompt-token count from an OpenAI-style ``usage`` object.
 
     The standard location is ``prompt_tokens_details.cached_tokens`` (OpenAI, Groq,
-    xAI, Mistral, Qwen, MiniMax, Fireworks, OpenRouter, LiteLLM, …). A few
-    OpenAI-compatible providers report the same number under a different name, so we
-    fall back to those when the standard field is absent/zero:
+    xAI, Mistral, Qwen, MiniMax, Fireworks, LiteLLM, …). A few OpenAI-compatible
+    providers report the same number under a different name, so we fall back to
+    those when the standard field is absent/zero:
 
     - Together / Moonshot(Kimi): top-level ``usage.cached_tokens``
-    - DeepSeek: top-level ``usage.prompt_cache_hit_tokens`` (with
-      ``prompt_cache_miss_tokens`` being the uncached remainder)
+    - Others: top-level ``usage.prompt_cache_hit_tokens`` (with
+      ``prompt_cache_miss_tokens`` being the uncached remainder). Kept as a
+      provider-agnostic fallback — a user-defined ``custom:`` endpoint can
+      still report cache hits this way.
 
     (Gemini's ``cached_content_token_count`` lives in ``usageMetadata``, not the
     OpenAI usage object, so it isn't captured here — see provider notes.)

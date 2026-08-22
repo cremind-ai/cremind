@@ -123,7 +123,7 @@ def test_other_openai_models_still_send_max_tokens(model):
 def test_gateway_is_not_sniffed_by_name():
     """A proxied ``openai/gpt-5.4`` keeps ``max_tokens`` until the gateway
     complains — some OpenAI-compatible gateways only accept the old name."""
-    p, calls = _make_provider("openai/gpt-5.4", base_url="https://openrouter.ai/api/v1")
+    p, calls = _make_provider("openai/gpt-5.4", base_url="https://gateway.example.com/v1")
     _run_stream(p, max_tokens=1000)
     assert calls[0]["max_tokens"] == 1000
     assert "max_completion_tokens" not in calls[0]

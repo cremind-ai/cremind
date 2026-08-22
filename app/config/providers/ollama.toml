@@ -57,13 +57,3 @@ prompt_cache = false
 vision = true
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
-
-[[models]]
-id = "deepseek-r1:14b"
-context_window = 131072
-display_name = "DeepSeek R1 14B"
-supports_reasoning = true
-group_hint = "low"
-prompt_cache = false
-input_price_per_1m = 0.00
-output_price_per_1m = 0.00
