@@ -2,6 +2,7 @@
 import { computed, watch, onMounted, onUnmounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useChatStore } from './stores/chat';
+import { useGroupChatStore } from './stores/groupChat';
 import { useSettingsStore } from './stores/settings';
 import { useEmbeddingStatusStore } from './stores/embeddingStatus';
 import { checkSetupStatus } from './services/configApi';
@@ -14,6 +15,7 @@ import FloatingTodoLayer from './components/plan/FloatingTodoLayer.vue';
 const route = useRoute();
 const router = useRouter();
 const chatStore = useChatStore();
+const groupChatStore = useGroupChatStore();
 const settingsStore = useSettingsStore();
 const embeddingStatusStore = useEmbeddingStatusStore();
 
@@ -110,6 +112,9 @@ async function handleProfileNavigation(
   // stream on demand via trackConversation, independent of connect().
   const onChatRoute = CHAT_ROUTES.has(routeName);
   if (previousProfile && previousProfile !== profileName) {
+    // Group rooms and their per-group SSE are scoped to the previous profile's
+    // token — drop them alongside the chat state, whatever route we land on.
+    groupChatStore.resetForProfileSwitch();
     // Reset chat state when switching to a different profile.
     if (onChatRoute) {
       await chatStore.resetForProfileSwitch();

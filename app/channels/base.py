@@ -26,10 +26,18 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any
 
+from app.channels.exceptions import ChannelNotImplemented
 from app.channels.notification_delivery import NotificationDeliveryMixin
 from app.events import queue as event_queue
 from app.events.notifications_buffer import get_event_notifications
 from app.events.stream_bus import get_event_stream_bus
+from app.channels.reply_target import (
+    ReplyTarget,
+    coerce_target,
+    group_key,
+    group_target,
+    sender_target,
+)
 from app.config.user_config import replay_reasoning_enabled
 from app.utils.common import convert_db_messages_to_history
 from app.utils.logger import logger
@@ -39,6 +47,24 @@ _OTP_TTL_SECONDS = 600  # 10 minutes
 # Telegram caps a single message at 4096 chars; the other platforms have
 # similar (looser) caps. Keep some headroom for the markdown wrapper.
 _MAX_MESSAGE_CHARS = 3500
+
+
+def platform_message_timestamp(message: Any) -> float | None:
+    """A platform message's own send time, in epoch seconds, or ``None``.
+
+    Every account that receives a message reports the same send time, which is
+    what lets :func:`app.channels.groups.keys.platform_key` tell N copies of one
+    message apart from one person repeating themselves. Defensive on purpose: a
+    missing or odd timestamp must weaken that key, never raise inside a receive
+    loop.
+    """
+    date = getattr(message, "date", None)
+    if date is None:
+        return None
+    try:
+        return float(date.timestamp())
+    except (AttributeError, TypeError, ValueError, OSError):
+        return None
 
 
 class PartialSendError(Exception):
@@ -70,6 +96,18 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
       (platform-specific send call).
     - Call :meth:`_handle_inbound` for every incoming user message.
 
+    Adapters whose transport can see group rooms declare
+    ``supports_group_chats`` and gain a second, independent entry point:
+    :meth:`_handle_group_inbound` for a message addressed to a platform group,
+    which goes through :mod:`app.channels.groups` rather than the per-sender
+    conversation pipeline.
+
+    ``bold_markup`` / ``italic_markup`` exist because one markdown dialect does
+    not travel: a single-asterisk ``*bold*`` is bold on Telegram, italic on
+    Discord, and two literal asterisks on Zalo, which sends plain text. Anything
+    written for a room goes through :meth:`bold` / :meth:`italic` so it reads as
+    emphasis wherever it lands.
+
     Notification mode (``channel["mode"] == "notification"``) is layered on top
     via :class:`NotificationDeliveryMixin`: the transport's own ``_run`` still
     connects and routes inbound (so ``/start`` subscribe works), but inbound is
@@ -77,32 +115,68 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
     (:meth:`_run_notification_delivery`) relays the notifications bus outward.
     """
 
+    # Whether this transport can take part in a platform group at all. Read off
+    # the CLASS (never an instance) by
+    # :func:`app.channels.registry.group_capable_channel_types`, so the Channels
+    # settings page only offers the toggle where it can work.
+    supports_group_chats: bool = False
+
+    # Whether the platform can be asked for a group's member list. False means
+    # the roster is only ever who has posted, which the API reports so the UI can
+    # say so rather than showing an empty list that looks broken.
+    supports_group_roster: bool = False
+
+    # Whether the platform tells us when our account is added to a group. False
+    # means a group is discovered by its first message instead — same outcome,
+    # one message later.
+    supports_group_join_events: bool = False
+
+    # Whether the platform can list the groups the account is ALREADY in. This
+    # is what makes pre-existing groups reachable: nobody added the account to
+    # them, so no join event is coming and no notification is owed — the
+    # operator picks them instead. See :meth:`fetch_joined_groups`.
+    supports_group_listing: bool = False
+
+    # Whether inbound messages carry a trustworthy "this author is a bot" flag.
+    # False disables the consecutive-bot-messages brake, which has nothing to
+    # count without it.
+    reports_sender_is_bot: bool = False
+
+    # Telegram's legacy markdown — the dialect this codebase has always written.
+    # Adapters whose platform spells emphasis differently override them; one
+    # whose platform has no markup at all sets ``("", "")`` and gets plain text.
+    bold_markup: tuple[str, str] = ("*", "*")
+    italic_markup: tuple[str, str] = ("_", "_")
+
     def __init__(self, channel: dict, storage: Any) -> None:
         self.channel = channel
         self.storage = storage
         self._task: asyncio.Task | None = None
         # Notification-mode delivery loop (mode == "notification" only).
         self._notif_task: asyncio.Task | None = None
-        # Per-sender in-flight forwarder tasks. Used both to (a) detect that a
-        # turn is still being processed when a second message arrives (the
-        # channel analog of the web UI's blocked send button), and (b) serialize
-        # forwarders for the same sender so a new forwarder doesn't accidentally
-        # absorb the tail of the previous run's events from the shared stream
-        # bus. A message that arrives while a turn is in flight is acked with a
-        # cosmetic "I'm thinking…" and dropped (never dispatched).
+        # Periodic "what groups is this account in?" reconcile, on the platforms
+        # that can answer. Owned here so it dies with the adapter.
+        self._group_sweep_task: asyncio.Task | None = None
+        # In-flight forwarder tasks, keyed by ``ReplyTarget.key`` — a bare sender
+        # id for a DM, ``cg:<group id>`` for a platform group. At most one is
+        # live per target, which serializes forwarders so a new one never absorbs
+        # the tail of the previous run's events from the shared stream bus. A
+        # forwarder ends at the first terminal event it sees, so runs that need
+        # one AFTER it are counted in ``_pending_runs`` and get a chained
+        # forwarder instead.
         self._inflight: dict[str, asyncio.Task] = {}
-        # Senders we've already sent the "I'm thinking…" busy ack to for the
-        # current in-flight period, so a burst of mid-turn messages produces a
-        # single ack rather than one per message. Cleared in ``_clear_inflight``.
-        self._busy_acked: set[str] = set()
-        # Per-sender locks that make the busy-check → dispatch decision in
-        # ``_handle_inbound`` atomic. Transports may spawn one ``_handle_inbound``
-        # task per inbound message (e.g. Telegram), so two messages arriving in
-        # the same poll batch could otherwise both pass the ``_inflight`` check
-        # before either registers a forwarder. Kept for the adapter's lifetime
-        # (one small lock per distinct sender, like ``_access_requested``); not
-        # pruned because a task may hold a reference across the acquire boundary,
-        # so removing an "unlocked" entry could hand out two parallel locks.
+        # Per-target count of runs still owed a forwarder (the live one included).
+        # A mid-turn message is folded into the running turn and needs no run of
+        # its own, so this only grows when a genuinely new run is started.
+        self._pending_runs: dict[str, int] = {}
+        # Per-sender locks that make the dispatch decision in ``_handle_inbound``
+        # atomic. Transports may spawn one ``_handle_inbound`` task per inbound
+        # message (e.g. Telegram), so two messages arriving in the same poll
+        # batch could otherwise interleave park and forwarder bookkeeping. Kept
+        # for the adapter's lifetime (one small lock per distinct sender, like
+        # ``_access_requested``); not pruned because a task may hold a reference
+        # across the acquire boundary, so removing an "unlocked" entry could
+        # hand out two parallel locks.
         self._inbound_locks: dict[str, asyncio.Lock] = {}
 
         # Sender ids we've already raised an operator "access request"
@@ -119,6 +193,14 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         # subscribing mid-pairing immediately gets the current state.
         self._auth_subscribers: list[asyncio.Queue] = []
         self._latest_auth_event: dict | None = None
+
+        # Everything this adapter remembers about the platform groups it is in:
+        # per-group ordering locks, the inbound dedupe ring, and the loop brakes'
+        # counters. Volatile by design — the durable facts are ``channel_groups``
+        # rows, and a second source of truth for them is what a restart is for.
+        from app.channels.groups.runtime import ChannelGroupRuntime
+
+        self.groups = ChannelGroupRuntime()
 
     @property
     def channel_id(self) -> str:
@@ -158,10 +240,22 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 self._run_notification_delivery(),
                 name=f"channel-notify:{self.channel_type}:{self.channel_id}",
             )
+        # Platforms that can enumerate the account's groups get a periodic
+        # reconcile, which is the only way to notice a group joined while
+        # Cremind was down — no event is replayed for those.
+        if type(self).supports_group_listing and self.groups_enabled():
+            from app.channels.groups.sweep import run_sweep_loop
+
+            self._group_sweep_task = asyncio.create_task(
+                run_sweep_loop(self),
+                name=f"channel-groups:{self.channel_type}:{self.channel_id}",
+            )
 
     async def stop(self) -> None:
         # Cancel any in-flight per-sender forwarders so shutdown doesn't
-        # leave dangling tasks subscribed to the stream bus.
+        # leave dangling tasks subscribed to the stream bus. Clearing the
+        # registries first also stops the done-callbacks chaining replacements.
+        self._pending_runs.clear()
         inflight = list(self._inflight.values())
         self._inflight.clear()
         for fwd in inflight:
@@ -170,6 +264,14 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         for fwd in inflight:
             try:
                 await fwd
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        sweep = self._group_sweep_task
+        self._group_sweep_task = None
+        if sweep is not None and not sweep.done():
+            sweep.cancel()
+            try:
+                await sweep
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         # Tear down the notification delivery loop (if any) so it unsubscribes
@@ -373,6 +475,89 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 f"channels[{self.channel_type}]: clear unlink failed",
             )
 
+    async def _store_self_identity(
+        self,
+        *,
+        user_id: str,
+        username: str | None,
+        is_bot: bool,
+        mention: str | None = None,
+        alt_ids: list[str] | None = None,
+        display_name: str | None = None,
+    ) -> None:
+        """Record which platform account this channel speaks as.
+
+        Knowing our own platform id is what lets a group ignore its own posts. In
+        a real group we receive everything, our own messages included, and
+        re-ingesting one would turn every answer into a new question.
+
+        ``mention`` is the token that pings this account on that platform, which
+        no two of them spell alike: ``@name`` on Telegram, ``<@id>`` on Discord,
+        ``<@Uid>`` on Slack, ``@digits`` on WhatsApp. It is what tells the group
+        prompt how the agent is addressed, and what
+        :func:`app.channels.groups.inbound._mention_visible` looks for when
+        deciding whether a woken agent can see why.
+
+        ``display_name`` is the name the OTHER members of a group see above our
+        messages — "Lý Nguyen", not the profile name and not the agent's own
+        name. In a group people address each other by that name, so without it
+        the agent cannot tell a message aimed at itself from one aimed at
+        somebody else: it reads "Lý Nguyen, what time is it?" as a question for
+        a third party. Several platforms have no username at all (WhatsApp,
+        Zalo), which makes this the only handle they have.
+
+        ``alt_ids`` are the other ids the same account is seen under. WhatsApp
+        reports a participant as ``<digits>@s.whatsapp.net`` on one device and
+        ``<opaque>@lid`` on another, so an echo check against a single id misses
+        our own message and the room starts answering itself.
+
+        Persisted on the channel row, so a restart knows who "we" are before any
+        adapter has connected. Best-effort: an adapter must still start when the
+        write fails.
+        """
+        if not user_id:
+            # Loud, because the consequence is silent and remote: without our own
+            # id a group cannot recognise its own posts, and on a platform that
+            # flags no bots (WhatsApp, the userbots) this is the only echo
+            # defence there is.
+            logger.warning(
+                f"channels[{self.channel_type}]: no account id reported for "
+                f"profile {self.profile} — a group chat cannot recognise this "
+                "channel's own messages",
+            )
+            return
+        identity: dict[str, Any] = {
+            "user_id": str(user_id),
+            "username": (username or "").lstrip("@") or None,
+            "is_bot": bool(is_bot),
+        }
+        # Written only when the platform reports them, so a transport with no
+        # mention syntax and one id per account keeps the row it always had.
+        if mention:
+            identity["mention"] = str(mention)
+        if (display_name or "").strip():
+            identity["display_name"] = str(display_name).strip()
+        other_ids = [
+            str(value).strip() for value in (alt_ids or []) if str(value or "").strip()
+        ]
+        if other_ids:
+            identity["alt_ids"] = other_ids
+        state = dict(self.channel.get("state") or {})
+        if state.get("self_identity") != identity:
+            state["self_identity"] = identity
+            try:
+                updated = await self.storage.update_channel(
+                    self.channel_id, state=state,
+                )
+                self.channel = (
+                    updated if updated is not None
+                    else {**self.channel, "state": state}
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    f"channels[{self.channel_type}]: persist self identity failed",
+                )
+
     def submit_auth_input(self, payload: dict) -> bool:
         """Receive user-typed pairing input (verification code, 2FA password).
 
@@ -417,6 +602,42 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 )
             await asyncio.sleep(interval)
 
+    async def _send_typing_to_chat(self, chat_id: str) -> None:
+        """Show "typing…" in a platform ROOM. Default no-op.
+
+        Separate from :meth:`_send_typing` for the same reason
+        :meth:`send_to_chat` is separate from :meth:`_send_text`: a room's id is
+        nobody's sender id, and on Telegram it is a negative number that
+        addresses no user at all.
+        """
+        return None
+
+    async def _typing_loop_for(
+        self, target: ReplyTarget, *, interval: float = 4.0,
+    ) -> None:
+        """Keep the right indicator alive for whichever destination this is."""
+        while True:
+            try:
+                if target.is_group:
+                    await self._send_typing_to_chat(target.address)
+                else:
+                    await self._send_typing(target.address)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    f"channels[{self.channel_type}]: typing indicator failed",
+                    exc_info=True,
+                )
+            await asyncio.sleep(interval)
+
+    async def _send_reply(self, target: ReplyTarget, text: str) -> None:
+        """Send one bubble to wherever this run is answering."""
+        if target.is_group:
+            await self.send_to_chat_chunked(target.address, text)
+        else:
+            await self._send_chunked(target.address, text)
+
     async def _send_chunked(self, sender_id: str, text: str) -> None:
         """Send ``text`` as one or more messages, each ≤ ``_MAX_MESSAGE_CHARS``.
 
@@ -428,6 +649,174 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             return
         for chunk in _split_for_messaging(text, _MAX_MESSAGE_CHARS):
             await self.send(sender_id, chunk)
+
+    # ── group chats (rooms, not people) ──
+
+    def bold(self, text: str) -> str:
+        """``text`` in this platform's bold, or unchanged where it has none."""
+        if not text:
+            return text
+        left, right = self.bold_markup
+        return f"{left}{text}{right}"
+
+    def italic(self, text: str) -> str:
+        """``text`` in this platform's italic, or unchanged where it has none."""
+        if not text:
+            return text
+        left, right = self.italic_markup
+        return f"{left}{text}{right}"
+
+    def groups_enabled(self) -> bool:
+        """Whether this channel takes part in platform group chats.
+
+        Three things have to be true: the transport can see rooms at all, the
+        operator turned the feature on for this channel, and the channel is not
+        in notification mode — a notification channel pushes automation output
+        outward and holds no conversations, so there is nothing for it to say in
+        a group.
+        """
+        if not type(self).supports_group_chats:
+            return False
+        if self._is_notification_mode():
+            return False
+        return bool((self.channel.get("config") or {}).get("group_chats_enabled"))
+
+    def self_identity(self) -> dict:
+        """The platform account this channel speaks as, as last recorded.
+
+        ``{}`` before any adapter has connected — every caller treats an unknown
+        identity as "not us", which is the safe direction for the echo filter
+        (a message wrongly attributed to somebody else is answered; one wrongly
+        attributed to us is silently dropped).
+        """
+        identity = (self.channel.get("state") or {}).get("self_identity")
+        return dict(identity) if isinstance(identity, dict) else {}
+
+    async def fetch_joined_groups(self) -> list[dict] | None:
+        """Every group this account is already in, or ``None`` if unknowable.
+
+        The counterpart to waiting for a join event. An account is usually in
+        groups long before Cremind is told to care about them, and nobody was
+        "added" to those — so there is no event coming, no notification to
+        raise, and without this no way to reach them but to wait for somebody to
+        happen to post. This is what lets the operator simply pick them.
+
+        ``None`` means the platform cannot enumerate them: a Telegram *bot* and
+        a Zalo bot have no such API. Adapters that can set
+        ``supports_group_listing`` and return
+        ``{"platform_chat_id", "title", "chat_type", "member_count"}`` per group.
+        """
+        return None
+
+    async def fetch_group_roster(self, chat_id: str) -> list[dict] | None:
+        """The platform's member list for a room, or ``None`` if it has none.
+
+        ``None`` is not a failure: a Telegram *bot* cannot enumerate a group and
+        a Zalo bot cannot see one at all, so their rosters are only ever who has
+        posted. Adapters that CAN answer set ``supports_group_roster`` and return
+        ``{"member_id", "alt_ids", "display_name", "username", "is_bot", "role"}``
+        per member.
+        """
+        return None
+
+    async def send_to_chat(self, chat_id: str, text: str) -> None:
+        """Send a message to a platform CHAT id — a room, not a person.
+
+        Distinct from :meth:`_send_text` because a room's id is nobody's sender
+        id: on Telegram a group chat id is negative and belongs to no user, so
+        addressing a room through the 1:1 path would deliver the message into
+        whichever private chat happens to share that number. Adapters that can
+        talk to a room override this; the rest say so.
+        """
+        raise ChannelNotImplemented(
+            f"{self.channel_type} channels cannot send to a chat id",
+        )
+
+    async def send_to_chat_chunked(self, chat_id: str, text: str) -> None:
+        """Send ``text`` to a room as one or more messages, each within the cap.
+
+        The room-addressed twin of :meth:`_send_chunked`, and swallowing failures
+        for the same reason: a mirrored group message is one bubble among
+        several, and abandoning the rest because one failed leaves the room with
+        half a conversation.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        for chunk in _split_for_messaging(text, _MAX_MESSAGE_CHARS):
+            try:
+                await self.send_to_chat(chat_id, chunk)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    f"channels[{self.channel_type}]: send to chat {chat_id} failed",
+                )
+
+    async def _handle_group_inbound(
+        self,
+        *,
+        chat_id: str,
+        chat_title: str | None,
+        chat_type: str | None,
+        sender_id: str,
+        sender_username: str | None,
+        sender_alt_ids: list[str] | None = None,
+        display_name: str | None,
+        text: str,
+        platform_message_id: str | None,
+        sender_is_bot: bool,
+        platform_message_date: float | None = None,
+        mentioned: bool = False,
+    ) -> None:
+        """Route a message from a platform group into the channel-group pipeline.
+
+        A SECOND inbound entry point, independent of the 1:1 DM pipeline in
+        :meth:`_handle_inbound`. A group message is addressed to a room, not to
+        this sender: there is no per-sender conversation to own it, and the
+        channel's subscribe gate does not apply — the group's own approval and
+        member policy decide who the agent listens to instead.
+
+        ``platform_message_date`` is the platform's own send time, which every
+        account that receives the message reports identically. It is what tells
+        two copies of one message apart from the same person saying the same
+        short thing twice ("status?") — see
+        :func:`app.channels.groups.keys.platform_key`.
+
+        ``sender_alt_ids`` carries the other ids this one account is seen under
+        where a platform has more than one (WhatsApp's ``@s.whatsapp.net`` and
+        ``@lid`` forms). The echo filter and the member policy both try every
+        one of them, so which form the transport happened to report does not
+        decide whether we recognise the account.
+
+        ``mentioned`` is the adapter's own answer to "did this message address
+        us?", computed per platform because no two spell a mention alike. True
+        means the agent replies immediately; false sends the message to the
+        relevance judge instead.
+
+        Never raises — the caller is a receive loop, and one unroutable message
+        must not be able to end it.
+        """
+        body = (text or "").strip()
+        if not body:
+            return
+        from app.channels.groups.inbound import GroupInbound, handle_group_message
+
+        await handle_group_message(
+            self,
+            GroupInbound(
+                chat_id=str(chat_id),
+                chat_title=chat_title,
+                chat_type=chat_type,
+                sender_id=str(sender_id),
+                sender_username=sender_username,
+                sender_alt_ids=list(sender_alt_ids or []),
+                display_name=display_name,
+                text=body,
+                platform_message_id=platform_message_id,
+                sender_is_bot=bool(sender_is_bot),
+                platform_message_date=platform_message_date,
+                mentioned=bool(mentioned),
+            ),
+        )
 
     # ── inbound flow ──
 
@@ -449,7 +838,7 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         The DB side of deleting a channel client is only half the job: this
         adapter also holds per-sender state in memory, and leaving it behind
         would make the "as if they had never written" promise false in visible
-        ways — a stale busy flag suppressing their next "I'm thinking…" ack, or
+        ways — a queued forwarder still chasing their deleted conversation, or
         a remembered access request meaning the operator never gets a fresh
         approval notification when they come back.
 
@@ -457,11 +846,12 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         call for a sender this adapter has never seen.
         """
         # A forwarder for a deleted conversation has nowhere to publish and
-        # would write into rows that no longer exist; drop it.
+        # would write into rows that no longer exist; drop it, and make sure the
+        # done-callback doesn't chain a replacement.
+        self._pending_runs.pop(sender_id, None)
         task = self._inflight.pop(sender_id, None)
         if task is not None and not task.done():
             task.cancel()
-        self._busy_acked.discard(sender_id)
         self._access_requested.discard(sender_id)
         # Only reclaim the lock when nobody holds it. A task can be parked on
         # ``acquire`` with a reference to this exact object, so removing a held
@@ -477,17 +867,16 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
     ) -> None:
         """Route an inbound platform message into Cremind.
 
-        If a previous run is still in flight for this sender, the message is
-        the channel analog of a second submit while the web UI's send button
-        is disabled: we reply once with a cosmetic "I'm thinking…" ack and
-        **drop** it — it is never dispatched, so it's never persisted, never
-        shown in the web UI, and never enters the model's history. Only the
-        user's own message and the ack remain visible on the channel.
+        Every authenticated message is dispatched. If a turn is already running
+        for this sender the message is folded INTO it (see
+        :mod:`app.events.user_message_delivery`), so the reply being written
+        takes it into account and the person gets one answer covering everything
+        they said — rather than the old "I'm thinking…" ack and a silent drop.
 
-        Dropping also satisfies the forwarder-serialization invariant for
-        free: because we never dispatch a second run while the first is still
-        publishing, a new forwarder can never absorb the tail of the wrong
-        run on the shared stream bus.
+        Forwarder serialization is preserved by ``_expect_run``: a folded-in
+        message starts no run, and a run that does start while a forwarder is
+        live gets a chained one when that forwarder finishes, so no forwarder
+        ever absorbs the tail of the wrong run on the shared stream bus.
         """
         text = (text or "").strip()
         if not text:
@@ -518,22 +907,10 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             await self._handle_access_gate(sender, auth, text)
             return
 
-        # Busy handling: if a turn is still in flight for this sender, drop the
-        # new message (see the method docstring) and ack once per busy period.
-        # The per-sender lock makes the check → dispatch atomic so two messages
-        # racing in from the same poll batch can't both get dispatched.
+        # The per-sender lock keeps the park attempt and the forwarder
+        # bookkeeping inside _dispatch_to_agent atomic, so two messages racing in
+        # from the same poll batch can't both decide they are starting the run.
         async with self._inbound_lock(sender_id):
-            inflight = self._inflight.get(sender_id)
-            if inflight is not None and not inflight.done():
-                if sender_id not in self._busy_acked:
-                    self._busy_acked.add(sender_id)
-                    await self.send(sender_id, "I'm thinking…")
-                logger.debug(
-                    f"[channels:{self.channel_type}] dropped mid-turn message "
-                    f"channel_id={self.channel_id} from={sender_id}"
-                )
-                return
-
             await self._dispatch_to_agent(
                 conversation_id, sender_id, display_name, text,
             )
@@ -686,11 +1063,173 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
 
     # ── dispatch + reply forwarding ──
 
+    def _spawn_forwarder(
+        self,
+        target: ReplyTarget | str,
+        conversation_id: str,
+        *,
+        name_hint: str = "fwd",
+    ) -> asyncio.Task:
+        """Start the forwarder + typing-loop pair for one run, as one task.
+
+        Registered in ``_inflight`` under ``target.key`` so at most one is live
+        per destination. Its done-callback chains a replacement while runs are
+        still owed one, since a forwarder terminates at the first terminal event
+        it absorbs.
+        """
+        target = coerce_target(target)
+        key = target.key
+
+        async def _supervised_forward() -> None:
+            typing = asyncio.create_task(
+                self._typing_loop_for(target),
+                name=f"channel-typing:{self.channel_type}:{key}",
+            )
+            try:
+                await self._forward_reply(conversation_id, target)
+            finally:
+                typing.cancel()
+                try:
+                    await typing
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+
+        forwarder = asyncio.create_task(
+            _supervised_forward(),
+            name=f"channel-{name_hint}:{self.channel_type}:{conversation_id}",
+        )
+        self._inflight[key] = forwarder
+
+        def _clear_inflight(task: asyncio.Task) -> None:
+            # Only clear if we're still the registered task — a later
+            # message may have replaced us before we observed our completion.
+            # (Also how shutdown avoids chaining: stop() empties _inflight
+            # before cancelling, so this returns early.)
+            if self._inflight.get(key) is not task:
+                return
+            self._inflight.pop(key, None)
+            remaining = self._pending_runs.get(key, 0) - 1
+            if remaining > 0:
+                self._pending_runs[key] = remaining
+                # Another run is still owed a reply. Safe to subscribe now: the
+                # bus clears its replay ring at end_run, so a fresh subscriber
+                # replays the NEXT run from its start rather than re-reading the
+                # one this forwarder just finished.
+                self._spawn_forwarder(target, conversation_id, name_hint="fwd-next")
+            else:
+                self._pending_runs.pop(key, None)
+
+        forwarder.add_done_callback(_clear_inflight)
+        return forwarder
+
+    def _expect_run(
+        self, target: ReplyTarget | str, conversation_id: str,
+    ) -> None:
+        """Record that one more run owes this target a reply, and cover it.
+
+        Spawns a forwarder when none is live; otherwise the live forwarder's
+        done-callback chains one, which is what keeps a forwarder from absorbing
+        the tail of a run that is not its own.
+        """
+        target = coerce_target(target)
+        self._pending_runs[target.key] = self._pending_runs.get(target.key, 0) + 1
+        existing = self._inflight.get(target.key)
+        if existing is None or existing.done():
+            self._spawn_forwarder(target, conversation_id)
+
+    def _release_expected_run(self, target: ReplyTarget | str) -> None:
+        """Undo an ``_expect_run`` whose run never started (enqueue failed)."""
+        target = coerce_target(target)
+        remaining = self._pending_runs.get(target.key, 0) - 1
+        if remaining > 0:
+            self._pending_runs[target.key] = remaining
+        else:
+            self._pending_runs.pop(target.key, None)
+
+    # Public because :mod:`app.channels.groups.dispatch` drives them and is not
+    # a subclass. Named for what they do rather than for the bookkeeping under
+    # them.
+
+    def expect_run_for(self, target: ReplyTarget, conversation_id: str) -> None:
+        """Cover one run that is about to start for ``target``."""
+        self._expect_run(target, conversation_id)
+
+    def release_run_for(self, target: ReplyTarget) -> None:
+        """Undo :meth:`expect_run_for`, and drop the forwarder it spawned.
+
+        Unlike the 1:1 failure path this also cancels: a room gets no "(internal
+        error)" message, so a forwarder left subscribed would sit there until
+        some unrelated later run terminated and then post that run's answer.
+        """
+        self._release_expected_run(target)
+        if not self._pending_runs.get(target.key):
+            forwarder = self._inflight.get(target.key)
+            if forwarder is not None and not forwarder.done():
+                forwarder.cancel()
+
+    def ensure_group_forwarder(
+        self, target: ReplyTarget, conversation_id: str,
+    ) -> None:
+        """Make sure a live run's answer reaches this room.
+
+        For a message folded into a turn already running: no new run, so no new
+        forwarder is owed — but the running turn may have been started somewhere
+        that pointed no forwarder at this group (a schedule, a task result), and
+        then nothing would carry its answer out.
+        """
+        existing = self._inflight.get(target.key)
+        if existing is None or existing.done():
+            self._expect_run(target, conversation_id)
+
+    def forget_group(self, group_id: str, platform_chat_id: str = "") -> None:
+        """Drop a group's in-memory state and stop carrying its replies.
+
+        Called when a group is blocked or forgotten. A forwarder still waiting on
+        a run would otherwise post that run's answer into a room the operator has
+        just said no to.
+        """
+        key = group_key(group_id)
+        self._pending_runs.pop(key, None)
+        task = self._inflight.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+        self.groups.forget_group(group_id, platform_chat_id)
+
     async def _dispatch_to_agent(
         self, conversation_id: str, sender_id: str,
         display_name: str | None, text: str,
     ) -> None:
         from app.agent.stream_runner import make_run_id
+        from app.events import user_message_delivery
+
+        target = sender_target(sender_id)
+
+        user_message_metadata = {
+            "source": "channel",
+            "channel_id": self.channel_id,
+            "channel_type": self.channel_type,
+            "sender_id": sender_id,
+            "display_name": display_name,
+        }
+
+        # Mid-turn: fold the message into the running turn rather than starting a
+        # second one. No new run, so no new forwarder — the live one is already
+        # accumulating this turn's text and will send the reply that accounts for
+        # what was just said.
+        parked = await user_message_delivery.try_park_user_message(
+            conversation_id=conversation_id,
+            profile=self.profile,
+            query=text,
+            user_message_metadata=user_message_metadata,
+        )
+        if parked is not None and parked.injected:
+            # The run may have been started elsewhere (a skill event, a task
+            # result) with no forwarder bound to this sender; cover it so the
+            # answer still reaches the platform.
+            existing = self._inflight.get(target.key)
+            if existing is None or existing.done():
+                self._expect_run(target, conversation_id)
+            return
 
         run_id = make_run_id(conversation_id, kind="channel")
 
@@ -706,39 +1245,13 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 f"channels: failed to load history for {conversation_id}",
             )
 
-        # The forwarder + typing-loop pair runs as a single supervised task.
-        # Registering it in ``_inflight`` lets ``_handle_inbound`` ack and
-        # serialize subsequent messages from the same sender.
-        async def _supervised_forward() -> None:
-            typing = asyncio.create_task(
-                self._typing_loop(sender_id),
-                name=f"channel-typing:{self.channel_type}:{sender_id}",
-            )
-            try:
-                await self._forward_reply(conversation_id, sender_id)
-            finally:
-                typing.cancel()
-                try:
-                    await typing
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
+        self._expect_run(target, conversation_id)
 
-        forwarder = asyncio.create_task(
-            _supervised_forward(),
-            name=f"channel-fwd:{self.channel_type}:{conversation_id}",
+        # A message that was parked and then lost the race to the turn's end is
+        # already persisted; run it without persisting it twice.
+        existing_user_message_id = (
+            parked.message_id if parked is not None else None
         )
-        self._inflight[sender_id] = forwarder
-
-        def _clear_inflight(task: asyncio.Task) -> None:
-            # Only clear if we're still the registered task — a later
-            # message may have replaced us before we observed our completion.
-            if self._inflight.get(sender_id) is task:
-                self._inflight.pop(sender_id, None)
-                # Busy period over: allow the next mid-turn burst to ack again.
-                self._busy_acked.discard(sender_id)
-
-        forwarder.add_done_callback(_clear_inflight)
-
         try:
             await event_queue.enqueue_user_message(
                 conversation_id=conversation_id,
@@ -747,17 +1260,16 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 query=text,
                 history_messages=history_messages,
                 reasoning=True,
-                user_message_metadata={
-                    "source": "channel",
-                    "channel_id": self.channel_id,
-                    "channel_type": self.channel_type,
-                    "sender_id": sender_id,
-                    "display_name": display_name,
-                },
+                user_message_metadata=user_message_metadata,
+                push_user_message=existing_user_message_id is None,
+                existing_user_message_id=existing_user_message_id,
                 update_title_from_query=False,
             )
         except Exception:  # noqa: BLE001
-            forwarder.cancel()
+            self._release_expected_run(target)
+            forwarder = self._inflight.get(target.key)
+            if forwarder is not None and not forwarder.done():
+                forwarder.cancel()
             logger.exception("channels: failed to enqueue inbound message")
             await self.send(sender_id, "(internal error: failed to dispatch message)")
 
@@ -771,7 +1283,13 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         :meth:`_dispatch_to_agent` but skips the user-message enqueue (the
         skill-event runner handles that).
 
-        No-op when no sender on this channel is bound to ``conversation_id``.
+        Also covers a platform GROUP conversation, which has no sender row at
+        all: without this, a follow-up turn (the mid-turn flush, a task result,
+        a schedule) would finish with nobody carrying its answer back to the
+        room. Only an approved group is carried — a run finishing in a group the
+        operator has since blocked must not post into it.
+
+        No-op when nothing on this channel is bound to ``conversation_id``.
         """
         senders = await self.storage.list_senders(self.channel_id)
         sender = next(
@@ -779,6 +1297,14 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             None,
         )
         if sender is None:
+            target = await self._group_target_for_conversation(conversation_id)
+            if target is not None:
+                logger.info(
+                    f"channels[{self.channel_type}]: forward_external_run "
+                    f"conv={conversation_id} group={target.group_id} — expecting run"
+                )
+                self._expect_run(target, conversation_id)
+                return
             logger.warning(
                 f"channels[{self.channel_type}]: forward_external_run "
                 f"no sender bound to conv={conversation_id} "
@@ -787,47 +1313,44 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             return
         sender_id = sender["sender_id"]
 
-        existing = self._inflight.get(sender_id)
-        if existing is not None and not existing.done():
-            logger.info(
-                f"channels[{self.channel_type}]: forward_external_run "
-                f"forwarder already in flight for sender={sender_id} — "
-                f"skipping (existing one will absorb this run's events)"
-            )
-            return
-
+        # Queue behind any live forwarder rather than skipping. A forwarder ends
+        # at the first terminal event it absorbs, so "one is already in flight"
+        # does NOT mean this run's events will be covered — it means they will be
+        # covered by the forwarder chained after it.
         logger.info(
             f"channels[{self.channel_type}]: forward_external_run "
-            f"conv={conversation_id} sender={sender_id} — spawning forwarder"
+            f"conv={conversation_id} sender={sender_id} — expecting run"
         )
+        self._expect_run(sender_target(sender_id), conversation_id)
 
-        async def _supervised_forward() -> None:
-            typing = asyncio.create_task(
-                self._typing_loop(sender_id),
-                name=f"channel-typing:{self.channel_type}:{sender_id}",
+    async def _group_target_for_conversation(
+        self, conversation_id: str,
+    ) -> ReplyTarget | None:
+        """The room this conversation belongs to, if it is an approved one."""
+        if not type(self).supports_group_chats:
+            return None
+        try:
+            from app.channels.groups.constants import STATUS_APPROVED
+            from app.storage import get_channel_group_storage
+
+            group = await get_channel_group_storage().get_group_by_conversation(
+                conversation_id
             )
-            try:
-                await self._forward_reply(conversation_id, sender_id)
-            finally:
-                typing.cancel()
-                try:
-                    await typing
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "channels: could not look up a channel group by conversation",
+                exc_info=True,
+            )
+            return None
+        if group is None or group.get("channel_id") != self.channel_id:
+            return None
+        if group.get("status") != STATUS_APPROVED:
+            return None
+        return group_target(group)
 
-        forwarder = asyncio.create_task(
-            _supervised_forward(),
-            name=f"channel-fwd-event:{self.channel_type}:{conversation_id}",
-        )
-        self._inflight[sender_id] = forwarder
-
-        def _clear_inflight(task: asyncio.Task) -> None:
-            if self._inflight.get(sender_id) is task:
-                self._inflight.pop(sender_id, None)
-
-        forwarder.add_done_callback(_clear_inflight)
-
-    async def _forward_reply(self, conversation_id: str, sender_id: str) -> None:
+    async def _forward_reply(
+        self, conversation_id: str, target: ReplyTarget | str,
+    ) -> None:
         """Forward an in-progress agent run from the stream bus to the platform.
 
         ``response_mode == "detail"`` sends the run's trigger header (for an
@@ -839,15 +1362,32 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         no trigger header, no steps: everything else is Cremind's internals,
         and a platform user who asked for just the answer reads them as noise.
 
+        A GROUP target reads the same setting — an operator who asked this
+        channel for steps asked for them everywhere it answers — but two things
+        still differ. An error becomes a log line rather than a message, because
+        an apology posted into a group is read by everyone and explains nothing
+        to them. And a ``[silent]`` answer sends nothing at all — that is the
+        agent deciding the message was not for it, which in a real group is most
+        messages.
+
+        Silence and steps interact, so in a room the LAST step is held until the
+        answer is known: a turn that reads a message and decides it was not for
+        it would otherwise post its reasoning about staying out of the
+        conversation. Only the pending step can be caught this way — a turn that
+        runs several steps and goes silent at the end has already posted the
+        earlier ones. Buffering every step to the end would fix that and defeat
+        the point of streaming progress, so it isn't done.
+
         Each bubble is sent through :meth:`send` which already isolates
         per-message exceptions, so a transient failure on one bubble can't
         prevent later bubbles from going out.
         """
+        target = coerce_target(target)
         bus = get_event_stream_bus()
         queue, replay, _is_active = await bus.subscribe(conversation_id)
         logger.info(
             f"channels[{self.channel_type}]: _forward_reply START "
-            f"conv={conversation_id} sender={sender_id} "
+            f"conv={conversation_id} to={target.key} "
             f"replay={len(replay)} active={_is_active}"
         )
         detail = self.response_mode == "detail"
@@ -862,8 +1402,30 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         step_index = 0
         seen_seqs: set[int] = set()
         terminated = False
+        # What this run did with its answer: "sent" | "silent" | "empty". Local
+        # to the log lines below — the durable record of it is stamped on the
+        # agent's message by the stream runner, not from here (see the note in
+        # the ``finally``).
+        outcome = "empty"
+        # Whether any part of this run has already reached the platform. A turn
+        # that answered an interruption has spoken before its final answer, so
+        # "nothing to send at the end" is then a finished turn rather than an
+        # empty one — and the Final-Answer fallback must not repeat what went
+        # out already.
+        sent_any = False
 
         async def flush_step(step: dict) -> None:
+            """Send one reasoning step as its own bubble.
+
+            Deliberately does NOT call ``note_agent_post`` for a room. That
+            counter is the flood brake, checked against
+            ``max_agent_posts_per_minute`` (20) when the NEXT message arrives —
+            so a fifteen-step turn would silence the room for a minute and
+            notify the operator, i.e. using "answer with steps" would switch the
+            agent off. The brake is there to stop runaway conversation, and a
+            step is not a conversational turn: what the room hears the agent
+            *say* is the interim reply and the answer, and those two do count.
+            """
             nonlocal step_index
             if not detail:
                 return
@@ -872,33 +1434,103 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             if body:
                 logger.debug(
                     f"channels[{self.channel_type}]: flush_step #{step_index} "
-                    f"len={len(body)} sender={sender_id}"
+                    f"len={len(body)} to={target.key}"
                 )
-                await self._send_chunked(sender_id, body)
+                await self._send_reply(target, body)
 
-        async def flush_final(text: str) -> None:
+        async def flush_interim() -> None:
+            """Send what the agent has said so far and start a fresh message.
+
+            A flow break is where a reply to an interruption ends. Buffering it
+            with the rest of the turn would deliver it once the work it
+            interrupted was over — which is precisely the wait the interruption
+            was trying to skip — and glued to the final answer, where it reads as
+            a contradiction ("Not yet, still installing." … "Done.").
+
+            The buffer is cleared either way: a segment the agent chose to keep
+            silent is spent, not carried into the next message.
+            """
+            nonlocal outcome, sent_any
+            text = "".join(text_chunks)
+            text_chunks.clear()
             text = text.strip()
-            if not text and final_answer_fallback:
+            if target.is_group:
+                text = _strip_silent_lines(text)
+            if not text:
+                return
+            logger.info(
+                f"channels[{self.channel_type}]: flush_interim sending "
+                f"len={len(text)} to={target.key} conv={conversation_id}"
+            )
+            await self._send_reply(target, text)
+            outcome = "sent"
+            sent_any = True
+            if target.is_group and target.group_id:
+                self.groups.note_agent_post(target.group_id)
+
+        def effective_final(text: str) -> str:
+            """What ``flush_final`` would send: fallback applied, then stripped.
+
+            Its own function because the terminal-step guard below has to ask
+            the same question *before* the answer is sent. Two copies of this
+            could disagree, and the way they'd disagree is a room being told the
+            agent's reasoning about a message it then stayed silent on.
+            """
+            text = text.strip()
+            if not text and final_answer_fallback and not sent_any:
+                # Only when nothing has gone out yet. After an interim flush the
+                # fallback holds text that was already sent, and using it here
+                # would say the same thing twice.
+                text = final_answer_fallback
+            if target.is_group:
+                text = _strip_silent_lines(text)
+            return text
+
+        async def flush_final(raw_text: str) -> None:
+            nonlocal outcome, sent_any
+            text = effective_final(raw_text)
+            if not raw_text.strip() and final_answer_fallback and not sent_any:
                 logger.info(
                     f"channels[{self.channel_type}]: flush_final using "
                     f"Final-Answer fallback (text_chunks empty) "
-                    f"len={len(final_answer_fallback)} sender={sender_id} "
+                    f"len={len(final_answer_fallback)} to={target.key} "
                     f"conv={conversation_id}"
                 )
-                text = final_answer_fallback
+            if target.is_group and not text:
+                # The agent said this one was not for it. Normal, and the common
+                # case in a busy room. Unless it already answered an
+                # interruption, in which case the turn did speak and only its
+                # tail was silent.
+                if not sent_any:
+                    outcome = "silent"
+                logger.info(
+                    f"channels[{self.channel_type}]: staying silent in "
+                    f"group={target.group_id} conv={conversation_id}"
+                )
+                return
             if not text:
+                if sent_any:
+                    # Everything this turn had to say went out at a flow break.
+                    return
+                outcome = "empty"
                 logger.error(
                     f"[channels:{self.channel_type}] flush_final empty "
-                    f"conv={conversation_id} sender={sender_id} — "
-                    f"user receives no response"
+                    f"conv={conversation_id} to={target.key} — "
+                    f"no response is sent"
                 )
                 return
             prefix = "*Response*\n\n" if detail and step_index > 0 else ""
             logger.info(
                 f"channels[{self.channel_type}]: flush_final sending "
-                f"len={len(text)} sender={sender_id} conv={conversation_id}"
+                f"len={len(text)} to={target.key} conv={conversation_id}"
             )
-            await self._send_chunked(sender_id, prefix + text)
+            await self._send_reply(target, prefix + text)
+            outcome = "sent"
+            sent_any = True
+            if target.is_group and target.group_id:
+                # Counted only on a message that actually went out, so a turn
+                # that stayed silent does not spend the room's rate budget.
+                self.groups.note_agent_post(target.group_id)
 
         async def absorb(event: dict) -> bool:
             nonlocal current_step, final_answer_fallback
@@ -925,9 +1557,12 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 if content:
                     logger.info(
                         f"channels[{self.channel_type}]: forwarding event "
-                        f"trigger len={len(content)} sender={sender_id}"
+                        f"trigger len={len(content)} to={target.key}"
                     )
-                    await self._send_chunked(sender_id, content)
+                    # Through ``_send_reply``, not the 1:1 path: a room's
+                    # ``address`` is a platform CHAT id, which on Telegram is a
+                    # negative number addressing no user at all.
+                    await self._send_reply(target, content)
             elif etype == "text":
                 token = data.get("token")
                 if token:
@@ -960,18 +1595,46 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             elif etype == "result" and detail and current_step is not None:
                 obs_parts = data.get("Observation") or []
                 current_step["observation"] = _format_observation_text(obs_parts)
-            elif etype == "complete":
+            elif etype == "flow_break":
+                # The agent stopped to answer something that interrupted it. Send
+                # that now as its own message — not terminal, the run continues.
                 if current_step is not None:
                     await flush_step(current_step)
                     current_step = None
-                await flush_final("".join(text_chunks))
+                await flush_interim()
+            elif etype == "complete":
+                final_text = "".join(text_chunks)
+                if current_step is not None:
+                    # In a room the last step is where the agent decides whether
+                    # the message was for it at all. Posting it before knowing
+                    # the answer would narrate a decision to stay out of the
+                    # conversation — so hold it when this turn is about to say
+                    # nothing. A DM has no silent outcome and keeps its order.
+                    staying_silent = (
+                        target.is_group
+                        and not sent_any
+                        and not effective_final(final_text)
+                    )
+                    if not staying_silent:
+                        await flush_step(current_step)
+                    current_step = None
+                await flush_final(final_text)
                 return True
             elif etype == "error":
                 if current_step is not None:
                     await flush_step(current_step)
                     current_step = None
                 err_msg = (data or {}).get("message") or "unknown error"
-                await self._send_chunked(sender_id, f"_Error:_ {err_msg}")
+                if target.is_group:
+                    # Never into a room: everyone there would read an apology
+                    # that means nothing to them, and the operator needs the log
+                    # line, not the group.
+                    logger.error(
+                        f"[channels:{self.channel_type}] run failed in "
+                        f"group={target.group_id} conv={conversation_id}: {err_msg}"
+                    )
+                else:
+                    await self._send_reply(target, f"_Error:_ {err_msg}")
                 return True
             return False
 
@@ -989,17 +1652,37 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         except asyncio.CancelledError:
             logger.info(
                 f"channels[{self.channel_type}]: _forward_reply CANCELLED "
-                f"conv={conversation_id} sender={sender_id}"
+                f"conv={conversation_id} to={target.key}"
             )
             return
         finally:
             logger.info(
                 f"channels[{self.channel_type}]: _forward_reply END "
-                f"conv={conversation_id} sender={sender_id} "
+                f"conv={conversation_id} to={target.key} "
                 f"terminated={terminated} steps={step_index} "
                 f"text_chunks={len(text_chunks)}"
             )
+            # NB: the turn's ``channel_group`` outcome stamp is NOT written here.
+            # This forwarder runs concurrently with whatever the group says
+            # next, so a stamp landing late would mean one turn replays a
+            # "[silent]" row that the next one drops — a deletion in the middle
+            # of the model's history, and a lost prompt cache every time. The
+            # stream runner writes it inline before ``complete`` instead (step
+            # 6f), from the same ``strip_silent_lines`` this posts by.
             await bus.unsubscribe(conversation_id, queue)
+
+
+def _strip_silent_lines(text: str) -> str:
+    """Drop the ``[silent]`` sentinel from an answer bound for a room.
+
+    Delegates to :func:`app.groups.render.strip_silent_lines` so that what gets
+    posted and what the turn's outcome stamp records can never disagree — the
+    stream runner stamps from the same function. (One of the two pure helpers
+    this feature shares with Cremind's own rooms; see the package docstring.)
+    """
+    from app.groups.render import strip_silent_lines
+
+    return strip_silent_lines(text)
 
 
 # ── Module-level formatters (no adapter state needed) ─────────────────────────

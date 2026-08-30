@@ -204,6 +204,19 @@ export async function createConversation(
 export interface SendMessageResponse {
   run_id: string;
   conversation_id: string;
+  /**
+   * 'injected' when the message was handed to a turn that was already running
+   * (no new run starts; `run_id` is that live run). 'queued' when it starts a
+   * turn of its own. Absent on older servers — treat as 'queued'.
+   */
+  delivery?: 'queued' | 'injected';
+  /**
+   * Server id of the persisted user row, whenever the server persisted it
+   * before responding — the injected path, and the queued path when a park
+   * lost the race to the turn's end. The sender needs it to recognise its own
+   * optimistic bubble when the `user_message` frame arrives.
+   */
+  message_id?: string;
 }
 
 export interface MessageAttachment {

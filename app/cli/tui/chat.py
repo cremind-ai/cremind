@@ -261,8 +261,14 @@ async def run_chat(
                         reasoning=(state.mode != "instant"),
                         mode=state.mode,
                     )
+                    # On the injected path this is the LIVE run's id, so Ctrl+C
+                    # still cancels the turn the message went into.
                     state.run_id = resp.run_id
-                    state.status = "running"
+                    state.status = (
+                        "delivered into current turn"
+                        if resp.delivery == "injected"
+                        else "running"
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:

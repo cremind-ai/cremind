@@ -49,6 +49,7 @@ from app.cli.commands.features import features_app
 from app.cli.commands.file_watchers import file_watchers_app
 from app.cli.commands.files import files_app
 from app.cli.commands.google import google_app
+from app.cli.commands.groups import group_app
 from app.cli.commands.llm import llm_app
 from app.cli.commands.logs import logs_app
 from app.cli.commands.processes import proc_app
@@ -237,6 +238,7 @@ app.command(
 app.add_typer(profile_app, name="profile")
 app.add_typer(auth_app, name="auth")
 app.add_typer(conv_app, name="conv")
+app.add_typer(group_app, name="group")
 app.add_typer(tools_app, name="tools")
 app.add_typer(llm_app, name="llm")
 app.add_typer(agents_app, name="agents")

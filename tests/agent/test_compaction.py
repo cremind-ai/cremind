@@ -126,15 +126,18 @@ def _agent_msg(context_tokens, *, provider="p", model="m", ordering=99) -> dict:
 
 
 class _FakeStore:
-    def __init__(self, messages, summary=None, watermark=-1, latest_agent=None):
+    def __init__(self, messages, summary=None, watermark=-1, latest_agent=None,
+                 state_ts=None):
         self._messages = messages
         self._summary = summary
         self._watermark = watermark
         self._latest_agent = latest_agent
+        # ms epoch of the last fold — what the auto-fold cooldown reads.
+        self._state_ts = state_ts
         self.set_calls: list[tuple] = []
 
     async def get_compaction_state(self, cid):
-        return self._summary, self._watermark, None
+        return self._summary, self._watermark, self._state_ts
 
     async def get_messages_after(self, cid, after, limit=5000, newest_first=False):
         rows = [m for m in self._messages if m["ordering"] > after]
@@ -542,6 +545,33 @@ def test_find_boundary_watermark_snaps_to_turn_start() -> None:
     assert compaction._row_is_turn_start(tail[0], include_reasoning=True)
 
 
+def test_row_is_turn_start_skips_rows_that_never_reach_the_wire() -> None:
+    """A user row filtered out of history contributes nothing, so starting the
+    verbatim tail at it would leave an assistant-first history — which Anthropic
+    rejects. Covers mid-turn rows the trace already carries, and ui_only rows
+    (which had the same latent bug)."""
+    def _user(metadata: dict | None) -> dict:
+        return {"ordering": 1, "role": "user", "content": "hi", "metadata": metadata}
+
+    assert compaction._row_is_turn_start(_user(None), include_reasoning=True)
+    assert not compaction._row_is_turn_start(
+        _user({"mid_turn": {"state": "pending"}}), include_reasoning=True,
+    )
+    assert not compaction._row_is_turn_start(
+        _user({"mid_turn": {"state": "consumed"}}), include_reasoning=True,
+    )
+    # With replay off the consumed row IS the only copy, so it qualifies again.
+    assert compaction._row_is_turn_start(
+        _user({"mid_turn": {"state": "consumed"}}), include_reasoning=False,
+    )
+    assert compaction._row_is_turn_start(
+        _user({"mid_turn": {"state": "released"}}), include_reasoning=True,
+    )
+    assert not compaction._row_is_turn_start(
+        _user({"ui_only": True}), include_reasoning=True,
+    )
+
+
 def test_get_messages_after_is_frontier_anchored(tmp_path: Path) -> None:
     store = _make_storage(tmp_path)
     _seed(store, n_messages=10)                          # orderings 0..9
@@ -585,6 +615,348 @@ def test_after_turn_compaction_auto_folds_when_enabled(monkeypatch) -> None:
     store = _FakeStore([], latest_agent=_agent_msg(980))
     evt = asyncio.run(compaction.after_turn_compaction(object(), "c1", "admin", store, context_id="c1"))
     assert evt is not None and evt["type"] == "compaction_auto_folded"
+
+
+# ── forced auto-fold for clientless conversations (group-chat seats) ───────────
+#
+# A seat is hidden: absent from the sidebar, and the room's UI listens on the group
+# bus, so nothing ever renders (let alone clicks) its "compact now" popup. With the
+# default auto_compact_enabled=False, suggest-only means the seat NEVER folds and
+# runs forever on the deterministic floor, which DROPS the oldest turns instead of
+# summarising them. ``force_auto`` is what closes that hole.
+
+def _band(monkeypatch, *, auto_compact_enabled=False):
+    """window 1000, reserve 50 → suggest 850, auto band 920, ceiling 950."""
+    _patch_cfg(monkeypatch, _cfg(auto_compact_enabled=auto_compact_enabled, percent=85))
+    monkeypatch.setattr(compaction, "context_window_for", lambda p, m: 1000)
+    monkeypatch.setattr(compaction, "response_reserve_for", lambda p, m: 50)
+
+
+def _count_folds(monkeypatch, *, folded=True) -> list:
+    calls: list = []
+
+    async def _fake_fold(*args, **kwargs):
+        calls.append(kwargs.get("context_id"))
+        return folded
+
+    monkeypatch.setattr(compaction, "run_model_fold", _fake_fold)
+    return calls
+
+
+def test_force_auto_folds_even_with_the_setting_off(monkeypatch) -> None:
+    _band(monkeypatch, auto_compact_enabled=False)
+    calls = _count_folds(monkeypatch)
+    store = _FakeStore([], latest_agent=_agent_msg(930))   # in the auto band
+    evt = asyncio.run(compaction.after_turn_compaction(
+        object(), "c1", "admin", store, context_id="seat", force_auto=True,
+    ))
+    assert evt is not None and evt["type"] == "compaction_auto_folded"
+    assert calls == ["seat"]
+
+
+def test_force_auto_returns_none_instead_of_a_suggestion(monkeypatch) -> None:
+    # 900 is over the suggest threshold but under the auto band. The ordinary path
+    # emits the popup here; the forced path has nobody to click it, so it stays quiet.
+    _band(monkeypatch)
+    calls = _count_folds(monkeypatch)
+    store = _FakeStore([], latest_agent=_agent_msg(900))
+
+    normal = asyncio.run(compaction.after_turn_compaction(
+        None, "c1", "admin", store, context_id="c1",
+    ))
+    assert normal is not None and normal["type"] == "compaction_suggested"
+
+    forced = asyncio.run(compaction.after_turn_compaction(
+        object(), "c1", "admin", store, context_id="seat", force_auto=True,
+    ))
+    assert forced is None
+    assert calls == []
+
+
+def test_force_auto_returns_none_when_the_fold_did_not_apply(monkeypatch) -> None:
+    # In the band, but the model refused/emptied the summary: no event at all —
+    # a suggestion here would be equally unclickable.
+    _band(monkeypatch)
+    calls = _count_folds(monkeypatch, folded=False)
+    store = _FakeStore([], latest_agent=_agent_msg(930))
+    evt = asyncio.run(compaction.after_turn_compaction(
+        object(), "c1", "admin", store, context_id="seat", force_auto=True,
+    ))
+    assert evt is None
+    assert calls == ["seat"]
+
+
+def test_force_auto_leaves_the_cooldown_and_ceiling_bypass_alone(monkeypatch) -> None:
+    """force_auto changes who decides to fold, not the anti-thrash rules."""
+    _band(monkeypatch)
+    calls = _count_folds(monkeypatch)
+    just_folded = time.time() * 1000
+
+    cooling = _FakeStore([], latest_agent=_agent_msg(930), state_ts=just_folded)
+    assert asyncio.run(compaction.after_turn_compaction(
+        object(), "c1", "admin", cooling, context_id="seat", force_auto=True,
+    )) is None
+    assert calls == []                              # cooldown still holds
+
+    # At/over the ceiling the cooldown is bypassed — the alternative is the floor.
+    over = _FakeStore([], latest_agent=_agent_msg(960), state_ts=just_folded)
+    evt = asyncio.run(compaction.after_turn_compaction(
+        object(), "c1", "admin", over, context_id="seat", force_auto=True,
+    ))
+    assert evt is not None and evt["type"] == "compaction_auto_folded"
+    assert calls == ["seat"]
+
+
+# ── the fold pays for itself (usage attribution) ───────────────────────────────
+
+class _FakeFoldAgent:
+    """Shaped like ReasoningAgent: the per-call usage records ride the DONE chunk."""
+
+    def __init__(self, records=None):
+        self._records = records
+        self.runs = 0
+
+    async def run(self, **kwargs):
+        self.runs += 1
+        yield {"type": ChatCompletionTypeEnum.CONTENT, "data": "compacting"}
+        chunk = {"type": ChatCompletionTypeEnum.DONE, "data": ""}
+        if self._records is not None:
+            chunk["usage_records"] = self._records
+        yield chunk
+
+
+def _capture_usage(monkeypatch) -> list[dict]:
+    calls: list[dict] = []
+
+    class _Usage:
+        async def add_usage_records(self, *, conversation_id, profile, records,
+                                    message_id=None, event_run_id=None):
+            calls.append({
+                "conversation_id": conversation_id, "profile": profile,
+                "records": records, "message_id": message_id,
+            })
+            return [f"u{i}" for i in range(len(records))]
+
+    import app.storage as storage_pkg
+    monkeypatch.setattr(storage_pkg, "get_usage_storage", lambda: _Usage())
+    return calls
+
+
+def test_run_model_fold_bills_itself_as_compaction(monkeypatch) -> None:
+    # The fold's product is a tool call, not a reply, so it never reaches the
+    # stream_runner accounting path — without this it is the one LLM call nobody
+    # pays for on paper.
+    from app.agent.usage import UsageRecord
+
+    _patch_cfg(monkeypatch, _cfg())
+    calls = _capture_usage(monkeypatch)
+    records = [
+        UsageRecord(
+            source_kind="reasoning", tool_id=None, label="claude-sonnet",
+            provider="anthropic", model="m", model_group=None, step_index=1,
+            input_tokens=10, cache_read_input_tokens=900,
+            cache_creation_input_tokens=0, output_tokens=42,
+        ).to_dict(),
+    ]
+    store = _FakeStore([_msg(0, _TEN)], latest_agent=_agent_msg(900))
+    agent = _FakeFoldAgent(records)
+    asyncio.run(compaction.run_model_fold(agent, "c1", "admin", store, context_id="ctx"))
+
+    assert agent.runs == 1
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["conversation_id"] == "c1" and call["profile"] == "admin"
+    assert call["message_id"] is None            # the fold has no assistant row
+    (rec,) = call["records"]
+    assert rec["source_kind"] == "compaction"    # not "reasoning" — a fold, not a step
+    assert rec["label"] == "Compaction"
+    assert rec["output_tokens"] == 42 and rec["cache_read_input_tokens"] == 900
+    assert rec["provider"] == "anthropic"        # provider/model kept for pricing
+    # The caller's records are not mutated in place.
+    assert records[0]["source_kind"] == "reasoning"
+
+
+def test_run_model_fold_records_nothing_when_the_turn_reported_no_usage(monkeypatch) -> None:
+    _patch_cfg(monkeypatch, _cfg())
+    calls = _capture_usage(monkeypatch)
+    store = _FakeStore([_msg(0, _TEN)], latest_agent=_agent_msg(900))
+    asyncio.run(compaction.run_model_fold(
+        _FakeFoldAgent(records=None), "c1", "admin", store, context_id="ctx",
+    ))
+    assert calls == []
+
+
+def test_usage_accounting_never_fails_a_fold(monkeypatch) -> None:
+    """The summary is already persisted by the time we bill; an accounting error
+    must not turn an applied fold into a failed one."""
+    _patch_cfg(monkeypatch, _cfg())
+
+    class _Boom:
+        async def add_usage_records(self, **kwargs):
+            raise RuntimeError("usage storage down")
+
+    import app.storage as storage_pkg
+    monkeypatch.setattr(storage_pkg, "get_usage_storage", lambda: _Boom())
+
+    store = _FakeStore([_msg(0, _TEN)], latest_agent=_agent_msg(900))
+    agent = _FakeFoldAgent([{"source_kind": "reasoning", "output_tokens": 1}])
+    # Folds nothing (the fake agent never calls the tool) but must not raise.
+    assert asyncio.run(compaction.run_model_fold(
+        agent, "c1", "admin", store, context_id="ctx",
+    )) is False
+
+
+# ── the fold is a nested MAINTENANCE turn, not a turn of the conversation ──────
+#
+# ``run_model_fold`` drives a whole agent turn, and ``after_turn_compaction``
+# calls it from inside the outer turn's run binding (``current_task_id_var`` is
+# still that turn's run id, and ``bind_run`` is still installed). The reasoning
+# loop drains the conversation's user inbox for whatever run id that var names,
+# at the top of EVERY step, and nothing else told a fold's loop apart from a real
+# one — so a message that landed after the outer turn's last drain was handed to
+# the FOLD: acknowledged by an LLM call nobody was streaming, billed to
+# compaction, mixed into the summary input, and answered for real again by the
+# turn-end flush.
+#
+# The force_auto tests above all monkeypatch ``run_model_fold`` away, which is
+# exactly why this was missed. These drive the real function, with a stand-in
+# agent that runs the REAL drain the loop runs.
+
+_OUTER_RUN = "msg:c1:outer"
+
+
+class _DrainProbeAgent:
+    """CremindAgent's shape, with the reasoning loop's real drain inside it.
+
+    A fake that only yields chunks reproduces nothing here: the defect was never
+    in compaction.py's own code but in what the nested loop is allowed to do. So
+    this reconstructs the top of a step exactly — the same ``ReasoningAgent``
+    methods, under the same ambient run id, with the ``maintenance`` flag
+    ``CremindAgent.run`` would have forwarded — and records what it was handed.
+    """
+
+    def __init__(self) -> None:
+        self.drained: list = []
+        self.notices: list = []
+        self.run_ids: list = []
+        self.maintenance: list = []
+
+    async def run(self, **kwargs):
+        from app.agent.reasoning_agent import ReasoningAgent
+        from app.utils.task_context import current_task_id_var
+
+        agent = ReasoningAgent.__new__(ReasoningAgent)
+        agent._maintenance = bool(kwargs.get("maintenance", False))
+        agent._event_run = False
+        self.maintenance.append(agent._maintenance)
+        self.run_ids.append(current_task_id_var.get())
+        self.drained.extend(agent._drain_user_messages())
+        self.notices.extend(agent._drain_task_notices())
+        yield {"type": ChatCompletionTypeEnum.DONE, "data": ""}
+
+
+def _park_for_the_running_turn(text: str = "actually, use staging") -> None:
+    from app.events import task_result_inbox
+
+    assert task_result_inbox.park_user_message_if_bound(
+        "c1", {"message_id": "m1", "text": text, "agent_text": text},
+    ) == _OUTER_RUN
+
+
+def _real_drain(run_id: str | None) -> list:
+    """What the outer turn's own next step would get."""
+    from app.agent.reasoning_agent import ReasoningAgent
+    from app.utils.task_context import current_task_id_var
+
+    agent = ReasoningAgent.__new__(ReasoningAgent)
+    agent._maintenance = False
+    agent._event_run = False
+    token = current_task_id_var.set(run_id)
+    try:
+        return agent._drain_user_messages()
+    finally:
+        current_task_id_var.reset(token)
+
+
+def _fold_inside_the_outer_turn(agent) -> None:
+    """Call the real fold from where ``after_turn_compaction`` calls it: still
+    inside the outer turn's run binding, one step short of its ``unbind_run``."""
+    store = _FakeStore([_msg(0, _TEN)], latest_agent=_agent_msg(900))
+
+    async def _run():
+        from app.utils.task_context import current_task_id_var
+
+        token = current_task_id_var.set(_OUTER_RUN)
+        try:
+            await compaction.run_model_fold(
+                agent, "c1", "admin", store, context_id="seat",
+            )
+            # The caller's binding is restored on the way out: the outer turn is
+            # still live and owns everything keyed to its run id.
+            assert current_task_id_var.get() == _OUTER_RUN
+        finally:
+            current_task_id_var.reset(token)
+
+    asyncio.run(_run())
+
+
+@pytest.fixture
+def _inbox():
+    from app.events import task_result_inbox
+
+    task_result_inbox.clear_all()
+    task_result_inbox.bind_run(_OUTER_RUN, "c1")
+    yield task_result_inbox
+    task_result_inbox.clear_all()
+
+
+def test_the_fold_does_not_steal_a_message_parked_for_the_running_turn(
+    monkeypatch, _inbox,
+) -> None:
+    _patch_cfg(monkeypatch, _cfg())
+    _park_for_the_running_turn()
+    agent = _DrainProbeAgent()
+
+    _fold_inside_the_outer_turn(agent)
+
+    assert agent.maintenance == [True]      # identity reached the nested agent
+    assert agent.run_ids == [None]          # ...and it ran outside the binding
+    assert agent.drained == []
+    # Still parked, so the turn-end flush that owns it can still deliver it.
+    assert _inbox.has_unconsumed_user_messages("c1")
+    drained = _real_drain(_OUTER_RUN)
+    assert len(drained) == 1 and "use staging" in drained[0]["content"]
+
+
+def test_the_fold_does_not_steal_a_task_notice_either(monkeypatch, _inbox) -> None:
+    """Same root cause, same fix: a notice consumed by the fold would have
+    interrupted a turn nobody is watching, and never reach the real one."""
+    _patch_cfg(monkeypatch, _cfg())
+    assert _inbox.park_if_bound("c1", {"label": "CI", "status_word": "completed"})
+    agent = _DrainProbeAgent()
+
+    _fold_inside_the_outer_turn(agent)
+
+    assert agent.notices == []
+    assert _inbox.drain_notices(_OUTER_RUN)   # still there for the real turn
+
+
+def test_an_ordinary_turn_still_drains(_inbox) -> None:
+    """The counterweight: the fix must not have turned the drain off for the
+    turns it exists for."""
+    _park_for_the_running_turn("wait, wrong repo")
+    drained = _real_drain(_OUTER_RUN)
+    assert len(drained) == 1 and "wrong repo" in drained[0]["content"]
+
+
+def test_an_absent_run_id_drains_nothing_rather_than_everything(_inbox) -> None:
+    """What the cleared context var relies on: no run id must mean 'no inbox to
+    read', not 'read them all' and not an exception."""
+    _park_for_the_running_turn()
+    assert _inbox.drain_user_messages("") == []
+    assert _inbox.drain_notices("") == []
+    assert _real_drain(None) == []
+    assert _inbox.has_unconsumed_user_messages("c1")
 
 
 def test_is_context_overflow_classifier() -> None:

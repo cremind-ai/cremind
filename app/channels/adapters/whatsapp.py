@@ -11,9 +11,12 @@ Lifecycle:
     1. Adapter spawns ``node index.js --profile … --channel-id … --working-dir …``.
     2. Sidecar prints ``WS_PORT=<port>`` to stdout once its WebSocket
        server is listening; the adapter parses that line and connects.
-    3. Sidecar emits ``{kind: "qr"|"ready"|"incoming"|"disconnected"|...}``
-       JSON frames; the adapter consumes them. ``incoming`` fans out into
-       :meth:`BaseChannelAdapter._handle_inbound`.
+    3. Sidecar emits ``{kind: "qr"|"ready"|"incoming"|"incoming_group"|
+       "disconnected"|...}`` JSON frames; the adapter consumes them.
+       ``incoming`` fans out into :meth:`BaseChannelAdapter._handle_inbound`;
+       ``incoming_group`` is a message written in a ``@g.us`` room and goes to
+       :meth:`BaseChannelAdapter._handle_group_inbound` instead, because it
+       belongs to the room rather than to whoever sent it.
     4. Outgoing replies and the typing indicator are pushed to the
        sidecar as ``{kind: "send"|"typing"}`` frames.
 
@@ -61,6 +64,14 @@ _ACK_TIMEOUT = 20.0
 _PN_SUFFIX = "@s.whatsapp.net"
 _LID_SUFFIX = "@lid"
 
+# The ``chat_type`` reported for a WhatsApp room. Deliberately not the bare word
+# "group": WhatsApp numbers messages per chat, so one message id identifies it
+# on every account that received it and the message-id dedupe key applies —
+# whereas ``("telegram", "group")`` in ``app.channels.groups.keys`` means "ids are per
+# account, fingerprint the content instead". Naming this "group" would opt
+# WhatsApp into a weaker key it does not need.
+_GROUP_CHAT_TYPE = "whatsapp_group"
+
 
 def _normalize_lid(value: str | None) -> str | None:
     """Return a linked-identity alias in canonical full-JID form, or ``None``.
@@ -79,6 +90,20 @@ def _normalize_lid(value: str | None) -> str | None:
 
 class WhatsappAdapter(BaseChannelAdapter):
     """In-process WhatsApp adapter that delegates platform IO to a Node sidecar."""
+
+    # The linked account is an ordinary member of every room it belongs to and
+    # receives everything posted there. ``bold_markup`` / ``italic_markup`` are
+    # inherited on purpose — WhatsApp really does spell emphasis ``*bold*`` and
+    # ``_italic_``, the same dialect the defaults were written for.
+    supports_group_chats = True
+    supports_group_roster = True
+    supports_group_join_events = True
+    # ``groupFetchAllParticipating`` names every group this number is in.
+    supports_group_listing = True
+    # Every WhatsApp account is a person's, ours included: the platform has
+    # no bot flag, so the consecutive-bot-messages brake has nothing to
+    # count and the id check is the whole echo defence.
+    reports_sender_is_bot = False
 
     def __init__(self, channel: dict, storage: Any) -> None:
         super().__init__(channel, storage)
@@ -151,6 +176,20 @@ class WhatsappAdapter(BaseChannelAdapter):
             raise ChannelAuthError(
                 f"WhatsApp send failed: {reply.get('error') or 'unknown error'}",
             )
+
+    async def send_to_chat(self, chat_id: str, text: str) -> None:
+        """Post into a ``@g.us`` room, through the same acked path as a DM.
+
+        The sidecar's ``send`` addresses whatever JID it is handed, so a room id
+        needs no separate control frame — but it does need the correlated ack:
+        a mirrored post that WhatsApp rejected has to surface as an exception
+        rather than as a room that quietly stops hearing the agents.
+        """
+        await self._send_text(str(chat_id), text)
+
+    async def _send_typing_to_chat(self, chat_id: str) -> None:
+        """The sidecar's presence update takes any JID, a room's included."""
+        await self._send_typing(str(chat_id))
 
     async def resolve_phone(self, phone: str) -> dict:
         """Look up ``phone`` on WhatsApp — ``{exists, jid, lid}``.
@@ -372,18 +411,26 @@ class WhatsappAdapter(BaseChannelAdapter):
             self._publish_auth_event({"kind": "ready"})
             logger.info(f"whatsapp[{self.channel_id}]: paired and ready")
             await self._mark_linked()
+            await self._note_self_identity(msg)
         elif kind == "incoming":
             sender_id = str(msg.get("sender_id") or "").strip()
             display_name = msg.get("display_name")
             text = msg.get("text") or ""
             if not sender_id or not text:
                 return
-            # Run inbound handling concurrently so per-sender serialisation
-            # in ``_inflight`` is the only blocking layer.
+            # Run inbound handling concurrently: nothing blocks a message any
+            # more (one arriving mid-turn is folded into the running turn), and
+            # the per-sender inbound lock keeps that decision atomic.
             asyncio.create_task(
                 self._handle_inbound_safe(sender_id, display_name, text),
                 name=f"whatsapp-inbound:{self.channel_id}:{sender_id}",
             )
+        elif kind == "group_joined":
+            self._route_group_joined(msg)
+        elif kind in ("group_metadata_result", "list_groups_result"):
+            self._resolve_pending(msg)
+        elif kind == "incoming_group":
+            self._route_group_message(msg)
         elif kind == "disconnected":
             logged_out = bool(msg.get("logged_out"))
             self._publish_auth_event(
@@ -418,6 +465,257 @@ class WhatsappAdapter(BaseChannelAdapter):
             logger.warning(
                 f"whatsapp[{self.channel_id}]: sidecar error — {msg.get('error')}",
             )
+
+    async def _note_self_identity(self, msg: dict) -> None:
+        """Record which WhatsApp account this linked device speaks as.
+
+        The room's echo filter has nothing else to work with. WhatsApp flags no
+        message as bot-authored — every participant is somebody's account — so
+        the mirrors we post ourselves come back looking exactly like a person
+        talking, and only our own ids can tell them apart.
+
+        Both JID forms are registered as alternates because a participant is
+        reported as ``<digits>@s.whatsapp.net`` on one device and
+        ``<opaque>@lid`` on another, and matching on one form alone lets our own
+        post back in on the run where the forms disagree.
+        """
+        digits = "".join(ch for ch in str(msg.get("self_id") or "") if ch.isdigit())
+        if not digits:
+            logger.debug(
+                f"whatsapp[{self.channel_id}]: sidecar reported no self id; "
+                "a bound room cannot recognise our own posts",
+            )
+            return
+        alt_ids = [f"{digits}{_PN_SUFFIX}"]
+        lid = _normalize_lid(msg.get("self_lid"))
+        if lid:
+            alt_ids.insert(0, lid)
+        await self._store_self_identity(
+            user_id=digits,
+            # WhatsApp has no usernames — a person is a number and a pushName —
+            # so the number carries the roster handle as well.
+            username=None,
+            is_bot=False,
+            mention=f"@{digits}",
+            alt_ids=alt_ids,
+            # The pushName, which is the only thing a group shows above our
+            # messages — the number itself is not what anybody addresses.
+            display_name=str(msg.get("self_name") or "").strip() or None,
+        )
+
+    def _route_group_message(self, msg: dict) -> None:
+        """Spawn the room path for one ``incoming_group`` frame.
+
+        Spawned rather than awaited so one room's message can't hold up the
+        WebSocket reader that the DM path, the send acks and the pairing events
+        all share.
+        """
+        chat_id = str(msg.get("chat_id") or "").strip()
+        sender_id = str(msg.get("sender_id") or "").strip()
+        text = msg.get("text") or ""
+        if not chat_id or not sender_id or not text:
+            return
+        message_id = msg.get("message_id")
+        timestamp = msg.get("timestamp")
+        asyncio.create_task(
+            self._handle_group_inbound_safe(
+                chat_id=chat_id,
+                chat_title=msg.get("chat_title"),
+                chat_type=_GROUP_CHAT_TYPE,
+                sender_id=sender_id,
+                sender_username=None,
+                sender_alt_ids=self._group_sender_alt_ids(
+                    sender_id, msg.get("sender_alt_ids"),
+                ),
+                display_name=msg.get("display_name"),
+                text=text,
+                platform_message_id=str(message_id) if message_id else None,
+                platform_message_date=(
+                    float(timestamp) if isinstance(timestamp, (int, float)) else None
+                ),
+                # There is no bot flag to carry honestly: every WhatsApp account
+                # is a person's, ours included, so the bot-author brake cannot
+                # fire here and the id check is the whole story.
+                sender_is_bot=False,
+                mentioned=self._is_mentioned(msg),
+            ),
+            name=f"whatsapp-group-inbound:{self.channel_id}:{chat_id}",
+        )
+
+    def _is_mentioned(self, msg: dict) -> bool:
+        """Whether this group message pings or quotes our own account.
+
+        WhatsApp carries both as annotations rather than in the text, so the
+        sidecar extracts them and this compares them against every id we are
+        known by — the ``@s.whatsapp.net`` form, the ``@lid`` form, and the bare
+        digits — because which one a mention names depends on the sender's
+        client.
+        """
+        identity = self.self_identity()
+        own = [str(identity.get("user_id") or ""), *(identity.get("alt_ids") or ())]
+        for jid in list(own):
+            digits = self._derive_phone(jid)
+            if digits:
+                own.append(digits)
+        reported = [
+            *(msg.get("mentioned_ids") or []),
+            msg.get("quoted_sender_id") or "",
+        ]
+        candidates: list[str] = []
+        for value in reported:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            candidates.append(text)
+            digits = self._derive_phone(text)
+            if digits:
+                candidates.append(digits)
+        from app.channels.groups.keys import ids_overlap
+
+        return ids_overlap(own, candidates)
+
+    def _route_group_joined(self, msg: dict) -> None:
+        """Spawn the discovery path for a room this number was just added to."""
+        chat_id = str(msg.get("chat_id") or "").strip()
+        if not chat_id:
+            return
+        asyncio.create_task(
+            self._note_group_joined(chat_id, msg.get("chat_title")),
+            name=f"whatsapp-group-joined:{self.channel_id}:{chat_id}",
+        )
+
+    async def _note_group_joined(self, chat_id: str, chat_title: Any) -> None:
+        from app.channels.groups.inbound import handle_group_joined
+
+        await handle_group_joined(
+            self,
+            chat_id=chat_id,
+            chat_title=chat_title,
+            chat_type=_GROUP_CHAT_TYPE,
+        )
+
+    async def fetch_joined_groups(self) -> list[dict] | None:
+        """Every WhatsApp group this number is in, via ``groupFetchAllParticipating``."""
+        if self._ws is None:
+            return None
+        request_id, fut = self._new_request()
+        try:
+            async with self._send_lock:
+                await self._ws.send(json.dumps({
+                    "kind": "list_groups",
+                    "request_id": request_id,
+                }))
+            reply = await asyncio.wait_for(fut, timeout=_ACK_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"whatsapp[{self.channel_id}]: the sidecar did not answer the "
+                "group-list request",
+            )
+            return None
+        finally:
+            self._pending.pop(request_id, None)
+        if not reply.get("ok"):
+            logger.warning(
+                f"whatsapp[{self.channel_id}]: group list failed: "
+                f"{reply.get('error') or 'unknown error'}",
+            )
+            return None
+        out: list[dict] = []
+        for group in reply.get("groups") or []:
+            chat_id = str((group or {}).get("id") or "").strip()
+            if not chat_id:
+                continue
+            out.append({
+                "platform_chat_id": chat_id,
+                "title": group.get("name") or None,
+                "chat_type": "group",
+                "member_count": group.get("member_count"),
+            })
+        return out
+
+    async def fetch_group_roster(self, chat_id: str) -> list[dict] | None:
+        """The room's participants, via the sidecar's ``groupMetadata`` call.
+
+        Both JID forms are kept per participant: WhatsApp reports the same
+        person as ``<digits>@s.whatsapp.net`` on one device and ``<opaque>@lid``
+        on another, and a member policy written against one form has to match
+        the other.
+        """
+        if self._ws is None:
+            return None
+        request_id, fut = self._new_request()
+        try:
+            async with self._send_lock:
+                await self._ws.send(json.dumps({
+                    "kind": "group_metadata",
+                    "chat_id": str(chat_id),
+                    "request_id": request_id,
+                }))
+            reply = await asyncio.wait_for(fut, timeout=_ACK_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"whatsapp[{self.channel_id}]: the sidecar did not answer the "
+                f"member-list request for {chat_id}",
+            )
+            return None
+        finally:
+            self._pending.pop(request_id, None)
+        if not reply.get("ok"):
+            logger.warning(
+                f"whatsapp[{self.channel_id}]: member list for {chat_id} failed: "
+                f"{reply.get('error') or 'unknown error'}",
+            )
+            return None
+        out: list[dict] = []
+        for participant in reply.get("participants") or []:
+            member_id = str(participant.get("id") or "").strip()
+            if not member_id:
+                continue
+            alts: list[str] = []
+            lid = str(participant.get("lid") or "").strip()
+            if lid and lid != member_id:
+                alts.append(lid)
+            for jid in [member_id, *alts]:
+                digits = self._derive_phone(jid)
+                if digits and digits not in alts:
+                    alts.append(digits)
+            admin = participant.get("admin")
+            out.append({
+                "member_id": member_id,
+                "alt_ids": alts,
+                "display_name": self._derive_phone(member_id) or None,
+                "username": None,
+                "is_bot": False,
+                "role": "admin" if admin else "member",
+            })
+        return out
+
+    def _group_sender_alt_ids(
+        self, sender_id: str, reported: Any,
+    ) -> list[str]:
+        """The other ids this participant may be recognised by.
+
+        Beyond the JID forms the sidecar saw, the bare phone digits are added:
+        a JID is not something anyone can look up, whereas the number is on the
+        contact card, so ``whatsapp:<digits>`` is what the group's User accounts
+        are documented to take and what an operator will actually paste in.
+        """
+        out: list[str] = []
+        for value in reported or []:
+            text = str(value or "").strip()
+            if text and text != sender_id and text not in out:
+                out.append(text)
+        for jid in [sender_id, *out]:
+            digits = self._derive_phone(jid)
+            if digits and digits not in out:
+                out.append(digits)
+        return out
+
+    async def _handle_group_inbound_safe(self, **kwargs: Any) -> None:
+        try:
+            await self._handle_group_inbound(**kwargs)
+        except Exception:  # noqa: BLE001
+            logger.exception("whatsapp: group inbound handler failed")
 
     async def _upsert_sender(
         self, sender_id: str, display_name: str | None,

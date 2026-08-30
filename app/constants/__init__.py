@@ -15,6 +15,12 @@ class ChatCompletionTypeEnum(Enum):
     # Plan-mode UI signal (ask_user_question / plan_ready / todos). Carries an
     # ``event`` discriminator; ``stream_runner`` translates it to a bus event.
     PLAN_EVENT = 10
+    # A user message arrived mid-turn and was folded into the running turn. The
+    # model's context stays one continuous chain; this only tells the UI to end
+    # the visible thinking flow here and start a new one, so the reply that
+    # follows reads as an answer to what was just asked rather than more of the
+    # work that was already under way.
+    FLOW_BREAK = 11
 
 
 INTRODUCE_ASSISTANT = "You are a virtual assistant that can help with a variety of tasks"

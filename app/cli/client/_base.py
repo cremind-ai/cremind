@@ -82,7 +82,16 @@ class Client:
 
     @staticmethod
     def _check_response(resp: httpx.Response) -> None:
-        """Raise APIError if status >= 400; mirror Go's APIError shape."""
+        """Raise APIError if status >= 400; mirror Go's APIError shape.
+
+        Error bodies come in two shapes. Most carry a human phrase in ``error``;
+        some pair a machine token there with the sentence in ``message``, and a
+        few put detail in ``message`` alongside a human ``error``. Keeping only
+        ``error`` reduced the second shape to a bare token — ``server returned
+        400: unsupported_channel_type`` told an operator nothing, least of all
+        which platforms would have worked. Both halves are kept whenever the
+        second adds something.
+        """
         if resp.status_code < 400:
             return
         raw = resp.content
@@ -93,7 +102,12 @@ class Client:
             except json.JSONDecodeError:
                 decoded = None
             if isinstance(decoded, dict) and isinstance(decoded.get("error"), str):
-                body = decoded["error"]
+                body = decoded["error"].strip()
+                detail = decoded.get("message")
+                if isinstance(detail, str):
+                    detail = detail.strip()
+                    if detail and detail != body:
+                        body = f"{body}: {detail}" if body else detail
             else:
                 body = raw.decode(errors="replace").strip()
         raise APIError(status=resp.status_code, body=body, raw=raw)

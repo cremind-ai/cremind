@@ -10,10 +10,21 @@ import {
   type ConversationMemory,
 } from '../services/conversationMemory';
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   modelValue: boolean;
   conversationId: string | null;
-}>();
+  /**
+   * Whether folding on demand is offered. Off for a group-chat seat: the
+   * trigger endpoint is owner-only and answers 403 there, so the button could
+   * only ever produce an error the reader cannot act on.
+   */
+  allowTrigger?: boolean;
+  /** Whose memory this is — a room shows one agent's seat at a time. */
+  title?: string;
+}>(), {
+  allowTrigger: true,
+  title: 'Conversation Memory',
+});
 
 const emit = defineEmits<{
   (e: 'update:modelValue', v: boolean): void;
@@ -122,7 +133,7 @@ watch(
   >
     <template #header="{ titleId, titleClass }">
       <div class="memory-dialog-header">
-        <span :id="titleId" :class="titleClass">Conversation Memory</span>
+        <span :id="titleId" :class="titleClass">{{ title }}</span>
         <ElTooltip content="Open Memory settings">
           <button
             type="button"
@@ -151,7 +162,8 @@ watch(
         <span>
           Long-term memory is <strong>off</strong> for this profile. Enable it in
           <em>Settings → Memory</em> (requires Compaction). The running summary
-          below is still kept for context. Use “Update now” to fold immediately.
+          below is still kept for context.<template v-if="allowTrigger">
+            Use “Update now” to fold immediately.</template>
         </span>
       </div>
 
@@ -239,7 +251,12 @@ watch(
         <ElButton @click="load()" :disabled="loading || triggering">
           <Icon icon="mdi:refresh" /> Refresh
         </ElButton>
-        <ElButton type="primary" @click="handleTrigger" :disabled="triggering || !conversationId">
+        <ElButton
+          v-if="allowTrigger"
+          type="primary"
+          @click="handleTrigger"
+          :disabled="triggering || !conversationId"
+        >
           <Icon icon="mdi:cog-sync-outline" /> Update now
         </ElButton>
       </div>

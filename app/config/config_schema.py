@@ -213,8 +213,9 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
         label="Conversation Compaction",
         description=(
             "Keeps long conversations within budget by folding the oldest turns "
-            "into a running summary (via the low model group) while recent turns "
-            "stay verbatim. Replaces fixed token-window truncation and is "
+            "into a running summary — written by the conversation's own model from "
+            "its already-cached prefix, not a separate summarizer — while recent "
+            "turns stay verbatim. Replaces fixed token-window truncation and is "
             "prompt-cache friendly — the summary at the front stays byte-stable "
             "between compactions."
         ),

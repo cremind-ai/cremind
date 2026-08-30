@@ -111,8 +111,10 @@ def test_task_inbox_migration_sqlite(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(mig, "get_database_provider", lambda *a, **k: provider)
 
     _build_old_db(provider)
-    mig.upgrade("head")
-    mig.upgrade("head")  # idempotent re-run
+    # Targeted at this revision rather than "head": later migrations chain onto
+    # it, and this file is about what THIS one does to a pre-feature install.
+    mig.upgrade(_NEW_HEAD)
+    mig.upgrade(_NEW_HEAD)  # idempotent re-run
 
     eng = provider.sync_engine()
     with eng.connect() as c:
@@ -152,7 +154,7 @@ def test_downgrade_removes_the_column_and_keeps_the_indexes(tmp_path: Path, monk
     monkeypatch.setattr(mig, "get_database_provider", lambda *a, **k: provider)
 
     _build_old_db(provider)
-    mig.upgrade("head")
+    mig.upgrade(_NEW_HEAD)
     mig.downgrade(_PRIOR_HEAD)
 
     eng = provider.sync_engine()

@@ -410,7 +410,8 @@ class BuiltInToolAdapter:
                                     switch_conversation_cwd,
                                 )
                                 await switch_conversation_cwd(
-                                    context_id, recovery_dir, get_conversation_storage(),
+                                    context_id, recovery_dir,
+                                    get_conversation_storage(), profile=profile,
                                 )
                                 tool_args["_working_directory"] = recovery_dir
                                 if tool_timeout is not None:

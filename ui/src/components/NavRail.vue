@@ -26,13 +26,16 @@ const emit = defineEmits<{
 const isAdminProfile = computed(() => (route.params.profile as string) === 'admin');
 
 const chatItem = computed(() => NAV_ITEMS.find(i => i.id === 'chat')!);
+const groupChatItem = computed(() => NAV_ITEMS.find(i => i.id === 'group-chat')!);
 
-// Route destinations shown as rail icons (excludes Chat, rendered separately,
-// and the notifications bell, which is a popover trigger).
+// Route destinations shown as rail icons (excludes Chat and Group chat, both
+// rendered separately so they stay pinned above the bell, and the
+// notifications bell itself, which is a popover trigger).
 const otherRailItems = computed(() =>
   NAV_ITEMS.filter(
     i => i.kind === 'route'
       && i.id !== 'chat'
+      && i.id !== 'group-chat'
       && (i.placement ?? 'rail') === 'rail'
       && (!i.adminOnly || isAdminProfile.value),
   ),
@@ -258,6 +261,10 @@ watch(
           skillName: entry.skill_name,
           eventRunId: entry.event_run_id,
           sourceKind: entry.source_kind,
+          channelId: entry.channel_id,
+          groupId: entry.group_id,
+          groupTitle: entry.group_title,
+          pick: entry.pick === true,
         });
         if (!isActiveConv) triggerBellAnimation(priority);
       },
@@ -281,6 +288,24 @@ const handleSelectSkillNotification = (skillId: string) => {
     name: 'tools-skills-settings',
     params: { profile },
     query: { skillId, tour: '1' },
+  });
+};
+
+const handleSelectChannelGroupNotification = (
+  payload: { channelId: string; groupId: string; pick?: boolean },
+) => {
+  bellPopoverVisible.value = false;
+  const profile = route.params.profile as string;
+  if (!profile || !payload.channelId) return;
+  router.push({
+    name: 'channels-page',
+    params: { profile },
+    query: {
+      channel: payload.channelId,
+      group: payload.groupId || undefined,
+      // No single group to approve — open the picker for this channel instead.
+      pick: payload.pick ? '1' : undefined,
+    },
   });
 };
 
@@ -340,6 +365,18 @@ onBeforeUnmount(closeNotificationsStream);
         </button>
       </ElTooltip>
 
+      <!-- Group chat, hardcoded right under Chat rather than left to the
+           v-for below, which would push it under the bell. -->
+      <ElTooltip content="Group chat" placement="right" :show-after="300">
+        <button
+          class="rail-item"
+          :class="{ active: isActive(groupChatItem) }"
+          @click="handleNavClick(groupChatItem)"
+        >
+          <Icon :icon="groupChatItem.icon" class="rail-icon" />
+        </button>
+      </ElTooltip>
+
       <!-- Notifications bell (standalone so its template ref is an element,
            not a v-for array). -->
       <ElTooltip content="Notifications" placement="right" :show-after="300" :disabled="bellPopoverVisible">
@@ -396,6 +433,7 @@ onBeforeUnmount(closeNotificationsStream);
       <NotificationList
         @select="handleSelectNotification"
         @select-skill="handleSelectSkillNotification"
+        @select-channel-group="handleSelectChannelGroupNotification"
         @dismiss="handleDismissNotification"
       />
     </ElPopover>

@@ -181,3 +181,17 @@ def test_server_id_regex():
     assert oc._SERVER_ID_RE.match("resp_x")
     assert oc._SERVER_ID_RE.match("msg_y")
     assert not oc._SERVER_ID_RE.match("call_abc")
+
+
+# ── prompt cache routing ────────────────────────────────────────────────────
+
+def test_the_session_id_becomes_the_prompt_cache_key():
+    """Codex routes the prompt cache on this. The provider's own fallback is a
+    ``uuid4`` generated in its constructor, and a provider instance is built per
+    turn — so a caller that wants a conversation to reuse its cache across turns
+    has to supply a stable id, which the reasoning agent now does."""
+    body = oc._build_request_body(
+        "gpt-5.4-mini", [{"role": "user", "content": "hi"}],
+        None, None, None, None, None, "admin:conv-1",
+    )
+    assert body["prompt_cache_key"] == "admin:conv-1"

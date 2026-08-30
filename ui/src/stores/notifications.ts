@@ -5,6 +5,8 @@ export type NotificationKind =
   | 'error'
   | 'channel_otp'
   | 'channel_subscribe_request'
+  | 'channel_group_request'
+  | 'channel_group_brake'
   | 'skill_register_required'
   | 'event_run_pending'
   | 'event_run_completed'
@@ -23,6 +25,13 @@ export interface NotificationEntry {
   seen: boolean;
   // Channel OTP context (only present when kind === 'channel_otp').
   channelType?: string;
+  // Channel group-chat context (kind === 'channel_group_*'). Used to deep-link
+  // the notification to that group's row on the Channels page.
+  channelId?: string;
+  groupId?: string;
+  /** "Choose which of this space's rooms to enable", not "approve this one". */
+  pick?: boolean;
+  groupTitle?: string;
   senderId?: string;
   senderName?: string;
   otp?: string;

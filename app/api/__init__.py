@@ -4,6 +4,7 @@ from app.api.admin_stream import get_admin_stream_routes
 from app.api.agents import get_agent_routes
 from app.api.blueprints import get_blueprint_routes
 from app.api.calendar import get_calendar_routes
+from app.api.channel_groups import get_channel_group_routes
 from app.api.channels import get_channel_routes
 from app.api.clean import get_clean_routes
 from app.api.conversations import get_conversation_routes
@@ -13,6 +14,7 @@ from app.api.event_runs import get_event_run_routes
 from app.api.file_watchers import get_file_watcher_routes
 from app.api.files import get_file_routes
 from app.api.google import get_google_routes
+from app.api.group_chats import get_group_chat_routes
 from app.api.oauth2 import get_oauth2_routes
 from app.api.processes import get_process_routes
 from app.api.terminals import get_terminal_routes
@@ -77,6 +79,8 @@ def get_api_routes(
         conversation_storage, agent_executor=agent_executor,
     ))
     routes.extend(get_channel_routes(conversation_storage))
+    routes.extend(get_channel_group_routes(conversation_storage))
+    routes.extend(get_group_chat_routes(conversation_storage))
     routes.extend(get_user_config_routes(config_storage))
     routes.extend(get_process_routes())
     routes.extend(get_terminal_routes())

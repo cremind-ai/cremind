@@ -58,6 +58,43 @@ const routes = [
     props: true,
     meta: { title: 'Chat' },
   },
+  // Group chat — one room shared by several profiles' agents. The bare route
+  // and the per-room route render the same view; the room id is a prop.
+  {
+    path: '/:profile/group-chat',
+    name: 'group-chat',
+    component: () => import('../views/GroupChatView.vue'),
+    props: true,
+    meta: { title: 'Group chat' },
+  },
+  {
+    path: '/:profile/group-chat/:groupId',
+    name: 'group-chat-room',
+    component: () => import('../views/GroupChatView.vue'),
+    props: true,
+    meta: { title: 'Group chat' },
+  },
+  {
+    path: '/:profile/group-chat/:groupId/settings',
+    name: 'group-chat-settings',
+    component: () => import('../views/GroupChatSettings.vue'),
+    props: true,
+    meta: { title: 'Group chat settings' },
+    // Group membership and settings are admin-owned (the backend gates the
+    // mutations with require_admin). Mirror the
+    // developer/embedding guards so a member profile never lands on a 403'd
+    // page — it goes back to the room it can actually use.
+    beforeEnter: (to: RouteLocationNormalized) => {
+      const profile = to.params.profile as string | undefined;
+      if (profile && profile !== 'admin') {
+        return {
+          path: `/${profile}/group-chat/${to.params.groupId as string}`,
+          replace: true,
+        };
+      }
+      return true;
+    },
+  },
   {
     path: '/:profile/settings',
     name: 'settings',

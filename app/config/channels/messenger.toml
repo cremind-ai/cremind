@@ -24,7 +24,11 @@ from the internet (a real deployment, or a tunnel such as ngrok / cloudflared).
        https://<your-public-cremind-host>/api/channels/webhook/messenger/<this-channel-id>
    and the Verify Token to the value you enter below. Subscribe to the
    messages and messaging_postbacks fields.
-5. Paste the page access token and the verify token below (and the app secret, if using signature verification)."""
+5. Paste the page access token and the verify token below (and the app secret, if using signature verification).
+
+Group chats: a Page has no group threads — every Messenger conversation is
+between the Page and one person — so there is nothing for a Messenger channel to
+take part in."""
 [channel.modes.fields]
 page_access_token = { description = "Page Access Token", type = "string", secret = true, required = true }
 verify_token = { description = "Webhook Verify Token (you choose this)", type = "string", secret = true, required = true }

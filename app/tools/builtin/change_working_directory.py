@@ -221,15 +221,26 @@ class ChangeWorkingDirectoryTool(BuiltInTool):
         new_str = str(new_path)
 
         # Persist alongside the in-memory ContextStorage write so the
-        # override survives server restart. Failures are logged but don't
-        # abort the tool call — the in-memory value still drives the
+        # override survives server restart. Both the durable column and the
+        # SSE channel are addressed by the conversation ROW id, which a
+        # group-chat seat's context_id ("group:<gid>:<profile>") is not — under
+        # it the update matches no row and the publish reaches no subscriber.
+        # The in-memory write above stays keyed by context_id: that is what the
+        # agent and every built-in tool read back. Failures are logged but
+        # don't abort the tool call — the in-memory value still drives the
         # current run.
+        row_id = context_id
         try:
             from app.events.runner import get_conversation_storage
-            from app.utils.working_directory import persist_working_directory
-            await persist_working_directory(
-                context_id, persist_path, get_conversation_storage(),
+            from app.utils.working_directory import (
+                persist_working_directory,
+                resolve_cwd_scope,
             )
+            conv_storage = get_conversation_storage()
+            row_id, _ = await resolve_cwd_scope(
+                conv_storage, context_id=context_id, profile=profile,
+            )
+            await persist_working_directory(row_id, persist_path, conv_storage)
         except Exception:  # noqa: BLE001
             logger.exception(
                 "Failed to persist cwd override for %s", context_id
@@ -237,15 +248,15 @@ class ChangeWorkingDirectoryTool(BuiltInTool):
 
         # Broadcast the cwd change on the conversation's SSE stream so any
         # subscribed UI (Vue file-tree pane, Go CLI tree) re-renders against
-        # the new directory. ``context_id`` is the conversation_id here.
+        # the new directory.
         try:
             await get_event_stream_bus().publish(
-                context_id,
+                row_id,
                 "cwd",
                 {"working_directory": new_str},
             )
         except Exception:  # noqa: BLE001
-            logger.exception("Failed to publish cwd change for %s", context_id)
+            logger.exception("Failed to publish cwd change for %s", row_id)
 
         return BuiltInToolResult(
             content=[{

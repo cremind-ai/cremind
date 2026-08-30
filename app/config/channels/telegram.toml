@@ -14,7 +14,13 @@ implemented = true
 instructions = """1. Open Telegram and start a chat with @BotFather.
 2. Send /newbot and follow the prompts to choose a name and username.
 3. BotFather will reply with an HTTP API token — paste it below.
-4. Anyone who finds your bot's username can DM it; the Cremind agent will reply."""
+4. Anyone who finds your bot's username can DM it; the Cremind agent will reply.
+
+Group chats: turn on "Group chats" below, then add the bot to the group. Open
+@BotFather, run /setprivacy and choose Disable (or make the bot an admin) —
+otherwise Telegram only delivers commands and @mentions to it. Telegram reports
+the join, so the group appears for approval immediately; approve it under
+Settings → Channels and the agent starts taking part."""
 [channel.modes.fields]
 bot_token = { description = "Bot API Token", type = "string", secret = true, required = true }
 
@@ -39,7 +45,12 @@ Setup:
 5. Pick an access-authentication method (open / passcode / one-time code /
    approval / allowlist) so unknown senders are gated before the agent runs.
    With approval or allowlist you approve each sender under Settings →
-   Channels (or `cremind channels approve`)."""
+   Channels (or `cremind channels approve`).
+
+Group chats: turn on "Group chats" below; the account must be a member of the
+group. Joining is reported, so the group appears for approval straight away —
+approve it under Settings → Channels. Other bots in the group are recognised as
+bots, which is what stops two assistants talking to each other forever."""
 [channel.modes.fields]
 api_id = { description = "API ID (from my.telegram.org)", type = "string", required = true }
 api_hash = { description = "API Hash (from my.telegram.org)", type = "string", secret = true, required = true }

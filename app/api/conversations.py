@@ -8,6 +8,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from app.agent.stream_runner import cancel_run, make_run_id
+from app.api._auth import is_admin
 from app.config.embedding_state import embedding_state
 from app.config.settings import BaseConfig
 from app.config.user_config import (
@@ -15,6 +16,7 @@ from app.config.user_config import (
     resolve_memory_config,
 )
 from app.events import queue as event_queue
+from app.events import user_message_delivery
 from app.api.events import publish_skill_events_admin_changed
 from app.api.file_watchers import publish_file_watchers_admin_changed
 from app.events.conversations_list_bus import (
@@ -37,6 +39,29 @@ def _require_auth(request: Request):
     if not getattr(request.user, "is_authenticated", False):
         return JSONResponse({"error": "Unauthenticated"}, status_code=401)
     return None
+
+
+def _reject_group_seat(conv: dict | None) -> JSONResponse | None:
+    """403 when this conversation is an agent's seat in a group chat.
+
+    A seat is one member's private view of a room, so writing into it directly
+    would put words in front of one agent that the room's timeline — and every
+    other member — never saw. The group endpoints post once and fan out; this
+    guard makes that the only way in. Returns ``None`` for ordinary
+    conversations, so callers can chain it after their own ownership checks.
+    """
+    if (conv or {}).get("kind") != "group_chat":
+        return None
+    return JSONResponse(
+        {
+            "error": "Group chat conversation",
+            "message": (
+                "This conversation is an agent's seat in a group chat; post to "
+                "the group via /api/group-chats/{id}/messages."
+            ),
+        },
+        status_code=403,
+    )
 
 
 def _usage_sum(rows: list[dict]) -> dict:
@@ -290,10 +315,18 @@ def get_conversation_routes(
         conv = await conversation_storage.get_conversation(conversation_id)
         if not conv:
             return JSONResponse({"error": "Conversation not found"}, status_code=404)
-        if conv.get("profile") != profile:
+        # The admin reads every agent's memory (the same reach it has over every
+        # agent's reasoning trace); a member reads only its own.
+        if conv.get("profile") != profile and not is_admin(request):
             return JSONResponse({"error": "Forbidden"}, status_code=403)
 
-        cfg = resolve_memory_config(profile)
+        # Everything below is scoped to the conversation's OWNER, never the
+        # viewer. Read as the viewer, an admin opening a member's group seat
+        # would see that seat's summary beside the ADMIN's long-term memories
+        # and the admin's own compaction threshold — a plausible-looking mix of
+        # two agents' minds.
+        owner = conv.get("profile") or profile
+        cfg = resolve_memory_config(owner)
         summary, watermark, last_compacted_at = await conversation_storage.get_compaction_state(
             conversation_id
         )
@@ -303,15 +336,15 @@ def get_conversation_routes(
             from app.events.runner import get_cremind_agent
             long_term = await asyncio.to_thread(
                 memory_vectorstore.list_long_term,
-                agent=get_cremind_agent(), profile=profile, limit=50,
+                agent=get_cremind_agent(), profile=owner, limit=50,
             )
         else:
-            long_term = await get_memory_storage().get_long_term(profile)
+            long_term = await get_memory_storage().get_long_term(owner)
 
         from app.agent import compaction
         usage = await compaction.context_usage(
             conversation_id=conversation_id,
-            profile=profile,
+            profile=owner,
             conversation_storage=conversation_storage,
         )
         return JSONResponse({
@@ -345,6 +378,9 @@ def get_conversation_routes(
             return JSONResponse({"error": "Conversation not found"}, status_code=404)
         if conv.get("profile") != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
+        group_seat = _reject_group_seat(conv)
+        if group_seat is not None:
+            return group_seat
 
         from app.agent import compaction
         from app.events.runner import get_cremind_agent
@@ -443,6 +479,12 @@ def get_conversation_routes(
         if conv.get("profile") != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
 
+        # Before anything is parked or queued: a seat only ever receives what
+        # the room fanned out to it.
+        group_seat = _reject_group_seat(conv)
+        if group_seat is not None:
+            return group_seat
+
         # External channels are inbound-only: the platform's user types into
         # the platform, the bot replies, and the Cremind UI/CLI render the
         # stream read-only. Reject web/CLI POSTs onto a non-main conversation
@@ -480,9 +522,6 @@ def get_conversation_routes(
 
         run_id = make_run_id(conversation_id, kind="msg")
 
-        # If this is a hidden event-run conversation, the message is a reply to a
-        # pending run: resume it (running + tick) and thread event_run flags so
-        # the run's status/usage update and request_user_input stays available.
         event_run_id: str | None = None
         is_event_run = conv.get("kind") == "event_run"
         # Plan mode is meaningless inside a hidden event-run conversation (those
@@ -491,22 +530,6 @@ def get_conversation_routes(
         if is_event_run and mode == "plan":
             mode = "reasoning"
             plan_action = None
-        if is_event_run:
-            try:
-                from app.storage import get_event_run_storage
-                store = get_event_run_storage()
-                run = await store.get_by_conversation(conversation_id)
-                if run is not None:
-                    event_run_id = run["id"]
-                    await store.update_status(
-                        run["id"], status="running", clear_pending=True,
-                    )
-                    from app.events.event_runs_admin_bus import publish_event_runs_changed
-                    publish_event_runs_changed(profile)
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    f"POST message: failed to resume event run for {conversation_id}"
-                )
 
         # User-message metadata: attachment names (kept out of the agent's text),
         # the non-default turn mode (for the UI mode chip + diagnosing "plan mode
@@ -528,6 +551,67 @@ def get_conversation_routes(
                 "plan_mode": {"stage": "accepted"},
             }
 
+        # Mid-turn delivery. If a turn is already running on this conversation,
+        # hand the message to it instead of queueing a second turn behind work
+        # the message may well change: it is persisted, announced on the bus, and
+        # injected into the running agent's next step. This is why the composer
+        # no longer blocks while streaming and channels no longer drop messages.
+        #
+        # Plan-mode Accept is excluded on purpose: it is a turn-starter for the
+        # execute phase, not a remark to fold into whatever is running.
+        existing_user_message_id: str | None = None
+        if plan_action != "accept":
+            parked = await user_message_delivery.try_park_user_message(
+                conversation_id=conversation_id,
+                profile=profile,
+                query=text,
+                user_message_metadata=user_message_metadata,
+                attachments=attachments or None,
+                mode=mode,
+                reasoning=reasoning,
+                event_run_id=None,
+                event_run=is_event_run,
+            )
+            if parked is not None and parked.injected:
+                # No event-run resume write here: mid-turn means the run row is
+                # already 'running' (a run parked on a question is, by
+                # definition, not mid-turn).
+                if not is_event_run:
+                    publish_conversations_changed(profile)
+                return JSONResponse(
+                    {
+                        "run_id": parked.run_id,
+                        "conversation_id": conversation_id,
+                        "delivery": "injected",
+                        "message_id": parked.message_id,
+                    },
+                    status_code=202,
+                )
+            if parked is not None:
+                # Lost the race to the turn's end: the row is persisted and
+                # released, so this turn must not persist it a second time.
+                existing_user_message_id = parked.message_id
+
+        # If this is a hidden event-run conversation, the message is a reply to a
+        # pending run: resume it (running + tick) and thread event_run flags so
+        # the run's status/usage update and request_user_input stays available.
+        if is_event_run:
+            try:
+                from app.storage import get_event_run_storage
+                store = get_event_run_storage()
+                run = await store.get_by_conversation(conversation_id)
+                if run is not None:
+                    event_run_id = run["id"]
+                    await store.update_status(
+                        run["id"], status="running", clear_pending=True,
+                    )
+                    from app.events.event_runs_admin_bus import publish_event_runs_changed
+                    publish_event_runs_changed(profile)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    f"POST message: failed to resume event run for {conversation_id}"
+                )
+
         await event_queue.enqueue_user_message(
             conversation_id=conversation_id,
             run_id=run_id,
@@ -539,7 +623,10 @@ def get_conversation_routes(
             plan_action=plan_action,
             attachments=attachments or None,
             user_message_metadata=user_message_metadata,
-            push_user_message=True,
+            # A message that was parked and then lost the race to the turn's end
+            # is already persisted; run it without persisting it twice.
+            push_user_message=existing_user_message_id is None,
+            existing_user_message_id=existing_user_message_id,
             # Event-run conversations keep meaningful titles; replies stream a
             # run-aware notification and update the run row.
             update_title_from_query=not is_event_run,
@@ -554,7 +641,16 @@ def get_conversation_routes(
             publish_conversations_changed(profile)
 
         return JSONResponse(
-            {"run_id": run_id, "conversation_id": conversation_id},
+            {
+                "run_id": run_id,
+                "conversation_id": conversation_id,
+                "delivery": "queued",
+                # Set when the park lost the race and the row was persisted
+                # before this response: the sender needs the id to recognise its
+                # own bubble when the (already published) frame arrives, or it
+                # renders the message twice. None on the ordinary queued path.
+                "message_id": existing_user_message_id,
+            },
             status_code=202,
         )
 
@@ -581,6 +677,9 @@ def get_conversation_routes(
             return JSONResponse({"error": "Conversation not found"}, status_code=404)
         if conv.get("profile") != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
+        group_seat = _reject_group_seat(conv)
+        if group_seat is not None:
+            return group_seat
 
         # Id rename path. Handled separately because it has to clean up
         # in-memory event state and cascade FK references atomically.
@@ -681,6 +780,12 @@ def get_conversation_routes(
             return JSONResponse({"error": "Conversation not found"}, status_code=404)
         if conv.get("profile") != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
+        # A seat outlives its owner's curiosity: deleting it here would leave a
+        # member of a live group with nowhere to receive messages. Leaving the
+        # group (or deleting it) is what removes a seat.
+        group_seat = _reject_group_seat(conv)
+        if group_seat is not None:
+            return group_seat
         await _cleanup_conversation_dependents(conversation_id)
         deleted = await conversation_storage.delete_conversation(conversation_id)
         if not deleted:
@@ -849,6 +954,9 @@ def get_conversation_routes(
             return JSONResponse({"error": "Conversation not found"}, status_code=404)
         if conv.get("profile") != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
+        group_seat = _reject_group_seat(conv)
+        if group_seat is not None:
+            return group_seat
 
         content = "Cancel this plan."
         message_id: str | None = None

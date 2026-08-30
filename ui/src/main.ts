@@ -6,6 +6,10 @@ import 'element-plus/dist/index.css'
 import hljsDarkUrl from 'highlight.js/styles/github-dark.css?url'
 import hljsLightUrl from 'highlight.js/styles/github.css?url'
 import './style.css'
+// How rendered Markdown looks in a message, shared by every chat surface. After
+// style.css so its tokens are defined; before any component, so a bubble's own
+// scoped overrides win.
+import './styles/markdown.css'
 import App from './App.vue'
 import router from './router'
 import { useSettingsStore } from './stores/settings'

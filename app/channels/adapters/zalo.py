@@ -10,6 +10,12 @@ same bot transport (the notification behavior itself lives in
 class). The Zalo personal-account transport is the separate
 :class:`app.channels.adapters.zalo_userbot.ZaloUserbotAdapter`.
 
+A message posted in a Zalo group takes the second inbound path
+(:meth:`BaseChannelAdapter._handle_group_inbound`) rather than the DM pipeline.
+The bot has to be a member of the group and someone has to post in it before
+Cremind knows the room exists — Zalo announces no membership change the way
+Telegram's ``my_chat_member`` does.
+
 Zalo Bot API quirks:
     - Base URL ``https://bot-api.zaloplatforms.com``, path ``/bot{token}/{method}``,
       every call is ``POST`` + JSON.
@@ -18,6 +24,7 @@ Zalo Bot API quirks:
       Telegram), and a ``408`` error code means "no updates" (a normal long-poll
       timeout), which we swallow.
     - Text is capped at 2000 characters per message.
+    - Message text is rendered literally: there is no markdown dialect at all.
 """
 
 from __future__ import annotations
@@ -113,7 +120,36 @@ class ZaloBotClient:
         return await self.call("sendChatAction", {"chat_id": chat_id, "action": action})
 
 
+def _message_epoch(value: Any) -> float | None:
+    """A Zalo message's own send time in epoch seconds, or ``None``.
+
+    Zalo reports a bare number where
+    :func:`app.channels.base.platform_message_timestamp` expects a ``datetime``,
+    so it gets its own coercion. Defensive because the time only sharpens the
+    dedupe key: an odd value must weaken that key, never raise inside the poll
+    loop.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class ZaloBotAdapter(BaseChannelAdapter):
+    # A Zalo bot receives updates from every group it has been added to, and can
+    # post back to that chat id.
+    supports_group_chats = True
+    # The Bot API names no members and reports no joins: a group is
+    # discovered when somebody speaks in it, and the roster is whoever has.
+    supports_group_roster = False
+    supports_group_join_events = False
+    reports_sender_is_bot = False
+
+    # Zalo has no markdown: whatever the mirror wraps arrives as literal
+    # characters, so a room's ``*Name*`` would reach it as two stray asterisks.
+    bold_markup = ("", "")
+    italic_markup = ("", "")
+
     def __init__(self, channel: dict, storage: Any) -> None:
         super().__init__(channel, storage)
         self._api: ZaloBotClient | None = None
@@ -135,7 +171,7 @@ class ZaloBotAdapter(BaseChannelAdapter):
         # auth error (channel disabled with a helpful message) instead of a
         # silent poll loop that never receives anything.
         try:
-            await self._api.get_me()
+            me = await self._api.get_me()
         except ZaloApiError as exc:
             await self._api.aclose()
             self._api = None
@@ -144,6 +180,8 @@ class ZaloBotAdapter(BaseChannelAdapter):
             await self._api.aclose()
             self._api = None
             raise ChannelAuthError(f"Zalo bot init failed: {exc}") from exc
+
+        await self._store_self_from_get_me(me)
 
         try:
             await self._poll_loop()
@@ -175,7 +213,44 @@ class ZaloBotAdapter(BaseChannelAdapter):
 
             self._handle_update(update)
 
+    async def _store_self_from_get_me(self, me: Any) -> None:
+        """Record which bot account this channel speaks as, from ``getMe``.
+
+        A bound group uses it to recognise (and drop) the posts its own member
+        agents mirrored into the room. ``ZaloBotClient.call`` already unwraps the
+        envelope's ``result``, so this is the bot object itself.
+
+        Best-effort: the token has just validated, and an unfamiliar payload
+        shape is no reason to refuse to poll — it costs the group layer one of
+        its two echo defences, nothing more.
+        """
+        if not isinstance(me, dict):
+            return
+        user_id = str(me.get("id") or "").strip()
+        if not user_id:
+            return
+        await self._store_self_identity(
+            user_id=user_id,
+            username=me.get("account_name"),
+            is_bot=True,
+            # No ``mention``: on Zalo a mention is a structured annotation
+            # attached to a message, not a token anybody can type into one, so
+            # there is no string an agent could write that would ping this bot.
+            # …which makes the display name the ONLY way a person in a Zalo
+            # group can address this account, so it is worth reaching for.
+            display_name=str(
+                me.get("display_name") or me.get("name") or "",
+            ).strip() or None,
+        )
+
     def _handle_update(self, update: Any) -> None:
+        """Route one polled update to the DM pipeline or to a group room.
+
+        The chat type is the whole routing decision, and it is read explicitly:
+        a Zalo chat id is an opaque string, so a room's is indistinguishable
+        from a person's and any id-shape heuristic would eventually answer a
+        room in someone's DM, or fold everyone in a room into one conversation.
+        """
         if not isinstance(update, dict):
             return
         event_name = update.get("event_name") or ""
@@ -193,6 +268,40 @@ class ZaloBotAdapter(BaseChannelAdapter):
         if not chat_id:
             return
         sender = message.get("from") or {}
+        chat_type = str(chat.get("chat_type") or "").strip().lower()
+
+        if chat_type in ("group", "supergroup"):
+            # A group message belongs to the room, and it used to fall through
+            # to the DM path below — which keys the conversation on the CHAT id,
+            # so every member of the room shared one conversation and the reply
+            # was addressed to the room as if it were a person.
+            sender_id = str(sender.get("id") or "").strip()
+            if not sender_id:
+                return
+            message_id = message.get("message_id")
+            asyncio.create_task(
+                self._handle_group_inbound_safe(
+                    chat_id=chat_id,
+                    chat_title=chat.get("title") or chat.get("name"),
+                    chat_type=chat_type,
+                    sender_id=sender_id,
+                    # Zalo gives a group member a display name and no handle, so
+                    # the name is all there is to attribute the post to.
+                    sender_username=None,
+                    display_name=sender.get("display_name") or sender.get("name"),
+                    text=str(text),
+                    platform_message_id=(
+                        str(message_id) if message_id is not None else None
+                    ),
+                    platform_message_date=_message_epoch(message.get("date")),
+                    sender_is_bot=bool(sender.get("is_bot")),
+                ),
+                name=f"zalo-group-inbound:{self.channel_id}:{chat_id}",
+            )
+            return
+
+        # A DM keys on the chat id, not the sender id: that is the id
+        # ``sendMessage`` wants back, and the two are not interchangeable.
         display_name = sender.get("display_name") or sender.get("name")
         asyncio.create_task(
             self._handle_inbound_safe(chat_id, display_name, str(text)),
@@ -207,12 +316,30 @@ class ZaloBotAdapter(BaseChannelAdapter):
         except Exception:  # noqa: BLE001
             logger.exception("zalo: inbound handler failed")
 
+    async def _handle_group_inbound_safe(self, **kwargs: Any) -> None:
+        try:
+            await self._handle_group_inbound(**kwargs)
+        except Exception:  # noqa: BLE001
+            logger.exception("zalo: group inbound handler failed")
+
     async def _send_text(self, sender_id: str, text: str) -> None:
         if self._api is None:
             raise ChannelAuthError("Zalo client not connected")
         # ``chat_id`` for a DM is the sender id we captured on inbound.
         for chunk in _split_for_messaging(text, _ZALO_TEXT_LIMIT):
             await self._api.send_message(sender_id, chunk)
+
+    async def send_to_chat(self, chat_id: str, text: str) -> None:
+        """Send to a room by its chat id — same call, an id nobody owns.
+
+        Not routed through :meth:`_send_text` because that one documents its
+        argument as a sender id; a group's chat id belongs to no user, and the
+        two only look alike.
+        """
+        if self._api is None:
+            raise ChannelAuthError("Zalo client not connected")
+        for chunk in _split_for_messaging(text, _ZALO_TEXT_LIMIT):
+            await self._api.send_message(chat_id, chunk)
 
     async def _send_typing(self, sender_id: str) -> None:
         if self._api is None:

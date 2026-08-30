@@ -7,6 +7,12 @@ import FileTreePanel from './FileTreePanel.vue';
 import TerminalPanel from './TerminalPanel.vue';
 import HorizontalResizableDivider from './HorizontalResizableDivider.vue';
 
+// The header name. One panel serves several workspaces — a conversation, an
+// event run, and in a room one agent's seat out of several — and the file tree
+// and terminals look identical whichever it is following, so the caller says
+// whose files these are.
+withDefaults(defineProps<{ title?: string }>(), { title: 'Workspace' });
+
 const panel = useTerminalPanelStore();
 const splitContainer = ref<HTMLElement | null>(null);
 const creatingTerminal = ref(false);
@@ -49,7 +55,7 @@ onMounted(() => {
     <template v-else>
       <div class="right-panel-header">
         <Icon icon="mdi:dock-right" class="header-icon" />
-        <span class="header-title">Workspace</span>
+        <span class="header-title" :title="title">{{ title }}</span>
         <ElTooltip content="New terminal" placement="bottom" :show-after="300">
           <button
             class="header-action"
@@ -115,8 +121,14 @@ onMounted(() => {
 }
 .header-title {
   flex: 1 1 auto;
+  min-width: 0;
   font-weight: 500;
   color: #cbd5f5;
+  /* The title is now caller-supplied (an agent name in a room), so it has to
+     yield to the action buttons instead of pushing them off the panel. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .header-action {
   background: transparent;

@@ -10,6 +10,15 @@ the message; the agent's thinking, text tokens, and tool output stream
 in real-time. With no argument, `chat` creates a new conversation and
 starts a fresh session; with a conversation id, it resumes the thread.
 
+You can keep typing while the agent works. A message sent mid-turn is handed to
+the run in progress rather than queued behind it — the agent picks it up on its
+next reasoning step, and the answer being written accounts for it (the status
+bar reads `delivered into current turn`). It replies to you right away in one
+short sentence and then carries on working, unless it is too early to say
+anything useful, in which case it covers the message in its final answer. A
+finished event task whose result arrives mid-turn interrupts the same way.
+Ctrl+C still cancels that run.
+
 Each thinking step in the transcript also shows the token counts of the
 reasoning call that produced it — rendered as a `tokens (in …, cached … /
 out …)` sub-line under the step's tool. This mirrors the per-step token
@@ -70,7 +79,7 @@ cremind chat [<conversation_id>] [-t <title>]
 
 | Key             | Action                                                                            |
 |-----------------|-----------------------------------------------------------------------------------|
-| **Enter**       | Send the composer's contents as a user message.                                   |
+| **Enter**       | Send the composer's contents as a user message — including while the agent is still working, in which case it is folded into the turn in progress. |
 | **Ctrl+C**      | Cancel the current in-flight run. If no run is in flight, quit the TUI.            |
 | **Ctrl+D**      | Quit the TUI immediately. Any in-flight run is left running on the server.         |
 | **PgUp / PgDn** | Scroll the message history.                                                       |

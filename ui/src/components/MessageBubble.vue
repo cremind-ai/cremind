@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, inject, ref, watch } from 'vue';
-import type { ChatMessage, FileAttachment, TerminalAttachment, StepTokenUsage } from '../stores/chat';
-import { formatTokens } from '../utils/usageFormat';
+import type { ChatMessage, FileAttachment, TerminalAttachment } from '../stores/chat';
 import { OpenTerminalKey } from '../composables/terminalTarget';
 import { createChatMarked } from '../utils/markdown';
 import vLinkBlank from '../directives/v-link-blank';
@@ -13,6 +12,7 @@ import { useTerminalPanelStore } from '../stores/terminalPanel';
 import { getProcess } from '../services/processApi';
 import { ElMessage } from 'element-plus';
 import MessageUsageChip from './MessageUsageChip.vue';
+import ThinkingProcess from './ThinkingProcess.vue';
 import TodoChip from './plan/TodoChip.vue';
 
 const props = defineProps<{
@@ -44,7 +44,6 @@ const marked = createChatMarked(resolveApiUrl);
 
 const isUser = computed(() => props.message.role === 'user');
 const isRejectedTrigger = computed(() => props.message.isRejectedTrigger === true);
-const hasThinking = computed(() => props.message.thinkingSteps && props.message.thinkingSteps.length > 0);
 const modeMeta = computed(() =>
   props.message.mode ? chatModeMeta(props.message.mode) : null,
 );
@@ -59,28 +58,6 @@ const copyToClipboard = async () => {
 const parsedContent = computed(() => {
   if (!props.message.content) return '';
   return marked.parse(props.message.content) as string;
-});
-
-// Group per-tool thinking steps by ``step`` so parallel tool calls in one model
-// turn render together under a single "Step N". Each group also carries the
-// reasoning call's token usage (``tokens``) for that step — every tool call in a
-// group shares the one reasoning call, so the first tool with usage is
-// authoritative; null for steps persisted before per-step tokens shipped.
-const thinkingGroups = computed(() => {
-  const steps = props.message.thinkingSteps || [];
-  const groups: { step: number | null; tools: any[]; tokens: StepTokenUsage | null }[] = [];
-  for (const s of steps) {
-    const last = groups[groups.length - 1];
-    if (last && s.step != null && last.step === s.step) {
-      last.tools.push(s);
-    } else {
-      groups.push({ step: s.step ?? null, tools: [s], tokens: null });
-    }
-  }
-  for (const g of groups) {
-    g.tokens = (g.tools.find(t => t.tokenUsage)?.tokenUsage as StepTokenUsage) ?? null;
-  }
-  return groups;
 });
 
 // Format latency information for display
@@ -119,46 +96,6 @@ const formatLatencyMs = (ms: number): string => {
     return `${ms}ms`;
   }
   return `${(ms / 1000).toFixed(1)}s`;
-};
-
-// Latency for a grouped step (relative to the previous group / request start).
-const groupLatency = (group: any, gIdx: number): string => {
-  const tool = group.tools?.[0];
-  if (!tool?.receivedAt || !props.message.latency?.requestSentAt) return '';
-  let ms: number;
-  if (gIdx === 0) {
-    ms = tool.receivedAt - props.message.latency.requestSentAt;
-  } else {
-    const prev = thinkingGroups.value[gIdx - 1]?.tools?.[0];
-    if (!prev?.receivedAt) return '';
-    ms = tool.receivedAt - prev.receivedAt;
-  }
-  return ms > 0 ? ` · ${formatLatencyMs(ms)}` : '';
-};
-
-// Extract text-only observation parts for display in code block
-const formatObservationText = (parts: any[]): string => {
-  if (!parts || !Array.isArray(parts)) return '';
-  const segments: string[] = [];
-  for (const part of parts) {
-    if (part.kind === 'text' && part.text) {
-      segments.push(part.text);
-    } else if (part.kind === 'data' && part.data) {
-      try {
-        segments.push(JSON.stringify(part.data, null, 2));
-      } catch {
-        segments.push(String(part.data));
-      }
-    }
-    // FileParts are rendered separately — not included in text block
-  }
-  return segments.join('\n');
-};
-
-// Extract file parts from observation for inline rendering
-const getObservationFiles = (parts: any[]): any[] => {
-  if (!parts || !Array.isArray(parts)) return [];
-  return parts.filter((p: any) => p.kind === 'file' && p.file);
 };
 
 // Build full URL for a file URI (absolute path or legacy /api/files/ path)
@@ -328,97 +265,6 @@ watch(
     if (latest) openTerminal(latest);
   }
 );
-
-// Collapse state for thinking process timeline
-const activeCollapse = ref<string[]>([]);
-
-// Track when the collapse was last expanded to prevent expand-then-immediately-collapse
-const lastExpandTime = ref<number>(0);
-
-// Track mouse down position to detect text selection drag
-const mouseDownPos = ref<{ x: number; y: number } | null>(null);
-
-// Auto-expand thinking section during streaming so user sees real-time steps
-watch(
-  () => props.message.thinkingSteps?.length,
-  (newLen) => {
-    if (newLen && newLen > 0 && props.message.isStreaming) {
-      if (!activeCollapse.value.includes('thinking')) {
-        activeCollapse.value = ['thinking'];
-      }
-    }
-  }
-);
-
-// Collapse automatically when streaming finishes
-watch(
-  () => props.message.isStreaming,
-  (streaming) => {
-    if (!streaming && activeCollapse.value.includes('thinking')) {
-      activeCollapse.value = [];
-    }
-  }
-);
-
-// Track when the collapse is expanded to prevent immediate re-collapse
-watch(activeCollapse, (newVal, oldVal) => {
-  // If we just expanded (went from [] to ['thinking'])
-  if (newVal.includes('thinking') && !oldVal.includes('thinking')) {
-    lastExpandTime.value = Date.now();
-  }
-});
-
-// Handle mouse down to track position for drag detection
-const handleMouseDown = (event: MouseEvent) => {
-  mouseDownPos.value = { x: event.clientX, y: event.clientY };
-};
-
-// Handle click on thinking section to collapse (with guards)
-const handleThinkingClick = (event: MouseEvent) => {
-  // Guard 1: Only collapse if currently expanded
-  if (!activeCollapse.value.includes('thinking')) {
-    return;
-  }
-
-  // Guard 2: Prevent immediate collapse after expand (within 300ms)
-  if (Date.now() - lastExpandTime.value < 300) {
-    return;
-  }
-
-  // Guard 3: Don't collapse if clicking on interactive elements
-  let target = event.target as HTMLElement;
-  while (target && target !== event.currentTarget) {
-    const tagName = target.tagName.toUpperCase();
-    if (
-      tagName === 'BUTTON' ||
-      tagName === 'A' ||
-      tagName === 'INPUT' ||
-      tagName === 'TEXTAREA' ||
-      target.getAttribute('role') === 'button'
-    ) {
-      return;
-    }
-    target = target.parentElement as HTMLElement;
-  }
-
-  // Guard 4: Don't collapse if user has text selected
-  const selection = window.getSelection();
-  if (selection && selection.toString().trim().length > 0) {
-    return;
-  }
-
-  // Guard 5: Don't collapse if mouse was dragged (text selection)
-  if (mouseDownPos.value) {
-    const dx = Math.abs(event.clientX - mouseDownPos.value.x);
-    const dy = Math.abs(event.clientY - mouseDownPos.value.y);
-    if (dx > 5 || dy > 5) {
-      return;
-    }
-  }
-
-  // All guards passed - collapse the thinking section
-  activeCollapse.value = [];
-};
 </script>
 
 <template>
@@ -458,6 +304,14 @@ const handleThinkingClick = (event: MouseEvent) => {
       <!-- Streaming cursor -->
       <span v-if="message.isStreaming" class="streaming-cursor">▊</span>
 
+      <!-- A group message the agent read but chose not to answer. Said plainly,
+           because an unanswered question in a transcript otherwise reads as the
+           agent having failed rather than having decided. -->
+      <div v-if="message.quietReason" class="quiet-note">
+        <Icon icon="mdi:volume-off" class="quiet-note-icon" />
+        <span>No reply — {{ message.quietReason }}</span>
+      </div>
+
       <!-- Token usage + estimated cost (expandable per sub-agent/tool) -->
       <MessageUsageChip v-if="message.tokenUsage" :message="message" :conversation-id="conversationId" />
 
@@ -467,88 +321,12 @@ const handleThinkingClick = (event: MouseEvent) => {
       </div>
 
       <!-- Collapsible Thinking Process Timeline -->
-      <div 
-        v-if="hasThinking" 
-        class="thinking-section"
-        @mousedown="handleMouseDown"
-        @click="handleThinkingClick"
-      >
-        <el-collapse v-model="activeCollapse">
-          <el-collapse-item name="thinking">
-            <template #title>
-              <span class="collapse-title">
-                <Icon icon="mdi:brain" class="collapse-icon" />
-                Thinking Process ({{ thinkingGroups.length }} steps)
-              </span>
-            </template>
-            <el-timeline>
-              <el-timeline-item
-                v-for="(group, gIdx) in thinkingGroups"
-                :key="gIdx"
-                :type="group.tools.some(t => t.result?.length) ? 'success' : 'primary'"
-                :hollow="!group.tools.some(t => t.result?.length)"
-                :timestamp="`Step ${gIdx + 1}${groupLatency(group, gIdx)}`"
-                placement="top"
-              >
-                <el-card shadow="never" class="timeline-card">
-                  <div
-                    v-if="group.tokens"
-                    class="step-tokens"
-                    title="Tokens for the reasoning call that produced this step"
-                  >
-                    <span class="step-tokens-item">
-                      <span class="step-tokens-num">{{ formatTokens(group.tokens.inputTokens) }}</span> new input
-                    </span>
-                    <span v-if="group.tokens.cacheReadTokens > 0" class="step-tokens-item">
-                      <span class="step-tokens-num">{{ formatTokens(group.tokens.cacheReadTokens) }}</span> cached
-                    </span>
-                    <span v-if="group.tokens.cacheCreationTokens > 0" class="step-tokens-item">
-                      <span class="step-tokens-num">{{ formatTokens(group.tokens.cacheCreationTokens) }}</span> cache-write
-                    </span>
-                    <span class="step-tokens-item">
-                      <span class="step-tokens-num">{{ formatTokens(group.tokens.outputTokens) }}</span> output
-                    </span>
-                  </div>
-                  <div v-for="(tool, tIdx) in group.tools" :key="tIdx" class="step-content">
-                    <span v-if="tool.modelLabel" class="model-badge step-model">
-                      {{ tool.modelLabel }}
-                    </span>
-                    <div class="step-detail">
-                      <span class="step-label">
-                        <Icon icon="mdi:flash" class="step-icon" /> Tool
-                      </span>
-                      <p>{{ tool.tool }}</p>
-                    </div>
-                    <div v-if="tool.toolInput" class="step-detail">
-                      <span class="step-label">
-                        <Icon icon="mdi:code-tags" class="step-icon" /> Input
-                      </span>
-                      <p class="action-input">{{ tool.toolInput }}</p>
-                    </div>
-                    <div v-if="tool.result && tool.result.length" class="step-detail observation">
-                      <span class="step-label">
-                        <Icon icon="mdi:check-circle" class="step-icon success-icon" /> Result
-                      </span>
-                      <pre v-if="formatObservationText(tool.result)" class="observation-code"><code>{{ formatObservationText(tool.result) }}</code></pre>
-                      <!-- Compact file cards inside the result -->
-                      <div v-for="(filePart, fIdx) in getObservationFiles(tool.result)" :key="fIdx" class="file-card">
-                        <Icon :icon="getFileIcon(filePart.file.mime_type)" class="file-card-icon" :class="{ 'pdf-icon': isPdfMime(filePart.file.mime_type), 'text-icon': filePart.file.mime_type?.startsWith('text/') }" />
-                        <div class="file-card-info">
-                          <span class="file-name">{{ filePart.file.name || 'file' }}</span>
-                          <span class="file-mime">{{ filePart.file.mime_type || 'unknown' }}</span>
-                        </div>
-                        <button class="file-download-btn" title="Open" @click.stop="openFileInNewTab(filePart.file.uri)">
-                          <Icon icon="mdi:open-in-new" />
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                </el-card>
-              </el-timeline-item>
-            </el-timeline>
-          </el-collapse-item>
-        </el-collapse>
-        </div>
+      <ThinkingProcess
+        :steps="message.thinkingSteps || []"
+        :is-streaming="message.isStreaming"
+        :conversation-id="conversationId"
+        :request-sent-at="message.latency?.requestSentAt"
+      />
 
       <!-- File attachments carousel (bottom of bubble) -->
       <div v-if="hasCarouselContent || showTodoChip" class="file-carousel-section">
@@ -750,6 +528,21 @@ const handleThinkingClick = (event: MouseEvent) => {
   color: var(--text-secondary);
 }
 
+/* "The agent read this and said nothing" — a footnote, not a warning. */
+.quiet-note {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  opacity: 0.8;
+}
+.quiet-note-icon {
+  flex-shrink: 0;
+  font-size: 0.85rem;
+}
+
 /* Message Header */
 .message-header {
   display: flex;
@@ -857,34 +650,9 @@ const handleThinkingClick = (event: MouseEvent) => {
 }
 
 /* Markdown content styles */
-.marked-content {
-  /* white-space: pre-wrap; */
-  word-wrap: break-word;
-  line-height: 1.25; /* Markdown content line spacing */
-}
-
-:deep(.marked-content p) {
-  margin: 0.1em 0; /* Paragraph spacing: top | bottom */
-  white-space: pre-wrap;
-  word-wrap: break-word;
-}
-
-:deep(.marked-content p:first-child) {
-  margin-top: 0;
-}
-
-:deep(.marked-content p:last-child) {
-  margin-bottom: 0;
-}
-
-:deep(.marked-content code) {
-  background: var(--surface-hover);
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-  font-size: 0.9em;
-  border: 1px solid var(--border-color);
-}
+/* The neutral Markdown rules live in styles/markdown.css, shared with the group
+   room's bubble. What stays here is only what this bubble inverts: white text on
+   the blue "you" bubble, where the shared surface colours would vanish. */
 
 .user-message :deep(.marked-content code) {
   background: rgba(255, 255, 255, 0.2);
@@ -892,75 +660,9 @@ const handleThinkingClick = (event: MouseEvent) => {
   border: 1px solid rgba(255, 255, 255, 0.3);
 }
 
-:deep(.marked-content pre) {
-  margin: 0.5em 0; /* Code block outer spacing */
-  padding: 8px; /* Code block inner padding */
-  background: var(--surface-hover);
-  border-radius: 6px;
-  overflow-x: auto;
-  border: 1px solid var(--border-color);
-}
-
 .user-message :deep(.marked-content pre) {
   background: rgba(0, 0, 0, 0.15);
   border: 1px solid rgba(255, 255, 255, 0.2);
-}
-
-:deep(.marked-content pre code) {
-  background: transparent;
-  padding: 0;
-  border-radius: 0;
-  display: block;
-  white-space: pre;
-  border: none;
-}
-
-:deep(.marked-content ul),
-:deep(.marked-content ol) {
-  margin: 0.3em 0; /* List outer spacing */
-  padding-left: 2em; /* List indent */
-}
-
-:deep(.marked-content li) {
-  margin: 0.15em 0; /* List item spacing */
-}
-
-:deep(.marked-content blockquote) {
-  margin: 0.5em 0; /* Blockquote outer spacing */
-  padding: 0.4em 0.8em; /* Blockquote inner padding: vertical | horizontal */
-  border-left: 3px solid var(--primary-color);
-  background: var(--surface-hover);
-  border-radius: 0 4px 4px 0;
-}
-
-:deep(.marked-content table) {
-  border-collapse: collapse;
-  margin: 0.5em 0; /* Table outer spacing */
-  width: 100%;
-  border-radius: 6px;
-  overflow: hidden;
-  border: 1px solid var(--border-color);
-}
-
-:deep(.marked-content table th),
-:deep(.marked-content table td) {
-  border: 1px solid var(--border-color);
-  padding: 8px 12px;
-  text-align: left;
-}
-
-:deep(.marked-content table th) {
-  background: var(--surface-hover);
-  font-weight: 600;
-}
-
-:deep(.marked-content a) {
-  color: var(--primary-color);
-  text-decoration: underline;
-}
-
-:deep(.marked-content a:hover) {
-  opacity: 0.8;
 }
 
 .user-message :deep(.marked-content a) {
@@ -970,29 +672,6 @@ const handleThinkingClick = (event: MouseEvent) => {
 
 .user-message :deep(.marked-content a:hover) {
   color: white;
-}
-
-:deep(.marked-content h1),
-:deep(.marked-content h2),
-:deep(.marked-content h3),
-:deep(.marked-content h4) {
-  margin: 0.5em 0 0.25em 0; /* Heading spacing: top | right | bottom | left */
-  font-weight: 600;
-  line-height: 1.2; /* Heading line spacing */
-}
-
-:deep(.marked-content h1:first-child),
-:deep(.marked-content h2:first-child),
-:deep(.marked-content h3:first-child),
-:deep(.marked-content h4:first-child) {
-  margin-top: 0;
-}
-
-:deep(.marked-content hr) {
-  margin: 0.75em 0; /* Horizontal rule spacing */
-  border: none;
-  height: 1px;
-  background: var(--border-color);
 }
 
 /* Streaming cursor */
@@ -1082,21 +761,6 @@ const handleThinkingClick = (event: MouseEvent) => {
   margin-bottom: 0;
 }
 
-/* Thinking Process Section */
-.thinking-section {
-  margin-top: 10px;
-  padding: 4px 12px;
-  background: var(--surface-hover);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  transition: all 0.2s ease;
-}
-
-/* Add cursor pointer when thinking section is expanded */
-.thinking-section:has(.el-collapse-item.is-active) :deep(.el-collapse-item__content) {
-  cursor: pointer;
-}
-
 /* Animation */
 @keyframes messageSlideIn {
   from {
@@ -1107,185 +771,6 @@ const handleThinkingClick = (event: MouseEvent) => {
     opacity: 1;
     transform: translateY(0);
   }
-}
-
-.thinking-section :deep(.el-collapse) {
-  border: none;
-}
-
-.thinking-section :deep(.el-collapse-item__header) {
-  background: transparent;
-  border: none;
-  font-size: 0.875rem;
-  height: 28px;
-  line-height: 28px;
-  min-height: 28px;
-  font-weight: 500;
-}
-
-.thinking-section :deep(.el-collapse-item__wrap) {
-  background: transparent;
-  border: none;
-}
-
-.thinking-section :deep(.el-collapse-item__content) {
-  padding-bottom: 8px;
-  padding-top: 8px;
-}
-
-.collapse-title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-weight: 600;
-  color: var(--primary-color);
-}
-
-.collapse-icon {
-  font-size: 1.1em;
-}
-
-.model-badge {
-  display: inline-block;
-  font-size: 0.7em;
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: var(--el-color-info-light-8, #e6e8eb);
-  color: var(--el-color-info, #909399);
-  font-weight: 500;
-  vertical-align: middle;
-}
-
-.reasoning-model {
-  margin-left: 8px;
-  padding: 1px 6px;
-  font-size: 0.72em;
-  line-height: 2.2;
-}
-
-.step-model {
-  float: right;
-  font-size: 0.75em;
-}
-
-/* Per-step reasoning-call token counts, above the step's tool calls. */
-.step-tokens {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 2px 12px;
-  margin-bottom: 8px;
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
-  cursor: default;
-}
-
-.step-tokens-item {
-  white-space: nowrap;
-}
-
-.step-tokens-num {
-  font-weight: 600;
-  color: var(--el-text-color-regular, inherit);
-}
-
-/* Timeline styles */
-.thinking-section :deep(.el-timeline) {
-  padding-left: 8px;
-  margin-top: 8px;
-}
-
-.thinking-section :deep(.el-timeline-item__timestamp) {
-  font-size: 0.75rem;
-  font-weight: 600;
-  color: var(--text-secondary);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-}
-
-.timeline-card {
-  margin-bottom: 8px;
-  background: var(--surface-color);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-}
-
-.timeline-card :deep(.el-card__body) {
-  padding: 12px;
-}
-
-.step-content {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.step-detail {
-  font-size: 0.875rem;
-}
-
-.step-label {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  font-weight: 600;
-  margin-bottom: 4px;
-  font-size: 0.875rem;
-  color: var(--text-primary);
-}
-
-.step-icon {
-  font-size: 1.1em;
-  color: var(--text-secondary);
-}
-
-.success-icon {
-  color: var(--success-color);
-}
-
-.step-detail p {
-  margin: 0;
-  padding-left: 4px;
-  word-break: break-word;
-  white-space: pre-wrap;
-  color: var(--text-secondary);
-  line-height: 1.6;
-}
-
-.step-detail.observation {
-  margin-top: 6px;
-  padding-top: 8px;
-  border-top: 1px dashed var(--border-color);
-}
-
-.action-input {
-  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-  font-size: 0.85rem;
-  background: var(--surface-hover);
-  padding: 6px 10px;
-  border-radius: 4px;
-  border: 1px solid var(--border-color);
-}
-
-.observation-code {
-  margin: 4px 0 0 0;
-  padding: 8px 10px;
-  background: var(--surface-hover);
-  border: 1px solid var(--border-color);
-  border-radius: 4px;
-  overflow-x: auto;
-  max-height: 300px;
-  overflow-y: auto;
-}
-
-.observation-code code {
-  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-  font-size: 0.82rem;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: var(--text-secondary);
 }
 
 /* ── File Carousel (bottom of agent bubble) ── */
@@ -1449,73 +934,4 @@ const handleThinkingClick = (event: MouseEvent) => {
   border-color: var(--success-color);
 }
 
-/* ── Observation file cards (inside thinking timeline) ── */
-.file-card {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  background: var(--surface-hover);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  margin-top: 6px;
-}
-
-.file-card-icon { font-size: 1.3em; color: var(--text-secondary); flex-shrink: 0; }
-.file-card-icon.pdf-icon { color: #e53935; }
-.file-card-icon.text-icon { color: var(--primary-color); }
-
-.file-card-info {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  flex: 1;
-  min-width: 0;
-}
-
-.file-name {
-  font-size: 0.8rem;
-  font-weight: 500;
-  color: var(--text-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.file-mime {
-  font-size: 0.68rem;
-  color: var(--text-tertiary);
-}
-
-.file-download-btn,
-.file-copy-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
-  padding: 0;
-  border-radius: 5px;
-  border: 1px solid var(--border-color);
-  background: var(--surface-color);
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: all 0.12s ease;
-  font: inherit;
-  font-size: 0.9rem;
-  text-decoration: none;
-  appearance: none;
-  flex-shrink: 0;
-}
-
-.file-download-btn:hover,
-.file-copy-btn:hover {
-  color: var(--primary-color);
-  border-color: var(--primary-color);
-}
-
-.file-copy-btn.copied {
-  color: var(--success-color);
-  border-color: var(--success-color);
-}
 </style>

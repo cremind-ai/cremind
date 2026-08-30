@@ -1,5 +1,5 @@
 ---
-description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders` with their token usage, wipe one subscriber's conversation history with `clear-history`, delete a client completely with `forget` (as if they had never messaged — conversation, messages, automations, contact details and access all removed), run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), set a channel's push-notification filter with `notify-filter`, push an ad-hoc message out to a notification channel with `send`, send a direct message to specific individual clients — one person or a bulk list, addressed by platform id or **phone number** — with `message`, record a contact's phone number with `set-phone`, decide per client whether the agent must ask before messaging them with `set-confirm` (the profile-wide default is `channels.confirm_before_send` in Settings → Config → Channels; turn it off so unattended automations can send without stopping to ask), `approve`/`revoke` who may subscribe to a notification channel, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). All channels gate access with the same per-channel **authentication** method — open, passcode, one-time code (`otp`), admin approval, or allowlist — controlling who may chat (bot/userbot) or subscribe (notification); `approve`/`revoke` authorize individual senders and work in every mode. A notification channel can also receive one-off messages you send with `cremind channels send` — the same delivery the agent's `send_notification` tool uses when you ask it to 'notify me on Telegram'. Separately, `cremind channels message` sends to **named individuals** rather than to subscribers: give it sender ids or phone numbers (one `--to`, or a JSON list for a bulk campaign such as thanking every customer in a spreadsheet), and each delivered message is saved into that client's own conversation so the agent has the context later; it previews by default and only sends with `--send`, and only WhatsApp can message someone who has never written first. Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
+description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders` with their token usage, wipe one subscriber's conversation history with `clear-history`, delete a client completely with `forget` (as if they had never messaged — conversation, messages, automations, contact details and access all removed), run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), set a channel's push-notification filter with `notify-filter`, push an ad-hoc message out to a notification channel with `send`, send a direct message to specific individual clients — one person or a bulk list, addressed by platform id or **phone number** — with `message`, record a contact's phone number with `set-phone`, decide per client whether the agent must ask before messaging them with `set-confirm` (the profile-wide default is `channels.confirm_before_send` in Settings → Config → Channels; turn it off so unattended automations can send without stopping to ask), `approve`/`revoke` who may subscribe to a notification channel, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). All channels gate access with the same per-channel **authentication** method — open, passcode, one-time code (`otp`), admin approval, or allowlist — controlling who may chat (bot/userbot) or subscribe (notification); `approve`/`revoke` authorize individual senders and work in every mode. A notification channel can also receive one-off messages you send with `cremind channels send` — the same delivery the agent's `send_notification` tool uses when you ask it to 'notify me on Telegram'. Separately, `cremind channels message` sends to **named individuals** rather than to subscribers: give it sender ids or phone numbers (one `--to`, or a JSON list for a bulk campaign such as thanking every customer in a spreadsheet), and each delivered message is saved into that client's own conversation so the agent has the context later; it previews by default and only sends with `--send`, and only WhatsApp can message someone who has never written first. Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. A channel can also take part in **group chats** — real Telegram, Discord, Slack, WhatsApp or Zalo groups full of real people that this profile's account has been added to: opt in per channel with `--group-chats`, then approve each group with `cremind channels groups approve` (new groups arrive `pending` with a high-priority notification and the agent reads nothing until you approve), and tune it with `channels groups list`/`members`/`policy`/`allow`/`deny`/`respond`/`refresh`/`block`/`forget`. In an approved group the agent replies when mentioned and otherwise only when a cheap relevance check says the message is for it, while everything else is still stored as context. This is **not** `cremind group`, which is Cremind's own rooms where several profiles' agents talk to each other; the two features share nothing. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
 ---
 
 # `cremind channels` — External Messaging Channel Management
@@ -48,6 +48,10 @@ The group covers these operations:
 - **`delete`** — Tear down the adapter and remove the row. **Cascades
   delete to every conversation that belonged to that channel and
   every per-sender authentication state.**
+- **`groups`** — Approve and manage the **platform group chats** this
+  channel's account has been added to: `list`, `approve`/`block`/`forget`,
+  `members`, `policy`, `allow`/`deny`, `respond` and `refresh` (see
+  **Group chats on a channel** below).
 - **`catalog`** — Dump the TOML-driven catalog (one entry per
   supported channel type, each describing which modes, which auth
   modes, and which config fields the channel needs). The web UI's
@@ -68,7 +72,7 @@ Each row returned by `list` looks like:
 | `channel_type`     | `telegram` \| `whatsapp` \| `discord` \| `slack` \| `messenger` \| `zalo`. Unique per profile (you can't register two Telegrams).  |
 | `mode`             | `bot` (a separate bot account replies — Telegram/Discord/Slack/Zalo bot, Messenger Page bot), `userbot` (your own account auto-replies — WhatsApp and Zalo personal via QR pairing), or `notification` (push-only: no conversation; forwards Cremind's automation/event notifications to the chat with a configurable filter). |
 | `auth_mode`        | **Legacy** per-sender gate (`none` \| `otp` \| `password`), superseded by the unified `config.subscribe_auth` (see **Access authentication** below). Still read for back-compat on channels created before unification (`password`→`passcode`, `otp`→`otp`, `none`→`open`); new channels set `subscribe_auth` and leave this `none`. |
-| `response_mode`    | `normal` — the platform user receives ONLY the final answer. `detail` — they also receive, as separate bubbles while the run executes, what triggered it (for event-driven runs) and each Thinking-Process step. Everything beyond the answer is Cremind's own working, so `normal` sends none of it. |
+| `response_mode`    | `normal` — the platform user receives ONLY the final answer. `detail` — they also receive, as separate bubbles while the run executes, what triggered it (for event-driven runs) and each Thinking-Process step. Everything beyond the answer is Cremind's own working, so `normal` sends none of it. Applies to **group chats too**, with one exception: a turn that answers `[silent]` (the agent judging the message was not for it) posts nothing at all, steps included. The setting is channel-wide — it cannot be `detail` in DMs and `normal` in that channel's rooms. Changing it restarts the adapter, so it takes effect on the next message with no `serve` restart. |
 | `enabled`          | `true`/`false`. Disabling stops the in-process adapter without deleting the row.                                          |
 | `status`           | `running` / `stopped` — derived live from the registry, not stored.                                                       |
 | `config`           | Platform-specific. Secret fields (`bot_token`, `password`, etc.) are redacted in `list`/`get` responses.                  |
@@ -109,6 +113,11 @@ External channels are **inbound-only from the platform's user**:
   user message on a per-sender conversation under that channel.
 - The Cremind agent runs and the response is sent back through the
   channel adapter to the platform user.
+- A message that arrives **while the bot is still composing** is folded into the
+  reply being written, so the agent takes it into account before answering. The
+  bot no longer replies "I'm thinking…" and no longer ignores those messages: a
+  burst gets one answer covering all of it, or — if the turn was already
+  finishing — an immediate follow-up reply.
 - You **cannot** post messages from the web UI or CLI into a non-`main`
   conversation — `POST /api/conversations/{id}/messages` returns 403
   `Read-only channel` for any conversation whose `channel_id` resolves
@@ -121,9 +130,187 @@ the one case where an *operator-initiated* outbound push is allowed, via
 path delivers straight to subscribers and never creates or writes a
 conversation.
 
+A **group** on the platform is a third path: the same inbound-only rule applies
+(the agent answers into the group through the adapter, and you cannot post into
+the group's conversation from the CLI), but the group has to be switched on and
+approved first — see **Group chats on a channel** below.
+
 Use `cremind conv get <id>` and `cremind conv attach <id>` to inspect channel
 conversations; use the corresponding platform (Telegram, etc.) to
 talk to the agent.
+
+## Group chats on a channel
+
+A channel is normally a set of one-to-one threads: one person messages the bot,
+the agent answers them. **Group chats** are the other shape — this profile's
+channel account (a Telegram bot or userbot, a Discord bot, a Slack app, the
+paired WhatsApp account, a Zalo bot or paired account) sits in a real group on
+that platform, alongside real people, and takes part in the conversation.
+
+### Not the same as `cremind group`
+
+Two features, similar names, nothing shared:
+
+| What you want | What to use |
+|---------------|-------------|
+| **One** profile's agent in a real Telegram/Discord/Slack/WhatsApp/Zalo group, alongside real people | `cremind channels groups` (this page) |
+| **Several** of your profiles' agents in one Cremind-owned room, talking to you and to each other | [`cremind group`](./%5Bcli%5Dcremind%20group.md) |
+
+A platform group is never mirrored into a Cremind room, a Cremind room is never
+bound to a platform chat, and neither one's settings reach the other.
+
+### Off by default
+
+Group chats are opt-in **per channel** (`config.group_chats_enabled`, off until
+you turn it on with `--group-chats` on `add` or `edit`, or the switch on the
+Channels page). While it is off the agent never sees group traffic at all:
+nothing is stored, no notification is raised, and it does not matter who adds the
+account to what. A bot can be added to any group by anybody, and an agent that
+silently started recording those would be a surprise nobody asked for.
+
+### Approve before the agent reads anything
+
+With the flag on, every group the account is in shows up in
+`cremind channels groups list` as **pending**, together with a **high-priority
+notification**. A pending group is inert: its messages are not read, not stored
+and not answered. It becomes live only when a human approves it — the Channels
+page, or `cremind channels groups approve <channel_id> <group>`.
+
+`block` is the opposite decision, kept on the record: the transcript so far
+survives and being re-added does not ask you again. `forget` erases the group and
+its conversation instead, so the next message from it asks afresh.
+
+### When the agent speaks
+
+Once a group is approved:
+
+- **Mentioned → it answers.** An `@mention`, or a reply to one of the agent's own
+  messages, is an immediate turn. Each platform spells a mention differently and
+  each adapter detects its own.
+- **Addressed by name → it answers.** The agent knows the name its account
+  shows in the group ("Lý Nguyen", not the profile name), so `@Lý Nguyen …` or
+  `Lý Nguyen, …` counts as being addressed even on platforms that report no
+  structured mention — Zalo has none at all.
+- **Not addressed → a cheap relevance check decides.** One call on the profile's
+  **`low`-tier model** reads the last few messages plus the new one and answers
+  "is this for *me*?". The agent is treated as a **member of the group**, not as
+  an intruder in it: a message put to everybody — a greeting, "anyone…?", a
+  question with no named addressee — is put to it too, and it answers like any
+  other member would. It stays out of exchanges addressed to somebody else by
+  name, side conversations it was never part of, and another assistant's reply
+  to the same question. Set `respond mention_only` to skip the check entirely.
+- **A broken check stays silent.** A timeout, a provider error, an unparseable
+  answer or no LLM configured at all resolve to *not relevant* — ambiguity leans
+  towards answering, but a provider outage must not turn a group into a
+  chatterbox.
+- **Either way the message is stored.** A message the agent does not answer still
+  lands in the group's conversation as context, so a later turn reads the thread
+  it is joining rather than one line out of nowhere.
+
+### Interrupting an agent that is busy
+
+A message sent while the agent is already working is **folded into the turn it
+is already running** rather than queued behind it. It goes through the same
+checks as any other message first, so an interruption meant for somebody else
+still gets nothing.
+
+One that **@mentions the agent** is answered during the pause: it posts one
+short line to the group — "not yet, still installing" — and carries straight on
+with the work. The line arrives while the job is still running, which is the
+point of asking, and the final answer still comes when the job is done.
+
+For a message that was *not* addressed to it by name but passed the relevance
+check anyway, replying now is the agent's own call — it may cover the point in
+its final message instead.
+
+Either way the interruption reaches the running turn, so "stop what you are
+doing" or "do X instead" changes course from that point rather than after the
+superseded work finishes.
+
+### The group's conversation
+
+Each approved group gets an **ordinary conversation** bound to the channel and
+titled after the group. It appears in the sidebar like any other, opens from the
+Channels page, and carries the whole transcript — the answered messages and the
+unanswered ones alike.
+
+### Who the agent answers
+
+Per group, with `groups policy`:
+
+| Mode | Effect |
+|------|--------|
+| `everyone` *(default)* | Answers anybody in the group **except** the deny list. |
+| `selected` | Answers **only** the allow list. |
+
+`groups allow` and `groups deny` move member ids between the two lists (adding to
+one removes from the other); both lists survive a mode switch, so flipping back
+does not lose a list you curated. A **denied** member is stronger than "not
+answered": their messages are dropped outright rather than stored, so somebody
+you blocked cannot fill the agent's context either.
+
+### Groups the account was already in
+
+Everything above is about being *added* to a group. The other half is the groups
+the account already belonged to when you turned the feature on — nobody added it
+to those, so there is no join to notice, no notification, and nothing to
+approve. They are **not** raised as pending, deliberately: switching the feature
+on would otherwise open with a wall of decisions you never asked to make.
+
+Reach them by picking instead:
+
+- **Web UI** — Channels page → the channel's Group chats section → **Add
+  existing groups…**, which lists what the platform says the account is in and
+  enables the ones you tick.
+- **CLI** — `cremind channels groups available <channel_id>` then
+  `cremind channels groups add <channel_id> -- <chat_id>…` (the `--` matters:
+  Telegram and Zalo ids start with a minus sign).
+
+Picking **is** approving; there is no second step.
+
+Alongside that, each listing-capable channel reconciles in the background every
+15 minutes. The first pass records what the account is in as a silent baseline;
+after that, a group that appears which is not in the baseline really was joined
+while Cremind was down, and gets the normal pending row and notification.
+
+### Loop brakes
+
+A group can contain other automated accounts — including another Cremind
+profile's agent, which is a supported way to use this — and two assistants being
+endlessly helpful at each other is the failure mode. Two caps stop it:
+
+- **20 agent posts per minute**, per group.
+- **8 consecutive bot-authored messages** with no human in between, after which
+  the agent goes quiet until a person posts. Only reachable on platforms that
+  flag bot authorship: **Telegram, Discord and Slack**. WhatsApp and Zalo report
+  no such flag, so only the rate cap applies there.
+
+A braked agent is quiet, not blind: messages keep being stored throughout.
+
+### Per-platform prerequisites
+
+The middle column is the step that is otherwise invisible — skip it and the
+account joins the group, looks perfectly healthy, and hears nothing.
+
+| Platform | Put in the group | The setup step that is easy to miss | Reports a join? | Lists existing groups? | Member roster |
+|----------|------------------|--------------------------------------|-----------------|------------------------|---------------|
+| Telegram (bot) | add the bot to the group | @BotFather → `/setprivacy` → **Disable**, or make the bot a group admin — otherwise it only ever receives messages that mention or reply to it | yes | no — the Bot API cannot enumerate | **administrators only** (the Bot API cannot enumerate a group), plus whoever has posted |
+| Telegram (userbot) | the paired personal account must be a member | none beyond pairing | yes | yes | full |
+| Discord | invite the bot to the server and give it access to the channel | enable **MESSAGE CONTENT INTENT** (Developer Portal → Bot → Privileged Gateway Intents), or messages arrive with an empty body; add **SERVER MEMBERS** for a complete roster | no per channel — joining a *server* raises one notification pointing at the picker | yes — every readable text channel, as `Server / #channel` | full with the Server Members intent, partial without |
+| Slack | `/invite` the app into the channel | add `channels:history`, `groups:history`, `channels:read` (plus `groups:read` for private channels), subscribe to `message.channels` / `message.groups` **and `member_joined_channel`**, then **reinstall** — a DM-only install does not cover channels | yes | yes | full |
+| WhatsApp | the QR-paired personal account must itself be a member | none beyond pairing | yes | yes | full |
+| Zalo (bot) | add the bot to the group and post once | none | no — discovered on the first message | no | **nobody**: the Bot API names no members, so the roster is whoever has posted |
+| Zalo (userbot) | the QR-paired personal account must itself be a member | none beyond pairing | yes | yes | full |
+| Messenger | — | **not supported.** A Messenger channel is a Facebook Page, and Pages have no group threads. | — | — | — |
+
+"Reports a join" is what decides *when* a group first appears: where the answer
+is no, the group shows up as pending on its **first message** instead of the
+moment the account was added. "Lists existing groups" is what decides whether
+**Add existing groups** / `channels groups available` can offer you the ones the
+account already belonged to; where the answer is no, waiting for somebody to
+post really is the only way in. `cremind channels groups refresh` re-asks the
+platform for the roster on demand and reports `unsupported` rather than failing
+where the platform names nobody.
 
 ## Finding this in the web UI
 
@@ -141,6 +328,14 @@ and per-row **Approve**/**Revoke**, **Open**, and **Clear history**
 actions (mirroring `cremind channels list`, `senders`,
 `approve`/`revoke`, and `clear-history`). The sidebar's conversation-list
 channel selector mirrors `cremind conv list --channel <type>`.
+
+On a group-capable channel the same card carries a **Group chats** panel — a
+badge counting the groups waiting on you, an on/off switch mirroring
+`--group-chats`, and per group the Approve / Block / Forget buttons, the
+**Everyone in the group** / **Only selected people** and **When mentioned or
+relevant** / **Only when mentioned** dropdowns, and **Refresh members** —
+mirroring `cremind channels groups` in full. A `channel_group_request`
+notification deep-links straight to the group it is about.
 
 ## Global flags
 
@@ -198,7 +393,8 @@ cremind channels add --type <kind>
                  [--mode bot|userbot|notification]
                  [--auth-mode none|otp|password]
                  [--response-mode normal|detail]
-                 [--enabled true|false]
+                 [--group-chats | --no-group-chats]
+                 [--enabled | --disabled]
                  [--no-pair]
                  [--json '<config-object>' | --config key=value ...]
 ```
@@ -234,7 +430,7 @@ channels pair <id>` runs. The QR is rendered in the terminal, or the
 prompt waits for the verification code. Pass `--no-pair` to skip; the
 root `--json` flag also suppresses auto-pairing because it implies a
 non-interactive caller. The auto-pair step is also skipped when
-`--enabled=false` (no live adapter to pair with yet — re-enable from
+`--disabled` (no live adapter to pair with yet — re-enable from
 the web UI or run `cremind channels pair <id>` after enabling).
 
 **Flags.**
@@ -245,7 +441,8 @@ the web UI or run `cremind channels pair <id>` after enabling).
 | `--mode`          | string  | `bot`     | Adapter mode (`bot`, `userbot`, or `notification`). Catalog-declared modes only; modes flagged `implemented = false` are rejected. |
 | `--auth-mode`     | string  | `none`    | Per-sender gate.                                                                   |
 | `--response-mode` | string  | `normal`  | Reply detail (`normal` or `detail`).                                               |
-| `--enabled`       | bool    | `true`    | Start the adapter immediately.                                                     |
+| `--group-chats/--no-group-chats` | bool | `--no-group-chats` | Let this channel's agent take part in **platform group chats**. New groups arrive `pending` and must be approved with `cremind channels groups approve` — see **Group chats on a channel**. |
+| `--enabled/--disabled` | bool | `--enabled` | Start the adapter immediately, or register the row without starting it.       |
 | `--json`          | string  | `""`      | Channel-specific config as a JSON object. Mutually exclusive with `--config`. **PowerShell caveat:** Windows PowerShell strips inner double quotes when passing arguments to native binaries, so `--json '{"k":"v"}'` arrives as `--json {k:v}` and fails to parse — prefer `--config k=v` on PS, or escape with backticks / the `--%` stop-parsing token. |
 | `--config`        | string (repeatable) | (none) | Channel-specific config as `key=value`, repeatable for multiple fields. Values are passed to the server as strings. Mutually exclusive with `--json`. Quoting-safe across PowerShell, cmd.exe, bash, and zsh. |
 | `--no-pair`       | bool    | `false`   | Skip the auto-launched pairing flow even when the chosen mode would warrant one.   |
@@ -276,7 +473,7 @@ status          running
 
 # Register a Telegram bot but don't start it yet
 $ cremind channels add --type telegram --mode bot \
-                   --enabled=false \
+                   --disabled \
                    --json '{"bot_token":"123:abc..."}'
 
 # WhatsApp with a password gate (mode is `userbot` — the agent auto-replies
@@ -657,6 +854,7 @@ and/or config — sending only the fields you pass.
 
 ```bash
 cremind channels edit <id> [--mode M] [--auth-mode A] [--response-mode R]
+                           [--group-chats | --no-group-chats]
                            [--json '<config>'] [--config KEY=VALUE ...]
 ```
 
@@ -667,6 +865,7 @@ cremind channels edit <id> [--mode M] [--auth-mode A] [--response-mode R]
 | `--mode`          | Channel mode (`bot`/`userbot`/`notification`).                       |
 | `--auth-mode`     | Auth mode (`none`/`otp`/`password`).                                 |
 | `--response-mode` | Reply detail (`normal`/`detail`).                                    |
+| `--group-chats/--no-group-chats` | Whether this channel's agent takes part in **platform group chats** (see **Group chats on a channel**). Turning it off leaves the groups on record but stops the agent reading them; turning it on does *not* approve anything — each group still starts `pending`. |
 | `--json`          | Config patch as a JSON object (on PowerShell prefer `--config`).     |
 | `--config`        | Config patch as repeatable `KEY=VALUE` (alternative to `--json`).    |
 
@@ -680,6 +879,10 @@ returns the full object. The auto-created `main` channel cannot be edited.
 
 ```bash
 $ cremind channels edit e2e8...d4f1 --response-mode detail --config bot_token=123:abc
+
+# Let this channel's agent take part in platform groups (each one still needs
+# approving with `cremind channels groups approve`)
+$ cremind channels edit e2e8...d4f1 --group-chats
 ```
 
 ### `cremind channels enable` / `cremind channels disable`
@@ -930,7 +1133,7 @@ must be set on the channel before `pair` is run.
 ```bash
 # Stand up a WhatsApp channel and pair it from the terminal in one go
 $ cremind channels add --type whatsapp --mode userbot --auth-mode otp \
-                   --json '{}' --enabled false
+                   --json '{}' --disabled
 id              <whatsapp-id>
 ...
 $ cremind channels pair <whatsapp-id>
@@ -953,6 +1156,359 @@ Password:           # echoed if 2FA, hidden as you type
 non-zero status. The adapter on the server keeps running — re-invoke
 `cremind channels pair <id>` (or open the web UI dialog) to resume the
 flow from wherever it stalled.
+
+### `cremind channels groups list`
+
+**Purpose.** List the platform groups this channel's account has been added to,
+with their approval status and member policy.
+
+**Syntax.**
+
+```bash
+cremind channels groups list <channel_id> [--status pending|approved|blocked]
+```
+
+**Flags.**
+
+| Flag | Type | Default | Meaning |
+|------|------|---------|---------|
+| `--status` | string | (all) | Show only `pending`, `approved` or `blocked` groups. |
+
+**Behavior.** Prints `GROUP_ID`, `CHAT_ID` (the id the platform uses), `TITLE`,
+`STATUS`, `MEMBERS` (how many are on record), `POLICY` (`everyone`/`selected`)
+and `LAST_MESSAGE`. A group appears the moment the account is added to it — or,
+on a platform that reports no join, when somebody first speaks — and stays
+`pending`, with the agent deaf to it, until you `approve` it. An empty list
+usually means group chats are still off for the channel; the command says so and
+names the `edit --group-chats` command that turns them on. With `--json`,
+returns the full rows including `settings`.
+
+**Example.**
+
+```bash
+$ cremind channels groups list e2e8...d4f1
+GROUP_ID   CHAT_ID          TITLE      STATUS    MEMBERS  POLICY    LAST_MESSAGE
+7c0f...e1  -1001234567890   Ops room   approved  6        everyone  2026-08-29 14:20
+9b31...a4  -1009876543210   Family     pending   0        everyone
+
+# Just the ones waiting on you
+$ cremind channels groups list e2e8...d4f1 --status pending
+```
+
+### `cremind channels groups approve`
+
+**Purpose.** Let the agent take part in one group.
+
+**Syntax.**
+
+```bash
+cremind channels groups approve <channel_id> <group>
+```
+
+**Arguments.**
+
+- `<channel_id>` — channel id, from `cremind channels list`.
+- `<group>` — group id, the platform's own chat id, or a unique title. Two
+  groups with the same title are refused rather than guessed at: approving the
+  wrong room is not a recoverable mistake.
+
+**Flags.** None beyond the root `--json`.
+
+**Behavior.** Flips the group to `approved`. From then on the agent reads the
+group's messages, replies immediately when mentioned (or replied to), and
+otherwise asks the relevance judge — see **Group chats on a channel**. Who it may
+answer is the group's member policy. Approval also asks the platform for a roster
+straight away where the platform will answer. Prints `id`, `title`, `status` and
+`conversation_id`.
+
+**Example.**
+
+```bash
+$ cremind channels groups approve e2e8...d4f1 "Ops room"
+id               7c0f...e1
+title            Ops room
+status           approved
+conversation_id  c_92bc
+```
+
+### `cremind channels groups block`
+
+**Purpose.** Keep the agent out of one group, and remember the decision.
+
+**Syntax.**
+
+```bash
+cremind channels groups block <channel_id> <group>
+```
+
+**Flags.** None beyond the root `--json`.
+
+**Behavior.** Flips the group to `blocked`. The transcript so far is kept, and
+being added to the group again does not ask you a second time — this is a
+decision on the record, not a dismissal. To erase the group instead, use
+`groups forget`. Prints the same four fields as `approve`.
+
+**Example.**
+
+```bash
+$ cremind channels groups block e2e8...d4f1 -1009876543210
+id               9b31...a4
+title            Family
+status           blocked
+conversation_id
+```
+
+### `cremind channels groups forget`
+
+**Purpose.** Erase a group and its transcript, as if the account had never been
+in it.
+
+**Syntax.**
+
+```bash
+cremind channels groups forget <channel_id> <group> [--yes]
+```
+
+**Flags.**
+
+| Flag | Type | Default | Meaning |
+|------|------|---------|---------|
+| `--yes`, `-y` | bool | `false` | Skip the confirmation prompt. |
+
+**Behavior.** Deletes the group row and its conversation with every message in
+it. Unlike `block`, nothing is remembered: the next message from that group
+arrives as a fresh `pending` request. Fails with a `409` while the group has a
+run in progress — wait for it to finish. Irreversible.
+
+**Confirmation.** Prompts before deleting. **Non-interactively (scripts,
+`exec_shell`) `--yes` is required** — without it the command explains what it
+would delete and exits 1 rather than guessing. With `--json` the confirmation is
+`{"deleted": true, "group_id": "<id>"}`.
+
+**Example.**
+
+```bash
+$ cremind channels groups forget e2e8...d4f1 "Family" --yes
+9b31...a4: forgotten
+```
+
+### `cremind channels groups members`
+
+**Purpose.** Show who is in a group, and whether the agent answers them.
+
+**Syntax.**
+
+```bash
+cremind channels groups members <channel_id> <group>
+```
+
+**Flags.** None beyond the root `--json`.
+
+**Behavior.** Prints `MEMBER_ID`, `NAME`, `SOURCE`, `BOT`, `RESPONDS` and
+`LAST_SEEN`. `SOURCE` says where the row came from: `roster` is the platform's
+own member list, `seen` is somebody who has posted here. `RESPONDS` is the
+member policy's verdict for that account — what `allow`/`deny`/`policy` change.
+`MEMBER_ID` is what `allow` and `deny` take.
+
+Some platforms name nobody: a Telegram **bot** can only list administrators, and
+a Zalo bot not even those, so a short list is not necessarily a wrong one — the
+rest fill in as people post. `cremind channels groups refresh` re-asks the
+platform.
+
+**Example.**
+
+```bash
+$ cremind channels groups members e2e8...d4f1 "Ops room"
+MEMBER_ID     NAME        SOURCE  BOT    RESPONDS  LAST_SEEN
+1644772063    Alexa       roster  false  true      2026-08-29 14:19
+216091010     Ops Bot     roster  true   true
+84986664411   Lee Nguyen  seen    false  true      2026-08-29 14:20
+```
+
+### `cremind channels groups policy`
+
+**Purpose.** Choose who the agent answers in a group: everyone, or only the
+accounts you allow.
+
+**Syntax.**
+
+```bash
+cremind channels groups policy <channel_id> <group> <everyone|selected>
+```
+
+**Flags.** None beyond the root `--json`.
+
+**Behavior.** `everyone` answers anybody in the group except those on the deny
+list; `selected` answers only the allow list. **Both lists are kept when you
+switch**, so flipping back does not lose one you curated. Any other `MODE`
+exits 1 before anything is sent. Prints `id`, `title`, `respond_mode`,
+`policy_mode`, `allow` and `deny`.
+
+**Example.**
+
+```bash
+$ cremind channels groups policy e2e8...d4f1 "Ops room" selected
+id            7c0f...e1
+title         Ops room
+respond_mode  mention_or_relevant
+policy_mode   selected
+allow         1644772063
+deny
+```
+
+### `cremind channels groups allow` / `cremind channels groups deny`
+
+**Purpose.** Move member accounts on and off the group's allow/deny lists.
+
+**Syntax.**
+
+```bash
+cremind channels groups allow <channel_id> <group> <member_id>...
+cremind channels groups deny  <channel_id> <group> <member_id>...
+```
+
+**Flags.** None beyond the root `--json`.
+
+**Behavior.** The two lists are exclusive: `allow` adds each id to the allow list
+and takes it off the deny list, `deny` does the reverse. Repeats are collapsed,
+so re-running is harmless. Member ids come from `cremind channels groups
+members`.
+
+Which list is consulted depends on `groups policy`: `everyone` reads the deny
+list, `selected` reads the allow list. A **denied** account is stronger than one
+that simply is not answered — their messages are dropped rather than stored, so
+somebody you blocked cannot fill the agent's context either. Both commands print
+the same six fields as `policy`.
+
+**Examples.**
+
+```bash
+# Under `selected`: these are the only people the agent answers
+$ cremind channels groups allow e2e8...d4f1 "Ops room" 1644772063 84986664411
+
+# Under `everyone`: shut one noisy bot out entirely
+$ cremind channels groups deny e2e8...d4f1 "Ops room" 216091010
+```
+
+### `cremind channels groups respond`
+
+**Purpose.** Decide when the agent may speak in a group without being mentioned.
+
+**Syntax.**
+
+```bash
+cremind channels groups respond <channel_id> <group> <mention_or_relevant|mention_only>
+```
+
+**Flags.** None beyond the root `--json`.
+
+**Behavior.** `mention_or_relevant` (the default) runs the cheap relevance check
+on messages that do not mention the agent and replies when the answer is yes.
+`mention_only` skips that check entirely — cheaper, and the right setting for a
+quiet assistant in a busy room. Either way an `@mention` or a reply to the agent
+still gets an answer, and every message is still stored as context. Any other
+`MODE` exits 1. Prints the same six fields as `policy`.
+
+**Example.**
+
+```bash
+$ cremind channels groups respond e2e8...d4f1 "Ops room" mention_only
+id            7c0f...e1
+title         Ops room
+respond_mode  mention_only
+policy_mode   everyone
+allow
+deny
+```
+
+### `cremind channels groups refresh`
+
+**Purpose.** Ask the platform who is in a group, now.
+
+**Syntax.**
+
+```bash
+cremind channels groups refresh <channel_id> <group>
+```
+
+**Flags.** None beyond the root `--json`.
+
+**Behavior.** The member list comes from the platform, not from Cremind, so the
+channel's adapter has to be **running**. Platforms that name nobody report
+`source: unsupported` rather than failing — a Zalo bot always, a Telegram bot
+beyond the administrators. Prints `id`, `title`, `members` and `source`.
+
+**Example.**
+
+```bash
+$ cremind channels groups refresh e2e8...d4f1 "Ops room"
+id       7c0f...e1
+title    Ops room
+members  6
+source   roster
+```
+
+### `cremind channels groups available`
+
+**Purpose.** List the groups this channel's account is **already** in.
+
+**Syntax.**
+
+```bash
+cremind channels groups available <channel_id>
+```
+
+**Flags.** None beyond the root `--json`.
+
+**Behavior.** The route into a group nobody added the agent to. A join event
+only fires while Cremind is running, so groups the account belonged to before
+the feature was switched on are never announced — this asks the platform
+directly. Needs the channel **running**. The `TRACKED` column shows `-` for a
+group Cremind does not know about yet, or its status where it does. Platforms
+that cannot enumerate groups (a Telegram bot, the Zalo bot) say so instead of
+returning an empty list.
+
+**Example.**
+
+```bash
+$ cremind channels groups available e2e8...d4f1
+CHAT_ID              TITLE        MEMBERS  TRACKED
+-1001987654321       Ops room     6        approved
+-1001222333444       Lunch club   12       -
+```
+
+### `cremind channels groups add`
+
+**Purpose.** Enable one or more groups the account is already in.
+
+**Syntax.**
+
+```bash
+cremind channels groups add <channel_id> [--title TEXT] -- <chat_id>...
+```
+
+A Telegram or Zalo chat id starts with a minus sign, which every CLI parser
+reads as the start of an option — hence the `--`.
+
+**Flags.**
+
+| Flag | Meaning |
+|------|---------|
+| `--title` | Title to store. Only meaningful when adding a single chat id; otherwise the platform's own name is used. |
+
+**Behavior.** Approved on the spot — naming a specific group out of your own
+list **is** the approval, so there is no second step and no notification. Each
+group gets its conversation and a roster refresh immediately. A group Cremind
+already knows is approved rather than duplicated, so this is also the quickest
+way to accept one that is sitting pending.
+
+**Example.**
+
+```bash
+$ cremind channels groups add e2e8...d4f1 -- -1001222333444
+GROUP_ID   CHAT_ID           TITLE       STATUS
+9a1b...c7  -1001222333444    Lunch club  approved
+```
 
 ### `cremind channels delete`
 
@@ -1174,3 +1730,35 @@ copy that line into a bug.
 documented behaviour: a channel deletion cascades to its conversations
 and per-sender rows. If you only want to pause a channel, toggle
 `enabled=false` from the web UI's Channels page instead.
+
+**The account is in the group but nothing happens** — Work down the list; each
+step is silent by design, which is why nothing shows up in the group itself:
+
+1. **Group chats are off for the channel.** The default. Nothing is stored and
+   no notification is raised while the flag is off, so an empty
+   `cremind channels groups list <id>` is the expected result. Turn it on with
+   `cremind channels edit <id> --group-chats`.
+2. **A platform prerequisite is missing.** Telegram privacy mode still enabled
+   (@BotFather → `/setprivacy` → **Disable**, or make the bot an admin),
+   Discord's MESSAGE CONTENT INTENT off (messages arrive with an empty body),
+   the Slack app missing `channels:history` / `groups:history` /
+   `channels:read` or never reinstalled after adding them, or — on WhatsApp and
+   Zalo — the paired account not actually being a member. See the table in
+   **Group chats on a channel**.
+3. **The group is still `pending`.** The agent reads nothing until a human
+   approves it: `cremind channels groups list <id> --status pending`, then
+   `cremind channels groups approve <id> <group>`.
+4. **The member is denied.** Under `everyone` a denied account's messages are
+   dropped outright; under `selected` anybody off the allow list is. Check with
+   `cremind channels groups members <id> <group>` — the `RESPONDS` column is the
+   verdict.
+5. **The judge decided it was not for the agent.** With `respond_mode`
+   `mention_or_relevant`, a message that does not mention the agent goes to a
+   relevance check that **fails closed** — a timeout, a provider error or no
+   `low`-tier model configured all read as "not relevant". The message is still
+   stored, just not answered. `@mention` the agent to be certain, or look for
+   the decision in `logs/app.log` (`[channel_group]`).
+
+A loop brake is the sixth possibility: 20 agent posts a minute, or 8 consecutive
+bot-authored messages with no human, and the agent stays quiet until a person
+posts.

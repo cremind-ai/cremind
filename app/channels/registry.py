@@ -27,6 +27,9 @@ from app.channels.base import BaseChannelAdapter
 from app.channels.exceptions import ChannelNotImplemented
 from app.utils.logger import logger
 
+# Answer of :func:`group_capable_channel_types`, computed once per process.
+_group_capable_cache: list[dict] | None = None
+
 
 def _notify_channel_disabled(channel: dict, reason: str) -> None:
     """Surface an auto-disabled channel as a high-priority notification.
@@ -105,6 +108,92 @@ def _resolve_adapter_class(
     raise ChannelNotImplemented(
         f"No adapter registered for channel_type={channel_type!r} mode={mode!r}",
     )
+
+
+def group_capable_channel_types() -> list[dict]:
+    """The channel types whose adapters can take part in a platform group.
+
+    ``[{"channel_type", "display_name", "icon"}]`` sorted by display name, ready
+    for the channels catalogue and the settings toggle to render as-is.
+
+    Derived from the adapter classes rather than written down, because a
+    hardcoded list drifts the moment an adapter learns groups: the settings page
+    would keep offering a toggle that silently does nothing, or hide one that
+    works. Importing the class is SDK-free — every adapter imports its
+    platform SDK inside the methods that use it — so this costs nothing on a
+    machine with no channel extras installed, and a type whose module cannot be
+    imported at all is simply left out.
+
+    Memoised because the answer is a property of the code, not of the database.
+    """
+    global _group_capable_cache
+    if _group_capable_cache is None:
+        from app.config import load_all_channel_catalogs
+
+        capable: list[dict] = []
+        for channel_type, catalog in load_all_channel_catalogs().items():
+            info = catalog.get("channel") or {}
+            modes = [
+                str(mode.get("id") or "")
+                for mode in info.get("modes") or []
+                if mode.get("implemented")
+            ]
+            if not any(_adapter_supports_group_chats(channel_type, m) for m in modes):
+                continue
+            capable.append({
+                "channel_type": channel_type,
+                "display_name": info.get("display_name") or channel_type,
+                "icon": info.get("icon") or "",
+            })
+        _group_capable_cache = sorted(
+            capable, key=lambda row: row["display_name"].lower(),
+        )
+    return list(_group_capable_cache)
+
+
+def adapter_class_for_channel_type(channel_type: str, mode: str = ""):
+    """The adapter CLASS behind one channel type, for a given mode.
+
+    For reading class-level capability flags (``supports_group_roster`` and
+    friends) without a running adapter — the API answers the same whether the
+    channel happens to be up. ``None`` when nothing can be resolved, which the
+    callers read as "this platform can do none of it".
+
+    **Pass the channel's own mode.** Two modes of one platform are two different
+    adapters with genuinely different capabilities: a Zalo *bot* can name nobody
+    in a group and cannot list the groups it is in, while the QR-paired personal
+    account does both. Falling back to the first implemented mode — which is
+    what an omitted ``mode`` does — answers for the bot and quietly tells a
+    userbot channel it cannot do things it can.
+    """
+    from app.config import load_channel_catalog
+
+    if mode:
+        try:
+            return _resolve_adapter_class(channel_type, mode)
+        except (ChannelNotImplemented, ImportError):
+            return None
+    try:
+        catalog = load_channel_catalog(channel_type) or {}
+    except Exception:  # noqa: BLE001
+        return None
+    for entry in (catalog.get("channel") or {}).get("modes") or []:
+        if not entry.get("implemented"):
+            continue
+        try:
+            return _resolve_adapter_class(channel_type, str(entry.get("id") or ""))
+        except (ChannelNotImplemented, ImportError):
+            continue
+    return None
+
+
+def _adapter_supports_group_chats(channel_type: str, mode: str) -> bool:
+    """Whether the adapter class behind one ``(type, mode)`` declares rooms."""
+    try:
+        adapter_cls = _resolve_adapter_class(channel_type, mode)
+    except (ChannelNotImplemented, ImportError):
+        return False
+    return bool(getattr(adapter_cls, "supports_group_chats", False))
 
 
 class ChannelRegistry:

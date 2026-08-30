@@ -181,6 +181,33 @@ export const useTerminalPanelStore = defineStore('terminalPanel', {
       this.minimized = false;
     },
 
+    /**
+     * Open a terminal into a NAMED conversation's bucket rather than whatever
+     * the panel is scoped to right now.
+     *
+     * ``openTerminal`` follows the scope, which is the wrong instinct when
+     * several agents are working at once: the one that happens to spawn a shell
+     * would yank the panel over to itself while the user is reading another
+     * agent's output. So the tab always lands in its own conversation's bucket,
+     * and the panel is only un-minimised for the conversation it is already
+     * focused on — anywhere else the tab waits quietly until the user goes
+     * there.
+     */
+    openTerminalFor(conversationId: string, attachment: TerminalAttachment) {
+      if (!conversationId) return;
+      if (!this.focusTerminalsByConversation[conversationId]) {
+        this.focusTerminalsByConversation[conversationId] = [];
+      }
+      const list = this.focusTerminalsByConversation[conversationId];
+      if (!list.find(t => t.processId === attachment.processId)) {
+        list.push({ ...attachment });
+      }
+      this.focusActivePidByConversation[conversationId] = attachment.processId;
+      if (this.focusConversationId === conversationId) {
+        this.minimized = false;
+      }
+    },
+
     // Spawn a new user-created interactive terminal on the backend and open it
     // as a tab. Independent of the agent — see services/terminalApi.ts. Opens
     // in the workspace's current cwd. Throws on failure (e.g. the per-profile

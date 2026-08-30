@@ -14,13 +14,23 @@ label = "Bot"
 implemented = true
 instructions = """1. Visit https://api.slack.com/apps → Create New App → From scratch.
 2. Under OAuth & Permissions, add bot scopes: chat:write, im:history, im:read, im:write, users:read.
+   For group chats, add channels:history, channels:read, groups:history, groups:read,
+   mpim:history and mpim:read as well.
 3. Install the app to your workspace; copy the Bot User OAuth Token (starts with xoxb-).
 4. Under Socket Mode, enable it and generate an App-Level Token (xapp-...) with connections:write.
-5. Under Event Subscriptions, subscribe to the bot event message.im.
+5. Under Event Subscriptions, subscribe to the bot event message.im — plus
+   message.channels, message.groups and message.mpim for group chats.
 6. Paste both tokens below.
 
 DM the bot and the Cremind agent replies. No public URL is needed — Socket Mode
-connects outbound."""
+connects outbound.
+
+Group chats: turn on "Group chats" below, then /invite the bot into the channel.
+Slack reports the join, so the channel appears for approval straight away —
+approve it under Settings → Channels before the agent reads anything there.
+
+New scopes only take effect once you reinstall the app — until then Slack keeps
+honouring the token you already have, and the channel messages never arrive."""
 [channel.modes.fields]
 bot_token = { description = "Bot User OAuth Token (xoxb-)", type = "string", secret = true, required = true }
 app_token = { description = "App-Level Token (xapp-)", type = "string", secret = true, required = true }
@@ -38,6 +48,10 @@ Setup:
 3. To alert a channel or specific users without subscribing, put their ids in
    "Target chat ids" (comma-separated) — a channel id (C…) posts to that channel;
    a user id (U…) opens a DM.
+
+Group chats need a conversational channel, not this one: a notification channel
+pushes automation output outward and holds no conversations. Add a bot-mode Slack
+channel for that.
 
 Access control: pick a "Subscription authentication" method — open, passcode
 (/start <passcode>), one-time code (you relay a code per person), admin approval

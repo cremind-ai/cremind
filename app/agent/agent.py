@@ -44,6 +44,9 @@ class CremindAgent:
         conversation_storage: Any | None = None,
     ):
         self._runners: dict[str, LLMProvider] = {}
+        # (provider, model, reasoning effort) each cached runner was built for,
+        # so a Settings change swaps it out on the next turn.
+        self._runner_keys: dict[str, tuple] = {}
         if runner is not None:
             self._runners["admin"] = runner
         self.registry = registry
@@ -68,10 +71,37 @@ class CremindAgent:
         return self._model_group_mgr
 
     def _ensure_runner(self, profile: str) -> LLMProvider:
-        """Create (or re-create) the LLM provider for ``profile`` from current config."""
+        """The LLM provider for ``profile``, reused while its config holds.
+
+        Reuse matters beyond saving an object. A provider instance carries
+        per-connection state that is meant to span a conversation — most visibly
+        the Codex path's prompt-cache session id, which is generated in its
+        constructor. Rebuilding the provider for every turn handed the API a
+        brand-new cache key each time, so a conversation never read back a
+        single cached token no matter how stable its prompt was.
+
+        The cache is keyed on what the config resolves to, so changing the model
+        or provider in Settings still takes effect on the next turn without any
+        explicit invalidation.
+        """
         mgr = self._ensure_setup(profile)
+        try:
+            provider_name, model_name = mgr.get_provider_and_model(
+                "high", profile=profile,
+            )
+            effort = mgr._get_group_reasoning_effort("high", profile=profile)
+            fingerprint = (provider_name, model_name, effort)
+        except Exception:  # noqa: BLE001
+            # Unreadable config: fall back to today's behaviour (build one) so a
+            # turn still runs, and do not cache what we cannot key.
+            return mgr.create_llm_for_model(profile=profile)
+
+        cached = self._runners.get(profile)
+        if cached is not None and self._runner_keys.get(profile) == fingerprint:
+            return cached
         runner = mgr.create_llm_for_model(profile=profile)
         self._runners[profile] = runner
+        self._runner_keys[profile] = fingerprint
         return runner
 
     def plan_llm(self, profile: str) -> LLMProvider:
@@ -145,6 +175,7 @@ class CremindAgent:
         plan_phase: str | None = None,
         message_origin: dict | None = None,
         task_chain_depth: int = 0,
+        maintenance: bool = False,
     ) -> AsyncGenerator[ReasoningStreamResponseType, None]:
         logger.debug(f"Running CremindAgent with query: {query} and profile: {profile}")
 
@@ -207,6 +238,11 @@ class CremindAgent:
             # How many event tasks this flow already chained — caps runaway
             # wait-continue-wait loops at dispatch time.
             task_chain_depth=task_chain_depth,
+            # A nested turn the system runs on the conversation's behalf rather
+            # than a turn of the conversation itself (the compaction fold). Every
+            # other identity signal is absent on such a run, so it has to be said
+            # explicitly or the run passes for an ordinary chat turn.
+            maintenance=maintenance,
         )
 
         async for result in reasoning_agent.run(query, task_history):

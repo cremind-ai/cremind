@@ -62,6 +62,7 @@ async def _worker(conversation_id: str) -> None:
                     agent_message_metadata=item.get("agent_message_metadata"),
                     attachments=item.get("attachments"),
                     push_user_message=item.get("push_user_message", True),
+                    existing_user_message_id=item.get("existing_user_message_id"),
                     trigger_event=item.get("trigger_event"),
                     publish_notification=item.get("publish_notification", False),
                     update_title_from_query=item.get("update_title_from_query", True),
@@ -114,6 +115,7 @@ async def enqueue_user_message(
     agent_message_metadata: Optional[Dict[str, Any]] = None,
     attachments: Optional[List[Dict[str, Any]]] = None,
     push_user_message: bool = True,
+    existing_user_message_id: Optional[str] = None,
     trigger_event: Optional[Dict[str, Any]] = None,
     update_title_from_query: bool = True,
     event_run_id: Optional[str] = None,
@@ -136,6 +138,12 @@ async def enqueue_user_message(
     system-injected turn rendered as a structured agent bubble instead of a fake
     user message — how an EVENT TASK's result re-enters the conversation that
     was waiting for it (see :mod:`app.events.event_task_delivery`).
+
+    ``existing_user_message_id`` (with ``push_user_message=False``) names a user
+    row the caller ALREADY persisted — a message that was parked for a mid-turn
+    injection and then had to run as its own turn after all. The runner treats it
+    as this turn's user message so compaction excludes it from the history tail
+    instead of feeding it twice (see :mod:`app.events.user_message_delivery`).
     """
     queue = _ensure_worker(conversation_id)
     await queue.put({
@@ -152,6 +160,7 @@ async def enqueue_user_message(
         "agent_message_metadata": agent_message_metadata,
         "attachments": attachments,
         "push_user_message": push_user_message,
+        "existing_user_message_id": existing_user_message_id,
         "trigger_event": trigger_event,
         "update_title_from_query": update_title_from_query,
         "event_run_id": event_run_id,

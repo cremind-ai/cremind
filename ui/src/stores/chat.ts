@@ -32,6 +32,15 @@ import {
 } from '../services/conversationsListStream';
 import { useTodoPanelsStore, livePanelKey } from './todoPanels';
 import { normalizeTodos, allTodosCompleted } from '../utils/todos';
+import { splitMidTurnSegments } from '../utils/midTurnSplit';
+import {
+  attachResultToSteps,
+  terminalAttachmentFromFrame,
+  terminalAttachmentsFromParts,
+  thinkingStepFromFrame,
+  thinkingStepsFromRecord,
+  tokenUsageFromFrame,
+} from '../utils/streamFrames';
 import type { AgentCard, Part, TaskState } from '@a2a-js/sdk';
 
 // Non-reactive per-conversation state for the live SSE subscription. Kept
@@ -111,6 +120,20 @@ function guessMimeFromName(name: string): string {
   return _MIME_BY_EXT[ext] || 'application/octet-stream';
 }
 
+/** Why a channel-group message got no reply, or undefined if it did. */
+const _QUIET_REASONS: Record<string, string> = {
+  'judge:irrelevant': 'not addressed to this agent',
+  'judge:error': "couldn't tell if this was for it — stayed quiet",
+  not_mentioned: 'no mention, and this group is set to mentions only',
+  'brake:rate': 'paused — replying too fast in this group',
+  'brake:bots': 'paused — only automated accounts had spoken',
+};
+export function quietReasonFrom(metadata: any): string | undefined {
+  const stamp = metadata?.channel_group;
+  if (!stamp || stamp.quiet !== true) return undefined;
+  return _QUIET_REASONS[stamp.decision] || 'no reply';
+}
+
 export interface TerminalAttachment {
   processId: string;
   command: string;
@@ -122,6 +145,11 @@ export interface TerminalAttachment {
   // interactive shell (the "New terminal" button), streamed via the
   // terminals API; closing its tab terminates the shell.
   kind?: 'process' | 'terminal';
+  // Whose shell this is, for a panel showing more than one agent's at once (a
+  // group room's tab strip mixes several members' terminals, and the command
+  // alone does not say which agent ran it). Unset in a two-party chat, where
+  // there is only ever one answer.
+  ownerLabel?: string;
 }
 
 export interface ChatMessage {
@@ -149,6 +177,11 @@ export interface ChatMessage {
   // distinct "skipped — didn't match" bubble, but never fed to the agent.
   isRejectedTrigger?: boolean;
   rejectedReason?: string;
+  // A channel-group message the agent read but chose not to answer. It is real
+  // conversation history (the agent sees it on later turns), so it renders as an
+  // ordinary user bubble — with a caption, because a reader looking at an
+  // unanswered question deserves to know it was a decision and not a failure.
+  quietReason?: string;
   // Non-default turn mode this user message was sent with (plan | instant),
   // shown as a chip on the bubble. Undefined for reasoning (the default).
   mode?: ChatMode;
@@ -176,18 +209,9 @@ export interface StepTokenUsage {
   outputTokens: number;
 }
 
-// Map the backend's snake_case per-step token payload (same shape on the live
-// ``thinking`` SSE event and the persisted ``thinking_steps`` blob) to camelCase.
-// Returns null when absent or all-zero so the UI can skip the badge cleanly.
-export function mapStepTokenUsage(raw: any): StepTokenUsage | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const inputTokens = raw.input_tokens || 0;
-  const cacheReadTokens = raw.cache_read_input_tokens || 0;
-  const cacheCreationTokens = raw.cache_creation_input_tokens || 0;
-  const outputTokens = raw.output_tokens || 0;
-  if (!(inputTokens || cacheReadTokens || cacheCreationTokens || outputTokens)) return null;
-  return { inputTokens, cacheReadTokens, cacheCreationTokens, outputTokens };
-}
+// Lives in utils/streamFrames.ts alongside the other frame mappers; re-exported
+// here because this store was its address before the room needed it too.
+export { mapStepTokenUsage } from '../utils/streamFrames';
 
 export interface ThinkingStep {
   // One tool call within a step. ``step`` groups parallel tool calls made in the
@@ -383,6 +407,7 @@ function makeRuntime(): ConversationRuntime {
     startedAt: Date.now(),
   };
 }
+
 
 export const useChatStore = defineStore('chat', {
   state: (): ChatState => ({
@@ -650,14 +675,24 @@ export const useChatStore = defineStore('chat', {
         fileAttachments: optimisticFileAttachments,
         mode: options?.mode && options.mode !== 'reasoning' ? options.mode : undefined,
       };
+      // Plain append, even mid-turn: the server answers a mid-turn send with a
+      // `flow_break` frame that closes the assistant bubble above, so the next
+      // reply opens a fresh one below this message. Chronological order is the
+      // right order, and it is the order a reload rebuilds from the DB rows.
       bucket.push(userMessage);
 
       // Flip to streaming optimistically so the sidebar/input UI updates
       // before the first SSE event lands. The 'streaming' tracker is what
       // keeps the SSE alive across navigation.
+      //
+      // Sending mid-turn is allowed (the server folds the message into the
+      // running turn), so a turn may already be live here: keep its elapsed
+      // timer running rather than restarting it for a message that did not
+      // start a new turn.
+      const wasStreaming = runtime.isStreaming;
       runtime.isStreaming = true;
       runtime.isSummarizing = false;
-      runtime.startedAt = Date.now();
+      if (!wasStreaming) runtime.startedAt = Date.now();
 
       // Make sure we're subscribed to events for this conversation BEFORE
       // the POST returns; otherwise we could miss the first few events
@@ -688,11 +723,25 @@ export const useChatStore = defineStore('chat', {
             attachments: options?.attachments,
           },
         );
+        // On the injected path this is the LIVE run's id, so Stop still
+        // cancels the right thing.
         runtime.currentTaskId = resp.run_id;
+        if (resp.message_id) {
+          // Let the incoming user_message frame dedupe against this bubble by
+          // id rather than by content. NOT gated on delivery: a park that lost
+          // the race to the turn's end answers "queued" but has already
+          // persisted the row AND published the frame, and without the id that
+          // frame arrives unrecognised and renders the message a second time.
+          userMessage.backendId = resp.message_id;
+        }
       } catch (e: any) {
         this.error = e?.message || 'Failed to send message';
-        runtime.isStreaming = false;
-        this.untrackConversation(cid, 'streaming');
+        // Only tear the streaming UI down if WE started it. A failed mid-turn
+        // send must not kill the turn that is still running and streaming.
+        if (!wasStreaming) {
+          runtime.isStreaming = false;
+          this.untrackConversation(cid, 'streaming');
+        }
         // Surface the failure inside the bucket so the user knows what
         // happened without inspecting devtools.
         bucket.push({
@@ -1217,7 +1266,8 @@ export const useChatStore = defineStore('chat', {
         // live stream's in-progress mutations — e.g. a terminal chip published
         // mid-run, before its DataPart is persisted.
         if (!this.messagesByConversation[id]) {
-          this.messagesByConversation[id] = messages.map(this.mapBackendMessage);
+          this.messagesByConversation[id] =
+            splitMidTurnSegments(messages, this.mapBackendMessage);
           // Restore any parked Plan-mode state (question form / plan approval /
           // todo panel) from message metadata — SSE replay can't (the ring is
           // dropped on `complete`).
@@ -1261,7 +1311,8 @@ export const useChatStore = defineStore('chat', {
         // discard in-progress mutations — e.g. a terminal chip published mid-run,
         // before its DataPart is persisted. Keep the live bucket.
         if (!this.messagesByConversation[id]) {
-          this.messagesByConversation[id] = messages.map(this.mapBackendMessage);
+          this.messagesByConversation[id] =
+            splitMidTurnSegments(messages, this.mapBackendMessage);
           this.restorePlanModeState(id, messages);
           this.restoreAgentActivityState(id, messages);
         }
@@ -1375,8 +1426,15 @@ export const useChatStore = defineStore('chat', {
           // NOT mutate its `id` — that would change ChatWindow's v-for key
           // and force Vue to unmount/remount the bubble, flashing it in an
           // unstyled position before the new element settles in.
+          //
+          // The streaming assistant bubble is SKIPPED rather than treated as a
+          // wall: a mid-turn send inserts its optimistic bubble above that
+          // bubble, so stopping there would miss it and duplicate the message
+          // when this frame beats the POST response (which is what stamps
+          // `backendId`).
           const lastUserIdx = (() => {
             for (let i = bucket.length - 1; i >= 0; i--) {
+              if (bucket[i].id === runtime.streamingAssistantId) continue;
               if (bucket[i].role === 'user') return i;
               if (bucket[i].role === 'assistant') return -1;
             }
@@ -1384,26 +1442,103 @@ export const useChatStore = defineStore('chat', {
           })();
           const alreadyPresent =
             (lastUserIdx >= 0 && bucket[lastUserIdx].content === content)
-            || (id !== undefined && bucket.some(m => m.id === id));
+            || (id !== undefined && bucket.some(m => m.id === id))
+            // A mid-turn send stamps the server id onto its optimistic bubble;
+            // the frame for it can land after the assistant has already
+            // streamed more text, so the "last user bubble" check above may
+            // have stopped at an assistant message.
+            || (id !== undefined && bucket.some(m => m.backendId === id));
           if (!alreadyPresent) {
             const evtMode = data.metadata?.mode;
-            bucket.push({
+            const incoming: ChatMessage = {
               id: id ?? this.generateId(),
               role: 'user',
               content,
               parts: [{ kind: 'text', text: content } as Part],
               timestamp: new Date(),
               mode: evtMode && evtMode !== 'reasoning' ? evtMode : undefined,
-            });
+            };
+            bucket.push(incoming);
           }
           // A new user turn supersedes any parked Plan-mode question/plan
           // (covers replies typed from another tab or the CLI).
           this.pendingQuestionByConversation[conversationId] = null;
           this.pendingPlanByConversation[conversationId] = null;
+          if (data.injected) {
+            // Folded into the turn already running, so the run keeps streaming.
+            // The bubble above stays open for now — the `flow_break` frame that
+            // follows is what closes it, once the agent has actually taken the
+            // message in. Clearing the stream state here instead would strand
+            // that bubble's spinner ('complete' finds it by streamingAssistantId).
+            runtime.isStreaming = true;
+            this.trackConversation(conversationId, 'streaming');
+            return;
+          }
           // A new run is starting; reset stream-local state.
           scratch.currentTextPart = '';
           scratch.todosThisRun = null;
           runtime.streamingAssistantId = undefined;
+          runtime.isStreaming = true;
+          this.trackConversation(conversationId, 'streaming');
+          return;
+        }
+
+        case 'run_started': {
+          // A turn starting on a user message that was already stored and
+          // already streamed (a mid-turn park that lost the race to the turn's
+          // end). The bubble is on screen; only the stream state is missing.
+          scratch.currentTextPart = '';
+          scratch.todosThisRun = null;
+          runtime.streamingAssistantId = undefined;
+          runtime.isStreaming = true;
+          this.trackConversation(conversationId, 'streaming');
+          return;
+        }
+
+        case 'quiet_user_message': {
+          // Somebody posted in a platform group and the agent decided the
+          // message was not for it. The row is real history, so it belongs in
+          // the transcript — but NO run is starting, and touching the streaming
+          // state here would light "Agent is thinking…" with nothing coming to
+          // turn it off. Deliberately the whole handler: push, and stop.
+          const id: string | undefined = data.id;
+          const content: string = data.content ?? '';
+          if (!content) return;
+          const alreadyPresent =
+            (id !== undefined && bucket.some(m => m.id === id))
+            || (id !== undefined && bucket.some(m => m.backendId === id));
+          if (!alreadyPresent) {
+            bucket.push({
+              id: id ?? this.generateId(),
+              role: 'user',
+              content,
+              parts: [{ kind: 'text', text: content } as Part],
+              timestamp: new Date(),
+              quietReason: quietReasonFrom(data.metadata),
+            });
+          }
+          return;
+        }
+
+        case 'flow_break': {
+          // The turn was interrupted — by the message sitting just above, or by
+          // an awaited event task's result landing. Close the bubble that was
+          // mid-thought so what follows reads as a response to the interruption
+          // instead of more of the work that was already running.
+          //
+          // Arrives twice around a reply the agent spoke: once before it, so it
+          // starts a bubble of its own, and once after, so the remaining work
+          // does not grow out of it. One LLM chain, three bubbles.
+          const message = findAssistant();
+          if (message) {
+            message.isStreaming = false;
+            if (message.latency) message.latency.completedAt = Date.now();
+          }
+          // The next thinking/text frame opens a fresh bubble via
+          // ensureAssistant. todosThisRun deliberately survives: it belongs to
+          // the turn, and 'complete' stamps it on whichever bubble is last.
+          runtime.streamingAssistantId = undefined;
+          scratch.currentTextPart = '';
           runtime.isStreaming = true;
           this.trackConversation(conversationId, 'streaming');
           return;
@@ -1464,46 +1599,19 @@ export const useChatStore = defineStore('chat', {
 
         case 'thinking': {
           const message = ensureAssistant();
-          const stepReceivedAt = Date.now();
           // One tool call. Several may share the same ``Step`` (parallel tools).
-          const thinkingStep: ThinkingStep = {
-            step: data.Step ?? null,
-            callId: data.Call_Id ?? null,
-            tool: data.Tool || '',
-            toolInput: data.Tool_Input || '',
-            receivedAt: stepReceivedAt,
-            modelLabel: data.Model_Label || null,
-            tokenUsage: mapStepTokenUsage(data.Token_Usage),
-          };
+          const thinkingStep = thinkingStepFromFrame(data);
           message.thinkingSteps = message.thinkingSteps || [];
           message.thinkingSteps.push(thinkingStep);
           if (message.latency && !message.latency.firstStepAt) {
-            message.latency.firstStepAt = stepReceivedAt;
+            message.latency.firstStepAt = thinkingStep.receivedAt;
           }
           return;
         }
 
         case 'result': {
           const message = ensureAssistant();
-          const resultRaw = data.Result ?? data.Observation;
-          const resultParts: ObservationPart[] = Array.isArray(resultRaw)
-            ? resultRaw
-            : [{
-                kind: 'text',
-                text: typeof resultRaw === 'string' ? resultRaw : JSON.stringify(resultRaw),
-              }];
-          const steps = message.thinkingSteps;
-          if (steps && steps.length > 0) {
-            // Pair the result with its call (parallel-safe); fall back to the
-            // most recent step still missing a result.
-            const target = (data.call_id
-              ? steps.find(s => s.callId === data.call_id && !s.result)
-              : undefined)
-              || [...steps].reverse().find(s => !s.result);
-            if (target) {
-              target.result = resultParts;
-            }
-          }
+          attachResultToSteps(message.thinkingSteps, data);
           return;
         }
 
@@ -1538,13 +1646,7 @@ export const useChatStore = defineStore('chat', {
 
         case 'terminal': {
           const message = ensureAssistant();
-          const attachment: TerminalAttachment = {
-            processId: data.process_id,
-            command: data.command || '',
-            commandShort: data.command_short || data.command || '',
-            workingDirectory: data.working_directory || '',
-            pty: Boolean(data.pty),
-          };
+          const attachment = terminalAttachmentFromFrame(data);
           message.terminalAttachments = message.terminalAttachments || [];
           if (!message.terminalAttachments.some(t => t.processId === attachment.processId)) {
             message.terminalAttachments.push(attachment);
@@ -1554,16 +1656,7 @@ export const useChatStore = defineStore('chat', {
 
         case 'token_usage': {
           const message = ensureAssistant();
-          const usage = data.token_usage ?? data;
-          const cacheRead = usage.cache_read_input_tokens || 0;
-          const cacheCreation = usage.cache_creation_input_tokens || 0;
-          message.tokenUsage = {
-            inputTokens: usage.input_tokens || 0,
-            outputTokens: usage.output_tokens || 0,
-            cacheReadTokens: cacheRead,
-            cacheCreationTokens: cacheCreation,
-            totalTokens: (usage.input_tokens || 0) + cacheRead + cacheCreation + (usage.output_tokens || 0),
-          };
+          message.tokenUsage = tokenUsageFromFrame(data);
           return;
         }
 
@@ -1723,7 +1816,11 @@ export const useChatStore = defineStore('chat', {
               message.backendId = data.assistant_id;
             }
           }
-          runtime.isStreaming = false;
+          // A message sent while this turn was ending runs as a follow-up turn
+          // that is being queued right now. Stay "streaming" across the gap so
+          // the composer and sidebar don't flicker idle for one enqueue.
+          const followupQueued = data.followup_queued === true;
+          runtime.isStreaming = followupQueued;
           runtime.isSummarizing = false;
           runtime.streamingAssistantId = undefined;
           scratch.currentTextPart = '';
@@ -1785,7 +1882,11 @@ export const useChatStore = defineStore('chat', {
             .catch(() => {});
           // Drop the 'streaming' tracker so the SSE can close when the
           // user navigates away (it stays open as long as 'active' is set).
-          this.untrackConversation(conversationId, 'streaming');
+          // Held when a follow-up turn is on its way: closing the stream here
+          // would miss its opening frames.
+          if (!followupQueued) {
+            this.untrackConversation(conversationId, 'streaming');
+          }
           // Sidebar refresh is handled by the conversations-list SSE stream
           // — the backend's stream_runner publishes a list-changed event on
           // the same `complete` it just emitted.
@@ -1904,17 +2005,7 @@ export const useChatStore = defineStore('chat', {
      * Map a backend MessageRecord to a frontend ChatMessage
      */
     mapBackendMessage(msg: MessageRecord): ChatMessage {
-      const thinkingSteps: ThinkingStep[] | undefined = msg.thinking_steps
-        ? msg.thinking_steps.map(s => ({
-            step: (s as any).step ?? null,
-            callId: (s as any).call_id ?? null,
-            tool: (s as any).tool ?? '',
-            toolInput: (s as any).tool_input ?? '',
-            result: ((s as any).result ?? s.observation) as ObservationPart[] | undefined,
-            modelLabel: s.model_label || null,
-            tokenUsage: mapStepTokenUsage((s as any).token_usage),
-          }))
-        : undefined;
+      const thinkingSteps = thinkingStepsFromRecord(msg.thinking_steps);
 
       const reasoningModelLabel = undefined;
 
@@ -1943,15 +2034,7 @@ export const useChatStore = defineStore('chat', {
         : undefined;
 
       const terminalAttachments: TerminalAttachment[] | undefined = msg.parts
-        ? msg.parts
-            .filter((p: any) => p.kind === 'data' && p.data && typeof p.data.process_id === 'string')
-            .map((p: any) => ({
-              processId: p.data.process_id,
-              command: p.data.command || '',
-              commandShort: p.data.command_short || p.data.command || '',
-              workingDirectory: p.data.working_directory || '',
-              pty: Boolean(p.data.pty),
-            }))
+        ? terminalAttachmentsFromParts(msg.parts)
         : undefined;
 
       const isRejectedTrigger = msg.metadata?.kind === 'rejected_trigger';
@@ -1982,6 +2065,7 @@ export const useChatStore = defineStore('chat', {
         summary: msg.summary ?? undefined,
         isRejectedTrigger: isRejectedTrigger || undefined,
         rejectedReason: isRejectedTrigger ? (msg.metadata?.rejected_reason ?? '') : undefined,
+        quietReason: quietReasonFrom(msg.metadata),
         mode: msg.metadata?.mode && msg.metadata.mode !== 'reasoning'
           ? (msg.metadata.mode as ChatMode)
           : undefined,

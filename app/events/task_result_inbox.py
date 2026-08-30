@@ -1,4 +1,5 @@
-"""The transient half of a conversation's pending event-task results.
+"""The transient half of a conversation's pending event-task results, plus the
+routing state for user messages that arrive while a turn is already running.
 
 The DURABLE inbox is a query, not a structure: a terminal ``event_runs`` row
 with ``deliver_to_origin`` and ``origin_delivered_at IS NULL`` already *is* a
@@ -16,11 +17,12 @@ conversation id for channel-backed conversations (those set an external
 out of the run id either. ``bind_run`` records the mapping in both directions
 while a turn is live; the reader tool resolves through it.
 
-**The notice.** A short "a result arrived" line, drained onto the next tool
-result the agent sees. Best-effort by design: if the turn takes no further tool
-call, the notice is simply never shown and the turn-end flush injects the result
-as a new turn instead. The notice is an optimisation; the flush is the
-guarantee.
+**The notice.** A short "a result arrived" line, drained at the top of the
+agent's next step and folded into the running turn exactly like a mid-turn user
+message — it interrupts the visible flow and gets a brief reply. Best-effort by
+design: if the turn ends before another step begins, the notice is simply never
+shown and the turn-end flush injects the result as a new turn instead. The
+notice is an optimisation; the flush is the guarantee.
 
 Why the binding — and not ``ConversationStreamBus.is_active`` — decides whether
 a result parks: ``start_run`` sets ``_active`` outside the ``try`` that owns the
@@ -30,6 +32,19 @@ ever firing — a silent, indefinite deferral of something v1 delivered at once.
 ``bind_run`` is the first statement *inside* that ``try`` and ``unbind_run`` the
 first statement of the ``finally``, so a binding exists only across a stretch
 that is guaranteed to be torn down.
+
+**The user-message inbox** (bottom section) rides the SAME binding and the SAME
+lock, deliberately. A message parked for a conversation whose turn is ending must
+either land before ``unbind_run`` (the turn-end flush owns it) or fail to park
+(the caller enqueues it as its own turn) — never neither. Serialising park and
+unbind on one lock is what makes that a two-outcome fork instead of a race; a
+second module with a second lock would reopen it.
+
+Unlike task results, here the DB row is the durable record: the caller persists
+the user message BEFORE parking, so losing this module's state on restart cannot
+lose the message. It does leave the row stranded at ``mid_turn.state ==
+"pending"`` (invisible to history by design), which is why the boot sweep in
+``user_message_delivery`` releases stragglers.
 """
 
 from __future__ import annotations
@@ -47,8 +62,8 @@ _lock = threading.Lock()
 # streamed turn.
 _run_to_conv: Dict[str, str] = {}
 _conv_to_run: Dict[str, str] = {}
-# conversation_id -> [ {event_run_id, label, status_word} ], drained onto a tool
-# result and cleared.
+# conversation_id -> [ {event_run_id, label, status_word} ], drained at the top
+# of the agent's next step and cleared.
 _notices: Dict[str, List[Dict[str, Any]]] = {}
 # conversation_id -> True once anything parked, so the turn-end hook can skip a
 # DB query on the overwhelming majority of turns. Cleared by reset().
@@ -56,6 +71,16 @@ _pending: Dict[str, bool] = {}
 # run_id -> the deepest task_chain_depth consumed by a mid-turn read, so the
 # reading turn inherits the chain cap it would otherwise escape.
 _consumed_depth: Dict[str, int] = {}
+# conversation_id -> [payload], user messages parked mid-turn and not yet handed
+# to the running agent, in arrival order.
+_user_parked: Dict[str, List[Dict[str, Any]]] = {}
+# conversation_id -> [payload], handed to the agent but not yet committed (the
+# turn's trace has to persist first). Survives unbind_run: the turn-end flush
+# runs after it and is what re-delivers these when a turn dies mid-flight.
+_user_drained: Dict[str, List[Dict[str, Any]]] = {}
+# A burst must not grow without bound. At the cap a park is REFUSED rather than
+# dropped, so the caller falls back to enqueueing an ordinary turn.
+_MAX_USER_PARKED = 20
 
 
 # ── run binding ─────────────────────────────────────────────────────────────
@@ -85,6 +110,18 @@ def conversation_for_run(run_id: str) -> Optional[str]:
         return None
     with _lock:
         return _run_to_conv.get(run_id)
+
+
+def bound_run_for(conversation_id: str) -> Optional[str]:
+    """The run id of this conversation's live turn, or None when it is idle.
+
+    A cheap pre-check only: by the time the caller acts on it the turn may have
+    ended, which is why parking is a single atomic call that re-checks.
+    """
+    if not conversation_id:
+        return None
+    with _lock:
+        return _conv_to_run.get(conversation_id)
 
 
 # ── the fork ────────────────────────────────────────────────────────────────
@@ -150,6 +187,8 @@ def discard(conversation_id: str) -> None:
     with _lock:
         _pending.pop(conversation_id, None)
         _notices.pop(conversation_id, None)
+        _user_parked.pop(conversation_id, None)
+        _user_drained.pop(conversation_id, None)
         run_id = _conv_to_run.pop(conversation_id, None)
         if run_id:
             _run_to_conv.pop(run_id, None)
@@ -179,6 +218,86 @@ def consumed_depth(run_id: str) -> int:
         return int(_consumed_depth.get(run_id, 0))
 
 
+# ── user messages that arrive mid-turn ──────────────────────────────────────
+
+
+def park_user_message_if_bound(
+    conversation_id: str, payload: Dict[str, Any],
+) -> Optional[str]:
+    """Park a just-persisted user message IF the conversation has a live turn.
+
+    ONE synchronous function for the same reason as :func:`park_if_bound`: the
+    liveness check and the park must not be separable, or a turn ending between
+    them would strand the message with nobody left to read it.
+
+    Returns the live run's id when parked (the caller answers "delivered into
+    that run"); ``None`` when the conversation is idle **or** the inbox is at
+    capacity, in which case the caller must run the message as its own turn. A
+    refusal is never a drop.
+    """
+    if not conversation_id:
+        return None
+    with _lock:
+        run_id = _conv_to_run.get(conversation_id)
+        if not run_id:
+            return None
+        parked = _user_parked.setdefault(conversation_id, [])
+        if len(parked) + len(_user_drained.get(conversation_id, [])) >= _MAX_USER_PARKED:
+            return None
+        parked.append(payload)
+        return run_id
+
+
+def drain_user_messages(run_id: str) -> List[Dict[str, Any]]:
+    """Hand this run's parked messages to the agent (drain-once).
+
+    Moved to ``_user_drained`` rather than dropped: until the turn's trace is
+    persisted the delivery is not final, and a turn that dies here must flush
+    them as a follow-up instead of swallowing them.
+    """
+    if not run_id:
+        return []
+    with _lock:
+        conversation_id = _run_to_conv.get(run_id)
+        if not conversation_id:
+            return []
+        moved = _user_parked.pop(conversation_id, []) or []
+        if moved:
+            _user_drained.setdefault(conversation_id, []).extend(moved)
+        return list(moved)
+
+
+def commit_user_messages(conversation_id: str) -> List[Dict[str, Any]]:
+    """Take the drained messages once the turn's trace is safely persisted."""
+    if not conversation_id:
+        return []
+    with _lock:
+        return _user_drained.pop(conversation_id, []) or []
+
+
+def take_unconsumed_user_messages(conversation_id: str) -> List[Dict[str, Any]]:
+    """Take everything the finished turn did not account for, in arrival order.
+
+    Drained entries arrived before parked ones, so they lead.
+    """
+    if not conversation_id:
+        return []
+    with _lock:
+        drained = _user_drained.pop(conversation_id, []) or []
+        parked = _user_parked.pop(conversation_id, []) or []
+        return drained + parked
+
+
+def has_unconsumed_user_messages(conversation_id: str) -> bool:
+    """Cheap turn-end gate: anything parked or uncommitted for this conversation."""
+    if not conversation_id:
+        return False
+    with _lock:
+        return bool(
+            _user_drained.get(conversation_id) or _user_parked.get(conversation_id)
+        )
+
+
 def clear_all() -> None:
     """Drop every entry. Tests only."""
     with _lock:
@@ -187,3 +306,5 @@ def clear_all() -> None:
         _notices.clear()
         _pending.clear()
         _consumed_depth.clear()
+        _user_parked.clear()
+        _user_drained.clear()

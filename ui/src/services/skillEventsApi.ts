@@ -76,6 +76,8 @@ export interface EventNotificationEntry {
     | 'error'
     | 'channel_otp'
     | 'channel_subscribe_request'
+    | 'channel_group_request'
+    | 'channel_group_brake'
     | 'skill_register_required'
     | 'event_run_pending'
     | 'event_run_completed'
@@ -91,7 +93,18 @@ export interface EventNotificationEntry {
   channel_type?: string;
   sender_id?: string;
   sender_name?: string;
+  // Set on a channel_group_request that names no single group: the account
+  // joined somewhere with many rooms (a Discord server), so the operator picks
+  // rather than approves.
+  pick?: boolean;
   otp?: string;
+  // Channel group-chat extras (kind === 'channel_group_request' | 'channel_group_brake').
+  group_id?: string;
+  group_title?: string;
+  platform_chat_id?: string;
+  status?: string;
+  discovered_via?: string;
+  brake?: string;
   // Skill-registration extras when kind === 'skill_register_required'.
   skill_id?: string;
   skill_name?: string;

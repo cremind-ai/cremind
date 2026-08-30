@@ -15,11 +15,19 @@ implemented = true
 instructions = """1. Visit https://discord.com/developers/applications and create a new application.
 2. Open the Bot tab → Add Bot, then click 'Reset Token' and copy the token.
 3. Under Privileged Gateway Intents, enable MESSAGE CONTENT INTENT.
-4. Use OAuth2 → URL Generator to invite the bot (scopes: bot; permissions: Send Messages, Read Message History).
+4. Use OAuth2 → URL Generator to invite the bot (scopes: bot; permissions: View Channel, Send Messages, Read Message History).
 5. Paste the bot token below.
 
-Direct-message the bot and the Cremind agent will reply. Server-channel
-messages are ignored — this is a 1:1 DM bridge."""
+Direct-message the bot and the Cremind agent will reply.
+
+To put the agent in a server channel instead, turn on "Group chats" below and
+invite the bot with the permissions above. Discord announces nothing when a bot
+joins a channel, so the channel appears for approval once somebody posts in it —
+approve it under Settings → Channels and the agent starts taking part. The bot
+also needs the MESSAGE CONTENT intent (and SERVER MEMBERS for a complete member
+list). Other bots' messages are recognised as such, so several agents can share
+one channel without
+answering each other's mirrors."""
 [channel.modes.fields]
 bot_token = { description = "Bot Token", type = "string", secret = true, required = true }
 

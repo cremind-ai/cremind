@@ -2,7 +2,7 @@
 import { computed, reactive, ref, watch } from 'vue';
 import {
   ElButton, ElDialog, ElForm, ElFormItem, ElInput, ElOption,
-  ElRadioButton, ElRadioGroup, ElSelect, ElTag,
+  ElRadioButton, ElRadioGroup, ElSelect, ElSwitch, ElTag,
 } from 'element-plus';
 import NotificationFilterEditor from './NotificationFilterEditor.vue';
 import {
@@ -46,6 +46,33 @@ const modeEntry = computed<ChannelCatalogMode | null>(() => {
 // Notification mode has no conversation: it shows a filter editor instead of
 // auth/response controls, which are irrelevant to a push-only channel.
 const isNotification = computed(() => dialogMode.value === 'notification');
+
+// Group chats are a conversational feature: a notification channel pushes
+// automation output outward and holds no conversations, so there is nothing for
+// it to say in a group.
+const supportsGroupChats = computed(
+  () => catalogEntry.value?.supports_group_chats === true && !isNotification.value,
+);
+
+// What each platform needs BEFORE the toggle can do anything. Static because
+// these are facts about the platform's own permission model, not about this
+// installation, and finding them out the hard way is a bot silently ignoring a
+// group it is plainly a member of.
+const GROUP_CHAT_HINTS: Record<string, string> = {
+  telegram:
+    'Telegram bots only see messages addressed to them until privacy mode is '
+    + 'off (BotFather → /setprivacy → Disable) or the bot is a group admin.',
+  discord:
+    'Needs the MESSAGE CONTENT intent enabled for the application, and the '
+    + 'SERVER MEMBERS intent for a complete member list.',
+  slack:
+    'Needs the channels:history / groups:history scopes, plus channels:read '
+    + 'and the member_joined_channel event subscription.',
+  whatsapp: 'The paired number has to be a member of the group.',
+  zalo: 'The paired account has to be a member of the group.',
+};
+
+const groupChatHint = computed(() => GROUP_CHAT_HINTS[props.channelType] || '');
 
 // Access-authentication methods — the SAME set for every mode (stored in
 // config.subscribe_auth). Labels are phrased per mode: notification gates who
@@ -108,6 +135,13 @@ watch(
               : dialogConfig.subscribe_passcode ? 'passcode'
                 : 'open';
       }
+      // Coerced rather than read straight through: `cremind channels edit
+      // --config group_chats_enabled=true` stores the STRING "true", and a
+      // truthy string would light the switch while the server (which type-checks
+      // the field) had refused it.
+      dialogConfig.group_chats_enabled =
+        initConfig.group_chats_enabled === true
+        || initConfig.group_chats_enabled === 'true';
     } else {
       // Prefer the first implemented mode as the default — picking an
       // unimplemented one and letting the user hit Connect only to get a
@@ -117,6 +151,7 @@ watch(
       dialogResponseMode.value = (entry.default_response_mode as any) || 'normal';
       for (const k of Object.keys(dialogConfig)) delete dialogConfig[k];
       dialogConfig.subscribe_auth = 'open';
+      dialogConfig.group_chats_enabled = false;
     }
   },
   { immediate: true },
@@ -143,6 +178,14 @@ function handleSubmit() {
   } else {
     // Never leak a notification-only filter into a conversational channel.
     delete config.notification_filter;
+  }
+  if (supportsGroupChats.value) {
+    // A real boolean: the server type-checks this field and 400s on a string.
+    config.group_chats_enabled = dialogConfig.group_chats_enabled === true;
+  } else {
+    // A platform that cannot join a group must not carry the key at all — the
+    // server refuses `true` on one, and a stored `false` is just noise.
+    delete config.group_chats_enabled;
   }
   emit('submit', {
     channel_type: props.channelType,
@@ -233,6 +276,16 @@ function handleSubmit() {
               ? 'Senders must send /start <passcode> to subscribe'
               : 'Senders must send this passcode to start chatting'"
           />
+        </ElFormItem>
+
+        <ElFormItem v-if="supportsGroupChats" label="Group chats">
+          <ElSwitch v-model="dialogConfig.group_chats_enabled" />
+          <p class="field-hint">
+            Let this agent take part in {{ catalogEntry?.display_name }} group
+            chats. Each group it is added to appears on the Channels page as
+            pending — the agent reads nothing there until you approve it.
+          </p>
+          <p v-if="groupChatHint" class="field-hint">{{ groupChatHint }}</p>
         </ElFormItem>
 
         <ElFormItem v-if="isNotification" label="Notification filter">

@@ -2,9 +2,9 @@
 
 Deleting the rows is not enough to make "as if they had never messaged" true:
 the adapter keeps per-sender state in memory, and each leftover has a visible
-consequence. A stale busy flag swallows their next "I'm thinking…" ack; a
-remembered access request means the operator never gets a fresh approval
-notification when the person comes back.
+consequence. A leftover pending-run count chases their deleted conversation with
+a chained forwarder; a remembered access request means the operator never gets a
+fresh approval notification when the person comes back.
 
 The one thing that must NOT be reclaimed unconditionally is a *held* inbound
 lock — the adapter's own comment explains that a task can be parked on it, so
@@ -33,25 +33,25 @@ class _Adapter(BaseChannelAdapter):
         self.sent.append((sender_id, text))
 
 
-def test_forget_clears_busy_and_access_memos():
+def test_forget_clears_pending_runs_and_access_memos():
     a = _Adapter()
-    a._busy_acked.add("s1")
+    a._pending_runs["s1"] = 2
     a._access_requested.add("s1")
 
     a.forget_sender("s1")
 
-    assert "s1" not in a._busy_acked
+    assert "s1" not in a._pending_runs
     assert "s1" not in a._access_requested
 
 
 def test_forget_leaves_other_senders_alone():
     a = _Adapter()
-    a._busy_acked.update({"s1", "s2"})
+    a._pending_runs.update({"s1": 1, "s2": 1})
     a._access_requested.update({"s1", "s2"})
 
     a.forget_sender("s1")
 
-    assert a._busy_acked == {"s2"}
+    assert a._pending_runs == {"s2": 1}
     assert a._access_requested == {"s2"}
 
 

@@ -113,6 +113,12 @@ def channels_add(
         None, "--config",
         help="Channel-specific config as repeatable key=value (alternative to --json).",
     ),
+    group_chats: bool = typer.Option(
+        False, "--group-chats/--no-group-chats",
+        help="Let this channel's agent take part in platform group chats. New "
+             "groups arrive as pending and must be approved with "
+             "`channels groups approve` (default: off).",
+    ),
     enabled: bool = typer.Option(True, "--enabled/--disabled", help="Start the adapter immediately."),
     no_pair: bool = typer.Option(
         False, "--no-pair",
@@ -163,6 +169,11 @@ def channels_add(
                 raise typer.Exit(code=1)
             k, v = kv.split("=", 1)
             config[k] = v
+
+    if group_chats:
+        # A real boolean, not the "true" string a --config key would carry: the
+        # server validates the type and would refuse the string.
+        config = {**(config or {}), "group_chats_enabled": True}
 
     cfg: Config = ctx.obj["cfg"]
     out_mode: OutputMode = ctx.obj["mode"]
@@ -709,6 +720,12 @@ def channels_edit(
     config_kv: Optional[list[str]] = typer.Option(
         None, "--config", help="Config patch as repeatable key=value.",
     ),
+    group_chats: Optional[bool] = typer.Option(
+        None, "--group-chats/--no-group-chats",
+        help="Whether this channel's agent takes part in platform group chats. "
+             "Turning it off leaves the groups on record but stops the agent "
+             "reading them.",
+    ),
 ) -> None:
     """Update a channel's settings (only the flags you pass).
 
@@ -723,6 +740,11 @@ def channels_edit(
     from app.cli.output import OutputMode, print_json, print_kv
 
     config = _parse_config_option(config_json, config_kv)
+    if group_chats is not None:
+        # Merged into the same patch rather than sent separately: the server
+        # merges ``config`` one level deep, so a flag and a --config key set in
+        # one call must arrive as one object.
+        config = {**(config or {}), "group_chats_enabled": group_chats}
     fields: dict[str, Any] = {}
     if mode is not None:
         fields["mode"] = mode
@@ -735,7 +757,7 @@ def channels_edit(
     if not fields:
         typer.echo(
             "nothing to update — pass at least one of --mode / --auth-mode / "
-            "--response-mode / --json / --config",
+            "--response-mode / --group-chats / --json / --config",
             err=True,
         )
         raise typer.Exit(code=1)
@@ -1236,3 +1258,607 @@ def _channel_mode_needs_pairing(
         if str(m.get("id") or "") == mode_id:
             return bool(m.get("setup_kind"))
     return False
+
+
+# ── channel group chats ───────────────────────────────────────────────────
+#
+# A platform group this channel's own account is in — a Telegram supergroup, a
+# Slack channel, a WhatsApp group. Not `cremind group`, which is Cremind's own
+# rooms where several profiles' agents talk to each other; the two are separate
+# features and share nothing.
+
+
+groups_app = typer.Typer(
+    name="groups",
+    help="Approve and manage the platform groups this channel's agent is in.",
+    no_args_is_help=True,
+)
+channels_app.add_typer(groups_app, name="groups")
+
+
+def _run_group_async(coro: Any) -> Any:
+    """`asyncio.run` plus a clean exit for the group resolver's `RuntimeError`.
+
+    `graceful_errors` only covers config/API/network failures, so without this a
+    mistyped group name would end in a traceback instead of one line of advice.
+    """
+    import asyncio
+
+    try:
+        return asyncio.run(coro)
+    except RuntimeError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
+
+
+def _stamp(value: Any) -> str:
+    """Render an epoch-MILLISECONDS timestamp; channel-group rows store ms.
+
+    ``epoch_seconds_field`` is the shared formatter and takes seconds, so the
+    conversion happens here rather than being silently wrong by a factor of a
+    thousand.
+    """
+    from app.cli.output.formatting import epoch_seconds_field
+
+    if not value:
+        return ""
+    try:
+        return epoch_seconds_field(float(value) / 1000.0)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _policy_of(group: dict[str, Any]) -> dict[str, Any]:
+    policy = (group.get("settings") or {}).get("member_policy") or {}
+    return {
+        "mode": str(policy.get("mode") or "everyone"),
+        "allow": list(policy.get("allow") or []),
+        "deny": list(policy.get("deny") or []),
+    }
+
+
+@groups_app.command("list")
+@graceful_errors
+def channel_groups_list(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id (from `channels list`)."),
+    status: Optional[str] = typer.Option(
+        None, "--status", help="Only pending, approved or blocked groups.",
+    ),
+) -> None:
+    """List the platform groups this channel's account has been added to.
+
+    A group appears here the moment the account is added to it (or, on platforms
+    that report no join, when somebody first speaks). It stays `pending` — and
+    the agent stays deaf to it — until you `approve` it.
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import list_channel_groups
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, Table, print_json
+    from app.cli.output.formatting import epoch_seconds_field
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> list[dict[str, Any]]:
+        async with Client(cfg) as client:
+            return await list_channel_groups(client, channel_id, status or "")
+
+    groups = asyncio.run(_run())
+
+    if mode.json:
+        print_json(groups)
+        return
+    if not groups:
+        sys.stdout.write(
+            "no groups seen yet — add this channel's account to a group, and "
+            "make sure group chats are enabled for the channel "
+            f"(`cremind channels edit {channel_id} --group-chats`).\n"
+        )
+        return
+    table = Table(
+        mode, "GROUP_ID", "CHAT_ID", "TITLE", "STATUS", "MEMBERS", "POLICY",
+        "LAST_MESSAGE",
+    )
+    for group in groups:
+        policy = _policy_of(group)
+        table.add_row(
+            str(group.get("id") or ""),
+            str(group.get("platform_chat_id") or ""),
+            str(group.get("title") or ""),
+            str(group.get("status") or ""),
+            str(group.get("member_count") or 0),
+            policy["mode"],
+            _stamp(group.get("last_message_at")),
+        )
+    table.render()
+
+
+def _set_group_status(
+    ctx: typer.Context, channel_id: str, group: str, status: str,
+) -> None:
+    from app.cli.client._base import Client
+    from app.cli.client.channels import (
+        resolve_channel_group,
+        set_channel_group_status,
+    )
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json, print_kv
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            found = await resolve_channel_group(client, channel_id, group)
+            return await set_channel_group_status(
+                client, channel_id, str(found["id"]), status,
+            )
+
+    updated = _run_group_async(_run())
+
+    if mode.json:
+        print_json(updated)
+        return
+    print_kv([
+        ("id", str(updated.get("id") or "")),
+        ("title", str(updated.get("title") or "")),
+        ("status", str(updated.get("status") or "")),
+        ("conversation_id", str(updated.get("conversation_id") or "")),
+    ])
+
+
+@groups_app.command("approve")
+@graceful_errors
+def channel_groups_approve(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    group: str = typer.Argument(..., help="Group id, chat id, or unique title."),
+) -> None:
+    """Let the agent take part in this group.
+
+    From now on the agent reads the group's messages and replies when it is
+    addressed — or, for a message that does not mention it, when a cheap
+    relevance check says the message is for it. Who it may answer is the group's
+    member policy (`groups policy`, `groups allow`, `groups deny`).
+    """
+    _set_group_status(ctx, channel_id, group, "approved")
+
+
+@groups_app.command("block")
+@graceful_errors
+def channel_groups_block(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    group: str = typer.Argument(..., help="Group id, chat id, or unique title."),
+) -> None:
+    """Stop the agent taking part in this group, and remember the decision.
+
+    The transcript so far is kept, and being added to the group again does not
+    ask you a second time. Use `groups forget` to erase it instead.
+    """
+    _set_group_status(ctx, channel_id, group, "blocked")
+
+
+@groups_app.command("forget")
+@graceful_errors
+def channel_groups_forget(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    group: str = typer.Argument(..., help="Group id, chat id, or unique title."),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the confirmation prompt.",
+    ),
+) -> None:
+    """Erase a group and its transcript, as if the account had never been in it.
+
+    Not the same as `block`, which is a decision on the record. After forgetting,
+    the next message from that group asks you to approve it again. Fails with a
+    409 while the group has a run in progress. This cannot be undone.
+    """
+    from app.cli.client._base import Client
+    from app.cli.client.channels import delete_channel_group, resolve_channel_group
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    if not yes:
+        prompt = (
+            f"Forget group {group} on channel {channel_id}? Its conversation and "
+            "every message in it are removed, and being added again will ask you "
+            "to approve it afresh. This cannot be undone."
+        )
+        if not sys.stdin.isatty():
+            # Non-interactive (scripts, exec_shell): never guess on a
+            # destructive action — make the caller opt in explicitly.
+            typer.echo(f"{prompt} Re-run with --yes to confirm.", err=True)
+            raise typer.Exit(code=1)
+        if not typer.confirm(prompt):
+            typer.echo("aborted", err=True)
+            raise typer.Exit(code=1)
+
+    async def _run() -> str:
+        async with Client(cfg) as client:
+            found = await resolve_channel_group(client, channel_id, group)
+            await delete_channel_group(client, channel_id, str(found["id"]))
+            return str(found["id"])
+
+    group_id = _run_group_async(_run())
+
+    if mode.json:
+        print_json({"deleted": True, "group_id": group_id})
+        return
+    sys.stdout.write(f"{group_id}: forgotten\n")
+
+
+@groups_app.command("members")
+@graceful_errors
+def channel_groups_members(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    group: str = typer.Argument(..., help="Group id, chat id, or unique title."),
+) -> None:
+    """Who is in a group, and whether the agent answers them.
+
+    `SOURCE` says where each row came from: `roster` is the platform's own
+    member list, `seen` is somebody who has posted. Some platforms name nobody —
+    a Telegram bot can only list administrators, and a Zalo bot not even those —
+    so a short list is not necessarily a wrong one.
+    """
+    from app.cli.client._base import Client
+    from app.cli.client.channels import resolve_channel_group
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, Table, print_json
+    from app.cli.output.formatting import epoch_seconds_field
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await resolve_channel_group(client, channel_id, group)
+
+    found = _run_group_async(_run())
+    members = found.get("members") or []
+
+    if mode.json:
+        print_json(members)
+        return
+    if not members:
+        sys.stdout.write(
+            "nobody recorded yet — this platform may not name group members; "
+            "they appear here as they post.\n"
+        )
+        return
+    table = Table(mode, "MEMBER_ID", "NAME", "SOURCE", "BOT", "RESPONDS", "LAST_SEEN")
+    for member in members:
+        table.add_row(
+            str(member.get("member_id") or ""),
+            str(member.get("display_name") or member.get("username") or ""),
+            str(member.get("source") or ""),
+            "true" if member.get("is_bot") else "false",
+            "true" if member.get("responds") else "false",
+            _stamp(member.get("last_seen_at")),
+        )
+    table.render()
+
+
+def _patch_group_settings(
+    ctx: typer.Context, channel_id: str, group: str, build: Any,
+) -> None:
+    """Resolve a group, build a settings patch from its current one, send it."""
+    from app.cli.client._base import Client
+    from app.cli.client.channels import (
+        resolve_channel_group,
+        set_channel_group_settings,
+    )
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json, print_kv
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            found = await resolve_channel_group(client, channel_id, group)
+            return await set_channel_group_settings(
+                client, channel_id, str(found["id"]), build(found),
+            )
+
+    updated = _run_group_async(_run())
+
+    if mode.json:
+        print_json(updated)
+        return
+    policy = _policy_of(updated)
+    settings = updated.get("settings") or {}
+    print_kv([
+        ("id", str(updated.get("id") or "")),
+        ("title", str(updated.get("title") or "")),
+        ("respond_mode", str(settings.get("respond_mode") or "")),
+        ("policy_mode", policy["mode"]),
+        ("allow", ", ".join(policy["allow"])),
+        ("deny", ", ".join(policy["deny"])),
+    ])
+
+
+@groups_app.command("policy")
+@graceful_errors
+def channel_groups_policy(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    group: str = typer.Argument(..., help="Group id, chat id, or unique title."),
+    policy_mode: str = typer.Argument(
+        ..., metavar="MODE", help="everyone | selected",
+    ),
+) -> None:
+    """Choose who the agent answers: everyone, or only the accounts you allow.
+
+    `everyone` answers anybody in the group except those on the deny list;
+    `selected` answers only the allow list. Both lists are kept when you switch,
+    so flipping back does not lose one you curated.
+    """
+    if policy_mode not in ("everyone", "selected"):
+        typer.echo("MODE must be 'everyone' or 'selected'", err=True)
+        raise typer.Exit(code=1)
+
+    def build(found: dict[str, Any]) -> dict[str, Any]:
+        policy = _policy_of(found)
+        policy["mode"] = policy_mode
+        return {"member_policy": policy}
+
+    _patch_group_settings(ctx, channel_id, group, build)
+
+
+@groups_app.command("allow")
+@graceful_errors
+def channel_groups_allow(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    group: str = typer.Argument(..., help="Group id, chat id, or unique title."),
+    member_id: list[str] = typer.Argument(
+        ..., help="Member ids (from `channels groups members`).",
+    ),
+) -> None:
+    """Answer these accounts: add them to the allow list, off the deny list."""
+    wanted = [m.strip() for m in member_id if m.strip()]
+
+    def build(found: dict[str, Any]) -> dict[str, Any]:
+        policy = _policy_of(found)
+        policy["allow"] = list(dict.fromkeys([*policy["allow"], *wanted]))
+        policy["deny"] = [d for d in policy["deny"] if d not in wanted]
+        return {"member_policy": policy}
+
+    _patch_group_settings(ctx, channel_id, group, build)
+
+
+@groups_app.command("deny")
+@graceful_errors
+def channel_groups_deny(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    group: str = typer.Argument(..., help="Group id, chat id, or unique title."),
+    member_id: list[str] = typer.Argument(
+        ..., help="Member ids (from `channels groups members`).",
+    ),
+) -> None:
+    """Never answer these accounts: add them to the deny list, off the allow list.
+
+    Their messages are dropped outright rather than kept as context, so a denied
+    account cannot fill the agent's history either.
+    """
+    wanted = [m.strip() for m in member_id if m.strip()]
+
+    def build(found: dict[str, Any]) -> dict[str, Any]:
+        policy = _policy_of(found)
+        policy["deny"] = list(dict.fromkeys([*policy["deny"], *wanted]))
+        policy["allow"] = [a for a in policy["allow"] if a not in wanted]
+        return {"member_policy": policy}
+
+    _patch_group_settings(ctx, channel_id, group, build)
+
+
+@groups_app.command("respond")
+@graceful_errors
+def channel_groups_respond(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    group: str = typer.Argument(..., help="Group id, chat id, or unique title."),
+    respond_mode: str = typer.Argument(
+        ..., metavar="MODE", help="mention_or_relevant | mention_only",
+    ),
+) -> None:
+    """When the agent may speak without being mentioned.
+
+    `mention_or_relevant` (the default) runs a cheap relevance check on messages
+    that do not mention the agent and replies when the answer is yes.
+    `mention_only` skips that check entirely — cheaper, and the right setting for
+    a quiet assistant in a busy room.
+    """
+    if respond_mode not in ("mention_or_relevant", "mention_only"):
+        typer.echo(
+            "MODE must be 'mention_or_relevant' or 'mention_only'", err=True,
+        )
+        raise typer.Exit(code=1)
+
+    def build(_found: dict[str, Any]) -> dict[str, Any]:
+        return {"respond_mode": respond_mode}
+
+    _patch_group_settings(ctx, channel_id, group, build)
+
+
+@groups_app.command("refresh")
+@graceful_errors
+def channel_groups_refresh(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    group: str = typer.Argument(..., help="Group id, chat id, or unique title."),
+) -> None:
+    """Ask the platform who is in a group, now.
+
+    Needs the channel to be running — the member list comes from the platform,
+    not from Cremind. Platforms that name nobody report `unsupported` rather
+    than failing.
+    """
+    from app.cli.client._base import Client
+    from app.cli.client.channels import (
+        refresh_channel_group_roster,
+        resolve_channel_group,
+    )
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json, print_kv
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            found = await resolve_channel_group(client, channel_id, group)
+            return await refresh_channel_group_roster(
+                client, channel_id, str(found["id"]),
+            )
+
+    result = _run_group_async(_run())
+
+    if mode.json:
+        print_json(result)
+        return
+    group_row = result.get("group") or {}
+    print_kv([
+        ("id", str(group_row.get("id") or "")),
+        ("title", str(group_row.get("title") or "")),
+        ("members", str(group_row.get("member_count") or 0)),
+        ("source", str(result.get("source") or "")),
+    ])
+
+
+@groups_app.command("available")
+@graceful_errors
+def channel_groups_available(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+) -> None:
+    """List the groups this channel's account is ALREADY in.
+
+    The way to reach a group nobody added the agent to. A join event only fires
+    while Cremind is watching, so groups the account belonged to beforehand are
+    never announced — this lists them, and `channels groups add` enables the
+    ones you want.
+
+    Platforms that cannot enumerate groups (a Telegram bot, the Zalo bot) say so
+    rather than returning an empty list.
+    """
+    from app.cli.client._base import Client
+    from app.cli.client.channels import list_available_channel_groups
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, Table, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await list_available_channel_groups(client, channel_id)
+
+    result = _run_group_async(_run())
+
+    if mode.json:
+        print_json(result)
+        return
+    if not result.get("supported"):
+        sys.stdout.write(
+            "this platform will not list the groups an account is in — add the "
+            "account to a group and say something there, and it appears here as "
+            "pending.\n"
+        )
+        return
+    groups = result.get("groups") or []
+    if not groups:
+        sys.stdout.write("this account is not in any groups.\n")
+        return
+    table = Table(mode, "CHAT_ID", "TITLE", "MEMBERS", "TRACKED")
+    for group in groups:
+        tracked = group.get("tracked") or {}
+        table.add_row(
+            str(group.get("platform_chat_id") or ""),
+            str(group.get("title") or ""),
+            str(group.get("member_count") or ""),
+            str(tracked.get("status") or "-"),
+        )
+    table.render()
+
+
+@groups_app.command("add")
+@graceful_errors
+def channel_groups_add(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    chat_ids: list[str] = typer.Argument(
+        ...,
+        help=(
+            "Platform chat ids, from `channels groups available`. Telegram and "
+            "Zalo ids start with '-', so put `--` before them."
+        ),
+    ),
+    title: str = typer.Option(
+        "", "--title", help="Title to store (only meaningful for one chat id).",
+    ),
+) -> None:
+    """Enable one or more groups the account is already in.
+
+    Approved immediately: naming a specific group out of your own list IS the
+    approval, so there is no second step. A group already known to Cremind is
+    approved rather than duplicated.
+
+    A Telegram or Zalo group id starts with a minus sign, which any CLI reads as
+    the start of an option — put `--` before the ids:
+
+        cremind channels groups add <channel_id> -- -1001987654321
+    """
+    from app.cli.client._base import Client
+    from app.cli.client.channels import add_channel_group
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, Table, print_json
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        async with Client(cfg) as client:
+            for chat_id in chat_ids:
+                out.append(await add_channel_group(
+                    client, channel_id, chat_id,
+                    # One title cannot name several groups; with more than one
+                    # pick the platform's own names are the only sensible ones.
+                    title=title if len(chat_ids) == 1 else "",
+                ))
+        return out
+
+    groups = _run_group_async(_run())
+
+    if mode.json:
+        print_json({"groups": groups})
+        return
+    table = Table(mode, "GROUP_ID", "CHAT_ID", "TITLE", "STATUS")
+    for group in groups:
+        table.add_row(
+            str(group.get("id") or ""),
+            str(group.get("platform_chat_id") or ""),
+            str(group.get("title") or ""),
+            str(group.get("status") or ""),
+        )
+    table.render()

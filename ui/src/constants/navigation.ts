@@ -44,6 +44,14 @@ export const NAV_ITEMS: NavItem[] = [
     activeRouteNames: ['conversation'],
   },
   {
+    id: 'group-chat',
+    label: 'Group chat',
+    icon: 'mdi:forum-outline',
+    kind: 'route',
+    routeName: 'group-chat',
+    activeRouteNames: ['group-chat-room', 'group-chat-settings'],
+  },
+  {
     id: 'notifications',
     label: 'Notifications',
     icon: 'mdi:bell-outline',

@@ -851,6 +851,30 @@ class ConversationStorage:
             session.add(msg)
         return True
 
+    async def list_pending_mid_turn_messages(self) -> list[dict]:
+        """User rows still marked ``mid_turn.state == "pending"``.
+
+        Parked messages are routed in memory, so a hard stop mid-turn leaves the
+        row at ``pending`` — a state history deliberately hides, which would make
+        the message invisible forever. The boot sweep reads them through here and
+        releases them (see :mod:`app.events.user_message_delivery`).
+
+        The JSON path comparison compiles per dialect (``JSON_EXTRACT`` on SQLite,
+        ``->>`` on PostgreSQL), so it runs on both supported backends.
+        """
+        await self._ensure_initialized()
+        async with self.async_session_maker() as session:
+            result = await session.execute(
+                select(MessageModel)
+                .where(
+                    MessageModel.role == "user",
+                    MessageModel.message_metadata["mid_turn"]["state"].as_string()
+                    == "pending",
+                )
+                .order_by(MessageModel.conversation_id, MessageModel.ordering)
+            )
+            return [self._msg_to_dict(m) for m in result.scalars().all()]
+
     async def get_messages(self, conversation_id: str, limit: int = 100, offset: int = 0) -> list[dict]:
         await self._ensure_initialized()
         async with self.async_session_maker() as session:
@@ -934,6 +958,46 @@ class ConversationStorage:
                 .limit(1)
             )).scalars().first()
             return self._msg_to_dict(row) if row is not None else None
+
+    async def get_message(self, message_id: str) -> dict | None:
+        """One message by id, or ``None``.
+
+        Used where a row is reached by id rather than by walking a conversation:
+        the group-chat trace endpoint (show the reasoning behind a posted answer)
+        and the boot sweep that re-posts a turn a crash interrupted.
+        """
+        if not message_id:
+            return None
+        await self._ensure_initialized()
+        async with self.async_session_maker() as session:
+            row = (await session.execute(
+                select(MessageModel).where(MessageModel.id == message_id)
+            )).scalar_one_or_none()
+            return self._msg_to_dict(row) if row is not None else None
+
+    async def get_messages_by_ids(
+        self, message_ids: list[str],
+    ) -> dict[str, dict]:
+        """Full message dicts for the given ids, keyed by id.
+
+        Ids that match nothing are simply absent, so a caller decorating rows
+        with these can treat a dangling reference as "nothing to add" rather
+        than as an error.
+
+        One ``IN`` query rather than a call per id: the group timeline decorates
+        a whole page of room rows with the seat messages behind them, which is
+        up to a few hundred lookups for one page load. Input is deduped and its
+        order is irrelevant — every caller indexes the result by id.
+        """
+        ids = [m for m in dict.fromkeys(message_ids) if m]
+        if not ids:
+            return {}
+        await self._ensure_initialized()
+        async with self.async_session_maker() as session:
+            rows = (await session.execute(
+                select(MessageModel).where(MessageModel.id.in_(ids))
+            )).scalars().all()
+            return {row.id: self._msg_to_dict(row) for row in rows}
 
     # ── Compaction state ──
 

@@ -4,7 +4,7 @@ description: "Manage **conversations** and stream agent replies from the termina
 
 # `cremind conv` — Conversation Management and Streaming
 
-`cremind conv` (alias `cremind conversation`) is the CLI for managing
+`cremind conv` is the CLI for managing
 conversations — the persistent units of agent dialogue — and for
 streaming agent runs inside them. Each conversation is owned by the
 active profile (resolved server-side from `CREMIND_TOKEN`).
@@ -16,7 +16,8 @@ The group splits into three concerns:
   history. `rename` changes the title; `set-id` changes the
   conversation id itself (with cascade across messages and skill-event
   subscriptions).
-- **Agent runs** — `send` (queue a user message and stream the agent's
+- **Agent runs** — `send` (send a user message — folded into the turn already
+  running, if there is one — and stream the agent's
   response), `attach` (subscribe to an already-running run without
   sending anything), `cancel` (stop an in-flight run by its `run_id`),
   `plan-cancel` (decline a pending Plan-mode approval without starting a run).
@@ -274,6 +275,40 @@ renderer.
 terminal output, and other events as they stream from the agent.
 Ctrl-C cancels the in-flight run cleanly. The conversation's id is
 returned to its idle state once the run completes.
+
+**Sending while the agent is already working.** You do not have to wait for a
+turn to finish. A message sent mid-turn is handed to the run in progress: the
+agent sees it on its next reasoning step and the answer it is writing takes it
+into account, so a correction ("actually, use staging") lands in time instead of
+arriving after the work is done. The server answers `202` with
+`"delivery": "injected"` and the id of the **live** run — no second run starts,
+and `cremind conv cancel` still targets the right one. `--raw` prints a short
+notice on stderr and keeps streaming that turn.
+
+The agent also answers you straight away, in one short grounded sentence
+("Not yet — two of four steps done"), as its own message before it goes back to
+work; the final answer still addresses the message when the turn ends. If it is
+too early to say anything useful it stays silent and replies at the end instead.
+A finished **event task** whose result lands mid-turn interrupts the same way,
+with a one-line heads-up that it arrived.
+
+On a **channel** conversation that interim reply is sent to the platform as its
+own message the moment it is written, rather than waiting for the turn and
+arriving glued to the final answer. The same holds inside a group — a platform
+group or a Cremind room — where it is posted for everyone to see; there the
+agent decides for itself whether the interruption is worth answering before the
+work is finished.
+
+If the turn is already finishing when the message lands, it runs as the
+immediately-following turn instead (`"delivery": "queued"`), and the stream stays
+open for its answer. Either way the message is answered exactly once.
+
+In `--json` mode each interruption also emits a `flow_break` event, marking
+where the visible flow was cut so a client can render the reply as a separate
+message rather than growing the one in progress. It can appear several times in
+one turn — once before the reply and once after it — and carries the row ids of
+the messages folded in (empty for the closing break and for event-task
+arrivals). Renderers that do not care about presentation can ignore it.
 
 **Examples.**
 

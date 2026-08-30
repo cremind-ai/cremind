@@ -41,6 +41,7 @@ from app.config.user_config import (
     resolve_compaction_config,
     resolve_memory_config,
 )
+from app.constants import ChatCompletionTypeEnum
 from app.lib.llm.pricing import (
     DEFAULT_CONTEXT_WINDOW,
     context_window_for,
@@ -54,6 +55,7 @@ from app.utils.common import (
     truncate_to_tokens_tail,
 )
 from app.utils.logger import logger
+from app.utils.task_context import current_task_id_var
 
 # Rough fixed reserves (tokens). These are approximations; the deterministic
 # floor + the runtime catch-and-retry are the real guarantee, so a modest
@@ -345,12 +347,18 @@ def _row_is_turn_start(row: dict, *, include_reasoning: bool) -> bool:
     """Whether a row may legally BEGIN the retained verbatim tail.
 
     Never a row whose replayed trace starts with a bare ``tool`` result (that would
-    orphan it from its ``tool_calls``). A ``user`` row always qualifies; an ``agent``
-    row qualifies when its trace (or plain content) begins with assistant text.
+    orphan it from its ``tool_calls``). A ``user`` row qualifies when it actually
+    reaches the wire — a row filtered out of history (``ui_only``, or a mid-turn
+    message already carried by a trace) contributes nothing, so starting the tail
+    at it would yield an assistant-first history, which Anthropic rejects. An
+    ``agent`` row qualifies when its trace (or plain content) begins with assistant
+    text.
     """
     role = row.get("role")
     if role == "user":
-        return True
+        return bool(
+            convert_db_messages_to_history([row], include_reasoning=include_reasoning)
+        )
     trace = row.get("llm_messages") if include_reasoning else None
     if trace:
         first = trace[0] if trace else None
@@ -657,7 +665,17 @@ async def run_model_fold(
     via the ``compact_conversation`` tool — no separate summarizer call. Shared by the
     manual "compact now" endpoint and the automatic post-turn fold. Returns ``True``
     when the compaction state actually changed (summary text or watermark advanced);
-    an empty/refused summary leaves state untouched and returns ``False``.
+    an empty/refused summary leaves state untouched and returns ``False``. The turn's
+    own token cost is billed back to the conversation (see :func:`_record_fold_usage`).
+
+    The nested turn is an INTERNAL MAINTENANCE turn, not a turn of the
+    conversation: it borrows the conversation's history, ``context_id`` and
+    profile but represents nobody and nothing streams it. Both halves of that
+    identity are set here — ``maintenance=True`` withholds the tools that would
+    let it speak to a room or a channel on the user's behalf, and the cleared run
+    binding below keeps it out of the inboxes belonging to the turn it runs
+    inside. Without them a fold looks exactly like a plain chat turn, because
+    every other identity signal (``message_origin``, ``event_run``) is absent.
     """
     try:
         cfg = resolve_compaction_config(profile)
@@ -677,22 +695,89 @@ async def run_model_fold(
         f"items to Done — within about {budget} tokens, then call the compact_conversation "
         "tool with that summary (plus any durable long_term_memories). Do not do anything else."
     )
-    async for _chunk in agent.run(
-        query=synthetic,
-        task_history=history,
-        context_id=context_id or conversation_id,
-        profile=profile,
-        reasoning=True,
-    ):
-        pass
+    fold_records: list[dict] = []
+    # Run the nested turn OUTSIDE the caller's run binding. The auto path is
+    # invoked from ``after_turn_compaction`` at the tail of a live turn, still
+    # inside that turn's ``current_task_id_var`` and its ``bind_run``; the agent
+    # loop drains the conversation's user inbox for whatever run id that var
+    # names at the top of EVERY step, and nothing else distinguishes a fold's
+    # loop from a real one. So a message the user sent between the outer turn's
+    # last drain and its ``unbind_run`` would be handed to the FOLD: acknowledged
+    # by a real LLM call streamed into a generator that keeps only the usage
+    # records (so the user never sees the reply their message produced), billed
+    # to "compaction", folded into the text the summary is written from — and a
+    # model handed a live question plus a request to answer it may answer instead
+    # of calling ``compact_conversation``, which for a seat means no fold at all
+    # and a drop back to the deterministic floor that DISCARDS oldest turns.
+    # Clearing the var leaves the message parked for the turn-end flush that
+    # actually owns it: both drains resolve no conversation and return empty, and
+    # ``get_event_task_results`` reports "no live turn" instead of consuming rows
+    # into a run nobody reads. ``maintenance=True`` says the same thing where it
+    # is readable and testable; this is the mechanism, because the drain keys on
+    # the context var.
+    ctx_token = current_task_id_var.set(None)
+    try:
+        async for chunk in agent.run(
+            query=synthetic,
+            task_history=history,
+            context_id=context_id or conversation_id,
+            profile=profile,
+            reasoning=True,
+            maintenance=True,
+        ):
+            # The terminal DONE chunk carries the turn's per-call usage records
+            # (see ReasoningAgent._token_fields); every other chunk is UI
+            # streaming this caller has no client for.
+            if isinstance(chunk, dict) and chunk.get("type") is ChatCompletionTypeEnum.DONE:
+                fold_records = list(chunk.get("usage_records") or [])
+    finally:
+        current_task_id_var.reset(ctx_token)
+
+    await _record_fold_usage(
+        records=fold_records, conversation_id=conversation_id, profile=profile,
+    )
 
     after = await conversation_storage.get_compaction_state(conversation_id)
     return (after[0] != before[0]) or (after[1] != before[1])
 
 
+async def _record_fold_usage(
+    *, records: list[dict], conversation_id: str, profile: str,
+) -> None:
+    """Bill the fold's own LLM calls to the conversation as ``compaction`` usage.
+
+    The fold drives a real agent turn, but its product is a tool call rather than a
+    reply, so it never reaches the ``stream_runner`` accounting path and there is no
+    assistant row to key the rows to — the one LLM call in the system nobody paid for
+    on paper, and the one that fires hardest precisely on the conversations that cost
+    the most. Records arrive stamped ``reasoning``/``tool``; rewriting them to a
+    distinct ``source_kind`` keeps the dashboard from reading a fold as another
+    reasoning step of the turn that triggered it. Best-effort — accounting must never
+    fail a fold (the summary is already persisted by the time we get here).
+    """
+    if not records:
+        return
+    try:
+        from app.storage import get_usage_storage
+
+        rewritten = [
+            {**r, "source_kind": "compaction", "label": "Compaction"} for r in records
+        ]
+        await get_usage_storage().add_usage_records(
+            conversation_id=conversation_id,
+            profile=profile,
+            records=rewritten,
+            message_id=None,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            f"[compaction] failed to record fold usage for conv={conversation_id}"
+        )
+
+
 async def after_turn_compaction(
     agent: Any, conversation_id: str, profile: str, conversation_storage: Any,
-    *, context_id: str | None = None,
+    *, context_id: str | None = None, force_auto: bool = False,
 ) -> dict | None:
     """Post-turn compaction step — returns an event ``{"type", "data"}`` to publish, or ``None``.
 
@@ -701,6 +786,15 @@ async def after_turn_compaction(
     cooldown that is bypassed at/over the ceiling), emitting ``compaction_auto_folded``.
     Otherwise, over the suggest threshold, emits ``compaction_suggested`` (today's
     behavior). The deterministic floor guarantees safety regardless of the outcome.
+
+    ``force_auto`` folds regardless of the ``auto_compact_enabled`` setting, for
+    conversations that have no client able to act on a suggestion — a group-chat seat
+    is hidden from the sidebar and the room's UI listens on the group bus, so its
+    ``compaction_suggested`` reaches nobody and suggest-only silently means "never
+    compact". Such a conversation would run forever on the deterministic floor, which
+    DROPS the oldest turns rather than summarising them. For the same reason the
+    suggestion is suppressed on this path: an event no one can click is noise, so a
+    fold that did not happen returns ``None``.
     """
     try:
         cfg = resolve_compaction_config(profile)
@@ -723,7 +817,7 @@ async def after_turn_compaction(
     ceiling = usage["ceiling"]
     threshold = usage["threshold"]
 
-    if cfg.auto_compact_enabled and current >= _auto_fold_threshold(
+    if (cfg.auto_compact_enabled or force_auto) and current >= _auto_fold_threshold(
         window, cfg.compact_threshold_percent, ceiling
     ):
         try:
@@ -768,7 +862,7 @@ async def after_turn_compaction(
                     },
                 }
 
-    if current >= threshold:
+    if current >= threshold and not force_auto:
         savings = max(0, current - cfg.keep_recent_tokens - cfg.max_tokens)
         return {
             "type": "compaction_suggested",

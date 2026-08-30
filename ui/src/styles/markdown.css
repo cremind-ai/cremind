@@ -1,0 +1,131 @@
+/**
+ * How rendered Markdown looks inside a message, wherever a message is shown.
+ *
+ * These were scoped `:deep()` rules inside MessageBubble.vue until the group
+ * room grew its own bubble and copied a subset of them — which promptly drifted,
+ * so the same answer rendered with headings and blockquotes in one chat and
+ * without them in the other. A stylesheet is the right shape for this: it is
+ * presentation with no component API, and both bubbles ask for it by putting
+ * `.marked-content` on the element they set `v-html` on.
+ *
+ * Everything here is neutral. A bubble that inverts its colours (the blue "own
+ * message" bubble on either surface) keeps those overrides in its own scoped
+ * block, where the extra class makes them win without `!important`.
+ */
+
+.marked-content {
+  word-wrap: break-word;
+  line-height: 1.25;
+}
+
+.marked-content p {
+  margin: 0.1em 0;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.marked-content p:first-child {
+  margin-top: 0;
+}
+
+.marked-content p:last-child {
+  margin-bottom: 0;
+}
+
+.marked-content code {
+  background: var(--surface-hover);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  font-size: 0.9em;
+  border: 1px solid var(--border-color);
+}
+
+.marked-content pre {
+  margin: 0.5em 0;
+  padding: 8px;
+  background: var(--surface-hover);
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--border-color);
+}
+
+.marked-content pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  display: block;
+  white-space: pre;
+  border: none;
+}
+
+.marked-content ul,
+.marked-content ol {
+  margin: 0.3em 0;
+  padding-left: 2em;
+}
+
+.marked-content li {
+  margin: 0.15em 0;
+}
+
+.marked-content blockquote {
+  margin: 0.5em 0;
+  padding: 0.4em 0.8em;
+  border-left: 3px solid var(--primary-color);
+  background: var(--surface-hover);
+  border-radius: 0 4px 4px 0;
+}
+
+.marked-content table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  width: 100%;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+}
+
+.marked-content table th,
+.marked-content table td {
+  border: 1px solid var(--border-color);
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.marked-content table th {
+  background: var(--surface-hover);
+  font-weight: 600;
+}
+
+.marked-content a {
+  color: var(--primary-color);
+  text-decoration: underline;
+}
+
+.marked-content a:hover {
+  opacity: 0.8;
+}
+
+.marked-content h1,
+.marked-content h2,
+.marked-content h3,
+.marked-content h4 {
+  margin: 0.5em 0 0.25em 0;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.marked-content h1:first-child,
+.marked-content h2:first-child,
+.marked-content h3:first-child,
+.marked-content h4:first-child {
+  margin-top: 0;
+}
+
+.marked-content hr {
+  margin: 0.75em 0;
+  border: none;
+  height: 1px;
+  background: var(--border-color);
+}

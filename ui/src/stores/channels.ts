@@ -11,7 +11,17 @@ import {
   setSenderConfirmation as apiSetSenderConfirmation,
   clearSenderHistory as apiClearSenderHistory,
   deleteSender as apiDeleteSender,
+  fetchChannelGroups,
+  updateChannelGroup as apiUpdateChannelGroup,
+  deleteChannelGroup as apiDeleteChannelGroup,
+  refreshChannelGroupRoster as apiRefreshChannelGroupRoster,
+  fetchAvailableChannelGroups as apiFetchAvailableChannelGroups,
+  addChannelGroup as apiAddChannelGroup,
+  type AvailableChannelGroupList,
   type ChannelCatalogEntry,
+  type ChannelGroup,
+  type ChannelGroupSettings,
+  type ChannelGroupStatus,
   type ChannelRow,
   type ChannelSenderRow,
   type CreateChannelPayload,
@@ -32,6 +42,13 @@ export const useChannelsStore = defineStore('channels', {
     channels: [] as ChannelRow[],
     activeFilter: MAIN_CHANNEL_TYPE as string,
     loading: false,
+    // Platform group chats, per channel. Loaded eagerly for every channel with
+    // the feature on, because the pending badge has to show on a COLLAPSED card
+    // — a group waiting for approval that only appears once you expand the card
+    // is a group nobody approves.
+    groupsByChannel: {} as Record<string, ChannelGroup[]>,
+    groupsEnabledByChannel: {} as Record<string, boolean>,
+    groupsLoading: {} as Record<string, boolean>,
   }),
 
   getters: {
@@ -67,6 +84,18 @@ export const useChannelsStore = defineStore('channels', {
     },
     mainChannel(state): ChannelRow | undefined {
       return state.channels.find((c) => c.channel_type === MAIN_CHANNEL_TYPE);
+    },
+    /** Whether this platform can take part in group chats at all. */
+    supportsGroupChats(state) {
+      return (channelType: string) =>
+        state.catalog[channelType]?.supports_group_chats === true;
+    },
+    /** How many of a channel's groups are waiting for a decision. */
+    pendingGroupCount(state) {
+      return (channelId: string) =>
+        (state.groupsByChannel[channelId] || []).filter(
+          (g) => g.status === 'pending',
+        ).length;
     },
   },
 
@@ -154,6 +183,118 @@ export const useChannelsStore = defineStore('channels', {
         settings.agentUrl, settings.authToken, channelId, senderId,
       );
     },
+    async loadGroups(channelId: string): Promise<ChannelGroup[]> {
+      const settings = useSettingsStore();
+      if (!settings.authToken) return [];
+      this.groupsLoading = { ...this.groupsLoading, [channelId]: true };
+      try {
+        const result = await fetchChannelGroups(
+          settings.agentUrl, settings.authToken, channelId,
+        );
+        this.groupsByChannel = {
+          ...this.groupsByChannel, [channelId]: result.groups,
+        };
+        this.groupsEnabledByChannel = {
+          ...this.groupsEnabledByChannel, [channelId]: result.group_chats_enabled,
+        };
+        return result.groups;
+      } finally {
+        this.groupsLoading = { ...this.groupsLoading, [channelId]: false };
+      }
+    },
+    /** Load groups for every channel that can have them.
+     *
+     *  ``allSettled`` because one channel failing (a stopped adapter, a
+     *  transient 500) must not cost the others their pending badges. */
+    async loadGroupsForAll() {
+      const targets = this.channels.filter(
+        (ch) => this.supportsGroupChats(ch.channel_type),
+      );
+      await Promise.allSettled(targets.map((ch) => this.loadGroups(ch.id)));
+    },
+    _replaceGroup(channelId: string, group: ChannelGroup) {
+      const rows = this.groupsByChannel[channelId] || [];
+      const idx = rows.findIndex((g) => g.id === group.id);
+      const next = idx >= 0
+        ? [...rows.slice(0, idx), group, ...rows.slice(idx + 1)]
+        : [group, ...rows];
+      this.groupsByChannel = { ...this.groupsByChannel, [channelId]: next };
+    },
+    async setGroupStatus(
+      channelId: string, groupId: string, status: ChannelGroupStatus,
+    ): Promise<ChannelGroup> {
+      const settings = useSettingsStore();
+      const group = await apiUpdateChannelGroup(
+        settings.agentUrl, settings.authToken, channelId, groupId, { status },
+      );
+      this._replaceGroup(channelId, group);
+      return group;
+    },
+    async setGroupSettings(
+      channelId: string, groupId: string, patch: Partial<ChannelGroupSettings>,
+    ): Promise<ChannelGroup> {
+      const settings = useSettingsStore();
+      const group = await apiUpdateChannelGroup(
+        settings.agentUrl, settings.authToken, channelId, groupId,
+        { settings: patch },
+      );
+      this._replaceGroup(channelId, group);
+      return group;
+    },
+    async deleteGroup(channelId: string, groupId: string) {
+      const settings = useSettingsStore();
+      await apiDeleteChannelGroup(
+        settings.agentUrl, settings.authToken, channelId, groupId,
+      );
+      this.groupsByChannel = {
+        ...this.groupsByChannel,
+        [channelId]: (this.groupsByChannel[channelId] || []).filter(
+          (g) => g.id !== groupId,
+        ),
+      };
+    },
+    /** The groups the account is already in, for the picker.
+     *
+     *  Not cached: it is a live question for the platform, and a stale answer
+     *  would offer a group the account has since left. */
+    async loadAvailableGroups(
+      channelId: string,
+    ): Promise<AvailableChannelGroupList> {
+      const settings = useSettingsStore();
+      return apiFetchAvailableChannelGroups(
+        settings.agentUrl, settings.authToken, channelId,
+      );
+    },
+    /** Enable a set of picked groups, then re-read the channel's list.
+     *
+     *  Sequential rather than parallel: each one creates a conversation and
+     *  asks the platform for a roster, and firing ten of those at a sidecar at
+     *  once is how a paired session drops. */
+    async addGroups(
+      channelId: string,
+      picks: { platform_chat_id: string; title?: string; chat_type?: string | null }[],
+    ): Promise<number> {
+      const settings = useSettingsStore();
+      let added = 0;
+      for (const pick of picks) {
+        await apiAddChannelGroup(
+          settings.agentUrl, settings.authToken, channelId, pick,
+        );
+        added += 1;
+      }
+      await this.loadGroups(channelId);
+      return added;
+    },
+    async refreshGroupRoster(
+      channelId: string, groupId: string,
+    ): Promise<'roster' | 'unsupported'> {
+      const settings = useSettingsStore();
+      const result = await apiRefreshChannelGroupRoster(
+        settings.agentUrl, settings.authToken, channelId, groupId,
+      );
+      if (result.group) this._replaceGroup(channelId, result.group);
+      return result.source;
+    },
     setFilter(filter: string) {
       this.activeFilter = filter || MAIN_CHANNEL_TYPE;
     },
@@ -161,6 +302,9 @@ export const useChannelsStore = defineStore('channels', {
       this.catalog = {};
       this.channels = [];
       this.activeFilter = MAIN_CHANNEL_TYPE;
+      this.groupsByChannel = {};
+      this.groupsEnabledByChannel = {};
+      this.groupsLoading = {};
     },
   },
 });

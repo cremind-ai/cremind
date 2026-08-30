@@ -53,6 +53,26 @@ class OpenAILLMProvider(LLMProvider):
         self.default_reasoning_effort = default_reasoning_effort
         self.encoder = encoding_for_model("gpt-4o")  # Fallback
 
+    def _prompt_cache_key(self, args: Optional[Dict[str, Any]]) -> Optional[str]:
+        """The caller's cache-routing key, if this endpoint understands one.
+
+        OpenAI caches long prompt prefixes automatically, but routes on an
+        opaque key so that requests sharing a prefix land on the same cache;
+        without one the routing is by organisation and effectively a coin toss
+        for a busy account. Sending it turns "18k tokens, 0 cached, every turn"
+        into a hit from the second turn on.
+
+        Restricted to OpenAI proper. ``base_url`` means some other
+        OpenAI-compatible server — Groq, Ollama, vLLM, a gateway — and several
+        of those reject a request carrying a parameter they do not know rather
+        than ignoring it, which would break every call instead of missing a
+        cache.
+        """
+        if self.base_url is not None:
+            return None
+        key = (args or {}).get("prompt_cache_key")
+        return str(key) if key else None
+
     async def chat_completion_stream(
         self,
         messages: List[ChatCompletionMessageParam],
@@ -115,6 +135,9 @@ class OpenAILLMProvider(LLMProvider):
                     params["tools"] = tools
                 if parallel_tool_calls is not None:
                     params["parallel_tool_calls"] = parallel_tool_calls
+                cache_key = self._prompt_cache_key(args)
+                if cache_key:
+                    params["prompt_cache_key"] = cache_key
 
                 response = await self.openai.chat.completions.create(**params)
 
@@ -274,6 +297,9 @@ class OpenAILLMProvider(LLMProvider):
                     params["tools"] = tools
                 if parallel_tool_calls is not None:
                     params["parallel_tool_calls"] = parallel_tool_calls
+                cache_key = self._prompt_cache_key(args)
+                if cache_key:
+                    params["prompt_cache_key"] = cache_key
 
                 response = await self.openai.chat.completions.create(**params)
 

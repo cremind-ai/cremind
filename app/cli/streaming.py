@@ -89,12 +89,20 @@ class RawRenderer:
             return False
         if event.type == "complete":
             sys.stdout.write("\n")
-            return False
+            # A message sent while this turn was ending runs as a follow-up
+            # turn; keep streaming so its answer is printed too.
+            return _followup_queued(event)
         return True
 
     def stop(self, error: Optional[BaseException]) -> None:
         if error is not None:
             sys.stderr.write(f"{error}\n")
+
+
+def _followup_queued(event: Event) -> bool:
+    """Whether a ``complete`` event says another turn is already on its way."""
+    data = event.data.get("data") if isinstance(event.data, dict) else None
+    return bool(isinstance(data, dict) and data.get("followup_queued"))
 
 
 class JSONRenderer:
@@ -107,7 +115,9 @@ class JSONRenderer:
         if not event.raw.endswith("\n"):
             sys.stdout.write("\n")
         sys.stdout.flush()
-        return event.type not in ("complete", "error")
+        if event.type == "complete":
+            return _followup_queued(event)
+        return event.type != "error"
 
     def stop(self, error: Optional[BaseException]) -> None:
         if error is not None:
@@ -151,6 +161,15 @@ async def run_stream(
                         mode=mode,
                     )
                     sent = True
+                    if resp.delivery == "injected":
+                        # Folded into a turn already in progress: what streams
+                        # below is that turn, and its answer covers this
+                        # message. stderr so piped stdout stays clean.
+                        sys.stderr.write(
+                            "• delivered into a turn already in progress; "
+                            "streaming that turn\n"
+                        )
+                        sys.stderr.flush()
                     if on_run_id is not None:
                         result = on_run_id(resp.run_id)
                         if hasattr(result, "__await__"):

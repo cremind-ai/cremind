@@ -39,11 +39,14 @@ function handleClose(term: TerminalAttachment) {
           :key="term.processId"
           class="tab"
           :class="{ active: term.processId === activePid }"
-          :title="term.command"
+          :title="term.ownerLabel ? `${term.ownerLabel} · ${term.command}` : term.command"
           role="tab"
           @click="panel.setActive(term.processId)"
         >
           <Icon icon="mdi:console" class="tab-icon" />
+          <!-- Whose shell this is. Only set when the strip mixes several
+               agents' terminals, where the command alone is ambiguous. -->
+          <span v-if="term.ownerLabel" class="tab-owner">{{ term.ownerLabel }}</span>
           <span class="tab-label">{{ term.commandShort || term.command }}</span>
           <span
             class="tab-close"
@@ -119,6 +122,20 @@ function handleClose(term: TerminalAttachment) {
 .tab-icon {
   flex-shrink: 0;
   font-size: 1rem;
+}
+.tab-owner {
+  flex-shrink: 0;
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #7dd3fc;
+  font-weight: 600;
+}
+.tab-owner::after {
+  content: '·';
+  margin-left: 6px;
+  color: #475569;
+  font-weight: 400;
 }
 .tab-label {
   overflow: hidden;

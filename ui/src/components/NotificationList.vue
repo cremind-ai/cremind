@@ -3,11 +3,15 @@ import { computed } from 'vue';
 import { Icon } from '@iconify/vue';
 import { useNotificationsStore, type NotificationEntry } from '../stores/notifications';
 import { useSettingsStore } from '../stores/settings';
+import { useChannelsStore } from '../stores/channels';
 import { formatRelativeTime } from '../utils/relativeTime';
 
 const emit = defineEmits<{
   select: [conversationId: string];
   'select-skill': [skillId: string];
+  'select-channel-group': [
+    payload: { channelId: string; groupId: string; pick?: boolean },
+  ];
   dismiss: [id: string];
 }>();
 
@@ -30,6 +34,14 @@ const handleSelect = (conversationId: string) => {
 const handleEntryClick = (entry: NotificationEntry) => {
   if (entry.kind === 'skill_register_required' && entry.skillId) {
     emit('select-skill', entry.skillId);
+  } else if (isChannelGroup(entry) && entry.channelId) {
+    // These carry no conversation id on purpose: the thing being asked for is
+    // a decision on the Channels page, not a transcript.
+    emit('select-channel-group', {
+      channelId: entry.channelId,
+      groupId: entry.groupId || '',
+      pick: entry.pick === true,
+    });
   } else {
     handleSelect(entry.conversationId);
   }
@@ -37,6 +49,15 @@ const handleEntryClick = (entry: NotificationEntry) => {
   // mutation runs synchronously but the parent's router push is async, so
   // emitting select first preserves the existing navigation contract.
   emit('dismiss', entry.id);
+};
+
+const isChannelGroup = (entry: NotificationEntry): boolean =>
+  entry.kind === 'channel_group_request' || entry.kind === 'channel_group_brake';
+
+const platformName = (channelType?: string): string => {
+  if (!channelType) return 'a channel';
+  const channels = useChannelsStore();
+  return channels.catalog[channelType]?.display_name || channelType;
 };
 
 const handleClearAll = () => {
@@ -95,6 +116,7 @@ const formatTime = (ts: number): string => formatRelativeTime(ts);
               error: entry.kind === 'error',
               otp: entry.kind === 'channel_otp',
               'skill-register': entry.kind === 'skill_register_required',
+              'channel-group': isChannelGroup(entry),
             }"
             @click="handleEntryClick(entry)"
           >
@@ -110,6 +132,13 @@ const formatTime = (ts: number): string => formatRelativeTime(ts);
                   </template>
                   <template v-else-if="entry.kind === 'channel_subscribe_request'">
                     Subscribe request: {{ entry.channelType || 'channel' }}
+                  </template>
+                  <template v-else-if="entry.kind === 'channel_group_request'">
+                    {{ entry.groupTitle || 'A group' }} on
+                    {{ platformName(entry.channelType) }} wants to chat
+                  </template>
+                  <template v-else-if="entry.kind === 'channel_group_brake'">
+                    Paused in {{ entry.groupTitle || 'a group' }}
                   </template>
                   <template v-else>{{ entry.conversationTitle }}</template>
                 </span>
@@ -131,6 +160,13 @@ const formatTime = (ts: number): string => formatRelativeTime(ts);
               >
                 <Icon icon="mdi:tools" class="kind-icon" />
                 <span>{{ entry.messagePreview || 'Click to register the background process.' }}</span>
+              </div>
+              <div
+                v-else-if="isChannelGroup(entry)"
+                class="preview channel-group-text"
+              >
+                <Icon icon="mdi:account-group-outline" class="kind-icon" />
+                <span>{{ entry.messagePreview || 'Open the Channels page to decide.' }}</span>
               </div>
               <div
                 v-else
@@ -165,6 +201,7 @@ const formatTime = (ts: number): string => formatRelativeTime(ts);
               error: entry.kind === 'error',
               otp: entry.kind === 'channel_otp',
               'skill-register': entry.kind === 'skill_register_required',
+              'channel-group': isChannelGroup(entry),
             }"
             @click="handleEntryClick(entry)"
           >
@@ -180,6 +217,13 @@ const formatTime = (ts: number): string => formatRelativeTime(ts);
                   </template>
                   <template v-else-if="entry.kind === 'channel_subscribe_request'">
                     Subscribe request: {{ entry.channelType || 'channel' }}
+                  </template>
+                  <template v-else-if="entry.kind === 'channel_group_request'">
+                    {{ entry.groupTitle || 'A group' }} on
+                    {{ platformName(entry.channelType) }} wants to chat
+                  </template>
+                  <template v-else-if="entry.kind === 'channel_group_brake'">
+                    Paused in {{ entry.groupTitle || 'a group' }}
                   </template>
                   <template v-else>{{ entry.conversationTitle }}</template>
                 </span>
@@ -201,6 +245,13 @@ const formatTime = (ts: number): string => formatRelativeTime(ts);
               >
                 <Icon icon="mdi:tools" class="kind-icon" />
                 <span>{{ entry.messagePreview || 'Click to register the background process.' }}</span>
+              </div>
+              <div
+                v-else-if="isChannelGroup(entry)"
+                class="preview channel-group-text"
+              >
+                <Icon icon="mdi:account-group-outline" class="kind-icon" />
+                <span>{{ entry.messagePreview || 'Open the Channels page to decide.' }}</span>
               </div>
               <div
                 v-else

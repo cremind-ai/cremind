@@ -18,12 +18,17 @@ from app.cli.client._base import Client
 class SendMessageResponse:
     run_id: str
     conversation_id: str
+    #: ``"injected"`` when the message was folded into a turn that was already
+    #: running (``run_id`` is that live run, and no new one starts), otherwise
+    #: ``"queued"``. Defaults to ``"queued"`` so older servers read correctly.
+    delivery: str = "queued"
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "SendMessageResponse":
         return cls(
             run_id=str(d.get("run_id") or ""),
             conversation_id=str(d.get("conversation_id") or ""),
+            delivery=str(d.get("delivery") or "queued"),
         )
 
 

@@ -15,12 +15,13 @@ turn, invisible until it ended.
 **Origin idle** — the result is injected as a continuation turn, and any
 sibling results still waiting come with it in ONE coalesced turn.
 
-**Origin mid-turn** — the result *parks*: a short notice rides the agent's next
-tool result, and the agent decides whether to pull the full text now with
-``get_event_task_results`` or keep working. Whatever it did not read is injected
-as one coalesced turn the moment the turn ends. Parking writes nothing to the
-DB, because the terminal-status write already made the row a pending inbox
-entry (``deliver_to_origin`` + ``origin_delivered_at IS NULL``).
+**Origin mid-turn** — the result *parks*: a short notice interrupts the running
+turn at its next step (the same channel a mid-turn user message uses, down to
+the brief reply the user gets), and the agent decides whether to pull the full
+text now with ``get_event_task_results`` or keep working. Whatever it did not
+read is injected as one coalesced turn the moment the turn ends. Parking writes
+nothing to the DB, because the terminal-status write already made the row a
+pending inbox entry (``deliver_to_origin`` + ``origin_delivered_at IS NULL``).
 
 Four properties this module is responsible for:
 
@@ -29,7 +30,7 @@ on ``origin_delivered_at IS NULL`` — the single arbiter, shared by every
 consumer (mid-turn read, idle injection, turn-end flush, boot sweep). The
 busy/idle fork is a heuristic about latency and never a correctness decision: if
 it guesses wrong, two consumers race on that one UPDATE and exactly one wins.
-A result is either in a tool result or in an injected turn, never both.
+A result is either handed to a running turn or in an injected turn, never both.
 
 **Never resurrected.** ``clear_delivery_claim`` is reachable only for a claim
 the *same call* took moments earlier (an enqueue that raised, a read that was

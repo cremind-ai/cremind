@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
-import { useRouter } from 'vue-router';
+import { ref, computed, nextTick, onMounted, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import { goBackToChat } from '../utils/backToChat';
-import { ElButton, ElCard, ElEmpty, ElMessage, ElMessageBox, ElOption, ElSelect, ElTable, ElTableColumn, ElTag } from 'element-plus';
+import { ElBadge, ElButton, ElCard, ElEmpty, ElMessage, ElMessageBox, ElOption, ElSelect, ElTable, ElTableColumn, ElTag } from 'element-plus';
 import { Icon } from '@iconify/vue';
+
+import ChannelGroupList from '../components/channels/ChannelGroupList.vue';
 
 import { useChannelsStore, MAIN_CHANNEL_TYPE } from '../stores/channels';
 import type { ChannelRow, ChannelSenderRow } from '../services/channelApi';
@@ -11,11 +13,18 @@ import { formatTokens, formatTokensCompact, formatUsd } from '../utils/usageForm
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
+const route = useRoute();
 const channelsStore = useChannelsStore();
 
 const loading = ref(false);
 const senders = ref<Record<string, ChannelSenderRow[]>>({});
 const expanded = ref<string | null>(null);
+// Set by a `channel_group_request` notification's deep link; cleared a few
+// seconds later so the row stops standing out once it has been found.
+const highlightGroupId = ref<string | null>(null);
+// Channel whose "add existing groups" dialog a deep link asked to open.
+const pickerChannelId = ref<string | null>(null);
+let highlightTimer: ReturnType<typeof setTimeout> | null = null;
 
 const externalChannels = computed(() =>
   channelsStore.channels.filter((c) => c.channel_type !== MAIN_CHANNEL_TYPE),
@@ -25,6 +34,10 @@ async function loadAll() {
   loading.value = true;
   try {
     await Promise.all([channelsStore.loadCatalog(), channelsStore.loadChannels()]);
+    // Eagerly, for every group-capable channel: the pending badge has to show
+    // on a COLLAPSED card, and a group nobody can see is a group nobody
+    // approves.
+    await channelsStore.loadGroupsForAll();
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : 'Failed to load channels');
   } finally {
@@ -37,14 +50,60 @@ async function toggleExpanded(channel: ChannelRow) {
     expanded.value = null;
     return;
   }
-  expanded.value = channel.id;
-  if (!senders.value[channel.id]) {
+  await expandChannel(channel.id);
+}
+
+async function expandChannel(channelId: string) {
+  expanded.value = channelId;
+  if (!senders.value[channelId]) {
     try {
-      senders.value[channel.id] = await channelsStore.fetchSenders(channel.id);
+      senders.value[channelId] = await channelsStore.fetchSenders(channelId);
     } catch (e) {
       ElMessage.error(e instanceof Error ? e.message : 'Failed to load senders');
     }
   }
+}
+
+/**
+ * Land on the group a notification was about.
+ *
+ * Follows the pattern the skills page already uses for `?skillId=…&tour=1`:
+ * read the query, act on it, then `replace` it away so a refresh (or a Back)
+ * does not re-trigger the jump.
+ */
+async function applyDeepLink() {
+  const channelId = String(route.query.channel || '');
+  const groupId = String(route.query.group || '');
+  // A notification with no group id means "you joined somewhere with many
+  // rooms" (a Discord server): there is nothing to approve yet, so it opens the
+  // picker instead of highlighting a row.
+  const pick = String(route.query.pick || '') === '1';
+  if (!channelId) return;
+  await expandChannel(channelId);
+  try {
+    await channelsStore.loadGroups(channelId);
+  } catch {
+    // The card still opens; the list shows whatever it already had.
+  }
+  if (groupId) {
+    await nextTick();
+    const selector = `[data-group-id="${(window as any).CSS?.escape
+      ? CSS.escape(groupId) : groupId}"]`;
+    document.querySelector(selector)?.scrollIntoView({
+      behavior: 'smooth', block: 'center',
+    });
+    highlightGroupId.value = groupId;
+    if (highlightTimer) clearTimeout(highlightTimer);
+    highlightTimer = setTimeout(() => { highlightGroupId.value = null; }, 4000);
+  }
+  if (pick) {
+    pickerChannelId.value = channelId;
+    await nextTick();
+    // One-shot: the child opens on the rising edge, so this can be released
+    // immediately and the operator can close and reopen the dialog by hand.
+    pickerChannelId.value = null;
+  }
+  router.replace({ query: {} });
 }
 
 function openConversation(senderRow: ChannelSenderRow) {
@@ -214,7 +273,24 @@ function goBack() {
   goBackToChat(router, props.profile);
 }
 
-onMounted(loadAll);
+function supportsGroups(channel: ChannelRow): boolean {
+  return channelsStore.supportsGroupChats(channel.channel_type);
+}
+
+function pendingGroups(channel: ChannelRow): number {
+  return channelsStore.pendingGroupCount(channel.id);
+}
+
+function groupsEnabled(channel: ChannelRow): boolean {
+  return channelsStore.groupsEnabledByChannel[channel.id] === true;
+}
+
+onMounted(async () => {
+  await loadAll();
+  await applyDeepLink();
+});
+
+watch(() => route.query, () => { applyDeepLink(); });
 </script>
 
 <template>
@@ -250,7 +326,14 @@ onMounted(loadAll);
         <div class="channel-icon"><Icon :icon="iconFor(channel)" /></div>
         <div class="channel-meta">
           <div class="channel-name">
-            {{ displayNameFor(channel) }}
+            <ElBadge
+              v-if="supportsGroups(channel) && pendingGroups(channel)"
+              :value="pendingGroups(channel)"
+              type="warning"
+            >
+              <span class="badge-anchor">{{ displayNameFor(channel) }}</span>
+            </ElBadge>
+            <template v-else>{{ displayNameFor(channel) }}</template>
             <ElTag
               v-if="channel.status === 'unlinked'"
               type="danger" size="small" effect="plain"
@@ -267,6 +350,9 @@ onMounted(loadAll);
           </div>
           <div class="channel-sub">
             Mode {{ channel.mode }} · Auth {{ channel.auth_mode }} · Reply {{ channel.response_mode }}
+            <template v-if="supportsGroups(channel)">
+              · Group chats {{ groupsEnabled(channel) ? 'on' : 'off' }}
+            </template>
           </div>
           <div v-if="channel.state?.last_error" class="channel-error">
             {{ channel.state.last_error }}
@@ -378,12 +464,26 @@ onMounted(loadAll);
             </template>
           </ElTableColumn>
         </ElTable>
+
+        <ChannelGroupList
+          v-if="supportsGroups(channel)"
+          :profile="props.profile"
+          :channel="channel"
+          :highlight-group-id="highlightGroupId"
+          :open-picker="pickerChannelId === channel.id"
+        />
       </div>
     </ElCard>
   </div>
 </template>
 
 <style scoped>
+/* Element Plus positions the badge against its slot; without a plain inline
+   anchor it hangs off the flex row's full width instead of off the name. */
+.badge-anchor {
+  display: inline-block;
+}
+
 .channels-mgmt { padding: 24px; max-width: 980px; margin: 0 auto; }
 .back-btn {
   display: flex; align-items: center; gap: 6px; background: none;

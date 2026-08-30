@@ -4,6 +4,12 @@ REST endpoints list / stop / interact with long-running ``exec_shell``
 processes.  A WebSocket endpoint streams their live stdout/stderr and
 accepts stdin + PTY resize messages from the UI.
 
+Everything here is owner-scoped, with one deliberate exception: the admin may
+*watch* a process belonging to a profile it shares a group room with, because
+the room's right-hand panel renders every member agent's terminal.  That
+exception ends at reading — see :func:`_may_view_process` versus
+:func:`_may_drive_process`.
+
 The agent-facing tools (``ExecShellInputTool`` / ``ExecShellOutputTool`` /
 ``ExecShellStopTool``) are unchanged — they delegate into the same helper
 functions this module uses.  The log-writer's file output is untouched.
@@ -64,6 +70,72 @@ def _require_auth(request: Request) -> Optional[JSONResponse]:
     return None
 
 
+def _shares_a_room(profile: str, owner: str) -> bool:
+    """Whether *profile* and *owner* sit in at least one group chat together.
+
+    ``GroupIndex`` keeps member sets in memory (rebuilt at boot and on every
+    membership change), so this is a set intersection, not a query — cheap
+    enough to run on the request path that the relaxation below can afford to
+    be scoped instead of blanket.
+
+    Fails **closed**: before the index is loaded (CLI, tests, early boot) it
+    knows of no groups, so the answer is "no room in common" and the caller
+    falls back to plain ownership. A viewing relaxation that guesses wrong is
+    worth losing; one that opens by default is not.
+    """
+    try:
+        from app.groups.index import get_group_index
+
+        index = get_group_index()
+        return bool(index.groups_for_profile(profile) & index.groups_for_profile(owner))
+    except Exception:  # noqa: BLE001
+        logger.debug("group co-membership lookup failed", exc_info=True)
+        return False
+
+
+def _may_view_process(profile: str, owner: str) -> bool:
+    """Whether *profile* may **read** a process owned by *owner* — output only.
+
+    Ownership is otherwise absolute, but a group room shows the admin every
+    member agent's terminal in its right-hand panel — the same read the admin
+    already has on every agent's reasoning trace. The relaxation is therefore
+    scoped to that justification: ``admin``, and only for an owner it actually
+    shares a room with, so a process belonging to a profile the admin has never
+    sat in a room with stays as invisible as it was before the panel existed.
+
+    Passing this is *not* permission to type into the process — see
+    :func:`_may_drive_process`. Every mutation (stdin, resize, stop) stays with
+    the owner.
+    """
+    if not profile or not owner or owner == profile:
+        return True
+    return profile == "admin" and _shares_a_room(profile, owner)
+
+
+def _may_drive_process(profile: str, owner: str) -> bool:
+    """Whether *profile* may **write** to a process owned by *owner*.
+
+    Ownership, with no relaxation whatsoever. Watching a member's terminal is a
+    read; writing to it is arbitrary code execution inside that member's live
+    shell, under their environment and credentials — a different power
+    entirely, and one nothing in the group room asks for.
+
+    The untagged cases (no viewer, no owner) mirror
+    ``exec_shell._require_process``, which only enforces when both names are
+    known — this helper must agree with it or the two gates disagree about who
+    the owner is.
+    """
+    return not profile or not owner or owner == profile
+
+
+# Client frames that change the process rather than observe it, refused on a
+# read-only attach. ``stop`` is listed although the socket does not implement
+# it: the whole point of naming the set is that a frame added later has to be
+# classified deliberately, and the one nobody may send over a borrowed view is
+# exactly the one a future patch is likeliest to wire up without thinking.
+_DRIVING_MESSAGE_TYPES = frozenset({"stdin", "resize", "stop"})
+
+
 def _decode_ws_token(token: str) -> Optional[Dict[str, Any]]:
     """Decode and validate the JWT used for WebSocket auth.
 
@@ -96,7 +168,7 @@ def get_process_routes() -> list:
         info = _process_registry.get(pid)
         if info is None:
             return JSONResponse({"error": "Process not found"}, status_code=404)
-        if profile and info.profile and info.profile != profile:
+        if not _may_view_process(profile, info.profile):
             return JSONResponse({"error": "Forbidden"}, status_code=403)
         status, exit_code = process_status(info)
         return JSONResponse({
@@ -205,13 +277,21 @@ def get_process_routes() -> list:
             logger.info(f"process ws rejected: unknown process id {pid!r}")
             await websocket.close(code=1008)
             return
-        if profile and info.profile and info.profile != profile:
+        if not _may_view_process(profile, info.profile):
             logger.warning(
                 f"process ws rejected (pid={pid}): profile {profile!r} may not "
                 f"access a process owned by {info.profile!r}"
             )
             await websocket.close(code=1008)
             return
+
+        # The relaxation above buys a view, nothing more. An earlier version of
+        # this handler passed the OWNER's name into the exec_shell calls below
+        # so the re-check inside them would pass — which handed every attached
+        # viewer a shell running as the owner. The viewer's own name goes in
+        # instead, and the driving frames are refused outright rather than left
+        # to be silently swallowed by a gate that reports nothing back.
+        may_drive = _may_drive_process(profile, info.profile)
 
         try:
             queue, snapshot = await subscribe(pid)
@@ -245,6 +325,11 @@ def get_process_routes() -> list:
                     "is_pty": info.is_pty,
                     "status": status,
                     "exit_code": exit_code,
+                    # Announced up front so a client can present a watcher's
+                    # socket as read-only instead of as a terminal that looks
+                    # live and eats every keystroke. Unknown keys are ignored
+                    # by today's frontend, so this costs nothing until used.
+                    "read_only": not may_drive,
                 },
             })
 
@@ -260,6 +345,7 @@ def get_process_routes() -> list:
                     await websocket.send_json(message)
 
             async def pump_from_client() -> None:
+                warned = False
                 while True:
                     raw = await websocket.receive_text()
                     try:
@@ -267,6 +353,26 @@ def get_process_routes() -> list:
                     except json.JSONDecodeError:
                         continue
                     msg_type = message.get("type")
+                    if msg_type in _DRIVING_MESSAGE_TYPES and not may_drive:
+                        if not warned:
+                            # Once per socket: a held-down key would otherwise
+                            # fill the log with the same refusal.
+                            warned = True
+                            logger.warning(
+                                f"process ws (pid={pid}): profile {profile!r} tried "
+                                f"to {msg_type} a process owned by {info.profile!r}; "
+                                "the attach is read-only"
+                            )
+                        await websocket.send_json({
+                            "type": "error",
+                            "error": "Forbidden",
+                            "message": (
+                                f"This process belongs to '{info.profile}'. You are "
+                                "attached read-only; input, resize and stop are "
+                                "available to its owner only."
+                            ),
+                        })
+                        continue
                     if msg_type == "stdin":
                         await write_stdin_to_process(
                             pid,

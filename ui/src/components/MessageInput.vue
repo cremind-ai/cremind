@@ -386,11 +386,7 @@ const handleClickInTextarea = () => {
 };
 
 // ── send / keyboard ──
-const handleClick = () => {
-  if (props.isProcessing) {
-    emit('stop');
-    return;
-  }
+const submit = () => {
   // Don't send while an attachment is still provisioning/uploading — its path
   // isn't in `attachments` yet, so the message would go without it.
   if (uploading.value) return;
@@ -401,6 +397,16 @@ const handleClick = () => {
     closeMenu();
     nextTick(adjustHeight);
   }
+};
+
+const handleClick = () => {
+  // While a turn is running the button is a Stop control; Enter is what sends
+  // (the server folds a mid-turn message into the running turn).
+  if (props.isProcessing) {
+    emit('stop');
+    return;
+  }
+  submit();
 };
 
 const handleKeydown = (event: KeyboardEvent) => {
@@ -429,7 +435,14 @@ const handleKeydown = (event: KeyboardEvent) => {
 
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
-    if (!props.isProcessing) handleClick();
+    // Sends even while the agent is working: the server folds a mid-turn
+    // message into the running turn. (The button itself stays a Stop control
+    // while processing, so `handleClick` is not the send path here.)
+    if (props.isProcessing) {
+      submit();
+    } else {
+      handleClick();
+    }
   }
 };
 

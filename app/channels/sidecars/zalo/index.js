@@ -14,11 +14,15 @@
  *   3. If saved credentials exist we `zalo.login(...)`; otherwise we
  *      `zalo.loginQR(...)` and emit {kind:"qr"} until the user scans.
  *   4. Events flow parent <-> sidecar as JSON frames:
- *        sidecar -> parent:  {kind:"qr"|"ready"|"incoming"|"disconnected"
- *                             |"send_error"|"error", ...}
- *        parent -> sidecar:  {kind:"send", sender_id, text}
- *                            {kind:"typing", sender_id}
+ *        sidecar -> parent:  {kind:"qr"|"ready"|"incoming"|"incoming_group"
+ *                             |"disconnected"|"send_error"|"error", ...}
+ *        parent -> sidecar:  {kind:"send", sender_id, text, thread_type?}
+ *                            {kind:"typing", sender_id, thread_type?}
  *                            {kind:"logout"}
+ *
+ * `sender_id` carries a thread id, which is a person's on a DM and a room's in
+ * a group; `thread_type` (default THREAD_USER) is the only thing that says
+ * which, so a room send without it would be delivered to whoever owns that id.
  *
  * Credentials (cookie/imei/userAgent) are persisted per (profile, channel-id)
  * at <working-dir>/<profile>/zalo/<channel-id>/credentials.json so a paired
@@ -59,6 +63,10 @@ let connectedClient = null;
 let api = null;
 let loginAttempt = 0;
 let persistTimer = null;
+// threadId -> room name. Only names we actually resolved are kept, so a lookup
+// that failed (or a room renamed since) is retried on the next message rather
+// than remembered as nameless forever.
+const groupTitles = new Map();
 
 function emit(payload) {
   if (connectedClient && connectedClient.readyState === 1) {
@@ -124,6 +132,51 @@ function snapshotCreds(zaloApi, captured) {
   return captured || null;
 }
 
+function ownId() {
+  // Which Zalo account this session logged in as. The parent stores it so a
+  // bound room can tell our own posts from a member's. Both accessors are tried
+  // because zca-js has moved this between the API surface and the context.
+  try {
+    if (api && api.getOwnId) {
+      const uid = api.getOwnId();
+      if (uid) return String(uid);
+    }
+  } catch (e) {
+    // Fall through to the context below.
+  }
+  try {
+    const ctx = api && api.getContext ? api.getContext() : null;
+    return String((ctx && ctx.uid) || '');
+  } catch (e) {
+    return '';
+  }
+}
+
+function groupTitle(threadId) {
+  // The room's name, cached per thread because getGroupInfo is a network round
+  // trip. Deliberately never awaited: the listener is an EventEmitter, so
+  // suspending here lets the next message's handler emit first and the room's
+  // timeline records the two in whichever order the lookups happened to
+  // return. The title is decoration the parent already has from the binding,
+  // so the first message from a room reports none and the next one does.
+  if (groupTitles.has(threadId)) return groupTitles.get(threadId);
+  groupTitles.set(threadId, null);
+  Promise.resolve()
+    .then(() => api.getGroupInfo(threadId))
+    .then((info) => {
+      const entry = (info && info.gridInfoMap && info.gridInfoMap[threadId])
+        || (info && info.groupInfo)
+        || null;
+      groupTitles.set(threadId, (entry && (entry.name || entry.groupName)) || null);
+    })
+    .catch((e) => {
+      // Drop the claim so a later message retries instead of caching the miss.
+      groupTitles.delete(threadId);
+      logInfo(`group title lookup failed for ${threadId}: ${e && (e.message || e)}`);
+    });
+  return null;
+}
+
 function extractText(content) {
   if (typeof content === 'string') return content;
   if (content && typeof content === 'object') {
@@ -134,7 +187,13 @@ function extractText(content) {
 
 async function startZalo() {
   loginAttempt += 1;
-  const zalo = new Zalo({ selfListen: false, logging: false });
+  // `selfListen: true` is load-bearing for group discovery, not a debugging
+  // knob. zca-js computes `isSelf` for a group event from whether the changed
+  // members include us, then drops the event when `isSelf && !selfListen` — so
+  // "you were added to a group", the one event this feature is built on, is
+  // exactly the one it filters out. Our own MESSAGES are still ignored, by the
+  // `m.isSelf` guard in `onMessage` below (and by the echo check in Python).
+  const zalo = new Zalo({ selfListen: true, logging: false });
   const saved = loadCreds();
 
   let captured = null;
@@ -185,9 +244,10 @@ async function startZalo() {
   // Session established — persist refreshed credentials and go live.
   saveCreds(snapshotCreds(api, captured));
   loginAttempt = 0;
-  emit({ kind: 'ready' });
+  emit({ kind: 'ready', self_id: ownId() });
   logInfo('session ready — starting listener');
   startListener();
+  announceSelfName();
 
   // Re-persist rotated cookies periodically so a later restore keeps working.
   if (!persistTimer) {
@@ -198,6 +258,25 @@ async function startZalo() {
   }
 }
 
+function announceSelfName() {
+  // The name this account shows above its own messages in a group. Zalo has no
+  // usernames and no typeable mention token, so this is the ONLY handle another
+  // member can address the agent by — without it the agent reads "Lý Nguyen,
+  // what time is it?" as a question for somebody else.
+  //
+  // Deliberately after `ready` and never awaited: it is one more network call
+  // on a session that is already live, and a slow or failed profile lookup must
+  // not delay (or fail) pairing.
+  Promise.resolve()
+    .then(() => api && api.fetchAccountInfo())
+    .then((info) => {
+      const profile = (info && info.profile) || {};
+      const name = String(profile.displayName || profile.zaloName || '').trim();
+      if (name) emit({ kind: 'self_info', self_name: name });
+    })
+    .catch((e) => logInfo(`fetchAccountInfo failed: ${e && (e.message || e)}`));
+}
+
 function scheduleReconnect() {
   const delay = Math.min(30_000, 1_000 * Math.pow(2, Math.min(loginAttempt, 5)));
   logInfo(`reconnect scheduled in ${delay}ms`);
@@ -205,18 +284,81 @@ function scheduleReconnect() {
 }
 
 function startListener() {
-  const onMessage = (m) => {
+  const onMessage = async (m) => {
     try {
       if (!m || m.isSelf) return;
-      if (m.type === THREAD_GROUP) return; // DM-only in v1
       const data = m.data || {};
-      const senderId = String(data.uidFrom || m.threadId || '');
       const text = extractText(data.content);
-      if (!senderId || !text) return;
+      if (!text) return;
+      if (m.type === THREAD_GROUP) {
+        // A room message is addressed to the room. It used to be dropped here,
+        // which is why a personal account could never carry a bound group.
+        const chatId = String(m.threadId || '');
+        const groupSenderId = String(data.uidFrom || '');
+        if (!chatId || !groupSenderId) return;
+        emit({
+          kind: 'incoming_group',
+          chat_id: chatId,
+          chat_title: groupTitle(chatId),
+          sender_id: groupSenderId,
+          display_name: data.dName || groupSenderId,
+          message_id: String(data.msgId || data.cliMsgId || '') || null,
+          // Zalo stamps milliseconds; the parent's dedupe key wants seconds.
+          timestamp: Number(data.ts) / 1000,
+          // A Zalo mention is a structured annotation, never text, so the
+          // parent cannot find it by reading the message. Same for a quote.
+          mentioned_ids: (data.mentions || [])
+            .map((mention) => String((mention && mention.uid) || ''))
+            .filter(Boolean),
+          quoted_sender_id: (data.quote && String(data.quote.ownerId || '')) || null,
+          text,
+        });
+        return;
+      }
+      const senderId = String(data.uidFrom || m.threadId || '');
+      if (!senderId) return;
       const displayName = data.dName || senderId;
       emit({ kind: 'incoming', sender_id: senderId, display_name: displayName, text });
     } catch (e) {
       logErr('onMessage', e);
+    }
+  };
+  const onGroupEvent = async (event) => {
+    // zca-js reports group membership changes here as a GroupEventType (see
+    // its models/GroupEvent.d.ts). Only three concern us, and they are matched
+    // EXACTLY: an earlier `includes('join')` also caught `join_request`, which
+    // is somebody else asking to join a group we are already in.
+    try {
+      const type = String((event && event.type) || '').toLowerCase();
+      const isJoin = type === 'join';
+      const isLeave = type === 'leave' || type === 'remove_member';
+      if (!isJoin && !isLeave) {
+        if (type && type !== 'unknown') logInfo(`group_event ignored: ${type}`);
+        return;
+      }
+      const data = (event && event.data) || {};
+      const threadId = String((event && event.threadId) || data.groupId || '');
+      if (!threadId) return;
+      const own = String((api && api.getOwnId && api.getOwnId()) || '');
+      const members = []
+        .concat(data.updateMembers || [], data.memberIds || [], data.uids || [])
+        .map((m) => String((m && (m.id || m.uid)) || m || ''));
+      // `isSelf` is zca-js's own answer to the same question; trust it when the
+      // member list came back in a shape we did not recognise.
+      const namesUs = members.length
+        ? members.includes(own)
+        : Boolean(event && event.isSelf);
+      if (own && !namesUs) return;
+      if (data.groupName) groupTitles.set(threadId, data.groupName);
+      const kind = isJoin ? 'group_joined' : 'group_left';
+      logInfo(`  -> ${kind} chat=${threadId}`);
+      emit({
+        kind,
+        chat_id: threadId,
+        chat_title: groupTitles.get(threadId) || null,
+      });
+    } catch (e) {
+      logErr('onGroupEvent', e);
     }
   };
   const onError = (err) => {
@@ -231,6 +373,13 @@ function startListener() {
   };
 
   api.listener.on('message', onMessage);
+  try {
+    api.listener.on('group_event', onGroupEvent);
+  } catch (e) {
+    // Older zca-js builds do not emit this; a group is then discovered
+    // by its first message instead, which is the same outcome later.
+    logInfo('group_event listener unavailable');
+  }
   api.listener.on('error', onError);
   api.listener.on('closed', onClosed);
   api.listener.start({ retryOnClose: false });
@@ -247,23 +396,123 @@ function invalidateAndReconnect() {
   setTimeout(() => { reconnecting = false; }, 1000);
 }
 
+function threadTypeOf(msg) {
+  // Defaults to the user thread so a parent frame that predates rooms (or one
+  // for a DM, which never carries the field) delivers exactly as it always did.
+  const raw = Number(msg.thread_type);
+  return Number.isInteger(raw) ? raw : THREAD_USER;
+}
+
 async function handleControl(msg) {
   if (!api) {
+    // Answer on the correlation id the caller waits on where there is one, so a
+    // roster request fails fast instead of hanging until its timeout.
+    if (msg.kind === 'group_info' || msg.kind === 'list_groups') {
+      emit({
+        kind: `${msg.kind === 'group_info' ? 'group_info' : 'list_groups'}_result`,
+        request_id: msg.request_id,
+        ok: false,
+        error: 'sidecar not ready',
+      });
+      return;
+    }
     emit({ kind: 'send_error', sender_id: msg.sender_id, error: 'sidecar not ready' });
     return;
   }
   if (msg.kind === 'send') {
     const threadId = String(msg.sender_id || '');
+    // The parent splits at this same cap, so the slice is a floor under a frame
+    // that somehow arrives longer — it truncates, it does not chunk.
     const text = String(msg.text || '').slice(0, 2000);
     try {
-      await api.sendMessage(text, threadId, THREAD_USER);
+      await api.sendMessage(text, threadId, threadTypeOf(msg));
     } catch (e) {
       emit({ kind: 'send_error', sender_id: msg.sender_id, error: String((e && e.message) || e) });
+    }
+  } else if (msg.kind === 'list_groups') {
+    // Every group this account is in. `getAllGroups` returns ids only, so the
+    // names come from a second call — batched, because an account in fifty
+    // groups would otherwise be fifty round trips.
+    try {
+      const all = await api.getAllGroups();
+      const ids = Object.keys((all && all.gridVerMap) || {});
+      const groups = [];
+      for (let i = 0; i < ids.length; i += 50) {
+        const batch = ids.slice(i, i + 50);
+        let info = null;
+        try {
+          info = await api.getGroupInfo(batch);
+        } catch (e) {
+          logInfo(`getGroupInfo batch failed: ${e && (e.message || e)}`);
+        }
+        const map = (info && info.gridInfoMap) || {};
+        for (const id of batch) {
+          const entry = map[id] || {};
+          const name = entry.name || entry.groupName || null;
+          if (name) groupTitles.set(id, name);
+          groups.push({
+            id,
+            name,
+            member_count: Number(entry.totalMember) || null,
+          });
+        }
+      }
+      emit({ kind: 'list_groups_result', request_id: msg.request_id, ok: true, groups });
+    } catch (e) {
+      emit({
+        kind: 'list_groups_result',
+        request_id: msg.request_id,
+        ok: false,
+        error: String((e && e.message) || e),
+      });
+    }
+  } else if (msg.kind === 'group_info') {
+    // The room's member list. Correlated by ``request_id`` because the parent
+    // awaits this one, unlike everything else the sidecar sends.
+    const threadId = String(msg.chat_id || '');
+    try {
+      const info = await api.getGroupInfo(threadId);
+      const entry = (info && info.gridInfoMap && info.gridInfoMap[threadId])
+        || (info && info.groupInfo)
+        || {};
+      if (entry.name || entry.groupName) {
+        groupTitles.set(threadId, entry.name || entry.groupName);
+      }
+      const admins = (entry.adminIds || []).map(String);
+      // ``currentMems`` carries names; ``memVerList`` is ids suffixed with a
+      // version (``<id>_<ver>``) and is the fallback when it is absent.
+      const members = (entry.currentMems || []).length
+        ? entry.currentMems.map((mem) => ({
+          id: String((mem && (mem.id || mem.uid)) || ''),
+          display_name: (mem && (mem.dName || mem.zaloName)) || null,
+        }))
+        : (entry.memVerList || []).map((raw) => ({
+          id: String(raw || '').split('_')[0],
+          display_name: null,
+        }));
+      emit({
+        kind: 'group_info_result',
+        request_id: msg.request_id,
+        ok: true,
+        chat_id: threadId,
+        name: entry.name || entry.groupName || null,
+        members: members
+          .filter((mem) => mem.id)
+          .map((mem) => ({ ...mem, is_admin: admins.includes(mem.id) })),
+      });
+    } catch (e) {
+      emit({
+        kind: 'group_info_result',
+        request_id: msg.request_id,
+        ok: false,
+        chat_id: threadId,
+        error: String((e && e.message) || e),
+      });
     }
   } else if (msg.kind === 'typing') {
     const threadId = String(msg.sender_id || '');
     try {
-      await api.sendTypingEvent(threadId, THREAD_USER);
+      await api.sendTypingEvent(threadId, threadTypeOf(msg));
     } catch (e) {
       // Non-fatal.
     }

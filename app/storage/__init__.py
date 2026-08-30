@@ -9,12 +9,17 @@ instances and re-fetching them.
 
 from app.databases import DatabaseProvider, get_database_provider
 from app.storage.autostart_storage import AutostartStorage
+from app.storage.channel_group_storage import (
+    ChannelGroupStorage,
+    get_channel_group_storage,
+)
 from app.storage.conversation_storage import ConversationStorage
 from app.storage.dynamic_config_storage import DynamicConfigStorage
 from app.storage.event_subscription_storage import EventSubscriptionStorage
 from app.storage.file_watcher_storage import FileWatcherSubscriptionStorage
 from app.storage.schedule_event_storage import ScheduleEventSubscriptionStorage
 from app.storage.event_run_storage import EventRunStorage, get_event_run_storage
+from app.storage.group_chat_storage import GroupChatStorage, get_group_chat_storage
 from app.storage.memory_storage import MemoryStorage
 from app.storage.usage_storage import UsageStorage
 from app.storage.tool_storage import ToolStorage, get_tool_storage
@@ -110,6 +115,10 @@ def invalidate_storage_singletons() -> None:
     _reset_tool_storage_singleton()
     import app.storage.event_run_storage as _ers
     _ers._instance = None
+    import app.storage.group_chat_storage as _gcs
+    _gcs._instance = None
+    import app.storage.channel_group_storage as _cgs
+    _cgs._instance = None
     try:
         from app.utils.client_storage import _reset_auth_client_storage_singleton
         _reset_auth_client_storage_singleton()
@@ -119,22 +128,26 @@ def invalidate_storage_singletons() -> None:
 
 __all__ = [
     "AutostartStorage",
+    "ChannelGroupStorage",
     "ConversationStorage",
     "DynamicConfigStorage",
     "EventSubscriptionStorage",
     "FileWatcherSubscriptionStorage",
     "ScheduleEventSubscriptionStorage",
     "EventRunStorage",
+    "GroupChatStorage",
     "MemoryStorage",
     "UsageStorage",
     "ToolStorage",
     "get_autostart_storage",
+    "get_channel_group_storage",
     "get_conversation_storage",
     "get_dynamic_config_storage",
     "get_event_subscription_storage",
     "get_file_watcher_storage",
     "get_schedule_event_storage",
     "get_event_run_storage",
+    "get_group_chat_storage",
     "get_memory_storage",
     "get_usage_storage",
     "get_tool_storage",

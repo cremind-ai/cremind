@@ -80,6 +80,46 @@ def _validate_subscribe_auth(config: dict) -> str | None:
     return None
 
 
+def _validate_group_chats_enabled(config: dict, channel_type: str) -> str | None:
+    """Return an error message if ``config.group_chats_enabled`` is invalid.
+
+    Absent is valid (off). ``True`` on a platform whose adapter cannot take part
+    in a group is refused rather than stored: the toggle would sit on in the UI
+    while nothing ever happened, which reads as a Cremind bug instead of as the
+    wrong platform.
+    """
+    val = config.get("group_chats_enabled")
+    if val is None:
+        return None
+    if not isinstance(val, bool):
+        return "group_chats_enabled must be true or false"
+    if not val:
+        return None
+    supported = {t["channel_type"] for t in _group_capable_types()}
+    if channel_type not in supported:
+        return (
+            f"{channel_type} channels cannot take part in group chats; "
+            f"supported: {', '.join(sorted(supported)) or 'none'}"
+        )
+    return None
+
+
+def _group_capable_types() -> list[dict]:
+    """Channel types whose adapters can take part in a platform group.
+
+    Guarded because this module is imported where there is no channel subsystem
+    (the CLI, tests): a missing adapter catalogue costs the settings page its
+    toggle, never a 500.
+    """
+    try:
+        from app.channels.registry import group_capable_channel_types
+
+        return group_capable_channel_types()
+    except Exception:  # noqa: BLE001
+        logger.exception("channels: could not list the group-capable types")
+        return []
+
+
 def _decorate(channel: dict) -> dict:
     """Add live-runtime ``status`` derived from the registry + persisted state.
 
@@ -206,6 +246,10 @@ async def create_channel_for_profile(
     if auth_err:
         return None, {"error": auth_err, "status": 400}
 
+    group_err = _validate_group_chats_enabled(config, channel_type)
+    if group_err:
+        return None, {"error": group_err, "status": 400}
+
     enabled = bool(payload.get("enabled", True))
 
     ch = await conversation_storage.create_channel(
@@ -240,7 +284,22 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         if unauth is not None:
             return unauth
         catalog = load_all_channel_catalogs()
-        return JSONResponse({"channels": catalog})
+        # Which of these can take part in a platform group. Derived from the
+        # adapter classes rather than declared in the TOML, so a transport that
+        # gains (or loses) group support cannot leave the settings page offering
+        # a toggle that does nothing.
+        group_capable = {t["channel_type"] for t in _group_capable_types()}
+        decorated = {
+            channel_type: {
+                **entry,
+                "channel": {
+                    **(entry.get("channel") or {}),
+                    "supports_group_chats": channel_type in group_capable,
+                },
+            }
+            for channel_type, entry in (catalog or {}).items()
+        }
+        return JSONResponse({"channels": decorated})
 
     async def handle_list_channels(request: Request) -> JSONResponse:
         unauth = _require_auth(request)
@@ -357,6 +416,11 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
             auth_err = _validate_subscribe_auth(merged)
             if auth_err:
                 return JSONResponse({"error": auth_err}, status_code=400)
+            group_err = _validate_group_chats_enabled(
+                merged, ch.get("channel_type") or "",
+            )
+            if group_err:
+                return JSONResponse({"error": group_err}, status_code=400)
             update["config"] = merged
 
         updated = await conversation_storage.update_channel(cid, **update)
@@ -368,7 +432,11 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         # channel's SDK extras aren't on disk yet (e.g. switching an existing
         # row to a new platform, or re-enabling on a host that never installed
         # them) — install at runtime before the adapter restarts.
-        runtime_keys = {"mode", "auth_mode", "enabled", "config"}
+        # ``response_mode`` included because a running adapter reads it off the
+        # dict snapshot it was constructed with (``BaseChannelAdapter.channel``),
+        # which only a restart replaces — without this, flipping "Reply detail"
+        # saves and then does nothing until the process happens to restart.
+        runtime_keys = {"mode", "auth_mode", "response_mode", "enabled", "config"}
         if any(k in update for k in runtime_keys):
             try:
                 updated = await get_channel_registry().restart_for_channel(

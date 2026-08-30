@@ -7,10 +7,11 @@ new turn and this tool is never needed.
 
 When it finishes while a turn is RUNNING, injecting it would only queue it
 behind that turn (one conversation runs one turn at a time), so it waits in the
-conversation's inbox and a short notice rides the agent's next tool result. This
-tool is how the agent acts on that notice: it hands over the full text of every
-waiting result and marks them delivered. Ignoring the notice is equally valid —
-whatever is unread is injected as one turn the moment the turn ends.
+conversation's inbox and a short notice interrupts the running turn at its next
+step. This tool is how the agent acts on that notice: it hands over the full
+text of every waiting result and marks them delivered. Ignoring the notice is
+equally valid — whatever is unread is injected as one turn the moment the turn
+ends.
 
 Lifecycle is *system-managed*: the tool is ``hidden`` (never shown in Settings,
 never in the built-in catalogue — so the ``description`` below is the model's
@@ -83,6 +84,12 @@ class GetEventTaskResultsTool(BuiltInTool):
             conversation_id=conversation_id,
             profile=str(arguments.get("_profile") or ""),
         )
+        # Everything waiting has now been handed over, so any notice still
+        # parked describes a row this call just delivered. Left in place it
+        # would interrupt the user on the next step about a result the agent is
+        # already holding. Discarded only on success: a read that raised (Stop,
+        # a DB error) released its claims, and those rows are still undelivered.
+        task_result_inbox.drain_notices(run_id or "")
         if depths and run_id:
             # A turn that pulls a result never mints a new trigger_event, so
             # without this the wait→read→register chain would restart the

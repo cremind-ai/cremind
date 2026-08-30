@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 
 import uvicorn
 from starlette.applications import Starlette
@@ -431,10 +432,92 @@ async def _on_shutdown() -> None:
         )
 
 
+def _resolve_public_port() -> int:
+    """The public origin's port: ``CREMIND_UI_PORT``, or 1515.
+
+    ``0`` is a real value, not an error — it means "open no public bind at
+    all", which is how the dev loop frees :1515 for Vite and how a deployment
+    puts an external proxy in front of the loopback app.
+    """
+    raw = os.environ.get("CREMIND_UI_PORT", "1515")
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(f"Invalid CREMIND_UI_PORT={raw!r}; defaulting to 1515.")
+        return 1515
+
+
+def _port_taken(bind_host: str, bind_port: int) -> bool:
+    """Whether something already holds this address."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        # No SO_REUSEADDR: on Linux it would let this probe bind beside a
+        # socket in TIME_WAIT and report free a port uvicorn then cannot take,
+        # and on Windows it would let two live listeners share one port
+        # outright. Leaving it off is what makes the answer mean the same
+        # thing on both.
+        try:
+            probe.bind((bind_host, bind_port))
+        except OSError:
+            return True
+    return False
+
+
+def _require_free_ports(host: str, public_port: int, loopback_port: int) -> None:
+    """Stop with one clear line if a port this server needs is already taken.
+
+    Worth doing up front because uvicorn binds its socket only AFTER the ASGI
+    lifespan has run: left to it, a clash starts the whole installation —
+    watchers, every channel adapter, the Node sidecars — then tears it down
+    again, and the one line that matters ends up buried under the teardown's
+    own warnings and a ``SystemExit`` raised inside a gathered task.
+
+    A racing bind in the gap between this check and uvicorn's own is possible
+    and harmless: that path simply fails the way it does today.
+    """
+    checks = [("127.0.0.1", loopback_port, False)]
+    if public_port != 0:
+        checks.insert(0, (host, public_port, True))
+    for bind_host, bind_port, is_public in checks:
+        if not _port_taken(bind_host, bind_port):
+            continue
+        if is_public:
+            what = "the public origin (CREMIND_UI_PORT)"
+            remedy = (
+                "Another Cremind is already serving, or a dev server has it — "
+                "the Vite HMR server uses this port too, and the backend must "
+                "then run with CREMIND_UI_PORT=0 so it binds only the internal "
+                "API (see CONTRIBUTING.md). Stop the other process, or choose "
+                "another port."
+            )
+        else:
+            what = "the internal API port (PORT)"
+            remedy = (
+                "Another Cremind is already running — its internal API holds "
+                "this port. Stop it, or set PORT to a free one."
+            )
+        logger.error(
+            f"Cannot start: {bind_host}:{bind_port} is already in use — that "
+            f"is {what}. {remedy}"
+        )
+        raise SystemExit(1)
+
+
 async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
     _silence_proactor_connection_reset(asyncio.get_running_loop())
 
-    # 0. Purge stale exec_shell stdout directories from previous runs.
+    # 0. Can we have the ports at all? Asked FIRST, before anything is started.
+    #
+    #    uvicorn binds its socket only after the ASGI lifespan has run, so
+    #    without this a port clash boots the entire installation — watchers,
+    #    every channel adapter, the Node sidecars — and then tears it all down
+    #    again, with the one line that matters buried under the teardown's own
+    #    warnings and a SystemExit raised inside a gathered task. Nothing here
+    #    has side effects, so failing at this point leaves no process, no
+    #    sidecar and no half-written state behind.
+    public_port = _resolve_public_port()
+    _require_free_ports(host, public_port, port)
+
+    # 0''. Purge stale exec_shell stdout directories from previous runs.
     cleanup_stdout_on_startup()
 
     # 0'. Wipe temporary chat-upload folders left behind by the previous run.
@@ -923,6 +1006,30 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to start event task delivery/timeout")
 
+            # 7f-ter. Mid-turn user messages. Their routing state lives in
+            # memory, so a crash leaves the rows parked at 'pending' — a state
+            # history hides on purpose. Release them (making them visible again)
+            # and answer them, so a message sent moments before a restart is not
+            # silently lost.
+            try:
+                from app.events.user_message_delivery import (
+                    sweep_stranded_mid_turn_messages,
+                )
+                await sweep_stranded_mid_turn_messages()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to sweep stranded mid-turn messages")
+
+            # 7f-quater. Group chats: load the membership index, make sure
+            # every member has its seat, and finish whatever a crash left
+            # half-done. Before anything can post, so the tool gate and the
+            # co-membership check do not read an empty room.
+            try:
+                from app.groups import boot as groups_boot
+
+                await groups_boot.initialize()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to initialize group chats")
+
             # 7g. Temporary chat-upload pruner — periodically removes idle
             # per-conversation upload folders so the temp tree never grows
             # unbounded during a long-lived process.
@@ -1138,12 +1245,7 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
     # The public server owns the ASGI lifespan (so ``_on_shutdown`` runs once);
     # the loopback server is started with ``lifespan="off"`` to avoid a second
     # shutdown of the same app.
-    raw_ui_port = os.environ.get("CREMIND_UI_PORT", "1515")
-    try:
-        public_port = int(raw_ui_port)
-    except ValueError:
-        logger.warning(f"Invalid CREMIND_UI_PORT={raw_ui_port!r}; defaulting to 1515.")
-        public_port = 1515
+    # ``public_port`` was resolved at the top of main(), with the port check.
 
     def _mk_config(bind_host: str, bind_port: int, *, lifespan: str) -> uvicorn.Config:
         return uvicorn.Config(

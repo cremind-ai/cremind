@@ -14,12 +14,17 @@
  *      <working-dir>/<profile>/whatsapp/<channel-id>/session/ so paired
  *      sessions survive restarts.
  *   4. Events flow parent <-> sidecar as JSON frames:
- *        sidecar -> parent:  {kind: "qr"|"ready"|"incoming"|"disconnected"
- *                             |"send_ack"|"send_error"|"resolve_result"
- *                             |"error", ...}
+ *        sidecar -> parent:  {kind: "qr"|"ready"|"incoming"|"incoming_group"
+ *                             |"disconnected"|"send_ack"|"send_error"
+ *                             |"resolve_result"|"error", ...}
  *        parent -> sidecar:  {kind: "send", sender_id, text, request_id?}
  *                            {kind: "resolve", phone, request_id}
  *                            {kind: "logout"}
+ *
+ *      "incoming" is a 1:1 message and "incoming_group" one written in a
+ *      @g.us room; they are separate kinds because a room message belongs to
+ *      the room, not to whoever sent it, and the parent routes it into a group
+ *      timeline instead of a per-sender conversation.
  *
  *      A "send" carrying a request_id is answered with exactly one
  *      {kind: "send_ack", request_id} or {kind: "send_error", request_id, error}
@@ -53,6 +58,8 @@ fs.mkdirSync(sessionDir, { recursive: true });
 let connectedClient = null;
 let sock = null;
 let socketStartCount = 0;
+// group JID -> subject, populated in the background by groupSubject().
+const groupSubjects = new Map();
 
 function emit(payload) {
   if (connectedClient && connectedClient.readyState === 1) {
@@ -75,6 +82,114 @@ function logInfo(line) {
   // write here is visible in the server logs prefixed with
   // ``whatsapp[<channel_id>] sidecar:``.
   process.stderr.write(`[whatsapp-sidecar] ${line}\n`);
+}
+
+function bareJid(value) {
+  // Drop the ``:<device>`` suffix WhatsApp appends to a JID's local part. It
+  // changes every time the account links a device, so two ids for one person
+  // would never compare equal and the parent would read our own mirror as a
+  // stranger's message.
+  const jid = String(value || '').trim();
+  if (!jid.includes('@')) return '';
+  const [local, domain] = jid.split('@');
+  return `${local.split(':')[0]}@${domain}`;
+}
+
+function selfIdentity() {
+  // Which account this linked device is. WhatsApp flags nothing as
+  // bot-authored, so a bound room can only recognise the mirrors we post
+  // ourselves by our own ids — without these the agent answers its own answer.
+  const user = (sock && sock.user) || {};
+  const out = {};
+  const digits = String(user.id || '').split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
+  if (digits) out.self_id = digits;
+  const lid = bareJid(user.lid);
+  if (lid) out.self_lid = lid;
+  // The pushName: the only thing a group shows above our messages, and so the
+  // only name another member can address this account by.
+  const name = String(user.name || user.verifiedName || '').trim();
+  if (name) out.self_name = name;
+  return out;
+}
+
+function unwrapEnvelopes(message) {
+  // Protocol envelopes that hide the actual text payload:
+  // ``ephemeralMessage`` wraps disappearing-mode messages, and
+  // ``viewOnceMessage`` / ``viewOnceMessageV2`` wrap one-shot media.
+  let root = message || {};
+  while (root && (root.ephemeralMessage || root.viewOnceMessage || root.viewOnceMessageV2)) {
+    root = (root.ephemeralMessage && root.ephemeralMessage.message)
+      || (root.viewOnceMessage && root.viewOnceMessage.message)
+      || (root.viewOnceMessageV2 && root.viewOnceMessageV2.message)
+      || {};
+  }
+  return root || {};
+}
+
+function messageText(root) {
+  return root.conversation
+    || (root.extendedTextMessage && root.extendedTextMessage.text)
+    || (root.imageMessage && root.imageMessage.caption)
+    || (root.videoMessage && root.videoMessage.caption)
+    || '';
+}
+
+function groupSubject(jid) {
+  // The room's name, cached per JID because groupMetadata is a network round
+  // trip and a busy room would otherwise make one per message. Deliberately
+  // never awaited: the title is decoration the parent already has from the
+  // binding, and a slow or failing lookup must not cost us the message. The
+  // first message from a room therefore reports no title; the next one does.
+  if (groupSubjects.has(jid)) return groupSubjects.get(jid);
+  groupSubjects.set(jid, null);
+  Promise.resolve()
+    .then(() => sock.groupMetadata(jid))
+    .then((meta) => { groupSubjects.set(jid, (meta && meta.subject) || null); })
+    .catch((e) => {
+      // Drop the claim so a later message retries instead of caching the miss.
+      groupSubjects.delete(jid);
+      logInfo(`group subject lookup failed for ${jid}: ${e && (e.message || e)}`);
+    });
+  return null;
+}
+
+function mentionContext(root) {
+  // Who this message pings, and whom it quotes. WhatsApp carries both as
+  // structured annotations rather than in the text: ``@1555…`` renders as a
+  // mention but the text the parent receives is just the digits, and a quote is
+  // nowhere in the text at all. Without these the agent could be addressed
+  // directly and never know.
+  const ctx = (root.extendedTextMessage && root.extendedTextMessage.contextInfo)
+    || (root.imageMessage && root.imageMessage.contextInfo)
+    || (root.videoMessage && root.videoMessage.contextInfo)
+    || null;
+  if (!ctx) return { mentionedIds: [], quotedSenderId: null };
+  const mentionedIds = [];
+  for (const jid of ctx.mentionedJid || []) {
+    const bare = bareJid(jid);
+    if (bare && !mentionedIds.includes(bare)) mentionedIds.push(bare);
+  }
+  return { mentionedIds, quotedSenderId: bareJid(ctx.participant) || null };
+}
+
+function groupSenderIds(m) {
+  // In a group ``remoteJid`` is the ROOM, so the sender has to come from the
+  // participant fields — reading it off remoteJid the way the DM path does
+  // would collapse every human in the room into one identity.
+  //
+  // Which form WhatsApp reports depends on the account's privacy settings, so
+  // every one seen is handed to the parent. The phone JID leads when there is
+  // one: it is the only form carrying a number a person can recognise, and the
+  // parent resolves an @lid-only participant through the alternates.
+  const seen = [];
+  for (const candidate of [
+    m.key.participantPn, m.key.participant, m.participant, m.key.participantLid,
+  ]) {
+    const jid = bareJid(candidate);
+    if (jid && !seen.includes(jid)) seen.push(jid);
+  }
+  const primary = seen.find((jid) => jid.endsWith('@s.whatsapp.net')) || seen[0] || '';
+  return { primary, alts: seen.filter((jid) => jid !== primary) };
 }
 
 async function startSocket() {
@@ -130,9 +245,47 @@ async function startSocket() {
     } else if (connection === 'open') {
       socketStartCount = 0;
       logInfo('connection open — paired and receiving');
-      emit({ kind: 'ready' });
+      emit({ kind: 'ready', ...selfIdentity() });
     } else if (connection === 'connecting') {
       logInfo('connecting…');
+    }
+  });
+
+  sock.ev.on('groups.upsert', (groups) => {
+    // Fired when this account joins (or is added to) a group. WhatsApp gives no
+    // "you were added" event of its own, so this is the closest thing, and it
+    // is what lets a group reach the operator for approval before anybody has
+    // spoken in it.
+    for (const g of groups || []) {
+      if (!g || !g.id) continue;
+      if (g.subject) groupSubjects.set(g.id, g.subject);
+      logInfo(`  -> group_joined chat=${g.id}`);
+      emit({
+        kind: 'group_joined',
+        chat_id: g.id,
+        chat_title: g.subject || null,
+      });
+    }
+  });
+
+  sock.ev.on('group-participants.update', (update) => {
+    // The other way in: somebody adds this number to an existing group. Only an
+    // 'add' naming US counts — every other participant change is somebody
+    // else's business.
+    try {
+      if (!update || update.action !== 'add') return;
+      const ownJid = bareJid(sock.user && sock.user.id);
+      const ownLid = bareJid(sock.user && sock.user.lid);
+      const added = (update.participants || []).map(bareJid);
+      if (!added.some((jid) => jid && (jid === ownJid || jid === ownLid))) return;
+      logInfo(`  -> group_joined (participant add) chat=${update.id}`);
+      emit({
+        kind: 'group_joined',
+        chat_id: update.id,
+        chat_title: groupSubjects.get(update.id) || null,
+      });
+    } catch (e) {
+      logInfo(`group-participants.update failed: ${e && (e.message || e)}`);
     }
   });
 
@@ -145,38 +298,44 @@ async function startSocket() {
       const fromMe = !!m.key.fromMe;
       logInfo(`  msg jid=${remoteJid} fromMe=${fromMe} hasMessage=${!!m.message} pushName=${m.pushName || ''}`);
       if (fromMe) continue;
-      // Skip non-DM JIDs:
-      //   @g.us         → WhatsApp groups (not routed in v1)
+      // Nobody is conversing in these, so they are dropped outright:
       //   @broadcast    → broadcast lists / status updates
       //   @newsletter   → channels (the WhatsApp-product "Channels", not ours)
-      if (
-        remoteJid.endsWith('@g.us')
-        || remoteJid.endsWith('@broadcast')
-        || remoteJid.endsWith('@newsletter')
-      ) {
-        logInfo(`  skipped (non-DM JID class)`);
+      if (remoteJid.endsWith('@broadcast') || remoteJid.endsWith('@newsletter')) {
+        logInfo(`  skipped (non-conversational JID class)`);
         continue;
       }
 
-      // Unwrap protocol envelopes that hide the actual text payload.
-      // ``ephemeralMessage`` wraps disappearing-mode messages;
-      // ``viewOnceMessage`` / ``viewOnceMessageV2`` wrap one-shot media.
-      let root = m.message || {};
-      while (root && (root.ephemeralMessage || root.viewOnceMessage || root.viewOnceMessageV2)) {
-        root = (root.ephemeralMessage && root.ephemeralMessage.message)
-          || (root.viewOnceMessage && root.viewOnceMessage.message)
-          || (root.viewOnceMessageV2 && root.viewOnceMessageV2.message)
-          || {};
-      }
-
-      const text = root.conversation
-        || (root.extendedTextMessage && root.extendedTextMessage.text)
-        || (root.imageMessage && root.imageMessage.caption)
-        || (root.videoMessage && root.videoMessage.caption)
-        || '';
+      const root = unwrapEnvelopes(m.message);
+      const text = messageText(root);
       if (!text) {
         const kinds = Object.keys(root || {});
         logInfo(`  skipped (no text payload; root kinds=[${kinds.join(',')}])`);
+        continue;
+      }
+
+      if (remoteJid.endsWith('@g.us')) {
+        const { primary, alts } = groupSenderIds(m);
+        if (!primary) {
+          logInfo(`  skipped (group message with no resolvable participant)`);
+          continue;
+        }
+        const timestamp = Number(m.messageTimestamp);
+        const { mentionedIds, quotedSenderId } = mentionContext(root);
+        logInfo(`  -> incoming_group chat=${remoteJid} sender=${primary} text_len=${text.length}`);
+        emit({
+          kind: 'incoming_group',
+          chat_id: remoteJid,
+          chat_title: groupSubject(remoteJid),
+          sender_id: primary,
+          sender_alt_ids: alts,
+          display_name: m.pushName || null,
+          message_id: (m.key && m.key.id) || null,
+          timestamp: Number.isFinite(timestamp) ? timestamp : null,
+          mentioned_ids: mentionedIds,
+          quoted_sender_id: quotedSenderId,
+          text,
+        });
         continue;
       }
       logInfo(`  -> incoming sender=${remoteJid} text_len=${text.length}`);
@@ -203,7 +362,9 @@ async function handleControl(msg) {
   if (!sock) {
     // Answer on the same correlation id the caller is waiting on, so a
     // request never hangs until its timeout just because we aren't paired yet.
-    const kind = msg.kind === 'resolve' ? 'resolve_result' : 'send_error';
+    const kind = msg.kind === 'resolve'
+      ? 'resolve_result'
+      : (msg.kind === 'group_metadata' ? 'group_metadata_result' : 'send_error');
     emit({
       kind,
       request_id: msg.request_id,
@@ -254,6 +415,57 @@ async function handleControl(msg) {
         request_id: msg.request_id,
         ok: false,
         phone,
+        error: String(e && e.message || e),
+      });
+    }
+  } else if (msg.kind === 'list_groups') {
+    // Every group this number is in. One call — Baileys keeps the list on the
+    // socket — so unlike the other platforms there is no batching to do.
+    try {
+      const all = await sock.groupFetchAllParticipating();
+      const groups = Object.values(all || {}).map((g) => {
+        if (g && g.id && g.subject) groupSubjects.set(g.id, g.subject);
+        return {
+          id: (g && g.id) || '',
+          name: (g && g.subject) || null,
+          member_count: ((g && g.participants) || []).length || null,
+        };
+      }).filter((g) => g.id);
+      emit({ kind: 'list_groups_result', request_id: msg.request_id, ok: true, groups });
+    } catch (e) {
+      emit({
+        kind: 'list_groups_result',
+        request_id: msg.request_id,
+        ok: false,
+        error: String(e && e.message || e),
+      });
+    }
+  } else if (msg.kind === 'group_metadata') {
+    // The group's participant list. Correlated like ``resolve`` because the
+    // parent awaits it: a roster refresh is a request/response, not a stream.
+    const chatId = String(msg.chat_id || '');
+    try {
+      const meta = await sock.groupMetadata(chatId);
+      if (meta && meta.subject) groupSubjects.set(chatId, meta.subject);
+      emit({
+        kind: 'group_metadata_result',
+        request_id: msg.request_id,
+        ok: true,
+        chat_id: chatId,
+        subject: (meta && meta.subject) || null,
+        participants: ((meta && meta.participants) || []).map((p) => ({
+          id: bareJid(p.id),
+          lid: bareJid(p.lid),
+          // Baileys reports 'admin' | 'superadmin' | undefined.
+          admin: p.admin || null,
+        })),
+      });
+    } catch (e) {
+      emit({
+        kind: 'group_metadata_result',
+        request_id: msg.request_id,
+        ok: false,
+        chat_id: chatId,
         error: String(e && e.message || e),
       });
     }

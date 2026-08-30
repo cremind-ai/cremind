@@ -9,13 +9,31 @@
 import { computed, onMounted, watch } from 'vue';
 import { Icon } from '@iconify/vue';
 import { ElPopover, ElSwitch } from 'element-plus';
-import type { ChatMessage } from '../stores/chat';
+import type { TokenUsage } from '../stores/chat';
 import { useChatStore } from '../stores/chat';
 import { useUsageStore } from '../stores/usage';
 import { useSettingsStore } from '../stores/settings';
 import { formatTokens, formatUsd, formatPercent, formatRatePerM } from '../utils/usageFormat';
 
-const props = defineProps<{ message: ChatMessage; conversationId?: string | null }>();
+/**
+ * The three fields this chip reads, and nothing else.
+ *
+ * Narrower than `ChatMessage` on purpose: `ChatMessage` satisfies it
+ * structurally, so the two-party bubble passes its message unchanged, while a
+ * GROUP post — which is a different row type entirely, and whose usage belongs
+ * to the seat message behind it — can be described by the ids that actually
+ * address the usage records, without being dressed up as a chat message.
+ */
+export interface UsageChipMessage {
+  id: string;
+  backendId?: string;
+  tokenUsage?: TokenUsage;
+}
+
+const props = defineProps<{
+  message: UsageChipMessage;
+  conversationId?: string | null;
+}>();
 const chat = useChatStore();
 const usage = useUsageStore();
 const settings = useSettingsStore();

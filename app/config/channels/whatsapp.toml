@@ -25,7 +25,13 @@ Prerequisites (one-time): install Node.js 18+ on PATH, then run
 3. Pick an access-authentication method (open / passcode / one-time code /
    approval / allowlist) so only trusted senders can chat with your agent.
    With approval or allowlist you approve each sender under Settings →
-   Channels (or `cremind channels approve`)."""
+   Channels (or `cremind channels approve`).
+
+Group chats: turn on "Group chats" below; the linked account must be a member of
+the group. Being added is reported, so the group appears for approval — approve
+it under Settings → Channels before the agent takes part. WhatsApp flags nothing
+as a bot, so the agent recognises its own posts by id alone; the per-minute cap
+is what stops a runaway exchange there."""
 [channel.modes.fields]
 phone = { description = "Phone (international format, e.g. +14155551212)", type = "string", required = false }
 

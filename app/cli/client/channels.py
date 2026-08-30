@@ -307,3 +307,158 @@ async def submit_channel_auth_input(
         f"/api/channels/{quote(channel_id, safe='')}/auth-input",
         body,
     )
+
+
+# ── channel group chats ───────────────────────────────────────────────────
+#
+# Platform groups this channel's account is in — a Telegram supergroup, a Slack
+# channel — NOT ``cremind group``, which is Cremind's own multi-agent rooms.
+
+
+async def list_channel_groups(
+    client: Client, channel_id: str, status: str = "",
+) -> list[dict[str, Any]]:
+    """The platform groups this channel knows about, newest first."""
+    path = f"/api/channels/{quote(channel_id, safe='')}/groups"
+    if status:
+        path = f"{path}?status={quote(status, safe='')}"
+    resp = await client.get_json(path)
+    if isinstance(resp, dict) and isinstance(resp.get("groups"), list):
+        return [g for g in resp["groups"] if isinstance(g, dict)]
+    return []
+
+
+async def update_channel_group(
+    client: Client, channel_id: str, group_id: str, fields: dict[str, Any],
+) -> dict[str, Any]:
+    """PATCH one group — ``status``, ``settings`` and/or ``title``."""
+    resp = await client.patch_json(
+        f"/api/channels/{quote(channel_id, safe='')}/groups/"
+        f"{quote(group_id, safe='')}",
+        fields,
+    )
+    if isinstance(resp, dict) and isinstance(resp.get("group"), dict):
+        return resp["group"]
+    raise RuntimeError("unexpected /api/channels/{id}/groups/{group} response")
+
+
+async def set_channel_group_status(
+    client: Client, channel_id: str, group_id: str, status: str,
+) -> dict[str, Any]:
+    return await update_channel_group(
+        client, channel_id, group_id, {"status": status},
+    )
+
+
+async def set_channel_group_settings(
+    client: Client, channel_id: str, group_id: str, settings: dict[str, Any],
+) -> dict[str, Any]:
+    """Patch a group's settings. Merged server-side one level deep."""
+    return await update_channel_group(
+        client, channel_id, group_id, {"settings": settings},
+    )
+
+
+async def delete_channel_group(
+    client: Client, channel_id: str, group_id: str,
+) -> None:
+    """Forget a group outright, transcript included."""
+    await client.delete(
+        f"/api/channels/{quote(channel_id, safe='')}/groups/"
+        f"{quote(group_id, safe='')}"
+    )
+
+
+async def list_available_channel_groups(
+    client: Client, channel_id: str,
+) -> dict[str, Any]:
+    """Groups the account is already in. ``{"supported": bool, "groups": [...]}``.
+
+    ``supported`` false means the platform will not enumerate them — a fact
+    about the platform, not a failure.
+    """
+    resp = await client.get_json(
+        f"/api/channels/{quote(channel_id, safe='')}/groups/available"
+    )
+    if not isinstance(resp, dict):
+        return {"supported": False, "groups": []}
+    return {
+        "supported": bool(resp.get("supported")),
+        "groups": [g for g in (resp.get("groups") or []) if isinstance(g, dict)],
+    }
+
+
+async def add_channel_group(
+    client: Client,
+    channel_id: str,
+    platform_chat_id: str,
+    *,
+    title: str = "",
+    chat_type: str = "",
+) -> dict[str, Any]:
+    """Enable a group the account is already in — approved on the spot.
+
+    Picking IS approving: the caller is naming a specific group out of their own
+    list, which is the decision the approve step exists to collect.
+    """
+    body: dict[str, Any] = {"platform_chat_id": platform_chat_id}
+    if title:
+        body["title"] = title
+    if chat_type:
+        body["chat_type"] = chat_type
+    resp = await client.post_json(
+        f"/api/channels/{quote(channel_id, safe='')}/groups", body,
+    )
+    if isinstance(resp, dict) and isinstance(resp.get("group"), dict):
+        return resp["group"]
+    raise RuntimeError("unexpected POST /api/channels/{id}/groups response")
+
+
+async def refresh_channel_group_roster(
+    client: Client, channel_id: str, group_id: str,
+) -> dict[str, Any]:
+    """Ask the platform who is in a group. ``{"group": …, "source": …}``."""
+    resp = await client.post_json(
+        f"/api/channels/{quote(channel_id, safe='')}/groups/"
+        f"{quote(group_id, safe='')}/roster",
+        {},
+    )
+    return resp if isinstance(resp, dict) else {}
+
+
+async def resolve_channel_group(
+    client: Client, channel_id: str, ref: str,
+) -> dict[str, Any]:
+    """Find one group by id, platform chat id, or unique title.
+
+    A group id is a uuid nobody types, so the two things an operator actually
+    has — the chat id they can see on the platform, and the title they can read
+    — resolve too. An ambiguous title raises rather than guessing: picking one
+    of two rooms called "Ops" and approving it is not a recoverable mistake.
+    """
+    wanted = (ref or "").strip()
+    if not wanted:
+        raise RuntimeError("no group given")
+    groups = await list_channel_groups(client, channel_id)
+    for group in groups:
+        if group.get("id") == wanted:
+            return group
+    for group in groups:
+        if str(group.get("platform_chat_id") or "") == wanted:
+            return group
+    matches = [
+        g for g in groups
+        if str(g.get("title") or "").strip().lower() == wanted.lower()
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        ids = ", ".join(str(g.get("id")) for g in matches)
+        raise RuntimeError(
+            f"{len(matches)} groups are called {wanted!r} on this channel; "
+            f"use one of these ids: {ids}"
+        )
+    raise RuntimeError(
+        f"no group on this channel matches {wanted!r} — list them with "
+        f"`cremind channels groups list {channel_id}`"
+    )

@@ -134,3 +134,69 @@ def test_metadata_none_or_missing_is_safe() -> None:
         {"role": "user", "content": "q1"},
         {"role": "assistant", "content": "a1"},
     ]
+
+
+# ── mid-turn user messages ──
+#
+# A message sent while a turn was running is persisted immediately, then either
+# injected into that turn or run as its own. Its ``mid_turn.state`` decides which
+# copy the model sees, so that it sees exactly one.
+
+
+def _mid_turn(state: str, content: str = "and use staging") -> dict:
+    return {
+        "role": "user",
+        "content": content,
+        "metadata": {"mid_turn": {"state": state, "run_id": "msg:c:1"}},
+    }
+
+
+@pytest.mark.parametrize("include_reasoning", [True, False])
+def test_pending_mid_turn_row_is_always_excluded(include_reasoning: bool) -> None:
+    """It is parked right now: the turn about to speak for it will also be given
+    it by injection, so including it here would feed the same words twice."""
+    db = [{"role": "user", "content": "q1"}, _mid_turn("pending")]
+    out = convert_db_messages_to_history(db, include_reasoning=include_reasoning)
+    assert out == [{"role": "user", "content": "q1"}]
+
+
+def test_consumed_mid_turn_row_defers_to_the_trace() -> None:
+    """The turn that absorbed it replays it verbatim inside llm_messages."""
+    db = [
+        _mid_turn("consumed"),
+        {"role": "agent", "content": "done", "llm_messages": _trace()},
+    ]
+    out = convert_db_messages_to_history(db, include_reasoning=True)
+    assert out == _trace()
+
+
+def test_consumed_mid_turn_row_is_included_when_replay_is_off() -> None:
+    """With no trace replay nothing else carries the text, so the row must."""
+    db = [
+        _mid_turn("consumed"),
+        {"role": "agent", "content": "done", "llm_messages": _trace()},
+    ]
+    out = convert_db_messages_to_history(db, include_reasoning=False)
+    assert out == [
+        {"role": "user", "content": "and use staging"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+
+@pytest.mark.parametrize("include_reasoning", [True, False])
+def test_released_mid_turn_row_is_an_ordinary_user_message(
+    include_reasoning: bool,
+) -> None:
+    """It was never injected (or the turn died first), so it runs as its own."""
+    db = [_mid_turn("released")]
+    out = convert_db_messages_to_history(db, include_reasoning=include_reasoning)
+    assert out == [{"role": "user", "content": "and use staging"}]
+
+
+def test_an_unknown_mid_turn_state_is_not_silently_hidden() -> None:
+    """Only the three known states filter; anything else stays visible rather
+    than vanishing from the model's context."""
+    db = [_mid_turn("something-new")]
+    assert convert_db_messages_to_history(db) == [
+        {"role": "user", "content": "and use staging"},
+    ]

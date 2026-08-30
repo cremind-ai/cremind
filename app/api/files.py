@@ -16,6 +16,7 @@ from starlette.routing import Route
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
+from app.api._auth import is_admin
 from app.config.settings import BaseConfig, get_user_working_directory
 from app.events import get_event_stream_bus
 from app.utils.context_storage import get_context
@@ -41,7 +42,7 @@ def _allowed_bases() -> list[str]:
     return bases
 
 
-def _allowed_bases_for_conversation(conversation_id: str | None) -> list[str]:
+def _allowed_bases_for_conversation(context_key: str | None) -> list[str]:
     """Same as ``_allowed_bases`` plus the active conversation's cwd override.
 
     The ``change_working_directory`` tool may switch a conversation into an
@@ -49,11 +50,17 @@ def _allowed_bases_for_conversation(conversation_id: str | None) -> list[str]:
     File-tree clients pass the originating ``conversation_id`` so the API
     can widen the allowlist for that one request without weakening the
     sandbox for unattributed callers.
+
+    ``context_key`` is that conversation's ``context_id`` — the key the agent
+    writes the override under, resolved once per request by
+    :func:`_conversation_scope`. Looking it up by the client-supplied row id
+    instead finds nothing for a group-chat seat, whose context_id is
+    ``group:<gid>:<profile>``.
     """
     bases = _allowed_bases()
-    if not conversation_id:
+    if not context_key:
         return bases
-    override = get_context(conversation_id, _WORKING_DIR_OVERRIDE_KEY)
+    override = get_context(context_key, _WORKING_DIR_OVERRIDE_KEY)
     if not override:
         return bases
     extra = os.path.realpath(override)
@@ -62,11 +69,58 @@ def _allowed_bases_for_conversation(conversation_id: str | None) -> list[str]:
     return bases
 
 
-def _is_inside_allowed(target: str, conversation_id: str | None = None) -> bool:
-    for base in _allowed_bases_for_conversation(conversation_id):
+def _is_inside_allowed(target: str, context_key: str | None = None) -> bool:
+    for base in _allowed_bases_for_conversation(context_key):
         if target == base or target.startswith(base + os.sep):
             return True
     return False
+
+
+async def _conversation_scope(
+    request: Request, conversation_id: str | None, *, write: bool,
+) -> tuple[str | None, str | None, JSONResponse | None]:
+    """Resolve a request's ``conversation_id`` into ``(row_id, context_key, denial)``.
+
+    Two problems are handled in one place, because both come from the same id.
+
+    Ownership: naming a conversation widens the path allowlist to whatever
+    directory that conversation was switched into, so an unchecked id let any
+    authenticated profile read — and upload into, and delete through — someone
+    else's custom cwd. The owner always passes. ``admin`` passes only when
+    ``write`` is ``False``, because the justification for the bypass is a read:
+    the group room's right-hand panel renders every member agent's file tree.
+    Nothing in that panel asks to *delete* a member's file, and ``/cwd`` would
+    be worse still — it repoints a running agent's working directory, so an
+    admin write there re-aims another profile's live turn at a directory of the
+    admin's choosing.
+
+    ``write`` is keyword-only and has no default on purpose: a route added later
+    has to state which side of that line it is on, rather than inheriting the
+    laxer half by saying nothing.
+
+    Identity: the override lives under the conversation's ``context_id``, which
+    equals the row id for an ordinary chat but not for a group-chat seat. Every
+    handler must widen and mutate under ``context_key`` and address the DB row
+    and the event bus by ``row_id``.
+
+    An id matching no row yields ``(None, None, None)`` — the request is served
+    against the static bases exactly as an unattributed one.
+    """
+    if not conversation_id:
+        return None, None, None
+    try:
+        from app.events.runner import get_conversation_storage
+        conv = await get_conversation_storage().get_conversation(conversation_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("files: failed to load conversation %s", conversation_id)
+        conv = None
+    if conv is None:
+        return None, None, None
+    profile = getattr(request.user, "username", "") or ""
+    if conv.get("profile") != profile and (write or not is_admin(request)):
+        return None, None, JSONResponse({"error": "Forbidden"}, status_code=403)
+    row_id = conv.get("id") or conversation_id
+    return row_id, conv.get("context_id") or row_id, None
 
 
 def _safe_resolve(relative_path: str) -> str | None:
@@ -123,12 +177,17 @@ async def _serve_file_by_path(request: Request):
     if not abs_path:
         return JSONResponse({"error": "No path specified"}, status_code=400)
     conversation_id = request.query_params.get("conversation_id") or None
+    _row_id, context_key, denied = await _conversation_scope(
+        request, conversation_id, write=False,
+    )
+    if denied is not None:
+        return denied
 
     target = os.path.realpath(abs_path)
-    if not _is_inside_allowed(target, conversation_id):
+    if not _is_inside_allowed(target, context_key):
         logger.debug(
             f"File access denied: target={target}, "
-            f"allowed_bases={_allowed_bases_for_conversation(conversation_id)}"
+            f"allowed_bases={_allowed_bases_for_conversation(context_key)}"
         )
         return JSONResponse({"error": "Access denied"}, status_code=403)
 
@@ -180,9 +239,14 @@ async def _list_directory(request: Request):
         return JSONResponse({"error": "No path specified"}, status_code=400)
     show_hidden = request.query_params.get("show_hidden", "0") == "1"
     conversation_id = request.query_params.get("conversation_id") or None
+    _row_id, context_key, denied = await _conversation_scope(
+        request, conversation_id, write=False,
+    )
+    if denied is not None:
+        return denied
 
     target = os.path.realpath(abs_path)
-    if not _is_inside_allowed(target, conversation_id):
+    if not _is_inside_allowed(target, context_key):
         return JSONResponse({"error": "Access denied"}, status_code=403)
     if not os.path.isdir(target):
         return JSONResponse({"error": "Not a directory"}, status_code=404)
@@ -252,8 +316,13 @@ async def _watch_directory(request: Request):
     if not abs_path:
         return JSONResponse({"error": "No path specified"}, status_code=400)
     conversation_id = request.query_params.get("conversation_id") or None
+    _row_id, context_key, denied = await _conversation_scope(
+        request, conversation_id, write=False,
+    )
+    if denied is not None:
+        return denied
     target = os.path.realpath(abs_path)
-    if not _is_inside_allowed(target, conversation_id):
+    if not _is_inside_allowed(target, context_key):
         return JSONResponse({"error": "Access denied"}, status_code=403)
     if not os.path.isdir(target):
         return JSONResponse({"error": "Not a directory"}, status_code=404)
@@ -350,7 +419,7 @@ async def _watch_directory(request: Request):
     )
 
 
-def _resolve_safe(abs_path: str, conversation_id: str | None) -> str | None:
+def _resolve_safe(abs_path: str, context_key: str | None) -> str | None:
     """Realpath-resolve and verify ``abs_path`` is within the allowlist.
 
     Returns the resolved absolute path on success, or ``None`` if the path is
@@ -360,7 +429,7 @@ def _resolve_safe(abs_path: str, conversation_id: str | None) -> str | None:
     if not abs_path:
         return None
     target = os.path.realpath(abs_path)
-    if not _is_inside_allowed(target, conversation_id):
+    if not _is_inside_allowed(target, context_key):
         return None
     return target
 
@@ -460,11 +529,16 @@ async def _upload_files(request: Request):
     target_dir = form.get("path", "")
     if not isinstance(target_dir, str) or not target_dir:
         return JSONResponse({"error": "No path specified"}, status_code=400)
-    conversation_id = form.get("conversation_id") or None
-    if isinstance(conversation_id, str) and not conversation_id:
+    conversation_id = form.get("conversation_id")
+    if not isinstance(conversation_id, str) or not conversation_id:
         conversation_id = None
+    _row_id, context_key, denied = await _conversation_scope(
+        request, conversation_id, write=True,
+    )
+    if denied is not None:
+        return denied
 
-    resolved = _resolve_safe(target_dir, conversation_id if isinstance(conversation_id, str) else None)
+    resolved = _resolve_safe(target_dir, context_key)
     if resolved is None:
         return JSONResponse({"error": "Access denied"}, status_code=403)
     if not os.path.isdir(resolved):
@@ -553,7 +627,12 @@ async def _delete_entry(request: Request):
     if not isinstance(path, str) or not path:
         return JSONResponse({"error": "No path specified"}, status_code=400)
 
-    resolved = _resolve_safe(path, conversation_id if isinstance(conversation_id, str) else None)
+    cid = conversation_id if isinstance(conversation_id, str) else None
+    _row_id, context_key, denied = await _conversation_scope(request, cid, write=True)
+    if denied is not None:
+        return denied
+
+    resolved = _resolve_safe(path, context_key)
     if resolved is None:
         return JSONResponse({"error": "Access denied"}, status_code=403)
     if _is_allowed_base(resolved):
@@ -596,7 +675,10 @@ async def _move_entry(request: Request):
         return JSONResponse({"error": "src and dest are required"}, status_code=400)
 
     cid = conversation_id if isinstance(conversation_id, str) else None
-    src_resolved = _resolve_safe(src, cid)
+    _row_id, context_key, denied = await _conversation_scope(request, cid, write=True)
+    if denied is not None:
+        return denied
+    src_resolved = _resolve_safe(src, context_key)
     if src_resolved is None:
         return JSONResponse({"error": "Access denied (src)"}, status_code=403)
     if _is_allowed_base(src_resolved):
@@ -609,7 +691,7 @@ async def _move_entry(request: Request):
     dest_parent = os.path.dirname(dest)
     if not dest_parent:
         return JSONResponse({"error": "dest must include a parent directory"}, status_code=400)
-    dest_parent_resolved = _resolve_safe(dest_parent, cid)
+    dest_parent_resolved = _resolve_safe(dest_parent, context_key)
     if dest_parent_resolved is None:
         return JSONResponse({"error": "Access denied (dest)"}, status_code=403)
     if not os.path.isdir(dest_parent_resolved):
@@ -652,10 +734,13 @@ async def _mkdir(request: Request):
         return JSONResponse({"error": "No path specified"}, status_code=400)
 
     cid = conversation_id if isinstance(conversation_id, str) else None
+    _row_id, context_key, denied = await _conversation_scope(request, cid, write=True)
+    if denied is not None:
+        return denied
     parent = os.path.dirname(path)
     if not parent:
         return JSONResponse({"error": "path must include a parent"}, status_code=400)
-    parent_resolved = _resolve_safe(parent, cid)
+    parent_resolved = _resolve_safe(parent, context_key)
     if parent_resolved is None:
         return JSONResponse({"error": "Access denied"}, status_code=403)
     if not os.path.isdir(parent_resolved):
@@ -703,6 +788,14 @@ async def _set_cwd(request: Request):
     if not isinstance(path, str) or not path:
         return JSONResponse({"error": "path is required"}, status_code=400)
 
+    row_id, context_key, denied = await _conversation_scope(
+        request, conversation_id, write=True,
+    )
+    if denied is not None:
+        return denied
+    if row_id is None:
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
+
     expanded = os.path.expanduser(path)
     if not os.path.isabs(expanded):
         return JSONResponse({"error": "path must be absolute"}, status_code=400)
@@ -711,7 +804,10 @@ async def _set_cwd(request: Request):
         return JSONResponse({"error": "path does not exist or is not a directory"},
                             status_code=400)
 
-    set_in_memory_override(conversation_id, new_path)
+    # The agent reads the override back under the conversation's context_id,
+    # while the durable column and the SSE channel belong to the row — one and
+    # the same id for an ordinary chat, two different ones for a group seat.
+    set_in_memory_override(context_key, new_path)
 
     # Persist alongside the in-memory write so the override survives a
     # server restart and reopening the conversation restores the same cwd
@@ -720,19 +816,19 @@ async def _set_cwd(request: Request):
     try:
         from app.events.runner import get_conversation_storage
         await persist_working_directory(
-            conversation_id, new_path, get_conversation_storage(),
+            row_id, new_path, get_conversation_storage(),
         )
     except Exception:  # noqa: BLE001
         logger.exception(
-            "Failed to persist cwd override for %s", conversation_id
+            "Failed to persist cwd override for %s", row_id
         )
 
     try:
         await get_event_stream_bus().publish(
-            conversation_id, "cwd", {"working_directory": new_path}
+            row_id, "cwd", {"working_directory": new_path}
         )
     except Exception:  # noqa: BLE001
-        logger.exception("Failed to publish cwd change for %s", conversation_id)
+        logger.exception("Failed to publish cwd change for %s", row_id)
 
     return JSONResponse({"working_directory": new_path})
 

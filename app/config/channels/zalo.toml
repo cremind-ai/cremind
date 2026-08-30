@@ -20,6 +20,12 @@ long-polls for messages.
 2. Paste the token below.
 3. Message the bot on Zalo and the Cremind agent will reply.
 
+Group chats: turn on "Group chats" below and add the bot to the Zalo group. Zalo
+announces nothing when a bot is added, so the group is discovered once somebody
+posts in it; approve it under Settings → Channels. A Zalo bot cannot list group
+members and sees no mention data, so the agent answers on relevance alone and
+the member list fills in as people post.
+
 Note: this is a Zalo *bot* account (Bot Creator / Marketplace), distinct from a
 Zalo Official Account (OA)."""
 [channel.modes.fields]
@@ -43,8 +49,12 @@ Setup:
    automatically on first boot).
 2. A QR code appears in the pairing dialog. Open Zalo on your phone →
    Settings → scan the QR to link this session.
-3. Once linked, DMs to your Zalo account are answered by the agent. Group chats
-   are ignored in this version."""
+3. Once linked, DMs to your Zalo account are answered by the agent.
+
+Group chats: turn on "Group chats" below; your account must already be in the
+group. Approve the group under Settings → Channels before the agent takes part.
+Zalo flags nothing as a bot, so the agent recognises its own posts by id alone;
+the per-minute cap is what stops a runaway exchange there."""
 
 [[channel.modes]]
 id = "notification"

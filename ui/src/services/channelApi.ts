@@ -41,6 +41,10 @@ export interface ChannelCatalogEntry {
   default_response_mode?: 'detail' | 'normal';
   modes: ChannelCatalogMode[];
   implemented?: boolean;
+  /** Whether this platform's adapter can take part in a group chat. Derived
+   *  server-side from the adapter classes, so the toggle is only offered where
+   *  it can actually do something. */
+  supports_group_chats?: boolean;
 }
 
 export interface ChannelRow {
@@ -166,6 +170,7 @@ function readChannelEntry(raw: any): ChannelCatalogEntry | null {
     default_response_mode: ch.default_response_mode || raw?.response?.default_mode,
     modes: ch.modes || [],
     implemented: ch.implemented !== false,
+    supports_group_chats: ch.supports_group_chats === true,
   };
 }
 
@@ -518,4 +523,203 @@ export async function submitChannelAuthInput(
     const err = await res.json().catch(() => ({}));
     throw new Error(err.error || err.message || `Auth input failed: ${res.statusText}`);
   }
+}
+
+// ── channel group chats ────────────────────────────────────────────────────
+//
+// A platform group this channel's own account is in — a Telegram supergroup, a
+// Slack channel. Unrelated to `groupChatApi.ts`, which is Cremind's own rooms
+// where several profiles' agents talk to each other.
+
+export type ChannelGroupStatus = 'pending' | 'approved' | 'blocked';
+
+export interface ChannelGroupMember {
+  member_id: string;
+  alt_ids: string[];
+  display_name: string;
+  username: string;
+  is_bot: boolean;
+  role: string | null;
+  /** `roster` came from the platform's member list; `seen` from having posted. */
+  source: 'roster' | 'seen';
+  first_seen_at: number | null;
+  last_seen_at: number | null;
+  message_count: number;
+  /** What the runtime gate would decide for this member — computed server-side
+   *  so the switch and the agent's behaviour cannot disagree. */
+  responds: boolean;
+}
+
+export interface ChannelGroupPolicy {
+  mode: 'everyone' | 'selected';
+  allow: string[];
+  deny: string[];
+}
+
+export interface ChannelGroupSettings {
+  member_policy: ChannelGroupPolicy;
+  respond_mode: 'mention_or_relevant' | 'mention_only';
+  max_agent_posts_per_minute: number;
+  max_consecutive_bot_messages: number;
+}
+
+/** What this platform can do, read off the adapter class server-side. */
+export interface ChannelGroupCapabilities {
+  roster: boolean;
+  join_events: boolean;
+  bot_flag: boolean;
+  /** Whether the platform can name the groups the account is already in. When
+   *  false, a group is only ever reached by somebody posting in it. */
+  listing: boolean;
+}
+
+export interface ChannelGroup {
+  id: string;
+  channel_id: string;
+  profile: string;
+  platform_chat_id: string;
+  chat_type: string | null;
+  title: string;
+  status: ChannelGroupStatus;
+  discovered_via: 'join' | 'message' | 'picked' | 'sweep';
+  conversation_id: string | null;
+  settings: ChannelGroupSettings;
+  members: ChannelGroupMember[];
+  member_count: number;
+  capabilities: ChannelGroupCapabilities;
+  roster_refreshed_at: number | null;
+  last_message_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ChannelGroupList {
+  groups: ChannelGroup[];
+  /** Whether the channel's own toggle is on. Off means nothing new will ever
+   *  appear here, which is worth saying rather than showing an empty list. */
+  group_chats_enabled: boolean;
+}
+
+export async function fetchChannelGroups(
+  agentUrl: string, authToken: string, channelId: string,
+  opts: { status?: ChannelGroupStatus } = {},
+): Promise<ChannelGroupList> {
+  const base = resolveBaseUrl(agentUrl);
+  const query = opts.status ? `?status=${encodeURIComponent(opts.status)}` : '';
+  const res = await fetch(
+    `${base}/api/channels/${encodeURIComponent(channelId)}/groups${query}`,
+    { headers: authHeaders(authToken) },
+  );
+  if (!res.ok) throw new Error(`Failed to fetch group chats: ${res.statusText}`);
+  const data = await res.json();
+  return {
+    groups: data.groups || [],
+    group_chats_enabled: data.group_chats_enabled === true,
+  };
+}
+
+export async function updateChannelGroup(
+  agentUrl: string, authToken: string, channelId: string, groupId: string,
+  patch: {
+    status?: ChannelGroupStatus;
+    settings?: Partial<ChannelGroupSettings>;
+    title?: string;
+  },
+): Promise<ChannelGroup> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/channels/${encodeURIComponent(channelId)}/groups/${encodeURIComponent(groupId)}`,
+    { method: 'PATCH', headers: authHeaders(authToken), body: JSON.stringify(patch) },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Failed to update the group: ${res.statusText}`);
+  }
+  const data = await res.json();
+  return data.group;
+}
+
+export async function deleteChannelGroup(
+  agentUrl: string, authToken: string, channelId: string, groupId: string,
+): Promise<void> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/channels/${encodeURIComponent(channelId)}/groups/${encodeURIComponent(groupId)}`,
+    { method: 'DELETE', headers: authHeaders(authToken) },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Failed to forget the group: ${res.statusText}`);
+  }
+}
+
+export async function refreshChannelGroupRoster(
+  agentUrl: string, authToken: string, channelId: string, groupId: string,
+): Promise<{ group: ChannelGroup; source: 'roster' | 'unsupported' }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/channels/${encodeURIComponent(channelId)}/groups/${encodeURIComponent(groupId)}/roster`,
+    { method: 'POST', headers: authHeaders(authToken), body: '{}' },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Failed to refresh the members: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+
+/** A group the account is in, as offered by the picker. */
+export interface AvailableChannelGroup {
+  platform_chat_id: string;
+  title: string;
+  chat_type: string | null;
+  member_count: number | null;
+  /** Set when we already know this group, so the picker can say so instead of
+   *  offering a choice the operator already made. */
+  tracked: { id: string; status: ChannelGroupStatus } | null;
+}
+
+export interface AvailableChannelGroupList {
+  /** False when the platform cannot enumerate groups at all (a Telegram bot,
+   *  the Zalo bot). Distinct from an empty list, and said differently. */
+  supported: boolean;
+  groups: AvailableChannelGroup[];
+}
+
+export async function fetchAvailableChannelGroups(
+  agentUrl: string, authToken: string, channelId: string,
+): Promise<AvailableChannelGroupList> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/channels/${encodeURIComponent(channelId)}/groups/available`,
+    { headers: authHeaders(authToken) },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Failed to list groups: ${res.statusText}`);
+  }
+  const data = await res.json();
+  return { supported: data.supported === true, groups: data.groups || [] };
+}
+
+export async function addChannelGroup(
+  agentUrl: string, authToken: string, channelId: string,
+  group: { platform_chat_id: string; title?: string; chat_type?: string | null },
+): Promise<ChannelGroup> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/channels/${encodeURIComponent(channelId)}/groups`,
+    {
+      method: 'POST',
+      headers: authHeaders(authToken),
+      body: JSON.stringify(group),
+    },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Failed to enable the group: ${res.statusText}`);
+  }
+  const data = await res.json();
+  return data.group;
 }

@@ -58,8 +58,11 @@ by running the backend on loopback only:
 $env:CREMIND_UI_PORT = "0"
 ```
 
-If you skip this you'll see the backend bind `:1515` in Terminal A's log —
-that's the warning sign. Set `CREMIND_UI_PORT=0` and restart Terminal A.
+If you skip this, whichever side starts first takes `:1515` and the other one
+says so. Start the backend first and Terminal A's log shows it binding `:1515`
+— the warning sign — and Vite then fails. Start Vite first and the backend
+refuses immediately with `Cannot start: 0.0.0.0:1515 is already in use`. Either
+way the fix is the same: set `CREMIND_UI_PORT=0` and restart Terminal A.
 
 ### Terminal A — backend
 

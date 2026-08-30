@@ -258,10 +258,30 @@ const cancelPlan = async () => {
         <Icon icon="mdi:chart-box-outline" />
       </button>
 
-      <ChatWindow
-        :messages="chatStore.messages"
-        :isStreaming="chatStore.isStreaming"
-      />
+      <!-- The transcript and the restore pill share one positioning context, so
+           the pill stops where the composer starts. Anchored to the whole chat
+           column instead, it had to guess the composer's height — and a
+           composer that starts at 112px and grows to 192px is not guessable, so
+           it sat on the textarea. -->
+      <div class="chat-region">
+        <ChatWindow
+          :messages="chatStore.messages"
+          :isStreaming="chatStore.isStreaming"
+        />
+
+        <button
+          v-if="showMinimizedPill"
+          class="terminal-restore-pill"
+          :title="'Show workspace panel'"
+          @click="terminalPanel.restore()"
+        >
+          <Icon icon="mdi:dock-right" />
+          <span>
+            Workspace<template v-if="terminalPanel.openTerminals.length > 0">
+              ({{ terminalPanel.openTerminals.length }})</template>
+          </span>
+        </button>
+      </div>
 
       <PlanBanner
         v-if="!isExternalChannel"
@@ -285,7 +305,7 @@ const cancelPlan = async () => {
       </div>
       <MessageInput
         v-else
-        :disabled="!chatStore.isConnected || chatStore.isStreaming"
+        :disabled="!chatStore.isConnected"
         :isProcessing="chatStore.isStreaming"
         :mode="settingsStore.chatMode"
         @update:mode="settingsStore.setChatMode(settingsStore.profileId, $event)"
@@ -304,18 +324,6 @@ const cancelPlan = async () => {
         />
       </div>
 
-      <button
-        v-if="showMinimizedPill"
-        class="terminal-restore-pill"
-        :title="'Show workspace panel'"
-        @click="terminalPanel.restore()"
-      >
-        <Icon icon="mdi:dock-right" />
-        <span>
-          Workspace<template v-if="terminalPanel.openTerminals.length > 0">
-            ({{ terminalPanel.openTerminals.length }})</template>
-        </span>
-      </button>
     </div>
 
     <template v-if="showRightPanel">
@@ -402,10 +410,23 @@ const cancelPlan = async () => {
   height: 100%;
 }
 
+/* Owns the space above the composer, and nothing else — which is what lets the
+   pill inside it be placed without knowing how tall the composer is. Mirrors
+   the constraints `.chat-section` gives ChatWindow, so the transcript sizes and
+   scrolls exactly as it did. */
+.chat-region {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .terminal-restore-pill {
   position: absolute;
   right: 16px;
-  bottom: 72px;
+  bottom: 16px;
   display: inline-flex;
   align-items: center;
   gap: 6px;

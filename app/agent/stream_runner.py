@@ -82,6 +82,32 @@ def _append_attachments_note(
     return f"{agent_query}\n\n{note}" if agent_query else note
 
 
+def attachment_file_parts(
+    attachments: Optional[List[Dict[str, Any]]],
+) -> List[dict]:
+    """File parts for composer-uploaded attachments on a persisted user message.
+
+    They re-render as file chips on reload; the abs path lives under
+    CREMIND_SYSTEM_DIR so the ``uri`` is servable via /api/files/open.
+    """
+    parts: List[dict] = []
+    for a in (attachments or []):
+        path = a.get("path")
+        name = a.get("name") or os.path.basename(path or "")
+        if not path:
+            continue
+        mime, _ = mimetypes.guess_type(name or path)
+        parts.append({
+            "kind": "file",
+            "file": {
+                "name": name,
+                "mimeType": mime or "application/octet-stream",
+                "uri": path,
+            },
+        })
+    return parts
+
+
 def cancel_run(run_id: str) -> bool:
     """Cancel the running asyncio task for ``run_id``. Idempotent."""
     task = _running_runs.get(run_id)
@@ -261,6 +287,22 @@ def _terminal_payloads(observation_parts: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _is_channel_group_conversation(conv: Optional[dict]) -> bool:
+    """Whether this conversation is a platform group's (Telegram, Zalo, …).
+
+    An ordinary ``kind="chat"`` row bound to an ordinary channel, so the context
+    id is the only thing that distinguishes it. Import kept local: the channels
+    package pulls in the adapter registry, and the stream runner is imported by
+    the slim CLI paths that must not.
+    """
+    try:
+        from app.channels.groups.origin import is_channel_group_context
+
+        return is_channel_group_context((conv or {}).get("context_id"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def _resolve_message_origin(
     conversation_storage: Any,
     conv: Optional[dict],
@@ -289,6 +331,28 @@ async def _resolve_message_origin(
     if event_run or not conv:
         return None
     try:
+        # A seat in a group chat answers "who is talking?" differently: not one
+        # sender on one channel, but a room with a roster, where every message
+        # already says who wrote it. Resolved before the channel lookup because a
+        # seat lives on the profile's ``main`` channel and would otherwise be
+        # described as the Web UI.
+        if conv.get("kind") == "group_chat":
+            from app.groups.origin import resolve_group_origin
+
+            return await resolve_group_origin(conversation_storage, conv)
+
+        # A platform group's conversation IS an ordinary channel conversation —
+        # same kind, same channel — so it has to be recognised before the
+        # sender lookup below, which would find no sender and describe a room
+        # full of people as a channel nobody is on the other end of.
+        from app.channels.groups.origin import (
+            is_channel_group_context,
+            resolve_channel_group_origin,
+        )
+
+        if is_channel_group_context(conv.get("context_id")):
+            return await resolve_channel_group_origin(conversation_storage, conv)
+
         channel_id = conv.get("channel_id")
         channel = (
             await conversation_storage.get_channel(channel_id) if channel_id else None
@@ -348,6 +412,7 @@ async def run_agent_to_bus(
     agent_message_metadata: Dict[str, Any] | None = None,
     attachments: List[Dict[str, Any]] | None = None,
     push_user_message: bool = True,
+    existing_user_message_id: str | None = None,
     publish_notification: bool = False,
     update_title_from_query: bool = True,
     trigger_event: Dict[str, Any] | None = None,
@@ -417,6 +482,15 @@ async def run_agent_to_bus(
     context_id = (conv or {}).get("context_id") or conversation_id
     title = (conv or {}).get("title") or "Untitled Chat"
 
+    # This turn runs in a member's seat in a group chat, which changes what
+    # happens at both ends of it: the room is told the agent started thinking,
+    # and whatever it says at the end is posted there rather than just stored.
+    is_group_chat = (conv or {}).get("kind") == "group_chat"
+    # A platform group (Telegram/Zalo/…): an ordinary conversation row, so only
+    # the context id says so. Shares the seat's compaction and outcome-stamping
+    # rules, and nothing else — the two features are independent.
+    is_channel_group = _is_channel_group_conversation(conv)
+
     message_origin = await _resolve_message_origin(
         conversation_storage, conv, conversation_id, event_run=event_run,
     )
@@ -458,7 +532,9 @@ async def run_agent_to_bus(
     # falls back to the user default.
     try:
         from app.utils.working_directory import hydrate_working_directory
-        await hydrate_working_directory(context_id, conversation_storage)
+        await hydrate_working_directory(
+            conversation_id, conversation_storage, context_key=context_id,
+        )
     except Exception:  # noqa: BLE001
         logger.exception(
             f"stream_runner: failed to hydrate cwd for {conversation_id}"
@@ -510,6 +586,11 @@ async def run_agent_to_bus(
     # answer), carried on the terminal DONE chunk. Persisted so later turns can replay
     # it into history. ``None`` for turns with no tool calls (those replay content-only).
     collected_llm_messages: list | None = None
+    # Where the visible flow was cut by a mid-turn message, as offsets into this
+    # turn's text and thinking steps. Collected as the breaks happen rather than
+    # on the terminal chunk: a cancelled turn never sends one, and its partial
+    # answer is persisted too — the segments have to survive that.
+    collected_mid_turn_breaks: list[dict] = []
     errored = False
     cancelled = False
     # Set when an unattended run touches a Drive file nobody granted. Kept apart
@@ -520,6 +601,10 @@ async def run_agent_to_bus(
     # Passed to compaction so the current turn (sent separately as the volatile
     # input) is excluded from the rebuilt history tail.
     current_turn_msg_id: Optional[str] = None
+    # Handle for the group-seat frame mirror, bound below and released in the
+    # finally. Initialised here so the teardown never reads it unbound when the
+    # turn dies between the two.
+    seat_mirror = None
 
     try:
         # 0. Claim this conversation as mid-turn for event-task delivery. A task
@@ -535,6 +620,20 @@ async def run_agent_to_bus(
         #    is_active fork a stale flag would park every later result for this
         #    conversation with no turn-end flush to rescue it.)
         task_result_inbox.bind_run(run_id, conversation_id)
+
+        # 0b. In a group, everyone can see who is composing. Published here so
+        #     the indicator appears the moment the turn is claimed rather than
+        #     when the first token arrives — a member that spends thirty seconds
+        #     on tool calls before speaking would otherwise look asleep.
+        if is_group_chat:
+            from app.groups.hooks import bind_seat_mirror, publish_agent_status
+
+            await publish_agent_status(conv=conv, profile=profile, state="thinking")
+            # 0c. And mirror this seat's frames onto the room's stream, so the
+            #     others watch the work rather than a spinner. Bound here, with
+            #     the indicator, because everything published from now on is
+            #     part of the turn the indicator is announcing.
+            seat_mirror = await bind_seat_mirror(conv, profile)
 
         # 1. Persist the trigger / user message and announce it on the bus.
         #    For skill events we render the trigger as an *agent* bubble with
@@ -572,25 +671,10 @@ async def run_agent_to_bus(
             })
         elif push_user_message:
             # Persist composer-uploaded attachments as file parts on the user
-            # message so they re-render as file chips on reload (their abs path
-            # lives under CREMIND_SYSTEM_DIR, so the ``uri`` is servable via
-            # /api/files/open). The caller's own ``user_parts`` win if supplied.
-            attachment_parts: List[dict] = []
-            for a in (attachments or []):
-                path = a.get("path")
-                name = a.get("name") or os.path.basename(path or "")
-                if not path:
-                    continue
-                mime, _ = mimetypes.guess_type(name or path)
-                attachment_parts.append({
-                    "kind": "file",
-                    "file": {
-                        "name": name,
-                        "mimeType": mime or "application/octet-stream",
-                        "uri": path,
-                    },
-                })
-            effective_user_parts = user_parts or (attachment_parts or None)
+            # message. The caller's own ``user_parts`` win if supplied.
+            effective_user_parts = user_parts or (
+                attachment_file_parts(attachments) or None
+            )
 
             user_msg_id: Optional[str] = None
             try:
@@ -612,6 +696,20 @@ async def run_agent_to_bus(
                 "id": user_msg_id,
                 "content": query,
                 "metadata": user_message_metadata or {},
+            })
+        elif existing_user_message_id:
+            # A message that was parked for a mid-turn injection and ended up
+            # running as its own turn: the row (and its bus frame) already exist,
+            # so nothing is persisted here — but it IS this turn's user message,
+            # and compaction must leave it out of the history tail rather than
+            # feed it alongside ``query``.
+            current_turn_msg_id = existing_user_message_id
+            # Clients mark the start of a turn by the ``user_message`` frame, and
+            # this path publishes none — so a viewer joining mid-turn would
+            # rebuild it starting from the PREVIOUS turn's marker. Say plainly
+            # that a run is starting instead; there is no message to carry.
+            await bus.publish(conversation_id, "run_started", {
+                "message_id": existing_user_message_id,
             })
 
         # 2. Stream the agent loop, mirroring chunks to the bus and collecting
@@ -733,6 +831,51 @@ async def run_agent_to_bus(
                             if "result" not in step:
                                 step["result"] = serialized_result
                                 break
+
+                elif ctype == ChatCompletionTypeEnum.FLOW_BREAK:
+                    # Something was folded into the running turn — a message the
+                    # user sent, or an awaited event task's result. Live clients
+                    # end the current assistant bubble here and open a fresh one;
+                    # the offsets record the same cut against this turn's text
+                    # and thinking steps so a reload rebuilds the identical
+                    # layout from the single persisted row.
+                    #
+                    # Two arrive per interruption the agent replies to: one
+                    # before the reply streams, one after, so the reply stands
+                    # as its own message between the work either side of it.
+                    # ``message_ids`` is empty on the second (and on a task
+                    # result, which has no row of its own to interleave).
+                    brk = dict(chunk.get("data") or {})
+                    brk["content_offset"] = len("".join(final_text_parts))
+                    brk["thinking_offset"] = len(collected_thinking_steps)
+                    collected_mid_turn_breaks.append(brk)
+                    await bus.publish(conversation_id, "flow_break", {
+                        "message_ids": brk.get("message_ids") or [],
+                        "step": brk.get("step"),
+                    })
+                    # In a seat, a break is where a reply to the interruption
+                    # ends — so this is where the room hears it. Holding it to
+                    # the end of the turn (step 6e) would delay it by exactly
+                    # the work the sender was interrupting. Awaited inline, like
+                    # 6e: the post has to reach the room in timeline order, and
+                    # the turn is already paused around the reply anyway.
+                    if is_group_chat:
+                        try:
+                            from app.groups.hooks import on_shadow_turn_segment
+
+                            await on_shadow_turn_segment(
+                                conversation_id=conversation_id,
+                                profile=profile,
+                                run_id=run_id,
+                                raw_text="".join(final_text_parts),
+                                mid_turn_breaks=collected_mid_turn_breaks,
+                                context_id=(conv or {}).get("context_id"),
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                f"stream_runner: mid-turn group post failed for "
+                                f"{conversation_id}"
+                            )
 
                 elif ctype == ChatCompletionTypeEnum.PLAN_EVENT:
                     # Plan-mode UI signal. ``data`` is {"event": <name>,
@@ -913,6 +1056,19 @@ async def run_agent_to_bus(
                 "agent_activity": activity_snapshot,
             }
 
+        # Where mid-turn messages cut the visible flow. One persisted turn, but
+        # the UI renders it as the same sequence of bubbles the user watched
+        # arrive — without this a reload collapses the whole turn back into one.
+        # The run id rides along because a seat that spoke mid-turn posted under
+        # it, and the boot sweep needs it to recognise those posts as this
+        # turn's rather than saying them all over again.
+        if collected_mid_turn_breaks:
+            agent_message_metadata = {
+                **(agent_message_metadata or {}),
+                "mid_turn_breaks": collected_mid_turn_breaks,
+                "run_id": run_id,
+            }
+
         assistant_msg_id: Optional[str] = None
         try:
             assistant_msg = await conversation_storage.add_message(
@@ -932,6 +1088,33 @@ async def run_agent_to_bus(
             logger.exception(
                 f"stream_runner: failed to persist assistant message for {conversation_id}"
             )
+
+        # 5. Commit the user messages this turn absorbed mid-flight. Gated on the
+        #    trace: ``collected_llm_messages`` is only set by the agent's terminal
+        #    DONE chunk, and it contains every drained message (they are appended
+        #    to _turn_messages before the LLM call that carries them). So a trace
+        #    on disk means the injection is durable and the row must not also
+        #    replay as a plain user message — while a cancelled or errored turn
+        #    persists no trace, leaves these uncommitted, and the turn-end flush
+        #    below re-delivers them as a follow-up turn.
+        if assistant_msg_id and collected_llm_messages:
+            for parked in task_result_inbox.commit_user_messages(conversation_id):
+                message_id = parked.get("message_id")
+                if not message_id:
+                    continue
+                try:
+                    await conversation_storage.update_message_metadata(
+                        message_id,
+                        {"mid_turn": {"state": "consumed", "run_id": run_id}},
+                    )
+                except Exception:  # noqa: BLE001
+                    # The trace carries the content either way; the row is left
+                    # 'pending' (invisible to history) until the boot sweep
+                    # releases it. Loud, because it is a real inconsistency.
+                    logger.exception(
+                        f"stream_runner: failed to mark mid-turn message {message_id} "
+                        f"consumed in {conversation_id}"
+                    )
 
         # Register the persisted message as the activity's patch target. If the
         # sub-agent already finished (fast task within the turn) this is a no-op;
@@ -1011,6 +1194,14 @@ async def run_agent_to_bus(
                     profile,
                     conversation_storage,
                     context_id=context_id,
+                    # Both kinds of room fold without asking. A Cremind seat is
+                    # hidden from the sidebar; a platform group's conversation is
+                    # visible but nobody is watching it — the people talking are
+                    # in Zalo, not in this web view, so a "compact?" popup waits
+                    # for a click that never comes while the group runs on the
+                    # deterministic floor, which DROPS old turns instead of
+                    # summarising them.
+                    force_auto=is_group_chat or is_channel_group,
                 )
                 if evt:
                     await bus.publish(conversation_id, evt["type"], evt["data"])
@@ -1091,11 +1282,78 @@ async def run_agent_to_bus(
                         f"stream_runner: event task delivery failed for {event_run_id}"
                     )
 
-        # 7. Terminal event so subscribers can flip isStreaming=false.
+        # 6e. Group chat: in a member's seat the final answer IS that agent's
+        #     post, so this is where it reaches the room. After the message is
+        #     persisted (the post is derived from it, and its metadata records
+        #     the outcome so a crash cannot double-post) and before the terminal
+        #     frame, so a client that reacts to 'complete' already sees the post.
+        #     An answer of exactly "[silent]" posts nothing: in a room where
+        #     everyone is asked, most members have nothing to add.
+        if is_group_chat:
+            try:
+                from app.groups.hooks import on_shadow_turn_complete
+
+                await on_shadow_turn_complete(
+                    conversation_storage=conversation_storage,
+                    conversation_id=conversation_id,
+                    profile=profile,
+                    run_id=run_id,
+                    assistant_msg_id=assistant_msg_id,
+                    raw_text="".join(final_text_parts),
+                    final_text=final_text,
+                    mid_turn_breaks=collected_mid_turn_breaks,
+                    cancelled=cancelled,
+                    errored=errored,
+                    context_id=(conv or {}).get("context_id"),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    f"stream_runner: group chat post failed for {conversation_id}"
+                )
+
+        # 6f. Platform group: record what this turn did with its answer, on the
+        #     agent's own row. The stamp is what keeps a silent turn out of the
+        #     model's replayed history and out of the relevance judge's
+        #     transcript — so it has to be written HERE, before 'complete',
+        #     rather than by the channel forwarder that posts the answer. The
+        #     forwarder runs concurrently with whatever the group says next: a
+        #     stamp landing late means turn N+1 replays the "[silent]" row and
+        #     turn N+2 does not, which is a deletion in the middle of the
+        #     history and costs the prompt cache every time it happens.
+        if is_channel_group and assistant_msg_id:
+            try:
+                from app.channels.groups.origin import group_id_from_context
+                from app.groups.render import strip_silent_lines
+
+                # The same function the forwarder posts by, so "what was said"
+                # and "what the history says was said" cannot disagree.
+                spoken = strip_silent_lines("".join(final_text_parts))
+                await conversation_storage.update_message_metadata(
+                    assistant_msg_id,
+                    {"channel_group": {
+                        "group_id": group_id_from_context(
+                            (conv or {}).get("context_id"),
+                        ),
+                        "kind": "sent" if spoken else "silent",
+                    }},
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    f"stream_runner: could not stamp the group outcome for "
+                    f"{conversation_id}"
+                )
+
+        # 7. Terminal event so subscribers can flip isStreaming=false — unless a
+        #    mid-turn message is about to run as a follow-up turn (the flush in
+        #    the finally below), in which case clients keep their streaming state
+        #    up rather than flickering idle for the length of one enqueue.
         await bus.publish(conversation_id, "complete", {
             "assistant_id": assistant_msg_id,
             "errored": errored,
             "cancelled": cancelled,
+            "followup_queued": task_result_inbox.has_unconsumed_user_messages(
+                conversation_id
+            ),
         })
 
         # 8. Optional notification. Event runs deep-link to the run detail
@@ -1136,6 +1394,29 @@ async def run_agent_to_bus(
         # than parking with nobody left to read it.
         task_result_inbox.unbind_run(run_id)
         _running_runs.pop(run_id, None)
+        # Drop the room's "thinking" indicator for this member, whatever ended
+        # the turn — a crashed turn that left one lit would read as an agent
+        # stuck composing forever.
+        if is_group_chat:
+            try:
+                from app.groups.hooks import publish_agent_status, unbind_seat_mirror
+
+                # Detach BEFORE announcing idle, and in that order: the tap
+                # would otherwise still be live while ``publish_agent_status``
+                # waits on its room lookup, and anything published in that gap
+                # (a cwd write from the files API, a racing publisher) arrives
+                # after "idle" and re-creates the live card the status just
+                # cleared. A tap left attached for longer than that would also
+                # mirror the NEXT turn's steps, under a run the room already
+                # watched finish.
+                await unbind_seat_mirror(conversation_id, seat_mirror)
+                await publish_agent_status(
+                    conv=conv, profile=profile, state="idle",
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "stream_runner: group idle status failed", exc_info=True,
+                )
         # Clear the plan-mode registry unconditionally (event runs clear
         # run_state above only for event runs; the plan registry must never leak
         # an entry per parked chat run).
@@ -1144,8 +1425,28 @@ async def run_agent_to_bus(
             current_task_id_var.reset(ctx_token)
         await bus.end_run(conversation_id)
 
-        # Turn-end reconciliation. Any task result that landed while this turn
-        # was running and the agent chose not to read is injected NOW, as one
+        # Turn-end reconciliation, part 1: user messages. Anything the user sent
+        # mid-turn that this turn did not absorb — it arrived during the final
+        # step, or the turn was cancelled or errored before its trace persisted —
+        # runs NOW as one coalesced follow-up turn. The injection is the
+        # optimisation; this is the guarantee that a sent message is always
+        # answered. Runs for event-run conversations too (a reply to a running
+        # event run is exactly this case), and BEFORE the task-result flush so
+        # the person waiting on an answer is served first.
+        if task_result_inbox.has_unconsumed_user_messages(conversation_id):
+            try:
+                from app.events.user_message_delivery import flush_user_inbox
+                await flush_user_inbox(
+                    conversation_id=conversation_id, profile=profile,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "stream_runner: turn-end user-message flush failed for "
+                    f"{conversation_id}"
+                )
+
+        # Turn-end reconciliation, part 2: any task result that landed while this
+        # turn was running and the agent chose not to read is injected NOW, as one
         # coalesced continuation turn — so a waiting flow can never stall on the
         # agent ignoring a notice, and the notice stays a safe optimisation.
         #

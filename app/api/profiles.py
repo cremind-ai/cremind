@@ -174,6 +174,19 @@ def get_profile_routes(
                     f"Could not remove the token file for deleted profile '{profile_name}'"
                 )
 
+            # Group memberships cascade away with the profile row, but the
+            # runtime state of its seats (queue worker, stream bus, run
+            # binding) and the in-memory group index do not — release them, or
+            # a room keeps trying to hand messages to a tenant that is gone.
+            try:
+                from app.groups import boot as groups_boot
+
+                await groups_boot.on_profile_deleted(profile_name)
+            except Exception:  # noqa: BLE001 — never block the delete
+                logger.exception(
+                    f"Group-chat cleanup failed for deleted profile '{profile_name}'"
+                )
+
             # Stop the watcher, drop the profile's skill rows, and remove the
             # per-profile embedding collection. The on-disk skills directory is
             # left intact so the profile's data can be recovered if desired.

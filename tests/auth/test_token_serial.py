@@ -47,7 +47,15 @@ def db(tmp_path, monkeypatch):
             )
 
     monkeypatch.setattr(settings_mod.BaseConfig, "get_jwt_secret", classmethod(lambda cls: _SECRET))
-    monkeypatch.setenv("CREMIND_SYSTEM_DIR", str(tmp_path / "sysdir"))
+    # The env var alone does not redirect anything: BaseConfig resolves it once
+    # at import, so ``tokens_dir()`` kept pointing at the developer's real
+    # ~/.cremind/tokens — these tests were rotating and deleting live token
+    # files there, and the "no stray temp file" assertion below was really
+    # asserting the shape of that directory. Patch the resolved attribute too,
+    # the way tests/api/test_auth_rotate.py does.
+    sysdir = tmp_path / "sysdir"
+    monkeypatch.setenv("CREMIND_SYSTEM_DIR", str(sysdir))
+    monkeypatch.setattr(settings_mod.BaseConfig, "CREMIND_SYSTEM_DIR", str(sysdir))
     monkeypatch.delenv("CREMIND_TOKEN_SERIAL_CACHE_TTL", raising=False)
     serial_mod.invalidate_serial_cache()
     yield provider

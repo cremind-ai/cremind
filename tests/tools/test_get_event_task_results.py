@@ -143,3 +143,37 @@ def test_nothing_is_recorded_when_the_inbox_was_empty(monkeypatch):
 
     _call(get_tools({})[0])
     assert task_result_inbox.consumed_depth(_RUN) == 0
+
+
+def test_a_read_discards_the_notices_it_covers(monkeypatch):
+    """A notice still parked after the read describes a row this call just
+    handed over. Left in place, the next step would interrupt the user about a
+    result the agent is already holding."""
+    async def _read(*, conversation_id, profile):
+        return ("results", [1])
+
+    import app.events.event_task_delivery as etd
+    monkeypatch.setattr(etd, "read_origin_inbox", _read)
+    task_result_inbox.bind_run(_RUN, _CONV)
+    task_result_inbox.park_if_bound(_CONV, {"label": "CI", "status_word": "completed"})
+
+    _call(get_tools({})[0])
+
+    assert task_result_inbox.drain_notices(_RUN) == []
+
+
+def test_a_failed_read_leaves_the_notices_parked(monkeypatch):
+    """It released its claims, so those rows are still undelivered — and the
+    agent should still be told about them."""
+    async def _boom(*, conversation_id, profile):
+        raise RuntimeError("db down")
+
+    import app.events.event_task_delivery as etd
+    monkeypatch.setattr(etd, "read_origin_inbox", _boom)
+    task_result_inbox.bind_run(_RUN, _CONV)
+    task_result_inbox.park_if_bound(_CONV, {"label": "CI", "status_word": "completed"})
+
+    with pytest.raises(RuntimeError):
+        _call(get_tools({})[0])
+
+    assert len(task_result_inbox.drain_notices(_RUN)) == 1

@@ -240,10 +240,27 @@ function dispatchFrame(conn: Connection, frame: ProfileEventsFrame) {
     // ring's lifecycle (stream_bus.start_run/end_run): a run-start marker
     // resets the buffer, the terminal `complete` drops it. `error` is NOT
     // terminal — stream_runner always publishes `complete` after it.
-    if (event.type === 'user_message' || event.type === 'event_trigger_message') {
+    //
+    // An INJECTED user message is not a run start — it lands in the middle of
+    // one. Resetting on it would throw away the frames of the work already in
+    // progress, and a subscriber joining afterwards would rebuild the turn
+    // missing everything before the interruption.
+    if (
+      (event.type === 'user_message' && !event.data?.injected)
+      || event.type === 'event_trigger_message'
+      // A turn whose user message was already persisted (and already framed)
+      // before the run started, so there is no `user_message` frame to mark it.
+      || event.type === 'run_started'
+    ) {
       conn.convBuffers.set(convId, [event]);
     } else if (event.type === 'complete') {
       conn.convBuffers.delete(convId);
+    } else if (event.type === 'quiet_user_message') {
+      // A message stored in a platform group that the agent did not answer.
+      // No run is involved, so it is neither a run start nor part of one — and
+      // buffering it would hand a late subscriber a stray frame outside any
+      // turn. It is already persisted; whoever arrives later fetches it with
+      // the rest of the history. Dispatched live below, kept nowhere.
     } else {
       let buf = conn.convBuffers.get(convId);
       if (!buf) {

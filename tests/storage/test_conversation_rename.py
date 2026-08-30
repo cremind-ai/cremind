@@ -33,6 +33,7 @@ from sqlalchemy import func, select  # noqa: E402
 from app.databases.sqlite import SqliteDatabaseProvider  # noqa: E402
 from app.storage.conversation_storage import ConversationStorage  # noqa: E402
 from app.storage.models import (  # noqa: E402
+    ChannelGroupModel,
     ChannelModel,
     ChannelSenderModel,
     ConversationModel,
@@ -56,12 +57,14 @@ _TABLES = (
     "file_watcher_subscriptions",
     "schedule_event_subscriptions",
     "event_runs",
+    "channel_groups",
 )
 
 # Every table that FK-references conversations.id — the rename must move all of
 # these. Kept explicit (not derived) so the test is an independent check on the
-# schema-driven loop in rename_conversation_id. ``event_runs.conversation_id``
-# is a SET NULL FK, but the rename still repoints the live value.
+# schema-driven loop in rename_conversation_id. ``event_runs.conversation_id`` and
+# ``channel_groups.conversation_id`` are SET NULL FKs, but the rename still
+# repoints the live value.
 _CHILD_MODELS = (
     MessageModel,
     UsageRecordModel,
@@ -70,6 +73,7 @@ _CHILD_MODELS = (
     FileWatcherSubscriptionModel,
     ScheduleEventSubscriptionModel,
     EventRunModel,
+    ChannelGroupModel,
 )
 
 _OLD = "c1-old"
@@ -132,6 +136,16 @@ async def _seed(store: ConversationStorage) -> None:
             id="er1", conversation_id=_OLD, profile="admin",
             source_kind="schedule", subscription_id="sch1", status="completed",
             label="run", action="a", created_at=now, updated_at=now,
+        ))
+        # A channel group's conversation is an ordinary chat row, so a rename
+        # has to move it like any other child — and its FK is SET NULL, so a
+        # missed repoint would silently unlink the group from its transcript
+        # rather than failing loudly.
+        s.add(ChannelGroupModel(
+            id="cg1", channel_id="ch", profile="admin",
+            platform_chat_id="-1001", status="approved",
+            discovered_via="message", conversation_id=_OLD,
+            created_at=now, updated_at=now,
         ))
 
 

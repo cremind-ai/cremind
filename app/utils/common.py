@@ -188,6 +188,22 @@ def convert_task_history_to_messages(task_history: list[Message]) -> list[ChatCo
     return messages
 
 
+def _is_silent_answer(entry: object) -> bool:
+    """Whether one replayed trace entry is a group turn's ``[silent]`` decision.
+
+    Only a plain assistant answer counts: a tool call is work the turn really
+    did, and the trace has to keep it even when the turn ended up saying nothing.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("role") != "assistant" or entry.get("tool_calls"):
+        return False
+    from app.groups.render import is_silent
+
+    content = entry.get("content")
+    return isinstance(content, str) and is_silent(content)
+
+
 def convert_db_messages_to_history(
     db_messages: list[dict],
     *,
@@ -207,6 +223,40 @@ def convert_db_messages_to_history(
     the prompt-cache prefix covers the prior reasoning. The trace already ends with
     the final answer, so it is not duplicated. Messages without a trace (older rows,
     or turns with no tool calls) fall back to the content-only form.
+
+    A user message that arrived mid-turn carries ``metadata.mid_turn.state`` and is
+    filtered on it, so that exactly one copy of it reaches the model:
+
+    ``pending``
+        Persisted and parked; the turn that will speak for it has not finished.
+        Excluded UNCONDITIONALLY — including it here would double-feed the message
+        to a turn that is also about to receive it by injection.
+    ``consumed``
+        Injected into a turn whose trace was persisted. Excluded when the trace
+        replays (it is in there verbatim, cache-alignedly); included when reasoning
+        replay is off, since then nothing else carries it.
+    ``released``
+        Never injected (or the turn died first); it runs as an ordinary user row.
+
+    A **group-chat seat** adds one rule, keyed off ``metadata.group`` so no caller
+    has to opt in and ordinary conversations are untouched: *turns that chose to
+    stay silent are dropped.* In a group every member is asked about every
+    message, so most turns end in the ``[silent]`` sentinel. A history of
+    ``user / "[silent]" / user / "[silent]"`` teaches the model that silence is
+    the house style and it stops answering altogether — so the rows stay in the
+    database (the room's own record of who was asked) but never reach the model.
+
+    Consecutive group posts are left as SEPARATE messages. They used to be joined
+    into one, on the belief that back-to-back user turns are a shape some
+    providers reject — which is not true of any provider this code talks to, and
+    the joining cost a seat its prompt cache. Merging rewrote a message that had
+    already been sent: dropping a silent turn leaves the posts on either side
+    adjacent, so the merged block grew on every turn and the cached prefix
+    diverged at it. Since silence is the *common* outcome in a room, a mostly
+    quiet seat re-paid for its whole transcript every turn. (Anthropic already
+    receives consecutive ``user`` messages on every parallel-tool step — each
+    ``tool_result`` is its own user message — and Gemini goes through Google's
+    OpenAI-compatible shim, which folds roles server-side.)
     """
     messages: list[ChatCompletionMessageParam] = []
     for m in db_messages:
@@ -214,9 +264,28 @@ def convert_db_messages_to_history(
         # filtered out) are shown in the conversation but must never enter the
         # model's context — the agent has no knowledge of them. This is the single
         # chokepoint every history-building path routes through.
-        if (m.get("metadata") or {}).get("ui_only"):
+        metadata = m.get("metadata") or {}
+        if metadata.get("ui_only"):
+            continue
+        mid_turn_state = (metadata.get("mid_turn") or {}).get("state")
+        if mid_turn_state == "pending":
+            continue
+        if mid_turn_state == "consumed" and include_reasoning:
             continue
         trace = m.get("llm_messages") if include_reasoning else None
+        # Either kind of room stamps the outcome of a turn that said nothing:
+        # ``group`` for a Cremind seat, ``channel_group`` for a platform group.
+        room_stamp = metadata.get("group") or metadata.get("channel_group") or {}
+        if room_stamp.get("kind") == "silent":
+            # Drop the sentinel, KEEP the rest of the turn. A turn that stayed
+            # silent may still have absorbed group posts mid-flight, and those
+            # rows are marked ``consumed`` — meaning this trace is the only copy
+            # of them left. Dropping the row wholesale would erase what the agent
+            # was told, which in a room is most of what it hears.
+            kept = [t for t in (trace or []) if not _is_silent_answer(t)]
+            if kept:
+                messages.extend(kept)
+            continue
         if trace:
             messages.extend(trace)
             continue

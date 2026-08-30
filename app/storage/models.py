@@ -24,6 +24,21 @@ Tables
 - server_config       : global server settings (no FK)
 - llm_config          : per-profile LLM settings (FK profile, CASCADE)
 - user_config         : per-profile general application settings (FK profile, CASCADE)
+- group_chats         : a room several profiles' agents share. SYSTEM-WIDE by
+                        design (a shared resource), with per-profile membership
+                        below (FK created_by SET NULL)
+- group_chat_members  : which profiles sit in a group + the hidden per-profile
+                        "shadow" conversation that is that agent's seat
+                        (FK group CASCADE, FK profile CASCADE)
+- group_chat_messages : the group's authoritative timeline — one row per post by
+                        a human, an agent, or the system (FK group CASCADE)
+- channel_groups      : a platform group (a Telegram/Slack/WhatsApp group) one
+                        channel's agent takes part in, with its approval status
+                        (FK channel CASCADE, FK profile CASCADE, FK conversation
+                        SET NULL). UNIQUE(channel_id, platform_chat_id)
+- channel_group_members : who is in such a group, from the platform's roster or
+                        from having posted (FK channel group CASCADE).
+                        UNIQUE(group_id, member_id)
 """
 
 import uuid
@@ -727,3 +742,234 @@ class LongTermMemoryModel(Base):
     source_conversation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     ordering: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+# ── group chat ──────────────────────────────────────────────────────────────
+#
+# A group chat is the one resource in Cremind that several profiles share. Every
+# other table is owned by exactly one profile; here the ROOM is system-wide and
+# membership is the per-profile part. Each member's participation is still fully
+# isolated — the agent answers from its own ``conversations`` row (its "seat",
+# ``kind='group_chat'``) with its own persona, tools and LLM. The only thing that
+# crosses the profile boundary is the text of a posted message.
+
+
+class GroupChatModel(Base):
+    """A room whose participants are whole profiles rather than one profile's
+    contacts.
+
+    ``created_by`` is informational (who set it up) and SET NULL on profile
+    delete: the room outlives its creator, because the other members are still
+    in it.
+    """
+
+    __tablename__ = "group_chats"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    # Normalized by ``app.groups.settings.normalize_settings``:
+    #   {"max_agent_hops": int, "max_agent_posts_per_minute": int,
+    #    "web_sender_name": str, "smart_routing": bool}
+    settings: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class GroupChatMemberModel(Base):
+    """One profile's membership of one group.
+
+    ``shadow_conversation_id`` is that member's SEAT: a hidden
+    ``conversations`` row (``kind='group_chat'``) where the group's messages
+    arrive as ordinary user turns and the agent's answer is its post. Kept here
+    rather than looked up by ``context_id`` so deletion and the boot sweeps are
+    O(members) and two concurrent fan-outs can never create two seats.
+    """
+
+    __tablename__ = "group_chat_members"
+
+    group_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("group_chats.id", ondelete="CASCADE"), primary_key=True
+    )
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"),
+        primary_key=True, index=True,
+    )
+    shadow_conversation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    joined_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class GroupChatMessageModel(Base):
+    """One post in a group's authoritative timeline.
+
+    Authoritative because it is the only copy: a room lives entirely inside
+    Cremind, and every member's seat reads its history from here.
+
+    ``sender_profile`` is a plain string, not an FK — a deleted profile's posts
+    stay readable in the history that mentions them.
+
+    UNIQUE on ``(source_message_id, segment)``, which makes re-posting an agent
+    turn idempotent so a crash between the insert and its bookkeeping cannot
+    double-post on the next boot.
+    """
+
+    __tablename__ = "group_chat_messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    group_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("group_chats.id", ondelete="CASCADE"), nullable=False
+    )
+    ordering: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # user | agent | system
+    sender_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    sender_profile: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    sender_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    # {"channel_type":"web","sender_id":<profile>} for the web/CLI composer.
+    sender_identity: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Distance from the last human message: humans post 0, an agent answering a
+    # human posts 1, an agent answering that agent posts 2… At the group's
+    # ``max_agent_hops`` the fan-out stops starting turns (the message is still
+    # delivered, just not answered) until a human speaks again.
+    hop: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    source_conversation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    # Which slice of the source turn this is (a turn interrupted mid-flight
+    # speaks more than once).
+    segment: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    delivered_to: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    message_metadata: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True, name="metadata",
+    )
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        Index("ix_group_chat_messages_group_ordering", "group_id", "ordering"),
+        UniqueConstraint(
+            "source_message_id", "segment", name="uq_group_chat_messages_source",
+        ),
+    )
+
+
+# ── channel group chats ─────────────────────────────────────────────────────
+#
+# The other kind of group, and unrelated to the three tables above. Here ONE
+# profile's channel account (a Telegram bot, a WhatsApp number) is a member of a
+# real group on that platform, alongside real people. Everything is keyed by
+# ``channel_id``, so a platform group belongs to exactly one channel of exactly
+# one profile — two profiles whose bots are in the same Telegram group get a row
+# each, approve independently, and never see each other's.
+
+
+class ChannelGroupModel(Base):
+    """A platform group one channel's agent has been added to.
+
+    Created the moment the account is added to a group (or, on platforms with no
+    join event, when the first message arrives) with ``status='pending'``: a bot
+    can be pulled into any group by anyone, so the agent stays deaf until a human
+    approves the row. ``blocked`` is the explicit refusal — kept rather than
+    deleted, so re-discovery does not ask again.
+
+    ``conversation_id`` is where the group's messages land: an ordinary
+    ``kind='chat'`` conversation bound to this channel, exactly like a DM
+    sender's, so the room shows up in the sidebar and can be read and steered
+    from the web composer. SET NULL rather than CASCADE — deleting the
+    conversation forgets the transcript, not the approval.
+
+    UNIQUE on ``(channel_id, platform_chat_id)``: one row per group per channel,
+    which is what makes "have we seen this chat before?" a single indexed lookup
+    on the inbound path.
+    """
+
+    __tablename__ = "channel_groups"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    channel_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("channels.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # Denormalised from the channel so per-profile queries and the profile-delete
+    # cascade do not need a join.
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    platform_chat_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # "group" | "supergroup" | "guild_text" | "channel" | "whatsapp_group" | …
+    # Carried because it decides how the message id behaves (see
+    # ``app.channels.groups.keys``), not for display.
+    chat_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    title: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # pending | approved | blocked
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default=text("'pending'"),
+    )
+    # join | message
+    discovered_via: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="message", server_default=text("'message'"),
+    )
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    # Normalized by ``app.channels.groups.policy.normalize_settings``:
+    #   {"member_policy": {"mode": "everyone"|"selected", "allow": [], "deny": []},
+    #    "respond_mode": "mention_or_relevant"|"mention_only",
+    #    "max_agent_posts_per_minute": int, "max_consecutive_bot_messages": int}
+    settings: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    roster_refreshed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_message_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "channel_id", "platform_chat_id", name="uq_channel_groups_chat",
+        ),
+    )
+
+
+class ChannelGroupMemberModel(Base):
+    """Somebody in a platform group, from the roster or from having posted.
+
+    Two sources, because no platform offers both halves reliably: ``roster`` rows
+    come from the platform's member list (Slack, WhatsApp, Discord, the Telegram
+    userbot) and carry display names and the admin flag; ``seen`` rows are people
+    who have simply spoken, which is all a Telegram *bot* or a Zalo bot can ever
+    know. Roster wins where both know a member.
+
+    ``alt_ids`` is the same account under its other ids — WhatsApp reports a
+    participant as ``<digits>@s.whatsapp.net`` on one device and ``<opaque>@lid``
+    on another — so the member policy matches whichever form the transport
+    happened to hand us.
+    """
+
+    __tablename__ = "channel_group_members"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    group_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("channel_groups.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    member_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    alt_ids: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    is_bot: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false(),
+    )
+    # "admin" | "member" | None (unknown)
+    role: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # roster | seen
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    first_seen_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_seen_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    message_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0"),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("group_id", "member_id", name="uq_channel_group_members"),
+    )

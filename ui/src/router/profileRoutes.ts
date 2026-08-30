@@ -9,6 +9,9 @@
 export const PROFILE_ROUTES = new Set([
   'chat',
   'conversation',
+  'group-chat',
+  'group-chat-room',
+  'group-chat-settings',
   'settings',
   'llm-settings',
   'tools-skills-settings',
@@ -40,4 +43,8 @@ export const PROFILE_ROUTES = new Set([
 // compete for that budget. Opening the chat stream on top of them saturated
 // the pool and stalled later REST requests with "Provisional headers are
 // shown" — see App.vue's handleProfileNavigation.
+// The group-chat routes are deliberately absent: the room already holds one
+// long-lived per-group SSE of its own, and adding the profile-events stream on
+// top would spend a second slot of the same ~6-connection budget for a
+// conversation list the page never renders.
 export const CHAT_ROUTES = new Set(['chat', 'conversation']);
