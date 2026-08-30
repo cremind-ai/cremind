@@ -108,6 +108,11 @@ spec:
             httpGet:
               path: /
               port: ui
+              {{- if include "cremind.sslMode" . }}
+              # The app terminates TLS on this port. kubelet probes do not
+              # verify the certificate, so the locally-signed one is fine.
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
@@ -118,6 +123,9 @@ spec:
             httpGet:
               path: /
               port: ui
+              {{- if include "cremind.sslMode" . }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
@@ -148,10 +156,11 @@ spec:
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-        {{- if .Values.proxy.enabled }}
+        {{- if include "cremind.proxyEnabled" . }}
         # Single entry point: nginx routes /api + /health -> backend, /vnc/ ->
         # noVNC, everything else -> the SPA, all on one port. Shares the pod
         # network namespace with the cremind container (reaches it on 127.0.0.1).
+        # Bypassed entirely when the app terminates TLS itself (cremind.ssl).
         - name: proxy
           image: "{{ .Values.proxy.image.registry }}/{{ .Values.proxy.image.repository }}:{{ .Values.proxy.image.tag }}"
           imagePullPolicy: {{ .Values.proxy.image.pullPolicy }}
@@ -176,7 +185,7 @@ spec:
               subPath: default.conf
         {{- end }}
       volumes:
-        {{- if .Values.proxy.enabled }}
+        {{- if include "cremind.proxyEnabled" . }}
         - name: proxy-config
           configMap:
             name: {{ include "cremind.fullname" . }}-proxy

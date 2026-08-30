@@ -128,3 +128,64 @@ appears in cremind.extraEnv.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Effective CREMIND_SSL mode ("" or "auto"). The first-class cremind.ssl value
+wins; when it is unset a CREMIND_SSL entry in cremind.extraEnv is honoured,
+because that was the only way to ask for in-pod TLS before this knob existed
+and those releases must keep rendering. cremind.validateSsl rejects
+contradictions and unsupported values.
+*/}}
+{{- define "cremind.sslMode" -}}
+{{- $mode := .Values.cremind.ssl | default "" -}}
+{{- if not $mode -}}
+{{- range .Values.cremind.extraEnv -}}
+{{- if eq .name "CREMIND_SSL" -}}
+{{- $mode = (.value | default "") -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $mode -}}
+{{- end -}}
+
+{{/*
+Effective reverse-proxy toggle. In-pod TLS and the nginx sidecar are mutually
+exclusive: the sidecar is plaintext on both sides, never mounts the system PVC
+that holds the certificate, could not read the root-owned 0600 key if it did,
+and the certificate does not exist until the app's first boot. There is no
+valid (ssl, proxy) pairing to choose between, so the chart bypasses the sidecar
+automatically instead of failing and demanding a second flag. Returns "true" or
+"" so it can be used directly in `if`.
+*/}}
+{{- define "cremind.proxyEnabled" -}}
+{{- if and .Values.proxy.enabled (not (include "cremind.sslMode" .)) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Guards for in-pod TLS. Fail the render on: an unsupported cremind.ssl value; an
+extraEnv CREMIND_SSL that CONTRADICTS cremind.ssl (the pod's env: beats
+envFrom:, so the ConfigMap would advertise a mode the container does not run);
+ingress together with in-pod TLS (the controller speaks plain HTTP to the
+backend and cannot portably re-encrypt to a private CA — terminate at the edge
+OR in the pod); and an explicit http:// appUrl while the pod serves https
+(which the server only catches as a boot-time warning).
+*/}}
+{{- define "cremind.validateSsl" -}}
+{{- $mode := include "cremind.sslMode" . -}}
+{{- if not (has $mode (list "" "auto")) -}}
+{{- fail (printf "cremind.ssl (or CREMIND_SSL via extraEnv) must be \"\" or \"auto\", got %q. Bring-your-own-certificate TLS is not supported in-pod — terminate TLS at the Ingress instead." $mode) -}}
+{{- end -}}
+{{- if .Values.cremind.ssl -}}
+{{- range .Values.cremind.extraEnv -}}
+{{- if and (eq .name "CREMIND_SSL") (ne (.value | default "") $.Values.cremind.ssl) -}}
+{{- fail "CREMIND_SSL in cremind.extraEnv contradicts cremind.ssl. Remove the extraEnv entry — cremind.ssl is the supported knob." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and $mode .Values.ingress.enabled -}}
+{{- fail "cremind.ssl and ingress.enabled are mutually exclusive. Terminate TLS at the edge with ingress.tls, or disable the Ingress to use in-pod TLS — an Ingress controller speaks plain HTTP to the backend and cannot portably re-encrypt to the pod's private CA." -}}
+{{- end -}}
+{{- if and $mode (hasPrefix "http://" (.Values.cremind.appUrl | default "")) -}}
+{{- fail "cremind.appUrl is http:// but the pod serves TLS (cremind.ssl=auto). Use https:// or leave appUrl blank to auto-derive https://localhost:1515." -}}
+{{- end -}}
+{{- end -}}

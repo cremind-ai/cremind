@@ -58,6 +58,7 @@ from app.cli.commands.server import server_app
 from app.cli.commands.setup import setup_app
 from app.cli.commands.skill_events import skill_events_app
 from app.cli.commands.skills import skills_app
+from app.cli.commands.tls import tls_app
 from app.cli.commands.tools import tools_app
 from app.cli.commands.upgrade import upgrade_app
 
@@ -128,7 +129,9 @@ def _root(
 
 
 # Top-level commands that never call the server — never prompt for a profile.
-_TOKEN_FREE_COMMANDS = {"version", "setup", "serve"}
+# `tls` reads a certificate off disk and hands it to the OS trust store; it
+# exists precisely for the case where nothing can talk to the server yet.
+_TOKEN_FREE_COMMANDS = {"version", "setup", "serve", "tls"}
 # `profile` subcommands that manage the local session and need no token.
 _PROFILE_SESSION_SUBCOMMANDS = {"use", "which", "clear"}
 # `auth` subcommands that must run without a usable token. `show` only reads a
@@ -263,6 +266,7 @@ app.add_typer(features_app, name="features")
 app.add_typer(embedding_app, name="embedding")
 app.add_typer(logs_app, name="logs")
 app.add_typer(server_app, name="server")
+app.add_typer(tls_app, name="tls")
 
 app.command(
     "chat",

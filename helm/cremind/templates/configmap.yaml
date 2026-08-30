@@ -1,5 +1,7 @@
 {{- /* Fail early if CREMIND_DB_PROVIDER was smuggled into extraEnv. */ -}}
 {{- include "cremind.assertNoDbProvider" . -}}
+{{- /* Fail early on an unsupported or self-contradictory TLS configuration. */ -}}
+{{- include "cremind.validateSsl" . -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -24,21 +26,32 @@ data:
   # no values knob — override via cremind.extraEnv if you must.
   CREMIND_UPGRADE_CHANNEL: {{ include "cremind.upgradeChannel" . | quote }}
   {{- /* APP_URL is what the A2A agent card advertises to the browser, so it
-         must be the externally-reachable origin. Auto-derive when unset. */ -}}
+         must be the externally-reachable origin. Auto-derive when unset: the
+         Ingress host (https when ingress.tls is populated), otherwise the
+         documented port-forward — https when the pod terminates TLS itself. */ -}}
+  {{- $sslMode := include "cremind.sslMode" . }}
   {{- $appUrl := .Values.cremind.appUrl }}
   {{- if not $appUrl }}
   {{- if .Values.ingress.enabled }}
   {{- $scheme := ternary "https" "http" (gt (len (.Values.ingress.tls | default list)) 0) }}
   {{- $appUrl = printf "%s://%s" $scheme .Values.ingress.host }}
   {{- else }}
-  {{- $appUrl = "http://localhost:1515" }}
+  {{- $appUrl = printf "%s://localhost:1515" (ternary "https" "http" (ne $sslMode "")) }}
   {{- end }}
   {{- end }}
   APP_URL: {{ $appUrl | quote }}
-  {{- /* Atlassian 3LO single fixed callback. Blank → the image default
-         (http://localhost:1515/api/oauth/callback) applies. */ -}}
-  {{- if .Values.cremind.atlassianRedirectUri }}
-  CREMIND_ATLASSIAN_REDIRECT_URI: {{ .Values.cremind.atlassianRedirectUri | quote }}
+  {{- /* Atlassian 3LO single fixed callback. Blank → the skills' own default
+         (http://localhost:1515/api/oauth/callback), which they hardcode
+         independently of APP_URL — so when the pod terminates TLS that default
+         would send the consent redirect to a plaintext URL on a port that only
+         speaks https, and the link would never complete in the browser. Fill
+         it in with the matching https form in that case. */ -}}
+  {{- $atlassianRedirect := .Values.cremind.atlassianRedirectUri }}
+  {{- if and (not $atlassianRedirect) $sslMode }}
+  {{- $atlassianRedirect = "https://localhost:1515/api/oauth/callback" }}
+  {{- end }}
+  {{- if $atlassianRedirect }}
+  CREMIND_ATLASSIAN_REDIRECT_URI: {{ $atlassianRedirect | quote }}
   {{- end }}
   HOST: {{ .Values.cremind.host | quote }}
   PORT: {{ .Values.cremind.apiPort | quote }}
@@ -49,9 +62,30 @@ data:
   {{- if .Values.cremind.timezone }}
   CREMIND_TIMEZONE: {{ .Values.cremind.timezone | quote }}
   {{- end }}
+  {{- /* In-pod TLS. Rendered from the RESOLVED mode (cremind.ssl, or a
+         pre-first-class CREMIND_SSL in extraEnv) so this ConfigMap is the one
+         place that states it and the checksum/config annotation rolls the pod
+         whichever spelling was used. validateSsl already rejected the
+         combinations that cannot work. */ -}}
+  {{- if $sslMode }}
+  CREMIND_SSL: {{ $sslMode | quote }}
+  {{- end }}
+  {{- if .Values.cremind.sslAutoHosts }}
+  CREMIND_SSL_AUTO_HOSTS: {{ .Values.cremind.sslAutoHosts | quote }}
+  {{- end }}
   {{- if .Values.desktop.enabled }}
   # Desktop flavor only: the desktop entrypoint exits 1 without a valid
   # RESOLUTION. The basic image's entrypoint ignores both, so we omit them.
   RESOLUTION: {{ .Values.cremind.resolution | quote }}
   VNC_PASSWORD: {{ .Values.cremind.vncPassword | quote }}
+  {{- /* Where noVNC answers. With the sidecar it is a route on the app
+         origin; without it (disabled, or bypassed for in-pod TLS) there is no
+         such route and websockify is reached on its own Service port. The
+         browser cannot tell which, so say it here — the UI shows this URL and
+         puts it in the exported config. */ -}}
+  {{- if include "cremind.proxyEnabled" . }}
+  CREMIND_NOVNC_URL: {{ printf "%s/vnc/vnc.html" $appUrl | quote }}
+  {{- else }}
+  CREMIND_NOVNC_URL: "http://localhost:6080/vnc.html"
+  {{- end }}
   {{- end }}

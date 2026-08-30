@@ -173,6 +173,9 @@ export interface InstallSecrets {
   spa_port?: number | null;
   novnc_port?: number | null;
   vnc_port?: number | null;
+  // Set by deployments that know where noVNC answers (the Helm chart), for
+  // the cases the browser cannot infer — see the API's comment.
+  novnc_url?: string | null;
   // Postgres block — populated when the Setup Wizard configured Postgres
   // (bootstrap.toml has db_provider="postgres").
   pg_host?: string | null;

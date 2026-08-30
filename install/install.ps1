@@ -1259,6 +1259,164 @@ if ($Mode -eq 'docker') {
     }
 }
 
+# ── https scheme ──────────────────────────────────────────────────────────
+
+# ``cremind serve`` puts TLS on the public origin (port 1515) when
+# CREMIND_SSL is set (``auto`` generates a locally-signed pair) or when an
+# explicit CREMIND_SSL_CERTFILE is configured. Every env template ships
+# those keys COMMENTED OUT, so only an uncommented assignment carrying a
+# value counts — a leading '#' has to read as "off", or a plain-HTTP
+# install would be handed an https:// URL that nothing is listening on.
+#
+# -EnvPath is the env file this install just wrote — optional, and it may
+# not exist yet. Called with no argument (or a path that isn't there) the
+# answer comes from the process environment alone, which is what the
+# pre-write decision below needs. The environment wins in either case when
+# it already carries the setting: ``docker compose`` interpolates
+# CREMIND_SSL from the invoking shell, and the native path copies the .env
+# into Env: before spawning the server.
+#
+# Note the internal API port (PORT, default 1112) stays plain HTTP even
+# with TLS on — it binds loopback only, for the CLI and the skills. This
+# helper is about the PUBLIC origin, so don't reach for it there.
+function Get-CremindScheme {
+    param([string] $EnvPath = '')
+    $sslMode = $env:CREMIND_SSL
+    $sslCert = $env:CREMIND_SSL_CERTFILE
+    if ($EnvPath -and (Test-Path $EnvPath)) {
+        foreach ($line in (Get-Content $EnvPath -ErrorAction SilentlyContinue)) {
+            $t = "$line".Trim()
+            if (-not $t -or $t.StartsWith('#')) { continue }
+            if ((-not $sslMode) -and $t -match '^CREMIND_SSL\s*=(.*)$') {
+                $sslMode = $Matches[1].Trim()
+            }
+            if ((-not $sslCert) -and $t -match '^CREMIND_SSL_CERTFILE\s*=(.*)$') {
+                $sslCert = $Matches[1].Trim()
+            }
+        }
+    }
+    if ($sslMode -or $sslCert) { return 'https' }
+    return 'http'
+}
+
+# Health probe for a URL built by Get-CremindScheme. CREMIND_SSL=auto serves a
+# certificate signed by a CA that is in no trust store yet, so the handshake —
+# not the health endpoint — is what would fail. The probe only needs to know
+# the listener answers, not to authenticate it. Plain HTTP takes the exact
+# call it always had, untouched.
+function Test-CremindHealth {
+    param(
+        [Parameter(Mandatory)][string] $Url,
+        [int] $TimeoutSec = 2
+    )
+    if (-not $Url.StartsWith('https://')) {
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec $TimeoutSec | Out-Null
+            return $true
+        } catch {
+            return $false
+        }
+    }
+    # PowerShell 6+ has a per-request switch and needs no global state.
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec $TimeoutSec -SkipCertificateCheck | Out-Null
+            return $true
+        } catch {
+            return $false
+        }
+    }
+    # Windows PowerShell 5.1 has no such switch, and the obvious workaround is
+    # a trap: ServerCertificateValidationCallback is invoked on the handshake
+    # thread, which is not a PowerShell runspace, so a scriptblock delegate
+    # never runs and EVERY https probe comes back false — a silent two-minute
+    # stall waiting for a backend that is already up. The delegate has to be
+    # compiled. Restored in ``finally`` so nothing else inherits it.
+    if (-not ('CremindTlsBypass' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public static class CremindTlsBypass {
+    public static void Enable() {
+        ServicePointManager.ServerCertificateValidationCallback =
+            delegate (object s, X509Certificate c, X509Chain ch, SslPolicyErrors e) { return true; };
+    }
+}
+'@
+    }
+    $savedCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+    [CremindTlsBypass]::Enable()
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec $TimeoutSec | Out-Null
+        return $true
+    } catch {
+        return $false
+    } finally {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $savedCallback
+    }
+}
+
+# Bring a rendered .env's public origin in line with a scheme. The
+# local/server templates hard-code http:// on APP_URL and
+# CORS_ALLOWED_ORIGINS — right for the overwhelmingly common plain-HTTP
+# install, so this rewrites rather than adding a second pair of templates.
+# Returns without touching the file unless TLS is on, and even then it only
+# edits those two assignment lines: the surrounding comments keep their
+# worked examples.
+#
+# -Raw in, -NoNewline out, so the file keeps the exact bytes it was written
+# with: a line-by-line Get-Content/Set-Content roundtrip would re-terminate
+# every line with CRLF, and Compose's env-file parser does not strip a
+# trailing carriage return from a value. ``-Encoding utf8`` on both sides
+# for the same reason the dev-channel CORS rewrite below needs it — Windows
+# PowerShell 5.1 decodes BOM-less UTF-8 as cp1252 by default and would
+# mangle the em-dashes in the template comments.
+function Set-CremindEnvUrlScheme {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Scheme
+    )
+    if ($Scheme -ne 'https') { return }
+    $text = Get-Content -Path $Path -Raw -Encoding utf8
+    # ``.`` never matches \n, so ^...$ under (?m) is one line — and any \r
+    # sits inside the match and is re-emitted with it.
+    $text = [regex]::Replace($text, '(?m)^(APP_URL|CORS_ALLOWED_ORIGINS)=.*$', {
+        param($m) $m.Value -replace 'http://', 'https://'
+    })
+    Set-Content -Path $Path -Value $text -NoNewline -Encoding utf8
+}
+
+# The scheme of the public origin, decided ONCE here — before the first
+# file is written. Everything the installer bakes a public URL into has to
+# agree with it, not just the closing banner: APP_URL feeds the A2A agent
+# card and the OAuth redirect derivation (the server logs a boot warning
+# when TLS is on and APP_URL is http://), CORS_ALLOWED_ORIGINS has to match
+# the origin the browser actually loads the SPA from, and credentials.toml
+# copies both.
+#
+# No env file exists at this point, so the process environment is the only
+# thing that can carry the setting — which is also the only way to ask for
+# TLS at install time, since every env template ships CREMIND_SSL commented
+# out:
+#
+#     $env:CREMIND_SSL = 'auto'; .\install.ps1 -Deployment server -AppHost cremind.lan
+#
+# Nothing set → 'http', and every file and line below is exactly what it
+# was before TLS existed.
+$UrlScheme = Get-CremindScheme
+
+# 'custom' carries an operator-supplied public URL and CORS list rather
+# than a preset the installer composes. They're still written through
+# verbatim — except that TLS on the public origin makes an http:// origin
+# simply wrong: the listener speaks TLS, and a page served from an https
+# origin can't call an http:// API. Upgrade the scheme in place and keep
+# the host, port and path the operator picked.
+if ($Deployment -eq 'custom' -and $UrlScheme -eq 'https') {
+    $CustomValues['public_url']      = $CustomValues['public_url']      -replace 'http://', 'https://'
+    $CustomValues['allowed_origins'] = $CustomValues['allowed_origins'] -replace 'http://', 'https://'
+}
+
 # ── docker install ────────────────────────────────────────────────────────
 
 # Random secret generator. ``RNGCryptoServiceProvider`` would be the
@@ -1406,15 +1564,18 @@ if ($Mode -eq 'docker') {
     }
     $CremindVer   = Resolve-CremindVersion
 
+    # $UrlScheme (decided before anything was written) — not a literal
+    # http:// — so the .env, the credentials.toml built from these two
+    # variables, and the closing banner all name the same origin.
     switch ($Deployment) {
         'local' {
-            $DockerAppUrl    = 'http://localhost:1515'
-            $DockerCors      = 'http://localhost:1515,http://127.0.0.1:1515'
+            $DockerAppUrl    = "${UrlScheme}://localhost:1515"
+            $DockerCors      = "${UrlScheme}://localhost:1515,${UrlScheme}://127.0.0.1:1515"
             $DockerWizardEnv = 'local'
         }
         'server' {
-            $DockerAppUrl    = "http://${AppHost}:1515"
-            $DockerCors      = "http://${AppHost}:1515,http://localhost:1515"
+            $DockerAppUrl    = "${UrlScheme}://${AppHost}:1515"
+            $DockerCors      = "${UrlScheme}://${AppHost}:1515,${UrlScheme}://localhost:1515"
             $DockerWizardEnv = 'server'
         }
         'custom' {
@@ -1579,23 +1740,30 @@ not a missing image. Things that help:
     } else {
         $HealthHost = $AppHost
     }
-    # Docker publishes only the single public port (1515); probe it on the host.
-    $HealthUrl = "http://${HealthHost}:1515/health"
+    # Docker publishes only the single public port (1515); probe it on the
+    # host. That port is the public origin, so its scheme follows the
+    # container's CREMIND_SSL* settings — which compose reads from the .env
+    # we just wrote. Re-checked against that file, but only when the
+    # environment hasn't already settled it: the environment won when
+    # $UrlScheme was decided, so this can never downgrade https to http and
+    # contradict the URLs written above.
+    if ($UrlScheme -ne 'https') {
+        $UrlScheme = Get-CremindScheme -EnvPath $EnvDocker
+    }
+    $HealthUrl = "${UrlScheme}://${HealthHost}:1515/health"
     Write-Info "Waiting for backend at $HealthUrl ..."
     for ($i = 0; $i -lt 60; $i++) {
-        try {
-            Invoke-WebRequest -UseBasicParsing -Uri $HealthUrl -TimeoutSec 2 | Out-Null
+        if (Test-CremindHealth -Url $HealthUrl) {
             Write-Ok "Backend is up"
             break
-        } catch {
-            Start-Sleep -Seconds 2
         }
+        Start-Sleep -Seconds 2
     }
 
     # Suppress the human-handoff block when the Electron app is driving —
     # it navigates to the in-window wizard via vue-router and a "Wizard
     # URL: ..." instruction would mislead the user.
-    $WizardUrl = "http://${HealthHost}:1515/#/setup"
+    $WizardUrl = "${UrlScheme}://${HealthHost}:1515/#/setup"
     if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
         Write-Step "Setup wizard"
 
@@ -1607,9 +1775,22 @@ Open this URL in your browser to continue setup:
 
     $WizardUrl
 
-  Cremind     : http://${HealthHost}:1515
+  Cremind     : ${UrlScheme}://${HealthHost}:1515
 "@
+        # With CREMIND_SSL=auto the certificate is signed by a CA generated
+        # for this install, which no browser knows yet — say so here rather
+        # than letting the interstitial be the user's first surprise.
+        if ($UrlScheme -eq 'https') {
+            # The CA lives inside the container, and a Docker install puts no
+            # cremind CLI on the host — so point at the download, which every
+            # device can reach, rather than a command that isn't there.
+            Write-Host "  Browsers warn until you trust the local CA (one-time per device)."
+            Write-Host "  Download it:  curl.exe -k -o cremind-ca.pem ${UrlScheme}://${HealthHost}:1515/ca.pem"
+            Write-Host "  Then trust it with 'cremind tls trust --file cremind-ca.pem', or your OS certificate manager."
+        }
         # Desktop image only: surface the noVNC viewer + VNC password.
+        # noVNC is websockify on its own port and never speaks TLS, so this
+        # URL stays http:// no matter what the app origin does.
         if ($DesktopUi -ne '0') {
             $NoVncUrl  = "http://${HealthHost}:6080/vnc.html"
             $StoredVnc = (Get-Content $EnvDocker | Where-Object { $_ -like 'VNC_PASSWORD=*' } | Select-Object -First 1) -replace '^VNC_PASSWORD=', ''
@@ -2049,6 +2230,12 @@ if (-not (Test-Path $EnvFile)) {
             $rendered | Set-Content -Path $EnvFile -Encoding utf8
         }
     }
+    # TLS moves the public origin to https://, so APP_URL and
+    # CORS_ALLOWED_ORIGINS have to move with it — the local/server
+    # templates hard-code http://. No-op on a plain-HTTP install. Inside
+    # the "file didn't exist" branch on purpose: a .env we're reusing is
+    # the user's, and the installer doesn't rewrite it.
+    Set-CremindEnvUrlScheme -Path $EnvFile -Scheme $UrlScheme
     # Stamp the install mode so the backend's mode-rule filter knows which
     # service modes to expose in the wizard. Native installs land here too;
     # docker installs stamp INSTALL_MODE into docker.env above.
@@ -2230,6 +2417,11 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
     # in a separate terminal). Starting a second cremind would just
     # collide on the bind, so treat it as already-running and skip the
     # spawn.
+    #
+    # PORT is the INTERNAL api port, which stays plain HTTP even when
+    # CREMIND_SSL puts TLS on the public origin (server.py keeps the
+    # loopback bind on uvicorn without a cert, for the CLI and the skills).
+    # So this probe — and the one below — must NOT follow Get-CremindScheme.
     if (-not $running) {
         try {
             Invoke-WebRequest -UseBasicParsing -Uri "http://${ServerHost}:${ServerPort}/health" -TimeoutSec 2 | Out-Null
@@ -2269,14 +2461,25 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
 # uses the host from -AppHost; 'local' is loopback. Custom URLs may
 # include a path/scheme; we normalise to the single public port (1515)
 # while preserving the hostname.
+#
+# The public origin is the one bind TLS applies to, so its scheme comes
+# from the .env we just wrote (or the environment the server inherits).
+# Re-checked against the file here because a pre-existing .env the
+# installer kept can carry an uncommented CREMIND_SSL the environment
+# doesn't. Only consulted when the environment hasn't already settled it,
+# so this can only ever turn http into https — never contradict the
+# APP_URL / CORS_ALLOWED_ORIGINS this run wrote.
+if ($UrlScheme -ne 'https') {
+    $UrlScheme = Get-CremindScheme -EnvPath $EnvFile
+}
 if ($Deployment -eq 'server') {
-    $WizardUrl = "http://${AppHost}:1515/#/setup"
+    $WizardUrl = "${UrlScheme}://${AppHost}:1515/#/setup"
 } elseif ($Deployment -eq 'custom') {
     $CustomHostPart = $CustomValues['public_url']
     if ($CustomHostPart -match '^https?://([^:/]+)') { $CustomHostPart = $Matches[1] } else { $CustomHostPart = 'localhost' }
-    $WizardUrl = "http://${CustomHostPart}:1515/#/setup"
+    $WizardUrl = "${UrlScheme}://${CustomHostPart}:1515/#/setup"
 } else {
-    $WizardUrl = 'http://localhost:1515/#/setup'
+    $WizardUrl = "${UrlScheme}://localhost:1515/#/setup"
 }
 
 # Suppress the human-handoff block when the Electron app is driving —
@@ -2294,6 +2497,16 @@ Open this URL in your browser to continue setup:
     $WizardUrl
 
   Cremind:    $($WizardUrl -replace '/#/setup$', '')
+"@
+
+    # Same nudge the Docker path prints: with CREMIND_SSL=auto the
+    # certificate is signed by a CA generated for this install, so the
+    # first visit is an interstitial until that CA is trusted once.
+    if ($UrlScheme -eq 'https') {
+        Write-Host "  Browsers warn until you trust the local CA (one-time): cremind tls trust"
+    }
+
+    Write-Host @"
   Stop:       Stop-Process -Id (Get-Content $PidFile)
   Re-open:    cremind serve   (or: & "$VenvCremind" serve)
 

@@ -122,8 +122,22 @@ export function buildMarkdownExport(s: ConfigExportSnapshot): string {
     const isK8s = v.environment === 'kubernetes';
     const novncPort = v.novnc_port ?? 6080;
     const vncPort = v.vnc_port ?? 5900;
+    // Fallbacks only — the wizard passes ``novnc_url`` whenever the
+    // deployment knows it (on Kubernetes the chart states it outright,
+    // because whether noVNC sits behind the proxy or on its own port is
+    // invisible from here). This guess covers older charts: the Kubernetes
+    // shape reaches noVNC through the *app* origin, so it inherits whatever
+    // scheme this page is served over. ``v.host`` is a bare hostname (the
+    // wizard strips the scheme off app_url), so the page is the only scheme
+    // source available. The Docker shape is NOT derived: 6080 is the
+    // container's own noVNC port, published directly and always plain http
+    // regardless of any TLS on the app port.
+    const appScheme = typeof window !== 'undefined'
+      && window.location?.protocol?.startsWith('http')
+      ? window.location.protocol.replace(':', '')
+      : 'http';
     const novncUrl = v.novnc_url || (isK8s
-      ? `http://${host}:1515/vnc/vnc.html`
+      ? `${appScheme}://${host}:1515/vnc/vnc.html`
       : `http://${host}:${novncPort}/vnc.html`);
     const vncEndpoint = v.vnc_endpoint || `${host}:${vncPort}`;
     lines.push(`## VNC Desktop (${isK8s ? 'Kubernetes' : 'Docker'})`);

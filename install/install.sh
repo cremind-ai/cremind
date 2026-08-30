@@ -1206,6 +1206,104 @@ if [ "$MODE" = "docker" ]; then
     fi
 fi
 
+# ── https scheme ──────────────────────────────────────────────────────────
+
+# ``cremind serve`` puts TLS on the public origin (port 1515) when
+# CREMIND_SSL is set (``auto`` generates a locally-signed pair) or when an
+# explicit CREMIND_SSL_CERTFILE is configured. Every env template ships
+# those keys COMMENTED OUT, so only an uncommented assignment carrying a
+# value counts — a leading '#' has to read as "off", or a plain-HTTP
+# install would be handed an https:// URL that nothing is listening on.
+#
+# $1 is the env file this install just wrote — optional, and it may not
+# exist yet. Called with no argument (or a path that isn't there) the
+# answer comes from the process environment alone, which is what the
+# pre-write decision below needs. The surrounding environment wins in
+# either case when it already carries the setting: ``docker compose``
+# interpolates CREMIND_SSL from the invoking shell, and the native path
+# exports the .env into its own environment before spawning the server.
+#
+# Note the internal API port (PORT, default 1112) stays plain HTTP even
+# with TLS on — it binds loopback only, for the CLI and the skills. This
+# helper is about the PUBLIC origin, so don't reach for it there.
+cremind_scheme() {
+    local env_file="${1:-}" ssl_mode ssl_cert
+    ssl_mode="${CREMIND_SSL:-}"
+    ssl_cert="${CREMIND_SSL_CERTFILE:-}"
+    if [ -f "$env_file" ]; then
+        if [ -z "$ssl_mode" ]; then
+            ssl_mode="$(grep -E '^[[:space:]]*CREMIND_SSL[[:space:]]*=' "$env_file" 2>/dev/null \
+                | head -1 | cut -d= -f2- | tr -d '[:space:]' || true)"
+        fi
+        if [ -z "$ssl_cert" ]; then
+            ssl_cert="$(grep -E '^[[:space:]]*CREMIND_SSL_CERTFILE[[:space:]]*=' "$env_file" 2>/dev/null \
+                | head -1 | cut -d= -f2- | tr -d '[:space:]' || true)"
+        fi
+    fi
+    if [ -n "$ssl_mode" ] || [ -n "$ssl_cert" ]; then
+        printf 'https'
+    else
+        printf 'http'
+    fi
+}
+
+# Health probe for a URL built by cremind_scheme. CREMIND_SSL=auto serves a
+# certificate signed by a CA that is in no trust store yet, so curl would
+# reject it — and the probe only needs to know the listener answers, not to
+# authenticate it. Plain HTTP keeps the exact invocation it always had.
+cremind_health_ok() {
+    case "$1" in
+        https://*) curl -fsS -k "$1" >/dev/null 2>&1 ;;
+        *)         curl -fsS "$1" >/dev/null 2>&1 ;;
+    esac
+}
+
+# The scheme of the public origin, decided ONCE here — before the first
+# file is written. Everything the installer bakes a public URL into has to
+# agree with it, not just the closing banner: APP_URL feeds the A2A agent
+# card and the OAuth redirect derivation (the server logs a boot warning
+# when TLS is on and APP_URL is http://), CORS_ALLOWED_ORIGINS has to match
+# the origin the browser actually loads the SPA from, and credentials.toml
+# copies both.
+#
+# No env file exists at this point, so the process environment is the only
+# thing that can carry the setting — which is also the only way to ask for
+# TLS at install time, since every env template ships CREMIND_SSL commented
+# out:
+#
+#     CREMIND_SSL=auto ./install.sh --deployment server --host cremind.lan
+#
+# Nothing set → ``http``, and every file and line below is exactly what it
+# was before TLS existed.
+URL_SCHEME="$(cremind_scheme)"
+
+# ``custom`` carries an operator-supplied public URL and CORS list rather
+# than a preset the installer composes. They're still written through
+# verbatim — except that TLS on the public origin makes an http:// origin
+# simply wrong: the listener speaks TLS, and a page served from an https
+# origin can't call an http:// API. Upgrade the scheme in place and keep
+# the host, port and path the operator picked.
+if [ "$URL_SCHEME" = "https" ] && [ "$DEPLOYMENT" = "custom" ]; then
+    CUSTOM_public_url="${CUSTOM_public_url//http:\/\//https:\/\/}"
+    CUSTOM_allowed_origins="${CUSTOM_allowed_origins//http:\/\//https:\/\/}"
+fi
+
+# Bring a rendered .env's public origin in line with $URL_SCHEME. The
+# local/server templates hard-code http:// on APP_URL and
+# CORS_ALLOWED_ORIGINS — right for the overwhelmingly common plain-HTTP
+# install, so this rewrites rather than adding a second pair of templates.
+# A no-op unless TLS is on, and even then it only touches those two
+# assignment lines: the surrounding comments keep their worked examples.
+apply_url_scheme_to_env() {
+    [ "$URL_SCHEME" = "https" ] || return 0
+    # -i.bak for the BSD sed on macOS, which requires the suffix argument.
+    sed -i.bak \
+        -e '/^APP_URL=/ s|http://|https://|g' \
+        -e '/^CORS_ALLOWED_ORIGINS=/ s|http://|https://|g' \
+        "$1"
+    rm -f "$1.bak"
+}
+
 # ── docker install ────────────────────────────────────────────────────────
 
 # Random secret generator. /dev/urandom + tr keeps us within the printable
@@ -1354,15 +1452,18 @@ if [ "$MODE" = "docker" ]; then
     fi
     CREMIND_VERSION="$(resolve_version)"
 
+    # $URL_SCHEME (decided before anything was written) — not a literal
+    # http:// — so the .env, the credentials.toml built from these two
+    # variables, and the closing banner all name the same origin.
     case "$DEPLOYMENT" in
         local)
-            DOCKER_APP_URL="http://localhost:1515"
-            DOCKER_CORS="http://localhost:1515,http://127.0.0.1:1515"
+            DOCKER_APP_URL="${URL_SCHEME}://localhost:1515"
+            DOCKER_CORS="${URL_SCHEME}://localhost:1515,${URL_SCHEME}://127.0.0.1:1515"
             DOCKER_WIZARD_ENV="local"
             ;;
         server)
-            DOCKER_APP_URL="http://$APP_HOST:1515"
-            DOCKER_CORS="http://$APP_HOST:1515,http://localhost:1515"
+            DOCKER_APP_URL="${URL_SCHEME}://$APP_HOST:1515"
+            DOCKER_CORS="${URL_SCHEME}://$APP_HOST:1515,${URL_SCHEME}://localhost:1515"
             DOCKER_WIZARD_ENV="server"
             ;;
         custom)
@@ -1515,10 +1616,19 @@ EOF
     else
         HEALTH_HOST="$APP_HOST"
     fi
-    HEALTH_URL="http://${HEALTH_HOST}:1515/health"
+    # Docker publishes the public origin and nothing else, so the scheme of
+    # every URL below follows the container's CREMIND_SSL* settings — which
+    # compose reads from the .env we just wrote. Re-checked against that
+    # file, but only when the environment hasn't already settled it: the
+    # environment won when $URL_SCHEME was decided, so this can never
+    # downgrade https to http and contradict the URLs written above.
+    if [ "$URL_SCHEME" != "https" ]; then
+        URL_SCHEME="$(cremind_scheme "$DOCKER_DIR/.env")"
+    fi
+    HEALTH_URL="${URL_SCHEME}://${HEALTH_HOST}:1515/health"
     info "Waiting for backend at $HEALTH_URL ..."
     for i in $(seq 1 60); do
-        if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
+        if cremind_health_ok "$HEALTH_URL"; then
             ok "Backend is up"
             break
         fi
@@ -1530,7 +1640,7 @@ EOF
     # block in that context misleads the user into thinking they need
     # to open a browser. Suppress the whole human-handoff section when
     # invoked with CREMIND_INSTALLER_FRONTEND=electron.
-    WIZARD_URL="http://${HEALTH_HOST}:1515/#/setup"
+    WIZARD_URL="${URL_SCHEME}://${HEALTH_HOST}:1515/#/setup"
     if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ]; then
         step "Setup wizard"
 
@@ -1542,9 +1652,24 @@ ${BOLD}Open this URL in your browser to continue setup:${RESET}
 
     ${BOLD}$WIZARD_URL${RESET}
 
-  ${BOLD}Cremind${RESET}:    http://${HEALTH_HOST}:1515
+  ${BOLD}Cremind${RESET}:    ${URL_SCHEME}://${HEALTH_HOST}:1515
 EOF
+        # With CREMIND_SSL=auto the certificate is signed by a CA generated
+        # for this install, which no browser knows yet — say so here rather
+        # than letting the interstitial be the user's first surprise.
+        if [ "$URL_SCHEME" = "https" ]; then
+            # The CA lives inside the container, and a Docker install puts no
+            # cremind CLI on the host — so point at the download, which every
+            # device can reach, rather than a command that isn't there.
+            cat <<EOF
+  Browsers warn until you trust the local CA (one-time per device).
+  Download it:  ${BOLD}curl -k -o cremind-ca.pem ${URL_SCHEME}://${HEALTH_HOST}:1515/ca.pem${RESET}
+  Then trust it with ${BOLD}cremind tls trust --file cremind-ca.pem${RESET}, or your OS certificate manager.
+EOF
+        fi
         # Desktop image only: surface the noVNC viewer + VNC password.
+        # noVNC is websockify on its own port and never speaks TLS, so this
+        # URL stays http:// no matter what the app origin does.
         if [ "$DESKTOP_UI" != "0" ]; then
             NOVNC_URL="http://${HEALTH_HOST}:6080/vnc.html"
             cat <<EOF
@@ -2045,6 +2170,12 @@ if [ ! -f "$ENV_FILE" ]; then
                 > "$ENV_FILE"
             ;;
     esac
+    # TLS moves the public origin to https://, so APP_URL and
+    # CORS_ALLOWED_ORIGINS have to move with it — the local/server
+    # templates hard-code http://. No-op on a plain-HTTP install. Inside
+    # the "file didn't exist" branch on purpose: a .env we're reusing is
+    # the user's, and the installer doesn't rewrite it.
+    apply_url_scheme_to_env "$ENV_FILE"
     # Stamp the install mode so the backend's mode-rule filter knows which
     # service modes to expose in the wizard. Native installs land here too;
     # docker installs stamp INSTALL_MODE into docker.env above.
@@ -2216,6 +2347,11 @@ if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ]; then
     # installer — typical dev case: ``uv run cremind serve`` in a separate
     # terminal. Starting a second cremind would collide on the bind, so
     # treat it as already-running and skip the spawn.
+    #
+    # PORT is the INTERNAL api port, which stays plain HTTP even when
+    # CREMIND_SSL puts TLS on the public origin (server.py keeps the
+    # loopback bind on uvicorn without a cert, for the CLI and the skills).
+    # So this probe — and the one below — must NOT follow cremind_scheme.
     if [ "$SERVER_RUNNING" -eq 0 ] && curl -fsS "http://${HOST:-127.0.0.1}:${PORT:-1112}/health" >/dev/null 2>&1; then
         info "Cremind is already responding at http://${HOST:-127.0.0.1}:${PORT:-1112} — skipping server start."
         SERVER_RUNNING=1
@@ -2248,17 +2384,28 @@ fi
 # uses the host from --host; ``local`` is loopback. Custom URLs may
 # include a path/scheme; normalise to the single public port (1515) while
 # preserving the hostname.
+#
+# The public origin is the one bind TLS applies to, so its scheme comes
+# from the .env we just wrote (or the environment the server inherits).
+# Re-checked against the file here because a pre-existing .env the
+# installer kept can carry an uncommented CREMIND_SSL the environment
+# doesn't. Only consulted when the environment hasn't already settled it,
+# so this can only ever turn http into https — never contradict the
+# APP_URL / CORS_ALLOWED_ORIGINS this run wrote.
+if [ "$URL_SCHEME" != "https" ]; then
+    URL_SCHEME="$(cremind_scheme "$ENV_FILE")"
+fi
 if [ "$DEPLOYMENT" = "server" ]; then
-    WIZARD_URL="http://$APP_HOST:1515/#/setup"
+    WIZARD_URL="${URL_SCHEME}://$APP_HOST:1515/#/setup"
 elif [ "$DEPLOYMENT" = "custom" ]; then
     # http://foo.bar:1515 → http://foo.bar:1515/#/setup
     CUSTOM_HOSTPART="${CUSTOM_public_url#*://}"
     CUSTOM_HOSTPART="${CUSTOM_HOSTPART%%/*}"
     CUSTOM_HOSTPART="${CUSTOM_HOSTPART%%:*}"
     [ -z "$CUSTOM_HOSTPART" ] && CUSTOM_HOSTPART="localhost"
-    WIZARD_URL="http://${CUSTOM_HOSTPART}:1515/#/setup"
+    WIZARD_URL="${URL_SCHEME}://${CUSTOM_HOSTPART}:1515/#/setup"
 else
-    WIZARD_URL="http://localhost:1515/#/setup"
+    WIZARD_URL="${URL_SCHEME}://localhost:1515/#/setup"
 fi
 
 # Suppress the human-handoff block when the Electron app is driving —
@@ -2276,6 +2423,18 @@ ${BOLD}Open this URL in your browser to continue setup:${RESET}
     ${BOLD}$WIZARD_URL${RESET}
 
   Cremind:    ${WIZARD_URL%/#/setup}
+EOF
+
+    # Same nudge the Docker path prints: with CREMIND_SSL=auto the
+    # certificate is signed by a CA generated for this install, so the
+    # first visit is an interstitial until that CA is trusted once.
+    if [ "$URL_SCHEME" = "https" ]; then
+        cat <<EOF
+  Browsers warn until you trust the local CA (one-time): ${BOLD}cremind tls trust${RESET}
+EOF
+    fi
+
+    cat <<EOF
   Stop:       kill \$(cat $SERVER_PID_FILE)
 
 EOF

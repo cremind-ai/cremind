@@ -56,6 +56,7 @@ import {
   type CreateChannelPayload,
 } from '../services/channelApi';
 import { useEmbeddingStatusStore } from '../stores/embeddingStatus';
+import { defaultAgentOrigin } from '../services/runtimeConfig';
 
 const props = defineProps<{
   profile?: string;
@@ -262,9 +263,13 @@ async function continueToSetupWizard() {
     // Sync the agentUrl now that the backend is up. ``setAgentUrl``
     // persists through to runtimeConfig (main-process JSON file via
     // the preload bridge), so the value survives the cross-origin
-    // pivot below.
+    // pivot below. ``defaultAgentOrigin`` prefers this page's own
+    // origin so an HTTPS (``CREMIND_SSL``) or proxied deployment
+    // doesn't get pinned to the plain-http loopback literal; under
+    // Electron the wizard still runs on ``file://`` here, so it
+    // yields that literal — matching the pivot target below.
     if (!settingsStore.agentUrl) {
-      await settingsStore.setAgentUrl('http://localhost:1515');
+      await settingsStore.setAgentUrl(defaultAgentOrigin());
     }
     // Pivot off ``file://`` onto the wheel-served SPA origin before
     // the user touches any setup form. The auth token created in
@@ -281,6 +286,14 @@ async function continueToSetupWizard() {
     //
     // Install stage stays on the asar — only the *setup* stage moves
     // to http. The user has not entered any wizard data at this seam.
+    //
+    // ``http`` (not ``https``) is correct here and must stay hardcoded:
+    // the backend deliberately refuses TLS when it was started by the
+    // Electron app — ``_resolve_tls`` in app/server.py returns None with
+    // a warning whenever ``CREMIND_ELECTRON_PARENT`` is set, precisely
+    // because the shell loads the UI over http://127.0.0.1. TLS applies
+    // to server deployments only, and those never take this branch (they
+    // are already on an http(s) origin, not ``file:``).
     if (window.location.protocol === 'file:') {
       window.location.replace('http://127.0.0.1:1515/#/setup');
       return;
@@ -635,7 +648,7 @@ async function loadInstallCatalog() {
   // to ``install_catalog.toml`` without rebuilding the SPA. Failures
   // are silent — the bundled copy is identical for the same release.
   try {
-    const url = settingsStore.agentUrl || 'http://localhost:1515';
+    const url = settingsStore.agentUrl || defaultAgentOrigin();
     const resp = await fetchInstallCatalog(url);
     installCatalog.value = resp.catalog;
     // Re-seed any custom field that the user hasn't touched yet so a
@@ -1133,12 +1146,15 @@ function buildConfigSnapshot(): ConfigExportSnapshot {
       const m = secrets.app_url.match(/^[a-z]+:\/\/([^/:]+)/i);
       if (m && m[1]) host = m[1];
     }
-    // Kubernetes runs a single pod behind an nginx proxy that fronts the
-    // SPA, API and noVNC on ONE port — there are no separately-exposed
-    // 6080/5900 ports. The agent desktop lives at the app origin under
-    // /vnc/vnc.html (e.g. http://localhost:1515/vnc/vnc.html for the
+    // Kubernetes usually runs a single pod behind an nginx proxy that fronts
+    // the SPA, API and noVNC on ONE port, with the desktop at /vnc/vnc.html on
+    // the app origin (e.g. http://localhost:1515/vnc/vnc.html for the
     // documented `port-forward svc/cremind 1515:80`, or https://<host>/...
-    // behind an Ingress). See helm/cremind/templates/proxy-configmap.yaml.
+    // behind an Ingress). But the chart bypasses that sidecar when the pod
+    // terminates TLS itself, and noVNC then answers on its own Service port
+    // instead — indistinguishable from here, so the chart tells us via
+    // CREMIND_NOVNC_URL and that wins whenever it is set.
+    // See helm/cremind/templates/{proxy-configmap,configmap}.yaml.
     if (secrets.install_mode === 'kubernetes') {
       let origin = 'http://localhost:1515';
       if (secrets.app_url) {
@@ -1147,7 +1163,7 @@ function buildConfigSnapshot(): ConfigExportSnapshot {
       vnc = {
         password: secrets.vnc_password as string,
         host,
-        novnc_url: `${origin}/vnc/vnc.html`,
+        novnc_url: secrets.novnc_url || `${origin}/vnc/vnc.html`,
         resolution: secrets.resolution || undefined,
         environment: 'kubernetes',
       };

@@ -93,9 +93,38 @@ cremind:
   # it as the JSON-RPC endpoint the UI connects to, so it MUST match how you
   # open Cremind in the browser. Leave blank to auto-derive: the Ingress URL
   # when ingress.enabled, otherwise http://localhost:1515 (the documented
-  # `port-forward svc/cremind 1515:80`). Override if you port-forward to a
-  # different local port or front it with another URL.
+  # `port-forward svc/cremind 1515:80`) — https:// there when ssl below is on.
+  # Override if you port-forward to a different local port or front it with
+  # another URL.
   appUrl: ""
+  # In-pod HTTPS. "" (the default) serves plain HTTP; with a real domain put
+  # TLS on the Ingress instead (see the ingress section). "auto" makes the
+  # server generate a local CA and sign its own certificate under
+  # <systemDir>/tls/ at first boot (both persist on the system PVC) and serve
+  # https on 1515 itself — the answer for domain-less access, i.e. a
+  # port-forward or NodePort, where no public CA will ever issue a
+  # certificate. Setting it:
+  #   - BYPASSES the nginx sidecar automatically. That sidecar is plaintext on
+  #     both sides and cannot front a TLS listener, so there is nothing to
+  #     choose between; the Service targets the app directly.
+  #   - moves noVNC to its own Service port 6080 on the desktop flavor (the
+  #     /vnc/ route lives in the bypassed sidecar).
+  #   - switches the optional probes to scheme HTTPS and makes the
+  #     auto-derived APP_URL https://localhost:1515.
+  # Mutually exclusive with ingress.enabled — the chart rejects that combo.
+  # Browsers warn until the generated CA is trusted once per device; the
+  # post-install notes walk through copying it out and trusting it. Only ""
+  # and "auto" are accepted: bring-your-own certificates belong on an Ingress.
+  # Releases predating this knob that set CREMIND_SSL through cremind.extraEnv
+  # keep working (the chart reads it), but move them over when convenient.
+  ssl: ""                        # -> CREMIND_SSL ("" = http, "auto" = in-pod https)
+  # Extra subject-alternative names for the auto-generated certificate, as a
+  # comma-separated list of hostnames/IPs. The certificate already covers
+  # localhost and the pod's own hostname/IPs; add whatever name the browser
+  # actually uses when you reach the pod some other way (a LAN name in front
+  # of a NodePort, say). Changing this reissues the server certificate on the
+  # next boot — the CA you trusted stays the same, so no re-trusting.
+  sslAutoHosts: ""               # -> CREMIND_SSL_AUTO_HOSTS (blank = built-in SANs)
   # Atlassian 3LO callback URL (jira/confluence skills). Atlassian allows only ONE
   # registered callback per app (exact match), so unlike Google this is a single
   # FIXED URL — register it once in the Atlassian developer console and set this to
@@ -184,6 +213,9 @@ extraVolumeMounts: []
 #                          /.well-known + A2A POST / — incl. SSE + WebSocket)
 # Containers in a pod share localhost, so the proxy reaches 127.0.0.1:{1515,80}.
 # The internal API bind (1112) is loopback-only and is not proxied.
+#
+# Automatically bypassed when cremind.ssl is set: this sidecar is plaintext on
+# both sides and cannot front the app's TLS listener (see cremind.ssl).
 proxy:
   enabled: true
   image:
@@ -208,11 +240,13 @@ service:
 # One hostname for the whole workflow (UI at /, noVNC at /vnc/). Set host +
 # className for your cluster.
 #
-# TLS belongs here, on the Ingress — that is also where HTTP/2 to the browser
-# comes from, since ingress controllers serve it by default. The container's
-# own CREMIND_SSL* settings are for non-Kubernetes deployments and should stay
-# unset in the chart: the pod would then be speaking TLS to a proxy that
-# expects plain HTTP.
+# TLS for a real domain belongs here, on the Ingress — that is also where
+# HTTP/2 to the browser comes from, since ingress controllers serve it by
+# default. For domain-less installs (a port-forward, a NodePort) use in-pod TLS
+# instead: cremind.ssl=auto, above. The two are mutually exclusive and the
+# chart rejects ingress.enabled together with cremind.ssl — an Ingress
+# controller speaks plain HTTP to the backend and cannot portably re-encrypt to
+# the pod's private CA.
 ingress:
   enabled: false
   className: ""

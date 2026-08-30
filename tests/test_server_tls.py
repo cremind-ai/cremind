@@ -140,6 +140,23 @@ def test_auto_mode_generates_a_pair(tls_env, tmp_path) -> None:
     assert cert.endswith("cert.pem") and key.endswith("key.pem")
 
 
+def test_auto_mode_says_how_to_trust_the_ca(tls_env, tmp_path) -> None:
+    """This log line is the only in-product pointer for a native install, so it
+    has to name something that ships — a command and a URL, not a repo file."""
+    said: list[str] = []
+    tls_env.setattr(server.logger, "info", lambda msg: said.append(str(msg)))
+    tls_env.setattr(BaseConfig, "SSL_MODE", "auto", raising=False)
+    tls_env.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path), raising=False)
+
+    server._resolve_tls(None, None, 1515)
+
+    message = next(m for m in said if "CREMIND_SSL=auto" in m)
+    assert "cremind tls trust" in message
+    assert "/ca.pem" in message
+    assert "ca.pem" in message and str(tmp_path) in message
+    assert "CONTRIBUTING" not in message, "released installs do not ship it"
+
+
 def test_an_explicit_pair_wins_over_auto(tls_env, pair, tmp_path) -> None:
     """Someone who supplies a real certificate should get it, even with
     CREMIND_SSL=auto left set in the environment."""

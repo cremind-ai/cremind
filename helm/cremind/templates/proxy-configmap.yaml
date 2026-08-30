@@ -1,4 +1,4 @@
-{{- if .Values.proxy.enabled }}
+{{- if include "cremind.proxyEnabled" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

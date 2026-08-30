@@ -70,7 +70,9 @@ services:
       # default, which keeps the port plain HTTP. Set these in .env — the
       # cert/key paths are container-side, so uncomment the certs mount in
       # ``volumes:`` below first. ``CREMIND_SSL=auto`` needs no mount: it
-      # generates into /root/.cremind/tls (the cremind-data volume).
+      # generates into /root/.cremind/tls (the cremind-data volume). Devices
+      # trust that CA once — fetch it from the running server at <origin>/ca.pem
+      # (or ``docker compose exec cremind cremind tls export --out -``).
       CREMIND_SSL_CERTFILE: ${CREMIND_SSL_CERTFILE:-}
       CREMIND_SSL_KEYFILE: ${CREMIND_SSL_KEYFILE:-}
       CREMIND_SSL_KEYFILE_PASSWORD: ${CREMIND_SSL_KEYFILE_PASSWORD:-}

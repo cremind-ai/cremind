@@ -238,4 +238,66 @@ jobs:
             echo "::error::CREMIND_DB_PROVIDER must not be templated — it makes the server skip the Setup Wizard."
             exit 1
           fi
+          # ── In-pod TLS (cremind.ssl=auto) ──────────────────────────────
+          # Default render stays plain HTTP behind the proxy sidecar.
+          if grep -qE '^[[:space:]]*CREMIND_SSL:' /tmp/cremind-render.yaml; then
+            echo "::error::the default render must not set CREMIND_SSL"; exit 1
+          fi
+          grep -q 'nginx-unprivileged' /tmp/cremind-render.yaml \
+            || { echo "::error::the default render must include the proxy sidecar"; exit 1; }
+          grep -q 'APP_URL: "http://localhost:1515"' /tmp/cremind-render.yaml \
+            || { echo "::error::the default render must derive an http APP_URL"; exit 1; }
+          # ssl=auto: env set, https APP_URL, sidecar bypassed, Service on the
+          # app's own port, noVNC given a port of its own (desktop is default).
+          helm template t helm/cremind --set cremind.ssl=auto > /tmp/cremind-ssl.yaml
+          grep -q 'CREMIND_SSL: "auto"' /tmp/cremind-ssl.yaml \
+            || { echo "::error::cremind.ssl=auto must template CREMIND_SSL"; exit 1; }
+          grep -q 'APP_URL: "https://localhost:1515"' /tmp/cremind-ssl.yaml \
+            || { echo "::error::cremind.ssl=auto must auto-derive an https APP_URL"; exit 1; }
+          if grep -q 'nginx-unprivileged' /tmp/cremind-ssl.yaml; then
+            echo "::error::cremind.ssl=auto must bypass the plaintext proxy sidecar"; exit 1
+          fi
+          grep -q 'targetPort: ui' /tmp/cremind-ssl.yaml \
+            || { echo "::error::cremind.ssl=auto must retarget the Service at the app"; exit 1; }
+          grep -q 'port: 6080' /tmp/cremind-ssl.yaml \
+            || { echo "::error::cremind.ssl=auto + desktop must expose noVNC on its own port"; exit 1; }
+          # The UI cannot tell whether noVNC sits behind the proxy or on its
+          # own port, and the OAuth callback is hardcoded http in the skills —
+          # so the chart has to state both, scheme-correctly.
+          grep -q 'CREMIND_NOVNC_URL: "http://localhost:6080/vnc.html"' /tmp/cremind-ssl.yaml \
+            || { echo "::error::ssl=auto must point CREMIND_NOVNC_URL at the noVNC Service port"; exit 1; }
+          grep -q 'CREMIND_NOVNC_URL: "http://localhost:1515/vnc/vnc.html"' /tmp/cremind-render.yaml \
+            || { echo "::error::the default render must point CREMIND_NOVNC_URL at the proxy route"; exit 1; }
+          grep -q 'CREMIND_ATLASSIAN_REDIRECT_URI: "https://localhost:1515/api/oauth/callback"' /tmp/cremind-ssl.yaml \
+            || { echo "::error::ssl=auto must default the Atlassian callback to https"; exit 1; }
+          if grep -qE '^[[:space:]]*CREMIND_ATLASSIAN_REDIRECT_URI:' /tmp/cremind-render.yaml; then
+            echo "::error::the default render must leave the Atlassian callback to the image default"; exit 1
+          fi
+          helm template t helm/cremind --set cremind.ssl=auto --set desktop.enabled=false \
+            > /tmp/cremind-ssl-basic.yaml
+          if grep -q 'name: novnc' /tmp/cremind-ssl-basic.yaml; then
+            echo "::error::the basic flavor must not expose a noVNC port"; exit 1
+          fi
+          # The pre-first-class spelling (CREMIND_SSL via extraEnv) must keep
+          # rendering, and must drive the same scheme-correct derivations.
+          helm template t helm/cremind \
+            --set 'cremind.extraEnv[0].name=CREMIND_SSL' \
+            --set 'cremind.extraEnv[0].value=auto' \
+            | grep -q 'APP_URL: "https://localhost:1515"' \
+            || { echo "::error::CREMIND_SSL via extraEnv must still derive an https APP_URL"; exit 1; }
+          helm template t helm/cremind --set proxy.enabled=false \
+            --set cremind.appUrl=https://localhost:1515 \
+            --set 'cremind.extraEnv[0].name=CREMIND_SSL' \
+            --set 'cremind.extraEnv[0].value=auto' > /dev/null \
+            || { echo "::error::the documented pre-first-class install must still render"; exit 1; }
+          # Combinations that cannot work must fail the render, not deploy broken.
+          for bad in \
+            "--set cremind.ssl=auto --set ingress.enabled=true" \
+            "--set cremind.ssl=on" \
+            "--set cremind.ssl=auto --set cremind.appUrl=http://localhost:1515" \
+          ; do
+            if helm template t helm/cremind $bad > /dev/null 2>&1; then
+              echo "::error::helm template should have rejected: $bad"; exit 1
+            fi
+          done
           echo "Helm chart render guards passed."

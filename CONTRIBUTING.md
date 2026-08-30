@@ -185,13 +185,33 @@ unavoidable. The CA exists so that step is a one-off — server certificates get
 reissued (on expiry, or when a hostname is added) and stay trusted, whereas a
 bare self-signed certificate would have to be re-trusted every time.
 
-Install `~/.cremind/tls/ca.pem` on each device that connects:
+On the machine running the server, that is one command:
+
+```bash
+uv run cremind tls trust
+```
+
+Devices that reach it over the network need the CA itself first — download it
+from the running server (click through the warning once; a CA certificate is
+public material), then trust the file:
+
+```bash
+curl -k -o cremind-ca.pem https://<host>:1515/ca.pem
+cremind tls trust --file cremind-ca.pem
+```
+
+`cremind tls trust --print-only` prints the command it would run instead of
+running it, `cremind tls export` copies the CA out (`docker compose exec
+cremind cremind tls export --out -` for a container install), and
+`cremind tls fingerprint` shows the SHA-256 to compare against the browser's
+certificate viewer. To do it by hand:
 
 | OS | Command |
 |---|---|
 | Windows | `certutil -addstore -user Root %USERPROFILE%\.cremind\tls\ca.pem` |
 | macOS | `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.cremind/tls/ca.pem` |
 | Linux (Debian/Ubuntu) | `sudo cp ~/.cremind/tls/ca.pem /usr/local/share/ca-certificates/cremind-local-ca.crt && sudo update-ca-certificates` |
+| Linux (RHEL/Fedora) | `sudo cp ~/.cremind/tls/ca.pem /etc/pki/ca-trust/source/anchors/cremind-local-ca.crt && sudo update-ca-trust extract` |
 
 Firefox keeps its own store — import it under Settings → Privacy & Security →
 Certificates → View Certificates → Authorities.
@@ -206,8 +226,10 @@ ACME/Let's Encrypt automation, certificate hot-reload (restart to rotate),
 mTLS, and an HTTP→HTTPS redirect listener are all out of scope — put a proxy in
 front if you need them. TLS is also ignored in two cases, with a warning:
 `CREMIND_UI_PORT=0` (an external proxy owns the origin) and the Electron
-desktop app (it loads the UI over `http://127.0.0.1:1515`). On Kubernetes, TLS
-terminates at the Ingress as it does today; leave these unset there.
+desktop app (it loads the UI over `http://127.0.0.1:1515`). On Kubernetes, put
+TLS on the Ingress when you have a domain; without one, the chart's
+`cremind.ssl=auto` runs this same in-pod TLS and its post-install notes cover
+trusting the CA.
 
 ## Installing your checkout via the installer scripts
 

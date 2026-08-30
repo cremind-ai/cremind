@@ -1715,6 +1715,13 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 "spa_port": _runtime_int("SPA_PORT", 1515) if is_docker else None,
                 "novnc_port": _runtime_int("NOVNC_PORT", 6080) if is_docker else None,
                 "vnc_port": _runtime_int("VNC_PORT", 5900) if is_docker else None,
+                # Where noVNC actually answers, when the deployment knows and
+                # the client cannot work it out. On Kubernetes that depends on
+                # whether the nginx sidecar is fronting it (/vnc/ on the app
+                # origin) or bypassed because the app terminates TLS itself
+                # (its own Service port) — a distinction invisible from the
+                # browser, so the chart states it.
+                "novnc_url": _runtime("CREMIND_NOVNC_URL"),
                 # Postgres block — populated from bootstrap.toml when the user
                 # picked Postgres in the wizard.
                 "pg_host": _pg("host", "") if has_postgres else None,

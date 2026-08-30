@@ -56,6 +56,7 @@ from app.api.llm import get_llm_routes
 from app.api.setup_stream import get_setup_stream_routes
 from app.api.skills import get_skill_routes
 from app.api.system import get_system_routes
+from app.api.tls import get_tls_routes
 from app.api.tools import get_tool_routes
 from app.api.upgrade import get_upgrade_routes
 from app.api.version import get_version_routes
@@ -492,10 +493,12 @@ def _resolve_tls(
         )
         logger.info(
             "CREMIND_SSL=auto — serving a locally-signed certificate. Browsers "
-            "will warn until this machine's CA is trusted; install "
-            f"{os.path.join(tls_dir(BaseConfig.CREMIND_SYSTEM_DIR), 'ca.pem')} "
-            "into the trust store of each device that connects (see the HTTPS "
-            "section in CONTRIBUTING.md)."
+            "warn until the CA is trusted, once per device: on this machine run "
+            "`cremind tls trust`; from another device download "
+            f"https://<this-host>:{public_port}/ca.pem and run "
+            "`cremind tls trust --file <download>` (or `cremind tls trust "
+            "--print-only` for the command to run by hand). CA file: "
+            f"{os.path.join(tls_dir(BaseConfig.CREMIND_SYSTEM_DIR), 'ca.pem')}"
         )
     elif not certfile or not keyfile:
         missing, given = (
@@ -797,6 +800,11 @@ async def main(
     # before storage comes up. Handlers resolve ``state`` lazily at request time.
     routes.extend(get_backup_routes(state))
     routes.extend(get_system_routes())
+    # The local-CA download. Pre-storage and unauthenticated because the
+    # certificate warning it fixes appears before login — often on the very
+    # first visit to the Setup Wizard — and the browser showing that warning
+    # is precisely the client with no token to present.
+    routes.extend(get_tls_routes())
     routes.extend(get_features_routes())
     routes.extend(get_config_routes(state))
     routes.extend(get_llm_routes(state))

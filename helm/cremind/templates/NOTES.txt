@@ -1,28 +1,96 @@
+{{- $sslMode := include "cremind.sslMode" . }}
+{{- $proxyOn := include "cremind.proxyEnabled" . }}
+{{- $scheme := ternary "https" "http" (ne $sslMode "") }}
+{{- $ingScheme := ternary "https" "http" (gt (len (.Values.ingress.tls | default list)) 0) }}
 Cremind has been deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
 
 This is a single-replica deployment that boots straight into the Setup Wizard
 (no install script). Storage choices are constrained for Kubernetes:
 PostgreSQL only (SQLite is rejected), embeddings off by default, and only
 external/in-cluster vector stores.
-
+{{ if $proxyOn }}
 Everything is served on ONE port by the in-pod reverse proxy — the UI, the API,
 {{- if .Values.desktop.enabled }} and noVNC.{{ else }} and (on the desktop flavor) noVNC.{{ end }} You never need to forward more than one port.
+{{- else if $sslMode }}
+The pod terminates TLS itself (CREMIND_SSL={{ $sslMode }}), so the plaintext nginx
+sidecar is bypassed and the Service fronts the app's https listener directly.
+{{- if .Values.desktop.enabled }}
+noVNC moves to its own port — see below.
+{{- end }}
+{{- else }}
+The reverse proxy is disabled, so the Service fronts the app's own listener
+directly.
+{{- if .Values.desktop.enabled }}
+noVNC moves to its own port — see below.
+{{- end }}
+{{- end }}
 
 1. Open the Setup Wizard
 {{- if .Values.ingress.enabled }}
 
-   http://{{ .Values.ingress.host }}{{ .Values.ingress.path }}#/setup
+   {{ $ingScheme }}://{{ .Values.ingress.host }}{{ .Values.ingress.path }}#/setup
 {{- if .Values.desktop.enabled }}
-   (the agent's desktop is at http://{{ .Values.ingress.host }}/vnc/vnc.html)
+   (the agent's desktop is at {{ $ingScheme }}://{{ .Values.ingress.host }}/vnc/vnc.html)
 {{- end }}
 {{- else }}
 
    kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "cremind.fullname" . }} 1515:{{ .Values.service.port }}
 
-   then browse to:  http://localhost:1515/#/setup
-{{- if .Values.desktop.enabled }}
-   (the agent's desktop is at http://localhost:1515/vnc/vnc.html)
+   then browse to:  {{ $scheme }}://localhost:1515/#/setup
+{{- if and .Values.desktop.enabled $proxyOn }}
+   (the agent's desktop is at {{ $scheme }}://localhost:1515/vnc/vnc.html)
+{{- else if .Values.desktop.enabled }}
+
+   The agent's desktop needs its own forward (there is no /vnc/ route without
+   the reverse proxy):
+
+   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "cremind.fullname" . }} 6080:6080
+
+   then browse to:  http://localhost:6080/vnc.html
 {{- end }}
+{{- end }}
+{{- if $sslMode }}
+
+   TRUST THE LOCAL CA — one-time per device.
+
+   The server signs its own certificate with a CA it generates at first boot
+   under {{ .Values.cremind.systemDir }}/tls/. Until that CA is trusted,
+   the browser says "Your connection is not private"
+   (ERR_CERT_AUTHORITY_INVALID). The CA lives on the system PVC, so it
+   survives restarts and you only ever do this once per device.
+
+   Copy it out once the pod is Running:
+
+   kubectl --namespace {{ .Release.Namespace }} exec deploy/{{ include "cremind.fullname" . }} -c cremind -- \
+     cat {{ .Values.cremind.systemDir }}/tls/ca.pem > cremind-ca.pem
+
+   In PowerShell replace `> cremind-ca.pem` with
+   `| Out-File -Encoding ascii cremind-ca.pem` — PowerShell's `>` writes UTF-16
+   with a BOM, which certutil rejects.
+
+   (You can also click through the warning once and download
+   {{ $scheme }}://localhost:1515/ca.pem — but then compare
+   `cremind tls fingerprint --file <download>` against the kubectl copy before
+   trusting it: a download over a connection you have not authenticated yet
+   could have been substituted. The kubectl route above is already
+   authenticated, which is why it comes first.)
+
+   Then trust it, either with Cremind's own helper:
+
+   cremind tls trust --file cremind-ca.pem
+
+   or by hand — `cremind tls trust --print-only --file cremind-ca.pem` prints
+   the command for your OS, which is one of:
+
+     Windows        certutil -addstore -user Root cremind-ca.pem
+     macOS          sudo security add-trusted-cert -d -r trustRoot \
+                      -k /Library/Keychains/System.keychain cremind-ca.pem
+     Debian/Ubuntu  sudo cp cremind-ca.pem \
+                      /usr/local/share/ca-certificates/cremind-local-ca.crt \
+                      && sudo update-ca-certificates
+
+   Firefox keeps its own store — import it under Settings → Privacy &
+   Security → Certificates → View Certificates → Authorities.
 {{- end }}
 
 2. Database step — PostgreSQL connection (pre-filled)

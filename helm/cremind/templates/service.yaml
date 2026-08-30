@@ -12,12 +12,19 @@ spec:
   type: {{ .Values.service.type }}
   selector:
     {{- include "cremind.selectorLabels" . | nindent 4 }}
+  {{- $proxyOn := include "cremind.proxyEnabled" . }}
+  {{- $sslOn := ne (include "cremind.sslMode" .) "" }}
   ports:
-    # Single entry point — the nginx proxy fronts UI + API + noVNC.
-    - name: http
+    # Single entry point — the nginx proxy fronts UI + API + noVNC. Without the
+    # proxy (explicitly disabled, or bypassed because the app terminates TLS
+    # itself) this lands directly on the app's own listener.
+    - name: {{ ternary "https" "http" $sslOn }}
       port: {{ .Values.service.port }}
-      targetPort: {{ if .Values.proxy.enabled }}http{{ else }}ui{{ end }}
+      targetPort: {{ if $proxyOn }}http{{ else }}ui{{ end }}
       protocol: TCP
+      {{- if $sslOn }}
+      appProtocol: https
+      {{- end }}
     # Codex OAuth ("Sign in with ChatGPT") callback. Deliberately NOT behind
     # the proxy: OpenAI hard-codes the redirect to http://localhost:1455, so
     # the only way the browser can deliver the code is a port-forward that
@@ -31,3 +38,15 @@ spec:
       port: {{ .Values.cremind.codexCallbackPort }}
       targetPort: {{ .Values.cremind.codexCallbackPort }}
       protocol: TCP
+    {{- if and .Values.desktop.enabled (not $proxyOn) }}
+    # The /vnc/ route lives in the nginx sidecar, so without it the desktop
+    # would be unreachable. websockify serves the whole noVNC bundle plus the
+    # VNC WebSocket at the root of container port 80, so expose it directly:
+    #   kubectl -n <ns> port-forward svc/<name> 6080:6080
+    #   -> http://localhost:6080/vnc.html
+    # Plain http on its own origin — TLS on the app port does not cover it.
+    - name: novnc
+      port: 6080
+      targetPort: novnc
+      protocol: TCP
+    {{- end }}

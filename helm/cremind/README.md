@@ -80,6 +80,7 @@ Reach it with a single port-forward (or an Ingress hostname):
 kubectl -n cremind port-forward svc/cremind 1515:80
 # UI / wizard:   http://localhost:1515/#/setup
 # agent desktop: http://localhost:1515/vnc/vnc.html   (desktop flavor only)
+# (https://localhost:1515 when installed with cremind.ssl=auto — see HTTPS below)
 ```
 
 Follow the `NOTES` printed after install: open `/#/setup` and click through. With
@@ -116,6 +117,100 @@ use either fallback — both complete the exchange server-side:
   paste it into the **"Having trouble? Paste the redirect URL"** box; or
 - run `cremind llm codex-oauth login` on your own machine against the cluster —
   the CLI binds `1455` locally, catches the redirect there, and relays the code.
+
+## HTTPS (in-pod TLS)
+
+With a real domain, terminate TLS at the Ingress (`ingress.tls`) — that also
+gets you HTTP/2, and a public CA means nobody sees a warning. This section is
+for the other case: **no domain**, reached over `kubectl port-forward` or a
+NodePort, where no public CA will ever issue a certificate.
+
+```bash
+helm install cremind oci://registry-1.docker.io/cremind/cremind \
+  --version <X.Y.Z> --namespace cremind --create-namespace \
+  --set cremind.ssl=auto
+```
+
+`cremind.ssl=auto` makes the server generate a local CA and sign its own
+certificate under `/root/.cremind/tls/` at first boot, then serve HTTPS (and
+HTTP/2) on 1515 itself. One flag is enough — the chart adjusts everything that
+depends on it:
+
+| | `cremind.ssl=""` (default) | `cremind.ssl=auto` |
+|---|---|---|
+| Service port 80 targets | nginx sidecar (`http`) | the app (`ui`), named `https` |
+| nginx proxy sidecar | runs | **bypassed** (it is plaintext-only) |
+| noVNC (desktop flavor) | `/vnc/vnc.html` on the same port | **Service port 6080**, `http://localhost:6080/vnc.html` |
+| auto-derived `APP_URL` | `http://localhost:1515` | `https://localhost:1515` |
+| probes (if enabled) | scheme HTTP | scheme HTTPS |
+
+`cremind.ssl` and `ingress.enabled` are mutually exclusive and the chart
+rejects the combination: an Ingress controller speaks plain HTTP to the backend
+and cannot portably re-encrypt to a private CA. Pick one place to terminate.
+
+### Trust the CA (one-time per device)
+
+Until the generated CA is in the device's trust store, browsers show
+`ERR_CERT_AUTHORITY_INVALID` / "Your connection is not private". No server can
+avoid that on its own — a certificate is trusted because it chains to a root the
+*device* already trusts. The CA exists precisely so this is a **one-off**: it
+lives on the `system` PVC, so it survives pod restarts and reschedules, and
+re-issued server certificates stay trusted under it.
+
+Copy it out of the pod:
+
+```bash
+kubectl -n cremind exec deploy/cremind -c cremind -- \
+  cat /root/.cremind/tls/ca.pem > cremind-ca.pem
+```
+
+In PowerShell use `| Out-File -Encoding ascii cremind-ca.pem` instead of `>` —
+PowerShell's redirection writes UTF-16 with a BOM and `certutil` rejects it.
+You can also click through the warning once and download
+`https://localhost:1515/ca.pem`.
+
+Then install it, either with Cremind's helper (`cremind tls trust --print-only`
+shows the command it would run):
+
+```bash
+cremind tls trust --file cremind-ca.pem
+```
+
+or by hand:
+
+| OS | Command |
+|---|---|
+| Windows | `certutil -addstore -user Root cremind-ca.pem` |
+| macOS | `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain cremind-ca.pem` |
+| Debian/Ubuntu | `sudo cp cremind-ca.pem /usr/local/share/ca-certificates/cremind-local-ca.crt && sudo update-ca-certificates` |
+| RHEL/Fedora | `sudo cp cremind-ca.pem /etc/pki/ca-trust/source/anchors/cremind-local-ca.crt && sudo update-ca-trust extract` |
+
+Firefox keeps its own trust store — import under Settings → Privacy & Security
+→ Certificates → View Certificates → Authorities.
+
+### Reaching the pod by another name
+
+The certificate covers `localhost`, the pod's hostname and its IPs. If you
+reach Cremind as something else (a LAN name in front of a NodePort, say), add
+it or the browser reports a name mismatch even after trusting the CA:
+
+```bash
+helm upgrade cremind <chart> --reuse-values \
+  --set-string 'cremind.sslAutoHosts=cremind.lan\,10.0.0.5'
+```
+
+Quote the whole argument: helm splits its own value on unescaped commas, and an
+unquoted `\` is removed by the shell before helm ever sees it. (`--set-string`
+additionally keeps an all-numeric name from being coerced to a number.)
+Changing this reissues only the server certificate on next boot; the CA you
+trusted is unaffected.
+
+### Upgrading from a pre-`cremind.ssl` install
+
+Releases that turned this on through `cremind.extraEnv` keep working — the
+chart reads `CREMIND_SSL` from there when `cremind.ssl` is unset, and derives
+the same scheme-correct URLs. Move to the first-class knob when convenient;
+setting both to *different* values fails the render on purpose.
 
 ## Bundled dependencies
 
@@ -181,14 +276,16 @@ embeddings.
 | _(release channel)_ | auto from `image.tag` | Not a knob. `test` when the effective tag is an RC (`…rcN.devM`, i.e. the `--devel` chart), else `production`; the in-app **Updates** page reports this. Force it via `cremind.extraEnv` (`CREMIND_UPGRADE_CHANNEL`). |
 | `cremind.installMode` | `kubernetes` | Drives external-only service modes. |
 | `cremind.setupWizardEnv` | `kubernetes` | Pre-fills the wizard. |
-| `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http://localhost:1515`. |
+| `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http(s)://localhost:1515`. |
+| `cremind.ssl` | `""` | `auto` = in-pod HTTPS with a generated local CA; bypasses the proxy sidecar. Rejects `ingress.enabled`. See [HTTPS](#https-in-pod-tls). |
+| `cremind.sslAutoHosts` | `""` | Extra SANs (CSV) for the generated certificate, for names beyond localhost/pod. |
 | `persistence.system.*` | `5Gi`, RWO | `bootstrap.toml`, tokens, profiles. |
 | `persistence.venv.*` | `8Gi`, RWO | Wizard-installed Python deps (LLM SDKs, embeddings). |
 | `persistence.work.*` | `10Gi`, RWO | Agent working dir (files it creates); `mountPath` must match the wizard's User Working Directory. |
 | `extraVolumes` / `extraVolumeMounts` | `[]` | Persist any additional paths (raw volume specs). |
 | `postgresql.enabled` | `true` | Bundled Bitnami PostgreSQL. |
 | `qdrant.enabled` / `chromadb.enabled` | `false` | Enable when turning on embeddings. |
-| `proxy.enabled` | `true` | nginx single-entry sidecar (UI + API + noVNC on one port; noVNC routes present only on the desktop flavor). |
+| `proxy.enabled` | `true` | nginx single-entry sidecar (UI + API + noVNC on one port; noVNC routes present only on the desktop flavor). Auto-bypassed when `cremind.ssl` is set — noVNC then moves to Service port 6080. |
 | `service.port` | `80` | The one Service port (fronts the proxy). |
 | `cremind.codexCallbackPort` | `1455` | Codex OAuth callback. Not really a knob — OpenAI hard-codes `localhost:1455`. Exposed as a second Service port purely so `port-forward svc/… 1455:1455` resolves; see [Sign in with ChatGPT](#sign-in-with-chatgpt-codex-oauth). |
 | `ingress.enabled` | `false` | One hostname for everything (UI at `/`; noVNC at `/vnc/` on the desktop flavor). |

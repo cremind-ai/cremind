@@ -41,6 +41,29 @@ export function getAgentUrl(): string {
   return ''
 }
 
+/**
+ * The origin to assume when nothing has told us where the backend is yet —
+ * the wizard's seed value and its pre-auth catalog fetch.
+ *
+ * Same reasoning as case 3 in ``getAgentUrl`` above: cremind is a single
+ * same-origin app, so the page's own origin is the backend. Deriving it
+ * (rather than hardcoding ``http://localhost:1515``) is what keeps the
+ * default right when the public origin is served over TLS (``CREMIND_SSL``)
+ * or fronted by a proxy / Ingress on another host or port.
+ *
+ * Electron loads the wizard from ``file://``, where ``location.origin`` is
+ * the unusable string ``"null"`` — hence the protocol guard and the historical
+ * loopback fallback. ``getAgentUrl`` can't be reused here: it has no such
+ * guard, and its higher-precedence sources are exactly the ones that are
+ * still empty at this point in the wizard.
+ */
+export function defaultAgentOrigin(): string {
+  if (typeof window !== 'undefined' && window.location?.protocol?.startsWith('http')) {
+    return window.location.origin
+  }
+  return 'http://localhost:1515'
+}
+
 export async function setAgentUrl(url: string): Promise<void> {
   if (window.cremind) {
     await window.cremind.setConfig({ agentUrl: url })
