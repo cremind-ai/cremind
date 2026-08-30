@@ -20,6 +20,7 @@ import glob
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -35,6 +36,7 @@ from app.types import ToolConfig
 from app.utils.task_context import current_task_id_var
 from app.tools.builtin.exec_shell_classifier import detect_tui_sequences
 from app.tools.builtin.exec_shell_input_mode import (
+    _ANSI_STRIP_RE,
     TerminalState,
     detect_input_mode,
     update_terminal_state,
@@ -201,6 +203,12 @@ _DEFAULT_CLEANUP_TTL_HOURS = 24
 # How long a single exec_shell_output call long-polls before returning a
 # "still running" heartbeat the agent can immediately re-issue (no sleep).
 _DEFAULT_OUTPUT_WAIT_TIMEOUT = 120.0
+# Once output starts arriving, how long the stream must stay quiet before the
+# accumulated batch is returned.  Chatty processes (installers, build tools)
+# emit in short bursts; returning on the first burst costs one LLM reasoning
+# step per burst, so we coalesce bursts separated by less than this window into
+# a single tool result.  0 restores the legacy return-on-first-burst behaviour.
+_DEFAULT_OUTPUT_QUIET_WINDOW = 2.0
 # Safety margin kept below MCP_TOOL_CALL_TIMEOUT so a heartbeat always returns
 # before the adapter's hard tool-call timeout turns it into a generic error.
 _OUTPUT_WAIT_MARGIN = 15.0
@@ -266,6 +274,7 @@ class Var:
     LOG_SILENCE_THRESHOLD = "LOG_SILENCE_THRESHOLD"
     LONG_RUNNING_TIMEOUT = "LONG_RUNNING_TIMEOUT"
     OUTPUT_WAIT_TIMEOUT = "OUTPUT_WAIT_TIMEOUT"
+    OUTPUT_QUIET_WINDOW = "OUTPUT_QUIET_WINDOW"
     CLEANUP_TTL_HOURS = "CLEANUP_TTL_HOURS"
     # UI-only defaults used by the Process Manager terminal view.  The
     # agent's per-invocation ``cols`` / ``rows`` arguments on ExecShellTool
@@ -308,9 +317,12 @@ TOOL_CONFIG: ToolConfig = {
         },
         Var.LARGE_OUTPUT_TOKEN_THRESHOLD: {
             "description": (
-                "Token count threshold for large output handling. "
-                "Only applies when LARGE_OUTPUT_MODE is 'manual'. "
-                "Default: 10000."
+                "Token count threshold for large output handling. When "
+                "LARGE_OUTPUT_MODE is 'manual', output above this is withheld "
+                "pending user confirmation. In both modes it also caps how "
+                "much a single exec_shell_output call accumulates before "
+                "returning, so a process flooding stdout still comes back "
+                "promptly. Default: 10000."
             ),
             "type": "number",
             "default": 10000,
@@ -334,15 +346,31 @@ TOOL_CONFIG: ToolConfig = {
         },
         Var.OUTPUT_WAIT_TIMEOUT: {
             "description": (
-                "Seconds a single exec_shell_output call blocks (long-polls) "
-                "waiting for new output before returning a 'still running' "
-                "heartbeat the agent can re-issue immediately. Returns the "
-                "instant output appears or the process exits, so this only "
-                "bounds dead-air waits. Automatically clamped below "
+                "Seconds a single exec_shell_output call may block in total. "
+                "While no output has arrived it long-polls, then returns a "
+                "'still running' heartbeat the agent can re-issue immediately. "
+                "Once output starts arriving the call keeps collecting until "
+                "the process goes quiet for OUTPUT_QUIET_WINDOW seconds (or "
+                "exits), then returns the whole batch — so this bounds the "
+                "total call, not just dead air. Automatically clamped below "
                 "MCP_TOOL_CALL_TIMEOUT. Default: 120."
             ),
             "type": "number",
             "default": _DEFAULT_OUTPUT_WAIT_TIMEOUT,
+        },
+        Var.OUTPUT_QUIET_WINDOW: {
+            "description": (
+                "Seconds of silence, once output has started arriving, before "
+                "an exec_shell_output call returns its accumulated batch. "
+                "Chatty processes emit in short bursts and each returned batch "
+                "costs the agent a reasoning step, so a larger window "
+                "coalesces more output into fewer tool calls at the cost of "
+                "seeing it slightly later. Interactive prompts and process "
+                "exits still return immediately. 0 returns after the first "
+                "burst. Default: 2."
+            ),
+            "type": "number",
+            "default": _DEFAULT_OUTPUT_QUIET_WINDOW,
         },
         Var.TERMINAL_DEFAULT_COLS: {
             "description": (
@@ -2311,6 +2339,7 @@ def _build_output_instruction(
     input_mode: Optional[str],
     is_pty: bool,
     truncated: bool,
+    wait_until_matched: Optional[bool] = None,
 ) -> str:
     """Deterministic next-step guidance for an ExecShellOutputTool result."""
     if truncated:
@@ -2350,6 +2379,13 @@ def _build_output_instruction(
                 "command with pty=true if keys are ignored."
             )
         return base
+    if wait_until_matched is False:
+        return (
+            "The wait_until pattern has not appeared yet and the process is "
+            "still running. Call exec_shell_output again with the same "
+            "wait_until to keep collecting, or drop it to return on the next "
+            "pause in output."
+        )
     if input_mode == "unknown":
         return (
             ""
@@ -2359,6 +2395,51 @@ def _build_output_instruction(
         "exec_shell_output again to keep waiting — it blocks until new output "
         "arrives or the process exits."
     )
+
+
+def _strip_ansi(text: str) -> str:
+    """Drop ANSI control sequences so ``wait_until`` matches what a human sees.
+
+    Progress bars and spinners interleave escape codes with their text, so a
+    plain pattern like ``Done`` would otherwise miss on styled output.
+    """
+    return _ANSI_STRIP_RE.sub("", text)
+
+
+def _coerce_positive(*candidates: Any) -> float:
+    """First candidate that parses as a number > 0.
+
+    Used for durations where zero is meaningless (a zero-length total wait
+    would return before reading anything).  The last candidate is the
+    hard-coded default and is assumed valid.
+    """
+    for value in candidates:
+        if value is None or isinstance(value, bool) or value == "":
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return float(candidates[-1])
+
+
+def _coerce_non_negative(*candidates: Any) -> float:
+    """First candidate that parses as a number >= 0, clamping negatives to 0.
+
+    Separate from ``_coerce_positive`` because 0 is meaningful for the quiet
+    window: it means "return as soon as the first burst arrives".
+    """
+    for value in candidates:
+        if value is None or isinstance(value, bool) or value == "":
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        return max(0.0, parsed)
+    return float(candidates[-1])
 
 
 def _refresh_expire(info: ProcessInfo, variables: Dict[str, Any]) -> None:
@@ -2378,10 +2459,12 @@ class ExecShellOutputTool(BuiltInTool):
     name: str = "exec_shell_output"
     description: str = (
         "Read newly available stdout from a long-running process started by "
-        "exec_shell, identified by its process_id. Blocks briefly until new "
-        "output arrives or the process exits, then returns what is available "
-        "with a `completed` flag; call again while `completed` is false to "
-        "collect the rest of the output."
+        "exec_shell, identified by its process_id. Blocks until output "
+        "arrives, then keeps collecting until the process has been quiet "
+        "briefly, exits, matches `wait_until`, or the batch grows large — so "
+        "output that arrives in bursts comes back as one result instead of "
+        "many. Returns the accumulated stdout with a `completed` flag; call "
+        "again while `completed` is false to collect the rest."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -2389,6 +2472,38 @@ class ExecShellOutputTool(BuiltInTool):
             "process_id": {
                 "type": "string",
                 "description": "The process_id returned by exec_shell.",
+            },
+            "wait_until": {
+                "type": "string",
+                "description": (
+                    "Optional regular expression. Keep collecting output "
+                    "until it matches, instead of returning when the process "
+                    "goes quiet — use it when you know what you are waiting "
+                    "for (e.g. 'Installation complete|\\$ $') to ride through "
+                    "long silent phases in one call. Process exit, an "
+                    "interactive prompt, a large batch, or max_wait still end "
+                    "the call; the result reports `wait_until_matched`."
+                ),
+            },
+            "quiet_window": {
+                "type": "number",
+                "description": (
+                    "Optional override (seconds) for how long the process must "
+                    "be quiet before the accumulated output is returned. "
+                    "Raise it to batch more chatty output into one call; 0 "
+                    "returns as soon as the first burst arrives. Ignored while "
+                    "`wait_until` is set. Defaults to the configured "
+                    "OUTPUT_QUIET_WINDOW (2s)."
+                ),
+            },
+            "max_wait": {
+                "type": "number",
+                "description": (
+                    "Optional override (seconds) for the total time this call "
+                    "may block before returning what it has. Still clamped by "
+                    "the server's tool-call timeout. Defaults to the "
+                    "configured OUTPUT_WAIT_TIMEOUT (120s)."
+                ),
             },
         },
         "required": ["process_id"],
@@ -2409,25 +2524,107 @@ class ExecShellOutputTool(BuiltInTool):
                 }
             )
 
-        # Long-poll window: block until new output is written or the process
-        # exits, returning the instant either happens.  On a long silence,
-        # return a "still running" heartbeat the agent can re-issue immediately
-        # (no sleep).  Clamp below MCP_TOOL_CALL_TIMEOUT so the heartbeat always
-        # beats the adapter's hard tool-call timeout (which would otherwise turn
-        # it into a generic, guidance-free error).
-        max_wait = float(
-            variables.get(Var.OUTPUT_WAIT_TIMEOUT) or _DEFAULT_OUTPUT_WAIT_TIMEOUT
+        # Two phases in one call:
+        #
+        #   1. Nothing collected yet — long-poll until output appears or the
+        #      process exits, else return a "still running" heartbeat the agent
+        #      can re-issue immediately (no sleep).
+        #   2. Output in hand — keep draining and accumulating until the stream
+        #      goes quiet for `quiet_window` (or `wait_until` matches, or the
+        #      process exits / prompts / floods / the deadline hits).  Chatty
+        #      processes emit in short bursts, and returning on the first burst
+        #      costs one LLM reasoning step per burst; batching turns an
+        #      installer's whole output into one or two tool results.
+        #
+        # `max_wait` bounds the whole call and is clamped below
+        # MCP_TOOL_CALL_TIMEOUT so we always beat the adapter's hard tool-call
+        # timeout (which would otherwise turn this into a generic,
+        # guidance-free error).
+        max_wait = _coerce_positive(
+            arguments.get("max_wait"),
+            variables.get(Var.OUTPUT_WAIT_TIMEOUT),
+            _DEFAULT_OUTPUT_WAIT_TIMEOUT,
         )
         tool_cap = BaseConfig.MCP_TOOL_CALL_TIMEOUT
         if tool_cap:
             max_wait = min(max_wait, max(1.0, float(tool_cap) - _OUTPUT_WAIT_MARGIN))
         deadline = time.monotonic() + max_wait
 
+        # 0 is a meaningful value (return on the first burst), so this cannot
+        # use the `variables.get(...) or DEFAULT` idiom the other vars use.
+        quiet_window = _coerce_non_negative(
+            arguments.get("quiet_window"),
+            variables.get(Var.OUTPUT_QUIET_WINDOW),
+            _DEFAULT_OUTPUT_QUIET_WINDOW,
+        )
+
+        wait_until_raw = arguments.get("wait_until")
+        wait_until_re = None
+        if isinstance(wait_until_raw, str) and wait_until_raw:
+            try:
+                wait_until_re = re.compile(wait_until_raw)
+            except re.error as exc:
+                return BuiltInToolResult(
+                    structured_content={
+                        "error": "Invalid wait_until pattern",
+                        "message": f"'{wait_until_raw}' is not a valid regular expression: {exc}",
+                        "instruction": (
+                            "Fix the regular expression and call again, or omit "
+                            "wait_until to return when the process goes quiet."
+                        ),
+                    }
+                )
+
+        # Verdict reported when we return without having seen the pattern.
+        # None (no pattern requested) keeps the key out of the result entirely.
+        pattern_pending: Optional[bool] = False if wait_until_re is not None else None
+
+        # Cap the accumulated batch so a firehose still returns promptly, and
+        # so manual large-output mode (which replaces the text with a notice)
+        # can only ever discard a bounded amount.  chars//4 mirrors the token
+        # fallback in _build_output_result.
+        cap_chars = max(1, token_threshold) * 4
+
+        # Accumulated output for this call.  The drain deletes .log files as it
+        # reads them, so anything already in here exists nowhere else — every
+        # exit path below must return it rather than drop it.
+        collected = ""
+        # Retained so a teardown that pops the registry entry mid-wait can
+        # still build a normal result out of what we already drained.
+        last_info: Optional[ProcessInfo] = None
+        last_state: Optional[LogWriterState] = None
+
         while True:
             # Re-fetch each iteration: a teardown (stop / cancel / TTL cleanup)
             # can pop the entry while we're blocked, and we must notice.
             info = _process_registry.get(process_id)
             if not info:
+                if collected and last_info is not None:
+                    # Teardown (stop / cancel / TTL cleanup) popped the entry
+                    # while we were accumulating; those paths wake readers, so
+                    # this is an expected wakeup.  The output we already drained
+                    # was deleted from disk as we read it — returning the
+                    # "not found" error here would destroy it.  Hand it back and
+                    # let the agent's next call report the missing process.
+                    vanished_state = (
+                        _read_state(last_info.log_dir) if last_info.log_dir else None
+                    ) or {}
+                    v_completed = vanished_state.get("status") == "completed"
+                    v_exit_code: Optional[int] = vanished_state.get("return_code")
+                    if not v_completed and last_info.process.returncode is not None:
+                        v_completed = True
+                        v_exit_code = last_info.process.returncode
+                    return self._build_output_result(
+                        process_id=process_id,
+                        info=last_info,
+                        state=last_state,
+                        merged_output=collected,
+                        completed=v_completed,
+                        exit_code=v_exit_code,
+                        large_output_mode=large_output_mode,
+                        token_threshold=token_threshold,
+                        wait_until_matched=pattern_pending,
+                    )
                 return BuiltInToolResult(
                     structured_content={
                         "error": "Process not found",
@@ -2443,6 +2640,7 @@ class ExecShellOutputTool(BuiltInTool):
                 )
 
             state = info.log_writer_state
+            last_info, last_state = info, state
 
             # Drain whatever output is currently on disk.  Hold rotate_lock
             # across clear + flush + list + read + delete so the writer cannot
@@ -2501,19 +2699,104 @@ class ExecShellOutputTool(BuiltInTool):
                 completed = True
                 exit_code = info.process.returncode
 
-            # Something to report — return it immediately.
-            if merged_output or completed:
+            collected += merged_output
+
+            # Everything _build_output_result needs for this iteration except
+            # the wait_until verdict.  `collected` no longer changes below, so
+            # snapshotting it here is safe.
+            batch = {
+                "process_id": process_id,
+                "info": info,
+                "state": state,
+                "merged_output": collected,
+                "completed": completed,
+                "exit_code": exit_code,
+                "large_output_mode": large_output_mode,
+                "token_threshold": token_threshold,
+            }
+
+            # The process exited — return everything we have plus the code.
+            if completed:
                 _refresh_expire(info, variables)
                 return self._build_output_result(
-                    process_id=process_id,
-                    info=info,
-                    state=state,
-                    merged_output=merged_output,
-                    completed=completed,
-                    exit_code=exit_code,
-                    large_output_mode=large_output_mode,
-                    token_threshold=token_threshold,
+                    **batch,
+                    wait_until_matched=(
+                        bool(wait_until_re.search(_strip_ansi(collected)))
+                        if wait_until_re is not None
+                        else None
+                    ),
                 )
+
+            if collected:
+                # The agent told us what it was waiting for and we've seen it.
+                if wait_until_re is not None and wait_until_re.search(
+                    _strip_ansi(collected)
+                ):
+                    _refresh_expire(info, variables)
+                    return self._build_output_result(**batch, wait_until_matched=True)
+
+                # A full batch — return promptly rather than accumulate an
+                # unbounded buffer.  Checked after appending, so the batch may
+                # overshoot by one read; that is bounded and fine.  Uses the
+                # cheap chars//4 heuristic (the exact tiktoken count happens
+                # once, in _build_output_result).
+                if len(collected) >= cap_chars:
+                    _refresh_expire(info, variables)
+                    return self._build_output_result(**batch, wait_until_matched=pattern_pending)
+
+                # An interactive prompt means no more output can arrive until
+                # we send input, so waiting out the quiet window would just add
+                # latency.  Only classify on iterations that actually drained
+                # bytes: detect_input_mode reads the tail plus terminal_state,
+                # and terminal_state is only mutated by the writer inside the
+                # same rotate_lock block that writes the log data — so with no
+                # new bytes, neither input has changed since the last check.
+                if merged_output and state is not None:
+                    mode_info = detect_input_mode(
+                        state.terminal_state,
+                        collected[-4096:],
+                        info.is_pty,
+                    )
+                    if mode_info.get("input_mode") in ("text", "selection"):
+                        _refresh_expire(info, variables)
+                        return self._build_output_result(
+                            **batch, wait_until_matched=pattern_pending
+                        )
+
+                # No writer state means no wake signal to wait on.
+                if state is None:
+                    _refresh_expire(info, variables)
+                    return self._build_output_result(**batch, wait_until_matched=pattern_pending)
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or (wait_until_re is None and quiet_window <= 0):
+                    _refresh_expire(info, variables)
+                    return self._build_output_result(**batch, wait_until_matched=pattern_pending)
+
+                # Wait for the next burst.  With wait_until set, silence alone
+                # must not end the call — the agent asked to wait for a
+                # pattern, so ride quiet phases out to the deadline.
+                #
+                # NOTE (pre-existing): two concurrent readers on one process
+                # share this event and serialise their drains on rotate_lock,
+                # so each .log file goes to exactly one of them and the stream
+                # splits arbitrarily between the two results.
+                try:
+                    await asyncio.wait_for(
+                        state.output_event.wait(),
+                        timeout=(
+                            remaining
+                            if wait_until_re is not None
+                            else min(remaining, quiet_window)
+                        ),
+                    )
+                except asyncio.TimeoutError:
+                    # Quiet long enough (or out of time) — return the batch.
+                    # Never a heartbeat: we have real output in hand.
+                    _refresh_expire(info, variables)
+                    return self._build_output_result(**batch, wait_until_matched=pattern_pending)
+                # Woke on new output / exit / teardown — loop and re-drain.
+                continue
 
             # Nothing yet and the process is still running.  Decide: wait or
             # heartbeat.  Early-heartbeat when we last saw the process sitting
@@ -2547,9 +2830,13 @@ class ExecShellOutputTool(BuiltInTool):
         exit_code: Optional[int],
         large_output_mode: str,
         token_threshold: int,
+        wait_until_matched: Optional[bool] = None,
     ) -> BuiltInToolResult:
         """Assemble the structured result for a read that produced output or
-        observed completion (the original post-processing path)."""
+        observed completion (the original post-processing path).
+
+        ``wait_until_matched`` is None when the caller passed no pattern.
+        """
         # Classify the current input mode from the tail of stdout + persistent
         # terminal-state flags.  Only meaningful while still running.  Cache it
         # on the writer state so a later empty heartbeat — whose tail is gone
@@ -2597,12 +2884,15 @@ class ExecShellOutputTool(BuiltInTool):
             structured["input_mode"] = mode_info["input_mode"]
             structured["input_mode_confidence"] = mode_info["confidence"]
             structured["input_signals"] = mode_info["signals"]
+        if wait_until_matched is not None:
+            structured["wait_until_matched"] = wait_until_matched
         structured["instruction"] = _build_output_instruction(
             completed=completed,
             return_code=exit_code,
             input_mode=mode_info["input_mode"] if mode_info is not None else None,
             is_pty=info.is_pty,
             truncated=truncated,
+            wait_until_matched=wait_until_matched,
         )
         return BuiltInToolResult(structured_content=structured)
 
