@@ -9,7 +9,6 @@ import { useNotificationsStore } from '../stores/notifications';
 import AgentCard from './AgentCard.vue';
 import NotificationList from './NotificationList.vue';
 import { openNotificationsStream, type NotificationStreamHandle } from '../services/notificationsStream';
-import { listProfiles } from '../services/configApi';
 import { NAV_ITEMS, SETTINGS_ITEM, type NavItem } from '../constants/navigation';
 
 const route = useRoute();
@@ -101,9 +100,7 @@ const agentTriggerRef = ref<HTMLElement | null>(null);
 // ── Account menu ──
 const userMenuTriggerRef = ref<HTMLElement | null>(null);
 const userMenuVisible = ref(false);
-const otherProfilesExist = ref(false);
 const currentProfileName = computed(() => (route.params.profile as string) || '');
-const hasMultipleProfiles = computed(() => otherProfilesExist.value);
 
 const handleOpenProfile = () => {
   userMenuVisible.value = false;
@@ -135,19 +132,6 @@ const handleLogout = () => {
   userMenuVisible.value = false;
   emit('logout');
 };
-
-// Whether a profile beyond the always-present admin exists — gates the
-// "Switch profile" item in the account menu.
-watch(
-  () => [settingsStore.authToken, settingsStore.profileId] as const,
-  ([token, profileId]) => {
-    if (!token || !profileId) return;
-    listProfiles(settingsStore.agentUrl, token)
-      .then(({ profiles }) => { otherProfilesExist.value = profiles.length > 1; })
-      .catch(() => { otherProfilesExist.value = false; });
-  },
-  { immediate: true },
-);
 
 // ── Notifications: bell popover, badge, arrival animation, SSE stream ──
 const bellPopoverVisible = ref(false);
@@ -519,7 +503,6 @@ onBeforeUnmount(closeNotificationsStream);
             <span>Profile</span>
           </button>
           <button
-            v-if="hasMultipleProfiles"
             type="button"
             role="menuitem"
             class="rail-menu-item"
