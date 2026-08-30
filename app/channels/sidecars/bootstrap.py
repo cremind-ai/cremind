@@ -1,10 +1,17 @@
 """Bootstrap for Node-based channel sidecars.
 
 Each sibling directory under ``app/channels/sidecars/`` that contains a
-``package.json`` is treated as a sidecar. At server startup we verify the
-sidecar's ``node_modules`` is present and matches the committed
-``package-lock.json``; if anything is off we run ``npm ci`` synchronously so
-the server never reaches a "ready" state with broken sidecar dependencies.
+``package.json`` is treated as a sidecar. We verify the sidecar's
+``node_modules`` is present and matches the committed ``package-lock.json``,
+and run ``npm ci`` when it is not.
+
+That happens in two places, and neither is on the critical path to the socket
+bind. :func:`start_background_bootstrap` warms the trees on a daemon thread at
+startup, and :func:`ensure_sidecar_ready` heals on demand when an adapter's
+channel is actually enabled. The second is the one that carries the
+correctness guarantee — the first is only there so the common case is already
+paid for by the time someone enables a channel. A shared per-directory lock
+keeps the two from running npm concurrently in one sidecar.
 
 The lockfiles *are* tracked in git (root ``.gitignore`` un-ignores
 ``app/channels/sidecars/*/package-lock.json``) and therefore ship inside the
@@ -15,7 +22,7 @@ older install in place (e.g. a Kubernetes venv PVC carrying a pre-fix wheel)
 instead of leaving the channel permanently unstartable. ``node`` itself never
 reads the lockfile; it resolves imports out of ``node_modules`` alone.
 
-Startup is best-effort: a failing install (registry unreachable, offline
+Bootstrap is best-effort: a failing install (registry unreachable, offline
 host) is logged and skipped rather than aborting boot, because a broken
 sidecar should only cost you that channel. Enabling the channel retries the
 install through :func:`ensure_sidecar_ready`, so a transient failure heals
@@ -34,6 +41,7 @@ adapters pass when they spawn the sidecar.
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import subprocess
 import threading
@@ -72,17 +80,20 @@ def discover_sidecars() -> list[Path]:
 def is_install_fresh(sidecar_dir: Path) -> tuple[bool, str]:
     """Return ``(fresh?, reason)`` for ``sidecar_dir``.
 
-    "Fresh" means ``node_modules`` exists and was last installed against the
-    current ``package-lock.json`` / ``package.json``. We use npm's own marker
-    file ``node_modules/.package-lock.json`` as the canonical timestamp of
-    the last install.
+    "Fresh" means ``node_modules`` exists and holds what the current
+    ``package-lock.json`` asks for. npm writes ``node_modules/.package-lock.json``
+    describing the tree it just built, so the two are directly comparable.
+
+    We compare *content*, not mtimes. pip rewrites every file it installs with
+    a fresh mtime and does no content-hash skip, so an mtime rule calls the
+    tree stale after each release upgrade and re-downloads ~66MB even when the
+    dependency trees are byte-identical — for users who never enable a sidecar
+    channel at all.
 
     A complete install with no ``package-lock.json`` counts as fresh: the
     lockfile is an input to ``npm ci``, never something node reads at run
     time. That keeps an install healed by the ``npm install`` fallback from
-    being re-installed on every boot. Once a lockfile does appear (a wheel
-    upgrade writes one with a current mtime), it lands newer than the marker
-    and the staleness check below converges the tree onto ``npm ci``.
+    being re-installed on every boot.
     """
     pkg = sidecar_dir / "package.json"
     lock = sidecar_dir / "package-lock.json"
@@ -95,11 +106,50 @@ def is_install_fresh(sidecar_dir: Path) -> tuple[bool, str]:
         return False, "node_modules missing"
     if not marker.exists():
         return False, "node_modules/.package-lock.json missing (incomplete install)"
-    marker_mtime = marker.stat().st_mtime
-    if lock.exists() and marker_mtime < lock.stat().st_mtime:
-        return False, "node_modules is stale relative to package-lock.json"
-    if marker_mtime < pkg.stat().st_mtime:
-        return False, "node_modules is stale relative to package.json"
+    if not lock.exists():
+        return True, "fresh"
+    return _installed_matches_lock(lock, marker)
+
+
+def _installed_matches_lock(lock: Path, marker: Path) -> tuple[bool, str]:
+    """Compare npm's install marker against the lockfile it should satisfy.
+
+    The marker is a *subset* of the lockfile: npm records only what it
+    actually installed, so every entry gated to another platform (the
+    ``@img/sharp-*`` binaries, say) is absent by design. Hence the two
+    directions differ — everything installed must still be in the lockfile at
+    the same version, and everything the lockfile requires unconditionally
+    must be installed.
+    """
+    try:
+        locked = json.loads(lock.read_text(encoding="utf-8")).get("packages") or {}
+        installed = json.loads(marker.read_text(encoding="utf-8")).get("packages") or {}
+    except (OSError, ValueError) as exc:
+        # An unreadable or malformed pair is not something we can reason
+        # about; reinstalling is the cheap, always-correct answer.
+        return False, f"could not compare node_modules against package-lock.json ({exc})"
+
+    for path, entry in installed.items():
+        want = locked.get(path)
+        if want is None:
+            return False, f"{path} is installed but no longer in package-lock.json"
+        if entry.get("version") != want.get("version"):
+            return (
+                False,
+                f"{path} is installed at {entry.get('version')}, "
+                f"package-lock.json wants {want.get('version')}",
+            )
+        if entry.get("resolved") != want.get("resolved"):
+            return False, f"{path} resolves to a different artifact than package-lock.json records"
+
+    for path, entry in locked.items():
+        # "" is the root project itself, never a node_modules entry. Optional
+        # deps are the platform-gated binaries npm legitimately skips.
+        if not path or entry.get("optional") or entry.get("dev"):
+            continue
+        if path not in installed:
+            return False, f"{path} is in package-lock.json but not installed"
+
     return True, "fresh"
 
 
@@ -178,8 +228,7 @@ def ensure_sidecar_installed(sidecar_dir: Path, *, timeout_s: int = 600) -> None
 def ensure_all_sidecars_installed(*, timeout_s: int = 600) -> None:
     """Verify and (re)install every discovered sidecar's ``node_modules``.
 
-    Called once during server startup, before any channels are enabled. A
-    sidecar that fails to install is logged and skipped — boot must not die
+    A sidecar that fails to install is logged and skipped — boot must not die
     because npm could not reach the registry. Enabling the channel retries.
     """
     sidecars = discover_sidecars()
@@ -194,6 +243,44 @@ def ensure_all_sidecars_installed(*, timeout_s: int = 600) -> None:
                 f"sidecar[{sidecar_dir.name}]: bootstrap failed — {exc}. "
                 "The channel will retry the install when it is enabled.",
             )
+
+
+def start_background_bootstrap(*, timeout_s: int = 600) -> threading.Thread | None:
+    """Warm every sidecar's ``node_modules`` without delaying the listener.
+
+    A cold ``npm ci`` for both sidecars is ~66MB and tens of seconds. Doing it
+    inline at startup pushed the socket bind out past the window the
+    installers wait for ``/health`` (10x1s in ``install/install.sh`` and
+    ``install.ps1``), so a fresh native install auto-opened the browser onto a
+    connection-refused page with the only clue buried in the log.
+
+    Correctness does not depend on this finishing, or even running: an adapter
+    calls :func:`ensure_sidecar_ready` when its channel is enabled, which
+    heals the tree on demand and reports what went wrong. This is a warm-up so
+    that the common case — enabling a channel later — is already paid for.
+    Both paths take the same per-directory lock, so they cannot race npm.
+
+    Returns the thread (for tests) or ``None`` when there is nothing to do.
+    """
+    sidecars = discover_sidecars()
+    if not sidecars:
+        return None
+
+    stale = [d for d in sidecars if not is_install_fresh(d)[0]]
+    if not stale:
+        logger.info("sidecar: dependencies fresh — nothing to bootstrap")
+        return None
+
+    names = ", ".join(d.name for d in stale)
+    logger.info(f"sidecar: warming {names} in the background; startup continues")
+    thread = threading.Thread(
+        target=ensure_all_sidecars_installed,
+        kwargs={"timeout_s": timeout_s},
+        name="sidecar-bootstrap",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 async def ensure_sidecar_ready(
