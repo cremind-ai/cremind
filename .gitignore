@@ -13,11 +13,15 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Lockfiles. We track ui/package-lock.json only — every other lockfile
-# (e.g. app/channels/sidecars/whatsapp/) is build-machine state, not
-# something we want creeping into PRs.
+# Lockfiles. Ignored by default, with two deliberate exceptions: ui/ and the
+# channel sidecars. The sidecar lockfiles MUST stay tracked — hatchling's
+# wheel build only ships VCS-tracked files, and the sidecar `npm ci` that
+# runs at boot (app/channels/sidecars/bootstrap.py) needs the lockfile to be
+# in the installed package. Un-ignoring them is what makes Zalo/WhatsApp
+# work on Docker/K8S installs.
 package-lock.json
 !ui/package-lock.json
+!app/channels/sidecars/*/package-lock.json
 yarn.lock
 
 # Editor directories and files

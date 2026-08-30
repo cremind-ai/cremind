@@ -1710,6 +1710,23 @@ resolution = "$CredsResolution"
 # tokens\, profile dirs) under the System Dir, so create it now.
 if (-not (Test-Path $CremindSystemDir)) { New-Item -ItemType Directory -Path $CremindSystemDir | Out-Null }
 
+# Advisory only — Node is needed by the WhatsApp/Zalo channel sidecars, which
+# are optional and off by default, so a missing (or too old) Node must never
+# block the install. Docker installs skip this: their image bundles Node 22.
+$NodeMajor = $null
+if (Get-Command node -ErrorAction SilentlyContinue) {
+    try {
+        $NodeMajor = [int]((& node -e 'console.log(process.versions.node.split(".")[0])' 2>$null) | Select-Object -First 1)
+    } catch { $NodeMajor = $null }
+}
+if ($null -eq $NodeMajor) {
+    Write-Info "Node.js: not found - the WhatsApp and Zalo channels need Node 20+ (https://nodejs.org). Everything else works without it."
+} elseif ($NodeMajor -lt 20) {
+    Write-Info "Node.js: v$NodeMajor found, but the WhatsApp and Zalo channels need Node 20+."
+} else {
+    Write-Ok "Node.js: v$NodeMajor (WhatsApp/Zalo channel sidecars supported)"
+}
+
 function Write-PythonManualHint {
     Write-Host ""
     Write-Host "Install options:"

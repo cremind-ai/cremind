@@ -15,6 +15,14 @@ venv/
 ENV/
 env/
 
+# Node dependency trees. The channel sidecars install theirs in place the
+# first time a server boots from a checkout, and ui/ has its own — together
+# they add gigabytes to the build context for files no stage reads (the
+# image installs the wheel, then runs `npm ci` from the lockfile itself).
+# The `**/` prefix is required: a bare ``node_modules/`` would only match
+# the one at the context root and miss every nested tree.
+**/node_modules/
+
 # IDE
 .vscode/
 .idea/

@@ -479,8 +479,8 @@ $ cremind channels add --type telegram --mode bot \
 # WhatsApp with a password gate (mode is `userbot` — the agent auto-replies
 # as your own WhatsApp account). The QR is rendered straight to the terminal
 # via `mdp/qrterminal`; scan it with WhatsApp → Linked Devices.
-# Prereq: Node 18+ on PATH and `npm install` already run inside
-# `app/channels/sidecars/whatsapp/`.
+# Prereq: Node 18+ on PATH. The sidecar's `node_modules/` is installed
+# automatically the first time the channel starts.
 $ cremind channels add --type whatsapp --mode userbot \
                    --auth-mode password \
                    --json '{"phone":"+14155551212","password":"hunter2"}'
@@ -1124,7 +1124,7 @@ without re-implementing the parser. The command still exits on `ready`
 in JSON mode.
 
 **Prerequisites.** Same as the channel itself — for WhatsApp, Node 18+
-and `npm install` already run inside `app/channels/sidecars/whatsapp/`.
+on PATH (the sidecar's dependencies install themselves on first start).
 For Telegram userbot, the `api_id` / `api_hash` / `phone` config fields
 must be set on the channel before `pair` is run.
 
@@ -1698,11 +1698,12 @@ that couldn't be installed at connect time (Telegram/Discord/Slack
 install their package automatically on enable — a failure here is
 usually an offline host or a locked-down index; install it manually with
 `cremind features install channel.discord.bot` / `.slack.bot` /
-`.telegram.bot` / `.telegram.userbot`), a missing `node_modules/` under
-`app/channels/sidecars/whatsapp/` or `app/channels/sidecars/zalo/` (run
-`npm install` once, or restart to auto-install), Node not on PATH, or —
-for Messenger — the Cremind host not being publicly reachable so Meta's
-webhook can't deliver.
+`.telegram.bot` / `.telegram.userbot`), a Node sidecar whose dependencies
+could not be installed (WhatsApp and Zalo userbot install their
+`node_modules/` on enable; a failure here means npm is missing or could
+not reach registry.npmjs.org — fix that and re-enable the channel to
+retry), Node not on PATH, or — for Messenger — the Cremind host not being
+publicly reachable so Meta's webhook can't deliver.
 
 **Telegram userbot keeps prompting for the code** — Either the code
 expired (Telegram codes are short-lived; the dialog will say "Code
