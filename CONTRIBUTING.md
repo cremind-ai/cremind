@@ -80,6 +80,17 @@ from `APP_URL`, so the production default (`:1515`) would send the consent
 redirect to Vite's SPA ("Select a profile…") instead of the backend's
 `/api/oauth/.../callback`. Pointing it at `:1112` lets linking complete.
 
+**HTTPS does not apply in this loop**, even with `CREMIND_SSL*` set in your
+`.env` — Terminal A warns and serves plain HTTP. `CREMIND_UI_PORT=0` opens no
+public bind, and the public bind is the only thing TLS applies to; the internal
+`:1112` API stays plain HTTP by design (the CLI, skills, and sidecars all speak
+to it). Putting Vite itself behind HTTPS would not change that either: the SPA
+reaches the API cross-origin at `:1112`, so that is where its SSE streams
+accumulate. To exercise HTTPS and HTTP/2, use the single-port smoke flow under
+[Variations](#variations) — and make sure `CREMIND_UI_PORT` is unset in that
+shell, or you will get the warning instead of TLS. See
+[HTTPS and HTTP/2](#https-and-http2).
+
 ### Terminal B — Vite dev server
 
 ```powershell
@@ -126,7 +137,7 @@ uvicorn's in-process reload (~2 s for a cold restart) but it always works.
 |---|---|
 | Backend only (API on loopback) | `$env:CREMIND_UI_PORT=0; uv run cremind serve` — binds `:1112` only, no public `:1515`. |
 | UI pointed at a remote backend | `cd ui ; npm run web:dev`. Configure the agent URL via the setup wizard, or `$env:VITE_AGENT_URL = "https://..."` before `npm run web:dev`. |
-| Single-port end-to-end smoke (no HMR) | `bash scripts/build_ui.sh ; uv run cremind serve` (Windows: `.\scripts\build_ui.ps1 ; uv run cremind serve`). The SPA gets bundled into `app/static/ui/`, served on `:1515` by the backend. Use for pre-release verification, not active dev. |
+| Single-port end-to-end smoke (no HMR) | `bash scripts/build_ui.sh ; uv run cremind serve` (Windows: `.\scripts\build_ui.ps1 ; uv run cremind serve`). The SPA gets bundled into `app/static/ui/`, served on `:1515` by the backend. Use for pre-release verification, not active dev. This is also the only local flow where [HTTPS and HTTP/2](#https-and-http2) apply — unset `CREMIND_UI_PORT` first. |
 | Electron desktop dev | `cd ui ; npm run dev`. Wraps the SPA in an Electron window. Talks to the backend URL from `~/.cremind-ui/cremind-config.json`. |
 
 ## HTTPS and HTTP/2
