@@ -90,7 +90,7 @@ from app.tools.builtin import (
     refresh_builtin_tool_oauth,
     register_builtin_tools,
 )
-from app.channels.sidecars.bootstrap import ensure_all_sidecars_installed
+from app.channels.sidecars.bootstrap import start_background_bootstrap
 from app.tools.builtin.exec_shell import cleanup_stdout_on_startup
 from app.tools.builtin.exec_shell_autostart import run_autostart_on_boot
 from app.tools.mcp import (
@@ -695,9 +695,12 @@ async def main(
         # Same best-effort rationale as the clear above.
         logger.debug(f"[boot] upgrade-status boot-marker best-effort failed: {e}")
 
-    # 0b. Verify channel sidecars' node_modules; reinstall if missing or
-    #     stale. Blocks startup so adapters never see a half-installed tree.
-    ensure_all_sidecars_installed()
+    # 0b. Warm channel sidecars' node_modules. Deliberately off the critical
+    #     path: a cold `npm ci` is ~66MB and would delay the bind past the
+    #     window the installers wait for /health. Adapters call
+    #     ensure_sidecar_ready() when a channel is enabled, so a half-installed
+    #     tree is still never handed to one.
+    start_background_bootstrap()
 
     # 0c. Runtime state. Storage-dependent objects are populated by the
     #     deferred boot closure below.

@@ -12,7 +12,10 @@ Everything here is hermetic: npm is faked through ``shutil.which`` and
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import subprocess
+import threading
 
 import pytest
 
@@ -23,6 +26,14 @@ from app.channels.sidecars import bootstrap
 # ── helpers ───────────────────────────────────────────────────────────────
 
 
+def _lock_body(packages: dict[str, str] | None) -> str:
+    """A lockfile/marker body in npm's shape, from ``{path: version}``."""
+    body: dict = {"name": "x", "lockfileVersion": 3, "packages": {"": {"name": "x"}}}
+    for path, version in (packages or {}).items():
+        body["packages"][path] = {"version": version}
+    return json.dumps(body)
+
+
 def make_sidecar(
     tmp_path,
     *,
@@ -30,28 +41,31 @@ def make_sidecar(
     lock: bool = True,
     node_modules: bool = True,
     marker: bool = True,
+    packages: dict[str, str] | None = None,
 ):
-    """Build a sidecar dir on disk with the requested pieces present."""
+    """Build a sidecar dir on disk with the requested pieces present.
+
+    ``packages`` seeds *what npm installed* (the marker). Pair it with
+    :func:`write_lock` to describe what the lockfile asks for; passing the
+    same mapping to both is the fresh case.
+    """
     d = tmp_path / name
     d.mkdir()
     (d / "package.json").write_text('{"name": "x"}')
     (d / "index.js").write_text("// sidecar")
     if lock:
-        (d / "package-lock.json").write_text("{}")
+        (d / "package-lock.json").write_text(_lock_body(packages))
     if node_modules:
         nm = d / "node_modules"
         nm.mkdir()
         if marker:
-            (nm / ".package-lock.json").write_text("{}")
+            (nm / ".package-lock.json").write_text(_lock_body(packages))
     return d
 
 
-def touch_newer(path, reference):
-    """Make ``path`` mtime strictly newer than ``reference``'s."""
-    import os
-
-    ref_mtime = reference.stat().st_mtime
-    os.utime(path, (ref_mtime + 10, ref_mtime + 10))
+def write_lock(sidecar_dir, packages: dict[str, str]):
+    """Rewrite only the lockfile, leaving the install marker as it was."""
+    (sidecar_dir / "package-lock.json").write_text(_lock_body(packages))
 
 
 class FakePopen:
@@ -134,21 +148,68 @@ def test_complete_install_without_lockfile_is_fresh(tmp_path):
     assert bootstrap.is_install_fresh(d) == (True, "fresh")
 
 
-def test_lockfile_newer_than_install_is_stale(tmp_path):
-    """A wheel upgrade drops in a fresh lockfile — reconcile onto npm ci."""
-    d = make_sidecar(tmp_path)
-    touch_newer(d / "package-lock.json", d / "node_modules" / ".package-lock.json")
+def test_upgraded_lockfile_wanting_a_new_version_is_stale(tmp_path):
+    """A wheel upgrade that really changes a dependency reconciles onto npm ci."""
+    d = make_sidecar(tmp_path, packages={"node_modules/ws": "8.20.0"})
+    write_lock(d, {"node_modules/ws": "8.21.3"})
     fresh, reason = bootstrap.is_install_fresh(d)
     assert not fresh
-    assert reason == "node_modules is stale relative to package-lock.json"
+    assert reason == "node_modules/ws is installed at 8.20.0, package-lock.json wants 8.21.3"
 
 
-def test_package_json_newer_than_install_is_stale(tmp_path):
-    d = make_sidecar(tmp_path)
-    touch_newer(d / "package.json", d / "node_modules" / ".package-lock.json")
+def test_lockfile_entry_missing_from_install_is_stale(tmp_path):
+    """A newly added dependency has to be installed before the tree is fresh."""
+    d = make_sidecar(tmp_path, packages={"node_modules/ws": "8.20.0"})
+    write_lock(d, {"node_modules/ws": "8.20.0", "node_modules/qrcode": "1.5.4"})
     fresh, reason = bootstrap.is_install_fresh(d)
     assert not fresh
-    assert reason == "node_modules is stale relative to package.json"
+    assert reason == "node_modules/qrcode is in package-lock.json but not installed"
+
+
+def test_platform_gated_optional_deps_do_not_make_it_stale(tmp_path):
+    """The sharp binaries are the reason this matters.
+
+    A portable lockfile carries every ``@img/sharp-*`` variant, but npm only
+    installs the one for the running platform. Requiring all of them would
+    call every healthy tree stale and reinstall on every single boot.
+    """
+    d = make_sidecar(tmp_path, packages={"node_modules/sharp": "0.34.5"})
+    lock = {
+        "packages": {
+            "": {"name": "x"},
+            "node_modules/sharp": {"version": "0.34.5"},
+            "node_modules/@img/sharp-linux-x64": {"version": "0.34.5", "optional": True},
+            "node_modules/@img/sharp-win32-x64": {"version": "0.34.5", "optional": True},
+        }
+    }
+    (d / "package-lock.json").write_text(json.dumps(lock))
+    assert bootstrap.is_install_fresh(d) == (True, "fresh")
+
+
+def test_touching_files_without_changing_them_stays_fresh(tmp_path):
+    """pip rewrites every file it installs with a fresh mtime.
+
+    An mtime-based rule therefore re-downloads ~66MB on every release
+    upgrade even when the dependency tree is byte-identical — including for
+    users who never enable a sidecar channel.
+    """
+    d = make_sidecar(tmp_path, packages={"node_modules/ws": "8.20.0"})
+    write_lock(d, {"node_modules/ws": "8.20.0"})
+    assert bootstrap.is_install_fresh(d) == (True, "fresh")
+
+    newer = (d / "node_modules" / ".package-lock.json").stat().st_mtime + 10_000
+    for name in ("package.json", "package-lock.json"):
+        os.utime(d / name, (newer, newer))
+
+    assert bootstrap.is_install_fresh(d) == (True, "fresh")
+
+
+def test_unreadable_lockfile_reinstalls_rather_than_guessing(tmp_path):
+    d = make_sidecar(tmp_path)
+    (d / "package-lock.json").write_text("{not json")
+    fresh, reason = bootstrap.is_install_fresh(d)
+    assert not fresh
+    assert "could not compare" in reason
 
 
 def test_fully_installed_is_fresh(tmp_path):
@@ -227,6 +288,58 @@ def test_boot_survives_a_failing_sidecar(tmp_path, monkeypatch):
 
     # Every sidecar is still attempted; one failure doesn't skip the rest.
     assert sorted(attempted) == ["whatsapp", "zalo"]
+
+
+# ── start_background_bootstrap ────────────────────────────────────────────
+
+
+def test_background_bootstrap_does_not_block_the_caller(tmp_path, monkeypatch):
+    """The regression: a cold npm ci used to delay the socket bind.
+
+    The installers wait 10x1s for /health and then open a browser, so a
+    startup that blocks on ~66MB of npm hands the user a dead link.
+    """
+    monkeypatch.setattr(bootstrap, "SIDECARS_ROOT", tmp_path)
+    make_sidecar(tmp_path, name="zalo", node_modules=False)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow(sidecar_dir, **kwargs):
+        started.set()
+        assert release.wait(timeout=5), "install ran but was never released"
+
+    monkeypatch.setattr(bootstrap, "ensure_sidecar_installed", slow)
+
+    thread = bootstrap.start_background_bootstrap()
+    assert thread is not None
+    # The install is genuinely in flight while we are already past the call.
+    assert started.wait(timeout=5)
+    assert thread.is_alive()
+    assert thread.daemon, "a hung npm must never keep the process alive"
+
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+def test_background_bootstrap_skips_entirely_when_everything_is_fresh(
+    tmp_path, monkeypatch
+):
+    """The steady state: no thread, no npm, on every normal restart."""
+    monkeypatch.setattr(bootstrap, "SIDECARS_ROOT", tmp_path)
+    make_sidecar(tmp_path, name="zalo", packages={"node_modules/ws": "8.20.0"})
+
+    def unexpected(sidecar_dir, **kwargs):  # pragma: no cover - must not run
+        raise AssertionError("a fresh tree must not be reinstalled")
+
+    monkeypatch.setattr(bootstrap, "ensure_sidecar_installed", unexpected)
+    assert bootstrap.start_background_bootstrap() is None
+
+
+def test_background_bootstrap_is_a_noop_without_sidecars(tmp_path, monkeypatch):
+    monkeypatch.setattr(bootstrap, "SIDECARS_ROOT", tmp_path)
+    assert bootstrap.start_background_bootstrap() is None
 
 
 # ── ensure_sidecar_ready (the adapter guard) ──────────────────────────────

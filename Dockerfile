@@ -309,10 +309,11 @@ RUN --mount=type=bind,target=/src,rw \
 # ── Pre-bake the channel sidecars' node_modules ───────────────────────────
 # Installing them here means a fresh install (including an air-gapped one)
 # boots with WhatsApp/Zalo ready and never touches the npm registry:
-# ``cp -a`` seeds the runtime venv preserving mtimes, so bootstrap.py's
-# freshness check passes and skips its own ``npm ci``.
+# bootstrap.py compares the install marker npm writes against the lockfile,
+# so a tree seeded into the runtime venv reads as fresh and no ``npm ci``
+# runs at boot.
 #
-# It does NOT replace that boot-time check. Image upgrades never resync an
+# It does NOT replace that boot-time warm-up. Image upgrades never resync an
 # existing runtime venv (the entrypoint seeds only when it is empty), and an
 # in-app wheel upgrade pip-installs a newer lockfile straight into that venv
 # — bootstrap.py is what reconciles node_modules in both those cases.
