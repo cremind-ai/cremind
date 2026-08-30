@@ -66,6 +66,16 @@ services:
       DISABLE_LOG: "false"
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
       SETUP_WIZARD_ENV: ${SETUP_WIZARD_ENV:-local}
+      # HTTPS on 1515, which also turns it into an HTTP/2 origin. Empty by
+      # default, which keeps the port plain HTTP. Set these in .env — the
+      # cert/key paths are container-side, so uncomment the certs mount in
+      # ``volumes:`` below first. ``CREMIND_SSL=auto`` needs no mount: it
+      # generates into /root/.cremind/tls (the cremind-data volume).
+      CREMIND_SSL_CERTFILE: ${CREMIND_SSL_CERTFILE:-}
+      CREMIND_SSL_KEYFILE: ${CREMIND_SSL_KEYFILE:-}
+      CREMIND_SSL_KEYFILE_PASSWORD: ${CREMIND_SSL_KEYFILE_PASSWORD:-}
+      CREMIND_SSL: ${CREMIND_SSL:-}
+      CREMIND_SSL_AUTO_HOSTS: ${CREMIND_SSL_AUTO_HOSTS:-}
       # How Cremind was installed. Read by the backend's service-mode
       # filter (see install_catalog.toml's [mode_rules]) so the Setup
       # Wizard only offers per-service modes that match the install.
@@ -96,6 +106,11 @@ services:
       # uninstall) along with the other named volumes. Inspect with:
       #   docker run --rm -v cremind_cremind-data:/data busybox ls /data
       - cremind-data:/root/.cremind
+      # TLS certificates, when you bring your own. Read-only, and pointed at
+      # by CREMIND_SSL_CERTFILE / CREMIND_SSL_KEYFILE using their /certs
+      # paths. Not needed for CREMIND_SSL=auto, which generates into the
+      # cremind-data volume above.
+      # - ./certs:/certs:ro
       # The runtime venv lives in a named volume so wizard-installed
       # extras (sentence-transformers, qdrant-client, anthropic, ...)
       # persist across ``docker compose down && up``. The entrypoint

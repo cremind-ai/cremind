@@ -129,6 +129,75 @@ uvicorn's in-process reload (~2 s for a cold restart) but it always works.
 | Single-port end-to-end smoke (no HMR) | `bash scripts/build_ui.sh ; uv run cremind serve` (Windows: `.\scripts\build_ui.ps1 ; uv run cremind serve`). The SPA gets bundled into `app/static/ui/`, served on `:1515` by the backend. Use for pre-release verification, not active dev. |
 | Electron desktop dev | `cd ui ; npm run dev`. Wraps the SPA in an Electron window. Talks to the backend URL from `~/.cremind-ui/cremind-config.json`. |
 
+## HTTPS and HTTP/2
+
+The public origin (`:1515`) serves plain HTTP by default. Give it a
+certificate and key and it serves HTTPS **and HTTP/2** instead:
+
+```bash
+CREMIND_SSL_CERTFILE=/path/fullchain.pem CREMIND_SSL_KEYFILE=/path/privkey.pem \
+  uv run cremind serve
+# or: uv run cremind serve --ssl-certfile ... --ssl-keyfile ...
+```
+
+HTTP/2 is the reason to bother. The UI holds a lot of long-lived SSE streams,
+and HTTP/1.1 limits a browser to ~6 connections per origin — which is why
+[`ui/src/services/sharedStream.ts`](ui/src/services/sharedStream.ts) elects a
+leader tab and [`app/api/profile_events.py`](app/api/profile_events.py)
+multiplexes several feeds into one response. Over HTTP/2 those streams share a
+single connection and the cap stops mattering. Browsers only negotiate HTTP/2
+over TLS (via ALPN), so it comes with HTTPS or not at all.
+
+Under TLS the public bind is served by **hypercorn** (uvicorn is HTTP/1.1-only);
+with TLS off, nothing changes. The internal API port (`:1112`) stays plain HTTP
+either way — it is loopback-only, and the CLI, skills, and sidecars all use it.
+
+Set `APP_URL` (and `CORS_ALLOWED_ORIGINS`, if it lists explicit origins) to
+`https://` to match; the server warns at boot if you forget.
+
+### Generated certificates, and the browser warning
+
+With no certificate of your own, `CREMIND_SSL=auto` makes one:
+
+```bash
+CREMIND_SSL=auto uv run cremind serve
+```
+
+It creates a small CA in `~/.cremind/tls/` and signs a server certificate with
+it, covering `localhost`, this machine's hostname, and its detected IPs. Add
+more with `CREMIND_SSL_AUTO_HOSTS=cremind.lan,10.0.0.5`.
+
+**Browsers will still warn until you trust the CA.** Nothing a server can do on
+its own prevents that: a certificate is trusted because it chains to a root
+already in the *device's* trust store, so one manual install per device is
+unavoidable. The CA exists so that step is a one-off — server certificates get
+reissued (on expiry, or when a hostname is added) and stay trusted, whereas a
+bare self-signed certificate would have to be re-trusted every time.
+
+Install `~/.cremind/tls/ca.pem` on each device that connects:
+
+| OS | Command |
+|---|---|
+| Windows | `certutil -addstore -user Root %USERPROFILE%\.cremind\tls\ca.pem` |
+| macOS | `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.cremind/tls/ca.pem` |
+| Linux (Debian/Ubuntu) | `sudo cp ~/.cremind/tls/ca.pem /usr/local/share/ca-certificates/cremind-local-ca.crt && sudo update-ca-certificates` |
+
+Firefox keeps its own store — import it under Settings → Privacy & Security →
+Certificates → View Certificates → Authorities.
+
+The alternative, and the right answer for a real deployment, is a certificate
+from a public CA (Let's Encrypt and friends). That needs a real domain name and
+warns nobody.
+
+### What this does not cover
+
+ACME/Let's Encrypt automation, certificate hot-reload (restart to rotate),
+mTLS, and an HTTP→HTTPS redirect listener are all out of scope — put a proxy in
+front if you need them. TLS is also ignored in two cases, with a warning:
+`CREMIND_UI_PORT=0` (an external proxy owns the origin) and the Electron
+desktop app (it loads the UI over `http://127.0.0.1:1515`). On Kubernetes, TLS
+terminates at the Ingress as it does today; leave these unset there.
+
 ## Installing your checkout via the installer scripts
 
 The two-terminal flow above is the fastest dev loop. If you want to

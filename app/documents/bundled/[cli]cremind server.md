@@ -9,6 +9,12 @@ operational surface of the web UI's **Developer** page. It complements
 `cremind serve` (which starts a server in-process) and the root
 `cremind version` (which prints the *locally installed* package version).
 
+How that server *listens* — bind address, port, and whether the public origin
+serves HTTPS with HTTP/2 — is configured on `cremind serve` itself (see
+`cremind serve --help`) or, for a setting that must survive a restart, in
+`~/.cremind/.env`. A restart re-execs the server without any command-line
+flags, so the `.env` is the durable place for them.
+
 The three read commands (`health`, `version`, `capabilities`) hit
 unauthenticated endpoints, so they work without a token — handy for probing a
 server before login or against a remote `--server`. `restart` is **admin-only**.

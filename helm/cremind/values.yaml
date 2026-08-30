@@ -207,6 +207,12 @@ service:
 ## @section Ingress
 # One hostname for the whole workflow (UI at /, noVNC at /vnc/). Set host +
 # className for your cluster.
+#
+# TLS belongs here, on the Ingress — that is also where HTTP/2 to the browser
+# comes from, since ingress controllers serve it by default. The container's
+# own CREMIND_SSL* settings are for non-Kubernetes deployments and should stay
+# unset in the chart: the pod would then be speaking TLS to a proxy that
+# expects plain HTTP.
 ingress:
   enabled: false
   className: ""

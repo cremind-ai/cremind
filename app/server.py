@@ -447,6 +447,118 @@ def _resolve_public_port() -> int:
         return 1515
 
 
+def _resolve_tls(
+    ssl_certfile: str | None,
+    ssl_keyfile: str | None,
+    public_port: int,
+) -> tuple[str, str] | None:
+    """The public bind's ``(certfile, keyfile)``, or ``None`` to serve plain HTTP.
+
+    Validated here rather than in ``BaseConfig`` because settings.py is imported
+    by every CLI command, where a stale cert path must not be fatal. Checked
+    alongside the port pre-flight for the same reason that check exists: a
+    misconfiguration should stop the process before boot has any side effects.
+    """
+    certfile = (ssl_certfile or BaseConfig.SSL_CERTFILE or "").strip()
+    keyfile = (ssl_keyfile or BaseConfig.SSL_KEYFILE or "").strip()
+    auto = BaseConfig.SSL_MODE.strip().lower() == "auto"
+
+    if not certfile and not keyfile and not auto:
+        return None
+
+    # An external proxy owns the origin in these two modes, so it — not this
+    # process — is what a browser connects to and what should hold the
+    # certificate. Warn rather than fail: the env may be set globally.
+    if public_port == 0:
+        logger.warning(
+            "TLS is configured but CREMIND_UI_PORT=0, so no public bind exists — "
+            "serving loopback-only over plain HTTP. Terminate TLS at whatever "
+            "proxy fronts this process."
+        )
+        return None
+    if os.environ.get("CREMIND_ELECTRON_PARENT") is not None:
+        logger.warning(
+            "TLS is configured but this process was started by the Electron app, "
+            "which loads the UI over http://127.0.0.1 — ignoring TLS. It applies "
+            "to server deployments."
+        )
+        return None
+
+    if auto and not certfile and not keyfile:
+        from app.config.tls_auto import ensure_local_tls, tls_dir
+
+        certfile, keyfile = ensure_local_tls(
+            BaseConfig.CREMIND_SYSTEM_DIR, BaseConfig.SSL_AUTO_HOSTS
+        )
+        logger.info(
+            "CREMIND_SSL=auto — serving a locally-signed certificate. Browsers "
+            "will warn until this machine's CA is trusted; install "
+            f"{os.path.join(tls_dir(BaseConfig.CREMIND_SYSTEM_DIR), 'ca.pem')} "
+            "into the trust store of each device that connects (see the HTTPS "
+            "section in CONTRIBUTING.md)."
+        )
+    elif not certfile or not keyfile:
+        missing, given = (
+            ("CREMIND_SSL_CERTFILE", "CREMIND_SSL_KEYFILE")
+            if not certfile
+            else ("CREMIND_SSL_KEYFILE", "CREMIND_SSL_CERTFILE")
+        )
+        logger.error(
+            f"Cannot start: {given} is set but {missing} is not — TLS needs both. "
+            "Set it, or unset both to serve plain HTTP (or use CREMIND_SSL=auto)."
+        )
+        raise SystemExit(1)
+
+    # Paths are interpolated plainly, not with !r: repr doubles every backslash,
+    # which makes a Windows path in an error message hard to read back.
+    for label, path in (("certificate", certfile), ("private key", keyfile)):
+        if not os.path.isfile(path):
+            logger.error(
+                f"Cannot start: the TLS {label} does not exist at {path}. "
+                "Fix the path, or unset CREMIND_SSL_CERTFILE/CREMIND_SSL_KEYFILE "
+                "to serve plain HTTP."
+            )
+            raise SystemExit(1)
+        if not os.access(path, os.R_OK):
+            logger.error(f"Cannot start: the TLS {label} at {path} is not readable.")
+            raise SystemExit(1)
+
+    # APP_URL is what the agent card advertises and what OAuth redirects derive
+    # from, so an http:// value here sends browsers to a port that now speaks TLS.
+    if BaseConfig.APP_URL.startswith("http://"):
+        logger.warning(
+            f"TLS is on but APP_URL is {BaseConfig.APP_URL!r} — the agent card and "
+            "OAuth redirects will point at http://. Change it to https:// (and "
+            "CORS_ALLOWED_ORIGINS with it, if that is set to explicit origins)."
+        )
+
+    return certfile, keyfile
+
+
+def _mk_hypercorn_config(host: str, port: int, certfile: str, keyfile: str):
+    """Hypercorn config for the TLS public bind.
+
+    Split out from the serve section so it can be asserted on without binding
+    a socket.
+    """
+    from hypercorn.config import Config as HypercornConfig
+
+    cfg = HypercornConfig()
+    cfg.bind = [f"{host}:{port}"]
+    cfg.certfile = certfile
+    cfg.keyfile = keyfile
+    if BaseConfig.SSL_KEYFILE_PASSWORD:
+        cfg.keyfile_password = BaseConfig.SSL_KEYFILE_PASSWORD
+    # The whole point of the TLS path: browsers negotiate HTTP/2 through ALPN
+    # and stop being limited to ~6 connections per origin. http/1.1 stays in
+    # the list so non-h2 clients (and the WebSocket upgrade) still work.
+    cfg.alpn_protocols = ["h2", "http/1.1"]
+    # Parity with the uvicorn binds' timeout_graceful_shutdown=10.
+    cfg.graceful_timeout = 10.0
+    cfg.accesslog = None
+    return cfg
+
+
 def _port_taken(bind_host: str, bind_port: int) -> bool:
     """Whether something already holds this address."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -502,7 +614,12 @@ def _require_free_ports(host: str, public_port: int, loopback_port: int) -> None
         raise SystemExit(1)
 
 
-async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
+async def main(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    ssl_certfile: str | None = None,
+    ssl_keyfile: str | None = None,
+):
     _silence_proactor_connection_reset(asyncio.get_running_loop())
 
     # 0. Can we have the ports at all? Asked FIRST, before anything is started.
@@ -516,6 +633,12 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
     #    sidecar and no half-written state behind.
     public_port = _resolve_public_port()
     _require_free_ports(host, public_port, port)
+
+    #    Resolved next, for the same reason: a bad cert path (or CREMIND_SSL=auto
+    #    with an unwritable system dir) should stop us here, not after the whole
+    #    installation has started. Generating the auto certificate at this point
+    #    also keeps that cost off the request path.
+    tls = _resolve_tls(ssl_certfile, ssl_keyfile, public_port)
 
     # 0''. Purge stale exec_shell stdout directories from previous runs.
     cleanup_stdout_on_startup()
@@ -685,7 +808,12 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
     # pre-storage guarantees they answer whenever a link is in flight.
     routes.extend(get_oauth_callback_routes())
 
+    from app.middleware import ConnectionHeaderFilter
+
     middleware_stack = [
+        # Outermost, so it also covers the SPA fallback, the mounted A2A app,
+        # and the routes appended to the live app after storage boots.
+        Middleware(ConnectionHeaderFilter),
         Middleware(
             CORSMiddleware,
             allow_origins=BaseConfig.CORS_ALLOWED_ORIGINS,
@@ -1252,6 +1380,55 @@ async def main(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
             app, host=bind_host, port=bind_port,
             timeout_graceful_shutdown=10, lifespan=lifespan,
         )
+
+    if tls is not None:
+        # ── TLS: hypercorn serves the public bind, uvicorn the loopback ──
+        #
+        # uvicorn speaks only HTTP/1.1, and HTTP/2 is the reason this path
+        # exists (see _mk_hypercorn_config), so the public bind moves to
+        # hypercorn whenever TLS is on. The loopback bind stays on uvicorn and
+        # stays plain HTTP, which is what keeps the CLI, the skills'
+        # CREMIND_SERVER, and the sidecars working untouched.
+        #
+        # Hypercorn always runs the ASGI lifespan — it has no "off" switch — so
+        # here the PUBLIC server owns it and the loopback keeps lifespan="off".
+        # Same invariant as the plain-HTTP path: _on_shutdown runs exactly once.
+        from hypercorn.asyncio import serve as hypercorn_serve
+
+        certfile, keyfile = tls
+        hypercorn_config = _mk_hypercorn_config(host, public_port, certfile, keyfile)
+
+        loop = asyncio.get_running_loop()
+        shutdown_event = asyncio.Event()
+
+        class _SignalFanoutServer(_BoundedShutdownServer):
+            """Relays uvicorn's signal handling to hypercorn.
+
+            Hypercorn installs no signal handlers of its own once given an
+            explicit ``shutdown_trigger`` (hypercorn/asyncio/run.py), so the
+            loopback uvicorn server is the single registrant and its
+            ``handle_exit`` is the one entry point for SIGINT/SIGTERM/SIGBREAK
+            on both platforms. It starts the supervised hard-exit timer
+            (inherited), stops itself, and releases hypercorn's trigger.
+
+            ``call_soon_threadsafe`` because handle_exit runs in a signal
+            context, which must not touch the loop directly.
+            """
+
+            def handle_exit(self, sig, frame):
+                loop.call_soon_threadsafe(shutdown_event.set)
+                super().handle_exit(sig, frame)
+
+        internal = _SignalFanoutServer(_mk_config("127.0.0.1", port, lifespan="off"))
+        logger.info(
+            f"Serving on public https://{host}:{public_port} (HTTP/2 + HTTP/1.1 via ALPN) "
+            f"(+ internal loopback http://127.0.0.1:{port})"
+        )
+        await asyncio.gather(
+            hypercorn_serve(app, hypercorn_config, shutdown_trigger=shutdown_event.wait),
+            internal.serve(),
+        )
+        return
 
     servers: list[uvicorn.Server] = []
     if public_port != 0:

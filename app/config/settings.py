@@ -299,6 +299,24 @@ class BaseConfig:
     LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
     DISABLE_LOG = _bool(os.environ.get("DISABLE_LOG", "false"))
     CORS_ALLOWED_ORIGINS = _csv_list(os.environ.get("CORS_ALLOWED_ORIGINS", "")) or ["*"]
+    # ── TLS for the PUBLIC bind (CREMIND_UI_PORT) ──
+    # Set both cert and key to serve https there; the server then also speaks
+    # HTTP/2, which is the point — the UI holds many long-lived SSE streams and
+    # HTTP/1.1 caps a browser at ~6 connections per origin. ``CREMIND_SSL=auto``
+    # generates a locally-signed pair instead (see app/config/tls_auto.py).
+    #
+    # The internal loopback bind (PORT) is always plain HTTP: the CLI, the
+    # skills' CREMIND_SERVER, and the sidecars all talk to it, and none of them
+    # gains anything from TLS over 127.0.0.1.
+    #
+    # Not validated here — settings.py is imported by every CLI command, and a
+    # stale cert path must not break `cremind conv list`. app/server.py checks
+    # the files at boot, where a clear failure belongs.
+    SSL_CERTFILE = os.environ.get("CREMIND_SSL_CERTFILE", "")
+    SSL_KEYFILE = os.environ.get("CREMIND_SSL_KEYFILE", "")
+    SSL_KEYFILE_PASSWORD = os.environ.get("CREMIND_SSL_KEYFILE_PASSWORD", "")
+    SSL_MODE = os.environ.get("CREMIND_SSL", "")  # "" | "auto"
+    SSL_AUTO_HOSTS = _csv_list(os.environ.get("CREMIND_SSL_AUTO_HOSTS", ""))
 
     # ── Application-level (TOML defaults, overridable via SQLite) ──
     SERVICE_NAME = _dynaconf_get("general.service_name", "cremind-agent")

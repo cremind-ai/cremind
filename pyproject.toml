@@ -44,6 +44,13 @@ dependencies = [
     # Pin <1.0 until server.py migrates to lifespan().
     "starlette>=0.52.1,<1.0",
     "uvicorn>=0.41.0",
+    # Serves the public origin when TLS is configured. uvicorn is TLS-capable
+    # but HTTP/1.1-only, and HTTP/2 is the reason the TLS path exists: the UI
+    # holds many long-lived SSE streams against a ~6-connection-per-origin cap.
+    # Core rather than an extra, because enabling TLS is an env-var-and-restart
+    # operation and the restart path cannot install packages. h2/hpack/
+    # hyperframe are already here via httpx[http2]; this adds wsproto+priority.
+    "hypercorn>=0.17",
     "python-multipart>=0.0.9",
     # a2a-sdk 1.0 removed `a2a.server.apps` and `A2AStarletteApplication`
     # along with much of the legacy server-app surface. Pin <1.0 until the
