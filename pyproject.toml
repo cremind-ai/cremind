@@ -185,6 +185,13 @@ packages = ["app"]
 # include matching paths even when ignored. Without this, ``cremind serve``
 # logs "SPA not present" and the 1515 listener never opens.
 artifacts = ["app/static/ui/**", "app/static/ui-electron/**"]
+# The channel sidecars install their node_modules in place — at boot on a
+# server, or the moment a developer starts one from a checkout. Those trees
+# are thousands of files and must never ride along in the wheel; the
+# sidecars' own .gitignore is not enough, because ``artifacts`` above
+# re-enables ignored files for the whole build. The lockfiles beside them
+# ARE tracked and DO ship: bootstrap.py needs them to run `npm ci`.
+exclude = ["app/channels/sidecars/*/node_modules/**"]
 
 [tool.hatch.build.targets.sdist]
 include = [

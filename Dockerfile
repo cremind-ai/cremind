@@ -16,9 +16,11 @@
 #   uv            pinned uv/uvx binaries (COPY source only)
 #   spa-builder   builds the SPA (referenced by neither final; kept for
 #                 parity / future use — BuildKit skips it when unreferenced)
-#   core          ubuntu:24.04 + python3.13 + uv + docker CLI + shared env
+#   core          ubuntu:24.04 + python3.13 + uv + docker CLI + node 22
+#                 (channel sidecars) + shared env
 #   desktop-deps  core + XFCE + TigerVNC + noVNC + Chrome (version-INDEPENDENT)
-#   venv-builder  core + the cremind wheel → /opt/cremind-baseline/venv
+#   venv-builder  core + the cremind wheel → /opt/cremind-baseline/venv,
+#                 plus the sidecars' pre-baked node_modules
 #   basic         core         + venv + entrypoint     (target)
 #   desktop       desktop-deps + venv + entrypoint     (target, LAST)
 #
@@ -163,6 +165,26 @@ RUN install -m 0755 -d /etc/apt/keyrings \
            docker-ce-cli docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
+# ── Node.js 22 LTS (NodeSource) — channel sidecars ────────────────────────
+# The WhatsApp (Baileys) and Zalo (zca-js) channels run as Node sidecars
+# spawned from the installed package; ``app/channels/sidecars/bootstrap.py``
+# runs ``npm ci`` for them at boot and the adapters re-run it when a channel
+# is enabled. Ubuntu 24.04's own ``nodejs`` package is 18.x, which is below
+# the zalo sidecar's ``engines.node >=20`` — hence NodeSource.
+#
+# This lands in ``core`` (not a final) so all four descendants get it: both
+# flavors need node at RUNTIME, and ``venv-builder`` needs npm at BUILD time
+# to pre-bake the sidecars' node_modules. Costs ~190MB in each flavor.
+RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && chmod a+r /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version && npm --version
+
 # ── shared runtime env ─────────────────────────────────────────────────────
 # ``PATH`` points at the runtime venv path; the entrypoint seeds it from
 # baseline before any ``cremind`` binary is invoked.
@@ -283,6 +305,39 @@ RUN --mount=type=bind,target=/src,rw \
     && PIP_INDEX_URL="$CREMIND_PIP_INDEX_URL" \
        PIP_EXTRA_INDEX_URL="$CREMIND_PIP_EXTRA_INDEX_URL" \
        /opt/cremind-baseline/venv/bin/pip install --pre $CREMIND_PIP_SPEC
+
+# ── Pre-bake the channel sidecars' node_modules ───────────────────────────
+# Installing them here means a fresh install (including an air-gapped one)
+# boots with WhatsApp/Zalo ready and never touches the npm registry:
+# ``cp -a`` seeds the runtime venv preserving mtimes, so bootstrap.py's
+# freshness check passes and skips its own ``npm ci``.
+#
+# It does NOT replace that boot-time check. Image upgrades never resync an
+# existing runtime venv (the entrypoint seeds only when it is empty), and an
+# in-app wheel upgrade pip-installs a newer lockfile straight into that venv
+# — bootstrap.py is what reconciles node_modules in both those cases.
+#
+# The missing-lockfile guard makes a packaging regression fail the image
+# build instead of shipping: the lockfiles are git-tracked precisely so the
+# wheel carries them. The ``-d`` gate keeps editable dev builds
+# (``CREMIND_PIP_SPEC="-e /src"``) working, where site-packages has no app/.
+RUN set -eux; \
+    sp="$(/opt/cremind-baseline/venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"; \
+    if [ -d "$sp/app/channels/sidecars" ]; then \
+        for d in "$sp"/app/channels/sidecars/*/; do \
+            [ -f "$d/package.json" ] || continue; \
+            if [ ! -f "$d/package-lock.json" ]; then \
+                echo "FATAL: $d ships without package-lock.json — check .gitignore/wheel packaging" >&2; \
+                exit 1; \
+            fi; \
+            (cd "$d" && npm ci --no-audit --no-fund); \
+            if [ ! -f "$d/node_modules/.package-lock.json" ]; then \
+                echo "FATAL: npm ci left no install marker in $d" >&2; \
+                exit 1; \
+            fi; \
+        done; \
+        npm cache clean --force; \
+    fi
 
 # ── Stage: basic (target) — headless cremind/cremind ──────────────────────
 FROM core AS basic

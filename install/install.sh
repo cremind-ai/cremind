@@ -1658,6 +1658,29 @@ fi
 # tokens/, profile dirs) under the System Dir, so create it now.
 mkdir -p "$CREMIND_SYSTEM_DIR"
 
+# Advisory only — Node is needed by the WhatsApp/Zalo channel sidecars, which
+# are optional and off by default, so a missing (or too old) Node must never
+# block the install. Docker installs skip this: their image bundles Node 22.
+check_node_for_sidecars() {
+    node_ver=""
+    if command -v node >/dev/null 2>&1; then
+        node_ver="$(node -e 'console.log(process.versions.node.split(".")[0])' 2>/dev/null || echo "")"
+    fi
+    case "$node_ver" in
+        ''|*[!0-9]*)
+            info "Node.js: not found — the WhatsApp and Zalo channels need Node 20+ (https://nodejs.org). Everything else works without it."
+            ;;
+        *)
+            if [ "$node_ver" -lt 20 ]; then
+                info "Node.js: v$node_ver found, but the WhatsApp and Zalo channels need Node 20+."
+            else
+                ok "Node.js: v$node_ver (WhatsApp/Zalo channel sidecars supported)"
+            fi
+            ;;
+    esac
+}
+check_node_for_sidecars
+
 # Print the manual-install hint shown when auto-install is declined or fails.
 print_python_manual_hint() {
     cat <<EOF >&2

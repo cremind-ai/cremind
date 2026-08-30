@@ -27,8 +27,10 @@ QR-scan pairing on next start.
 
 Prerequisites (surfaced as :class:`ChannelNotImplemented` if missing):
     - Node 18+ on PATH.
-    - ``npm install`` has been run once inside
-      ``app/channels/sidecars/whatsapp/`` so ``node_modules/`` exists.
+    - ``node_modules/`` inside ``app/channels/sidecars/whatsapp/``. Starting
+      the channel installs it on demand (see
+      :func:`app.channels.sidecars.bootstrap.ensure_sidecar_ready`), so this
+      only fails when npm is absent or the install itself does.
 
 Pairing UX:
     The latest QR (data URL) is published on a per-adapter pub-sub queue
@@ -41,13 +43,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
 from pathlib import Path
 from typing import Any
 
 from app.channels.base import BaseChannelAdapter
 from app.channels.exceptions import ChannelAuthError, ChannelNotImplemented
-from app.channels.sidecars.bootstrap import is_install_fresh
+from app.channels.sidecars.bootstrap import ensure_sidecar_ready
 from app.config.settings import BaseConfig
 from app.utils.logger import logger
 
@@ -119,7 +120,7 @@ class WhatsappAdapter(BaseChannelAdapter):
     # ── lifecycle (overrides _run; start/stop are inherited) ──
 
     async def _run(self) -> None:
-        self._check_prereqs()
+        await ensure_sidecar_ready(_SIDECAR_DIR, label="WhatsApp", node_hint="Node 18+")
         try:
             await self._spawn_sidecar()
         except Exception as exc:  # noqa: BLE001
@@ -268,24 +269,6 @@ class WhatsappAdapter(BaseChannelAdapter):
             logger.debug(f"[channels:whatsapp] typing send dropped: {e}")
 
     # ── helpers ──
-
-    def _check_prereqs(self) -> None:
-        if shutil.which("node") is None:
-            raise ChannelNotImplemented(
-                "Node.js is not installed or not on PATH. Install Node 18+ "
-                "to use the WhatsApp channel.",
-            )
-        if not _SIDECAR_INDEX.exists():
-            raise ChannelNotImplemented(
-                f"WhatsApp sidecar source missing: {_SIDECAR_INDEX}",
-            )
-        fresh, reason = is_install_fresh(_SIDECAR_DIR)
-        if not fresh:
-            raise ChannelNotImplemented(
-                f"WhatsApp sidecar dependencies are not ready: {reason}. "
-                f"Restart the server (startup auto-installs) or run "
-                f"`npm ci` manually in {_SIDECAR_DIR}.",
-            )
 
     def _resolve_working_dir(self) -> str:
         # ``BaseConfig.CREMIND_SYSTEM_DIR`` already expands ``~`` and

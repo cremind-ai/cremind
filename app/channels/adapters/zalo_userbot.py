@@ -42,7 +42,7 @@ from typing import Any
 
 from app.channels.base import BaseChannelAdapter, _split_for_messaging
 from app.channels.exceptions import ChannelAuthError, ChannelNotImplemented
-from app.channels.sidecars.bootstrap import is_install_fresh
+from app.channels.sidecars.bootstrap import ensure_sidecar_ready
 from app.config.settings import BaseConfig
 from app.utils.logger import logger
 
@@ -109,22 +109,11 @@ class ZaloUserbotAdapter(BaseChannelAdapter):
     # ── lifecycle (overrides _run; start/stop are inherited) ──
 
     async def _run(self) -> None:
-        import shutil
-
-        if shutil.which("node") is None:
-            raise ChannelNotImplemented(
-                "Node.js is not installed or not on PATH. Install Node 20+ "
-                "to use the Zalo personal-account channel.",
-            )
-        if not _SIDECAR_INDEX.exists():
-            raise ChannelNotImplemented(f"Zalo sidecar source missing: {_SIDECAR_INDEX}")
-        fresh, reason = is_install_fresh(_SIDECAR_DIR)
-        if not fresh:
-            raise ChannelNotImplemented(
-                f"Zalo sidecar dependencies are not ready: {reason}. "
-                f"Restart the server (startup auto-installs) or run "
-                f"`npm ci` manually in {_SIDECAR_DIR}.",
-            )
+        await ensure_sidecar_ready(
+            _SIDECAR_DIR,
+            label="Zalo personal-account",
+            node_hint="Node 20+",
+        )
 
         try:
             await self._spawn_sidecar()

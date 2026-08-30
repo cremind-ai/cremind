@@ -305,6 +305,13 @@ jobs:
           python -c "import app, app.storage, app.storage.migrations"
           cremind --help >/dev/null
 
+      # The import smoke test above can't see missing *data* files. The
+      # channel sidecars' lockfiles are the ones that bite: without them
+      # the boot-time `npm ci` can't run and Zalo/WhatsApp never start on
+      # Docker/K8S installs.
+      - name: Check wheel ships sidecar lockfiles
+        run: python scripts/check_wheel_contents.py
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
