@@ -497,7 +497,7 @@ const pivot = useHttpsPivot();
 // Bind the refs at the top level of setup: Vue templates auto-unwrap refs
 // returned directly from setup, but NOT refs reached through a property
 // (``pivot.phase`` would compare a Ref against a string).
-const { phase: pivotPhase, error: pivotError } = pivot;
+const { phase: pivotPhase, error: pivotError, forwardHint: pivotForwardHint } = pivot;
 const { copy: copyPivot, isCopied: isPivotCopied } = useCopyToClipboard();
 
 async function copyPivotValue(text: string, key: string) {
@@ -537,6 +537,7 @@ async function retryHttpsPivot() {
     nextOrigin: finishTls.value.nextOrigin,
     profile: profileName.value,
     profileToken: generatedToken.value,
+    installMode: serviceCapabilities.value?.install_mode ?? null,
   });
 }
 
@@ -1150,6 +1151,10 @@ async function handleFinish() {
     nextOrigin: finishTls.value.nextOrigin,
     profile: profileName.value,
     profileToken: generatedToken.value,
+    // On Kubernetes the restart kills the user's `kubectl port-forward`,
+    // so the composable switches to tell-and-keep-watching instead of
+    // redirecting into an origin nothing is tunnelling to.
+    installMode: serviceCapabilities.value?.install_mode ?? null,
   };
   if (!finishTls.value.restartSupported) {
     // Nothing supervises this process — restarting it would just leave it
@@ -1494,6 +1499,30 @@ async function downloadConfigFile(format: ExportFormat) {
             Watching <code>{{ pivotTargetUrl }}</code> for the restarted
             server to answer. You'll be taken there automatically.
           </p>
+          <!-- Kubernetes: the restart replaces the pod's container, which
+               terminates the user's `kubectl port-forward` — the tunnel
+               targets one pod instance and never reconnects on its own. The
+               server is almost certainly already back; only the tunnel is
+               gone, and only the user can bring it back. -->
+          <template v-if="pivotForwardHint">
+            <ElAlert type="warning" :closable="false" show-icon
+              title="Restart your port-forward">
+              <p>
+                The restart ended your <code>kubectl port-forward</code> —
+                that tunnel points at the old container and doesn't reconnect.
+                Run the same port-forward command again in your terminal;
+                this page continues on its own the moment it's back.
+              </p>
+              <p>
+                If you skipped trusting the certificate earlier, the wait
+                can't tell — use the button below and handle the browser
+                warning there.
+              </p>
+            </ElAlert>
+            <ElButton @click="pivot.redirectNow()">
+              Continue to {{ pivotTargetUrl }} anyway
+            </ElButton>
+          </template>
         </template>
 
         <template v-else-if="pivotPhase === 'redirecting'">
@@ -1860,6 +1889,7 @@ async function downloadConfigFile(format: ExportFormat) {
           v-else-if="currentStepKey === 'secure'"
           :agent-url="settingsStore.agentUrl"
           :tls="tlsStatus"
+          :install-mode="serviceCapabilities?.install_mode ?? null"
         />
         <StepProfileCreate
           v-else-if="currentStepKey === 'complete'"

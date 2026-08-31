@@ -173,8 +173,12 @@ new user is `ERR_CERT_AUTHORITY_INVALID`. `after-setup` removes that entirely:
 3. Its last step restarts the server. Kubelet brings the pod back serving
    https on the same port, to a browser that now trusts the chain.
 
-Keep the same port-forward running throughout; it flips to
-`https://localhost:1515` at the end and needs no re-forwarding.
+One practical wrinkle: the restart in step 3 also **terminates your
+`kubectl port-forward`** — the tunnel is bound to the old pod instance and
+never reconnects on its own (kubectl prints `lost connection to pod`). The
+wizard expects this: it tells you to re-run the same port-forward command and
+keeps watching, then continues to `https://localhost:1515` by itself the
+moment the tunnel is back. Same command, same port, nothing else to change.
 
 **Use `after-setup` on Kubernetes unless you have a reason not to.** `auto`
 remains the right pick for a headless or API-only install, where no browser is

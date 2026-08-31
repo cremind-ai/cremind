@@ -20,6 +20,10 @@ import type { TlsStatus } from '../../services/configApi';
 const props = defineProps<{
   agentUrl: string;
   tls: TlsStatus | null;
+  /** INSTALL_MODE, for deployment-specific copy. On Kubernetes the restart
+   *  drops the user's `kubectl port-forward`, and forewarning that here is
+   *  what keeps it a non-event instead of a "connection lost" scare. */
+  installMode?: string | null;
 }>();
 
 const { copy, isCopied } = useCopyToClipboard();
@@ -35,6 +39,9 @@ const caUrl = computed(() => `${props.agentUrl}/ca.pem`);
 const fingerprint = computed(() => props.tls?.ca_sha256 ?? null);
 const httpsUrl = computed(() => props.tls?.https_url ?? null);
 const restartSupported = computed(() => Boolean(props.tls?.restart_supported));
+const isKubernetes = computed(
+  () => (props.installMode ?? '').toLowerCase() === 'kubernetes',
+);
 
 // Per-OS trust commands. These mirror ``_platform_commands`` in
 // app/cli/commands/tls.py — the CLI decides the same thing at runtime for the
@@ -209,6 +216,13 @@ const orderedTargets = computed(() => {
         Cremind restarts itself and this page moves to
         <code v-if="httpsUrl">{{ httpsUrl }}</code><span v-else>its HTTPS address</span>.
         You stay signed in — your session is carried across.
+      </p>
+      <p v-if="restartSupported && isKubernetes">
+        That restart will also end your <code>kubectl port-forward</code> —
+        the tunnel points at the old container and doesn't reconnect by
+        itself. When this page says it's waiting, run the same port-forward
+        command again in your terminal; everything then continues
+        automatically.
       </p>
       <p v-else>
         When you click <strong>Start Using Cremind</strong> on the final step,

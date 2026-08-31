@@ -71,9 +71,12 @@ noVNC moves to its own port — see below.
    TLS yet, so the wizard can hand it to you and have it trusted BEFORE the
    first https page exists. Follow its steps; there is nothing to do here.
 
-   Keep the port-forward above running throughout. Finishing setup restarts
-   the server on https, on the SAME forwarded port — so at the end you simply
-   continue at https://localhost:1515, with no certificate warning.
+   Finishing setup restarts the pod onto https on the same Service port.
+   That restart ENDS the port-forward above — the tunnel targets one pod
+   instance and does not reconnect. When the wizard says it is waiting for
+   the secure server, re-run the same port-forward command; the wizard then
+   continues to https://localhost:1515 on its own, with no certificate
+   warning.
 
    To verify the CA out of band instead of taking the wizard's copy on trust:
 
