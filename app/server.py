@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+import sys
 
 import uvicorn
 from starlette.applications import Starlette
@@ -633,35 +634,42 @@ def _mk_hypercorn_config(host: str, port: int, certfile: str, keyfile: str):
 def _port_taken(bind_host: str, bind_port: int) -> bool:
     """Whether something already holds this address.
 
-    The probe has to predict the bind the real server is about to attempt, so
-    it sets the same option that server does — and that option means opposite
-    things on the two platforms, hence the fork:
+    The probe's whole job is to predict the bind ``main()`` is about to
+    attempt, so it resolves the address family the way uvicorn and hypercorn
+    both do — a colon in the host means IPv6 — rather than assuming IPv4.
+    Assuming it meant that ``HOST=::`` failed the probe with a ``gaierror``
+    that ``OSError`` quietly caught, and every dual-stack boot died claiming
+    the port was in use.
 
-    On POSIX, uvicorn and hypercorn both set ``SO_REUSEADDR`` before binding.
-    There the flag excuses only sockets that are already on their way out —
-    TIME_WAIT, and the FIN_WAIT_2 a vanished peer can pin for a minute — and
-    only when the departing socket carried the flag too, which a previous
-    Cremind's always did. A live ``listen()`` still loses the address either
-    way. So a strict probe is *more* conservative than the bind it exists to
-    predict: it reports taken a port the server would have been given.
+    ``SO_REUSEADDR`` is set on Linux only, which needs the three-way story
+    behind a two-way-looking flag:
 
-    Not hypothetical. A pod's network namespace outlives its container — it
-    belongs to the sandbox — so the ``CREMIND_SSL=after-setup`` restart comes
-    up into the sockets the previous process left on :1515, which are the
-    wizard session's own connections: the browser's, arriving down a ``kubectl
-    port-forward`` that the restart itself severs, so their remnants sit there
-    with no peer left to finish the close. The strict probe read that as "in
-    use" and refused to boot, once per restart, until the remnants aged out a
-    minute later — by which time kubelet had stacked up enough CrashLoopBackOff
-    to keep the pod down well past that.
+    - **Linux** — it excuses sockets already on their way out (TIME_WAIT, and
+      the FIN_WAIT_2 a vanished peer can pin for a minute), and only when the
+      departing socket carried the flag too, which a previous Cremind's always
+      did. A live ``listen()`` keeps the address regardless. Since both real
+      servers set it, a strict probe here is *more* conservative than the bind
+      it is predicting: it reports taken a port the server would have got.
+    - **macOS/BSD** — the flag also lets a live listener on a *different*
+      local address share the port, so setting it would blind the check to a
+      second Cremind bound to 127.0.0.1 while this one binds 0.0.0.0.
+    - **Windows** — worse still: it lets a second live listener bind over the
+      first outright. Note this is the one place the probe deliberately stops
+      predicting the real bind: uvicorn and hypercorn set the flag there too,
+      so they *would* take a port out from under a running Cremind. Refusing
+      instead, with a message naming the conflict, beats two servers fighting
+      over one port and whichever the OS happens to favour.
 
-    On Windows ``SO_REUSEADDR`` means something else entirely: it lets a
-    second *live* listener bind over the first. Setting it there would make
-    the probe blind to exactly what this check exists to catch — a second
-    Cremind, or Vite already holding :1515 — so Windows keeps the strict bind.
+    Linux is also the only place that needs it. A pod's network namespace
+    outlives its container, so a server that restarts itself — which only
+    Docker and Kubernetes do, per ``restart_supported`` — always comes back to
+    find its predecessor's connections still closing on the same port. Left
+    strict, the probe refused to boot on every one of those restarts until the
+    remnants aged out a minute later.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        if os.name != "nt":
+    family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+        if sys.platform.startswith("linux"):
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             probe.bind((bind_host, bind_port))
@@ -673,14 +681,16 @@ def _port_taken(bind_host: str, bind_port: int) -> bool:
 def _require_free_ports(host: str, public_port: int, loopback_port: int) -> None:
     """Stop with one clear line if a port this server needs is already taken.
 
-    Worth doing up front because uvicorn binds its socket only AFTER the ASGI
-    lifespan has run: left to it, a clash starts the whole installation —
-    watchers, every channel adapter, the Node sidecars — then tears it down
-    again, and the one line that matters ends up buried under the teardown's
-    own warnings and a ``SystemExit`` raised inside a gathered task.
+    Worth doing up front because both servers bind their socket only AFTER the
+    ASGI lifespan has run — uvicorn, and hypercorn on the TLS path, which
+    creates its sockets after ``wait_for_startup``. Left to them, a clash
+    starts the whole installation — watchers, every channel adapter, the Node
+    sidecars — then tears it down again, and the one line that matters ends up
+    buried under the teardown's own warnings and a ``SystemExit`` raised
+    inside a gathered task.
 
-    A racing bind in the gap between this check and uvicorn's own is possible
-    and harmless: that path simply fails the way it does today.
+    A racing bind in the gap between this check and the server's own is
+    possible and harmless: that path simply fails the way it does today.
     """
     checks = [("127.0.0.1", loopback_port, False)]
     if public_port != 0:

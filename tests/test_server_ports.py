@@ -1,21 +1,23 @@
 """The port pre-flight: fail fast, and say which port and what to do.
 
-uvicorn binds its listening socket only AFTER the ASGI lifespan has run, so a
-port already in use used to start the whole installation — watchers, every
+Both servers bind their listening socket only AFTER the ASGI lifespan has run,
+so a port already in use used to start the whole installation — watchers, every
 channel adapter, the Node sidecars — before failing, then tear it all down
 again, with the actual cause buried under the teardown's own warnings and a
 ``SystemExit`` raised inside a gathered task. These pin the check that moved
 that decision to the top of ``main()``.
 
 Real sockets rather than mocks: the question being asked is whether the OS will
-give us the address, and that is exactly what the probe has to get right on
-both Windows and Linux.
+give us the address, and that is exactly what the probe has to get right. It
+gets it right differently per platform — ``SO_REUSEADDR`` means three different
+things across Linux, macOS/BSD and Windows — so the cases that turn on that are
+marked Linux-only rather than asserted everywhere and quietly wrong somewhere.
 """
 
 from __future__ import annotations
 
-import os
 import socket
+import sys
 
 import pytest
 
@@ -43,9 +45,10 @@ def test_a_listening_socket_reads_as_taken() -> None:
 
 
 @pytest.mark.skipif(
-    os.name == "nt",
-    reason="Windows SO_REUSEADDR means 'share a live listener', so the probe "
-    "there stays strict and a closing socket does read as taken.",
+    not sys.platform.startswith("linux"),
+    reason="SO_REUSEADDR only means 'excuse a closing socket' on Linux — on "
+    "macOS/BSD and Windows it also excuses live listeners, so the probe stays "
+    "strict there and a closing socket does read as taken.",
 )
 def test_a_closing_socket_reads_as_free_because_the_real_bind_would_get_it() -> None:
     """The Kubernetes regression: a pod's network namespace outlives its
@@ -57,16 +60,23 @@ def test_a_closing_socket_reads_as_free_because_the_real_bind_would_get_it() -> 
     halves: the probe says free, and a bind shaped exactly like uvicorn's and
     hypercorn's then gets the port.
 
-    The dying listener sets ``SO_REUSEADDR`` here because the real one does,
-    and that is load-bearing rather than incidental: Linux excuses a closing
-    socket only when *both* it and the newcomer carry the flag. Drop it from
-    the setup below and the scenario stops being the one that happens in
-    production — the remnant becomes genuinely unbindable and the test fails
-    for a reason that has nothing to do with the probe.
+    Shaped like production throughout, because the details are what decide
+    the answer:
+
+    - The dying listener holds ``0.0.0.0`` and the probe asks for ``0.0.0.0``,
+      as the server does, while the remnant itself sits on ``127.0.0.1`` —
+      the address an arriving connection lands on. Probing the address the
+      test just bound would never exercise the wildcard-vs-specific overlap
+      that the real check has to get right.
+    - That listener sets ``SO_REUSEADDR`` because the real one does, and it is
+      load-bearing rather than incidental: Linux excuses a closing socket only
+      when *both* it and the newcomer carry the flag. Drop it and the scenario
+      stops being the one that happens in production — the remnant becomes
+      genuinely unbindable and the test fails for an unrelated reason.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("127.0.0.1", 0))
+        listener.bind(("0.0.0.0", 0))
         listener.listen(1)
         port = listener.getsockname()[1]
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
@@ -76,11 +86,57 @@ def test_a_closing_socket_reads_as_free_because_the_real_bind_would_get_it() -> 
             # behind in TIME_WAIT rather than the client's.
             conn.close()
 
-    assert server._port_taken("127.0.0.1", port) is False
+    assert server._port_taken("0.0.0.0", port) is False
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as real:
         real.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        real.bind(("127.0.0.1", port))  # what uvicorn and hypercorn do, verbatim
+        real.bind(("0.0.0.0", port))  # what uvicorn and hypercorn do, verbatim
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Only Linux both sets the flag and refuses this overlap. Windows "
+    "lets a wildcard bind coexist with a specific one whatever the probe does, "
+    "so the conflict is undetectable there — and the real bind would equally "
+    "succeed, so the probe is not wrong about it, merely unable to help.",
+)
+def test_a_live_listener_on_another_local_address_still_reads_as_taken() -> None:
+    """The other half of the overlap above, and the half that must NOT relax:
+    a second Cremind (or Vite) holding ``127.0.0.1:1515`` still has to be
+    caught by the wildcard probe the server itself would use. This is the
+    constraint the SO_REUSEADDR relaxation is bounded by — the flag has to
+    excuse the closing socket in the previous test without also excusing this
+    live one — so the two are pinned as a pair.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+        held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        held.bind(("127.0.0.1", 0))
+        held.listen(1)
+        port = held.getsockname()[1]
+        assert server._port_taken("0.0.0.0", port) is True
+
+
+def test_an_ipv6_host_is_probed_on_an_ipv6_socket() -> None:
+    """``HOST=::`` is a documented knob (the chart's ``server.host``), and an
+    IPv6 literal handed to an AF_INET socket raises ``gaierror`` — an
+    ``OSError``, so the probe swallowed it and called every port taken. That
+    made the pre-flight refuse to boot at all on a dual-stack deployment. Both
+    real servers pick the family by looking for a colon in the host; so does
+    the probe now.
+    """
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+        s.bind(("::1", 0))
+        port = s.getsockname()[1]
+
+    assert server._port_taken("::1", port) is False
+
+
+def test_a_live_ipv6_listener_still_reads_as_taken() -> None:
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as held:
+        held.bind(("::1", 0))
+        held.listen(1)
+        port = held.getsockname()[1]
+        assert server._port_taken("::1", port) is True
 
 
 def test_the_probe_leaves_the_port_free_for_the_real_bind() -> None:

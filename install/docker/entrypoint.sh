@@ -160,30 +160,45 @@ cremind serve --host "$HOST" --port "$PORT" 2>&1 \
 # ── 5. Watchdog ───────────────────────────────────────────────────────────
 
 # What the server is actually about to speak, so the banner in ``docker logs``
-# / ``kubectl logs`` doesn't send anyone to an http URL that resets. Mirrors
-# ``_resolve_tls``: ``auto`` serves TLS from the first boot, ``after-setup``
-# only once the wizard has written bootstrap.toml. noVNC is never fronted by
-# the app's listener, so its line stays http either way.
+# / ``kubectl logs`` doesn't send anyone to an http URL that resets.
+#
+# This tracks ``_resolve_tls`` in app/server.py, in its order: an explicit
+# certificate pair wins over any mode; ``auto`` serves TLS from the first
+# boot; ``after-setup`` only once the wizard has written bootstrap.toml; and
+# CREMIND_UI_PORT=0 opens no public bind at all, so there is no https origin
+# to advertise. ``read`` trims the surrounding whitespace that ``.strip()``
+# does on the Python side. noVNC is never fronted by the app's listener, so
+# its line stays http regardless.
 #
 # Lowercase and unexported on purpose: dynaconf reads every exported CREMIND_*
 # variable as a setting, so a banner detail must not be spelled like one.
+read -r banner_mode <<< "${CREMIND_SSL:-}"
+read -r banner_certfile <<< "${CREMIND_SSL_CERTFILE:-}"
+read -r banner_keyfile <<< "${CREMIND_SSL_KEYFILE:-}"
+banner_port="${CREMIND_UI_PORT:-1515}"
 banner_scheme=http
-case "$(echo "${CREMIND_SSL:-}" | tr '[:upper:]' '[:lower:]')" in
-    auto)
-        banner_scheme=https
-        ;;
-    after-setup)
-        if [ -f "${CREMIND_SYSTEM_DIR:-/root/.cremind}/bootstrap.toml" ]; then
+if [ "$banner_port" = "0" ]; then
+    banner_scheme=http
+elif [ -n "$banner_certfile" ] && [ -n "$banner_keyfile" ]; then
+    banner_scheme=https
+else
+    case "${banner_mode,,}" in
+        auto)
             banner_scheme=https
-        fi
-        ;;
-esac
+            ;;
+        after-setup)
+            if [ -f "${CREMIND_SYSTEM_DIR:-/root/.cremind}/bootstrap.toml" ]; then
+                banner_scheme=https
+            fi
+            ;;
+    esac
+fi
 
 if [ "$CREMIND_IMAGE_FLAVOR" = "desktop" ]; then
     cat <<EOF
 ================================================================
  Cremind-Desktop ready.
-   Cremind      : $banner_scheme://<host>:1515  (UI + API — single public port)
+   Cremind      : $banner_scheme://<host>:$banner_port  (UI + API — single public port)
    noVNC        : http://<host>:6080/vnc.html  (VNC password set)
    Resolution   : $RESOLUTION
 ================================================================
@@ -192,7 +207,7 @@ else
     cat <<EOF
 ================================================================
  Cremind ready.
-   Cremind      : $banner_scheme://<host>:1515  (UI + API — single public port)
+   Cremind      : $banner_scheme://<host>:$banner_port  (UI + API — single public port)
 ================================================================
 EOF
 fi
