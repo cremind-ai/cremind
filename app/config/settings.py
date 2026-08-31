@@ -150,6 +150,11 @@ def relocate_system_directory(new_path: str) -> str:
       - Creates ``new_path`` (``mkdir -p``).
       - Moves the existing ``.env`` from the current System Directory
         into ``new_path`` (overwrites if a stale file already exists).
+      - Moves the ``tls/`` directory (local CA + server certificate) with
+        it. Under ``CREMIND_SSL=after-setup`` the user trusts that CA
+        *during* the wizard, before submitting this path — leaving it
+        behind would strand the certificate they trusted and mint a
+        different one on the next boot.
       - Updates ``BaseConfig.CREMIND_SYSTEM_DIR`` in process memory.
       - Sets ``os.environ['CREMIND_SYSTEM_DIR']`` so any subprocess this
         session spawns inherits the new path.
@@ -203,6 +208,8 @@ def relocate_system_directory(new_path: str) -> str:
             except OSError:
                 pass
 
+    _relocate_tls_dir(current, expanded)
+
     BaseConfig.CREMIND_SYSTEM_DIR = expanded
     os.environ["CREMIND_SYSTEM_DIR"] = expanded
     # Keep the derived SQLite path in sync — it was computed at class
@@ -216,6 +223,77 @@ def relocate_system_directory(new_path: str) -> str:
     _upsert_env_line(env_path, "CREMIND_SYSTEM_DIR", expanded)
 
     return expanded
+
+
+def _relocate_tls_dir(current: str, expanded: str) -> None:
+    """Move ``<current>/tls`` to ``<expanded>/tls``, best effort.
+
+    The CA under there may already be trusted on the user's machine — with
+    ``CREMIND_SSL=after-setup`` the wizard hands it over before this
+    relocation runs — so losing it means the next boot mints a different CA
+    and the browser warns again despite the user having done everything right.
+
+    Never fatal. By the time we get here the ``.env`` move is committed, and
+    failing setup over a certificate that can be regenerated would be a worse
+    outcome than a warning telling the operator to move one directory.
+    """
+    src = os.path.join(current, "tls")
+    dst = os.path.join(expanded, "tls")
+    if not os.path.isdir(src) or os.path.exists(dst):
+        return
+
+    try:
+        os.replace(src, dst)
+        return
+    except OSError:
+        pass  # Cross-filesystem, or a racing writer — fall back to copying.
+
+    import shutil
+
+    copied: list[str] = []
+    try:
+        os.makedirs(dst, exist_ok=True)
+        # Copy everything first; only unlink once the whole set has landed.
+        # A half-moved tls/ is the failure this function exists to prevent.
+        for name in os.listdir(src):
+            src_file = os.path.join(src, name)
+            if not os.path.isfile(src_file):
+                continue
+            dst_file = os.path.join(dst, name)
+            shutil.copy2(src_file, dst_file)
+            copied.append(dst_file)
+            if name.endswith(".key") or name == "key.pem":
+                try:
+                    os.chmod(dst_file, 0o600)
+                except OSError:  # pragma: no cover - Windows ACLs
+                    pass
+    except OSError as e:
+        for path in copied:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        # Imported at call time: this module is deliberately free of an
+        # app.utils dependency at import time (it is imported by everything,
+        # including the CLI, long before logging is configured).
+        from app.utils import logger
+
+        logger.warning(
+            f"Could not move the TLS directory to {dst}: {e}. The local CA is "
+            f"still at {src} — move that directory across by hand, or the next "
+            "boot will generate a new CA that devices have to trust again."
+        )
+        return
+
+    for name in os.listdir(src):
+        try:
+            os.unlink(os.path.join(src, name))
+        except OSError:
+            pass
+    try:
+        os.rmdir(src)
+    except OSError:
+        pass
 
 
 def _upsert_env_line(env_path: str, key: str, value: str) -> None:

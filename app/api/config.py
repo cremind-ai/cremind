@@ -252,6 +252,41 @@ def _reject_external_in_docker_install(service_id: str) -> str | None:
     )
 
 
+def _setup_tls_next_steps(request: Request) -> dict:
+    """The HTTPS hand-off fields of the setup response (``CREMIND_SSL=after-setup``).
+
+    ``tls_pending`` says the server is about to switch to HTTPS once it
+    restarts; ``next_origin`` is where the browser should go afterwards; and
+    ``restart_supported`` says whether the wizard may trigger that restart
+    itself or has to ask the operator to do it.
+
+    ``next_origin`` prefers the request's own ``Host``, because that is the
+    only name known to be reachable *from the browser*: behind
+    ``kubectl port-forward`` or an SSH tunnel the client reaches
+    ``localhost:1515`` while the server's configured ``APP_URL`` says
+    something else entirely. Falls back to ``APP_URL`` when there is no Host
+    header to trust.
+
+    Extracted to module level so it is unit-testable without driving the whole
+    setup flow (same reason as :func:`_kubernetes_sqlite_rejection`).
+    """
+    from app.config.tls_mode import current_tls_facts, https_origin_from_app_url
+
+    facts = current_tls_facts()
+    next_origin = None
+    if facts.pending_https:
+        host = (request.headers.get("host") or "").strip()
+        next_origin = (
+            f"https://{host}" if host
+            else (https_origin_from_app_url(BaseConfig.APP_URL) or None)
+        )
+    return {
+        "tls_pending": facts.pending_https,
+        "next_origin": next_origin,
+        "restart_supported": facts.restart_supported,
+    }
+
+
 def _kubernetes_sqlite_rejection(requested: str) -> str | None:
     """Backend-side enforcement of the Kubernetes PostgreSQL-only policy (Seam A).
 
@@ -1328,6 +1363,11 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 # will report MissingDependency until they retry from
                 # Settings.
                 "failed_features": failed_features,
+                # HTTPS hand-off (CREMIND_SSL=after-setup). Deliberately not
+                # folded into ``restart_required`` above — that one means
+                # "a feature needs a fresh process", and the wizard already
+                # gives it embedding-specific meaning.
+                **_setup_tls_next_steps(request),
             }
         )
 

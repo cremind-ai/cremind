@@ -103,16 +103,34 @@ spec:
             - name: vnc
               containerPort: 5900
             {{- end }}
+          {{- /* Probe action, shared by both probes below.
+                 ""          -> httpGet on plain HTTP.
+                 auto        -> httpGet with scheme HTTPS (the app terminates
+                                TLS from the very first boot; kubelet does not
+                                verify the certificate, so the locally-signed
+                                one is fine).
+                 after-setup -> tcpSocket. This mode serves plain HTTP until
+                                the Setup Wizard completes and https after the
+                                restart, and NO httpGet is true in both phases:
+                                scheme HTTPS fails against the http listener —
+                                restart-looping the pod before setup can even
+                                finish — and scheme HTTP fails after the flip.
+                                A TCP connect to the port is the one check that
+                                holds across it. */}}
+          {{- $sslMode := include "cremind.sslMode" . }}
           {{- if .Values.readinessProbe.enabled }}
           readinessProbe:
+            {{- if eq $sslMode "after-setup" }}
+            tcpSocket:
+              port: ui
+            {{- else }}
             httpGet:
               path: /
               port: ui
-              {{- if include "cremind.sslMode" . }}
-              # The app terminates TLS on this port. kubelet probes do not
-              # verify the certificate, so the locally-signed one is fine.
+              {{- if $sslMode }}
               scheme: HTTPS
               {{- end }}
+            {{- end }}
             initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
@@ -120,12 +138,18 @@ spec:
           {{- end }}
           {{- if .Values.livenessProbe.enabled }}
           livenessProbe:
+            {{- /* Same two-phase reasoning as the readiness probe above. */}}
+            {{- if eq $sslMode "after-setup" }}
+            tcpSocket:
+              port: ui
+            {{- else }}
             httpGet:
               path: /
               port: ui
-              {{- if include "cremind.sslMode" . }}
+              {{- if $sslMode }}
               scheme: HTTPS
               {{- end }}
+            {{- end }}
             initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}

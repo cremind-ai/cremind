@@ -1,13 +1,14 @@
 ---
-description: "Fix the browser's HTTPS certificate warning — \"Your connection is not private\", ERR_CERT_AUTHORITY_INVALID, NET::ERR_CERT_AUTHORITY_INVALID, \"not secure\" — on a Cremind server running with CREMIND_SSL=auto, by trusting the Cremind Local CA it generates. `cremind tls trust` installs that CA into the Windows, macOS, or Linux trust store (one-off per device); `cremind tls export` copies ca.pem out to hand to another machine; `cremind tls fingerprint` prints its SHA-256 to compare against what the browser shows. Other devices download the CA from https://<host>:1515/ca.pem. Runs entirely locally — no server call, no token. Distinct from supplying your own certificate through CREMIND_SSL_CERTFILE/CREMIND_SSL_KEYFILE, and from terminating TLS at an Ingress or reverse proxy."
+description: "Fix the browser's HTTPS certificate warning — \"Your connection is not private\", ERR_CERT_AUTHORITY_INVALID, NET::ERR_CERT_AUTHORITY_INVALID, \"not secure\" — on a Cremind server running with CREMIND_SSL=auto or CREMIND_SSL=after-setup, by trusting the Cremind Local CA it generates. `cremind tls trust` installs that CA into the Windows, macOS, or Linux trust store (one-off per device); `cremind tls export` copies ca.pem out to hand to another machine; `cremind tls fingerprint` prints its SHA-256 to compare against what the browser shows. Other devices download the CA from https://<host>:1515/ca.pem. Runs entirely locally — no server call, no token. Distinct from supplying your own certificate through CREMIND_SSL_CERTFILE/CREMIND_SSL_KEYFILE, and from terminating TLS at an Ingress or reverse proxy."
 ---
 
 # `cremind tls` — Trust the local HTTPS certificate authority
 
-When Cremind serves HTTPS with `CREMIND_SSL=auto`, it generates its own
-certificate authority in `<CREMIND_SYSTEM_DIR>/tls/` and signs the server
-certificate with it. Browsers reject that chain until the CA is installed in
-the **device's** trust store, which is what the warning page means:
+When Cremind serves HTTPS with `CREMIND_SSL=auto` or `CREMIND_SSL=after-setup`,
+it generates its own certificate authority in `<CREMIND_SYSTEM_DIR>/tls/` and
+signs the server certificate with it. Browsers reject that chain until the CA
+is installed in the **device's** trust store, which is what the warning page
+means:
 
 > Your connection is not private — `ERR_CERT_AUTHORITY_INVALID`
 > Issuer: Cremind Local CA
@@ -18,6 +19,12 @@ unavoidable. The CA exists so it is a **one-off**: server certificates get
 reissued (on expiry, or when a hostname is added) and stay trusted underneath
 it, and on Kubernetes and Docker the CA lives on a persistent volume, so it
 survives restarts.
+
+With `after-setup` you should never see the warning at all: the server stays on
+plain HTTP while the Setup Wizard runs, the wizard walks you through trusting
+the CA there, and only then does it restart into HTTPS — to a browser that
+already trusts the chain. These commands are how you do the same thing by hand,
+on another device, or after the fact.
 
 These commands run entirely on the local machine — they read a file and hand it
 to the operating system. They never call the Cremind API and need no token,
@@ -138,8 +145,8 @@ Authorities**. Some Chromium builds on Linux use an NSS store the same way.
 ## Troubleshooting
 
 - **`No CA certificate at ...`** — the server has never run with
-  `CREMIND_SSL=auto`, or it runs on another machine. Fetch the CA as above and
-  pass `--file`.
+  `CREMIND_SSL=auto` or `CREMIND_SSL=after-setup`, or it runs on another
+  machine. Fetch the CA as above and pass `--file`.
 - **The warning persists after trusting** — check the fingerprint matches
   (`cremind tls fingerprint` against the browser's certificate viewer), restart
   the browser, and confirm the address matches a name on the certificate. Names
@@ -147,6 +154,9 @@ Authorities**. Some Chromium builds on Linux use an NSS store the same way.
   `CREMIND_SSL_AUTO_HOSTS` set on the server.
 - **A `sudo` step failed** — the printed command can be run by hand in a shell
   with the right privileges.
-- **The server serves plain HTTP** — `CREMIND_SSL=auto` is ignored when
-  `CREMIND_UI_PORT=0` (an external proxy owns the origin) and under the
-  Electron desktop app. Nothing needs trusting in either case.
+- **The server serves plain HTTP** — with `CREMIND_SSL=after-setup` that is
+  expected until the Setup Wizard completes: the CA already exists and the
+  wizard hands it over, then the server restarts into HTTPS. Otherwise
+  `CREMIND_SSL` is ignored when `CREMIND_UI_PORT=0` (an external proxy owns
+  the origin) and under the Electron desktop app — nothing needs trusting in
+  either of those cases.

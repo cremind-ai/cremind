@@ -1,6 +1,10 @@
 {{- $sslMode := include "cremind.sslMode" . }}
 {{- $proxyOn := include "cremind.proxyEnabled" . }}
 {{- $scheme := ternary "https" "http" (ne $sslMode "") }}
+{{- /* What the browser types RIGHT NOW, as opposed to $scheme (the steady
+       state APP_URL and the port name describe). They differ for exactly one
+       mode: after-setup serves plain HTTP until the Setup Wizard completes. */}}
+{{- $browseScheme := ternary "http" $scheme (eq $sslMode "after-setup") }}
 {{- $ingScheme := ternary "https" "http" (gt (len (.Values.ingress.tls | default list)) 0) }}
 Cremind has been deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
 
@@ -11,6 +15,16 @@ external/in-cluster vector stores.
 {{ if $proxyOn }}
 Everything is served on ONE port by the in-pod reverse proxy — the UI, the API,
 {{- if .Values.desktop.enabled }} and noVNC.{{ else }} and (on the desktop flavor) noVNC.{{ end }} You never need to forward more than one port.
+{{- else if eq $sslMode "after-setup" }}
+The pod terminates TLS itself (CREMIND_SSL=after-setup), so the plaintext nginx
+sidecar is bypassed and the Service fronts the app's own listener directly.
+TLS waits for setup: the server serves plain HTTP while the Setup Wizard runs,
+and the wizard walks you through trusting its local CA. When you finish, it
+restarts the server, which comes back on https — to a browser that already
+trusts the chain, so the first https page loads with no warning at all.
+{{- if .Values.desktop.enabled }}
+noVNC moves to its own port — see below.
+{{- end }}
 {{- else if $sslMode }}
 The pod terminates TLS itself (CREMIND_SSL={{ $sslMode }}), so the plaintext nginx
 sidecar is bypassed and the Service fronts the app's https listener directly.
@@ -36,9 +50,9 @@ noVNC moves to its own port — see below.
 
    kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "cremind.fullname" . }} 1515:{{ .Values.service.port }}
 
-   then browse to:  {{ $scheme }}://localhost:1515/#/setup
+   then browse to:  {{ $browseScheme }}://localhost:1515/#/setup
 {{- if and .Values.desktop.enabled $proxyOn }}
-   (the agent's desktop is at {{ $scheme }}://localhost:1515/vnc/vnc.html)
+   (the agent's desktop is at {{ $browseScheme }}://localhost:1515/vnc/vnc.html)
 {{- else if .Values.desktop.enabled }}
 
    The agent's desktop needs its own forward (there is no /vnc/ route without
@@ -49,7 +63,29 @@ noVNC moves to its own port — see below.
    then browse to:  http://localhost:6080/vnc.html
 {{- end }}
 {{- end }}
-{{- if $sslMode }}
+{{- if eq $sslMode "after-setup" }}
+
+   TRUST THE LOCAL CA — the wizard walks you through it.
+
+   The CA is generated at the first boot even though nothing is served over
+   TLS yet, so the wizard can hand it to you and have it trusted BEFORE the
+   first https page exists. Follow its steps; there is nothing to do here.
+
+   Keep the port-forward above running throughout. Finishing setup restarts
+   the server on https, on the SAME forwarded port — so at the end you simply
+   continue at https://localhost:1515, with no certificate warning.
+
+   To verify the CA out of band instead of taking the wizard's copy on trust:
+
+   kubectl --namespace {{ .Release.Namespace }} exec deploy/{{ include "cremind.fullname" . }} -c cremind -- \
+     cat {{ .Values.cremind.systemDir }}/tls/ca.pem > cremind-ca.pem
+
+   (In PowerShell replace `> cremind-ca.pem` with
+   `| Out-File -Encoding ascii cremind-ca.pem`.) Then compare
+   `cremind tls fingerprint --file <the wizard's download>` against
+   `cremind tls fingerprint --file cremind-ca.pem` — the kubectl route is
+   already authenticated, which is what makes it the reference.
+{{- else if $sslMode }}
 
    TRUST THE LOCAL CA — one-time per device.
 

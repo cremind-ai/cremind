@@ -2,6 +2,10 @@
  * API client for server configuration, LLM providers, tool management, and profiles.
  */
 
+// Type-only: the setup response echoes the channel rows it created, in the
+// same shape the channels API returns them.
+import type { ChannelRow } from './channelApi';
+
 function resolveBaseUrl(agentUrl: string): string {
   if (agentUrl.startsWith('http://') || agentUrl.startsWith('https://')) {
     return agentUrl;
@@ -44,6 +48,34 @@ export async function checkSetupStatus(
 
 export type DeploymentMode = 'docker' | 'native' | 'external';
 
+// ── TLS state (CREMIND_SSL) ──
+//
+// Returned as the ``tls`` block of GET /api/services/capabilities. The whole
+// decision the Setup Wizard needs is ``pending_https``: the backend sets it
+// true only when *this* server will really come back on HTTPS after its next
+// boot, and false wherever TLS can never happen (Electron,
+// ``CREMIND_UI_PORT=0``). Gating the "Secure this install" step on it
+// therefore inherits those exclusions without the UI sniffing the
+// environment itself.
+export interface TlsStatus {
+  /** ``CREMIND_SSL``: '' (plain HTTP), 'auto' (HTTPS from boot one), or
+   *  'after-setup' (HTTP until the wizard finishes, then HTTPS). */
+  mode: '' | 'auto' | 'after-setup';
+  /** Whether the process answering right now bound TLS. */
+  serving_https: boolean;
+  /** Whether it will bind TLS on its next boot. See the note above. */
+  pending_https: boolean;
+  /** SHA-256 of the local CA, colon-separated uppercase hex — the exact
+   *  form OS dialogs and browser certificate viewers display. ``null``
+   *  when no CA has been generated. */
+  ca_sha256: string | null;
+  /** Where the server expects to answer once it is serving HTTPS. */
+  https_url: string | null;
+  /** Whether something supervises this process, so a restart actually
+   *  comes back (Docker / Kubernetes) rather than leaving it down. */
+  restart_supported: boolean;
+}
+
 export interface ServiceCapability {
   id: string;
   display_name: string;
@@ -64,6 +96,11 @@ export interface ServiceCapabilitiesResponse {
    *  filtered each service's ``supported_modes`` by the catalog's
    *  mode rule for this mode; the UI just renders what came back. */
   install_mode?: string | null;
+  /** What TLS this server serves, and what it will serve next. Optional:
+   *  a server older than the after-setup HTTPS feature omits the block
+   *  entirely, and every consumer must degrade to the feature simply not
+   *  existing rather than assuming plain HTTP forever. */
+  tls?: TlsStatus;
 }
 
 export async function fetchServiceCapabilities(
@@ -128,6 +165,35 @@ export interface EmbeddingSetupConfig {
   };
 }
 
+/** Everything the Setup Wizard reads off ``POST /api/config/setup``.
+ *
+ *  Fields past ``profile`` are optional because they are conditional on the
+ *  server: ``channels``/``channel_errors`` only appear when the wizard asked
+ *  for channels, and the three ``tls_*`` fields only exist on a server new
+ *  enough to have the after-setup HTTPS hand-off. Callers fall back to what
+ *  ``/api/services/capabilities`` already told them.
+ */
+export interface CompleteSetupResponse {
+  success: boolean;
+  token: string;
+  expires_at?: string;
+  profile: string;
+  /** A newly-installed feature (torch, a DB driver, …) needs a fresh
+   *  process before it can be activated. Unrelated to the TLS switch. */
+  restart_required?: boolean;
+  channels?: ChannelRow[];
+  channel_errors?: Array<{ channel_type: string | null; error: string }>;
+  /** The server will serve HTTPS after its next boot — the wizard should
+   *  restart it and pivot the browser to ``next_origin``. */
+  tls_pending?: boolean;
+  /** Where to send the browser after the restart. Derived server-side from
+   *  the request's own Host header, so it is already correct behind a
+   *  port-forward or an SSH tunnel. */
+  next_origin?: string | null;
+  /** Whether the wizard may trigger that restart itself. */
+  restart_supported?: boolean;
+}
+
 export async function completeSetup(
   agentUrl: string,
   config: {
@@ -143,7 +209,7 @@ export async function completeSetup(
   // not the token — so admin's JWT authorizes creating a differently-named
   // profile.
   token?: string,
-): Promise<{ success: boolean; token: string; expires_at: string; profile: string }> {
+): Promise<CompleteSetupResponse> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/config/setup`, {
     method: 'POST',
@@ -155,6 +221,33 @@ export async function completeSetup(
     throw new Error(data.error || `Setup failed: ${res.statusText}`);
   }
   return res.json();
+}
+
+/** Ask the server to restart itself (admin-gated; returns 202 Accepted).
+ *
+ *  Same endpoint and success rule as ``triggerHttpRestart`` in
+ *  ``composables/useServerRestart.ts``, but parameterised rather than
+ *  reading the settings store: the HTTPS pivot fires this with the token
+ *  the Setup Wizard has just minted, which is not the active session token
+ *  yet at the moment of the call.
+ */
+export async function requestServerRestart(
+  agentUrl: string,
+  token: string,
+): Promise<void> {
+  const base = resolveBaseUrl(agentUrl);
+  const headers: Record<string, string> = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const res = await fetch(`${base}/api/system/restart`, {
+    method: 'POST',
+    headers,
+  });
+  // 202 is the happy path (``res.ok`` already covers it); 401/403/5xx
+  // surface as errors so the caller can offer a manual fallback.
+  if (!res.ok && res.status !== 202) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { error?: string }).error ?? `HTTP ${res.status}`);
+  }
 }
 
 export interface InstallSecrets {

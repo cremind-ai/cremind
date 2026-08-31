@@ -240,7 +240,41 @@ async def get_service_capabilities(request: Request) -> JSONResponse:
         "image_flavor": get_image_flavor(),
         # Tray/jumplist/dock gating list — see UI_FEATURES docstring above.
         "ui_features": list(UI_FEATURES),
+        # What TLS this server is serving, and what it will serve next. The
+        # wizard needs this BEFORE the admin token exists (to decide whether to
+        # show the "trust the CA" step), which is exactly what this endpoint's
+        # open-until-setup-completes gate above provides.
+        "tls": _tls_capabilities(),
     })
+
+
+def _tls_capabilities() -> dict:
+    """The ``tls`` block of the capabilities payload.
+
+    ``pending_https`` carries the whole decision for the UI: it is true only
+    when this server really will switch to HTTPS on its next boot, and false
+    wherever TLS can never happen (Electron, ``CREMIND_UI_PORT=0``) — so the
+    wizard gating on it inherits those exclusions without sniffing the
+    environment itself.
+    """
+    from app.config.settings import BaseConfig
+    from app.config.tls_auto import ca_fingerprint_sha256
+    from app.config.tls_mode import current_tls_facts, https_origin_from_app_url
+
+    facts = current_tls_facts()
+    https_url = (
+        https_origin_from_app_url(BaseConfig.APP_URL)
+        if (facts.serving_https or facts.pending_https)
+        else None
+    )
+    return {
+        "mode": facts.mode,
+        "serving_https": facts.serving_https,
+        "pending_https": facts.pending_https,
+        "ca_sha256": ca_fingerprint_sha256(BaseConfig.CREMIND_SYSTEM_DIR),
+        "https_url": https_url or None,
+        "restart_supported": facts.restart_supported,
+    }
 
 
 async def get_tray_capabilities(_request: Request) -> JSONResponse:

@@ -290,11 +290,63 @@ jobs:
             --set 'cremind.extraEnv[0].name=CREMIND_SSL' \
             --set 'cremind.extraEnv[0].value=auto' > /dev/null \
             || { echo "::error::the documented pre-first-class install must still render"; exit 1; }
+          # ── Deferred in-pod TLS (cremind.ssl=after-setup) ──────────────
+          # Serves plain HTTP until the Setup Wizard completes, then restarts
+          # into https. The manifests render the STEADY STATE — same https
+          # APP_URL, same bypassed sidecar, same noVNC port as auto — because
+          # that is the origin for the whole life of the install. The probes
+          # and appProtocol are the two exceptions; they are pinned below.
+          helm template t helm/cremind --set cremind.ssl=after-setup \
+            > /tmp/cremind-ssl-after.yaml
+          grep -q 'CREMIND_SSL: "after-setup"' /tmp/cremind-ssl-after.yaml \
+            || { echo "::error::cremind.ssl=after-setup must template CREMIND_SSL verbatim"; exit 1; }
+          grep -q 'APP_URL: "https://localhost:1515"' /tmp/cremind-ssl-after.yaml \
+            || { echo "::error::cremind.ssl=after-setup must derive the https steady-state APP_URL"; exit 1; }
+          if grep -q 'nginx-unprivileged' /tmp/cremind-ssl-after.yaml; then
+            echo "::error::cremind.ssl=after-setup must bypass the proxy sidecar in both phases"; exit 1
+          fi
+          grep -q 'targetPort: ui' /tmp/cremind-ssl-after.yaml \
+            || { echo "::error::cremind.ssl=after-setup must retarget the Service at the app"; exit 1; }
+          grep -q 'port: 6080' /tmp/cremind-ssl-after.yaml \
+            || { echo "::error::cremind.ssl=after-setup + desktop must expose noVNC on its own port"; exit 1; }
+          grep -q 'CREMIND_NOVNC_URL: "http://localhost:6080/vnc.html"' /tmp/cremind-ssl-after.yaml \
+            || { echo "::error::after-setup must point CREMIND_NOVNC_URL at the noVNC Service port"; exit 1; }
+          grep -q 'CREMIND_ATLASSIAN_REDIRECT_URI: "https://localhost:1515/api/oauth/callback"' /tmp/cremind-ssl-after.yaml \
+            || { echo "::error::after-setup must default the Atlassian callback to https"; exit 1; }
+          # Probes: no httpGet is true in BOTH phases (scheme HTTPS fails
+          # against the http listener and would restart-loop the pod before
+          # setup finishes; scheme HTTP fails after the flip), so after-setup
+          # gets a tcpSocket. auto, TLS from the first byte, keeps httpGet.
+          helm template t helm/cremind --set cremind.ssl=after-setup \
+            --set readinessProbe.enabled=true > /tmp/cremind-ssl-after-probe.yaml
+          grep -q 'tcpSocket' /tmp/cremind-ssl-after-probe.yaml \
+            || { echo "::error::after-setup probes must be tcpSocket — true in both phases"; exit 1; }
+          if grep -q 'scheme: HTTPS' /tmp/cremind-ssl-after-probe.yaml; then
+            echo "::error::after-setup probes must not assert HTTPS — the pre-setup phase is plain HTTP"; exit 1
+          fi
+          helm template t helm/cremind --set cremind.ssl=auto \
+            --set readinessProbe.enabled=true | grep -q 'scheme: HTTPS' \
+            || { echo "::error::cremind.ssl=auto probes must keep scheme HTTPS"; exit 1; }
+          # appProtocol is a static claim a service mesh enforces, so only
+          # `auto` (https from the first byte) may make it.
+          if grep -q 'appProtocol: https' /tmp/cremind-ssl-after.yaml; then
+            echo "::error::after-setup must not claim appProtocol: https — it serves plain HTTP until setup completes"; exit 1
+          fi
+          grep -q 'appProtocol: https' /tmp/cremind-ssl.yaml \
+            || { echo "::error::cremind.ssl=auto must keep appProtocol: https"; exit 1; }
+          # The pre-first-class spelling accepts after-setup too.
+          helm template t helm/cremind \
+            --set 'cremind.extraEnv[0].name=CREMIND_SSL' \
+            --set 'cremind.extraEnv[0].value=after-setup' \
+            | grep -q 'APP_URL: "https://localhost:1515"' \
+            || { echo "::error::CREMIND_SSL=after-setup via extraEnv must derive the https APP_URL"; exit 1; }
           # Combinations that cannot work must fail the render, not deploy broken.
           for bad in \
             "--set cremind.ssl=auto --set ingress.enabled=true" \
+            "--set cremind.ssl=after-setup --set ingress.enabled=true" \
             "--set cremind.ssl=on" \
             "--set cremind.ssl=auto --set cremind.appUrl=http://localhost:1515" \
+            "--set cremind.ssl=after-setup --set cremind.appUrl=http://localhost:1515" \
           ; do
             if helm template t helm/cremind $bad > /dev/null 2>&1; then
               echo "::error::helm template should have rejected: $bad"; exit 1

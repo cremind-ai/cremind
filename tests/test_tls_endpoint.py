@@ -103,7 +103,11 @@ def test_404_when_no_ca_has_been_generated(system_dir, client):
     response = client.get("/ca.pem")
 
     assert response.status_code == 404
-    assert "CREMIND_SSL=auto" in response.json()["error"]
+    # Both CA-generating modes are named: under after-setup this endpoint is
+    # live during the plain-HTTP wizard phase, so a 404 there must not send
+    # the reader off to look for the wrong setting.
+    error = response.json()["error"]
+    assert "auto" in error and "after-setup" in error
 
 
 def test_head_is_allowed(system_dir, client):

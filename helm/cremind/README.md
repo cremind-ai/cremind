@@ -80,7 +80,8 @@ Reach it with a single port-forward (or an Ingress hostname):
 kubectl -n cremind port-forward svc/cremind 1515:80
 # UI / wizard:   http://localhost:1515/#/setup
 # agent desktop: http://localhost:1515/vnc/vnc.html   (desktop flavor only)
-# (https://localhost:1515 when installed with cremind.ssl=auto — see HTTPS below)
+# (https://localhost:1515 with cremind.ssl=auto, or with after-setup once the
+#  wizard has finished — see HTTPS below)
 ```
 
 Follow the `NOTES` printed after install: open `/#/setup` and click through. With
@@ -128,27 +129,65 @@ NodePort, where no public CA will ever issue a certificate.
 ```bash
 helm install cremind oci://registry-1.docker.io/cremind/cremind \
   --version <X.Y.Z> --namespace cremind --create-namespace \
-  --set cremind.ssl=auto
+  --set cremind.ssl=after-setup
 ```
 
-`cremind.ssl=auto` makes the server generate a local CA and sign its own
-certificate under `/root/.cremind/tls/` at first boot, then serve HTTPS (and
-HTTP/2) on 1515 itself. One flag is enough — the chart adjusts everything that
-depends on it:
+`cremind.ssl` makes the server generate a local CA and sign its own certificate
+under `/root/.cremind/tls/` at first boot, then serve HTTPS (and HTTP/2) on
+1515 itself. `auto` does that from the very first byte; `after-setup` waits
+until the Setup Wizard has finished (see [No-warning first
+load](#no-warning-first-load) — it is the better default for Kubernetes). One
+flag is enough either way — the chart adjusts everything that depends on it:
 
-| | `cremind.ssl=""` (default) | `cremind.ssl=auto` |
-|---|---|---|
-| Service port 80 targets | nginx sidecar (`http`) | the app (`ui`), named `https` |
-| nginx proxy sidecar | runs | **bypassed** (it is plaintext-only) |
-| noVNC (desktop flavor) | `/vnc/vnc.html` on the same port | **Service port 6080**, `http://localhost:6080/vnc.html` |
-| auto-derived `APP_URL` | `http://localhost:1515` | `https://localhost:1515` |
-| probes (if enabled) | scheme HTTP | scheme HTTPS |
+| | `cremind.ssl=""` (default) | `cremind.ssl=auto` | `cremind.ssl=after-setup` |
+|---|---|---|---|
+| Service port 80 targets | nginx sidecar (`http`) | the app (`ui`), named `https` | the app (`ui`), named `https` |
+| nginx proxy sidecar | runs | **bypassed** (it is plaintext-only) | **bypassed**, in both phases |
+| noVNC (desktop flavor) | `/vnc/vnc.html` on the same port | **Service port 6080**, `http://localhost:6080/vnc.html` | **Service port 6080**, `http://localhost:6080/vnc.html` |
+| auto-derived `APP_URL` | `http://localhost:1515` | `https://localhost:1515` | `https://localhost:1515` (steady state) |
+| probes (if enabled) | scheme HTTP | scheme HTTPS | **`tcpSocket`** (true in both phases) |
+| browser scheme during setup | `http` | `https` (warns) | `http` |
+
+The manifests describe the install `after-setup` *becomes*: `APP_URL`, the
+Atlassian callback and the Service port name are all the https steady state
+from the first render, because that is what an agent card, an OAuth redirect
+and a CORS origin have to say for the whole life of the install bar the wizard.
+Only the probes track the phase, because a probe that is wrong for five minutes
+restarts the pod. The server logs which phase it booted in.
 
 `cremind.ssl` and `ingress.enabled` are mutually exclusive and the chart
 rejects the combination: an Ingress controller speaks plain HTTP to the backend
 and cannot portably re-encrypt to a private CA. Pick one place to terminate.
 
+### No-warning first load
+
+With `auto`, the very first page anyone opens — the Setup Wizard — is already
+behind a certificate no device trusts yet, so the first thing Cremind shows a
+new user is `ERR_CERT_AUTHORITY_INVALID`. `after-setup` removes that entirely:
+
+1. The pod comes up serving **plain HTTP** on 1515 (the CA and certificate are
+   generated anyway, at that first boot). Port-forward and open the wizard —
+   no warning, because there is no TLS yet.
+2. The wizard hands you the CA and walks you through trusting it, while
+   nothing is behind a certificate.
+3. Its last step restarts the server. Kubelet brings the pod back serving
+   https on the same port, to a browser that now trusts the chain.
+
+Keep the same port-forward running throughout; it flips to
+`https://localhost:1515` at the end and needs no re-forwarding.
+
+**Use `after-setup` on Kubernetes unless you have a reason not to.** `auto`
+remains the right pick for a headless or API-only install, where no browser is
+involved and TLS from the first byte matters more than the interstitial: a
+client that talks to Cremind over the API can be handed the CA out of band and
+should never see a plaintext window at all.
+
 ### Trust the CA (one-time per device)
+
+Under `after-setup` the wizard walks you through this at the right moment and
+you can skip ahead — the `kubectl` extraction below is still the authenticated
+reference to verify its copy against. Under `auto` it is the first thing to do,
+before the interstitial.
 
 Until the generated CA is in the device's trust store, browsers show
 `ERR_CERT_AUTHORITY_INVALID` / "Your connection is not private". No server can
@@ -166,8 +205,11 @@ kubectl -n cremind exec deploy/cremind -c cremind -- \
 
 In PowerShell use `| Out-File -Encoding ascii cremind-ca.pem` instead of `>` —
 PowerShell's redirection writes UTF-16 with a BOM and `certutil` rejects it.
-You can also click through the warning once and download
-`https://localhost:1515/ca.pem`.
+You can also download `https://localhost:1515/ca.pem` (under `auto`, by
+clicking through the warning once) — then compare
+`cremind tls fingerprint --file <download>` against the `kubectl` copy before
+trusting it. The `kubectl` route is already authenticated, which is why it
+comes first.
 
 Then install it, either with Cremind's helper (`cremind tls trust --print-only`
 shows the command it would run):
@@ -209,7 +251,8 @@ trusted is unaffected.
 
 Releases that turned this on through `cremind.extraEnv` keep working — the
 chart reads `CREMIND_SSL` from there when `cremind.ssl` is unset, and derives
-the same scheme-correct URLs. Move to the first-class knob when convenient;
+the same scheme-correct URLs. That spelling accepts `after-setup` too, though
+there is no reason to prefer it. Move to the first-class knob when convenient;
 setting both to *different* values fails the render on purpose.
 
 ## Bundled dependencies
@@ -277,7 +320,7 @@ embeddings.
 | `cremind.installMode` | `kubernetes` | Drives external-only service modes. |
 | `cremind.setupWizardEnv` | `kubernetes` | Pre-fills the wizard. |
 | `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http(s)://localhost:1515`. |
-| `cremind.ssl` | `""` | `auto` = in-pod HTTPS with a generated local CA; bypasses the proxy sidecar. Rejects `ingress.enabled`. See [HTTPS](#https-in-pod-tls). |
+| `cremind.ssl` | `""` | `auto` = in-pod HTTPS with a generated local CA from the first boot; `after-setup` = the same, but plain HTTP until the Setup Wizard finishes so the CA is trusted before any https page loads (recommended when a browser is involved). Both bypass the proxy sidecar and reject `ingress.enabled`. See [HTTPS](#https-in-pod-tls). |
 | `cremind.sslAutoHosts` | `""` | Extra SANs (CSV) for the generated certificate, for names beyond localhost/pod. |
 | `persistence.system.*` | `5Gi`, RWO | `bootstrap.toml`, tokens, profiles. |
 | `persistence.venv.*` | `8Gi`, RWO | Wizard-installed Python deps (LLM SDKs, embeddings). |

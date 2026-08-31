@@ -1226,6 +1226,11 @@ fi
 # Note the internal API port (PORT, default 1112) stays plain HTTP even
 # with TLS on — it binds loopback only, for the CLI and the skills. This
 # helper is about the PUBLIC origin, so don't reach for it there.
+#
+# ANY non-empty CREMIND_SSL reads as https here, ``after-setup`` included:
+# this answers "what is the public origin", which for after-setup is https
+# once the wizard has run — the steady state every written file must carry.
+# For "what is it serving this minute" use cremind_boot_scheme below.
 cremind_scheme() {
     local env_file="${1:-}" ssl_mode ssl_cert
     ssl_mode="${CREMIND_SSL:-}"
@@ -1241,6 +1246,44 @@ cremind_scheme() {
         fi
     fi
     if [ -n "$ssl_mode" ] || [ -n "$ssl_cert" ]; then
+        printf 'https'
+    else
+        printf 'http'
+    fi
+}
+
+# The scheme this server answers on RIGHT NOW, as opposed to the steady state
+# cremind_scheme reports.
+#
+# ``CREMIND_SSL=after-setup`` serves plain HTTP until the Setup Wizard writes
+# bootstrap.toml, then restarts into https. Everything the installer WRITES —
+# APP_URL, CORS_ALLOWED_ORIGINS, credentials.toml — must say https, because
+# that is the origin for the whole life of the install bar the wizard, so
+# those call sites keep using cremind_scheme. But the two things that touch
+# the freshly-started server — the health probe and the wizard URL we hand the
+# user — have to match the listener that exists at this moment, or we health-
+# gate an https URL against an http listener and fail the install.
+#
+# An explicit certificate pair overrides the phase: with CREMIND_SSL_CERTFILE
+# set there is nothing to defer and the server binds TLS immediately.
+# Otherwise this is cremind_scheme, argument for argument.
+cremind_boot_scheme() {
+    local env_file="${1:-}" ssl_mode ssl_cert
+    ssl_mode="${CREMIND_SSL:-}"
+    ssl_cert="${CREMIND_SSL_CERTFILE:-}"
+    if [ -f "$env_file" ]; then
+        if [ -z "$ssl_mode" ]; then
+            ssl_mode="$(grep -E '^[[:space:]]*CREMIND_SSL[[:space:]]*=' "$env_file" 2>/dev/null \
+                | head -1 | cut -d= -f2- | tr -d '[:space:]' || true)"
+        fi
+        if [ -z "$ssl_cert" ]; then
+            ssl_cert="$(grep -E '^[[:space:]]*CREMIND_SSL_CERTFILE[[:space:]]*=' "$env_file" 2>/dev/null \
+                | head -1 | cut -d= -f2- | tr -d '[:space:]' || true)"
+        fi
+    fi
+    if [ -z "$ssl_cert" ] && [ "$ssl_mode" = "after-setup" ]; then
+        printf 'http'
+    elif [ -n "$ssl_mode" ] || [ -n "$ssl_cert" ]; then
         printf 'https'
     else
         printf 'http'
@@ -1625,7 +1668,19 @@ EOF
     if [ "$URL_SCHEME" != "https" ]; then
         URL_SCHEME="$(cremind_scheme "$DOCKER_DIR/.env")"
     fi
-    HEALTH_URL="${URL_SCHEME}://${HEALTH_HOST}:1515/health"
+    # What the container is serving THIS MINUTE. Same inputs, but
+    # CREMIND_SSL=after-setup answers http until the wizard finishes — probing
+    # https there would hang the health gate against a plaintext listener and
+    # fail the install. $URL_SCHEME above stays the steady state, because the
+    # URLs already written into .env describe the whole life of the install.
+    BOOT_SCHEME="$(cremind_boot_scheme "$DOCKER_DIR/.env")"
+    # https steady state reached over http right now == TLS deferred to the
+    # wizard. The banner below says so instead of pointing at a CA download.
+    SSL_DEFERRED=0
+    if [ "$URL_SCHEME" = "https" ] && [ "$BOOT_SCHEME" = "http" ]; then
+        SSL_DEFERRED=1
+    fi
+    HEALTH_URL="${BOOT_SCHEME}://${HEALTH_HOST}:1515/health"
     info "Waiting for backend at $HEALTH_URL ..."
     for i in $(seq 1 60); do
         if cremind_health_ok "$HEALTH_URL"; then
@@ -1640,7 +1695,10 @@ EOF
     # block in that context misleads the user into thinking they need
     # to open a browser. Suppress the whole human-handoff section when
     # invoked with CREMIND_INSTALLER_FRONTEND=electron.
-    WIZARD_URL="${URL_SCHEME}://${HEALTH_HOST}:1515/#/setup"
+    # The wizard runs against the listener that exists now, so this URL is
+    # $BOOT_SCHEME — under after-setup an https link here would simply not
+    # open. It becomes https on its own once the wizard restarts the server.
+    WIZARD_URL="${BOOT_SCHEME}://${HEALTH_HOST}:1515/#/setup"
     if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ]; then
         step "Setup wizard"
 
@@ -1652,12 +1710,19 @@ ${BOLD}Open this URL in your browser to continue setup:${RESET}
 
     ${BOLD}$WIZARD_URL${RESET}
 
-  ${BOLD}Cremind${RESET}:    ${URL_SCHEME}://${HEALTH_HOST}:1515
+  ${BOLD}Cremind${RESET}:    ${BOOT_SCHEME}://${HEALTH_HOST}:1515
+EOF
+        if [ "$SSL_DEFERRED" -eq 1 ]; then
+            # after-setup: nothing to trust out of band, and pointing at
+            # /ca.pem here would only duplicate what the wizard is about to
+            # walk the user through — on a page that has no warning to explain.
+            cat <<EOF
+  Starts on http:// — the Setup Wizard walks you through trusting the certificate, then switches to https:// with no warning.
 EOF
         # With CREMIND_SSL=auto the certificate is signed by a CA generated
         # for this install, which no browser knows yet — say so here rather
         # than letting the interstitial be the user's first surprise.
-        if [ "$URL_SCHEME" = "https" ]; then
+        elif [ "$URL_SCHEME" = "https" ]; then
             # The CA lives inside the container, and a Docker install puts no
             # cremind CLI on the host — so point at the download, which every
             # device can reach, rather than a command that isn't there.
@@ -2395,17 +2460,26 @@ fi
 if [ "$URL_SCHEME" != "https" ]; then
     URL_SCHEME="$(cremind_scheme "$ENV_FILE")"
 fi
+# The scheme the server is answering on right now. Identical to $URL_SCHEME
+# except under CREMIND_SSL=after-setup, which serves plain HTTP until the
+# wizard completes — the link below has to open, so it follows the listener,
+# not the steady state the .env describes.
+BOOT_SCHEME="$(cremind_boot_scheme "$ENV_FILE")"
+SSL_DEFERRED=0
+if [ "$URL_SCHEME" = "https" ] && [ "$BOOT_SCHEME" = "http" ]; then
+    SSL_DEFERRED=1
+fi
 if [ "$DEPLOYMENT" = "server" ]; then
-    WIZARD_URL="${URL_SCHEME}://$APP_HOST:1515/#/setup"
+    WIZARD_URL="${BOOT_SCHEME}://$APP_HOST:1515/#/setup"
 elif [ "$DEPLOYMENT" = "custom" ]; then
     # http://foo.bar:1515 → http://foo.bar:1515/#/setup
     CUSTOM_HOSTPART="${CUSTOM_public_url#*://}"
     CUSTOM_HOSTPART="${CUSTOM_HOSTPART%%/*}"
     CUSTOM_HOSTPART="${CUSTOM_HOSTPART%%:*}"
     [ -z "$CUSTOM_HOSTPART" ] && CUSTOM_HOSTPART="localhost"
-    WIZARD_URL="${URL_SCHEME}://${CUSTOM_HOSTPART}:1515/#/setup"
+    WIZARD_URL="${BOOT_SCHEME}://${CUSTOM_HOSTPART}:1515/#/setup"
 else
-    WIZARD_URL="${URL_SCHEME}://localhost:1515/#/setup"
+    WIZARD_URL="${BOOT_SCHEME}://localhost:1515/#/setup"
 fi
 
 # Suppress the human-handoff block when the Electron app is driving —
@@ -2428,7 +2502,13 @@ EOF
     # Same nudge the Docker path prints: with CREMIND_SSL=auto the
     # certificate is signed by a CA generated for this install, so the
     # first visit is an interstitial until that CA is trusted once.
-    if [ "$URL_SCHEME" = "https" ]; then
+    # after-setup has no interstitial to warn about — the wizard hands the
+    # user the CA while the origin is still plain HTTP.
+    if [ "$SSL_DEFERRED" -eq 1 ]; then
+        cat <<EOF
+  Starts on http:// — the Setup Wizard walks you through trusting the certificate, then switches to https:// with no warning.
+EOF
+    elif [ "$URL_SCHEME" = "https" ]; then
         cat <<EOF
   Browsers warn until you trust the local CA (one-time): ${BOLD}cremind tls trust${RESET}
 EOF

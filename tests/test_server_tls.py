@@ -167,6 +167,128 @@ def test_an_explicit_pair_wins_over_auto(tls_env, pair, tmp_path) -> None:
     assert not (tmp_path / "tls" / "ca.pem").exists(), "nothing should be generated"
 
 
+# ── CREMIND_SSL=after-setup ──────────────────────────────────────────────
+#
+# The wizard phase serves plain HTTP on purpose: a certificate nobody trusts
+# yet turns the very first page a user opens into a security warning, which is
+# precisely what this mode exists to avoid. The CA is still generated, because
+# the wizard has to hand it over during that phase.
+
+
+def _after_setup(tls_env, tmp_path, *, bootstrap: bool):
+    tls_env.setattr(BaseConfig, "SSL_MODE", "after-setup", raising=False)
+    tls_env.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path), raising=False)
+    tls_env.setattr(server, "bootstrap_exists", lambda: bootstrap)
+
+
+def test_after_setup_serves_plain_http_until_setup_completes(tls_env, tmp_path) -> None:
+    _after_setup(tls_env, tmp_path, bootstrap=False)
+    assert server._resolve_tls(None, None, 1515) is None
+
+
+def test_after_setup_still_generates_the_ca_during_the_wizard(tls_env, tmp_path) -> None:
+    """The wizard hands this file to the user before any HTTPS page loads."""
+    _after_setup(tls_env, tmp_path, bootstrap=False)
+    server._resolve_tls(None, None, 1515)
+    assert (tmp_path / "tls" / "ca.pem").is_file()
+
+
+def test_after_setup_explains_the_phase(tls_env, tmp_path) -> None:
+    said: list[str] = []
+    tls_env.setattr(server.logger, "info", lambda msg: said.append(str(msg)))
+    _after_setup(tls_env, tmp_path, bootstrap=False)
+
+    server._resolve_tls(None, None, 1515)
+
+    message = next(m for m in said if "after-setup" in m)
+    assert "plain HTTP" in message and "wizard" in message
+    # It names where it is going, which doubles as the "APP_URL says https but
+    # we are serving http" signal for this phase.
+    assert "https://cremind.example.com" in message
+
+
+def test_after_setup_serves_tls_once_setup_is_done(tls_env, tmp_path) -> None:
+    _after_setup(tls_env, tmp_path, bootstrap=True)
+
+    resolved = server._resolve_tls(None, None, 1515)
+
+    assert resolved is not None
+    cert, key = resolved
+    assert cert.endswith("cert.pem") and key.endswith("key.pem")
+    assert (tmp_path / "tls" / "ca.pem").is_file()
+
+
+def test_after_setup_names_its_own_mode_in_the_trust_log(tls_env, tmp_path) -> None:
+    """The post-restart boot must not claim to be CREMIND_SSL=auto."""
+    said: list[str] = []
+    tls_env.setattr(server.logger, "info", lambda msg: said.append(str(msg)))
+    _after_setup(tls_env, tmp_path, bootstrap=True)
+
+    server._resolve_tls(None, None, 1515)
+
+    assert any("CREMIND_SSL=after-setup" in m and "cremind tls trust" in m for m in said)
+
+
+def test_an_explicit_pair_wins_over_after_setup(tls_env, pair, tmp_path) -> None:
+    cert, key = pair
+    _after_setup(tls_env, tmp_path, bootstrap=False)
+    assert server._resolve_tls(cert, key, 1515) == (cert, key)
+    assert not (tmp_path / "tls" / "ca.pem").exists(), "nothing should be generated"
+
+
+def test_after_setup_generates_nothing_when_tls_can_never_happen(
+    tls_env, tmp_path
+) -> None:
+    """No public bind means no TLS ever — so no CA, and nothing pending."""
+    _warnings(tls_env)
+    _after_setup(tls_env, tmp_path, bootstrap=False)
+
+    assert server._resolve_tls(None, None, 0) is None
+    assert not (tmp_path / "tls").exists()
+
+
+def test_after_setup_generates_nothing_under_electron(tls_env, tmp_path) -> None:
+    _warnings(tls_env)
+    _after_setup(tls_env, tmp_path, bootstrap=False)
+    tls_env.setenv("CREMIND_ELECTRON_PARENT", "1")
+
+    assert server._resolve_tls(None, None, 1515) is None
+    assert not (tmp_path / "tls").exists()
+
+
+def test_an_unknown_mode_warns_instead_of_silently_serving_http(tls_env) -> None:
+    """A typo in something the operator deliberately set should say so."""
+    said = _warnings(tls_env)
+    tls_env.setattr(BaseConfig, "SSL_MODE", "aftersetup", raising=False)
+
+    assert server._resolve_tls(None, None, 1515) is None
+
+    message = next(m for m in said if "aftersetup" in m)
+    assert "after-setup" in message and "auto" in message
+
+
+def test_the_mode_is_read_case_insensitively(tls_env, tmp_path) -> None:
+    tls_env.setattr(BaseConfig, "SSL_MODE", "After-Setup", raising=False)
+    tls_env.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path), raising=False)
+    tls_env.setattr(server, "bootstrap_exists", lambda: True)
+
+    assert server._resolve_tls(None, None, 1515) is not None
+
+
+def test_supervised_environments(monkeypatch) -> None:
+    """Kubernetes counts: the wizard now asks for a restart deliberately, and a
+    wedged shutdown there stops the kubelet bringing the pod back at all."""
+    monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
+    for mode, expected in (
+        ("docker", True),
+        ("kubernetes", True),
+        ("native", False),
+        ("", False),
+    ):
+        monkeypatch.setenv("INSTALL_MODE", mode)
+        assert server._supervised_env() is expected, mode
+
+
 def test_the_hypercorn_config_asks_for_http2(pair) -> None:
     """ALPN advertising h2 is the entire reason the TLS path uses hypercorn:
     it is how a browser escapes the ~6-connection-per-origin cap. http/1.1

@@ -130,11 +130,18 @@ appears in cremind.extraEnv.
 {{- end -}}
 
 {{/*
-Effective CREMIND_SSL mode ("" or "auto"). The first-class cremind.ssl value
-wins; when it is unset a CREMIND_SSL entry in cremind.extraEnv is honoured,
-because that was the only way to ask for in-pod TLS before this knob existed
-and those releases must keep rendering. cremind.validateSsl rejects
-contradictions and unsupported values.
+Effective CREMIND_SSL mode ("", "auto" or "after-setup"). The first-class
+cremind.ssl value wins; when it is unset a CREMIND_SSL entry in
+cremind.extraEnv is honoured, because that was the only way to ask for in-pod
+TLS before this knob existed and those releases must keep rendering.
+cremind.validateSsl rejects contradictions and unsupported values.
+
+Everything downstream keys on this being TRUTHY, i.e. "the app owns TLS on
+1515", and renders the STEADY STATE (https APP_URL, https Atlassian callback,
+Service port named https). Under after-setup the pod serves plain HTTP for the
+one stretch between first boot and the Setup Wizard finishing, and the server
+logs that phase; the rendered manifests describe the install it becomes, which
+is what an agent card / OAuth callback / CORS origin has to say.
 */}}
 {{- define "cremind.sslMode" -}}
 {{- $mode := .Values.cremind.ssl | default "" -}}
@@ -156,6 +163,13 @@ and the certificate does not exist until the app's first boot. There is no
 valid (ssl, proxy) pairing to choose between, so the chart bypasses the sidecar
 automatically instead of failing and demanding a second flag. Returns "true" or
 "" so it can be used directly in `if`.
+
+after-setup bypasses it in BOTH phases, deliberately — even though the sidecar
+COULD front the plain-HTTP stretch. Keeping it out means the Service→app path
+is identical either side of the mid-wizard flip: the port-forward the user
+opened to run the wizard is the very same one that serves https when the server
+comes back, with no Service edit, no re-forward, and no window where the
+sidecar is proxying a listener that has just turned into TLS.
 */}}
 {{- define "cremind.proxyEnabled" -}}
 {{- if and .Values.proxy.enabled (not (include "cremind.sslMode" .)) -}}true{{- end -}}
@@ -172,8 +186,8 @@ OR in the pod); and an explicit http:// appUrl while the pod serves https
 */}}
 {{- define "cremind.validateSsl" -}}
 {{- $mode := include "cremind.sslMode" . -}}
-{{- if not (has $mode (list "" "auto")) -}}
-{{- fail (printf "cremind.ssl (or CREMIND_SSL via extraEnv) must be \"\" or \"auto\", got %q. Bring-your-own-certificate TLS is not supported in-pod — terminate TLS at the Ingress instead." $mode) -}}
+{{- if not (has $mode (list "" "auto" "after-setup")) -}}
+{{- fail (printf "cremind.ssl (or CREMIND_SSL via extraEnv) must be \"\", \"auto\" or \"after-setup\", got %q. Bring-your-own-certificate TLS is not supported in-pod — terminate TLS at the Ingress instead." $mode) -}}
 {{- end -}}
 {{- if .Values.cremind.ssl -}}
 {{- range .Values.cremind.extraEnv -}}
@@ -183,9 +197,9 @@ OR in the pod); and an explicit http:// appUrl while the pod serves https
 {{- end -}}
 {{- end -}}
 {{- if and $mode .Values.ingress.enabled -}}
-{{- fail "cremind.ssl and ingress.enabled are mutually exclusive. Terminate TLS at the edge with ingress.tls, or disable the Ingress to use in-pod TLS — an Ingress controller speaks plain HTTP to the backend and cannot portably re-encrypt to the pod's private CA." -}}
+{{- fail "cremind.ssl (auto or after-setup) and ingress.enabled are mutually exclusive. Terminate TLS at the edge with ingress.tls, or disable the Ingress to use in-pod TLS — an Ingress controller speaks plain HTTP to the backend and cannot portably re-encrypt to the pod's private CA." -}}
 {{- end -}}
 {{- if and $mode (hasPrefix "http://" (.Values.cremind.appUrl | default "")) -}}
-{{- fail "cremind.appUrl is http:// but the pod serves TLS (cremind.ssl=auto). Use https:// or leave appUrl blank to auto-derive https://localhost:1515." -}}
+{{- fail "cremind.appUrl is http:// but the pod serves TLS (cremind.ssl=auto or after-setup). Use https:// or leave appUrl blank to auto-derive https://localhost:1515. Under after-setup the plain-HTTP stretch before the Setup Wizard finishes is temporary; APP_URL states the steady state." -}}
 {{- end -}}
 {{- end -}}

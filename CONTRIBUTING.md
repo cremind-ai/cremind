@@ -220,6 +220,40 @@ The alternative, and the right answer for a real deployment, is a certificate
 from a public CA (Let's Encrypt and friends). That needs a real domain name and
 warns nobody.
 
+### Deferring HTTPS until after setup
+
+`CREMIND_SSL=auto` has one ugly consequence: the very first page anyone opens —
+the Setup Wizard — is already behind a certificate no device trusts yet, so the
+first thing Cremind ever shows is an interstitial. `after-setup` removes it:
+
+```bash
+CREMIND_SSL=after-setup uv run cremind serve
+```
+
+1. **Until the wizard completes** (`bootstrap.toml` does not exist yet) the
+   server serves plain HTTP. The CA and server certificate are generated at
+   that first boot anyway — the mode changes *when TLS is bound*, not whether
+   the material exists.
+2. The wizard hands the user the CA and walks them through trusting it, while
+   nothing is behind a certificate and there is no warning to click past.
+3. Its last step **restarts the server**, which comes back serving HTTPS to a
+   browser that already trusts the chain. The first https load is clean — no
+   warning, not even once.
+
+TLS is bound once, at process start (hypercorn with a certificate, uvicorn
+without), so the "after" is a real restart rather than a live flip. Everything
+written into config — `APP_URL`, `CORS_ALLOWED_ORIGINS`, the Helm chart's
+rendered manifests — states the **https steady state**, because that is the
+origin for the whole life of the install bar the wizard; the server logs which
+phase it booted in. See
+[`app/config/tls_mode.py`](app/config/tls_mode.py) for the shared facts the
+server and the wizard's API both read.
+
+Prefer `after-setup` to `auto` whenever a person will open the wizard in a
+browser (that includes the Helm chart, `--set cremind.ssl=after-setup`).
+`auto` stays right for headless or API-only installs, where no browser is
+involved and there is no first-run interstitial to avoid.
+
 ### What this does not cover
 
 ACME/Let's Encrypt automation, certificate hot-reload (restart to rotate),
@@ -228,8 +262,16 @@ front if you need them. TLS is also ignored in two cases, with a warning:
 `CREMIND_UI_PORT=0` (an external proxy owns the origin) and the Electron
 desktop app (it loads the UI over `http://127.0.0.1:1515`). On Kubernetes, put
 TLS on the Ingress when you have a domain; without one, the chart's
-`cremind.ssl=auto` runs this same in-pod TLS and its post-install notes cover
-trusting the CA.
+`cremind.ssl=auto` / `cremind.ssl=after-setup` run this same in-pod TLS and its
+post-install notes cover trusting the CA.
+
+`after-setup`'s final restart is also not something Cremind can always perform
+itself. Docker Compose restarts the container and kubelet restarts the pod, so
+the wizard triggers it directly there; a bare `uv run cremind serve` (or an
+unsupervised native install) has nothing to bring the process back, so the
+wizard asks the operator to restart instead of killing a server that would stay
+down. Run it under a supervisor — a systemd unit, `docker compose`, the
+chart — if you want that step to be automatic.
 
 ## Installing your checkout via the installer scripts
 

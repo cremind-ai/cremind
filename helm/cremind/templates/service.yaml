@@ -13,16 +13,25 @@ spec:
   selector:
     {{- include "cremind.selectorLabels" . | nindent 4 }}
   {{- $proxyOn := include "cremind.proxyEnabled" . }}
-  {{- $sslOn := ne (include "cremind.sslMode" .) "" }}
+  {{- $sslMode := include "cremind.sslMode" . }}
+  {{- $sslOn := ne $sslMode "" }}
   ports:
     # Single entry point — the nginx proxy fronts UI + API + noVNC. Without the
     # proxy (explicitly disabled, or bypassed because the app terminates TLS
     # itself) this lands directly on the app's own listener.
+    #
+    # The port NAME is steady-state (after-setup ends up on https like auto);
+    # it is a label, and renaming it mid-life would break anything selecting on
+    # it. appProtocol is NOT: a service mesh reads it as a static claim about
+    # the wire protocol and will happily originate TLS / apply L7 policy on the
+    # strength of it, so under after-setup — plain HTTP until the Setup Wizard
+    # completes — it would mis-handle the whole first phase. Only `auto`, which
+    # is TLS from the first byte, gets to make that claim.
     - name: {{ ternary "https" "http" $sslOn }}
       port: {{ .Values.service.port }}
       targetPort: {{ if $proxyOn }}http{{ else }}ui{{ end }}
       protocol: TCP
-      {{- if $sslOn }}
+      {{- if eq $sslMode "auto" }}
       appProtocol: https
       {{- end }}
     # Codex OAuth ("Sign in with ChatGPT") callback. Deliberately NOT behind

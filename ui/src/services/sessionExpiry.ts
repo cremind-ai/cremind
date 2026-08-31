@@ -24,7 +24,14 @@ import { getApiOrigin } from './a2aClient';
 // Routes where a 401 is expected and must NOT trigger a redirect: the
 // ProfileSelector startup ``/api/me`` probes, LoginPage token verification, and
 // the SetupWizard's pre-token calls all live here.
-const AUTH_ROUTE_NAMES = new Set(['home', 'login', 'setup', 'setup-profile']);
+//
+// ``setup-handoff`` is the HTTPS-pivot landing route: the server it lands on
+// booted seconds earlier, so an in-flight call can 401 transiently while the
+// hand-off guard is still importing the token. Ejecting there would throw away
+// the very session being handed over.
+const AUTH_ROUTE_NAMES = new Set([
+  'home', 'login', 'setup', 'setup-profile', 'setup-handoff',
+]);
 
 // Idempotency guard so a burst of concurrent 401s (or the SSE retry loop) only
 // redirects once. Reset once the redirect settles (see ``handleUnauthorized``).

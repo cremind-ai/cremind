@@ -183,3 +183,91 @@ def test_service_capabilities_includes_image_flavor(
 
     body = json.loads(response.body)
     assert body["image_flavor"] is None
+
+
+# ── the ``tls`` block ────────────────────────────────────────────────────
+#
+# The Setup Wizard reads this BEFORE any admin token exists, to decide whether
+# to offer the "trust the CA" step and where to send the browser afterwards.
+
+
+def _capabilities(monkeypatch) -> dict:
+    _stub_state(monkeypatch, setup_complete=False)
+    resp = asyncio.run(features_api.get_service_capabilities(_make_request()))
+    import json
+
+    return json.loads(resp.body)
+
+
+def _tls_env(monkeypatch, tmp_path, mode: str, *, serving: bool) -> None:
+    from app.config import tls_mode
+    from app.config.settings import BaseConfig
+
+    monkeypatch.setattr(BaseConfig, "SSL_MODE", mode, raising=False)
+    monkeypatch.setattr(BaseConfig, "SSL_CERTFILE", "", raising=False)
+    monkeypatch.setattr(BaseConfig, "SSL_KEYFILE", "", raising=False)
+    monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path), raising=False)
+    monkeypatch.setattr(BaseConfig, "APP_URL", "http://localhost:1515", raising=False)
+    monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
+    monkeypatch.delenv("CREMIND_UI_PORT", raising=False)
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
+    tls_mode.record_boot_tls(serving)
+
+
+def test_tls_block_is_present_with_every_field(monkeypatch, tmp_path) -> None:
+    _tls_env(monkeypatch, tmp_path, "", serving=False)
+    tls = _capabilities(monkeypatch)["tls"]
+    assert set(tls) == {
+        "mode", "serving_https", "pending_https",
+        "ca_sha256", "https_url", "restart_supported",
+    }
+
+
+def test_after_setup_reports_pending_with_the_https_url(monkeypatch, tmp_path) -> None:
+    """What makes the wizard show the step and know where it is going."""
+    _tls_env(monkeypatch, tmp_path, "after-setup", serving=False)
+
+    tls = _capabilities(monkeypatch)["tls"]
+
+    assert tls["mode"] == "after-setup"
+    assert tls["serving_https"] is False
+    assert tls["pending_https"] is True
+    # APP_URL is http here; the wizard must still be sent to https.
+    assert tls["https_url"] == "https://localhost:1515"
+    assert tls["restart_supported"] is True
+
+
+def test_the_ca_fingerprint_is_published_once_generated(monkeypatch, tmp_path) -> None:
+    from app.config.tls_auto import ensure_local_tls
+
+    _tls_env(monkeypatch, tmp_path, "after-setup", serving=False)
+    assert _capabilities(monkeypatch)["tls"]["ca_sha256"] is None
+
+    ensure_local_tls(str(tmp_path))
+    fingerprint = _capabilities(monkeypatch)["tls"]["ca_sha256"]
+
+    assert fingerprint and fingerprint.count(":") == 31, fingerprint
+    assert fingerprint == fingerprint.upper()
+
+
+def test_electron_is_never_pending(monkeypatch, tmp_path) -> None:
+    """The server refuses TLS under Electron, so the wizard must not pivot."""
+    _tls_env(monkeypatch, tmp_path, "after-setup", serving=False)
+    monkeypatch.setenv("CREMIND_ELECTRON_PARENT", "1")
+
+    tls = _capabilities(monkeypatch)["tls"]
+
+    assert tls["pending_https"] is False
+    assert tls["https_url"] is None
+
+
+def test_plain_http_reports_nothing_pending(monkeypatch, tmp_path) -> None:
+    _tls_env(monkeypatch, tmp_path, "", serving=False)
+    tls = _capabilities(monkeypatch)["tls"]
+    assert tls["pending_https"] is False and tls["https_url"] is None
+
+
+def test_a_native_install_cannot_restart_itself(monkeypatch, tmp_path) -> None:
+    _tls_env(monkeypatch, tmp_path, "after-setup", serving=False)
+    monkeypatch.setenv("INSTALL_MODE", "native")
+    assert _capabilities(monkeypatch)["tls"]["restart_supported"] is False

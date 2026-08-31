@@ -113,11 +113,28 @@ cremind:
   #     auto-derived APP_URL https://localhost:1515.
   # Mutually exclusive with ingress.enabled — the chart rejects that combo.
   # Browsers warn until the generated CA is trusted once per device; the
-  # post-install notes walk through copying it out and trusting it. Only ""
-  # and "auto" are accepted: bring-your-own certificates belong on an Ingress.
-  # Releases predating this knob that set CREMIND_SSL through cremind.extraEnv
-  # keep working (the chart reads it), but move them over when convenient.
-  ssl: ""                        # -> CREMIND_SSL ("" = http, "auto" = in-pod https)
+  # post-install notes walk through copying it out and trusting it.
+  #
+  # "after-setup" is the same in-pod TLS, deferred by one phase — and the
+  # recommended choice when a person will open this in a browser:
+  #   - PHASE 1, until the Setup Wizard completes (bootstrap.toml does not
+  #     exist yet): plain HTTP on 1515. The CA is still generated at the first
+  #     boot, so the wizard can hand it to you and walk you through trusting
+  #     it while nothing is behind a certificate yet.
+  #   - PHASE 2, from the wizard's last step: it restarts the server, which
+  #     comes back serving https to a browser that already trusts the chain.
+  #     No certificate warning is ever shown — not even once.
+  # The manifests render the STEADY STATE, so APP_URL is https://localhost:1515
+  # and the Service port is named https from the start; the server logs which
+  # phase it booted in. The probes below are the one exception: they become
+  # tcpSocket, the only check that is true in BOTH phases (an httpGet would
+  # fail on one side of the flip and restart-loop the pod).
+  #
+  # Only "", "auto" and "after-setup" are accepted: bring-your-own certificates
+  # belong on an Ingress. Releases predating this knob that set CREMIND_SSL
+  # through cremind.extraEnv keep working (the chart reads it, including
+  # after-setup), but move them over when convenient.
+  ssl: ""                        # -> CREMIND_SSL ("" = http, "auto" = in-pod https, "after-setup" = http until setup finishes, then https)
   # Extra subject-alternative names for the auto-generated certificate, as a
   # comma-separated list of hostnames/IPs. The certificate already covers
   # localhost and the pod's own hostname/IPs; add whatever name the browser
@@ -270,6 +287,14 @@ ingress:
 # genuine `cremind serve` crash exits the container and Kubernetes restarts it.
 # Re-enable these only if you specifically want hang-detection, and then give
 # them a grace window longer than your slowest setup (raise failureThreshold).
+#
+# What they probe follows cremind.ssl: an httpGet on / (scheme HTTP by
+# default, HTTPS when ssl=auto), except under ssl=after-setup, where they
+# become a tcpSocket connect to the same port. That mode serves plain HTTP
+# until the wizard completes and https after the restart, and no httpGet is
+# true in both phases — scheme HTTPS would fail against the http listener and
+# restart-loop the pod before setup could finish, scheme HTTP would fail after
+# the flip. A TCP connect holds across it.
 readinessProbe:
   enabled: false
   initialDelaySeconds: 20

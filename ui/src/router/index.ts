@@ -14,6 +14,46 @@ declare module 'vue-router' {
 
 const APP_NAME = __IS_ELECTRON__ ? 'Cremind App' : 'Cremind Web UI';
 
+// How long a hand-off URL stays usable. The Setup Wizard consumes it within
+// seconds of minting it; anything older is a bookmarked or leaked URL being
+// replayed, and gets bounced to the login screen instead of importing a
+// token.
+const HANDOFF_MAX_AGE_MS = 10 * 60_000;
+
+/**
+ * Consume the cross-origin session hand-off from the Setup Wizard's HTTPS
+ * pivot (``CREMIND_SSL=after-setup``).
+ *
+ * ``localStorage`` is per-origin, so the token minted while the wizard ran on
+ * ``http://host:1515`` does not exist on ``https://host:1515``. The wizard
+ * therefore redirects here with the token in the URL *fragment* — the SPA uses
+ * ``createWebHashHistory``, so the fragment is the route and, being a
+ * fragment, is never sent to the server or written to its logs.
+ *
+ * This guard always redirects, so the token-bearing URL is replaced in history
+ * rather than left sitting in the address bar and the back stack.
+ */
+function consumeSetupHandoff(to: RouteLocationNormalized) {
+  const token = typeof to.query.token === 'string' ? to.query.token : '';
+  const profile = typeof to.query.profile === 'string' ? to.query.profile : '';
+  if (!token || !profile) {
+    return { path: '/', replace: true };
+  }
+  const ts = Number.parseInt(
+    typeof to.query.ts === 'string' ? to.query.ts : '',
+    10,
+  );
+  if (!Number.isFinite(ts) || Date.now() - ts > HANDOFF_MAX_AGE_MS) {
+    // Expired or malformed: land on the login screen WITHOUT importing the
+    // token. The user still has it (the wizard made them save the config
+    // export), and a replayed URL buys an attacker nothing.
+    return { path: `/login/${profile}`, replace: true };
+  }
+  useSettingsStore().setTokenForProfile(profile, token);
+  // The PROFILE_ROUTES guard below activates the profile on this navigation.
+  return { path: `/${profile}`, replace: true };
+}
+
 const routes = [
   // Root: profile selector (or redirect to setup if first time)
   {
@@ -34,6 +74,15 @@ const routes = [
     component: () => import('../views/SetupWizard.vue'),
     props: true,
     meta: { title: 'Setup' },
+  },
+  // Cross-origin session hand-off, landed on by the Setup Wizard's HTTPS
+  // pivot (CREMIND_SSL=after-setup). See ``consumeSetupHandoff`` above.
+  {
+    path: '/setup-handoff',
+    name: 'setup-handoff',
+    component: () => import('../views/SetupHandoff.vue'),
+    meta: { title: 'Signing in' },
+    beforeEnter: consumeSetupHandoff,
   },
   // Login route for a specific profile
   {

@@ -63,6 +63,13 @@ from app.api.version import get_version_routes
 from app.auth import verify_token
 from app.config.bootstrap import bootstrap_exists
 from app.config.settings import BaseConfig, set_dynamic_config_storage
+from app.config.tls_mode import (
+    MODE_AFTER_SETUP,
+    MODE_AUTO,
+    effective_ssl_mode,
+    https_origin_from_app_url,
+    record_boot_tls,
+)
 from app.runtime import BootedState, get_state
 from app.constants import INTRODUCE_ASSISTANT
 from app.documents import (
@@ -433,6 +440,28 @@ async def _on_shutdown() -> None:
         )
 
 
+def _supervised_env() -> bool:
+    """Is something out there that will restart us if we exit?
+
+    Matters for shutdown, not for booting: where a supervisor exists, a hung
+    lifespan shutdown is worse than an abrupt one, because it stops the
+    supervisor from bringing us back at all (see ``_BoundedShutdownServer``).
+
+    Docker (compose sets ``restart: unless-stopped``), Kubernetes (the kubelet
+    restarts the pod; its container exits when ``cremind serve`` does) and
+    Electron (which respawns us over IPC) all qualify. ``CREMIND_SSL=after-setup``
+    makes this load-bearing rather than incidental: the Setup Wizard now asks
+    for a restart deliberately, so a wedged shutdown would strand the user
+    mid-setup. A bare ``cremind serve`` in a terminal is NOT supervised — it
+    keeps clean-shutdown semantics so Ctrl-C doesn't truncate work, and the
+    wizard asks the operator to restart by hand instead.
+    """
+    return (
+        os.environ.get("INSTALL_MODE") in ("docker", "kubernetes")
+        or os.environ.get("CREMIND_ELECTRON_PARENT") is not None
+    )
+
+
 def _resolve_public_port() -> int:
     """The public origin's port: ``CREMIND_UI_PORT``, or 1515.
 
@@ -462,9 +491,27 @@ def _resolve_tls(
     """
     certfile = (ssl_certfile or BaseConfig.SSL_CERTFILE or "").strip()
     keyfile = (ssl_keyfile or BaseConfig.SSL_KEYFILE or "").strip()
-    auto = BaseConfig.SSL_MODE.strip().lower() == "auto"
+    mode = effective_ssl_mode()
+    auto = mode == MODE_AUTO
+    after_setup = mode == MODE_AFTER_SETUP
+    # after-setup defers TLS until the Setup Wizard has written bootstrap.toml,
+    # so the wizard itself runs over plain HTTP and can hand the user the CA to
+    # trust before any HTTPS page loads. Past that point it is exactly auto.
+    generated = auto or (after_setup and bootstrap_exists())
 
-    if not certfile and not keyfile and not auto:
+    if not certfile and not keyfile and not (auto or after_setup):
+        if mode:
+            # An unrecognised value is a typo in something the operator
+            # deliberately set. Silently serving plain HTTP is the worst
+            # reading of that; failing the boot over a stale exported variable
+            # is too harsh, and warn-don't-fail is what the other "TLS was
+            # asked for but won't happen" paths below already do.
+            logger.warning(
+                f"Ignoring unknown CREMIND_SSL={BaseConfig.SSL_MODE!r} — serving "
+                'plain HTTP. Valid values are "" (plain HTTP), "auto" (HTTPS '
+                'with a generated local CA), and "after-setup" (plain HTTP '
+                "until the Setup Wizard completes, then HTTPS)."
+            )
         return None
 
     # An external proxy owns the origin in these two modes, so it — not this
@@ -485,14 +532,35 @@ def _resolve_tls(
         )
         return None
 
-    if auto and not certfile and not keyfile:
+    if after_setup and not generated and not certfile and not keyfile:
+        # The wizard phase. Generate the CA now anyway — eagerly, before
+        # serving anything — so /ca.pem and its fingerprint are live while the
+        # wizard walks the user through trusting it. Then serve plain HTTP:
+        # the certificate is worth nothing until that trust step has happened,
+        # and a warning on the very first page is what this mode exists to
+        # avoid.
+        from app.config.tls_auto import ensure_local_tls, tls_dir
+
+        ensure_local_tls(BaseConfig.CREMIND_SYSTEM_DIR, BaseConfig.SSL_AUTO_HOSTS)
+        next_origin = https_origin_from_app_url(BaseConfig.APP_URL)
+        logger.info(
+            "CREMIND_SSL=after-setup and the Setup Wizard has not completed — "
+            "serving plain HTTP so the wizard can run without a certificate "
+            "warning. The wizard hands you the local CA to trust, then restarts "
+            f"this server into HTTPS{f' at {next_origin}' if next_origin else ''}. "
+            "CA file: "
+            f"{os.path.join(tls_dir(BaseConfig.CREMIND_SYSTEM_DIR), 'ca.pem')}"
+        )
+        return None
+
+    if generated and not certfile and not keyfile:
         from app.config.tls_auto import ensure_local_tls, tls_dir
 
         certfile, keyfile = ensure_local_tls(
             BaseConfig.CREMIND_SYSTEM_DIR, BaseConfig.SSL_AUTO_HOSTS
         )
         logger.info(
-            "CREMIND_SSL=auto — serving a locally-signed certificate. Browsers "
+            f"CREMIND_SSL={mode} — serving a locally-signed certificate. Browsers "
             "warn until the CA is trusted, once per device: on this machine run "
             "`cremind tls trust`; from another device download "
             f"https://<this-host>:{public_port}/ca.pem and run "
@@ -642,6 +710,10 @@ async def main(
     #    installation has started. Generating the auto certificate at this point
     #    also keeps that cost off the request path.
     tls = _resolve_tls(ssl_certfile, ssl_keyfile, public_port)
+    # What the Setup Wizard is told about TLS has to be what we actually did,
+    # not a recomputation — between the wizard writing bootstrap.toml and the
+    # restart landing, recomputing would claim HTTPS while we serve plain HTTP.
+    record_boot_tls(tls is not None)
 
     # 0''. Purge stale exec_shell stdout directories from previous runs.
     cleanup_stdout_on_startup()
@@ -1333,16 +1405,7 @@ async def main(
     import os
     import threading
 
-    # Detect supervised environments where a hung shutdown would block
-    # a container restart: Docker (INSTALL_MODE set by the entrypoint /
-    # docker-compose template) and Electron (CREMIND_ELECTRON_PARENT set
-    # by the Electron main process when it spawns us). Bare ``cremind
-    # serve`` in dev keeps the old clean-shutdown behaviour so Ctrl-C
-    # doesn't truncate work.
-    _supervised = (
-        os.environ.get("INSTALL_MODE") == "docker"
-        or os.environ.get("CREMIND_ELECTRON_PARENT") is not None
-    )
+    _supervised = _supervised_env()
 
     class _BoundedShutdownServer(uvicorn.Server):
         """uvicorn.Server with a hard exit-deadline on SIGTERM/SIGINT.

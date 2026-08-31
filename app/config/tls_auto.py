@@ -17,6 +17,7 @@ friends) is the alternative, and it needs a real domain name.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import ipaddress
 import os
 import socket
@@ -51,6 +52,26 @@ def _paths(system_dir: str) -> dict[str, str]:
         "cert": os.path.join(d, "cert.pem"),
         "key": os.path.join(d, "key.pem"),
     }
+
+
+def ca_fingerprint_sha256(system_dir: str) -> str | None:
+    """SHA-256 of the local CA certificate, or ``None`` if there isn't one.
+
+    Colon-separated uppercase hex over the DER — the format certificate
+    viewers show, so a user can compare what the Setup Wizard displays against
+    what their browser and OS trust dialog show, and against
+    ``cremind tls fingerprint``.
+    """
+    path = _paths(system_dir)["ca_cert"]
+    try:
+        with open(path, "rb") as fh:
+            cert = x509.load_pem_x509_certificate(fh.read())
+    except (OSError, ValueError):
+        return None
+    digest = hashlib.sha256(
+        cert.public_bytes(serialization.Encoding.DER)
+    ).hexdigest().upper()
+    return ":".join(digest[i:i + 2] for i in range(0, len(digest), 2))
 
 
 def _write_private(path: str, data: bytes) -> None:

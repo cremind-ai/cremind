@@ -110,7 +110,7 @@ def test_export_reports_a_missing_ca(runner, monkeypatch, tmp_path):
     result = _invoke(runner, monkeypatch, ["tls", "export"])
 
     assert result.exit_code == 1
-    assert "CREMIND_SSL=auto" in result.output
+    assert "auto" in result.output and "after-setup" in result.output
 
 
 # ── fingerprint ──────────────────────────────────────────────────────────

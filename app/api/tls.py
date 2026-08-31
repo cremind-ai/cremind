@@ -1,9 +1,11 @@
 """Local CA download — unauthenticated.
 
-``CREMIND_SSL=auto`` signs the server's certificate with a CA it generates
-under ``<system dir>/tls/``. Browsers reject that chain until the CA is in the
-*device's* trust store, so every device that connects needs a copy of it once.
-This endpoint is how they get one.
+``CREMIND_SSL=auto`` and ``CREMIND_SSL=after-setup`` both sign the server's
+certificate with a CA generated under ``<system dir>/tls/``. Browsers reject
+that chain until the CA is in the *device's* trust store, so every device that
+connects needs a copy of it once. This endpoint is how they get one — including
+during after-setup's plain-HTTP wizard phase, where the CA already exists and
+the Setup Wizard hands it over before the first HTTPS page is ever loaded.
 
 It must be unauthenticated. The moment a user meets the warning is before they
 have logged in — often before the Setup Wizard has even run — and the browser
@@ -47,7 +49,7 @@ async def get_ca_pem(_request: Request) -> FileResponse | JSONResponse:
         return JSONResponse(
             {
                 "error": "No local CA on this server. One is generated at boot "
-                         "when CREMIND_SSL=auto is set."
+                         "when CREMIND_SSL is set to auto or after-setup."
             },
             status_code=404,
         )

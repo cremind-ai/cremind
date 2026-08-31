@@ -6,6 +6,7 @@ import {
   ElForm, ElFormItem, ElInput, ElRadio, ElRadioGroup, ElAlert, ElTag,
   ElSelect, ElOption, ElCheckbox,
 } from 'element-plus';
+import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { useConfigStore } from '../stores/config';
 import { useChatStore } from '../stores/chat';
@@ -16,6 +17,7 @@ import StepToolConfig from '../components/setup/StepToolConfig.vue';
 import StepMemoryConfig from '../components/setup/StepMemoryConfig.vue';
 import StepChannelsConfig from '../components/setup/StepChannelsConfig.vue';
 import StepProfileCreate from '../components/setup/StepProfileCreate.vue';
+import StepSecureInstall from '../components/setup/StepSecureInstall.vue';
 import RestoreFromBackupCard from '../components/setup/RestoreFromBackupCard.vue';
 import ChannelPairingDialog from '../components/channels/ChannelPairingDialog.vue';
 import { storeToRefs } from 'pinia';
@@ -57,6 +59,8 @@ import {
 } from '../services/channelApi';
 import { useEmbeddingStatusStore } from '../stores/embeddingStatus';
 import { defaultAgentOrigin } from '../services/runtimeConfig';
+import { useHttpsPivot } from '../composables/useHttpsPivot';
+import { useCopyToClipboard } from '../composables/useCopyToClipboard';
 
 const props = defineProps<{
   profile?: string;
@@ -188,17 +192,20 @@ const recommendedInstallMode = computed<string | null>(() =>
   }),
 );
 
-// Two visible stages plus the interstitial:
+// Two visible stages plus two interstitials:
 //   'installer'   — Electron-only: Welcome / Deployment / Mode / Install
 //   'transition' — install finished; the user clicks Continue to start
 //                   the Setup Wizard. Always rendered between the two
 //                   stages so the boundary is unambiguous.
 //   'setup'       — the existing Setup Wizard (Server / Embedding / …)
+//   'https-pivot' — CREMIND_SSL=after-setup only: setup is done, the
+//                   server is restarting into HTTPS and the browser is
+//                   about to move to the HTTPS origin.
 //
 // Web users (``__IS_ELECTRON__ === false``) and Electron users with a
 // prior install start at ``'setup'`` and behave exactly like the
 // pre-merge curl-installed flow.
-const currentStage = ref<'installer' | 'transition' | 'setup'>(
+const currentStage = ref<'installer' | 'transition' | 'setup' | 'https-pivot'>(
   isElectron.value && !settingsStore.agentUrl ? 'installer' : 'setup',
 );
 
@@ -464,6 +471,75 @@ const activeProfile = ref<SetupProfile | null>(null);
 // the same fallback they used to show with no install locks.
 const serviceCapabilities = ref<ServiceCapabilitiesResponse | null>(null);
 
+// ── HTTPS after setup (CREMIND_SSL=after-setup) ──────────────────────────
+//
+// No extra fetch: ``runPostInstallSetupChecks`` already loads
+// /api/services/capabilities pre-token and is awaited before the first
+// render, so the ``tls`` block is here by the time ``setupSteps`` is read.
+// A server without the block (older release, or one that can never serve
+// TLS — Electron, CREMIND_UI_PORT=0) leaves ``tlsPending`` false and the
+// whole feature invisible.
+const tlsStatus = computed(() => serviceCapabilities.value?.tls ?? null);
+const tlsPending = computed(() => Boolean(tlsStatus.value?.pending_https));
+
+// Snapshot of the TLS hand-off fields from the setup response, captured in
+// ``handleCompleteSetup`` and consumed by ``handleFinish``. Kept separate
+// from ``tlsStatus`` because the POST's ``next_origin`` is derived from the
+// request's Host header and so beats the server's configured APP_URL behind
+// a port-forward.
+const finishTls = ref<{
+  pending: boolean;
+  nextOrigin: string | null;
+  restartSupported: boolean;
+} | null>(null);
+
+const pivot = useHttpsPivot();
+// Bind the refs at the top level of setup: Vue templates auto-unwrap refs
+// returned directly from setup, but NOT refs reached through a property
+// (``pivot.phase`` would compare a Ref against a string).
+const { phase: pivotPhase, error: pivotError } = pivot;
+const { copy: copyPivot, isCopied: isPivotCopied } = useCopyToClipboard();
+
+async function copyPivotValue(text: string, key: string) {
+  if (!(await copyPivot(text, key))) ElMessage.error('Failed to copy');
+}
+
+/** The HTTPS URL shown on the pivot interstitial. Mirrors the composable's
+ *  own target rule so the text and the redirect can't disagree. */
+const pivotTargetUrl = computed(() => {
+  const next = finishTls.value?.nextOrigin ?? null;
+  if (next) {
+    try {
+      if (new URL(next).hostname === window.location.hostname) {
+        return next.replace(/\/+$/, '');
+      }
+    } catch {
+      /* unparseable — fall through to the browser's own host */
+    }
+  }
+  return `https://${window.location.host}`;
+});
+
+/** Leave the pivot and enter Cremind on the plain-HTTP origin instead. The
+ *  session is already active (``handleFinish`` sets the token before it
+ *  starts the pivot), so this is always a working fallback. */
+function continueOnHttp() {
+  pivot.cancelManualProbe();
+  router.push(`/${profileName.value}`);
+}
+
+/** "Retry restart" on the failed pane. */
+async function retryHttpsPivot() {
+  if (!finishTls.value) return;
+  await pivot.run({
+    agentUrl: settingsStore.agentUrl,
+    restartToken: generatedToken.value,
+    nextOrigin: finishTls.value.nextOrigin,
+    profile: profileName.value,
+    profileToken: generatedToken.value,
+  });
+}
+
 // First-run installer steps (Electron only, stage = 'installer').
 //
 // ``install-version`` sits between ``install-mode`` and ``install-run``
@@ -579,6 +655,14 @@ const setupSteps = computed(() => {
       { key: 'tools', title: 'Tools', description: 'Configure built-in tools' },
       { key: 'memory', title: 'Memory', description: 'Optional — learns habits & facts' },
       { key: 'channels', title: 'Channels', description: 'Connect messaging apps (optional)' },
+      // CREMIND_SSL=after-setup only. First-setup branch ONLY, on purpose:
+      // per-profile setup runs against a server that has already flipped to
+      // HTTPS, and silently restarting the whole server out of a
+      // profile-creation wizard would be hostile to the other profiles
+      // using it.
+      ...(tlsPending.value
+        ? [{ key: 'secure', title: 'Secure', description: 'Trust the HTTPS certificate' }]
+        : []),
       { key: 'complete', title: 'Complete', description: 'Generate token' },
     ];
   }
@@ -949,10 +1033,21 @@ async function handleCompleteSetup() {
 
     const result = await completeSetup(settingsStore.agentUrl, config as any, adminToken.value);
     generatedToken.value = result.token;
-    tokenExpiresAt.value = (result as any).expires_at || '';
-    restartRequired.value = Boolean((result as any).restart_required);
-    createdChannels.value = (result as any).channels || [];
-    channelErrors.value = (result as any).channel_errors || [];
+    tokenExpiresAt.value = result.expires_at || '';
+    restartRequired.value = Boolean(result.restart_required);
+    createdChannels.value = result.channels || [];
+    channelErrors.value = result.channel_errors || [];
+    // HTTPS hand-off. The POST is the authority here — its ``next_origin``
+    // is built from the request's own Host header, so it survives a
+    // port-forward that the capabilities block's APP_URL-derived
+    // ``https_url`` would get wrong. Fall back to capabilities for a server
+    // that predates these fields.
+    finishTls.value = {
+      pending: result.tls_pending ?? tlsPending.value,
+      nextOrigin: result.next_origin ?? tlsStatus.value?.https_url ?? null,
+      restartSupported:
+        result.restart_supported ?? tlsStatus.value?.restart_supported ?? false,
+    };
 
     // Fire-and-forget: the downloadable config bundle wants Docker
     // install-time secrets (VNC password, docker-generated PG creds)
@@ -1026,7 +1121,12 @@ async function handleFinish() {
     );
   }
 
-  // Save token per-profile and activate, then redirect to chat
+  // Save token per-profile and activate, then redirect to chat.
+  //
+  // This happens BEFORE the HTTPS pivot below, deliberately: every failure
+  // branch of the pivot (restart refused, server never comes back, user
+  // declines) then falls back to a fully working session on the plain-HTTP
+  // origin, rather than stranding the user with a token they never got.
   settingsStore.setTokenForProfile(profileName.value, generatedToken.value);
   settingsStore.activateProfile(profileName.value);
   configStore.setupComplete = true;
@@ -1034,7 +1134,31 @@ async function handleFinish() {
   // the chat view; otherwise the conversations list / messages survive and
   // their detail views 404 against the freshly empty DB.
   await chatStore.resetForProfileSwitch();
-  router.push(`/${profileName.value}`);
+
+  // CREMIND_SSL=after-setup: the server is about to switch to HTTPS. Restart
+  // it and carry the session across to the HTTPS origin so the user never
+  // sees a certificate warning (they trusted the CA on the Secure step) and
+  // never has to re-enter a token (localStorage is per-origin).
+  if (!isFirstSetup.value || !finishTls.value?.pending) {
+    router.push(`/${profileName.value}`);
+    return;
+  }
+  currentStage.value = 'https-pivot';
+  const pivotOptions = {
+    agentUrl: settingsStore.agentUrl,
+    restartToken: generatedToken.value,
+    nextOrigin: finishTls.value.nextOrigin,
+    profile: profileName.value,
+    profileToken: generatedToken.value,
+  };
+  if (!finishTls.value.restartSupported) {
+    // Nothing supervises this process — restarting it would just leave it
+    // down. Ask the operator to do it, and watch for the HTTPS origin to
+    // come up so we can pivot the moment it does.
+    pivot.enterManualMode(pivotOptions);
+    return;
+  }
+  await pivot.run(pivotOptions);
 }
 
 const embeddingReady = computed(() => {
@@ -1274,6 +1398,9 @@ async function downloadConfigFile(format: ExportFormat) {
           <template v-else-if="currentStage === 'transition'">
             Installation complete
           </template>
+          <template v-else-if="currentStage === 'https-pivot'">
+            Switching to HTTPS
+          </template>
           <template v-else>
             {{ isFirstSetup ? 'Welcome to Cremind' : `Setup Profile: ${profileName}` }}
           </template>
@@ -1285,6 +1412,9 @@ async function downloadConfigFile(format: ExportFormat) {
           <template v-else-if="currentStage === 'transition'">
             The backend is running. Continue to configure your LLM
             providers, tools, and first profile.
+          </template>
+          <template v-else-if="currentStage === 'https-pivot'">
+            Setup is complete. Cremind is moving to its secure address.
           </template>
           <template v-else>
             {{ isFirstSetup ? "Let's set up your personal assistant" : 'Configure your new profile' }}
@@ -1298,8 +1428,11 @@ async function downloadConfigFile(format: ExportFormat) {
         </div>
       </div>
 
+      <!-- Explicit whitelist rather than "not transition": the interstitial
+           stages (transition, https-pivot) each render their own card and
+           must show no step bar. -->
       <ElSteps
-        v-if="currentStage !== 'transition'"
+        v-if="currentStage === 'installer' || currentStage === 'setup'"
         :active="currentStep"
         finish-status="success"
         align-center
@@ -1339,7 +1472,85 @@ async function downloadConfigFile(format: ExportFormat) {
         </ElButton>
       </div>
 
-      <div class="step-content">
+      <!-- ── HTTPS pivot (CREMIND_SSL=after-setup) ────────────────────
+           Setup is finished and the session is already active on this
+           (plain-HTTP) origin, so every branch below is a safe place to
+           stop: "Continue on HTTP for now" always lands the user in a
+           working Cremind. -->
+      <div v-if="currentStage === 'https-pivot'" class="stage-transition https-pivot">
+        <template v-if="pivotPhase === 'restarting'">
+          <div class="stage-transition-spinner"></div>
+          <h2>Restarting Cremind into HTTPS…</h2>
+          <p>
+            Asking the server to restart so it comes back serving TLS. This
+            takes a few seconds.
+          </p>
+        </template>
+
+        <template v-else-if="pivotPhase === 'waiting'">
+          <div class="stage-transition-spinner"></div>
+          <h2>Waiting for the secure server…</h2>
+          <p>
+            Watching <code>{{ pivotTargetUrl }}</code> for the restarted
+            server to answer. You'll be taken there automatically.
+          </p>
+        </template>
+
+        <template v-else-if="pivotPhase === 'redirecting'">
+          <div class="stage-transition-spinner"></div>
+          <h2>Taking you to the secure address…</h2>
+          <p>
+            Moving to <code>{{ pivotTargetUrl }}</code>. You stay signed in.
+          </p>
+        </template>
+
+        <template v-else-if="pivotPhase === 'manual'">
+          <div class="stage-transition-spinner"></div>
+          <h2>Restart Cremind to finish</h2>
+          <p>
+            Nothing supervises this server, so Cremind can't restart itself
+            without staying down. Restart it by hand — for a native install,
+            stop it and run <code>cremind serve</code> again. Under Docker or
+            Kubernetes, restart the container or pod.
+          </p>
+          <p>
+            The moment it answers on
+            <code>{{ pivotTargetUrl }}</code><button
+              type="button"
+              class="copy-icon-btn"
+              :class="{ copied: isPivotCopied('pivot-url') }"
+              :title="isPivotCopied('pivot-url') ? 'Copied!' : 'Copy URL'"
+              @click="copyPivotValue(pivotTargetUrl, 'pivot-url')"
+            ><Icon :icon="isPivotCopied('pivot-url') ? 'mdi:check' : 'mdi:content-copy'" /></button>
+            this page moves there and you stay signed in.
+          </p>
+          <ElButton @click="continueOnHttp">Continue on HTTP for now</ElButton>
+        </template>
+
+        <template v-else-if="pivotPhase === 'failed'">
+          <ElAlert
+            type="error"
+            :closable="false"
+            show-icon
+            title="Couldn't restart the server"
+            class="pivot-alert"
+          >
+            <p>{{ pivotError || 'The restart request was rejected.' }}</p>
+            <p>
+              Setup itself completed and you're signed in — this only affects
+              the switch to HTTPS. Retry, or continue on the plain-HTTP
+              address and restart the server yourself later; it will come back
+              on <code>{{ pivotTargetUrl }}</code>.
+            </p>
+          </ElAlert>
+          <div class="pivot-actions">
+            <ElButton type="primary" @click="retryHttpsPivot">Retry restart</ElButton>
+            <ElButton @click="continueOnHttp">Continue on HTTP</ElButton>
+          </div>
+        </template>
+      </div>
+
+      <div v-if="currentStage !== 'https-pivot'" class="step-content">
         <!-- ── Installer phase (Electron + first-run only) ──────── -->
         <div v-if="currentStepKey === 'install-welcome' && showRestoreCard" class="installer-pane">
           <RestoreFromBackupCard @cancel="showRestoreCard = false" />
@@ -1643,6 +1854,13 @@ async function downloadConfigFile(format: ExportFormat) {
           :configs="channelConfigs"
           @update="handleChannelConfigsUpdate"
         />
+        <!-- Skippable by design: no gate on Next, ``handleNext`` falls
+             through to the generic advance. -->
+        <StepSecureInstall
+          v-else-if="currentStepKey === 'secure'"
+          :agent-url="settingsStore.agentUrl"
+          :tls="tlsStatus"
+        />
         <StepProfileCreate
           v-else-if="currentStepKey === 'complete'"
           :token="generatedToken"
@@ -1756,7 +1974,12 @@ async function downloadConfigFile(format: ExportFormat) {
         </div>
       </div>
 
-      <div v-if="currentStage !== 'transition'" class="step-actions">
+      <!-- Whitelist, not "not transition": the https-pivot stage renders
+           its own actions inside the interstitial card. -->
+      <div
+        v-if="currentStage === 'installer' || currentStage === 'setup'"
+        class="step-actions"
+      >
         <!-- Previous: hidden during the install-run step and after the
              token has been generated. -->
         <ElButton
@@ -1958,6 +2181,50 @@ async function downloadConfigFile(format: ExportFormat) {
 .stage-transition-log .installer-log-pane--inline {
   height: 200px;
 }
+
+/* ── HTTPS pivot interstitial (CREMIND_SSL=after-setup) ─────────────── */
+.https-pivot code {
+  background: var(--hover-bg);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.85em;
+  word-break: break-all;
+}
+.stage-transition-spinner {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 3px solid var(--border-color);
+  border-top-color: var(--primary-color, var(--el-color-primary));
+  animation: pivot-spin 0.9s linear infinite;
+}
+@keyframes pivot-spin {
+  to { transform: rotate(360deg); }
+}
+.https-pivot .pivot-alert {
+  width: 100%;
+  max-width: 560px;
+  text-align: left;
+}
+.https-pivot .pivot-alert p { margin: 6px 0 0; line-height: 1.55; }
+.https-pivot .pivot-actions { display: flex; gap: 10px; }
+.https-pivot .copy-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 1px;
+  margin-left: 4px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  transition: color 0.15s ease;
+}
+.https-pivot .copy-icon-btn:hover { color: var(--primary-color); }
+.https-pivot .copy-icon-btn.copied { color: var(--success-color); }
 
 /* ── Installer-phase styles (Electron + first-run only) ─────────────── */
 .installer-pane h2 {

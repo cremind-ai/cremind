@@ -73,6 +73,12 @@ services:
       # generates into /root/.cremind/tls (the cremind-data volume). Devices
       # trust that CA once — fetch it from the running server at <origin>/ca.pem
       # (or ``docker compose exec cremind cremind tls export --out -``).
+      # ``CREMIND_SSL=after-setup`` is the same generated CA with the switch
+      # deferred by one phase: plain HTTP while the Setup Wizard runs, so the
+      # wizard can walk the user through trusting the CA before any https page
+      # exists, then a container restart into https — the first https load is
+      # to an already-trusting browser, so no warning is ever shown. APP_URL
+      # stays the https:// steady state either way.
       CREMIND_SSL_CERTFILE: ${CREMIND_SSL_CERTFILE:-}
       CREMIND_SSL_KEYFILE: ${CREMIND_SSL_KEYFILE:-}
       CREMIND_SSL_KEYFILE_PASSWORD: ${CREMIND_SSL_KEYFILE_PASSWORD:-}
@@ -110,8 +116,8 @@ services:
       - cremind-data:/root/.cremind
       # TLS certificates, when you bring your own. Read-only, and pointed at
       # by CREMIND_SSL_CERTFILE / CREMIND_SSL_KEYFILE using their /certs
-      # paths. Not needed for CREMIND_SSL=auto, which generates into the
-      # cremind-data volume above.
+      # paths. Not needed for CREMIND_SSL=auto / after-setup, which generate
+      # into the cremind-data volume above.
       # - ./certs:/certs:ro
       # The runtime venv lives in a named volume so wizard-installed
       # extras (sentence-transformers, qdrant-client, anthropic, ...)

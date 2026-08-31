@@ -46,6 +46,8 @@ def test_the_description_carries_the_errors_users_actually_paste():
         "trust",
         "ca.pem",
         "cremind_ssl=auto",
+        # Both modes generate a CA, so both must find this doc.
+        "cremind_ssl=after-setup",
     ):
         assert keyword in description, f"description never mentions {keyword!r}"
 

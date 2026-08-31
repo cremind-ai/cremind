@@ -65,9 +65,9 @@ def _read_ca(path: Path):
     if not path.is_file():
         typer.secho(f"No CA certificate at {path}", fg="red", err=True)
         typer.secho(
-            "A local CA is generated at boot when CREMIND_SSL=auto is set. For a "
-            "server running elsewhere (Docker, Kubernetes, another host), "
-            "download https://<host>:1515/ca.pem and pass it with --file.",
+            "A local CA is generated at boot when CREMIND_SSL is set to auto or "
+            "after-setup. For a server running elsewhere (Docker, Kubernetes, "
+            "another host), download <host>:1515/ca.pem and pass it with --file.",
             err=True,
         )
         raise typer.Exit(1)
