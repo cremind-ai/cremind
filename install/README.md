@@ -45,7 +45,7 @@ shows no radio (it's local-only).
    - `production` / `test`: resolve the latest version from PyPI / Test PyPI, then `docker compose pull` + `docker compose up -d` (no local build; a missing tag fails hard).
    - `dev`: `docker compose pull --ignore-pull-failures` for sidecars, then `docker compose up -d --build` against the local checkout via `docker-compose.override.yml`.
 5. Wait for `http://<host>:1515/health` to return 200.
-6. Open `http://<host>:1515/#/setup` in your browser. *(Desktop image only:* also print the noVNC URL + VNC password.*)*
+6. Open `http://<host>:1515/#/setup` in your browser. *(Desktop image only:* also print the noVNC URL + VNC password.*)* On the `after-setup` TLS default this stays `http://` — finishing the wizard restarts the container into `https://`.
 
 The bundle defines four services. Only `cremind` is started at install
 time; the others are activated by the wizard:
@@ -78,13 +78,26 @@ docker compose down -v             # stop and delete all data
    wheel ships the prebuilt SPA inside it (see
    [`scripts/build_ui.sh`](../scripts/build_ui.sh)), so no separate UI
    install is needed.
-4. Generate `~/.cremind/.env` from [`templates/local.env`](templates/local.env), [`templates/server.env.tmpl`](templates/server.env.tmpl) (with `__APP_HOST__` substituted), or [`templates/custom.env.tmpl`](templates/custom.env.tmpl) (with the four advanced-field placeholders substituted). The installer also appends `INSTALL_MODE=docker|native` so the backend's Setup Wizard can filter per-service deployment modes.
-5. Generate `~/.cremind/bootstrap.toml` selecting SQLite.
-6. Run `cremind db upgrade` to apply Alembic migrations.
+4. Generate `~/.cremind/.env` from [`templates/local.env`](templates/local.env), [`templates/server.env.tmpl`](templates/server.env.tmpl) (with `__APP_HOST__` substituted), or [`templates/custom.env.tmpl`](templates/custom.env.tmpl) (with the four advanced-field placeholders substituted). The installer also appends `INSTALL_MODE=docker|native` so the backend's Setup Wizard can filter per-service deployment modes, and the resolved `CREMIND_SSL` (see `--ssl`).
+5. Generate `~/.cremind/bootstrap.toml` selecting SQLite, and run
+   `cremind db upgrade` to apply Alembic migrations — **unless** the install
+   is on the `after-setup` TLS default, in which case both are left to the
+   Setup Wizard. `bootstrap.toml` existing is what tells the server setup is
+   finished and TLS should be bound, so writing one here would put the wizard
+   itself behind a certificate nothing trusts yet. The server boots in
+   deferred-storage mode until the wizard completes, exactly as it does under
+   Docker and Kubernetes.
+6. Write a `cremind` wrapper into `~/.cremind/bin/` and put it on `PATH`. It
+   loads `~/.cremind/.env` (anything already in your environment wins) before
+   handing over to the venv binary, so a later `cremind serve` from any
+   directory keeps the install's settings — including `CREMIND_SSL`, which the
+   wizard's restart step depends on.
 7. Start `cremind serve` in the background. It serves the single public
    origin on `:1515` (UI + API) plus an internal loopback API on `:1112`.
    Wait for `/health`.
-8. Open `http://<host>:1515/#/setup` in your browser.
+8. Open `http://<host>:1515/#/setup` in your browser. (Still `http://` on the
+   `after-setup` default — the switch to `https://` happens when the wizard
+   finishes.)
 
 Both modes are idempotent: re-running upgrades in place and keeps your
 existing config + database. Use `--reinstall` (sh) or `-Reinstall` (ps1)
@@ -116,6 +129,7 @@ container-friendly defaults) for one release; new scripts should use
 | `--wizard-preset ID`                 | (custom) Override `SETUP_WIZARD_ENV`. |
 | `--mode docker\|native`              | Skip the mode prompt. `--docker` and `--native` are aliases. |
 | `--desktop` / `--no-desktop`         | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `--unattended`; a re-install keeps the previous choice. `--no-desktop` pulls the headless `cremind/cremind`. |
+| `--ssl none\|auto\|after-setup`      | TLS on the public origin. Default `after-setup`: plain HTTP for the wizard, which hands you the CA to trust, then a restart into HTTPS with no warning. `auto` is HTTPS from boot one; `none` opts out. A re-install keeps the previous choice. `custom` deployments keep plain HTTP (their URLs are yours) unless you pass this flag. |
 | `--no-launch`                        | Don't open the wizard at the end. |
 | `--unattended`                       | Use defaults; never prompt. Implies `--mode docker` if Docker is present. |
 | `--reinstall`                        | Wipe the existing venv (native) or regenerate compose+.env (docker). |
@@ -132,6 +146,7 @@ container-friendly defaults) for one release; new scripts should use
 | `-WizardPreset ID`                  | (custom) Override `SETUP_WIZARD_ENV`. |
 | `-Mode docker\|native`              | Skip the mode prompt. |
 | `-Desktop` / `-NoDesktop`           | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `-Unattended`; a re-install keeps the previous choice. `-NoDesktop` pulls the headless `cremind/cremind`. |
+| `-Ssl none\|auto\|after-setup`      | TLS on the public origin. Default `after-setup`: plain HTTP for the wizard, which hands you the CA to trust, then a restart into HTTPS with no warning. `auto` is HTTPS from boot one; `none` opts out. A re-install keeps the previous choice. `custom` deployments keep plain HTTP (their URLs are yours) unless you pass this flag. |
 | `-NoLaunch`                         | Don't open the wizard at the end. |
 | `-Unattended`                       | Use defaults; never prompt. |
 | `-Reinstall`                        | Wipe the existing venv or regenerate compose+.env. |

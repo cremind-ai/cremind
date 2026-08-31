@@ -66,6 +66,14 @@ function cremindSubprocessEnv(): NodeJS.ProcessEnv {
     ...process.env,
     CREMIND_SYSTEM_DIR: systemDirPath(),
     CREMIND_INSTALL_DIR: installDirPath(),
+    // The backend keys its "an external shell owns the origin" checks off this
+    // (app/server.py, app/config/tls_mode.py): it must not bind TLS, and must
+    // not tell the Setup Wizard a switch to https is pending, because this app
+    // loads the UI over http://127.0.0.1 and would simply lose the backend.
+    // The checks predate any writer — declaring it here is what makes them
+    // real. It matters now that the installers persist CREMIND_SSL into the
+    // .env, which a spawned `cremind` can pick up.
+    CREMIND_ELECTRON_PARENT: '1',
   }
   if (INSTALL_CHANNEL === 'production') return base
   return { ...base, CREMIND_UPGRADE_CHANNEL: INSTALL_CHANNEL }
@@ -353,7 +361,8 @@ function backendPidFilePath(): string {
 // surfaces as ``Error: spawn EINVAL``. We dodge it by reading the
 // install-time shim (``<SYSTEM_DIR>/bin/cremind.cmd``), pulling the
 // underlying ``cremind.exe`` path out of it, and spawning that instead.
-// On POSIX the shim is a symlink, which ``spawn`` follows transparently.
+// On POSIX the shim is a ``/bin/sh`` wrapper, which ``spawn`` executes via
+// its shebang.
 function cremindExePath(): string {
   const sys = systemDirPath()
   const bin = path.join(sys, 'bin')
@@ -361,8 +370,8 @@ function cremindExePath(): string {
     const shim = path.join(bin, 'cremind.cmd')
     try {
       const content = fs.readFileSync(shim, 'utf8')
-      // The shim install.ps1 writes is two lines:
-      //   @echo off
+      // The shim install.ps1 writes loads $CREMIND_SYSTEM_DIR\.env and then
+      // hands over on a line of its own:
       //   "C:\path\to\cremind.exe" %*
       const m = content.match(/^"([^"]+)"\s*%\*/m)
       if (m && m[1]) return m[1]

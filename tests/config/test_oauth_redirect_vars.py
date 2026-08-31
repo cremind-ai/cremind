@@ -52,6 +52,19 @@ def test_omitted_for_non_loopback_app_url(monkeypatch):
         assert sv._resolve_google_redirect_uri(None) is None, app_url
 
 
+def test_omitted_for_https_loopback_app_url(monkeypatch):
+    """A TLS local install (CREMIND_SSL) is loopback but still not usable here.
+
+    The installed-app loopback flow is http-only, so an https redirect would be
+    refused at the consent screen. Omitting it falls back to manual paste — the
+    same path a non-loopback APP_URL takes. Since the installers default local
+    installs to TLS, this is the common case, not an exotic one.
+    """
+    for app_url in ("https://localhost:1515", "https://127.0.0.1:1515"):
+        monkeypatch.setattr(BaseConfig, "APP_URL", app_url, raising=False)
+        assert sv._resolve_google_redirect_uri(None) is None, app_url
+
+
 def test_build_system_env_includes_and_omits(monkeypatch):
     """End-to-end through the real builder the skills' subprocess env comes from."""
     monkeypatch.setattr(BaseConfig, "APP_URL", "http://localhost:1515", raising=False)

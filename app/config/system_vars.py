@@ -32,11 +32,21 @@ from app.utils.logger import logger
 # per-flow ``state`` (not the path) disambiguates the provider/flow.
 _OAUTH_CALLBACK_PATH = "/api/oauth/callback"
 
-# APP_URL origins a Google "Desktop" client will accept as a redirect: loopback
-# only (localhost / 127.0.0.1, any port). A real hostname (Ingress/domain/LAN
-# server) is rejected by Google, so the Google redirect is left unset there and
-# the skill falls back to the manual ``complete-link`` paste.
-_LOOPBACK_APP_URL_RE = re.compile(r"^https?://(127\.0\.0\.1|localhost)(:[0-9]+)?(/|$)")
+# APP_URL origins a Google "Desktop" client will accept as a redirect: an
+# ``http://`` loopback (localhost / 127.0.0.1, any port). A real hostname
+# (Ingress/domain/LAN server) is rejected by Google, so the Google redirect is
+# left unset there and the skill falls back to the manual ``complete-link``
+# paste.
+#
+# ``http://`` and not ``https?://``: the installed-app loopback flow (RFC 8252
+# §7.3, which is what a Desktop client implements) is specified over plain
+# HTTP, and Google will not accept an https loopback redirect for this client
+# type. That combination stopped being hypothetical when the installers began
+# defaulting local installs to TLS — advertising ``https://localhost:1515/...``
+# would fail at the consent screen with redirect_uri_mismatch, mid-flow and
+# with nothing useful to tell the user. Omitting it instead routes those
+# installs down the same manual-paste path Ingress deployments already use.
+_LOOPBACK_APP_URL_RE = re.compile(r"^http://(127\.0\.0\.1|localhost)(:[0-9]+)?(/|$)")
 
 
 def _app_url_base() -> Optional[str]:

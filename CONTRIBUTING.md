@@ -230,6 +230,13 @@ first thing Cremind ever shows is an interstitial. `after-setup` removes it:
 CREMIND_SSL=after-setup uv run cremind serve
 ```
 
+This is what the installers pick by default (`install.sh --ssl none` /
+`install.ps1 -Ssl none` opts out), so a normal install lands here without
+anyone setting a variable — they write `CREMIND_SSL` into the `.env` they
+render, and the `cremind` shim they put on `PATH` loads that `.env` so a
+later `cremind serve` in a fresh terminal keeps the setting. The env var
+above is for this repo's own runs, where no installer has been involved.
+
 1. **Until the wizard completes** (`bootstrap.toml` does not exist yet) the
    server serves plain HTTP. The CA and server certificate are generated at
    that first boot anyway — the mode changes *when TLS is bound*, not whether

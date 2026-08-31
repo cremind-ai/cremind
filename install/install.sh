@@ -26,6 +26,20 @@
 #   --public-url URL            (custom deployment) Override APP_URL in .env.
 #   --allowed-origins LIST      (custom deployment) Override CORS_ALLOWED_ORIGINS.
 #   --wizard-preset ID          (custom deployment) Override SETUP_WIZARD_ENV.
+#   --ssl none|auto|after-setup TLS on the public origin (port 1515).
+#                               ``after-setup`` (the default) serves plain
+#                               HTTP while the Setup Wizard runs, hands you
+#                               the local CA to trust, then restarts into
+#                               HTTPS — so the first https page never warns.
+#                               ``auto`` is HTTPS from the first boot (the
+#                               wizard itself is already behind the untrusted
+#                               certificate). ``none`` opts out of TLS.
+#                               A re-install keeps the previous choice unless
+#                               you pass this flag. custom/container
+#                               deployments do not take the after-setup
+#                               default — their URLs are yours, so they stay
+#                               on plain HTTP unless you pass this flag,
+#                               which still applies to them.
 #   --no-launch                 Skip opening the setup wizard at the end.
 #   --unattended                Use defaults; never prompt. Implies --no-launch
 #                               unless deployment+host are also provided.
@@ -124,6 +138,15 @@ MODE=""           # docker | native (default: prompt if Docker available)
 # "1" = desktop image (cremind/cremind-desktop); "0" = basic headless image
 # (cremind/cremind). Ignored for native installs.
 DESKTOP_UI=""
+# TLS on the public origin, from --ssl. SSL_MODE holds the flag's raw value
+# until the ── ssl mode ── block resolves it (fresh installs default to
+# ``after-setup``); SSL_EXPLICIT records whether the operator actually asked,
+# which is what separates "plain HTTP by choice" from "not specified".
+# Deliberately NOT named like any key app/installer/output.py emits — the TUI
+# read-back sources its output file, and a collision would silently clobber
+# a flag the operator passed on the command line.
+SSL_MODE=""
+SSL_EXPLICIT=0
 NO_LAUNCH=0
 UNATTENDED=0
 REINSTALL=0
@@ -176,6 +199,8 @@ while [ $# -gt 0 ]; do
         --allowed-origins=*)      CUSTOM_allowed_origins="${1#*=}"; shift ;;
         --wizard-preset)          CUSTOM_wizard_preset="$2"; shift 2 ;;
         --wizard-preset=*)        CUSTOM_wizard_preset="${1#*=}"; shift ;;
+        --ssl)                    SSL_MODE="$2"; SSL_EXPLICIT=1; shift 2 ;;
+        --ssl=*)                  SSL_MODE="${1#*=}"; SSL_EXPLICIT=1; shift ;;
         --no-launch)              NO_LAUNCH=1; shift ;;
         --unattended)             UNATTENDED=1; shift ;;
         --reinstall)              REINSTALL=1; shift ;;
@@ -474,6 +499,11 @@ fi
 case "$CHANNEL" in
     production|test|dev) ;;
     *) err "Invalid --channel: $CHANNEL (must be production, test, or dev)"; exit 2 ;;
+esac
+
+case "$SSL_MODE" in
+    ""|none|auto|after-setup) ;;
+    *) err "Invalid --ssl: $SSL_MODE (must be none, auto, or after-setup)"; exit 2 ;;
 esac
 
 if [ "$CHANNEL" = "dev" ]; then
@@ -1210,10 +1240,11 @@ fi
 
 # ``cremind serve`` puts TLS on the public origin (port 1515) when
 # CREMIND_SSL is set (``auto`` generates a locally-signed pair) or when an
-# explicit CREMIND_SSL_CERTFILE is configured. Every env template ships
-# those keys COMMENTED OUT, so only an uncommented assignment carrying a
-# value counts — a leading '#' has to read as "off", or a plain-HTTP
-# install would be handed an https:// URL that nothing is listening on.
+# explicit CREMIND_SSL_CERTFILE is configured. The env TEMPLATES ship those
+# keys commented out and the installer appends the resolved value below, so
+# only an uncommented assignment carrying a value counts — a leading '#' has
+# to read as "off", or a plain-HTTP install would be handed an https:// URL
+# that nothing is listening on.
 #
 # $1 is the env file this install just wrote — optional, and it may not
 # exist yet. Called with no argument (or a path that isn't there) the
@@ -1267,8 +1298,18 @@ cremind_scheme() {
 # An explicit certificate pair overrides the phase: with CREMIND_SSL_CERTFILE
 # set there is nothing to defer and the server binds TLS immediately.
 # Otherwise this is cremind_scheme, argument for argument.
+#
+# $2 = "1" says the wizard has already run (bootstrap.toml exists), which ends
+# the deferral: the server binds TLS from boot one, exactly as ``_resolve_tls``
+# decides it (app/server.py). Re-running the installer over a finished install
+# is the case that needs this — without it the health gate probes http://
+# against a TLS listener, waits out its full budget, and hands the user a
+# wizard URL that cannot load. Caller-supplied rather than tested here because
+# only the caller knows where to look: the native path can see the file on the
+# host, while a Docker install keeps it inside the cremind-data volume and has
+# to ask the running container instead.
 cremind_boot_scheme() {
-    local env_file="${1:-}" ssl_mode ssl_cert
+    local env_file="${1:-}" setup_complete="${2:-0}" ssl_mode ssl_cert
     ssl_mode="${CREMIND_SSL:-}"
     ssl_cert="${CREMIND_SSL_CERTFILE:-}"
     if [ -f "$env_file" ]; then
@@ -1281,7 +1322,7 @@ cremind_boot_scheme() {
                 | head -1 | cut -d= -f2- | tr -d '[:space:]' || true)"
         fi
     fi
-    if [ -z "$ssl_cert" ] && [ "$ssl_mode" = "after-setup" ]; then
+    if [ -z "$ssl_cert" ] && [ "$ssl_mode" = "after-setup" ] && [ "$setup_complete" != "1" ]; then
         printf 'http'
     elif [ -n "$ssl_mode" ] || [ -n "$ssl_cert" ]; then
         printf 'https'
@@ -1301,6 +1342,90 @@ cremind_health_ok() {
     esac
 }
 
+# ── ssl mode ──────────────────────────────────────────────────────────────
+#
+# Resolve the TLS mode BEFORE the scheme decision below, because that
+# decision reads CREMIND_SSL and every file written afterwards has to agree
+# with it. Exporting the variable is deliberately the whole propagation
+# mechanism: cremind_scheme reads it, ``docker compose`` interpolates it into
+# the container, and the native path re-asserts it from the .env it stamps —
+# no call site below needs to know this block exists.
+#
+# Precedence, highest first:
+#
+#   1. --ssl on the command line. ``none`` is a real answer, not "unset": it
+#      clears an inherited CREMIND_SSL so the opt-out can't be undone by a
+#      variable left in the shell.
+#   2. An inherited CREMIND_SSL / CREMIND_SSL_CERTFILE — the pre-flag way of
+#      asking, still honoured.
+#   3. The previous install's choice. Docker regenerates its bundle every
+#      run, so the old docker/.env is read before it's overwritten; a native
+#      .env is kept as-is and carries itself. An install that predates this
+#      flag has no CREMIND_SSL line and reads as "http", which is what it
+#      was — upgrades never flip scheme behind the user's back.
+#   4. Default: after-setup. Plain HTTP while the wizard runs, then a restart
+#      into HTTPS with the CA already trusted.
+#
+# Two cases opt out of (4), both because HTTPS can't work or isn't ours to
+# decide — NOT merely because nobody is watching. The Cremind desktop app runs
+# this script on macOS/Linux (ui/electron/main.ts) and loads the UI over
+# http://127.0.0.1, where the server ignores TLS entirely (app/server.py), so
+# the flag is refused rather than silently ignored; and a custom install
+# carries operator-supplied URLs that we must not rewrite unasked
+# (``container`` is already folded into ``custom`` by the alias block above).
+# An explicit --ssl still wins for custom, because then they did ask.
+#
+# --unattended is deliberately NOT one of them: it means "don't prompt", and
+# nothing about the default needs a prompt. The wizard is opened by a human
+# afterwards in either case, so an unattended install that quietly came up on
+# plain HTTP while the same command without the flag came up on TLS would be a
+# difference nobody could see coming. (The desktop app happens to pass
+# --unattended, but it is the Electron arm above that exempts it, on purpose:
+# the reason is "TLS cannot work here", not "nobody is watching".)
+if [ "${CREMIND_INSTALLER_FRONTEND:-}" = "electron" ]; then
+    if [ "$SSL_EXPLICIT" = "1" ] && [ "$SSL_MODE" != "none" ]; then
+        warn "--ssl $SSL_MODE ignored: the desktop app loads the UI over http://127.0.0.1, where the server does not serve TLS."
+    fi
+    SSL_MODE=""
+    unset CREMIND_SSL CREMIND_SSL_CERTFILE
+elif [ "$SSL_EXPLICIT" = "1" ]; then
+    if [ "$SSL_MODE" = "none" ]; then SSL_MODE=""; fi
+elif [ -n "${CREMIND_SSL:-}" ] || [ -n "${CREMIND_SSL_CERTFILE:-}" ]; then
+    SSL_MODE="${CREMIND_SSL:-}"
+else
+    # prev_ssl unset = no previous install to learn from (fall through to the
+    # default); set-but-empty = a previous install that chose plain HTTP.
+    unset prev_ssl
+    if [ "$MODE" = "docker" ]; then
+        prev_env="$CREMIND_INSTALL_DIR/docker/.env"
+    else
+        prev_env="$ENV_FILE"
+    fi
+    if [ -f "$prev_env" ]; then
+        # ``|| true``: no match makes grep exit 1, which under
+        # ``set -o pipefail`` would take the whole install down.
+        prev_ssl="$(grep -E '^[[:space:]]*CREMIND_SSL[[:space:]]*=' "$prev_env" 2>/dev/null \
+            | head -1 | cut -d= -f2- | tr -d '[:space:]' || true)"
+    fi
+    if [ -n "${prev_ssl+x}" ]; then
+        SSL_MODE="$prev_ssl"
+    elif [ "$DEPLOYMENT" = "custom" ]; then
+        SSL_MODE=""
+    else
+        SSL_MODE="after-setup"
+    fi
+fi
+if [ -n "$SSL_MODE" ]; then
+    export CREMIND_SSL="$SSL_MODE"
+elif [ "$SSL_EXPLICIT" = "1" ]; then
+    # An explicit ``none`` has to beat the environment, or cremind_scheme
+    # still answers https from a leftover variable and the opt-out is a lie.
+    if [ -n "${CREMIND_SSL_CERTFILE:-}" ]; then
+        warn "--ssl none: ignoring the inherited CREMIND_SSL_CERTFILE — this install serves plain HTTP."
+    fi
+    unset CREMIND_SSL CREMIND_SSL_CERTFILE
+fi
+
 # The scheme of the public origin, decided ONCE here — before the first
 # file is written. Everything the installer bakes a public URL into has to
 # agree with it, not just the closing banner: APP_URL feeds the A2A agent
@@ -1310,14 +1435,9 @@ cremind_health_ok() {
 # copies both.
 #
 # No env file exists at this point, so the process environment is the only
-# thing that can carry the setting — which is also the only way to ask for
-# TLS at install time, since every env template ships CREMIND_SSL commented
-# out:
-#
-#     CREMIND_SSL=auto ./install.sh --deployment server --host cremind.lan
-#
-# Nothing set → ``http``, and every file and line below is exactly what it
-# was before TLS existed.
+# thing that can carry the setting — which is exactly what the block above
+# just settled. Plain HTTP → ``http``, and every file and line below is
+# exactly what it was before TLS existed.
 URL_SCHEME="$(cremind_scheme)"
 
 # ``custom`` carries an operator-supplied public URL and CORS list rather
@@ -1345,6 +1465,41 @@ apply_url_scheme_to_env() {
         -e '/^CORS_ALLOWED_ORIGINS=/ s|http://|https://|g' \
         "$1"
     rm -f "$1.bak"
+}
+
+# The inverse, for ``--ssl none`` against a .env that a previous install left
+# on https. Kept separate rather than folded in as an else-branch because
+# every other caller of apply_url_scheme_to_env relies on plain HTTP being a
+# no-op: the templates ship http:// URLs, and a plain-HTTP install must not
+# start rewriting a file it has no opinion about.
+downgrade_url_scheme_in_env() {
+    sed -i.bak \
+        -e '/^APP_URL=/ s|https://|http://|g' \
+        -e '/^CORS_ALLOWED_ORIGINS=/ s|https://|http://|g' \
+        "$1"
+    rm -f "$1.bak"
+}
+
+# Replace an existing uncommented ``KEY=...`` line, or append one. Used only
+# on a .env the installer is deliberately amending (the --ssl keep branch);
+# the ordinary path appends to a file it just wrote from a template.
+#
+# An empty value writes an empty assignment rather than deleting the line:
+# cremind_scheme treats a present-but-empty value as "off", and leaving an
+# explicit ``CREMIND_SSL=`` behind is also what tells the NEXT re-install
+# that plain HTTP was a decision, not an absence.
+upsert_env_key() {
+    local file="$1" key="$2" value="$3"
+    if grep -q "^${key}=" "$file" 2>/dev/null; then
+        # The value can contain '/' (URLs) and '&' (sed's "whole match"), so
+        # use '|' as the delimiter and escape any '&' in the replacement.
+        local escaped
+        escaped="$(printf '%s' "$value" | sed -e 's/[&|\\]/\\&/g')"
+        sed -i.bak -e "s|^${key}=.*|${key}=${escaped}|" "$file"
+        rm -f "$file.bak"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$file"
+    fi
 }
 
 # ── docker install ────────────────────────────────────────────────────────
@@ -1560,6 +1715,22 @@ EOF
     # ``pip_spec()`` pin to ``cremind==<version>`` and look up PyPI
     # for a release that may not be published yet during release prep.
     printf 'CREMIND_UPGRADE_CHANNEL=%s\n' "$CHANNEL" >>"$DOCKER_DIR/.env"
+
+    # Stamp the resolved TLS mode. The template ships CREMIND_SSL commented
+    # out, and compose interpolates ``${CREMIND_SSL:-}`` from THIS file (every
+    # compose call runs from $DOCKER_DIR), so without the line here the
+    # setting would live only in the installing shell: the next
+    # ``docker compose up -d`` from a clean terminal would recreate the
+    # container with TLS off while APP_URL still said https://. Written even
+    # when empty, so a re-install can tell "previous install chose plain HTTP"
+    # from "no previous install".
+    printf 'CREMIND_SSL=%s\n' "$SSL_MODE" >>"$DOCKER_DIR/.env"
+    # Generated certificates cover localhost, the container's hostname and
+    # its detected IPs — none of which is the name a server deployment is
+    # reached by. Mirrors the commented AUTO_HOSTS pairs in server.env.tmpl.
+    if [ -n "$SSL_MODE" ] && [ "$DEPLOYMENT" = "server" ] && [ -n "$APP_HOST" ]; then
+        printf 'CREMIND_SSL_AUTO_HOSTS=%s\n' "$APP_HOST" >>"$DOCKER_DIR/.env"
+    fi
     chmod 600 "$DOCKER_DIR/.env"
 
     # Dev channel: emit a docker-compose.override.yml that points the
@@ -1674,21 +1845,40 @@ EOF
     # fail the install. $URL_SCHEME above stays the steady state, because the
     # URLs already written into .env describe the whole life of the install.
     BOOT_SCHEME="$(cremind_boot_scheme "$DOCKER_DIR/.env")"
+    # Under after-setup the answer flips once the wizard has run, and the
+    # marker it flips on — bootstrap.toml — lives INSIDE the container's
+    # cremind-data volume, where the host cannot see it. So a re-install of an
+    # already-set-up install can't infer the phase; it has to ask. Probe both
+    # candidates and believe whichever answers: that is the listener, whatever
+    # a file says. Order matters only for speed, so try the declared guess
+    # first.
+    BOOT_CANDIDATES="$BOOT_SCHEME"
+    if [ "$URL_SCHEME" = "https" ] && [ "$BOOT_SCHEME" = "http" ]; then
+        BOOT_CANDIDATES="$BOOT_SCHEME https"
+    fi
+    info "Waiting for backend at ${BOOT_SCHEME}://${HEALTH_HOST}:1515/health ..."
+    for i in $(seq 1 60); do
+        answered=0
+        for candidate in $BOOT_CANDIDATES; do
+            if cremind_health_ok "${candidate}://${HEALTH_HOST}:1515/health"; then
+                if [ "$candidate" != "$BOOT_SCHEME" ]; then
+                    info "Backend answered on ${candidate}:// — setup has already been completed on this install."
+                    BOOT_SCHEME="$candidate"
+                fi
+                ok "Backend is up"
+                answered=1
+                break
+            fi
+        done
+        if [ "$answered" = "1" ]; then break; fi
+        sleep 2
+    done
     # https steady state reached over http right now == TLS deferred to the
     # wizard. The banner below says so instead of pointing at a CA download.
     SSL_DEFERRED=0
     if [ "$URL_SCHEME" = "https" ] && [ "$BOOT_SCHEME" = "http" ]; then
         SSL_DEFERRED=1
     fi
-    HEALTH_URL="${BOOT_SCHEME}://${HEALTH_HOST}:1515/health"
-    info "Waiting for backend at $HEALTH_URL ..."
-    for i in $(seq 1 60); do
-        if cremind_health_ok "$HEALTH_URL"; then
-            ok "Backend is up"
-            break
-        fi
-        sleep 2
-    done
 
     # The Electron app drives navigation to the wizard inside its own
     # window — printing a "Wizard URL: http://localhost:1515/#/setup"
@@ -2116,12 +2306,55 @@ fi
 
 # ── shim & PATH ───────────────────────────────────────────────────────────
 
-# Create a symlink in $BIN_DIR so a single, stable path on PATH points at
+# Drop a wrapper into $BIN_DIR so a single, stable path on PATH points at
 # the venv's `cremind`. This means re-installs (which can rebuild the venv)
 # don't change what the user has on PATH.
+#
+# The wrapper also loads $CREMIND_SYSTEM_DIR/.env before handing over.
+# Nothing in the app does: app/config/settings.py resolves its dotenv path
+# relative to the working directory, so a ``cremind serve`` typed in an
+# arbitrary folder sees none of the install's settings. That gap is
+# invisible for a local install (the defaults match the template) right up
+# until it isn't — under CREMIND_SSL=after-setup the wizard asks the
+# operator to restart the server by hand, and a restart that dropped
+# CREMIND_SSL would come back on plain HTTP and strand the wizard waiting
+# for an https origin that never arrives.
+#
+# The real process environment always wins, so ``CREMIND_SSL=... cremind``
+# still overrides, and a missing file is a silent no-op. Values are parsed,
+# never sourced, so a stray backtick in a .env cannot execute anything.
+#
+# ``rm -f`` first: previous installs left a SYMLINK here, and ``cat >`` on a
+# symlink writes straight through it — into the venv's own entry script.
 mkdir -p "$BIN_DIR"
-ln -sfn "$VENV_DIR/bin/cremind" "$BIN_DIR/cremind"
-ok "Linked $BIN_DIR/cremind -> $VENV_DIR/bin/cremind"
+rm -f "$BIN_DIR/cremind"
+cat > "$BIN_DIR/cremind" <<EOF
+#!/bin/sh
+# Generated by the Cremind installer. Loads KEY=VALUE lines from the
+# Cremind .env (the real environment wins), then execs the venv binary.
+_envf="\${CREMIND_SYSTEM_DIR:-\$HOME/.cremind}/.env"
+if [ -f "\$_envf" ]; then
+    _cr="\$(printf '\\r')"
+    while IFS= read -r _line || [ -n "\$_line" ]; do
+        case "\$_line" in 'export '*) _line="\${_line#export }" ;; esac
+        case "\$_line" in ''|'#'*) continue ;; esac
+        _k="\${_line%%=*}"
+        [ "\$_k" = "\$_line" ] && continue
+        case "\$_k" in ''|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac
+        eval "[ \\\${\$_k+x} ]" && continue
+        _v="\${_line#*=}"
+        _v="\${_v%\$_cr}"
+        case "\$_v" in
+            \\"*\\") _v="\${_v#\\"}"; _v="\${_v%\\"}" ;;
+            \\'*\\') _v="\${_v#\\'}"; _v="\${_v%\\'}" ;;
+        esac
+        export "\$_k=\$_v"
+    done < "\$_envf"
+fi
+exec "$VENV_DIR/bin/cremind" "\$@"
+EOF
+chmod +x "$BIN_DIR/cremind"
+ok "Wrote $BIN_DIR/cremind (loads .env, then -> $VENV_DIR/bin/cremind)"
 
 # Append a marker block to the user's shell rc so $BIN_DIR is on PATH for
 # every new shell. The block is idempotent (re-runs are no-ops) and uses a
@@ -2247,9 +2480,47 @@ if [ ! -f "$ENV_FILE" ]; then
     if ! grep -q '^INSTALL_MODE=' "$ENV_FILE" 2>/dev/null; then
         printf 'INSTALL_MODE=%s\n' "$MODE" >> "$ENV_FILE"
     fi
+    # Stamp the resolved TLS mode. This is what makes the choice outlive the
+    # installing shell: the server start below sources this file, and the
+    # ``cremind`` wrapper does the same for every later run — including the
+    # manual restart the wizard asks for under after-setup. Plain HTTP writes
+    # nothing, leaving a fresh .env exactly as the template shipped it.
+    if [ -n "$SSL_MODE" ]; then
+        printf 'CREMIND_SSL=%s\n' "$SSL_MODE" >> "$ENV_FILE"
+        if [ "$DEPLOYMENT" = "server" ] && [ -n "$APP_HOST" ]; then
+            printf 'CREMIND_SSL_AUTO_HOSTS=%s\n' "$APP_HOST" >> "$ENV_FILE"
+        fi
+    fi
     ok "Wrote $ENV_FILE"
 else
     info ".env already exists — keeping it. Edit $ENV_FILE if you need to."
+    # ...with one exception: an explicit --ssl is an instruction about THIS
+    # install, and silently losing it to a stale line in a kept file would
+    # make the flag a no-op on every re-install. Only an explicit flag
+    # reaches here — the resolution above already carried an unflagged
+    # re-install's previous choice forward from this same file.
+    if [ "$SSL_EXPLICIT" = "1" ]; then
+        upsert_env_key "$ENV_FILE" CREMIND_SSL "$SSL_MODE"
+        if [ -n "$SSL_MODE" ] && [ "$DEPLOYMENT" = "server" ] && [ -n "$APP_HOST" ]; then
+            upsert_env_key "$ENV_FILE" CREMIND_SSL_AUTO_HOSTS "$APP_HOST"
+        fi
+        apply_url_scheme_to_env "$ENV_FILE"
+        if [ -z "$SSL_MODE" ]; then
+            # ``--ssl none`` turns off the mode we own, but a certificate PAIR
+            # in the kept file is a separate, equally valid way to ask for TLS
+            # (the server templates document it as option 1), and clearing an
+            # inherited env var upstream did nothing about a line in the file.
+            # Rewriting the URLs to http:// while that pair still binds TLS
+            # would leave the install describing an origin it does not serve —
+            # worse than doing nothing. Leave the URLs alone and say so.
+            if grep -qE '^CREMIND_SSL_CERTFILE[[:space:]]*=[[:space:]]*[^[:space:]]' "$ENV_FILE" 2>/dev/null; then
+                warn "--ssl none: $ENV_FILE still sets CREMIND_SSL_CERTFILE, which serves TLS on its own. Left APP_URL/CORS on https:// to match — comment that line out if you meant plain HTTP."
+            else
+                downgrade_url_scheme_in_env "$ENV_FILE"
+            fi
+        fi
+        warn "Updated CREMIND_SSL (and the APP_URL/CORS scheme) in the existing $ENV_FILE to match --ssl."
+    fi
 fi
 
 # Stamp the channel-specific keys into .env so the running app's upgrader
@@ -2306,7 +2577,19 @@ esac
 # Native installs (curl | sh, no Electron) get the SQLite default here,
 # matching the legacy behavior; the wizard can still flip them to
 # Postgres on first setup.
-if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ]; then
+#
+# after-setup skips it for a different reason: bootstrap.toml existing is
+# precisely what the server reads as "setup is done, serve TLS now"
+# (app/config/tls_mode.py). Writing one here would collapse after-setup into
+# ``auto`` — the wizard's very first page would sit behind a certificate no
+# browser trusts yet, which is the one thing this mode exists to prevent. So
+# the file is left to the wizard, exactly as under Docker and Kubernetes, and
+# the server boots in deferred-storage mode until then.
+SKIP_BOOTSTRAP_FOR_TLS=0
+if [ "$SSL_MODE" = "after-setup" ] && [ ! -f "$BOOTSTRAP_FILE" ]; then
+    SKIP_BOOTSTRAP_FOR_TLS=1
+fi
+if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ] && [ "$SKIP_BOOTSTRAP_FOR_TLS" = "0" ]; then
     if [ ! -f "$BOOTSTRAP_FILE" ]; then
         info "Generating $BOOTSTRAP_FILE (SQLite, the recommended default)"
         cat > "$BOOTSTRAP_FILE" <<'EOF'
@@ -2372,7 +2655,12 @@ chmod 600 "$CREDS_FILE"
 # is what eventually creates the DB. Keeping this here means a stray
 # $CREMIND_SYSTEM_DIR/storage/cremind.db never shows up between the installer
 # finishing and the user choosing to continue.
-if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ]; then
+#
+# Skipped under after-setup for the bootstrap reason above, and it has to be
+# BOTH: ``cremind db upgrade`` writes bootstrap.toml itself when the file is
+# missing (app/cli/commands/db.py), so gating only the block above would let
+# this line put it back and defeat the mode anyway.
+if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ] && [ "$SKIP_BOOTSTRAP_FOR_TLS" = "0" ]; then
     info "Migrating database to current schema"
     "$VENV_DIR/bin/cremind" db upgrade >>"$LOG_FILE" 2>&1
     REVISION="$("$VENV_DIR/bin/cremind" db current 2>/dev/null || echo "?")"
@@ -2464,7 +2752,14 @@ fi
 # except under CREMIND_SSL=after-setup, which serves plain HTTP until the
 # wizard completes — the link below has to open, so it follows the listener,
 # not the steady state the .env describes.
-BOOT_SCHEME="$(cremind_boot_scheme "$ENV_FILE")"
+#
+# ...and after-setup stops deferring once the wizard HAS completed, which is
+# the case on every re-install of a finished install. bootstrap.toml is the
+# marker the server itself reads for that, and on a native install it is
+# right there on the host.
+SETUP_COMPLETE=0
+if [ -f "$BOOTSTRAP_FILE" ]; then SETUP_COMPLETE=1; fi
+BOOT_SCHEME="$(cremind_boot_scheme "$ENV_FILE" "$SETUP_COMPLETE")"
 SSL_DEFERRED=0
 if [ "$URL_SCHEME" = "https" ] && [ "$BOOT_SCHEME" = "http" ]; then
     SSL_DEFERRED=1

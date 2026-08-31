@@ -3,7 +3,9 @@
 ``CREMIND_SSL`` has three values:
 
 ``""``
-    Plain HTTP. The default.
+    Plain HTTP. What an unset variable means — though not what a fresh
+    install gets: the installers default to ``after-setup`` and write it
+    into the ``.env`` they render (``--ssl none`` opts out).
 ``"auto"``
     HTTPS from the first boot, with a certificate signed by a CA generated
     into ``<system dir>/tls/``. Browsers warn until that CA is trusted, and
