@@ -631,13 +631,38 @@ def _mk_hypercorn_config(host: str, port: int, certfile: str, keyfile: str):
 
 
 def _port_taken(bind_host: str, bind_port: int) -> bool:
-    """Whether something already holds this address."""
+    """Whether something already holds this address.
+
+    The probe has to predict the bind the real server is about to attempt, so
+    it sets the same option that server does — and that option means opposite
+    things on the two platforms, hence the fork:
+
+    On POSIX, uvicorn and hypercorn both set ``SO_REUSEADDR`` before binding.
+    There the flag excuses only sockets that are already on their way out —
+    TIME_WAIT, and the FIN_WAIT_2 a vanished peer can pin for a minute — and
+    only when the departing socket carried the flag too, which a previous
+    Cremind's always did. A live ``listen()`` still loses the address either
+    way. So a strict probe is *more* conservative than the bind it exists to
+    predict: it reports taken a port the server would have been given.
+
+    Not hypothetical. A pod's network namespace outlives its container — it
+    belongs to the sandbox — so the ``CREMIND_SSL=after-setup`` restart comes
+    up into the sockets the previous process left on :1515, which are the
+    wizard session's own connections: the browser's, arriving down a ``kubectl
+    port-forward`` that the restart itself severs, so their remnants sit there
+    with no peer left to finish the close. The strict probe read that as "in
+    use" and refused to boot, once per restart, until the remnants aged out a
+    minute later — by which time kubelet had stacked up enough CrashLoopBackOff
+    to keep the pod down well past that.
+
+    On Windows ``SO_REUSEADDR`` means something else entirely: it lets a
+    second *live* listener bind over the first. Setting it there would make
+    the probe blind to exactly what this check exists to catch — a second
+    Cremind, or Vite already holding :1515 — so Windows keeps the strict bind.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        # No SO_REUSEADDR: on Linux it would let this probe bind beside a
-        # socket in TIME_WAIT and report free a port uvicorn then cannot take,
-        # and on Windows it would let two live listeners share one port
-        # outright. Leaving it off is what makes the answer mean the same
-        # thing on both.
+        if os.name != "nt":
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             probe.bind((bind_host, bind_port))
         except OSError:

@@ -14,6 +14,7 @@ both Windows and Linux.
 
 from __future__ import annotations
 
+import os
 import socket
 
 import pytest
@@ -39,6 +40,47 @@ def test_a_listening_socket_reads_as_taken() -> None:
         held.listen(1)
         port = held.getsockname()[1]
         assert server._port_taken("127.0.0.1", port) is True
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows SO_REUSEADDR means 'share a live listener', so the probe "
+    "there stays strict and a closing socket does read as taken.",
+)
+def test_a_closing_socket_reads_as_free_because_the_real_bind_would_get_it() -> None:
+    """The Kubernetes regression: a pod's network namespace outlives its
+    container, so the ``CREMIND_SSL=after-setup`` restart always boots into the
+    sockets the previous server left behind. A strict probe called those "in
+    use" and refused to start — four times over, kubelet backing off further
+    each time, until the remnants finally aged out. What the probe has to
+    answer is whether the *server's* bind would succeed, so this pins both
+    halves: the probe says free, and a bind shaped exactly like uvicorn's and
+    hypercorn's then gets the port.
+
+    The dying listener sets ``SO_REUSEADDR`` here because the real one does,
+    and that is load-bearing rather than incidental: Linux excuses a closing
+    socket only when *both* it and the newcomer carry the flag. Drop it from
+    the setup below and the scenario stops being the one that happens in
+    production — the remnant becomes genuinely unbindable and the test fails
+    for a reason that has nothing to do with the probe.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+            client.connect(("127.0.0.1", port))
+            conn, _ = listener.accept()
+            # The serving side closes first, which is what leaves *its* address
+            # behind in TIME_WAIT rather than the client's.
+            conn.close()
+
+    assert server._port_taken("127.0.0.1", port) is False
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as real:
+        real.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        real.bind(("127.0.0.1", port))  # what uvicorn and hypercorn do, verbatim
 
 
 def test_the_probe_leaves_the_port_free_for_the_real_bind() -> None:

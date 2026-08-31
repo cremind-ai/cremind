@@ -159,11 +159,31 @@ cremind serve --host "$HOST" --port "$PORT" 2>&1 \
 
 # ── 5. Watchdog ───────────────────────────────────────────────────────────
 
+# What the server is actually about to speak, so the banner in ``docker logs``
+# / ``kubectl logs`` doesn't send anyone to an http URL that resets. Mirrors
+# ``_resolve_tls``: ``auto`` serves TLS from the first boot, ``after-setup``
+# only once the wizard has written bootstrap.toml. noVNC is never fronted by
+# the app's listener, so its line stays http either way.
+#
+# Lowercase and unexported on purpose: dynaconf reads every exported CREMIND_*
+# variable as a setting, so a banner detail must not be spelled like one.
+banner_scheme=http
+case "$(echo "${CREMIND_SSL:-}" | tr '[:upper:]' '[:lower:]')" in
+    auto)
+        banner_scheme=https
+        ;;
+    after-setup)
+        if [ -f "${CREMIND_SYSTEM_DIR:-/root/.cremind}/bootstrap.toml" ]; then
+            banner_scheme=https
+        fi
+        ;;
+esac
+
 if [ "$CREMIND_IMAGE_FLAVOR" = "desktop" ]; then
     cat <<EOF
 ================================================================
  Cremind-Desktop ready.
-   Cremind      : http://<host>:1515  (UI + API — single public port)
+   Cremind      : $banner_scheme://<host>:1515  (UI + API — single public port)
    noVNC        : http://<host>:6080/vnc.html  (VNC password set)
    Resolution   : $RESOLUTION
 ================================================================
@@ -172,7 +192,7 @@ else
     cat <<EOF
 ================================================================
  Cremind ready.
-   Cremind      : http://<host>:1515  (UI + API — single public port)
+   Cremind      : $banner_scheme://<host>:1515  (UI + API — single public port)
 ================================================================
 EOF
 fi
