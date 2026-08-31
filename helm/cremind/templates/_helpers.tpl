@@ -156,23 +156,48 @@ is what an agent card / OAuth callback / CORS origin has to say.
 {{- end -}}
 
 {{/*
-Effective reverse-proxy toggle. In-pod TLS and the nginx sidecar are mutually
-exclusive: the sidecar is plaintext on both sides, never mounts the system PVC
-that holds the certificate, could not read the root-owned 0600 key if it did,
-and the certificate does not exist until the app's first boot. There is no
-valid (ssl, proxy) pairing to choose between, so the chart bypasses the sidecar
-automatically instead of failing and demanding a second flag. Returns "true" or
-"" so it can be used directly in `if`.
+Sidecar mode selection. proxy.enabled runs the nginx sidecar in exactly ONE of
+two modes, keyed on cremind.ssl; the toggles below are mutually exclusive and
+each returns "true" or "" so it can be used directly in `if`.
 
-after-setup bypasses it in BOTH phases, deliberately — even though the sidecar
-COULD front the plain-HTTP stretch. Keeping it out means the Service→app path
-is identical either side of the mid-wizard flip: the port-forward the user
-opened to run the wizard is the very same one that serves https when the server
-comes back, with no Service edit, no re-forward, and no window where the
-sidecar is proxying a listener that has just turned into TLS.
+  ssl unset -> cremind.proxyEnabled: the L7 reverse proxy (default.conf in the
+               proxy ConfigMap) — one plaintext entry point routing /vnc/ +
+               /websockify to noVNC and everything else to the app.
+
+  ssl set   -> cremind.relayEnabled: a LAYER-4 TCP passthrough (an nginx
+               stream{} proxy_pass to 127.0.0.1:1515). Bytes are relayed
+               untouched, so the app's TLS — and after-setup's pre-flip plain
+               HTTP — runs end-to-end between the browser and the app. The
+               sidecar never terminates, inspects or re-encrypts anything and
+               needs no certificate material, which is why the old objections
+               to pairing ssl with the (L7, plaintext) sidecar do not apply.
+
+Why relay at all, instead of the Service targeting the app directly as this
+chart previously did under ssl? Because kubectl >= 1.23 tears down the ENTIRE
+port-forward tunnel on the first refused in-pod dial. The app container exits
+and restarts mid-flow — the Setup Wizard's after-setup https flip, every
+in-app upgrade — leaving a 15-40s listener gap in which a single browser
+request would kill the user's tunnel. The relay container never restarts
+across those events: it always ACCEPTS the dial (and merely closes the
+connection when the upstream is down), so the tunnel survives and the browser
+simply retries. The Service targets the relay whenever ssl is on and
+proxy.enabled; proxy.enabled=false restores the direct Service->app wiring.
 */}}
 {{- define "cremind.proxyEnabled" -}}
 {{- if and .Values.proxy.enabled (not (include "cremind.sslMode" .)) -}}true{{- end -}}
+{{- end -}}
+
+{{- define "cremind.relayEnabled" -}}
+{{- if and .Values.proxy.enabled (include "cremind.sslMode" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Either sidecar mode — gates the container, its ConfigMap and its volume.
+Equivalent to proxy.enabled today, but spelled as the union so the gate stays
+correct if the modes ever diverge.
+*/}}
+{{- define "cremind.sidecarEnabled" -}}
+{{- if or (include "cremind.proxyEnabled" .) (include "cremind.relayEnabled" .) -}}true{{- end -}}
 {{- end -}}
 
 {{/*

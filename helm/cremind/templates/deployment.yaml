@@ -30,6 +30,11 @@ spec:
       annotations:
         # Roll the pod when the env ConfigMap changes.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if include "cremind.sidecarEnabled" . }}
+        # Same for the sidecar's config: a subPath mount never hot-reloads, so
+        # without this an edit would sit unused until the next pod roll.
+        checksum/proxy-config: {{ include (print $.Template.BasePath "/proxy-configmap.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -180,23 +185,43 @@ spec:
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-        {{- if include "cremind.proxyEnabled" . }}
+        {{- $proxyOn := include "cremind.proxyEnabled" . }}
+        {{- $relayOn := include "cremind.relayEnabled" . }}
+        {{- if or $proxyOn $relayOn }}
+        {{- if $proxyOn }}
         # Single entry point: nginx routes /api + /health -> backend, /vnc/ ->
         # noVNC, everything else -> the SPA, all on one port. Shares the pod
         # network namespace with the cremind container (reaches it on 127.0.0.1).
-        # Bypassed entirely when the app terminates TLS itself (cremind.ssl).
+        {{- else }}
+        # Layer-4 TCP relay: passes bytes through to the app's own listener
+        # untouched (TLS stays end-to-end; see cremind.relayEnabled in
+        # _helpers.tpl). Never restarts when the app container does, so a
+        # kubectl port-forward survives the after-setup https flip and in-app
+        # upgrades — kubectl >= 1.23 would otherwise kill the whole tunnel on
+        # the first refused dial into the pod.
+        {{- end }}
         - name: proxy
           image: "{{ .Values.proxy.image.registry }}/{{ .Values.proxy.image.repository }}:{{ .Values.proxy.image.tag }}"
           imagePullPolicy: {{ .Values.proxy.image.pullPolicy }}
           ports:
+            {{- if $proxyOn }}
             - name: http
               containerPort: {{ .Values.proxy.port }}
+            {{- else }}
+            - name: relay
+              containerPort: {{ .Values.proxy.port }}
+            # Pod-internal only: carries /healthz for the probes below. Not on
+            # the Service.
+            - name: relay-admin
+              containerPort: {{ .Values.proxy.adminPort | default 8081 }}
+            {{- end }}
+          {{- $probePort := ternary "http" "relay-admin" (ne $proxyOn "") }}
           readinessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet: { path: /healthz, port: {{ $probePort }} }
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet: { path: /healthz, port: {{ $probePort }} }
             initialDelaySeconds: 10
             periodSeconds: 20
           {{- with .Values.proxy.resources }}
@@ -205,11 +230,18 @@ spec:
           {{- end }}
           volumeMounts:
             - name: proxy-config
+              {{- if $proxyOn }}
               mountPath: /etc/nginx/conf.d/default.conf
               subPath: default.conf
+              {{- else }}
+              # Full-file override: stream{} must be top-level, outside the
+              # http{} context that conf.d is included into.
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              {{- end }}
         {{- end }}
       volumes:
-        {{- if include "cremind.proxyEnabled" . }}
+        {{- if include "cremind.sidecarEnabled" . }}
         - name: proxy-config
           configMap:
             name: {{ include "cremind.fullname" . }}-proxy

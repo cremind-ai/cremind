@@ -41,6 +41,11 @@ port, `1455`, which carries no application traffic — it exists so a port-forwa
 can reach the transient Codex OAuth callback listener; see
 [Sign in with ChatGPT](#sign-in-with-chatgpt-codex-oauth).)
 
+Under [`cremind.ssl`](#https-in-pod-tls) the same sidecar runs as a **layer-4
+TCP passthrough relay** instead: no routes, no termination, bytes forwarded
+untouched — so the app's TLS runs end-to-end *and* a `kubectl port-forward`
+survives the app restarting underneath it.
+
 ## Install
 
 ```bash
@@ -141,8 +146,8 @@ flag is enough either way — the chart adjusts everything that depends on it:
 
 | | `cremind.ssl=""` (default) | `cremind.ssl=auto` | `cremind.ssl=after-setup` |
 |---|---|---|---|
-| Service port 80 targets | nginx sidecar (`http`) | the app (`ui`), named `https` | the app (`ui`), named `https` |
-| nginx proxy sidecar | runs | **bypassed** (it is plaintext-only) | **bypassed**, in both phases |
+| Service port 80 targets | nginx sidecar (`http`) | nginx sidecar as L4 relay (`relay`), named `https` | nginx sidecar as L4 relay (`relay`), named `https` |
+| nginx sidecar | runs as L7 proxy | runs as **L4 TCP relay** (passthrough) | runs as **L4 TCP relay**, in both phases |
 | noVNC (desktop flavor) | `/vnc/vnc.html` on the same port | **Service port 6080**, `http://localhost:6080/vnc.html` | **Service port 6080**, `http://localhost:6080/vnc.html` |
 | auto-derived `APP_URL` | `http://localhost:1515` | `https://localhost:1515` | `https://localhost:1515` (steady state) |
 | probes (if enabled) | scheme HTTP | scheme HTTPS | **`tcpSocket`** (true in both phases) |
@@ -173,12 +178,28 @@ new user is `ERR_CERT_AUTHORITY_INVALID`. `after-setup` removes that entirely:
 3. Its last step restarts the server. Kubelet brings the pod back serving
    https on the same port, to a browser that now trusts the chain.
 
-One practical wrinkle: the restart in step 3 also **terminates your
-`kubectl port-forward`** — the tunnel is bound to the old pod instance and
-never reconnects on its own (kubectl prints `lost connection to pod`). The
-wizard expects this: it tells you to re-run the same port-forward command and
-keeps watching, then continues to `https://localhost:1515` by itself the
-moment the tunnel is back. Same command, same port, nothing else to change.
+Step 3 used to cost you the tunnel. `kubectl` ≥ 1.23 ends a port-forward the
+first time a connection into the pod is **refused**, so the moment the browser
+polled during the restart the whole tunnel died with `lost connection to pod`.
+With the default `proxy.enabled=true` that no longer happens: the tunnel now
+lands on the relay sidecar, which stays up while the app is down and answers
+every dial (accepting and closing a connection is not refusing one). The wizard
+polls, the pod comes back, and the page continues to `https://localhost:1515`
+by itself — nothing to re-run. The same protection covers the restarts that
+in-app upgrades perform later.
+
+With `proxy.enabled=false` there is no relay and the old behaviour stands:
+re-run the same port-forward command when the wizard says it is waiting, and it
+continues on its own the moment the tunnel is back. Either way, a self-healing
+forward is worth having, since `helm upgrade`, laptop sleep and network blips
+all end tunnels too:
+
+```bash
+while true; do kubectl -n cremind port-forward svc/cremind 1515:80; sleep 1; done
+```
+```powershell
+while ($true) { kubectl -n cremind port-forward svc/cremind 1515:80; Start-Sleep -Seconds 1 }
+```
 
 **Use `after-setup` on Kubernetes unless you have a reason not to.** `auto`
 remains the right pick for a headless or API-only install, where no browser is
@@ -324,7 +345,7 @@ embeddings.
 | `cremind.installMode` | `kubernetes` | Drives external-only service modes. |
 | `cremind.setupWizardEnv` | `kubernetes` | Pre-fills the wizard. |
 | `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http(s)://localhost:1515`. |
-| `cremind.ssl` | `""` | `auto` = in-pod HTTPS with a generated local CA from the first boot; `after-setup` = the same, but plain HTTP until the Setup Wizard finishes so the CA is trusted before any https page loads (recommended when a browser is involved). Both bypass the proxy sidecar and reject `ingress.enabled`. See [HTTPS](#https-in-pod-tls). |
+| `cremind.ssl` | `""` | `auto` = in-pod HTTPS with a generated local CA from the first boot; `after-setup` = the same, but plain HTTP until the Setup Wizard finishes so the CA is trusted before any https page loads (recommended when a browser is involved). Both switch the sidecar to an L4 passthrough relay and reject `ingress.enabled`. See [HTTPS](#https-in-pod-tls). |
 | `cremind.sslAutoHosts` | `""` | Extra SANs (CSV) for the generated certificate, for names beyond localhost/pod. |
 | `persistence.system.*` | `5Gi`, RWO | `bootstrap.toml`, tokens, profiles. |
 | `persistence.venv.*` | `8Gi`, RWO | Wizard-installed Python deps (LLM SDKs, embeddings). |
@@ -332,7 +353,8 @@ embeddings.
 | `extraVolumes` / `extraVolumeMounts` | `[]` | Persist any additional paths (raw volume specs). |
 | `postgresql.enabled` | `true` | Bundled Bitnami PostgreSQL. |
 | `qdrant.enabled` / `chromadb.enabled` | `false` | Enable when turning on embeddings. |
-| `proxy.enabled` | `true` | nginx single-entry sidecar (UI + API + noVNC on one port; noVNC routes present only on the desktop flavor). Auto-bypassed when `cremind.ssl` is set — noVNC then moves to Service port 6080. |
+| `proxy.enabled` | `true` | nginx sidecar. Without `cremind.ssl` it is the single-entry L7 proxy (UI + API + noVNC on one port; noVNC routes only on the desktop flavor). With `cremind.ssl` it is an L4 TCP passthrough relay that keeps a port-forward alive across app restarts, and noVNC moves to Service port 6080. `false` removes it and points the Service at the app. |
+| `proxy.adminPort` | `8081` | Relay mode only: pod-internal port carrying the sidecar's own `/healthz` for its probes. Never on the Service. |
 | `service.port` | `80` | The one Service port (fronts the proxy). |
 | `cremind.codexCallbackPort` | `1455` | Codex OAuth callback. Not really a knob — OpenAI hard-codes `localhost:1455`. Exposed as a second Service port purely so `port-forward svc/… 1455:1455` resolves; see [Sign in with ChatGPT](#sign-in-with-chatgpt-codex-oauth). |
 | `ingress.enabled` | `false` | One hostname for everything (UI at `/`; noVNC at `/vnc/` on the desktop flavor). |

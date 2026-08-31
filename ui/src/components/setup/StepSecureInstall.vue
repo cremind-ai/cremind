@@ -218,11 +218,11 @@ const orderedTargets = computed(() => {
         You stay signed in — your session is carried across.
       </p>
       <p v-if="restartSupported && isKubernetes">
-        That restart will also end your <code>kubectl port-forward</code> —
-        the tunnel points at the old container and doesn't reconnect by
-        itself. When this page says it's waiting, run the same port-forward
-        command again in your terminal; everything then continues
-        automatically.
+        The restart takes 20&ndash;40 seconds and this page waits it out on its
+        own. Your <code>kubectl port-forward</code> normally survives it. If
+        the page is still waiting after a minute, re-run the same port-forward
+        command in your terminal — on some setups the tunnel does end with the
+        restart — and everything continues automatically from there.
       </p>
       <p v-else>
         When you click <strong>Start Using Cremind</strong> on the final step,

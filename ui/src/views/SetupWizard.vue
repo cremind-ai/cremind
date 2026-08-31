@@ -525,6 +525,10 @@ const pivotTargetUrl = computed(() => {
  *  starts the pivot), so this is always a working fallback. */
 function continueOnHttp() {
   pivot.cancelManualProbe();
+  // ``handleFinish`` closed this before the restart; we are staying on the
+  // HTTP origin after all, and the SPA does not remount on a route change, so
+  // nothing else would bring it back.
+  embeddingStatusStore.connect(settingsStore.agentUrl);
   router.push(`/${profileName.value}`);
 }
 
@@ -1145,6 +1149,14 @@ async function handleFinish() {
     return;
   }
   currentStage.value = 'https-pivot';
+  // Quiesce the live event stream before asking the server to go down. It is
+  // pointed at the plain-HTTP origin and reconnects on a 1s backoff, so it
+  // would spend the whole restart dialling a listener that is not there — and
+  // under `kubectl port-forward` a refused in-pod dial does not just fail, it
+  // tears down the user's whole tunnel (kubectl >= 1.23). The pivot's own
+  // probes are deliberately paced for the same reason; this closes the other,
+  // noisier source. Every path that stays on HTTP reconnects it below.
+  embeddingStatusStore.disconnect();
   const pivotOptions = {
     agentUrl: settingsStore.agentUrl,
     restartToken: generatedToken.value,
@@ -1497,25 +1509,31 @@ async function downloadConfigFile(format: ExportFormat) {
           <h2>Waiting for the secure server…</h2>
           <p>
             Watching <code>{{ pivotTargetUrl }}</code> for the restarted
-            server to answer. You'll be taken there automatically.
+            server to answer — usually 20&ndash;40 seconds, since it reruns
+            migrations and reloads your skills on the way up. You'll be taken
+            there automatically.
           </p>
-          <!-- Kubernetes: the restart replaces the pod's container, which
-               terminates the user's `kubectl port-forward` — the tunnel
-               targets one pod instance and never reconnects on its own. The
-               server is almost certainly already back; only the tunnel is
-               gone, and only the user can bring it back. -->
+          <!-- Kubernetes only, and only once the wait has run long enough that
+               "still booting" is no longer a plausible explanation. Two things
+               look identical from here and neither is ours to fix: the
+               `kubectl port-forward` tunnel died with the restart (it survives
+               on the default chart, whose relay sidecar keeps answering while
+               the app is down — but not with proxy.enabled=false or on an
+               older chart), or the server is up and this browser does not
+               trust its certificate. Name both; the button covers the second. -->
           <template v-if="pivotForwardHint">
             <ElAlert type="warning" :closable="false" show-icon
-              title="Restart your port-forward">
+              title="This is taking longer than it should">
               <p>
-                The restart ended your <code>kubectl port-forward</code> —
-                that tunnel points at the old container and doesn't reconnect.
-                Run the same port-forward command again in your terminal;
-                this page continues on its own the moment it's back.
+                Two things look the same from this page. Your
+                <code>kubectl port-forward</code> may have ended with the
+                restart — re-run the same command in your terminal and this
+                page continues on its own the moment it's back.
               </p>
               <p>
-                If you skipped trusting the certificate earlier, the wait
-                can't tell — use the button below and handle the browser
+                Or the server is already up and this browser doesn't trust its
+                certificate yet, which fails the check in exactly the same way.
+                In that case use the button below and accept the browser's
                 warning there.
               </p>
             </ElAlert>

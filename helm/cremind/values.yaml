@@ -104,11 +104,12 @@ cremind:
   # https on 1515 itself — the answer for domain-less access, i.e. a
   # port-forward or NodePort, where no public CA will ever issue a
   # certificate. Setting it:
-  #   - BYPASSES the nginx sidecar automatically. That sidecar is plaintext on
-  #     both sides and cannot front a TLS listener, so there is nothing to
-  #     choose between; the Service targets the app directly.
+  #   - switches the nginx sidecar from HTTP reverse proxy to a raw TCP relay
+  #     in front of 1515, so TLS stays end-to-end and the sidecar needs no
+  #     certificate material (proxy.enabled=false removes it entirely and
+  #     targets the app directly).
   #   - moves noVNC to its own Service port 6080 on the desktop flavor (the
-  #     /vnc/ route lives in the bypassed sidecar).
+  #     /vnc/ route lives in the L7 sidecar, which relay mode does not run).
   #   - switches the optional probes to scheme HTTPS and makes the
   #     auto-derived APP_URL https://localhost:1515.
   # Mutually exclusive with ingress.enabled — the chart rejects that combo.
@@ -231,8 +232,15 @@ extraVolumeMounts: []
 # Containers in a pod share localhost, so the proxy reaches 127.0.0.1:{1515,80}.
 # The internal API bind (1112) is loopback-only and is not proxied.
 #
-# Automatically bypassed when cremind.ssl is set: this sidecar is plaintext on
-# both sides and cannot front the app's TLS listener (see cremind.ssl).
+# With cremind.ssl set the same sidecar switches to a LAYER-4 TCP passthrough
+# relay (no routes, no /vnc/): bytes flow untouched between the browser and the
+# app's 1515 listener, so TLS stays end-to-end and the sidecar needs no
+# certificate material. Its job in that mode is keeping `kubectl port-forward`
+# alive: kubectl >= 1.23 kills the whole tunnel on one refused in-pod dial, and
+# the app container restarts mid-flow (the wizard's after-setup https flip,
+# in-app upgrades) — the relay never restarts with it and always accepts the
+# dial. Set enabled=false to remove the sidecar entirely (the Service then
+# targets the app directly).
 proxy:
   enabled: true
   image:
@@ -242,6 +250,11 @@ proxy:
     tag: "1.27-alpine"
     pullPolicy: IfNotPresent
   port: 8080
+  # Relay-mode only (cremind.ssl set): a second, pod-internal port carrying the
+  # sidecar's own /healthz for its probes. Never exposed on the Service. The
+  # templates default this to 8081 if absent, so `helm upgrade --reuse-values`
+  # from a release predating this key cannot render an empty port.
+  adminPort: 8081
   resources:
     requests: { cpu: 25m, memory: 32Mi }
     limits: { cpu: 200m, memory: 128Mi }

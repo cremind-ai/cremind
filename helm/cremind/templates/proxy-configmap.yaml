@@ -1,4 +1,6 @@
-{{- if include "cremind.proxyEnabled" . }}
+{{- $proxyOn := include "cremind.proxyEnabled" . }}
+{{- $relayOn := include "cremind.relayEnabled" . }}
+{{- if or $proxyOn $relayOn }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -6,6 +8,7 @@ metadata:
   labels:
     {{- include "cremind.labels" . | nindent 4 }}
 data:
+{{- if $proxyOn }}
   default.conf: |
     # Single entry point for Cremind. The cremind container and this nginx
     # sidecar share the pod network namespace. The cremind app now serves the
@@ -92,4 +95,79 @@ data:
             proxy_send_timeout 3600s;
         }
     }
+{{- else }}
+  nginx.conf: |
+    # FULL nginx.conf override — not a conf.d include. The stream{} block below
+    # must sit at TOP level (a sibling of http{}), which nothing under
+    # /etc/nginx/conf.d/ can provide (conf.d is included inside http{}), so
+    # relay mode replaces the whole file. It mirrors the nginx-unprivileged
+    # image's own nginx.conf requirements: NO `user` directive (the container
+    # already runs as uid 101), pid under /tmp, http temp paths under /tmp (the
+    # only guaranteed-writable dirs), logs to the image's stdout/stderr
+    # symlinks. The stream module is compiled statically into the official
+    # 1.27-alpine binary — no load_module needed.
+    #
+    # DELIBERATELY omits `include /etc/nginx/conf.d/*.conf;` — the image's stock
+    # default.conf listens on {{ .Values.proxy.port }} in the http context and
+    # would collide with the stream listener below ("address already in use",
+    # container crash-loop).
+
+    # A loopback byte-pump for a single user: one worker is plenty and keeps
+    # memory flat (the image default `auto` scales to node cores pointlessly).
+    worker_processes  1;
+
+    error_log  /var/log/nginx/error.log notice;
+    pid        /tmp/nginx.pid;
+
+    events {
+        worker_connections  1024;
+    }
+
+    # Layer-4 TCP passthrough: bytes are relayed untouched, so the app's TLS
+    # session (and after-setup's pre-flip plain HTTP) runs end-to-end between
+    # the browser and 127.0.0.1:{{ .Values.cremind.uiPort }} — this container
+    # never terminates, inspects or re-encrypts anything and holds no
+    # certificate material. Its one job is to keep ACCEPTING in-pod dials while
+    # the app container restarts (the Setup Wizard's https flip, in-app
+    # upgrades): kubectl >= 1.23 kills the whole port-forward tunnel on the
+    # first refused dial, and an accepted-then-closed connection is what keeps
+    # it alive — the browser just retries.
+    stream {
+        server {
+            listen {{ .Values.proxy.port }};
+            proxy_pass 127.0.0.1:{{ .Values.cremind.uiPort }};
+            # A loopback connect either succeeds or is refused instantly; the
+            # short timeout only bounds the SYN-retry edge while the app
+            # container is mid-teardown.
+            proxy_connect_timeout 5s;
+            # Idle timeout on an ESTABLISHED relay, reset by traffic in either
+            # direction — hour-long SSE / WebSocket-over-TLS flows carry
+            # keepalives well inside it. Matches the 3600s read/send timeouts
+            # the http-mode sidecar uses.
+            proxy_timeout 3600s;
+        }
+    }
+
+    # Minimal http context on a separate pod-internal admin port, solely so the
+    # sidecar's own probes stay an httpGet that proves nginx itself is serving.
+    # (A tcpSocket probe on the relay port would also pass, but each probe would
+    # trigger a spurious upstream dial — error-log noise every period whenever
+    # the app is down.)
+    http {
+        client_body_temp_path /tmp/client_temp;
+        proxy_temp_path       /tmp/proxy_temp;
+        fastcgi_temp_path     /tmp/fastcgi_temp;
+        uwsgi_temp_path       /tmp/uwsgi_temp;
+        scgi_temp_path        /tmp/scgi_temp;
+        default_type          text/plain;
+        # kubelet probes land every few seconds — don't log them.
+        access_log            off;
+
+        server {
+            listen {{ .Values.proxy.adminPort | default 8081 }};
+            server_name _;
+            location = /healthz { return 200 "ok\n"; }
+        }
+    }
+{{- end }}
 {{- end }}

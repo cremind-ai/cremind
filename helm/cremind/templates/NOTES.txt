@@ -1,5 +1,6 @@
 {{- $sslMode := include "cremind.sslMode" . }}
 {{- $proxyOn := include "cremind.proxyEnabled" . }}
+{{- $relayOn := include "cremind.relayEnabled" . }}
 {{- $scheme := ternary "https" "http" (ne $sslMode "") }}
 {{- /* What the browser types RIGHT NOW, as opposed to $scheme (the steady
        state APP_URL and the port name describe). They differ for exactly one
@@ -16,8 +17,16 @@ external/in-cluster vector stores.
 Everything is served on ONE port by the in-pod reverse proxy — the UI, the API,
 {{- if .Values.desktop.enabled }} and noVNC.{{ else }} and (on the desktop flavor) noVNC.{{ end }} You never need to forward more than one port.
 {{- else if eq $sslMode "after-setup" }}
-The pod terminates TLS itself (CREMIND_SSL=after-setup), so the plaintext nginx
-sidecar is bypassed and the Service fronts the app's own listener directly.
+The pod terminates TLS itself (CREMIND_SSL=after-setup).
+{{- if $relayOn }}
+The nginx sidecar stays in front as a raw TCP relay: it passes your bytes
+through untouched (the TLS session runs end-to-end to the app) and it never
+restarts when the server does — so the port-forward below keeps working
+straight through the Setup Wizard's mid-flow restart.
+{{- else }}
+The nginx sidecar is disabled, so the Service fronts the app's own listener
+directly.
+{{- end }}
 TLS waits for setup: the server serves plain HTTP while the Setup Wizard runs,
 and the wizard walks you through trusting its local CA. When you finish, it
 restarts the server, which comes back on https — to a browser that already
@@ -26,8 +35,15 @@ trusts the chain, so the first https page loads with no warning at all.
 noVNC moves to its own port — see below.
 {{- end }}
 {{- else if $sslMode }}
-The pod terminates TLS itself (CREMIND_SSL={{ $sslMode }}), so the plaintext nginx
-sidecar is bypassed and the Service fronts the app's https listener directly.
+The pod terminates TLS itself (CREMIND_SSL={{ $sslMode }}).
+{{- if $relayOn }}
+The nginx sidecar stays in front as a raw TCP relay — it passes your bytes
+through untouched, so TLS runs end-to-end to the app's https listener, and it
+keeps a port-forward alive across server restarts.
+{{- else }}
+The nginx sidecar is disabled, so the Service fronts the app's https listener
+directly.
+{{- end }}
 {{- if .Values.desktop.enabled }}
 noVNC moves to its own port — see below.
 {{- end }}
@@ -70,13 +86,33 @@ noVNC moves to its own port — see below.
    The CA is generated at the first boot even though nothing is served over
    TLS yet, so the wizard can hand it to you and have it trusted BEFORE the
    first https page exists. Follow its steps; there is nothing to do here.
-
+{{ if $relayOn }}
+   Finishing setup restarts the server onto https on the same Service port.
+   Your port-forward SURVIVES this: the tunnel lands on the relay sidecar,
+   which keeps accepting connections while the server is down (kubectl 1.23+
+   ends a tunnel the first time a connection into the pod is refused — the
+   relay exists so that never happens). The wizard keeps watching and
+   continues to https://localhost:1515 on its own, with no certificate
+   warning and nothing to re-run. The same protection covers the restarts
+   that in-app upgrades perform later.
+{{- else }}
    Finishing setup restarts the pod onto https on the same Service port.
    That restart ENDS the port-forward above — the tunnel targets one pod
    instance and does not reconnect. When the wizard says it is waiting for
    the secure server, re-run the same port-forward command; the wizard then
    continues to https://localhost:1515 on its own, with no certificate
    warning.
+{{- end }}
+
+   Belt and braces — a self-healing forward re-establishes the tunnel
+   whenever it drops (helm upgrades replace the pod; laptop sleep and network
+   blips end tunnels too):
+
+   bash:
+     while true; do kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "cremind.fullname" . }} 1515:{{ .Values.service.port }}; sleep 1; done
+
+   PowerShell:
+     while ($true) { kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "cremind.fullname" . }} 1515:{{ .Values.service.port }}; Start-Sleep -Seconds 1 }
 
    To verify the CA out of band instead of taking the wizard's copy on trust:
 

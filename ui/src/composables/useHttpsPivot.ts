@@ -12,9 +12,20 @@
 //   2. A rejected probe is ambiguous: the server may be down, or it may be up
 //      with a certificate this browser does not trust (the TLS handshake fails
 //      the fetch identically). So we never treat "still failing" as fatal —
-//      when the budget expires we redirect anyway. If the user skipped the
-//      trust step, the browser's own interstitial on the HTTPS URL is the
-//      honest, actionable signal, and they were shown that URL beforehand.
+//      off Kubernetes, when the budget expires we redirect anyway. If the user
+//      skipped the trust step, the browser's own interstitial on the HTTPS URL
+//      is the honest, actionable signal, and they were shown that URL
+//      beforehand. On Kubernetes we never blind-redirect: see ``run``.
+//
+// A third thing shapes the timing. Under ``kubectl port-forward``, a dial that
+// reaches the pod and finds nothing listening is REFUSED, and kubectl >= 1.23
+// answers a refused dial by tearing down the whole tunnel. So every probe we
+// fire into the restart gap risks killing the very tunnel we are waiting on —
+// which is why the first Kubernetes probe waits for the server to plausibly be
+// back rather than starting at ``INITIAL_DELAY_MS``. (The chart's relay sidecar
+// makes the dial land on something that is always listening, so this is
+// belt-and-braces there — but it still matters for ``proxy.enabled=false`` and
+// for installs on an older chart.)
 
 import { getCurrentScope, onScopeDispose, readonly, ref } from 'vue';
 
@@ -31,14 +42,25 @@ export type PivotPhase =
 /** Let the old process actually die before the first probe, or we'd get a
  *  fulfilled fetch off the listener that is on its way out. */
 const INITIAL_DELAY_MS = 2000;
+/** Kubernetes waits far longer before its FIRST probe. The restart is not one
+ *  event but a chain: the helper SIGTERMs at +1.5s, the server drains (up to
+ *  12s), the container exits, the kubelet restarts it, the entrypoint runs
+ *  ``cremind db upgrade``, and only then does the app boot — migrations,
+ *  skills, documents, channels — before it binds. Nothing can answer inside
+ *  ~15s, so an earlier probe cannot succeed; it can only cost us the tunnel
+ *  (a refused in-pod dial ends a ``kubectl port-forward``). */
+const K8S_INITIAL_DELAY_MS = 15_000;
 const PROBE_INTERVAL_MS = 1500;
 const PROBE_BUDGET_MS = 25_000;
 /** One probe's own timeout. Short: a live listener answers immediately. */
 const PROBE_TIMEOUT_MS = 2000;
-/** On Kubernetes, how long probes may fail before we conclude the
- *  port-forward died with the restart and say so. The pod itself is back
- *  well inside this on any healthy cluster. */
-const FORWARD_HINT_AFTER_MS = 8000;
+/** On Kubernetes, how long probes may fail (after the initial delay above)
+ *  before we surface the "something needs your attention" hint. A healthy flip
+ *  finishes well inside this, so the hint means one of the two things the
+ *  probe genuinely cannot distinguish — a dead tunnel, or an untrusted CA —
+ *  rather than "still booting". Firing it earlier made it appear during every
+ *  normal restart, telling users to fix something that was not broken. */
+const FORWARD_HINT_AFTER_MS = 45_000;
 
 // Manual mode — the operator restarts the server by hand, so the wait is
 // open-ended and the poll is gentler.
@@ -57,10 +79,12 @@ export interface PivotRunOptions {
   profile: string;
   profileToken: string;
   /** INSTALL_MODE, when known. On ``kubernetes`` the browser reaches the
-   *  server through ``kubectl port-forward`` — a tunnel to a specific pod
-   *  that DIES when the restart replaces the container. The wait then only
-   *  ends when the user re-runs the forward, so we tell them, keep watching,
-   *  and never blind-redirect into an origin nothing is tunnelling to. */
+   *  server through ``kubectl port-forward``, a tunnel that a refused in-pod
+   *  dial can kill outright. The chart's relay sidecar keeps it alive across
+   *  the restart, but an install with ``proxy.enabled=false`` (or an older
+   *  chart) still loses it and only the user can bring it back — so on
+   *  Kubernetes we probe late, wait indefinitely, and never blind-redirect
+   *  into an origin nothing may be tunnelling to. */
   installMode?: string | null;
 }
 
@@ -76,10 +100,11 @@ export function useHttpsPivot() {
   const forwardHint = ref(false);
 
   // Manual-mode poll handle, so ``cancelManualProbe`` (and scope teardown)
-  // can stop it. The budgeted probe inside ``run`` needs no handle: it is
-  // awaited inline and always terminates.
+  // can stop it. ``cancelled`` stops the loop inside ``run`` for the same
+  // reasons: on Kubernetes that loop no longer has a deadline, so leaving the
+  // page has to end it explicitly or it would outlive the component.
   let manualTimer: ReturnType<typeof setTimeout> | null = null;
-  let manualCancelled = false;
+  let cancelled = false;
   // The last run's destination, so the interstitial's "Continue anyway"
   // button can redirect on demand (e.g. a user who skipped the trust step
   // and whose probes therefore fail on the handshake, not the tunnel).
@@ -144,6 +169,9 @@ export function useHttpsPivot() {
     lastTarget = { target, profile: options.profile, token: options.profileToken };
     error.value = null;
     forwardHint.value = false;
+    // "Retry restart" reaches here after a cancel, so clear the flag or the
+    // loop below would abort before its first probe.
+    cancelled = false;
     phase.value = 'restarting';
     try {
       await requestServerRestart(options.agentUrl, options.restartToken);
@@ -153,34 +181,45 @@ export function useHttpsPivot() {
       return;
     }
 
-    // On Kubernetes the restart takes the user's ``kubectl port-forward``
-    // down with it — the tunnel targets one pod instance and does not
-    // reconnect. From here every probe fails with no distinction between
-    // "pod still booting", "tunnel dead" and "up but CA untrusted", so the
-    // policy differs by deployment: elsewhere, a spent budget redirects
-    // anyway (the browser's own interstitial is the honest signal); on
-    // Kubernetes the origin is unreachable until the user re-runs the
-    // forward, so redirecting lands on a bare connection error with no
-    // instructions. Instead we say what to do, keep watching so the moment
-    // the forward is back we pivot, and leave "Continue anyway" for the
-    // user who skipped the trust step (their tunnel is fine; only the
-    // handshake fails).
+    // On Kubernetes the browser reaches the server through a tunnel that the
+    // restart can take down with it, and from here every failed probe means
+    // one of three indistinguishable things: "pod still booting", "tunnel
+    // dead", or "up but CA untrusted". That shapes two decisions.
+    //
+    // WAITING: we hold off the first probe (K8S_INITIAL_DELAY_MS) because
+    // nothing can answer that early anyway, and a dial into the gap is what
+    // kills a tunnel in the first place.
+    //
+    // GIVING UP: we don't. Off Kubernetes a spent budget redirects anyway —
+    // the browser's own interstitial is then the honest signal. Here the
+    // origin may be unreachable rather than untrusted, and redirecting into a
+    // tunnel nothing is listening on lands the user on a bare connection
+    // error with no instructions and no way back. So we keep watching
+    // indefinitely, surface the hint, and leave "Continue anyway" as the
+    // deliberate escape hatch for the user who knows their tunnel is fine and
+    // only the handshake is failing.
     const forwardDies = (options.installMode ?? '').toLowerCase() === 'kubernetes';
     phase.value = 'waiting';
-    await sleep(INITIAL_DELAY_MS);
+    await sleep(forwardDies ? K8S_INITIAL_DELAY_MS : INITIAL_DELAY_MS);
     const started = Date.now();
-    const deadline = started + (forwardDies ? MANUAL_BUDGET_MS : PROBE_BUDGET_MS);
-    while (Date.now() < deadline) {
+    const deadline = started + PROBE_BUDGET_MS;
+    while (!cancelled && (forwardDies || Date.now() < deadline)) {
       if (phase.value !== 'waiting') return; // redirectNow() won the race
       if (await probeOnce(target)) {
+        if (cancelled) return;
         goTo(target, options.profile, options.profileToken);
         return;
       }
       if (forwardDies && Date.now() - started > FORWARD_HINT_AFTER_MS) {
         forwardHint.value = true;
       }
-      await sleep(PROBE_INTERVAL_MS);
+      // Once the hint is up we are no longer racing a boot — poll gently so an
+      // unattended tab doesn't spin at 1.5s forever.
+      await sleep(forwardHint.value ? MANUAL_INTERVAL_MS : PROBE_INTERVAL_MS);
     }
+    // Only reachable off Kubernetes (spent budget) or after a cancel — and a
+    // cancel means the user already left for the HTTP origin.
+    if (cancelled) return;
     goTo(target, options.profile, options.profileToken);
   }
 
@@ -199,33 +238,35 @@ export function useHttpsPivot() {
     lastTarget = { target, profile: options.profile, token: options.profileToken };
     error.value = null;
     phase.value = 'manual';
-    manualCancelled = false;
+    cancelled = false;
     const deadline = Date.now() + MANUAL_BUDGET_MS;
 
     const tick = async () => {
-      if (manualCancelled) return;
+      if (cancelled) return;
       if (await probeOnce(target)) {
-        if (manualCancelled) return;
+        if (cancelled) return;
         goTo(target, options.profile, options.profileToken);
         return;
       }
-      if (manualCancelled || Date.now() >= deadline) return;
+      if (cancelled || Date.now() >= deadline) return;
       manualTimer = setTimeout(() => { void tick(); }, MANUAL_INTERVAL_MS);
     };
 
     manualTimer = setTimeout(() => { void tick(); }, MANUAL_INTERVAL_MS);
   }
 
-  /** Stop the manual poll — the user chose to stay on HTTP for now. */
+  /** Stop watching — the user chose to stay on HTTP for now. Ends the manual
+   *  poll AND the ``run`` loop, which on Kubernetes has no deadline of its
+   *  own. */
   function cancelManualProbe(): void {
-    manualCancelled = true;
+    cancelled = true;
     if (manualTimer !== null) {
       clearTimeout(manualTimer);
       manualTimer = null;
     }
   }
 
-  // Never leave a timer running against a torn-down component (the wizard
+  // Never leave a poll running against a torn-down component (the wizard
   // unmounts the moment "Continue on HTTP for now" routes away).
   if (getCurrentScope()) {
     onScopeDispose(cancelManualProbe);
