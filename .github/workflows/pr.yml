@@ -245,20 +245,30 @@ jobs:
           fi
           grep -q 'nginx-unprivileged' /tmp/cremind-render.yaml \
             || { echo "::error::the default render must include the proxy sidecar"; exit 1; }
+          # With ssl off the sidecar is the L7 proxy — an http{} server, no
+          # stream{} block. The stream{} presence/absence is what separates
+          # the two sidecar modes below; the image name is the same in both.
+          if grep -qE '^[[:space:]]*stream \{' /tmp/cremind-render.yaml; then
+            echo "::error::the default render must keep the sidecar in L7 proxy mode (no stream{})"; exit 1
+          fi
           grep -q 'APP_URL: "http://localhost:1515"' /tmp/cremind-render.yaml \
             || { echo "::error::the default render must derive an http APP_URL"; exit 1; }
-          # ssl=auto: env set, https APP_URL, sidecar bypassed, Service on the
-          # app's own port, noVNC given a port of its own (desktop is default).
+          # ssl=auto: env set, https APP_URL, the sidecar switched from the L7
+          # plaintext proxy to an L4 stream relay, Service on the relay's port,
+          # noVNC given a port of its own (desktop is default).
           helm template t helm/cremind --set cremind.ssl=auto > /tmp/cremind-ssl.yaml
           grep -q 'CREMIND_SSL: "auto"' /tmp/cremind-ssl.yaml \
             || { echo "::error::cremind.ssl=auto must template CREMIND_SSL"; exit 1; }
           grep -q 'APP_URL: "https://localhost:1515"' /tmp/cremind-ssl.yaml \
             || { echo "::error::cremind.ssl=auto must auto-derive an https APP_URL"; exit 1; }
-          if grep -q 'nginx-unprivileged' /tmp/cremind-ssl.yaml; then
-            echo "::error::cremind.ssl=auto must bypass the plaintext proxy sidecar"; exit 1
-          fi
-          grep -q 'targetPort: ui' /tmp/cremind-ssl.yaml \
-            || { echo "::error::cremind.ssl=auto must retarget the Service at the app"; exit 1; }
+          # The sidecar stays under ssl — it keeps a kubectl port-forward alive
+          # across app restarts — but it MUST be the L4 passthrough, never the
+          # L7 proxy: a stream{} block means bytes are relayed untouched, so the
+          # app's TLS runs end-to-end and the sidecar holds no cert material.
+          grep -qE '^[[:space:]]*stream \{' /tmp/cremind-ssl.yaml \
+            || { echo "::error::cremind.ssl=auto must run the sidecar as an L4 stream relay"; exit 1; }
+          grep -q 'targetPort: relay' /tmp/cremind-ssl.yaml \
+            || { echo "::error::cremind.ssl=auto must point the Service at the relay listener"; exit 1; }
           grep -q 'port: 6080' /tmp/cremind-ssl.yaml \
             || { echo "::error::cremind.ssl=auto + desktop must expose noVNC on its own port"; exit 1; }
           # The UI cannot tell whether noVNC sits behind the proxy or on its
@@ -293,7 +303,7 @@ jobs:
           # ── Deferred in-pod TLS (cremind.ssl=after-setup) ──────────────
           # Serves plain HTTP until the Setup Wizard completes, then restarts
           # into https. The manifests render the STEADY STATE — same https
-          # APP_URL, same bypassed sidecar, same noVNC port as auto — because
+          # APP_URL, same L4 relay sidecar, same noVNC port as auto — because
           # that is the origin for the whole life of the install. The probes
           # and appProtocol are the two exceptions; they are pinned below.
           helm template t helm/cremind --set cremind.ssl=after-setup \
@@ -302,11 +312,13 @@ jobs:
             || { echo "::error::cremind.ssl=after-setup must template CREMIND_SSL verbatim"; exit 1; }
           grep -q 'APP_URL: "https://localhost:1515"' /tmp/cremind-ssl-after.yaml \
             || { echo "::error::cremind.ssl=after-setup must derive the https steady-state APP_URL"; exit 1; }
-          if grep -q 'nginx-unprivileged' /tmp/cremind-ssl-after.yaml; then
-            echo "::error::cremind.ssl=after-setup must bypass the proxy sidecar in both phases"; exit 1
-          fi
-          grep -q 'targetPort: ui' /tmp/cremind-ssl-after.yaml \
-            || { echo "::error::cremind.ssl=after-setup must retarget the Service at the app"; exit 1; }
+          # Relay mode is what makes the flip survivable: the app container
+          # restarts into https underneath a sidecar that never restarts, so
+          # the port-forward is not torn down mid-flip.
+          grep -qE '^[[:space:]]*stream \{' /tmp/cremind-ssl-after.yaml \
+            || { echo "::error::cremind.ssl=after-setup must run the sidecar as an L4 stream relay in both phases"; exit 1; }
+          grep -q 'targetPort: relay' /tmp/cremind-ssl-after.yaml \
+            || { echo "::error::cremind.ssl=after-setup must point the Service at the relay listener"; exit 1; }
           grep -q 'port: 6080' /tmp/cremind-ssl-after.yaml \
             || { echo "::error::cremind.ssl=after-setup + desktop must expose noVNC on its own port"; exit 1; }
           grep -q 'CREMIND_NOVNC_URL: "http://localhost:6080/vnc.html"' /tmp/cremind-ssl-after.yaml \
