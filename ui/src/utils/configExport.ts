@@ -14,6 +14,10 @@ export interface ConfigExportSnapshot {
   token: string;
   tokenExpiresAt: string;
   agentUrl: string;
+  // True when ``agentUrl`` is the HTTPS origin the server pivots to on the
+  // post-setup restart rather than the origin this page is served from —
+  // the ``after-setup`` TLS mode runs the whole wizard on plain HTTP.
+  agentUrlPendingHttps?: boolean;
   generatedAt: string;
   deployment: {
     type: 'local' | 'server' | 'custom';
@@ -89,6 +93,9 @@ export function buildMarkdownExport(s: ConfigExportSnapshot): string {
   lines.push('');
   lines.push(`- **Profile:** \`${s.profile}\``);
   lines.push(`- **Agent URL:** \`${s.agentUrl}\``);
+  if (s.agentUrlPendingHttps) {
+    lines.push('  - _This HTTPS address becomes active once setup finishes and the server restarts._');
+  }
   if (s.tokenExpiresAt) lines.push(`- **Token expires:** ${s.tokenExpiresAt}`);
   lines.push(`- **Token recovery path on server:** \`~/.cremind/tokens/${s.profile}.token\``);
   lines.push('');
@@ -264,7 +271,11 @@ export function buildEnvExport(s: ConfigExportSnapshot): string {
 
   out.push('# --- Profile & Token ---');
   push(envLine('CREMIND_PROFILE', s.profile));
-  push(envLine('CREMIND_AGENT_URL', s.agentUrl));
+  // CREMIND_SERVER is the name the `cremind` CLI reads (app/cli/config.py).
+  if (s.agentUrlPendingHttps) {
+    out.push('# HTTPS address; active after the post-setup restart.');
+  }
+  push(envLine('CREMIND_SERVER', s.agentUrl));
   push(envLine('CREMIND_TOKEN', s.token));
   push(envLine('CREMIND_TOKEN_EXPIRES_AT', s.tokenExpiresAt));
   out.push('');

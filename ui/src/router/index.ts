@@ -224,6 +224,24 @@ const routes = [
     },
   },
   {
+    path: '/:profile/settings/security',
+    name: 'security-settings',
+    component: () => import('../views/SecuritySettings.vue'),
+    props: true,
+    meta: { title: 'HTTPS & Certificate' },
+    // The CA fingerprint this page needs comes from
+    // ``/api/services/capabilities``, which is require_admin post-setup.
+    // Mirror the embedding-settings guard so non-admin profiles never land
+    // on a page that can only 401.
+    beforeEnter: (to: RouteLocationNormalized) => {
+      const profile = to.params.profile as string | undefined;
+      if (profile && profile !== 'admin') {
+        return { path: `/${profile}/settings`, replace: true };
+      }
+      return true;
+    },
+  },
+  {
     path: '/:profile/settings/blueprints',
     name: 'blueprint-settings',
     component: () => import('../views/BlueprintSettings.vue'),

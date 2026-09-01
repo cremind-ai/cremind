@@ -69,6 +69,13 @@ const allCards: SettingsCard[] = [
     adminOnly: true,
   },
   {
+    title: 'HTTPS & Certificate',
+    description: "Download this install's certificate authority and trust it on this device",
+    icon: 'mdi:certificate-outline',
+    route: 'security',
+    adminOnly: true,
+  },
+  {
     title: 'Blueprints',
     description: "Package this profile's design (persona, tools, skills, LLM, settings, events) to share, or import one into a new profile",
     icon: 'mdi:file-document-multiple-outline',

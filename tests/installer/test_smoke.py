@@ -269,6 +269,78 @@ def test_screen_desktop_short_circuits_when_set(loaded_catalog: catalog.Catalog)
     assert new_state.desktop == "0"
 
 
+def test_screen_vnc_password_skips_when_not_docker(
+    loaded_catalog: catalog.Catalog,
+) -> None:
+    """A native install has no container desktop to protect."""
+    state = TuiResult(mode="native")
+    new_state, action = tui.screen_vnc_password(state, _ctx(loaded_catalog))
+    assert action == "skip"
+    assert new_state.vnc_password == ""
+
+
+def test_screen_vnc_password_skips_when_desktop_declined(
+    loaded_catalog: catalog.Catalog,
+) -> None:
+    """The basic image ships no VNC server, so there is nothing to ask about."""
+    state = TuiResult(mode="docker", desktop="0")
+    new_state, action = tui.screen_vnc_password(state, _ctx(loaded_catalog))
+    assert action == "skip"
+    assert new_state.vnc_password == ""
+
+
+def test_screen_vnc_password_short_circuits_when_set(
+    loaded_catalog: catalog.Catalog,
+) -> None:
+    """``--vnc-password`` on the command line pre-answers the screen."""
+    state = TuiResult(mode="docker", desktop="1", vnc_password="abc123")
+    new_state, action = tui.screen_vnc_password(state, _ctx(loaded_catalog))
+    assert action == "skip"
+    assert new_state.vnc_password == "abc123"
+
+
+@pytest.mark.parametrize("value", ["abc123", "Pw@6789", "a.b-c_d"])
+def test_validate_vnc_password_accepts_the_vnc_range(value: str) -> None:
+    assert tui.validate_vnc_password(value) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "abc12",       # 5 — below TigerVNC's minimum
+        "abcdefghi",   # 9 — past the DES cut-off, would be silently truncated
+        "abc 123",     # space: unquoted in the compose .env
+        "abc|123",     # pipe: install.sh renders the template with sed s|…|…|g
+        "abc$123",     # dollar: install.ps1 -replace, and shell expansion
+        "abc#123",     # hash: starts a comment in a .env file
+        'abc"123',     # quote: breaks the TOML string in credentials.toml
+    ],
+)
+def test_validate_vnc_password_rejects_what_the_pipeline_cannot_carry(
+    value: str,
+) -> None:
+    assert tui.validate_vnc_password(value) is not None
+
+
+def test_validate_vnc_password_blank_depends_on_a_previous_install() -> None:
+    """Blank means "keep the current password" — but only if there is one."""
+    assert tui.validate_vnc_password("", allow_blank=True) is None
+    assert tui.validate_vnc_password("", allow_blank=False) is not None
+
+
+def test_vnc_password_rides_the_output_file_under_its_own_key(tmp_path) -> None:
+    """Never as ``VNC_PASSWORD``: install.sh sources this file and owns that
+    name for its own flag/previous/generated chain."""
+    from app.installer.output import write
+
+    out = tmp_path / "tui.out"
+    write(TuiResult(mode="docker", desktop="1", vnc_password="abc123"), out)
+
+    body = out.read_text(encoding="utf-8")
+    assert "VNC_PASSWORD_INPUT=abc123" in body
+    assert "\nVNC_PASSWORD=" not in body
+
+
 def test_run_with_all_values_prepopulated(loaded_catalog: catalog.Catalog) -> None:
     """End-to-end: every screen short-circuits, run() returns to confirm.
 
@@ -282,6 +354,7 @@ def test_run_with_all_values_prepopulated(loaded_catalog: catalog.Catalog) -> No
         deployment="local",
         mode="docker",
         desktop="1",
+        vnc_password="abc123",
     )
     # Strip the confirm screen so the test doesn't open a dialog.
     original = tui._SCREENS

@@ -185,6 +185,30 @@ def native_env(monkeypatch: pytest.MonkeyPatch):
     )
 
 
+@pytest.fixture
+def post_setup_env(monkeypatch: pytest.MonkeyPatch):
+    """A native install whose setup is finished — Settings' situation.
+
+    Settings → HTTPS & Certificate offers the same one-click trust long after
+    the wizard is gone, so the admin gate is the guard that matters here; in
+    ``native_env`` it never runs.
+    """
+    from types import SimpleNamespace
+
+    import app.runtime as runtime
+
+    monkeypatch.setenv("INSTALL_MODE", "native")
+    monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
+    monkeypatch.setattr(
+        runtime,
+        "get_state",
+        lambda: SimpleNamespace(
+            storage_ready=True,
+            config_storage=SimpleNamespace(is_setup_complete=lambda: True),
+        ),
+    )
+
+
 def _fingerprint(system_dir) -> str:
     from app.config.tls_auto import ca_fingerprint_sha256
 
@@ -338,3 +362,41 @@ def test_trust_skips_the_dialog_when_already_trusted(
     assert response.status_code == 200
     assert response.json()["already_trusted"] is True
     assert calls == []
+
+
+def test_trust_needs_the_admin_token_once_setup_is_complete(
+    system_dir, post_setup_env, monkeypatch,
+):
+    """The pre-setup window is open by design; afterwards, writing a root CA
+    into the machine's trust store is admin-only. The refusal must come
+    before anything touches the trust store."""
+    ensure_local_tls(str(system_dir))
+    calls = _stub_plan(monkeypatch)
+
+    response = _trust_client().post(
+        "/api/tls/trust", json={"ca_sha256": _fingerprint(system_dir)}
+    )
+
+    assert response.status_code in (401, 403)
+    assert calls == []
+
+
+def test_trust_works_post_setup_for_an_admin(
+    system_dir, post_setup_env, monkeypatch,
+):
+    """Settings → HTTPS & Certificate: admin + loopback + fingerprint still
+    compose into a working trust, so a user who skipped the wizard step can
+    finish it later."""
+    ensure_local_tls(str(system_dir))
+    calls = _stub_plan(monkeypatch)
+    # ``post_trust`` imports require_admin inside the function, so the patch
+    # has to land on the defining module.
+    monkeypatch.setattr("app.api._auth.require_admin", lambda _r: None)
+
+    response = _trust_client().post(
+        "/api/tls/trust", json={"ca_sha256": _fingerprint(system_dir)}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["trusted"] is True
+    assert len(calls) == 1

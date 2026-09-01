@@ -218,15 +218,22 @@ def _text(
     default: str = "",
     validator: Callable[[str], str | None] | None = None,
     allow_back: bool = False,
+    password: bool = False,
 ) -> tuple[str | None, Action]:
-    """Free-text screen. Enter submits directly; loops until valid or cancel."""
+    """Free-text screen. Enter submits directly; loops until valid or cancel.
+
+    ``password`` masks the typed characters (prompt_toolkit renders ``*``);
+    the value itself is returned in the clear.
+    """
     while True:
 
         def _accept(buf) -> bool:
             get_app().exit(result=(buf.text, "advance"))
             return True  # keep the text in the buffer
 
-        textfield = TextArea(text=default, multiline=False, accept_handler=_accept)
+        textfield = TextArea(
+            text=default, multiline=False, accept_handler=_accept, password=password,
+        )
         buttons = [_back_button()] if allow_back else []
         body = HSplit(
             [
@@ -247,7 +254,9 @@ def _text(
             err = validator(value or "")
             if err is not None:
                 _message(title="Invalid input", text=err)
-                default = value or ""
+                # Handing a rejected password back as a masked default would
+                # leave the user editing a value they cannot read.
+                default = "" if password else (value or "")
                 continue
         return value, action
 
@@ -596,6 +605,98 @@ def screen_desktop(state: TuiResult, ctx: "Context") -> ScreenResult:
     return replace(state, desktop=value or ""), "advance"
 
 
+# The one rule for a VNC password, shared by every front-end. install.sh and
+# install.ps1 carry the same regex literally (a drift test pins the three
+# copies together), and the Electron wizard validates against it too.
+#
+# 6-8 is VNC's own range: TigerVNC's vncpasswd refuses anything under 6, and
+# the classic DES scheme keys off the first 8 characters only — a 20-character
+# password would be silently truncated to 8, so we cap rather than mislead.
+# The charset is what survives the trip to the container: install.sh renders
+# the .env template with ``sed s|__VNC_PASSWORD__|...|g`` (so no ``|``, ``&``
+# or ``\``), install.ps1 with ``-replace`` (so no ``$``), and the value then
+# sits unquoted in a compose .env and inside a TOML basic string. Widening
+# this set means fixing both renderers first.
+VNC_PASSWORD_PATTERN = r"^[A-Za-z0-9@%_+=:,.-]{6,8}$"
+VNC_PASSWORD_ERROR = (
+    "Use 6 to 8 characters, from letters, digits and @ % _ + = : , . -\n"
+    "(VNC itself ignores anything past the 8th character.)"
+)
+
+
+def validate_vnc_password(value: str, *, allow_blank: bool = False) -> str | None:
+    """Return an error message for a rejected password, or ``None`` if valid.
+
+    ``allow_blank`` is set on a re-install that already has a password: an
+    empty entry there means "keep the current one" rather than "no password".
+    """
+    import re
+
+    if not value:
+        if allow_blank:
+            return None
+        return "A password is required for the VNC Desktop.\n\n" + VNC_PASSWORD_ERROR
+    if not re.match(VNC_PASSWORD_PATTERN, value):
+        return VNC_PASSWORD_ERROR
+    return None
+
+
+def screen_vnc_password(state: TuiResult, ctx: "Context") -> ScreenResult:
+    """Ask for the desktop's VNC password, twice, and only when it applies.
+
+    Sits immediately after :func:`screen_desktop` so ``state.desktop`` is
+    already decided. Skipped whenever there is nothing to protect (native
+    install, desktop declined) or the value arrived by flag.
+    """
+    if state.mode != "docker":
+        return state, "skip"
+    if state.desktop == "0":
+        return state, "skip"
+    if state.vnc_password:
+        return state, "skip"
+
+    vp = ctx.catalog.vnc_password
+    text = vp.prompt
+    if vp.hint:
+        text += f"\n\n{vp.hint}"
+
+    while True:
+        value, action = _text(
+            title="Cremind · VNC password",
+            text=text,
+            validator=lambda v: validate_vnc_password(
+                v, allow_blank=ctx.vnc_password_preset
+            ),
+            allow_back=ctx.can_go_back,
+            password=True,
+        )
+        if action != "advance":
+            return state, action
+        entered = value or ""
+        if not entered:
+            # Blank + a previous install ⇒ keep what is already in docker/.env.
+            # (The validator rejects blank when there is nothing to keep.)
+            return replace(state, vnc_password=""), "advance"
+
+        confirm, action = _text(
+            title="Cremind · VNC password",
+            text="Type the same password again to confirm.",
+            allow_back=True,
+            password=True,
+        )
+        if action == "cancel":
+            return state, "cancel"
+        if action == "back":
+            continue  # back on the confirm re-asks for the password itself
+        if (confirm or "") != entered:
+            _message(
+                title="Passwords do not match",
+                text="The two entries were different. Please type it again.",
+            )
+            continue
+        return replace(state, vnc_password=entered), "advance"
+
+
 def screen_confirm(state: TuiResult, ctx: "Context") -> ScreenResult:
     version_label = state.version_spec or "(latest on channel)"
     if state.channel == "dev":
@@ -609,6 +710,11 @@ def screen_confirm(state: TuiResult, ctx: "Context") -> ScreenResult:
     ]
     if state.mode == "docker":
         rows.append(("Desktop UI", "yes" if state.desktop != "0" else "no (basic image)"))
+        if state.desktop != "0":
+            rows.append((
+                "VNC password",
+                "********" if state.vnc_password else "(keep existing)",
+            ))
     if state.deployment == "server" and state.app_host:
         rows.append(("Host", state.app_host))
     if state.deployment == "custom":
@@ -642,6 +748,9 @@ class Context:
     has_docker: bool
     electron_version: str
     version_mode: str = "latest"
+    # True when a previous install already has a VNC password on disk, which
+    # makes an empty entry mean "keep that one" instead of being rejected.
+    vnc_password_preset: bool = False
     # Set by the driver before each screen call: True when there is a previous
     # *prompted* screen to return to. Screens forward it as ``allow_back``.
     can_go_back: bool = False
@@ -657,6 +766,7 @@ _SCREENS: list[Callable[[TuiResult, Context], ScreenResult]] = [
     screen_custom_fields,
     screen_mode,
     screen_desktop,
+    screen_vnc_password,
     screen_confirm,
 ]
 
@@ -668,6 +778,7 @@ def run(
     in_container: bool,
     has_docker: bool,
     electron_version: str,
+    vnc_password_preset: bool = False,
 ) -> TuiResult | None:
     """Drive the screen list; return the final TuiResult or ``None`` on cancel.
 
@@ -683,6 +794,7 @@ def run(
         in_container=in_container,
         has_docker=has_docker,
         electron_version=electron_version,
+        vnc_password_preset=vnc_password_preset,
     )
     state = initial
     cursor = 0

@@ -27,8 +27,11 @@ already trusts the chain. On a **native** install the wizard's "Secure this
 install" step does it in one click ("Trust it on this device" — the server and
 the browser share the machine, so the server hands the CA to the OS itself),
 and a **Docker** install's host is offered the same thing by the installer
-right after the container starts. These commands are how you do the same thing
-by hand, on another device, or after the fact.
+right after the container starts. Skipping that step is not permanent — the
+admin profile can come back to it any time under **Settings → HTTPS &
+Certificate**, which offers the same one-click trust, the same fingerprint,
+and the same CA download. These commands are how you do the same thing by
+hand, on another device, or after the fact.
 
 These commands run entirely on the local machine — they read a file and hand it
 to the operating system. They never call the Cremind API and need no token,

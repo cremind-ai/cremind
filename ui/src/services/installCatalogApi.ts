@@ -75,6 +75,12 @@ export interface DockerDesktopEntry {
   default: boolean;
 }
 
+/** The VNC password question, asked when the desktop UI is included. */
+export interface VncPasswordEntry {
+  prompt: string;
+  hint: string;
+}
+
 export interface InstallCatalog {
   schema_version?: number;
   deployments: Record<string, DeploymentEntry>;
@@ -82,6 +88,7 @@ export interface InstallCatalog {
   mode_rules: Record<string, ModeRule>;
   service_modes: Record<string, ServiceModeEntry>;
   docker_desktop?: DockerDesktopEntry;
+  vnc_password?: VncPasswordEntry;
 }
 
 export interface InstallCatalogResponse {

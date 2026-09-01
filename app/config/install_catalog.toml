@@ -1,7 +1,7 @@
 # AUTO-GENERATED copy of install/catalog.toml shipped with the
 # backend. Do not edit by hand — re-run
 # `python install/scripts/build_catalog.py`.
-# Source SHA-256: 3413b5984b85868601f67c96b406a4e1042aafd4b990f6ae88e7bebc7622f40b
+# Source SHA-256: b2e69882e9556a0d5d79c3076bf5b048a768f6838559e0cea624f2809b6b2617
 
 # Cremind install/setup catalog — single source of truth.
 #
@@ -141,6 +141,28 @@ order       = 20
 prompt  = "Install the VNC Desktop UI?"
 hint    = "Adds an XFCE desktop inside the container so you can watch the agent work at http://<host>:6080/vnc.html. Answer No to install the smaller headless image (cremind/cremind)."
 default = true
+
+
+# ── VNC password ───────────────────────────────────────────────────────────
+# Asked right after [docker_desktop], and only when the answer was Yes: the
+# password that unlocks the desktop at http://<host>:6080/vnc.html. Entered
+# twice (entry + confirmation) in every interactive front-end.
+#
+# The 6-8 length is VNC's, not ours: TigerVNC's vncpasswd rejects anything
+# shorter than 6, and the classic VNC DES scheme only keys off the first 8
+# characters — a longer password would silently be truncated, so we cap it
+# instead of pretending. The charset is what survives every hop the value
+# takes: install.sh renders the template with `sed s|__VNC_PASSWORD__|...|g`,
+# install.ps1 with -replace, and the value then sits unquoted in a compose
+# .env and inside a TOML basic string in credentials.toml.
+#
+# Non-interactive installs (--unattended, no TTY) never prompt: they take
+# --vnc-password if given, else keep the previous install's password, else
+# generate one and print it at the end.
+
+[vnc_password]
+prompt = "Choose a password for the VNC Desktop"
+hint   = "6-8 characters, from letters, digits and @ % _ + = : , . - — VNC ignores anything past the 8th character. You will sign in with it at http://<host>:6080/vnc.html. Leave empty when re-installing to keep the current password."
 
 
 # ── Mode rules ───────────────────────────────────────────────────────────

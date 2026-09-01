@@ -1,6 +1,6 @@
 # AUTO-GENERATED from install/catalog.toml. Do not edit by hand.
 # Regenerate with: python install/scripts/build_catalog.py
-# Source SHA-256:  3413b5984b85868601f67c96b406a4e1042aafd4b990f6ae88e7bebc7622f40b
+# Source SHA-256:  b2e69882e9556a0d5d79c3076bf5b048a768f6838559e0cea624f2809b6b2617
 
 $script:CatalogSchema = 1
 
@@ -95,6 +95,12 @@ $script:DockerDesktop = [ordered]@{
     Prompt  = 'Install the VNC Desktop UI?'
     Hint    = 'Adds an XFCE desktop inside the container so you can watch the agent work at http://<host>:6080/vnc.html. Answer No to install the smaller headless image (cremind/cremind).'
     Default = $true
+}
+
+# ── VNC password ──
+$script:VncPasswordPrompt = [ordered]@{
+    Prompt = 'Choose a password for the VNC Desktop'
+    Hint   = '6-8 characters, from letters, digits and @ % _ + = : , . - — VNC ignores anything past the 8th character. You will sign in with it at http://<host>:6080/vnc.html. Leave empty when re-installing to keep the current password.'
 }
 
 # ── Mode rules ──

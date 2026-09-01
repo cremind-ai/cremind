@@ -54,6 +54,19 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["", "1", "0"],
         help="Docker desktop-UI choice: 1 desktop, 0 basic, empty = ask.",
     )
+    p.add_argument(
+        "--vnc-password",
+        default="",
+        dest="vnc_password",
+        help="Pre-supplied VNC Desktop password; empty = ask when applicable.",
+    )
+    p.add_argument(
+        "--vnc-password-set",
+        default="0",
+        choices=["0", "1"],
+        help="1 if a previous install already has a VNC password, which makes "
+             "an empty answer mean 'keep the existing one'.",
+    )
     p.add_argument("--version", default="", dest="version_spec")
     p.add_argument("--host", default="", dest="app_host")
     p.add_argument("--listen-host", default="", dest="custom_listen_host")
@@ -92,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         app_host=args.app_host,
         mode=args.mode,
         desktop=args.desktop,
+        vnc_password=args.vnc_password,
         custom_listen_host=args.custom_listen_host,
         custom_public_url=args.custom_public_url,
         custom_allowed_origins=args.custom_allowed_origins,
@@ -105,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
             in_container=args.in_container == "1",
             has_docker=args.has_docker == "1",
             electron_version=args.electron_version,
+            vnc_password_preset=args.vnc_password_set == "1",
         )
     except KeyboardInterrupt:
         _write_cancel_marker(args.output)

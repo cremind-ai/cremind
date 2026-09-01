@@ -690,6 +690,11 @@ type InstallerRunPayload = {
    *  or install the headless basic image (cremind/cremind). Undefined ⇒ let
    *  the install script decide (default desktop / previous choice on re-run). */
   desktopUi?: boolean
+  /** Docker + desktop only: the VNC Desktop password. The install runs
+   *  ``--unattended``, so it can never prompt — the wizard collects this
+   *  instead. Omitted ⇒ the script keeps the previous install's password or
+   *  generates one. */
+  vncPassword?: string
   /** Advanced .env overrides for the `custom` deployment. Keys mirror
    *  install/catalog.toml's deployments.custom.advanced_fields[].key. */
   customFields?: {
@@ -997,6 +1002,12 @@ async function runInstaller(
   if (payload.mode === 'docker' && payload.desktopUi !== undefined) {
     args.push(payload.desktopUi ? '--desktop' : '--no-desktop')
   }
+  // The desktop's VNC password. This run is --unattended, so the script's own
+  // prompt never fires — an omitted value falls through to its
+  // previous-install / generated chain rather than blocking.
+  if (payload.mode === 'docker' && payload.desktopUi && payload.vncPassword) {
+    args.push('--vnc-password', payload.vncPassword)
+  }
   // Forward custom-deployment overrides so the install scripts skip
   // their interactive prompts. Empty values are dropped so the scripts'
   // catalog defaults take effect for fields the user didn't fill in.
@@ -1042,6 +1053,7 @@ async function runInstaller(
       if (a === '--mode')             return ['-Mode']
       if (a === '--desktop')          return ['-Desktop']
       if (a === '--no-desktop')       return ['-NoDesktop']
+      if (a === '--vnc-password')     return ['-VncPassword']
       if (a === '--unattended')       return ['-Unattended']
       if (a === '--no-launch')        return ['-NoLaunch']
       if (a === '--channel')          return ['-Channel']
