@@ -1694,6 +1694,7 @@ class WriteFileTool(BuiltInTool):
             "uri": file_uri,
             "name": file_name,
             "mime_type": mime,
+            "origin": "created",
         }
 
         payload: ToolResultWithFiles = {
@@ -1885,6 +1886,7 @@ class OverwriteFileTool(BuiltInTool):
             "uri": file_uri,
             "name": file_name,
             "mime_type": mime,
+            "origin": "created",
         }
 
         payload: ToolResultWithFiles = {
@@ -1982,6 +1984,9 @@ def _relocation_result(
         "uri": final_target.replace(os.sep, "/"),
         "name": os.path.basename(final_target),
         "mime_type": _guess_mime(final_target),
+        # The relocated file is where the agent PUT it — an output of the
+        # call, not a file that merely passed through.
+        "origin": "created",
     }
     payload: ToolResultWithFiles = {"text": text, "_files": [file_entry]}
     return BuiltInToolResult(structured_content=payload)

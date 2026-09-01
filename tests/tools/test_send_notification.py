@@ -21,11 +21,16 @@ class _FakeAdapter:
         self._recipients = recipients
         self._raise = raise_exc
         self.delivered: list[str] = []
+        self.delivered_files: list[str] = []
 
     async def deliver_text(self, text):
         if self._raise is not None:
             raise self._raise
         self.delivered.append(text)
+        return self._recipients
+
+    async def deliver_file(self, path, *, name=None, caption=None):
+        self.delivered_files.append(path)
         return self._recipients
 
 
@@ -132,3 +137,55 @@ def test_transport_error_on_one_channel_does_not_abort_others():
     assert by_type["slack"]["status"] == "sent"
     # An error on one channel must NOT produce the "no recipients" hint.
     assert "message" not in out
+
+
+# ── attachments ──────────────────────────────────────────────────────────
+
+
+def _profile_file(monkeypatch, tmp_path, profile="p", name="report.pdf") -> str:
+    """A real file inside the profile's own system-dir slice."""
+    from app.config.settings import BaseConfig
+
+    monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path))
+    target_dir = tmp_path / profile
+    target_dir.mkdir(parents=True, exist_ok=True)
+    path = target_dir / name
+    path.write_bytes(b"pdf")
+    return str(path)
+
+
+def test_attachment_inside_profile_roots_is_delivered(monkeypatch, tmp_path):
+    path = _profile_file(monkeypatch, tmp_path)
+    a = _FakeAdapter("telegram", "c1", recipients=2)
+    out = _run(
+        {"message": "report", "_profile": "p", "attachments": [path]},
+        registry=_FakeRegistry([a]),
+    )
+    assert out["delivered"] is True
+    assert a.delivered_files == [path]
+    assert out["channels"][0]["files_delivered"] == 1
+
+
+def test_another_profiles_path_is_rejected(monkeypatch, tmp_path):
+    """Check #3: profile p must not be able to ship profile q's files out."""
+    other = _profile_file(monkeypatch, tmp_path, profile="q", name="secret.txt")
+    a = _FakeAdapter("telegram", "c1", recipients=2)
+    out = _run(
+        {"message": "hi", "_profile": "p", "attachments": [other]},
+        registry=_FakeRegistry([a]),
+    )
+    assert out["error"] == "InvalidAttachment"
+    assert out["rejected"][0]["path"] == other
+    assert a.delivered == [] and a.delivered_files == []
+
+
+def test_a_missing_file_is_rejected_not_silently_dropped(monkeypatch, tmp_path):
+    path = _profile_file(monkeypatch, tmp_path)
+    ghost = str(tmp_path / "p" / "never-written.txt")
+    a = _FakeAdapter("telegram", "c1", recipients=1)
+    out = _run(
+        {"message": "hi", "_profile": "p", "attachments": [path, ghost]},
+        registry=_FakeRegistry([a]),
+    )
+    assert out["error"] == "InvalidAttachment"
+    assert a.delivered_files == []

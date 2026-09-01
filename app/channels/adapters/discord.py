@@ -18,13 +18,18 @@ error surfaced in ``state.last_error``.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
+from app.channels.attachments import IncomingFile, dest_for
 from app.channels.base import BaseChannelAdapter, _split_for_messaging
 from app.channels.exceptions import ChannelAuthError, ChannelNotImplemented
 from app.utils.logger import logger
 
 _DISCORD_MSG_LIMIT = 2000
+# Discord's default per-file upload cap for bots (non-boosted). The API
+# rejects bigger uploads anyway; the pre-check turns that into a clear error.
+_DISCORD_UPLOAD_LIMIT = 10 * 1024 * 1024
 
 
 def _is_mentioned(client: Any, message: Any) -> bool:
@@ -122,6 +127,7 @@ class DiscordAdapter(BaseChannelAdapter):
     reports_sender_is_bot = True
     # Every text channel of every server the bot is in.
     supports_group_listing = True
+    supports_file_send = True
 
     # Discord reads a single asterisk as ITALIC, so the base ``*bold*`` default
     # would quietly emphasise every mirrored name and step header the wrong way.
@@ -224,6 +230,8 @@ class DiscordAdapter(BaseChannelAdapter):
         if own_id and str(getattr(author, "id", "") or "") == own_id:
             return
 
+        files = self._extract_files(message)
+
         if getattr(message, "guild", None) is not None:
             channel_id = getattr(getattr(message, "channel", None), "id", None)
             if channel_id is None:
@@ -250,6 +258,7 @@ class DiscordAdapter(BaseChannelAdapter):
                 platform_message_date=_sent_timestamp(message),
                 sender_is_bot=bool(getattr(author, "bot", False)),
                 mentioned=_is_mentioned(client, message),
+                files=files or None,
             )
             return
 
@@ -257,14 +266,45 @@ class DiscordAdapter(BaseChannelAdapter):
             return
 
         text = getattr(message, "content", None) or ""
-        if not text:
+        if not text and not files:
             return
         sender_id = str(author.id)
         self._users[sender_id] = author
         display_name = getattr(author, "display_name", None) or getattr(
             author, "name", None,
         )
-        await self._handle_inbound_safe(sender_id, display_name, text)
+        await self._handle_inbound_safe(
+            sender_id, display_name, text, files=files or None,
+        )
+
+    def _extract_files(self, message: Any) -> list[IncomingFile]:
+        """Attachment descriptors from ``message.attachments`` — unfetched.
+
+        Each ``fetch`` calls the attachment's own ``save`` (a CDN download)
+        only after the base adapter clears the sender.
+        """
+        found: list[IncomingFile] = []
+        for attachment in getattr(message, "attachments", None) or ():
+            name = getattr(attachment, "filename", None) or (
+                f"discord_file_{getattr(attachment, 'id', 'unknown')}"
+            )
+            size = getattr(attachment, "size", None)
+            mime = getattr(attachment, "content_type", None)
+
+            def _make_fetch(attachment: Any = attachment, name: str = name):
+                async def fetch(dest_dir: str) -> str:
+                    dest = dest_for(dest_dir, name)
+                    await attachment.save(dest)
+                    return dest
+
+                return fetch
+
+            found.append(IncomingFile(
+                name=name, mime=mime,
+                size=int(size) if isinstance(size, (int, float)) else None,
+                fetch=_make_fetch(),
+            ))
+        return found
 
     async def _run(self) -> None:
         if self.channel.get("mode") not in ("bot", "notification"):
@@ -293,9 +333,10 @@ class DiscordAdapter(BaseChannelAdapter):
 
     async def _handle_inbound_safe(
         self, sender_id: str, display_name: str | None, text: str,
+        files: Any = None,
     ) -> None:
         try:
-            await self._handle_inbound(sender_id, display_name, text)
+            await self._handle_inbound(sender_id, display_name, text, files=files)
         except Exception:  # noqa: BLE001
             logger.exception("discord: inbound handler failed")
 
@@ -344,6 +385,45 @@ class DiscordAdapter(BaseChannelAdapter):
             raise ChannelAuthError(f"Discord user {sender_id} not resolvable")
         for chunk in _split_for_messaging(text, _DISCORD_MSG_LIMIT):
             await user.send(chunk)
+
+    async def _send_file(
+        self, sender_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        user = await self._get_user(sender_id)
+        if user is None:
+            raise ChannelAuthError(f"Discord user {sender_id} not resolvable")
+        await self._send_file_to(user, path, name, caption)
+
+    async def _send_file_to_chat(
+        self, chat_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        channel = await self._get_channel(chat_id)
+        if channel is None:
+            raise ChannelAuthError(f"Discord channel {chat_id} not resolvable")
+        await self._send_file_to(channel, path, name, caption)
+
+    async def _send_file_to(
+        self, destination: Any, path: str, name: str | None, caption: str | None,
+    ) -> None:
+        try:
+            size = os.path.getsize(path)
+        except OSError as exc:
+            raise ValueError(f"cannot read file to send: {path}") from exc
+        if size > _DISCORD_UPLOAD_LIMIT:
+            raise ValueError(
+                f"'{name or os.path.basename(path)}' is {size} bytes; Discord "
+                f"caps bot uploads at {_DISCORD_UPLOAD_LIMIT} bytes",
+            )
+        import discord  # type: ignore
+
+        await destination.send(
+            content=(caption or "")[:_DISCORD_MSG_LIMIT] or None,
+            file=discord.File(path, filename=name or os.path.basename(path)),
+        )
 
     async def fetch_joined_groups(self) -> list[dict] | None:
         """Every text channel this bot can read, across every server it is in.

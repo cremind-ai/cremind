@@ -40,6 +40,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from app.channels.attachments import IncomingFile, dest_for
 from app.channels.base import BaseChannelAdapter, platform_message_timestamp
 from app.channels.exceptions import ChannelAuthError, ChannelNotImplemented
 from app.config.settings import BaseConfig
@@ -89,6 +90,8 @@ class TelegramUserbotAdapter(BaseChannelAdapter):
     reports_sender_is_bot = True
     # A real account's dialog list names every group it is in.
     supports_group_listing = True
+    # MTProto has none of the Bot API's 20/50 MB file caps.
+    supports_file_send = True
 
     def __init__(self, channel: dict, storage: Any) -> None:
         super().__init__(channel, storage)
@@ -378,7 +381,8 @@ class TelegramUserbotAdapter(BaseChannelAdapter):
         if not event.message or event.message.out:
             return
         text = event.message.message or ""
-        if not text:
+        files = self._extract_files(event.message)
+        if not text and not files:
             return
 
         sender_id = str(event.sender_id)
@@ -394,7 +398,9 @@ class TelegramUserbotAdapter(BaseChannelAdapter):
         except Exception:  # noqa: BLE001
             pass
 
-        await self._handle_inbound(sender_id, display_name, text)
+        await self._handle_inbound(
+            sender_id, display_name, text, files=files or None,
+        )
 
     async def _dispatch_group_event(self, event: Any) -> None:
         """Route a group/supergroup message into the channel-group pipeline.
@@ -420,7 +426,8 @@ class TelegramUserbotAdapter(BaseChannelAdapter):
         if message is None or getattr(message, "out", False):
             return
         text = getattr(message, "message", "") or ""
-        if not text:
+        files = self._extract_files(message)
+        if not text and not files:
             return
 
         sender_id = str(event.sender_id)
@@ -458,7 +465,41 @@ class TelegramUserbotAdapter(BaseChannelAdapter):
             # counts.
             sender_is_bot=bool(getattr(sender, "bot", False)),
             mentioned=await self._is_mentioned(event, message),
+            files=files or None,
         )
+
+    def _extract_files(self, message: Any) -> list[IncomingFile]:
+        """Attachment descriptors for one Telethon message — nothing fetched.
+
+        Telethon's ``message.file`` wraps every media kind (document, photo,
+        video, voice…) with a uniform name/size/mime surface, so one branch
+        covers them all. Stickers are skipped — they are reactions, not files.
+        ``fetch`` downloads via ``download_media`` only after the base adapter
+        clears the sender.
+        """
+        if getattr(message, "media", None) is None:
+            return []
+        wrapper = getattr(message, "file", None)
+        if wrapper is None:
+            return []
+        if getattr(message, "sticker", None) is not None:
+            return []
+        message_id = getattr(message, "id", None) or "msg"
+        ext = getattr(wrapper, "ext", None) or ""
+        name = getattr(wrapper, "name", None) or f"media_{message_id}{ext}"
+        mime = getattr(wrapper, "mime_type", None)
+        size = getattr(wrapper, "size", None)
+
+        async def fetch(dest_dir: str) -> str:
+            if self._client is None:
+                raise ChannelAuthError("Telegram userbot client not connected")
+            dest = dest_for(dest_dir, name)
+            saved = await self._client.download_media(message, file=dest)
+            if not saved:
+                raise ValueError(f"download_media returned nothing for '{name}'")
+            return str(saved)
+
+        return [IncomingFile(name=name, mime=mime, size=size, fetch=fetch)]
 
     async def _is_mentioned(self, event: Any, message: Any) -> bool:
         """Whether this group message addresses our own account.
@@ -640,6 +681,42 @@ class TelegramUserbotAdapter(BaseChannelAdapter):
             raise ChannelAuthError("Telegram userbot client not connected")
         peer = await self._resolve_peer(str(chat_id))
         await self._client.send_message(peer, text, parse_mode="md")
+
+    async def _send_file(
+        self, sender_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        await self._send_file_to_peer(sender_id, path, name, caption)
+
+    async def _send_file_to_chat(
+        self, chat_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        await self._send_file_to_peer(str(chat_id), path, name, caption)
+
+    async def _send_file_to_peer(
+        self, peer_id: str, path: str, name: str | None, caption: str | None,
+    ) -> None:
+        """``send_file`` as a document, so the bytes and filename survive.
+
+        ``force_document=True`` keeps Telegram from recompressing images; the
+        attributes give the file its intended name when it differs from the
+        path's basename.
+        """
+        if self._client is None:
+            raise ChannelAuthError("Telegram userbot client not connected")
+        peer = await self._resolve_peer(peer_id)
+        from telethon.tl.types import DocumentAttributeFilename  # type: ignore
+
+        attributes = [DocumentAttributeFilename(name)] if name else None
+        await self._client.send_file(
+            peer, path,
+            caption=(caption or "")[:1024] or None,
+            force_document=True,
+            attributes=attributes,
+        )
 
     async def _send_typing(self, sender_id: str) -> None:
         if self._client is None:

@@ -87,7 +87,7 @@ def _capture(monkeypatch, adapter):
     async def _group(**kwargs):
         group_calls.append(kwargs)
 
-    async def _dm(sender_id, display_name, text):
+    async def _dm(sender_id, display_name, text, files=None):
         dm_calls.append((sender_id, display_name, text))
 
     monkeypatch.setattr(adapter, "_handle_group_inbound", _group)
@@ -133,6 +133,7 @@ def test_a_room_message_goes_to_the_group(monkeypatch):
             "platform_message_date": 1_700_000_000.0,
             "sender_is_bot": False,
             "mentioned": False,
+            "files": None,
         }]
         # The reply peer is cached under the ROOM, not the person who spoke.
         assert adapter._peer_cache[str(_CHAT_ID)] == f"peer:{_CHAT_ID}"

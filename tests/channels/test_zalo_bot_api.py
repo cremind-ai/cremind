@@ -99,7 +99,7 @@ def test_handle_update_extracts_text_message():
     adapter = _adapter()
     seen: list[tuple] = []
 
-    async def fake_inbound(sender_id, display_name, text):
+    async def fake_inbound(sender_id, display_name, text, files=None):
         seen.append((sender_id, display_name, text))
 
     adapter._handle_inbound_safe = fake_inbound  # type: ignore[assignment]

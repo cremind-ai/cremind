@@ -285,6 +285,7 @@ class ConvertToMarkdownTool(BuiltInTool):
             "uri": file_uri,
             "name": out_name,
             "mime_type": "text/markdown",
+            "origin": "created",
         }
 
         payload: ToolResultWithFiles = {

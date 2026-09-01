@@ -43,8 +43,9 @@ TOOL_CONFIG: ToolConfig = {
         "Push a message OUT to the user on their notification channels (e.g. "
         "Telegram). Use it when the user asks to be notified, texted, pinged, "
         "or sent a result on a channel: still answer in chat AND deliver the "
-        "final answer through this tool. Only offered when the profile has at "
-        "least one enabled notification channel."
+        "final answer through this tool. Can also deliver files (absolute "
+        "paths in 'attachments'). Only offered when the profile has at least "
+        "one enabled notification channel."
     ),
 }
 
@@ -58,6 +59,10 @@ class SendNotificationTool(BuiltInTool):
         "etc.). 'message' (required) is the text to deliver. 'channels' "
         "(optional) restricts delivery to specific channel TYPES, e.g. "
         '["telegram"]; omit it to send to every enabled notification channel. '
+        "'attachments' (optional) is a list of ABSOLUTE file paths to deliver "
+        "alongside the message — files you created or were given (working "
+        "directory, uploads, or the Cremind data dir); channels whose platform "
+        "can't carry files deliver a text notice naming the file instead. "
         "Returns per-channel recipient counts and any failures. Still answer "
         "the user in chat as well — this tool only delivers the out-of-band copy."
     )
@@ -75,6 +80,15 @@ class SendNotificationTool(BuiltInTool):
                     "Optional list of channel TYPES to target (e.g. "
                     '"telegram", "slack"). Omit to send to every enabled '
                     "notification channel."
+                ),
+            },
+            "attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional ABSOLUTE file paths to deliver with the message. "
+                    "Pass paths exactly as given/produced — do not shorten or "
+                    "relativize them."
                 ),
             },
         },
@@ -129,6 +143,32 @@ class SendNotificationTool(BuiltInTool):
                 }
             )
 
+        # Attachments: validated against the profile's own roots (the same
+        # trust boundary system_file enforces) plus the turn's working
+        # directory. Rejections fail the call loudly — silently dropping a
+        # file the user asked to receive would be worse than an error.
+        attachments: List[Dict[str, Any]] = []
+        raw_attachments = arguments.get("attachments") or []
+        if raw_attachments:
+            from app.channels.attachments import validate_outbound_paths
+
+            extra_roots = [arguments.get("_working_directory")]
+            attachments, rejected = validate_outbound_paths(
+                profile, raw_attachments, extra_roots=extra_roots,
+            )
+            if rejected:
+                return BuiltInToolResult(
+                    structured_content={
+                        "error": "InvalidAttachment",
+                        "message": (
+                            "Some attachment paths were rejected. Only existing "
+                            "files inside your own directories can be sent; pass "
+                            "absolute paths exactly as produced."
+                        ),
+                        "rejected": rejected,
+                    }
+                )
+
         available_types = sorted({a.channel_type for a in adapters})
 
         requested = arguments.get("channels")
@@ -162,6 +202,14 @@ class SendNotificationTool(BuiltInTool):
                 count = await adapter.deliver_text(message)
                 entry["recipients"] = count
                 total_recipients += count
+                files_delivered = 0
+                if count > 0 and attachments:
+                    for att in attachments:
+                        await adapter.deliver_file(
+                            att["path"], name=att.get("name"),
+                        )
+                        files_delivered += 1
+                    entry["files_delivered"] = files_delivered
                 if count > 0:
                     entry["status"] = "sent"
                     any_success = True

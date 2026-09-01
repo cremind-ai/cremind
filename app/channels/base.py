@@ -21,11 +21,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import secrets
 import time
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Sequence
 
+from app.channels.attachments import (
+    IncomingFile,
+    discard_incoming_files,
+    file_fallback_text,
+    placeholder_text,
+    stage_incoming_files,
+)
 from app.channels.exceptions import ChannelNotImplemented
 from app.channels.notification_delivery import NotificationDeliveryMixin
 from app.events import queue as event_queue
@@ -47,6 +55,16 @@ _OTP_TTL_SECONDS = 600  # 10 minutes
 # Telegram caps a single message at 4096 chars; the other platforms have
 # similar (looser) caps. Keep some headroom for the markdown wrapper.
 _MAX_MESSAGE_CHARS = 3500
+# Cap on files auto-delivered with one reply. A runaway loop writing files
+# must become a log line, not a message flood on somebody's phone.
+_MAX_REPLY_FILES = 5
+
+
+def _file_size(path: str) -> int | None:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
 
 
 def platform_message_timestamp(message: Any) -> float | None:
@@ -141,6 +159,13 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
     # False disables the consecutive-bot-messages brake, which has nothing to
     # count without it.
     reports_sender_is_bot: bool = False
+
+    # Whether this transport can deliver a FILE outward. Read off the CLASS
+    # like ``supports_group_chats`` (dry-run previews consult it before any
+    # adapter instance is involved). False routes every file send through the
+    # fallback notice instead — the recipient learns a file exists rather than
+    # receiving silence.
+    supports_file_send: bool = False
 
     # Telegram's legacy markdown — the dialect this codebase has always written.
     # Adapters whose platform spells emphasis differently override them; one
@@ -344,6 +369,69 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 raise
             sent += 1
         return sent
+
+    # ── file delivery (outbound) ──
+
+    async def _send_file(
+        self, sender_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        """Send one file to a person. Adapters that can, override this and set
+        ``supports_file_send``; the rest say so and callers degrade to a text
+        notice."""
+        raise ChannelNotImplemented(
+            f"{self.channel_type} channels cannot send files",
+        )
+
+    async def _send_file_to_chat(
+        self, chat_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        """Room-addressed twin of :meth:`_send_file` — a chat id is nobody's
+        sender id (see :meth:`send_to_chat`)."""
+        raise ChannelNotImplemented(
+            f"{self.channel_type} channels cannot send files to a chat id",
+        )
+
+    async def send_file(
+        self, sender_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        """Send one file, swallowing errors (mirror of :meth:`send`).
+
+        On a transport with no file support the recipient gets
+        :func:`file_fallback_text` instead — the file's NAME, never its server
+        path — so they at least learn something was produced for them.
+        """
+        display = name or os.path.basename(path)
+        try:
+            await self._send_file(
+                sender_id, path, name=name, mime=mime, caption=caption,
+            )
+        except ChannelNotImplemented:
+            await self.send(sender_id, file_fallback_text(display, _file_size(path)))
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                f"channels[{self.channel_type}]: file send to {sender_id} failed",
+            )
+
+    async def send_file_strict(
+        self, sender_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        """File send that RAISES (mirror of :meth:`send_strict`).
+
+        ``ChannelNotImplemented`` propagates so programmatic callers (direct
+        send, notify) can report "this transport can't carry files" honestly
+        instead of logging it away.
+        """
+        await self._send_file(
+            sender_id, path, name=name, mime=mime, caption=caption,
+        )
 
     def _derive_phone(self, sender_id: str) -> str | None:
         """Return the contact's phone (canonical digits) implied by ``sender_id``.
@@ -638,6 +726,16 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         else:
             await self._send_chunked(target.address, text)
 
+    async def _send_reply_file(
+        self, target: ReplyTarget, path: str, *,
+        name: str | None = None, mime: str | None = None,
+    ) -> None:
+        """Send one file to wherever this run is answering (never raises)."""
+        if target.is_group:
+            await self.send_file_to_chat(target.address, path, name=name, mime=mime)
+        else:
+            await self.send_file(target.address, path, name=name, mime=mime)
+
     async def _send_chunked(self, sender_id: str, text: str) -> None:
         """Send ``text`` as one or more messages, each ≤ ``_MAX_MESSAGE_CHARS``.
 
@@ -680,6 +778,16 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         if self._is_notification_mode():
             return False
         return bool((self.channel.get("config") or {}).get("group_chats_enabled"))
+
+    def _auto_send_files_enabled(self) -> bool:
+        """Whether reply forwarders auto-deliver the files a run created.
+
+        On by default — an operator turns it off per channel with
+        ``config.auto_send_files = false`` (the send tools still work; only
+        the automatic delivery stops). Only an explicit ``False`` disables.
+        """
+        value = (self.channel.get("config") or {}).get("auto_send_files")
+        return True if value is None else bool(value)
 
     def self_identity(self) -> dict:
         """The platform account this channel speaks as, as last recorded.
@@ -751,6 +859,28 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                     f"channels[{self.channel_type}]: send to chat {chat_id} failed",
                 )
 
+    async def send_file_to_chat(
+        self, chat_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        """Send one file to a room, swallowing errors (mirror of
+        :meth:`send_to_chat_chunked`); degrades to the fallback notice where
+        the transport has no file support."""
+        display = name or os.path.basename(path)
+        try:
+            await self._send_file_to_chat(
+                chat_id, path, name=name, mime=mime, caption=caption,
+            )
+        except ChannelNotImplemented:
+            await self.send_to_chat_chunked(
+                chat_id, file_fallback_text(display, _file_size(path)),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                f"channels[{self.channel_type}]: file send to chat {chat_id} failed",
+            )
+
     async def _handle_group_inbound(
         self,
         *,
@@ -766,6 +896,7 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         sender_is_bot: bool,
         platform_message_date: float | None = None,
         mentioned: bool = False,
+        files: Sequence[IncomingFile] | None = None,
     ) -> None:
         """Route a message from a platform group into the channel-group pipeline.
 
@@ -794,9 +925,13 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
 
         Never raises — the caller is a receive loop, and one unroutable message
         must not be able to end it.
+
+        ``files`` are unfetched attachment descriptors; the group pipeline
+        stages them only for an approved group and an allowed member, and
+        discards them unfetched on every earlier drop.
         """
         body = (text or "").strip()
-        if not body:
+        if not body and not files:
             return
         from app.channels.groups.inbound import GroupInbound, handle_group_message
 
@@ -815,6 +950,7 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 sender_is_bot=bool(sender_is_bot),
                 platform_message_date=platform_message_date,
                 mentioned=bool(mentioned),
+                files=list(files or []),
             ),
         )
 
@@ -864,6 +1000,7 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
 
     async def _handle_inbound(
         self, sender_id: str, display_name: str | None, text: str,
+        *, files: Sequence[IncomingFile] | None = None,
     ) -> None:
         """Route an inbound platform message into Cremind.
 
@@ -877,19 +1014,29 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         message starts no run, and a run that does start while a forwarder is
         live gets a chained one when that forwarder finishes, so no forwarder
         ever absorbs the tail of the wrong run on the shared stream bus.
+
+        ``files`` are attachment descriptors whose bytes have NOT been fetched;
+        they are staged (downloaded) only after the sender passes the auth
+        gate, so a stranger's payload is never pulled onto disk. A message that
+        is only a file still gets a turn — a placeholder stands in for the
+        caption the sender didn't write.
         """
         text = (text or "").strip()
-        if not text:
+        if not text and not files:
             return
+        if not text and files:
+            text = placeholder_text([f.name for f in files])
 
         logger.debug(
             f"[channels:{self.channel_type}] inbound channel_id={self.channel_id} "
-            f"from={sender_id} msg_len={len(text)}"
+            f"from={sender_id} msg_len={len(text)} files={len(files or ())}"
         )
 
         # Notification-mode channels don't converse: inbound messages are
-        # subscribe/unsubscribe control commands, not agent prompts.
+        # subscribe/unsubscribe control commands, not agent prompts — a file
+        # has nowhere to go there.
         if self._is_notification_mode():
+            await discard_incoming_files(files)
             await self._handle_notification_command(sender_id, display_name, text)
             return
 
@@ -901,11 +1048,18 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         # ``config.subscribe_auth``): gate who may talk to the agent. An
         # unauthenticated sender's message is never dispatched — the gate
         # either advances them toward authentication (otp/passcode) or holds
-        # them (approval/allowlist) until an operator approves.
+        # them (approval/allowlist) until an operator approves. Their files
+        # are discarded unfetched.
         auth = self._subscribe_auth()
         if auth != "open" and not sender["authenticated"]:
+            await discard_incoming_files(files)
             await self._handle_access_gate(sender, auth, text)
             return
+
+        attachments = (
+            await stage_incoming_files(self, conversation_id, files)
+            if files else None
+        )
 
         # The per-sender lock keeps the park attempt and the forwarder
         # bookkeeping inside _dispatch_to_agent atomic, so two messages racing in
@@ -913,6 +1067,7 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         async with self._inbound_lock(sender_id):
             await self._dispatch_to_agent(
                 conversation_id, sender_id, display_name, text,
+                attachments=attachments or None,
             )
 
     async def _upsert_sender(
@@ -1198,6 +1353,7 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
     async def _dispatch_to_agent(
         self, conversation_id: str, sender_id: str,
         display_name: str | None, text: str,
+        attachments: list[dict] | None = None,
     ) -> None:
         from app.agent.stream_runner import make_run_id
         from app.events import user_message_delivery
@@ -1221,6 +1377,7 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             profile=self.profile,
             query=text,
             user_message_metadata=user_message_metadata,
+            attachments=attachments,
         )
         if parked is not None and parked.injected:
             # The run may have been started elsewhere (a skill event, a task
@@ -1261,6 +1418,7 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 history_messages=history_messages,
                 reasoning=True,
                 user_message_metadata=user_message_metadata,
+                attachments=attachments,
                 push_user_message=existing_user_message_id is None,
                 existing_user_message_id=existing_user_message_id,
                 update_title_from_query=False,
@@ -1413,6 +1571,15 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         # empty one — and the Final-Answer fallback must not repeat what went
         # out already.
         sent_any = False
+        # Files the run created, held for delivery AFTER the final answer —
+        # identical in detail and normal modes (files are output, not steps).
+        # Deduped by uri and capped; ``absorb``'s "file" branch is the only
+        # collector and ``deliver_pending_files`` the only sender, so a file
+        # can never go out twice even though it also appears in ``result``
+        # events and persisted parts.
+        pending_files: list[dict] = []
+        seen_file_uris: set[str] = set()
+        auto_files = self._auto_send_files_enabled()
 
         async def flush_step(step: dict) -> None:
             """Send one reasoning step as its own bubble.
@@ -1532,6 +1699,41 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 # that stayed silent does not spend the room's rate budget.
                 self.groups.note_agent_post(target.group_id)
 
+        async def deliver_pending_files() -> None:
+            """Send the run's created files, after the final answer.
+
+            A silent group turn sends nothing — files included: the agent
+            decided the message was not for it, and a file landing in the room
+            anyway would be the loudest possible way to be wrong about that.
+            A DM delivers even when the final text was empty — a turn whose
+            entire output is a file is a legitimate answer.
+            """
+            if not pending_files:
+                return
+            if target.is_group and not sent_any:
+                logger.info(
+                    f"channels[{self.channel_type}]: withholding "
+                    f"{len(pending_files)} file(s) from silent turn in "
+                    f"group={target.group_id} conv={conversation_id}"
+                )
+                return
+            for payload in pending_files:
+                info = payload.get("file") or {}
+                uri = str(info.get("uri") or "")
+                # Re-check existence: a write→move sequence leaves the written
+                # uri dangling, and dedupe-by-uri cannot catch a rename.
+                if not uri or not os.path.isfile(uri):
+                    continue
+                logger.info(
+                    f"channels[{self.channel_type}]: delivering reply file "
+                    f"'{info.get('name') or os.path.basename(uri)}' "
+                    f"to={target.key} conv={conversation_id}"
+                )
+                await self._send_reply_file(
+                    target, uri,
+                    name=info.get("name"), mime=info.get("mimeType"),
+                )
+
         async def absorb(event: dict) -> bool:
             nonlocal current_step, final_answer_fallback
             seq = event.get("seq")
@@ -1595,6 +1797,27 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             elif etype == "result" and detail and current_step is not None:
                 obs_parts = data.get("Observation") or []
                 current_step["observation"] = _format_observation_text(obs_parts)
+            elif etype == "file":
+                # A tool-touched file. Only ``origin == "created"`` is held for
+                # delivery: read_file publishes these events too, and
+                # auto-forwarding a file the agent merely READ would hand out
+                # anything it looked at. This branch is the forwarder's only
+                # file collector, and ``deliver_pending_files`` its only
+                # sender — files in ``result`` events and persisted parts are
+                # never sent from here, so nothing goes out twice.
+                if auto_files:
+                    origin = str(
+                        (data.get("metadata") or {}).get("origin") or "referenced"
+                    )
+                    uri = str((data.get("file") or {}).get("uri") or "")
+                    if (
+                        origin == "created"
+                        and uri
+                        and uri not in seen_file_uris
+                        and len(pending_files) < _MAX_REPLY_FILES
+                    ):
+                        seen_file_uris.add(uri)
+                        pending_files.append(data)
             elif etype == "flow_break":
                 # The agent stopped to answer something that interrupted it. Send
                 # that now as its own message — not terminal, the run continues.
@@ -1619,11 +1842,15 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                         await flush_step(current_step)
                     current_step = None
                 await flush_final(final_text)
+                await deliver_pending_files()
                 return True
             elif etype == "error":
                 if current_step is not None:
                     await flush_step(current_step)
                     current_step = None
+                # A failed run delivers no files: whatever it wrote along the
+                # way is the debris of the failure, not an answer.
+                pending_files.clear()
                 err_msg = (data or {}).get("message") or "unknown error"
                 if target.is_group:
                     # Never into a room: everyone there would read an apology

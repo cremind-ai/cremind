@@ -24,6 +24,26 @@ channels_app = typer.Typer(
 )
 
 
+def _read_attachment_files(paths: Optional[list[str]]) -> list[tuple[str, bytes]]:
+    """Read ``--file`` attachments into ``(basename, bytes)`` pairs.
+
+    Read client-side because the CLI may run on a different machine — its
+    paths mean nothing to the server, so the bytes travel as multipart.
+    Errors exit cleanly before any request is made.
+    """
+    import os
+
+    out: list[tuple[str, bytes]] = []
+    for path in paths or []:
+        try:
+            with open(path, "rb") as fh:
+                out.append((os.path.basename(path), fh.read()))
+        except OSError as e:
+            typer.echo(f"--file: {e}", err=True)
+            raise typer.Exit(code=1) from e
+    return out
+
+
 @channels_app.command("list")
 @graceful_errors
 def channels_list(ctx: typer.Context) -> None:
@@ -303,6 +323,12 @@ def channels_send(
         help="Read the message from this file (use '-' for stdin). Preferred on "
              "PowerShell, where inline quoting mangles apostrophes/quotes.",
     ),
+    file: Optional[list[str]] = typer.Option(
+        None, "--file", "-F",
+        help="Attach a local file to the send. Repeat for several files. "
+             "Recipients on a platform that can't carry files get a text "
+             "notice naming the file instead.",
+    ),
 ) -> None:
     """Push an ad-hoc message OUT to a notification-mode channel.
 
@@ -314,6 +340,7 @@ def channels_send(
     Examples:
       cremind channels send <id> "Deploy finished OK"
       cremind channels send <id> --message-file note.txt
+      cremind channels send <id> "monthly report attached" -F report.pdf
       echo "1+1 = 2" | cremind channels send <id> -f -
     """
     import asyncio
@@ -340,14 +367,20 @@ def channels_send(
                 raise typer.Exit(code=1) from e
     elif message is not None:
         text = message
+    elif file:
+        # Attachments alone are a complete send; don't park on stdin for a
+        # message nobody intends to type.
+        text = ""
     else:
         # No message given anywhere — fall back to stdin (supports piping).
         text = sys.stdin.read()
 
     text = text.strip()
-    if not text:
+    if not text and not file:
         typer.echo("message is empty — nothing to send", err=True)
         raise typer.Exit(code=1)
+
+    files = _read_attachment_files(file)
 
     cfg: Config = ctx.obj["cfg"]
     out_mode: OutputMode = ctx.obj["mode"]
@@ -355,7 +388,7 @@ def channels_send(
 
     async def _run() -> dict[str, Any]:
         async with Client(cfg) as client:
-            return await notify_channel(client, channel_id, text)
+            return await notify_channel(client, channel_id, text, files=files)
 
     result = asyncio.run(_run())
 
@@ -364,7 +397,10 @@ def channels_send(
         return
     recipients = int(result.get("recipients") or 0)
     if result.get("delivered"):
-        sys.stdout.write(f"Delivered to {recipients} recipient(s).\n")
+        suffix = ""
+        if files:
+            suffix = f" ({int(result.get('files_delivered') or 0)} file(s))"
+        sys.stdout.write(f"Delivered to {recipients} recipient(s){suffix}.\n")
     else:
         sys.stdout.write(
             "Not delivered — the channel has no recipients yet "
@@ -405,6 +441,11 @@ def channels_message(
         False, "--send",
         help="Actually deliver. Without this the command only previews who "
              "would be messaged.",
+    ),
+    file: Optional[list[str]] = typer.Option(
+        None, "--file", "-F",
+        help="Attach a local file, delivered to every recipient after their "
+             "text. Repeat for several files.",
     ),
 ) -> None:
     """Message specific clients on a channel — one or many.
@@ -488,14 +529,17 @@ def channels_message(
     else:
         text = message
     text = text.strip() if text else None
-    # A shared message is optional only when every recipient brings its own.
-    if not text and not all(r.get("message") for r in recipients):
+    # A shared message is optional when every recipient brings its own, or
+    # when the send is carried by attachments alone.
+    if not text and not file and not all(r.get("message") for r in recipients):
         typer.echo(
             "no message text — pass one as an argument, via --message-file, or "
             "on every recipient in --recipients-file",
             err=True,
         )
         raise typer.Exit(code=1)
+
+    files = _read_attachment_files(file)
 
     cfg: Config = ctx.obj["cfg"]
     out_mode: OutputMode = ctx.obj["mode"]
@@ -506,6 +550,7 @@ def channels_message(
             return await send_channel_message(
                 client, channel_id, recipients, message=text,
                 dry_run=not send, default_country_code=country_code,
+                files=files,
             )
 
     result = asyncio.run(_run())

@@ -1,5 +1,5 @@
 ---
-description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders` with their token usage, wipe one subscriber's conversation history with `clear-history`, delete a client completely with `forget` (as if they had never messaged — conversation, messages, automations, contact details and access all removed), run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), set a channel's push-notification filter with `notify-filter`, push an ad-hoc message out to a notification channel with `send`, send a direct message to specific individual clients — one person or a bulk list, addressed by platform id or **phone number** — with `message`, record a contact's phone number with `set-phone`, decide per client whether the agent must ask before messaging them with `set-confirm` (the profile-wide default is `channels.confirm_before_send` in Settings → Config → Channels; turn it off so unattended automations can send without stopping to ask), `approve`/`revoke` who may subscribe to a notification channel, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). All channels gate access with the same per-channel **authentication** method — open, passcode, one-time code (`otp`), admin approval, or allowlist — controlling who may chat (bot/userbot) or subscribe (notification); `approve`/`revoke` authorize individual senders and work in every mode. A notification channel can also receive one-off messages you send with `cremind channels send` — the same delivery the agent's `send_notification` tool uses when you ask it to 'notify me on Telegram'. Separately, `cremind channels message` sends to **named individuals** rather than to subscribers: give it sender ids or phone numbers (one `--to`, or a JSON list for a bulk campaign such as thanking every customer in a spreadsheet), and each delivered message is saved into that client's own conversation so the agent has the context later; it previews by default and only sends with `--send`, and only WhatsApp can message someone who has never written first. Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. A channel can also take part in **group chats** — real Telegram, Discord, Slack, WhatsApp or Zalo groups full of real people that this profile's account has been added to: opt in per channel with `--group-chats`, then approve each group with `cremind channels groups approve` (new groups arrive `pending` with a high-priority notification and the agent reads nothing until you approve), and tune it with `channels groups list`/`members`/`policy`/`allow`/`deny`/`respond`/`refresh`/`block`/`forget`. In an approved group the agent replies when mentioned and otherwise only when a cheap relevance check says the message is for it, while everything else is still stored as context. This is **not** `cremind group`, which is Cremind's own rooms where several profiles' agents talk to each other; the two features share nothing. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
+description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders` with their token usage, wipe one subscriber's conversation history with `clear-history`, delete a client completely with `forget` (as if they had never messaged — conversation, messages, automations, contact details and access all removed), run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), set a channel's push-notification filter with `notify-filter`, push an ad-hoc message out to a notification channel with `send` (attach files with `--file`), send a direct message to specific individual clients — one person or a bulk list, addressed by platform id or **phone number** — with `message` (also `--file`-capable), record a contact's phone number with `set-phone`, decide per client whether the agent must ask before messaging them with `set-confirm` (the profile-wide default is `channels.confirm_before_send` in Settings → Config → Channels; turn it off so unattended automations can send without stopping to ask), `approve`/`revoke` who may subscribe to a notification channel, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). All channels gate access with the same per-channel **authentication** method — open, passcode, one-time code (`otp`), admin approval, or allowlist — controlling who may chat (bot/userbot) or subscribe (notification); `approve`/`revoke` authorize individual senders and work in every mode. A notification channel can also receive one-off messages you send with `cremind channels send` — the same delivery the agent's `send_notification` tool uses when you ask it to 'notify me on Telegram'. Separately, `cremind channels message` sends to **named individuals** rather than to subscribers: give it sender ids or phone numbers (one `--to`, or a JSON list for a bulk campaign such as thanking every customer in a spreadsheet), and each delivered message is saved into that client's own conversation so the agent has the context later; it previews by default and only sends with `--send`, and only WhatsApp can message someone who has never written first. Channels carry **files in both directions**: a user attaching a photo or document on the platform hands it to the agent (staged into the conversation's temporary upload folder, size-capped), the agent's own created files (reports, screenshots, conversions) are auto-delivered back with its reply, and `send`/`message` push files outward with `--file` — platforms that can't carry a file deliver a text notice naming it instead. Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. A channel can also take part in **group chats** — real Telegram, Discord, Slack, WhatsApp or Zalo groups full of real people that this profile's account has been added to: opt in per channel with `--group-chats`, then approve each group with `cremind channels groups approve` (new groups arrive `pending` with a high-priority notification and the agent reads nothing until you approve), and tune it with `channels groups list`/`members`/`policy`/`allow`/`deny`/`respond`/`refresh`/`block`/`forget`. In an approved group the agent replies when mentioned and otherwise only when a cheap relevance check says the message is for it, while everything else is still stored as context. This is **not** `cremind group`, which is Cremind's own rooms where several profiles' agents talk to each other; the two features share nothing. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
 ---
 
 # `cremind channels` — External Messaging Channel Management
@@ -128,16 +128,68 @@ channel has no conversation at all — it is a push-only feed — so it is
 the one case where an *operator-initiated* outbound push is allowed, via
 `cremind channels send` (or the agent's `send_notification` tool). That
 path delivers straight to subscribers and never creates or writes a
-conversation.
+conversation — and it can carry **files** now (`--file`, or the tool's
+`attachments`).
 
 A **group** on the platform is a third path: the same inbound-only rule applies
 (the agent answers into the group through the adapter, and you cannot post into
 the group's conversation from the CLI), but the group has to be switched on and
 approved first — see **Group chats on a channel** below.
 
+Files ride the same directions the text does: a platform user's attachment
+becomes a file the agent can read (see **Files on channels** below), the
+agent's reply auto-delivers the files it created, and the two outbound push
+commands take `--file`. What the inbound-only rule still forbids is composing
+into a channel conversation from the web UI or CLI — file or not.
+
 Use `cremind conv get <id>` and `cremind conv attach <id>` to inspect channel
 conversations; use the corresponding platform (Telegram, etc.) to
 talk to the agent.
+
+## Files on channels
+
+Channels carry files **both ways** on every platform that can:
+
+**Inbound (user → agent).** A file attached on the platform — with or without
+a caption — is downloaded into the conversation's temporary upload folder
+(`<data dir>/<profile>/uploads_tmp/<conversation id>/`, the same place the web
+composer's attachments land) and the agent gets its absolute path, so it can
+read, convert, analyse or save it with its file tools. A file-only message
+still starts a turn (the agent sees `[sent a file: report.pdf]`). Files are
+only accepted from senders who have passed the channel's access
+authentication, and each file is capped by the `uploads.tmp_max_bytes` server
+setting (100 MiB default). The folder is temporary — wiped on server restart
+and pruned when idle — so ask the agent to *save* anything that must persist.
+
+**Outbound (agent → user).** Files the agent **created** during a reply (a
+written report, a converted document, a browser screenshot) are delivered to
+the channel conversation automatically after its answer — at most 5 per reply,
+never from a group turn the agent chose to stay silent on. Files it merely
+*read* are never auto-sent. Set `auto_send_files: false` in a channel's config
+to turn auto-delivery off for that channel. The agent can also send files
+explicitly: `send_notification` and `send_channel_message` both take an
+`attachments` list of absolute paths, restricted to the profile's own
+directories.
+
+**Operator pushes.** `cremind channels send <id> -F <path>` and
+`cremind channels message <id> ... --file <path>` upload local files with the
+request (multipart), so they work from a remote CLI.
+
+**Platform caveats.**
+
+| Platform | Notes |
+|----------|-------|
+| Telegram (bot) | Bot API hard caps: 20 MB inbound (`getFile`), 50 MB outbound. Bigger files: use the userbot mode, which has neither. |
+| Telegram (userbot) | Full support, no bot-API caps. |
+| Slack | Needs the `files:read` (inbound) and `files:write` (outbound) OAuth scopes — re-install an older app to grant them. Sending into a channel requires membership. |
+| Discord | Inbound fine; outbound capped at 10 MB (Discord's default bot limit). |
+| WhatsApp | Full support via the sidecar; media is spooled to disk at receipt. |
+| Zalo (userbot) | Supported via the sidecar (unofficial library — shapes may drift). |
+| Zalo (bot) | Inbound only where the Bot API supplies a download URL; **no outbound file support** — recipients get a text notice naming the file. |
+| Messenger | Inbound via webhook attachments; outbound capped at 25 MB, captions sent as a separate text message. |
+
+On any platform (or size) that can't take a file, the recipient gets a notice
+— `📎 <name> — this channel can't receive files…` — instead of silence.
 
 ## Group chats on a channel
 
@@ -611,6 +663,7 @@ channel — straight to its recipients, right now.
 ```bash
 cremind channels send <id> "<message>"
 cremind channels send <id> --message-file <path>   # or -f -  for stdin
+cremind channels send <id> "<message>" --file <path> [--file ...]
 ```
 
 **Behavior.** POSTs to `/api/channels/{id}/notify`. The message is delivered to
@@ -618,6 +671,12 @@ the channel's recipients — the union of `config.target_chat_ids` and everyone
 who has `/start`-subscribed — via the running adapter. Unlike automatic
 notifications, this **bypasses the channel's `notification_filter`** (you asked
 for it explicitly), so quiet hours / priority / kind rules do not apply.
+
+**Attachments.** `--file <path>` (repeatable, short form `-F`) attaches local
+files, uploaded with the request — so it works from a remote CLI. With `--file`
+the message text is optional. Recipients on a platform without file support get
+a text notice naming each file; see **Files on channels** for per-platform
+limits.
 
 Requirements: the channel must be in `notification` mode (HTTP 400 otherwise)
 and its adapter must be running (HTTP 409 otherwise). If the channel has no
@@ -635,7 +694,8 @@ argument). On Windows PowerShell, prefer `--message-file` / stdin — PowerShell
 mangles inline quotes and apostrophes when passing arguments to native binaries.
 
 **Output.** Prints `Delivered to N recipient(s).` (or a "no recipients" notice).
-`--json` at the root returns `{"delivered": <bool>, "recipients": <int>}`.
+`--json` at the root returns `{"delivered": <bool>, "recipients": <int>}`, plus
+`"files_delivered"` when files were attached.
 
 **Examples.**
 
@@ -643,6 +703,10 @@ mangles inline quotes and apostrophes when passing arguments to native binaries.
 # Send straight from the command line
 $ cremind channels send e2e8...d4f1 "Nightly backup finished OK"
 Delivered to 2 recipient(s).
+
+# Attach the report itself
+$ cremind channels send e2e8...d4f1 "monthly report attached" -F report.pdf
+Delivered to 2 recipient(s) (1 file(s)).
 
 # PowerShell-safe: read the body from a file
 PS> cremind channels send e2e8...d4f1 --message-file .\note.txt
@@ -729,6 +793,13 @@ Entries without their own `message` fall back to the shared message argument.
 `--message-file <path>`, or on stdin. On Windows PowerShell prefer
 `--message-file` / `--recipients-file` — PowerShell mangles inline quotes and
 apostrophes when passing arguments to native binaries.
+
+**Attachments.** `--file <path>` (repeatable, short form `-F`) attaches local
+files delivered to **every** recipient after their text; with `--file` the
+shared message is optional. Files are uploaded with the request. A recipient
+whose platform can't carry files gets a text notice naming each file and the
+result marks them `files_unsupported`; the preview already flags such
+recipients. See **Files on channels** for per-platform limits.
 
 **Output.** A `TO / STATUS / CHANNEL / SENDER_ID / NEW / DETAIL` table, then a
 summary line. `STATUS` is `would_send` (preview), `sent`, `failed`, or `skipped`

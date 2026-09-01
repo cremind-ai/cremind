@@ -502,6 +502,12 @@ class BuiltInToolAdapter:
                                         name=file_entry.get("name"),
                                         mime_type=file_entry.get("mime_type"),
                                     ),
+                                    # "created" = a tool output worth delivering
+                                    # outward (channel forwarders key off it);
+                                    # "referenced" = it merely passed through.
+                                    metadata={
+                                        "origin": file_entry.get("origin") or "referenced",
+                                    },
                                 )))
 
             if not has_file_parts and tool_results:

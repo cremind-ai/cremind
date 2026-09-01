@@ -37,9 +37,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 from pathlib import Path
 from typing import Any
 
+from app.channels.attachments import files_from_sidecar_frame
 from app.channels.base import BaseChannelAdapter, _split_for_messaging
 from app.channels.exceptions import ChannelAuthError, ChannelNotImplemented
 from app.channels.sidecars.bootstrap import ensure_sidecar_ready
@@ -60,6 +63,8 @@ _THREAD_GROUP = 1
 
 # How long the sidecar has to answer a member-list request.
 _ROSTER_TIMEOUT = 20.0
+# File sends upload the whole payload before the ack; far longer leash.
+_FILE_ACK_TIMEOUT = 180.0
 
 
 def _frame_epoch(value: Any) -> float | None:
@@ -90,6 +95,9 @@ class ZaloUserbotAdapter(BaseChannelAdapter):
     # Zalo tells a personal account nothing about whether an author is
     # automated, so the bot-streak brake has nothing to count here.
     reports_sender_is_bot = False
+    # ``send_file`` control frame → zca-js attachment send, answered by a
+    # correlated ``send_file_result``.
+    supports_file_send = True
 
     # Zalo has no markdown: whatever the mirror wraps arrives as literal
     # characters, so a room's ``*Name*`` would reach it as two stray asterisks.
@@ -169,7 +177,82 @@ class ZaloUserbotAdapter(BaseChannelAdapter):
         except Exception as e:  # noqa: BLE001
             logger.debug(f"[channels:zalo] typing send dropped: {e}")
 
+    async def _send_file(
+        self, sender_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        await self._send_file_frame(sender_id, path, name, caption, thread_type=None)
+
+    async def _send_file_to_chat(
+        self, chat_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        await self._send_file_frame(
+            str(chat_id), path, name, caption, thread_type=_THREAD_GROUP,
+        )
+
+    async def _send_file_frame(
+        self, thread_id: str, path: str, name: str | None,
+        caption: str | None, *, thread_type: int | None,
+    ) -> None:
+        """``send_file`` frame with a correlated ``send_file_result`` ack.
+
+        Unlike text sends (fire-and-forget on this sidecar), a file send is
+        awaited: a strict caller recording history must know whether Zalo
+        actually accepted the upload. The frame carries the file's PATH —
+        never bytes (4 MiB WS frame cap; shared filesystem).
+        """
+        if self._ws is None:
+            raise ChannelAuthError("Zalo sidecar not connected")
+        abs_path = os.path.abspath(path)
+        if not os.path.isfile(abs_path):
+            raise ValueError(f"cannot read file to send: {path}")
+        payload: dict[str, Any] = {
+            "kind": "send_file",
+            "sender_id": thread_id,
+            "path": abs_path,
+            "name": name or os.path.basename(abs_path),
+            "caption": caption,
+        }
+        if thread_type is not None:
+            payload["thread_type"] = thread_type
+        request_id, fut = self._new_request()
+        try:
+            async with self._send_lock:
+                await self._ws.send(json.dumps({**payload, "request_id": request_id}))
+            reply = await asyncio.wait_for(fut, timeout=_FILE_ACK_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            raise ChannelAuthError(
+                f"Zalo sidecar did not confirm the file send within "
+                f"{_FILE_ACK_TIMEOUT:.0f}s (thread {thread_id})",
+            ) from exc
+        finally:
+            self._pending.pop(request_id, None)
+        if not reply.get("ok"):
+            raise ChannelAuthError(
+                f"Zalo file send failed: {reply.get('error') or 'unknown error'}",
+            )
+
     # ── helpers ──
+
+    def _media_spool_dir(self) -> str:
+        """Sidecar's inbound-media spool, next to its credentials dir.
+
+        Same contract as the WhatsApp spool: the sidecar downloads media at
+        receipt and frames carry paths; wiped on every spawn.
+        """
+        return os.path.join(
+            BaseConfig.CREMIND_SYSTEM_DIR, self.profile, "zalo",
+            self.channel_id, "media_spool",
+        )
+
+    def _prepare_media_spool(self) -> str:
+        media_dir = self._media_spool_dir()
+        shutil.rmtree(media_dir, ignore_errors=True)
+        os.makedirs(media_dir, exist_ok=True)
+        return media_dir
 
     async def _spawn_sidecar(self) -> None:
         try:
@@ -180,11 +263,16 @@ class ZaloUserbotAdapter(BaseChannelAdapter):
             ) from exc
 
         working_dir = BaseConfig.CREMIND_SYSTEM_DIR
+        media_dir = self._prepare_media_spool()
+        from app.utils.uploads_tmp import max_upload_bytes
+
         cmd = [
             "node", str(_SIDECAR_INDEX),
             "--profile", self.profile,
             "--channel-id", self.channel_id,
             "--working-dir", working_dir,
+            "--media-dir", media_dir,
+            "--media-max-bytes", str(max_upload_bytes()),
         ]
         logger.info(f"zalo[{self.channel_id}]: spawning sidecar — {' '.join(cmd)}")
         self._proc = await asyncio.create_subprocess_exec(
@@ -307,7 +395,8 @@ class ZaloUserbotAdapter(BaseChannelAdapter):
             chat_id = str(msg.get("chat_id") or "").strip()
             sender_id = str(msg.get("sender_id") or "").strip()
             text = msg.get("text") or ""
-            if not chat_id or not sender_id or not text:
+            files = files_from_sidecar_frame(msg)
+            if not chat_id or not sender_id or (not text and not files):
                 return
             message_id = str(msg.get("message_id") or "").strip()
             asyncio.create_task(
@@ -331,6 +420,7 @@ class ZaloUserbotAdapter(BaseChannelAdapter):
                     # The id check is the whole echo defence here.
                     sender_is_bot=False,
                     mentioned=self._is_mentioned(msg),
+                    files=files or None,
                 ),
                 name=f"zalo-group-inbound:{self.channel_id}:{chat_id}",
             )
@@ -348,16 +438,19 @@ class ZaloUserbotAdapter(BaseChannelAdapter):
                     self._note_group_left(chat_id),
                     name=f"zalo-group-left:{self.channel_id}:{chat_id}",
                 )
-        elif kind in ("group_info_result", "list_groups_result"):
+        elif kind in ("group_info_result", "list_groups_result", "send_file_result"):
             self._resolve_pending(msg)
         elif kind == "incoming":
             sender_id = str(msg.get("sender_id") or "").strip()
             display_name = msg.get("display_name")
             text = msg.get("text") or ""
-            if not sender_id or not text:
+            files = files_from_sidecar_frame(msg)
+            if not sender_id or (not text and not files):
                 return
             asyncio.create_task(
-                self._handle_inbound_safe(sender_id, display_name, text),
+                self._handle_inbound_safe(
+                    sender_id, display_name, text, files=files or None,
+                ),
                 name=f"zalo-inbound:{self.channel_id}:{sender_id}",
             )
         elif kind == "disconnected":
@@ -381,9 +474,10 @@ class ZaloUserbotAdapter(BaseChannelAdapter):
 
     async def _handle_inbound_safe(
         self, sender_id: str, display_name: str | None, text: str,
+        files: Any = None,
     ) -> None:
         try:
-            await self._handle_inbound(sender_id, display_name, text)
+            await self._handle_inbound(sender_id, display_name, text, files=files)
         except Exception:  # noqa: BLE001
             logger.exception("zalo: inbound handler failed")
 

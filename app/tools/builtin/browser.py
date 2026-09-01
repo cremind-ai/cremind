@@ -904,6 +904,7 @@ class BrowserTool(BuiltInTool):
                 "uri": file_uri,
                 "name": file_name,
                 "mime_type": "image/png",
+                "origin": "created",
             }
             payload: ToolResultWithFiles = {
                 "text": f"Screenshot saved: {file_name} (target_id: {tid})",

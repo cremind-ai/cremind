@@ -21,9 +21,16 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from app.channels.attachments import IncomingFile, dest_for
 from app.channels.base import BaseChannelAdapter, platform_message_timestamp
 from app.channels.exceptions import ChannelAuthError, ChannelNotImplemented
 from app.utils.logger import logger
+
+# Hard Bot API caps, both below Cremind's own upload ceiling: ``getFile``
+# refuses files over 20 MB and uploads over 50 MB. The userbot transport has
+# neither limit — the bundled doc points people there for big files.
+_TG_BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+_TG_BOT_UPLOAD_LIMIT = 50 * 1024 * 1024
 
 
 def _full_name(user: Any) -> str | None:
@@ -49,6 +56,7 @@ class TelegramAdapter(BaseChannelAdapter):
     supports_group_roster = True
     supports_group_join_events = True
     reports_sender_is_bot = True
+    supports_file_send = True
 
     def __init__(self, channel: dict, storage: Any) -> None:
         super().__init__(channel, storage)
@@ -208,7 +216,13 @@ class TelegramAdapter(BaseChannelAdapter):
             return
 
         msg = getattr(update, "message", None)
-        if msg is None or not msg.text:
+        if msg is None:
+            return
+        files = self._extract_files(msg)
+        # A media message's text lives in ``caption``; a file with no caption
+        # still has to reach the pipeline (the base synthesizes a placeholder).
+        text = msg.text or getattr(msg, "caption", None) or ""
+        if not text and not files:
             return
 
         chat = getattr(msg, "chat", None)
@@ -238,7 +252,7 @@ class TelegramAdapter(BaseChannelAdapter):
                             getattr(user, "last_name", None),
                         ]),
                     ) or None,
-                    text=msg.text,
+                    text=text,
                     platform_message_id=(
                         str(message_id) if message_id is not None else None
                     ),
@@ -248,6 +262,7 @@ class TelegramAdapter(BaseChannelAdapter):
                     platform_message_date=platform_message_timestamp(msg),
                     sender_is_bot=bool(getattr(user, "is_bot", False)),
                     mentioned=self._is_mentioned(msg),
+                    files=files or None,
                 ),
                 name=f"telegram-group-inbound:{self.channel_id}:{chat.id}",
             )
@@ -256,9 +271,83 @@ class TelegramAdapter(BaseChannelAdapter):
         sender_id = str(user.id) if user else str(msg.chat.id)
         display_name = _full_name(user) if user else None
         asyncio.create_task(
-            self._handle_inbound_safe(sender_id, display_name, msg.text),
+            self._handle_inbound_safe(sender_id, display_name, text, files=files or None),
             name=f"telegram-inbound:{self.channel_id}:{sender_id}",
         )
+
+    def _extract_files(self, msg: Any) -> list[IncomingFile]:
+        """Attachment descriptors for one message — no bytes are fetched here.
+
+        Covers documents, photos (largest size), video, audio, voice notes and
+        video notes. Stickers are deliberately skipped: people use them as
+        reactions, and "understand this webp of a cat in sunglasses" is not a
+        request anyone made. Each descriptor's ``fetch`` runs ``getFile`` only
+        after the base adapter has decided the sender may talk to the agent.
+        """
+        message_id = getattr(msg, "message_id", None) or "msg"
+        found: list[IncomingFile] = []
+
+        document = getattr(msg, "document", None)
+        if document is not None:
+            found.append(self._incoming_media(
+                document,
+                getattr(document, "file_name", None) or f"document_{message_id}",
+                getattr(document, "mime_type", None),
+            ))
+        photos = list(getattr(msg, "photo", None) or ())
+        if photos:
+            # PhotoSize entries are ordered smallest→largest; take the original.
+            found.append(self._incoming_media(
+                photos[-1], f"photo_{message_id}.jpg", "image/jpeg",
+            ))
+        video = getattr(msg, "video", None)
+        if video is not None:
+            found.append(self._incoming_media(
+                video,
+                getattr(video, "file_name", None) or f"video_{message_id}.mp4",
+                getattr(video, "mime_type", None) or "video/mp4",
+            ))
+        audio = getattr(msg, "audio", None)
+        if audio is not None:
+            found.append(self._incoming_media(
+                audio,
+                getattr(audio, "file_name", None) or f"audio_{message_id}.mp3",
+                getattr(audio, "mime_type", None),
+            ))
+        voice = getattr(msg, "voice", None)
+        if voice is not None:
+            found.append(self._incoming_media(
+                voice, f"voice_{message_id}.ogg",
+                getattr(voice, "mime_type", None) or "audio/ogg",
+            ))
+        video_note = getattr(msg, "video_note", None)
+        if video_note is not None:
+            found.append(self._incoming_media(
+                video_note, f"video_note_{message_id}.mp4", "video/mp4",
+            ))
+        return found
+
+    def _incoming_media(
+        self, media: Any, name: str, mime: str | None,
+    ) -> IncomingFile:
+        file_id = getattr(media, "file_id", None)
+        size = getattr(media, "file_size", None)
+
+        async def fetch(dest_dir: str) -> str:
+            if size and size > _TG_BOT_DOWNLOAD_LIMIT:
+                raise ValueError(
+                    f"'{name}' is {size} bytes; Telegram bots can only download "
+                    f"files up to {_TG_BOT_DOWNLOAD_LIMIT} bytes (use the "
+                    "userbot transport for bigger files)",
+                )
+            if self._bot is None:
+                self._bot = await self._build_bot()
+            tg_file = await self._bot.get_file(file_id)
+            dest = dest_for(dest_dir, name)
+            await tg_file.download_to_drive(custom_path=dest)
+            return dest
+
+        return IncomingFile(name=name, mime=mime, size=size, fetch=fetch)
 
     def _is_self(self, user: Any) -> bool:
         """Whether an update was written by this very bot.
@@ -411,9 +500,10 @@ class TelegramAdapter(BaseChannelAdapter):
 
     async def _handle_inbound_safe(
         self, sender_id: str, display_name: str | None, text: str,
+        files: Any = None,
     ) -> None:
         try:
-            await self._handle_inbound(sender_id, display_name, text)
+            await self._handle_inbound(sender_id, display_name, text, files=files)
         except Exception:  # noqa: BLE001
             logger.exception("telegram: inbound handler failed")
 
@@ -435,6 +525,20 @@ class TelegramAdapter(BaseChannelAdapter):
         if self._bot is None:
             self._bot = await self._build_bot()
         await self._send_with_retry(int(chat_id), text)
+
+    async def _send_file(
+        self, sender_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        await self._send_document_with_retry(int(sender_id), path, name, caption)
+
+    async def _send_file_to_chat(
+        self, chat_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        await self._send_document_with_retry(int(chat_id), path, name, caption)
 
     async def _send_typing_to_chat(self, chat_id: str) -> None:
         """Show "typing…" in a group, addressed by the room's own (negative) id."""
@@ -525,6 +629,68 @@ class TelegramAdapter(BaseChannelAdapter):
                 last_exc = exc
                 logger.warning(
                     f"telegram: send failed (attempt {attempts}/{max_attempts}); "
+                    f"resetting connection pool. cause={exc}",
+                )
+                await self._reset_bot()
+                await asyncio.sleep(0.75 * attempts)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                break
+        if last_exc is not None:
+            raise last_exc
+
+    async def _send_document_with_retry(
+        self, chat_id: int, path: str, name: str | None, caption: str | None,
+    ) -> None:
+        """``send_document`` with the same stale-pool reset as text sends.
+
+        Everything goes out as a document (not ``send_photo``) so the file
+        arrives byte-identical with its filename — Telegram recompresses
+        photos. Captions are clipped to Telegram's 1024-char cap.
+        """
+        import os
+
+        from telegram.error import NetworkError  # type: ignore
+
+        try:
+            size = os.path.getsize(path)
+        except OSError as exc:
+            raise ValueError(f"cannot read file to send: {path}") from exc
+        if size > _TG_BOT_UPLOAD_LIMIT:
+            raise ValueError(
+                f"'{name or os.path.basename(path)}' is {size} bytes; Telegram "
+                f"bots can only upload files up to {_TG_BOT_UPLOAD_LIMIT} bytes",
+            )
+        clipped = (caption or "")[:1024] or None
+
+        attempts = 0
+        last_exc: Exception | None = None
+        max_attempts = 3
+        while attempts < max_attempts:
+            attempts += 1
+            if self._bot is None:
+                try:
+                    self._bot = await self._build_bot()
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    await asyncio.sleep(0.75 * attempts)
+                    continue
+            try:
+                with open(path, "rb") as handle:
+                    await self._bot.send_document(
+                        chat_id=chat_id,
+                        document=handle,
+                        filename=name or os.path.basename(path),
+                        caption=clipped,
+                        read_timeout=120.0,
+                        write_timeout=120.0,
+                    )
+                return
+            except NetworkError as exc:
+                last_exc = exc
+                logger.warning(
+                    f"telegram: file send failed (attempt {attempts}/{max_attempts}); "
                     f"resetting connection pool. cause={exc}",
                 )
                 await self._reset_bot()

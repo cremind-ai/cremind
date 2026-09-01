@@ -42,7 +42,7 @@ class _FakeAdapter:
     def __init__(self):
         self.messages: list[tuple] = []
 
-    async def handle_webhook_message(self, sender_id, text):
+    async def handle_webhook_message(self, sender_id, text, attachments=None):
         self.messages.append((sender_id, text))
 
 

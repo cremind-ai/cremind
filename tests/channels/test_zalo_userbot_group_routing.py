@@ -84,7 +84,7 @@ def _capture(monkeypatch, adapter):
     async def _group(**kwargs):
         group_calls.append(kwargs)
 
-    async def _dm(sender_id, display_name, text):
+    async def _dm(sender_id, display_name, text, files=None):
         dm_calls.append((sender_id, display_name, text))
 
     monkeypatch.setattr(adapter, "_handle_group_inbound", _group)
@@ -131,6 +131,7 @@ def test_a_room_frame_goes_to_the_group(monkeypatch):
             "sender_is_bot": False,
             # Nobody pinged us in this one; the room decides what that means.
             "mentioned": False,
+            "files": None,
         }]
 
     asyncio.run(scenario())

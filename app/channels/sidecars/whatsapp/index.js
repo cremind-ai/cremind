@@ -18,6 +18,8 @@
  *                             |"disconnected"|"send_ack"|"send_error"
  *                             |"resolve_result"|"error", ...}
  *        parent -> sidecar:  {kind: "send", sender_id, text, request_id?}
+ *                            {kind: "send_file", sender_id, path, name?, mime?,
+ *                             caption?, request_id?}
  *                            {kind: "resolve", phone, request_id}
  *                            {kind: "logout"}
  *
@@ -26,7 +28,14 @@
  *      the room, not to whoever sent it, and the parent routes it into a group
  *      timeline instead of a per-sender conversation.
  *
- *      A "send" carrying a request_id is answered with exactly one
+ *      Media never rides the WebSocket (its frames are capped at 4 MiB).
+ *      Inbound media is downloaded AT RECEIPT into --media-dir (Baileys'
+ *      media keys are only reliably usable near the event) and the frame
+ *      carries {files: [{path, name, mime, size}]}; the parent moves or
+ *      deletes the spooled file. Outbound "send_file" carries the file's
+ *      absolute path — parent and sidecar share the filesystem by design.
+ *
+ *      A "send"/"send_file" carrying a request_id is answered with exactly one
  *      {kind: "send_ack", request_id} or {kind: "send_error", request_id, error}
  *      so the parent can await real delivery to WhatsApp's servers instead of
  *      assuming a write to this socket succeeded. Sends without a request_id
@@ -52,8 +61,16 @@ const workingDir = workingDirArg.startsWith('~')
   ? path.join(os.homedir(), workingDirArg.slice(1))
   : workingDirArg;
 const sessionDir = path.join(workingDir, profile, 'whatsapp', channelId, 'session');
+// Where inbound media is spooled for the parent to claim (see the frame notes
+// above). The parent wipes and recreates it on every spawn.
+const mediaDir = argv['media-dir']
+  || path.join(workingDir, profile, 'whatsapp', channelId, 'media_spool');
+const mediaMaxBytes = Number(argv['media-max-bytes']) > 0
+  ? Number(argv['media-max-bytes'])
+  : 100 * 1024 * 1024;
 
 fs.mkdirSync(sessionDir, { recursive: true });
+fs.mkdirSync(mediaDir, { recursive: true });
 
 let connectedClient = null;
 let sock = null;
@@ -114,13 +131,16 @@ function selfIdentity() {
 
 function unwrapEnvelopes(message) {
   // Protocol envelopes that hide the actual text payload:
-  // ``ephemeralMessage`` wraps disappearing-mode messages, and
-  // ``viewOnceMessage`` / ``viewOnceMessageV2`` wrap one-shot media.
+  // ``ephemeralMessage`` wraps disappearing-mode messages,
+  // ``viewOnceMessage`` / ``viewOnceMessageV2`` wrap one-shot media, and
+  // ``documentWithCaptionMessage`` wraps a captioned document.
   let root = message || {};
-  while (root && (root.ephemeralMessage || root.viewOnceMessage || root.viewOnceMessageV2)) {
+  while (root && (root.ephemeralMessage || root.viewOnceMessage
+    || root.viewOnceMessageV2 || root.documentWithCaptionMessage)) {
     root = (root.ephemeralMessage && root.ephemeralMessage.message)
       || (root.viewOnceMessage && root.viewOnceMessage.message)
       || (root.viewOnceMessageV2 && root.viewOnceMessageV2.message)
+      || (root.documentWithCaptionMessage && root.documentWithCaptionMessage.message)
       || {};
   }
   return root || {};
@@ -131,7 +151,95 @@ function messageText(root) {
     || (root.extendedTextMessage && root.extendedTextMessage.text)
     || (root.imageMessage && root.imageMessage.caption)
     || (root.videoMessage && root.videoMessage.caption)
+    || (root.documentMessage && root.documentMessage.caption)
     || '';
+}
+
+// mime -> filename extension for synthesized media names. Best-effort: an
+// unknown mime just gets no extension and the parent's tools sniff it.
+const EXT_BY_MIME = {
+  'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp',
+  'image/gif': '.gif', 'video/mp4': '.mp4', 'video/3gpp': '.3gp',
+  'audio/ogg': '.ogg', 'audio/mpeg': '.mp3', 'audio/mp4': '.m4a',
+  'audio/aac': '.aac', 'audio/wav': '.wav', 'application/pdf': '.pdf',
+};
+
+function extForMime(mime) {
+  const bare = String(mime || '').split(';')[0].trim().toLowerCase();
+  return EXT_BY_MIME[bare] || '';
+}
+
+function mediaNode(root) {
+  // The one media payload a message carries, if any. Stickers are skipped on
+  // purpose — people use them as reactions, not as files.
+  if (root.documentMessage) {
+    const node = root.documentMessage;
+    return {
+      node,
+      name: String(node.fileName || '').trim()
+        || `document${extForMime(node.mimetype)}`,
+      mime: node.mimetype || null,
+    };
+  }
+  if (root.imageMessage) {
+    const node = root.imageMessage;
+    return { node, name: `image${extForMime(node.mimetype) || '.jpg'}`, mime: node.mimetype || 'image/jpeg' };
+  }
+  if (root.videoMessage) {
+    const node = root.videoMessage;
+    return { node, name: `video${extForMime(node.mimetype) || '.mp4'}`, mime: node.mimetype || 'video/mp4' };
+  }
+  if (root.audioMessage) {
+    const node = root.audioMessage;
+    return { node, name: `audio${extForMime(node.mimetype) || '.ogg'}`, mime: node.mimetype || 'audio/ogg' };
+  }
+  return null;
+}
+
+// Minimal pino-shaped logger for downloadMediaMessage's context arg — it only
+// ever logs; a missing method there must not cost us the download.
+const noopLogger = {
+  level: 'silent',
+  trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {},
+  child() { return noopLogger; },
+};
+
+async function spoolIncomingMedia(m, root) {
+  // Download a message's media into the spool NOW — Baileys' media keys are
+  // only reliably usable near receipt — and hand the parent the path. Returns
+  // [] for no media, over-cap media, or a failed download: the message itself
+  // still flows, just without its file.
+  const media = mediaNode(root);
+  if (!media) return [];
+  const declared = Number(media.node.fileLength);
+  if (Number.isFinite(declared) && declared > mediaMaxBytes) {
+    logInfo(`  media skipped (declared ${declared} bytes > cap ${mediaMaxBytes})`);
+    return [];
+  }
+  try {
+    const { downloadMediaMessage } = require('@whiskeysockets/baileys');
+    const buffer = await downloadMediaMessage(
+      m, 'buffer', {},
+      { logger: noopLogger, reuploadRequest: sock.updateMediaMessage },
+    );
+    if (!buffer || !buffer.length) {
+      logInfo('  media skipped (empty download)');
+      return [];
+    }
+    if (buffer.length > mediaMaxBytes) {
+      logInfo(`  media skipped (downloaded ${buffer.length} bytes > cap ${mediaMaxBytes})`);
+      return [];
+    }
+    const safeName = path.basename(media.name).replace(/[\\/:*?"<>|]/g, '_') || 'file';
+    const spoolName = `${Date.now()}_${((m.key && m.key.id) || 'msg').replace(/[^A-Za-z0-9_-]/g, '')}_${safeName}`;
+    const spoolPath = path.join(mediaDir, spoolName);
+    fs.writeFileSync(spoolPath, buffer);
+    logInfo(`  media spooled ${spoolName} (${buffer.length} bytes)`);
+    return [{ path: spoolPath, name: safeName, mime: media.mime, size: buffer.length }];
+  } catch (e) {
+    logInfo(`  media download failed: ${e && (e.message || e)}`);
+    return [];
+  }
 }
 
 function groupSubject(jid) {
@@ -289,7 +397,7 @@ async function startSocket() {
     }
   });
 
-  sock.ev.on('messages.upsert', ({ messages, type }) => {
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
     logInfo(`messages.upsert type=${type} count=${(messages || []).length}`);
     if (type !== 'notify') return;
     for (const m of messages) {
@@ -308,9 +416,10 @@ async function startSocket() {
 
       const root = unwrapEnvelopes(m.message);
       const text = messageText(root);
-      if (!text) {
+      const files = await spoolIncomingMedia(m, root);
+      if (!text && files.length === 0) {
         const kinds = Object.keys(root || {});
-        logInfo(`  skipped (no text payload; root kinds=[${kinds.join(',')}])`);
+        logInfo(`  skipped (no text or media payload; root kinds=[${kinds.join(',')}])`);
         continue;
       }
 
@@ -322,7 +431,7 @@ async function startSocket() {
         }
         const timestamp = Number(m.messageTimestamp);
         const { mentionedIds, quotedSenderId } = mentionContext(root);
-        logInfo(`  -> incoming_group chat=${remoteJid} sender=${primary} text_len=${text.length}`);
+        logInfo(`  -> incoming_group chat=${remoteJid} sender=${primary} text_len=${text.length} files=${files.length}`);
         emit({
           kind: 'incoming_group',
           chat_id: remoteJid,
@@ -335,10 +444,11 @@ async function startSocket() {
           mentioned_ids: mentionedIds,
           quoted_sender_id: quotedSenderId,
           text,
+          files,
         });
         continue;
       }
-      logInfo(`  -> incoming sender=${remoteJid} text_len=${text.length}`);
+      logInfo(`  -> incoming sender=${remoteJid} text_len=${text.length} files=${files.length}`);
 
       // Preserve the **full JID** as the sender id. Multi-device WhatsApp
       // exposes opaque ``<id>@lid`` identifiers for some contacts; stripping
@@ -353,6 +463,7 @@ async function startSocket() {
         sender_id: senderId,
         display_name: displayName,
         text,
+        files,
       });
     }
   });
@@ -379,6 +490,44 @@ async function handleControl(msg) {
     const jid = senderId.includes('@') ? senderId : `${senderId}@s.whatsapp.net`;
     try {
       await sock.sendMessage(jid, { text: String(msg.text || '') });
+      if (msg.request_id) {
+        emit({ kind: 'send_ack', request_id: msg.request_id, sender_id: msg.sender_id, ok: true });
+      }
+    } catch (e) {
+      emit({
+        kind: 'send_error',
+        request_id: msg.request_id,
+        sender_id: msg.sender_id,
+        error: String(e && e.message || e),
+      });
+    }
+  } else if (msg.kind === 'send_file') {
+    // The frame carries a PATH (never bytes — the WS caps frames at 4 MiB);
+    // parent and sidecar share the filesystem by design. The content shape is
+    // picked by mime so a photo lands as a photo and everything else as a
+    // document with its filename intact. ``{url: <path>}`` streams from disk,
+    // so a big file never has to fit in memory here.
+    const senderId = String(msg.sender_id || '');
+    const jid = senderId.includes('@') ? senderId : `${senderId}@s.whatsapp.net`;
+    try {
+      const filePath = String(msg.path || '');
+      if (!filePath || !fs.existsSync(filePath)) {
+        throw new Error(`file not found: ${filePath}`);
+      }
+      const name = String(msg.name || path.basename(filePath) || 'file');
+      const mime = String(msg.mime || '') || 'application/octet-stream';
+      const caption = msg.caption ? String(msg.caption) : undefined;
+      let content;
+      if (mime.startsWith('image/') && mime !== 'image/svg+xml') {
+        content = { image: { url: filePath }, caption };
+      } else if (mime.startsWith('video/')) {
+        content = { video: { url: filePath }, caption, mimetype: mime };
+      } else if (mime.startsWith('audio/')) {
+        content = { audio: { url: filePath }, mimetype: mime };
+      } else {
+        content = { document: { url: filePath }, fileName: name, mimetype: mime, caption };
+      }
+      await sock.sendMessage(jid, content);
       if (msg.request_id) {
         emit({ kind: 'send_ack', request_id: msg.request_id, sender_id: msg.sender_id, ok: true });
       }

@@ -30,8 +30,12 @@ Zalo Bot API quirks:
 from __future__ import annotations
 
 import asyncio
+import mimetypes
+import os
 from typing import Any
+from urllib.parse import urlparse
 
+from app.channels.attachments import IncomingFile, dest_for
 from app.channels.base import BaseChannelAdapter, _split_for_messaging
 from app.channels.exceptions import ChannelAuthError, ChannelNotImplemented
 from app.utils.logger import logger
@@ -257,10 +261,27 @@ class ZaloBotAdapter(BaseChannelAdapter):
         message = update.get("message")
         if not isinstance(message, dict):
             return
-        # v1 handles inbound text only; other event kinds (image/sticker/
-        # unsupported) are logged and skipped.
+        # Text events flow as before. Media events flow when the update carries
+        # a downloadable URL; the Bot API's media payloads are thinly documented,
+        # so detection is defensive (see ``_extract_files``) and anything else —
+        # stickers included — is logged and skipped. Outbound file support stays
+        # off for this transport (``supports_file_send`` default): the Bot API
+        # exposes no reliable upload surface, so the base fallback notice covers
+        # agent-sent files honestly.
         text = message.get("text")
-        if event_name != "message.text.received" or not text:
+        files: list[IncomingFile] = []
+        if event_name == "message.text.received" and text:
+            body = str(text)
+        elif event_name.startswith("message.") and event_name.endswith(".received"):
+            body = str(message.get("caption") or "")
+            files = self._extract_files(message)
+            if not body and not files:
+                logger.debug(
+                    f"zalo: skipping event={event_name!r} "
+                    f"(no text and no downloadable payload; keys={sorted(message)})",
+                )
+                return
+        else:
             logger.debug(f"zalo: skipping event={event_name!r} (no text payload)")
             return
         chat = message.get("chat") or {}
@@ -289,12 +310,13 @@ class ZaloBotAdapter(BaseChannelAdapter):
                     # the name is all there is to attribute the post to.
                     sender_username=None,
                     display_name=sender.get("display_name") or sender.get("name"),
-                    text=str(text),
+                    text=body,
                     platform_message_id=(
                         str(message_id) if message_id is not None else None
                     ),
                     platform_message_date=_message_epoch(message.get("date")),
                     sender_is_bot=bool(sender.get("is_bot")),
+                    files=files or None,
                 ),
                 name=f"zalo-group-inbound:{self.channel_id}:{chat_id}",
             )
@@ -304,15 +326,51 @@ class ZaloBotAdapter(BaseChannelAdapter):
         # ``sendMessage`` wants back, and the two are not interchangeable.
         display_name = sender.get("display_name") or sender.get("name")
         asyncio.create_task(
-            self._handle_inbound_safe(chat_id, display_name, str(text)),
+            self._handle_inbound_safe(chat_id, display_name, body, files=files or None),
             name=f"zalo-inbound:{self.channel_id}:{chat_id}",
         )
 
+    def _extract_files(self, message: dict) -> list[IncomingFile]:
+        """Descriptors for a media update's downloadable URL, if it has one.
+
+        The Bot API's media payloads are thinly documented, so this probes the
+        plausible URL fields and logs (rather than guesses) when none match —
+        the debug line names the keys so a real payload shape can be added.
+        """
+        found: list[IncomingFile] = []
+        for key in ("photo_url", "file_url", "document_url", "image_url", "photo"):
+            value = message.get(key)
+            if not isinstance(value, str) or not value.startswith("http"):
+                continue
+            name = os.path.basename(urlparse(value).path) or f"zalo_{key}"
+            mime, _ = mimetypes.guess_type(name)
+
+            def _make_fetch(url: str = value, name: str = name):
+                async def fetch(dest_dir: str) -> str:
+                    import httpx
+
+                    dest = dest_for(dest_dir, name)
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(120.0), follow_redirects=True,
+                    ) as client:
+                        async with client.stream("GET", url) as resp:
+                            resp.raise_for_status()
+                            with open(dest, "wb") as out:
+                                async for chunk in resp.aiter_bytes(1 << 20):
+                                    out.write(chunk)
+                    return dest
+
+                return fetch
+
+            found.append(IncomingFile(name=name, mime=mime, fetch=_make_fetch()))
+        return found
+
     async def _handle_inbound_safe(
         self, sender_id: str, display_name: str | None, text: str,
+        files: Any = None,
     ) -> None:
         try:
-            await self._handle_inbound(sender_id, display_name, text)
+            await self._handle_inbound(sender_id, display_name, text, files=files)
         except Exception:  # noqa: BLE001
             logger.exception("zalo: inbound handler failed")
 

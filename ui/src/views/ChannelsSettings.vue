@@ -10,6 +10,7 @@ import { useChannelsStore, MAIN_CHANNEL_TYPE } from '../stores/channels';
 import type {
   ChannelCatalogEntry, ChannelRow, CreateChannelPayload,
 } from '../services/channelApi';
+import ChannelAddGrid from '../components/channels/ChannelAddGrid.vue';
 import ChannelPairingDialog from '../components/channels/ChannelPairingDialog.vue';
 import ChannelEditDialog from '../components/channels/ChannelEditDialog.vue';
 
@@ -271,32 +272,7 @@ onMounted(loadAll);
 
         <div v-if="availableForAdd.length > 0" class="add-section">
           <h3>Add a channel</h3>
-          <div class="add-grid">
-            <ElCard
-              v-for="entry in availableForAdd"
-              :key="entry.type"
-              shadow="hover"
-              class="add-card"
-              :class="{ disabled: entry.implemented === false }"
-              @click="entry.implemented !== false && openCreate(entry.type)"
-            >
-              <div class="add-card-content">
-                <Icon :icon="entry.icon || 'mdi:link-variant'" class="add-icon" />
-                <div>
-                  <div class="add-name">
-                    {{ entry.display_name }}
-                    <ElTag
-                      v-if="entry.implemented === false"
-                      type="info" size="small" effect="plain"
-                    >coming soon</ElTag>
-                  </div>
-                  <div class="add-modes">
-                    {{ entry.modes.map((m) => m.label).join(' · ') }}
-                  </div>
-                </div>
-              </div>
-            </ElCard>
-          </div>
+          <ChannelAddGrid :channels="availableForAdd" @select="openCreate" />
         </div>
       </template>
     </div>
@@ -353,13 +329,7 @@ onMounted(loadAll);
 .channel-error { font-size: 0.85rem; color: var(--el-color-danger); margin-top: 4px; }
 .channel-actions { display: flex; align-items: center; gap: 8px; }
 
+/* The grid itself lives in ChannelAddGrid.vue; only its heading is ours. */
 .add-section { margin-top: 32px; }
 .add-section h3 { font-size: 1rem; font-weight: 600; margin-bottom: 12px; }
-.add-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
-.add-card { cursor: pointer; }
-.add-card.disabled { cursor: not-allowed; opacity: 0.6; }
-.add-card-content { display: flex; align-items: center; gap: 12px; }
-.add-icon { font-size: 28px; color: var(--primary-color); flex-shrink: 0; }
-.add-name { font-weight: 600; display: flex; align-items: center; gap: 8px; }
-.add-modes { font-size: 0.8rem; color: var(--text-secondary); margin-top: 2px; }
 </style>

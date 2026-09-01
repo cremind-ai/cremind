@@ -15,14 +15,24 @@
  *      `zalo.loginQR(...)` and emit {kind:"qr"} until the user scans.
  *   4. Events flow parent <-> sidecar as JSON frames:
  *        sidecar -> parent:  {kind:"qr"|"ready"|"incoming"|"incoming_group"
- *                             |"disconnected"|"send_error"|"error", ...}
+ *                             |"disconnected"|"send_error"|"send_file_result"
+ *                             |"error", ...}
  *        parent -> sidecar:  {kind:"send", sender_id, text, thread_type?}
+ *                            {kind:"send_file", sender_id, path, name?,
+ *                             caption?, thread_type?, request_id}
  *                            {kind:"typing", sender_id, thread_type?}
  *                            {kind:"logout"}
  *
  * `sender_id` carries a thread id, which is a person's on a DM and a room's in
  * a group; `thread_type` (default THREAD_USER) is the only thing that says
  * which, so a room send without it would be delivered to whoever owns that id.
+ *
+ * Media never rides the WebSocket (4 MiB frame cap). Inbound media is
+ * downloaded AT RECEIPT into --media-dir and the frame carries
+ * {files: [{path, name, mime, size}]}; the parent moves or deletes the
+ * spooled file. Outbound "send_file" carries an absolute path — parent and
+ * sidecar share the filesystem by design — and is answered with exactly one
+ * correlated {kind:"send_file_result", request_id, ok, error?}.
  *
  * Credentials (cookie/imei/userAgent) are persisted per (profile, channel-id)
  * at <working-dir>/<profile>/zalo/<channel-id>/credentials.json so a paired
@@ -56,8 +66,14 @@ const workingDir = workingDirArg.startsWith('~')
   : workingDirArg;
 const sessionDir = path.join(workingDir, profile, 'zalo', channelId);
 const credsFile = path.join(sessionDir, 'credentials.json');
+// Inbound-media spool (see the frame notes above). Parent wipes it per spawn.
+const mediaDir = argv['media-dir'] || path.join(sessionDir, 'media_spool');
+const mediaMaxBytes = Number(argv['media-max-bytes']) > 0
+  ? Number(argv['media-max-bytes'])
+  : 100 * 1024 * 1024;
 
 fs.mkdirSync(sessionDir, { recursive: true });
+fs.mkdirSync(mediaDir, { recursive: true });
 
 let connectedClient = null;
 let api = null;
@@ -185,6 +201,78 @@ function extractText(content) {
   return '';
 }
 
+// zca-js msgType values that carry a downloadable payload in content.href.
+// Unofficial library — the shapes drift between builds, so detection is
+// defensive and every unrecognised media shape is logged rather than guessed
+// at. Stickers are deliberately absent: they are reactions, not files.
+const MEDIA_MSG_TYPES = new Set([
+  'chat.photo', 'share.file', 'chat.video.msg', 'chat.voice', 'chat.gif',
+]);
+
+function mediaFromMessage(data) {
+  // {url, name, isFile} for a media message, or null. `title` is the FILENAME
+  // on a share.file and (when present) the CAPTION on a photo/video — the
+  // caller uses `isFile` to keep a filename from becoming message text.
+  const content = data && data.content;
+  const msgType = String((data && data.msgType) || '');
+  if (!content || typeof content !== 'object' || !content.href) return null;
+  if (!MEDIA_MSG_TYPES.has(msgType)) {
+    if (msgType) logInfo(`media-like content ignored (msgType=${msgType})`);
+    return null;
+  }
+  const isFile = msgType === 'share.file';
+  let name = isFile ? String(content.title || '').trim() : '';
+  if (!name) {
+    try {
+      const urlPath = new URL(content.href).pathname;
+      name = path.basename(urlPath) || '';
+    } catch (e) { /* fall through */ }
+  }
+  if (!name) {
+    const ext = msgType === 'chat.photo' ? '.jpg'
+      : msgType === 'chat.video.msg' ? '.mp4'
+        : msgType === 'chat.voice' ? '.aac'
+          : msgType === 'chat.gif' ? '.gif' : '';
+    name = `zalo_media${ext}`;
+  }
+  return { url: content.href, name, isFile };
+}
+
+async function spoolIncomingMedia(media) {
+  // Download a media message's payload into the spool NOW (the CDN URLs are
+  // session-scoped) and hand the parent the path. Returns [] for no media,
+  // over-cap media, or a failed download — the message still flows.
+  if (!media) return [];
+  try {
+    const resp = await fetch(media.url);
+    if (!resp.ok) {
+      logInfo(`media download failed (${resp.status}) for ${media.name}`);
+      return [];
+    }
+    const declared = Number(resp.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > mediaMaxBytes) {
+      logInfo(`media skipped (declared ${declared} bytes > cap ${mediaMaxBytes})`);
+      return [];
+    }
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    if (!buffer.length) return [];
+    if (buffer.length > mediaMaxBytes) {
+      logInfo(`media skipped (downloaded ${buffer.length} bytes > cap ${mediaMaxBytes})`);
+      return [];
+    }
+    const safeName = path.basename(media.name).replace(/[\\/:*?"<>|]/g, '_') || 'file';
+    const spoolName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${safeName}`;
+    const spoolPath = path.join(mediaDir, spoolName);
+    fs.writeFileSync(spoolPath, buffer);
+    logInfo(`media spooled ${spoolName} (${buffer.length} bytes)`);
+    const mime = String(resp.headers.get('content-type') || '').split(';')[0] || null;
+    return [{ path: spoolPath, name: safeName, mime, size: buffer.length }];
+  } catch (e) {
+    logInfo(`media download failed: ${e && (e.message || e)}`);
+    return [];
+  }
+}
+
 async function startZalo() {
   loginAttempt += 1;
   // `selfListen: true` is load-bearing for group discovery, not a debugging
@@ -288,8 +376,19 @@ function startListener() {
     try {
       if (!m || m.isSelf) return;
       const data = m.data || {};
-      const text = extractText(data.content);
-      if (!text) return;
+      const media = mediaFromMessage(data);
+      const files = media ? await spoolIncomingMedia(media) : [];
+      // For a media message the old extractText would surface content.title —
+      // the FILENAME on a share.file — or the raw CDN href as "text". With the
+      // file itself flowing, the text is only what the sender actually typed:
+      // a photo/video caption (title), or nothing.
+      let text;
+      if (media) {
+        text = media.isFile ? '' : String((data.content && data.content.title) || '');
+      } else {
+        text = extractText(data.content);
+      }
+      if (!text && files.length === 0) return;
       if (m.type === THREAD_GROUP) {
         // A room message is addressed to the room. It used to be dropped here,
         // which is why a personal account could never carry a bound group.
@@ -312,13 +411,14 @@ function startListener() {
             .filter(Boolean),
           quoted_sender_id: (data.quote && String(data.quote.ownerId || '')) || null,
           text,
+          files,
         });
         return;
       }
       const senderId = String(data.uidFrom || m.threadId || '');
       if (!senderId) return;
       const displayName = data.dName || senderId;
-      emit({ kind: 'incoming', sender_id: senderId, display_name: displayName, text });
+      emit({ kind: 'incoming', sender_id: senderId, display_name: displayName, text, files });
     } catch (e) {
       logErr('onMessage', e);
     }
@@ -407,9 +507,9 @@ async function handleControl(msg) {
   if (!api) {
     // Answer on the correlation id the caller waits on where there is one, so a
     // roster request fails fast instead of hanging until its timeout.
-    if (msg.kind === 'group_info' || msg.kind === 'list_groups') {
+    if (msg.kind === 'group_info' || msg.kind === 'list_groups' || msg.kind === 'send_file') {
       emit({
-        kind: `${msg.kind === 'group_info' ? 'group_info' : 'list_groups'}_result`,
+        kind: `${msg.kind}_result`,
         request_id: msg.request_id,
         ok: false,
         error: 'sidecar not ready',
@@ -428,6 +528,30 @@ async function handleControl(msg) {
       await api.sendMessage(text, threadId, threadTypeOf(msg));
     } catch (e) {
       emit({ kind: 'send_error', sender_id: msg.sender_id, error: String((e && e.message) || e) });
+    }
+  } else if (msg.kind === 'send_file') {
+    // zca-js MessageContent takes an `attachments` array of local file paths;
+    // the caption rides in `msg`. Answered with a correlated result frame so
+    // the parent's strict senders can record what really happened.
+    const threadId = String(msg.sender_id || '');
+    try {
+      const filePath = String(msg.path || '');
+      if (!filePath || !fs.existsSync(filePath)) {
+        throw new Error(`file not found: ${filePath}`);
+      }
+      await api.sendMessage(
+        { msg: String(msg.caption || ''), attachments: [filePath] },
+        threadId,
+        threadTypeOf(msg),
+      );
+      emit({ kind: 'send_file_result', request_id: msg.request_id, ok: true });
+    } catch (e) {
+      emit({
+        kind: 'send_file_result',
+        request_id: msg.request_id,
+        ok: false,
+        error: String((e && e.message) || e),
+      });
     }
   } else if (msg.kind === 'list_groups') {
     // Every group this account is in. `getAllGroups` returns ids only, so the

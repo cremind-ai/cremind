@@ -32,6 +32,7 @@ reads that state so exactly one copy of the message ever reaches the model.
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -413,6 +414,27 @@ async def _deliver_followup(
     return True
 
 
+def _attachments_from_parts(parts: Any) -> Optional[List[Dict[str, Any]]]:
+    """Rebuild ``[{"name", "path"}]`` attachments from a persisted row's parts.
+
+    The park payload lives in memory, so after a crash the file parts on the
+    persisted row are the only record of what was attached. Paths that no
+    longer exist are dropped — the uploads_tmp tree may have been wiped on
+    this same boot — which still beats the old behaviour of dropping all of
+    them unconditionally (files the agent had already moved out survive).
+    """
+    result: List[Dict[str, Any]] = []
+    for part in parts or []:
+        if not isinstance(part, dict) or part.get("kind") != "file":
+            continue
+        info = part.get("file") or {}
+        path = str(info.get("uri") or "")
+        if not path or not os.path.isfile(path):
+            continue
+        result.append({"name": info.get("name") or os.path.basename(path), "path": path})
+    return result or None
+
+
 async def sweep_stranded_mid_turn_messages() -> int:
     """Release mid-turn rows a crash left parked, and answer them.
 
@@ -457,7 +479,7 @@ async def sweep_stranded_mid_turn_messages() -> int:
                 "message_id": message_id,
                 "text": row.get("content") or "",
                 "agent_text": row.get("content") or "",
-                "attachments": None,
+                "attachments": _attachments_from_parts(row.get("parts")),
                 "mode": "reasoning",
                 "reasoning": True,
                 "event_run": False,

@@ -308,6 +308,86 @@ def _kubernetes_sqlite_rejection(requested: str) -> str | None:
     return None
 
 
+def _oauth_auth_method_ids(provider_name: str) -> set[str]:
+    """Ids of a provider's ``kind = "oauth"`` auth methods, per its TOML catalog.
+
+    Returns an empty set for an unknown provider (including a
+    ``custom:<slug>`` one, which has no TOML file at all) or an unreadable
+    catalog — callers read "no oauth methods" as "nothing to filter", which is
+    the safe direction: a catalog problem must never break setup.
+    """
+    try:
+        from app.config import load_provider_catalog
+        from app.config.provider_auth import normalize_provider_auth_methods
+
+        catalog = load_provider_catalog(provider_name)
+        methods = normalize_provider_auth_methods(catalog.get("provider") or {})
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            f"Could not read auth methods for provider {provider_name!r}",
+            exc_info=True,
+        )
+        return set()
+    return {
+        str(m.get("id"))
+        for m in methods
+        if isinstance(m, dict) and str(m.get("kind") or "").lower() == "oauth"
+    }
+
+
+def _drop_unusable_oauth_auth_methods(llm_config: dict) -> dict:
+    """Strip ``<provider>.auth_method`` picks the wizard can't actually complete.
+
+    An auth method whose catalog ``kind`` is ``"oauth"`` (today only OpenAI's
+    ``codex_oauth``) works only once its browser sign-in has stored tokens
+    server-side, and that flow cannot run inside the wizard. Persisting the
+    bare selection pins the brand-new profile to an unconfigured backend: the
+    LLM page reads "Not Configured" and offers only the models that backend can
+    serve, while the API key the user typed sits unused. Dropping the key lets
+    the profile fall back to the provider's default method instead.
+    ``kind = "device_code"`` (GitHub Copilot) is deliberately left alone — that
+    flow *does* complete during setup.
+
+    The one exemption: a payload that also carries ``<provider>.oauth_token``
+    is handing us a real token alongside the choice, so that selection is
+    honored. Nothing produces such a payload today — it is an escape hatch for
+    a future caller that can supply tokens inline (restore replays a DB dump
+    without touching this handler, and ``SETUP_WIZARD_ENV`` only carries
+    deployment presets). Known limitation: the check looks only at the payload,
+    never at tokens ALREADY stored for the target profile, so re-running the
+    wizard over a profile that has completed the browser sign-in still drops
+    the pick unless the token is re-sent.
+
+    Returns a new dict; the caller's payload is left untouched. A non-dict
+    payload is passed through unchanged so the caller's own handling of it is
+    unaffected. Extracted to module level so the filter is unit-testable
+    without driving the whole setup flow (same reason as
+    :func:`_kubernetes_sqlite_rejection`).
+    """
+    if not isinstance(llm_config, dict):
+        return llm_config
+    suffix = ".auth_method"
+    out: dict = {}
+    oauth_ids: dict[str, set[str]] = {}
+    for key, value in llm_config.items():
+        provider = key[: -len(suffix)] if key.endswith(suffix) else ""
+        # A bare ``auth_method`` names no provider, so there is no catalog to
+        # check it against — leave it to the persist loop untouched.
+        if provider and not llm_config.get(f"{provider}.oauth_token"):
+            if provider not in oauth_ids:
+                oauth_ids[provider] = _oauth_auth_method_ids(provider)
+            if str(value) in oauth_ids[provider]:
+                logger.warning(
+                    f"setup: dropping {key}={value!r} — that auth method needs a "
+                    f"browser sign-in the wizard can't complete, and persisting "
+                    f"it would leave the profile pinned to an unconfigured "
+                    f"{provider} backend"
+                )
+                continue
+        out[key] = value
+    return out
+
+
 def _apply_injected_postgres_password(pg_in: dict) -> None:
     """Fill an empty Postgres password from the injected ``CREMIND_POSTGRES_PASSWORD``.
 
@@ -1060,7 +1140,11 @@ def get_config_routes(state: BootedState) -> list[Route]:
         # Save LLM and tool configs for ALL profiles (including first setup)
         # (must happen before on_first_setup so tool enabled states are persisted)
         _emit_setup("llm_config", "Saving LLM provider settings…")
-        llm_config = body.get("llm_config", {})
+        # Defense in depth: the wizard has no way to finish a browser OAuth
+        # sign-in, so an OAuth ``auth_method`` arriving without tokens would
+        # strand the new profile on a backend it can't reach. Drop it here
+        # rather than trusting the frontend not to send it.
+        llm_config = _drop_unusable_oauth_auth_methods(body.get("llm_config", {}))
         for key, value in llm_config.items():
             is_secret = (
                 "api_key" in key
@@ -1376,6 +1460,15 @@ def get_config_routes(state: BootedState) -> list[Route]:
 
         Requires admin auth. Does NOT delete profiles or data.
         """
+        # The gate every caller was already told to expect — this docstring,
+        # the CLI client, `cremind setup` help and the bundled doc all say
+        # "admin auth required", and the unauthenticated sibling below points
+        # here as the authenticated path. Without it, anyone could clear
+        # ``setup_complete`` and then walk the first-setup branch of
+        # ``handle_setup`` to be issued a fresh admin token.
+        denied = require_admin(request)
+        if denied is not None:
+            return denied
         if gate := _require_storage():
             return gate
         state.config_storage.delete("server_config", "setup_complete")

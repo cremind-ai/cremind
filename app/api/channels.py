@@ -11,6 +11,9 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
+import shutil
+import uuid
 from typing import Any
 
 from starlette.requests import Request
@@ -25,6 +28,92 @@ from app.utils.logger import logger
 
 
 _REDACTED = "***"
+
+
+async def _parse_send_body(
+    request: Request, profile: str,
+) -> tuple[dict, list[dict], str | None, JSONResponse | None]:
+    """Parse a ``/notify`` / ``/message`` body in either of its two forms.
+
+    Returns ``(payload, attachments, spool_dir, error)``. JSON bodies stay as
+    before, plus an optional ``attachments`` array of ABSOLUTE server paths —
+    validated against the profile's own roots, exactly the boundary the agent's
+    tools enforce. ``multipart/form-data`` (the remote-CLI form: the caller has
+    no server filesystem to point at) carries the same JSON in a ``payload``
+    field plus any number of file parts, written into a throwaway spool inside
+    ``uploads_tmp`` — inside on purpose, so the boot wipe and the idle pruner
+    cover a crash-leaked spool. The CALLER removes ``spool_dir`` in a
+    ``finally`` after delivery.
+    """
+    from app.channels.attachments import validate_outbound_paths
+    from app.utils.uploads_tmp import max_upload_bytes, uploads_tmp_root
+
+    content_type = (request.headers.get("content-type") or "").lower()
+    if content_type.startswith("multipart/"):
+        from app.api.files import _write_upload
+
+        try:
+            form = await request.form()
+        except Exception:  # noqa: BLE001
+            return {}, [], None, JSONResponse(
+                {"error": "Invalid multipart body"}, status_code=400,
+            )
+        raw_payload = form.get("payload")
+        payload: dict = {}
+        if raw_payload:
+            try:
+                parsed = json.loads(str(raw_payload))
+                payload = parsed if isinstance(parsed, dict) else {}
+            except Exception:  # noqa: BLE001
+                return {}, [], None, JSONResponse(
+                    {"error": "'payload' must be a JSON object"}, status_code=400,
+                )
+        spool_dir = os.path.join(uploads_tmp_root(profile), f"outbound-{uuid.uuid4()}")
+        os.makedirs(spool_dir, exist_ok=True)
+        attachments: list[dict] = []
+        cap = max_upload_bytes()
+        for value in form.values():
+            if not hasattr(value, "filename") or not getattr(value, "filename", None):
+                continue
+            result = await _write_upload(value, spool_dir, max_bytes=cap)
+            if result.get("status") == "error":
+                shutil.rmtree(spool_dir, ignore_errors=True)
+                return {}, [], None, JSONResponse(
+                    {"error": "Upload failed", "detail": result}, status_code=400,
+                )
+            attachments.append({
+                "path": result["path"],
+                "name": result.get("saved_as") or result.get("name"),
+            })
+        return payload, attachments, spool_dir, None
+
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        return {}, [], None, JSONResponse(
+            {"error": "Invalid JSON body"}, status_code=400,
+        )
+    if not isinstance(payload, dict):
+        return {}, [], None, JSONResponse(
+            {"error": "Body must be a JSON object"}, status_code=400,
+        )
+    raw_attachments = payload.get("attachments") or []
+    if raw_attachments:
+        ok, rejected = validate_outbound_paths(profile, raw_attachments)
+        if rejected:
+            return {}, [], None, JSONResponse(
+                {
+                    "error": "Invalid attachments",
+                    "message": (
+                        "Attachment paths must be existing files inside this "
+                        "profile's own directories."
+                    ),
+                    "rejected": rejected,
+                },
+                status_code=400,
+            )
+        return payload, ok, None, None
+    return payload, [], None, None
 
 
 def _require_auth(request: Request):
@@ -940,13 +1029,16 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
     async def handle_notify_channel(request: Request) -> JSONResponse:
         """Push an ad-hoc message OUT to a notification-mode channel.
 
-        Body: ``{"message": "..."}``. Delivers straight to the channel's
-        recipients (configured ``target_chat_ids`` ∪ authenticated subscribers)
-        via the live adapter's ``deliver_text`` — a direct push that bypasses
-        the channel's ``NotificationFilter`` (an explicit, operator-initiated
-        send). Backs ``cremind channels send`` and mirrors the agent's
-        ``send_notification`` tool. Only valid for ``mode == "notification"``
-        channels with a running adapter.
+        Body: JSON ``{"message": "...", "attachments": ["<abs server path>"]?}``
+        or ``multipart/form-data`` with a ``payload`` JSON field plus file
+        parts (the remote-CLI form — see ``_parse_send_body``). Delivers
+        straight to the channel's recipients (configured ``target_chat_ids`` ∪
+        authenticated subscribers) via the live adapter's ``deliver_text`` /
+        ``deliver_file`` — a direct push that bypasses the channel's
+        ``NotificationFilter`` (an explicit, operator-initiated send). Backs
+        ``cremind channels send`` and mirrors the agent's ``send_notification``
+        tool. Only valid for ``mode == "notification"`` channels with a
+        running adapter.
         """
         unauth = _require_auth(request)
         if unauth is not None:
@@ -970,50 +1062,67 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
                 status_code=400,
             )
 
+        payload, attachments, spool_dir, err = await _parse_send_body(request, profile)
+        if err is not None:
+            return err
         try:
-            payload = await request.json()
-        except Exception:  # noqa: BLE001
-            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        if not isinstance(payload, dict):
-            return JSONResponse({"error": "Body must be a JSON object"}, status_code=400)
-        message = str(payload.get("message") or "").strip()
-        if not message:
-            return JSONResponse(
-                {"error": "'message' is required and cannot be empty"},
-                status_code=400,
-            )
+            message = str(payload.get("message") or "").strip()
+            if not message and not attachments:
+                return JSONResponse(
+                    {"error": "'message' is required and cannot be empty"},
+                    status_code=400,
+                )
 
-        try:
-            adapter = get_channel_registry().get_adapter(cid)
-        except RuntimeError:
-            adapter = None
-        if adapter is None:
-            return JSONResponse(
-                {
-                    "error": "Adapter not running",
-                    "message": (
-                        "The channel is not currently running, so nothing could "
-                        "be delivered."
-                    ),
-                },
-                status_code=409,
-            )
+            try:
+                adapter = get_channel_registry().get_adapter(cid)
+            except RuntimeError:
+                adapter = None
+            if adapter is None:
+                return JSONResponse(
+                    {
+                        "error": "Adapter not running",
+                        "message": (
+                            "The channel is not currently running, so nothing could "
+                            "be delivered."
+                        ),
+                    },
+                    status_code=409,
+                )
 
-        try:
-            recipients = await adapter.deliver_text(message)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception(f"channels: notify send failed for {cid}")
-            return JSONResponse(
-                {"error": "Delivery failed", "message": str(exc)},
-                status_code=502,
-            )
-        return JSONResponse({"delivered": recipients > 0, "recipients": recipients})
+            try:
+                recipients = await adapter.deliver_text(message) if message else 0
+                files_delivered = 0
+                if attachments:
+                    for att in attachments:
+                        count = await adapter.deliver_file(
+                            att["path"], name=att.get("name"),
+                        )
+                        recipients = max(recipients, count)
+                        if count > 0:
+                            files_delivered += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(f"channels: notify send failed for {cid}")
+                return JSONResponse(
+                    {"error": "Delivery failed", "message": str(exc)},
+                    status_code=502,
+                )
+            body: dict[str, Any] = {
+                "delivered": recipients > 0,
+                "recipients": recipients,
+            }
+            if attachments:
+                body["files_delivered"] = files_delivered
+            return JSONResponse(body)
+        finally:
+            if spool_dir:
+                shutil.rmtree(spool_dir, ignore_errors=True)
 
     async def handle_send_channel_message(request: Request) -> JSONResponse:
         """Message specific clients on this channel — one or many.
 
         Body: ``{"recipients": [{"to", "message"?, "name"?}, ...], "message"?,
-        "dry_run"?, "default_country_code"?}``. Unlike ``/notify`` (which
+        "dry_run"?, "default_country_code"?, "attachments"?}`` — or the same
+        as multipart with file parts (see ``_parse_send_body``). Unlike ``/notify`` (which
         broadcasts to the channel's own subscribers), this addresses named
         individuals by platform sender id or phone number, registers anyone the
         platform lets us contact cold, and records each delivered message in
@@ -1039,58 +1148,59 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         if ch["profile"] != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
 
+        payload, attachments, spool_dir, err = await _parse_send_body(request, profile)
+        if err is not None:
+            return err
         try:
-            payload = await request.json()
-        except Exception:  # noqa: BLE001
-            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        if not isinstance(payload, dict):
-            return JSONResponse({"error": "Body must be a JSON object"}, status_code=400)
+            from app.channels import direct_send
 
-        from app.channels import direct_send
+            try:
+                recipients = direct_send.normalize_recipients(payload.get("recipients"))
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
 
-        try:
-            recipients = direct_send.normalize_recipients(payload.get("recipients"))
-        except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
+            dry_run = payload.get("dry_run")
+            dry_run = True if dry_run is None else bool(dry_run)
 
-        dry_run = payload.get("dry_run")
-        dry_run = True if dry_run is None else bool(dry_run)
+            try:
+                adapter = get_channel_registry().get_adapter(cid)
+            except RuntimeError:
+                adapter = None
+            if adapter is None:
+                return JSONResponse(
+                    {
+                        "error": "Adapter not running",
+                        "message": (
+                            "The channel is not currently running, so nothing could "
+                            "be delivered."
+                        ),
+                    },
+                    status_code=409,
+                )
 
-        try:
-            adapter = get_channel_registry().get_adapter(cid)
-        except RuntimeError:
-            adapter = None
-        if adapter is None:
-            return JSONResponse(
-                {
-                    "error": "Adapter not running",
-                    "message": (
-                        "The channel is not currently running, so nothing could "
-                        "be delivered."
-                    ),
-                },
-                status_code=409,
-            )
-
-        try:
-            summary = await direct_send.send_direct_messages(
-                adapters=[adapter],
-                storage=conversation_storage,
-                recipients=recipients,
-                message=payload.get("message"),
-                default_country_code=payload.get("default_country_code"),
-                dry_run=dry_run,
-                initiated_by="api",
-            )
-        except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception(f"channels: direct send failed for {cid}")
-            return JSONResponse(
-                {"error": "Delivery failed", "message": str(exc)},
-                status_code=502,
-            )
-        return JSONResponse(summary)
+            try:
+                summary = await direct_send.send_direct_messages(
+                    adapters=[adapter],
+                    storage=conversation_storage,
+                    recipients=recipients,
+                    message=payload.get("message"),
+                    default_country_code=payload.get("default_country_code"),
+                    dry_run=dry_run,
+                    initiated_by="api",
+                    attachments=attachments or None,
+                )
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(f"channels: direct send failed for {cid}")
+                return JSONResponse(
+                    {"error": "Delivery failed", "message": str(exc)},
+                    status_code=502,
+                )
+            return JSONResponse(summary)
+        finally:
+            if spool_dir:
+                shutil.rmtree(spool_dir, ignore_errors=True)
 
     async def handle_messenger_webhook(request: Request):
         """Public Facebook Messenger webhook (GET verify + POST receive).
@@ -1148,9 +1258,16 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
                         continue
                     sender = (evt.get("sender") or {}).get("id")
                     text = message.get("text")
-                    if sender and text:
+                    attachments = [
+                        a for a in (message.get("attachments") or [])
+                        if isinstance(a, dict)
+                    ]
+                    if sender and (text or attachments):
                         try:
-                            await adapter.handle_webhook_message(str(sender), str(text))
+                            await adapter.handle_webhook_message(
+                                str(sender), str(text or ""),
+                                attachments=attachments or None,
+                            )
                         except Exception:  # noqa: BLE001
                             logger.exception(
                                 f"messenger[{channel_id}]: inbound handling failed",

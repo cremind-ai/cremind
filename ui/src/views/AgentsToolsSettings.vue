@@ -1284,11 +1284,12 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
 }
 .feature-install-log {
   max-height: 240px; overflow-y: auto;
-  background: var(--el-fill-color-darker);
-  border: 1px solid var(--el-border-color);
+  background: var(--bg-color);
+  border: 1px solid var(--border-color);
   border-radius: 4px;
   padding: 8px 12px;
   margin: 12px 0;
+  color: var(--text-primary);
   font-family: var(--el-font-family-monospace, ui-monospace, Menlo, monospace);
   font-size: 12px;
   white-space: pre-wrap;

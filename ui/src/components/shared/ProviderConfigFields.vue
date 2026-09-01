@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, watch } from 'vue';
 import { ElForm, ElFormItem, ElInput, ElTag, ElButton, ElRadioGroup, ElRadio, ElMessage } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import type { LLMProvider, LLMModel, ProviderConfigField, AuthMethod, CodexOAuthStart } from '../../services/configApi';
@@ -22,7 +22,10 @@ const props = withDefaults(defineProps<{
   saving?: boolean;
   // Browser-OAuth methods ("Sign in with ChatGPT") capture tokens server-side,
   // which needs an existing profile — so the flow is offered only from Settings,
-  // not the setup wizard (which leaves this false and shows a hint instead).
+  // not the setup wizard. When false those methods are dropped from the auth
+  // radio entirely (see `visibleAuthMethods`); leaving them selectable let the
+  // wizard persist an auth method with no tokens behind it. A static pointer to
+  // Settings takes their place.
   allowBrowserOauth?: boolean;
 }>(), {
   showConfiguredBadge: false,
@@ -36,6 +39,17 @@ const emit = defineEmits<{
   'save-config': [];
   'save-provider': [];
   'remove-config': [];
+  // The selected auth method moved (radio click, or the reset below). Some
+  // providers serve a *different model set* per method — OpenAI's Codex OAuth
+  // is the live example — so the host refetches this provider's models rather
+  // than leaving the previous method's list on screen until a page reload.
+  'auth-method-change': [methodId: string];
+  // A browser-OAuth sign-in completed and its tokens are now stored
+  // server-side. The host refetches the provider so its method-specific models
+  // and configured state appear without a reload. The provider is named
+  // explicitly because the flow completes minutes later in another window —
+  // the host's selection is no evidence of who started it.
+  'oauth-complete': [providerName: string];
 }>();
 
 const settingsStore = useSettingsStore();
@@ -52,17 +66,58 @@ const deviceCodePolling = ref(false);
 const deviceCodeComplete = ref(false);
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
 
+/**
+ * The auth methods this host actually offers.
+ *
+ * Browser-OAuth methods are dropped wherever the flow can't complete — the
+ * setup wizard, where the profile that would hold the captured tokens doesn't
+ * exist yet. Leaving the radio selectable there let the wizard persist
+ * ``openai.auth_method=codex_oauth`` with no tokens behind it. Device-code
+ * methods (GitHub Copilot) are deliberately NOT filtered: that flow does work
+ * during setup and hands its token back for the wizard to bundle.
+ */
+const visibleAuthMethods = computed<AuthMethod[]>(() => {
+  const methods = props.provider.auth_methods ?? [];
+  if (props.allowBrowserOauth) return methods;
+  return methods.filter(m => m.kind !== 'oauth');
+});
+
 const hasMultipleAuthMethods = computed(() =>
-  (props.provider.auth_methods?.length ?? 0) > 1
+  visibleAuthMethods.value.length > 1
+);
+
+/** Setup only: the provider offers a browser sign-in we're not showing, so the
+ *  card still points at where it can be done. */
+const hasHiddenBrowserOauth = computed(() =>
+  !props.allowBrowserOauth && (props.provider.auth_methods ?? []).some(m => m.kind === 'oauth')
 );
 
 const activeAuthMethod = computed<AuthMethod | null>(() => {
-  const methods = props.provider.auth_methods;
-  if (!methods || methods.length === 0) return null;
+  const methods = visibleAuthMethods.value;
+  if (methods.length === 0) return null;
   return methods.find(m => m.id === props.provider.selectedAuthMethod)
     || methods.find(m => m.is_default)
     || methods[0];
 });
+
+// A preset, or (during per-profile setup) the admin's saved config, can point
+// this provider at a browser-OAuth method we don't offer. Snap the selection
+// back to the default visible method so the card renders a usable form — and
+// tell the host, whose model list is keyed on the selected method.
+watch(
+  [() => props.provider.name, () => props.provider.selectedAuthMethod, () => props.allowBrowserOauth],
+  () => {
+    const methods = props.provider.auth_methods ?? [];
+    if (methods.length === 0 || props.allowBrowserOauth) return;
+    const current = methods.find(m => m.id === props.provider.selectedAuthMethod);
+    if (current?.kind !== 'oauth') return;
+    const fallback = visibleAuthMethods.value.find(m => m.is_default) || visibleAuthMethods.value[0];
+    if (!fallback) return;
+    props.provider.selectedAuthMethod = fallback.id;
+    emit('auth-method-change', fallback.id);
+  },
+  { immediate: true },
+);
 
 const isNoAuth = computed(() =>
   activeAuthMethod.value?.kind === 'none'
@@ -88,6 +143,10 @@ const codexPasteUrl = ref('');
 const codexPasteSubmitting = ref(false);
 let codexPollTimer: ReturnType<typeof setTimeout> | null = null;
 let codexDeadline = 0;
+// The provider the in-flight sign-in belongs to, captured when it STARTS. It
+// finishes in a second window some minutes later, so nothing about the state
+// of the UI at that moment can be trusted to identify it.
+let codexProviderName = '';
 
 function resetCodexState(cancel = false) {
   if (cancel && codexData.value?.state) {
@@ -106,6 +165,7 @@ function resetCodexState(cancel = false) {
 async function startCodexLogin() {
   codexLoading.value = true;
   resetCodexState();
+  codexProviderName = props.provider.name;
   try {
     const data = await startCodexOAuth(settingsStore.agentUrl, settingsStore.authToken);
     codexData.value = data;
@@ -138,6 +198,9 @@ function applyCodexResult(status: string, email?: string | null, plan?: string |
     props.provider.configured = true;
     if (codexPollTimer) { clearTimeout(codexPollTimer); codexPollTimer = null; }
     ElMessage.success(`Signed in to ChatGPT${email ? ` as ${email}` : ''}`);
+    // Tokens are stored now, so this provider serves its OAuth-only model set —
+    // the host reloads it here instead of on the next page load.
+    emit('oauth-complete', codexProviderName);
     return true;
   }
   return false;
@@ -213,6 +276,7 @@ function onAuthMethodChange(methodId: string) {
   deviceCodePolling.value = false;
   // Reset (and cancel) any in-flight Codex OAuth flow when switching away.
   resetCodexState(true);
+  emit('auth-method-change', methodId);
 }
 
 async function startDeviceLogin() {
@@ -289,7 +353,7 @@ async function pollForToken(deviceCode: string, interval: number) {
           size="small"
         >
           <ElRadio
-            v-for="am in provider.auth_methods"
+            v-for="am in visibleAuthMethods"
             :key="am.id"
             :value="am.id"
           >
@@ -297,6 +361,13 @@ async function pollForToken(deviceCode: string, interval: number) {
             <span v-if="am.hint" class="auth-hint">{{ am.hint }}</span>
           </ElRadio>
         </ElRadioGroup>
+      </div>
+
+      <!-- Setup only: the browser sign-in exists but isn't offered here. Kept
+           for discoverability so nobody concludes the provider can't do it. -->
+      <div v-if="hasHiddenBrowserOauth" class="no-auth-info">
+        Sign in with ChatGPT is available from Settings → LLM Providers after setup.
+        Finish setup with another method (e.g. API Key), then sign in later.
       </div>
 
       <!-- Instructions for the active auth method -->
@@ -351,75 +422,71 @@ async function pollForToken(deviceCode: string, interval: number) {
         </div>
       </template>
 
-      <!-- Browser OAuth flow (e.g. OpenAI "Sign in with ChatGPT") -->
+      <!-- Browser OAuth flow (e.g. OpenAI "Sign in with ChatGPT"). Reachable
+           only where the flow is offered: `activeAuthMethod` is picked from
+           `visibleAuthMethods`, which drops oauth methods otherwise (setup
+           gets the static pointer to Settings above instead). -->
       <template v-else-if="isBrowserOAuth">
-        <div v-if="!allowBrowserOauth" class="no-auth-info">
-          Sign in with ChatGPT is available from Settings → LLM Providers after setup.
-          Finish setup with another method (e.g. API Key), then sign in later.
+        <div v-if="codexComplete" class="device-code-done">
+          Signed in{{ codexEmail ? ` as ${codexEmail}` : '' }}{{ codexPlan ? ` (${codexPlan})` : '' }}.
         </div>
 
-        <template v-else>
-          <div v-if="codexComplete" class="device-code-done">
-            Signed in{{ codexEmail ? ` as ${codexEmail}` : '' }}{{ codexPlan ? ` (${codexPlan})` : '' }}.
+        <div v-else-if="!codexData" class="device-code-start">
+          <ElButton type="primary" :loading="codexLoading" @click="startCodexLogin" size="small">
+            Sign in with ChatGPT
+          </ElButton>
+        </div>
+
+        <div v-else class="device-code-active">
+          <div class="device-code-step">
+            <span class="device-code-label">Link:</span>
+            <a :href="codexData.authorize_url" target="_blank" rel="noopener" class="device-code-link">
+              Open ChatGPT sign-in
+            </a>
+            <button
+              type="button"
+              class="copy-icon-btn"
+              :class="{ copied: isCopied('codex-url') }"
+              :title="isCopied('codex-url') ? 'Copied!' : 'Copy link'"
+              @click="copyValue(codexData.authorize_url, 'codex-url')"
+            >
+              <Icon :icon="isCopied('codex-url') ? 'mdi:check' : 'mdi:content-copy'" />
+            </button>
+          </div>
+          <div v-if="codexPolling" class="device-code-status">
+            <span class="polling-indicator">Waiting for authorization...</span>
           </div>
 
-          <div v-else-if="!codexData" class="device-code-start">
-            <ElButton type="primary" :loading="codexLoading" @click="startCodexLogin" size="small">
-              Sign in with ChatGPT
-            </ElButton>
-          </div>
-
-          <div v-else class="device-code-active">
-            <div class="device-code-step">
-              <span class="device-code-label">Link:</span>
-              <a :href="codexData.authorize_url" target="_blank" rel="noopener" class="device-code-link">
-                Open ChatGPT sign-in
-              </a>
-              <button
-                type="button"
-                class="copy-icon-btn"
-                :class="{ copied: isCopied('codex-url') }"
-                :title="isCopied('codex-url') ? 'Copied!' : 'Copy link'"
-                @click="copyValue(codexData.authorize_url, 'codex-url')"
+          <div class="codex-paste">
+            <a href="#" class="codex-paste-toggle" @click.prevent="codexPasteOpen = !codexPasteOpen">
+              {{ codexPasteOpen ? 'Hide' : 'Having trouble? Paste the redirect URL' }}
+            </a>
+            <div v-if="codexPasteOpen" class="codex-paste-body">
+              <p v-if="codexData.listener_error" class="codex-paste-hint">{{ codexData.listener_error }}</p>
+              <p v-else-if="codexData.capture_hint" class="codex-paste-hint">{{ codexData.capture_hint }}</p>
+              <p v-else class="codex-paste-hint">
+                After approving, copy the URL from your browser's address bar (it starts with
+                http://localhost:1455/) and paste it here.
+              </p>
+              <ElInput
+                v-model="codexPasteUrl"
+                type="textarea"
+                :rows="2"
+                placeholder="http://localhost:1455/auth/callback?code=...&state=..."
+              />
+              <ElButton
+                type="primary"
+                size="small"
+                :loading="codexPasteSubmitting"
+                :disabled="!codexPasteUrl.trim()"
+                style="margin-top: 6px;"
+                @click="submitPastedUrl"
               >
-                <Icon :icon="isCopied('codex-url') ? 'mdi:check' : 'mdi:content-copy'" />
-              </button>
-            </div>
-            <div v-if="codexPolling" class="device-code-status">
-              <span class="polling-indicator">Waiting for authorization...</span>
-            </div>
-
-            <div class="codex-paste">
-              <a href="#" class="codex-paste-toggle" @click.prevent="codexPasteOpen = !codexPasteOpen">
-                {{ codexPasteOpen ? 'Hide' : 'Having trouble? Paste the redirect URL' }}
-              </a>
-              <div v-if="codexPasteOpen" class="codex-paste-body">
-                <p v-if="codexData.listener_error" class="codex-paste-hint">{{ codexData.listener_error }}</p>
-                <p v-else-if="codexData.capture_hint" class="codex-paste-hint">{{ codexData.capture_hint }}</p>
-                <p v-else class="codex-paste-hint">
-                  After approving, copy the URL from your browser's address bar (it starts with
-                  http://localhost:1455/) and paste it here.
-                </p>
-                <ElInput
-                  v-model="codexPasteUrl"
-                  type="textarea"
-                  :rows="2"
-                  placeholder="http://localhost:1455/auth/callback?code=...&state=..."
-                />
-                <ElButton
-                  type="primary"
-                  size="small"
-                  :loading="codexPasteSubmitting"
-                  :disabled="!codexPasteUrl.trim()"
-                  style="margin-top: 6px;"
-                  @click="submitPastedUrl"
-                >
-                  Complete sign-in
-                </ElButton>
-              </div>
+                Complete sign-in
+              </ElButton>
             </div>
           </div>
-        </template>
+        </div>
       </template>
 
       <!-- Regular fields for non-device-code, non-none auth methods -->

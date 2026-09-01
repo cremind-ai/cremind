@@ -39,11 +39,13 @@ def _req(body=None, username="p1", path_params=None, method="POST"):
         return body
     # ``method`` matters because the sender-detail route is a method dispatcher
     # (PATCH updates, DELETE removes the client), same as the real request.
+    # ``headers`` is what the send endpoints sniff to tell JSON from multipart.
     return SimpleNamespace(
         method=method,
         user=SimpleNamespace(is_authenticated=True, username=username),
         path_params=path_params or {},
         json=_json,
+        headers={"content-type": "application/json"},
     )
 
 

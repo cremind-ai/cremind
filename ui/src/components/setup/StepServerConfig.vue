@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, computed, onMounted } from 'vue';
 import { ElForm, ElFormItem, ElInput, ElInputNumber, ElRadioGroup, ElRadio, ElSelect, ElOption } from 'element-plus';
-import DeploymentModeRadio from './DeploymentModeRadio.vue';
+import DeploymentModeRadio from '../shared/DeploymentModeRadio.vue';
 import type { DeploymentMode, ServiceCapabilitiesResponse } from '../../services/configApi';
 import type { InstallCatalog } from '../../services/installCatalogApi';
 

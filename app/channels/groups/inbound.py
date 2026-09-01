@@ -58,7 +58,12 @@ from app.utils.logger import logger
 
 @dataclass
 class GroupInbound:
-    """One message as an adapter reports it."""
+    """One message as an adapter reports it.
+
+    ``files`` are :class:`app.channels.attachments.IncomingFile` descriptors —
+    unfetched. The pipeline stages them only for an approved group and an
+    allowed member; every earlier drop discards them unfetched.
+    """
 
     chat_id: str
     sender_id: str
@@ -72,10 +77,13 @@ class GroupInbound:
     sender_is_bot: bool = False
     platform_message_date: Optional[float] = None
     mentioned: bool = False
+    files: List[Any] = field(default_factory=list)
 
 
 async def handle_group_message(adapter: Any, msg: GroupInbound) -> None:
     """Run one inbound group message through the pipeline. Never raises."""
+    from app.channels.attachments import discard_incoming_files
+
     try:
         await _handle(adapter, msg)
     except Exception:  # noqa: BLE001
@@ -83,19 +91,31 @@ async def handle_group_message(adapter: Any, msg: GroupInbound) -> None:
             f"[channel_group] {adapter.channel_type}: failed to handle a message "
             f"in chat {msg.chat_id}"
         )
+        # Safety net for sidecar-spooled payloads; staged/removed files are
+        # tolerated (discard callbacks swallow their own errors).
+        await discard_incoming_files(msg.files)
 
 
 async def _handle(adapter: Any, msg: GroupInbound) -> None:
+    from app.channels.attachments import discard_incoming_files, placeholder_text
+
     if not adapter.groups_enabled():
+        await discard_incoming_files(msg.files)
         return
     body = (msg.text or "").strip()
-    if not body:
+    if not body and not msg.files:
         return
+    if not body and msg.files:
+        # A file-only message must still reach the room's transcript (and
+        # possibly a turn); this stands in for the caption nobody wrote.
+        body = placeholder_text([f.name for f in msg.files])
+        msg.text = body
 
     identity = adapter.self_identity()
     sender_ids = candidate_ids(msg.sender_id, msg.sender_alt_ids)
     own_ids = [str(identity.get("user_id") or ""), *(identity.get("alt_ids") or ())]
     if ids_overlap(own_ids, sender_ids):
+        await discard_incoming_files(msg.files)
         return
 
     key = platform_key(
@@ -108,6 +128,7 @@ async def _handle(adapter: Any, msg: GroupInbound) -> None:
         platform_message_date=msg.platform_message_date,
     )
     if adapter.groups.seen_recently(key):
+        await discard_incoming_files(msg.files)
         return
 
     from app.storage import get_channel_group_storage
@@ -125,6 +146,7 @@ async def _handle(adapter: Any, msg: GroupInbound) -> None:
                 chat_type=msg.chat_type,
                 discovered_via=DISCOVERED_VIA_MESSAGE,
             )
+            await discard_incoming_files(msg.files)
             return
 
         group = await _refresh_title(storage, group, msg.chat_title, adapter)
@@ -153,6 +175,7 @@ async def _handle(adapter: Any, msg: GroupInbound) -> None:
                 f"[channel_group] {group_id} is {group.get('status')}; "
                 "the message is not delivered"
             )
+            await discard_incoming_files(msg.files)
             return
 
         settings = _settings(group)
@@ -163,6 +186,7 @@ async def _handle(adapter: Any, msg: GroupInbound) -> None:
                 f"[channel_group] {group_id}: {msg.sender_id} is not answered "
                 "under this group's member policy"
             )
+            await discard_incoming_files(msg.files)
             return
 
         adapter.groups.note_inbound_author(group_id, msg.sender_is_bot)
@@ -174,7 +198,18 @@ async def _handle(adapter: Any, msg: GroupInbound) -> None:
             logger.error(
                 f"[channel_group] {group_id}: no conversation; message dropped"
             )
+            await discard_incoming_files(msg.files)
             return
+
+        # The group is approved, the member is allowed, and the conversation
+        # is known — only now do attachment bytes move.
+        attachments = None
+        if msg.files:
+            from app.channels.attachments import stage_incoming_files
+
+            attachments = await stage_incoming_files(
+                adapter, conversation_id, msg.files,
+            ) or None
 
         start_turn, decision = await _decide(
             adapter,
@@ -216,6 +251,7 @@ async def _handle(adapter: Any, msg: GroupInbound) -> None:
         await dispatch.deliver_to_group(
             adapter, group, conversation_id, rendered, metadata,
             start_turn=start_turn,
+            attachments=attachments,
         )
         await storage.update_group(group_id, last_message_at=time.time() * 1000)
 

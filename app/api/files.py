@@ -444,22 +444,10 @@ def _is_allowed_base(path: str) -> bool:
 
 
 def _unique_dest(target_dir: str, basename: str) -> str:
-    """Return ``target_dir + sep + basename`` with a numeric suffix that
-    avoids collisions, mimicking the OS file managers' "(1)", "(2)" style.
+    """Collision-free destination path; shared logic lives in ``uploads_tmp``."""
+    from app.utils.uploads_tmp import unique_dest
 
-    ``foo.txt`` → ``foo (1).txt`` → ``foo (2).txt`` …
-    """
-    candidate = os.path.join(target_dir, basename)
-    if not os.path.exists(candidate):
-        return candidate
-    stem, ext = os.path.splitext(basename)
-    n = 1
-    while True:
-        renamed = f"{stem} ({n}){ext}"
-        candidate = os.path.join(target_dir, renamed)
-        if not os.path.exists(candidate):
-            return candidate
-        n += 1
+    return unique_dest(target_dir, basename)
 
 
 _UPLOAD_CHUNK = 1 << 20  # 1 MiB

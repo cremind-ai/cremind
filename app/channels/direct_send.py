@@ -38,12 +38,22 @@ explicit adapter list and share this one implementation.
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from app.channels.attachments import file_fallback_text
 from app.channels.base import PartialSendError
+from app.channels.exceptions import ChannelNotImplemented
 from app.utils.logger import logger
+
+
+def _safe_size(path: str) -> int | None:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
 
 
 # A single call may fan out this far. High enough for a real campaign, low
@@ -96,11 +106,20 @@ class RecipientOutcome:
     error: str | None = None
     detail: str | None = None
     alternatives: list[str] = field(default_factory=list)
+    # File-attachment outcome: how many files reached this recipient, and
+    # whether their transport can't carry files at all (they got the text
+    # fallback notice instead).
+    files_sent: int = 0
+    files_unsupported: bool = False
 
     def as_dict(self) -> dict:
         data = asdict(self)
         if not data["alternatives"]:
             data.pop("alternatives")
+        if not data["files_sent"]:
+            data.pop("files_sent")
+        if not data["files_unsupported"]:
+            data.pop("files_unsupported")
         return {k: v for k, v in data.items() if v is not None}
 
 
@@ -410,6 +429,7 @@ async def send_direct_messages(
     initiated_by: str = "tool",
     confirm: bool = False,
     confirm_policy: Any = None,
+    attachments: list[dict] | None = None,
 ) -> dict:
     """Resolve, send, register and record.
 
@@ -435,6 +455,11 @@ async def send_direct_messages(
     failure never aborts the others (a bad row in a spreadsheet shouldn't cost
     the other 99 their message), but a run of consecutive transport failures
     does, since that means the channel itself is broken.
+
+    ``attachments`` are already-validated ``{"path", "name"?, "mime"?}``
+    entries (see :func:`app.channels.attachments.validate_outbound_paths` —
+    the caller owns that validation) sent to EVERY recipient after their text.
+    A send with attachments needs no text.
     """
     if len(recipients) > MAX_RECIPIENTS:
         raise ValueError(
@@ -443,12 +468,13 @@ async def send_direct_messages(
         )
 
     shared = (message or "").strip()
-    missing_text = [r["to"] for r in recipients if not (r.get("message") or shared)]
-    if missing_text:
-        raise ValueError(
-            "No message text for: " + ", ".join(missing_text[:5])
-            + ". Provide 'message' for the whole send, or a 'message' on each recipient.",
-        )
+    if not attachments:
+        missing_text = [r["to"] for r in recipients if not (r.get("message") or shared)]
+        if missing_text:
+            raise ValueError(
+                "No message text for: " + ", ".join(missing_text[:5])
+                + ". Provide 'message' for the whole send, or a 'message' on each recipient.",
+            )
 
     senders_by_channel: dict[str, list[dict]] = {}
     for adapter in adapters:
@@ -501,6 +527,11 @@ async def send_direct_messages(
                 display_name=entry.get("name") or (sender or {}).get("display_name"),
                 conversation_id=(sender or {}).get("conversation_id"),
                 new_contact=bool(info.get("cold")),
+                # Flagged at resolution (off the CLASS, like the dry-run
+                # preview needs) so a preview already tells the caller which
+                # recipients would get the fallback notice instead of a file.
+                files_unsupported=bool(attachments)
+                and not type(adapter).supports_file_send,
             ),
             "entry": entry,
             "text": text,
@@ -526,7 +557,9 @@ async def send_direct_messages(
                 pending.append(slot)
 
     if dry_run or pending:
-        return _preview_summary(plan, pending, dry_run=dry_run)
+        return _preview_summary(
+            plan, pending, dry_run=dry_run, attachments=attachments,
+        )
 
     results: list[RecipientOutcome] = []
     consecutive_failures = 0
@@ -557,6 +590,7 @@ async def send_direct_messages(
                 text=text, info=info, display_name=entry.get("name"),
                 initiated_by=initiated_by, base=base,
                 senders_by_channel=senders_by_channel,
+                attachments=attachments,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception(f"[direct_send] send failed for {base.to}")
@@ -594,7 +628,11 @@ async def send_direct_messages(
 
 
 def _preview_summary(
-    plan: list[dict[str, Any]], pending: list[dict[str, Any]], *, dry_run: bool,
+    plan: list[dict[str, Any]],
+    pending: list[dict[str, Any]],
+    *,
+    dry_run: bool,
+    attachments: list[dict] | None = None,
 ) -> dict:
     """Summarize a call that resolved recipients but sent nothing.
 
@@ -616,6 +654,13 @@ def _preview_summary(
         "resolved": resolved,
         "new_contacts": cold,
     }
+    if attachments:
+        summary["attachments"] = len(attachments)
+        unsupported = sum(
+            1 for r in results if r.status == "would_send" and r.files_unsupported
+        )
+        if unsupported:
+            summary["files_unsupported_recipients"] = unsupported
 
     if pending:
         summary["needs_confirmation"] = [
@@ -650,6 +695,7 @@ async def _send_one(
     *, adapter: Any, storage: Any, sender_id: str, text: str, info: dict,
     display_name: str | None, initiated_by: str, base: RecipientOutcome,
     senders_by_channel: dict[str, list[dict]],
+    attachments: list[dict] | None = None,
 ) -> RecipientOutcome:
     """Send to one resolved recipient, then record it in their conversation.
 
@@ -716,15 +762,56 @@ async def _send_one(
             base.detail = str(exc)
             return base
 
+        # ── attachments, after the text landed ──
+        #
+        # A transport with no file support downgrades each file to the
+        # fallback notice (name only, never the server path); any other
+        # failure records what DID reach the client and reports the rest,
+        # mirroring the partial-delivery contract above.
+        delivered_files: list[dict] = []
+        file_error: str | None = None
+        for att in attachments or []:
+            path = att.get("path") or ""
+            att_name = att.get("name") or os.path.basename(path)
+            try:
+                await adapter.send_file_strict(
+                    sender_id, path, name=att_name, mime=att.get("mime"),
+                )
+                delivered_files.append({"name": att_name, "path": path})
+            except ChannelNotImplemented:
+                base.files_unsupported = True
+                try:
+                    await adapter.send_strict(
+                        sender_id, file_fallback_text(att_name, _safe_size(path)),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    file_error = str(exc)
+                    break
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    f"[direct_send] file send failed for {base.to} ({att_name})",
+                )
+                file_error = str(exc)
+                break
+        base.files_sent = len(delivered_files)
+
+        from app.agent.stream_runner import attachment_file_parts
+
         msg = await storage.add_message(
             conversation_id=conversation_id, role="agent", content=text,
+            parts=attachment_file_parts(delivered_files) or None,
             metadata=_metadata(
                 adapter, sender_id, base.display_name, initiated_by,
-                cold=base.new_contact,
+                cold=base.new_contact, partial=file_error is not None,
             ),
         )
-        base.status = "sent"
         base.message_id = msg["id"]
+        if file_error is not None:
+            base.status = "failed"
+            base.error = "file_delivery_failed"
+            base.detail = file_error
+        else:
+            base.status = "sent"
         return base
 
 
