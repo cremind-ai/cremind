@@ -112,6 +112,13 @@ docker compose down -v             # stop and delete all data
    down. `--no-boot-service` / `-NoBootService` opts out, and anywhere a
    service cannot be registered (WSL without systemd, SSH to a Mac) the
    installer falls back to the old background process for this session only.
+   Upgrading an install that predates the service, the installer stops the
+   background server it started last time so the service can own the port —
+   otherwise that older, unsupervised process would go on serving the wizard,
+   and the restart in step 8 would still have to be done by hand. A server
+   the installer did not start (a dev `cremind serve`) is left alone; there
+   the service is registered without being started and takes over once that
+   one stops.
 8. Open `http://<host>:1515/#/setup` in your browser. (Still `http://` on the
    `after-setup` default — the switch to `https://` happens when the wizard
    finishes.) On a native install the wizard's "Secure this install" step

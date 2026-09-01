@@ -2880,10 +2880,51 @@ if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ]; then
     . "$ENV_FILE"
     set +a
 
+    # Stop a server a previous run of this installer started, so the boot
+    # service can own the port instead. Succeeds only once it is gone.
+    #
+    # The PID is checked against the install before anything is signalled:
+    # install.pid outlives the process it names and PIDs get recycled, so an
+    # unguarded kill could hit whatever unrelated program holds the number
+    # now. Refusing is always safe — the caller then registers the service
+    # without starting it.
+    stop_installer_server() {
+        local server_pid="$1"
+        local cmdline
+        local waited=0
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            return 0
+        fi
+        cmdline="$(ps -p "$server_pid" -o args= 2>/dev/null || true)"
+        case "$cmdline" in
+            *"$CREMIND_SYSTEM_DIR"*) ;;
+            *) return 1 ;;
+        esac
+        info "Stopping the unsupervised server (pid $server_pid) so the boot service can take over."
+        kill "$server_pid" 2>/dev/null || true
+        while [ "$waited" -lt 15 ] && kill -0 "$server_pid" 2>/dev/null; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if kill -0 "$server_pid" 2>/dev/null; then
+            return 1
+        fi
+        # The service writes server.pid; nothing should be left pointing a
+        # later uninstall at a dead PID.
+        rm -f "$SERVER_PID_FILE"
+        return 0
+    }
+
     SERVER_RUNNING=0
+    # PID of an unsupervised server left behind by an EARLIER run of this
+    # installer. install.pid is written by the fallback spawn below and by
+    # nothing else, so a live PID in it means "ours, and unsupervised" — the
+    # one server we may stop to hand its port to the boot service.
+    OUR_SERVER_PID=""
     if [ -f "$SERVER_PID_FILE" ] && kill -0 "$(cat "$SERVER_PID_FILE")" 2>/dev/null; then
         info "Cremind is already running (pid $(cat "$SERVER_PID_FILE"))."
         SERVER_RUNNING=1
+        OUR_SERVER_PID="$(cat "$SERVER_PID_FILE")"
     fi
 
     # Detect a server bound to the port without going through this
@@ -2907,6 +2948,23 @@ if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ]; then
         # ``cremind boot`` renders and registers the unit — the installer
         # deliberately does not, so there is exactly one place that knows what
         # a Cremind unit file looks like.
+
+        # Hand the port over first. An unsupervised server from an earlier
+        # install is still running OUR process, and leaving it up means IT
+        # serves the Setup Wizard — without CREMIND_SUPERVISED, so the
+        # wizard's after-setup switch to HTTPS would tell the user to restart
+        # by hand. That is the exact experience the boot service exists to
+        # remove, and it would otherwise greet every upgrade from a
+        # pre-service install. A foreign server on the port (a dev ``uv run
+        # cremind serve``) is never touched — it gets the register-only path
+        # below.
+        if [ "$SERVER_RUNNING" -eq 1 ] && [ -n "$OUR_SERVER_PID" ]; then
+            if stop_installer_server "$OUR_SERVER_PID"; then
+                SERVER_RUNNING=0
+            else
+                warn "Could not stop the server at pid $OUR_SERVER_PID — registering the boot service without starting it."
+            fi
+        fi
         if [ "$SERVER_RUNNING" -eq 1 ]; then
             # Something else owns the port (typically a dev ``uv run cremind
             # serve``). Register without starting: a second server would only

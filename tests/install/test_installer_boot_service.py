@@ -150,6 +150,113 @@ def test_a_running_server_gets_registration_without_a_start() -> None:
     assert re.search(r"if \(\$running\).*?boot enable --no-start", ps1_block, re.S)
 
 
+# ── handing the port over on an upgrade ───────────────────────────────────
+#
+# The population that most needs the boot service is the one upgrading from an
+# install that predates it, and that is exactly the population a register-only
+# path strands: the OLD unsupervised process keeps the port, so it is the one
+# serving the Setup Wizard, and it has no CREMIND_SUPERVISED — leaving the
+# after-setup switch to HTTPS asking the user to restart by hand.
+
+
+def test_an_installer_started_server_is_stopped_before_registering() -> None:
+    """Otherwise the upgrade registers a service around a server it never owns."""
+    ps1_block = _ps1().split("# ── start the server", 1)[1]
+    assert re.search(
+        r"if \(\$running -and \$OurServerPid -gt 0\).*?"
+        r"if \(Stop-CremindInstallerServer \$OurServerPid\).*?"
+        r"\$running = \$false.*?boot enable",
+        ps1_block,
+        re.S,
+    )
+
+    sh_block = _sh().split("# ── start the server", 1)[1]
+    assert re.search(
+        r'if stop_installer_server "\$OUR_SERVER_PID"; then.*?'
+        r"SERVER_RUNNING=0.*?boot enable",
+        sh_block,
+        re.S,
+    )
+
+
+def test_only_a_server_this_installer_started_is_a_candidate() -> None:
+    """A dev ``cremind serve`` on the port must never be killed under them.
+
+    ``install.pid`` is written by the fallback spawn and by nothing else, so it
+    is the only evidence that the process is ours to stop. A server found by
+    the health probe alone leaves the variable empty and keeps --no-start.
+    """
+    ps1_block = _ps1().split("# ── start the server", 1)[1]
+    # Set only inside the install.pid branch, never from the health probe.
+    assert ps1_block.count("$OurServerPid = [int] $existingPid") == 1
+    assert "$OurServerPid = 0" in ps1_block
+    probe = ps1_block.split("# Detect a server that's already bound", 1)[1]
+    assert "$OurServerPid" not in probe.split("if ($BootServiceOn)", 1)[0]
+
+    sh_block = _sh().split("# ── start the server", 1)[1]
+    assert sh_block.count('OUR_SERVER_PID="$(cat "$SERVER_PID_FILE")"') == 1
+    assert 'OUR_SERVER_PID=""' in sh_block
+    sh_probe = sh_block.split("# Detect a server bound to the port", 1)[1]
+    assert "OUR_SERVER_PID" not in sh_probe.split('"$BOOT_SERVICE" = "1"', 1)[0]
+
+
+def test_the_stop_is_guarded_against_a_recycled_pid() -> None:
+    """install.pid outlives the process it names, and PIDs get reused.
+
+    Both scripts must prove the PID still belongs to this install before
+    signalling it, or an upgrade could kill an unrelated program that happens
+    to hold the number now.
+    """
+    ps1 = _ps1()
+    assert (
+        "$procPath.StartsWith($CremindSystemDir, [StringComparison]::OrdinalIgnoreCase)"
+        in ps1
+    )
+    sh = _sh()
+    assert 'cmdline="$(ps -p "$server_pid" -o args= 2>/dev/null || true)"' in sh
+    assert '*"$CREMIND_SYSTEM_DIR"*) ;;' in sh
+
+
+def test_a_refused_or_failed_stop_degrades_to_register_only() -> None:
+    """Never leave the user without a server: the old path is still there."""
+    for script, warning in (
+        (_ps1(), "Could not stop the server at pid"),
+        (_sh(), "Could not stop the server at pid"),
+    ):
+        assert warning in script
+        assert "registering the boot service without starting it." in script
+
+
+def test_a_successful_stop_clears_install_pid_in_both() -> None:
+    """The service writes server.pid; install.pid must not name a dead process.
+
+    A stale entry would send the uninstaller's kill — and the desktop app's
+    tree-kill on quit — at whatever later owns the number.
+    """
+    ps1_stop = _ps1().split("function Stop-CremindInstallerServer", 1)[1]
+    assert "Remove-Item -LiteralPath $PidFile" in ps1_stop.split("\n    }", 1)[0]
+
+    sh_stop = _sh().split("stop_installer_server() {", 1)[1]
+    assert 'rm -f "$SERVER_PID_FILE"' in sh_stop.split("\n    }", 1)[0]
+
+
+def test_nothing_is_stopped_when_no_service_will_be_registered() -> None:
+    """``--no-boot-service`` must not cost the user their running server.
+
+    The hand-over only makes sense as the first half of "the service owns the
+    port now"; without a registration it would just be a kill.
+    """
+    ps1_block = _ps1().split("# ── start the server", 1)[1]
+    assert ps1_block.index("if ($BootServiceOn) {") < ps1_block.index(
+        "if (Stop-CremindInstallerServer $OurServerPid)"
+    )
+
+    sh_block = _sh().split("# ── start the server", 1)[1]
+    assert sh_block.index('if [ "$BOOT_SERVICE" = "1" ]; then') < sh_block.index(
+        'if stop_installer_server "$OUR_SERVER_PID"; then'
+    )
+
+
 def test_a_failed_registration_falls_back_to_the_old_spawn() -> None:
     """WSL without systemd, SSH to a Mac, a locked-down Task Scheduler — the
     install must still leave the user with a reachable wizard."""

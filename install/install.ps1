@@ -2975,12 +2975,50 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
     $ServerHost = if ($ParsedEnv.ContainsKey('HOST')) { $ParsedEnv['HOST'] } else { '127.0.0.1' }
     $ServerPort = if ($ParsedEnv.ContainsKey('PORT')) { $ParsedEnv['PORT'] } else { '1112' }
 
+    # Stop a server a previous run of this installer started, so the boot
+    # service can own the port instead. Returns $true only once it is gone.
+    #
+    # The PID is checked against the install before anything is killed:
+    # install.pid outlives the process it names and Windows recycles PIDs, so
+    # an unguarded Stop-Process could take out whatever unrelated program
+    # holds the number now. Refusing is always safe — the caller falls back to
+    # registering the service without starting it.
+    function Stop-CremindInstallerServer {
+        param([Parameter(Mandatory)][int] $ServerPid)
+        $proc = Get-Process -Id $ServerPid -ErrorAction SilentlyContinue
+        if (-not $proc) { return $true }
+        $procPath = $null
+        try { $procPath = $proc.Path } catch { }
+        if (-not $procPath -or
+            -not $procPath.StartsWith($CremindSystemDir, [StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+        Write-Info "Stopping the unsupervised server (pid $ServerPid) so the boot service can take over."
+        try {
+            Stop-Process -Id $ServerPid -Force -ErrorAction Stop
+            Wait-Process -Id $ServerPid -Timeout 15 -ErrorAction SilentlyContinue
+        } catch {
+            return $false
+        }
+        if (Get-Process -Id $ServerPid -ErrorAction SilentlyContinue) { return $false }
+        # The service writes server.pid; nothing should be left pointing a
+        # later uninstall (or the desktop app's tree-kill) at a dead PID.
+        Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
+        return $true
+    }
+
     $running = $false
+    # PID of an unsupervised server left behind by an EARLIER run of this
+    # installer. ``install.pid`` is written by the fallback spawn below and by
+    # nothing else, so a live PID in it means "ours, and unsupervised" — the
+    # one server we may stop to hand its port to the boot service.
+    $OurServerPid = 0
     if (Test-Path $PidFile) {
         $existingPid = Get-Content $PidFile | Select-Object -First 1
         if ($existingPid -and (Get-Process -Id $existingPid -ErrorAction SilentlyContinue)) {
             Write-Info "Cremind is already running (pid $existingPid)."
             $running = $true
+            $OurServerPid = [int] $existingPid
         }
     }
 
@@ -3009,6 +3047,22 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
     # deliberately renders neither, so there is exactly one place that knows
     # what they look like.
     if ($BootServiceOn) {
+        # Hand the port over first. An unsupervised server from an earlier
+        # install is still running OUR process, and leaving it up means IT
+        # serves the Setup Wizard — without CREMIND_SUPERVISED, so the
+        # wizard's after-setup switch to HTTPS would tell the user to restart
+        # by hand. That is the exact experience the boot service exists to
+        # remove, and it would otherwise greet every upgrade from a
+        # pre-service install. A foreign server on the port (a dev
+        # ``cremind serve``) is never touched — it gets the register-only
+        # path below.
+        if ($running -and $OurServerPid -gt 0) {
+            if (Stop-CremindInstallerServer $OurServerPid) {
+                $running = $false
+            } else {
+                Write-Warn2 "Could not stop the server at pid $OurServerPid — registering the boot service without starting it."
+            }
+        }
         if ($running) {
             # Something else owns the port (typically a dev ``cremind serve``).
             # Register without starting: a second server would only collide on
