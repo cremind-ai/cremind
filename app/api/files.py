@@ -112,7 +112,7 @@ async def _conversation_scope(
         from app.events.runner import get_conversation_storage
         conv = await get_conversation_storage().get_conversation(conversation_id)
     except Exception:  # noqa: BLE001
-        logger.exception("files: failed to load conversation %s", conversation_id)
+        logger.exception(f"files: failed to load conversation {conversation_id}")
         conv = None
     if conv is None:
         return None, None, None
@@ -384,7 +384,7 @@ async def _watch_directory(request: Request):
         observer.schedule(_Handler(), target, recursive=True)
         observer.start()
     except Exception as e:  # noqa: BLE001
-        logger.exception("Failed to start filesystem watcher for %s", target)
+        logger.exception(f"Failed to start filesystem watcher for {target}")
         return JSONResponse({"error": f"Failed to watch: {e}"}, status_code=500)
 
     async def generator():
@@ -444,22 +444,10 @@ def _is_allowed_base(path: str) -> bool:
 
 
 def _unique_dest(target_dir: str, basename: str) -> str:
-    """Return ``target_dir + sep + basename`` with a numeric suffix that
-    avoids collisions, mimicking the OS file managers' "(1)", "(2)" style.
+    """Collision-free destination path; shared logic lives in ``uploads_tmp``."""
+    from app.utils.uploads_tmp import unique_dest
 
-    ``foo.txt`` → ``foo (1).txt`` → ``foo (2).txt`` …
-    """
-    candidate = os.path.join(target_dir, basename)
-    if not os.path.exists(candidate):
-        return candidate
-    stem, ext = os.path.splitext(basename)
-    n = 1
-    while True:
-        renamed = f"{stem} ({n}){ext}"
-        candidate = os.path.join(target_dir, renamed)
-        if not os.path.exists(candidate):
-            return candidate
-        n += 1
+    return unique_dest(target_dir, basename)
 
 
 _UPLOAD_CHUNK = 1 << 20  # 1 MiB
@@ -496,7 +484,7 @@ async def _write_upload(value, target_dir: str, max_bytes: int | None = None) ->
                             "error": f"File exceeds the {max_bytes}-byte upload limit"}
                 out.write(chunk)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Upload failed for %s", basename)
+        logger.exception(f"Upload failed for {basename}")
         return {"name": basename, "saved_as": "", "status": "error", "error": str(exc)}
     return {
         "name": basename,
@@ -589,7 +577,9 @@ async def _upload_temp_files(request: Request):
         from app.events.runner import get_conversation_storage
         conv = await get_conversation_storage().get_conversation(conversation_id)
     except Exception:  # noqa: BLE001
-        logger.exception("upload-temp: failed to load conversation %s", conversation_id)
+        logger.exception(
+            f"upload-temp: failed to load conversation {conversation_id}"
+        )
         conv = None
     if conv is None:
         return JSONResponse({"error": "Conversation not found"}, status_code=404)
@@ -646,7 +636,7 @@ async def _delete_entry(request: Request):
         else:
             os.remove(resolved)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Delete failed for %s", resolved)
+        logger.exception(f"Delete failed for {resolved}")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
     return JSONResponse({"ok": True})
@@ -711,7 +701,7 @@ async def _move_entry(request: Request):
     try:
         shutil.move(src_resolved, dest_resolved)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Move failed: %s -> %s", src_resolved, dest_resolved)
+        logger.exception(f"Move failed: {src_resolved} -> {dest_resolved}")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
     return JSONResponse({"ok": True, "dest": dest_resolved})
@@ -752,7 +742,7 @@ async def _mkdir(request: Request):
     try:
         os.makedirs(target, exist_ok=False)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("mkdir failed for %s", target)
+        logger.exception(f"mkdir failed for {target}")
         return JSONResponse({"error": str(exc)}, status_code=500)
     return JSONResponse({"ok": True, "path": target})
 
@@ -819,16 +809,14 @@ async def _set_cwd(request: Request):
             row_id, new_path, get_conversation_storage(),
         )
     except Exception:  # noqa: BLE001
-        logger.exception(
-            "Failed to persist cwd override for %s", row_id
-        )
+        logger.exception(f"Failed to persist cwd override for {row_id}")
 
     try:
         await get_event_stream_bus().publish(
             row_id, "cwd", {"working_directory": new_path}
         )
     except Exception:  # noqa: BLE001
-        logger.exception("Failed to publish cwd change for %s", row_id)
+        logger.exception(f"Failed to publish cwd change for {row_id}")
 
     return JSONResponse({"working_directory": new_path})
 

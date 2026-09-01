@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List
+import os
+from typing import TYPE_CHECKING, Any, List
 
 from a2a.types import (
     Role,
@@ -291,6 +292,8 @@ def convert_db_messages_to_history(
             continue
         role = "assistant" if m["role"] == "agent" else m["role"]
         content = m.get("content") or ""
+        if role == "user":
+            content = _append_file_part_paths(content, m.get("parts"))
         if not content.strip():
             continue
         messages.append({
@@ -298,6 +301,42 @@ def convert_db_messages_to_history(
             "content": content,
         })
     return messages
+
+
+def _append_file_part_paths(content: str, parts: Any) -> str:
+    """Name each file attached to a past user message by its absolute path.
+
+    A file only ever reaches the model as a path it can hand to a tool, and
+    that path is appended to the query of the turn the file arrived on
+    (``_append_attachments_note``). A message that never ran a turn — a group
+    post the relevance judge stayed quiet on — never produced that note, and a
+    later turn asking "what is that image?" saw only the row's text, which
+    names the file but not where it is. The agent then hunted the filename
+    across the disk.
+
+    So the path is restored here, from the row's own file parts. Content-only
+    and deterministic: no filesystem check (a stat would make the prompt vary
+    with the temp-dir pruner and cost the cache), and the tool reports a
+    missing file perfectly well on its own. Malformed parts are skipped rather
+    than raised on — history assembly must not die on one bad row.
+    """
+    if not isinstance(parts, list):
+        return content
+    lines: list[str] = []
+    for part in parts:
+        if not isinstance(part, dict) or part.get("kind") != "file":
+            continue
+        file_info = part.get("file")
+        if not isinstance(file_info, dict):
+            continue
+        uri = str(file_info.get("uri") or "").strip()
+        if not uri:
+            continue
+        name = str(file_info.get("name") or "").strip() or os.path.basename(uri)
+        lines.append(f'[attached file "{name}" — absolute path: {uri}]')
+    if not lines:
+        return content
+    return "\n".join([content, *lines]) if content else "\n".join(lines)
 
 
 _CONTENT_TOKEN_ENCODER = None

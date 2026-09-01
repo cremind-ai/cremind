@@ -26,6 +26,10 @@ import { renderServiceModeDescription } from '../../services/installCatalogApi';
 // provided as a prop (the common case); a small hardcoded fallback
 // keeps the component renderable on backends that don't ship the
 // catalog endpoint (older builds, smoke tests).
+//
+// Lives under shared/ because it has three consumers across two
+// directories: the wizard's server + embedding steps, and the Settings
+// Vector Embedding page.
 
 const props = defineProps<{
   modelValue: DeploymentMode;

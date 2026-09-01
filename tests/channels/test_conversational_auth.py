@@ -75,7 +75,9 @@ class _ConvAdapter(BaseChannelAdapter):
     async def _send_text(self, sender_id, text):
         self.sent.append((sender_id, text))
 
-    async def _dispatch_to_agent(self, conversation_id, sender_id, display_name, text):
+    async def _dispatch_to_agent(
+        self, conversation_id, sender_id, display_name, text, attachments=None,
+    ):
         self.dispatched.append((conversation_id, sender_id, text))
 
 

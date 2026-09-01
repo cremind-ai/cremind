@@ -101,10 +101,17 @@ async def deliver_to_group(
     metadata: Dict[str, Any],
     *,
     start_turn: bool,
+    attachments: Optional[list] = None,
 ) -> None:
-    """Hand one group message to the agent, with or without starting a turn."""
+    """Hand one group message to the agent, with or without starting a turn.
+
+    ``attachments`` are already-staged ``{"name", "path"}`` entries (see
+    :func:`app.channels.attachments.stage_incoming_files`) — they ride the
+    same kwargs the web composer uses, so the agent sees the paths and the
+    persisted row gets its file chips.
+    """
     if not start_turn:
-        await _quiet_write(adapter, conversation_id, rendered, metadata)
+        await _quiet_write(adapter, conversation_id, rendered, metadata, attachments)
         return
 
     from app.agent.stream_runner import make_run_id
@@ -119,6 +126,7 @@ async def deliver_to_group(
         profile=adapter.profile,
         query=rendered,
         user_message_metadata=metadata,
+        attachments=attachments,
     )
     if parked is not None and parked.injected:
         # Folded into the running turn — that turn's answer covers it. The run
@@ -138,6 +146,7 @@ async def deliver_to_group(
             history_messages=history,
             reasoning=True,
             user_message_metadata=metadata,
+            attachments=attachments,
             # A message that was parked and then lost the race to the turn's end
             # is already persisted; run it without persisting it twice.
             push_user_message=parked is None,
@@ -154,7 +163,11 @@ async def deliver_to_group(
 
 
 async def _quiet_write(
-    adapter: Any, conversation_id: str, rendered: str, metadata: Dict[str, Any],
+    adapter: Any,
+    conversation_id: str,
+    rendered: str,
+    metadata: Dict[str, Any],
+    attachments: Optional[list] = None,
 ) -> None:
     """Store a message as context without waking the agent.
 
@@ -162,11 +175,14 @@ async def _quiet_write(
     turn-end flush, which would start exactly the turn this path exists to avoid.
     """
     try:
+        from app.agent.stream_runner import attachment_file_parts
+
         row = await adapter.storage.add_message(
             conversation_id=conversation_id,
             role="user",
             content=rendered,
             metadata=metadata,
+            parts=attachment_file_parts(attachments) or None,
         )
     except Exception:  # noqa: BLE001
         logger.exception(

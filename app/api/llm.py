@@ -717,6 +717,23 @@ def get_llm_routes(state: BootedState) -> list[Route]:
             return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
         model_groups = body.get("model_groups", {})
+        # ``high`` is the one group nothing can fall back from: every optional
+        # group resolves to it, so storing a blank here leaves the profile
+        # unable to answer at all, and the channel paths that fail closed (the
+        # group relevance judge) go silent with no user-visible reason. The UI
+        # can send one by accident — picking a different provider clears the
+        # model field — so refuse it rather than persisting an unusable state.
+        # A key that is simply absent still means "leave it alone".
+        if "high" in model_groups and not str(model_groups.get("high") or "").strip():
+            return JSONResponse(
+                {
+                    "error": (
+                        "A main model is required. Choose one for the Model "
+                        "group before saving."
+                    ),
+                },
+                status_code=400,
+            )
         for group, value in model_groups.items():
             if group in ("high", "vision", "audio", "low", "plan"):
                 config_storage.set("llm_config", f"model_group.{group}", str(value), profile=profile)

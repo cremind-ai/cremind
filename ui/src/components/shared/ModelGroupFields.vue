@@ -15,8 +15,15 @@ import type { ModelOption } from '../../composables/useLLMModels';
 const props = withDefaults(defineProps<{
   /** Provider options for the Provider dropdown. */
   providers: { name: string; display_name: string }[];
-  /** Flattened model list built by the parent's ``rebuildModelList``. */
+  /** Flattened model list built by the parent's ``rebuildModelList``. This is
+   *  what the picker OFFERS, so it is scoped to each provider's active auth
+   *  method. */
   allModels: ModelOption[];
+  /** Superset of ``allModels``: every model the parent has ever fetched, used
+   *  only to NAME a bound model. The two diverge while an auth method is being
+   *  previewed — the offered list re-scopes to that method, but a model saved
+   *  under the other one must keep its label and its reasoning options. */
+  knownModels?: ModelOption[];
   /** Selected provider name (v-model:provider). */
   provider: string;
   /** Selected model group value "provider/model" (v-model:model). */
@@ -33,6 +40,7 @@ const props = withDefaults(defineProps<{
   showReasoning?: boolean;
   modelPlaceholder?: string;
 }>(), {
+  knownModels: () => [],
   reasoningEffort: null,
   useVision: false,
   useAudio: false,
@@ -69,9 +77,30 @@ const filteredModels = computed<ModelOption[]>(() => {
   return props.allModels.filter((m) => m.provider === props.provider);
 });
 
+/** Describe a bound model: the offered list first, then everything the parent
+ *  has ever fetched (see the ``knownModels`` prop). */
+function describeModel(value: string): ModelOption | undefined {
+  if (!value) return undefined;
+  return props.allModels.find((m) => m.value === value)
+    || props.knownModels.find((m) => m.value === value);
+}
+
 const reasoningOptions = computed<string[]>(() => {
-  const found = props.allModels.find((m) => m.value === props.model);
-  return found?.reasoning_effort || [];
+  if (!props.model) return [];
+  const found = describeModel(props.model);
+  if (found) return found.reasoning_effort || [];
+  // Nothing describes the bound model any more (a catalog dropped it). Keep the
+  // row alive on the effort that is bound so it stays visible and clearable —
+  // hiding it would make a saved effort look gone while it still gets saved.
+  return props.reasoningEffort ? [props.reasoningEffort] : [];
+});
+
+/** The bound model when the offered list doesn't contain it — surfaced as its
+ *  own option so the picker shows a name instead of the bare "provider/id". */
+const boundModelOption = computed<ModelOption | null>(() => {
+  if (!props.model || filteredModels.value.some((m) => m.value === props.model)) return null;
+  return describeModel(props.model)
+    || { label: props.model, value: props.model, provider: extractProvider(props.model) };
 });
 
 const providerProxy = computed({
@@ -116,6 +145,12 @@ watch(() => props.model, () => {
 
     <ElFormItem label="Model">
       <ElSelect v-model="modelProxy" filterable :clearable="clearable" :placeholder="modelPlaceholder">
+        <ElOption
+          v-if="boundModelOption"
+          :key="boundModelOption.value"
+          :label="boundModelOption.label"
+          :value="boundModelOption.value"
+        />
         <ElOption v-for="m in filteredModels" :key="m.value" :label="m.label" :value="m.value" />
       </ElSelect>
     </ElFormItem>

@@ -3,8 +3,7 @@ import { ref, computed, onMounted, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useRouter } from 'vue-router';
 import {
-  ElForm, ElFormItem, ElInput, ElInputNumber, ElSelect, ElOption,
-  ElSwitch, ElButton, ElMessage, ElMessageBox, ElDialog,
+  ElButton, ElMessage, ElMessageBox, ElDialog,
 } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
@@ -15,16 +14,14 @@ import {
   fetchServiceCapabilities,
   streamFeaturesInstall,
   EmbeddingFeaturesNotInstalledError,
-  type DeploymentMode,
   type EmbeddingConfig,
   type EmbeddingFeaturesNotInstalledDetail,
   type FeatureInstallEvent,
-  type ServiceCapability,
   type ServiceCapabilitiesResponse,
 } from '../services/configApi';
 import { fetchInstallCatalog, type InstallCatalog } from '../services/installCatalogApi';
 import { useServerRestart } from '../composables/useServerRestart';
-import DeploymentModeRadio from '../components/setup/DeploymentModeRadio.vue';
+import EmbeddingConfigForm from '../components/shared/EmbeddingConfigForm.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -39,6 +36,10 @@ const { status, phase, error: errorMsg, busy: isBusy } = storeToRefs(embeddingSt
 const loading = ref(true);
 const saving = ref(false);
 
+// Seeded with the disabled shape so ``applyChanges`` has something valid to
+// read before ``loadConfig`` resolves; the shared EmbeddingConfigForm renders
+// only after that (it lives under ``v-else`` on ``loading``) and owns the
+// field defaults and deployment-mode clamping from there on.
 const form = ref<EmbeddingConfig>({
   enabled: false,
   provider: 'me5',
@@ -53,34 +54,6 @@ const form = ref<EmbeddingConfig>({
 
 const serviceCapabilities = ref<ServiceCapabilitiesResponse | null>(null);
 const installCatalog = ref<InstallCatalog | null>(null);
-const qdrantCapability = computed(() => serviceCapabilities.value?.services?.qdrant ?? null);
-const chromaCapability = computed(() => serviceCapabilities.value?.services?.chroma ?? null);
-const dockerAvailable = computed(() => serviceCapabilities.value?.docker_available ?? false);
-
-// Lifted from StepEmbeddingConfig.vue's ``pickInitialMode``: when the
-// saved deployment_mode doesn't survive the install-mode rule filter
-// (e.g. previous setup saved ``external`` for Qdrant but the install
-// mode now restricts to Docker-only), snap to the first effectively
-// allowed mode so the form renders the right sub-fields.
-function pickInitialMode(
-  saved: DeploymentMode | undefined,
-  cap: ServiceCapability | null,
-  preferred: DeploymentMode,
-): DeploymentMode {
-  if (!cap) return saved ?? preferred;
-  const effective = cap.supported_modes.filter((mode) =>
-    mode === 'docker' ? dockerAvailable.value : true,
-  );
-  if (saved && effective.includes(saved)) return saved;
-  if (effective.includes(preferred)) return preferred;
-  return effective[0] ?? preferred;
-}
-
-const showGemmaToken = computed(() => form.value.enabled && form.value.provider === 'gemma');
-const showQdrant = computed(() => form.value.enabled && form.value.vectorstore.provider === 'qdrant');
-const showChroma = computed(() => form.value.enabled && form.value.vectorstore.provider === 'chroma');
-const qdrantMode = computed(() => form.value.vectorstore.qdrant.deployment_mode);
-const chromaMode = computed(() => form.value.vectorstore.chroma.deployment_mode);
 
 const phaseLabel = computed(() => {
   if (!phase.value) return '';
@@ -142,42 +115,6 @@ async function loadConfig() {
     loading.value = false;
   }
 }
-
-// When capabilities arrive after the form has already mounted, clamp
-// any deployment_mode that the live mode list no longer supports. Same
-// shape as StepEmbeddingConfig.vue.
-watch([qdrantCapability, dockerAvailable], () => {
-  const cap = qdrantCapability.value;
-  if (!cap) return;
-  const effective = cap.supported_modes.filter((m) =>
-    m === 'docker' ? dockerAvailable.value : true,
-  );
-  if (effective.length && !effective.includes(form.value.vectorstore.qdrant.deployment_mode)) {
-    form.value.vectorstore.qdrant.deployment_mode = pickInitialMode(
-      form.value.vectorstore.qdrant.deployment_mode, cap, 'external',
-    );
-  }
-});
-watch([chromaCapability, dockerAvailable], () => {
-  const cap = chromaCapability.value;
-  if (!cap) return;
-  const effective = cap.supported_modes.filter((m) =>
-    m === 'docker' ? dockerAvailable.value : true,
-  );
-  if (effective.length && !effective.includes(form.value.vectorstore.chroma.deployment_mode)) {
-    form.value.vectorstore.chroma.deployment_mode = pickInitialMode(
-      form.value.vectorstore.chroma.deployment_mode, cap, 'native',
-    );
-  }
-});
-
-// When the user keeps editing, mirror the active provider's
-// deployment_mode up to the top-level vectorstore key so the persisted
-// shape stays consistent.
-watch(form, (val) => {
-  const provider = val.vectorstore.provider;
-  val.vectorstore.deployment_mode = val.vectorstore[provider].deployment_mode;
-}, { deep: true });
 
 // Detect a busy→ready transition so we can confirm to the user that
 // the rebuild they triggered actually finished. We only flash the
@@ -404,145 +341,54 @@ async function restartFromInstallDialog() {
       <div v-if="loading" class="loading-state">Loading…</div>
 
       <template v-else>
-        <div class="status-row">
-          <span class="status-label">Current status:</span>
-          <span :class="statusBadgeClass">{{ statusBadgeText }}</span>
-          <span v-if="phaseLabel" class="status-phase">— {{ phaseLabel }}</span>
-        </div>
-        <div v-if="errorMsg" class="error-banner">{{ errorMsg }}</div>
+        <!-- Every field is the shared EmbeddingConfigForm (the Setup Wizard's
+             embedding step renders the same one). What's Settings-only lives
+             in its slots — the live status row above the fields, the rebuild
+             warning under the store picker — plus the Apply flow below. -->
+        <EmbeddingConfigForm
+          v-model="form"
+          :service-capabilities="serviceCapabilities"
+          :install-catalog="installCatalog"
+          :disabled="isBusy || saving"
+        >
+          <template #intro>
+            <div class="status-row">
+              <span class="status-label">Current status:</span>
+              <span :class="statusBadgeClass">{{ statusBadgeText }}</span>
+              <span v-if="phaseLabel" class="status-phase">— {{ phaseLabel }}</span>
+            </div>
+            <div v-if="errorMsg" class="error-banner">{{ errorMsg }}</div>
+          </template>
 
-        <ElForm label-position="top" class="config-form" :disabled="isBusy || saving">
-          <ElFormItem label="Enable Vector Embedding">
-            <ElSwitch v-model="form.enabled" :disabled="isBusy || saving" />
+          <template #enable-hint="{ enabled }">
             <div class="field-hint">
-              {{ form.enabled
+              {{ enabled
                   ? 'Configure the model and vector store below. Applying changes will reload + rebuild caches.'
                   : 'Embedding-dependent features (long-term memory search, semantic Google Places filtering, document search) are disabled.' }}
             </div>
-          </ElFormItem>
-
-          <template v-if="form.enabled">
-            <div class="section-divider"></div>
-            <h3 class="section-title">Embedding Model</h3>
-
-            <ElFormItem label="Model">
-              <ElSelect v-model="form.provider" style="width: 100%">
-                <ElOption value="me5" label="ME5 — Multilingual E5 Base (no auth, 768 dims)" />
-                <ElOption value="gemma" label="Gemma 300M — Google (requires HF_TOKEN, 768 dims)" />
-              </ElSelect>
-            </ElFormItem>
-
-            <ElFormItem v-if="showGemmaToken" label="HuggingFace Token (HF_TOKEN)">
-              <ElInput
-                v-model="form.hf_token"
-                type="password"
-                show-password
-                placeholder="hf_..."
-              />
-              <div class="field-hint">
-                Required to download the gated <code>google/embeddinggemma-300m</code> model.
-              </div>
-            </ElFormItem>
-
-            <div class="section-divider"></div>
-            <h3 class="section-title">Vector Store</h3>
-
-            <ElFormItem label="Provider">
-              <ElSelect v-model="form.vectorstore.provider" style="width: 100%">
-                <ElOption value="qdrant" label="Qdrant" />
-                <ElOption value="chroma" label="ChromaDB" />
-              </ElSelect>
-              <div class="field-hint">
-                Switching stores triggers a full rebuild — the new store starts empty.
-              </div>
-            </ElFormItem>
-
-            <template v-if="showQdrant">
-              <ElFormItem v-if="qdrantCapability" label="Qdrant Deployment">
-                <DeploymentModeRadio
-                  v-model="form.vectorstore.qdrant.deployment_mode"
-                  :service="qdrantCapability"
-                  :docker-available="dockerAvailable"
-                  :catalog="installCatalog"
-                />
-              </ElFormItem>
-              <template v-if="qdrantMode === 'docker'">
-                <div class="info-box">
-                  Cremind will start a <code>qdrant/qdrant</code> container alongside
-                  itself and connect on <code>qdrant:6333</code>.
-                </div>
-              </template>
-              <template v-else>
-                <ElFormItem label="Qdrant Host">
-                  <ElInput v-model="form.vectorstore.qdrant.host" placeholder="localhost" />
-                </ElFormItem>
-                <ElFormItem label="Qdrant Port">
-                  <ElInputNumber v-model="form.vectorstore.qdrant.port" :min="1" :max="65535" />
-                </ElFormItem>
-                <ElFormItem label="API Key (optional)">
-                  <ElInput v-model="form.vectorstore.qdrant.api_key" type="password" show-password />
-                </ElFormItem>
-                <ElFormItem label="Use HTTPS">
-                  <ElSwitch v-model="form.vectorstore.qdrant.https" />
-                </ElFormItem>
-              </template>
-            </template>
-
-            <template v-if="showChroma">
-              <ElFormItem v-if="chromaCapability" label="ChromaDB Deployment">
-                <DeploymentModeRadio
-                  v-model="form.vectorstore.chroma.deployment_mode"
-                  :service="chromaCapability"
-                  :docker-available="dockerAvailable"
-                  :catalog="installCatalog"
-                />
-              </ElFormItem>
-
-              <template v-if="chromaMode === 'docker'">
-                <div class="info-box">
-                  Cremind will start a <code>chromadb/chroma</code> container alongside
-                  itself and connect on <code>chroma:8000</code>.
-                </div>
-              </template>
-              <template v-else-if="chromaMode === 'native'">
-                <ElFormItem label="Persist Path">
-                  <ElInput
-                    v-model="form.vectorstore.chroma.persist_path"
-                    placeholder="Leave blank for <working_dir>/storage/chroma"
-                  />
-                  <div class="field-hint">
-                    Cremind runs the <code>chromadb</code> Python library in-process — no separate service.
-                  </div>
-                </ElFormItem>
-              </template>
-              <template v-else>
-                <ElFormItem label="Chroma Host">
-                  <ElInput v-model="form.vectorstore.chroma.host" placeholder="localhost" />
-                </ElFormItem>
-                <ElFormItem label="Chroma Port">
-                  <ElInputNumber v-model="form.vectorstore.chroma.port" :min="1" :max="65535" />
-                </ElFormItem>
-                <ElFormItem label="Use SSL">
-                  <ElSwitch v-model="form.vectorstore.chroma.ssl" />
-                </ElFormItem>
-                <ElFormItem label="API Key (optional)">
-                  <ElInput v-model="form.vectorstore.chroma.api_key" type="password" show-password />
-                </ElFormItem>
-              </template>
-            </template>
           </template>
 
-          <div class="actions">
-            <ElButton
-              type="primary"
-              :loading="saving || isBusy"
-              :disabled="isBusy"
-              @click="applyChanges"
-            >
-              {{ isBusy ? 'Waiting…' : 'Apply Changes' }}
-            </ElButton>
-          </div>
-        </ElForm>
+          <template #store-hint>
+            <div class="field-hint">
+              Switching stores triggers a full rebuild — the new store starts empty.
+            </div>
+          </template>
+        </EmbeddingConfigForm>
+
+        <!-- Outside the shared form on purpose: the form owns the fields, not
+             the save. The button used to sit inside the ElForm and inherit its
+             ``disabled``; ``:loading`` covers the same ground here, since a
+             loading ElButton is already unclickable. -->
+        <div class="actions">
+          <ElButton
+            type="primary"
+            :loading="saving || isBusy"
+            :disabled="isBusy"
+            @click="applyChanges"
+          >
+            {{ isBusy ? 'Waiting…' : 'Apply Changes' }}
+          </ElButton>
+        </div>
       </template>
     </div>
 
@@ -668,43 +514,45 @@ async function restartFromInstallDialog() {
 
 .error-banner {
   margin: 8px 0 16px 0; padding: 10px 14px;
-  background: #fff4f4; border: 1px solid #f5a3a3; border-radius: 6px;
-  color: #b03030; font-size: 0.825rem;
+  background: var(--surface-hover); border: 1px solid var(--el-color-danger); border-radius: 6px;
+  color: var(--el-color-danger); font-size: 0.825rem;
 }
 
-.config-form { max-width: 540px; }
-.section-divider { border-top: 1px solid var(--border-color); margin: 18px 0 14px; }
-.section-title { font-size: 0.95rem; font-weight: 600; color: var(--text-primary); margin: 0 0 10px 0; }
+/* The hints we pass into EmbeddingConfigForm's slots are compiled in this
+   component's scope, so the shared form's own ``.field-hint`` rule can't
+   reach them. */
 .field-hint { margin-top: 4px; font-size: 0.775rem; color: var(--text-secondary); line-height: 1.4; }
-.field-hint code { background: var(--surface-color); padding: 1px 4px; border-radius: 3px; font-size: 0.78rem; }
-.info-box {
-  margin: 8px 0 16px 0; padding: 12px 16px;
-  background: var(--hover-bg); border-radius: 8px;
-  font-size: 0.825rem; color: var(--text-secondary); line-height: 1.5;
-}
-.info-box code { background: var(--surface-color); padding: 1px 4px; border-radius: 3px; font-size: 0.8rem; }
 .actions { margin-top: 24px; }
 
 .feature-install-body p { margin: 0 0 12px 0; font-size: 0.875rem; line-height: 1.5; }
 .feature-install-body code { background: var(--surface-color); padding: 1px 4px; border-radius: 3px; font-size: 0.8rem; }
 .feature-install-list { margin: 0 0 12px 18px; padding: 0; font-size: 0.825rem; color: var(--text-secondary); }
 .feature-install-list li { margin-bottom: 2px; }
-.feature-install-restart-tag { color: #b07300; }
+/* Bare text on the dialog body, so it needs a token: the fixed amber was
+   near-unreadable against the dark-mode background. */
+.feature-install-restart-tag { color: var(--el-color-warning); }
+/* Same frame as the Agents & Tools install log: on ``--surface-color`` with
+   no border the box was invisible against the light-mode dialog body, which
+   made a streaming install look like nothing was happening. */
 .feature-install-log {
   max-height: 240px; overflow-y: auto; margin: 12px 0;
-  padding: 10px 12px; background: var(--surface-color);
-  border-radius: 6px; font-family: var(--font-mono, monospace);
+  padding: 10px 12px; background: var(--bg-color);
+  border: 1px solid var(--border-color);
+  border-radius: 6px; color: var(--text-primary);
+  font-family: var(--font-mono, monospace);
   font-size: 0.75rem; line-height: 1.4;
 }
 .feature-install-log > div { white-space: pre-wrap; }
+/* Semantic tokens, not fixed hex: these banners sit inside the install dialog
+   and hard-coded light tints rendered as near-white blocks in dark mode. */
 .feature-install-error {
   margin: 8px 0 0 0; padding: 8px 12px;
-  background: #fff4f4; border: 1px solid #f5a3a3; border-radius: 6px;
-  color: #b03030; font-size: 0.825rem;
+  background: var(--surface-hover); border: 1px solid var(--el-color-danger); border-radius: 6px;
+  color: var(--el-color-danger); font-size: 0.825rem;
 }
 .feature-install-restart {
   margin: 8px 0 0 0; padding: 10px 12px;
-  background: #fff8e1; border-radius: 6px;
-  color: #b07300; font-size: 0.825rem; line-height: 1.5;
+  background: var(--surface-hover); border: 1px solid var(--el-color-warning); border-radius: 6px;
+  color: var(--el-color-warning); font-size: 0.825rem; line-height: 1.5;
 }
 </style>

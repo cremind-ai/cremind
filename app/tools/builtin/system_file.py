@@ -42,6 +42,14 @@ DEFAULT_GREP_RESULTS = 50               # per-call max_results default
 MAX_GREP_FILES_SCANNED = 5000           # traversal budget (files actually read)
 MAX_GREP_CONTEXT_LINES = 50             # clamp for context / -A / -B / -C
 
+# Traversal budget shared by every name-based walk (search_files, and grep's
+# candidate scan). Counts directory entries VISITED, not results returned, so a
+# walk over a tree where nothing matches is bounded too — a filter that matches
+# nothing is exactly when a walk runs longest. An internal rail, deliberately
+# not a per-profile variable: it exists to bound the process, not to tune
+# behaviour, and raising it is how you hang the server.
+MAX_SCAN_ENTRIES = 200000
+
 
 class Var:
     """Variable keys for the System File tool's per-profile overrides."""
@@ -670,7 +678,12 @@ class SearchFilesTool(BuiltInTool):
                 "type": "integer",
                 "description": (
                     "Maximum number of results to return. "
-                    "Defaults to 20, capped at 100."
+                    "Defaults to 20, capped at 100. The response sets "
+                    "truncated=true when the walk stopped early — either at "
+                    "this limit or at the server's scan budget — and "
+                    "truncation_note says which; a broad search from a large "
+                    "directory can hit the budget before reaching a match, so "
+                    "search from the most specific path you know."
                 ),
             },
         },
@@ -710,11 +723,43 @@ class SearchFilesTool(BuiltInTool):
                 "message": f"'{rel_path}' is not a directory.",
             })
 
+        # The walk is synchronous and can be enormous (a search rooted at the
+        # home directory visits every file the user owns). Run it off the event
+        # loop — otherwise it blocks every other conversation, channel and API
+        # request in the process, and the adapter's call timeout cannot fire on
+        # a coroutine that never awaits. Same reason grep_files offloads.
+        payload = await asyncio.to_thread(
+            self._run_search,
+            search_root=search_root,
+            data_dir=data_dir,
+            rel_path=rel_path,
+            query=query,
+            pattern=pattern,
+            type_filter=type_filter,
+            max_results=max_results,
+        )
+        return BuiltInToolResult(structured_content=payload)
+
+    def _run_search(
+        self,
+        *,
+        search_root: str,
+        data_dir: str,
+        rel_path: str,
+        query: str,
+        pattern: Optional[str],
+        type_filter: Optional[str],
+        max_results: int,
+    ) -> Dict[str, Any]:
+        """Walk *search_root* for name matches. Synchronous; runs in a thread."""
         keywords = query.lower().split()
         base = os.path.realpath(data_dir)
-        results = []
+        results: List[Dict[str, Any]] = []
+        scanned = 0
+        truncated = False
+        budget_exhausted = False
 
-        for dirpath, dirnames, filenames in os.walk(search_root):
+        for dirpath, dirnames, filenames in os.walk(search_root, followlinks=False):
             entries = []
             if type_filter != "file":
                 entries.extend((d, True) for d in dirnames)
@@ -722,6 +767,13 @@ class SearchFilesTool(BuiltInTool):
                 entries.extend((f, False) for f in filenames)
 
             for name, is_dir in entries:
+                # Counted per entry visited, not per match: a filter that
+                # matches nothing is exactly when a walk runs longest.
+                scanned += 1
+                if scanned > MAX_SCAN_ENTRIES:
+                    truncated = budget_exhausted = True
+                    break
+
                 name_lower = name.lower()
 
                 if not all(kw in name_lower for kw in keywords):
@@ -757,18 +809,35 @@ class SearchFilesTool(BuiltInTool):
 
                 results.append(entry)
                 if len(results) >= max_results:
+                    truncated = True
                     break
 
-            if len(results) >= max_results:
+            if truncated:
                 break
 
-        return BuiltInToolResult(structured_content={
+        note = None
+        if budget_exhausted:
+            note = (
+                f"Scan budget ({MAX_SCAN_ENTRIES} entries) reached before the "
+                f"tree was fully walked; results are partial. Search a more "
+                f"specific 'path', or narrow 'pattern'."
+            )
+        elif truncated:
+            note = (
+                f"Result limit ({max_results}) reached; more matches may exist. "
+                f"Narrow the query or raise max_results."
+            )
+
+        return {
             "query": query,
             "search_root": rel_path,
             "total_matches": len(results),
             "max_results": max_results,
+            "truncated": truncated,
+            "entries_scanned": scanned,
+            "truncation_note": note,
             "results": results,
-        })
+        }
 
 
 class GrepFilesTool(BuiltInTool):
@@ -1039,9 +1108,18 @@ class GrepFilesTool(BuiltInTool):
 
         ``followlinks=False`` (the os.walk default) prevents directory-symlink
         loops from causing infinite recursion on any OS.
+
+        ``MAX_GREP_FILES_SCANNED`` bounds the files actually read, but only
+        counts files that got past these name filters — a glob matching nothing
+        walks the whole tree before yielding once. ``MAX_SCAN_ENTRIES`` bounds
+        the traversal itself so that case terminates too.
         """
+        scanned = 0
         for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
             for name in filenames:
+                scanned += 1
+                if scanned > MAX_SCAN_ENTRIES:
+                    return
                 if _grep_name_matches(name, glob_variants, type_exts):
                     yield os.path.join(dirpath, name)
 
@@ -1694,6 +1772,7 @@ class WriteFileTool(BuiltInTool):
             "uri": file_uri,
             "name": file_name,
             "mime_type": mime,
+            "origin": "created",
         }
 
         payload: ToolResultWithFiles = {
@@ -1885,6 +1964,7 @@ class OverwriteFileTool(BuiltInTool):
             "uri": file_uri,
             "name": file_name,
             "mime_type": mime,
+            "origin": "created",
         }
 
         payload: ToolResultWithFiles = {
@@ -1982,6 +2062,9 @@ def _relocation_result(
         "uri": final_target.replace(os.sep, "/"),
         "name": os.path.basename(final_target),
         "mime_type": _guess_mime(final_target),
+        # The relocated file is where the agent PUT it — an output of the
+        # call, not a file that merely passed through.
+        "origin": "created",
     }
     payload: ToolResultWithFiles = {"text": text, "_files": [file_entry]}
     return BuiltInToolResult(structured_content=payload)

@@ -7,6 +7,7 @@ import {
   type ChannelCatalogEntry,
   type CreateChannelPayload,
 } from '../../services/channelApi';
+import ChannelAddGrid from '../channels/ChannelAddGrid.vue';
 import ChannelEditDialog from '../channels/ChannelEditDialog.vue';
 
 const props = defineProps<{
@@ -166,32 +167,7 @@ onMounted(loadCatalog);
 
     <div v-if="!loading && availableForAdd.length > 0" class="add-section">
       <h4 class="add-title">Add a channel</h4>
-      <div class="add-grid">
-        <ElCard
-          v-for="entry in availableForAdd"
-          :key="entry.type"
-          shadow="hover"
-          class="add-card"
-          :class="{ disabled: entry.implemented === false }"
-          @click="entry.implemented !== false && openCreate(entry.type)"
-        >
-          <div class="add-card-content">
-            <Icon :icon="entry.icon || 'mdi:link-variant'" class="add-icon" />
-            <div>
-              <div class="add-name">
-                {{ entry.display_name }}
-                <ElTag
-                  v-if="entry.implemented === false"
-                  type="info" size="small" effect="plain"
-                >coming soon</ElTag>
-              </div>
-              <div class="add-modes">
-                {{ entry.modes.map((m) => m.label).join(' · ') }}
-              </div>
-            </div>
-          </div>
-        </ElCard>
-      </div>
+      <ChannelAddGrid :channels="availableForAdd" @select="openCreate" />
     </div>
 
     <ChannelEditDialog
@@ -224,16 +200,7 @@ onMounted(loadCatalog);
 .draft-sub { font-size: 0.8rem; color: var(--text-secondary); margin-top: 2px; }
 .draft-actions { display: flex; align-items: center; gap: 8px; }
 
+/* The grid itself lives in ChannelAddGrid.vue; only its heading is ours. */
 .add-section { margin-top: 20px; }
 .add-title { font-size: 0.95rem; font-weight: 600; margin: 0 0 10px 0; }
-.add-grid {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 12px;
-}
-.add-card { cursor: pointer; }
-.add-card.disabled { cursor: not-allowed; opacity: 0.6; }
-.add-card-content { display: flex; align-items: center; gap: 12px; }
-.add-icon { font-size: 28px; color: var(--primary-color); flex-shrink: 0; }
-.add-name { font-weight: 600; display: flex; align-items: center; gap: 8px; }
-.add-modes { font-size: 0.8rem; color: var(--text-secondary); margin-top: 2px; }
 </style>

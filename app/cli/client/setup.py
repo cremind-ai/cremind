@@ -17,14 +17,22 @@ class SetupResponse:
     token: str
     expires_at: str
     profile: str
+    # Non-fatal problems with a setup that still succeeded, each
+    # ``{"code": ..., "message": ...}``. The wizard shows these in its live
+    # log; headless callers would otherwise never learn that, say, the
+    # profile they just created has no model and cannot answer anything.
+    warnings: tuple[dict[str, str], ...] = ()
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "SetupResponse":
+        raw = d.get("warnings")
+        warnings = tuple(w for w in raw if isinstance(w, dict)) if isinstance(raw, list) else ()
         return cls(
             success=bool(d.get("success") or False),
             token=str(d.get("token") or ""),
             expires_at=str(d.get("expires_at") or ""),
             profile=str(d.get("profile") or ""),
+            warnings=warnings,
         )
 
 

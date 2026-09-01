@@ -138,7 +138,10 @@ class SendChannelMessageTool(BuiltInTool):
         "explaining what would work. Give 'channel' when a recipient could "
         "belong to more than one connected platform.\n\n"
         "Give a shared 'message' for everyone, and/or a per-recipient "
-        "'message' to personalise (mail-merge from a sheet). Every delivered "
+        "'message' to personalise (mail-merge from a sheet). 'attachments' "
+        "(optional) is a list of ABSOLUTE file paths delivered to EVERY "
+        "recipient after their text; recipients on a platform that can't carry "
+        "files get a text notice naming the file instead. Every delivered "
         "message is saved to that person's conversation, so later turns can "
         "see what was already sent to them. Max 100 recipients per call."
     )
@@ -194,7 +197,16 @@ class SendChannelMessageTool(BuiltInTool):
                 "type": "string",
                 "description": (
                     "Text sent to every recipient that has no per-recipient "
-                    "override. Required unless every recipient carries its own."
+                    "override. Required unless every recipient carries its own "
+                    "or 'attachments' is given."
+                ),
+            },
+            "attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional ABSOLUTE file paths delivered to every recipient "
+                    "after their text. Pass paths exactly as given/produced."
                 ),
             },
             "channel": {
@@ -312,6 +324,32 @@ class SendChannelMessageTool(BuiltInTool):
                 }
             )
 
+        # Attachments: validated against the profile's own roots (system_file's
+        # trust boundary) plus the turn's working directory, before anything is
+        # resolved or sent.
+        attachments: list[dict] | None = None
+        raw_attachments = arguments.get("attachments") or []
+        if raw_attachments:
+            from app.channels.attachments import validate_outbound_paths
+
+            ok, rejected = validate_outbound_paths(
+                profile, raw_attachments,
+                extra_roots=[arguments.get("_working_directory")],
+            )
+            if rejected:
+                return BuiltInToolResult(
+                    structured_content={
+                        "error": "InvalidAttachment",
+                        "message": (
+                            "Some attachment paths were rejected. Only existing "
+                            "files inside your own directories can be sent; pass "
+                            "absolute paths exactly as produced."
+                        ),
+                        "rejected": rejected,
+                    }
+                )
+            attachments = ok or None
+
         # Re-read the profile default here rather than trusting the schema the
         # model saw: the description is shaped per profile in prepare_tools, but
         # the setting can change between that and this call, and the safe stance
@@ -337,6 +375,7 @@ class SendChannelMessageTool(BuiltInTool):
                 initiated_by="send_channel_message",
                 confirm=confirm,
                 confirm_policy=_policy,
+                attachments=attachments,
             )
         except ValueError as exc:
             return BuiltInToolResult(

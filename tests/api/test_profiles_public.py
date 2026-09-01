@@ -10,6 +10,11 @@ fed by a pre-auth endpoint, so these tests pin its contract:
 - internal ``__``-prefixed profiles stay hidden;
 - its error path does not leak exception details (it is public);
 - the authenticated ``GET /api/profiles`` keeps requiring a token.
+
+The two lists are deliberately different contracts, so the last group of tests
+pins them apart: ``/names`` is a login dropdown and shows every profile to
+everyone, while ``GET /api/profiles`` is the settings screen's management roster
+and shows a non-admin only its own profile — the one it can actually act on.
 """
 
 from __future__ import annotations
@@ -100,3 +105,46 @@ def test_authenticated_list_still_requires_token() -> None:
     response = asyncio.run(handler(request))
 
     assert response.status_code == 401
+
+
+def _auth(username: str) -> SimpleNamespace:
+    return SimpleNamespace(user=SimpleNamespace(is_authenticated=True, username=username))
+
+
+def test_authenticated_list_shows_admin_every_profile() -> None:
+    storage = _make_storage(
+        [{"name": "admin"}, {"name": "lee"}, {"name": "sam"}, {"name": "__server__"}]
+    )
+    handler = _get_handler(storage, "/api/profiles", "GET")
+
+    response = asyncio.run(handler(_auth("admin")))
+
+    assert response.status_code == 200
+    assert _body(response) == {"profiles": ["admin", "lee", "sam"]}
+
+
+def test_authenticated_list_scopes_non_admin_to_own_profile() -> None:
+    """A token is scoped to one profile, so the management roster is too.
+
+    The names are not secret — ``/names`` hands them to anyone — but this list
+    is what the settings screen renders as actionable rows, and a non-admin can
+    act on exactly one of them.
+    """
+    storage = _make_storage([{"name": "admin"}, {"name": "lee"}, {"name": "sam"}])
+    handler = _get_handler(storage, "/api/profiles", "GET")
+
+    response = asyncio.run(handler(_auth("lee")))
+
+    assert response.status_code == 200
+    assert _body(response) == {"profiles": ["lee"]}
+
+
+def test_names_endpoint_stays_unscoped_for_the_login_dropdown() -> None:
+    """The public list must NOT inherit the management list's scoping —
+    the login screen has no caller to scope to."""
+    storage = _make_storage([{"name": "admin"}, {"name": "lee"}])
+    handler = _get_handler(storage, "/api/profiles/names", "GET")
+
+    body = _body(asyncio.run(handler(SimpleNamespace())))
+
+    assert body["profiles"] == ["admin", "lee"]

@@ -28,6 +28,14 @@ const showFactoryConfirm = ref(false);
 const factoryConfirmText = ref('');
 const isOwnProfile = computed(() => props.profile === settingsStore.profileId);
 
+// Gates the three admin-only sections below: creating a profile (the setup
+// wizard behind the form), reconfiguring the server, and the wording of the
+// profile list (GET /api/profiles scopes itself to the caller's own profile for
+// everyone else). Key off the SIGNED-IN profile (settingsStore.profileId), not
+// props.profile — the server authorizes against the token's identity, so merely
+// viewing another profile's page never grants that profile's rights.
+const isAdmin = computed(() => settingsStore.profileId === 'admin');
+
 // Agent name (loaded from backend)
 const agentName = ref('');
 const loadingAgentName = ref(false);
@@ -167,6 +175,14 @@ async function handleDeleteProfile(name: string) {
     // reconcile against the live list on the selector (ProfileSelector.vue).
     settingsStore.removeTokenForProfile(name);
     ElMessage.success(`Profile '${name}' deleted`);
+    if (name === settingsStore.profileId) {
+      // We just deleted the profile we are signed in as, so the token this
+      // page holds is dead — reloading the list would only 401. Send the user
+      // to the profile selector instead; it reconciles the saved-profile cards
+      // against the live list on mount.
+      router.push('/');
+      return;
+    }
     await loadProfiles();
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : 'Failed to delete profile');
@@ -317,8 +333,13 @@ function goBack() { router.push(`/${props.profile}/settings`); }
         </ElButton>
       </div>
 
-      <!-- Create Profile -->
-      <div class="section">
+      <!-- Create Profile — admin only. This form never calls POST /api/profiles:
+           it opens the setup wizard, which completes through POST
+           /api/config/setup, and that endpoint gates every profile after the
+           first behind require_admin (403 "Admin profile required"). Hide the
+           form rather than let a non-admin walk into a dead end in a second
+           tab, where the failure surfaces mid-wizard with the work already done. -->
+      <div v-if="isAdmin" class="section">
         <h2 class="section-title">Create New Profile</h2>
         <p class="section-desc">
           Creates a new profile and opens its setup page in a new tab.
@@ -340,9 +361,25 @@ function goBack() { router.push(`/${props.profile}/settings`); }
         </div>
       </div>
 
-      <!-- Existing Profiles -->
+      <!-- Existing Profiles — the server scopes GET /api/profiles to the
+           caller's own profile for non-admins, so the heading and blurb change
+           with the audience: a one-row table under the plural "Existing
+           Profiles" heading reads as a broken load rather than as the intended
+           scoping. -->
       <div class="section">
-        <h2 class="section-title">Existing Profiles</h2>
+        <h2 class="section-title">{{ isAdmin ? 'Existing Profiles' : 'Your Profile' }}</h2>
+        <p class="section-desc">
+          <template v-if="isAdmin">
+            Every profile on this server. Deleting one also removes its
+            conversations, tool overrides, and skill registrations.
+          </template>
+          <template v-else>
+            Only your own profile is listed — every other profile is managed by
+            the <code>admin</code> profile. Deleting yours also removes its
+            conversations, tool overrides, and skill registrations, and signs
+            you out.
+          </template>
+        </p>
         <div v-if="loading" class="loading-state">Loading...</div>
         <ElTable v-else :data="profiles.map(p => ({ name: p }))" stripe size="default">
           <ElTableColumn prop="name" label="Profile Name" />
@@ -365,8 +402,11 @@ function goBack() { router.push(`/${props.profile}/settings`); }
         </ElTable>
       </div>
 
-      <!-- Reconfigure -->
-      <div class="section">
+      <!-- Reconfigure — admin only: POST /api/config/reconfigure resets the
+           server-wide setup status, so it answers a non-admin with 403. Hiding
+           it keeps us from offering everyone a button that only admin can
+           press. -->
+      <div v-if="isAdmin" class="section">
         <h2 class="section-title">Reconfigure</h2>
         <p class="section-desc">
           Reset the setup status and re-run the initial configuration wizard.

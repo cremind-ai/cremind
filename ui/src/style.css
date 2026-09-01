@@ -64,7 +64,9 @@
   --el-fill-color: #f8fafc;
   --el-fill-color-light: #f1f5f9;
   --el-fill-color-lighter: #f8fafc;
-  
+  --el-fill-color-dark: #ebedf0;
+  --el-fill-color-darker: #e6e8eb;
+
   --el-box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
   --el-box-shadow-light: 0 1px 2px rgba(0, 0, 0, 0.05);
   --el-box-shadow-lighter: 0 1px 2px rgba(0, 0, 0, 0.03);
@@ -132,7 +134,9 @@
   --el-fill-color: #334155;
   --el-fill-color-light: #334155;
   --el-fill-color-lighter: #1e293b;
-  
+  --el-fill-color-dark: #334155;
+  --el-fill-color-darker: #0f172a;
+
   --el-box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
   --el-box-shadow-light: 0 1px 2px rgba(0, 0, 0, 0.2);
   --el-box-shadow-lighter: 0 1px 2px rgba(0, 0, 0, 0.1);

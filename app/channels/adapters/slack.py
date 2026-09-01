@@ -48,9 +48,12 @@ _GROUP_CHANNEL_TYPES = ("channel", "group", "mpim")
 # ordinary post; ``thread_broadcast`` is a threaded reply the author also sent to
 # the channel; ``bot_message`` is how every mirror the other members post arrives,
 # and dropping those here would hide them from the only layer that can tell our
-# own room's echo from an unrelated bot. Everything else (edits, joins, deletes,
-# file shares) has no row on the timeline.
-_GROUP_KEEP_SUBTYPES = (None, "bot_message", "thread_broadcast")
+# own room's echo from an unrelated bot; ``file_share`` is how a message with an
+# attachment arrives — with or without a caption. Everything else (edits, joins,
+# deletes) has no row on the timeline.
+_GROUP_KEEP_SUBTYPES = (None, "bot_message", "thread_broadcast", "file_share")
+# DM subtypes worth ingesting: an ordinary post or a file share.
+_DM_KEEP_SUBTYPES = (None, "file_share")
 
 
 def _ts_seconds(ts: str | None) -> float | None:
@@ -81,6 +84,8 @@ class SlackAdapter(BaseChannelAdapter):
     reports_sender_is_bot = True
     # ``users.conversations`` names every channel the app is a member of.
     supports_group_listing = True
+    # ``files.uploadV2`` — needs the ``files:write`` scope on the app.
+    supports_file_send = True
 
     def __init__(self, channel: dict, storage: Any) -> None:
         super().__init__(channel, storage)
@@ -197,9 +202,10 @@ class SlackAdapter(BaseChannelAdapter):
 
     async def _handle_inbound_safe(
         self, sender_id: str, display_name: str | None, text: str,
+        files: Any = None,
     ) -> None:
         try:
-            await self._handle_inbound(sender_id, display_name, text)
+            await self._handle_inbound(sender_id, display_name, text, files=files)
         except Exception:  # noqa: BLE001
             logger.exception("slack: inbound handler failed")
 
@@ -217,19 +223,23 @@ class SlackAdapter(BaseChannelAdapter):
             await self._handle_group_event(event)
             return
         # Only direct messages; skip bot echoes and edit/delete subtypes.
+        # ``file_share`` stays: it is how an attached file arrives.
         if channel_type != "im":
             return
-        if event.get("bot_id") or event.get("subtype"):
+        if event.get("bot_id") or event.get("subtype") not in _DM_KEEP_SUBTYPES:
             return
         user_id = event.get("user")
         text = event.get("text") or ""
-        if not user_id or not text:
+        files = self._extract_files(event)
+        if not user_id or (not text and not files):
             return
         im_channel = event.get("channel")
         if im_channel:
             self._im_channels[str(user_id)] = str(im_channel)
         display_name = await self._resolve_name(str(user_id))
-        await self._handle_inbound_safe(str(user_id), display_name, text)
+        await self._handle_inbound_safe(
+            str(user_id), display_name, text, files=files or None,
+        )
 
     async def _handle_group_event(self, event: dict) -> None:
         """Hand one channel / private-channel / group-DM message to the room.
@@ -240,13 +250,14 @@ class SlackAdapter(BaseChannelAdapter):
         """
         chat_id = str(event.get("channel") or "")
         text = event.get("text") or ""
+        files = self._extract_files(event)
         sender_is_bot = (
             bool(event.get("bot_id")) or event.get("subtype") == "bot_message"
         )
         # A post made by an app carries no ``user`` at all, so its ``bot_id`` is
         # the only identity it has.
         sender_id = str(event.get("user") or event.get("bot_id") or "")
-        if not chat_id or not text or not sender_id:
+        if not chat_id or not sender_id or (not text and not files):
             return
 
         display_name: str | None = None
@@ -269,7 +280,67 @@ class SlackAdapter(BaseChannelAdapter):
             platform_message_date=_ts_seconds(ts),
             sender_is_bot=sender_is_bot,
             mentioned=self._is_mentioned(event, text),
+            files=files or None,
         )
+
+    def _extract_files(self, event: dict) -> list[Any]:
+        """Attachment descriptors from an event's ``files`` array — unfetched.
+
+        Downloading a Slack file needs the ``files:read`` scope and the bot
+        token as a bearer header on ``url_private_download``. Both are checked
+        only when ``fetch`` actually runs — after the base adapter clears the
+        sender — and a missing scope surfaces as the HTML login page Slack
+        serves instead of bytes, which the fetch rejects loudly rather than
+        staging a fake "file".
+        """
+        from app.channels.attachments import IncomingFile, dest_for
+
+        found: list[Any] = []
+        for entry in event.get("files") or ():
+            if not isinstance(entry, dict):
+                continue
+            url = entry.get("url_private_download") or entry.get("url_private")
+            if not url:
+                continue
+            name = entry.get("name") or f"slack_file_{entry.get('id') or 'unknown'}"
+            mime = entry.get("mimetype")
+            size = entry.get("size")
+
+            def _make_fetch(url: str = url, name: str = name):
+                async def fetch(dest_dir: str) -> str:
+                    import httpx
+
+                    token = (self.channel.get("config") or {}).get("bot_token") or ""
+                    dest = dest_for(dest_dir, name)
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(120.0), follow_redirects=True,
+                    ) as client:
+                        async with client.stream(
+                            "GET", url,
+                            headers={"Authorization": f"Bearer {token}"},
+                        ) as resp:
+                            resp.raise_for_status()
+                            ctype = resp.headers.get("content-type", "")
+                            if ctype.startswith("text/html"):
+                                raise ValueError(
+                                    "Slack served a login page instead of the "
+                                    "file — the app is likely missing the "
+                                    "files:read scope (re-install it with that "
+                                    "scope granted)",
+                                )
+                            with open(dest, "wb") as out:
+                                async for chunk in resp.aiter_bytes(1 << 20):
+                                    out.write(chunk)
+                    return dest
+
+                return fetch
+
+            found.append(IncomingFile(
+                name=name, mime=mime,
+                size=int(size) if isinstance(size, (int, float)) else None,
+                fetch=_make_fetch(),
+            ))
+        return found
 
     async def _dispatch_member_joined(self, event: dict) -> None:
         """Notice this app being added to a channel.
@@ -490,3 +561,42 @@ class SlackAdapter(BaseChannelAdapter):
         if self._app is None:
             raise ChannelAuthError("Slack app not connected")
         await self._app.client.chat_postMessage(channel=chat_id, text=text)
+
+    async def _send_file(
+        self, sender_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        if self._app is None:
+            raise ChannelAuthError("Slack app not connected")
+        channel_id = await self._resolve_channel(sender_id)
+        if not channel_id:
+            raise ChannelAuthError(f"Slack channel for {sender_id} not resolvable")
+        await self._upload_file(channel_id, path, name, caption)
+
+    async def _send_file_to_chat(
+        self, chat_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        if self._app is None:
+            raise ChannelAuthError("Slack app not connected")
+        await self._upload_file(chat_id, path, name, caption)
+
+    async def _upload_file(
+        self, channel_id: str, path: str, name: str | None, caption: str | None,
+    ) -> None:
+        """``files.uploadV2`` into one conversation.
+
+        Needs the ``files:write`` scope; a workspace whose app predates it must
+        be re-installed with the scope granted. ``missing_scope`` comes back as
+        a SlackApiError, which propagates so strict callers can report it.
+        """
+        import os
+
+        await self._app.client.files_upload_v2(
+            channel=channel_id,
+            file=path,
+            filename=name or os.path.basename(path),
+            initial_comment=caption or None,
+        )

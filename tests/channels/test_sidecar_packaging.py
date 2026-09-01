@@ -88,6 +88,42 @@ def test_lockfile_matches_its_manifest(sidecar):
     )
 
 
+# What the Python adapters assume each sidecar's source implements. There is
+# no JS test harness, so these pins are what keeps the frame protocol from
+# drifting silently: an adapter sending ``send_file`` to a sidecar that lost
+# the handler would time out at runtime with nothing failing in CI.
+_REQUIRED_SOURCE_MARKERS = {
+    "whatsapp": (
+        "send_file",              # outbound file control frame
+        "--media-dir",            # header documents the argv contract
+        "media-dir",              # argv parsing
+        "downloadMediaMessage",   # inbound media spooling
+        "files",                  # incoming frames carry a files array
+    ),
+    "zalo": (
+        "send_file",
+        "send_file_result",       # correlated ack the adapter awaits
+        "media-dir",
+        "spoolIncomingMedia",
+        "files",
+    ),
+}
+
+
+@pytest.mark.parametrize("sidecar", _sidecars(), ids=lambda p: p.name)
+def test_source_implements_the_frame_protocol(sidecar):
+    markers = _REQUIRED_SOURCE_MARKERS.get(sidecar.name)
+    if markers is None:
+        pytest.skip(f"{sidecar.name}: no protocol pins declared")
+    source = (sidecar / "index.js").read_text(encoding="utf-8")
+    for marker in markers:
+        assert marker in source, (
+            f"{sidecar.name}/index.js no longer contains {marker!r} — the "
+            "Python adapter's frame protocol depends on it (see "
+            "app/channels/adapters/*.py)."
+        )
+
+
 @pytest.mark.parametrize("sidecar", _sidecars(), ids=lambda p: p.name)
 def test_imports_are_declared_dependencies(sidecar):
     """Relying on a transitive dep works until the tree gets deduped differently."""

@@ -107,6 +107,23 @@ async def delete_target_profile(profile_name: str, deps: Deps) -> None:
     from app.skills import profile_skills_dir, teardown_profile_skills
     from app.tools.builtin.exec_shell_autostart import teardown_processes_for_dir
 
+    # The same rule ``handle_delete_profile`` enforces in app/api/profiles.py:
+    # ``admin`` is a literal profile name, not a role, so removing it leaves an
+    # install with no profile able to create, list or delete any other. The
+    # abort/replace paths reach here with the *caller's own* profile, which may
+    # well be admin, so the API's 403 alone does not close the hole.
+    # Refuse the whole teardown, not just the delete: stopping admin's listeners
+    # and dropping its skills while the profile itself survives is a worse
+    # half-state than leaving the aborted import's design in place, which the
+    # user can still undo by hand. Rollback is best-effort (every step below is
+    # swallowed individually), so this refuses by returning and never raises.
+    if profile_name == "admin":
+        logger.warning(
+            "[blueprint] refusing to delete the 'admin' profile on import rollback — "
+            "leaving it and its skills/listeners intact"
+        )
+        return
+
     try:
         await teardown_processes_for_dir(profile_skills_dir(profile_name), profile=profile_name)
     except Exception:  # noqa: BLE001

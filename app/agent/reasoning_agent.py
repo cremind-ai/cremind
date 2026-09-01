@@ -3163,14 +3163,16 @@ class ReasoningAgent:
                     row_id, str(dir_path), conv_storage,
                 )
             except Exception:  # noqa: BLE001
-                logger.exception("Failed to persist skill cwd anchor for %s", self.context_id)
+                logger.exception(
+                    f"Failed to persist skill cwd anchor for {self.context_id}"
+                )
             try:
                 from app.events import get_event_stream_bus
                 await get_event_stream_bus().publish(
                     row_id, "cwd", {"working_directory": str(dir_path)},
                 )
             except Exception:  # noqa: BLE001
-                logger.exception("Failed to publish skill cwd anchor for %s", row_id)
+                logger.exception(f"Failed to publish skill cwd anchor for {row_id}")
 
         self._append_tool_result(call_id, obs, fn_name=tool.tool_id, truncate=False)
         yield self._result_artifact(

@@ -96,9 +96,9 @@ class ModelGroupManager:
         if not self._model_auth_compatible(provider_name, model_name, profile):
             if group in ("vision", "audio", "low", "plan"):
                 logger.warning(
-                    "[model_groups] %s group model %s/%s is not eligible for the "
-                    "active auth method; falling back to the high group.",
-                    group, provider_name, model_name,
+                    f"[model_groups] {group} group model {provider_name}/"
+                    f"{model_name} is not eligible for the active auth method; "
+                    f"falling back to the high group."
                 )
                 return self.get_provider_and_model("high", profile=profile)
             raise SetupRequiredError(

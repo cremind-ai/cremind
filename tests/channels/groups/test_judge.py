@@ -135,6 +135,48 @@ def test_a_provider_error_means_stay_quiet(monkeypatch):
     assert asyncio.run(_judge()) is False
 
 
+def test_an_unconfigured_profile_is_reported_as_config_not_as_a_crash(monkeypatch):
+    """A profile with no model configured is the one "failure" that isn't one.
+
+    It stayed quiet correctly but logged a full traceback, which read as a
+    channel bug — the thing to say is which profile is unconfigured and where
+    to fix it. Real case: a profile created through the wizard with the LLM
+    step untouched ignored every group message, and the log pointed at the
+    file pipeline instead of at Settings.
+
+    Messages are captured off the loguru logger (``caplog`` sees nothing from
+    it), the same way ``tests/test_server_tls.py`` does it.
+    """
+    from app.lib.llm.exceptions import SetupRequiredError
+    import app.channels.groups.judge as judge_mod
+
+    class _Unconfigured:
+        def low_performance_llm(self, _profile):
+            raise SetupRequiredError(
+                "The 'high' model group is not configured.",
+                code="missing_model_group",
+            )
+
+    import app.events.runner as runner
+    monkeypatch.setattr(runner, "get_cremind_agent", lambda: _Unconfigured())
+
+    said: list[str] = []
+    monkeypatch.setattr(judge_mod.logger, "error", lambda msg: said.append(str(msg)))
+    # ``exception`` is the generic catch-all path; reaching it would mean the
+    # unconfigured case is still being reported as a crash.
+    monkeypatch.setattr(
+        judge_mod.logger, "exception",
+        lambda *_a, **_kw: said.append("EXCEPTION-PATH"),
+    )
+
+    assert asyncio.run(_judge(profile="bobo")) is False
+
+    logged = "\n".join(said)
+    assert "EXCEPTION-PATH" not in logged
+    assert "bobo" in logged
+    assert "LLM Providers" in logged  # says where to fix it
+
+
 def test_a_timeout_means_stay_quiet(monkeypatch):
     _wire_llm(monkeypatch, _Hanging())
     import app.channels.groups.judge as judge_mod

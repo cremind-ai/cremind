@@ -112,12 +112,20 @@ class ToolResultFile(TypedDict):
                        e.g. ``/home/user/.cremind/report.pdf``.
       - ``name``      (optional) — human-readable filename.
       - ``mime_type``  (optional) — MIME type, e.g. ``image/png``.
+      - ``origin``    (optional) — ``"created"`` when the tool produced or
+                       placed this file as an output of the call (wrote,
+                       converted, captured, moved it); ``"referenced"`` (the
+                       default) when the file merely passed through (was
+                       read). Channel reply forwarders auto-deliver only
+                       ``"created"`` files, so a tool that merely *reads* a
+                       file must never mark it created.
 
     Extra metadata fields are allowed and will be ignored by the adapter.
     """
     uri: str
     name: NotRequired[Optional[str]]
     mime_type: NotRequired[Optional[str]]
+    origin: NotRequired[Optional[str]]
 
 
 class ToolResultWithFiles(TypedDict):

@@ -380,6 +380,41 @@ def test_the_boot_sweep_is_a_no_op_on_a_clean_boot(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_the_boot_sweep_rebuilds_attachments_from_the_persisted_parts(
+    tmp_path, monkeypatch,
+):
+    """The park payload lives in memory, so after a crash the file parts on the
+    row are the only record of what was attached. Paths that no longer exist
+    (the uploads_tmp wipe) are dropped; the survivors reach the follow-up."""
+    async def scenario():
+        cs, queued, _fw, _bus = _setup(tmp_path, monkeypatch)
+        cid = await _conv(cs)
+
+        kept = tmp_path / "kept.pdf"
+        kept.write_bytes(b"pdf")
+        gone = str(tmp_path / "wiped-on-boot.pdf")   # never created
+
+        await cs.add_message(
+            conversation_id=cid, role="user", content="see the files",
+            metadata={"mid_turn": {"state": "pending"}},
+            parts=[
+                {"kind": "file",
+                 "file": {"name": "kept.pdf", "mimeType": "application/pdf",
+                          "uri": str(kept)}},
+                {"kind": "file",
+                 "file": {"name": "wiped-on-boot.pdf",
+                          "mimeType": "application/pdf", "uri": gone}},
+            ],
+        )
+
+        assert await umd.sweep_stranded_mid_turn_messages() == 1
+        (turn,) = queued
+        assert str(kept) in turn["query"]            # the survivor is re-listed
+        assert gone not in turn["query"]             # the wiped one is not
+
+    asyncio.run(scenario())
+
+
 # ── "was this for me?", answered before the pause ───────────────────────────
 
 

@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from app.channels.groups.constants import JUDGE_SOURCE_KIND
 from app.constants import ChatCompletionTypeEnum
 from app.lib.llm.base import done_chunk_token_usage
+from app.lib.llm.exceptions import SetupRequiredError
 from app.utils.logger import logger
 
 _TOOL_NAME = "report_relevance"
@@ -289,6 +290,17 @@ async def judge_relevance(
             )
             return False
         llm = agent.low_performance_llm(profile)
+    except SetupRequiredError as exc:
+        # Not a fault to debug: the profile has no model configured, so nothing
+        # here can work until someone picks one. A traceback buried the one
+        # sentence that matters and made an unconfigured profile look like a
+        # channel bug — say what is wrong and how to fix it instead.
+        logger.error(
+            f"[channel_group] profile {profile!r} has no model configured, so "
+            f"group messages are ignored — choose one in Settings → LLM "
+            f"Providers ({exc})"
+        )
+        return False
     except Exception:  # noqa: BLE001
         logger.exception("[channel_group] relevance judge has no LLM; staying quiet")
         return False

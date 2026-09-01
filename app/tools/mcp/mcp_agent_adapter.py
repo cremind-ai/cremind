@@ -330,7 +330,11 @@ class MCPAgentAdapter:
                         text_content = parsed.get("text", "")
                         if text_content:
                             artifact_parts.append(Part(root=TextPart(text=text_content)))
-                        # Convert each ToolResultFile → FilePart
+                        # Convert each ToolResultFile → FilePart. MCP servers
+                        # have no vocabulary for provenance, so their files
+                        # default to "referenced" — a channel forwarder must
+                        # never auto-push a file an external server merely
+                        # mentioned; the agent can still send one explicitly.
                         for file_entry in files_list:
                             if isinstance(file_entry, dict) and "uri" in file_entry:
                                 artifact_parts.append(Part(root=FilePart(
@@ -339,6 +343,9 @@ class MCPAgentAdapter:
                                         name=file_entry.get("name"),
                                         mime_type=file_entry.get("mime_type"),
                                     ),
+                                    metadata={
+                                        "origin": file_entry.get("origin") or "referenced",
+                                    },
                                 )))
 
             # If no _files found, fall back to a single DataPart.

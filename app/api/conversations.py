@@ -465,11 +465,13 @@ def get_conversation_routes(
                     continue
                 if not is_inside_conversation_tmp(profile, conversation_id, path):
                     logger.warning(
-                        "POST message: dropping attachment outside temp dir: %r", path,
+                        f"POST message: dropping attachment outside temp dir: {path!r}"
                     )
                     continue
                 if not os.path.isfile(path):
-                    logger.warning("POST message: dropping missing attachment: %r", path)
+                    logger.warning(
+                        f"POST message: dropping missing attachment: {path!r}"
+                    )
                     continue
                 attachments.append({"name": name, "path": path})
 

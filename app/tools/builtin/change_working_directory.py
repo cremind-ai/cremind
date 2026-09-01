@@ -242,9 +242,7 @@ class ChangeWorkingDirectoryTool(BuiltInTool):
             )
             await persist_working_directory(row_id, persist_path, conv_storage)
         except Exception:  # noqa: BLE001
-            logger.exception(
-                "Failed to persist cwd override for %s", context_id
-            )
+            logger.exception(f"Failed to persist cwd override for {context_id}")
 
         # Broadcast the cwd change on the conversation's SSE stream so any
         # subscribed UI (Vue file-tree pane, Go CLI tree) re-renders against
@@ -256,7 +254,7 @@ class ChangeWorkingDirectoryTool(BuiltInTool):
                 {"working_directory": new_str},
             )
         except Exception:  # noqa: BLE001
-            logger.exception("Failed to publish cwd change for %s", row_id)
+            logger.exception(f"Failed to publish cwd change for {row_id}")
 
         return BuiltInToolResult(
             content=[{

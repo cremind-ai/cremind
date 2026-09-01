@@ -7,11 +7,23 @@ straightforward JSON.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from urllib.parse import quote
 
 from app.cli.client._base import Client
+
+
+def _multipart_parts(
+    files: list[tuple[str, bytes]],
+) -> list[tuple[str, tuple[str, bytes]]]:
+    """httpx multipart parts for attached files.
+
+    The server keys off each part's FILENAME, not the field name (same
+    contract as ``/api/files/upload``), so the field name is constant.
+    """
+    return [("file", (name, data)) for name, data in files]
 
 
 @dataclass(frozen=True)
@@ -213,6 +225,7 @@ async def send_channel_message(
     client: Client, channel_id: str, recipients: list[dict[str, Any]],
     message: str | None = None, dry_run: bool = True,
     default_country_code: str | None = None,
+    files: list[tuple[str, bytes]] | None = None,
 ) -> dict[str, Any]:
     """Message specific clients on a channel — one or many.
 
@@ -221,15 +234,24 @@ async def send_channel_message(
     phone number and records each delivered message in that client's
     conversation. ``dry_run`` defaults to True: it resolves the recipients and
     reports who *would* be messaged without sending anything.
+
+    ``files`` are ``(basename, bytes)`` attachments delivered to every
+    recipient; with them the request goes out as multipart (the CLI runs on a
+    machine whose paths mean nothing to the server).
     """
     payload: dict[str, Any] = {"recipients": recipients, "dry_run": dry_run}
     if message is not None:
         payload["message"] = message
     if default_country_code:
         payload["default_country_code"] = default_country_code
-    resp = await client.post_json(
-        f"/api/channels/{quote(channel_id, safe='')}/message", payload,
-    )
+    url = f"/api/channels/{quote(channel_id, safe='')}/message"
+    if files:
+        resp = await client.upload(
+            url, files=_multipart_parts(files),
+            data={"payload": json.dumps(payload)},
+        )
+    else:
+        resp = await client.post_json(url, payload)
     return resp if isinstance(resp, dict) else {}
 
 
@@ -272,19 +294,28 @@ async def delete_channel(client: Client, channel_id: str) -> None:
 
 async def notify_channel(
     client: Client, channel_id: str, message: str,
+    files: list[tuple[str, bytes]] | None = None,
 ) -> dict[str, Any]:
     """Push an ad-hoc ``message`` OUT to a notification-mode channel.
 
     Delivers to the channel's recipients (configured target chat IDs ∪
     authenticated subscribers) via the running adapter, bypassing the channel's
-    notification filter. Returns ``{"delivered": bool, "recipients": int}``.
-    The server rejects non-notification channels (HTTP 400) and channels whose
-    adapter isn't running (HTTP 409).
+    notification filter. Returns ``{"delivered": bool, "recipients": int}``
+    (plus ``files_delivered`` when files were attached). The server rejects
+    non-notification channels (HTTP 400) and channels whose adapter isn't
+    running (HTTP 409).
+
+    ``files`` are ``(basename, bytes)`` attachments; with them the request
+    goes out as multipart — the CLI's local paths mean nothing to the server.
     """
-    resp = await client.post_json(
-        f"/api/channels/{quote(channel_id, safe='')}/notify",
-        {"message": message},
-    )
+    url = f"/api/channels/{quote(channel_id, safe='')}/notify"
+    if files:
+        resp = await client.upload(
+            url, files=_multipart_parts(files),
+            data={"payload": json.dumps({"message": message})},
+        )
+    else:
+        resp = await client.post_json(url, {"message": message})
     return resp if isinstance(resp, dict) else {}
 
 

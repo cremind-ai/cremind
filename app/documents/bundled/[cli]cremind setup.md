@@ -127,7 +127,8 @@ from **stdin**. `--json` and `--json-file` are mutually exclusive.
   },
   "llm_config": {
     "anthropic.api_key": "sk-...",
-    "auth_method": "anthropic"
+    "auth_method": "anthropic",
+    "model_group.high": "anthropic/claude-..."
   },
   "tool_configs": {
     "<tool_id>": { "_enabled": "true", "VAR_NAME": "value" }
@@ -144,10 +145,20 @@ from **stdin**. `--json` and `--json-file` are mutually exclusive.
 The first profile must be named `admin`. A `profile` field is required
 either inside the JSON or via `--profile`.
 
+**`model_group.high` is what makes the profile usable.** It names the single
+model everything resolves to (`provider/model-id`); the optional `low`,
+`plan`, `vision` and `audio` groups all fall back to it. A payload without
+it still succeeds — you may intend to pick the model later in Settings → LLM
+Providers — but until one is set the profile answers **nothing**: web chat
+reports the missing model, direct messages on a channel come back as an
+error, and messages in a group chat are ignored with no reply at all.
+
 **Behavior.** On success, prints a key-value table to stdout containing
-`profile`, `expires_at`, and `token`, then writes the recommended
-`export CREMIND_TOKEN=...` line to **stderr** so users can copy/paste it.
-With `--json`, the full response object is emitted to stdout instead.
+`profile`, `expires_at`, and `token`, then writes any **warnings** followed
+by the recommended `export CREMIND_TOKEN=...` line to **stderr** so users can
+copy/paste it. With `--json`, the full response object — including the
+`warnings` array of `{code, message}` entries — is emitted to stdout instead.
+The only code today is `no_main_model`.
 
 **Examples.**
 
@@ -157,6 +168,8 @@ $ echo '{"profile":"admin"}' | cremind setup complete
 profile     admin
 expires_at  2026-06-01T14:00:00Z
 token       eyJhbGciOi...
+
+Warning: Profile 'admin' has no main model, so it cannot answer anything yet — messages on every channel will be ignored or error. Choose one in Settings → LLM Providers.
 
 Export the token to use the CLI:
   export CREMIND_TOKEN=eyJhbGciOi...

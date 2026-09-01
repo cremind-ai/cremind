@@ -709,13 +709,22 @@ export async function listLLMProviders(
   return res.json();
 }
 
+/** List a provider's models.
+ *
+ * ``authMethod`` previews the model set a given auth method serves without
+ * having to save it first — some providers (OpenAI's Codex OAuth) serve a
+ * different model set per method, so the pickers pass the *selected* method
+ * rather than letting the server fall back to the stored/default one.
+ */
 export async function getProviderModels(
   agentUrl: string,
   token: string,
-  providerName: string
+  providerName: string,
+  authMethod?: string
 ): Promise<{ provider: Record<string, unknown>; models: LLMModel[] }> {
   const base = resolveBaseUrl(agentUrl);
-  const res = await fetch(`${base}/api/llm/providers/${encodeURIComponent(providerName)}/models`, {
+  const query = authMethod ? `?auth_method=${encodeURIComponent(authMethod)}` : '';
+  const res = await fetch(`${base}/api/llm/providers/${encodeURIComponent(providerName)}/models${query}`, {
     headers: authHeaders(token),
   });
   if (!res.ok) throw new Error(`Failed to get models: ${res.statusText}`);
@@ -1442,7 +1451,10 @@ export async function deleteProfile(
     method: 'DELETE',
     headers: authHeaders(token),
   });
-  if (!res.ok) throw new Error(`Failed to delete profile: ${res.statusText}`);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to delete profile: ${res.statusText}`);
+  }
   return res.json();
 }
 

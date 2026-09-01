@@ -31,6 +31,8 @@ does not re-spam old notifications.
 from __future__ import annotations
 
 import asyncio
+import mimetypes
+import os
 import secrets
 import time
 from typing import Any
@@ -195,6 +197,41 @@ class NotificationDeliveryMixin:
         recipients = await self._notification_recipients()
         for target in recipients:
             await self._send_chunked(target, text)  # type: ignore[attr-defined]
+        return len(recipients)
+
+    async def deliver_file(
+        self, path: str, *, name: str | None = None, caption: str | None = None,
+    ) -> int:
+        """Send one file to every notification recipient; return the count.
+
+        The file twin of :meth:`deliver_text`, with the same contract: an
+        explicit, user-commanded send, so transport errors propagate. The one
+        exception is a transport that cannot carry files at all
+        (:class:`~app.channels.exceptions.ChannelNotImplemented`): each
+        recipient then gets the fallback notice naming the file — never its
+        server path — so the push still tells them something was produced.
+        """
+        from app.channels.attachments import file_fallback_text
+        from app.channels.exceptions import ChannelNotImplemented
+
+        if not path or not os.path.isfile(path):
+            return 0
+        display = name or os.path.basename(path)
+        try:
+            size: int | None = os.path.getsize(path)
+        except OSError:
+            size = None
+        mime, _ = mimetypes.guess_type(display or path)
+        recipients = await self._notification_recipients()
+        for target in recipients:
+            try:
+                await self._send_file(  # type: ignore[attr-defined]
+                    target, path, name=display, mime=mime, caption=caption,
+                )
+            except ChannelNotImplemented:
+                await self._send_chunked(  # type: ignore[attr-defined]
+                    target, file_fallback_text(display, size),
+                )
         return len(recipients)
 
     # ── subscription authentication ──

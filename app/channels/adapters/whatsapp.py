@@ -43,9 +43,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 from pathlib import Path
 from typing import Any
 
+from app.channels.attachments import IncomingFile, files_from_sidecar_frame
 from app.channels.base import BaseChannelAdapter
 from app.channels.exceptions import ChannelAuthError, ChannelNotImplemented
 from app.channels.sidecars.bootstrap import ensure_sidecar_ready
@@ -61,6 +64,9 @@ _PORT_HEADER = "WS_PORT="
 # Generous: Baileys may be mid-reconnect, and a false "timed out" would cost a
 # direct-send recipient their history entry (see ``send_strict``).
 _ACK_TIMEOUT = 20.0
+# File uploads carry the whole payload to WhatsApp's servers before the ack
+# comes back, so they get a far longer leash than a text send.
+_FILE_ACK_TIMEOUT = 180.0
 
 _PN_SUFFIX = "@s.whatsapp.net"
 _LID_SUFFIX = "@lid"
@@ -105,6 +111,10 @@ class WhatsappAdapter(BaseChannelAdapter):
     # no bot flag, so the consecutive-bot-messages brake has nothing to
     # count and the id check is the whole echo defence.
     reports_sender_is_bot = False
+    # ``send_file`` control frame → Baileys media message. The frame carries a
+    # PATH, never bytes — sidecar and server share the filesystem, and the WS
+    # has a 4 MiB frame cap.
+    supports_file_send = True
 
     def __init__(self, channel: dict, storage: Any) -> None:
         super().__init__(channel, storage)
@@ -187,6 +197,61 @@ class WhatsappAdapter(BaseChannelAdapter):
         rather than as a room that quietly stops hearing the agents.
         """
         await self._send_text(str(chat_id), text)
+
+    async def _send_file(
+        self, sender_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        await self._send_file_frame(sender_id, path, name, mime, caption)
+
+    async def _send_file_to_chat(
+        self, chat_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        # Like ``send``, the sidecar addresses whatever JID it is handed.
+        await self._send_file_frame(str(chat_id), path, name, mime, caption)
+
+    async def _send_file_frame(
+        self, jid: str, path: str, name: str | None, mime: str | None,
+        caption: str | None,
+    ) -> None:
+        """``send_file`` control frame, awaited like a text send.
+
+        The frame carries the file's absolute PATH — never bytes — because the
+        WS has a 4 MiB frame cap and the sidecar shares this filesystem by
+        design (it already takes ``--working-dir``).
+        """
+        if self._ws is None:
+            raise ChannelAuthError("WhatsApp sidecar not connected")
+        abs_path = os.path.abspath(path)
+        if not os.path.isfile(abs_path):
+            raise ValueError(f"cannot read file to send: {path}")
+        request_id, fut = self._new_request()
+        try:
+            async with self._send_lock:
+                await self._ws.send(json.dumps({
+                    "kind": "send_file",
+                    "sender_id": jid,
+                    "path": abs_path,
+                    "name": name or os.path.basename(abs_path),
+                    "mime": mime,
+                    "caption": caption,
+                    "request_id": request_id,
+                }))
+            reply = await asyncio.wait_for(fut, timeout=_FILE_ACK_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            raise ChannelAuthError(
+                f"WhatsApp sidecar did not confirm the file send within "
+                f"{_FILE_ACK_TIMEOUT:.0f}s (recipient {jid})",
+            ) from exc
+        finally:
+            self._pending.pop(request_id, None)
+        if not reply.get("ok"):
+            raise ChannelAuthError(
+                f"WhatsApp file send failed: {reply.get('error') or 'unknown error'}",
+            )
 
     async def _send_typing_to_chat(self, chat_id: str) -> None:
         """The sidecar's presence update takes any JID, a room's included."""
@@ -277,6 +342,27 @@ class WhatsappAdapter(BaseChannelAdapter):
         # case a non-canonical value ever flows through.
         return BaseConfig.CREMIND_SYSTEM_DIR
 
+    def _media_spool_dir(self) -> str:
+        """Where the sidecar spools inbound media before Python claims it.
+
+        Next to the session dir, inside the profile's slice. The sidecar
+        downloads media at receipt (Baileys' media keys are only reliably
+        usable near the event) and puts the PATH in the frame; the descriptor's
+        ``fetch`` then moves the file into the conversation's upload dir, and
+        every drop path deletes it. Wiped on each spawn so a crash never
+        accumulates orphans.
+        """
+        return os.path.join(
+            self._resolve_working_dir(), self.profile, "whatsapp",
+            self.channel_id, "media_spool",
+        )
+
+    def _prepare_media_spool(self) -> str:
+        media_dir = self._media_spool_dir()
+        shutil.rmtree(media_dir, ignore_errors=True)
+        os.makedirs(media_dir, exist_ok=True)
+        return media_dir
+
     async def _spawn_sidecar(self) -> None:
         try:
             import websockets  # type: ignore  # noqa: F401
@@ -287,11 +373,16 @@ class WhatsappAdapter(BaseChannelAdapter):
             ) from exc
 
         working_dir = self._resolve_working_dir()
+        media_dir = self._prepare_media_spool()
+        from app.utils.uploads_tmp import max_upload_bytes
+
         cmd = [
             "node", str(_SIDECAR_INDEX),
             "--profile", self.profile,
             "--channel-id", self.channel_id,
             "--working-dir", working_dir,
+            "--media-dir", media_dir,
+            "--media-max-bytes", str(max_upload_bytes()),
         ]
         logger.info(
             f"whatsapp[{self.channel_id}]: spawning sidecar — {' '.join(cmd)}",
@@ -399,13 +490,16 @@ class WhatsappAdapter(BaseChannelAdapter):
             sender_id = str(msg.get("sender_id") or "").strip()
             display_name = msg.get("display_name")
             text = msg.get("text") or ""
-            if not sender_id or not text:
+            files = self._files_from_frame(msg)
+            if not sender_id or (not text and not files):
                 return
             # Run inbound handling concurrently: nothing blocks a message any
             # more (one arriving mid-turn is folded into the running turn), and
             # the per-sender inbound lock keeps that decision atomic.
             asyncio.create_task(
-                self._handle_inbound_safe(sender_id, display_name, text),
+                self._handle_inbound_safe(
+                    sender_id, display_name, text, files=files or None,
+                ),
                 name=f"whatsapp-inbound:{self.channel_id}:{sender_id}",
             )
         elif kind == "group_joined":
@@ -496,7 +590,8 @@ class WhatsappAdapter(BaseChannelAdapter):
         chat_id = str(msg.get("chat_id") or "").strip()
         sender_id = str(msg.get("sender_id") or "").strip()
         text = msg.get("text") or ""
-        if not chat_id or not sender_id or not text:
+        files = self._files_from_frame(msg)
+        if not chat_id or not sender_id or (not text and not files):
             return
         message_id = msg.get("message_id")
         timestamp = msg.get("timestamp")
@@ -521,9 +616,14 @@ class WhatsappAdapter(BaseChannelAdapter):
                 # fire here and the id check is the whole story.
                 sender_is_bot=False,
                 mentioned=self._is_mentioned(msg),
+                files=files or None,
             ),
             name=f"whatsapp-group-inbound:{self.channel_id}:{chat_id}",
         )
+
+    def _files_from_frame(self, msg: dict) -> list[IncomingFile]:
+        """Descriptors for a frame's spooled media files (shared helper)."""
+        return files_from_sidecar_frame(msg)
 
     def _is_mentioned(self, msg: dict) -> bool:
         """Whether this group message pings or quotes our own account.
@@ -733,9 +833,10 @@ class WhatsappAdapter(BaseChannelAdapter):
 
     async def _handle_inbound_safe(
         self, sender_id: str, display_name: str | None, text: str,
+        files: Any = None,
     ) -> None:
         try:
-            await self._handle_inbound(sender_id, display_name, text)
+            await self._handle_inbound(sender_id, display_name, text, files=files)
         except Exception:  # noqa: BLE001
             logger.exception("whatsapp: inbound handler failed")
 

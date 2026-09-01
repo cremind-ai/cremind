@@ -10,6 +10,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from app.api._auth import is_admin
 from app.api.config import PROFILE_NAME_PATTERN
 from app.auth import delete_token_file
 from app.skills import initialize_profile_skills, teardown_profile_skills
@@ -31,7 +32,9 @@ def _profile_from_request(request: Request) -> str:
     return getattr(request.user, "username", "") or ""
 
 
-def _require_own_profile(request: Request) -> tuple[str | None, JSONResponse | None]:
+def _require_own_profile(
+    request: Request, *, allow_admin: bool = False,
+) -> tuple[str | None, JSONResponse | None]:
     """Authorize a ``{profile_name}``-scoped route.
 
     Returns ``(name, None)`` when the caller is authenticated and the URL's
@@ -44,6 +47,14 @@ def _require_own_profile(request: Request) -> tuple[str | None, JSONResponse | N
     * 403 — a *valid* name that is not the caller's own profile. A token is
       scoped to exactly one profile (its JWT ``sub``), so it may only touch
       that profile.
+
+    ``allow_admin=True`` widens the last check to "your own profile, or *any*
+    profile if you are admin" — the same branch ``app.api.auth._resolve_target``
+    makes for token rotation. It is opt-in per route because the personal
+    endpoints (persona, instructions, agent name) are deliberately private even
+    from admin; only administration of the profile itself (delete) takes it.
+    The 401 → 400 → 403 ordering is unchanged either way: an unauthenticated or
+    malformed call is rejected before admin-ness is ever consulted.
     """
     unauth = _require_auth(request)
     if unauth is not None:
@@ -54,7 +65,7 @@ def _require_own_profile(request: Request) -> tuple[str | None, JSONResponse | N
     if not PROFILE_NAME_PATTERN.match(name) or len(name) > 64:
         return None, JSONResponse({"error": "Invalid profile name"}, status_code=400)
     own = _profile_from_request(request)
-    if name != own:
+    if name != own and not (allow_admin and is_admin(request)):
         return None, JSONResponse(
             {"error": f"You can only modify your own profile ('{own}')."},
             status_code=403,
@@ -76,6 +87,14 @@ def get_profile_routes(
         try:
             profiles = await conversation_storage.list_profiles()
             visible = [p["name"] for p in profiles if not p["name"].startswith("__")]
+            # This is the *management* roster — it drives the settings screen's
+            # profile list, where every row is an object the caller may act on.
+            # A token is scoped to one profile, so a non-admin only ever sees
+            # its own. (The login dropdown's list of every name stays on the
+            # public ``/api/profiles/names`` below, which is a different
+            # contract: names, and nothing to act on.)
+            if not is_admin(request):
+                visible = [n for n in visible if n == _profile_from_request(request)]
             return JSONResponse({"profiles": visible}, status_code=200)
         except Exception as e:
             logger.error(f"Error listing profiles: {e}")
@@ -100,6 +119,19 @@ def get_profile_routes(
         unauth = _require_auth(request)
         if unauth is not None:
             return unauth
+        # Creating a profile is a tenancy decision, not a self-service one: a
+        # new profile gets its own skills, tool rows and embedding table. Only
+        # admin may make it. Checked after auth so an anonymous caller still
+        # gets 401 (never a 403 that would confirm the endpoint exists), and
+        # before validation so a non-admin learns nothing about name rules.
+        # The first-run wizard does NOT come through here — it creates the
+        # admin profile via ``POST /api/config/setup`` — so nothing bootstraps
+        # itself into a chicken-and-egg with this gate.
+        if not is_admin(request):
+            return JSONResponse(
+                {"error": "Only the admin profile can create profiles."},
+                status_code=403,
+            )
         try:
             body = await request.json()
             name = body.get("name")
@@ -152,9 +184,22 @@ def get_profile_routes(
             return JSONResponse({"error": f"Internal server error: {e}"}, status_code=500)
 
     async def handle_delete_profile(request: Request) -> JSONResponse:
-        profile_name, err = _require_own_profile(request)
+        # Admin may delete any profile — it is the only profile with a view of
+        # the others (see ``handle_list_profiles``), so without this branch a
+        # profile could only ever be removed by its own token, which is exactly
+        # the token that disappears with it.
+        profile_name, err = _require_own_profile(request, allow_admin=True)
         if err is not None:
             return err
+        # ...but never itself. ``admin`` is a literal name, not a role column
+        # (``app.api._auth.is_admin``), so deleting it would leave an install
+        # with no profile able to create, list or remove any other — an
+        # unrecoverable state from the API alone. The web UI disables the row;
+        # this makes it a server rule so the CLI can't get there either.
+        if profile_name == "admin":
+            return JSONResponse(
+                {"error": "The admin profile cannot be deleted."}, status_code=403,
+            )
         try:
             # Cascade FKs handle profile_tools / tool_configs / conversations / messages
             success = await conversation_storage.delete_profile(profile_name)

@@ -1,12 +1,14 @@
 """Pure, DB-free tests for the blueprint feature.
 
 Covers the secret file filter, the bidirectional version-compat gate, the
-fail-closed export audit, staging-extraction safety, and the schedule
-next-fire-at recompute — the correctness-critical logic that needs no storage.
+fail-closed export audit, staging-extraction safety, the schedule
+next-fire-at recompute, and the undeletable-admin guard on abort rollback —
+the correctness-critical logic that needs no storage.
 """
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import io
 import tarfile
@@ -243,3 +245,63 @@ def test_recompute_daily_recurrence_from_past_dtstart():
     got = first_occurrence_on_or_after(rrule="FREQ=DAILY", dtstart=dtstart, moment=now)
     assert got is not None
     assert got >= now  # next future occurrence, no backlog
+
+
+# ── abort rollback never deletes admin ────────────────────────────────────────
+
+
+class _RecordingStorage:
+    """Stands in for ConversationStorage, recording delete_profile calls."""
+
+    def __init__(self):
+        self.deleted: list[str] = []
+
+    async def delete_profile(self, profile_name: str) -> bool:
+        self.deleted.append(profile_name)
+        return True
+
+
+@pytest.fixture
+def torn_down(monkeypatch):
+    """Stub the two teardown helpers so rollback touches no real skills/procs."""
+    import app.skills as skills
+    import app.tools.builtin.exec_shell_autostart as autostart
+
+    torn: list[str] = []
+
+    async def _teardown_processes(directory, *, profile):
+        torn.append(f"listeners:{profile}")
+        return {"stopped": [], "removed_autostart": 0}
+
+    async def _teardown_skills(profile, registry, *, drop_embeddings=None):
+        torn.append(f"skills:{profile}")
+
+    monkeypatch.setattr(autostart, "teardown_processes_for_dir", _teardown_processes)
+    monkeypatch.setattr(skills, "teardown_profile_skills", _teardown_skills)
+    return torn
+
+
+def _deps(storage):
+    from app.blueprint.apply import Deps
+
+    return Deps(registry=object(), conversation_storage=storage, config_storage=None)
+
+
+def test_rollback_refuses_to_delete_admin(torn_down):
+    from app.blueprint.apply import delete_target_profile
+
+    storage = _RecordingStorage()
+    asyncio.run(delete_target_profile("admin", _deps(storage)))
+    assert storage.deleted == []
+    # Whole-teardown refusal: admin keeps its listeners and skills too, or the
+    # rollback leaves a half-dismantled profile it cannot then remove.
+    assert torn_down == []
+
+
+def test_rollback_still_deletes_an_imported_profile(torn_down):
+    from app.blueprint.apply import delete_target_profile
+
+    storage = _RecordingStorage()
+    asyncio.run(delete_target_profile("imported", _deps(storage)))
+    assert storage.deleted == ["imported"]
+    assert torn_down == ["listeners:imported", "skills:imported"]

@@ -115,7 +115,7 @@ def _capture(monkeypatch, adapter):
     async def _group(**kwargs):
         group_calls.append(kwargs)
 
-    async def _dm(sender_id, display_name, text):
+    async def _dm(sender_id, display_name, text, files=None):
         dm_calls.append((sender_id, display_name, text))
 
     monkeypatch.setattr(adapter, "_handle_group_inbound", _group)
@@ -145,6 +145,7 @@ def test_a_channel_message_goes_to_the_room(monkeypatch):
             "sender_is_bot": False,
             # Nobody tagged us in this one; the room decides what that means.
             "mentioned": False,
+            "files": None,
         }
 
     asyncio.run(scenario())
@@ -245,17 +246,50 @@ def test_a_thread_broadcast_still_reaches_the_room(monkeypatch):
 
 
 def test_an_edit_or_a_join_is_dropped(monkeypatch):
-    """The timeline has no row to revise and nothing to say about a join."""
+    """The timeline has no row to revise and nothing to say about a join.
+
+    ``file_share`` is deliberately NOT in this list any more — a shared file
+    is a message with an attachment, and it now flows (see the file test).
+    """
     async def scenario():
         adapter = _adapter()
         group_calls, dm_calls = _capture(monkeypatch, adapter)
 
-        for subtype in ("message_changed", "message_deleted", "channel_join",
-                        "file_share"):
+        for subtype in ("message_changed", "message_deleted", "channel_join"):
             await adapter._dispatch_message_event(_event(subtype=subtype))
 
         assert group_calls == []
         assert dm_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_a_file_share_reaches_the_room_with_its_file(monkeypatch):
+    """``subtype=file_share`` used to be discarded; the attachment now flows
+    as an unfetched descriptor alongside the caption."""
+    async def scenario():
+        adapter = _adapter()
+        group_calls, dm_calls = _capture(monkeypatch, adapter)
+
+        event = _event(subtype="file_share")
+        event["files"] = [{
+            "id": "F123",
+            "name": "report.pdf",
+            "mimetype": "application/pdf",
+            "size": 1234,
+            "url_private_download": "https://files.slack.com/report.pdf",
+        }]
+        await adapter._dispatch_message_event(event)
+
+        assert dm_calls == []
+        assert len(group_calls) == 1
+        files = group_calls[0]["files"]
+        assert files is not None and len(files) == 1
+        assert files[0].name == "report.pdf"
+        assert files[0].mime == "application/pdf"
+        assert files[0].size == 1234
+        # Descriptor only — nothing has been downloaded yet.
+        assert callable(files[0].fetch)
 
     asyncio.run(scenario())
 

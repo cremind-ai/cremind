@@ -19,17 +19,28 @@ who messaged the Page within the last 24 hours (or require message tags).
 from __future__ import annotations
 
 import asyncio
+import mimetypes
+import os
 from typing import Any
+from urllib.parse import urlparse
 
+from app.channels.attachments import IncomingFile, dest_for
 from app.channels.base import BaseChannelAdapter, _split_for_messaging
 from app.channels.exceptions import ChannelAuthError
 from app.utils.logger import logger
 
 _GRAPH_URL = "https://graph.facebook.com/v21.0/me/messages"
 _MESSENGER_TEXT_LIMIT = 2000
+# Meta caps Messenger attachments at 25 MB.
+_MESSENGER_UPLOAD_LIMIT = 25 * 1024 * 1024
+# Webhook attachment types that carry a downloadable payload.url. ``fallback``
+# (link previews) and ``location`` have no file behind them.
+_ATTACHMENT_TYPES = ("image", "video", "audio", "file")
 
 
 class MessengerAdapter(BaseChannelAdapter):
+    supports_file_send = True
+
     def __init__(self, channel: dict, storage: Any) -> None:
         super().__init__(channel, storage)
         self._client: Any = None
@@ -60,15 +71,62 @@ class MessengerAdapter(BaseChannelAdapter):
                 except Exception:  # noqa: BLE001
                     pass
 
-    async def handle_webhook_message(self, sender_id: str, text: str) -> None:
-        """Entry point called by the public webhook route for each inbound message."""
-        await self._handle_inbound_safe(sender_id, None, text)
+    async def handle_webhook_message(
+        self, sender_id: str, text: str,
+        attachments: list[dict] | None = None,
+    ) -> None:
+        """Entry point called by the public webhook route for each inbound message.
+
+        ``attachments`` are the raw webhook entries (``{"type", "payload":
+        {"url"}}``); the CDN URLs Meta hands out are unauthenticated but
+        time-limited, which is fine — the deferred fetch runs within this same
+        request's handling.
+        """
+        files = self._extract_files(attachments)
+        await self._handle_inbound_safe(sender_id, None, text, files=files or None)
+
+    def _extract_files(
+        self, attachments: list[dict] | None,
+    ) -> list[IncomingFile]:
+        found: list[IncomingFile] = []
+        for index, entry in enumerate(attachments or ()):
+            if not isinstance(entry, dict):
+                continue
+            kind = str(entry.get("type") or "")
+            if kind not in _ATTACHMENT_TYPES:
+                continue
+            url = str((entry.get("payload") or {}).get("url") or "")
+            if not url:
+                continue
+            name = os.path.basename(urlparse(url).path) or f"messenger_{kind}_{index}"
+            mime, _ = mimetypes.guess_type(name)
+
+            def _make_fetch(url: str = url, name: str = name):
+                async def fetch(dest_dir: str) -> str:
+                    import httpx
+
+                    dest = dest_for(dest_dir, name)
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(120.0), follow_redirects=True,
+                    ) as client:
+                        async with client.stream("GET", url) as resp:
+                            resp.raise_for_status()
+                            with open(dest, "wb") as out:
+                                async for chunk in resp.aiter_bytes(1 << 20):
+                                    out.write(chunk)
+                    return dest
+
+                return fetch
+
+            found.append(IncomingFile(name=name, mime=mime, fetch=_make_fetch()))
+        return found
 
     async def _handle_inbound_safe(
         self, sender_id: str, display_name: str | None, text: str,
+        files: Any = None,
     ) -> None:
         try:
-            await self._handle_inbound(sender_id, display_name, text)
+            await self._handle_inbound(sender_id, display_name, text, files=files)
         except Exception:  # noqa: BLE001
             logger.exception("messenger: inbound handler failed")
 
@@ -90,6 +148,69 @@ class MessengerAdapter(BaseChannelAdapter):
         for chunk in _split_for_messaging(text, _MESSENGER_TEXT_LIMIT):
             await self._graph_post(
                 {"recipient": {"id": sender_id}, "message": {"text": chunk}},
+            )
+
+    async def _send_file(
+        self, sender_id: str, path: str, *,
+        name: str | None = None, mime: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        """Multipart Graph send: the attachment rides as ``filedata``.
+
+        Messenger attachments have no caption slot, so a caption goes out as
+        its own text message first. Unlike :meth:`_graph_post` (fire-and-log,
+        good enough for reply bubbles) this RAISES on a Graph error — strict
+        callers record history from the outcome.
+        """
+        import json as _json
+
+        try:
+            size = os.path.getsize(path)
+        except OSError as exc:
+            raise ValueError(f"cannot read file to send: {path}") from exc
+        if size > _MESSENGER_UPLOAD_LIMIT:
+            raise ValueError(
+                f"'{name or os.path.basename(path)}' is {size} bytes; Messenger "
+                f"caps attachments at {_MESSENGER_UPLOAD_LIMIT} bytes",
+            )
+        if caption:
+            await self._send_text(sender_id, caption)
+
+        effective_mime = mime or "application/octet-stream"
+        attachment_type = "file"
+        for prefix in ("image", "video", "audio"):
+            if effective_mime.startswith(prefix + "/"):
+                attachment_type = prefix
+                break
+
+        if self._client is None:
+            import httpx
+
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(20.0))
+        with open(path, "rb") as handle:
+            resp = await self._client.post(
+                _GRAPH_URL,
+                params={"access_token": self._page_token()},
+                data={
+                    "recipient": _json.dumps({"id": sender_id}),
+                    "message": _json.dumps({
+                        "attachment": {
+                            "type": attachment_type,
+                            "payload": {"is_reusable": False},
+                        },
+                    }),
+                },
+                files={
+                    "filedata": (
+                        name or os.path.basename(path), handle, effective_mime,
+                    ),
+                },
+                timeout=180.0,
+            )
+        if resp.status_code >= 400:
+            raise ChannelAuthError(
+                f"Messenger file send failed ({resp.status_code}): "
+                f"{resp.text[:300]}",
             )
 
     async def _send_typing(self, sender_id: str) -> None:

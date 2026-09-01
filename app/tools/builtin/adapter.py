@@ -103,9 +103,14 @@ def resolve_sandbox_recovery_dir(
     if not recovery:
         return None
 
+    # Strictly BELOW home, never home itself. Recovering onto the home root
+    # makes the whole user tree the working directory, and the next search or
+    # grep walks all of it — which is how one denied lookup turned into a
+    # process-wide stall. A denial there surfaces to the model instead, and the
+    # user can still cd anywhere deliberately.
     home = os.path.realpath(os.path.expanduser("~"))
     recovery_real = os.path.realpath(recovery)
-    if recovery_real == home or recovery_real.startswith(home + os.sep):
+    if recovery_real.startswith(home + os.sep):
         return recovery_real
     return None
 
@@ -401,8 +406,8 @@ class BuiltInToolAdapter:
                         recovery_dir = resolve_sandbox_recovery_dir(result_data, tool_args)
                         if recovery_dir:
                             logger.info(
-                                "Sandbox denial from '%s'; auto-switching cwd to "
-                                "'%s' and retrying once", tool_name, recovery_dir,
+                                f"Sandbox denial from '{tool_name}'; auto-switching "
+                                f"cwd to '{recovery_dir}' and retrying once"
                             )
                             try:
                                 from app.events.runner import get_conversation_storage
@@ -423,7 +428,7 @@ class BuiltInToolAdapter:
                                 result_data = self._extract_tool_result(result)
                             except Exception:  # noqa: BLE001
                                 logger.exception(
-                                    "Sandbox auto-recovery failed for '%s'", tool_name
+                                    f"Sandbox auto-recovery failed for '{tool_name}'"
                                 )
                     _fold_result_usage(result)
                     tool_results[tool_name] = result_data
@@ -502,6 +507,12 @@ class BuiltInToolAdapter:
                                         name=file_entry.get("name"),
                                         mime_type=file_entry.get("mime_type"),
                                     ),
+                                    # "created" = a tool output worth delivering
+                                    # outward (channel forwarders key off it);
+                                    # "referenced" = it merely passed through.
+                                    metadata={
+                                        "origin": file_entry.get("origin") or "referenced",
+                                    },
                                 )))
 
             if not has_file_parts and tool_results:

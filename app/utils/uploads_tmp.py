@@ -85,6 +85,40 @@ def _as_number(value, default):
 
 # ── path helpers ─────────────────────────────────────────────────────────
 
+def safe_basename(name: str) -> str:
+    """Reduce a client/platform-supplied filename to a safe basename.
+
+    Strips any path components (both separators — a Windows-style ``\\`` in a
+    name uploaded from another OS is still a path component) and rejects the
+    degenerate values by falling back to ``"file"``. Never raises: every
+    caller is a receive path that must not die on a hostile name.
+    """
+    cleaned = (name or "").replace("\\", "/")
+    base = os.path.basename(cleaned).strip()
+    if not base or base in (".", ".."):
+        return "file"
+    return base
+
+
+def unique_dest(target_dir: str, basename: str) -> str:
+    """Return ``target_dir + sep + basename`` with a numeric suffix that
+    avoids collisions, mimicking the OS file managers' "(1)", "(2)" style.
+
+    ``foo.txt`` → ``foo (1).txt`` → ``foo (2).txt`` …
+    """
+    candidate = os.path.join(target_dir, basename)
+    if not os.path.exists(candidate):
+        return candidate
+    stem, ext = os.path.splitext(basename)
+    n = 1
+    while True:
+        renamed = f"{stem} ({n}){ext}"
+        candidate = os.path.join(target_dir, renamed)
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
+
+
 def uploads_tmp_root(profile: str) -> str:
     """Return ``<CREMIND_SYSTEM_DIR>/<profile>/uploads_tmp`` (not created)."""
     return os.path.join(BaseConfig.CREMIND_SYSTEM_DIR, profile, UPLOADS_TMP_DIRNAME)

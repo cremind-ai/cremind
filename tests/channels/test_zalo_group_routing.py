@@ -78,7 +78,7 @@ def _capture(monkeypatch, adapter):
     async def _group(**kwargs):
         group_calls.append(kwargs)
 
-    async def _dm(sender_id, display_name, text):
+    async def _dm(sender_id, display_name, text, files=None):
         dm_calls.append((sender_id, display_name, text))
 
     monkeypatch.setattr(adapter, "_handle_group_inbound", _group)
@@ -106,6 +106,7 @@ def test_a_group_message_goes_to_the_room(monkeypatch):
             "platform_message_id": "m-42",
             "platform_message_date": 1_700_000_000.0,
             "sender_is_bot": False,
+            "files": None,
         }]
 
     asyncio.run(scenario())
