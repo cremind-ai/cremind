@@ -20,7 +20,13 @@ What happens next is supervisor-dependent:
   back to this HTTP path, ``backendProcess.on('exit')`` fires but
   the main process does not auto-respawn — the user would see a
   dead backend.
-- Under a bare ``cremind serve``: the backend exits and stays down.
+- Under the boot service ``cremind boot enable`` registers (a systemd unit,
+  a LaunchAgent, or a Windows respawn loop): the service restarts the
+  backend within a couple of seconds. This is what makes the restart — and
+  the ``CREMIND_SSL=after-setup`` switch to HTTPS, which *is* a restart —
+  work on a native install.
+- Under a bare, unsupervised ``cremind serve``: the backend exits and stays
+  down.
 
 The UI's confirmation dialog warns about these consequences before
 the user gets here.

@@ -37,9 +37,14 @@ _RESTART_CAVEAT = {
     "electron": "Electron install — Cremind will relaunch the backend "
                 "automatically.",
 }
+_RESTART_CAVEAT_SUPERVISED = (
+    "Boot service detected — the OS (systemd / launchd / Scheduled Task) will "
+    "restart the backend automatically (a few seconds)."
+)
 _RESTART_CAVEAT_DEFAULT = (
     "No supervisor detected — the backend will stay DOWN after it stops. "
-    "You will need to relaunch `cremind serve` manually."
+    "You will need to relaunch `cremind serve` manually, or register a boot "
+    "service with `cremind boot enable`."
 )
 
 
@@ -148,6 +153,7 @@ def server_capabilities(ctx: typer.Context) -> None:
     features_str = ", ".join(ui_features) if isinstance(ui_features, list) else ""
     print_kv([
         ("install_mode", str(caps.get("install_mode") or "")),
+        ("supervised", "true" if caps.get("supervised") else "false"),
         ("ui_features", features_str),
     ])
 
@@ -184,7 +190,15 @@ def server_restart(
 
     caps = asyncio.run(_capabilities())
     install_mode = str(caps.get("install_mode") or "")
-    caveat = _RESTART_CAVEAT.get(install_mode, _RESTART_CAVEAT_DEFAULT)
+    # A native install with a boot service is supervised even though its
+    # install_mode says nothing about it, so fall back through `supervised`
+    # before assuming nothing will bring the backend back.
+    caveat = _RESTART_CAVEAT.get(
+        install_mode,
+        _RESTART_CAVEAT_SUPERVISED
+        if caps.get("supervised")
+        else _RESTART_CAVEAT_DEFAULT,
+    )
 
     # Caveat/prompt go to stderr so stdout stays clean for --json.
     if not yes:

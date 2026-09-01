@@ -35,6 +35,10 @@ export function useServerRestart() {
   const phase = ref<RestartPhase>('idle')
   const error = ref<string | null>(null)
   const installMode = ref<InstallMode>(null)
+  // Whether something restarts the backend when it exits. Distinct from
+  // installMode: a native install with a boot service (`cremind boot enable`)
+  // is supervised, and install_mode alone cannot say so.
+  const supervised = ref(false)
   const installModeLoaded = ref(false)
 
   const isBusy = computed(() => phase.value === 'restarting')
@@ -50,12 +54,16 @@ export function useServerRestart() {
     try {
       const r = await fetch(`${settings.agentUrl}/api/services/tray-capabilities`)
       if (r.ok) {
-        const body = (await r.json()) as { install_mode?: InstallMode }
+        const body = (await r.json()) as {
+          install_mode?: InstallMode
+          supervised?: boolean
+        }
         installMode.value = body.install_mode ?? null
+        supervised.value = Boolean(body.supervised)
       }
     } catch {
-      // Leave installMode at null — the dialog will show the
-      // most-conservative "no supervisor" warning copy.
+      // Leave installMode at null and supervised false — the dialog will show
+      // the most-conservative "no supervisor" warning copy.
     } finally {
       installModeLoaded.value = true
     }
@@ -167,6 +175,7 @@ export function useServerRestart() {
     phase: readonly(phase),
     error: readonly(error),
     installMode: readonly(installMode),
+    supervised: readonly(supervised),
     isBusy,
     loadInstallMode,
     restart,

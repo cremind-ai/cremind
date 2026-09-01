@@ -15,9 +15,17 @@ from app.config.tls_mode import (
     MODE_AFTER_SETUP,
     MODE_AUTO,
     compute_tls_facts,
+    current_tls_facts,
     effective_ssl_mode,
+    env_supervised,
     https_origin_from_app_url,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_supervisor(monkeypatch):
+    """A dev box running under a boot service must not skew these answers."""
+    monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
 
 
 # ── https_origin_from_app_url ────────────────────────────────────────────
@@ -116,6 +124,40 @@ def test_electron_is_never_pending(monkeypatch):
 def test_restart_supported_tracks_the_supervisor(install_mode, expected):
     """Only a supervised process comes back after the wizard restarts it."""
     assert _facts(install_mode=install_mode).restart_supported is expected
+
+
+@pytest.mark.parametrize("install_mode", ["native", "custom", ""])
+def test_a_boot_service_makes_any_install_restartable(install_mode):
+    """`cremind boot enable` is the supervisor install_mode cannot describe.
+
+    It says one thing about the process — something respawns me — which is
+    true regardless of how Cremind was installed, so it is read on its own
+    rather than as a modifier of the install mode.
+    """
+    facts = _facts(install_mode=install_mode, supervised=True)
+    assert facts.restart_supported is True
+
+
+def test_env_supervised_reads_the_unit_flag(monkeypatch):
+    for raw in ("1", "true", "YES"):
+        monkeypatch.setenv("CREMIND_SUPERVISED", raw)
+        assert env_supervised() is True
+    for raw in ("0", "false", "", "maybe"):
+        monkeypatch.setenv("CREMIND_SUPERVISED", raw)
+        assert env_supervised() is False
+    monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
+    assert env_supervised() is False
+
+
+def test_current_facts_pick_up_the_unit_flag(monkeypatch):
+    """A hand-run `cremind serve` never sees the flag; the unit always does."""
+    monkeypatch.setattr(BaseConfig, "SSL_MODE", MODE_AFTER_SETUP, raising=False)
+    monkeypatch.setenv("INSTALL_MODE", "native")
+    monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
+    assert current_tls_facts(public_port=1515).restart_supported is False
+
+    monkeypatch.setenv("CREMIND_SUPERVISED", "1")
+    assert current_tls_facts(public_port=1515).restart_supported is True
 
 
 # ── the anti-drift pin ───────────────────────────────────────────────────

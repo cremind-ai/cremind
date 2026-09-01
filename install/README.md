@@ -102,9 +102,16 @@ docker compose down -v             # stop and delete all data
    handing over to the venv binary, so a later `cremind serve` from any
    directory keeps the install's settings — including `CREMIND_SSL`, which the
    wizard's restart step depends on.
-7. Start `cremind serve` in the background. It serves the single public
-   origin on `:1515` (UI + API) plus an internal loopback API on `:1112`.
-   Wait for `/health`.
+7. Register a boot service (`cremind boot enable` — a systemd user unit, a
+   launchd LaunchAgent, or a logon Scheduled Task) and let it start
+   `cremind serve`. It serves the single public origin on `:1515` (UI + API)
+   plus an internal loopback API on `:1112`. Wait for `/health`. The service
+   is what makes Cremind come back after a reboot **and** what makes the
+   wizard's restart work at all — the server stops cleanly rather than
+   re-executing itself, so on an unsupervised install a restart leaves it
+   down. `--no-boot-service` / `-NoBootService` opts out, and anywhere a
+   service cannot be registered (WSL without systemd, SSH to a Mac) the
+   installer falls back to the old background process for this session only.
 8. Open `http://<host>:1515/#/setup` in your browser. (Still `http://` on the
    `after-setup` default — the switch to `https://` happens when the wizard
    finishes.) On a native install the wizard's "Secure this install" step
@@ -143,6 +150,7 @@ container-friendly defaults) for one release; new scripts should use
 | `--mode docker\|native`              | Skip the mode prompt. `--docker` and `--native` are aliases. |
 | `--desktop` / `--no-desktop`         | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `--unattended`; a re-install keeps the previous choice. `--no-desktop` pulls the headless `cremind/cremind`. |
 | `--ssl none\|auto\|after-setup`      | TLS on the public origin. Default `after-setup`: plain HTTP for the wizard, which hands you the CA to trust, then a restart into HTTPS with no warning. `auto` is HTTPS from boot one; `none` opts out. A re-install keeps the previous choice. `custom` deployments keep plain HTTP (their URLs are yours) unless you pass this flag. |
+| `--boot-service` / `--no-boot-service` | (native) Register a login/boot service that starts `cremind serve` and restarts it if it stops. Default: on — it is also what makes the in-app restart and the after-setup HTTPS switch work. A re-install keeps a previous opt-out. Ignored for docker (the daemon supervises the container) and for Electron-driven installs. Manage it later with `cremind boot`. |
 | `--no-launch`                        | Don't open the wizard at the end. |
 | `--unattended`                       | Use defaults; never prompt. Implies `--mode docker` if Docker is present. |
 | `--reinstall`                        | Wipe the existing venv (native) or regenerate compose+.env (docker). |
@@ -160,6 +168,7 @@ container-friendly defaults) for one release; new scripts should use
 | `-Mode docker\|native`              | Skip the mode prompt. |
 | `-Desktop` / `-NoDesktop`           | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `-Unattended`; a re-install keeps the previous choice. `-NoDesktop` pulls the headless `cremind/cremind`. |
 | `-Ssl none\|auto\|after-setup`      | TLS on the public origin. Default `after-setup`: plain HTTP for the wizard, which hands you the CA to trust, then a restart into HTTPS with no warning. `auto` is HTTPS from boot one; `none` opts out. A re-install keeps the previous choice. `custom` deployments keep plain HTTP (their URLs are yours) unless you pass this flag. |
+| `-BootService` / `-NoBootService`   | (native) Register a logon Scheduled Task that starts `cremind serve` and restarts it if it stops. Default: on — it is also what makes the in-app restart and the after-setup HTTPS switch work. A re-install keeps a previous opt-out. Ignored for docker and for Electron-driven installs. Manage it later with `cremind boot`. |
 | `-NoLaunch`                         | Don't open the wizard at the end. |
 | `-Unattended`                       | Use defaults; never prompt. |
 | `-Reinstall`                        | Wipe the existing venv or regenerate compose+.env. |
@@ -207,8 +216,20 @@ the wizard, not by the installer, so they survive re-runs as well.
 | `~/.cremind/.env`                      | Backend env vars. |
 | `~/.cremind/bootstrap.toml`            | DB-provider selection. |
 | `~/.cremind/install.log`               | Output of `pip install` and `cremind db upgrade`. |
-| `~/.cremind/install.pid`               | PID of the install-session server. |
+| `~/.cremind/install.pid`               | PID of the install-session server (fallback path only — never a service-run one). |
+| `~/.cremind/server.pid`                | PID of the server, written by the server itself when a boot service supervises it. |
 | `~/.cremind/server.log`                | `cremind serve` stdout/stderr. |
+
+Plus, when a boot service is registered — all owned by `cremind boot`, and
+removed by `cremind boot disable` or by uninstalling:
+
+| Path | Purpose |
+|---|---|
+| `~/.config/systemd/user/cremind.service` | (Linux) The systemd user unit. |
+| `~/Library/LaunchAgents/io.cremind.server.plist` | (macOS) The LaunchAgent. |
+| Scheduled Task `Cremind Server`         | (Windows) The logon trigger. |
+| `~/.cremind/bin/cremind-task.xml`, `cremind-boot.vbs`, `cremind-boot-loop.ps1` | (Windows) The task definition and its respawn loop. |
+| `~/.cremind/supervisor.pid`            | (Windows) PID of the respawn loop. |
 
 `CREMIND_WORKING_DIR` overrides `~/.cremind` for side-by-side staging
 installs. `CREMIND_TEMPLATE_BASE` overrides the URL the scripts fetch
@@ -223,7 +244,29 @@ cd ~/.cremind/docker
 docker compose down
 ```
 
-**Native (install-session server):**
+**Native (boot service — the default):**
+
+```bash
+systemctl --user stop cremind                          # Linux, this session
+launchctl bootout gui/$(id -u)/io.cremind.server       # macOS, this session
+```
+
+```powershell
+Stop-ScheduledTask -TaskName 'Cremind Server'          # Windows, this session
+```
+
+Those stop it until the next login. To unregister it altogether:
+
+```
+cremind boot disable
+```
+
+`cremind boot status` reports whether the service is registered, running, and
+surviving logout. Uninstalling removes it too — you do not need to disable it
+first.
+
+**Native (fallback, `--no-boot-service` or where no service could be
+registered):** the server runs only until you log out or stop it explicitly.
 
 ```bash
 kill $(cat ~/.cremind/install.pid)
@@ -232,11 +275,6 @@ kill $(cat ~/.cremind/install.pid)
 ```powershell
 Stop-Process -Id (Get-Content ~/.cremind/install.pid)
 ```
-
-A real service unit (systemd / launchd / Scheduled Task) for native
-installs is a follow-up; for now the install-session server runs only
-until you log out or run `kill` explicitly. Docker mode is supervised
-by the daemon and survives logout.
 
 ## Building the SPA into the wheel
 

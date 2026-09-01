@@ -52,6 +52,24 @@ def effective_ssl_mode() -> str:
     return BaseConfig.SSL_MODE.strip().lower()
 
 
+def env_supervised() -> bool:
+    """``CREMIND_SUPERVISED`` — something respawns this process when it exits.
+
+    Set by the boot service ``cremind boot enable`` registers (the systemd
+    unit's ``Environment=``, the LaunchAgent's ``EnvironmentVariables``, the
+    Windows respawn loop), so it is true exactly when a supervisor is really
+    watching — a hand-run ``cremind serve`` never sees it.
+
+    Deliberately independent of ``INSTALL_MODE``: it states one fact about the
+    process, not how Cremind was installed.
+    """
+    return (os.environ.get("CREMIND_SUPERVISED") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def environment_forces_plain_http(public_port: int) -> bool:
     """True when nothing this process does can result in TLS being served.
 
@@ -117,6 +135,7 @@ def compute_tls_facts(
     public_port: int,
     serving_https: bool,
     install_mode: str,
+    supervised: bool = False,
 ) -> TlsFacts:
     """Pure core of :func:`current_tls_facts`, parameterised for testing."""
     forced_plain = environment_forces_plain_http(public_port)
@@ -139,10 +158,12 @@ def compute_tls_facts(
         # restart actually happens.
         pending_https=pending,
         # A restart only comes back where something supervises the process.
-        # Docker Compose restarts the container, kubelet restarts the pod; a
-        # bare ``cremind serve`` in a terminal simply stays down, so the
-        # wizard must ask the operator instead of killing their server.
-        restart_supported=install_mode in ("docker", "kubernetes"),
+        # Docker Compose restarts the container, kubelet restarts the pod, and
+        # on a native install the boot service from ``cremind boot enable``
+        # does (it sets CREMIND_SUPERVISED). A bare ``cremind serve`` in a
+        # terminal simply stays down, so the wizard must ask the operator
+        # instead of killing their server.
+        restart_supported=supervised or install_mode in ("docker", "kubernetes"),
     )
 
 
@@ -160,6 +181,7 @@ def current_tls_facts(public_port: int | None = None) -> TlsFacts:
         public_port=public_port,
         serving_https=boot_serving_https(),
         install_mode=(os.environ.get("INSTALL_MODE") or "").strip().lower(),
+        supervised=env_supervised(),
     )
 
 

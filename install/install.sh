@@ -40,6 +40,19 @@
 #                               default — their URLs are yours, so they stay
 #                               on plain HTTP unless you pass this flag,
 #                               which still applies to them.
+#   --boot-service              Register a login/boot service (systemd user
+#   --no-boot-service           unit on Linux, LaunchAgent on macOS) that
+#                               starts ``cremind serve`` and restarts it if it
+#                               stops. Default: on for native installs, which
+#                               is also what makes the in-app restart and the
+#                               after-setup HTTPS switch work. A re-install
+#                               keeps a previous --no-boot-service; an install
+#                               made before this flag existed gains the
+#                               service. Ignored for docker
+#                               mode (the daemon supervises the container) and
+#                               for installs driven by the desktop app (it
+#                               owns the backend itself). Manage it later with
+#                               ``cremind boot enable|disable|status``.
 #   --no-launch                 Skip opening the setup wizard at the end.
 #   --unattended                Use defaults; never prompt. Implies --no-launch
 #                               unless deployment+host are also provided.
@@ -147,6 +160,12 @@ DESKTOP_UI=""
 # a flag the operator passed on the command line.
 SSL_MODE=""
 SSL_EXPLICIT=0
+# Boot service, from --boot-service / --no-boot-service. Same shape as the
+# SSL pair above, and named to avoid the same TUI-output collision.
+# BOOT_SERVICE holds the raw request until the ── boot service ── block
+# resolves it; BOOT_EXPLICIT separates "the operator said no" from "unset".
+BOOT_SERVICE=""
+BOOT_EXPLICIT=0
 NO_LAUNCH=0
 UNATTENDED=0
 REINSTALL=0
@@ -201,6 +220,8 @@ while [ $# -gt 0 ]; do
         --wizard-preset=*)        CUSTOM_wizard_preset="${1#*=}"; shift ;;
         --ssl)                    SSL_MODE="$2"; SSL_EXPLICIT=1; shift 2 ;;
         --ssl=*)                  SSL_MODE="${1#*=}"; SSL_EXPLICIT=1; shift ;;
+        --boot-service)           BOOT_SERVICE=1; BOOT_EXPLICIT=1; shift ;;
+        --no-boot-service)        BOOT_SERVICE=0; BOOT_EXPLICIT=1; shift ;;
         --no-launch)              NO_LAUNCH=1; shift ;;
         --unattended)             UNATTENDED=1; shift ;;
         --reinstall)              REINSTALL=1; shift ;;
@@ -389,6 +410,35 @@ if [ "$UNINSTALL" -eq 1 ]; then
         esac
     fi
 
+    # Tear the boot service down FIRST. It is a supervisor: if it is still
+    # registered when the kills below land, it puts the server straight back,
+    # and the uninstall then deletes files out from under a running process.
+    #
+    # Unconditional — both --keep and --purge, every install kind. The unit
+    # lives outside both directories (like the PATH block further down), so
+    # nothing else in this script would ever remove it. The `cremind boot`
+    # command owns the details; the raw commands are the fallback for a venv
+    # too broken to run, which is exactly when someone reaches for --purge.
+    BOOT_TORN_DOWN=0
+    if [ -x "$UNINSTALL_SYSTEM_DIR/venv/bin/cremind" ]; then
+        if "$UNINSTALL_SYSTEM_DIR/venv/bin/cremind" boot disable --yes >/dev/null 2>&1; then
+            BOOT_TORN_DOWN=1
+        fi
+    fi
+    if [ "$BOOT_TORN_DOWN" -eq 0 ]; then
+        case "$(uname -s)" in
+            Darwin)
+                launchctl bootout "gui/$(id -u)/io.cremind.server" >/dev/null 2>&1 || true
+                rm -f "$HOME/Library/LaunchAgents/io.cremind.server.plist"
+                ;;
+            *)
+                systemctl --user disable --now cremind.service >/dev/null 2>&1 || true
+                rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/cremind.service"
+                systemctl --user daemon-reload >/dev/null 2>&1 || true
+                ;;
+        esac
+    fi
+
     # Stop any backend tracked via install.pid. Best-effort — a stale PID
     # file from a crashed install just no-ops here.
     if [ -f "$UNINSTALL_INSTALL_DIR/install.pid" ]; then
@@ -402,8 +452,9 @@ if [ "$UNINSTALL" -eq 1 ]; then
             kill -9 "$pid" 2>/dev/null || true
         fi
     fi
-    # Also stop the long-running server (writes server.pid in System Dir
-    # after Setup Wizard completes).
+    # Also stop the long-running server. It writes server.pid in the System
+    # Dir when a boot service supervises it (app/server.py), so this catches
+    # a server the teardown above orphaned rather than stopped.
     if [ -f "$UNINSTALL_SYSTEM_DIR/server.pid" ]; then
         pid=$(cat "$UNINSTALL_SYSTEM_DIR/server.pid" 2>/dev/null || true)
         [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
@@ -1425,6 +1476,42 @@ elif [ "$SSL_EXPLICIT" = "1" ]; then
     fi
     unset CREMIND_SSL CREMIND_SSL_CERTFILE
 fi
+
+# ── boot service ─────────────────────────────────────────────────────────
+#
+# Whether to register a login/boot service (systemd user unit / LaunchAgent)
+# that starts ``cremind serve`` and restarts it when it exits. Resolved here,
+# next to the ssl block, because both are settings the .env carries forward
+# and both are ignored under the Electron front-end.
+#
+# Default ON for native installs. That is a bigger default than --ssl's, and
+# deliberately so: without a supervisor the in-app restart and the after-setup
+# HTTPS switch leave the server down, which reads as a bug rather than as a
+# missing feature.
+#
+# The persistence rule differs from --ssl on purpose. --ssl treats a missing
+# marker as "no previous choice"; here a missing CREMIND_BOOT_SERVICE means an
+# install that predates this feature, and those should GAIN the service on
+# upgrade. So only a literal ``disabled`` sticks — an explicit opt-out is the
+# one thing carried forward.
+if [ "${CREMIND_INSTALLER_FRONTEND:-}" = "electron" ]; then
+    if [ "$BOOT_EXPLICIT" = "1" ] && [ "$BOOT_SERVICE" = "1" ]; then
+        warn "--boot-service ignored: the desktop app starts and stops the backend itself."
+    fi
+    BOOT_SERVICE=0
+elif [ "$MODE" = "docker" ]; then
+    if [ "$BOOT_EXPLICIT" = "1" ] && [ "$BOOT_SERVICE" = "1" ]; then
+        warn "--boot-service ignored: docker restarts the container for you."
+    fi
+    BOOT_SERVICE=0
+elif [ "$BOOT_EXPLICIT" = "1" ]; then
+    :
+elif [ -f "$ENV_FILE" ] && grep -qE '^[[:space:]]*CREMIND_BOOT_SERVICE[[:space:]]*=[[:space:]]*disabled' "$ENV_FILE" 2>/dev/null; then
+    BOOT_SERVICE=0
+else
+    BOOT_SERVICE=1
+fi
+if [ "$BOOT_SERVICE" = "1" ]; then BOOT_MARKER="enabled"; else BOOT_MARKER="disabled"; fi
 
 # The scheme of the public origin, decided ONCE here — before the first
 # file is written. Everything the installer bakes a public URL into has to
@@ -2583,6 +2670,9 @@ if [ ! -f "$ENV_FILE" ]; then
             printf 'CREMIND_SSL_AUTO_HOSTS=%s\n' "$APP_HOST" >> "$ENV_FILE"
         fi
     fi
+    # Record the boot-service choice so a re-install doesn't silently undo an
+    # opt-out. Nothing in the app reads this key — only the block above does.
+    printf 'CREMIND_BOOT_SERVICE=%s\n' "$BOOT_MARKER" >> "$ENV_FILE"
     ok "Wrote $ENV_FILE"
 else
     info ".env already exists — keeping it. Edit $ENV_FILE if you need to."
@@ -2613,6 +2703,11 @@ else
         fi
         warn "Updated CREMIND_SSL (and the APP_URL/CORS scheme) in the existing $ENV_FILE to match --ssl."
     fi
+    # Unconditional, unlike --ssl above: the resolution block already read the
+    # old value out of this very file, so writing it back is either a no-op or
+    # the operator's new instruction. It also upgrades a pre-feature .env,
+    # which has no such key at all.
+    upsert_env_key "$ENV_FILE" CREMIND_BOOT_SERVICE "$BOOT_MARKER"
 fi
 
 # Stamp the channel-specific keys into .env so the running app's upgrader
@@ -2769,11 +2864,14 @@ SERVER_PID_FILE="$CREMIND_INSTALL_DIR/install.pid"
 if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ]; then
     step "Starting Cremind"
 
-    # We start the server in the background so the wizard URL works as
-    # soon as we open the browser. The PID is recorded so the user can
-    # stop it with `kill $(cat $CREMIND_INSTALL_DIR/install.pid)`. Future Phase:
-    # install a real service unit (systemd / launchd) so it survives
-    # logout.
+    # Preferred path: register a boot service and let IT start the server, so
+    # the process that serves the wizard is the same one that comes back after
+    # a logout, a reboot, or the restart the wizard itself asks for. The
+    # fallback — a background ``cremind serve`` whose PID we record so the
+    # user can `kill $(cat $CREMIND_INSTALL_DIR/install.pid)` — is what every
+    # install did before, and is still what runs wherever a service cannot be
+    # registered (WSL without systemd, an SSH session on a Mac, a locked-down
+    # Task Scheduler).
 
     # Source the .env early so HOST/PORT are honored both by the health
     # probe below and by the spawned server.
@@ -2800,6 +2898,31 @@ if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ]; then
     if [ "$SERVER_RUNNING" -eq 0 ] && curl -fsS "http://${HOST:-127.0.0.1}:${PORT:-1112}/health" >/dev/null 2>&1; then
         info "Cremind is already responding at http://${HOST:-127.0.0.1}:${PORT:-1112} — skipping server start."
         SERVER_RUNNING=1
+    fi
+
+    # BOOT_REGISTERED drives the "Stop:" copy at the end, and turns back off
+    # if the registration fails so the fallback spawn still happens.
+    BOOT_REGISTERED=0
+    if [ "$BOOT_SERVICE" = "1" ]; then
+        # ``cremind boot`` renders and registers the unit — the installer
+        # deliberately does not, so there is exactly one place that knows what
+        # a Cremind unit file looks like.
+        if [ "$SERVER_RUNNING" -eq 1 ]; then
+            # Something else owns the port (typically a dev ``uv run cremind
+            # serve``). Register without starting: a second server would only
+            # collide on the bind, and the unit takes over once that one stops.
+            if "$VENV_DIR/bin/cremind" boot enable --no-start --yes >>"$LOG_FILE" 2>&1; then
+                BOOT_REGISTERED=1
+                info "Boot service registered — it takes over when the running server stops."
+            fi
+        elif "$VENV_DIR/bin/cremind" boot enable --yes >>"$LOG_FILE" 2>&1; then
+            BOOT_REGISTERED=1
+            SERVER_RUNNING=1
+            ok "Cremind started by the boot service (logs: $CREMIND_SYSTEM_DIR/server.log)"
+        fi
+        if [ "$BOOT_REGISTERED" -eq 0 ]; then
+            warn "Could not register a boot service (see $LOG_FILE) — starting Cremind for this session only."
+        fi
     fi
 
     if [ "$SERVER_RUNNING" -eq 0 ]; then
@@ -2901,10 +3024,27 @@ EOF
 EOF
     fi
 
-    cat <<EOF
+    # A service-run server ignores install.pid — telling the user to kill a
+    # PID that isn't there (or, worse, one the service would immediately
+    # respawn) would be the wrong instruction.
+    if [ "${BOOT_REGISTERED:-0}" -eq 1 ]; then
+        if [ "$(uname -s)" = "Darwin" ]; then
+            BOOT_STOP_CMD="launchctl bootout gui/\$(id -u)/io.cremind.server"
+        else
+            BOOT_STOP_CMD="systemctl --user stop cremind"
+        fi
+        cat <<EOF
+  Starts automatically at login. Manage it with ${BOLD}cremind boot status${RESET}.
+  Stop once:  $BOOT_STOP_CMD
+  Stop for good: ${BOLD}cremind boot disable${RESET}
+
+EOF
+    else
+        cat <<EOF
   Stop:       kill \$(cat $SERVER_PID_FILE)
 
 EOF
+    fi
 
     # Activation guidance — front-and-center because bash can't update
     # the parent shell's PATH for us, and "command not found" right

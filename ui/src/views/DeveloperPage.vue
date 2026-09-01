@@ -49,6 +49,7 @@ const {
   phase: restartPhase,
   error: restartError,
   installMode,
+  supervised,
   isBusy: restartBusy,
   loadInstallMode,
   restart: triggerRestart,
@@ -87,7 +88,18 @@ const restartConfirmCopy = computed(() => {
         type: 'warning' as const,
       };
     default:
-      // ``native`` and ``null`` (unknown) — assume no supervisor.
+      // ``native`` and ``null`` (unknown). A boot service (`cremind boot
+      // enable`) supervises a native install, and install_mode cannot say so
+      // — without this branch we would warn a supervised user that their
+      // backend stays down, which is simply untrue.
+      if (supervised.value) {
+        return {
+          message:
+            'Active connections will drop. The boot service will restart the ' +
+            'backend automatically — this usually takes a few seconds.',
+          type: 'warning' as const,
+        };
+      }
       return {
         message:
           'Warning: this install has no supervisor. The backend will exit and ' +
@@ -414,11 +426,16 @@ watch(autoScroll, (on) => {
           <Icon icon="mdi:application-brackets-outline" />
           <span>Electron install — Cremind will relaunch the backend automatically.</span>
         </div>
+        <div v-else-if="supervised" class="restart-hint">
+          <Icon icon="mdi:restart" />
+          <span>Boot service — the OS will restart the backend automatically.</span>
+        </div>
         <div v-else class="restart-hint restart-hint-warning">
           <Icon icon="mdi:alert-outline" />
           <span>
             No supervisor detected — restarting will leave the backend down. You will
-            need to relaunch <code>cremind serve</code> manually.
+            need to relaunch <code>cremind serve</code> manually, or register a boot
+            service with <code>cremind boot enable</code>.
           </span>
         </div>
         <div v-if="restartPhase === 'failed' && restartError" class="restart-error">

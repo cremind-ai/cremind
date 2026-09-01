@@ -70,6 +70,19 @@
     cremind/cremind image (no noVNC/VNC ports). A re-install keeps the
     previous choice unless you pass a flag. Setting both flags is an error.
 
+.PARAMETER BootService
+    Register a Scheduled Task that starts Cremind at logon and restarts it if
+    it stops. Default: on for native installs, which is also what makes the
+    in-app restart and the after-setup HTTPS switch work. Manage it later with
+    `cremind boot enable|disable|status`.
+
+.PARAMETER NoBootService
+    Skip the logon Scheduled Task; Cremind runs only until you log out. A
+    re-install keeps a previous -NoBootService; an install made before this
+    flag existed gains the service. Setting both flags is an error. Ignored
+    for docker mode (the daemon supervises the container) and for
+    Electron-driven installs (the app owns the backend).
+
 .PARAMETER NoLaunch
     Skip opening the setup wizard at the end.
 
@@ -148,6 +161,11 @@ param(
     # Neither set = ask (default desktop). Setting both is an error.
     [switch] $Desktop,
     [switch] $NoDesktop,
+    # Register a logon Scheduled Task that starts and supervises the server?
+    # Neither set = on for native installs, unless a previous install opted
+    # out. Setting both is an error. See the ── boot service ── section.
+    [switch] $BootService,
+    [switch] $NoBootService,
     [switch] $NoLaunch,
     [switch] $Unattended,
     [switch] $Reinstall,
@@ -381,6 +399,45 @@ if ($Uninstall) {
         }
     }
 
+    # Tear the boot service down FIRST. It is a supervisor: if the task and
+    # its respawn loop are still alive when the kills below land, the loop
+    # puts the server straight back, and the uninstall then deletes files out
+    # from under a running process (which on Windows also locks the venv).
+    #
+    # Unconditional - both -Keep and -Purge, every install kind. The task
+    # lives outside both directories (like the PATH entry removed further
+    # down), so nothing else here would remove it. `cremind boot` owns the
+    # details; the raw commands are the fallback for a venv too broken to
+    # run, which is exactly when someone reaches for -Purge.
+    $BootTornDown = $false
+    $UninstallVenvCremind = Join-Path $UninstallSystemDir 'venv\Scripts\cremind.exe'
+    if (Test-Path -LiteralPath $UninstallVenvCremind) {
+        try {
+            & $UninstallVenvCremind boot disable --yes *> $null
+            $BootTornDown = ($LASTEXITCODE -eq 0)
+        } catch { }
+    }
+    if (-not $BootTornDown) {
+        & schtasks.exe /End /TN 'Cremind Server' 2>$null | Out-Null
+        & schtasks.exe /Delete /TN 'Cremind Server' /F 2>$null | Out-Null
+        $SupervisorPidFile = Join-Path $UninstallSystemDir 'supervisor.pid'
+        if (Test-Path -LiteralPath $SupervisorPidFile) {
+            try {
+                $supervisorPid = [int](Get-Content -LiteralPath $SupervisorPidFile -ErrorAction Stop | Select-Object -First 1)
+                # /T: the server hangs off the loop via cmd.exe, so only a
+                # tree kill reaches it.
+                if ($supervisorPid -gt 0) {
+                    & taskkill.exe /PID $supervisorPid /T /F 2>$null | Out-Null
+                    # taskkill returns once the kill is *requested*. The task's
+                    # working directory is the System Dir, so deleting that
+                    # directory below fails with a sharing violation until the
+                    # tree has actually gone.
+                    Wait-Process -Id $supervisorPid -Timeout 10 -ErrorAction SilentlyContinue
+                }
+            } catch { }
+        }
+    }
+
     Stop-CremindProcess (Join-Path $UninstallInstallDir 'install.pid')
     Stop-CremindProcess (Join-Path $UninstallSystemDir 'server.pid')
 
@@ -452,7 +509,8 @@ if ($Uninstall) {
         $toRemoveFromSystem = @(
             'venv',
             'bin',
-            'server.pid'
+            'server.pid',
+            'supervisor.pid'
         )
         foreach ($name in $toRemoveFromSystem) {
             $p = Join-Path $UninstallSystemDir $name
@@ -610,6 +668,11 @@ if ($Desktop -and $NoDesktop) {
     exit 2
 }
 $DesktopUi = if ($Desktop) { '1' } elseif ($NoDesktop) { '0' } else { '' }
+if ($BootService -and $NoBootService) {
+    Write-Err2 "-BootService and -NoBootService are mutually exclusive"
+    exit 2
+}
+$BootExplicit = ($BootService -or $NoBootService)
 
 # ── paths ─────────────────────────────────────────────────────────────────
 
@@ -1619,6 +1682,48 @@ if ($SslMode) {
     Remove-Item Env:CREMIND_SSL -ErrorAction SilentlyContinue
     Remove-Item Env:CREMIND_SSL_CERTFILE -ErrorAction SilentlyContinue
 }
+
+# ── boot service ──────────────────────────────────────────────────────────
+#
+# Whether to register a logon Scheduled Task that starts ``cremind serve`` and
+# restarts it when it exits. Resolved here, next to the ssl block, because
+# both are settings the .env carries forward and both are ignored under the
+# Electron front-end.
+#
+# Default ON for native installs. That is a bigger default than -Ssl's, and
+# deliberately so: without a supervisor the in-app restart and the after-setup
+# HTTPS switch leave the server down, which reads as a bug rather than as a
+# missing feature.
+#
+# The persistence rule differs from -Ssl on purpose. -Ssl treats a missing
+# marker as "no previous choice"; here a missing CREMIND_BOOT_SERVICE means an
+# install that predates this feature, and those should GAIN the service on
+# upgrade. So only a literal 'disabled' sticks.
+if ($env:CREMIND_INSTALLER_FRONTEND -eq 'electron') {
+    if ($BootService) {
+        Write-Warn2 "-BootService ignored: the desktop app starts and stops the backend itself."
+    }
+    $BootServiceOn = $false
+} elseif ($Mode -eq 'docker') {
+    if ($BootService) {
+        Write-Warn2 "-BootService ignored: docker restarts the container for you."
+    }
+    $BootServiceOn = $false
+} elseif ($BootExplicit) {
+    $BootServiceOn = [bool]$BootService
+} else {
+    $BootServiceOn = $true
+    if (Test-Path -LiteralPath $EnvFile) {
+        foreach ($line in (Get-Content -LiteralPath $EnvFile -ErrorAction SilentlyContinue)) {
+            $t = "$line".Trim()
+            if ($t -match '^CREMIND_BOOT_SERVICE\s*=\s*disabled\s*$') {
+                $BootServiceOn = $false
+                break
+            }
+        }
+    }
+}
+$BootMarker = if ($BootServiceOn) { 'enabled' } else { 'disabled' }
 
 # The scheme of the public origin, decided ONCE here — before the first
 # file is written. Everything the installer bakes a public URL into has to
@@ -2654,6 +2759,9 @@ if (-not (Test-Path $EnvFile)) {
             Add-Content -Path $EnvFile -Value "CREMIND_SSL_AUTO_HOSTS=$AppHost" -Encoding utf8
         }
     }
+    # Record the boot-service choice so a re-install doesn't silently undo an
+    # opt-out. Nothing in the app reads this key — only the block above does.
+    Add-Content -Path $EnvFile -Value "CREMIND_BOOT_SERVICE=$BootMarker" -Encoding utf8
     Write-Ok "Wrote $EnvFile"
 } else {
     Write-Info ".env already exists — keeping it. Edit $EnvFile if you need to."
@@ -2685,6 +2793,11 @@ if (-not (Test-Path $EnvFile)) {
         }
         Write-Warn2 "Updated CREMIND_SSL (and the APP_URL/CORS scheme) in the existing $EnvFile to match -Ssl."
     }
+    # Unconditional, unlike -Ssl above: the resolution block already read the
+    # old value out of this very file, so writing it back is either a no-op or
+    # the operator's new instruction. It also upgrades a pre-feature .env,
+    # which has no such key at all.
+    Set-CremindEnvKey -Path $EnvFile -Key 'CREMIND_BOOT_SERVICE' -Value $BootMarker
 }
 
 # Stamp the channel-specific keys into .env so the running app's upgrader
@@ -2834,6 +2947,10 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron' -and
 
 # ── start the server ──────────────────────────────────────────────────────
 
+# Declared out here so the wizard handoff can read it under Set-StrictMode
+# even on the paths that never reach the block below.
+$BootRegistered = $false
+
 # Skip starting ``cremind serve`` when the Electron app is driving —
 # the app spawns the backend itself once the user clicks Continue, and
 # that's also when the SQLite DB is created.
@@ -2883,6 +3000,35 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
             Write-Info "Cremind is already responding at http://${ServerHost}:${ServerPort} — skipping server start."
             $running = $true
         } catch { }
+    }
+
+    # Preferred path: register a logon Scheduled Task and let IT start the
+    # server, so the process serving the wizard is the same one that comes
+    # back after a logout, a reboot, or the restart the wizard itself asks
+    # for. ``cremind boot`` owns the task and the respawn loop — the installer
+    # deliberately renders neither, so there is exactly one place that knows
+    # what they look like.
+    if ($BootServiceOn) {
+        if ($running) {
+            # Something else owns the port (typically a dev ``cremind serve``).
+            # Register without starting: a second server would only collide on
+            # the bind, and the task takes over at the next logon.
+            Invoke-NativeLogged { & $VenvCremind boot enable --no-start --yes }
+            if ($LASTEXITCODE -eq 0) {
+                $BootRegistered = $true
+                Write-Info "Boot service registered — it takes over when the running server stops."
+            }
+        } else {
+            Invoke-NativeLogged { & $VenvCremind boot enable --yes }
+            if ($LASTEXITCODE -eq 0) {
+                $BootRegistered = $true
+                $running = $true
+                Write-Ok "Cremind started by the boot service (logs: $ServerLogFile)"
+            }
+        }
+        if (-not $BootRegistered) {
+            Write-Warn2 "Could not register a boot service (see $LogFile) — starting Cremind for this session only."
+        }
     }
 
     if (-not $running) {
@@ -2978,7 +3124,21 @@ Open this URL in your browser to continue setup:
         Write-Host "  Browsers warn until you trust the local CA (one-time): cremind tls trust"
     }
 
-    Write-Host @"
+    # A service-run server ignores install.pid — telling the user to stop a
+    # PID that isn't there (or one the loop would immediately respawn) would
+    # be the wrong instruction.
+    if ($BootRegistered) {
+        Write-Host @"
+  Starts automatically at logon. Manage it with: cremind boot status
+  Stop once:     Stop-ScheduledTask -TaskName 'Cremind Server'
+  Stop for good: cremind boot disable
+
+  Tip: open a NEW terminal so ``cremind`` is on PATH (already-open
+       shells won't see the User PATH update).
+
+"@
+    } else {
+        Write-Host @"
   Stop:       Stop-Process -Id (Get-Content $PidFile)
   Re-open:    cremind serve   (or: & "$VenvCremind" serve)
 
@@ -2986,6 +3146,7 @@ Open this URL in your browser to continue setup:
        shells won't see the User PATH update).
 
 "@
+    }
 
     if (-not $NoLaunch -and -not $Unattended) {
         Start-Process $WizardUrl

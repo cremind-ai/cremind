@@ -116,6 +116,7 @@ def test_tray_capabilities_returns_features_without_auth(
     skips the admin gate that breaks ``/api/services/capabilities``."""
     _stub_state(monkeypatch, setup_complete=True)
     monkeypatch.setattr(features_api, "get_active_install_mode", lambda: "native")
+    monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
 
     response = asyncio.run(features_api.get_tray_capabilities(_make_request()))
     import json
@@ -124,6 +125,26 @@ def test_tray_capabilities_returns_features_without_auth(
     assert response.status_code == 200
     assert body["install_mode"] == "native"
     assert sorted(body["ui_features"]) == sorted(features_api.UI_FEATURES)
+    assert body["supervised"] is False
+
+
+def test_tray_capabilities_reports_a_boot_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``install_mode`` alone cannot say whether a native install is supervised.
+
+    Both the Developer page's restart warning and ``cremind server restart``
+    read this field; without it they tell a user with a boot service that
+    their backend will stay down.
+    """
+    _stub_state(monkeypatch, setup_complete=True)
+    monkeypatch.setattr(features_api, "get_active_install_mode", lambda: "native")
+    monkeypatch.setenv("CREMIND_SUPERVISED", "1")
+
+    response = asyncio.run(features_api.get_tray_capabilities(_make_request()))
+    import json
+
+    assert json.loads(response.body)["supervised"] is True
 
 
 # ── image_flavor gate (drives Electron's "Open VNC Desktop" entry) ─────────

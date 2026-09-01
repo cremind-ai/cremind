@@ -13,6 +13,7 @@ Startup sequence:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import os
 import socket
 import sys
@@ -68,6 +69,7 @@ from app.config.tls_mode import (
     MODE_AFTER_SETUP,
     MODE_AUTO,
     effective_ssl_mode,
+    env_supervised,
     https_origin_from_app_url,
     record_boot_tls,
 )
@@ -449,18 +451,52 @@ def _supervised_env() -> bool:
     supervisor from bringing us back at all (see ``_BoundedShutdownServer``).
 
     Docker (compose sets ``restart: unless-stopped``), Kubernetes (the kubelet
-    restarts the pod; its container exits when ``cremind serve`` does) and
-    Electron (which respawns us over IPC) all qualify. ``CREMIND_SSL=after-setup``
-    makes this load-bearing rather than incidental: the Setup Wizard now asks
-    for a restart deliberately, so a wedged shutdown would strand the user
-    mid-setup. A bare ``cremind serve`` in a terminal is NOT supervised — it
-    keeps clean-shutdown semantics so Ctrl-C doesn't truncate work, and the
-    wizard asks the operator to restart by hand instead.
+    restarts the pod; its container exits when ``cremind serve`` does), Electron
+    (which respawns us over IPC) and the boot service ``cremind boot enable``
+    registers on a native install (systemd/launchd/Scheduled Task, which sets
+    ``CREMIND_SUPERVISED``) all qualify. ``CREMIND_SSL=after-setup`` makes this
+    load-bearing rather than incidental: the Setup Wizard now asks for a restart
+    deliberately, so a wedged shutdown would strand the user mid-setup. A bare
+    ``cremind serve`` in a terminal is NOT supervised — it keeps clean-shutdown
+    semantics so Ctrl-C doesn't truncate work, and the wizard asks the operator
+    to restart by hand instead.
     """
     return (
         os.environ.get("INSTALL_MODE") in ("docker", "kubernetes")
         or os.environ.get("CREMIND_ELECTRON_PARENT") is not None
+        or env_supervised()
     )
+
+
+def _write_server_pid_if_supervised() -> None:
+    """Record our PID in ``<system dir>/server.pid`` when under a boot service.
+
+    Only when supervised, and deliberately not ``install.pid``: the desktop app
+    tree-kills whatever PID sits in *that* file when it quits, and a
+    service-run server must not be collateral. A hand-run ``cremind serve``
+    writes nothing, so ``cremind boot disable`` can never mistake a developer's
+    terminal server for the one it manages.
+
+    Called after the port pre-flight so a losing duplicate never overwrites the
+    PID of the process that actually holds the ports.
+    """
+    if not env_supervised():
+        return
+    pid_path = Path(BaseConfig.CREMIND_SYSTEM_DIR) / "server.pid"
+    try:
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(os.getpid()), encoding="ascii")
+    except OSError as e:
+        logger.warning(f"Could not write {pid_path}: {e}")
+        return
+
+    def _remove_pid_file() -> None:
+        try:
+            pid_path.unlink()
+        except OSError:
+            pass
+
+    atexit.register(_remove_pid_file)
 
 
 def _resolve_public_port() -> int:
@@ -660,12 +696,18 @@ def _port_taken(bind_host: str, bind_port: int) -> bool:
       instead, with a message naming the conflict, beats two servers fighting
       over one port and whichever the OS happens to favour.
 
-    Linux is also the only place that needs it. A pod's network namespace
-    outlives its container, so a server that restarts itself — which only
-    Docker and Kubernetes do, per ``restart_supported`` — always comes back to
-    find its predecessor's connections still closing on the same port. Left
-    strict, the probe refused to boot on every one of those restarts until the
-    remnants aged out a minute later.
+    Linux is also where it is most needed. A pod's network namespace outlives
+    its container, so a restarting server always comes back to find its
+    predecessor's connections still closing on the same port; left strict, the
+    probe refused to boot on every one of those restarts until the remnants
+    aged out a minute later.
+
+    macOS and Windows stay strict, and a native install with a boot service is
+    now a restarting server there too (``cremind boot``). Their supervisors are
+    paced for it rather than relaxing this probe: launchd throttles a respawn
+    to ~5s and the Windows loop waits 2s, both long enough for a closing
+    listener to clear, and a genuine clash still gets one clear line instead of
+    two servers quietly fighting over a port.
     """
     family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
     with socket.socket(family, socket.SOCK_STREAM) as probe:
@@ -739,6 +781,10 @@ async def main(
     #    sidecar and no half-written state behind.
     public_port = _resolve_public_port()
     _require_free_ports(host, public_port, port)
+    #    Now that the ports are ours, tell the boot service (and the
+    #    uninstallers, which have always stopped this PID) which process to
+    #    manage. No-op unless something is actually supervising us.
+    _write_server_pid_if_supervised()
 
     #    Resolved next, for the same reason: a bad cert path (or CREMIND_SSL=auto
     #    with an unwritable system dir) should stop us here, not after the whole

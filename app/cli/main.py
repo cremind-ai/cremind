@@ -36,6 +36,7 @@ from app.cli.commands.agents import agents_app
 from app.cli.commands.auth import auth_app
 from app.cli.commands.backup import backup_app
 from app.cli.commands.blueprint import blueprint_app
+from app.cli.commands.boot import boot_app
 from app.cli.commands.calendar import calendar_app
 from app.cli.commands.drive import drive_app
 from app.cli.commands.channels import channels_app
@@ -131,7 +132,9 @@ def _root(
 # Top-level commands that never call the server — never prompt for a profile.
 # `tls` reads a certificate off disk and hands it to the OS trust store; it
 # exists precisely for the case where nothing can talk to the server yet.
-_TOKEN_FREE_COMMANDS = {"version", "setup", "serve", "tls"}
+# `boot` registers an OS service for a server that may not be running — or
+# even installed — yet, for the same reason.
+_TOKEN_FREE_COMMANDS = {"version", "setup", "serve", "tls", "boot"}
 # `profile` subcommands that manage the local session and need no token.
 _PROFILE_SESSION_SUBCOMMANDS = {"use", "which", "clear"}
 # `auth` subcommands that must run without a usable token. `show` only reads a
@@ -267,6 +270,7 @@ app.add_typer(embedding_app, name="embedding")
 app.add_typer(logs_app, name="logs")
 app.add_typer(server_app, name="server")
 app.add_typer(tls_app, name="tls")
+app.add_typer(boot_app, name="boot")
 
 app.command(
     "chat",

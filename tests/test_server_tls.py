@@ -10,6 +10,8 @@ approach as tests/test_server_ports.py).
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from app import server
@@ -279,6 +281,7 @@ def test_supervised_environments(monkeypatch) -> None:
     """Kubernetes counts: the wizard now asks for a restart deliberately, and a
     wedged shutdown there stops the kubelet bringing the pod back at all."""
     monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
+    monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
     for mode, expected in (
         ("docker", True),
         ("kubernetes", True),
@@ -287,6 +290,39 @@ def test_supervised_environments(monkeypatch) -> None:
     ):
         monkeypatch.setenv("INSTALL_MODE", mode)
         assert server._supervised_env() is expected, mode
+
+
+def test_a_boot_service_counts_as_a_supervisor(monkeypatch) -> None:
+    """A native install with `cremind boot enable` is supervised too.
+
+    The unit sets CREMIND_SUPERVISED, so a hung lifespan shutdown would stop
+    it bringing the server back — exactly the case the bounded shutdown
+    exists for.
+    """
+    monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
+    monkeypatch.setenv("INSTALL_MODE", "native")
+    monkeypatch.setenv("CREMIND_SUPERVISED", "1")
+
+    assert server._supervised_env() is True
+
+
+def test_the_server_pid_file_is_only_written_when_supervised(
+    monkeypatch, tmp_path
+) -> None:
+    """A hand-run `cremind serve` must leave no pid file behind.
+
+    `cremind boot disable` and the uninstallers stop whatever PID sits in
+    server.pid; a developer's terminal server must never be that PID.
+    """
+    monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path), raising=False)
+    monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
+
+    server._write_server_pid_if_supervised()
+    assert not (tmp_path / "server.pid").exists()
+
+    monkeypatch.setenv("CREMIND_SUPERVISED", "1")
+    server._write_server_pid_if_supervised()
+    assert (tmp_path / "server.pid").read_text().strip() == str(os.getpid())
 
 
 def test_the_hypercorn_config_asks_for_http2(pair) -> None:

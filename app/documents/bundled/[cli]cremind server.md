@@ -95,15 +95,18 @@ cremind server capabilities
 ```
 
 **Behavior.** Reads the public tray-capabilities endpoint: `install_mode`
-(`docker`/`electron`/`native`) and `ui_features`. No token required. (The
-richer admin `/api/services/capabilities` used by the Setup Wizard is
-intentionally not wrapped here.)
+(`docker`/`electron`/`native`), `supervised` (whether something restarts the
+backend when it exits — true on Docker/Electron, and on a native install with
+a boot service registered by `cremind boot enable`), and `ui_features`. No
+token required. (The richer admin `/api/services/capabilities` used by the
+Setup Wizard is intentionally not wrapped here.)
 
 **Example.**
 
 ```bash
 $ cremind server capabilities
 install_mode:  docker
+supervised:    true
 ui_features:   processes, events, channels
 ```
 
@@ -148,8 +151,11 @@ restarting (pid 12841)
 ## Troubleshooting
 
 **`server restart` says the backend will stay DOWN** — You're on a `native`
-install with no supervisor. After restarting you must run `cremind serve`
-again. Use Docker or Electron for auto-restart.
+install with no supervisor, so nothing brings the backend back. Register one
+with `cremind boot enable` (a systemd user unit, a launchd LaunchAgent, or a
+logon Scheduled Task) and restarts come back on their own; Docker and Electron
+installs are supervised already. Without it, run `cremind serve` again after
+each restart.
 
 **`server health` exits non-zero** — A subsystem is degraded (HTTP 503). Run it
 again or check `cremind logs tail --level error` for the cause. A `disabled`

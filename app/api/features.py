@@ -302,12 +302,20 @@ async def get_tray_capabilities(_request: Request) -> JSONResponse:
     metadata with no security value; the richer capabilities endpoint
     stays admin-gated for the Setup Wizard's deeper payload.
     """
+    from app.config.tls_mode import env_supervised
+
     return JSONResponse({
         "install_mode": get_active_install_mode(),
         # desktop / basic / None. None (native or a pre-flavor image) is
         # treated as desktop for Docker installs by the Electron client.
         "image_flavor": get_image_flavor(),
         "ui_features": list(UI_FEATURES),
+        # Whether something restarts this process when it exits. On a native
+        # install that is the boot service (`cremind boot enable`), which
+        # install_mode alone cannot reveal — the Developer page's restart
+        # warning would otherwise tell a supervised user their backend stays
+        # down.
+        "supervised": env_supervised(),
     })
 
 
