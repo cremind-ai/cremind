@@ -72,10 +72,32 @@ const props = withDefaults(defineProps<{
   variant: 'page',
 });
 
+/**
+ * What a host needs to know to gate on this configuration, derived here
+ * because only this component holds the provider catalog. The flat record
+ * alone can't answer either question: `model_group.high` may be absent
+ * because nothing was picked, and "no credentials" is fine for a provider
+ * whose auth method needs none (ollama/vllm are `kind: "none"`).
+ */
+export interface LLMConfigValidity {
+  /** `model_group.high`, empty when no main model is picked. */
+  mainModel: string;
+  /** Display name of the provider serving the main model (for messages). */
+  mainProviderLabel: string;
+  /** The main model's provider wants credentials this record doesn't carry.
+   *  Advisory, not fatal — a key can legitimately come from the environment
+   *  (the provider factory falls back to it), so hosts should warn, not block. */
+  mainProviderNeedsCredentials: boolean;
+}
+
 const emit = defineEmits<{
   /** Controlled mode only: the COMPLETE flat configuration record. Never a
    *  partial patch — the wizard replaces its `llmConfig` wholesale. */
   'update:config': [config: Record<string, string>];
+  /** Controlled mode only: emitted with every `update:config`, describing the
+   *  same record. Kept separate so the host gates on a decision made here
+   *  rather than re-deriving one it lacks the catalog to make. */
+  'update:validity': [validity: LLMConfigValidity];
 }>();
 
 // Sentinel dropdown value for the "add a new custom provider" affordance.
@@ -570,7 +592,58 @@ function emitConfig() {
     }
   }
 
+  // The provider fetch can fail on a revisit (`onMounted`'s catch leaves the
+  // list empty). Rebuilding from an empty list would emit a record with no
+  // credentials and no auth methods at all — and the host replaces its copy
+  // wholesale, so everything typed on an earlier visit would vanish with
+  // nothing on screen to show it. Carry the seed's provider keys forward.
+  if (providers.value.length === 0) {
+    for (const [key, value] of Object.entries(seedConfig)) {
+      if (key === 'default_provider' || key.startsWith('model_group.')) continue;
+      if (!(key in config)) config[key] = value;
+    }
+  }
+
   emit('update:config', config);
+  emit('update:validity', buildValidity(config));
+}
+
+/**
+ * Describe the record for a host that has to gate on it.
+ *
+ * Credential detection reads the record being emitted rather than component
+ * state, so it always describes exactly what the host is about to persist.
+ */
+function buildValidity(config: Record<string, string>): LLMConfigValidity {
+  const mainModel = config['model_group.high'] || '';
+  const name = extractProvider(mainModel);
+  const provider = providers.value.find(p => p.name === name);
+  if (!mainModel || !provider) {
+    return { mainModel, mainProviderLabel: name, mainProviderNeedsCredentials: false };
+  }
+
+  const label = provider.display_name || name;
+  const method = (provider.auth_methods || []).find(m => m.id === provider.selectedAuthMethod);
+  if (!method) {
+    // Legacy provider shape: a bare API key is all there is to check.
+    return {
+      mainModel,
+      mainProviderLabel: label,
+      mainProviderNeedsCredentials: !config[`${name}.api_key`],
+    };
+  }
+  // `none` (ollama, vllm) needs nothing. A device-code sign-in has no fields
+  // but very much needs completing: its token reaches the record as an
+  // api_key, so its absence is what "not signed in" looks like here.
+  let needs = false;
+  if (method.kind === 'device_code') {
+    needs = !config[`${name}.api_key`];
+  } else if (method.kind !== 'none') {
+    needs = Object.entries(method.fields || {}).some(
+      ([key, field]) => field.required && !config[`${name}.${key}`],
+    ) || (Object.keys(method.fields || {}).length === 0 && !config[`${name}.api_key`]);
+  }
+  return { mainModel, mainProviderLabel: label, mainProviderNeedsCredentials: needs };
 }
 
 watch([modelGroups, roleProviders, reasoningEfforts, optionalEnabled], emitConfig, { deep: true });
@@ -773,6 +846,14 @@ async function removeProviderConfiguration(provider: ProviderWithState) {
 }
 
 async function saveModelGroups() {
+  // Everything falls back to the main model, so saving a blank one leaves the
+  // profile unable to answer at all — and it is easy to do by accident,
+  // because changing a section's Provider clears its Model. The backend
+  // refuses this too; catching it here keeps the message next to the field.
+  if (!modelGroups.value.high) {
+    ElMessage.error('Choose a Model before saving — the assistant needs one to answer.');
+    return;
+  }
   saving.value = true;
   try {
     // Only the reasoning-capable roles carry an effort; the opt-in roles would
@@ -853,6 +934,7 @@ async function saveModelGroups() {
               :provider="selectedApiKeyProvider"
               :show-configured-badge="showConfiguredBadge"
               :show-save-buttons="selfSaving"
+              :persist-credentials="selfSaving"
               :saving="saving"
               :allow-browser-oauth="allowBrowserOauth"
               @save-provider="saveProvider(selectedApiKeyProvider!)"

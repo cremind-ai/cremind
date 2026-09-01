@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import {
-  ElSteps, ElStep, ElButton, ElMessage,
+  ElSteps, ElStep, ElButton, ElMessage, ElMessageBox,
   ElForm, ElFormItem, ElInput, ElRadio, ElRadioGroup, ElAlert, ElTag,
   ElSelect, ElOption, ElCheckbox,
 } from 'element-plus';
@@ -13,6 +13,7 @@ import { useChatStore } from '../stores/chat';
 import StepServerConfig from '../components/setup/StepServerConfig.vue';
 import StepEmbeddingConfig, { type EmbeddingConfigPayload } from '../components/setup/StepEmbeddingConfig.vue';
 import StepLLMConfig from '../components/setup/StepLLMConfig.vue';
+import type { LLMConfigValidity } from '../components/shared/LLMConfigForm.vue';
 import StepToolConfig from '../components/setup/StepToolConfig.vue';
 import StepMemoryConfig from '../components/setup/StepMemoryConfig.vue';
 import StepChannelsConfig from '../components/setup/StepChannelsConfig.vue';
@@ -434,6 +435,10 @@ function reconcileInstallStateFromSecrets(secrets: InstallSecrets | null) {
 const serverConfig = ref<Record<string, any>>({});
 const embeddingConfig = ref<EmbeddingConfigPayload | null>(null);
 const llmConfig = ref<Record<string, string>>({});
+// What the LLM step says about its own record. Emitted alongside every
+// ``llmConfig`` update, because judging it needs the provider catalog that
+// only the form holds. Null until the step has mounted once.
+const llmValidity = ref<LLMConfigValidity | null>(null);
 const toolConfigs = ref<Record<string, Record<string, string>>>({});
 const agentConfigs = ref<Record<string, Record<string, string>>>({});
 const channelConfigs = ref<CreateChannelPayload[]>([]);
@@ -874,6 +879,10 @@ function handleLLMConfigUpdate(config: Record<string, string>) {
   llmConfig.value = config;
 }
 
+function handleLLMValidityUpdate(validity: LLMConfigValidity) {
+  llmValidity.value = validity;
+}
+
 function handleToolConfigsUpdate(configs: Record<string, Record<string, string>>) {
   toolConfigs.value = configs;
 }
@@ -935,7 +944,23 @@ const canAdvanceFromInstallerVersion = computed(() => {
   return validateVersionSpec();
 });
 
-function handleNext() {
+/**
+ * The LLM step's hard requirement: a main model.
+ *
+ * Everything resolves to `model_group.high` — the optional groups all fall
+ * back to it — so a profile created without one cannot answer anything, on
+ * any surface, and the failure is invisible where it matters most: a group
+ * chat swallows the error and simply never replies. Walking past this step is
+ * the one way to create such a profile, so the step does not let you.
+ *
+ * Read from `llmConfig`, the very record `handleCompleteSetup` posts, so the
+ * gate and the payload cannot disagree.
+ */
+const canAdvanceFromLLM = computed(() =>
+  Boolean((llmConfig.value['model_group.high'] || '').trim()),
+);
+
+async function handleNext() {
   const key = currentStepKey.value;
 
   // Installer phase gates / actions.
@@ -977,6 +1002,28 @@ function handleNext() {
       return;
     }
   }
+  if (key === 'llm') {
+    if (!canAdvanceFromLLM.value) {
+      ElMessage.error('Choose a Model — the assistant needs one to answer anything.');
+      return;
+    }
+    // Missing credentials only warn: a key can legitimately come from the
+    // environment, which the wizard cannot see. Blocking would strand a
+    // perfectly valid deployment.
+    if (llmValidity.value?.mainProviderNeedsCredentials) {
+      const label = llmValidity.value.mainProviderLabel || 'this provider';
+      try {
+        await ElMessageBox.confirm(
+          `No credentials were entered for ${label}. The assistant can only answer `
+          + `if the key comes from the environment instead. Continue anyway?`,
+          'Missing credentials',
+          { confirmButtonText: 'Continue', cancelButtonText: 'Go back', type: 'warning' },
+        );
+      } catch {
+        return;  // "Go back" (or dismissed) — stay on the step.
+      }
+    }
+  }
   if (currentStep.value < steps.value.length - 1) {
     currentStep.value++;
   }
@@ -1001,6 +1048,13 @@ function retryInstallerRun() {
 }
 
 async function handleCompleteSetup() {
+  // The LLM step's own gate is the one users meet; this catches the case
+  // where the step list changes and 'llm' stops being something you walk
+  // past. A profile with no main model can never answer anything.
+  if (!canAdvanceFromLLM.value) {
+    ElMessage.error('Go back to LLM Providers and choose a Model first.');
+    return;
+  }
   submitting.value = true;
   setupLog.value = [];
 
@@ -1879,6 +1933,7 @@ async function downloadConfigFile(format: ExportFormat) {
           :token="adminToken"
           :config="llmConfig"
           @update="handleLLMConfigUpdate"
+          @validity="handleLLMValidityUpdate"
         />
         <StepToolConfig
           v-else-if="currentStepKey === 'tools'"
@@ -2096,6 +2151,9 @@ async function downloadConfigFile(format: ExportFormat) {
           <ElButton
             v-if="!isLastStep"
             type="primary"
+            :disabled="currentStepKey === 'llm' && !canAdvanceFromLLM"
+            :title="currentStepKey === 'llm' && !canAdvanceFromLLM
+              ? 'Choose a Model first — the assistant needs one to answer.' : ''"
             @click="handleNext"
           >
             Next

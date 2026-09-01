@@ -21,6 +21,7 @@ not sending that key is not a guarantee. These tests pin the backend defense:
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -223,6 +224,16 @@ def _run_setup(storage: _FakeConfigStorage, llm_config: dict[str, str]) -> dict[
     return storage.llm_config_for("second")
 
 
+def _run_setup_response(storage: _FakeConfigStorage, llm_config: dict[str, str]) -> dict:
+    """The response body, for the parts of setup that report rather than store."""
+    handler = _get_setup_handler(storage)
+    response = asyncio.run(
+        handler(_make_request({"profile": "second", "llm_config": llm_config}))
+    )
+    assert response.status_code == 200, response.body
+    return json.loads(response.body)
+
+
 def test_setup_does_not_persist_a_token_less_oauth_method(setup_env) -> None:
     persisted = _run_setup(
         setup_env,
@@ -285,3 +296,87 @@ def test_setup_still_classifies_secrets(setup_env) -> None:
     }
     assert by_key["openai.api_key"] is True
     assert by_key["openai.auth_method"] is False
+
+
+# ── A profile with no main model ──────────────────────────────────────────
+#
+# ``model_group.high`` is the one model everything resolves to. Without it the
+# profile cannot answer anything — and where it hurts most, a group chat, the
+# relevance judge swallows the resulting SetupRequiredError and the agent just
+# never replies. Setup is deliberately NOT rejected (headless bootstrap and
+# restore configure the model later), so the warning is the only signal there
+# is. It reached a live install through the wizard: the LLM step was walked
+# past untouched and the profile was agent-dead from creation.
+
+
+def _codes(response: dict) -> list[str]:
+    return [w["code"] for w in response.get("warnings", [])]
+
+
+def test_a_setup_with_no_main_model_still_succeeds_but_warns(setup_env) -> None:
+    # Exactly what the wizard emits from an untouched LLM step.
+    response = _run_setup_response(
+        setup_env,
+        {
+            "default_provider": "groq",
+            "model_group.vision.enabled": "false",
+            "model_group.audio.enabled": "false",
+            "openai.auth_method": "api_key",
+        },
+    )
+    assert response["success"] is True
+    assert _codes(response) == ["no_main_model"]
+    assert "second" in response["warnings"][0]["message"]
+    # Everything sent is still persisted — this warns, it does not reject.
+    assert setup_env.llm_config_for("second")["default_provider"] == "groq"
+
+
+def test_a_setup_that_picks_a_main_model_does_not_warn(setup_env) -> None:
+    response = _run_setup_response(
+        setup_env,
+        {"model_group.high": "openai/gpt-5.4", "openai.api_key": "sk-test"},
+    )
+    assert _codes(response) == []
+
+
+def test_a_blank_main_model_warns_like_a_missing_one(setup_env) -> None:
+    """``PUT /api/llm/model-groups`` could store an empty string, and the
+    resolver treats it as unset — so the check must too."""
+    response = _run_setup_response(setup_env, {"model_group.high": "   "})
+    assert _codes(response) == ["no_main_model"]
+
+
+def test_an_empty_llm_config_warns(setup_env) -> None:
+    response = _run_setup_response(setup_env, {})
+    assert _codes(response) == ["no_main_model"]
+
+
+def test_the_warning_reaches_the_wizards_live_log(setup_env, monkeypatch) -> None:
+    """The response field serves headless callers; the wizard's progress
+    stream is where a human sees it."""
+    entries: list[dict] = []
+    monkeypatch.setattr(config_api, "publish_setup_event", entries.append)
+
+    _run_setup_response(setup_env, {"default_provider": "groq"})
+
+    warnings = [e for e in entries if e.get("level") == "warning"]
+    assert len(warnings) == 1
+    assert warnings[0]["step"] == "llm_config"
+    assert "no main model" in warnings[0]["message"]
+
+
+def test_a_rerun_over_a_profile_that_already_has_a_model_does_not_warn(
+    setup_env, monkeypatch,
+) -> None:
+    """Re-running setup need not resend the model. Warning then would cry wolf
+    at the one profile that is actually fine."""
+    monkeypatch.setattr(
+        setup_env, "get",
+        lambda table, key, **_kw: (
+            "openai/gpt-5.4" if key == "model_group.high"
+            else "test-jwt-secret-long-enough-for-hs256" if key == "jwt_secret"
+            else None
+        ),
+    )
+    response = _run_setup_response(setup_env, {"openai.api_key": "sk-test"})
+    assert _codes(response) == []

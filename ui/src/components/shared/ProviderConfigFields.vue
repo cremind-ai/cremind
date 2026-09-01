@@ -27,11 +27,20 @@ const props = withDefaults(defineProps<{
   // wizard persist an auth method with no tokens behind it. A static pointer to
   // Settings takes their place.
   allowBrowserOauth?: boolean;
+  // Whether a completed device-code sign-in should be stored server-side
+  // against the session's own profile (Settings), or handed back for the host
+  // to bundle into its own save (the setup wizard). The distinction is not
+  // cosmetic: per-profile setup runs on the ADMIN's token, so persisting
+  // server-side would write the token into admin's config — contaminating one
+  // profile with another's credentials — and leave the profile being created
+  // with an auth method it has no token for.
+  persistCredentials?: boolean;
 }>(), {
   showConfiguredBadge: false,
   showSaveButtons: false,
   saving: false,
   allowBrowserOauth: false,
+  persistCredentials: false,
 });
 
 const emit = defineEmits<{
@@ -299,7 +308,16 @@ async function startDeviceLogin() {
 async function pollForToken(deviceCode: string, interval: number) {
   if (!deviceCodePolling.value) return;
   try {
-    const result = await pollDeviceCode(settingsStore.agentUrl, settingsStore.authToken, deviceCode);
+    // The backend persists the token against the REQUEST's profile when the
+    // call is authenticated, and returns it in-band when it isn't. Where this
+    // host bundles credentials itself (the wizard), poll unauthenticated: the
+    // session token there belongs to whoever is *driving* setup — the admin —
+    // not to the profile being created.
+    const result = await pollDeviceCode(
+      settingsStore.agentUrl,
+      props.persistCredentials ? settingsStore.authToken : '',
+      deviceCode,
+    );
     if (result.status === 'complete') {
       deviceCodePolling.value = false;
       deviceCodeComplete.value = true;

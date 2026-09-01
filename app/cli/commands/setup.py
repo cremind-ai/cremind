@@ -136,6 +136,7 @@ def setup_complete(
             "token": resp.token,
             "expires_at": resp.expires_at,
             "profile": resp.profile,
+            "warnings": [dict(w) for w in resp.warnings],
         })
     else:
         print_kv([
@@ -144,6 +145,13 @@ def setup_complete(
             ("token", resp.token),
         ])
         sys.stderr.write("\n")
+        # Setup succeeded, so these go to stderr alongside the token hint
+        # rather than failing the command — but they are the difference
+        # between a working profile and one that silently ignores everything.
+        for warning in resp.warnings:
+            sys.stderr.write(f"Warning: {warning.get('message') or warning.get('code')}\n")
+        if resp.warnings:
+            sys.stderr.write("\n")
         sys.stderr.write("Export the token to use the CLI:\n")
         sys.stderr.write(f"  export CREMIND_TOKEN={resp.token}\n")
 

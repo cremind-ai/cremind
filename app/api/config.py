@@ -388,6 +388,50 @@ def _drop_unusable_oauth_auth_methods(llm_config: dict) -> dict:
     return out
 
 
+def _no_main_model_warning(
+    config_storage, llm_config: dict, profile_name: str,
+) -> list[dict[str, str]]:
+    """One warning entry when ``profile_name`` ends up with no main model.
+
+    ``model_group.high`` is the single model everything resolves to — the
+    optional groups all fall back to it (see
+    :mod:`app.lib.llm.model_groups`), so without it *every* turn raises
+    ``SetupRequiredError``. The empty string counts as missing: ``PUT
+    /api/llm/model-groups`` used to store one, and the resolver treats it the
+    same as unset.
+
+    The payload is checked first and the stored value only as a fallback, so a
+    re-run that doesn't resend the model doesn't warn about a profile that
+    already has one. A storage read that fails is treated as "nothing stored"
+    — warning about a healthy profile is a great deal cheaper than staying
+    silent about a dead one.
+
+    Returns a list (empty when fine) so the caller can ``extend`` its warnings
+    without a None check. Module level, like
+    :func:`_drop_unusable_oauth_auth_methods`, so it is unit-testable without
+    driving the whole setup flow.
+    """
+    if str((llm_config or {}).get("model_group.high") or "").strip():
+        return []
+    try:
+        stored = config_storage.get(
+            "llm_config", "model_group.high", profile=profile_name,
+        )
+    except Exception:  # noqa: BLE001
+        stored = None
+    if str(stored or "").strip():
+        return []
+
+    message = (
+        f"Profile '{profile_name}' has no main model, so it cannot answer "
+        f"anything yet — messages on every channel will be ignored or error. "
+        f"Choose one in Settings → LLM Providers."
+    )
+    logger.warning(f"setup: {message}")
+    _emit_setup("llm_config", message, level="warning")
+    return [{"code": "no_main_model", "message": message}]
+
+
 def _apply_injected_postgres_password(pg_in: dict) -> None:
     """Fill an empty Postgres password from the injected ``CREMIND_POSTGRES_PASSWORD``.
 
@@ -828,6 +872,13 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 status_code=400,
             )
 
+        # Non-fatal problems with a setup that otherwise succeeded, returned to
+        # the caller so a headless client can act on what the wizard's live log
+        # shows a human. Kept as a list of coded entries rather than another
+        # top-level boolean: ``restart_required`` / ``failed_features`` already
+        # went that way and the response is crowded enough.
+        setup_warnings: list[dict[str, str]] = []
+
         _emit_setup(
             "start",
             (
@@ -1158,6 +1209,16 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 is_secret = False
             config_storage.set("llm_config", key, str(value), is_secret=is_secret, profile=profile_name)
 
+        # A profile with no main model is agent-dead: every turn raises
+        # SetupRequiredError, and the channel paths that fail closed (the group
+        # relevance judge) then swallow it — the profile simply never answers,
+        # anywhere, with nothing user-visible to explain why. Setup is NOT
+        # rejected over it, because configuring the model later is legitimate
+        # (``cremind setup complete`` bootstraps headlessly, restores replay a
+        # DB dump), but it is called out loudly enough that nobody has to
+        # discover it from a traceback three days later.
+        setup_warnings.extend(_no_main_model_warning(config_storage, llm_config, profile_name))
+
         # Per-profile general settings from the wizard (Settings → Config keys),
         # e.g. the Memory opt-in (``{"memory.enabled": "true"}``). Validated
         # against CONFIG_SCHEMA and coerced/stringified the same way the
@@ -1447,6 +1508,11 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 # will report MissingDependency until they retry from
                 # Settings.
                 "failed_features": failed_features,
+                # Non-fatal problems with a setup that still succeeded, each
+                # ``{code, message}``. Today the only code is
+                # ``no_main_model``; clients should render whatever arrives
+                # rather than switching on the codes they know.
+                "warnings": setup_warnings,
                 # HTTPS hand-off (CREMIND_SSL=after-setup). Deliberately not
                 # folded into ``restart_required`` above — that one means
                 # "a feature needs a fresh process", and the wizard already

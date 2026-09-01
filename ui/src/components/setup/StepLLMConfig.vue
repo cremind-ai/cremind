@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import LLMConfigForm from '../shared/LLMConfigForm.vue';
+import LLMConfigForm, { type LLMConfigValidity } from '../shared/LLMConfigForm.vue';
 
 /**
  * Setup Wizard step: LLM providers + models.
@@ -21,6 +21,10 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   update: [config: Record<string, string>];
+  // Forwarded verbatim: the wizard gates its Next button on this (a profile
+  // created without a main model can never answer anything), and only the
+  // form has the provider catalog needed to judge it.
+  validity: [validity: LLMConfigValidity];
 }>();
 </script>
 
@@ -38,6 +42,7 @@ const emit = defineEmits<{
       :token="props.token ?? ''"
       :initial-config="props.config"
       @update:config="emit('update', $event)"
+      @update:validity="emit('validity', $event)"
     />
   </div>
 </template>
