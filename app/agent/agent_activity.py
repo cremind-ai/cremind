@@ -254,8 +254,8 @@ class AgentActivity:
             )
         except Exception:  # noqa: BLE001 — persistence patch is best-effort
             logger.exception(
-                "agent_activity: failed to patch persisted metadata for %s",
-                self.conversation_id,
+                f"agent_activity: failed to patch persisted metadata for "
+                f"{self.conversation_id}"
             )
 
     # ── snapshot + publish ────────────────────────────────────────────────────
@@ -306,7 +306,7 @@ class AgentActivity:
             )
         except Exception:  # noqa: BLE001 — UI streaming is best-effort
             logger.exception(
-                "agent_activity: failed to publish for %s", self.conversation_id
+                f"agent_activity: failed to publish for {self.conversation_id}"
             )
 
 
@@ -331,8 +331,8 @@ async def _resolve_conversation_id(profile: str, context_id: str) -> str:
             return conv["id"]
     except Exception:  # noqa: BLE001
         logger.debug(
-            "agent_activity: conversation resolution failed for %s; using context_id",
-            context_id,
+            f"agent_activity: conversation resolution failed for {context_id}; "
+            f"using context_id"
         )
     return context_id
 

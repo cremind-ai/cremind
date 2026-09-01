@@ -68,7 +68,7 @@ async def _try_load(conv_storage: Any, method: str, *args: Any) -> dict | None:
         return await fn(*args)
     except Exception:  # noqa: BLE001
         logger.debug(
-            "resolve_cwd_scope: %s%r failed", method, args, exc_info=True,
+            f"resolve_cwd_scope: {method}{args!r} failed", exc_info=True,
         )
         return None
 
@@ -161,8 +161,8 @@ async def hydrate_working_directory(
             conv = await conv_storage.get_conversation(conversation_id)
         except Exception:  # noqa: BLE001
             logger.exception(
-                "hydrate_working_directory: get_conversation failed for %s",
-                conversation_id,
+                f"hydrate_working_directory: get_conversation failed for "
+                f"{conversation_id}"
             )
             conv = None
         if conv:
@@ -176,9 +176,8 @@ async def hydrate_working_directory(
             return persisted
         # Stale: directory is gone. Clear so we don't keep retrying it.
         logger.info(
-            "hydrate_working_directory: persisted cwd %r for %s no longer "
-            "exists; falling back to user default",
-            persisted, conversation_id,
+            f"hydrate_working_directory: persisted cwd {persisted!r} for "
+            f"{conversation_id} no longer exists; falling back to user default"
         )
         if conv_storage is not None:
             try:
@@ -187,8 +186,8 @@ async def hydrate_working_directory(
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    "hydrate_working_directory: failed to clear stale cwd "
-                    "for %s", conversation_id,
+                    f"hydrate_working_directory: failed to clear stale cwd for "
+                    f"{conversation_id}"
                 )
 
     return get_user_working_directory()
@@ -215,8 +214,8 @@ async def persist_working_directory(
         )
     except Exception:  # noqa: BLE001
         logger.exception(
-            "persist_working_directory: update_conversation failed for %s",
-            conversation_id,
+            f"persist_working_directory: update_conversation failed for "
+            f"{conversation_id}"
         )
 
 
@@ -268,8 +267,7 @@ async def switch_conversation_cwd(
             )
         except Exception:  # noqa: BLE001
             logger.exception(
-                "switch_conversation_cwd: failed to publish cwd event for %s",
-                row_id,
+                f"switch_conversation_cwd: failed to publish cwd event for {row_id}"
             )
 
 

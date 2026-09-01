@@ -283,7 +283,8 @@ def get_tool_routes(state: BootedState) -> list[Route]:
                     options_result = await hook(variables=merged, profile=profile, refresh=False)
                 except Exception:  # noqa: BLE001 — never block a write on the hook
                     logger.debug(
-                        "variable-options check failed for tool '%s'", tool_id, exc_info=True
+                        f"variable-options check failed for tool '{tool_id}'",
+                        exc_info=True,
                     )
                     options_result = {}
                 for key in dynamic_keys:
@@ -710,7 +711,7 @@ def get_tool_routes(state: BootedState) -> list[Route]:
         try:
             result = await hook(variables=variables, profile=profile, refresh=refresh)
         except Exception as exc:  # noqa: BLE001 — hooks shouldn't raise; belt-and-braces
-            logger.exception("variable-options hook failed for tool '%s'", tool_id)
+            logger.exception(f"variable-options hook failed for tool '{tool_id}'")
             return JSONResponse(
                 {"error": f"Failed to resolve options: {exc}"}, status_code=500
             )

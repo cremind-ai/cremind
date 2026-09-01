@@ -97,6 +97,33 @@ def test_recovery_none_for_dir_outside_home(tmp_path, monkeypatch):
     assert resolve_sandbox_recovery_dir(_denial(str(outside)), {"path": str(outside)}) is None
 
 
+def test_recovery_none_for_the_home_root_itself(tmp_path, monkeypatch):
+    """Recovering ONTO home makes the entire user tree the working directory,
+    and the next search_files/grep_files walks all of it. That is how one denied
+    lookup stalled the whole process. One level below home still recovers."""
+    home = tmp_path / "home"
+    home.mkdir()
+    _set_home(monkeypatch, home)
+
+    assert resolve_sandbox_recovery_dir(_denial(str(home)), {"path": str(home)}) is None
+
+    below = home / "Documents"
+    below.mkdir()
+    assert resolve_sandbox_recovery_dir(
+        _denial(str(below)), {"path": str(below)},
+    ) == os.path.realpath(str(below))
+
+
+def test_recovery_none_for_a_file_sitting_directly_in_home(tmp_path, monkeypatch):
+    """The parent of such a file IS home, so the same rule applies."""
+    home = tmp_path / "home"
+    home.mkdir()
+    f = home / "notes.txt"
+    f.write_text("x")
+    _set_home(monkeypatch, home)
+    assert resolve_sandbox_recovery_dir(_denial(str(f)), {"path": str(f)}) is None
+
+
 def test_recovery_none_for_non_denial_results(tmp_path, monkeypatch):
     home = tmp_path / "home"
     d = home / "d"
