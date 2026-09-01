@@ -217,6 +217,32 @@ def test_the_stop_is_guarded_against_a_recycled_pid() -> None:
     assert '*"$CREMIND_SYSTEM_DIR"*) ;;' in sh
 
 
+def test_the_stop_confirms_exit_through_the_handle_not_a_pid_lookup() -> None:
+    """Confirming with ``Get-Process -Id`` reports a dead server as still alive.
+
+    A process stays enumerable by PID while any handle to it is open, and the
+    function holds one, so a PID lookup keeps answering after the process has
+    exited. That reads a successful stop as a failure — and because the caller
+    gates the fallback spawn on the same answer, the install would end with
+    nothing serving at all: the worst outcome this hand-over can produce, and
+    strictly worse than never having stopped anything. Asking the handle also
+    removes the PID-reuse race the ownership guard exists to cover.
+    """
+    body = _ps1().split("function Stop-CremindInstallerServer", 1)[1]
+    body = body.split("\n    }", 1)[0]
+    assert "$proc.WaitForExit(" in body
+    after_the_kill = body.split("Stop-Process", 1)[1]
+    executed = "\n".join(
+        line for line in after_the_kill.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert "Get-Process" not in executed, (
+        "the post-stop check must ask the handle, not re-look-up the PID"
+    )
+    # The kill itself takes the handle too, so nothing races on the number.
+    assert "Stop-Process -InputObject $proc" in body
+
+
 def test_a_refused_or_failed_stop_degrades_to_register_only() -> None:
     """Never leave the user without a server: the old path is still there."""
     for script, warning in (

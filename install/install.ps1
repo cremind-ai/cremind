@@ -2995,12 +2995,19 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
         }
         Write-Info "Stopping the unsupervised server (pid $ServerPid) so the boot service can take over."
         try {
-            Stop-Process -Id $ServerPid -Force -ErrorAction Stop
-            Wait-Process -Id $ServerPid -Timeout 15 -ErrorAction SilentlyContinue
+            Stop-Process -InputObject $proc -Force -ErrorAction Stop
         } catch {
-            return $false
+            # Exiting between the lookup and the kill is a success. Anything
+            # else (no rights) leaves it running and must not read as one.
+            if (-not $proc.HasExited) { return $false }
         }
-        if (Get-Process -Id $ServerPid -ErrorAction SilentlyContinue) { return $false }
+        # Ask the HANDLE, not the PID. A process stays enumerable by PID while
+        # any handle to it is open — and $proc is one — so ``Get-Process -Id``
+        # keeps answering for a process that has already exited, reading a
+        # successful stop as a failure. The caller gates the fallback spawn on
+        # this answer, so that lie ends the install with nothing serving at
+        # all. WaitForExit also pins the identity: no PID reuse to race.
+        if (-not $proc.WaitForExit(15000)) { return $false }
         # The service writes server.pid; nothing should be left pointing a
         # later uninstall (or the desktop app's tree-kill) at a dead PID.
         Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
