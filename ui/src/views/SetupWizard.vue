@@ -136,6 +136,32 @@ const installMode = ref<'docker' | 'native'>('native');
 // Docker mode only: include the VNC Desktop UI (cremind/cremind-desktop) or
 // install the headless basic image (cremind/cremind). Default on = desktop.
 const installDesktopUi = ref(true);
+// The desktop's VNC password. This install runs ``--unattended``, so the
+// script's own prompt never fires and the wizard has to ask. The rule mirrors
+// install.sh / install.ps1 / app/installer/tui.py: 6-8 characters from a
+// charset that survives the .env render, the compose file and credentials.toml.
+// (6 = TigerVNC's minimum, 8 = where the classic DES scheme stops reading.)
+const VNC_PASSWORD_RE = /^[A-Za-z0-9@%_+=:,.-]{6,8}$/;
+const installVncPassword = ref('');
+const installVncPasswordConfirm = ref('');
+const installVncPasswordError = computed(() => {
+  if (installMode.value !== 'docker' || !installDesktopUi.value) return '';
+  if (!installVncPassword.value) return '';  // untouched — not an error yet
+  if (!VNC_PASSWORD_RE.test(installVncPassword.value)) {
+    return 'Use 6-8 characters from letters, digits and @ % _ + = : , . -';
+  }
+  if (installVncPasswordConfirm.value
+      && installVncPassword.value !== installVncPasswordConfirm.value) {
+    return 'The two entries do not match.';
+  }
+  return '';
+});
+/** Whether the VNC fields are filled in well enough to start the install. */
+const installVncPasswordReady = computed(() => {
+  if (installMode.value !== 'docker' || !installDesktopUi.value) return true;
+  return VNC_PASSWORD_RE.test(installVncPassword.value)
+    && installVncPassword.value === installVncPasswordConfirm.value;
+});
 const installLog = ref<Array<{ stream: string; line: string }>>([]);
 const installing = ref(false);
 const installDone = ref(false);
@@ -348,6 +374,10 @@ async function startInstallerRun() {
       // Docker mode only: forward the desktop-UI toggle. Omitted for native
       // so the script's default applies.
       desktopUi: installMode.value === 'docker' ? installDesktopUi.value : undefined,
+      // Only when the desktop is actually being installed; otherwise the
+      // script keeps the previous password or generates one.
+      vncPassword: installMode.value === 'docker' && installDesktopUi.value
+        ? installVncPassword.value : undefined,
       customFields,
       // Pass the explicit spec only when the user picked "Specific";
       // omitting it lets the install script resolve the channel default
@@ -524,6 +554,15 @@ const pivotTargetUrl = computed(() => {
   }
   return `https://${window.location.host}`;
 });
+
+/** The Agent URL the exported config should name. Under ``after-setup`` the
+ *  whole wizard runs on plain HTTP and TLS only starts on the restart that
+ *  follows, so ``window.location.origin`` would hand the user an address that
+ *  stops working the moment they finish. Reuse ``pivotTargetUrl`` so the
+ *  export, the interstitial and the redirect can't name different origins. */
+const exportAgentUrl = computed(() => (
+  finishTls.value?.pending ? pivotTargetUrl.value : settingsStore.agentUrl
+));
 
 /** Leave the pivot and enter Cremind on the plain-HTTP origin instead. The
  *  session is already active (``handleFinish`` sets the token before it
@@ -933,6 +972,9 @@ const canAdvanceFromInstallerDeployment = computed(() => {
 });
 const canAdvanceFromInstallerMode = computed(() => {
   if (installMode.value === 'docker' && installDockerDisabled.value) return false;
+  // A blank/mismatched VNC password can't be fixed later from the log pane —
+  // the install is already unattended by then.
+  if (!installVncPasswordReady.value) return false;
   return true;
 });
 // Block Next on the version step until either ``latest`` is selected
@@ -1385,7 +1427,8 @@ function buildConfigSnapshot(): ConfigExportSnapshot {
     profile: profileName.value,
     token: generatedToken.value,
     tokenExpiresAt: tokenExpiresAt.value,
-    agentUrl: settingsStore.agentUrl,
+    agentUrl: exportAgentUrl.value,
+    agentUrlPendingHttps: Boolean(finishTls.value?.pending),
     generatedAt: new Date().toISOString(),
     deployment: {
       type: installDeployment.value,
@@ -1801,6 +1844,36 @@ async function downloadConfigFile(format: ExportFormat) {
               <span class="installer-hint">
                 {{ installCatalog?.docker_desktop?.hint
                   ?? 'Adds an XFCE desktop inside the container so you can watch the agent work. Uncheck to install the smaller headless image (cremind/cremind).' }}
+              </span>
+            </ElFormItem>
+            <!-- The install runs --unattended, so the script can never ask
+                 for this itself. Collect it here or the desktop ships with a
+                 generated password the user has to go looking for. -->
+            <ElFormItem v-if="installDesktopUi">
+              <label class="installer-label">
+                {{ installCatalog?.vnc_password?.prompt ?? 'Choose a password for the VNC Desktop' }}
+              </label>
+              <ElInput
+                v-model="installVncPassword"
+                type="password"
+                show-password
+                placeholder="6-8 characters"
+                autocomplete="new-password"
+              />
+              <ElInput
+                v-model="installVncPasswordConfirm"
+                type="password"
+                show-password
+                placeholder="Confirm the password"
+                autocomplete="new-password"
+                style="margin-top: 8px;"
+              />
+              <span v-if="installVncPasswordError" class="installer-error">
+                {{ installVncPasswordError }}
+              </span>
+              <span v-else class="installer-hint">
+                {{ installCatalog?.vnc_password?.hint
+                  ?? 'Used to sign in to the desktop. VNC ignores anything past the 8th character.' }}
               </span>
             </ElFormItem>
           </ElForm>
@@ -2350,6 +2423,20 @@ async function downloadConfigFile(format: ExportFormat) {
   font-size: 12px;
   line-height: 1.45;
   color: var(--text-secondary);
+}
+.installer-pane .installer-label {
+  display: block;
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+.installer-pane .installer-error {
+  display: block;
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--el-color-danger);
 }
 .installer-pane .installer-badge {
   display: inline-block;

@@ -70,6 +70,14 @@
     cremind/cremind image (no noVNC/VNC ports). A re-install keeps the
     previous choice unless you pass a flag. Setting both flags is an error.
 
+.PARAMETER VncPassword
+    (Docker mode, desktop UI only) Password for the VNC Desktop at
+    http://<host>:6080/vnc.html. 6-8 characters from [A-Za-z0-9@%_+=:,.-] —
+    VNC ignores anything past the 8th character. Interactive installs ask for
+    it (entered twice) when the desktop UI is included; with -Unattended or no
+    console this flag wins, else the previous install's password is kept, else
+    one is generated and printed at the end.
+
 .PARAMETER BootService
     Register a Scheduled Task that starts Cremind at logon and restarts it if
     it stops. Default: on for native installs, which is also what makes the
@@ -161,6 +169,11 @@ param(
     # Neither set = ask (default desktop). Setting both is an error.
     [switch] $Desktop,
     [switch] $NoDesktop,
+    # Password for the VNC Desktop at http://<host>:6080/vnc.html. Docker +
+    # desktop only. Empty = ask interactively (twice), or — with -Unattended
+    # / no console — keep the previous install's password, else generate one.
+    # 6-8 characters from [A-Za-z0-9@%_+=:,.-]; see $VncPasswordRe below.
+    [string] $VncPassword = '',
     # Register a logon Scheduled Task that starts and supervises the server?
     # Neither set = on for native installs, unless a previous install opted
     # out. Setting both is an error. See the ── boot service ── section.
@@ -668,6 +681,26 @@ if ($Desktop -and $NoDesktop) {
     exit 2
 }
 $DesktopUi = if ($Desktop) { '1' } elseif ($NoDesktop) { '0' } else { '' }
+
+# The one rule for a VNC password, mirrored verbatim in install.sh and
+# app/installer/tui.py (a drift test pins the three together). 6-8 is VNC's
+# own range — vncpasswd rejects under 6 and the DES scheme keys off the first
+# 8 only. The charset excludes | & \ $ # space and quotes because the value
+# passes through a -replace into the .env template, an unquoted compose .env,
+# and a TOML basic string in credentials.toml.
+$VncPasswordRe = '^[A-Za-z0-9@%_+=:,.-]{6,8}$'
+# A bad -VncPassword fails now, in every mode. Unattended installs never
+# prompt, but they must not silently install a password the container will
+# mangle either — failing fast beats debugging a desktop you cannot unlock.
+if ($VncPassword -and $VncPassword -notmatch $VncPasswordRe) {
+    Write-Err2 "Invalid -VncPassword: use 6-8 characters from letters, digits and @ % _ + = : , . -"
+    Write-Err2 "(VNC itself ignores anything past the 8th character.)"
+    exit 2
+}
+# The VNC password a previous install left in docker\.env, read before the TUI
+# runs so an empty answer can mean "keep that one" instead of rotating it.
+$PrevVncPassword = ''
+
 if ($BootService -and $NoBootService) {
     Write-Err2 "-BootService and -NoBootService are mutually exclusive"
     exit 2
@@ -1018,6 +1051,19 @@ if ($HasDocker) {
     Write-Info "Docker: not detected (or not running)"
 }
 
+# Read the VNC password a previous install left behind, so both the TUI and
+# the fallback prompt can offer "leave empty to keep the current one". Done
+# once here because the TUI needs it before it renders, and the docker branch
+# further down needs it again to resolve $VncPwd.
+$prevVncEnv = Join-Path (Join-Path $CremindInstallDir 'docker') '.env'
+if (Test-Path -LiteralPath $prevVncEnv) {
+    $prevVncLine = Get-Content -LiteralPath $prevVncEnv |
+        Where-Object { $_ -like 'VNC_PASSWORD=*' } | Select-Object -First 1
+    if ($prevVncLine) {
+        $PrevVncPassword = ($prevVncLine -replace '^VNC_PASSWORD=', '').Trim()
+    }
+}
+
 # ── TUI bootstrap ─────────────────────────────────────────────────────────
 #
 # Mirror of the install.sh bootstrap: launch the prompt_toolkit TUI for a
@@ -1082,6 +1128,11 @@ function Invoke-InstallerTuiBootstrap {
     if ($Deployment)      { $tuiArgs.Add('--deployment');       $tuiArgs.Add($Deployment) }
     if ($Mode)            { $tuiArgs.Add('--mode');             $tuiArgs.Add($Mode) }
     if ($DesktopUi)       { $tuiArgs.Add('--desktop');          $tuiArgs.Add($DesktopUi) }
+    if ($VncPassword)     { $tuiArgs.Add('--vnc-password');     $tuiArgs.Add($VncPassword) }
+    # Always sent (never empty): tells the TUI whether an empty password
+    # answer may mean "keep the existing one".
+    $tuiArgs.Add('--vnc-password-set')
+    $tuiArgs.Add($(if ($PrevVncPassword) { '1' } else { '0' }))
     if ($Version)         { $tuiArgs.Add('--version');          $tuiArgs.Add($Version) }
     if ($AppHost)         { $tuiArgs.Add('--host');             $tuiArgs.Add($AppHost) }
     if ($ListenHost)      { $tuiArgs.Add('--listen-host');      $tuiArgs.Add($ListenHost) }
@@ -1133,6 +1184,7 @@ function Invoke-InstallerTuiBootstrap {
                     'APP_HOST'             { if (-not $AppHost)        { Set-Variable -Scope Script AppHost $v } }
                     'MODE'                 { if (-not $Mode)           { Set-Variable -Scope Script Mode $v } }
                     'DESKTOP_UI'           { if (-not $DesktopUi)      { Set-Variable -Scope Script DesktopUi $v } }
+                    'VNC_PASSWORD_INPUT'   { if (-not $VncPassword)    { Set-Variable -Scope Script VncPassword $v } }
                     'CUSTOM_listen_host'   { if (-not $ListenHost)     { Set-Variable -Scope Script ListenHost $v } }
                     'CUSTOM_public_url'    { if (-not $PublicUrl)      { Set-Variable -Scope Script PublicUrl $v } }
                     'CUSTOM_allowed_origins' { if (-not $AllowedOrigins) { Set-Variable -Scope Script AllowedOrigins $v } }
@@ -1348,6 +1400,55 @@ if ($Mode -eq 'docker') {
         Write-Ok "Desktop UI: no (basic headless image)"
     } else {
         Write-Ok "Desktop UI: yes (VNC desktop image)"
+    }
+}
+
+# ── VNC password (docker + desktop only) ──────────────────────────────────
+#
+# Asked here when the TUI didn't (-NoTui, TUI failure) and no -VncPassword was
+# passed. Unattended installs deliberately fall through without asking: the
+# docker branch below still resolves a password from the previous install or
+# generates one, so a scripted install never blocks.
+#
+# Read-Host -AsSecureString, not -MaskInput: the latter is PowerShell 7.1+,
+# and the Electron installer spawns Windows PowerShell 5.1.
+if ($Mode -eq 'docker' -and $DesktopUi -ne '0' -and -not $VncPassword -and -not $Unattended) {
+    Write-Host ""
+    Write-Host $script:VncPasswordPrompt.Prompt -ForegroundColor White
+    if ($script:VncPasswordPrompt.Hint) {
+        Write-Host ("  $($script:VncPasswordPrompt.Hint)") -ForegroundColor DarkGray
+    }
+    # Bounded, because every ``continue`` below re-reads: a host whose
+    # Read-Host returns empty without blocking would otherwise spin forever.
+    # Giving up falls through to the previous/generated password, which is the
+    # non-interactive behaviour.
+    $vncTries = 0
+    while (-not $VncPassword -and $vncTries -lt 5) {
+        $vncTries++
+        $sec = Read-Host "VNC password" -AsSecureString
+        $pw = [System.Net.NetworkCredential]::new('', $sec).Password
+        if (-not $pw) {
+            if ($PrevVncPassword) {
+                Write-Ok "Keeping the existing VNC password."
+                break
+            }
+            Write-Warn2 "A password is required for the VNC Desktop."
+            continue
+        }
+        if ($pw -notmatch $VncPasswordRe) {
+            Write-Warn2 "Use 6-8 characters from letters, digits and @ % _ + = : , . -"
+            continue
+        }
+        $sec2 = Read-Host "Confirm VNC password" -AsSecureString
+        $pw2 = [System.Net.NetworkCredential]::new('', $sec2).Password
+        if ($pw -ne $pw2) {
+            Write-Warn2 "The two entries were different. Please try again."
+            continue
+        }
+        $VncPassword = $pw
+    }
+    if (-not $VncPassword -and -not $PrevVncPassword) {
+        Write-Warn2 "No VNC password entered; generating one and printing it at the end."
     }
 }
 
@@ -1876,9 +1977,11 @@ if ($Mode -eq 'docker') {
     # drift if the .env is reused across runs, and a previous-channel
     # docker-compose.override.yml silently keeps a stale ``build:``
     # context alive on dev→test/prod switches. Regenerating from
-    # templates on every run is the only way to keep state honest;
-    # VNC_PASSWORD is the only true secret here and the installer
-    # surfaces it at the end of the run, so re-rolling it is cheap.
+    # templates on every run is the only way to keep state honest.
+    # VNC_PASSWORD is the one true secret here, and it is deliberately NOT
+    # re-rolled: it is carried over from the previous .env (see the
+    # precedence chain below) so a re-run doesn't invalidate a password the
+    # user chose or wrote down.
     if (Test-Path $ComposeFile) {
         Write-Info "Regenerating $DockerDir config (templates re-render every run)"
     }
@@ -1893,7 +1996,13 @@ if ($Mode -eq 'docker') {
     } else {
         $ImageRepo   = 'cremind/cremind-desktop'
         $BuildTarget = 'desktop'
-        $VncPwd      = New-Secret
+        # Precedence: what the operator chose (flag or prompt) → what the
+        # previous install used → a fresh secret. The middle step is what
+        # keeps a re-run from silently rotating a password the user picked
+        # and wrote down.
+        $VncPwd = if ($VncPassword) { $VncPassword }
+                  elseif ($PrevVncPassword) { $PrevVncPassword }
+                  else { New-Secret }
     }
     $CremindVer   = Resolve-CremindVersion
 

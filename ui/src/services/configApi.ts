@@ -109,16 +109,21 @@ export interface TrustLocalCaResult {
 
 /** One-click CA trust — ``POST /api/tls/trust``. The fingerprint echo is
  *  mandatory: it proves this page read the CA from the same origin and pins
- *  the request to that exact CA. No token: this runs in the wizard's
- *  pre-setup bootstrap window. */
+ *  the request to that exact CA.
+ *
+ *  The token is optional because the Setup Wizard calls this inside the
+ *  pre-setup bootstrap window, where no JWT can exist yet and the backend
+ *  skips its admin gate. Post-setup callers (Settings → HTTPS & Certificate)
+ *  MUST pass the admin token, or ``require_admin`` 401s the request. */
 export async function trustLocalCa(
   agentUrl: string,
   caSha256: string,
+  token?: string,
 ): Promise<TrustLocalCaResult> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/tls/trust`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders(token ?? ''),
     body: JSON.stringify({ ca_sha256: caSha256 }),
   });
   // Every outcome — success, refusal, tool failure — carries a structured

@@ -42,6 +42,10 @@ type CremindInstallerRunPayload = {
   /** Docker mode only: include the VNC Desktop UI (true → cremind-desktop)
    *  or the headless basic image (false → cremind/cremind). */
   desktopUi?: boolean
+  /** Docker + desktop only: the VNC Desktop password. The install runs
+   *  ``--unattended``, so the script can never prompt for it — omitting it
+   *  keeps the previous install's password or generates one. */
+  vncPassword?: string
   /** Advanced .env overrides for the `custom` deployment. Keys mirror
    *  install/catalog.toml's deployments.custom.advanced_fields[].key. */
   customFields?: {

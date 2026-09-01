@@ -22,6 +22,15 @@
 #                               ports). Default: desktop, including
 #                               --unattended; a re-install keeps the previous
 #                               choice unless you pass a flag.
+#   --vnc-password PW           (Docker + desktop) Password for the VNC
+#                               Desktop at http://<host>:6080/vnc.html.
+#                               6-8 characters from [A-Za-z0-9@%_+=:,.-];
+#                               VNC ignores anything past the 8th. Interactive
+#                               installs ask for it (twice) when the desktop
+#                               is included; without a TTY or with
+#                               --unattended, this flag wins, else the
+#                               previous install's password is kept, else one
+#                               is generated and printed at the end.
 #   --listen-host HOST          (custom deployment) Override HOST in .env.
 #   --public-url URL            (custom deployment) Override APP_URL in .env.
 #   --allowed-origins LIST      (custom deployment) Override CORS_ALLOWED_ORIGINS.
@@ -151,6 +160,23 @@ MODE=""           # docker | native (default: prompt if Docker available)
 # "1" = desktop image (cremind/cremind-desktop); "0" = basic headless image
 # (cremind/cremind). Ignored for native installs.
 DESKTOP_UI=""
+# VNC Desktop password, from --vnc-password or the TUI / fallback prompt.
+# Deliberately NOT named VNC_PASSWORD: the TUI's output file is sourced, and
+# VNC_PASSWORD is the variable the docker branch below resolves from the
+# flag → previous install → generated chain. A collision would clobber one
+# with the other (same warning as SSL_MODE above).
+VNC_PASSWORD_INPUT=""
+# The VNC password a previous install left in docker/.env, read once before
+# the TUI runs. Non-empty makes an empty answer mean "keep that one" instead
+# of silently rotating the password on every re-run.
+PREV_VNC_PASSWORD=""
+# The one rule for a VNC password, mirrored verbatim in install.ps1 and
+# app/installer/tui.py (a drift test pins the three together). 6-8 is VNC's
+# own range — vncpasswd rejects under 6 and the DES scheme keys off the first
+# 8 only. The charset excludes | & \ $ # space and quotes because the value
+# passes through `sed s|__VNC_PASSWORD__|...|g` below, an unquoted compose
+# .env, and a TOML basic string in credentials.toml.
+VNC_PASSWORD_RE='^[A-Za-z0-9@%_+=:,.-]{6,8}$'
 # TLS on the public origin, from --ssl. SSL_MODE holds the flag's raw value
 # until the ── ssl mode ── block resolves it (fresh installs default to
 # ``after-setup``); SSL_EXPLICIT records whether the operator actually asked,
@@ -210,6 +236,8 @@ while [ $# -gt 0 ]; do
         --native)                 MODE="native"; shift ;;
         --desktop)                DESKTOP_UI=1; shift ;;
         --no-desktop)             DESKTOP_UI=0; shift ;;
+        --vnc-password)           VNC_PASSWORD_INPUT="$2"; shift 2 ;;
+        --vnc-password=*)         VNC_PASSWORD_INPUT="${1#*=}"; shift ;;
         --listen-host)            CUSTOM_listen_host="$2"; shift 2 ;;
         --listen-host=*)          CUSTOM_listen_host="${1#*=}"; shift ;;
         --public-url)             CUSTOM_public_url="$2"; shift 2 ;;
@@ -556,6 +584,16 @@ case "$SSL_MODE" in
     ""|none|auto|after-setup) ;;
     *) err "Invalid --ssl: $SSL_MODE (must be none, auto, or after-setup)"; exit 2 ;;
 esac
+
+# A bad --vnc-password fails now, in every mode. Unattended installs never
+# prompt, but they must not silently install a password the container will
+# mangle either — failing fast beats debugging a desktop you cannot unlock.
+if [ -n "$VNC_PASSWORD_INPUT" ] \
+   && ! printf '%s' "$VNC_PASSWORD_INPUT" | grep -Eq "$VNC_PASSWORD_RE"; then
+    err "Invalid --vnc-password: use 6-8 characters from letters, digits and @ % _ + = : , . -"
+    err "(VNC itself ignores anything past the 8th character.)"
+    exit 2
+fi
 
 if [ "$CHANNEL" = "dev" ]; then
     if [ -z "$REPO_ROOT" ] || [ ! -f "$REPO_ROOT/pyproject.toml" ]; then
@@ -954,6 +992,18 @@ fi
 # Sourcing that file pre-populates DEPLOYMENT / MODE / VERSION_SPEC etc.
 # so the existing ``if [ -z "$X" ]`` guards in the prompt blocks below
 # skip cleanly.
+# Read the VNC password a previous install left behind, so both the TUI and
+# the fallback prompt can offer "leave empty to keep the current one". Done
+# once here because the TUI needs it before it renders, and the docker branch
+# further down needs it again to resolve VNC_PASSWORD.
+read_prev_vnc_password() {
+    local prev_env="$CREMIND_INSTALL_DIR/docker/.env"
+    [ -f "$prev_env" ] || return 0
+    PREV_VNC_PASSWORD="$(sed -n 's/^VNC_PASSWORD=//p' "$prev_env" | head -n 1)"
+}
+
+read_prev_vnc_password
+
 tui_run_bootstrap() {
     [ "$UNATTENDED" -eq 1 ] && return 0
     [ "$NO_TUI" = "1" ] && return 0
@@ -989,6 +1039,10 @@ tui_run_bootstrap() {
         fi
     fi
 
+    # Tells the TUI an empty password answer means "keep the existing one".
+    local vnc_pw_preset=0
+    [ -n "$PREV_VNC_PASSWORD" ] && vnc_pw_preset=1
+
     local tui_out
     tui_out="$(mktemp 2>/dev/null || echo "$CREMIND_INSTALL_DIR/.tui-out")"
     # shellcheck disable=SC2064
@@ -1004,6 +1058,8 @@ tui_run_bootstrap() {
             --deployment "$DEPLOYMENT" \
             --mode "$MODE" \
             --desktop "$DESKTOP_UI" \
+            --vnc-password "$VNC_PASSWORD_INPUT" \
+            --vnc-password-set "$vnc_pw_preset" \
             --version "$VERSION_SPEC" \
             --host "$APP_HOST" \
             --listen-host "$CUSTOM_listen_host" \
@@ -1024,6 +1080,8 @@ tui_run_bootstrap() {
             --deployment "$DEPLOYMENT" \
             --mode "$MODE" \
             --desktop "$DESKTOP_UI" \
+            --vnc-password "$VNC_PASSWORD_INPUT" \
+            --vnc-password-set "$vnc_pw_preset" \
             --version "$VERSION_SPEC" \
             --host "$APP_HOST" \
             --listen-host "$CUSTOM_listen_host" \
@@ -1285,6 +1343,55 @@ if [ "$MODE" = "docker" ]; then
     else
         ok "Desktop UI: yes (VNC desktop image)"
     fi
+fi
+
+# ── VNC password (docker + desktop only) ──────────────────────────────────
+#
+# Asked here when the TUI didn't (--no-tui, no /dev/tty, TUI failure) and no
+# --vnc-password was passed. Unattended installs deliberately fall through
+# without asking: the docker branch below still resolves a password from the
+# previous install or generates one, so a scripted install never blocks.
+if [ "$MODE" = "docker" ] && [ "$DESKTOP_UI" != "0" ] \
+   && [ -z "$VNC_PASSWORD_INPUT" ] && [ "$UNATTENDED" -eq 0 ] && [ -e /dev/tty ]; then
+    echo
+    printf '%s%s%s\n' "$BOLD" "$VNC_PASSWORD_PROMPT" "$RESET"
+    [ -n "$VNC_PASSWORD_HINT" ] && printf '  %s%s%s\n' "$DIM" "$VNC_PASSWORD_HINT" "$RESET"
+    # Bounded, because every ``continue`` below re-reads: a tty that exists
+    # but only returns EOF (stdin closed behind an interactive-looking shell)
+    # would otherwise spin forever. Giving up falls through to the
+    # previous/generated password, which is the non-interactive behaviour.
+    vnc_tries=0
+    while [ "$vnc_tries" -lt 5 ]; do
+        vnc_tries=$((vnc_tries + 1))
+        # -s keeps it off the screen; the explicit echo restores the newline
+        # -s swallows.
+        read -r -s -p "VNC password: " vnc_pw </dev/tty || vnc_pw=""
+        echo
+        if [ -z "$vnc_pw" ]; then
+            if [ -n "$PREV_VNC_PASSWORD" ]; then
+                ok "Keeping the existing VNC password."
+                break
+            fi
+            warn "A password is required for the VNC Desktop."
+            continue
+        fi
+        if ! printf '%s' "$vnc_pw" | grep -Eq "$VNC_PASSWORD_RE"; then
+            warn "Use 6-8 characters from letters, digits and @ % _ + = : , . -"
+            continue
+        fi
+        read -r -s -p "Confirm VNC password: " vnc_pw2 </dev/tty || vnc_pw2=""
+        echo
+        if [ "$vnc_pw" != "$vnc_pw2" ]; then
+            warn "The two entries were different. Please try again."
+            continue
+        fi
+        VNC_PASSWORD_INPUT="$vnc_pw"
+        break
+    done
+    if [ -z "$VNC_PASSWORD_INPUT" ] && [ -z "$PREV_VNC_PASSWORD" ]; then
+        warn "No VNC password entered; generating one and printing it at the end."
+    fi
+    unset vnc_pw vnc_pw2 vnc_tries
 fi
 
 # ── https scheme ──────────────────────────────────────────────────────────
@@ -1716,9 +1823,11 @@ if [ "$MODE" = "docker" ]; then
     # drift if the .env is reused across runs, and a previous-channel
     # docker-compose.override.yml silently keeps a stale ``build:``
     # context alive on dev→test/prod switches. Regenerating from
-    # templates on every run is the only way to keep state honest;
-    # VNC_PASSWORD is the only true secret here and the installer
-    # surfaces it at the end of the run, so re-rolling it is cheap.
+    # templates on every run is the only way to keep state honest.
+    # VNC_PASSWORD is the one true secret here, and it is deliberately NOT
+    # re-rolled: it is carried over from the previous .env (see the
+    # precedence chain below) so a re-run doesn't invalidate a password the
+    # user chose or wrote down.
     if [ -f "$DOCKER_DIR/docker-compose.yml" ]; then
         info "Regenerating $DOCKER_DIR config (templates re-render every run)"
     fi
@@ -1733,7 +1842,11 @@ if [ "$MODE" = "docker" ]; then
     else
         IMAGE_REPO="cremind/cremind-desktop"
         BUILD_TARGET="desktop"
-        VNC_PASSWORD="$(gen_secret)"
+        # Precedence: what the operator chose (flag or prompt) → what the
+        # previous install used → a fresh secret. The middle step is what
+        # keeps a re-run from silently rotating a password the user picked
+        # and wrote down.
+        VNC_PASSWORD="${VNC_PASSWORD_INPUT:-${PREV_VNC_PASSWORD:-$(gen_secret)}}"
     fi
     CREMIND_VERSION="$(resolve_version)"
 

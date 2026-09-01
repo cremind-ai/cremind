@@ -21,6 +21,7 @@ export const PROFILE_ROUTES = new Set([
   'profile-settings',
   'channels-settings',
   'backup-settings',
+  'security-settings',
   'blueprint-settings',
   'blueprint-import',
   'updates',

@@ -159,6 +159,13 @@ def render_bash(catalog: dict[str, Any], digest: str) -> str:
     add("DOCKER_DESKTOP_DEFAULT=" + ("1" if dd.get("default", True) else "0"))
     add("")
 
+    # VNC password sub-question (asked only when the desktop UI is included).
+    vp = catalog.get("vnc_password", {})
+    add("# ── VNC password ──")
+    add("VNC_PASSWORD_PROMPT=" + _bash_quote(vp.get("prompt", "")))
+    add("VNC_PASSWORD_HINT=" + _bash_quote(vp.get("hint", "")))
+    add("")
+
     # Mode rules
     rules = catalog.get("mode_rules", {})
     add("# ── Mode rules ──")
@@ -272,6 +279,15 @@ def render_powershell(catalog: dict[str, Any], digest: str) -> str:
     add(f"    Prompt  = {_ps_quote(dd.get('prompt', ''))}")
     add(f"    Hint    = {_ps_quote(dd.get('hint', ''))}")
     add(f"    Default = ${'true' if dd.get('default', True) else 'false'}")
+    add("}")
+    add("")
+
+    # VNC password sub-question (asked only when the desktop UI is included).
+    vp = catalog.get("vnc_password", {})
+    add("# ── VNC password ──")
+    add("$script:VncPasswordPrompt = [ordered]@{")
+    add(f"    Prompt = {_ps_quote(vp.get('prompt', ''))}")
+    add(f"    Hint   = {_ps_quote(vp.get('hint', ''))}")
     add("}")
     add("")
 

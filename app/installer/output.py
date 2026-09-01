@@ -31,6 +31,12 @@ class TuiResult:
     # Docker desktop-UI choice: "" unset (let the shell decide), "1" desktop,
     # "0" basic. Only meaningful when mode == "docker".
     desktop: str = ""
+    # The VNC password the user typed, or "" when they were not asked / chose
+    # to keep the existing one. Written as VNC_PASSWORD_INPUT, deliberately
+    # NOT as VNC_PASSWORD: install.sh sources this file and assigns its own
+    # VNC_PASSWORD later from the flag/previous/generated chain, so reusing
+    # that name would have the TUI's answer clobbered (or clobber it).
+    vnc_password: str = ""
     custom_listen_host: str = ""
     custom_public_url: str = ""
     custom_allowed_origins: str = ""
@@ -44,6 +50,7 @@ class TuiResult:
             "APP_HOST": self.app_host,
             "MODE": self.mode,
             "DESKTOP_UI": self.desktop,
+            "VNC_PASSWORD_INPUT": self.vnc_password,
             "CUSTOM_listen_host": self.custom_listen_host,
             "CUSTOM_public_url": self.custom_public_url,
             "CUSTOM_allowed_origins": self.custom_allowed_origins,

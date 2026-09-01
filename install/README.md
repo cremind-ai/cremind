@@ -39,7 +39,7 @@ shows no radio (it's local-only).
 ## What docker mode does
 
 1. Detect Docker, ask deployment type (local / server / custom) and host or advanced fields, then ask whether to include the VNC Desktop UI (default yes; `--desktop` / `--no-desktop` skip the prompt). A re-install defaults to the previously-chosen flavor.
-2. Generate a random VNC password *(desktop image only)*.
+2. Ask for the VNC password *(desktop image only)* — entered twice, 6–8 characters from `[A-Za-z0-9@%_+=:,.-]` (VNC ignores anything past the 8th). Precedence: `--vnc-password` → what you type → the previous install's password → a generated one. Non-interactive runs (`--unattended`, no TTY, the Electron installer) never prompt: they take the flag if given, otherwise keep the previous password, otherwise generate one and print it at the end.
 3. Render [`docker-compose.yml`](templates/docker-compose.yml.tmpl) and an `.env` file (image flavor, ports, app URL, CORS, and — for the desktop image — VNC password) into `~/.cremind/docker/`. For a basic (`--no-desktop`) install the noVNC/VNC port maps and VNC env are stripped. The Setup Wizard later appends to `COMPOSE_PROFILES` as the user activates Docker-mode services; the bundle starts with only the `cremind` container running.
 4. Per-channel image strategy:
    - `production` / `test`: resolve the latest version from PyPI / Test PyPI, then `docker compose pull` + `docker compose up -d` (no local build; a missing tag fails hard).
@@ -156,6 +156,7 @@ container-friendly defaults) for one release; new scripts should use
 | `--wizard-preset ID`                 | (custom) Override `SETUP_WIZARD_ENV`. |
 | `--mode docker\|native`              | Skip the mode prompt. `--docker` and `--native` are aliases. |
 | `--desktop` / `--no-desktop`         | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `--unattended`; a re-install keeps the previous choice. `--no-desktop` pulls the headless `cremind/cremind`. |
+| `--vnc-password PW`                  | (docker + desktop) Password for the VNC Desktop. 6–8 chars from `[A-Za-z0-9@%_+=:,.-]`. Interactive installs ask for it (twice) instead; unattended runs fall back to the previous install's password, else a generated one. An invalid value is a hard error in every mode. |
 | `--ssl none\|auto\|after-setup`      | TLS on the public origin. Default `after-setup`: plain HTTP for the wizard, which hands you the CA to trust, then a restart into HTTPS with no warning. `auto` is HTTPS from boot one; `none` opts out. A re-install keeps the previous choice. `custom` deployments keep plain HTTP (their URLs are yours) unless you pass this flag. |
 | `--boot-service` / `--no-boot-service` | (native) Register a login/boot service that starts `cremind serve` and restarts it if it stops. Default: on — it is also what makes the in-app restart and the after-setup HTTPS switch work. A re-install keeps a previous opt-out. Ignored for docker (the daemon supervises the container) and for Electron-driven installs. Manage it later with `cremind boot`. |
 | `--no-launch`                        | Don't open the wizard at the end. |
@@ -174,6 +175,7 @@ container-friendly defaults) for one release; new scripts should use
 | `-WizardPreset ID`                  | (custom) Override `SETUP_WIZARD_ENV`. |
 | `-Mode docker\|native`              | Skip the mode prompt. |
 | `-Desktop` / `-NoDesktop`           | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `-Unattended`; a re-install keeps the previous choice. `-NoDesktop` pulls the headless `cremind/cremind`. |
+| `-VncPassword PW`                   | (docker + desktop) Password for the VNC Desktop. 6–8 chars from `[A-Za-z0-9@%_+=:,.-]`. Interactive installs ask for it (twice) instead; unattended runs fall back to the previous install's password, else a generated one. An invalid value is a hard error in every mode. |
 | `-Ssl none\|auto\|after-setup`      | TLS on the public origin. Default `after-setup`: plain HTTP for the wizard, which hands you the CA to trust, then a restart into HTTPS with no warning. `auto` is HTTPS from boot one; `none` opts out. A re-install keeps the previous choice. `custom` deployments keep plain HTTP (their URLs are yours) unless you pass this flag. |
 | `-BootService` / `-NoBootService`   | (native) Register a logon Scheduled Task that starts `cremind serve` and restarts it if it stops. Default: on — it is also what makes the in-app restart and the after-setup HTTPS switch work. A re-install keeps a previous opt-out. Ignored for docker and for Electron-driven installs. Manage it later with `cremind boot`. |
 | `-NoLaunch`                         | Don't open the wizard at the end. |

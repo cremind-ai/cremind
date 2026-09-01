@@ -60,10 +60,19 @@ class DockerDesktop:
 
 
 @dataclass(frozen=True)
+class VncPasswordPrompt:
+    """The VNC password question (asked only when the desktop UI is on)."""
+
+    prompt: str = "Choose a password for the VNC Desktop"
+    hint: str = ""
+
+
+@dataclass(frozen=True)
 class Catalog:
     deployments: tuple[Deployment, ...] = ()
     modes: tuple[Mode, ...] = ()
     docker_desktop: DockerDesktop = DockerDesktop()
+    vnc_password: VncPasswordPrompt = VncPasswordPrompt()
 
     def deployment(self, deployment_id: str) -> Deployment | None:
         for d in self.deployments:
@@ -131,8 +140,15 @@ def load(path: str | Path) -> Catalog:
         default=bool(dd_raw.get("default", True)),
     )
 
+    vp_raw = data.get("vnc_password", {}) or {}
+    vnc_password = VncPasswordPrompt(
+        prompt=vp_raw.get("prompt", VncPasswordPrompt.prompt),
+        hint=vp_raw.get("hint", ""),
+    )
+
     return Catalog(
         deployments=tuple(deployments),
         modes=tuple(modes),
         docker_desktop=docker_desktop,
+        vnc_password=vnc_password,
     )
