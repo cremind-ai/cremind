@@ -2030,6 +2030,68 @@ not a missing image. Things that help:
     # wizard. The banner below says so instead of pointing at a CA download.
     $SslDeferred = ($UrlScheme -eq 'https' -and $BootScheme -eq 'http')
 
+    # ── host-side CA trust ────────────────────────────────────────────────
+    # The CA lives inside the container, where nothing can reach the HOST's
+    # trust store — but this script runs on the host, so it can. This is the
+    # Docker counterpart of the wizard's one-click trust (which the server
+    # can only offer on native installs): download /ca.pem from the running
+    # container and offer to add it to the current user's Trusted Root store.
+    # Declining is fine — the wizard's "Secure this install" step shows the
+    # manual command, and every OTHER device needs that path anyway.
+    #
+    # Both listener phases serve /ca.pem: under after-setup it is plain http,
+    # and a finished install answers https — which Invoke-WebRequest accepts
+    # via Schannel exactly when this host already trusts the CA from a
+    # previous run (and then the thumbprint check below skips the prompt).
+    # A host that never trusted it gets a failed download and a pointer, not
+    # a failed install.
+    if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron' -and -not $Unattended -and $UrlScheme -eq 'https') {
+        $CaTmp = Join-Path $env:TEMP 'cremind-local-ca.pem'
+        $CaCert = $null
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri "${BootScheme}://${HealthHost}:1515/ca.pem" -OutFile $CaTmp -TimeoutSec 10 | Out-Null
+            $CaCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CaTmp)
+        } catch {
+            # No local CA (operator certificate pair → /ca.pem 404s, and there
+            # is genuinely nothing of ours to trust) or an untrusted https
+            # listener — either way the wizard step has it covered.
+            Write-Info "Skipping host CA trust ($($_.Exception.Message.Trim()))."
+        }
+        if ($CaCert) {
+            $CaStore = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
+            $CaStore.Open('ReadWrite')
+            try {
+                $found = $CaStore.Certificates.Find('FindByThumbprint', $CaCert.Thumbprint, $false)
+                if ($found.Count -gt 0) {
+                    Write-Ok "This machine already trusts the Cremind local CA."
+                } else {
+                    $CaSha256 = [System.BitConverter]::ToString(
+                        [System.Security.Cryptography.SHA256]::Create().ComputeHash($CaCert.RawData)
+                    ) -replace '-', ':'
+                    Write-Host ""
+                    Write-Host "Cremind will serve HTTPS with a certificate signed by its own local CA."
+                    Write-Host "Trusting that CA now removes the browser warning on this machine; every"
+                    Write-Host "other device gets the same walkthrough in the Setup Wizard."
+                    Write-Host "  Subject : $($CaCert.Subject)"
+                    Write-Host "  SHA-256 : $CaSha256"
+                    $TrustAnswer = Read-Host "Add it to the current user's Trusted Root store? Windows asks you to confirm. [Y/n]"
+                    if ($TrustAnswer -notmatch '^[nN]') {
+                        try {
+                            $CaStore.Add($CaCert)
+                            Write-Ok "Trusted the Cremind local CA for the current user."
+                        } catch {
+                            # Includes the user clicking No on the Windows dialog.
+                            Write-Warn2 "CA not trusted ($($_.Exception.Message.Trim())). The Setup Wizard's 'Secure this install' step shows the manual command."
+                        }
+                    } else {
+                        Write-Info "Skipped. The Setup Wizard's 'Secure this install' step covers it."
+                    }
+                }
+            } finally { $CaStore.Dispose() }
+        }
+        Remove-Item $CaTmp -ErrorAction SilentlyContinue
+    }
+
     # Suppress the human-handoff block when the Electron app is driving —
     # it navigates to the in-window wizard via vue-router and a "Wizard
     # URL: ..." instruction would mislead the user.

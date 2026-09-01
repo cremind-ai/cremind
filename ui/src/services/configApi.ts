@@ -74,6 +74,60 @@ export interface TlsStatus {
   /** Whether something supervises this process, so a restart actually
    *  comes back (Docker / Kubernetes) rather than leaving it down. */
   restart_supported: boolean;
+  /** Whether THIS server can trust the CA on THIS device — native installs
+   *  answering their own machine's browser only. Optional: older servers
+   *  omit it, and the wizard degrades to the manual commands. */
+  local_trust?: TlsLocalTrust;
+}
+
+/** The server-side "Trust it on this device" capability. ``supported`` is
+ *  computed per request: it is true only when the server process runs on the
+ *  same machine as this browser (native install, loopback peer), i.e. when
+ *  ``POST /api/tls/trust`` would land the CA in the right trust store. */
+export interface TlsLocalTrust {
+  supported: boolean;
+  /** Human name of the store the server would write ("the current user's
+   *  Trusted Root store", "your login keychain"). Null when unsupported. */
+  store: string | null;
+  /** Which OS-side prompt to forewarn about (Windows confirmation dialog,
+   *  macOS password prompt). */
+  os_prompt: 'windows' | 'macos' | 'linux' | null;
+  /** Definitive only on Windows; null means unknown, not "no". */
+  already_trusted: boolean | null;
+  /** Why ``supported`` is false, in showable words. */
+  reason: string | null;
+}
+
+export interface TrustLocalCaResult {
+  trusted: boolean;
+  already_trusted?: boolean;
+  store?: string | null;
+  error?: string;
+  /** Copy-pasteable fallback commands when the server-side attempt failed. */
+  manual_commands?: string[];
+}
+
+/** One-click CA trust — ``POST /api/tls/trust``. The fingerprint echo is
+ *  mandatory: it proves this page read the CA from the same origin and pins
+ *  the request to that exact CA. No token: this runs in the wizard's
+ *  pre-setup bootstrap window. */
+export async function trustLocalCa(
+  agentUrl: string,
+  caSha256: string,
+): Promise<TrustLocalCaResult> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/tls/trust`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ca_sha256: caSha256 }),
+  });
+  // Every outcome — success, refusal, tool failure — carries a structured
+  // body; prefer its message over an opaque HTTP error.
+  try {
+    return (await res.json()) as TrustLocalCaResult;
+  } catch {
+    return { trusted: false, error: `Trust request failed: ${res.statusText}` };
+  }
 }
 
 export interface ServiceCapability {

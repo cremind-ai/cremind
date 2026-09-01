@@ -1880,6 +1880,98 @@ EOF
         SSL_DEFERRED=1
     fi
 
+    # ── host-side CA trust ────────────────────────────────────────────────
+    # The CA lives inside the container, where nothing can reach the HOST's
+    # trust store — but this script runs on the host, so it can. This is the
+    # Docker counterpart of the wizard's one-click trust (which the server
+    # can only offer on native installs): download /ca.pem from the running
+    # container and offer to install it system-wide. Declining is fine — the
+    # wizard's "Secure this install" step shows the manual command, and every
+    # OTHER device needs that path anyway.
+    #
+    # Both listener phases serve /ca.pem: under after-setup it is plain http,
+    # and a finished install answers https — which curl accepts exactly when
+    # this host already trusts the CA from a previous run (and then the
+    # already-trusted check below skips the prompt). A host that never
+    # trusted it gets a failed download and a pointer, not a failed install.
+    if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ] && [ "$UNATTENDED" -eq 0 ] \
+        && [ "$URL_SCHEME" = "https" ]; then
+        CA_TMP="$(mktemp "${TMPDIR:-/tmp}/cremind-ca.XXXXXX" 2>/dev/null || true)"
+        CA_FETCHED=0
+        if [ -n "$CA_TMP" ]; then
+            if curl -fsS --max-time 10 -o "$CA_TMP" "${BOOT_SCHEME}://${HEALTH_HOST}:1515/ca.pem" 2>/dev/null \
+                && grep -q "BEGIN CERTIFICATE" "$CA_TMP" 2>/dev/null; then
+                CA_FETCHED=1
+            else
+                # No local CA (operator certificate pair → /ca.pem 404s, and
+                # there is genuinely nothing of ours to trust) or an untrusted
+                # https listener — either way the wizard step has it covered.
+                info "Skipping host CA trust (could not fetch the CA from the container)."
+            fi
+        fi
+        if [ "$CA_FETCHED" -eq 1 ]; then
+            CA_SUDO=""
+            if [ "$(id -u)" -ne 0 ]; then CA_SUDO="sudo"; fi
+            CA_ALREADY=0
+            CA_ANCHOR=""
+            CA_TRUST_CMD=""
+            case "$(uname -s)" in
+                Darwin)
+                    # CN presence in the System keychain is the best cheap
+                    # check macOS offers; the add below sets trustRoot anyway.
+                    if security find-certificate -c "Cremind Local CA" -Z /Library/Keychains/System.keychain >/dev/null 2>&1; then
+                        CA_ALREADY=1
+                    fi
+                    CA_TRUST_CMD="$CA_SUDO security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain $CA_TMP"
+                    ;;
+                *)
+                    if [ -d /usr/local/share/ca-certificates ]; then
+                        CA_ANCHOR="/usr/local/share/ca-certificates/cremind-local-ca.crt"
+                        CA_TRUST_CMD="$CA_SUDO cp $CA_TMP $CA_ANCHOR && $CA_SUDO update-ca-certificates"
+                    elif [ -d /etc/pki/ca-trust/source/anchors ]; then
+                        CA_ANCHOR="/etc/pki/ca-trust/source/anchors/cremind-local-ca.crt"
+                        CA_TRUST_CMD="$CA_SUDO cp $CA_TMP $CA_ANCHOR && $CA_SUDO update-ca-trust extract"
+                    fi
+                    if [ -n "$CA_ANCHOR" ] && [ -f "$CA_ANCHOR" ] && cmp -s "$CA_TMP" "$CA_ANCHOR"; then
+                        CA_ALREADY=1
+                    fi
+                    ;;
+            esac
+            if [ "$CA_ALREADY" -eq 1 ]; then
+                ok "This machine already trusts the Cremind local CA."
+            elif [ -z "$CA_TRUST_CMD" ]; then
+                info "No known trust store on this system — the Setup Wizard's 'Secure this install' step shows the options."
+            else
+                echo ""
+                echo "Cremind will serve HTTPS with a certificate signed by its own local CA."
+                echo "Trusting that CA now removes the browser warning on this machine; every"
+                echo "other device gets the same walkthrough in the Setup Wizard."
+                if command -v openssl >/dev/null 2>&1; then
+                    CA_FP="$(openssl x509 -in "$CA_TMP" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//' || true)"
+                    if [ -n "$CA_FP" ]; then echo "  SHA-256 : $CA_FP"; fi
+                fi
+                if [ -n "$CA_SUDO" ]; then
+                    echo "  (needs sudo — you may be asked for your password)"
+                fi
+                trust_ans=""
+                read -r -p "Trust it system-wide now? [Y/n]: " trust_ans </dev/tty || trust_ans=""
+                case "$trust_ans" in
+                    [nN]*)
+                        info "Skipped. The Setup Wizard's 'Secure this install' step covers it."
+                        ;;
+                    *)
+                        if sh -c "$CA_TRUST_CMD"; then
+                            ok "Trusted the Cremind local CA."
+                        else
+                            warn "CA not trusted — the Setup Wizard's 'Secure this install' step shows the manual command."
+                        fi
+                        ;;
+                esac
+            fi
+        fi
+        if [ -n "$CA_TMP" ]; then rm -f "$CA_TMP"; fi
+    fi
+
     # The Electron app drives navigation to the wizard inside its own
     # window — printing a "Wizard URL: http://localhost:1515/#/setup"
     # block in that context misleads the user into thinking they need

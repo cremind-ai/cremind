@@ -76,11 +76,11 @@ def test_never_serves_private_key_material(system_dir, client):
 
 
 def test_no_sibling_file_is_reachable(system_dir, client):
-    """The route takes no filename, so nothing else in tls/ is addressable."""
+    """The file route takes no filename, so nothing else in tls/ is addressable."""
     ensure_local_tls(str(system_dir))
 
     paths = [route.path for route in get_tls_routes()]
-    assert paths == ["/ca.pem"]
+    assert paths == ["/ca.pem", "/api/tls/trust"]
     # There is no route that could resolve these, with or without traversal.
     for probe in ("/ca.key", "/tls/ca.key", "/key.pem", "/ca.pem/../ca.key"):
         assert client.get(probe).status_code == 404
@@ -128,3 +128,213 @@ def test_follows_a_relocated_system_dir(system_dir, client, tmp_path, monkeypatc
     monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(moved))
 
     assert client.get("/ca.pem").status_code == 200
+
+
+# ── POST /api/tls/trust — the one-click "Trust it on this device" ─────────
+#
+# The endpoint writes a root CA into an OS trust store, so what these tests
+# pin is the guard stack: native-only, loopback-only, fingerprint echo
+# required, honest fallbacks when the tool fails. The actual per-OS command
+# construction is tested in tests/config/test_tls_trust.py; here every
+# execution is stubbed.
+
+
+class _ForceClient:
+    """ASGI wrapper that sets the peer address the guards will see.
+
+    Starlette's TestClient reports the peer as ``("testclient", 50000)``,
+    which parses as no IP at all — every request would fail the loopback
+    check for the wrong reason.
+    """
+
+    def __init__(self, app, host: str):
+        self._app = app
+        self._host = host
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            scope = dict(scope)
+            scope["client"] = (self._host, 40000)
+        await self._app(scope, receive, send)
+
+
+def _trust_client(client_host: str = "127.0.0.1") -> TestClient:
+    app = Starlette(
+        routes=get_tls_routes(),
+        middleware=[Middleware(AuthenticationMiddleware, backend=_AlwaysAnon())],
+    )
+    return TestClient(_ForceClient(app, client_host))
+
+
+@pytest.fixture
+def native_env(monkeypatch: pytest.MonkeyPatch):
+    """A native install, pre-setup — the wizard's situation."""
+    from types import SimpleNamespace
+
+    import app.runtime as runtime
+
+    monkeypatch.setenv("INSTALL_MODE", "native")
+    monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
+    monkeypatch.setattr(
+        runtime,
+        "get_state",
+        lambda: SimpleNamespace(
+            storage_ready=False,
+            config_storage=SimpleNamespace(is_setup_complete=lambda: False),
+        ),
+    )
+
+
+def _fingerprint(system_dir) -> str:
+    from app.config.tls_auto import ca_fingerprint_sha256
+
+    fp = ca_fingerprint_sha256(str(system_dir))
+    assert fp is not None
+    return fp
+
+
+def _stub_plan(monkeypatch, *, supported=True, run_ok=True, run_error=None,
+               already=False):
+    import app.api.tls as tls_api
+    from app.config.tls_trust import TrustPlan
+
+    plan = TrustPlan(
+        supported=supported,
+        store="test store" if supported else None,
+        commands=[["certutil", "-addstore", "-user", "Root", "ca.pem"]],
+        reason=None if supported else "not on this platform",
+        os_prompt="windows" if supported else None,
+    )
+    calls: list[TrustPlan] = []
+
+    def _run(p):
+        calls.append(p)
+        return (run_ok, run_error)
+
+    monkeypatch.setattr(tls_api, "server_trust_plan", lambda _p: plan)
+    monkeypatch.setattr(tls_api, "run_trust_plan", _run)
+    monkeypatch.setattr(tls_api, "already_trusted", lambda _p: already)
+    return calls
+
+
+def test_trust_happy_path_runs_the_plan(system_dir, native_env, monkeypatch):
+    ensure_local_tls(str(system_dir))
+    calls = _stub_plan(monkeypatch)
+
+    response = _trust_client().post(
+        "/api/tls/trust", json={"ca_sha256": _fingerprint(system_dir)}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["trusted"] is True and body["already_trusted"] is False
+    assert body["store"] == "test store"
+    assert len(calls) == 1
+
+
+def test_trust_is_refused_for_a_remote_client(system_dir, native_env, monkeypatch):
+    """Trusting server-side lands on the SERVER's machine — a remote browser
+    must be told to run the command on its own device instead."""
+    ensure_local_tls(str(system_dir))
+    calls = _stub_plan(monkeypatch)
+
+    response = _trust_client("192.168.1.20").post(
+        "/api/tls/trust", json={"ca_sha256": _fingerprint(system_dir)}
+    )
+
+    assert response.status_code == 403
+    assert calls == []
+
+
+def test_trust_is_refused_in_containers(system_dir, native_env, monkeypatch):
+    """Docker/Kubernetes can only write the container's store, which the
+    browser on the host never consults."""
+    ensure_local_tls(str(system_dir))
+    calls = _stub_plan(monkeypatch)
+
+    for mode in ("docker", "kubernetes"):
+        monkeypatch.setenv("INSTALL_MODE", mode)
+        response = _trust_client().post(
+            "/api/tls/trust", json={"ca_sha256": _fingerprint(system_dir)}
+        )
+        assert response.status_code == 409, mode
+    assert calls == []
+
+
+def test_trust_requires_the_fingerprint_echo(system_dir, native_env, monkeypatch):
+    """The echo proves the caller read the CA from the same origin (a
+    cross-site page cannot) and pins the request to THIS CA."""
+    ensure_local_tls(str(system_dir))
+    calls = _stub_plan(monkeypatch)
+    client = _trust_client()
+
+    assert client.post("/api/tls/trust", json={}).status_code == 400
+    assert client.post(
+        "/api/tls/trust", content=b"ca_sha256=x",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    ).status_code == 400
+    wrong = "AA:" * 31 + "AA"
+    assert client.post(
+        "/api/tls/trust", json={"ca_sha256": wrong}
+    ).status_code == 409
+    assert calls == []
+
+
+def test_trust_404s_without_a_ca(system_dir, native_env, monkeypatch):
+    _stub_plan(monkeypatch)
+
+    response = _trust_client().post(
+        "/api/tls/trust", json={"ca_sha256": "AA:BB"}
+    )
+
+    assert response.status_code == 404
+
+
+def test_trust_reports_an_unsupported_platform_with_the_manual_commands(
+    system_dir, native_env, monkeypatch,
+):
+    ensure_local_tls(str(system_dir))
+    _stub_plan(monkeypatch, supported=False)
+
+    response = _trust_client().post(
+        "/api/tls/trust", json={"ca_sha256": _fingerprint(system_dir)}
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["trusted"] is False
+    assert body["manual_commands"], "the fallback must be actionable"
+
+
+def test_trust_reports_a_tool_failure_honestly(system_dir, native_env, monkeypatch):
+    """A cancelled Windows dialog comes back as a tool failure — the
+    response must say so and hand over the manual command, never claim
+    success."""
+    ensure_local_tls(str(system_dir))
+    _stub_plan(monkeypatch, run_ok=False, run_error="certutil exited with 1")
+
+    response = _trust_client().post(
+        "/api/tls/trust", json={"ca_sha256": _fingerprint(system_dir)}
+    )
+
+    assert response.status_code == 502
+    body = response.json()
+    assert body["trusted"] is False
+    assert "certutil" in body["error"]
+    assert body["manual_commands"]
+
+
+def test_trust_skips_the_dialog_when_already_trusted(
+    system_dir, native_env, monkeypatch,
+):
+    """A wizard re-run must not pop the OS confirmation again."""
+    ensure_local_tls(str(system_dir))
+    calls = _stub_plan(monkeypatch, already=True)
+
+    response = _trust_client().post(
+        "/api/tls/trust", json={"ca_sha256": _fingerprint(system_dir)}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["already_trusted"] is True
+    assert calls == []

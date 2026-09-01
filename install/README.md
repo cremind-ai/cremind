@@ -45,7 +45,17 @@ shows no radio (it's local-only).
    - `production` / `test`: resolve the latest version from PyPI / Test PyPI, then `docker compose pull` + `docker compose up -d` (no local build; a missing tag fails hard).
    - `dev`: `docker compose pull --ignore-pull-failures` for sidecars, then `docker compose up -d --build` against the local checkout via `docker-compose.override.yml`.
 5. Wait for `http://<host>:1515/health` to return 200.
-6. Open `http://<host>:1515/#/setup` in your browser. *(Desktop image only:* also print the noVNC URL + VNC password.*)* On the `after-setup` TLS default this stays `http://` — finishing the wizard restarts the container into `https://`.
+6. Offer to trust the Cremind local CA on this machine (skipped with
+   `--unattended`, or when TLS is off). The CA lives inside the container,
+   where the Setup Wizard's one-click trust can't reach your trust store —
+   but the installer runs on your machine, so it downloads `/ca.pem` from
+   the container and adds it for you (Windows: the current user's Trusted
+   Root store, after Windows' own confirmation dialog; macOS/Linux:
+   system-wide, via `sudo`). Declining is fine — the wizard's "Secure this
+   install" step shows the manual command, and any *other* device you browse
+   from needs that path anyway. A re-install detects the CA is already
+   trusted and skips the prompt.
+7. Open `http://<host>:1515/#/setup` in your browser. *(Desktop image only:* also print the noVNC URL + VNC password.*)* On the `after-setup` TLS default this stays `http://` — finishing the wizard restarts the container into `https://`.
 
 The bundle defines four services. Only `cremind` is started at install
 time; the others are activated by the wizard:
@@ -97,7 +107,10 @@ docker compose down -v             # stop and delete all data
    Wait for `/health`.
 8. Open `http://<host>:1515/#/setup` in your browser. (Still `http://` on the
    `after-setup` default — the switch to `https://` happens when the wizard
-   finishes.)
+   finishes.) On a native install the wizard's "Secure this install" step
+   trusts the CA in **one click**: the server runs on this machine, so it
+   hands the CA to your OS trust store itself (`POST /api/tls/trust`) —
+   no download, no terminal. The OS still asks for its own confirmation.
 
 Both modes are idempotent: re-running upgrades in place and keeps your
 existing config + database. Use `--reinstall` (sh) or `-Reinstall` (ps1)

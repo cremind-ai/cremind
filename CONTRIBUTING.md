@@ -242,7 +242,15 @@ above is for this repo's own runs, where no installer has been involved.
    that first boot anyway — the mode changes *when TLS is bound*, not whether
    the material exists.
 2. The wizard hands the user the CA and walks them through trusting it, while
-   nothing is behind a certificate and there is no warning to click past.
+   nothing is behind a certificate and there is no warning to click past. On a
+   **native** install this is one click: the server runs on the same machine
+   as the browser, so `POST /api/tls/trust` lets it hand the CA to the OS
+   trust store itself (guarded to loopback peers and non-container installs —
+   see [`app/api/tls.py`](app/api/tls.py)). Docker installs get the
+   equivalent from the *installer*, which runs on the host and offers to
+   trust the downloaded CA right after the container starts. Kubernetes and
+   remote-server browsers stay manual by nature — the device that must trust
+   the CA is not one any Cremind process runs on.
 3. Its last step **restarts the server**, which comes back serving HTTPS to a
    browser that already trusts the chain. The first https load is clean — no
    warning, not even once.

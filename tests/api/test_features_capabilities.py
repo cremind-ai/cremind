@@ -21,15 +21,17 @@ import pytest
 from app.api import features as features_api
 
 
-def _make_request() -> object:
+def _make_request(client_host: str | None = None) -> object:
     """Minimal Starlette-compatible Request stand-in.
 
     ``get_service_capabilities`` only calls ``require_admin(request)`` on
     setup-complete installs; we route the test through the
-    setup-not-complete branch (the pre-auth wizard path) so we never
-    touch the request object's interface.
+    setup-not-complete branch (the pre-auth wizard path) so the only
+    request attribute read is ``client`` (by the ``tls.local_trust``
+    block, which checks whether the peer is loopback).
     """
-    return SimpleNamespace(headers={}, cookies={})
+    client = SimpleNamespace(host=client_host, port=12345) if client_host else None
+    return SimpleNamespace(headers={}, cookies={}, client=client)
 
 
 def _stub_state(monkeypatch: pytest.MonkeyPatch, *, setup_complete: bool = False) -> None:
@@ -219,7 +221,10 @@ def test_tls_block_is_present_with_every_field(monkeypatch, tmp_path) -> None:
     tls = _capabilities(monkeypatch)["tls"]
     assert set(tls) == {
         "mode", "serving_https", "pending_https",
-        "ca_sha256", "https_url", "restart_supported",
+        "ca_sha256", "https_url", "restart_supported", "local_trust",
+    }
+    assert set(tls["local_trust"]) == {
+        "supported", "store", "os_prompt", "already_trusted", "reason",
     }
 
 
@@ -271,3 +276,86 @@ def test_a_native_install_cannot_restart_itself(monkeypatch, tmp_path) -> None:
     _tls_env(monkeypatch, tmp_path, "after-setup", serving=False)
     monkeypatch.setenv("INSTALL_MODE", "native")
     assert _capabilities(monkeypatch)["tls"]["restart_supported"] is False
+
+
+# ── the ``tls.local_trust`` block (one-click trust) ───────────────────────
+#
+# ``supported`` must be true ONLY when POSTing /api/tls/trust would land the
+# CA in the right device's store: a native install answering its own
+# machine's browser. Everything else degrades to the manual commands.
+
+
+def _local_trust(
+    monkeypatch, tmp_path, *, install_mode: str, client_host: str,
+    generate_ca: bool = False,
+) -> dict:
+    import app.api.tls as tls_api
+    from app.config.tls_trust import TrustPlan
+
+    _tls_env(monkeypatch, tmp_path, "after-setup", serving=False)
+    monkeypatch.setenv("INSTALL_MODE", install_mode)
+    if generate_ca:
+        from app.config.tls_auto import ensure_local_tls
+
+        ensure_local_tls(str(tmp_path))
+    # Platform-independent: the per-OS plan logic has its own unit tests
+    # (tests/config/test_tls_trust.py); here only the wiring is under test.
+    monkeypatch.setattr(
+        tls_api,
+        "server_trust_plan",
+        lambda _p: TrustPlan(
+            supported=True,
+            store="test store",
+            commands=[["certutil", "-addstore", "-user", "Root", "x"]],
+            os_prompt="windows",
+        ),
+    )
+    monkeypatch.setattr(tls_api, "already_trusted", lambda _p: False)
+    _stub_state(monkeypatch, setup_complete=False)
+    resp = asyncio.run(
+        features_api.get_service_capabilities(_make_request(client_host))
+    )
+    import json
+
+    return json.loads(resp.body)["tls"]["local_trust"]
+
+
+def test_local_trust_offered_to_a_native_installs_own_browser(
+    monkeypatch, tmp_path,
+) -> None:
+    lt = _local_trust(
+        monkeypatch, tmp_path,
+        install_mode="native", client_host="127.0.0.1", generate_ca=True,
+    )
+    assert lt["supported"] is True
+    assert lt["store"] == "test store"
+    assert lt["os_prompt"] == "windows"
+    assert lt["already_trusted"] is False
+
+
+def test_local_trust_refused_for_containers(monkeypatch, tmp_path) -> None:
+    """A container can only write its own store — never the browser's."""
+    for mode in ("docker", "kubernetes"):
+        lt = _local_trust(
+            monkeypatch, tmp_path, install_mode=mode, client_host="127.0.0.1",
+        )
+        assert lt["supported"] is False, mode
+        assert lt["reason"], mode
+
+
+def test_local_trust_refused_for_a_remote_browser(monkeypatch, tmp_path) -> None:
+    """A LAN client of a native install must get the manual commands —
+    trusting server-side would land the CA on the wrong device."""
+    lt = _local_trust(
+        monkeypatch, tmp_path, install_mode="native", client_host="192.168.1.20",
+    )
+    assert lt["supported"] is False
+
+
+def test_local_trust_refused_without_a_ca(monkeypatch, tmp_path) -> None:
+    """No CA on disk (plain HTTP, or an operator certificate pair) — there
+    is nothing of ours to trust, so no button."""
+    lt = _local_trust(
+        monkeypatch, tmp_path, install_mode="native", client_host="127.0.0.1",
+    )
+    assert lt["supported"] is False

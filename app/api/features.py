@@ -244,11 +244,11 @@ async def get_service_capabilities(request: Request) -> JSONResponse:
         # wizard needs this BEFORE the admin token exists (to decide whether to
         # show the "trust the CA" step), which is exactly what this endpoint's
         # open-until-setup-completes gate above provides.
-        "tls": _tls_capabilities(),
+        "tls": _tls_capabilities(request),
     })
 
 
-def _tls_capabilities() -> dict:
+def _tls_capabilities(request: Request) -> dict:
     """The ``tls`` block of the capabilities payload.
 
     ``pending_https`` carries the whole decision for the UI: it is true only
@@ -257,6 +257,7 @@ def _tls_capabilities() -> dict:
     wizard gating on it inherits those exclusions without sniffing the
     environment itself.
     """
+    from app.api.tls import local_trust_capabilities
     from app.config.settings import BaseConfig
     from app.config.tls_auto import ca_fingerprint_sha256
     from app.config.tls_mode import current_tls_facts, https_origin_from_app_url
@@ -274,6 +275,12 @@ def _tls_capabilities() -> dict:
         "ca_sha256": ca_fingerprint_sha256(BaseConfig.CREMIND_SYSTEM_DIR),
         "https_url": https_url or None,
         "restart_supported": facts.restart_supported,
+        # Whether THIS server can put the CA into THIS device's trust store —
+        # true only on a native install answering its own machine's browser
+        # (the request's peer is loopback). Drives the wizard's one-click
+        # "Trust it on this device" button; everywhere else the wizard shows
+        # the manual per-OS commands.
+        "local_trust": local_trust_capabilities(request),
     }
 
 

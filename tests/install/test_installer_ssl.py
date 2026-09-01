@@ -288,3 +288,56 @@ def test_none_does_not_downgrade_urls_when_a_certfile_still_serves_tls() -> None
     """
     assert "^CREMIND_SSL_CERTFILE\\s*=\\s*\\S" in _ps1()
     assert "^CREMIND_SSL_CERTFILE[[:space:]]*=[[:space:]]*[^[:space:]]" in _sh()
+
+
+# ── host-side CA trust (docker) ───────────────────────────────────────────
+#
+# A Docker install's CA lives inside the container, where the server's own
+# one-click trust (POST /api/tls/trust, native-only) can never reach the
+# host's store — so the INSTALLER is the only process that can automate the
+# trust step there. These guards keep that block present, offered rather
+# than forced, and mirrored across both scripts.
+
+
+def test_docker_installs_offer_host_ca_trust_in_both() -> None:
+    ps1, sh = _ps1(), _sh()
+    # Both fetch the CA from the running container's public endpoint...
+    assert re.search(r"host-side CA trust[\s\S]{0,3000}ca\.pem", ps1)
+    assert re.search(r"host-side CA trust[\s\S]{0,3000}ca\.pem", sh)
+    # ...and write the store a browser actually consults on that host.
+    assert "X509Store]::new('Root', 'CurrentUser')" in ps1
+    assert "update-ca-certificates" in sh and "add-trusted-cert" in sh
+
+
+def test_host_ca_trust_is_offered_not_forced() -> None:
+    """Installing a root CA needs a consent moment. On Windows the OS dialog
+    provides a second one, but the scripts must ask first — and honour a No."""
+    ps1, sh = _ps1(), _sh()
+    assert re.search(r"host-side CA trust[\s\S]{0,4000}Read-Host", ps1)
+    assert re.search(r"host-side CA trust[\s\S]{0,4500}read -r -p \"Trust it", sh)
+
+
+def test_host_ca_trust_skips_unattended_and_electron() -> None:
+    """--unattended has nobody to consent, and under Electron the server
+    never serves TLS — both must skip the block entirely."""
+    ps1, sh = _ps1(), _sh()
+    m = re.search(
+        r"if \(\$env:CREMIND_INSTALLER_FRONTEND -ne 'electron' -and "
+        r"-not \$Unattended -and \$UrlScheme -eq 'https'\)",
+        ps1,
+    )
+    assert m, "install.ps1 lost the trust block's gate"
+    assert re.search(
+        r'\[ "\$\{CREMIND_INSTALLER_FRONTEND:-\}" != "electron" \] '
+        r'&& \[ "\$UNATTENDED" -eq 0 \]',
+        sh,
+    ), "install.sh lost the trust block's gate"
+
+
+def test_host_ca_trust_skips_when_already_trusted() -> None:
+    """A re-install must not pop the OS dialog / sudo prompt again."""
+    ps1, sh = _ps1(), _sh()
+    assert re.search(r"host-side CA trust[\s\S]{0,4000}FindByThumbprint", ps1)
+    # Linux compares the shipped anchor; macOS asks the keychain.
+    assert re.search(r"host-side CA trust[\s\S]{0,5000}cmp -s", sh)
+    assert re.search(r"host-side CA trust[\s\S]{0,5000}find-certificate", sh)

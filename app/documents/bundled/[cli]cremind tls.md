@@ -23,8 +23,12 @@ survives restarts.
 With `after-setup` you should never see the warning at all: the server stays on
 plain HTTP while the Setup Wizard runs, the wizard walks you through trusting
 the CA there, and only then does it restart into HTTPS — to a browser that
-already trusts the chain. These commands are how you do the same thing by hand,
-on another device, or after the fact.
+already trusts the chain. On a **native** install the wizard's "Secure this
+install" step does it in one click ("Trust it on this device" — the server and
+the browser share the machine, so the server hands the CA to the OS itself),
+and a **Docker** install's host is offered the same thing by the installer
+right after the container starts. These commands are how you do the same thing
+by hand, on another device, or after the fact.
 
 These commands run entirely on the local machine — they read a file and hand it
 to the operating system. They never call the Cremind API and need no token,
