@@ -100,13 +100,46 @@ export function useServerRestart() {
     }
   }
 
-  /** Poll ``/health`` with exponential backoff until a 200 lands or
-   *  the budget runs out. Returns true on success. */
-  async function pollHealth(): Promise<boolean> {
+  /** ``boot_id`` from ``/health``, or null if it can't be read.
+   *
+   *  Identifies the serving process. Null covers an older backend that
+   *  doesn't report one and an unreachable server alike — both leave
+   *  ``pollHealth`` on its weaker fallback. */
+  async function fetchBootId(): Promise<string | null> {
+    const settings = useSettingsStore()
+    if (!settings.agentUrl) return null
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 2000)
+      const r = await fetch(`${settings.agentUrl}/health`, {
+        method: 'GET',
+        cache: 'no-store',
+        signal: controller.signal,
+      })
+      clearTimeout(timer)
+      const body = (await r.json()) as { boot_id?: unknown }
+      return typeof body.boot_id === 'string' ? body.boot_id : null
+    } catch {
+      return null
+    }
+  }
+
+  /** Poll ``/health`` with exponential backoff until the NEW server
+   *  answers or the budget runs out. Returns true on success.
+   *
+   *  "Answered" is not enough on its own: the shutdown is graceful, so for
+   *  a second or two after the request the old listener is still draining
+   *  and still replying 200. Compare ``boot_id`` against the one taken
+   *  before the restart and only a different process counts. Where no
+   *  baseline could be read, fall back to requiring at least one failed
+   *  probe first — weaker (the down-gap can be missed between backoff
+   *  steps) but better than treating the dying server as the new one. */
+  async function pollHealth(baselineBootId: string | null): Promise<boolean> {
     const settings = useSettingsStore()
     if (!settings.agentUrl) return false
     const deadline = Date.now() + HEALTH_POLL_BUDGET_MS
     let delay = HEALTH_POLL_INITIAL_MS
+    let sawFailure = false
     while (Date.now() < deadline) {
       await new Promise<void>((resolve) => setTimeout(resolve, delay))
       try {
@@ -123,9 +156,17 @@ export function useServerRestart() {
         // 503 means "alive but degraded" — that still counts as
         // "the listener came back". Anything 2xx/5xx works; only
         // network failures should keep us polling.
-        if (r.status > 0) return true
+        if (baselineBootId === null) {
+          if (sawFailure) return true
+        } else {
+          const body = (await r.json().catch(() => ({}))) as { boot_id?: unknown }
+          if (typeof body.boot_id === 'string' && body.boot_id !== baselineBootId) {
+            return true
+          }
+        }
       } catch {
         // Network failure — backend is still down or restarting.
+        sawFailure = true
       }
       delay = Math.min(delay * 1.5, HEALTH_POLL_MAX_MS)
     }
@@ -139,6 +180,9 @@ export function useServerRestart() {
     if (isBusy.value) return
     phase.value = 'restarting'
     error.value = null
+    // Before anything is triggered: this is the process we are waiting to
+    // see replaced.
+    const baselineBootId = await fetchBootId()
     try {
       if (isElectronRuntime() && installMode.value === 'electron') {
         await triggerElectronRestart()
@@ -150,11 +194,11 @@ export function useServerRestart() {
       error.value = e instanceof Error ? e.message : String(e)
       return
     }
-    // The kill landed (or the IPC respawn returned). Now wait for the
+    // The request landed (or the IPC respawn returned). Now wait for a NEW
     // listener to come back. Under Docker / Electron this finishes in
     // ~5–15s; under bare pip it never will, and we give up at the
     // budget.
-    const ok = await pollHealth()
+    const ok = await pollHealth(baselineBootId)
     if (!ok) {
       phase.value = 'failed'
       error.value =

@@ -2,10 +2,11 @@
 
 A native install has no supervisor. The installer starts ``cremind serve`` once,
 for the install session, and that process dies at logout. Worse, the in-app
-restart is deliberately *SIGTERM-and-die* (see :mod:`app.system.restart`): the
-server cannot re-exec itself, so on native installs ``POST /api/system/restart``
-— and the ``CREMIND_SSL=after-setup`` flip to HTTPS that depends on it — leave
-the backend down. This module closes both gaps by handing the job to the
+restart is a deliberate *stop* (see :mod:`app.system.restart`): the server
+drains its connections, runs its cleanup and exits, but it cannot re-exec
+itself, so on native installs ``POST /api/system/restart`` — and the
+``CREMIND_SSL=after-setup`` flip to HTTPS that depends on it — leave the
+backend down. This module closes both gaps by handing the job to the
 operating system's own service manager:
 
 - Linux:   a **systemd user unit** at ``~/.config/systemd/user/cremind.service``
@@ -68,6 +69,12 @@ SUPERVISOR_PID_FILE = "supervisor.pid"
 #: Written by the server itself when ``CREMIND_SUPERVISED`` is set. The
 #: uninstallers have always stopped whatever PID is in here.
 SERVER_PID_FILE = "server.pid"
+#: Dropped by the server the moment it begins a *deliberate* shutdown (the
+#: Restart Server button, an upgrade, a restore, the after-setup HTTPS flip),
+#: and consumed by the Windows respawn loop below. Without it the loop cannot
+#: tell "the user asked for a restart 4 seconds after boot" from "this server
+#: crashes on startup", and damps the former as if it were the latter.
+RESTART_DELIBERATE_FILE = ".restart.deliberate"
 
 
 @dataclass(frozen=True)
@@ -329,6 +336,7 @@ $shim      = '__EXEC__'
 $logFile   = Join-Path $systemDir 'server.log'
 $supPid    = Join-Path $systemDir '__SUPERVISOR_PID__'
 $srvPid    = Join-Path $systemDir '__SERVER_PID__'
+$restartMk = Join-Path $systemDir '__RESTART_DELIBERATE__'
 
 # Single-instance guard. A manual "schtasks /Run" or a second logon trigger
 # (fast user switching) would otherwise start a rival supervisor.
@@ -390,7 +398,14 @@ while ($true) {
 
   Remove-Item -LiteralPath $srvPid -Force -ErrorAction SilentlyContinue
 
-  if ($elapsed -lt 15) {
+  # Did it stop because someone asked it to? The server drops this marker as
+  # it begins a deliberate shutdown - the Restart Server button, an upgrade, a
+  # restore, the after-setup HTTPS flip. Consume it either way: a marker left
+  # behind by an earlier restart must never excuse a later crash.
+  $deliberate = Test-Path -LiteralPath $restartMk
+  Remove-Item -LiteralPath $restartMk -Force -ErrorAction SilentlyContinue
+
+  if ($elapsed -lt 15 -and -not $deliberate) {
     # Died on startup: a port clash the probe missed, a broken venv, bad
     # config. Back off hard rather than spinning on Python imports.
     Start-Sleep -Seconds 30
@@ -654,6 +669,7 @@ def _enable_windows(
                     SYSTEM_DIR=_ps_single(str(sysdir)),
                     SUPERVISOR_PID=SUPERVISOR_PID_FILE,
                     SERVER_PID=SERVER_PID_FILE,
+                    RESTART_DELIBERATE=RESTART_DELIBERATE_FILE,
                 ),
             ),
             BootArtifact(
@@ -858,10 +874,22 @@ def _read_pid(path: str) -> int | None:
     return pid if pid > 0 else None
 
 
+#: What ``supervisor.pid`` may name: the respawn loop, which the Scheduled
+#: Task launches through wscript as ``powershell.exe``.
+_SUPERVISOR_IMAGE_NAMES = ("powershell.exe",)
+#: What ``server.pid`` may name. The loop runs the install's ``cremind.cmd``
+#: shim, which runs ``venv\\Scripts\\cremind.exe`` — but that is a launcher
+#: stub: it CreateProcess-es the interpreter and waits on it. The process that
+#: writes ``server.pid`` (its own ``os.getpid()``) is therefore the child
+#: ``python.exe``. ``cremind.exe`` stays accepted for any packaging whose
+#: launcher runs the interpreter in-process instead.
+_SERVER_IMAGE_NAMES = ("python.exe", "pythonw.exe", "cremind.exe")
+
+
 def _kill_pid_file(path: str) -> list[str]:
     """Tree-kill the process named by ``path``. Returns warnings.
 
-    Windows recycles PIDs aggressively, so the process name is checked before
+    Windows recycles PIDs aggressively, so the process is identified before
     anything is killed — a stale ``supervisor.pid`` must never take an
     innocent process with it.
     """
@@ -869,19 +897,31 @@ def _kill_pid_file(path: str) -> list[str]:
     if pid is None:
         return []
     if sys.platform == "win32":
+        is_supervisor = path.endswith(SUPERVISOR_PID_FILE)
         expected = (
-            "powershell.exe"
-            if path.endswith(SUPERVISOR_PID_FILE)
-            else "cremind.exe"
+            _SUPERVISOR_IMAGE_NAMES if is_supervisor else _SERVER_IMAGE_NAMES
         )
         name = _process_name(pid)
         if name is None:
             return []
-        if name.lower() != expected:
+        if name.lower() not in expected:
             return [
                 f"Skipped killing pid {pid} from {os.path.basename(path)}: it is "
-                f"{name}, not {expected} (stale pid file)."
+                f"{name}, not {' or '.join(expected)} (stale pid file)."
             ]
+        # A name is weak evidence for the server: every Python on the machine
+        # is a "python.exe". Where Windows will tell us the image path, demand
+        # the very interpreter this install runs — ``boot disable`` and the
+        # uninstaller both execute from the install's own venv, which is the
+        # same venv the shim launches.
+        if not is_supervisor:
+            image = _process_image_path(pid)
+            if image is not None and not _same_binary(image, sys.executable):
+                return [
+                    f"Skipped killing pid {pid} from {os.path.basename(path)}: "
+                    f"it runs {image}, not this install's {sys.executable} "
+                    "(stale pid file)."
+                ]
         code, detail = _run(["taskkill", "/PID", str(pid), "/T", "/F"])
         if code != 0:
             return [detail]
@@ -926,6 +966,73 @@ def _process_name(pid: int) -> str | None:
     if not line.startswith('"'):
         return None
     return line.split(",")[0].strip().strip('"')
+
+
+#: PROCESS_QUERY_LIMITED_INFORMATION — the least-privileged right that still
+#: answers "which binary is this?", and the one a standard user is granted for
+#: their own processes.
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def _process_image_path(pid: int) -> str | None:
+    """Full path of ``pid``'s executable on Windows, or None if unknowable.
+
+    Best-effort by nature — a process owned by another user, one that exits
+    mid-call, or a Python without a usable ``ctypes`` all answer None, and the
+    caller falls back to the image *name*. Same shape as the Windows ancestor
+    lookup in ``app/cli/session.py``: any failure is None, never an exception.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+        ]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.OpenProcess(
+            _PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return None
+        try:
+            size = wintypes.DWORD(32768)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(
+                handle, 0, buf, ctypes.byref(size)
+            ):
+                return None
+            return buf.value or None
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 - identification is best-effort
+        return None
+
+
+def _same_binary(a: str, b: str) -> bool:
+    """Whether two paths name the same executable file."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        # One of them is gone, or lives somewhere samefile cannot stat. Compare
+        # the resolved text instead: on Windows, case-insensitively.
+        return (
+            os.path.normcase(os.path.realpath(a))
+            == os.path.normcase(os.path.realpath(b))
+        )
 
 
 def _pid_alive(pid: int) -> bool:

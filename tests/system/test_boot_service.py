@@ -248,6 +248,24 @@ def test_windows_task_launches_the_loop_not_the_shim(monkeypatch, sysdir):
     assert "__" not in loop
 
 
+def test_the_loop_damps_crashes_but_not_deliberate_restarts(monkeypatch, sysdir):
+    """A restart clicked seconds after a boot is not a crash loop.
+
+    The 15s/30s damping is right for a port clash or a broken venv and wrong
+    for the Restart Server button, the after-setup HTTPS flip, or an upgrade —
+    all of which the server marks before it goes.
+    """
+    plan = _enable(monkeypatch, "win32", sysdir, user_id="S-1-5-21-99")
+    loop = _artifact(plan, ".ps1").content
+
+    assert boot_service.RESTART_DELIBERATE_FILE in loop
+    # The marker is read, then consumed unconditionally: one left behind by an
+    # earlier restart must never excuse a later crash.
+    assert "$deliberate = Test-Path -LiteralPath $restartMk" in loop
+    assert "Remove-Item -LiteralPath $restartMk" in loop
+    assert "if ($elapsed -lt 15 -and -not $deliberate) {" in loop
+
+
 def test_windows_enable_registers_then_runs(monkeypatch, sysdir):
     plan = _enable(monkeypatch, "win32", sysdir, user_id="S-1-5-21-99")
     xml_path = _artifact(plan, ".xml").path
@@ -521,6 +539,98 @@ def test_a_stale_windows_pid_file_never_kills_a_stranger(monkeypatch, tmp_path):
     warnings = boot_service._kill_pid_file(str(pid_file))
 
     assert killed == [], "a pid that is not our supervisor must be left alone"
+    assert warnings and "stale pid file" in warnings[0]
+
+
+def _fake_tasklist(name: str, killed: list):
+    """subprocess.run stand-in: ``tasklist`` reports ``name`` until a kill
+    lands, then reports nothing — so ``_wait_for_exit`` sees it go."""
+    alive = [True]
+
+    def _run(argv, **_kwargs):
+        if argv[0] == "tasklist":
+            if not alive[0]:
+                return SimpleNamespace(returncode=0, stdout="INFO: no tasks", stderr="")
+            return SimpleNamespace(
+                returncode=0, stdout=f'"{name}","4242","Console"', stderr=""
+            )
+        killed.append(argv)
+        alive[0] = False
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    return _run
+
+
+def test_the_server_pid_names_the_interpreter_not_the_launcher(monkeypatch, tmp_path):
+    """``venv\\Scripts\\cremind.exe`` is a launcher stub — it CreateProcess-es
+    the interpreter and waits — so the process that writes ``server.pid`` (its
+    own getpid) is a ``python.exe``. Expecting ``cremind.exe`` meant the
+    orphan-server kill was skipped on every single Windows install.
+    """
+    pid_file = tmp_path / boot_service.SERVER_PID_FILE
+    pid_file.write_text("4242")
+    killed: list = []
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(boot_service.subprocess, "run", _fake_tasklist("python.exe", killed))
+    # The interpreter this install runs is the one holding the pid file.
+    monkeypatch.setattr(boot_service, "_process_image_path", lambda pid: sys.executable)
+
+    warnings = boot_service._kill_pid_file(str(pid_file))
+
+    assert killed == [["taskkill", "/PID", "4242", "/T", "/F"]]
+    assert warnings == []
+
+
+def test_a_foreign_python_holding_the_server_pid_is_left_alone(monkeypatch, tmp_path):
+    """Every Python on the machine is a "python.exe", so the name alone is
+    weak evidence. Where Windows will name the binary, it has to be ours."""
+    pid_file = tmp_path / boot_service.SERVER_PID_FILE
+    pid_file.write_text("4242")
+    killed: list = []
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(boot_service.subprocess, "run", _fake_tasklist("python.exe", killed))
+    monkeypatch.setattr(
+        boot_service, "_process_image_path", lambda pid: r"C:\Other\Python\python.exe"
+    )
+
+    warnings = boot_service._kill_pid_file(str(pid_file))
+
+    assert killed == []
+    assert warnings and "stale pid file" in warnings[0]
+
+
+def test_an_unidentifiable_image_falls_back_to_the_name(monkeypatch, tmp_path):
+    """A process whose path Windows won't hand over must not become
+    unkillable — the name check is the floor, not a bonus."""
+    pid_file = tmp_path / boot_service.SERVER_PID_FILE
+    pid_file.write_text("4242")
+    killed: list = []
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(boot_service.subprocess, "run", _fake_tasklist("python.exe", killed))
+    monkeypatch.setattr(boot_service, "_process_image_path", lambda pid: None)
+
+    warnings = boot_service._kill_pid_file(str(pid_file))
+
+    assert killed == [["taskkill", "/PID", "4242", "/T", "/F"]]
+    assert warnings == []
+
+
+def test_a_stranger_holding_the_server_pid_is_left_alone(monkeypatch, tmp_path):
+    """PID reuse again, from the other direction: the recycled number now
+    belongs to something that is not a Python at all."""
+    pid_file = tmp_path / boot_service.SERVER_PID_FILE
+    pid_file.write_text("4242")
+    killed: list = []
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(boot_service.subprocess, "run", _fake_tasklist("notepad.exe", killed))
+
+    warnings = boot_service._kill_pid_file(str(pid_file))
+
+    assert killed == []
     assert warnings and "stale pid file" in warnings[0]
 
 

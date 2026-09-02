@@ -14,9 +14,14 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import json
 import os
+import signal
 import socket
 import sys
+import threading
+import time
+from typing import Callable
 
 import uvicorn
 from starlette.applications import Starlette
@@ -74,6 +79,11 @@ from app.config.tls_mode import (
     record_boot_tls,
 )
 from app.runtime import BootedState, get_state
+from app.system.boot_service import RESTART_DELIBERATE_FILE, SERVER_PID_FILE
+from app.system.shutdown_watch import (
+    ShutdownRequestWatcher,
+    clear_stale_shutdown_request,
+)
 from app.constants import INTRODUCE_ASSISTANT
 from app.documents import (
     DocumentSyncService,
@@ -443,6 +453,90 @@ async def _on_shutdown() -> None:
         )
 
 
+# ── deliberate shutdown ───────────────────────────────────────────────────
+#
+# A restart is a *deliberate* shutdown: the Developer page's Restart Server
+# button, the after-setup HTTPS flip, an upgrade, a restore. Every one of them
+# wants exactly what an OS SIGTERM does — drain, run ``_on_shutdown``, exit —
+# and wants it to happen in THIS process rather than by being terminated from
+# outside. On Windows there is no other way to get it: ``os.kill(pid,
+# SIGTERM)`` maps onto ``TerminateProcess``, which skips the lifespan hook
+# entirely and orphans the node sidecars and managed processes it would have
+# stopped. So the initiators ask, and the detached helper
+# (:mod:`app.system.restart`) is only a watchdog for a request that wedges.
+
+_shutdown_loop: asyncio.AbstractEventLoop | None = None
+_initiate_shutdown: Callable[[], None] | None = None
+
+
+def _install_shutdown_seam(
+    loop: asyncio.AbstractEventLoop, initiate: Callable[[], None]
+) -> None:
+    """Publish this process's shutdown trigger. One call per serve path."""
+    global _shutdown_loop, _initiate_shutdown
+    _shutdown_loop = loop
+    _initiate_shutdown = initiate
+
+
+def _clear_shutdown_seam() -> None:
+    """Retract the trigger once the servers are done with it."""
+    global _shutdown_loop, _initiate_shutdown
+    _shutdown_loop = None
+    _initiate_shutdown = None
+
+
+def _write_deliberate_restart_marker() -> None:
+    """Tell the supervisor this stop was asked for, not a crash.
+
+    The Windows respawn loop damps fast crash loops by waiting 30s before
+    restarting a server that died within 15s of booting — right for a port
+    clash or a broken venv, wrong for a restart clicked moments after a boot.
+    This marker separates the two; the loop consumes and deletes it.
+
+    Only written when supervised, because nothing reads it otherwise, and
+    best-effort: losing it costs a slower respawn, never the restart itself.
+    """
+    if not _supervised_env():
+        return
+    path = Path(BaseConfig.CREMIND_SYSTEM_DIR) / RESTART_DELIBERATE_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps({"pid": os.getpid(), "requested_at": time.time()}),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.debug(f"[shutdown] could not write {path}: {e}")
+
+
+def request_graceful_shutdown(delay_s: float = 0.0) -> bool:
+    """Begin the shutdown a SIGTERM would, ``delay_s`` seconds from now.
+
+    Thread-safe: the sentinel watcher calls it from its own thread, the
+    restart endpoint from a request handler. ``delay_s`` buys the response
+    time to reach the client — the listener dies moments later.
+
+    Returns False when nothing is serving yet. Callers must keep their own
+    escalation regardless: a wedged event loop swallows a scheduled callback
+    just as quietly as a missing seam.
+    """
+    loop, initiate = _shutdown_loop, _initiate_shutdown
+    if loop is None or initiate is None:
+        return False
+    # Written here rather than inside the callback: if the loop is wedged the
+    # callback never runs, and the supervisor still deserves to know that the
+    # stop which follows was deliberate.
+    _write_deliberate_restart_marker()
+    try:
+        loop.call_soon_threadsafe(lambda: loop.call_later(delay_s, initiate))
+    except RuntimeError:
+        # Loop already closed — we are past serving.
+        return False
+    return True
+
+
 def _supervised_env() -> bool:
     """Is something out there that will restart us if we exit?
 
@@ -482,7 +576,7 @@ def _write_server_pid_if_supervised() -> None:
     """
     if not env_supervised():
         return
-    pid_path = Path(BaseConfig.CREMIND_SYSTEM_DIR) / "server.pid"
+    pid_path = Path(BaseConfig.CREMIND_SYSTEM_DIR) / SERVER_PID_FILE
     try:
         pid_path.parent.mkdir(parents=True, exist_ok=True)
         pid_path.write_text(str(os.getpid()), encoding="ascii")
@@ -850,6 +944,21 @@ async def main(
     except Exception as e:  # noqa: BLE001
         # Same best-effort rationale as the clear above.
         logger.debug(f"[boot] upgrade-status boot-marker best-effort failed: {e}")
+
+    # 0a''. Drop shutdown-handshake leftovers from the previous run. Both files
+    #       are consumed by whoever reads them first, so one surviving a boot
+    #       means its reader never got there — a crash mid-restart, or a
+    #       Windows respawn loop too old to know about the marker. Acting on
+    #       either now would be wrong in both directions: a stale request would
+    #       stop the server we just started, and a stale marker would excuse a
+    #       crash that has not happened yet.
+    try:
+        clear_stale_shutdown_request(BaseConfig.CREMIND_SYSTEM_DIR)
+        (Path(BaseConfig.CREMIND_SYSTEM_DIR) / RESTART_DELIBERATE_FILE).unlink(
+            missing_ok=True
+        )
+    except OSError as e:
+        logger.debug(f"[boot] shutdown-marker clear best-effort failed: {e}")
 
     # 0b. Warm channel sidecars' node_modules. Deliberately off the critical
     #     path: a cold `npm ci` is ~66MB and would delay the bind past the
@@ -1483,9 +1592,6 @@ async def main(
     # otherwise hold the server alive). It does NOT bound the lifespan
     # shutdown hook — that's handled in _on_shutdown itself via
     # asyncio.wait_for. Keep both.
-    import os
-    import threading
-
     _supervised = _supervised_env()
 
     class _BoundedShutdownServer(uvicorn.Server):
@@ -1579,10 +1685,27 @@ async def main(
             f"Serving on public https://{host}:{public_port} (HTTP/2 + HTTP/1.1 via ALPN) "
             f"(+ internal loopback http://127.0.0.1:{port})"
         )
-        await asyncio.gather(
-            hypercorn_serve(app, hypercorn_config, shutdown_trigger=shutdown_event.wait),
-            internal.serve(),
+        # In-process shutdown trigger. ``handle_exit`` is precisely what a
+        # signal would reach: it releases hypercorn's trigger, stops the
+        # loopback server, and arms the supervised hard-exit timer.
+        _install_shutdown_seam(
+            loop, lambda: internal.handle_exit(signal.SIGTERM, None)
         )
+        watcher = ShutdownRequestWatcher(
+            BaseConfig.CREMIND_SYSTEM_DIR,
+            on_request=lambda: request_graceful_shutdown(0.0),
+        )
+        watcher.start()
+        try:
+            await asyncio.gather(
+                hypercorn_serve(
+                    app, hypercorn_config, shutdown_trigger=shutdown_event.wait
+                ),
+                internal.serve(),
+            )
+        finally:
+            watcher.stop()
+            _clear_shutdown_seam()
         return
 
     servers: list[uvicorn.Server] = []
@@ -1597,13 +1720,30 @@ async def main(
         servers.append(_BoundedShutdownServer(_mk_config("127.0.0.1", port, lifespan="auto")))
         logger.info(f"CREMIND_UI_PORT=0 — serving loopback-only on http://127.0.0.1:{port}")
 
-    if len(servers) == 1:
-        await servers[0].serve()
-    else:
-        # asyncio.gather propagates the first exception; on a clean shutdown
-        # that's a CancelledError from a signal handler and the sibling
-        # server's task is cancelled too, which is what we want.
-        await asyncio.gather(*(s.serve() for s in servers))
+    # Same in-process trigger as the TLS path. Every bind gets it: only the
+    # public server owns the lifespan, so stopping one while the other keeps
+    # accepting would leave the gather below hanging on a half-dead pair.
+    def _initiate_shutdown_now() -> None:
+        for server in servers:
+            server.handle_exit(signal.SIGTERM, None)
+
+    _install_shutdown_seam(asyncio.get_running_loop(), _initiate_shutdown_now)
+    watcher = ShutdownRequestWatcher(
+        BaseConfig.CREMIND_SYSTEM_DIR,
+        on_request=lambda: request_graceful_shutdown(0.0),
+    )
+    watcher.start()
+    try:
+        if len(servers) == 1:
+            await servers[0].serve()
+        else:
+            # asyncio.gather propagates the first exception; on a clean shutdown
+            # that's a CancelledError from a signal handler and the sibling
+            # server's task is cancelled too, which is what we want.
+            await asyncio.gather(*(s.serve() for s in servers))
+    finally:
+        watcher.stop()
+        _clear_shutdown_seam()
 
 
 class _CachingStaticFiles(StaticFiles):
