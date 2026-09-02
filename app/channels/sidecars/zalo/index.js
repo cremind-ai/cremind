@@ -570,11 +570,13 @@ function threadTypeOf(msg) {
   return Number.isInteger(raw) ? raw : THREAD_USER;
 }
 
-// Last typing error seen per thread, so a permanently failing indicator costs
-// one line rather than one every 4 seconds for the length of every turn. A
-// success clears the entry, so a failure that comes back after a recovery is
-// reported again instead of being remembered as already-said.
-const typingErrors = new Map();
+// Last typing OUTCOME seen per thread — the accepted status as readily as the
+// error. Logging only failures leaves two very different states looking
+// identical: Zalo accepted the event and showed nothing, or we never asked at
+// all. That ambiguity is what made a room with no indicator take a full
+// investigation to explain. One line per thread per change of outcome, so a
+// steady state (working or broken) stays quiet and a change is always said.
+const typingOutcomes = new Map();
 
 function describeThrown(e) {
   // Never throws and never renders "[object Object]": a control-frame handler
@@ -591,15 +593,15 @@ function describeThrown(e) {
   }
 }
 
-function noteTypingResult(threadId, threadType, error) {
+function noteTypingResult(threadId, threadType, outcome) {
   const key = `${threadId}:${threadType}`;
-  if (!error) {
-    typingErrors.delete(key);
-    return;
-  }
-  if (typingErrors.get(key) === error) return;
-  typingErrors.set(key, error);
-  logInfo(`sendTypingEvent failed thread=${threadId} type=${threadType}: ${error}`);
+  if (typingOutcomes.get(key) === outcome) return;
+  typingOutcomes.set(key, outcome);
+  // THREAD_GROUP is called out by name because it is the interesting half:
+  // Zalo answers a group typing event on a different service from a DM's, and
+  // accepts one for a two-person room that it then never broadcasts.
+  const kind = threadType === THREAD_GROUP ? 'group' : 'user';
+  logInfo(`sendTypingEvent ${outcome} thread=${threadId} type=${threadType} (${kind})`);
 }
 
 async function handleControl(msg) {
@@ -748,12 +750,16 @@ async function handleControl(msg) {
     const threadId = String(msg.sender_id || '');
     const threadType = threadTypeOf(msg);
     try {
-      await api.sendTypingEvent(threadId, threadType);
-      noteTypingResult(threadId, threadType, null);
+      const res = await api.sendTypingEvent(threadId, threadType);
+      // zca-js throws on a non-OK status, a non-zero error_code, or a body it
+      // cannot parse (utils.js resolveResponse), so reaching here means Zalo
+      // ACCEPTED the event. Said out loud because an accepted event that no
+      // client ever renders is a platform answer, not a bug on this side.
+      noteTypingResult(threadId, threadType, `accepted status=${(res && res.status)}`);
     } catch (e) {
       // Still non-fatal — the parent re-ticks every 4s and a missing
       // indicator must never cost the reply — but no longer invisible.
-      noteTypingResult(threadId, threadType, describeThrown(e));
+      noteTypingResult(threadId, threadType, `failed: ${describeThrown(e)}`);
     }
   } else if (msg.kind === 'logout') {
     try { if (api && api.listener) api.listener.stop(); } catch (e) { /* ignore */ }

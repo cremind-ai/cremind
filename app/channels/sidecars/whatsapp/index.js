@@ -101,11 +101,13 @@ function logInfo(line) {
   process.stderr.write(`[whatsapp-sidecar] ${line}\n`);
 }
 
-// Last typing error seen per JID, so a permanently failing indicator costs one
-// line rather than one every 4 seconds for the length of every turn. A success
-// clears the entry, so a failure that returns after a recovery is reported
-// again instead of being remembered as already-said.
-const typingErrors = new Map();
+// Last typing OUTCOME seen per JID — the acceptance as readily as the error.
+// Logging only failures leaves two very different states looking identical:
+// the platform took the event and showed nothing, or we never asked at all.
+// That ambiguity is what made a room with no indicator hard to explain on the
+// sibling Zalo transport. One line per JID per change of outcome, so a steady
+// state stays quiet.
+const typingOutcomes = new Map();
 
 function describeThrown(e) {
   // Never throws and never renders "[object Object]": a control-frame handler
@@ -122,14 +124,10 @@ function describeThrown(e) {
   }
 }
 
-function noteTypingResult(jid, error) {
-  if (!error) {
-    typingErrors.delete(jid);
-    return;
-  }
-  if (typingErrors.get(jid) === error) return;
-  typingErrors.set(jid, error);
-  logInfo(`sendPresenceUpdate('composing') failed jid=${jid}: ${error}`);
+function noteTypingResult(jid, outcome) {
+  if (typingOutcomes.get(jid) === outcome) return;
+  typingOutcomes.set(jid, outcome);
+  logInfo(`sendPresenceUpdate('composing') ${outcome} jid=${jid}`);
 }
 
 function bareJid(value) {
@@ -660,12 +658,12 @@ async function handleControl(msg) {
     const jid = senderId.includes('@') ? senderId : `${senderId}@s.whatsapp.net`;
     try {
       await sock.sendPresenceUpdate('composing', jid);
-      noteTypingResult(jid, null);
+      noteTypingResult(jid, 'accepted');
     } catch (e) {
       // Still non-fatal — the parent re-ticks every 4s and a missing indicator
       // must never cost the reply. But swallowing it whole is how a chat that
       // shows no "typing…" leaves nothing anywhere to say why.
-      noteTypingResult(jid, describeThrown(e));
+      noteTypingResult(jid, `failed: ${describeThrown(e)}`);
     }
   } else if (msg.kind === 'logout') {
     try {
