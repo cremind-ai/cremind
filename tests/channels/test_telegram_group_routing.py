@@ -13,7 +13,10 @@ adapter reads them defensively), so no bot, token, or network is involved.
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
+
+import pytest
 
 from app.channels.adapters.telegram import TelegramAdapter
 
@@ -392,6 +395,22 @@ def test_send_to_chat_addresses_the_room(monkeypatch):
 #
 # The indicator runs every four seconds for the whole length of a run, so what
 # it does with a failure matters more than it would on a once-per-message call.
+#
+# ``python-telegram-bot`` is an optional extra and is NOT installed in CI, so
+# the two symbols the typing path imports are stood up as modules rather than
+# imported — the same rule the rest of this file follows ("no bot, token, or
+# network is involved"). The fake error hierarchy mirrors PTB's real one, which
+# ``test_bad_request_really_is_a_network_error`` pins wherever the extra exists.
+
+
+class _NetworkError(Exception):
+    pass
+
+
+class _BadRequest(_NetworkError):
+    """PTB really does derive its 400 from its transport error. That is the
+    whole hazard the code under test works around."""
+
 
 class _TypingBot:
     def __init__(self, raises=None):
@@ -404,7 +423,34 @@ class _TypingBot:
             raise self.raises
 
 
-def test_typing_in_a_room_is_addressed_to_the_room(monkeypatch):
+@pytest.fixture()
+def _ptb(monkeypatch):
+    error = ModuleType("telegram.error")
+    error.NetworkError = _NetworkError
+    error.BadRequest = _BadRequest
+    constants = ModuleType("telegram.constants")
+    constants.ChatAction = SimpleNamespace(TYPING="typing")
+    for name, module in (
+        ("telegram", ModuleType("telegram")),
+        ("telegram.error", error),
+        ("telegram.constants", constants),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    yield
+
+
+def test_bad_request_really_is_a_network_error():
+    """The premise the fakes above encode, checked against the real library
+    wherever it is installed. If PTB ever untangled the two, the guard in
+    ``_typing_failed`` becomes dead weight rather than load-bearing — and this
+    is the test that would say so."""
+    pytest.importorskip("telegram", reason="python-telegram-bot is an optional extra")
+    from telegram.error import BadRequest, NetworkError  # type: ignore
+
+    assert issubclass(BadRequest, NetworkError)
+
+
+def test_typing_in_a_room_is_addressed_to_the_room(_ptb):
     async def scenario():
         adapter = _adapter()
         adapter._bot = _TypingBot()
@@ -416,14 +462,12 @@ def test_typing_in_a_room_is_addressed_to_the_room(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_a_transport_failure_rebuilds_the_bot(monkeypatch):
+def test_a_transport_failure_rebuilds_the_bot(_ptb, monkeypatch):
     """The stale httpx pool the message-send path also recovers from: without
     the reset the room's indicator would stay dark for the rest of the run."""
-    from telegram.error import NetworkError  # type: ignore
-
     async def scenario():
         adapter = _adapter()
-        adapter._bot = _TypingBot(raises=NetworkError("pool is dead"))
+        adapter._bot = _TypingBot(raises=_NetworkError("pool is dead"))
         resets: list[int] = []
 
         async def _reset():
@@ -437,17 +481,15 @@ def test_a_transport_failure_rebuilds_the_bot(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_a_rejected_chat_does_not_rebuild_the_bot(monkeypatch):
+def test_a_rejected_chat_does_not_rebuild_the_bot(_ptb, monkeypatch):
     """``BadRequest`` is a SUBCLASS of ``NetworkError`` in PTB, so catching the
     transport error alone would read a permanent "chat not found" — a room whose
     id outlived our membership — as a stale pool, and tear the httpx client down
     and build it back up every four seconds for as long as that room is
     answered, silently."""
-    from telegram.error import BadRequest  # type: ignore
-
     async def scenario():
         adapter = _adapter()
-        adapter._bot = _TypingBot(raises=BadRequest("chat not found"))
+        adapter._bot = _TypingBot(raises=_BadRequest("chat not found"))
         resets: list[int] = []
 
         async def _reset():
@@ -461,13 +503,11 @@ def test_a_rejected_chat_does_not_rebuild_the_bot(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_a_rejected_sender_does_not_rebuild_the_bot_either(monkeypatch):
+def test_a_rejected_sender_does_not_rebuild_the_bot_either(_ptb, monkeypatch):
     """The DM path shares the decision, so it cannot drift from the room's."""
-    from telegram.error import BadRequest  # type: ignore
-
     async def scenario():
         adapter = _adapter()
-        adapter._bot = _TypingBot(raises=BadRequest("chat not found"))
+        adapter._bot = _TypingBot(raises=_BadRequest("chat not found"))
         resets: list[int] = []
 
         async def _reset():
