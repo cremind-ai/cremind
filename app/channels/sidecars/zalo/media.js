@@ -12,8 +12,19 @@
  * from the Zalo PC app answered 404 on Kubernetes while a photo sent from the
  * phone forty seconds later, on the same session, downloaded fine — and because
  * a caption-less photo whose download failed carries no text either, the message
- * was dropped and the agent never learned anything had been posted. Three
- * plausible causes survive the evidence, and each rung below answers one:
+ * was dropped and the agent never learned anything had been posted.
+ *
+ * One cause is MEASURED and is what the rung below answers first. A file's href
+ * redirects to a router (`file-<pool>-<n>.flchat.vn`) that picks a CDN edge from
+ * the CLIENT's network: from a residential ISP it answers 302 to an edge, and
+ * from a hosting network (this deployment's Kubernetes egress) it answers a bare
+ * 404 — same object, same IP, same seconds, headers irrelevant. The edges it
+ * would have chosen serve that same path to anybody who asks them by name, so
+ * when the router refuses us we ask them ourselves. Photos ride a different CDN
+ * and never see this.
+ *
+ * Three further causes remain plausible but unproven, and the rest of the ladder
+ * answers those:
  *
  *   - the object is stale (the PC app dedupes an upload by content hash, so a
  *     "new" send can point at an object minted — and since expired — days ago):
@@ -52,6 +63,28 @@ const PARAM_URL_KEYS = ['hd', 'hdUrl', 'oriUrl', 'normalUrl', 'rawUrl', 'url', '
 // a voice note it is a preview, not the payload, and spooling it would hand the
 // agent a JPEG named `report.pdf`.
 const THUMB_MSG_TYPES = new Set(['chat.photo', 'chat.gif']);
+
+// The file CDN's router, whose 404 means "no edge is mapped to your network"
+// rather than "no such object" (see the header). Deliberately narrow: it must
+// match the router and NOTHING else, because a match sends six requests.
+//   file-stal-22.flchat.vn            -> matches, pool label `file-stal-22`
+//   file-stal-22-te-vnso-ne-2.flchat.vn -> no (an edge is not a router)
+//   file-stal-22.dlfl.vn              -> no (the pre-redirect host; no edges
+//                                        exist under that domain at all)
+//   res-zalo-1.zdn.vn                 -> no (the photo CDN, a different shape)
+const FILE_ROUTER_HOST = /^(file-[a-z0-9]+-\d+)\.flchat\.vn$/i;
+
+// The edges that router hands residential clients, best-first as measured from
+// the Kubernetes pod: ne-* are VNETWORK CDN nodes, pt-* are ISP-hosted PoPs.
+// It is a WALK, not a single name: `ne-3` and `pt-63` answered 404 for an
+// object the other four served, so one name would have fixed nothing. They stay
+// on the list because they are two cheap 4xx at the end of a walk that has
+// already failed four times. The pool label always comes from the router's own
+// hostname — the same path under another pool's label answers 404.
+export const FILE_EDGE_SUFFIXES = [
+  'te-vnso-ne-2', 'te-vnso-ne-1', 'te-vnso-pt-64', 'te-vnso-pt-65',
+  'te-vnso-ne-3', 'te-vnso-pt-63',
+];
 
 const KIND_BY_TYPE = {
   'chat.photo': 'photo',
@@ -92,6 +125,44 @@ function isRetryable(status) {
   if (FINAL_STATUSES.has(status)) return false;
   return status === 404 || status === 408 || status === 425 || status === 429
     || status >= 500;
+}
+
+function hostnameOf(url) {
+  try {
+    return new URL(url).hostname;
+  } catch (e) {
+    return '';
+  }
+}
+
+export function edgeCandidates(finalUrl, suffixes = FILE_EDGE_SUFFIXES) {
+  // The CDN edges that `finalUrl`'s router would have redirected a residential
+  // client to, or [] when that url is not a router. The path and query are
+  // carried over untouched: a Zalo url can be signed, and the edge is asked for
+  // exactly what the router was asked for, only by name.
+  let parsed;
+  try {
+    parsed = new URL(finalUrl);
+  } catch (e) {
+    return [];
+  }
+  const match = FILE_ROUTER_HOST.exec(parsed.hostname);
+  if (!match) return [];
+  const pool = match[1];
+  return (suffixes || []).map((suffix) => {
+    const edge = new URL(parsed.toString());
+    edge.hostname = `${pool}-${suffix}.flchat.vn`;
+    return { source: `edge.${suffix}`, url: edge.toString() };
+  });
+}
+
+export function attemptTrail(attempts) {
+  // `href:404@file-stal-22.flchat.vn,edge.te-vnso-ne-2:200` — the host only
+  // where a redirect moved the answer somewhere other than what we asked for,
+  // which is the fact the first failing log line did not have.
+  return (attempts || [])
+    .map((a) => `${a.source}:${a.status}${a.host ? `@${a.host}` : ''}`)
+    .join(',');
 }
 
 export function describeUrl(url) {
@@ -194,17 +265,26 @@ async function fetchOne(url, headers, opts) {
   try {
     resp = await fetchImpl(url, init);
   } catch (e) {
-    const why = e && e.name === 'TimeoutError'
+    let why = e && e.name === 'TimeoutError'
       ? `timeout after ${attemptTimeoutMs}ms`
       : String((e && (e.message || e.name)) || e);
-    return { ok: false, status: `error:${why}` };
+    // undici reports every network failure as the same "fetch failed", and puts
+    // the reason that actually names it (ENOTFOUND, ECONNREFUSED) in `cause`.
+    // Without this a drifted CDN hostname and a refused connection read alike.
+    const cause = e && e.cause && (e.cause.message || e.cause.code);
+    if (cause) why += `: ${cause}`;
+    return { ok: false, status: `error:${why}`, url };
   }
-  if (!resp.ok) return { ok: false, status: resp.status };
+  // Where the answer actually came from: undici follows redirects and reports
+  // the FINAL url here, which is how a router's 404 is told apart from the
+  // href's own. A synthetic Response has no url; fall back to what we asked.
+  const landed = (typeof resp.url === 'string' && resp.url) || url;
+  if (!resp.ok) return { ok: false, status: resp.status, url: landed };
   const declared = Number(resp.headers.get('content-length'));
   if (Number.isFinite(declared) && declared > maxBytes) {
     // The cap is our policy, not the CDN's answer: a bigger copy will not help
     // and a thumbnail is not the file that was sent, so this ends the ladder.
-    return { ok: false, status: 'over-cap', capped: true, size: declared };
+    return { ok: false, status: 'over-cap', capped: true, size: declared, url: landed };
   }
   let buffer;
   try {
@@ -212,14 +292,18 @@ async function fetchOne(url, headers, opts) {
   } catch (e) {
     // A body that dies mid-read used to escape all the way to onMessage's
     // catch, which dropped the message exactly like a failed download.
-    return { ok: false, status: `error:body:${String((e && e.message) || e)}` };
+    return {
+      ok: false,
+      status: `error:body:${String((e && e.message) || e)}`,
+      url: landed,
+    };
   }
   if (buffer.length > maxBytes) {
-    return { ok: false, status: 'over-cap', capped: true, size: buffer.length };
+    return { ok: false, status: 'over-cap', capped: true, size: buffer.length, url: landed };
   }
-  if (!buffer.length) return { ok: false, status: 'empty' };
+  if (!buffer.length) return { ok: false, status: 'empty', url: landed };
   const mime = String(resp.headers.get('content-type') || '').split(';')[0] || null;
-  return { ok: true, status: resp.status, buffer, mime };
+  return { ok: true, status: resp.status, buffer, mime, url: landed };
 }
 
 export async function downloadMedia(media, opts = {}) {
@@ -236,6 +320,7 @@ export async function downloadMedia(media, opts = {}) {
     attemptTimeoutMs = ATTEMPT_TIMEOUT_MS,
     totalBudgetMs = TOTAL_BUDGET_MS,
     retryDelaysMs = RETRY_DELAYS_MS,
+    edgeSuffixes = FILE_EDGE_SUFFIXES,
   } = opts;
   const candidates = (media && media.candidates) || [];
   const present = (media && media.present) || [];
@@ -249,7 +334,13 @@ export async function downloadMedia(media, opts = {}) {
 
   const failure = (extra) => ({
     ok: false,
-    status: lastStatus,
+    // An HTTP status the ladder actually saw beats the last marker: when a
+    // router's 404 is followed by six edges that do not resolve, "HTTP 404" is
+    // what the sender needs to read, not a hostname from a DNS error.
+    status: attempts.reduce(
+      (found, a) => (typeof a.status === 'number' ? a.status : found),
+      null,
+    ) ?? lastStatus,
     described: describeUrl(primary),
     urls,
     attempts,
@@ -258,7 +349,14 @@ export async function downloadMedia(media, opts = {}) {
     ...extra,
   });
 
-  for (const cand of candidates) {
+  // A copy, because a router's 404 splices its edges in behind the candidate
+  // that hit it — the ladder grows from what the CDN answers, not only from
+  // what the message named.
+  const queue = [...candidates];
+  let edgesSpliced = false;
+
+  for (let i = 0; i < queue.length; i += 1) {
+    const cand = queue[i];
     const described = describeUrl(cand.url);
     if (!urls.includes(described)) urls.push(described);
     const maxTries = cand.source === 'href' ? retryDelaysMs.length + 1 : 1;
@@ -274,7 +372,10 @@ export async function downloadMedia(media, opts = {}) {
       const outcome = await fetchOne(cand.url, headers, {
         fetchImpl, maxBytes, attemptTimeoutMs,
       });
-      attempts.push({ source: cand.source, status: outcome.status });
+      const landed = hostnameOf(outcome.url);
+      const record = { source: cand.source, status: outcome.status };
+      if (landed && landed !== hostnameOf(cand.url)) record.host = landed;
+      attempts.push(record);
       lastStatus = outcome.status;
       if (outcome.ok) {
         return {
@@ -291,6 +392,21 @@ export async function downloadMedia(media, opts = {}) {
         };
       }
       if (outcome.capped) return failure({ capped: true, size: outcome.size });
+      if (outcome.status === 404 && !edgesSpliced) {
+        const edges = edgeCandidates(outcome.url, edgeSuffixes);
+        if (edges.length) {
+          // The router refused this NETWORK, so asking it again is waiting for
+          // nothing — that is the 1s+3s of backoff the first failing log spent.
+          // Every copy one message names sits on one pool, so this happens once.
+          edgesSpliced = true;
+          queue.splice(i + 1, 0, ...edges);
+          for (const edge of edges) {
+            const edgeDescribed = describeUrl(edge.url);
+            if (!urls.includes(edgeDescribed)) urls.push(edgeDescribed);
+          }
+          break;
+        }
+      }
       if (!isRetryable(outcome.status)) break;
     }
     if (budgetSpent) break;

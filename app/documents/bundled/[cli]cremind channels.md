@@ -187,7 +187,7 @@ request (multipart), so they work from a remote CLI.
 | Slack | Needs the `files:read` (inbound) and `files:write` (outbound) OAuth scopes — re-install an older app to grant them. Sending into a channel requires membership. |
 | Discord | Inbound fine; outbound capped at 10 MB (Discord's default bot limit). |
 | WhatsApp | Full support via the sidecar; media is spooled to disk at receipt. |
-| Zalo (userbot) | Supported via the sidecar (unofficial library — shapes may drift). |
+| Zalo (userbot) | Supported via the sidecar (unofficial library — shapes may drift). Inbound files are fetched straight from Zalo's CDN; on a hosted server (cloud, Docker, Kubernetes) that means going to the CDN edge nodes, which the sidecar does on its own — see the 404 entry under Troubleshooting. |
 | Zalo (bot) | Inbound only where the Bot API supplies a download URL; **no outbound file support** — recipients get a text notice naming the file. |
 | Messenger | Inbound via webhook attachments; outbound capped at 25 MB, captions sent as a separate text message. |
 
@@ -1851,6 +1851,43 @@ its contacts and its groups. Do **not** delete and re-add the channel —
 that works only because a new channel id gets an empty session
 directory, and it destroys the channel's groups and contact history.
 Applies to WhatsApp userbot, Zalo personal account and Telegram userbot.
+
+**Zalo files fail with HTTP 404 on a hosted server, while photos work** —
+A file or video sent into a Zalo chat never reaches the agent, and
+`logs/app.log` carries a line like:
+
+```
+zalo[<id>] sidecar: [zalo-sidecar] media download failed for report.pdf:
+  msgType=share.file platform=2 ageMs=4477 status=404
+  attempts=href:404@file-stal-22.flchat.vn,edge.te-vnso-ne-2:404,…
+```
+
+Files ride a different Zalo CDN from photos. Their URL redirects to a
+router that picks a delivery node from the **client's** network: a home
+internet connection is redirected on to a node, while a hosting network
+(a cloud VM, Kubernetes, most VPS providers) is answered a bare 404 —
+the same file, the same second, regardless of headers. Nothing is wrong
+with the file, and re-sending it does not help.
+
+The sidecar handles this itself: on that 404 it asks the CDN nodes
+directly, so a healthy hosted server logs a **success**, not an error —
+`media spooled … via edge.te-vnso-ne-2 after href:404@…`. That line
+appears at WARNING because every sidecar message does; it means the
+fallback worked.
+
+When a download still fails, read `attempts=`:
+
+- `edge.…:403` on every node — the object is gone from Zalo's side (an
+  old forwarded message, or an expired upload). Ask the sender to
+  re-send it.
+- `error:fetch failed: getaddrinfo ENOTFOUND …` on every node — Zalo
+  renamed its CDN nodes. Report the log line; the node list ships in the
+  sidecar and needs an update.
+- `href:404` with no `@` host — the URL never reached the router, so this
+  is a different problem (check outbound HTTPS from the host).
+
+Trust the log line over the hostnames printed here: they are Zalo's and
+can change.
 
 **Telegram userbot keeps prompting for the code** — Either the code
 expired (Telegram codes are short-lived; the dialog will say "Code
