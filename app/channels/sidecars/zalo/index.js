@@ -30,7 +30,9 @@
  * Media never rides the WebSocket (4 MiB frame cap). Inbound media is
  * downloaded AT RECEIPT into --media-dir and the frame carries
  * {files: [{path, name, mime, size}]}; the parent moves or deletes the
- * spooled file. Which url is fetched, and how often, is media.js's business.
+ * spooled file. Which url is fetched, and how often, is media.js's business —
+ * including asking Zalo's CDN edges directly when the file router refuses this
+ * host's network, which is what a server on a hosting provider gets.
  * A media message whose download FAILS still flows: its frame carries a
  * bracketed notice in `text` instead of the file, because a caption-less photo
  * that could not be fetched has neither and the parent would drop it — which
@@ -53,6 +55,7 @@ import { WebSocketServer } from 'ws';
 import { Zalo } from 'zca-js';
 
 import {
+  attemptTrail,
   downloadMedia,
   mediaFailureNotice,
   mediaFromMessage,
@@ -219,7 +222,8 @@ async function mediaHeadersFor(url) {
   // Referer and a User-Agent of "node", which is exactly what a hotlink filter
   // is built to turn away — and such a host answers 404 as readily as 403.
   // No Cookie: the jar only holds zalo.me cookies, so a CDN host would get
-  // none anyway, and a hand-set Cookie header follows cross-origin redirects.
+  // none anyway (and undici drops Cookie across a cross-origin redirect, so a
+  // hand-set one would not survive the hop to the CDN in any case).
   const headers = {
     Accept: 'image/*,video/*,audio/*,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
@@ -248,7 +252,7 @@ async function spoolIncomingMedia(media) {
       maxBytes: mediaMaxBytes,
       headersFor: mediaHeadersFor,
     });
-    const trail = result.attempts.map((a) => `${a.source}:${a.status}`).join(',');
+    const trail = attemptTrail(result.attempts);
     if (!result.ok) {
       if (result.capped) {
         // A cap we chose, not a failure to report: the sender can see the file

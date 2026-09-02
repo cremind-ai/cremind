@@ -62,6 +62,8 @@ const fetchImpl = async (url, init) => {
   if (step.throw) {
     const err = new Error(step.throw);
     err.name = step.name || 'TypeError';
+    // undici hides the reason that names a network failure in `cause`.
+    if (step.cause) err.cause = new Error(step.cause);
     throw err;
   }
   const headers = new Map(
@@ -71,6 +73,10 @@ const fetchImpl = async (url, init) => {
   return {
     ok: step.status >= 200 && step.status < 300,
     status: step.status,
+    // `url` is where a redirect LANDED. Spread conditionally so a step that
+    // does not set one leaves the property absent, exactly like the synthetic
+    // Response the fallback in fetchOne exists for.
+    ...(step.url === undefined ? {} : { url: step.url }),
     headers: { get: (k) => {
       const key = String(k).toLowerCase();
       return headers.has(key) ? headers.get(key) : null;
@@ -103,6 +109,7 @@ console.log(JSON.stringify({
     candidates: media.candidates, present: media.present, paramKeys: media.paramKeys,
   },
   result: result && { ...result, buffer: undefined, size: result.buffer ? result.buffer.length : 0 },
+  trail: result ? mod.attemptTrail(result.attempts) : null,
   calls,
   sleeps,
   ignored,
@@ -129,6 +136,42 @@ def _run(scenario: dict) -> dict:
 _ORIGINAL = "https://f37-zpg-r.zdn.vn/pics/original.jpg"
 _HD = "https://f1-zpg-r.zdn.vn/pics/hd.jpg"
 _THUMB = "https://f37-zpg-r.zdn.vn/pics/thumb.jpg"
+
+
+# A file rides a different CDN from a photo: its href redirects to a "router"
+# that picks an edge from the CLIENT's network, so a server on a hosting
+# provider is answered 404 while a home connection is redirected to an edge.
+_FILE_HREF = "https://file-stal-22.dlfl.vn/gr/b8b446fc/2aOboQvoizAT2bgyUIVtgwSd"
+_ROUTER = "https://file-stal-22.flchat.vn/gr/b8b446fc/2aOboQvoizAT2bgyUIVtgwSd"
+_EDGE_SUFFIXES = [
+    "te-vnso-ne-2", "te-vnso-ne-1", "te-vnso-pt-64", "te-vnso-pt-65",
+    "te-vnso-ne-3", "te-vnso-pt-63",
+]
+
+
+def _edge(suffix: str) -> str:
+    return f"https://file-stal-22-{suffix}.flchat.vn/gr/b8b446fc/2aOboQvoizAT2bgyUIVtgwSd"
+
+
+def _file(**overrides) -> dict:
+    """A share.file exactly as the failing PC-app message came in: one href,
+    and params that carry checksums but no second copy to fall back to."""
+    data = {
+        "msgType": "share.file",
+        "ts": "1000",
+        "paramsExt": {"platformType": 2},
+        "content": {
+            "title": "report.pdf",
+            "href": _FILE_HREF,
+            "thumb": _THUMB,
+            "params": json.dumps({
+                "fileSize": "175067", "checksum": "abc", "checksumSha": "",
+                "fileExt": "pdf", "fdata": "{}", "fType": 1,
+            }),
+        },
+    }
+    data.update(overrides)
+    return data
 
 
 def _photo(**overrides) -> dict:
@@ -379,3 +422,257 @@ def test_a_sticker_is_not_media_and_is_logged_as_ignored():
 
     assert out["media"] is None
     assert out["ignored"] == ["media-like content ignored (msgType=chat.sticker)"]
+
+
+# --- the file CDN's router ---------------------------------------------------
+#
+# A file's href redirects to `file-<pool>-<n>.flchat.vn`, which picks a CDN edge
+# from the CLIENT's network: a residential ISP is redirected on to an edge, a
+# hosting network is answered a bare 404 — same object, same second, headers
+# irrelevant. The edges serve that path to anyone who asks them by name, so a
+# router 404 is answered by asking them directly rather than by giving up.
+
+
+def _router_404(landed: str = _ROUTER) -> dict:
+    """What a hosted server gets: the redirect happened, the router refused."""
+    return {"status": 404, "url": landed}
+
+
+def test_a_router_404_goes_straight_to_the_cdn_edges():
+    out = _run({
+        "data": _file(),
+        "responses": {
+            _FILE_HREF: [_router_404()],
+            _edge("te-vnso-ne-2"): [{"status": 200, "body": "pdfbytes"}],
+        },
+    })
+
+    assert out["result"]["ok"] is True
+    assert out["result"]["source"] == "edge.te-vnso-ne-2"
+    assert out["result"]["size"] == 8
+    # The router's answer is about our network, not this moment, so asking it
+    # again is waiting for nothing — that backoff is what the first failing
+    # deployment spent before reporting a file nobody could see.
+    assert out["sleeps"] == []
+    assert [c["url"] for c in out["calls"]] == [_FILE_HREF, _edge("te-vnso-ne-2")]
+    # The log line now says who answered, which the first one could not.
+    assert out["trail"] == (
+        "href:404@file-stal-22.flchat.vn,edge.te-vnso-ne-2:200"
+    )
+
+
+def test_the_first_request_is_still_bare_and_the_edges_are_not():
+    out = _run({
+        "data": _file(),
+        "responses": {
+            _FILE_HREF: [_router_404()],
+            _edge("te-vnso-ne-2"): [{"status": 200}],
+        },
+    })
+
+    assert out["calls"][0]["headers"] is None
+    assert out["calls"][1]["headers"]["Referer"] == "https://chat.zalo.me/"
+
+
+def test_the_edges_are_walked_in_measured_order_until_one_answers():
+    """Two of the six answered 404 for an object the others served, so a single
+    fallback name would have fixed nothing."""
+    out = _run({
+        "data": _file(),
+        "responses": {
+            _FILE_HREF: [_router_404()],
+            _edge("te-vnso-ne-2"): [{"status": 404}],
+            _edge("te-vnso-ne-1"): [{"status": 403}],
+            _edge("te-vnso-pt-64"): [{"throw": "fetch failed"}],
+            _edge("te-vnso-pt-65"): [{"status": 200, "body": "pdf"}],
+        },
+    })
+
+    assert out["result"]["source"] == "edge.te-vnso-pt-65"
+    assert [c["url"] for c in out["calls"]] == [
+        _FILE_HREF,
+        _edge("te-vnso-ne-2"), _edge("te-vnso-ne-1"),
+        _edge("te-vnso-pt-64"), _edge("te-vnso-pt-65"),
+    ]
+    # An edge is an alternate: one try each, no backoff between them.
+    assert out["sleeps"] == []
+
+
+def test_every_edge_failing_still_tells_the_sender_the_http_status():
+    """A drifted CDN name must not leak into the chat as the failure reason."""
+    out = _run({
+        "data": _file(),
+        "responses": {
+            _FILE_HREF: [_router_404()],
+            **{
+                _edge(s): [{
+                    "throw": "fetch failed",
+                    "cause": f"getaddrinfo ENOTFOUND file-stal-22-{s}.flchat.vn",
+                }]
+                for s in _EDGE_SUFFIXES
+            },
+        },
+    })
+
+    assert out["result"]["ok"] is False
+    # Six DNS errors after one real 404: the 404 is the answer that means
+    # something to the person who sent the file.
+    assert out["result"]["status"] == 404
+    assert out["notice"] == (
+        "[sent a file: report.pdf, but it could not be downloaded (HTTP 404)]"
+    )
+    # ...while the log keeps the reason undici buried in `cause`.
+    assert "getaddrinfo ENOTFOUND" in out["trail"]
+    assert len(out["result"]["urls"]) == 1 + len(_EDGE_SUFFIXES)
+
+
+def test_a_file_whose_edges_all_404_reports_the_router_and_every_edge():
+    out = _run({
+        "data": _file(),
+        "responses": {_FILE_HREF: [_router_404()]},
+    })
+
+    assert out["result"]["status"] == 404
+    assert out["trail"] == ",".join(
+        ["href:404@file-stal-22.flchat.vn"]
+        + [f"edge.{s}:404" for s in _EDGE_SUFFIXES]
+    )
+    # A share.file offers no second copy and never falls back to a thumbnail,
+    # so the edges are the whole ladder after the href.
+    assert out["media"]["present"] == ["href"]
+
+
+def test_the_edge_host_comes_from_where_the_redirect_landed():
+    """The href is on dlfl.vn, which has no edges at all; the pool label has to
+    be read off the router the redirect actually reached."""
+    out = _run({
+        "data": _file(),
+        "responses": {
+            _FILE_HREF: [{"status": 404, "url": _ROUTER.replace("22", "7")}],
+            _edge("te-vnso-ne-2").replace("22", "7"): [{"status": 200}],
+        },
+    })
+
+    assert out["result"]["source"] == "edge.te-vnso-ne-2"
+    assert out["calls"][1]["url"] == _edge("te-vnso-ne-2").replace("22", "7")
+
+
+def test_an_href_that_is_already_the_router_needs_no_redirect_to_trigger():
+    """A Response with no url at all — the fallback path in fetchOne."""
+    data = _file()
+    data["content"]["href"] = _ROUTER
+    out = _run({
+        "data": data,
+        "responses": {
+            _ROUTER: [{"status": 404}],
+            _edge("te-vnso-ne-2"): [{"status": 200}],
+        },
+    })
+
+    assert out["result"]["source"] == "edge.te-vnso-ne-2"
+    # Nothing moved, so the trail carries no host token.
+    assert out["trail"] == "href:404,edge.te-vnso-ne-2:200"
+
+
+@pytest.mark.parametrize("landed", [
+    None,                                        # no redirect: the href itself
+    "https://f37-zpg-r.zdn.vn/pics/original.jpg",  # the photo CDN
+    "https://res-zalo-1.zdn.vn/pics/x.jpg",      # same shape, different CDN
+    _edge("te-vnso-ne-2"),                       # an edge is not a router
+])
+def test_a_404_from_anywhere_but_the_router_keeps_todays_retries(landed):
+    """A match sends six extra requests, so the pattern must match the router
+    and nothing else."""
+    step = {"status": 404} if landed is None else {"status": 404, "url": landed}
+    out = _run({"data": _photo(), "responses": {_ORIGINAL: [step]}})
+
+    assert [c["url"] for c in out["calls"]][:3] == [_ORIGINAL] * 3
+    assert out["sleeps"] == [1000, 3000]
+    assert not any("flchat.vn" in c["url"] for c in out["calls"])
+
+
+def test_the_edges_are_synthesised_once_per_download():
+    """Every copy a message names sits on one pool; a second router 404 from a
+    params.* copy must not queue the same six again."""
+    data = _photo()
+    data["content"]["params"] = json.dumps({"hd": _ROUTER + "-hd"})
+    out = _run({
+        "data": data,
+        "responses": {
+            _ORIGINAL: [{"status": 404, "url": _ROUTER}],
+            _ROUTER + "-hd": [{"status": 404, "url": _ROUTER + "-hd"}],
+        },
+    })
+
+    edge_calls = [c["url"] for c in out["calls"] if "-te-vnso-" in c["url"]]
+    assert len(edge_calls) == len(_EDGE_SUFFIXES)
+
+
+def test_the_walk_can_be_pointed_somewhere_else_or_turned_off():
+    off = _run({
+        "data": _file(),
+        "opts": {"edgeSuffixes": []},
+        "responses": {_FILE_HREF: [_router_404()]},
+    })
+    assert [c["url"] for c in off["calls"]] == [_FILE_HREF] * 3
+    assert off["sleeps"] == [1000, 3000]
+
+    custom = _run({
+        "data": _file(),
+        "opts": {"edgeSuffixes": ["te-vnso-pt-64", "te-vnso-ne-2"]},
+        "responses": {
+            _FILE_HREF: [_router_404()],
+            _edge("te-vnso-ne-2"): [{"status": 200}],
+        },
+    })
+    assert [c["url"] for c in custom["calls"]] == [
+        _FILE_HREF, _edge("te-vnso-pt-64"), _edge("te-vnso-ne-2"),
+    ]
+
+
+def test_a_signed_url_reaches_the_edge_intact_but_never_the_log():
+    signed = f"{_ROUTER}?token=SECRET&e=1"
+    out = _run({
+        "data": _file(),
+        "responses": {
+            _FILE_HREF: [{"status": 404, "url": signed}],
+            f"{_edge('te-vnso-ne-2')}?token=SECRET&e=1": [{"status": 200}],
+        },
+    })
+
+    assert out["result"]["ok"] is True
+    assert "SECRET" not in json.dumps(out["result"])
+    assert out["result"]["urls"][1].endswith("?token&e")
+
+
+def test_the_budget_stops_the_edge_walk_too():
+    """Six extra hosts must not become six extra ways to stall a message: the
+    walk starts attempts only while the budget lasts (slow answers here, since
+    the edges are asked back-to-back with nothing to sleep on)."""
+    out = _run({
+        "data": _file(),
+        "opts": {"totalBudgetMs": 1000},
+        "responses": {
+            _FILE_HREF: [{"status": 404, "url": _ROUTER, "elapsed": 600}],
+            _edge("te-vnso-ne-2"): [{"status": 404, "elapsed": 600}],
+        },
+    })
+
+    assert out["result"]["budgetSpent"] is True
+    assert len(out["calls"]) == 2
+
+
+def test_an_over_cap_edge_ends_the_ladder():
+    out = _run({
+        "data": _file(),
+        "maxBytes": 10,
+        "responses": {
+            _FILE_HREF: [_router_404()],
+            _edge("te-vnso-ne-2"): [
+                {"status": 200, "headers": {"content-length": "999"}},
+            ],
+        },
+    })
+
+    assert out["result"]["capped"] is True
+    assert len(out["calls"]) == 2
