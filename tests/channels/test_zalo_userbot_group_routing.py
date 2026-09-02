@@ -172,6 +172,30 @@ def test_a_room_frame_missing_its_room_or_author_is_dropped(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_a_photo_that_could_not_be_downloaded_still_reaches_the_room(monkeypatch):
+    """The empty-frame guard above is exactly what used to swallow a photo.
+
+    A caption-less photo whose CDN download fails has no text and no file, so
+    it looks like the empty frame the previous test drops. The sidecar
+    therefore synthesises a notice into ``text`` (see media.js
+    ``mediaFailureNotice``); this pins that such a frame still routes, so the
+    agent can tell the sender their photo never arrived.
+    """
+    async def scenario():
+        adapter = _adapter()
+        group_calls, dm_calls = _capture(monkeypatch, adapter)
+        notice = "[sent a photo, but it could not be downloaded (HTTP 404)]"
+
+        await adapter._handle_sidecar_event(_group_frame(text=notice, files=[]))
+        await _settle()
+
+        assert dm_calls == []
+        assert group_calls[0]["text"] == notice
+        assert group_calls[0]["files"] is None
+
+    asyncio.run(scenario())
+
+
 def test_ready_records_the_account_the_room_must_ignore():
     """This account receives the mirrors the member agents post into the room;
     without its own id recorded, its answers come back in as new questions."""
