@@ -14,7 +14,11 @@ Telethon-shaped events; no Telethon, session file, or network is involved.
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
+from typing import Any
+
+import pytest
 
 from app.channels.adapters.telegram_userbot import TelegramUserbotAdapter
 
@@ -25,12 +29,19 @@ _ALEXA = 1644772063
 class _Client:
     def __init__(self):
         self.sent: list[tuple] = []
+        self.requests: list[Any] = []
 
     async def get_input_entity(self, value):
         return f"peer:{value}"
 
     async def send_message(self, peer, text, parse_mode=None):
         self.sent.append((peer, text, parse_mode))
+
+    async def __call__(self, request):
+        # Telethon's client is callable: `await client(SomeRequest(...))` is how
+        # a raw MTProto request is issued.
+        self.requests.append(request)
+        return True
 
 
 class _Event:
@@ -242,6 +253,99 @@ def test_send_to_chat_addresses_the_room():
         await adapter.send_to_chat(str(_CHAT_ID), "mirrored")
 
         assert adapter._client.sent == [(f"peer:{_CHAT_ID}", "mirrored", "md")]
+
+    asyncio.run(scenario())
+
+
+# --- typing ------------------------------------------------------------------
+#
+# Telethon is an optional extra and is not installed here, so the two symbols
+# ``_typing_pulse`` imports are stood up as modules. That is the whole SDK
+# surface this path touches: one request class and one action.
+
+class _SetTypingRequest:
+    def __init__(self, peer, action):
+        self.peer = peer
+        self.action = action
+
+
+class _SendMessageTypingAction:
+    pass
+
+
+class _SendMessageCancelAction:
+    pass
+
+
+@pytest.fixture()
+def _telethon(monkeypatch):
+    messages = ModuleType("telethon.tl.functions.messages")
+    messages.SetTypingRequest = _SetTypingRequest
+    types = ModuleType("telethon.tl.types")
+    types.SendMessageTypingAction = _SendMessageTypingAction
+    types.SendMessageCancelAction = _SendMessageCancelAction
+    for name, module in (
+        ("telethon", ModuleType("telethon")),
+        ("telethon.tl", ModuleType("telethon.tl")),
+        ("telethon.tl.functions", ModuleType("telethon.tl.functions")),
+        ("telethon.tl.functions.messages", messages),
+        ("telethon.tl.types", types),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    yield
+
+
+def test_typing_reaches_a_room_and_a_person_alike(_telethon):
+    """MTProto has no chat-type discriminator for ``messages.setTyping`` — only
+    the peer differs — so a room needs no separate request, just the room hook
+    that used to be missing entirely."""
+    async def scenario():
+        adapter = _adapter()
+        adapter._client = _Client()
+        await adapter._send_typing_to_chat(str(_CHAT_ID))
+        await adapter._send_typing(str(_ALEXA))
+
+        peers = [request.peer for request in adapter._client.requests]
+        assert peers == [f"peer:{_CHAT_ID}", f"peer:{_ALEXA}"]
+
+    asyncio.run(scenario())
+
+
+def test_a_typing_pulse_is_not_immediately_cancelled(_telethon):
+    """The regression that matters.
+
+    This used to be ``async with client.action(peer, 'typing'): pass``, whose
+    ``__aenter__`` only schedules the send in a background task — an empty body
+    then cancels that task before it takes its first step, so nothing was sent
+    on either transport, DMs included. Anything that clears the action again
+    within the same pulse puts us back there.
+    """
+    async def scenario():
+        adapter = _adapter()
+        adapter._client = _Client()
+        await adapter._send_typing(str(_ALEXA))
+
+        actions = [type(request.action) for request in adapter._client.requests]
+        assert actions == [_SendMessageTypingAction]
+
+    asyncio.run(scenario())
+
+
+def test_a_typing_failure_never_reaches_the_caller(_telethon):
+    """The loop that drives this treats a pulse as best-effort; an exception
+    escaping here would be logged by the loop but is cheaper to stop at source,
+    where the peer that failed is still known."""
+    async def scenario():
+        adapter = _adapter()
+
+        class _Broken(_Client):
+            async def get_input_entity(self, value):
+                raise RuntimeError("no such peer")
+
+        adapter._client = _Broken()
+        await adapter._send_typing_to_chat("-100999")
+
+        assert adapter._client.requests == []
 
     asyncio.run(scenario())
 

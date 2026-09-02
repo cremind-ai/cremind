@@ -734,17 +734,45 @@ class TelegramUserbotAdapter(BaseChannelAdapter):
             attributes=attributes,
         )
 
-    async def _send_typing(self, sender_id: str) -> None:
+    async def _typing_pulse(self, peer_id: str) -> None:
+        """One typing pulse at ``peer_id``. Telegram renders it for ~5s.
+
+        A raw ``SetTypingRequest`` rather than ``client.action(peer, 'typing')``:
+        that helper does not send anything on enter, it only *schedules* a
+        background task (``_ChatAction.__aenter__`` → ``create_task(self._update())``),
+        and with an empty body ``__aexit__`` cancels that task before it takes
+        its first step — so ``async with …: pass`` sets no action at all, and
+        with ``auto_cancel`` at its default would clear it anyway. Keeping the
+        indicator alive across a turn is
+        :meth:`~app.channels.base.BaseChannelAdapter._typing_loop_for`'s job on
+        its own 4-second cadence, not this method's.
+        """
         if self._client is None:
             return
         try:
-            peer = await self._resolve_peer(sender_id)
-            # ``client.action(peer, 'typing')`` is a context manager that
-            # sets the action on enter and clears it on exit. Using it
-            # bare like this fires one typing pulse, which Telegram clients
-            # render as "typing…" for ~5s.
-            async with self._client.action(peer, "typing"):
-                pass
+            from telethon.tl.functions.messages import (  # type: ignore
+                SetTypingRequest,
+            )
+            from telethon.tl.types import SendMessageTypingAction  # type: ignore
+
+            peer = await self._resolve_peer(peer_id)
+            await self._client(SetTypingRequest(peer, SendMessageTypingAction()))
         except Exception:  # noqa: BLE001
             # Typing is best-effort; the loop will retry next tick.
-            pass
+            logger.debug(
+                "telegram-userbot: typing indicator failed", exc_info=True,
+            )
+
+    async def _send_typing(self, sender_id: str) -> None:
+        await self._typing_pulse(sender_id)
+
+    async def _send_typing_to_chat(self, chat_id: str) -> None:
+        """Show "typing…" in a room, addressed by the room's own marked id.
+
+        MTProto needs no separate room request and no chat-type argument —
+        ``messages.setTyping`` takes an ``InputPeer``, and a group's resolves
+        through the same :meth:`_resolve_peer` cache from the same marked
+        (negative, ``-100…`` for a supergroup) id :meth:`send_to_chat` already
+        sends to. Only the peer differs.
+        """
+        await self._typing_pulse(str(chat_id))

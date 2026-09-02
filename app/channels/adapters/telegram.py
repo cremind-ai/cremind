@@ -541,35 +541,61 @@ class TelegramAdapter(BaseChannelAdapter):
         await self._send_document_with_retry(int(chat_id), path, name, caption)
 
     async def _send_typing_to_chat(self, chat_id: str) -> None:
-        """Show "typing…" in a group, addressed by the room's own (negative) id."""
+        """Show "typing…" in a group, addressed by the room's own (negative) id.
+
+        Recovers from the stale connection pool the same way
+        :meth:`_send_typing` does — without it a single dead pooled connection
+        leaves the ROOM's indicator dark for the rest of the run while the DM
+        one heals itself on the next tick.
+        """
+        from telegram.constants import ChatAction  # type: ignore
         try:
             if self._bot is None:
                 self._bot = await self._build_bot()
-            await self._bot.send_chat_action(chat_id=int(chat_id), action="typing")
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "[channels:telegram] group typing indicator failed", exc_info=True,
+            await self._bot.send_chat_action(
+                chat_id=int(chat_id), action=ChatAction.TYPING,
             )
+        except Exception as exc:  # noqa: BLE001
+            await self._typing_failed(exc, f"group {chat_id}")
 
     async def _send_typing(self, sender_id: str) -> None:
         """Show "typing…" to ``sender_id`` for ~5 seconds.
 
-        Called by :meth:`BaseChannelAdapter._typing_loop` on a short cadence
+        Called by :meth:`BaseChannelAdapter._typing_loop_for` on a short cadence
         so the indicator stays visible for the duration of the run. No
         retry: if the platform call fails, the loop will tick again in a
         few seconds; logging here would be too noisy.
         """
         from telegram.constants import ChatAction  # type: ignore
-        from telegram.error import NetworkError  # type: ignore
-        if self._bot is None:
-            self._bot = await self._build_bot()
         try:
+            if self._bot is None:
+                self._bot = await self._build_bot()
             await self._bot.send_chat_action(
                 chat_id=int(sender_id), action=ChatAction.TYPING,
             )
-        except NetworkError:
-            # Same stale-pool failure mode the message-send path handles.
+        except Exception as exc:  # noqa: BLE001
+            await self._typing_failed(exc, f"sender {sender_id}")
+
+    async def _typing_failed(self, exc: Exception, who: str) -> None:
+        """Decide whether a failed typing pulse is worth rebuilding the bot for.
+
+        The distinction matters because this runs every 4 seconds for the whole
+        length of a run: ``BadRequest`` is a *subclass* of ``NetworkError`` in
+        PTB, so catching the latter alone would treat a permanent "chat not
+        found" — a room whose id outlived the bot's membership — as a stale
+        pool and tear down and rebuild the httpx client on every tick, silently,
+        for as long as the room keeps being answered. Only a genuine transport
+        failure gets the reset; everything else is logged and left alone.
+        """
+        from telegram.error import BadRequest, NetworkError  # type: ignore
+
+        if isinstance(exc, NetworkError) and not isinstance(exc, BadRequest):
+            # The stale-pool failure mode the message-send path also handles.
             await self._reset_bot()
+            return
+        logger.debug(
+            f"[channels:telegram] typing indicator failed for {who}", exc_info=exc,
+        )
 
     async def _send_with_retry(self, chat_id: int, text: str) -> None:
         """Send with markdown + transient-error retry + plain-text fallback.

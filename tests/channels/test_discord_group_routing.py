@@ -326,6 +326,33 @@ def test_a_channel_the_session_has_not_seen_is_fetched():
     assert fetched == [_CHANNEL_ID]
 
 
+def test_typing_in_a_room_survives_a_cold_gateway_cache():
+    """The indicator goes up *before* the answer, so it is the one call most
+    likely to run on a cold cache — a cache-only lookup here is how the reply
+    used to arrive with no "typing…" ahead of it."""
+    fetched: list[int] = []
+    typed: list[str] = []
+
+    class _Channel:
+        async def typing(self):
+            typed.append("pulse")
+
+    async def _fetch(channel_id):
+        fetched.append(channel_id)
+        return _Channel()
+
+    async def scenario():
+        adapter = _adapter()
+        adapter._client = SimpleNamespace(
+            get_channel=lambda cid: None, fetch_channel=_fetch,
+        )
+        await adapter._send_typing_to_chat(str(_CHANNEL_ID))
+
+    asyncio.run(scenario())
+    assert fetched == [_CHANNEL_ID]
+    assert typed == ["pulse"]
+
+
 def test_bold_is_two_asterisks_because_one_is_italic_here():
     """One room's text is mirrored to every platform bound to it, so the mirror
     asks the carrying adapter for emphasis instead of writing Telegram's."""

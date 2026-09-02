@@ -562,6 +562,32 @@ class SlackAdapter(BaseChannelAdapter):
             raise ChannelAuthError("Slack app not connected")
         await self._app.client.chat_postMessage(channel=chat_id, text=text)
 
+    async def _send_typing(self, sender_id: str) -> None:
+        """No indicator: Slack gives an app no way to show one. Deliberate.
+
+        Spelled out rather than left to the base no-op so the absence reads as
+        a checked platform limit instead of the oversight it looks like next to
+        every other adapter here. Slack's modern Web API has no typing method;
+        the only "user is typing" primitive is the legacy RTM websocket frame,
+        which a granular-scope Socket Mode app cannot send.
+        ``assistant.threads.setStatus`` is deprecated and rejects anything that
+        is not an app-DM assistant thread, and its replacement
+        ``agents.sessions.setStatus`` sets a session lifecycle value inside the
+        Agents & AI Apps feature — it needs a ``thread_ts`` this adapter never
+        tracks, and it is not a thing to re-tick every four seconds.
+        """
+        return None
+
+    async def _send_typing_to_chat(self, chat_id: str) -> None:
+        """No indicator in a room either — see :meth:`_send_typing`.
+
+        Worth stating separately: this adapter IS group-capable
+        (``supports_group_chats``), so a reader checking why a mirrored room
+        never shows the agent composing should find the answer here rather
+        than concluding the override was forgotten.
+        """
+        return None
+
     async def _send_file(
         self, sender_id: str, path: str, *,
         name: str | None = None, mime: str | None = None,

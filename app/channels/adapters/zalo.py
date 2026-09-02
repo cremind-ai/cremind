@@ -407,3 +407,21 @@ class ZaloBotAdapter(BaseChannelAdapter):
         except Exception:  # noqa: BLE001
             # Typing is best-effort; the typing loop retries on the next tick.
             logger.debug("zalo: typing action dropped", exc_info=True)
+
+    async def _send_typing_to_chat(self, chat_id: str) -> None:
+        """Show "typing…" in a room — the same call, an id nobody owns.
+
+        ``sendChatAction`` takes the same opaque id ``sendMessage`` does (the
+        API documents the argument as the recipient's *or the conversation's*
+        id), so a room needs no separate call and no chat-type argument — only
+        its own id, which :meth:`send_to_chat` already proves is addressable.
+        Without this override the base no-op runs instead and a Zalo bot is
+        silently never seen composing in a group.
+        """
+        if self._api is None:
+            return
+        try:
+            await self._api.send_chat_action(str(chat_id), "typing")
+        except Exception:  # noqa: BLE001
+            # Best-effort; the typing loop retries on the next tick.
+            logger.debug("zalo: group typing action dropped", exc_info=True)

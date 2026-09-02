@@ -101,6 +101,35 @@ function logInfo(line) {
   process.stderr.write(`[whatsapp-sidecar] ${line}\n`);
 }
 
+// Last typing OUTCOME seen per JID — the acceptance as readily as the error.
+// Logging only failures leaves two very different states looking identical:
+// the platform took the event and showed nothing, or we never asked at all.
+// That ambiguity is what made a room with no indicator hard to explain on the
+// sibling Zalo transport. One line per JID per change of outcome, so a steady
+// state stays quiet.
+const typingOutcomes = new Map();
+
+function describeThrown(e) {
+  // Never throws and never renders "[object Object]": a control-frame handler
+  // that raises while describing a failure escapes into the socket's error
+  // path, which this sidecar mirrors onto the pairing stream — so a missed
+  // typing pulse could otherwise surface as an error in the QR dialog.
+  try {
+    if (e instanceof Error) return e.message || e.name || 'Error';
+    if (e && typeof e.message === 'string' && e.message) return e.message;
+    return JSON.stringify(e) || Object.prototype.toString.call(e);
+  } catch (inner) {
+    // A circular object, a throwing getter, a null-prototype value.
+    return Object.prototype.toString.call(e);
+  }
+}
+
+function noteTypingResult(jid, outcome) {
+  if (typingOutcomes.get(jid) === outcome) return;
+  typingOutcomes.set(jid, outcome);
+  logInfo(`sendPresenceUpdate('composing') ${outcome} jid=${jid}`);
+}
+
 function bareJid(value) {
   // Drop the ``:<device>`` suffix WhatsApp appends to a JID's local part. It
   // changes every time the account links a device, so two ids for one person
@@ -471,6 +500,12 @@ async function startSocket() {
 
 async function handleControl(msg) {
   if (!sock) {
+    if (msg.kind === 'typing') {
+      // The parent re-ticks every 4s while a run composes, so a session that is
+      // reconnecting would report one lost "send" per tick for a message nobody
+      // sent. Dropping the tick is the whole correct answer.
+      return;
+    }
     // Answer on the same correlation id the caller is waiting on, so a
     // request never hangs until its timeout just because we aren't paired yet.
     const kind = msg.kind === 'resolve'
@@ -623,8 +658,12 @@ async function handleControl(msg) {
     const jid = senderId.includes('@') ? senderId : `${senderId}@s.whatsapp.net`;
     try {
       await sock.sendPresenceUpdate('composing', jid);
+      noteTypingResult(jid, 'accepted');
     } catch (e) {
-      // Non-fatal.
+      // Still non-fatal — the parent re-ticks every 4s and a missing indicator
+      // must never cost the reply. But swallowing it whole is how a chat that
+      // shows no "typing…" leaves nothing anywhere to say why.
+      noteTypingResult(jid, `failed: ${describeThrown(e)}`);
     }
   } else if (msg.kind === 'logout') {
     try {
