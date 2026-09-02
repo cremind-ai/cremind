@@ -1,5 +1,5 @@
 ---
-description: "Subscribe to and manage **skill events and notifications**: `list`, `edit`, `pause`, `resume`, or `delete` a skill's event subscriptions for the active profile, `simulate` an event by dropping a markdown file in the watched folder, `stream` events and `notifications` over SSE, browse the events a skill declares (`events <skill>`), and check or start its listener daemon (`listener-status`, `listener-start`). Given an **event id / subscription id** copied from the web UI's Events page, use it here with `edit`, `pause`, `resume`, `delete`, or `simulate` to answer questions about that event or change it. `pause` keeps a subscription but stops it firing (`resume` re-enables it) without touching the skill's shared listener. Also covers **one-shot event tasks** — subscriptions registered to wait for a single occurrence, whose result is delivered back into the conversation that is waiting for it, after which they terminate; `list` shows their TASK status and TIMEOUT deadline and `edit --timeout/--no-timeout` adjusts how long they wait. Use this for events emitted by installed skills — distinct from filesystem (`cremind file-watchers`) and time (`cremind calendar`) events."
+description: "Subscribe to and manage **skill events and notifications**: `list`, `edit`, `pause`, `resume`, or `delete` a skill's event subscriptions for the active profile, `simulate` an event by dropping a markdown file in the watched folder, `stream` events and `notifications` over SSE, browse the events a skill declares (`events <skill>`), and check or start its listener daemon (`listener-status`, `listener-start`). Given an **event id / subscription id** copied from the web UI's Events page, use it here with `edit`, `pause`, `resume`, `delete`, or `simulate` to answer questions about that event or change it. `pause` keeps a subscription but stops it firing (`resume` re-enables it) without touching the skill's shared listener. **Every subscription registered from a conversation reports each run's result back into it as a new turn** — a **standing** one on every occurrence, indefinitely; a **one-shot event task** once, then it terminates. Only a subscription bound to a reserved host conversation (or one since deleted) reports nothing and surfaces as a notification only. `list` shows a task's TASK status and TIMEOUT deadline and `edit --timeout/--no-timeout` adjusts how long it waits. Use this for events emitted by installed skills — distinct from filesystem (`cremind file-watchers`) and time (`cremind calendar`) events."
 ---
 
 # `cremind skill-events` — Skill Event Subscriptions and Notifications
@@ -39,19 +39,28 @@ The group covers four orthogonal concerns:
 
 ## Standing subscriptions vs one-shot event tasks
 
-A subscription is one of two things, and the difference decides what happens
-when it fires:
+Both kinds report back. A subscription registered from a real conversation
+reports *every* run's result into that conversation as a new turn — the
+difference is only how many times it fires:
 
 - A **standing subscription** handles *every* future occurrence, indefinitely
-  ("when an important email arrives, notify me"). Each firing runs in its own
-  hidden conversation and surfaces as a notification; nothing is reported back
-  into the chat that registered it.
-- An **event task** waits for exactly *one* occurrence, because a conversation
-  cannot continue without it ("I replied to the customer — wait for their
-  answer, then draft the follow-up"). When it fires, the run's result is
-  delivered back into that conversation as a new turn, so the assistant picks
-  the flow up where it left off. Then the task terminates: `task_status` goes
-  from `active` to `completed`, and the row is kept as history.
+  ("when an important email arrives, extract who it is from and what they want,
+  and report that"). Each firing runs in its own hidden conversation; when the
+  run finishes, its result lands in the registering conversation as a new turn
+  (or is folded into a turn already running there, with a heads-up notice).
+- A **one-shot event task** waits for exactly *one* occurrence, because a
+  conversation cannot continue without it ("I replied to the customer — wait for
+  their answer, then draft the follow-up"). It reports its single result the
+  same way, so the assistant picks the flow up where it left off. Then the task
+  terminates: `task_status` goes from `active` to `completed`, and the row is
+  kept as history. Only a one-shot task carries a deadline.
+
+A subscription bound to a **reserved host conversation** — the blueprint import
+host `__skill_events__`, or the calendar UI's `__schedule__` — has nowhere to
+report, and neither does one whose conversation has since been deleted. Those
+runs still happen and still surface as notifications; they simply produce no
+turn. `cremind event-runs list` shows the difference: its DELIVERED column is
+filled in for every run that had somewhere to report, and blank only for these.
 
 Tasks are registered by the assistant while it works (they are the answer to
 "do X, wait for the outcome, then do Y"), not created from the CLI. What the
@@ -132,8 +141,8 @@ cremind skill-events list
 | `CONVERSATION` | `conversation_id`     | Conversation the subscription routes events into. Blank if none. |
 | `CONV_TITLE`   | `conversation_title`  | Title of that conversation, for readability.           |
 | `PAUSED`       | `paused`              | `yes` when retained but not firing.                    |
-| `TASK`         | `task_status`         | Blank for a standing subscription. For a one-shot task: `active` (still waiting), `triggered` (its run is in flight), `completed`, `cancelled`, or `timed_out`. |
-| `TIMEOUT`      | `timeout_at`          | A task's deadline, local time. Blank means it waits indefinitely. |
+| `TASK`         | `task_status`         | Blank for a **standing** subscription — it keeps firing, and reporting, indefinitely. For a **one-shot** task: `active` (still waiting), `triggered` (its run is in flight), `completed`, `cancelled`, or `timed_out`. |
+| `TIMEOUT`      | `timeout_at`          | A one-shot task's deadline, local time. Blank means it waits indefinitely; a standing subscription never has one. |
 
 With `--json`, returns the underlying array.
 
@@ -215,11 +224,57 @@ $ cremind skill-events edit sub_4f02 --action "summarize the PR and post it to #
 $ cremind skill-events edit sub_7c31 --timeout 120
 ```
 
+### `cremind skill-events pause`
+
+**Purpose.** Keep a subscription but stop it firing — the reversible version of
+`delete`, for a rule that is too noisy for now.
+
+**Syntax.**
+
+```bash
+cremind skill-events pause <id>
+```
+
+**Behavior.** PATCHes `paused: true` on the subscription. It is then skipped at
+dispatch, so no runs fire and nothing is reported into its conversation. The
+skill's shared listener is untouched, so sibling subscriptions on the same skill
+keep firing. Prints the updated row as a key-value table; with `--json`, returns
+the row.
+
+A paused **one-shot task** still times out — the deadline is a promise to the
+waiting conversation, not to the watcher.
+
+**Example.**
+
+```bash
+$ cremind skill-events pause sub_4f02
+```
+
+### `cremind skill-events resume`
+
+**Purpose.** Re-enable a paused subscription so it fires again.
+
+**Syntax.**
+
+```bash
+cremind skill-events resume <id>
+```
+
+**Behavior.** PATCHes `paused: false`. Firing resumes from the *next* event —
+occurrences that happened while it was paused are not replayed. Prints the
+updated row as a key-value table; with `--json`, returns the row.
+
+**Example.**
+
+```bash
+$ cremind skill-events resume sub_4f02
+```
+
 ### `cremind skill-events simulate`
 
 **Purpose.** Drop a markdown file under the subscription's watched
-events folder, simulating a real event firing. Useful for development
-and dry-running event handlers.
+events folder, simulating a real event firing. Useful for developing
+event handlers — but see the warnings below: it is **not a dry run**.
 
 **Syntax.**
 
@@ -239,13 +294,25 @@ cremind skill-events simulate <id> [--filename <name>]      # body read from std
 
 **Behavior.** Reads the markdown body from **stdin** until EOF and
 posts it to the server, which writes it under the subscription's
-watched folder. The skill's listener daemon then picks it up and
-routes it through the normal event pipeline. Silent on success.
+watched folder. The watchdog then picks it up and routes it through the
+normal event pipeline. The server returns one or more `warnings`, which the
+command prints to stderr.
 
-**Simulating a one-shot task consumes it.** The dispatcher cannot tell a
+**This is not a dry run — it sends real messages.** Two things surprise people:
+
+- **It fires every subscription for that skill event, not just `<id>`.** The
+  file lands in a folder, and the folder is keyed by `(skill, event_type)`; the
+  id in the command only picks which folder to write to. Every active
+  subscription for that pair in your profile fires (paused rules and spent
+  one-shot tasks are skipped).
+- **Each of those runs reports its result into the conversation that registered
+  it** — a real message in that chat, and if the rule was registered from a
+  Cremind room or a platform group, a real post there that other people see.
+
+**Simulating a one-shot task also consumes it.** The dispatcher cannot tell a
 simulated event from a real one, which is the point — but it means the task
 spends its single firing on your test and the real event will no longer
-trigger it. The command prints a warning to stderr when that happens.
+trigger it.
 
 **Examples.**
 

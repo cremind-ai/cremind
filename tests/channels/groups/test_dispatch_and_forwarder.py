@@ -492,3 +492,51 @@ def test_groups_are_off_for_a_notification_channel():
 def test_groups_are_off_when_the_config_switch_is():
     assert make_adapter(enabled=False).groups_enabled() is False
     assert make_adapter(enabled=True).groups_enabled() is True
+
+
+def test_an_automation_result_header_is_never_posted():
+    """The header IS the result; the answer restates it in the agent's words.
+
+    For an ordinary run the Trigger block explains what set the run off and is
+    worth showing in detail mode. For an automation reporting back it is the
+    whole result text, so sending it as well posts the same outcome twice —
+    once as machine scaffolding, once as the reply the user actually reads.
+    """
+    adapter = _adapter()
+    _run_forward(
+        adapter,
+        [
+            {"seq": 1, "type": "event_trigger_message",
+             "data": {
+                 "content": "Trigger: automation completed: Daily digest\nContent:\ntwo tickets",
+                 "metadata": {"source": "event_task_result", "trigger": True},
+             }},
+            _text("Two new tickets came in today.", seq=2),
+            _complete(),
+        ],
+        target=group_target(_group_row()),
+        response_mode="detail",
+    )
+    assert adapter.chat_sends == [("-1001", "Two new tickets came in today.")]
+    assert adapter.sent == []
+
+
+def test_the_agents_own_answer_is_not_mistaken_for_the_header():
+    """Both rows carry ``source``; only the machine block carries ``trigger``."""
+    adapter = _adapter()
+    _run_forward(
+        adapter,
+        [
+            {"seq": 1, "type": "event_trigger_message",
+             "data": {
+                 "content": "Trigger: schedule",
+                 "metadata": {"source": "event_task_result"},
+             }},
+            _text("done", seq=2),
+            _complete(),
+        ],
+        target=group_target(_group_row()),
+        response_mode="detail",
+    )
+    # No ``trigger`` marker, so this is an ordinary run's header: still sent.
+    assert adapter.chat_sends[0] == ("-1001", "Trigger: schedule")

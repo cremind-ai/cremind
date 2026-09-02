@@ -26,17 +26,25 @@ to build a listener, and how to test.
    are single-use: they are never replayed. If nobody is subscribed, the file is
    still consumed and dropped — that's by design.
 4. The content is **fanned out** to every subscription matching
-   `(profile, skill, event_type)`. Each match enqueues a run on that
-   subscription's conversation.
-5. Runs for one conversation are **sequential**; different conversations run
-   concurrently.
+   `(profile, skill, event_type)`. Each match becomes its own run.
+5. Each run executes in its **own hidden `event_run` conversation** — never in
+   the subscribed chat itself. Runs of a single subscription are sequential (one
+   FIFO per subscription); different subscriptions run concurrently, up to the
+   `[event_runs] max_parallel_runs` budget.
 6. Before spending a full turn, a cheap **relevance gate** classifies whether the
    event content satisfies the subscription's `action` condition. It **fails
    open** — if it can't decide, it runs. (So `action` can carry a fine-grained
    condition like "only when the sender is my manager".)
-7. The agent runs on the subscribed conversation with, essentially,
+7. The agent runs with, essentially,
    `action + "\n\n" + <the event file's content>`. The trigger is recorded as a
-   structured bubble in that conversation.
+   structured bubble in that hidden run conversation.
+8. When the run finishes, **its result is reported back into the conversation
+   that registered the subscription**, as a new turn there (or folded into a
+   turn already running there, with a one-line heads-up that it arrived). This
+   happens for *every* firing of a standing subscription, not just for one-shot
+   tasks. Only a subscription with nowhere to report — one bound to a reserved
+   host conversation, or to a conversation since deleted — produces no turn; its
+   runs surface as notifications only.
 
 Consequences you must design around:
 
@@ -158,20 +166,43 @@ created by the agent calling the skill's own tool with a `subscribe` object:
 ```
 subscribe:
   trigger: [new_item]          # one or more declared event names
-  action: "Summarize the item and post it to the team channel"
+  action: "Extract the item's title, owner and link, and report them"
+  task: true                   # optional — ONE-SHOT (next occurrence only)
+  timeout_minutes: 1440        # optional — only valid together with `task`
 ```
 
 - One row is written per trigger; triggers are validated against the skill's
   declared events.
-- **Subscribing is refused while the agent is itself reacting to an event**
-  (anti-recursion), so an event handler can't spawn more subscriptions.
+- **Every subscription reports its runs back.** When a run finishes, its result
+  lands in the conversation that registered the subscription as a new turn. So
+  `action` must say what to **extract and report** — "extract the sender and
+  what they are asking for, and report them", never "notify the user". The
+  reporting is automatic; an action phrased as a notification produces a turn
+  whose whole content is "I notified them", which is worth nothing to read.
+- The action must be **self-contained**: the run happens in a fresh hidden
+  conversation that sees only `action` plus the event content, so a gate can
+  reject one that leans on context the run will not have ("the file we discussed
+  earlier", "continue what I asked for").
+- **`task: true` makes the subscription ONE-SHOT**: it waits for the *next*
+  occurrence only, runs once, reports, then terminates. It requires exactly one
+  `trigger`. Without it the subscription is **standing** — it fires on every
+  occurrence, indefinitely, reporting each one.
+- **`timeout_minutes`** (1–43200, default 10080 = 7 days) is valid only
+  alongside `task`. When the deadline passes with no event, the task gives up and
+  reports "the event never fired", so the waiting conversation is not left
+  hanging.
+- Anti-recursion is two-tier. **Inside an event run, nothing can be registered
+  at all.** On a turn started by a *reported result*, only **one-shot tasks**
+  may be registered — a standing rule registered there would re-register itself
+  on every result it produced.
 - Subscriptions are per conversation and per profile. An event only fires the
   subscriptions in the same profile that declared them.
 
 Manage subscriptions from the CLI:
 
-- `cremind skill-events list` — list subscriptions (with their ids).
-- `cremind skill-events delete <sub_id>` — remove one.
+- `cremind skill-events list|edit|pause|resume|delete` — list subscriptions with
+  their ids, re-point a trigger or rewrite an action, pause one without losing
+  it (and resume it later), or remove it.
 
 ---
 
@@ -181,7 +212,7 @@ Manage subscriptions from the CLI:
 |---|---|
 | `cremind skill-events events <skill>` | List the events a skill declares (reads its `SKILL.md`). Succeeds only if the skill is **registered** — a good post-write registration check. |
 | `cremind skill-events list` | List subscriptions and their ids. |
-| `cremind skill-events simulate <sub_id>` | Inject a synthetic event for that subscription (body from stdin; optional `--filename`) and watch the conversation react. The end-to-end test. |
+| `cremind skill-events simulate <sub_id>` | Inject a synthetic event (body from stdin; optional `--filename`). The end-to-end test — but **not a dry run**: it writes a real event file, so every subscription for that skill + event type in the profile fires, and each one reports its result into its own conversation (a platform group chat, or a Cremind room, if that is where it was registered). A one-shot `task` spends its single firing on it. |
 | `cremind skill-events delete <sub_id>` | Delete a subscription. |
 | `cremind skill-events listener-status <skill>` | Listener heartbeat/status. |
 | `cremind skill-events listener-start <skill>` | Start the declared `long_running_app` listener now (also respawned on boot). |
@@ -200,6 +231,31 @@ Manage subscriptions from the CLI:
    to nobody). If it lingers, the path/format is wrong.
 3. **End-to-end:** load the skill in a conversation and ask for an automation so
    the agent subscribes; `cremind skill-events list` to get the `sub_id`; then
-   `cremind skill-events simulate <sub_id>` and confirm the conversation reacts.
+   `cremind skill-events simulate <sub_id>` and confirm the registering
+   conversation receives an `[Event result]` turn carrying what the action was
+   asked to report.
 4. **Listener (if any):** `cremind skill-events listener-start <name>` then
    `listener-status <name>`.
+
+---
+
+## 7. Volume and back-pressure
+
+One run per subscription per event file — so a chatty listener means a chatty
+chat. How many turns the user ends up reading is decided by what the listener
+emits, not by how the action is worded.
+
+- **Filter at the listener.** Dropping an uninteresting item before writing the
+  file is free. Every file written costs a run, a relevance-gate call, and
+  usually a turn in someone's conversation.
+- **Prefer digest-style actions.** "Report the one-line summary and the link" is
+  a fine thing to receive twenty times a day; "walk through the item in detail"
+  is not.
+- **Results coalesce.** A result landing while that conversation is mid-turn is
+  folded into the running turn rather than stacking up behind it.
+- **Bounded on purpose.** Only the newest `[event_runs] max_results_per_delivery`
+  (default 5) *standing* results per conversation are reported, and standing
+  results older than `undelivered_max_age_hours` (default 72h) are dropped as
+  stale. Dropped results show as `skipped` in `cremind event-runs list`. One-shot
+  task results are never dropped by either bound — one more reason to use
+  `task: true` when a conversation genuinely depends on one specific outcome.

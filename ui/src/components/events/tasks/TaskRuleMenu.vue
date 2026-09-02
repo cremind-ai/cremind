@@ -95,7 +95,9 @@ function onCommand(cmd: RuleAction) {
           <ElDropdownItem v-if="scheduleActionable" command="edit">
             <Icon icon="mdi:pencil-outline" /> Edit event
           </ElDropdownItem>
-          <ElDropdownItem v-if="scheduleActionable" command="toggle-pause">
+          <!-- A one-shot schedule cannot be paused (the server answers 400
+               task_pause_unsupported), so don't offer it — matches the table. -->
+          <ElDropdownItem v-if="scheduleActionable && !sub.eventTask" command="toggle-pause">
             <Icon :icon="isPaused ? 'mdi:play' : 'mdi:pause'" />
             {{ isPaused ? 'Resume' : 'Pause' }}
           </ElDropdownItem>

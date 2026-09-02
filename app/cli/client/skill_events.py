@@ -41,8 +41,11 @@ async def simulate_skill_event(
 ) -> dict[str, Any]:
     """Drop a synthetic event file. Returns the server's payload.
 
-    The payload carries ``task_warning`` when the target is a one-shot task,
-    because simulating one really consumes its single firing.
+    The payload carries ``warnings`` (a list of strings): always one saying that
+    every active subscription for that skill/event fires and each run reports
+    its result into the conversation that registered it, plus a second when the
+    target is a one-shot task, because simulating one really consumes its
+    single firing.
     """
     body: dict[str, str] = {"content": content}
     if filename:

@@ -65,13 +65,20 @@ def test_a_one_time_event_is_a_task(monkeypatch):
     assert "Do NOT wait, sleep, or poll" in out["message"]
 
 
-def test_a_recurring_event_is_not_a_task(monkeypatch):
+def test_a_recurring_event_is_not_a_task_but_still_reports_back(monkeypatch):
+    """``task`` means ONE-SHOT, and a recurrence is not one.
+
+    It still reports, though — every firing comes back to the chat that created
+    it — so the confirmation has to say that, or the model tells the user their
+    "every day at 8pm" digest will only show up on the Events page.
+    """
     prov = _FakeProvider()
     out = _drive({**_BASE, "rrule": "FREQ=DAILY"}, prov, monkeypatch)
     assert prov.created["task"] is False
     assert out["task"] is False
-    # And the model is told plainly that nothing comes back.
-    assert "do NOT come back to this chat" in out["message"]
+    assert "reports the result back into THIS conversation" in out["message"]
+    assert "do NOT come back to this chat" not in out["message"]
+    assert "do NOT wait, sleep, or poll" in out["message"]
 
 
 @pytest.mark.parametrize("extra", [
@@ -113,4 +120,7 @@ def test_the_result_reports_what_the_row_actually_says(monkeypatch):
 
     out = _drive(dict(_BASE), _RefusingProvider(), monkeypatch)
     assert out["task"] is False
-    assert "do NOT come back to this chat" in out["message"]
+    # A row that can never fire promises nothing — the one failure this must
+    # not have is telling the user to expect a report that never arrives.
+    assert "will never fire" in out["message"]
+    assert "nothing will be reported back" in out["message"]

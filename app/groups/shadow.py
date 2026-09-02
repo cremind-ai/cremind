@@ -110,11 +110,20 @@ async def delete_shadow_conversation(
     conversation_storage: Any, group_id: str, profile: str,
     conversation_id: Optional[str] = None,
 ) -> None:
-    """Tear a seat down completely — runtime state first, then the row.
+    """Tear a seat down completely — everything homed on it, then the row.
 
-    Mirrors :func:`app.events.run_lifecycle.discard_run_conversation`: dropping
-    only the row would leave a queue worker, a stream-bus entry and possibly a
-    run binding pointing at a conversation that no longer exists.
+    A seat is not a scratch conversation: a member can register automations from
+    it, so it owns rules, their run history and their hidden run conversations
+    exactly like an ordinary chat. It therefore goes through the same teardown
+    every other conversation-delete path uses, which cancels in-flight runs,
+    deletes the runs and their hidden conversations, disarms file watchers,
+    removes schedules, and drops the queue / stream-bus / inbox state this used
+    to discard by hand.
+
+    Order is load-bearing: the cascade finds those rules BY conversation id, and
+    the FK cascade behind ``delete_conversation`` would have deleted them first,
+    turning the whole teardown into a silent no-op that leaks run rows, hidden
+    conversations and live watchdog observers.
     """
     from app.storage import get_group_chat_storage
 
@@ -125,15 +134,11 @@ async def delete_shadow_conversation(
         conv_id = (member or {}).get("shadow_conversation_id")
     if conv_id:
         try:
-            from app.events import queue as event_queue
-            from app.events import task_result_inbox
-            from app.events.stream_bus import get_event_stream_bus
+            from app.reset._conversations import cleanup_conversation_dependents
 
-            event_queue.discard_queue(conv_id)
-            await get_event_stream_bus().discard(conv_id)
-            task_result_inbox.discard(conv_id)
+            await cleanup_conversation_dependents(conversation_storage, conv_id)
         except Exception:  # noqa: BLE001
-            logger.exception(f"[group] failed to discard runtime state for {conv_id}")
+            logger.exception(f"[group] dependent teardown failed for seat {conv_id}")
         try:
             await conversation_storage.delete_conversation(conv_id)
         except Exception:  # noqa: BLE001

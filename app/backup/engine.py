@@ -439,13 +439,63 @@ def _sha256_file(path: Path) -> str:
 # ── apply ──────────────────────────────────────────────────────────────────
 
 
-def apply_staged_restore(staged_dir: Path, *, target_system_dir: str) -> RestoreReport:
+def _close_out_undelivered_event_results(engine: Any) -> int:
+    """Stop restored event results from being reported into live chats.
+
+    ``event_runs`` travels inside every archive, delivery state and all, and the
+    exactly-once lock IS one of its columns — so a restore rewinds it. Without
+    this the next boot's sweep would report an archive's owed results into
+    whatever conversations survived, including a Cremind room or a Telegram
+    group, and would report a second time anything delivered after the backup
+    was taken.
+
+    ``pending`` rows are left alone: they hold no result yet (the run stopped to
+    ask a question), so a human answering later produces a fresh outcome rather
+    than a replay. Returns the number closed out, or -1 when it could not run.
+    """
+    from sqlalchemy import update as sa_update
+
+    from app.storage.models import EventRunModel
+
+    now_ms = time.time() * 1000
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(
+                sa_update(EventRunModel.__table__)
+                .where(
+                    EventRunModel.__table__.c.deliver_to_origin.is_(True),
+                    EventRunModel.__table__.c.origin_delivered_at.is_(None),
+                    EventRunModel.__table__.c.status != "pending",
+                )
+                .values(origin_delivered_at=now_ms, origin_delivery_mode="skipped")
+            )
+        return int(result.rowcount or 0)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[backup:restore] could not close out undelivered event results",
+            exc_info=True,
+        )
+        return -1
+
+
+def apply_staged_restore(
+    staged_dir: Path,
+    *,
+    target_system_dir: str,
+    close_out_owed_results: bool = True,
+) -> RestoreReport:
     """Import the staged DB dump into the target's provider, relocate paths, and
     replace the file trees under ``target_system_dir``.
 
     Leaves the DB at head. Resolves the database provider from the *target's*
     bootstrap (which is how SQLite→Postgres works). Disposes the engine at the
     end so the subsequent boot rebuilds a clean provider.
+
+    ``close_out_owed_results`` is what stops an archive's event results from
+    being replayed into live conversations. A ROLLBACK passes ``False``: it
+    restores this install's own state from minutes ago, so its owed results are
+    genuinely still owed and discarding them would be the rollback quietly
+    breaking flows it was supposed to leave untouched.
     """
     from app.databases import get_database_provider, set_database_provider
     from app.storage import migrations
@@ -484,6 +534,13 @@ def apply_staged_restore(staged_dir: Path, *, target_system_dir: str) -> Restore
 
         migrations.upgrade("head")
 
+        # After the head upgrade, so the delivery columns exist even when the
+        # archive predates them.
+        closed_out = (
+            _close_out_undelivered_event_results(engine)
+            if close_out_owed_results else 0
+        )
+
         # Re-pin the local secret — overwrites any value an older archive
         # carried and guarantees the row exists for newer archives that omit it
         # — then re-mint each restored profile's token file under it.
@@ -513,6 +570,19 @@ def apply_staged_restore(staged_dir: Path, *, target_system_dir: str) -> Restore
             f"{len(report.unmapped)} stored path(s) point outside the backed-up "
             f"home/system directories and were left unchanged; processes that use "
             f"them may fail until fixed."
+        )
+    if closed_out > 0:
+        warnings.append(
+            f"{closed_out} automation result(s) that had not yet reached their "
+            f"conversation were closed out (marked 'skipped') and will not be "
+            f"reported — a restore never replays results into chats, rooms or "
+            f"channel groups."
+        )
+    elif closed_out < 0:
+        warnings.append(
+            "Could not close out the archive's undelivered automation results; "
+            "the next boot may report results from this backup into live "
+            "conversations."
         )
 
     logger.info(
@@ -620,17 +690,28 @@ def _restore_file_trees(staged_dir: Path, target_system_dir: str) -> int:
 
 
 def restore_backup(
-    archive: Path, passphrase: str | None = None, *, target_system_dir: str
+    archive: Path,
+    passphrase: str | None = None,
+    *,
+    target_system_dir: str,
+    close_out_owed_results: bool = True,
 ) -> RestoreReport:
     """One-shot stage + apply, cleaning up the temp staging dir.
 
     Used by the offline CLI and the setup-mode (fresh install) path, where
-    there is no live server to quiesce and no restart is needed.
+    there is no live server to quiesce and no restart is needed — and by the
+    rollback of a failed restore, which passes ``close_out_owed_results=False``
+    because it is putting this install's own state back, not replaying someone
+    else's archive.
     """
     tmp = Path(tempfile.mkdtemp(prefix="cremind-restore-"))
     try:
         staged = stage_backup(Path(archive), passphrase, tmp)
-        report = apply_staged_restore(staged.staging_dir, target_system_dir=target_system_dir)
+        report = apply_staged_restore(
+            staged.staging_dir,
+            target_system_dir=target_system_dir,
+            close_out_owed_results=close_out_owed_results,
+        )
         report.warnings.extend(staged.verify_warnings)
         return report
     finally:

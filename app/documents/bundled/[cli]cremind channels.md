@@ -575,6 +575,16 @@ profile's notification stream — the same automation/event activity the web UI
 shows (schedule / file-watcher / skill-event runs, run errors, pending prompts) —
 and forwards entries that pass a **filter** to the chat.
 
+**Notification vs delivery.** A notification is a *headline*, not the work. Every
+rule registered from a conversation reports each run's actual answer back into
+that conversation, as a new turn there — independently of any notification
+channel, and that is where you read it. A notification-mode channel only mirrors
+the fact that something happened, filtered as below; muting, filtering or
+deleting one changes what you are *told*, never what the agent does or where its
+answer lands. The exception is a rule with nowhere to report — one bound to a
+reserved host conversation, or to a conversation since deleted — for which the
+notification is all there is.
+
 **Transports.** Telegram notification runs over a normal bot (BotFather token —
 no account login). WhatsApp notification runs over your linked WhatsApp account
 (same QR pairing as its userbot mode).

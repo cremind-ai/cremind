@@ -35,6 +35,14 @@ TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 # the user's reply and must remain answerable).
 ACTIVE_STATUSES = ("running", "pending")
 
+# When a run's result actually became available. The inbox is ordered by this
+# rather than by ``created_at`` (fire time) because a run that parked ``pending``
+# on a question for hours finishes AFTER runs that fired later — and the
+# coalesced turn tells the model the results are "in the order they finished".
+_TERMINAL_TS = func.coalesce(
+    EventRunModel.finished_at, EventRunModel.updated_at, EventRunModel.created_at,
+)
+
 
 class EventRunStorage:
     """Async CRUD + aggregates + retention for ``event_runs``."""
@@ -226,15 +234,39 @@ class EventRunStorage:
                 .values(origin_delivery_mode=mode)
             )
 
+    async def close_out_delivery(self, run_id_pk: str, mode: str = "skipped") -> bool:
+        """Take a result out of the inbox WITHOUT reporting it.
+
+        For results that must never reach a conversation: a cancelled run, an
+        origin that no longer exists, a stale or over-the-cap standing result,
+        and every owed result a restore brought back from an archive.
+
+        The lock is :meth:`claim_delivery`'s conditional UPDATE — this adds no
+        second one. A sibling that already claimed the row makes this return
+        ``False`` and nothing is written, which is what keeps "closed out" and
+        "delivered" mutually exclusive. Setting ``origin_delivered_at`` also
+        un-pins the row from the retention prune, so a closed-out backlog can
+        finally age out of ``event_runs``.
+        """
+        if not await self.claim_delivery(run_id_pk):
+            return False
+        await self.set_delivery_mode(run_id_pk, mode)
+        return True
+
     async def list_pending_for_origin(
         self, origin_conversation_id: str,
     ) -> list[dict[str, Any]]:
-        """A conversation's pending-results inbox, oldest first.
+        """A conversation's pending-results inbox, oldest FINISHED first.
 
         The same predicate as :meth:`list_undelivered_task_runs`, sliced by
-        origin: a terminal task run that has not been handed over yet *is* the
+        origin: a terminal run that has not been handed over yet *is* the
         inbox entry — parking a result writes nothing, because the terminal
         status write already put the row in this set.
+
+        Deliberately unbounded: the caller must SEE every owed row, because
+        whatever it decides not to report it has to close out through
+        :meth:`close_out_delivery`. A SQL ``LIMIT`` here would hide those rows
+        and leave them owed (and unprunable) forever.
 
         ``cancelled`` is deliberately excluded. A cancelled run is a deliberate
         kill from the Events page, and v1 terminates it quietly; surfacing "your
@@ -250,17 +282,20 @@ class EventRunStorage:
         ]
         async with self.async_session_maker() as session:
             rows = (await session.execute(
-                select(EventRunModel).where(*conds).order_by(EventRunModel.created_at.asc())
+                select(EventRunModel)
+                .where(*conds)
+                .order_by(_TERMINAL_TS.asc(), EventRunModel.created_at.asc())
             )).scalars().all()
         return [self._row_to_dict(r) for r in rows]
 
     async def list_undelivered_task_runs(
         self, profile: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Terminal task runs whose result never reached the origin chat.
+        """Terminal runs whose result never reached the origin chat.
 
         The boot sweep's work list: a crash between the terminal status write
-        and the injection leaves exactly these rows behind.
+        and the injection leaves exactly these rows behind. Ordered oldest
+        FINISHED first, like :meth:`list_pending_for_origin`.
         """
         conds = [
             EventRunModel.deliver_to_origin.is_(True),
@@ -271,7 +306,9 @@ class EventRunStorage:
             conds.append(EventRunModel.profile == profile)
         async with self.async_session_maker() as session:
             rows = (await session.execute(
-                select(EventRunModel).where(*conds).order_by(EventRunModel.created_at.asc())
+                select(EventRunModel)
+                .where(*conds)
+                .order_by(_TERMINAL_TS.asc(), EventRunModel.created_at.asc())
             )).scalars().all()
         return [self._row_to_dict(r) for r in rows]
 
@@ -469,10 +506,18 @@ class EventRunStorage:
         ``pending`` runs are left as-is — their reply path is DB-backed and
         survives a restart, so they remain answerable. Returns the count fixed.
 
-        An interrupted EVENT TASK run keeps ``deliver_to_origin`` here, so the
-        boot delivery sweep still reports the failure into the conversation
-        that was waiting on it rather than leaving the flow hanging.
+        An interrupted run keeps ``deliver_to_origin`` here, so the boot
+        delivery sweep still reports the failure into the conversation that was
+        waiting on it rather than leaving the flow hanging.
+
+        ``finished_at`` is stamped from the row's own last activity, NOT from
+        boot time. A three-week outage would otherwise make every interrupted
+        run look like it finished seconds ago, and the delivery age bound — the
+        one thing standing between that outage and a backlog of stale reports
+        landing in people's chats — would never fire for exactly the population
+        a long outage produces.
         """
+        now_ms = time.time() * 1000
         async with self.async_session_maker.begin() as session:
             result = await session.execute(
                 update(EventRunModel)
@@ -480,8 +525,13 @@ class EventRunStorage:
                 .values(
                     status="failed",
                     error="Interrupted by server restart",
-                    finished_at=time.time() * 1000,
-                    updated_at=time.time() * 1000,
+                    finished_at=func.coalesce(
+                        EventRunModel.finished_at,
+                        EventRunModel.updated_at,
+                        EventRunModel.created_at,
+                        now_ms,
+                    ),
+                    updated_at=now_ms,
                 )
             )
             n = result.rowcount or 0

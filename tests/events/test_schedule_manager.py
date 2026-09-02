@@ -202,3 +202,37 @@ def test_manager_skips_disabled_profile(tmp_path, monkeypatch):
 
     asyncio.run(run())
     assert recorded == []  # disabled profile: nothing armed, nothing fired
+
+
+def test_a_recurring_schedule_keeps_the_conversation_it_reports_to(tmp_path, monkeypatch):
+    """"Every day at 8 PM, compile the news and tell me."
+
+    A recurrence is not a one-shot task, so it is never claimed and never
+    terminates — and each firing still has to carry the conversation that
+    created it, because that is where the delivery layer reports the result.
+    """
+    store = _make_store(tmp_path)
+    _seed(store)
+    recorded = _wire(monkeypatch, store)
+
+    fire_at = time.time() + 0.3
+    row = store.insert(
+        conversation_id="c1", profile="admin", title="news digest",
+        action="compile the day's headlines", schedule_kind="recurrence",
+        dtstart=R.format_local(R.from_epoch(fire_at)), duration_minutes=30,
+        next_fire_at=fire_at, rrule="FREQ=DAILY", recurrence_end_type="never",
+    )
+
+    async def run():
+        mgr = sm.ScheduleManager()
+        mgr.start(asyncio.get_running_loop())
+        await asyncio.sleep(0.9)
+        mgr.stop()
+
+    asyncio.run(run())
+
+    assert len(recorded) == 1
+    assert recorded[0]["conversation_id"] == "c1"
+    assert recorded[0]["sub"]["task"] is False, "a recurrence is not a one-shot"
+    # Still armed for tomorrow: the rule reports again rather than ending.
+    assert store.get(row["id"])["status"] == "active"

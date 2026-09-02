@@ -1,9 +1,10 @@
-"""``get_event_task_results`` built-in tool — pull waiting event-task results.
+"""``get_event_task_results`` built-in tool — pull waiting automation results.
 
-An *event task* is a one-shot event the agent registered mid-flow because it
-cannot finish without the outcome ("open the PR, wait for CI, then merge"). When
-one finishes while this conversation is idle, its result arrives on its own as a
-new turn and this tool is never needed.
+A result here is the outcome of an automation registered from this conversation:
+a ONE-SHOT task the agent is waiting on ("open the PR, wait for CI, then merge")
+or a STANDING rule that reports after every run ("summarize every new email").
+When one finishes while this conversation is idle, its result arrives on its own
+as a new turn and this tool is never needed.
 
 When it finishes while a turn is RUNNING, injecting it would only queue it
 behind that turn (one conversation runs one turn at a time), so it waits in the
@@ -47,17 +48,20 @@ _NO_CONTEXT = (
 class GetEventTaskResultsTool(BuiltInTool):
     name: str = "get_event_task_results"
     description: str = (
-        "Read the results of one-shot event tasks that finished while this "
-        "conversation was busy and are waiting to be handed to you. Call this "
-        "when a notice tells you results are waiting AND the outcome affects "
-        "what you should do next — for example you registered a task earlier in "
-        "this flow and have now reached the step that was waiting on it. Takes "
-        "no arguments: one call returns EVERY result currently waiting and hands "
-        "them all over, so call it once, not once per result. If you do NOT call "
-        "it, the waiting results are delivered automatically as a new turn the "
-        "moment this turn ends — so ignoring the notice is a legitimate choice "
-        "when you are in the middle of something unrelated. Do not re-register a "
-        "task that has just finished."
+        "Read the results of automations registered from this conversation — "
+        "one-shot tasks and standing rules alike — whose runs finished while "
+        "this conversation was busy and are waiting to be handed to you. Call "
+        "this when a notice tells you results are waiting AND the outcome "
+        "affects what you should do next — for example you registered a "
+        "one-shot task earlier in this flow and have now reached the step that "
+        "was waiting on it, or a standing rule's result changes what you are "
+        "doing. Takes no arguments: one call returns EVERY result currently "
+        "waiting and hands them all over, so call it once, not once per result. "
+        "If you do NOT call it, the waiting results are delivered automatically "
+        "as a new turn the moment this turn ends — so ignoring the notice is a "
+        "legitimate choice when you are in the middle of something unrelated. Do "
+        "not re-register a one-shot task that has just finished, and never "
+        "re-register a standing rule — it is still active and will report again."
     )
     parameters: Dict[str, Any] = {
         "type": "object",

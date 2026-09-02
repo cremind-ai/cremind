@@ -32,6 +32,24 @@ const openable = computed(() =>
   store.runsForSubscription(props.entry.kind, props.entry.id),
 );
 
+// Every rule registered from a real conversation reports EACH run's result back
+// into it — one-shot or standing. The exception is a rule bound to a reserved
+// host conversation (the calendar UI's `__schedule__`, the blueprint import
+// host): nobody reads those, so such a run can only raise a notification. An
+// event made on the calendar is always one of them.
+const notificationOnly = computed(() => {
+  const e = props.entry;
+  if (e.conversationId.startsWith('__')) return true;
+  return e.kind === 'schedule' && e.raw.source === 'manual';
+});
+const reportsHint = computed(() =>
+  notificationOnly.value
+    ? 'Made on the calendar, so there is no chat to report into — each run only '
+      + 'raises a notification.'
+    : 'Every run reports its result back into the conversation that registered '
+      + 'this rule, as a new turn.',
+);
+
 const listener = computed<ListenerStatus | null>(() =>
   props.entry.kind === 'skill_event'
     ? props.listeners[props.entry.skillName] ?? null
@@ -150,7 +168,7 @@ function open() {
       <span
         v-if="entry.eventTask"
         class="ic-oneshot"
-        title="One-shot task: fires once, returns its result to the conversation that registered it, then ends."
+        title="One-shot task: waits for the next occurrence only, runs once, reports, then ends — a standing rule keeps firing."
       >
         one-shot
       </span>
@@ -190,6 +208,13 @@ function open() {
       </template>
       <span v-else>No runs yet</span>
       <span v-if="summary?.pending_count" class="ic-waiting">· {{ summary.pending_count }} waiting</span>
+      <!-- Where a run's result goes. Worth a line: a rule that reports into a
+           chat is a very different thing from one that only notifies. -->
+      <span class="ic-reports" :title="reportsHint">
+        ·
+        <Icon :icon="notificationOnly ? 'mdi:bell-outline' : 'mdi:reply'" />
+        {{ notificationOnly ? 'notification only' : 'reports to chat' }}
+      </span>
       <EventIdChip :id="entry.id" kind="event" size="xs" class="ic-id" />
     </div>
   </article>
@@ -301,5 +326,11 @@ function open() {
   display: inline-block;
 }
 .ic-waiting { color: var(--warning-color, #e6a23c); }
+.ic-reports {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+}
 .ic-id { margin-left: auto; }
 </style>

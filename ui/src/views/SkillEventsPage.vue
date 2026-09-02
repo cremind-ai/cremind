@@ -235,8 +235,10 @@ function onViewChange(mode: string | number | boolean | undefined) {
     <template v-else>
     <CollapsibleSection title="Skill Events" icon="mdi:lightning-bolt-outline" :count="sortedSubs.length">
     <p class="page-blurb">
-      Each subscription re-runs its conversation with the saved <em>action</em> whenever a new
-      event file appears in the skill's <code>events/&lt;event_type&gt;/</code> folder.
+      Each subscription runs the saved <em>action</em> whenever a new event file
+      appears in the skill's <code>events/&lt;event_type&gt;/</code> folder. The run
+      happens in a hidden per-run conversation, and its result is reported back
+      into the conversation that subscribed.
       Subscriptions are made by the assistant when you ask for an automation
       (e.g. "when a new email arrives, summarize it").
     </p>

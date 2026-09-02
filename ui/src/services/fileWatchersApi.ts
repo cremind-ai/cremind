@@ -37,7 +37,12 @@ export interface FileWatcherSubscription {
   armed: boolean;
   paused: boolean;
   created_at: number;
-  /** One-shot task: fires once, returns its result to `conversation_id`, ends. */
+  /**
+   * ONE-SHOT task: waits for the next matching file event only, runs once,
+   * reports, then ends (optionally giving up at `timeout_at`). Reporting is not
+   * what makes it a task — a standing watcher fires forever and reports EVERY
+   * run's result back into `conversation_id` too.
+   */
   task: boolean;
   task_status: EventTaskStatus | null;
   timeout_at: number | null;   // epoch SECONDS (event runs use ms)

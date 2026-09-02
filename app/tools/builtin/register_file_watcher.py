@@ -130,23 +130,26 @@ def _auto_name(root_path: str, extensions: List[str], target_kind: str) -> str:
 class RegisterFileWatcherTool(BuiltInTool):
     name: str = "register_file_watcher"
     description: str = (
-        "Register a watcher on a directory that re-runs an action (or notifies "
-        "the user) whenever files or folders inside it are created, modified, "
-        "deleted, or moved. Use this when the user asks to be notified or to "
-        "take action whenever something happens to a file or folder on disk. "
-        "Requires at minimum `path` and `action`. Defaults: `triggers` = all "
-        "four events (created, modified, deleted, moved); `target_kind` = any "
-        "(file / folder / any); `recursive` = true; `extensions` = none "
-        "(match all). `action` is a natural-language instruction the assistant "
-        "executes when the watcher fires — do not embed event metadata into it; "
-        "the runtime appends a structured Content block describing the event "
-        "automatically. Example: 'when a python file changes in MyDocs, notify "
-        "me' → path='MyDocs', triggers=['modified','created'], "
-        "target_kind='file', extensions=['.py'], action='notify the user about "
-        "the change'. Add `task: true` instead when the user is waiting for ONE "
-        "specific file event before the conversation can continue (a report to "
-        "land, an export to finish, an error log to be written): the watcher "
-        "then fires once and its outcome comes back to this chat."
+        "Register a watcher on a directory that runs an action whenever files "
+        "or folders inside it are created, modified, deleted, or moved. Use "
+        "this when the user asks to be told about, or to act on, something "
+        "happening to a file or folder on disk. Requires at minimum `path` and "
+        "`action`. Defaults: `triggers` = all four events (created, modified, "
+        "deleted, moved); `target_kind` = any (file / folder / any); "
+        "`recursive` = true; `extensions` = none (match all). `action` is a "
+        "natural-language instruction the assistant executes when the watcher "
+        "fires — do not embed event metadata into it; the runtime appends a "
+        "structured Content block describing the event automatically. Every "
+        "run's outcome is reported back into THIS conversation when it "
+        "finishes, whether the watcher is standing or one-shot, so write "
+        "`action` to extract and report — never to notify. Example: 'when a "
+        "python file changes in MyDocs, tell me what changed' → path='MyDocs', "
+        "triggers=['modified','created'], target_kind='file', "
+        "extensions=['.py'], action='summarise what changed in the file'. Add "
+        "`task: true` when the user is waiting for ONE specific file event "
+        "before the conversation can continue (a report to land, an export to "
+        "finish, an error log to be written): the watcher then fires once, "
+        "reports back, and removes itself."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -231,18 +234,18 @@ class RegisterFileWatcherTool(BuiltInTool):
                 "description": (
                     "Set true to make this a ONE-SHOT TASK instead of a standing "
                     "watcher: it fires on the FIRST matching event only, runs "
-                    "`action` once in the background, delivers the outcome back "
+                    "`action` once in the background, reports the outcome back "
                     "into THIS conversation as a new turn (where you continue "
                     "the user's flow), then removes itself. Use it whenever the "
                     "request has a 'do X, wait for the file, then do Y' shape "
                     "(run the job and wait for its output; trigger the bug and "
-                    "wait for the error log). Leave it off only for a standing "
-                    "rule that must handle EVERY future occurrence indefinitely "
-                    "— a standing rule's runs never report back here. With "
-                    "task=true, write `action` so it EXTRACTS and REPORTS what "
-                    "you need (e.g. 'read the log and report the error and stack "
-                    "trace'); do NOT ask it to notify the user — you do that "
-                    "here when the result arrives."
+                    "wait for the error log). Leave it off for a standing rule "
+                    "that must handle EVERY future occurrence — a standing "
+                    "watcher stays active and reports back here after each run, "
+                    "until it is deleted. In both cases write `action` so it "
+                    "EXTRACTS and REPORTS what you need (e.g. 'read the log and "
+                    "report the error and stack trace'); do NOT ask it to notify "
+                    "the user — you do that here when the result arrives."
                 ),
             },
             "timeout_minutes": {
@@ -252,10 +255,11 @@ class RegisterFileWatcherTool(BuiltInTool):
                 "description": (
                     "Only valid together with task=true: give up after this many "
                     "minutes if no matching file event happens. On timeout a "
-                    "'timed out' result is delivered back into this "
+                    "'timed out' result is reported back into this "
                     "conversation, so the flow is never left hanging. Omit for "
                     f"the default ({TASK_TIMEOUT_DEFAULT_MINUTES} = 7 days). "
-                    "Never send it without task=true."
+                    "Never send it without task=true — a standing watcher has no "
+                    "deadline."
                 ),
             },
         },
@@ -432,7 +436,7 @@ class RegisterFileWatcherTool(BuiltInTool):
                 f"FIRST matching {triggers_list} event ({target_summary}, "
                 f"{ext_summary})"
                 f"{format_timeout_clause(timeout_at, timeout_minutes)}, runs "
-                f"\"{action}\" once in a background conversation, delivers the "
+                f"\"{action}\" once in a background conversation, reports the "
                 "outcome back into THIS conversation as a new turn, then removes "
                 "itself. Register any further tasks now, then END YOUR TURN with "
                 "a short message telling the user exactly what you are waiting "
@@ -443,8 +447,12 @@ class RegisterFileWatcherTool(BuiltInTool):
             confirmation = (
                 f"Registered file watcher '{name}' (ID: {row['id']}) on "
                 f"{resolved_path} ({recursive_summary}). Triggers: {triggers_list}. "
-                f"Watching {target_summary} ({ext_summary}). "
-                f"When a matching event fires, I'll run: {action}."
+                f"Watching {target_summary} ({ext_summary}). Each time a matching "
+                f"event fires I'll run \"{action}\" in a background conversation "
+                "and report the result back here as a new turn; the watcher stays "
+                f"active until it is deleted (delete_file_watcher id={row['id']}). "
+                "Finish this turn with a short confirmation to the user — do not "
+                "wait for the first run."
             )
         if not armed:
             confirmation += (

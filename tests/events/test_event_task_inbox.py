@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from pathlib import Path
 
 import pytest
@@ -392,7 +393,7 @@ def test_a_read_cancelled_midway_releases_its_claims(tmp_path, monkeypatch):
         )
 
         # Blow up after the claims are taken, while the text is being built.
-        def _boom(_items):
+        def _boom(_items, **_kwargs):
             raise asyncio.CancelledError()
 
         monkeypatch.setattr(etd, "build_read_result_text", _boom)
@@ -405,6 +406,308 @@ def test_a_read_cancelled_midway_releases_its_claims(tmp_path, monkeypatch):
     rid, still_pending = asyncio.run(_run())
     assert [r["id"] for r in still_pending] == [rid], "the result must survive a Stop"
     assert asyncio.run(ers.get(rid))["origin_delivered_at"] is None
+
+
+async def _standing_run(
+    cs, ers, subs, origin_id, *, label="imap-email:new-mail", answer=None,
+    finished_at=None,
+):
+    """A STANDING rule's run that has just gone terminal.
+
+    No claim: a standing rule is never spent, which is exactly what makes it
+    able to report again tomorrow.
+    """
+    sub = subs.insert(
+        conversation_id=origin_id, profile="p1", skill_name="imap-email",
+        event_type="new-mail", action="summarize it", task=False,
+    )
+    run_conv = await cs.create_conversation(profile="p1", title="run", kind="event_run")
+    if answer:
+        await cs.add_message(
+            conversation_id=run_conv["id"], role="agent", content=answer,
+        )
+    created = await ers.create(
+        profile="p1", source_kind="skill_event", subscription_id=sub["id"],
+        conversation_id=run_conv["id"], label=label, action="summarize it",
+        trigger_payload={"once": False}, origin_conversation_id=origin_id,
+        deliver_to_origin=True,
+    )
+    rid = created["run"]["id"]
+    await ers.update_status(rid, status="completed", mark_finished=True)
+    if finished_at is not None:
+        await _set_finished_at(ers, rid, finished_at)
+    return rid, sub
+
+
+async def _set_finished_at(ers, run_id: str, value: float) -> None:
+    """Backdate a run so the age bound has something to act on."""
+    from sqlalchemy import text as _text
+
+    async with ers.async_session_maker.begin() as session:
+        await session.execute(
+            _text("UPDATE event_runs SET finished_at = :v WHERE id = :i"),
+            {"v": value, "i": run_id},
+        )
+
+
+# ── volume bounds ───────────────────────────────────────────────────────────
+
+
+def test_only_the_newest_standing_results_are_reported(tmp_path, monkeypatch):
+    """A rule that fires faster than the chat answers must not flood it.
+
+    The newest results are worth reading; the backlog behind them is not. What
+    is dropped is still named in the turn, because a result vanishing without
+    trace is worse than a slightly longer message.
+    """
+    cs, ers, subs, _, queued, _ = _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "app.events.run_config.max_results_per_delivery", lambda: 2,
+    )
+
+    async def _run():
+        origin = await cs.create_conversation(profile="p1", title="Mail")
+        now_ms = time.time() * 1000
+        ids = []
+        for i in range(4):
+            rid, _ = await _standing_run(
+                cs, ers, subs, origin["id"], label=f"rule-{i}",
+                answer=f"summary {i}", finished_at=now_ms + i,
+            )
+            ids.append(rid)
+        outcome = await etd.flush_origin_inbox(
+            conversation_id=origin["id"], profile="p1", reason="idle",
+        )
+        rows = [await ers.get(r) for r in ids]
+        return ids, outcome, rows
+
+    ids, outcome, rows = asyncio.run(_run())
+
+    assert len(queued) == 1, "one turn, however deep the backlog"
+    query = queued[0]["query"]
+    assert "summary 2" in query and "summary 3" in query
+    assert "summary 0" not in query and "summary 1" not in query
+    # The dropped ones are named, not just counted.
+    assert "rule-0" in query and "rule-1" in query
+    assert "dropped without being reported" in query
+
+    assert outcome.claimed == {ids[2], ids[3]}
+    assert outcome.dropped == frozenset({ids[0], ids[1]})
+    assert [r["origin_delivery_mode"] for r in rows[:2]] == ["skipped", "skipped"]
+    assert [r["origin_delivery_mode"] for r in rows[2:]] == ["injected", "injected"]
+
+
+def test_one_shot_results_are_never_dropped_by_the_cap(tmp_path, monkeypatch):
+    """Each was explicitly awaited by a flow that cannot continue without it."""
+    cs, ers, subs, _, queued, _ = _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "app.events.run_config.max_results_per_delivery", lambda: 2,
+    )
+
+    async def _run():
+        origin = await cs.create_conversation(profile="p1", title="Mail")
+        for i in range(4):
+            await _task_run(
+                cs, ers, subs, origin["id"], label=f"task-{i}",
+                answer=f"outcome {i}", trigger_payload={"once": True},
+            )
+        return await etd.flush_origin_inbox(
+            conversation_id=origin["id"], profile="p1", reason="idle",
+        )
+
+    outcome = asyncio.run(_run())
+    assert len(outcome.claimed) == 4
+    assert outcome.dropped == frozenset()
+    assert all(f"outcome {i}" in queued[0]["query"] for i in range(4))
+
+
+def test_results_older_than_the_age_bound_are_closed_out(tmp_path, monkeypatch):
+    """After a week of downtime, "here is today's news" x7 is noise."""
+    cs, ers, subs, _, queued, _ = _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "app.events.run_config.undelivered_max_age_hours", lambda: 1,
+    )
+
+    async def _run():
+        origin = await cs.create_conversation(profile="p1", title="Mail")
+        now_ms = time.time() * 1000
+        old, _ = await _standing_run(
+            cs, ers, subs, origin["id"], label="yesterday", answer="stale news",
+            finished_at=now_ms - 5 * 3600 * 1000,
+        )
+        fresh, _ = await _standing_run(
+            cs, ers, subs, origin["id"], label="today", answer="fresh news",
+            finished_at=now_ms - 60 * 1000,
+        )
+        outcome = await etd.flush_origin_inbox(
+            conversation_id=origin["id"], profile="p1", reason="idle",
+        )
+        return old, fresh, outcome, await ers.get(old)
+
+    old, fresh, outcome, old_row = asyncio.run(_run())
+    assert outcome.claimed == {fresh}
+    assert outcome.dropped == frozenset({old})
+    assert "fresh news" in queued[0]["query"]
+    assert "stale news" not in queued[0]["query"]
+    assert old_row["origin_delivery_mode"] == "skipped"
+
+
+def test_a_one_shot_result_outlives_the_age_bound(tmp_path, monkeypatch):
+    """Its deadline is ``timeout_minutes``; dropping it would strand the flow."""
+    cs, ers, subs, _, queued, _ = _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "app.events.run_config.undelivered_max_age_hours", lambda: 1,
+    )
+
+    async def _run():
+        origin = await cs.create_conversation(profile="p1", title="Deploy")
+        rid, _ = await _task_run(
+            cs, ers, subs, origin["id"], answer="CI is green",
+            trigger_payload={"once": True},
+        )
+        await _set_finished_at(ers, rid, time.time() * 1000 - 30 * 24 * 3600 * 1000)
+        return rid, await etd.flush_origin_inbox(
+            conversation_id=origin["id"], profile="p1", reason="idle",
+        )
+
+    rid, outcome = asyncio.run(_run())
+    assert outcome.claimed == {rid}
+    assert outcome.dropped == frozenset()
+    assert "CI is green" in queued[0]["query"]
+
+
+def test_a_dropped_result_reports_as_stale_not_delivered(tmp_path, monkeypatch):
+    """DELIVERED suppresses the run's own notification; a dropped one must not."""
+    cs, ers, subs, _, _, _ = _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "app.events.run_config.undelivered_max_age_hours", lambda: 1,
+    )
+
+    async def _run():
+        origin = await cs.create_conversation(profile="p1", title="Mail")
+        rid, _ = await _standing_run(
+            cs, ers, subs, origin["id"], answer="old news",
+            finished_at=time.time() * 1000 - 9 * 3600 * 1000,
+        )
+        return await etd.on_run_terminal(
+            event_run_id=rid, profile="p1", status="completed", final_text="old news",
+        )
+
+    assert asyncio.run(_run()) == etd.SKIPPED_STALE
+    assert etd.SKIPPED_STALE not in etd.SUPPRESSES_RUN_NOTIFICATION
+
+
+def test_an_all_stale_flush_still_says_something(tmp_path, monkeypatch):
+    """The runs' own notifications were suppressed when they parked.
+
+    If everything owed is then dropped, this notification is the only thing
+    left that keeps that promise.
+    """
+    cs, ers, subs, _, queued, _ = _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "app.events.run_config.undelivered_max_age_hours", lambda: 1,
+    )
+    pushed = []
+
+    class _Buffer:
+        def push(self, **kwargs):
+            pushed.append(kwargs)
+            return kwargs
+
+    monkeypatch.setattr("app.events.get_event_notifications", lambda: _Buffer())
+
+    async def _run():
+        origin = await cs.create_conversation(profile="p1", title="Mail")
+        await _standing_run(
+            cs, ers, subs, origin["id"], label="nightly", answer="old",
+            finished_at=time.time() * 1000 - 9 * 3600 * 1000,
+        )
+        return await etd.flush_origin_inbox(
+            conversation_id=origin["id"], profile="p1", reason="idle",
+        )
+
+    outcome = asyncio.run(_run())
+    assert queued == [], "nothing worth a turn"
+    assert len(outcome.dropped) == 1
+    assert len(pushed) == 1
+    assert "nightly" in pushed[0]["message_preview"]
+
+
+def test_delivery_order_follows_when_runs_finished(tmp_path, monkeypatch):
+    """A run that parked on a question finishes after ones that fired later."""
+    cs, ers, subs, _, queued, _ = _setup(tmp_path, monkeypatch)
+
+    async def _run():
+        origin = await cs.create_conversation(profile="p1", title="Mail")
+        now_ms = time.time() * 1000
+        first, _ = await _standing_run(
+            cs, ers, subs, origin["id"], label="asked-first", answer="slow answer",
+            finished_at=now_ms,
+        )
+        second, _ = await _standing_run(
+            cs, ers, subs, origin["id"], label="asked-second", answer="quick answer",
+            finished_at=now_ms - 60_000,
+        )
+        await etd.flush_origin_inbox(
+            conversation_id=origin["id"], profile="p1", reason="idle",
+        )
+        return first, second
+
+    asyncio.run(_run())
+    query = queued[0]["query"]
+    assert query.index("quick answer") < query.index("slow answer")
+
+
+def test_a_room_origin_is_told_it_is_speaking_to_a_room(tmp_path, monkeypatch):
+    """And raises no notification: the post itself is how the room finds out."""
+    cs, ers, subs, _, queued, _ = _setup(tmp_path, monkeypatch)
+
+    async def _run():
+        seat = await cs.create_conversation(
+            profile="p1", title="seat", kind="group_chat", context_id="group:g1:p1",
+        )
+        plain = await cs.create_conversation(profile="p1", title="chat")
+        await _standing_run(cs, ers, subs, seat["id"], answer="digest")
+        await _standing_run(cs, ers, subs, plain["id"], answer="digest")
+        await etd.flush_origin_inbox(
+            conversation_id=seat["id"], profile="p1", reason="idle",
+        )
+        await etd.flush_origin_inbox(
+            conversation_id=plain["id"], profile="p1", reason="idle",
+        )
+
+    asyncio.run(_run())
+    seat_turn, plain_turn = queued[0], queued[1]
+    assert seat_turn["publish_notification"] is False
+    assert "posted to everyone in it" in seat_turn["query"]
+    assert plain_turn["publish_notification"] is True
+    assert "posted to everyone in it" not in plain_turn["query"]
+
+
+def test_the_trigger_bubble_is_marked_but_the_answer_is_not(tmp_path, monkeypatch):
+    """Both rows carry ``source``; only the machine-written block is a trigger.
+
+    Everything that renders or filters an automation result keys on this, so
+    without it the agent's own reply is labelled as the automation's output.
+    """
+    cs, ers, subs, _, queued, _ = _setup(tmp_path, monkeypatch)
+
+    async def _run():
+        origin = await cs.create_conversation(profile="p1", title="Mail")
+        await _standing_run(cs, ers, subs, origin["id"], answer="digest")
+        await etd.flush_origin_inbox(
+            conversation_id=origin["id"], profile="p1", reason="idle",
+        )
+
+    asyncio.run(_run())
+    trigger_meta = queued[0]["user_message_metadata"]
+    answer_meta = queued[0]["agent_message_metadata"]
+    assert trigger_meta["source"] == "event_task_result"
+    assert trigger_meta["trigger"] is True
+    assert trigger_meta["once"] is False
+    assert trigger_meta["label"]
+    assert answer_meta["source"] == "event_task_result"
+    assert "trigger" not in answer_meta
 
 
 def test_deciding_to_park_cannot_be_split_by_an_await(tmp_path, monkeypatch):

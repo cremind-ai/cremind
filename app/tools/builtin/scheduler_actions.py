@@ -68,7 +68,10 @@ class ScheduleCreateTool(BuiltInTool):
         "Create a NEW Calendar & Schedule event (a time-based Cremind event). Use "
         "AFTER calling `scheduler` to normalize the time: copy the parser's "
         "dtstart and (for recurrences) rrule verbatim. When the event fires, its "
-        "action RUNS in this conversation (the agent executes it). Open-ended "
+        "action runs in a background conversation and the result is reported "
+        "back into THIS conversation as a new turn — on every firing of a "
+        "recurring event, or the single firing of a one-time event (a one-shot "
+        "task). Open-ended "
         "recurrences are stored as a single advancing rule, never an infinite set. "
         "This tool ONLY creates events — it does not list, change, or stop them. "
         "To LIST, EDIT, pause/resume, or CANCEL an EXISTING schedule event, use "
@@ -356,13 +359,27 @@ class ScheduleCreateTool(BuiltInTool):
                 "the user what you are waiting for. To cancel before it fires: "
                 f"`cremind calendar schedule status {row['id']} cancelled`."
             )
+        elif row.get("status") != "active":
+            # The provider stored it but it can never fire (its moment has
+            # passed). Promising a report that will never arrive is the one
+            # failure this feature must not have.
+            when = "recurring" if rrule else "one-time"
+            message = (
+                f"Created the {when} scheduled action '{title}' for {dtstart}, "
+                "but its time has already passed, so it will never fire and "
+                "nothing will be reported back. If the user still wants it, ask "
+                "for a future time and create it again."
+            )
         else:
             when = "recurring" if rrule else "one-time"
             message = (
-                f"Created a {when} scheduled action '{title}' starting {dtstart}. "
-                "Each firing runs in its own background conversation; the results "
-                "do NOT come back to this chat — the user sees them on the Events "
-                "page and in notifications."
+                f"Created a {when} scheduled action '{title}' starting {dtstart} "
+                f"(id {row['id']}). Each firing runs its action in a background "
+                "conversation and reports the result back into THIS conversation "
+                "as a new turn; the schedule stays active until the user stops it "
+                f"(`cremind calendar schedule status {row['id']} cancelled`). "
+                "Finish this turn now with a short confirmation — do NOT wait, "
+                "sleep, or poll for the first firing."
             )
         return BuiltInToolResult(structured_content={
             "ok": True,

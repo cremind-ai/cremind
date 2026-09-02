@@ -1524,6 +1524,39 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         )
         self._expect_run(sender_target(sender_id), conversation_id)
 
+    async def release_external_run(self, conversation_id: str) -> None:
+        """Undo :meth:`forward_external_run` when the run never started.
+
+        The mirror image, resolving the same target the same way (a bound
+        sender, else an approved group). Without it a caller that armed a
+        forwarder and then failed to enqueue leaves the expectation standing,
+        and the chained forwarder absorbs whatever run happens next on that
+        conversation — posting to the platform an answer the user asked for in
+        the web UI. No-op when nothing is bound.
+        """
+        try:
+            senders = await self.storage.list_senders(self.channel_id)
+            sender = next(
+                (s for s in senders if s.get("conversation_id") == conversation_id),
+                None,
+            )
+            target = (
+                sender_target(sender["sender_id"]) if sender is not None
+                else await self._group_target_for_conversation(conversation_id)
+            )
+            if target is None:
+                return
+            logger.info(
+                f"channels[{self.channel_type}]: release_external_run "
+                f"conv={conversation_id} to={target.key}"
+            )
+            self.release_run_for(target)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                f"channels[{self.channel_type}]: could not release the expected "
+                f"run for conv={conversation_id}"
+            )
+
     async def _group_target_for_conversation(
         self, conversation_id: str,
     ) -> ReplyTarget | None:
@@ -1790,6 +1823,15 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 f"conv={conversation_id}"
             )
             if etype == "event_trigger_message":
+                # An automation reporting back: the "trigger" here IS the full
+                # result text, and the answer that follows restates it in the
+                # agent's own words — sending both posts the same outcome twice.
+                # Keyed on the persisted metadata because the frame carries no
+                # kind, and on ``trigger`` because the agent's answer row shares
+                # ``source`` with the block.
+                meta = data.get("metadata") or {}
+                if meta.get("source") == "event_task_result" and meta.get("trigger"):
+                    return False
                 # The formatted Trigger/Action/Content block stream_runner
                 # produced for this run. It explains what set the run off, which
                 # belongs with the reasoning steps — so it goes out only in

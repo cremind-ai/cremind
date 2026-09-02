@@ -86,3 +86,37 @@ def test_the_note_helper_and_the_prompt_agree_on_the_shape() -> None:
     assert routing_note_for_names(["you"]) == ROUTING_NOTE_YOU
     assert routing_note_for_names(["Mimi"]).startswith("[to: ")
     assert "A note naming other members" in _format_group_chat_block(_origin())
+
+
+def test_an_automation_result_is_licensed_to_speak() -> None:
+    """A digest the room asked for must not be answered [silent].
+
+    An automation's result re-enters the seat carrying none of the room's cues —
+    no sender prefix, no routing note, nobody addressing anyone — so under the
+    SPEAK / STAY SILENT rules alone it reads as somebody else's traffic, and the
+    thing the room set up is exactly what never gets posted.
+    """
+    block = _format_group_chat_block(_origin())
+    assert "YOUR OWN automation reporting back" in block
+    assert "[Event result]" in block
+    assert "nothing new to report" in block
+    # After the interruption rule and before style: it belongs with the other
+    # "when does this count as speech" clauses.
+    assert block.index("INTERRUPTIONS:") < block.index("AUTOMATION RESULTS:")
+    assert block.index("AUTOMATION RESULTS:") < block.index("STYLE:")
+
+
+def test_both_rooms_share_one_automation_clause() -> None:
+    """A Cremind room and a platform group must not drift apart on this."""
+    from app.agent.reasoning_agent import (
+        _ROOM_EVENT_RESULT_CLAUSE,
+        _format_channel_group_block,
+    )
+
+    assert _ROOM_EVENT_RESULT_CLAUSE in _format_group_chat_block(_origin())
+    channel_block = _format_channel_group_block({
+        "group_name": "Ops",
+        "self_name": "Rex",
+        "members": [],
+    })
+    assert _ROOM_EVENT_RESULT_CLAUSE in channel_block

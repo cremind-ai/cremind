@@ -82,7 +82,11 @@ def render_recent_for_judge(
     row, which is exactly the signal this function exists to provide.
 
     Rows the agent stayed silent on are skipped: they are messages it chose not
-    to answer, and showing them as its own speech would be a lie.
+    to answer, and showing them as its own speech would be a lie. So is the
+    trigger block of an automation result — machine-written text the agent never
+    said. It is stored as an agent row (that is how the transcript renders it),
+    and it shares ``metadata.source`` with the agent's real answer to the same
+    turn, so the two are told apart by the ``trigger`` marker.
     """
     label = account_name.strip() or agent_name
     out: list[str] = []
@@ -94,6 +98,11 @@ def render_recent_for_judge(
         stamp = metadata.get("channel_group") or {}
         if row.get("role") in {"agent", "assistant"}:
             if stamp.get("kind") in {"silent", "empty"}:
+                continue
+            if (
+                metadata.get("source") == "event_task_result"
+                and metadata.get("trigger")
+            ):
                 continue
             content = f"{label} (you): {content}"
         if len(content) > _JUDGE_ROW_MAX_CHARS:

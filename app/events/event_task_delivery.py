@@ -1,11 +1,18 @@
-"""Returning an EVENT TASK's result to the conversation that was waiting for it.
+"""Returning an event run's result to the conversation that registered the rule.
 
-Ordinary event runs are fire-and-forget: they execute in a hidden conversation
-and surface as a notification. An *event task* is the other shape — the agent
-registered it mid-flow precisely because it cannot finish without the outcome
-("open the PR, wait for CI, then merge"). So when a task run reaches a terminal
-status its result comes back to the origin conversation, the flow continues
-there, and the one-shot subscription terminates.
+Every rule registered from a real conversation reports back: a ONE-SHOT task the
+agent registered mid-flow because it cannot finish without the outcome ("open the
+PR, wait for CI, then merge"), and a STANDING rule that reports after each firing
+("summarize every new email", "every day at 8 PM compile the news"). The two
+differ in what happens next, not in whether the result arrives: a one-shot
+continues the flow that was waiting on it and terminates its subscription, while
+a standing rule's result is acted on and reported, and the rule stays armed.
+
+Only a run with nowhere to report is silent — a rule bound to a reserved host
+(the calendar UI's ``__schedule__``, the blueprint import host) or to a
+conversation that has since been deleted. Those surface as notifications, as
+before. :func:`app.events.task_policy.is_deliverable_origin` draws that line and
+the run dispatcher freezes the answer onto the run at fire time.
 
 *How* it comes back depends on what the origin is doing at that moment, because
 one conversation runs one turn at a time (``app/events/queue.py``): a result
@@ -47,12 +54,20 @@ stack entirely.
 **Never a silent hang.** A failed run, a run interrupted by a restart, a task
 whose event never fired before its deadline, a notice the agent ignored: each
 delivers *something* back, through four backstops (mid-turn read, turn-end
-flush, any later turn's flush, boot sweep).
+flush, any later turn's flush, boot sweep). A ONE-SHOT result is never dropped
+by the volume bounds below for the same reason.
+
+**Bounded.** A standing rule can fire faster than its conversation answers, and
+an outage can leave a week of them owed. Only the newest
+``max_results_per_delivery`` standing results are reported in one turn and only
+those younger than ``undelivered_max_age_hours``; the rest are closed out (they
+remain in the run history) and the turn says which rules they came from.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, NamedTuple, Optional, Set
+import time
+from typing import Any, Dict, FrozenSet, List, NamedTuple, Optional, Set, Tuple
 
 from app.events import task_result_inbox
 from app.utils.logger import logger
@@ -61,16 +76,20 @@ from app.utils.logger import logger
 class FlushOutcome(NamedTuple):
     """What one :func:`flush_origin_inbox` call did.
 
-    ``claimed`` holds only the ids THIS call claimed and enqueued, so a caller
+    ``claimed`` holds only the ids THIS call claimed and ENQUEUED, so a caller
     can tell "I delivered my row" from "a sibling flush already took it" — the
     distinction that stops a coalesced boot sweep from releasing a claim it does
-    not own. ``origin_gone`` is separate because it is not a delivery failure:
-    the results were closed out permanently, and the run's own notification must
-    stay so the outcome is not lost entirely.
+    not own. ``dropped`` holds the ids this call claimed and closed out without
+    reporting (stale, or over the per-delivery cap); the two sets are disjoint,
+    because a row in ``claimed`` produces a message and a row in ``dropped``
+    never will. ``origin_gone`` is separate because it is not a delivery
+    failure: the results were closed out permanently, and the run's own
+    notification must stay so the outcome is not lost entirely.
     """
 
     claimed: Set[str]
     origin_gone: bool = False
+    dropped: FrozenSet[str] = frozenset()
 
 # Return values of :func:`on_run_terminal`, so callers can branch without
 # re-reading the DB (the stream runner uses them to suppress the run's own
@@ -84,6 +103,11 @@ FAILED = "failed"
 #: The origin conversation was mid-turn: the result waits in its inbox for the
 #: agent to read, or for the turn-end flush. No DB write was taken.
 PARKED = "parked"
+#: Closed out without reporting: too old, or past the per-delivery cap for its
+#: conversation. Deliberately NOT in :data:`SUPPRESSES_RUN_NOTIFICATION` — the
+#: origin will never speak for this result, so the hidden run's own notification
+#: is the only trace left and must stay.
+SKIPPED_STALE = "skipped_stale"
 
 #: Outcomes where the origin conversation itself raises the user-facing
 #: notification, so the hidden run must not raise a second one. ``PARKED``
@@ -96,7 +120,113 @@ MODE_INJECTED = "injected"
 MODE_READ = "read"
 MODE_SKIPPED = "skipped"
 
-_NO_OUTPUT = "(the task run produced no output)"
+_NO_OUTPUT = "(the run produced no output)"
+
+_SOURCE_KIND_WORDS = {
+    "skill_event": "skill event",
+    "file_watcher": "file watcher",
+    "schedule": "schedule",
+}
+
+
+# ── shape of a pending row ──────────────────────────────────────────────────
+
+
+def _is_once(run: Dict[str, Any]) -> bool:
+    """Whether this run belongs to a ONE-SHOT task, frozen at fire time.
+
+    The rule row is editable and deletable, so the run carries its own answer
+    (``trigger_payload["once"]``, written by the dispatcher). A row from before
+    that key existed falls back to ``deliver_to_origin``: back then only a
+    one-shot task ever delivered, so an old delivering row IS one — which keeps
+    its wording, its chain depth and its subscription termination correct
+    through the upgrade.
+    """
+    payload = run.get("trigger_payload") or {}
+    if "once" in payload:
+        return bool(payload["once"])
+    return bool(run.get("deliver_to_origin"))
+
+
+def _terminal_ts(run: Dict[str, Any]) -> float:
+    """When this run's result became available (epoch ms)."""
+    for key in ("finished_at", "updated_at", "created_at"):
+        value = run.get(key)
+        if value:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
+def _stale_cutoff_ms() -> Optional[float]:
+    """Results finishing before this are not worth reporting. None = no bound."""
+    from app.events.run_config import undelivered_max_age_hours
+
+    hours = undelivered_max_age_hours()
+    if hours <= 0:
+        return None
+    return time.time() * 1000 - hours * 3600 * 1000
+
+
+def _partition_pending(
+    rows: List[Dict[str, Any]], *, cap: int, cutoff_ms: Optional[float],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split an inbox into what to report now and what to close out.
+
+    ``rows`` arrive oldest-finished first and come back in the same order.
+
+    Both bounds apply to STANDING results only. A one-shot result was
+    explicitly awaited by a flow that cannot continue without it — dropping one
+    silently would strand that flow forever, and its ``timeout_minutes`` is
+    already the deadline that governs it. So a one-shot row is always kept,
+    however old, and never counts against the cap.
+    """
+    fresh: List[Dict[str, Any]] = []
+    dropped: List[Dict[str, Any]] = []
+    for row in rows:
+        if cutoff_ms is not None and not _is_once(row) and _terminal_ts(row) < cutoff_ms:
+            dropped.append(row)
+        else:
+            fresh.append(row)
+
+    recurring = [row for row in fresh if not _is_once(row)]
+    if len(recurring) > cap:
+        over_cap = {id(row) for row in recurring[: len(recurring) - cap]}
+        keep = [row for row in fresh if id(row) not in over_cap]
+        dropped += [row for row in fresh if id(row) in over_cap]
+    else:
+        keep = fresh
+    dropped.sort(key=_terminal_ts)
+    return keep, dropped
+
+
+def _dropped_line(items: List[Dict[str, Any]]) -> str:
+    """Name the results that were closed out, so the agent can say what was lost."""
+    if not items:
+        return ""
+    named = "; ".join(
+        f"{it['run'].get('label') or 'automation'} ({status_word_for(it['status'])})"
+        for it in items
+    )
+    n = len(items)
+    return (
+        f"\n\n{n} older result{'s' if n != 1 else ''} for this conversation "
+        f"{'were' if n != 1 else 'was'} dropped without being reported — too old, "
+        f"or past the per-conversation limit: {named}. Mention this if it matters; "
+        "the full history is on the Events page (`cremind event-runs list`)."
+    )
+
+
+def _room_line() -> str:
+    """Licence to speak, for a result landing in a room rather than a 1:1 chat."""
+    return (
+        "\n\nThis conversation is a room: your answer is posted to everyone in it. "
+        "This result is YOUR OWN automation reporting back — the room asked for it "
+        "when the rule was set up — so report the outcome in your own words. Answer "
+        "exactly [silent] only if the result says there is nothing new to report."
+    )
 
 
 # ── message construction ────────────────────────────────────────────────────
@@ -118,22 +248,29 @@ def build_result_block(
 ) -> str:
     """One result's ``Awaited / Task action / Status / …`` body.
 
-    Pure, and THE single place a task outcome is worded: the mid-turn read, the
-    idle injection and the coalesced turn-end injection all render through it,
-    so their instructions to the model cannot drift apart.
+    Pure, and THE single place an outcome is worded: the mid-turn read, the idle
+    injection and the coalesced turn-end injection all render through it, so
+    their instructions to the model cannot drift apart.
+
+    A ONE-SHOT result continues the flow that was waiting on it. A STANDING
+    rule's result is acted on and reported — and must say so explicitly, or the
+    model treats the report as a flow to continue and re-registers the rule that
+    just fired.
     """
     label = run.get("label") or "event task"
     action = run.get("action") or ""
     word = status_word_for(status, timed_out=timed_out)
+    once = _is_once(run)
 
     if timed_out:
+        # A timeout only exists for a one-shot: it is the deadline on the wait.
         body = (
             f"Result:\n{result_text}\n\n"
             "Tell the user it timed out and what you do know; do NOT assume the "
             "outcome happened. If it is worth waiting longer, register a new "
             "one-shot task with a larger timeout_minutes."
         )
-    elif status == "completed":
+    elif status == "completed" and once:
         body = (
             f"Result:\n{result_text}\n\n"
             "Continue the original flow from here: carry out the step that was "
@@ -142,16 +279,38 @@ def build_result_block(
             "the user the final answer. Do not re-register the task that just "
             "finished, and do not repeat work already done above."
         )
-    else:
+    elif status == "completed":
+        body = (
+            f"Result:\n{result_text}\n\n"
+            "Act on it as the rule intended and tell the user what came of it. "
+            "The rule stays active and will report again on its next occurrence "
+            "— do NOT re-register it, and do not register a standing automation "
+            "from this turn."
+        )
+    elif once:
         body = (
             f"Failure:\n{result_text}\n\n"
             "Report the failure to the user and propose a next step. Do not "
             "silently retry more than once."
         )
+    else:
+        body = (
+            f"Failure:\n{result_text}\n\n"
+            "Report the failure to the user and propose a next step. The rule "
+            "stays active and will try again on its next occurrence — do NOT "
+            "re-register it, and do not silently retry more than once."
+        )
 
+    if once:
+        return (
+            f"Awaited: {label}\n"
+            f"Task action: {action}\n"
+            f"Status: {word}\n\n"
+            f"{body}"
+        )
     return (
-        f"Awaited: {label}\n"
-        f"Task action: {action}\n"
+        f"Automation: {label}\n"
+        f"Rule action: {action}\n"
         f"Status: {word}\n\n"
         f"{body}"
     )
@@ -163,49 +322,78 @@ def build_task_result_messages(
     status: str,
     result_text: str,
     timed_out: bool = False,
+    room: bool = False,
+    dropped: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[str, Dict[str, Any]]:
     """Build ``(query, trigger_event)`` for a SINGLE result's continuation turn.
 
     Pure, so the wording is unit-testable. ``query`` is what the model reads;
     ``trigger_event`` renders the structured bubble the user sees (and marks the
-    turn as event-triggered, which is what lets the agent chain one more task
-    but not a standing automation).
+    turn as event-triggered, which is what lets the agent chain one more
+    one-shot task but not a standing automation).
     """
     label = run.get("label") or "event task"
     action = run.get("action") or ""
     depth = int((run.get("trigger_payload") or {}).get("task_chain_depth") or 0)
     word = status_word_for(status, timed_out=timed_out)
+    once = _is_once(run)
 
-    query = (
-        "[Event task result] The one-shot task registered earlier in this "
-        "conversation has finished. This turn continues the flow that was "
-        "waiting on it; the full conversation history is above.\n"
-        + build_result_block(
-            run, status=status, result_text=result_text, timed_out=timed_out,
+    if once:
+        header = (
+            "[Event task result] The one-shot task registered earlier in this "
+            "conversation has finished. This turn continues the flow that was "
+            "waiting on it; the full conversation history is above.\n"
         )
+    else:
+        header = (
+            f"[Event result] Your automation '{label}' "
+            f"({_SOURCE_KIND_WORDS.get(run.get('source_kind') or '', 'rule')}) "
+            f"fired at {_fired_at_for(run)} and has finished. This turn is that "
+            "rule reporting back; the full conversation history is above.\n"
+        )
+
+    query = header + build_result_block(
+        run, status=status, result_text=result_text, timed_out=timed_out,
     )
+    if room:
+        query += _room_line()
+    query += _dropped_line(dropped or [])
+
     trigger_event = {
         "kind": "event_task_result",
-        "event_type": f"event task {word}: {label}",
+        "event_type": (
+            f"event task {word}: {label}" if once else f"automation {word}: {label}"
+        ),
         "action": action,
         "content": result_text,
         "status": word,
         "source_kind": run.get("source_kind"),
         "subscription_id": run.get("subscription_id"),
         "event_run_id": run.get("id"),
-        "task_chain_depth": depth + 1,
+        "label": label,
+        "once": once,
+        "fired_at": _fired_at_for(run),
+        "dropped": len(dropped or []),
+        # A one-shot continuation is one more hop in a wait chain and carries the
+        # runaway counter forward. A standing rule's report is not a hop at all —
+        # it is paced by the outside world, so it starts a fresh flow at 0.
+        "task_chain_depth": depth + 1 if once else 0,
     }
     return query, trigger_event
 
 
 def build_multi_result_messages(
     items: List[Dict[str, Any]],
+    *,
+    room: bool = False,
+    dropped: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[str, Dict[str, Any]]:
     """Build ``(query, trigger_event)`` for N results arriving as ONE turn.
 
-    ``items`` are ``{"run", "status", "result_text", "timed_out"}`` dicts in
-    arrival order. Coalescing matters because one user request can spawn several
-    one-shot tasks ("watch both pipelines, then tell me"): N separate turns
+    ``items`` are ``{"run", "status", "result_text", "timed_out"}`` dicts in the
+    order the runs finished. Coalescing matters because one request can spawn
+    several one-shot tasks ("watch both pipelines, then tell me") and because a
+    standing rule can fire several times while a turn runs: N separate turns
     would make the agent reconcile them blind, one at a time, and would send N
     messages to a platform user.
 
@@ -222,30 +410,63 @@ def build_multi_result_messages(
         for it in items
     ]
     n = len(items)
-    query = (
-        f"[Event task results] {n} one-shot tasks registered earlier in this "
-        "conversation have finished. This turn continues the flow that was "
-        "waiting on them; the full conversation history is above.\n\n"
-        "Results in the order they finished:\n\n"
-        + "\n\n---\n\n".join(blocks)
-        + "\n\nReconcile all of the above before you act, then continue the "
-        "original flow. If the flow needs one more wait, register the NEXT "
-        "one-shot task and end your turn. Do not re-register any task that "
-        "just finished."
-    )
+    once_flags = [_is_once(it["run"]) for it in items]
+    all_once = all(once_flags)
+    n_once = sum(1 for flag in once_flags if flag)
+
+    if all_once:
+        header = (
+            f"[Event task results] {n} one-shot tasks registered earlier in this "
+            "conversation have finished. This turn continues the flow that was "
+            "waiting on them; the full conversation history is above.\n\n"
+            "Results in the order they finished:\n\n"
+        )
+        tail = (
+            "\n\nReconcile all of the above before you act, then continue the "
+            "original flow. If the flow needs one more wait, register the NEXT "
+            "one-shot task and end your turn. Do not re-register any task that "
+            "just finished."
+        )
+    else:
+        mix = (
+            f" ({n_once} one-shot, {n - n_once} recurring)" if n_once else ""
+        )
+        header = (
+            f"[Event results] {n} automation results for this conversation are "
+            f"ready{mix}. This turn is those rules reporting back; the full "
+            "conversation history is above.\n\n"
+            "Results in the order they finished:\n\n"
+        )
+        tail = (
+            "\n\nHandle each result as its block instructs, then answer once. A "
+            "one-shot result continues the flow that was waiting on it; a "
+            "standing rule's result is acted on and reported. NEVER re-register "
+            "a rule that just reported, and do not register a standing "
+            "automation from this turn."
+        )
+
+    query = header + "\n\n---\n\n".join(blocks) + tail
+    if room:
+        query += _room_line()
+    query += _dropped_line(dropped or [])
 
     words = {
         status_word_for(it["status"], timed_out=bool(it.get("timed_out")))
         for it in items
     }
     kinds = {it["run"].get("source_kind") for it in items}
-    depth = max(
+    # max, not sum: depth measures how long this flow's wait chain is — and only
+    # a one-shot is a hop in one, so a batch of standing reports starts at 0.
+    once_depths = [
         int((it["run"].get("trigger_payload") or {}).get("task_chain_depth") or 0)
-        for it in items
-    )
+        for it, flag in zip(items, once_flags) if flag
+    ]
     trigger_event = {
         "kind": "event_task_result",
-        "event_type": f"event task results: {n} finished",
+        "event_type": (
+            f"event task results: {n} finished" if all_once
+            else f"automation results: {n} ready"
+        ),
         # N actions cannot be summarised into one; the blocks carry them.
         "action": "",
         "content": "\n\n---\n\n".join(
@@ -257,13 +478,21 @@ def build_multi_result_messages(
         "subscription_id": "",
         "event_run_id": "",
         "event_run_ids": [it["run"].get("id") for it in items],
-        # max, not sum: depth measures how long this flow's wait chain is.
-        "task_chain_depth": depth + 1,
+        "label": f"{n} automation results",
+        "once": all_once,
+        "fired_at": _fired_at_for(items[-1]["run"]) if items else "",
+        "dropped": len(dropped or []),
+        "task_chain_depth": max(once_depths) + 1 if once_depths else 0,
     }
     return query, trigger_event
 
 
-def build_read_result_text(items: List[Dict[str, Any]]) -> str:
+def build_read_result_text(
+    items: List[Dict[str, Any]],
+    *,
+    room: bool = False,
+    dropped: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     """Render pulled results for the tool that read them mid-turn."""
     blocks = [
         build_result_block(
@@ -276,11 +505,16 @@ def build_read_result_text(items: List[Dict[str, Any]]) -> str:
     tail = (
         "\n\n--- end of results ---\n"
         "These results have been handed over and will NOT arrive again as a "
-        "separate turn. Continue the flow that was waiting on each outcome. "
+        "separate turn. A one-shot task's result continues the flow that was "
+        "waiting on it; a standing rule's result is acted on and reported, and "
+        "that rule is still active — never re-register one that just reported. "
         "Summarize what matters in your reply — this tool output may not be "
         "visible in later turns."
     )
-    return f"{header}\n\n" + "\n\n---\n\n".join(blocks) + tail
+    text = f"{header}\n\n" + "\n\n---\n\n".join(blocks) + tail
+    if room:
+        text += _room_line()
+    return text + _dropped_line(dropped or [])
 
 
 # ── delivery ────────────────────────────────────────────────────────────────
@@ -294,11 +528,11 @@ async def on_run_terminal(
     final_text: Optional[str] = None,
     error: Optional[str] = None,
 ) -> str:
-    """Hand a finished task run's result back to its origin conversation.
+    """Hand a finished run's result back to the conversation that registered it.
 
-    Safe to call for every terminal event run — a non-task run returns
-    :data:`NOT_TASK` after one cheap read. Never raises: a delivery problem must
-    not turn a completed run into a failed one.
+    Safe to call for every terminal event run — a run with nowhere to report
+    returns :data:`NOT_TASK` after one cheap read. Never raises: a delivery
+    problem must not turn a completed run into a failed one.
     """
     from app.storage import get_event_run_storage
 
@@ -310,7 +544,13 @@ async def on_run_terminal(
         return FAILED
     if not run or not run.get("deliver_to_origin"):
         return NOT_TASK
+    if run.get("origin_delivered_at"):
+        # Someone already holds this row's lock — a sibling flush that coalesced
+        # it, a stale close-out, or a restore. Nothing left to do, and no reason
+        # to read an inbox we would lose every claim in.
+        return ALREADY_DELIVERED
 
+    once = _is_once(run)
     source_kind = run.get("source_kind") or ""
     subscription_id = run.get("subscription_id") or ""
 
@@ -321,10 +561,10 @@ async def on_run_terminal(
     # (rather than in the inbox) is also what keeps such rows out of
     # ``list_pending_for_origin`` and unpinned from the retention prune.
     if status == "cancelled":
-        if not await store.claim_delivery(event_run_id):
+        if not await _close_out(store, event_run_id):
             return ALREADY_DELIVERED
-        await _set_mode(store, event_run_id, MODE_SKIPPED)
-        _terminate_task_subscription(source_kind, subscription_id, "cancelled")
+        if once:
+            _terminate_task_subscription(source_kind, subscription_id, "cancelled")
         return SKIPPED_CANCELLED
 
     origin_id = run.get("origin_conversation_id")
@@ -332,10 +572,10 @@ async def on_run_terminal(
         # The origin conversation was deleted (FK SET NULL). Nothing to continue
         # — leave the run's own notification in place so the outcome is not lost
         # entirely.
-        if not await store.claim_delivery(event_run_id):
+        if not await _close_out(store, event_run_id):
             return ALREADY_DELIVERED
-        await _set_mode(store, event_run_id, MODE_SKIPPED)
-        _terminate_task_subscription(source_kind, subscription_id, "completed")
+        if once:
+            _terminate_task_subscription(source_kind, subscription_id, "completed")
         return ORIGIN_GONE
 
     # ── the fork ───────────────────────────────────────────────────────────
@@ -349,6 +589,9 @@ async def on_run_terminal(
         "status_word": status_word_for(
             status, timed_out=bool((run.get("trigger_payload") or {}).get("timed_out")),
         ),
+        # Lets the notice tell a result the flow is BLOCKED on from a routine
+        # report, so the agent knows which one is worth reading right now.
+        "once": once,
     }
     if task_result_inbox.park_if_bound(origin_id, notice):
         _publish_changed(profile, source_kind)
@@ -372,10 +615,20 @@ async def on_run_terminal(
         return ORIGIN_GONE
     if event_run_id in result.claimed:
         logger.info(
-            f"[event_task] delivered {source_kind} task result "
-            f"(run={event_run_id}, status={status}) to conversation {origin_id}"
+            f"[event_task] delivered {source_kind} result "
+            f"(run={event_run_id}, status={status}, once={once}) to "
+            f"conversation {origin_id}"
         )
         return DELIVERED
+    if event_run_id in result.dropped:
+        # Closed out rather than reported (too old, or past this conversation's
+        # per-delivery cap). The origin will never speak for it, so the hidden
+        # run's own notification must stay — see SKIPPED_STALE.
+        logger.info(
+            f"[event_task] closed out {source_kind} result without reporting "
+            f"(run={event_run_id}, status={status}) for conversation {origin_id}"
+        )
+        return SKIPPED_STALE
     # This call did not claim our row, so a sibling flush already delivered it
     # — the boot-sweep coalescing case, where injecting row 1 sweeps up rows
     # 2..N. Reporting FAILED here would release a claim we do not hold and
@@ -390,14 +643,22 @@ async def flush_origin_inbox(
     reason: str = "turn_end",
     final_text_hint: Optional[Dict[str, str]] = None,
 ) -> FlushOutcome:
-    """Inject every result waiting on this conversation as ONE turn.
+    """Report every result waiting on this conversation as ONE turn.
 
     The only injection path in the system — the idle delivery, the turn-end
     reconciliation and (transitively) the boot sweep all land here, so there is
-    exactly one place that words, forwards and enqueues a continuation.
+    exactly one place that words, bounds, forwards and enqueues a continuation.
+
+    Volume is bounded here too: only the newest ``max_results_per_delivery``
+    STANDING results are reported, and only those younger than the age bound.
+    The rest are closed out through the same exactly-once claim (so they can
+    never be reported later, and stop pinning the retention prune) and the turn
+    names them, because a result silently vanishing is worse than a long turn.
     """
     from app.events import queue as event_queue
     from app.events import runner as event_runner
+    from app.events.run_config import max_results_per_delivery
+    from app.events.user_message_delivery import is_room_conversation
     from app.storage import get_event_run_storage
 
     store = get_event_run_storage()
@@ -425,35 +686,61 @@ async def flush_origin_inbox(
             f"run; closing out {len(rows)} pending result(s)"
         )
         for row in rows:
-            if await store.claim_delivery(row["id"]):
-                await _set_mode(store, row["id"], MODE_SKIPPED)
+            if await _close_out(store, row["id"]) and _is_once(row):
                 _terminate_task_subscription(
                     row.get("source_kind") or "", row.get("subscription_id") or "",
                     "completed",
                 )
         return FlushOutcome(set(), origin_gone=True)
 
+    keep, over = _partition_pending(
+        rows, cap=max_results_per_delivery(), cutoff_ms=_stale_cutoff_ms(),
+    )
+    dropped_items: List[Dict[str, Any]] = []
+    dropped_ids: Set[str] = set()
+    for row in over:
+        if not await _close_out(store, row["id"]):
+            continue  # a concurrent read/flush owns this one
+        dropped_ids.add(row["id"])
+        dropped_items.append(await _describe_row(row))
+        if _is_once(row):
+            _terminate_task_subscription(
+                row.get("source_kind") or "", row.get("subscription_id") or "", "completed",
+            )
+    if dropped_ids:
+        logger.warning(
+            f"[event_task] closed out {len(dropped_ids)} stale/over-cap result(s) "
+            f"for {conversation_id} without reporting them"
+        )
+
     items: List[Dict[str, Any]] = []
     claimed: Set[str] = set()
-    for row in rows:
+    for row in keep:
         if not await store.claim_delivery(row["id"]):
             continue  # a concurrent read/flush owns this one
         claimed.add(row["id"])
         items.append(await _describe_row(row, hint=(final_text_hint or {}).get(row["id"])))
 
     if not items:
-        return FlushOutcome(set())
+        # Everything owed was dropped. The hidden runs' own notifications were
+        # suppressed when they parked, so without this the outcome would vanish
+        # from every surface except the Events page.
+        if dropped_items:
+            _notify_dropped(profile, conversation_id, dropped_items)
+        return FlushOutcome(set(), dropped=frozenset(dropped_ids))
 
+    is_room = is_room_conversation(conv)
+    adapter = None
     try:
         history_messages = await _load_history(conversation_storage, conversation_id, profile)
 
         # Mirror the continuation to the platform when the origin chat lives on
-        # an external channel. The task runs' own output was deliberately NOT
+        # an external channel. The runs' own output is deliberately NOT
         # forwarded (see run_dispatcher), and N results coalesce into this one
         # turn, so the user gets exactly one message.
         try:
             from app.events.run_dispatcher import _maybe_forward_to_channel
-            await _maybe_forward_to_channel(
+            adapter = await _maybe_forward_to_channel(
                 conversation_storage, conversation_id, conversation_id,
             )
         except Exception:  # noqa: BLE001
@@ -464,9 +751,12 @@ async def flush_origin_inbox(
             query, trigger_event = build_task_result_messages(
                 it["run"], status=it["status"], result_text=it["result_text"],
                 timed_out=bool(it.get("timed_out")),
+                room=is_room, dropped=dropped_items,
             )
         else:
-            query, trigger_event = build_multi_result_messages(items)
+            query, trigger_event = build_multi_result_messages(
+                items, room=is_room, dropped=dropped_items,
+            )
 
         metadata = {
             "source": "event_task_result",
@@ -475,6 +765,19 @@ async def flush_origin_inbox(
             "subscription_id": trigger_event.get("subscription_id"),
             "event_run_id": trigger_event.get("event_run_id"),
             "event_run_ids": [it["run"].get("id") for it in items],
+        }
+        # The TRIGGER bubble gets its own dict. The agent's answer is persisted
+        # with ``metadata`` too, so anything that must recognise the machine-
+        # written block (the UI badge, the CLI transcript, the channel forwarder,
+        # the room relevance judge) keys on ``trigger`` — keying on ``source``
+        # alone would tag the agent's own reply as an automation result.
+        trigger_metadata = {
+            **metadata,
+            "trigger": True,
+            "label": trigger_event.get("label"),
+            "once": trigger_event.get("once"),
+            "fired_at": trigger_event.get("fired_at"),
+            "dropped": trigger_event.get("dropped"),
         }
 
         from app.agent.stream_runner import make_run_id
@@ -486,12 +789,14 @@ async def flush_origin_inbox(
             query=query,
             history_messages=history_messages,
             reasoning=True,
-            user_message_metadata=metadata,
+            user_message_metadata=trigger_metadata,
             agent_message_metadata=metadata,
             push_user_message=False,
             trigger_event=trigger_event,
             update_title_from_query=False,
-            publish_notification=True,
+            # A room's answer IS the notification: it is posted where everyone
+            # can see it, and a push deep-linked at a hidden seat is unopenable.
+            publish_notification=not is_room,
         )
     except Exception:  # noqa: BLE001
         logger.exception(
@@ -503,16 +808,28 @@ async def flush_origin_inbox(
                 await store.clear_delivery_claim(run_id_pk)
             except Exception:  # noqa: BLE001
                 logger.exception(f"[event_task] failed to release claim on {run_id_pk}")
-        return FlushOutcome(set())
+        # The forwarder was armed for a run that will now never start. Left
+        # standing it absorbs whatever runs next on this conversation — pushing
+        # to the platform an answer the user asked for in the web UI.
+        if adapter is not None:
+            try:
+                await adapter.release_external_run(conversation_id)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    f"[event_task] failed to release the forwarder for {conversation_id}"
+                )
+        return FlushOutcome(set(), dropped=frozenset(dropped_ids))
 
     for it in items:
         await _finish_delivery(store, it["run"], profile, MODE_INJECTED)
     _publish_all_changed(profile, items)
     logger.info(
-        f"[event_task] injected {len(items)} task result(s) into {conversation_id} "
-        f"({reason})"
+        f"[event_task] reported {len(items)} result(s) into {conversation_id} "
+        f"({reason}"
+        + (f", dropped {len(dropped_ids)}" if dropped_ids else "")
+        + ")"
     )
-    return FlushOutcome(claimed)
+    return FlushOutcome(claimed, dropped=frozenset(dropped_ids))
 
 
 async def read_origin_inbox(
@@ -526,7 +843,13 @@ async def read_origin_inbox(
     because "Stop" arrives as :class:`asyncio.CancelledError` — which the leaf
     runner does not catch — the whole body releases its own claims on any
     ``BaseException`` before re-raising.
+
+    Applies the same volume bounds as the flush: a rule that fired fifty times
+    during a long turn must not hand the agent fifty blocks.
     """
+    from app.events import runner as event_runner
+    from app.events.run_config import max_results_per_delivery
+    from app.events.user_message_delivery import is_room_conversation
     from app.storage import get_event_run_storage
 
     store = get_event_run_storage()
@@ -547,10 +870,36 @@ async def read_origin_inbox(
             [],
         )
 
+    # Close out what must not be reported BEFORE anything is claimed for the
+    # hand-over: dropped ids must never enter ``claimed``, or the release below
+    # would put a closed-out result back into the inbox.
+    keep, over = _partition_pending(
+        rows, cap=max_results_per_delivery(), cutoff_ms=_stale_cutoff_ms(),
+    )
+    dropped_items: List[Dict[str, Any]] = []
+    for row in over:
+        if not await _close_out(store, row["id"]):
+            continue
+        dropped_items.append(await _describe_row(row))
+        if _is_once(row):
+            _terminate_task_subscription(
+                row.get("source_kind") or "", row.get("subscription_id") or "", "completed",
+            )
+
+    is_room = False
+    try:
+        conversation_storage = event_runner.get_conversation_storage()
+        if conversation_storage is not None:
+            is_room = is_room_conversation(
+                await conversation_storage.get_conversation(conversation_id)
+            )
+    except Exception:  # noqa: BLE001
+        logger.debug("[event_task] could not classify the origin", exc_info=True)
+
     items: List[Dict[str, Any]] = []
     claimed: List[str] = []
     try:
-        for row in rows:
+        for row in keep:
             described = await _describe_row(row)
             if not await store.claim_delivery(row["id"]):
                 continue  # a concurrent flush owns this one; it will be injected
@@ -558,13 +907,19 @@ async def read_origin_inbox(
             items.append(described)
 
         if not items:
+            if dropped_items:
+                return (
+                    "No results are waiting any more."
+                    + _dropped_line(dropped_items).lstrip("\n"),
+                    [],
+                )
             return (
                 "No task results are waiting — they are being delivered as a new "
                 "turn right now. Carry on; you will see them shortly.",
                 [],
             )
 
-        text = build_read_result_text(items)
+        text = build_read_result_text(items, room=is_room, dropped=dropped_items)
     except BaseException:
         # Includes CancelledError (the user pressed Stop). Release anything this
         # call claimed, so the results are re-deliverable instead of lost.
@@ -622,11 +977,17 @@ async def _finish_delivery(
     Per-row on purpose: one coalesced flush can span a skill-event row and a
     file-watcher row, and each one's subscription has to be terminated in its
     own table or that rule stays ``triggered`` forever.
+
+    Only a ONE-SHOT terminates — a standing rule must stay armed to report
+    again. The SQL already guarantees it (``set_task_status`` matches
+    ``task = TRUE AND task_status = 'triggered'``, which a standing row never
+    satisfies), but saying it here keeps the intent readable.
     """
     await _set_mode(store, run.get("id") or "", mode)
-    _terminate_task_subscription(
-        run.get("source_kind") or "", run.get("subscription_id") or "", "completed",
-    )
+    if _is_once(run):
+        _terminate_task_subscription(
+            run.get("source_kind") or "", run.get("subscription_id") or "", "completed",
+        )
 
 
 async def _set_mode(store: Any, run_id_pk: str, mode: str) -> None:
@@ -636,6 +997,66 @@ async def _set_mode(store: Any, run_id_pk: str, mode: str) -> None:
         await store.set_delivery_mode(run_id_pk, mode)
     except Exception:  # noqa: BLE001
         logger.exception(f"[event_task] failed to record delivery mode for {run_id_pk}")
+
+
+async def _close_out(store: Any, run_id_pk: str) -> bool:
+    """Take one result out of the inbox without reporting it. Never raises."""
+    if not run_id_pk:
+        return False
+    try:
+        return bool(await store.close_out_delivery(run_id_pk, MODE_SKIPPED))
+    except Exception:  # noqa: BLE001
+        logger.exception(f"[event_task] failed to close out {run_id_pk}")
+        return False
+
+
+def _fired_at_for(run: Dict[str, Any]) -> str:
+    """When the trigger happened, in the profile's own timezone."""
+    payload = run.get("trigger_payload") or {}
+    for key in ("fired_at", "detected_at"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    created = run.get("created_at")
+    if created:
+        try:
+            return _format_epoch(float(created) / 1000, run.get("profile") or "")
+        except (TypeError, ValueError):
+            pass
+    return "an unknown time"
+
+
+def _notify_dropped(
+    profile: str, conversation_id: str, items: List[Dict[str, Any]],
+) -> None:
+    """Say something when a whole batch was closed out unreported.
+
+    The hidden runs' own notifications were suppressed when their results
+    parked, on the promise that the conversation would speak for them. If every
+    one is then dropped, this is the only thing that keeps the promise.
+    """
+    if not items:
+        return
+    names = ", ".join(
+        it["run"].get("label") or "automation" for it in items[:5]
+    )
+    more = f" (+{len(items) - 5} more)" if len(items) > 5 else ""
+    try:
+        from app.events import get_event_notifications
+
+        get_event_notifications().push(
+            profile=profile,
+            conversation_id=conversation_id,
+            conversation_title="",
+            message_preview=(
+                f"{len(items)} automation result(s) were dropped without being "
+                f"reported (too old, or past the per-conversation limit): {names}{more}"
+            ),
+            kind="error",
+            priority="normal",
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("[event_task] failed to notify about dropped results")
 
 
 async def _load_history(conversation_storage: Any, conversation_id: str, profile: str) -> list:
@@ -687,7 +1108,11 @@ async def deliver_timeout(source_kind: str, sub: Dict[str, Any]) -> str:
             conversation_id=None,
             label=label,
             action=sub.get("action") or "",
-            trigger_payload={"timed_out": True, "timeout_at": sub.get("timeout_at")},
+            # A timeout only exists for a one-shot: it is the deadline on the
+            # wait, so the result must render with one-shot wording.
+            trigger_payload={
+                "timed_out": True, "timeout_at": sub.get("timeout_at"), "once": True,
+            },
             origin_conversation_id=origin_id,
             deliver_to_origin=bool(origin_id),
             status="failed",
@@ -712,20 +1137,27 @@ async def deliver_timeout(source_kind: str, sub: Dict[str, Any]) -> str:
 
 
 async def sweep_undelivered() -> int:
-    """Deliver task results a crash left stranded. Idempotent; runs at boot.
+    """Report results a crash left stranded. Idempotent; runs at boot.
 
     Must run AFTER :meth:`EventRunStorage.recover_after_restart`, which flips
     interrupted ``running`` rows to ``failed`` — that is what makes them
-    terminal, and therefore deliverable, here.
+    terminal, and therefore deliverable, here — and AFTER the channel adapters
+    start, or a recovered result bound to a Telegram chat or a platform group
+    reaches the web UI only (its forwarder needs a live adapter).
 
     "Stranded by a crash" and "parked while the origin was mid-turn" are the
     same query by construction, so this also picks up results the process died
-    holding. Note the interaction with coalescing: delivering row 1 claims every
+    holding. Note the interaction with coalescing: reporting row 1 claims every
     sibling of the same origin, so rows 2..N must resolve to
     :data:`ALREADY_DELIVERED` — never :data:`FAILED`, whose claim release would
-    resurrect an already-delivered result and re-deliver it on every boot.
+    resurrect an already-reported result and re-deliver it on every boot.
     :func:`on_run_terminal` guarantees that by keying on the id set the flush
     reports back.
+
+    A standing rule's result that is simply too old is closed out here rather
+    than reported: after a week of downtime, seven "here is today's news" turns
+    arriving at once — in a chat, a room, or a platform group — are noise.
+    One-shot results are never dropped, however old.
     """
     from app.storage import get_event_run_storage
 
@@ -736,9 +1168,25 @@ async def sweep_undelivered() -> int:
         logger.exception("[event_task] boot sweep: failed to list undelivered runs")
         return 0
 
+    cutoff = _stale_cutoff_ms()
     delivered = 0
+    stale: Dict[str, List[Dict[str, Any]]] = {}
     for run in rows:
         try:
+            # A cancelled row still goes through on_run_terminal: it terminates
+            # its rule as "cancelled", which the close-out below cannot do.
+            if (
+                cutoff is not None
+                and run.get("status") != "cancelled"
+                and not _is_once(run)
+                and _terminal_ts(run) < cutoff
+            ):
+                if await _close_out(store, run["id"]):
+                    stale.setdefault(
+                        run.get("origin_conversation_id") or "", [],
+                    ).append(await _describe_row(run))
+                continue
+
             final_text = await _recover_final_text(run)
             outcome = await on_run_terminal(
                 event_run_id=run["id"],
@@ -752,7 +1200,14 @@ async def sweep_undelivered() -> int:
         except Exception:  # noqa: BLE001
             logger.exception(f"[event_task] boot sweep: delivery failed for {run.get('id')}")
     if delivered:
-        logger.info(f"[event_task] boot sweep delivered {delivered} stranded task result(s)")
+        logger.info(f"[event_task] boot sweep reported {delivered} stranded result(s)")
+    for origin_id, items in stale.items():
+        logger.info(
+            f"[event_task] boot sweep closed out {len(items)} stale result(s) "
+            f"owed to {origin_id or '(no origin)'}"
+        )
+        if origin_id:
+            _notify_dropped(items[0]["run"].get("profile") or "", origin_id, items)
 
     await _reconcile_orphaned_tasks()
     return delivered

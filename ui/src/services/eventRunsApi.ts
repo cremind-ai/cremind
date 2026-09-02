@@ -2,9 +2,10 @@
  * API client for event runs — the per-trigger execution history.
  *
  * Each fired event rule (skill / file-watcher / schedule) runs in its own hidden
- * conversation, tracked by an `event_runs` row. Mirrors skillEventsApi.ts: each
- * call resolves the base URL from the active agent URL and attaches a Bearer
- * token.
+ * conversation, tracked by an `event_runs` row, and reports its result back into
+ * the conversation that registered the rule (see `deliver_to_origin` below).
+ * Mirrors skillEventsApi.ts: each call resolves the base URL from the active
+ * agent URL and attaches a Bearer token.
  */
 
 function resolveBaseUrl(agentUrl: string): string {
@@ -59,15 +60,23 @@ export interface EventRun {
   updated_at: number; // epoch ms
   finished_at: number | null; // epoch ms
   /**
-   * EVENT TASK delivery. A task run owes its result to the conversation that
-   * registered the rule: `origin_conversation_id` is that conversation and
-   * `origin_delivered_at` (epoch ms) is when it was handed over — null while
-   * the result is still waiting in that conversation's inbox.
+   * RESULT DELIVERY. Every run owes its result to the conversation that
+   * registered the rule — one-shot task or standing rule alike:
+   * `origin_conversation_id` is that conversation and `origin_delivered_at`
+   * (epoch ms) is when it was handed over — null while the result is still
+   * waiting in that conversation's inbox.
    * `origin_delivery_mode` says HOW: 'injected' (arrived as its own turn),
    * 'read' (the assistant pulled it mid-reasoning, so there is no separate
-   * turn to look for), 'skipped' (cancelled, or the conversation is gone), or
-   * null on rows delivered before the mode was recorded. Blank/false on
-   * ordinary event runs, which report only via notifications.
+   * turn to look for), 'skipped' (the run was cancelled, the conversation is
+   * gone, or the result was dropped as stale — only the newest few standing
+   * results per conversation are reported, older ones are closed out, and a
+   * restore from backup closes out everything still owed; one-shot results are
+   * never dropped by those bounds), or null on rows delivered before the mode
+   * was recorded.
+   * `deliver_to_origin` is false only when there was nowhere to report: the
+   * rule is bound to a reserved host conversation (the calendar UI's
+   * `__schedule__`, the blueprint import host) or its conversation has since
+   * been deleted. Those runs surface as notifications only.
    */
   origin_conversation_id: string | null;
   deliver_to_origin: boolean;

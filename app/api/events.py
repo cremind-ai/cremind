@@ -357,14 +357,42 @@ def get_event_routes() -> list[Route]:
                 {"error": "write_failed", "message": str(exc)}, status_code=500,
             )
         payload: Dict[str, Any] = {"ok": True, "path": str(file_path)}
+        # Not a dry run, in two ways worth saying out loud. The file goes to the
+        # watched folder, so it fans out to EVERY subscription for this
+        # (skill, event_type) — the id in the URL only picks the folder — and
+        # each of those runs now reports its result into the conversation that
+        # registered it: a real message, possibly in a room or a platform group.
+        try:
+            siblings = get_event_subscription_storage().list_by_event(
+                profile=existing["profile"],
+                skill_name=existing["skill_name"],
+                event_type=existing["event_type"],
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("simulate: could not count the subscriptions that will fire")
+            siblings = [existing]
+        # The same filter the fan-out applies, so the number is the truth.
+        live = [
+            s for s in siblings
+            if not s.get("paused")
+            and not (s.get("task") and s.get("task_status") != "active")
+        ]
+        warnings = [
+            f"This fires EVERY active subscription for "
+            f"{existing['skill_name']}/{existing['event_type']} in this profile "
+            f"({len(live)}), not just this one, and each run reports its result "
+            "into the conversation that registered it — a real message in that "
+            "chat, room or channel group."
+        ]
         # Simulating a one-shot task really consumes it — the dispatcher cannot
         # tell a synthetic trigger from a real one, and a dry-run mode would test
         # something other than what happens in production. Say so plainly.
         if existing.get("task") and existing.get("task_status") == "active":
-            payload["task_warning"] = (
+            warnings.append(
                 "This is a one-shot task: the simulated event consumes its single "
                 "firing, so the real event will no longer trigger it."
             )
+        payload["warnings"] = warnings
         return JSONResponse(payload)
 
     async def handle_skill_events(request: Request) -> JSONResponse:

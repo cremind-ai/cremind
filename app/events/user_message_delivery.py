@@ -274,6 +274,23 @@ def _continuation_query(
     return "\n".join(lines)
 
 
+def is_room_conversation(conv: Optional[Dict[str, Any]]) -> bool:
+    """Whether this conversation is a ROOM — several people can read it.
+
+    Two shapes qualify: a Cremind group-chat seat (``kind == "group_chat"``,
+    whose answer is posted to the room) and a platform group, which is an
+    ordinary ``chat`` conversation and so can only be spotted by its context id.
+    Shared by the mid-turn user-message flush and the event-result flush, which
+    both need to word a turn differently — and notify differently — when what
+    the agent says will be read by a room rather than by one person.
+    """
+    from app.channels.groups.origin import is_channel_group_context
+
+    return (conv or {}).get("kind") == "group_chat" or is_channel_group_context(
+        (conv or {}).get("context_id")
+    )
+
+
 async def _conversation_flags(
     conversation_storage: Any, conversation_id: str, profile: str,
 ) -> tuple[Optional[str], bool, bool]:
@@ -292,11 +309,7 @@ async def _conversation_flags(
     # A platform group is an ordinary ``chat`` conversation, so the kind alone
     # cannot spot it — but its follow-up turn needs the same wording as a seat's:
     # several people are talking, and staying silent is a real answer.
-    from app.channels.groups.origin import is_channel_group_context
-
-    is_group_chat = kind == "group_chat" or is_channel_group_context(
-        (conv or {}).get("context_id")
-    )
+    is_group_chat = is_room_conversation(conv)
     if conv is None or kind != "event_run":
         return None, False, is_group_chat
     try:

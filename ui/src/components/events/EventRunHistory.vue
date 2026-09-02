@@ -13,6 +13,7 @@ import { Icon } from '@iconify/vue';
 import { useEventRunsStore } from '../../stores/eventRuns';
 import EventRunStatusTag from './EventRunStatusTag.vue';
 import EventIdChip from './EventIdChip.vue';
+import EventRunDeliveryChip from './EventRunDeliveryChip.vue';
 import { formatTimestamp, formatTokensCompact, formatUsd } from '../../utils/usageFormat';
 import { runDuration } from '../../utils/duration';
 import type { EventRun, EventRunSourceKind } from '../../services/eventRunsApi';
@@ -99,6 +100,14 @@ function loadOlder() {
         </ElTableColumn>
         <ElTableColumn label="Duration" width="90" align="right">
           <template #default="{ row }">{{ runDuration(row as EventRun) }}</template>
+        </ElTableColumn>
+        <!-- "Did the 8pm digest actually reach my chat?" — blank for a rule
+             with nowhere to report (a reserved host conversation, or a deleted
+             one), which is the whole answer for those runs. -->
+        <ElTableColumn label="Delivered" width="160">
+          <template #default="{ row }">
+            <EventRunDeliveryChip :run="row as EventRun" compact />
+          </template>
         </ElTableColumn>
         <ElTableColumn label="" width="120" align="right">
           <template #default="{ row }">

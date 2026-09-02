@@ -1,5 +1,5 @@
 ---
-description: "View and manage **event runs** — the per-trigger execution history of automatic event rules (skill, file-watcher, schedule). Each fired trigger runs in its own isolated conversation with a status (running/pending/completed/failed/cancelled) and token usage; reply to runs pending your input, cancel a running run, and inspect or delete run history. Resolve an **event id / run id** copied from the web UI's Events page with `show` to report details about that run, or `reply`/`cancel`/`delete` to act on it. Runs belonging to **one-shot event tasks** also show where their result was delivered — the conversation that was waiting on the outcome — via the `DELIVERED` column and the `origin_conversation_id` field, including whether that conversation received it as a new turn (`injected`), its assistant read it mid-reasoning (`read`), or it is still waiting (`pending`)."
+description: "View and manage **event runs** — the per-trigger execution history of automatic event rules (skill, file-watcher, schedule). Each fired trigger runs in its own isolated conversation with a status (running/pending/completed/failed/cancelled) and token usage; reply to runs pending your input, cancel a running run, and inspect or delete run history. Resolve an **event id / run id** copied from the web UI's Events page with `show` to report details about that run, or `reply`/`cancel`/`delete` to act on it. **Every rule registered from a conversation reports each run's result back into it** — standing rules as much as one-shot tasks — and the `DELIVERED` column plus `origin_conversation_id` show where it went and how: a new turn (`injected`), read mid-reasoning (`read`), still owed (`pending`), or dropped (`skipped` — cancelled, conversation gone, or stale under the `[event_runs]` knobs `max_results_per_delivery` / `undelivered_max_age_hours`). `DELIVERED` is blank only for a run with nowhere to report: a rule bound to a reserved host conversation, or one since deleted."
 ---
 
 # `cremind event-runs` — Event Run History
@@ -84,19 +84,25 @@ the local time the trigger fired. `COST` is the run's estimated dollar cost and
 straight into `show` / `reply` / `delete` / `cancel`. A `shown / total` footer
 follows the table; an empty result prints `no event runs match.`.
 
-`DELIVERED` is blank for an ordinary event run. It is filled in only for a
-**one-shot event task**, whose result is handed back to the conversation that
-was waiting for it, and it says *how* that happened:
+`DELIVERED` is filled in for **every** run that had somewhere to report — every
+rule registered from a real conversation reports each run's result back into it,
+standing rules as much as one-shot tasks — and it says *how* that happened:
 
 | Value      | Meaning                                                                     |
 |------------|-----------------------------------------------------------------------------|
-| `pending`  | Still waiting in that conversation's inbox — the hand-over is owed. A run interrupted by a restart is delivered by a sweep on the next boot, so this should not persist. |
-| `injected` | The waiting conversation received it as a new turn.                          |
+| `pending`  | Still waiting in that conversation's inbox — the hand-over is owed. A run interrupted by a restart is reported by a sweep on the next boot, so this should not persist. |
+| `injected` | The conversation received it as a new turn.                                  |
 | `read`     | Its assistant pulled the result mid-reasoning, so it was folded into a turn that was already running — expect no separate turn for it. |
-| `skipped`  | Deliberately not delivered: the run was cancelled, or the waiting conversation no longer exists. |
-| `yes`      | Delivered by an older build, before the mode was recorded.                    |
+| `skipped`  | Not reported. Either the run was cancelled or its conversation no longer exists — **or the result was dropped as stale**: only the newest `[event_runs] max_results_per_delivery` (default 5) *standing* results per conversation are reported, and standing results older than `[event_runs] undelivered_max_age_hours` (default 72) are closed out. A restore from backup also closes out every result still owed rather than replaying it. One-shot task results are never dropped by either bound. |
+| `yes`      | Reported by an older build, before the mode was recorded.                    |
 
-`read` is the one worth knowing about: it is why a delivered result can leave no
+It is blank only when there was nowhere to report: the rule is bound to a
+**reserved host conversation** (the calendar UI's `__schedule__`, the blueprint
+import host `__skill_events__`), or the conversation it was registered from has
+since been deleted. Those runs still happen and still surface as notifications;
+they just produce no turn.
+
+`read` is the one worth knowing about: it is why a reported result can leave no
 turn of its own in the conversation.
 
 With `--json`, returns the raw `{runs: [...], total: N}` object (each run in the
@@ -133,14 +139,16 @@ updated / finished timestamps, and — when present — the `pending_question` a
 (`input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`,
 `output_tokens`, `total_tokens`, `total_usd`, `request_count`).
 
-For a **one-shot event task** run the panel adds `origin_conversation_id` (the
-conversation waiting for the result) and `result_delivered` (when the
-continuation turn was injected, or `pending`).
+For a run that reports back — any rule registered from a real conversation — the
+panel adds `origin_conversation_id` (the conversation the result goes to),
+`result_delivered` (when the turn landed, or `pending`), and a `delivery` row
+naming the mode once one is recorded.
 
 When the run has a `conversation_id`, the panel also prints hints to view the
 transcript (`cremind conv get <conversation_id>`) and, for a pending run, to
-reply (`cremind event-runs reply <run-id> "..."`); a task run additionally
-prints where its result went (`cremind conv get <origin_conversation_id>`).
+reply (`cremind event-runs reply <run-id> "..."`); a run that reports back
+additionally prints a `Reported to:` hint with
+`cremind conv get <origin_conversation_id>`.
 
 **Timed-out tasks appear here too.** A task whose event never fired before its
 deadline is recorded as a `failed` run with no transcript
