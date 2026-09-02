@@ -570,6 +570,38 @@ function threadTypeOf(msg) {
   return Number.isInteger(raw) ? raw : THREAD_USER;
 }
 
+// Last typing error seen per thread, so a permanently failing indicator costs
+// one line rather than one every 4 seconds for the length of every turn. A
+// success clears the entry, so a failure that comes back after a recovery is
+// reported again instead of being remembered as already-said.
+const typingErrors = new Map();
+
+function describeThrown(e) {
+  // Never throws and never renders "[object Object]": a control-frame handler
+  // that raises while describing a failure would escape into the socket's
+  // error path and surface as a channel error, which a missed typing pulse has
+  // no business doing.
+  try {
+    if (e instanceof Error) return e.message || e.name || 'Error';
+    if (e && typeof e.message === 'string' && e.message) return e.message;
+    return JSON.stringify(e) || Object.prototype.toString.call(e);
+  } catch (inner) {
+    // A circular object, a throwing getter, a null-prototype value.
+    return Object.prototype.toString.call(e);
+  }
+}
+
+function noteTypingResult(threadId, threadType, error) {
+  const key = `${threadId}:${threadType}`;
+  if (!error) {
+    typingErrors.delete(key);
+    return;
+  }
+  if (typingErrors.get(key) === error) return;
+  typingErrors.set(key, error);
+  logInfo(`sendTypingEvent failed thread=${threadId} type=${threadType}: ${error}`);
+}
+
 async function handleControl(msg) {
   if (!api) {
     // Answer on the correlation id the caller waits on where there is one, so a
@@ -581,6 +613,12 @@ async function handleControl(msg) {
         ok: false,
         error: 'sidecar not ready',
       });
+      return;
+    }
+    if (msg.kind === 'typing') {
+      // The parent re-ticks every 4s while a run composes, so a session that is
+      // reconnecting would report one lost "send" per tick for a message nobody
+      // sent. Dropping the tick is the whole correct answer.
       return;
     }
     emit({ kind: 'send_error', sender_id: msg.sender_id, error: 'sidecar not ready' });
@@ -701,11 +739,21 @@ async function handleControl(msg) {
       });
     }
   } else if (msg.kind === 'typing') {
+    // A room's typing is not a person's: zca-js sends ThreadType.User to
+    // `<chat service>/api/message/typing` with {toid, destType} and
+    // ThreadType.Group to `<group service>/api/group/typing` with {grid} —
+    // two different services, which fail independently. This branch used to
+    // swallow the failure whole, so a room that showed no "typing…" left
+    // nothing anywhere to say why while DMs kept working.
     const threadId = String(msg.sender_id || '');
+    const threadType = threadTypeOf(msg);
     try {
-      await api.sendTypingEvent(threadId, threadTypeOf(msg));
+      await api.sendTypingEvent(threadId, threadType);
+      noteTypingResult(threadId, threadType, null);
     } catch (e) {
-      // Non-fatal.
+      // Still non-fatal — the parent re-ticks every 4s and a missing
+      // indicator must never cost the reply — but no longer invisible.
+      noteTypingResult(threadId, threadType, describeThrown(e));
     }
   } else if (msg.kind === 'logout') {
     try { if (api && api.listener) api.listener.stop(); } catch (e) { /* ignore */ }

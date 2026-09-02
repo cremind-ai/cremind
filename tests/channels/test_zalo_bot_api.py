@@ -157,3 +157,25 @@ def test_send_text_splits_to_zalo_limit():
     asyncio.run(run())
     assert len(sent) >= 3
     assert all(len(chunk) <= 2000 for chunk in sent)
+
+
+def test_typing_is_shown_in_a_room_as_well_as_a_dm():
+    """A Zalo bot declares group chats, and ``sendChatAction`` takes the same
+    opaque id ``sendMessage`` does — so the room hook is one call, and without
+    it the base no-op runs instead and the bot is never seen composing in a
+    group."""
+    adapter = _adapter()
+    actions: list[tuple[str, str]] = []
+
+    class FakeClient:
+        async def send_chat_action(self, chat_id, action="typing"):
+            actions.append((chat_id, action))
+
+    adapter._api = FakeClient()  # type: ignore[assignment]
+
+    async def run():
+        await adapter._send_typing_to_chat("room-1")
+        await adapter._send_typing("person-1")
+
+    asyncio.run(run())
+    assert actions == [("room-1", "typing"), ("person-1", "typing")]

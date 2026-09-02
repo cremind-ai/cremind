@@ -239,6 +239,37 @@ def test_send_to_chat_marks_the_frame_as_a_group_thread():
     asyncio.run(scenario())
 
 
+def test_typing_in_a_room_is_marked_as_a_group_thread():
+    """The two thread types are two different Zalo services — ``/api/group/typing``
+    with a ``grid`` against ``/api/message/typing`` with a ``toid`` — so an
+    unmarked frame does not merely address the wrong thread, it asks the wrong
+    host to show the indicator."""
+    async def scenario():
+        adapter = _adapter()
+        adapter._ws = _Socket()
+        await adapter._send_typing_to_chat(_CHAT_ID)
+
+        assert adapter._ws.frames == [{
+            "kind": "typing", "sender_id": _CHAT_ID, "thread_type": 1,
+        }]
+
+    asyncio.run(scenario())
+
+
+def test_typing_at_a_person_carries_no_thread_type():
+    """The sidecar defaults an absent ``thread_type`` to the user thread, which
+    is what a DM wants; pinning that here is what makes the group frame above a
+    deliberate difference rather than an accident."""
+    async def scenario():
+        adapter = _adapter()
+        adapter._ws = _Socket()
+        await adapter._send_typing(_SENDER_ID)
+
+        assert adapter._ws.frames == [{"kind": "typing", "sender_id": _SENDER_ID}]
+
+    asyncio.run(scenario())
+
+
 def test_a_long_message_is_split_rather_than_cut():
     """The sidecar slices a ``send`` frame at 2000 characters instead of
     chunking it, so anything past that used to vanish without a trace."""

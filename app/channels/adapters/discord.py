@@ -138,6 +138,11 @@ class DiscordAdapter(BaseChannelAdapter):
         self._client: Any = None
         # sender_id (str user id) -> discord.User, so replies don't re-fetch.
         self._users: dict[str, Any] = {}
+        # chat_id (str channel id) -> discord channel, for the ones the gateway
+        # cache never answers for. Only HTTP-fetched channels land here; a
+        # cached one is read from the gateway on every call, so this cannot go
+        # stale ahead of it.
+        self._channels: dict[str, Any] = {}
 
     def _bot_token(self) -> str:
         token = (self.channel.get("config") or {}).get("bot_token")
@@ -363,6 +368,12 @@ class DiscordAdapter(BaseChannelAdapter):
         ``None`` for a channel this session has not seen traffic in yet — the
         normal state right after a restart, and exactly when the mirror wants to
         post — so a miss falls back to the HTTP fetch.
+
+        A fetched channel is remembered the way :meth:`_get_user` remembers a
+        fetched user, because this is no longer called once per message: the
+        typing indicator asks every four seconds for the whole length of a run,
+        and a channel the gateway will never cache (one whose guild is
+        unavailable, say) would otherwise mean an HTTP round trip per tick.
         """
         client = self._client
         if client is None:
@@ -373,11 +384,16 @@ class DiscordAdapter(BaseChannelAdapter):
             return None
         if channel is not None:
             return channel
+        cached = self._channels.get(chat_id)
+        if cached is not None:
+            return cached
         try:
-            return await client.fetch_channel(int(chat_id))
+            channel = await client.fetch_channel(int(chat_id))
         except Exception:  # noqa: BLE001
             logger.debug(f"discord: channel {chat_id} not resolvable", exc_info=True)
             return None
+        self._channels[chat_id] = channel
+        return channel
 
     async def _send_text(self, sender_id: str, text: str) -> None:
         user = await self._get_user(sender_id)
@@ -511,16 +527,25 @@ class DiscordAdapter(BaseChannelAdapter):
         return out
 
     async def _send_typing_to_chat(self, chat_id: str) -> None:
-        """Show the typing indicator in a guild channel."""
-        client = self._client
-        if client is None:
+        """Show the typing indicator in a guild channel.
+
+        Resolved through :meth:`_get_channel` rather than ``client.get_channel``:
+        the gateway cache answers ``None`` for a channel this session has not
+        seen traffic in yet — the state right after a restart, and exactly when
+        a run is composing its first mirrored reply — so a cache-only lookup is
+        how the answer arrives with no "typing…" ahead of it.
+        """
+        channel = await self._get_channel(chat_id)
+        if channel is None:
             return
         try:
-            channel = client.get_channel(int(chat_id))
-            if channel is None:
-                return
+            # Awaiting ``typing()`` sends ONE packet; the ``async with`` form
+            # would start a second re-tick loop alongside ``_typing_loop_for``.
+            # Discord's indicator lasts ~10s. (Note the contrast with Telethon,
+            # whose same-looking helper sends nothing until its task runs.)
             await channel.typing()
         except Exception:  # noqa: BLE001
+            # Also where a bound forum/category channel lands: not Messageable.
             logger.debug(
                 "[channels:discord] group typing indicator failed", exc_info=True,
             )
@@ -547,7 +572,7 @@ class DiscordAdapter(BaseChannelAdapter):
         try:
             dm = user.dm_channel or await user.create_dm()
             # Entering the typing context sends a single typing packet; we exit
-            # immediately since the base ``_typing_loop`` re-ticks every few
+            # immediately since the base ``_typing_loop_for`` re-ticks every few
             # seconds (Discord's indicator lasts ~10s).
             async with dm.typing():
                 pass

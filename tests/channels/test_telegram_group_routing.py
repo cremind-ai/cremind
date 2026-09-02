@@ -388,6 +388,99 @@ def test_send_to_chat_addresses_the_room(monkeypatch):
     asyncio.run(scenario())
 
 
+# --- typing ------------------------------------------------------------------
+#
+# The indicator runs every four seconds for the whole length of a run, so what
+# it does with a failure matters more than it would on a once-per-message call.
+
+class _TypingBot:
+    def __init__(self, raises=None):
+        self.raises = raises
+        self.calls: list[tuple] = []
+
+    async def send_chat_action(self, chat_id, action):
+        self.calls.append((chat_id, action))
+        if self.raises is not None:
+            raise self.raises
+
+
+def test_typing_in_a_room_is_addressed_to_the_room(monkeypatch):
+    async def scenario():
+        adapter = _adapter()
+        adapter._bot = _TypingBot()
+        await adapter._send_typing_to_chat(str(_CHAT_ID))
+
+        assert adapter._bot.calls == [(_CHAT_ID, "typing")]
+        assert isinstance(adapter._bot.calls[0][0], int)
+
+    asyncio.run(scenario())
+
+
+def test_a_transport_failure_rebuilds_the_bot(monkeypatch):
+    """The stale httpx pool the message-send path also recovers from: without
+    the reset the room's indicator would stay dark for the rest of the run."""
+    from telegram.error import NetworkError  # type: ignore
+
+    async def scenario():
+        adapter = _adapter()
+        adapter._bot = _TypingBot(raises=NetworkError("pool is dead"))
+        resets: list[int] = []
+
+        async def _reset():
+            resets.append(1)
+
+        monkeypatch.setattr(adapter, "_reset_bot", _reset)
+        await adapter._send_typing_to_chat(str(_CHAT_ID))
+
+        assert resets == [1]
+
+    asyncio.run(scenario())
+
+
+def test_a_rejected_chat_does_not_rebuild_the_bot(monkeypatch):
+    """``BadRequest`` is a SUBCLASS of ``NetworkError`` in PTB, so catching the
+    transport error alone would read a permanent "chat not found" — a room whose
+    id outlived our membership — as a stale pool, and tear the httpx client down
+    and build it back up every four seconds for as long as that room is
+    answered, silently."""
+    from telegram.error import BadRequest  # type: ignore
+
+    async def scenario():
+        adapter = _adapter()
+        adapter._bot = _TypingBot(raises=BadRequest("chat not found"))
+        resets: list[int] = []
+
+        async def _reset():
+            resets.append(1)
+
+        monkeypatch.setattr(adapter, "_reset_bot", _reset)
+        await adapter._send_typing_to_chat(str(_CHAT_ID))
+
+        assert resets == []
+
+    asyncio.run(scenario())
+
+
+def test_a_rejected_sender_does_not_rebuild_the_bot_either(monkeypatch):
+    """The DM path shares the decision, so it cannot drift from the room's."""
+    from telegram.error import BadRequest  # type: ignore
+
+    async def scenario():
+        adapter = _adapter()
+        adapter._bot = _TypingBot(raises=BadRequest("chat not found"))
+        resets: list[int] = []
+
+        async def _reset():
+            resets.append(1)
+
+        monkeypatch.setattr(adapter, "_reset_bot", _reset)
+        await adapter._send_typing("1644772063")
+
+        assert resets == []
+
+    asyncio.run(scenario())
+
+
 def test_store_self_identity_persists_it_on_the_channel_row():
     """Who "we" are has to survive a restart: a group recognises its own posts
     from the persisted identity, before any adapter has connected."""
