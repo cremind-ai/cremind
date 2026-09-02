@@ -88,6 +88,28 @@ def test_the_block_explains_when_NOT_to_use_a_task():
     """Without this the model turns every standing automation into a one-shot."""
     assert "STANDING subscription" in EVENT_TASKS_GUIDANCE
     assert "every future occurrence" in EVENT_TASKS_GUIDANCE
+    assert "omit `task`" in EVENT_TASKS_GUIDANCE
+
+
+def test_the_block_says_every_rule_reports_back():
+    """The claim the whole feature rests on, and the one it used to deny."""
+    flat = " ".join(EVENT_TASKS_GUIDANCE.split())
+    assert "EVERY rule registered from this conversation reports each run's" in flat
+    assert "never report back to this conversation" not in flat
+
+
+def test_the_block_says_a_standing_result_is_not_a_flow_to_continue():
+    """Otherwise the model 're-arms' a rule that is still perfectly armed."""
+    flat = " ".join(EVENT_TASKS_GUIDANCE.split())
+    assert "NEVER re-register it" in flat
+    assert "stays active and reports back after EACH run" in flat
+
+
+def test_the_block_names_the_cli_for_stopping_an_automation():
+    """'Stop sending me this' has no tool — the model must know where to go."""
+    for command in ("cremind skill-events", "cremind file-watchers",
+                    "cremind calendar schedule"):
+        assert command in EVENT_TASKS_GUIDANCE
 
 
 def test_the_block_teaches_both_ways_a_result_comes_back():

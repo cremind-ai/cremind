@@ -117,8 +117,10 @@ skill directory must not be read with System File):
     (b) if it has a listener, approve the registration notification or run
     `cremind skill-events listener-start <name>` (it respawns on boot); (c) to
     automate, load the skill in the conversation that should react and ask for it
-    (that creates a subscription — note subscriptions can't be created while
-    reacting to an event); (d) editing `SKILL.md` hot-reloads within ~1s —
+    (that creates a subscription; every firing's result is reported back into
+    that conversation, so pick the chat that should receive it — and note
+    subscriptions can't be created from inside an event run); (d) editing
+    `SKILL.md` hot-reloads within ~1s —
     **re-run `validate.py` after any frontmatter edit** (an unquoted `:` or a
     stray `---` silently drops the skill; step 7 is not a one-time gate).
 

@@ -16,7 +16,7 @@ renderer's `render` returns False to stop the loop.
 from __future__ import annotations
 
 import sys
-from typing import Any, Awaitable, Callable, Optional, Protocol, runtime_checkable
+from typing import Awaitable, Callable, Optional, Protocol, runtime_checkable
 
 from app.cli.client._base import Client
 from app.cli.client._sse import Event
@@ -58,6 +58,20 @@ class RawRenderer:
                 if isinstance(text, str) and text:
                     sys.stdout.write(text)
                     sys.stdout.flush()
+            return True
+        if event.type == "event_trigger_message":
+            # An automation fired here, or reported a run's result back into
+            # this conversation. The answer streams below as ordinary text; a
+            # one-line notice on stderr says what caused it without
+            # contaminating piped stdout.
+            data = event.data.get("data") if isinstance(event.data, dict) else None
+            d = data if isinstance(data, dict) else {}
+            meta = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
+            label = str(meta.get("label") or "").strip()
+            sys.stderr.write(
+                f"[Automation: {label}]\n" if label else "[Automation]\n"
+            )
+            sys.stderr.flush()
             return True
         if event.type in ("ask_user_question", "plan_ready", "todos"):
             payload = event.data.get("data") if isinstance(event.data, dict) else None

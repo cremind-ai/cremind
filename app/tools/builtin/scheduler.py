@@ -496,15 +496,18 @@ class SchedulerTool(BuiltInTool):
                     feature_on = is_enabled(profile)
                 except Exception:  # noqa: BLE001
                     feature_on = False
-            # A one-time (instant) event registers as an EVENT TASK, so the
-            # model must know its outcome comes back as a later turn — otherwise
-            # it tries to wait for it inside this turn.
+            # Whatever the cadence, the outcome comes back as a later turn —
+            # otherwise the model tries to wait for it inside this one. A
+            # one-time event is additionally a ONE-SHOT task: it stops itself.
             task_note = (
-                " A one-time event you register is a TASK: it fires once and its "
-                "outcome is delivered back into this conversation as a later "
-                "turn — so register it, then end your turn; never wait or poll "
-                "for it."
-                if schedule_kind == "instant" else ""
+                " A one-time event you register is a one-shot TASK: it fires "
+                "once and its outcome is reported back into this conversation "
+                "as a later turn — so register it, then end your turn; never "
+                "wait or poll for it."
+                if schedule_kind == "instant" else
+                " An event you register here reports each firing's result back "
+                "into this conversation as a later turn — register it, tell the "
+                "user, and end your turn; never wait or poll for it."
             )
             result["registration_note"] = (
                 "PARSED ONLY — nothing is scheduled yet. This tool just "

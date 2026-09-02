@@ -58,6 +58,13 @@ channel that cannot start in the new environment produces a **warning** (see
 `cremind backup report`) rather than failing silently — restart or re-link it
 manually.
 
+A restore **never replays run results a conversation was still owed** when the
+backup was taken. Those results describe a moment that has passed, so they are
+closed out as `skipped` (visible in `cremind event-runs list`'s DELIVERED
+column) and counted in the restore warnings, rather than landing in the
+conversation as turns about stale news. The rules themselves are restored and
+fire again normally.
+
 ## Finding this in the web UI
 
 > **Settings → Backup & Restore**

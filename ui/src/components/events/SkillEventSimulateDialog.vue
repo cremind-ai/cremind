@@ -50,6 +50,12 @@ async function fire() {
       simulateFilename.value,
     );
     ElMessage.success(`Event fired — wrote ${result.path}`);
+    // The server knows how far this actually reaches (how many subscriptions
+    // fire, whether a one-shot is being spent); show it rather than letting the
+    // success toast imply nothing else happened.
+    for (const warning of result.warnings ?? []) {
+      ElMessage.warning({ message: warning, duration: 10000, showClose: true });
+    }
     simulateOpen.value = false;
   } catch (err) {
     if (targetCid) {
@@ -69,6 +75,16 @@ defineExpose({ open });
       <strong>{{ simulateTarget.skill_name }}</strong>.
       The file is written into the watched events folder; the watchdog picks
       it up just like a real event and deletes it after dispatch.
+    </p>
+    <p class="dialog-info sim-warning" v-if="simulateTarget">
+      This sends real messages. Every active subscription for this skill event
+      in your profile fires — not just this one — and each run reports its
+      result into the conversation that registered it, which may be a room or a
+      channel group.
+      <span v-if="simulateTarget.task && simulateTarget.task_status === 'active'">
+        This one-shot task will be consumed by the simulated event and will no
+        longer fire for the real one.
+      </span>
     </p>
     <div class="sim-field">
       <label class="sim-label">File name</label>
@@ -102,6 +118,9 @@ defineExpose({ open });
   color: var(--text-secondary);
   font-size: 0.875rem;
   line-height: 1.5;
+}
+.sim-warning {
+  color: var(--el-color-warning);
 }
 .sim-field {
   margin-bottom: 12px;

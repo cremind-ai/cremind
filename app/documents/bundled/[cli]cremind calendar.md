@@ -1,5 +1,5 @@
 ---
-description: "Create, edit, and delete **scheduled and recurring events, reminders, and timers** (one-off or RRULE-recurring) that fire an agent action at a set time; enable or disable the per-profile **Calendar & Schedule** feature, connect or disconnect **Google Calendar**, and pause/resume/cancel schedule subscriptions. Use this to set a reminder, schedule a recurring task, or link a Google calendar — time-based triggers, unlike filesystem or skill events. Also reports **which Google account the calendar is using and where it came from** (`google_source`: the gcalendar skill's link, which takes precedence, or one connected here) — consult this when asked why the calendar shows the wrong account or why connecting Google here is refused. `schedule list` also shows which one-time events are **event tasks** (created by the assistant to wait for a moment, delivering their result back into the conversation that is waiting); tasks cannot be paused or made recurring."
+description: "Create, edit, and delete **scheduled and recurring events, reminders, and timers** (one-off or RRULE-recurring) that fire an agent action at a set time; enable or disable the per-profile **Calendar & Schedule** feature, connect or disconnect **Google Calendar**, and pause/resume/cancel schedule subscriptions. Use this to set a reminder, schedule a recurring task, or link a Google calendar — time-based triggers, unlike filesystem or skill events. Also reports **which Google account the calendar is using and where it came from** (`google_source`: the gcalendar skill's link, which takes precedence, or one connected here) — consult this when asked why the calendar shows the wrong account or why connecting Google here is refused. **Every event created from a conversation reports each firing's result back into it as a new turn**, recurring events included; `schedule list`'s TASK column marks a **ONE-SHOT event task** (waits for one moment, reports, then terminates — it cannot be paused or made recurring). Manual events, added here or in the calendar UI, are bound to the `__schedule__` host conversation, so they have nowhere to report and surface as notifications only."
 ---
 
 # `cremind calendar` — Calendar & Schedule
@@ -19,8 +19,10 @@ The feature is **off by default per profile** and must be enabled
 
 Each time a schedule event *fires*, that single firing now runs in its own
 isolated, hidden per-run conversation (not one shared `__schedule__` thread),
-tracked with a status and token usage. Browse that run history — and reply to a
-firing that paused to ask you something — with `cremind event-runs`
+tracked with a status and token usage. When the run finishes, its result is
+reported back into the conversation that created the event, as a new turn —
+every firing, recurring events included. Browse that run history — and reply to
+a firing that paused to ask you something — with `cremind event-runs`
 (`cremind event-runs list --kind schedule`).
 
 ## Finding this in the web UI
@@ -220,13 +222,18 @@ cremind calendar schedule list
 Renders an `ID / TITLE / KIND / START / STATUS / TASK / CONV_TITLE` table;
 `--json` returns the `subscriptions` array.
 
-`TASK` is `yes` for a **one-time event task**: an event the assistant created
-while working, for a moment the conversation is waiting on ("check the build at
-16:00 and tell me"). When it fires, the result is delivered back into that
+`TASK` is `yes` for a **ONE-SHOT event task**: an event the assistant created
+while working, for a single moment the conversation is waiting on ("check the
+build at 16:00 and tell me"). It fires once, reports its result back into that
 conversation as a new turn so the assistant can continue, and the row flips to
-`completed`. Recurring events and events you add yourself (from the calendar UI
-or `cremind calendar add`) are never tasks — their runs surface as
-notifications and on the Events page instead.
+`completed`.
+
+Blank does *not* mean nothing is reported. A recurring event created from a chat
+reports **every** firing back into that chat the same way — it simply never
+terminates, so it is not a task. What has nowhere to report is a **manual**
+event: one you added from the calendar UI or with `cremind calendar add` is
+bound to the profile's `__schedule__` host conversation, so its runs surface as
+notifications and on the Events page only.
 
 ### `cremind calendar schedule status`
 
@@ -239,13 +246,15 @@ cremind calendar schedule status <id> active|paused|cancelled
 Prints the updated event. Any value other than `active`/`paused`/`cancelled`
 is rejected.
 
-**Tasks cannot be paused** (`400 task_pause_unsupported`). Resuming re-seeds an
-event's fire time from *now*, so a one-time task whose moment passed while
-paused would silently never fire and the conversation waiting for it would
-never hear back. Cancel or delete it instead. For the same reason,
-`cremind calendar edit` refuses to add an `--rrule` to a task
-(`400 task_recurrence_conflict`): a recurring rule never reports back. Create a
-separate recurring event if that is what you want.
+**One-shot tasks cannot be paused** (`400 task_pause_unsupported`). Resuming
+re-seeds an event's fire time from *now*, so a one-shot task whose moment passed
+while paused would silently never fire and the conversation waiting for it would
+never hear back. Cancel or delete it instead. Relatedly,
+`cremind calendar edit` refuses to add an `--rrule` to a one-shot task
+(`400 task_recurrence_conflict`): "wait for this one moment, then terminate" and
+"repeat indefinitely" are contradictory lifecycles. Create a separate recurring
+event if that is what you want — it reports every firing back to its
+conversation just the same.
 
 ## Worked examples
 

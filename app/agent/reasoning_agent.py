@@ -189,39 +189,57 @@ report the outcome instead.
 '''
 
 
-# Appended to every NON-event-run turn's system prompt. Teaches the one thing the
-# tool descriptions cannot: that "do X, wait for the outcome, then do Y" is a
-# real, supported shape, and that the way to serve it is to register a one-shot
-# task and END the turn — not to sleep, poll, or re-check in a loop. Appended
-# (not a template slot) and gated on the conversation-constant ``_event_run``
-# flag, so a chat conversation's cached system prefix stays byte-stable.
+# Appended to every NON-event-run turn's system prompt. Teaches what no tool
+# description can: every rule registered from a chat reports each run's result
+# back to it, "do X, wait for the outcome, then do Y" is served by a ONE-SHOT
+# task plus ending the turn, and "every time / every day" is served by a standing
+# rule that keeps reporting. Appended (not a template slot) and gated on the
+# conversation-constant ``_event_run`` flag, so a chat conversation's cached
+# system prefix stays byte-stable.
 EVENT_TASKS_GUIDANCE = '''
 
-EVENT TASKS — WAITING FOR SOMETHING TO HAPPEN: When a request has the shape "do
-X, wait for the outcome, then do Y", do X now, register a ONE-SHOT TASK for the
-outcome, and END YOUR TURN. Never sleep, poll, or re-check in a loop.
-- waiting for a skill event (an email reply, a webhook, a new item) -> that
-  skill's `subscribe` with `task: true`, exactly ONE `trigger`, and an optional
-  `timeout_minutes`;
-- waiting for a file to appear or change -> `register_file_watcher` with
-  `task: true` (+ optional `timeout_minutes`);
-- waiting for a moment in time -> `schedule_create` with no `rrule`: every
-  one-time event you create is already a task.
-A task runs its `action` once in a background conversation, then its result — or
-a "timed out" notice — comes back to THIS conversation and the task stops itself.
-How it comes back depends on what you are doing when it lands: if nothing is
-running here it arrives on its own as a new turn; if it lands while a turn is
-still running you get a short bracketed notice on your next step naming the task
-and whether it succeeded, and you decide — call `get_event_task_results` to read
-it now if it changes your next step, or keep working and it is handed to you as a
-new turn the moment your turn ends. Either way nothing is lost and nothing needs
-polling. So write `action` to EXTRACT and REPORT what you need in order to
-continue; do NOT ask it to notify the user, you will do that here. You may
-register several tasks in one turn; results that land together are handed over
-together. When you are done, finish with a short message naming exactly what you
-are waiting for. Use a STANDING subscription (no `task`) or a recurring schedule
-ONLY when the user wants every future occurrence handled indefinitely — those
-never report back to this conversation.
+EVENT TASKS AND AUTOMATIONS — ACTING WHEN SOMETHING HAPPENS: You can register
+rules that run an `action` later, in a background conversation, when something
+happens. EVERY rule registered from this conversation reports each run's result
+back HERE once the run finishes — a one-shot task and a standing rule alike — so
+you never need the action to notify anyone, and you never wait for it here.
+TWO SHAPES, ONE FLAG. `task: true` means ONE-SHOT: wait for the NEXT matching
+occurrence only, run the action once, report back, then stop (giving up after
+`timeout_minutes` with a "timed out" result instead). Use it for "do X, wait
+for the outcome, then do Y": do X now, register the task, and END YOUR TURN
+with a short message naming exactly what you are waiting for.
+Never sleep, poll, or re-check in a loop. Use a STANDING subscription or a
+recurring schedule (omit `task`) — "every time …", "every day at …",
+"whenever …" — when the user wants every future occurrence handled: it stays
+active and reports back after EACH run until the user stops it.
+- a skill event (an email reply, a webhook, a new item) -> that skill's
+  `subscribe`; for a one-shot task add `task: true`, exactly ONE `trigger`,
+  and an optional `timeout_minutes`;
+- a file appearing or changing -> `register_file_watcher`; for a one-shot
+  task add `task: true` (+ optional `timeout_minutes`);
+- a moment in time -> `schedule_create`: a one-time event (no `rrule`) is
+  already a one-shot task; an `rrule` makes it a recurring automation.
+HOW RESULTS COME BACK depends on what you are doing when one lands: if nothing
+is running here it arrives on its own as a new turn beginning [Event result]
+or [Event task result]; if it lands while a turn is still running you get a
+short bracketed notice on your next step naming the rule and whether it
+succeeded, and you decide — call `get_event_task_results` to read it now if it
+changes your next step, or keep working and it is handed to you as a new turn
+the moment your turn ends. Either way nothing is lost and nothing needs
+polling. So write `action` to EXTRACT and REPORT what matters (the decision in
+the reply, the error in the log, the day's headlines); do NOT ask it to notify
+the user or post anywhere — you do that here when the result arrives. You may
+register several rules in one turn; results that land together are handed
+over together.
+WHEN A RESULT ARRIVES: for a one-shot task, continue the flow that was waiting
+on it (register the NEXT one-shot task if the flow needs another wait). For a
+standing rule, act on the result as the rule intended and tell the user what
+came of it — the rule is still active and will report again on its next
+occurrence, so NEVER re-register it, and never register a standing automation
+from a result turn. To list, pause, resume or stop automations use the CLI
+(`cremind skill-events`, `cremind file-watchers`, `cremind calendar schedule`):
+run `documentation_search` for the command's doc, then run it with the Shell
+Executor.
 '''
 
 
@@ -354,15 +372,16 @@ _ACK_REQUEST = (
     "no reply, respond with exactly: SKIP"
 )
 
-# The same pause, for the other kind of interruption: an awaited event task's
-# outcome landed mid-turn. The user did not ask anything here, so the reply is
-# news rather than an answer — hence its own wording.
+# The same pause, for the other kind of interruption: an automation's outcome
+# landed mid-turn. The user did not ask anything here, so the reply is news
+# rather than an answer — hence its own wording.
 _TASK_ACK_REQUEST = (
     "[Pause — tell the user what just landed, then the work resumes]\n"
-    "The notice above names a one-shot task you registered earlier that has "
-    "just finished, and whether it succeeded. In ONE short sentence tell the "
-    "user it arrived and what it means for what you are doing — no more. Do "
-    "not report its full result (you have not read it yet), do not promise to "
+    "The notice above names an automation registered earlier in this "
+    "conversation — a one-shot task or a standing rule — whose run has just "
+    "finished, and whether it succeeded. In ONE short sentence tell the user "
+    "it arrived and what it means for what you are doing — no more. Do not "
+    "report its full result (you have not read it yet), do not promise to "
     "report back, and do not summarise the whole job: this is a heads-up, not "
     "the final answer, and the work continues immediately afterwards.\n"
     "If it does not affect what the user is waiting on and saying so would "
@@ -505,6 +524,23 @@ def _format_message_origin_block(origin: Optional[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Shared by both room blocks. An automation's result re-enters a seat (or a
+# platform group) as a turn carrying none of the room's cues — no "<Name>:"
+# prefix, no routing note, nobody addressing anyone — so the SPEAK / STAY SILENT
+# rules read it as "not for me" and the digest the room itself asked for is
+# answered [silent]. Static text in a conversation-constant block, so the cached
+# prompt prefix is unaffected.
+_ROOM_EVENT_RESULT_CLAUSE = (
+    "AUTOMATION RESULTS: a turn that begins with [Event result], [Event "
+    "results], [Event task result] or [Event task results] — or a "
+    "`get_event_task_results` result — is YOUR OWN automation reporting back: "
+    "the room asked for it when the rule was set up, so it is for you even "
+    "though nobody addressed you. Report the outcome to the room in your own "
+    "words, as one short post; answer [silent] only if the result explicitly "
+    "says there is nothing new to report."
+)
+
+
 def _format_group_chat_block(origin: Optional[dict]) -> str:
     """Render the room an agent is sitting in, and the etiquette of being in it.
 
@@ -573,6 +609,7 @@ def _format_group_chat_block(origin: Optional[dict]) -> str:
         "asked to pause and answer them in one line. That line is posted on its "
         "own and judged on its own, so giving it does not break the rule above "
         "and does not stop this turn ending [silent].",
+        _ROOM_EVENT_RESULT_CLAUSE,
         "STYLE: keep posts short and addressed to whoever they are for. Ask a "
         "member by name when you need something from them, and answer in one "
         "message rather than several.",
@@ -664,6 +701,7 @@ def _format_channel_group_block(origin: Optional[dict]) -> str:
         "asked to pause and answer them in one line. That line is sent on its "
         "own and judged on its own, so giving it does not break the rule above "
         "and does not stop this turn ending [silent].",
+        _ROOM_EVENT_RESULT_CLAUSE,
         "LOOPS: some accounts here may be automated too, including other "
         "assistants. Do not keep an exchange going with one out of politeness — "
         "if nothing new is being asked of you, stay silent.",
@@ -1673,7 +1711,10 @@ class ReasoningAgent:
             "type": "object",
             "description": (
                 "Subscribe this conversation to one or more of this skill's "
-                "events so an action runs automatically whenever an event fires."
+                "events so an action runs automatically whenever an event "
+                "fires. Each run's result is reported back into this "
+                "conversation when it finishes — on every firing for a standing "
+                "subscription, once for a one-shot task (`task: true`)."
             ),
             "properties": {
                 "trigger": {
@@ -1712,15 +1753,16 @@ class ReasoningAgent:
                         "Set true to make this a ONE-SHOT TASK instead of a "
                         "standing subscription: it waits for the NEXT matching "
                         "event only, runs `action` once in the background, "
-                        "delivers the outcome back into THIS conversation as a "
+                        "reports the outcome back into THIS conversation as a "
                         "new turn (where you continue the user's flow), then "
                         "stops itself. Use it whenever the request has a 'do X, "
                         "wait for the outcome, then do Y' shape (send the email "
                         "and wait for the reply; open the PR and wait for CI). "
-                        "Requires EXACTLY ONE `trigger`. Leave it off only for a "
-                        "standing rule that must handle EVERY future occurrence "
-                        "indefinitely — a standing rule's runs never report back "
-                        "here. With task=true, write `action` so it EXTRACTS and "
+                        "Requires EXACTLY ONE `trigger`. Leave it off for a "
+                        "standing subscription that must handle EVERY future "
+                        "occurrence — a standing subscription stays active and "
+                        "reports back here after each run, until the user stops "
+                        "it. In both cases write `action` so it EXTRACTS and "
                         "REPORTS the outcome you need (e.g. 'read the reply and "
                         "report the decision and any date proposed'); do NOT ask "
                         "it to notify the user — you do that here when the "
@@ -1734,10 +1776,11 @@ class ReasoningAgent:
                     "description": (
                         "Only valid together with task=true: give up after this "
                         "many minutes if the event never fires. On timeout a "
-                        "'timed out' result is delivered back into this "
+                        "'timed out' result is reported back into this "
                         "conversation, so the flow is never left hanging. Omit "
                         f"for the default ({TASK_TIMEOUT_DEFAULT_MINUTES} = 7 "
-                        "days). Never send it without task=true."
+                        "days). Never send it without task=true — a standing "
+                        "subscription has no deadline."
                     ),
                 },
             },
@@ -1916,10 +1959,13 @@ class ReasoningAgent:
         - inside an event run → always refused (an automation must not create
           automations);
         - on an ordinary chat turn → never refused;
-        - on a turn started by an event-task result → only ONE-SHOT TASKS are
+        - on a turn started by an event RESULT (a one-shot task's, or a standing
+          rule's — every report starts such a turn) → only ONE-SHOT TASKS are
           allowed. That is what lets a flow wait again ("reply to the customer,
           wait for their next mail") while a standing automation — which would
-          re-register on every single result — stays blocked.
+          be registered again on every single report — stays blocked. A user
+          message folded into the turn clears the flag, because a person asking
+          for a standing rule is not the unattended loop this guards against.
         """
         if not self._is_registration_leaf(entry):
             return False
@@ -1976,20 +2022,22 @@ class ReasoningAgent:
         chain_depth = self._effective_chain_depth()
         if chain_depth >= MAX_TASK_CHAIN_DEPTH:
             return (
-                f"This flow has already chained {chain_depth} event "
+                f"This flow has already chained {chain_depth} one-shot event "
                 "tasks, which is the limit — nothing was registered. Finish now "
                 "and tell the user where things stand; if more waiting is needed "
                 "they can ask again in a new message."
             )
         return (
-            "This turn was started by an event-task result, so it may register "
-            "only ONE-SHOT TASKS — a recurring or standing automation would "
-            "re-register itself on every future result. Nothing was created. To "
-            "wait for one more outcome, register a task instead: "
-            "`schedule_create` with no `rrule` (and no `end`/`all_day`, duration "
-            "under 30 minutes), or `register_file_watcher` with `task: true`. If "
-            "the user really wants a permanent automation, finish this turn and "
-            "tell them to ask for it in a new message."
+            "This turn was started by an event result, so it may register "
+            "only ONE-SHOT TASKS — a recurring or standing automation "
+            "registered here would be registered again on every future report. "
+            "Nothing was created. To wait for one more outcome, register a "
+            "one-shot task instead: `schedule_create` with no `rrule` (and no "
+            "`end`/`all_day`, duration under 30 minutes), or "
+            "`register_file_watcher` with `task: true`. Recurring and standing "
+            "automations are registered from a turn the user starts: if they "
+            "really want one, finish this turn and tell them to ask for it in a "
+            "new message."
         )
 
     # Mutating leaves refused (at dispatch, schema still exposed) during the plan
@@ -2101,6 +2149,13 @@ class ReasoningAgent:
             injected = drained + notices
             self._turn_messages.extend(injected)
             instruction = self._build_instruction()
+            # In a room, an automation's result reporting back is not something
+            # to announce: the ack is posted to the room as its own message, and
+            # the result itself is posted moments later when the turn ends — two
+            # unsolicited posts for one outcome, the first of which nobody asked
+            # for. A person interrupting is different: that still earns a reply.
+            if notices and not drained and getattr(self, "_room_chat", False):
+                injected = []
             if injected:
                 # Something interrupted a busy agent. Tell the user NOW rather
                 # than at the end of the job: see _acknowledge_interruption for
@@ -2661,22 +2716,32 @@ class ReasoningAgent:
         if not notices:
             return []
 
+        # Say which shape each result is: one the flow may be BLOCKED on, or a
+        # rule reporting in. Without it the agent cannot tell the line it must
+        # read now from the four it can safely ignore.
         lines = "\n".join(
-            f"- {n.get('label') or 'event task'} — {n.get('status_word') or 'finished'}"
+            f"- {n.get('label') or 'event task'} — "
+            f"{n.get('status_word') or 'finished'}"
+            + (
+                " (one-shot task you were waiting on)" if n.get("once")
+                else " (standing rule)"
+            )
             for n in notices
         )
         return [{
             "role": "user",
             "content": (
                 f"[Event task results waiting — {len(notices)}]\n"
-                "A one-shot task registered earlier in this conversation "
-                f"finished while this turn was running:\n{lines}\n"
+                "An automation registered earlier in this conversation — a "
+                "one-shot task or a standing rule — finished while this turn "
+                f"was running:\n{lines}\n"
                 "Call `get_event_task_results` now (no arguments) if these "
                 "outcomes change what you should do next — answering without "
                 "them risks a stale answer. If they are irrelevant to what you "
                 "are doing right now, keep working: every waiting result is "
                 "delivered automatically as a new turn as soon as this turn "
-                "ends."
+                "ends. A standing rule's result never needs re-registering — "
+                "the rule is still active."
             ),
         }]
 
@@ -2737,6 +2802,13 @@ class ReasoningAgent:
         # the message ever reached the inbox. Read once, at the pause, to tell a
         # declined answer apart from a question that was never this agent's.
         self._drained_addressed = any(p.get("addressed") for p in parked)
+        # A person just spoke into this turn, so it is no longer only an
+        # automation reporting back. The registration gate exists to stop an
+        # unattended result from re-registering rules; a human asking for one
+        # ("also do this every morning") is exactly the case it must not refuse,
+        # and a present human is what that gate's own docstring says resets the
+        # concern. The chain-depth cap is untouched.
+        self._triggered_by_event = False
         body = "\n\n---\n\n".join(texts)
         plural = len(texts) > 1
         subj = "they" if plural else "it"          # subject pronoun
@@ -2923,7 +2995,13 @@ class ReasoningAgent:
             "the full plan-derived steps when a plan for this automation exists. It "
             "runs later in a fresh conversation with no access to this one, so inline "
             "every concrete value verbatim (URLs, emails, paths, IDs) — never 'the "
-            "provided X'."
+            "provided X'. Add `task: true` (exactly one `trigger`, optional "
+            "`timeout_minutes`) only when the user is waiting for the NEXT "
+            "occurrence and this conversation continues from it — the subscription "
+            "then fires once, reports back, and stops; leave it off for a standing "
+            "rule that handles every future occurrence. Either way each run's "
+            "result is reported back into this conversation when it finishes, so "
+            "write `action` to extract and report, not to notify."
         )
 
     @staticmethod
@@ -3014,11 +3092,13 @@ class ReasoningAgent:
             # run risks a recursive event storm (event → reasoning → subscribe →
             # event → …).
             #
-            # A turn started by an EVENT-TASK RESULT is different: it is an
-            # ordinary chat turn continuing a flow, and that flow may legitimately
-            # need to wait once more ("reply to the customer, then wait for their
-            # next mail"). One-shot tasks are therefore allowed there; a standing
-            # subscription is not, since it would re-register on every result.
+            # A turn started by an EVENT RESULT is different — a one-shot task's
+            # or a standing rule's, since every report starts such a turn. It is
+            # an ordinary chat turn continuing a flow, and that flow may
+            # legitimately need to wait once more ("reply to the customer, then
+            # wait for their next mail"). One-shot tasks are therefore allowed
+            # there; a standing subscription is not, since it would be
+            # registered again on every report.
             sub_args = args.get("subscribe") or {}
             if getattr(self, "_event_run", False):
                 obs = (
@@ -3043,13 +3123,15 @@ class ReasoningAgent:
                     obs = self._registration_refusal()
                 elif not is_task_subscribe_args(sub_args):
                     obs = (
-                        "This turn was started by an event-task result, so it may "
+                        "This turn was started by an event result, so it may "
                         "register only ONE-SHOT TASKS. A standing subscription "
-                        "would fire forever, so nothing was created. Re-call "
-                        "`subscribe` with `task: true`, exactly one `trigger`, and "
-                        "an optional `timeout_minutes` if you need to wait for one "
-                        "more occurrence; otherwise finish your turn and answer "
-                        "the user."
+                        "registered here would be registered again on every "
+                        "report, so nothing was created. Re-call `subscribe` "
+                        "with `task: true`, exactly one `trigger`, and an "
+                        "optional `timeout_minutes` if you need to wait for one "
+                        "more occurrence; otherwise act on the result and answer "
+                        "the user. A standing subscription is registered from a "
+                        "turn the user starts."
                     )
                 else:
                     obs = None

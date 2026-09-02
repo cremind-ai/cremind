@@ -159,7 +159,16 @@ def _attempt_rollback(safety_backup_path: str, target: str) -> bool:
         from app.databases import set_database_provider
 
         set_database_provider(None)
-        restore_backup(Path(safety_backup_path), target_system_dir=target)
+        # Owed automation results are kept: the safety backup is THIS install's
+        # own state from minutes ago, so its undelivered results are genuinely
+        # still owed to live conversations. Closing them out is right for an
+        # incoming archive and wrong for a rollback, whose whole job is to leave
+        # everything as it was.
+        restore_backup(
+            Path(safety_backup_path),
+            target_system_dir=target,
+            close_out_owed_results=False,
+        )
         logger.info("[backup:restore] rollback to safety backup succeeded")
         return True
     except Exception:  # noqa: BLE001

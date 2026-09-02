@@ -324,3 +324,27 @@ async def _judge(**overrides):
     }
     kwargs.update(overrides)
     return await judge_relevance(**kwargs)
+
+
+def test_an_automation_trigger_block_is_not_the_agents_speech():
+    """The agent never said it — the delivery layer wrote it.
+
+    It is stored as an agent row because that is how the transcript renders it,
+    and it shares ``metadata.source`` with the agent's real answer to the same
+    turn, so the two are told apart by the ``trigger`` marker. Showing the block
+    to the judge would have it weighing machine scaffolding as conversation.
+    """
+    rows = [
+        {"role": "user", "content": "Alexa (user): anything new?"},
+        {"role": "agent",
+         "content": "Trigger: automation completed: Daily digest\nContent:\ntwo tickets",
+         "metadata": {"source": "event_task_result", "trigger": True,
+                      "channel_group": {"kind": "sent"}}},
+        {"role": "agent", "content": "Two new tickets came in today.",
+         "metadata": {"source": "event_task_result",
+                      "channel_group": {"kind": "sent"}}},
+    ]
+    assert render_recent_for_judge(rows, agent_name="Rex") == [
+        "Alexa (user): anything new?",
+        "Rex (you): Two new tickets came in today.",
+    ]

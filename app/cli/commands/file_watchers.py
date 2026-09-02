@@ -80,7 +80,9 @@ def file_watchers_list(ctx: typer.Context) -> None:
             string_field(s, "extensions"),
             bool_field(s, "armed", False),
             bool_field(s, "paused", False),
-            # TASK shows the one-shot lifecycle (blank for standing watchers).
+            # TASK shows the one-shot lifecycle. Blank for a standing watcher,
+            # which keeps firing and reports every firing back to its
+            # conversation.
             (s.get("task_status") or "active") if s.get("task") else "",
             epoch_seconds_field(s.get("timeout_at")),
             string_field(s, "conversation_title"),
@@ -194,16 +196,18 @@ def file_watchers_register(
     task: bool = typer.Option(
         False, "--task",
         help=(
-            "Register a ONE-SHOT task: fires on the first matching event, "
-            "delivers its result back into the bound conversation, then removes "
-            "itself (instead of watching forever)."
+            "Register a ONE-SHOT task: fires on the FIRST matching event, "
+            "reports its result back into the bound conversation, then removes "
+            "itself. Without it the watcher is standing — it keeps watching and "
+            "reports each firing back to that same conversation."
         ),
     ),
     timeout: Optional[int] = typer.Option(
         None, "--timeout",
         help=(
-            "Requires --task: minutes to wait before giving up and reporting "
-            "that the event never fired (default 7 days)."
+            "Requires --task (a standing watcher has no deadline): minutes to "
+            "wait before giving up and reporting that the event never fired "
+            "(default 7 days)."
         ),
     ),
 ) -> None:
@@ -289,13 +293,16 @@ def file_watchers_edit(
     timeout: Optional[int] = typer.Option(
         None, "--timeout",
         help=(
-            "One-shot tasks only: minutes from now before the task gives up and "
-            "reports back that its event never fired."
+            "ONE-SHOT tasks only: minutes from now before the task gives up "
+            "and reports back that its event never fired."
         ),
     ),
     no_timeout: bool = typer.Option(
         False, "--no-timeout",
-        help="One-shot tasks only: clear the deadline (wait indefinitely).",
+        help=(
+            "ONE-SHOT tasks only: clear the deadline (wait indefinitely for "
+            "the single firing)."
+        ),
     ),
 ) -> None:
     """Edit a file watcher (only the flags you pass are changed)."""

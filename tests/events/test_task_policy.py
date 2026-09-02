@@ -132,3 +132,42 @@ def test_is_task_registration_routes_by_leaf():
     assert not is_task_registration("scheduler", "schedule_create", {"rrule": "FREQ=DAILY"})
     # Anything that isn't a registration leaf is simply not a task registration.
     assert not is_task_registration("system_file", "write_file", {"task": True})
+
+
+# ── where a result may be reported ──────────────────────────────────────────
+
+
+def test_an_ordinary_conversation_can_receive_a_result():
+    from app.events.task_policy import is_deliverable_origin
+
+    assert is_deliverable_origin("chat", None) is True
+    assert is_deliverable_origin("chat", "ctx-1") is True
+    assert is_deliverable_origin(None, None) is True
+
+
+def test_both_room_shapes_can_receive_a_result():
+    """A seat posts the answer to its room; a platform group mirrors it out."""
+    from app.events.task_policy import is_deliverable_origin
+
+    assert is_deliverable_origin("group_chat", "group:g1:p1") is True
+    assert is_deliverable_origin("chat", "channel_group:g1") is True
+
+
+def test_a_hidden_run_conversation_is_never_an_origin():
+    """Otherwise an automation could report into its own scratch space."""
+    from app.events.task_policy import is_deliverable_origin
+
+    assert is_deliverable_origin("event_run", None) is False
+    assert is_deliverable_origin("event_run", "ctx-1") is False
+
+
+def test_a_reserved_host_conversation_has_no_reader():
+    """The calendar UI's schedule host and the blueprint import host.
+
+    Rules bound to these keep the old behaviour — notifications only — because
+    reporting into a conversation nobody opens is worse than not reporting.
+    """
+    from app.events.task_policy import is_deliverable_origin
+
+    assert is_deliverable_origin("chat", "__schedule__") is False
+    assert is_deliverable_origin("chat", "__skill_events__") is False

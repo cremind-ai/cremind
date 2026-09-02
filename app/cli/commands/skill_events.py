@@ -60,7 +60,9 @@ def skill_events_list(ctx: typer.Context) -> None:
             string_field(s, "conversation_id"),
             string_field(s, "conversation_title"),
             "yes" if s.get("paused") else "",
-            # TASK shows the one-shot lifecycle (blank for standing rules).
+            # TASK shows the one-shot lifecycle. Blank for a standing rule,
+            # which keeps firing and reports every firing back to its
+            # conversation.
             (s.get("task_status") or "active") if s.get("task") else "",
             epoch_seconds_field(s.get("timeout_at")),
         )
@@ -150,13 +152,18 @@ def skill_events_edit(
     timeout: Optional[int] = typer.Option(
         None, "--timeout",
         help=(
-            "One-shot tasks only: minutes from now before the task gives up and "
-            "reports back that its event never fired."
+            "ONE-SHOT tasks only (a standing rule has no deadline — it fires "
+            "indefinitely and reports every firing back to its conversation): "
+            "minutes from now before the task gives up and reports back that "
+            "its event never fired."
         ),
     ),
     no_timeout: bool = typer.Option(
         False, "--no-timeout",
-        help="One-shot tasks only: clear the deadline (wait indefinitely).",
+        help=(
+            "ONE-SHOT tasks only: clear the deadline (wait indefinitely for "
+            "the single firing)."
+        ),
     ),
 ) -> None:
     """Edit a skill event subscription (only the flags you pass are changed)."""
@@ -228,8 +235,12 @@ def skill_events_simulate(
 ) -> None:
     """Drop a markdown file into the watched events folder (dev tool).
 
-    Simulating a ONE-SHOT TASK consumes its single firing, so the real event
-    will no longer trigger it — the server says so and it is echoed here.
+    Not a dry run. The file fires EVERY active subscription for that
+    skill/event in the profile — not just <sub-id>, which only picks the folder
+    — and each run reports its result into the conversation that registered it,
+    which may be a Cremind room or a platform group. Simulating a ONE-SHOT TASK
+    also consumes its single firing. The server returns these as warnings and
+    they are echoed to stderr.
     """
     import asyncio
 
@@ -246,8 +257,7 @@ def skill_events_simulate(
             return await simulate_skill_event(client, sub_id, body, filename)
 
     out = asyncio.run(_run())
-    warning = (out or {}).get("task_warning")
-    if warning:
+    for warning in (out or {}).get("warnings") or []:
         typer.echo(f"warning: {warning}", err=True)
 
 

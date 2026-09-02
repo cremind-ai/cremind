@@ -634,3 +634,59 @@ def test_a_sentinel_and_note_on_one_line_still_means_silence(
         assert (await _marker(env, msg_id))["kind"] == "silent"
 
     asyncio.run(run())
+
+
+# ── automations reporting into a room ───────────────────────────────────────
+
+
+def test_an_automation_post_is_a_new_root_not_another_hop(tmp_path, monkeypatch) -> None:
+    """A daily digest must not run the room out of agent hops.
+
+    The hop counter exists to stop agents talking to each other forever, and it
+    is measured from the last human message. An automation is paced by the
+    outside world instead, so if its posts inherited the count a room whose only
+    traffic is a digest would hit ``max_agent_hops`` within a week and then stop
+    waking anyone — including for a report that names a member by name.
+    """
+    env = _env(tmp_path, monkeypatch)
+
+    async def run():
+        group, conv, msg_id = await _seat(env)
+        await on_shadow_turn_complete(
+            conversation_storage=env.conversation_storage,
+            conversation_id=conv["id"],
+            profile="dog",
+            run_id="run-auto",
+            assistant_msg_id=msg_id,
+            raw_text="Today's digest: two new tickets.",
+            final_text="Today's digest: two new tickets.",
+            context_id=shadow_context_id(group["id"], "dog"),
+            event_result=True,
+        )
+
+    asyncio.run(run())
+    assert len(env.posts) == 1
+    assert env.posts[0]["content"] == "Today's digest: two new tickets."
+    assert env.posts[0]["hop"] == 1
+
+
+def test_an_ordinary_answer_still_counts_its_hops(tmp_path, monkeypatch) -> None:
+    """The control: only an automation's report gets the fresh-root treatment."""
+    env = _env(tmp_path, monkeypatch)
+
+    async def run():
+        group, conv, msg_id = await _seat(env)
+        await on_shadow_turn_complete(
+            conversation_storage=env.conversation_storage,
+            conversation_id=conv["id"],
+            profile="dog",
+            run_id="run-plain",
+            assistant_msg_id=msg_id,
+            raw_text="It is 14:20.",
+            final_text="It is 14:20.",
+            context_id=shadow_context_id(group["id"], "dog"),
+        )
+
+    asyncio.run(run())
+    # No override: fan-out derives the hop from the room's own history.
+    assert env.posts[0]["hop"] is None

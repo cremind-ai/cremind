@@ -1,10 +1,10 @@
 """Unified streaming runner for agent runs.
 
 This module owns a single agent-to-bus pipeline used by *both* user-typed
-messages (via ``POST /api/conversations/{id}/messages``) and skill-event
-triggered runs (via :mod:`app.events.runner`). The previous codebase had two
+messages (via ``POST /api/conversations/{id}/messages``) and event-triggered
+runs (via :mod:`app.events.run_dispatcher`). The previous codebase had two
 near-identical implementations -- one in :class:`CremindAgentExecutor` and one
-in :func:`app.events.runner.run_event` -- which diverged in subtle ways and
+per-event-family runner -- which diverged in subtle ways and
 forced clients to choose between two streaming protocols (A2A SDK over a
 client-owned HTTP request vs. SSE subscription with replay). Consolidating
 here lets the SSE path serve both: a browser client POSTs a message, the run
@@ -490,6 +490,10 @@ async def run_agent_to_bus(
     # the context id says so. Shares the seat's compaction and outcome-stamping
     # rules, and nothing else — the two features are independent.
     is_channel_group = _is_channel_group_conversation(conv)
+    # This turn is one of the agent's own automations reporting back. It matters
+    # to a room: such a post is paced by the outside world, not by the room's
+    # conversation, so it must not inherit the agent-to-agent hop count.
+    is_event_result = (trigger_event or {}).get("kind") == "event_task_result"
 
     message_origin = await _resolve_message_origin(
         conversation_storage, conv, conversation_id, event_run=event_run,
@@ -870,6 +874,7 @@ async def run_agent_to_bus(
                                 raw_text="".join(final_text_parts),
                                 mid_turn_breaks=collected_mid_turn_breaks,
                                 context_id=(conv or {}).get("context_id"),
+                                event_result=is_event_result,
                             )
                         except Exception:  # noqa: BLE001
                             logger.exception(
@@ -1305,6 +1310,7 @@ async def run_agent_to_bus(
                     cancelled=cancelled,
                     errored=errored,
                     context_id=(conv or {}).get("context_id"),
+                    event_result=is_event_result,
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(

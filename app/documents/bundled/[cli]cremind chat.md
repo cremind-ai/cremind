@@ -16,8 +16,14 @@ next reasoning step, and the answer being written accounts for it (the status
 bar reads `delivered into current turn`). It replies to you right away in one
 short sentence and then carries on working, unless it is too early to say
 anything useful, in which case it covers the message in its final answer. A
-finished event task whose result arrives mid-turn interrupts the same way.
-Ctrl+C still cancels that run.
+finished run from any automation registered in this conversation — one-shot or
+standing — reports its result here too, and one arriving mid-turn interrupts the
+same way. Ctrl+C still cancels that run.
+
+A turn nobody typed is labelled in the transcript: an `[Automation: <rule>]`
+line appears above it, naming the rule whose result caused it (with a one-shot
+marker when the rule was a one-shot task), so an answer never arrives without a
+visible cause.
 
 Each thinking step in the transcript also shows the token counts of the
 reasoning call that produced it — rendered as a `tokens (in …, cached … /

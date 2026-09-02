@@ -100,3 +100,5 @@ long_term_retrieve_limit = 10  # top-K long-term facts retrieved from the vector
 max_parallel_runs = 5          # max simultaneous event-triggered agent runs (server-wide)
 run_history_cap = 50           # run records kept per event rule; older terminal runs are pruned automatically
 task_timeout_sweep_seconds = 30  # how often to expire one-shot event tasks that never fired
+max_results_per_delivery = 5     # newest standing-rule results one conversation receives per turn; older ones are closed out as stale (one-shot task results are never dropped)
+undelivered_max_age_hours = 72   # a standing-rule result older than this is closed out instead of reported into its conversation (0 = no age limit)

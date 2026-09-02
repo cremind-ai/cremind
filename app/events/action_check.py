@@ -154,19 +154,30 @@ def _build_check_tools() -> List[Dict[str, Any]]:
     ]
 
 
-# Appended for EVENT TASKS only, and to the USER message so the cached system
-# prompt stays byte-identical for the standing-registration case. A task action
-# is a "find out X and report it" instruction: its output is routed back to the
-# waiting conversation automatically, so a checker that expects the action to
-# say who to notify would reject perfectly good task actions.
-_TASK_NOTE = (
+# Appended to the USER message only, so the cached system prompt stays
+# byte-identical for every registration. Every rule reports its output back to
+# the conversation that registered it, so a checker expecting the action to say
+# who to notify would reject perfectly good actions. The two variants differ only
+# in whether that happens once or on every occurrence — which is what tells the
+# judge whether "read the reply" is a complete instruction or a missing loop.
+_TASK_NOTE_ONCE = (
     "\n\nTASK NOTE: this ACTION belongs to a ONE-SHOT TASK. It runs once and its "
-    "output is returned automatically to the conversation that registered it, "
+    "output is reported automatically to the conversation that registered it, "
     "which then continues the user's flow. Judge it as a 'find out X and report "
     "it' instruction: it is self-contained if the executing agent can obtain and "
     "report the outcome from the ACTION text plus the event that triggered it. "
     "Do NOT flag it for failing to notify the user, for not saying where to send "
     "the result, or for not naming the waiting conversation — delivery is "
+    "automatic."
+)
+_RULE_NOTE_RECURRING = (
+    "\n\nRULE NOTE: this ACTION belongs to a STANDING rule. It runs on every "
+    "matching occurrence and each run's output is reported automatically to the "
+    "conversation that registered it. Judge it as a 'find out X and report it' "
+    "instruction: it is self-contained if the executing agent can obtain and "
+    "report the outcome from the ACTION text plus the event that triggered it. "
+    "Do NOT flag it for failing to notify the user, for not saying where to send "
+    "the result, or for not naming the registering conversation — delivery is "
     "automatic."
 )
 
@@ -182,7 +193,7 @@ def _format_check_prompt(action: str, request_context: str, *, task: bool = Fals
         "ONLY to spot concrete values the ACTION relies on but omits):\n"
         f"{ctx or '(not available)'}\n\n"
         f"Call {_TOOL_NAME} with your decision."
-        + (_TASK_NOTE if task else "")
+        + (_TASK_NOTE_ONCE if task else _RULE_NOTE_RECURRING)
     )
 
 
@@ -299,7 +310,10 @@ def build_rejection_message(
         "look at and what to report back — the result returns to this "
         "conversation automatically, so no delivery or notification step is "
         "required."
-        if task else ""
+        if task else
+        "\nBecause each run of this rule reports back to this conversation "
+        "automatically, `action` only needs to say what to look at and what to "
+        "report — no delivery or notification step is required."
     )
     return (
         "Registration rejected: the action is not self-contained. When it fires "

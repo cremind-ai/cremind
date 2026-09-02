@@ -256,7 +256,15 @@ async def _execute(job: Dict[str, Any]) -> None:
             "dropping duplicate trigger"
         )
         return
-    deliver_to_origin = is_task and bool(origin_conversation_id)
+
+    # ── Where does this run's result go? ───────────────────────────────────
+    # Every rule registered from a real conversation reports each run back to
+    # it; only a hidden run conversation or a reserved host (the calendar UI's
+    # __schedule__, the blueprint import host) has nobody to report to. One read
+    # per fire, and only for a trigger that survived the gate and the claim.
+    deliver_to_origin = await _origin_is_deliverable(
+        conversation_storage, origin_conversation_id, fallback=is_task,
+    )
 
     # ── Create the hidden per-run conversation + run row ───────────────────
     try:
@@ -269,6 +277,13 @@ async def _execute(job: Dict[str, Any]) -> None:
         _revert_task_claim(is_task, source_kind, subscription_id)
         return
 
+    # Freeze one-shot-ness onto the run: the rule row is editable and deletable,
+    # but how the result must be worded ("continue the flow you were waiting on"
+    # vs "your automation reported back") is decided by what the rule was WHEN
+    # IT FIRED. The delivery layer reads it back as ``trigger_payload["once"]``.
+    trigger_payload = dict(job.get("trigger_payload") or {})
+    trigger_payload["once"] = is_task
+
     store = get_event_run_storage()
     try:
         created = await store.create(
@@ -278,7 +293,7 @@ async def _execute(job: Dict[str, Any]) -> None:
             conversation_id=conversation_id,
             label=label,
             action=job.get("action", ""),
-            trigger_payload=job.get("trigger_payload"),
+            trigger_payload=trigger_payload,
             history_cap=run_history_cap(),
             origin_conversation_id=origin_conversation_id,
             deliver_to_origin=deliver_to_origin,
@@ -304,17 +319,13 @@ async def _execute(job: Dict[str, Any]) -> None:
             event_run_id=event_run_id,
         )
 
-    # Best-effort platform forwarding: if the rule was registered from an
-    # external channel, mirror the run's reply back to that platform.
-    #
-    # Skipped for event tasks: their result is about to re-enter the origin
-    # conversation as a continuation turn, and THAT turn forwards to the
-    # platform. Mirroring here too would send the platform user both the raw
-    # run output and the continuation — two messages for one outcome.
-    if not deliver_to_origin:
-        await _maybe_forward_to_channel(
-            conversation_storage, origin_conversation_id, conversation_id,
-        )
+    # No platform mirroring from here. A run whose result reports back is
+    # forwarded by the continuation turn it starts in the origin conversation
+    # (see ``event_task_delivery.flush_origin_inbox``), which is the turn that
+    # words the outcome for a human. A run that reports nowhere has no platform
+    # target either: this call used to pass the HIDDEN run conversation's id,
+    # which no channel sender row and no platform-group row ever matches, so it
+    # only ever logged "no sender bound to conv=".
 
     # ── Run the agent in the hidden conversation ───────────────────────────
     from app.agent.stream_runner import make_run_id, run_agent_to_bus
@@ -368,6 +379,40 @@ async def _execute(job: Dict[str, Any]) -> None:
 # Only skill-event and file-watcher tasks are claimed here. A schedule task is
 # already consumed by ``ScheduleManager._fire`` (it flips the row to completed
 # before dispatching), so re-claiming it would always lose.
+
+
+async def _origin_is_deliverable(
+    conversation_storage: Any,
+    origin_conversation_id: Optional[str],
+    *,
+    fallback: bool,
+) -> bool:
+    """Whether this run's result may be reported into its origin conversation.
+
+    ``fallback`` is what to answer when the conversation cannot be READ (a
+    connection blip, a locked SQLite file). It is the caller's one-shot flag,
+    because by the time we get here a one-shot task has already spent its single
+    firing: answering ``False`` on a transient error would leave the flow that
+    registered it waiting forever, which is the one failure this feature must
+    not have. A row that reads back cleanly and says "reserved host" or "hidden
+    run" is refused for real.
+    """
+    if not origin_conversation_id:
+        return False
+    try:
+        conv = await conversation_storage.get_conversation(origin_conversation_id)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            f"[event_run] could not read origin {origin_conversation_id}; "
+            f"falling back to deliver={fallback}"
+        )
+        return fallback
+    if conv is None:
+        return False
+
+    from app.events.task_policy import is_deliverable_origin
+
+    return is_deliverable_origin(conv.get("kind"), conv.get("context_id"))
 
 
 def _task_subscription_storage(source_kind: str) -> Any:
@@ -434,23 +479,50 @@ async def _maybe_forward_to_channel(
     conversation_storage: Any,
     registering_conversation_id: Optional[str],
     run_conversation_id: str,
-) -> None:
+) -> Any:
+    """Arm a platform forwarder for the run about to start, if any.
+
+    Returns the adapter that was armed, so a caller whose run then fails to
+    start can release the expectation instead of leaving a forwarder waiting for
+    a run that never comes (it would absorb the NEXT run on that conversation
+    and post its answer to the platform). ``None`` when nothing was armed.
+
+    Boot-safe: during the boot delivery sweep the channel registry singleton may
+    not exist yet, and asking for it raises rather than returning ``None``.
+    """
     if not registering_conversation_id:
-        return
+        return None
     try:
         conv = await conversation_storage.get_conversation(registering_conversation_id)
         channel_id = (conv or {}).get("channel_id")
         if not channel_id:
-            return
+            return None
         channel = await conversation_storage.get_channel(channel_id)
         channel_type = (channel or {}).get("channel_type")
-        if channel and channel_type and channel_type != "main":
-            from app.channels.registry import get_channel_registry
-            adapter = get_channel_registry().get_adapter(channel_id)
-            if adapter is not None:
-                await adapter.forward_external_run(run_conversation_id)
+        if not (channel and channel_type and channel_type != "main"):
+            return None
+
+        from app.channels.registry import get_channel_registry
+        try:
+            registry = get_channel_registry()
+        except RuntimeError:
+            logger.debug(
+                "[event_run] channel registry not initialized yet; no forwarder "
+                f"for {registering_conversation_id}"
+            )
+            return None
+        adapter = registry.get_adapter(channel_id)
+        if adapter is None:
+            logger.warning(
+                f"[event_run] no live adapter for channel {channel_id}; the reply "
+                f"for {registering_conversation_id} reaches the web UI only"
+            )
+            return None
+        await adapter.forward_external_run(run_conversation_id)
+        return adapter
     except Exception:  # noqa: BLE001
         logger.exception("[event_run] channel forwarder setup failed")
+        return None
 
 
 def _publish_runs_changed(profile: str) -> None:

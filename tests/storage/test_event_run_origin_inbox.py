@@ -183,3 +183,53 @@ def test_the_boot_sweep_still_finds_a_waiting_result(tmp_path):
 
     rid, undelivered = asyncio.run(_go())
     assert undelivered == [rid]
+
+
+def test_the_inbox_is_ordered_by_when_runs_finished(tmp_path):
+    """A run that stopped to ask a question finishes AFTER later ones.
+
+    Ordering by fire time would present that stale result as the newest thing
+    the conversation heard — and the coalesced turn tells the model the results
+    are "in the order they finished".
+    """
+    store = _store(tmp_path)
+
+    async def _go():
+        first = await _run(store)
+        second = await _run(store, sub="sub-2")
+        # The one that fired first only finishes now, after the later one.
+        await asyncio.sleep(0.01)
+        await store.update_status(first, status="completed", mark_finished=True)
+        rows = await store.list_pending_for_origin("origin-1")
+        return first, second, [r["id"] for r in rows]
+
+    first, second, order = asyncio.run(_go())
+    assert order == [second, first]
+
+
+def test_closing_a_result_out_takes_it_off_the_books(tmp_path):
+    """For results that must never be reported: stale, over-cap, or restored.
+
+    It goes through the same conditional claim as a delivery, so "closed out"
+    and "delivered" are mutually exclusive — and setting the claim is also what
+    lets the retention prune finally reach the row.
+    """
+    store = _store(tmp_path)
+
+    async def _go():
+        rid = await _run(store)
+        first = await store.close_out_delivery(rid)
+        second = await store.close_out_delivery(rid)
+        return (
+            first, second, await store.get(rid),
+            await store.list_pending_for_origin("origin-1"),
+            await store.list_undelivered_task_runs(),
+        )
+
+    first, second, row, pending, owed = asyncio.run(_go())
+    assert first is True
+    assert second is False, "a sibling cannot close out what is already claimed"
+    assert row["origin_delivery_mode"] == "skipped"
+    assert row["origin_delivered_at"] is not None
+    assert pending == []
+    assert owed == []

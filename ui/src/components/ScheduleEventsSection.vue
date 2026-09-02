@@ -98,6 +98,16 @@ function nextRun(row: ScheduleEventSubscription): string {
   return new Date(row.next_fire_at * 1000).toLocaleString();
 }
 
+// Every schedule the assistant registered reports each run's result back into
+// the conversation that asked for it; one made here on the calendar is bound to
+// the reserved `__schedule__` host, so it has nowhere to report.
+function reportsHint(row: ScheduleEventSubscription): string {
+  return row.source === 'manual'
+    ? 'Made on the calendar, so there is no chat to report into — each run only '
+      + 'raises a notification.'
+    : 'Every run reports its result back into this conversation, as a new turn.';
+}
+
 function statusType(status: string): 'success' | 'info' | 'warning' | 'danger' {
   if (status === 'active') return 'success';
   if (status === 'paused') return 'warning';
@@ -140,7 +150,9 @@ async function confirmDelete(row: ScheduleEventSubscription) {
     <p class="section-blurb">
       Time-based events from the <strong>Calendar &amp; Schedule</strong> feature.
       Each fires at its time (and, for a recurrence, at every following
-      occurrence) — running its action in the conversation that created it.
+      occurrence), running its action in a hidden per-run conversation and
+      reporting the result back into the conversation that created it — except
+      for events made on the calendar itself, which only notify.
       Create them from the calendar, or ask the assistant
       (e.g. "every weekday at 9am, summarize my unread email").
     </p>
@@ -190,6 +202,12 @@ async function confirmDelete(row: ScheduleEventSubscription) {
           <a class="conv-link" @click.prevent="openConversation(row.conversation_id)">
             {{ row.conversation_title || '(unnamed)' }}
           </a>
+          <!-- Where each run's result lands. An event made on the calendar is
+               bound to the reserved host conversation, so it has no chat to
+               report into and only raises a notification. -->
+          <span class="reports-hint" :title="reportsHint(row as ScheduleEventSubscription)">
+            {{ row.source === 'manual' ? 'notification only' : 'reports each run here' }}
+          </span>
         </template>
       </ElTableColumn>
       <ElTableColumn label="Next run" min-width="170">
@@ -205,7 +223,7 @@ async function confirmDelete(row: ScheduleEventSubscription) {
             size="small"
             type="info"
             class="task-tag"
-            title="One-shot task: fires once, returns its result to the conversation that registered it, then ends."
+            title="One-shot task: waits for the next occurrence only, runs once, reports, then ends — a recurring schedule keeps firing."
           >
             one-shot
           </ElTag>
@@ -316,5 +334,10 @@ async function confirmDelete(row: ScheduleEventSubscription) {
 }
 .task-tag {
   margin-left: 4px;
+}
+.reports-hint {
+  display: block;
+  color: var(--text-tertiary);
+  font-size: 0.75rem;
 }
 </style>

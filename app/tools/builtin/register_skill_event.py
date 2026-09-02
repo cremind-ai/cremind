@@ -303,7 +303,7 @@ async def register_skill_events(
             f"Registered a one-shot TASK on the '{triggers[0]}' event of skill "
             f"'{canonical_skill_id}' (id {rows[0]['id']}). It waits for the next "
             f"such event{format_timeout_clause(timeout_at, timeout_minutes)}, runs "
-            f"\"{action}\" once in a background conversation, delivers the "
+            f"\"{action}\" once in a background conversation, reports the "
             "outcome back into THIS conversation as a new turn, then stops "
             "itself. Nothing else is needed from you about it: register any "
             "further tasks now, then END YOUR TURN with a short message telling "
@@ -314,15 +314,23 @@ async def register_skill_events(
         t = triggers[0]
         confirmation = (
             f"Subscribed this conversation to the '{t}' event of skill "
-            f"'{canonical_skill_id}'. Whenever a new event arrives in "
-            f"{source_dir / 'events' / t}, I'll run: {action}."
+            f"'{canonical_skill_id}' (id {rows[0]['id']}). Each time a new event "
+            f"arrives in {source_dir / 'events' / t} I'll run \"{action}\" in a "
+            "background conversation and report the result back here as a new "
+            "turn; the subscription stays active until the user stops it. Finish "
+            "this turn with a short confirmation to the user — do not wait for "
+            "the first run."
         )
     else:
         trig_list = ", ".join(f"'{t}'" for t in triggers)
         confirmation = (
             f"Subscribed this conversation to {len(triggers)} events of skill "
-            f"'{canonical_skill_id}': {trig_list}. Whenever any of these events "
-            f"fires (under {source_dir / 'events'}/<event_type>/), I'll run: {action}."
+            f"'{canonical_skill_id}': {trig_list}. Each time any of these events "
+            f"fires (under {source_dir / 'events'}/<event_type>/) I'll run "
+            f"\"{action}\" in a background conversation and report the result "
+            "back here as a new turn — one result per event; each subscription "
+            "stays active until the user stops it. Finish this turn with a short "
+            "confirmation to the user — do not wait for the first run."
         )
 
     logger.info(

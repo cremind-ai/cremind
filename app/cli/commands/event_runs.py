@@ -4,8 +4,10 @@ Each fired event trigger — a skill event, a file-watcher change, or a
 schedule/calendar event — runs in its own isolated, hidden conversation and is
 tracked by an ``event_runs`` row carrying a status
 (``running``/``pending``/``completed``/``failed``/``cancelled``) and a per-run
-token-usage rollup. This group lists that run history, shows one run in detail,
-replies to a run that is pending your input, and deletes run history.
+token-usage rollup. A run whose rule was registered from a real conversation
+reports its result back into that conversation as a new turn. This group lists
+that run history, shows one run in detail, replies to a run that is pending your
+input, and deletes run history.
 
 Mirrors the Events-page run-history child tables and the run-detail drawer in
 the web UI.
@@ -77,14 +79,26 @@ def _fmt_ts(value: Any) -> str:
 def _delivery_cell(run: dict[str, Any]) -> str:
     """Whether this run owes its result to a waiting conversation, and how it paid.
 
-    Blank for an ordinary event run — only EVENT TASK runs deliver back.
+    Every rule registered from a real conversation reports each run's result
+    back into it — standing rules as much as one-shot tasks. Blank means there
+    was nowhere to report: the rule is bound to a reserved host conversation
+    (the calendar UI's ``__schedule__``, the blueprint import host
+    ``__skill_events__``), or its conversation has since been deleted. Those
+    runs surface as notifications only.
+
     ``pending`` means the result is still waiting in that conversation's inbox.
     Otherwise the mode says what actually happened, which is what explains a
-    delivered result that produced no visible turn:
+    reported result that produced no visible turn:
 
       injected  the waiting conversation got it as a new turn
       read      its agent pulled it mid-reasoning, so it is inside that turn
-      skipped   the run was cancelled, or the waiting conversation is gone
+      skipped   the run was cancelled, the waiting conversation is gone, or
+                the result was dropped as stale — only the newest
+                ``[event_runs] max_results_per_delivery`` standing results per
+                conversation are reported, standing results older than
+                ``undelivered_max_age_hours`` are closed out, and a restore
+                from backup closes out every result still owed (one-shot
+                results are never dropped by either bound)
       yes       delivered before modes were recorded (older rows)
     """
     if not run.get("deliver_to_origin"):
@@ -242,9 +256,9 @@ def event_runs_show(
     if run.get("deliver_to_origin"):
         rows.append(("origin_conversation_id", string_field(run, "origin_conversation_id")))
         rows.append(("result_delivered", _fmt_ts(run.get("origin_delivered_at")) or "pending"))
-        mode = run.get("origin_delivery_mode")
-        if mode:
-            rows.append(("delivery", str(mode)))
+        delivery_mode = run.get("origin_delivery_mode")
+        if delivery_mode:
+            rows.append(("delivery", str(delivery_mode)))
     pending = run.get("pending_question")
     if pending:
         rows.append(("pending_question", str(pending)))
@@ -272,7 +286,7 @@ def event_runs_show(
             sys.stdout.write(f'Reply:       cremind event-runs reply {run_pk} "..."\n')
     origin_id = string_field(run, "origin_conversation_id")
     if run.get("deliver_to_origin") and origin_id:
-        sys.stdout.write(f"Delivered to: cremind conv get {origin_id}\n")
+        sys.stdout.write(f"Reported to: cremind conv get {origin_id}\n")
 
 
 @event_runs_app.command("reply")

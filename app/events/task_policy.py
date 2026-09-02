@@ -1,15 +1,22 @@
-"""What counts as an EVENT TASK, and how its timeout is resolved.
+"""What counts as an EVENT TASK, where a result may be reported, and timeouts.
 
-An event task is a ONE-SHOT event subscription whose run result is delivered
-back into the conversation that registered it, so the agent there can continue a
-multi-step flow ("open the PR, wait for CI, then merge"). Three families can be
-tasks — a skill event, a file watcher, or an agent-created one-time schedule —
-and this module is the single place that decides which calls create one.
+**Reporting back is universal.** Every rule registered from a real conversation
+— skill event, file watcher or schedule; one-shot or standing — hands each run's
+result back to that conversation (see :mod:`app.events.event_task_delivery`).
+:func:`is_deliverable_origin` is the single predicate that says which
+conversations can receive one; the run dispatcher consults it once per fire.
+
+**``task`` means ONE-SHOT**, and nothing else: wait for the NEXT matching
+occurrence only, run once, report, then terminate — optionally giving up at a
+deadline (:func:`resolve_task_timeout`). It is the shape behind "do X, wait for
+the outcome, then do Y". A standing rule keeps firing and keeps reporting. The
+predicates here decide which registration calls create the one-shot shape.
 
 It is deliberately dependency-free (stdlib only): the reasoning agent imports it
-at dispatch time, the three registration tools import it while validating, and
-tests import it directly. Keeping the predicates here is what stops "the agent
-was allowed to register this" from drifting away from "this actually comes back".
+at dispatch time, the three registration tools import it while validating, the
+run dispatcher imports it at fire time, and tests import it directly. Keeping
+the predicates here is what stops "the agent was allowed to register this" from
+drifting away from "this actually comes back".
 """
 
 from __future__ import annotations
@@ -23,14 +30,47 @@ TASK_TIMEOUT_MIN_MINUTES = 1
 TASK_TIMEOUT_MAX_MINUTES = 43200        # 30 days
 TASK_TIMEOUT_DEFAULT_MINUTES = 10080    # 7 days
 
-#: How many event tasks one flow may chain before the agent must stop and hand
-#: back to the user. Each continuation turn increments the depth carried on the
-#: trigger payload; without a cap an email ping-pong could self-perpetuate.
+#: How many ONE-SHOT tasks one flow may chain before the agent must stop and
+#: hand back to the user. Only a one-shot continuation carries the depth on its
+#: trigger payload (a recurring rule's result mints depth 0 — it is a fresh
+#: report, not another hop in a wait chain); without a cap an email ping-pong
+#: could self-perpetuate. Best-effort: nothing persists the depth on the rule.
 MAX_TASK_CHAIN_DEPTH = 10
 
 #: Registration leaves that become task registrations when their args say so.
 _SCHEDULE_LEAF = ("scheduler", "schedule_create")
 _WATCHER_LEAF = ("system_file", "register_file_watcher")
+
+#: Conversations that exist only to own rules nobody reads: the calendar UI's
+#: per-profile schedule host and the blueprint import host. The ``__`` prefix is
+#: the reserved-context convention (``app.api.calendar.SCHEDULE_CONTEXT_ID``,
+#: ``app.blueprint.apply._SKILL_EVENTS_CONTEXT_ID``).
+_RESERVED_CONTEXT_PREFIX = "__"
+
+
+def is_deliverable_origin(
+    kind: Optional[str], context_id: Optional[str],
+) -> bool:
+    """Whether a run's result may be reported into this conversation.
+
+    Pure: the caller passes the conversation row's ``kind`` and ``context_id``,
+    and must treat a MISSING row (no conversation at all) as not deliverable —
+    this function never touches storage.
+
+    Two kinds of origin are refused. A hidden ``event_run`` conversation is an
+    automation's own scratch space: reporting into it would let an automation
+    feed itself. A reserved host (``__schedule__``, ``__skill_events__``) has no
+    reader, so a rule bound to one stays notification-only exactly as before.
+
+    Everything else is deliverable, including the two room shapes — a group-chat
+    seat (``group:<gid>:<profile>``) and a platform group
+    (``channel_group:<gid>``) — whose turns post their answer to the room.
+    """
+    if (kind or "chat") == "event_run":
+        return False
+    if str(context_id or "").startswith(_RESERVED_CONTEXT_PREFIX):
+        return False
+    return True
 
 
 def resolve_task_timeout(

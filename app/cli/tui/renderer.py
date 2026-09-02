@@ -77,7 +77,7 @@ class RenderedLine:
     """
 
     kind: str  # "user" | "thinking" | "text" | "phase" | "summary" |
-               # "terminal" | "file" | "error" | "info"
+               # "terminal" | "file" | "error" | "info" | "event"
     body: str  # ANSI-styled string
 
 
@@ -101,6 +101,24 @@ def format_event(event: Event, theme: Theme) -> Optional[RenderedLine]:
             "user",
             t.style(t.user_msg, "you: ") + content,
         )
+
+    if event.type == "event_trigger_message":
+        # What set this turn off, when nobody typed anything: an automation
+        # firing, or an automation's run reporting its result back here.
+        # Without it the answer below arrives with no visible cause.
+        content = str(data.get("content") or "")
+        meta = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        if meta.get("source") == "event_task_result" and meta.get("trigger"):
+            label = str(meta.get("label") or "") or _trigger_label(content)
+            head = f"[Automation: {label}]" if label else "[Automation]"
+            if meta.get("once"):
+                head += " (one-shot)"
+        else:
+            head = "[Event trigger]"
+        body = t.style(t.section, head)
+        if content:
+            body += "\n" + t.style(t.dim, content)
+        return RenderedLine("event", body)
 
     if event.type == "thinking":
         # One tool call in a step. Fields mirror ``_thinking_artifact`` on the
@@ -214,6 +232,14 @@ def format_event(event: Event, theme: Theme) -> Optional[RenderedLine]:
 
     # token_usage and unknown types are dropped from the transcript
     return None
+
+
+def _trigger_label(content: str) -> str:
+    """Fall back to the block's own ``Trigger: ...`` line for a missing label."""
+    for line in content.splitlines():
+        if line.startswith("Trigger:"):
+            return line[len("Trigger:"):].strip()
+    return ""
 
 
 def _summarize_token_usage(usage: dict[str, Any]) -> tuple[int, str]:

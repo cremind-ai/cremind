@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, inject, ref, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import type { ChatMessage, FileAttachment, TerminalAttachment } from '../stores/chat';
 import { OpenTerminalKey } from '../composables/terminalTarget';
 import { createChatMarked } from '../utils/markdown';
@@ -42,8 +43,35 @@ const resolveApiUrl = (href: string): string => {
 // Configure marked with syntax highlighting + URL rewriting (shared factory).
 const marked = createChatMarked(resolveApiUrl);
 
+const route = useRoute();
+const router = useRouter();
+
 const isUser = computed(() => props.message.role === 'user');
 const isRejectedTrigger = computed(() => props.message.isRejectedTrigger === true);
+// An event run reporting back into the conversation that registered its rule.
+// Only the trigger bubble carries the flag — the agent's own answer to it is an
+// ordinary reply and must not be labelled as machine output.
+const isEventResult = computed(() => props.message.isEventResult === true);
+const eventResultTitle = computed(() => {
+  const label = props.message.eventResultLabel;
+  return label ? `Automation result — ${label}` : 'Automation result';
+});
+const eventResultNote = computed(() =>
+  props.message.eventResultOnce
+    ? 'One-shot task: reported once, then ended.'
+    : 'Reported by a standing rule; it stays active and will report again.',
+);
+// The Events page hosts the run drawer and deep-links a run via ?run=<id>.
+const eventRunProfile = computed(() => {
+  const profile = route.params.profile;
+  return typeof profile === 'string' && profile ? profile : null;
+});
+function openEventRun() {
+  const profile = eventRunProfile.value;
+  const runId = props.message.eventRunId;
+  if (!profile || !runId) return;
+  router.push({ name: 'skill-events', params: { profile }, query: { run: runId } });
+}
 const modeMeta = computed(() =>
   props.message.mode ? chatModeMeta(props.message.mode) : null,
 );
@@ -298,6 +326,24 @@ watch(
         </div>
       </div>
 
+      <!-- An event run reporting its result back into this conversation. The
+           turn is machine-made, so say which rule made it and whether that rule
+           is done or will report again. -->
+      <div v-if="isEventResult" class="event-result-banner">
+        <Icon icon="mdi:lightning-bolt-outline" class="event-result-icon" />
+        <div class="event-result-text">
+          <span class="event-result-title">{{ eventResultTitle }}</span>
+          <span class="event-result-note">{{ eventResultNote }}</span>
+        </div>
+        <a
+          v-if="message.eventRunId && eventRunProfile"
+          class="event-result-link"
+          @click.stop.prevent="openEventRun"
+        >
+          Open run
+        </a>
+      </div>
+
       <!-- Main text content -->
       <div v-if="message.content" class="text-content marked-content" v-html="parsedContent" v-link-blank></div>
 
@@ -527,6 +573,44 @@ watch(
   font-size: 0.8rem;
   color: var(--text-secondary);
 }
+
+/* Automation result: a turn an event run reported back. Informational, not a
+   warning — the result is wanted, it just wasn't asked for just now. */
+.event-result-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  border-radius: 8px;
+  background: var(--primary-bg, rgba(59, 130, 246, 0.1));
+  border: 1px solid var(--primary-color, #3b82f6);
+}
+.event-result-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+  font-size: 1.05rem;
+  color: var(--primary-color, #3b82f6);
+}
+.event-result-text { display: flex; flex-direction: column; gap: 2px; }
+.event-result-title {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--primary-color, #3b82f6);
+}
+.event-result-note {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+.event-result-link {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 0.8rem;
+  color: var(--primary-color, #3b82f6);
+  cursor: pointer;
+  text-decoration: none;
+}
+.event-result-link:hover { text-decoration: underline; }
 
 /* "The agent read this and said nothing" — a footnote, not a warning. */
 .quiet-note {

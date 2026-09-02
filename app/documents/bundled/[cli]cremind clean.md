@@ -38,7 +38,7 @@ The last two columns show which preset includes each one.
 | | `--uploads` | Uploaded chat files | ✅ | ✅ |
 | | `--plans` | Plan-mode files | ✅ | ✅ |
 | **Usage & event-run history** | `--usage` | Token/cost usage records | ✅ | ✅ |
-| | `--event-runs` | Event-run history | ✅ | ✅ |
+| | `--event-runs` | Event-run history, including results a conversation is still owed (they are discarded, never reported) | ✅ | ✅ |
 | **Automation & channels** | `--processes` | Running background processes (shells the agent started) | ✅ | ✅ |
 | | `--schedules` | Schedule / calendar rules | ✅ | ✅ |
 | | `--file-watchers` | File-watcher rules | ✅ | ✅ |
@@ -80,7 +80,7 @@ cremind clean components [--<component> ...] [--all] [--yes]
 | `--uploads` | Uploaded chat files. |
 | `--plans` | Plan-mode files. |
 | `--usage` | Token/cost usage records. |
-| `--event-runs` | Event-run history. |
+| `--event-runs` | Event-run history — including any run result a conversation is still owed, which is discarded rather than reported into it. |
 | `--processes` | Kill running background processes started by the agent. |
 | `--schedules` | Schedule / calendar rules. |
 | `--file-watchers` | File-watcher rules. |

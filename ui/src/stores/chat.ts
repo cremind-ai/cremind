@@ -134,6 +134,29 @@ export function quietReasonFrom(metadata: any): string | undefined {
   return _QUIET_REASONS[stamp.decision] || 'no reply';
 }
 
+/**
+ * Automation-result stamp on a TRIGGER bubble: an event run reporting back into
+ * the conversation whose rule started it, one-shot or standing.
+ *
+ * Keyed on `trigger`, not on `source` alone — the agent's own answer in the same
+ * turn carries the same `source` and would otherwise be labelled as machine
+ * output. Shared by the live frame and the reload mapper so the two can't drift.
+ */
+export function eventResultFrom(metadata: any): {
+  label: string;
+  once: boolean;
+  runId?: string;
+} | undefined {
+  if (metadata?.source !== 'event_task_result' || metadata?.trigger !== true) {
+    return undefined;
+  }
+  return {
+    label: typeof metadata.label === 'string' ? metadata.label : '',
+    once: metadata.once === true,
+    runId: typeof metadata.event_run_id === 'string' ? metadata.event_run_id : undefined,
+  };
+}
+
 export interface TerminalAttachment {
   processId: string;
   command: string;
@@ -177,6 +200,14 @@ export interface ChatMessage {
   // distinct "skipped — didn't match" bubble, but never fed to the agent.
   isRejectedTrigger?: boolean;
   rejectedReason?: string;
+  // An event run reporting its result back into the conversation that
+  // registered the rule. Set on the TRIGGER bubble only (see eventResultFrom),
+  // where it renders an "Automation result" banner; `eventResultOnce` tells a
+  // one-shot task from a standing rule that will report again.
+  isEventResult?: boolean;
+  eventResultLabel?: string;
+  eventResultOnce?: boolean;
+  eventRunId?: string;
   // A channel-group message the agent read but chose not to answer. It is real
   // conversation history (the agent sees it on later turns), so it renders as an
   // ordinary user bubble — with a caption, because a reader looking at an
@@ -1554,6 +1585,9 @@ export const useChatStore = defineStore('chat', {
           const alreadyPresent =
             id !== undefined && bucket.some(m => m.id === id);
           if (!alreadyPresent) {
+            // A rule's run reporting back arrives as a trigger too; flag it so
+            // the bubble says where this turn came from.
+            const eventResult = eventResultFrom(data.metadata);
             bucket.push({
               id: id ?? this.generateId(),
               role: 'assistant',
@@ -1561,6 +1595,10 @@ export const useChatStore = defineStore('chat', {
               parts: [{ kind: 'text', text: content } as Part],
               timestamp: new Date(),
               isStreaming: false,
+              isEventResult: eventResult ? true : undefined,
+              eventResultLabel: eventResult?.label,
+              eventResultOnce: eventResult?.once,
+              eventRunId: eventResult?.runId,
             });
           }
           this.pendingQuestionByConversation[conversationId] = null;
@@ -2038,6 +2076,7 @@ export const useChatStore = defineStore('chat', {
         : undefined;
 
       const isRejectedTrigger = msg.metadata?.kind === 'rejected_trigger';
+      const eventResult = eventResultFrom(msg.metadata);
 
       // Per-turn todo snapshot for the chip (plan mode + event runs). Only agent
       // turns that actually drove a non-empty list get one; partial "executing"
@@ -2065,6 +2104,10 @@ export const useChatStore = defineStore('chat', {
         summary: msg.summary ?? undefined,
         isRejectedTrigger: isRejectedTrigger || undefined,
         rejectedReason: isRejectedTrigger ? (msg.metadata?.rejected_reason ?? '') : undefined,
+        isEventResult: eventResult ? true : undefined,
+        eventResultLabel: eventResult?.label,
+        eventResultOnce: eventResult?.once,
+        eventRunId: eventResult?.runId,
         quietReason: quietReasonFrom(msg.metadata),
         mode: msg.metadata?.mode && msg.metadata.mode !== 'reasoning'
           ? (msg.metadata.mode as ChatMode)

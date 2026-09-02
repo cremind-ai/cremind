@@ -217,3 +217,104 @@ def test_backup_omits_jwt_secret_and_tokens(restore_env, tmp_path):
         if rec.get("table") == "server_config"
     ]
     assert "jwt_secret" not in server_config_keys
+
+
+def _seed_owed_results(system_dir: Path) -> None:
+    """A conversation owed one result, plus one already reported."""
+    now_ms = time.time() * 1000
+    eng = get_database_provider().sync_engine()
+    with eng.begin() as c:
+        c.execute(
+            text(
+                "INSERT INTO profiles (id, name, created_at, updated_at) "
+                "VALUES ('p1','admin',:t,:t)"
+            ),
+            {"t": time.time()},
+        )
+        c.execute(
+            text(
+                "INSERT INTO conversations (id, profile, title, created_at, updated_at) "
+                "VALUES ('c1','admin','Mail',:t,:t)"
+            ),
+            {"t": time.time()},
+        )
+        for rid, delivered, mode in (
+            ("r-owed", None, None),
+            ("r-done", now_ms, "injected"),
+        ):
+            c.execute(
+                text(
+                    "INSERT INTO event_runs (id, profile, source_kind, subscription_id, "
+                    "status, label, action, turn_count, created_at, updated_at, "
+                    "finished_at, origin_conversation_id, deliver_to_origin, "
+                    "origin_delivered_at, origin_delivery_mode) "
+                    "VALUES (:id,'admin','skill_event','s1','completed','nightly','',0,"
+                    ":t,:t,:t,'c1',1,:d,:m)"
+                ),
+                {"id": rid, "t": now_ms, "d": delivered, "m": mode},
+            )
+
+
+def test_a_restore_never_replays_owed_results(restore_env, tmp_path):
+    """An archive's undelivered results must not be reported into live chats.
+
+    ``event_runs`` travels inside every backup, delivery state and all, and the
+    exactly-once lock IS one of its columns — so a restore rewinds it. Without
+    the close-out the next boot's sweep would report an archive's owed results
+    into whatever conversations survived (a room, a Telegram group), and would
+    report a second time anything delivered after the backup was taken.
+    """
+    from app.backup import engine as be
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    restore_env(src)
+    migrations.upgrade("head")
+    _seed_owed_results(src)
+
+    archive = be.create_backup(be.BackupOptions()).path
+
+    restore_env(dst)
+    migrations.upgrade("head")
+    report = be.restore_backup(archive, target_system_dir=str(dst))
+
+    set_database_provider(None)
+    set_database_provider(create_database_provider())
+    with get_database_provider().sync_engine().connect() as c:
+        rows = dict(c.execute(text(
+            "SELECT id, origin_delivery_mode FROM event_runs"
+        )).all())
+
+    assert rows["r-owed"] == "skipped", "an owed result must not be reported"
+    assert rows["r-done"] == "injected", "an already-reported one is untouched"
+    assert any("closed out" in w for w in report.warnings), report.warnings
+
+
+def test_a_rollback_keeps_the_results_this_install_still_owes(restore_env, tmp_path):
+    """A rollback restores THIS install's own state from minutes ago.
+
+    Its undelivered results are genuinely still owed to live conversations, so
+    discarding them would be the rollback quietly breaking the flows it exists
+    to leave untouched.
+    """
+    from app.backup import engine as be
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    restore_env(src)
+    migrations.upgrade("head")
+    _seed_owed_results(src)
+
+    archive = be.create_backup(be.BackupOptions()).path
+
+    restore_env(dst)
+    migrations.upgrade("head")
+    be.restore_backup(
+        archive, target_system_dir=str(dst), close_out_owed_results=False,
+    )
+
+    set_database_provider(None)
+    set_database_provider(create_database_provider())
+    with get_database_provider().sync_engine().connect() as c:
+        owed = c.execute(text(
+            "SELECT origin_delivered_at FROM event_runs WHERE id='r-owed'"
+        )).scalar()
+    assert owed is None

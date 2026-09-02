@@ -95,6 +95,7 @@ async def _post_new_segments(
     raw_text: str,
     mid_turn_breaks: Optional[List[Dict[str, Any]]],
     include_open_tail: bool,
+    event_result: bool = False,
 ) -> tuple[List[str], bool]:
     """Post whichever of this turn's segments have not been posted yet.
 
@@ -161,6 +162,13 @@ async def _post_new_segments(
             source_message_id=source_message_id,
             segment=index,
             originated_from_shadow_turn=True,
+            # An automation reporting back is a NEW root, not another hop in an
+            # agent-to-agent chain: nothing in the room prompted it. Left to
+            # inherit the hop count, a room whose only traffic is a daily digest
+            # would reach ``max_agent_hops`` within a week and then never wake a
+            # member again — including for a report that names one. The flood cap
+            # still bounds it.
+            hop=1 if event_result else None,
         )
         if row is not None:
             posted.append(row["id"])
@@ -175,6 +183,7 @@ async def on_shadow_turn_segment(
     raw_text: str,
     mid_turn_breaks: Optional[List[Dict[str, Any]]] = None,
     context_id: Optional[str] = None,
+    event_result: bool = False,
 ) -> List[str]:
     """Post what a still-running turn has just finished saying.
 
@@ -210,6 +219,7 @@ async def on_shadow_turn_segment(
             raw_text=raw_text,
             mid_turn_breaks=mid_turn_breaks,
             include_open_tail=False,
+            event_result=event_result,
         )
         if posted:
             logger.info(
@@ -238,6 +248,7 @@ async def on_shadow_turn_complete(
     cancelled: bool = False,
     errored: bool = False,
     context_id: Optional[str] = None,
+    event_result: bool = False,
 ) -> List[str]:
     """Post a finished seat turn into its group. Returns the posted message ids.
 
@@ -314,6 +325,7 @@ async def on_shadow_turn_complete(
             raw_text=raw_text or final_text,
             mid_turn_breaks=mid_turn_breaks,
             include_open_tail=True,
+            event_result=event_result,
         )
         posted.extend(fresh)
         if posted:

@@ -390,7 +390,10 @@ def schedule_list(ctx: typer.Context) -> None:
             string_field(s, "schedule_kind"),
             string_field(s, "dtstart"),
             string_field(s, "status"),
-            # TASK marks a one-shot whose result returns to its conversation.
+            # TASK marks a ONE-SHOT — it fires once and terminates. A recurring
+            # event created from a chat is blank here and still reports every
+            # firing back to that chat; a manual event (bound to __schedule__)
+            # has nowhere to report and surfaces as a notification only.
             "yes" if s.get("task") else "",
             string_field(s, "conversation_title"),
         )

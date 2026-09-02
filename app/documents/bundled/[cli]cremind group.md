@@ -162,6 +162,24 @@ gets a reply during the pause, and if the agent tries to defer one it is asked
 again. Its discretion is intact where discretion is real: a post to the room at
 large, or another member's exchange, is still its own call.
 
+## Automations registered from a seat
+
+A member can register an automation from inside its seat — a skill-event
+subscription, a file watcher, a schedule — exactly as it would from an ordinary
+chat. A seat is a real conversation, so every one of that rule's runs reports its
+result back **into that seat**, standing rules as much as one-shot tasks.
+
+What the room sees is the member's *answer*, not the result. The agent reads the
+reported result in its seat and, if it has something worth saying, posts to the
+room like any other turn; a result that needs no answer is handled privately and
+the timeline stays quiet.
+
+Two consequences follow. A reported result raises no notification of its own — it
+is a turn in a seat, not an item on the notification bus. And the other members
+are not woken by it either: they learn of it only through whatever the seat
+posts, and only if the router names them in that post (see **Routing — who
+starts a turn**).
+
 ## The `send_group_message` tool
 
 Agents can post into a room from *outside* it — from an ordinary one-to-one

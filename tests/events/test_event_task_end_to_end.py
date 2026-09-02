@@ -219,8 +219,14 @@ def test_a_task_waits_once_then_hands_its_result_back(tmp_path, monkeypatch):
     assert sub["completed_at"] is not None
 
 
-def test_a_standing_subscription_keeps_firing_and_stays_out_of_the_chat(tmp_path, monkeypatch):
-    """The control case: today's behaviour must be completely unchanged."""
+def test_a_standing_subscription_keeps_firing_and_reports_every_run(tmp_path, monkeypatch):
+    """"Summarize every new email": fires forever, reports each result back.
+
+    The other half of the feature. Unlike a one-shot the rule is never spent,
+    and unlike the old behaviour its runs do not vanish into the notification
+    list — each one comes back to the chat that asked for it, worded as a rule
+    reporting rather than as a flow to continue.
+    """
     cs, ers, subs, agent = _setup(tmp_path, monkeypatch)
 
     async def _scenario():
@@ -242,9 +248,28 @@ def test_a_standing_subscription_keeps_firing_and_stays_out_of_the_chat(tmp_path
 
     before, runs, messages, sub = asyncio.run(_scenario())
 
-    assert len(runs) == 2                       # fires every time
-    assert all(r["deliver_to_origin"] is False for r in runs)
-    assert len(messages) == before              # nothing injected into the chat
+    assert len(runs) == 2                            # fires every time
+    assert all(r["deliver_to_origin"] is True for r in runs)
+    assert all(r["origin_delivered_at"] is not None for r in runs)
+    assert all(r["origin_delivery_mode"] == "injected" for r in runs)
+
+    # Two reports arrived: each is a trigger bubble plus the agent's answer.
+    assert len(messages) == before + 4
+    triggers = [
+        m for m in messages
+        if (m.get("metadata") or {}).get("source") == "event_task_result"
+        and (m.get("metadata") or {}).get("trigger")
+    ]
+    assert len(triggers) == 2
+    assert all(t["metadata"]["once"] is False for t in triggers)
+    assert all(t["metadata"].get("label") for t in triggers)
+
+    # Worded as a rule reporting back, not as a one-shot flow continuing.
+    reports = [q for q in agent.queries if q.startswith("[Event result]")]
+    assert len(reports) == 2
+    assert "do NOT re-register it" in reports[0]
+
+    # And the rule is still armed for the next mail.
     assert sub["task"] is False
     assert sub["task_status"] is None
 

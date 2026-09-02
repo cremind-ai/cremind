@@ -1393,19 +1393,18 @@ async def main(
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to start schedule manager")
 
-            # 7f-bis. Event tasks. First hand back any one-shot result a crash
-            # stranded (boot recovery in 6b has already flipped interrupted runs
-            # to 'failed', which is what makes them deliverable), then start the
-            # deadline sweep so a task whose event never fires still reports
-            # back instead of hanging its conversation forever.
+            # 7f-bis. Event-task deadlines: a one-shot task whose event never
+            # fires must still report back instead of hanging its conversation
+            # forever. Safe here even though results now reach platforms through
+            # the adapters started in step 11 — the first sweep is one
+            # ``task_timeout_sweep_seconds`` away (30s by default), long after
+            # boot finishes. Delivery of what a crash stranded is step 12.
             try:
-                from app.events.event_task_delivery import sweep_undelivered
                 from app.events.task_timeout_manager import get_task_timeout_manager
 
-                await sweep_undelivered()
                 get_task_timeout_manager().start(loop)
             except Exception:  # noqa: BLE001
-                logger.exception("Failed to start event task delivery/timeout")
+                logger.exception("Failed to start the event task timeout sweep")
 
             # 7f-ter. Mid-turn user messages. Their routing state lives in
             # memory, so a crash leaves the rows parked at 'pending' — a state
@@ -1550,6 +1549,21 @@ async def main(
                 await get_channel_registry(conversation_storage).start_all_enabled()
             except Exception:  # noqa: BLE001
                 logger.exception("Error starting channel adapters during boot")
+
+            # 12. Hand back what a crash stranded. AFTER step 11 on purpose: a
+            #     recovered result belongs to the conversation that registered
+            #     the rule, and if that is a channel DM or a platform group its
+            #     continuation turn needs a live adapter to carry the answer out
+            #     — before this point the channel registry does not even exist,
+            #     so the result would reach the web UI only. Also after 7f-quater
+            #     (group boot), so a result owed to a seat is not posted into a
+            #     room whose membership index is still empty.
+            try:
+                from app.events.event_task_delivery import sweep_undelivered
+
+                await sweep_undelivered()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to sweep undelivered event results")
 
             try:
                 _db_backend = get_database_provider().name

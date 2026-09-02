@@ -20,6 +20,7 @@ import ResizableDivider from '../ResizableDivider.vue';
 import ConversationUsagePanel from '../ConversationUsagePanel.vue';
 import EventRunStatusTag from './EventRunStatusTag.vue';
 import EventIdChip from './EventIdChip.vue';
+import EventRunDeliveryChip from './EventRunDeliveryChip.vue';
 import { OpenTerminalKey } from '../../composables/terminalTarget';
 import { formatTimestamp, formatTokensCompact, formatUsd } from '../../utils/usageFormat';
 
@@ -44,39 +45,6 @@ const cwd = computed(() => {
   const id = cid.value;
   if (!id) return run.value?.trigger_payload?.cwd ?? '';
   return terminalPanel.cwdByConversation[id] ?? '';
-});
-
-// One-shot task delivery, three ways. A result the assistant READ was folded
-// into a turn that was already running, so a user looking for "the turn where
-// the result arrived" would never find one — hence its own wording.
-const deliveryLabel = computed(() => {
-  const r = run.value;
-  if (!r?.origin_delivered_at) return 'Delivery pending';
-  if (r.origin_delivery_mode === 'read') return 'Result read by the assistant';
-  if (r.origin_delivery_mode === 'skipped') return 'Delivery skipped';
-  return 'Result delivered';
-});
-const deliveryIcon = computed(() => {
-  const r = run.value;
-  if (!r?.origin_delivered_at) return 'mdi:progress-clock';
-  if (r.origin_delivery_mode === 'read') return 'mdi:eye-check';
-  if (r.origin_delivery_mode === 'skipped') return 'mdi:cancel';
-  return 'mdi:reply';
-});
-const deliveryHint = computed(() => {
-  const r = run.value;
-  if (!r?.origin_delivered_at) {
-    return 'This task result is still waiting in its conversation’s inbox.';
-  }
-  if (r.origin_delivery_mode === 'read') {
-    return 'The assistant read this result while it was already working, so it '
-      + 'was used inside that turn rather than arriving as a new one.';
-  }
-  if (r.origin_delivery_mode === 'skipped') {
-    return 'This result was deliberately not delivered — the run was cancelled, '
-      + 'or the conversation waiting for it no longer exists.';
-  }
-  return 'This task result was delivered back into the conversation that was waiting for it.';
 });
 
 const usagePanelOpen = ref(false);
@@ -277,20 +245,10 @@ async function deleteRun() {
           <span>· {{ formatTokensCompact(run.usage.total_tokens) }} tokens</span>
           <span>· {{ formatUsd(run.usage.total_usd) }}</span>
           <span v-if="cwd" class="run-cwd" :title="cwd">· cwd: {{ cwd }}</span>
-          <!-- One-shot task runs owe their result to the chat that registered
-               the rule; say whether that hand-over happened, and how. "Read"
-               is the one that needs saying: the result was folded into a turn
-               that was already running, so there is no separate turn to find. -->
-          <span
-            v-if="run.deliver_to_origin"
-            class="run-delivery"
-            :class="{ owed: !run.origin_delivered_at }"
-            :title="deliveryHint"
-          >
-            ·
-            <Icon :icon="deliveryIcon" />
-            {{ deliveryLabel }}
-          </span>
+          <!-- A run of a rule registered from a chat owes its result to that
+               chat — one-shot or standing, every firing reports back. Say
+               whether the hand-over happened, and how. -->
+          <EventRunDeliveryChip :run="run" link-origin />
         </div>
       </div>
 
@@ -400,13 +358,6 @@ async function deleteRun() {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.run-delivery {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  white-space: nowrap;
-}
-.run-delivery.owed { color: var(--warning-color, #e6a23c); }
 .pending-banner {
   margin: 8px 16px 0;
   width: auto;

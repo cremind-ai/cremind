@@ -289,8 +289,10 @@ The agent also answers you straight away, in one short grounded sentence
 ("Not yet — two of four steps done"), as its own message before it goes back to
 work; the final answer still addresses the message when the turn ends. If it is
 too early to say anything useful it stays silent and replies at the end instead.
-A finished **event task** whose result lands mid-turn interrupts the same way,
-with a one-line heads-up that it arrived.
+A finished run from **any automation registered here** — a skill-event rule, a
+file watcher, a schedule, one-shot or standing — reports its result into this
+conversation, and one that lands mid-turn interrupts the same way, with a
+one-line heads-up that it arrived.
 
 On a **channel** conversation that interim reply is sent to the platform as its
 own message the moment it is written, rather than waiting for the turn and

@@ -24,7 +24,7 @@ function authHeaders(token: string): Record<string, string> {
 export type EventTaskStatus =
   | 'active'      // armed, waiting for its single occurrence
   | 'triggered'   // fired; its run is in flight
-  | 'completed'   // result delivered back to the origin conversation
+  | 'completed'   // its one run reported back and the task ended
   | 'cancelled'
   | 'timed_out';  // the awaited event never happened before the deadline
 
@@ -38,7 +38,12 @@ export interface SkillEventSubscription {
   action: string;
   created_at: number;
   paused: boolean;
-  /** One-shot task: fires once, returns its result to `conversation_id`, ends. */
+  /**
+   * ONE-SHOT task: waits for the next matching event only, runs once, reports,
+   * then ends (optionally giving up at `timeout_at`). Reporting is not what
+   * makes it a task — a standing subscription fires forever and reports EVERY
+   * run's result back into `conversation_id` too.
+   */
   task: boolean;
   task_status: EventTaskStatus | null;
   timeout_at: number | null;   // epoch SECONDS (event runs use ms)
@@ -167,7 +172,7 @@ export async function simulateEvent(
   id: string,
   content: string,
   filename?: string,
-): Promise<{ ok: boolean; path: string }> {
+): Promise<{ ok: boolean; path: string; warnings?: string[] }> {
   const base = resolveBaseUrl(agentUrl);
   const body: Record<string, string> = { content };
   if (filename && filename.trim()) {
