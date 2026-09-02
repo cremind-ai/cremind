@@ -1,5 +1,5 @@
 ---
-description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders` with their token usage, wipe one subscriber's conversation history with `clear-history`, delete a client completely with `forget` (as if they had never messaged — conversation, messages, automations, contact details and access all removed), run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), set a channel's push-notification filter with `notify-filter`, push an ad-hoc message out to a notification channel with `send` (attach files with `--file`), send a direct message to specific individual clients — one person or a bulk list, addressed by platform id or **phone number** — with `message` (also `--file`-capable), record a contact's phone number with `set-phone`, decide per client whether the agent must ask before messaging them with `set-confirm` (the profile-wide default is `channels.confirm_before_send` in Settings → Config → Channels; turn it off so unattended automations can send without stopping to ask), `approve`/`revoke` who may subscribe to a notification channel, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). All channels gate access with the same per-channel **authentication** method — open, passcode, one-time code (`otp`), admin approval, or allowlist — controlling who may chat (bot/userbot) or subscribe (notification); `approve`/`revoke` authorize individual senders and work in every mode. A notification channel can also receive one-off messages you send with `cremind channels send` — the same delivery the agent's `send_notification` tool uses when you ask it to 'notify me on Telegram'. Separately, `cremind channels message` sends to **named individuals** rather than to subscribers: give it sender ids or phone numbers (one `--to`, or a JSON list for a bulk campaign such as thanking every customer in a spreadsheet), and each delivered message is saved into that client's own conversation so the agent has the context later; it previews by default and only sends with `--send`, and only WhatsApp can message someone who has never written first. Channels carry **files in both directions**: a user attaching a photo or document on the platform hands it to the agent (staged into the conversation's temporary upload folder, size-capped), the agent's own created files (reports, screenshots, conversions) are auto-delivered back with its reply, and `send`/`message` push files outward with `--file` — platforms that can't carry a file deliver a text notice naming it instead. Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. A channel can also take part in **group chats** — real Telegram, Discord, Slack, WhatsApp or Zalo groups full of real people that this profile's account has been added to: opt in per channel with `--group-chats`, then approve each group with `cremind channels groups approve` (new groups arrive `pending` with a high-priority notification and the agent reads nothing until you approve), and tune it with `channels groups list`/`members`/`policy`/`allow`/`deny`/`respond`/`refresh`/`block`/`forget`. In an approved group the agent replies when mentioned and otherwise only when a cheap relevance check says the message is for it, while everything else is still stored as context. This is **not** `cremind group`, which is Cremind's own rooms where several profiles' agents talk to each other; the two features share nothing. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
+description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders` with their token usage, wipe one subscriber's conversation history with `clear-history`, delete a client completely with `forget` (as if they had never messaged — conversation, messages, automations, contact details and access all removed), run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), recover a **stuck pairing** with `repair` when `pair` shows no QR or code at all — the symptom of a saved session invalidated from the outside, typically because the same WhatsApp/Zalo/Telegram account was paired in another environment or the device was revoked from the phone; `repair` clears the dead session and re-pairs while **keeping the channel**, its contacts and its groups, which deleting and re-adding the channel would have destroyed, set a channel's push-notification filter with `notify-filter`, push an ad-hoc message out to a notification channel with `send` (attach files with `--file`), send a direct message to specific individual clients — one person or a bulk list, addressed by platform id or **phone number** — with `message` (also `--file`-capable), record a contact's phone number with `set-phone`, decide per client whether the agent must ask before messaging them with `set-confirm` (the profile-wide default is `channels.confirm_before_send` in Settings → Config → Channels; turn it off so unattended automations can send without stopping to ask), `approve`/`revoke` who may subscribe to a notification channel, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). All channels gate access with the same per-channel **authentication** method — open, passcode, one-time code (`otp`), admin approval, or allowlist — controlling who may chat (bot/userbot) or subscribe (notification); `approve`/`revoke` authorize individual senders and work in every mode. A notification channel can also receive one-off messages you send with `cremind channels send` — the same delivery the agent's `send_notification` tool uses when you ask it to 'notify me on Telegram'. Separately, `cremind channels message` sends to **named individuals** rather than to subscribers: give it sender ids or phone numbers (one `--to`, or a JSON list for a bulk campaign such as thanking every customer in a spreadsheet), and each delivered message is saved into that client's own conversation so the agent has the context later; it previews by default and only sends with `--send`, and only WhatsApp can message someone who has never written first. Channels carry **files in both directions**: a user attaching a photo or document on the platform hands it to the agent (staged into the conversation's temporary upload folder, size-capped), the agent's own created files (reports, screenshots, conversions) are auto-delivered back with its reply, and `send`/`message` push files outward with `--file` — platforms that can't carry a file deliver a text notice naming it instead. Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. A channel can also take part in **group chats** — real Telegram, Discord, Slack, WhatsApp or Zalo groups full of real people that this profile's account has been added to: opt in per channel with `--group-chats`, then approve each group with `cremind channels groups approve` (new groups arrive `pending` with a high-priority notification and the agent reads nothing until you approve), and tune it with `channels groups list`/`members`/`policy`/`allow`/`deny`/`respond`/`refresh`/`block`/`forget`. In an approved group the agent replies when mentioned and otherwise only when a cheap relevance check says the message is for it, while everything else is still stored as context. This is **not** `cremind group`, which is Cremind's own rooms where several profiles' agents talk to each other; the two features share nothing. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
 ---
 
 # `cremind channels` — External Messaging Channel Management
@@ -20,8 +20,11 @@ The group covers these operations:
   (`bot`/`userbot` for conversation, or `notification` for push-only
   alerts), and a JSON blob of platform-specific config
   (e.g. `{"bot_token":"…"}` for Telegram).
-- **`pair`** — Run the interactive pairing flow (WhatsApp QR, Telegram
-  userbot code + 2FA) in the terminal.
+- **`pair`** — Run the interactive pairing flow (WhatsApp QR, Zalo QR,
+  Telegram userbot code + 2FA) in the terminal.
+- **`repair`** — Clear a saved pairing session that the platform
+  invalidated behind our back, and pair again — keeping the channel and
+  its groups. The fix when `pair` never shows a QR or code.
 - **`notify-filter`** — Show or set the notification filter of a
   `notification`-mode channel (see **Notification mode** below).
 - **`send`** — Push a one-off, ad-hoc message out to a
@@ -1187,6 +1190,7 @@ cremind channels pair <id>
 | `password_required`| Reads from stdin **without echo** (via `golang.org/x/term`), POSTed back as `{password: ...}`.                                                            |
 | `ready`            | Prints `✓ Paired successfully.` and exits cleanly.                                                                                                       |
 | `disconnected`     | Logs the disconnect; if `logged_out=true`, exits (the session was unlinked remotely and needs a fresh pair). Otherwise waits for reconnect.              |
+| `unlinked`         | The platform revoked the session from its side. Prints the reason and exits, pointing at `cremind channels repair`.                                       |
 | `error`            | Prints the error to stderr; the loop continues.                                                                                                          |
 
 With root-level `--json`, every SSE frame is printed verbatim instead
@@ -1227,6 +1231,63 @@ Password:           # echoed if 2FA, hidden as you type
 non-zero status. The adapter on the server keeps running — re-invoke
 `cremind channels pair <id>` (or open the web UI dialog) to resume the
 flow from wherever it stalled.
+
+**If no QR or code ever appears,** the saved session was invalidated
+from the outside and `pair` cannot recover on its own — use
+`cremind channels repair` below.
+
+### `cremind channels repair`
+
+**Purpose.** Clear a channel's saved pairing session and pair it again,
+**keeping the channel** — its contacts, its conversations and its bound
+groups all survive.
+
+**Syntax.**
+
+```bash
+cremind channels repair <id>
+```
+
+**When to use it.** When `pair` sits there and no QR or code ever
+arrives. That is the signature of a session that was invalidated from
+the outside — the same account paired in another environment, or the
+device revoked from the phone. Such a session still looks valid on
+disk, so the adapter keeps restoring it instead of pairing, and no new
+code is ever produced. Deleting and re-adding the channel used to be
+the only way out; it also threw away the channel's contacts and groups.
+
+**Behavior.** `POST /api/channels/{id}/repair`, then the same
+interactive flow as `pair`. The server, in order: stops the adapter (so
+the sidecar releases its session files), deletes the saved session,
+clears the remote-unlink markers and re-enables the channel, then
+starts a fresh adapter — which, finding nothing to restore, pairs from
+scratch. Applies to every channel that pairs interactively: WhatsApp
+userbot, Zalo personal account, Telegram userbot.
+
+**Refused when** the channel authenticates from its configuration
+rather than by pairing (any bot-token channel — Telegram bot, Discord,
+Slack, Messenger, Zalo bot). Those have no session to reset; fix their
+credentials with `cremind channels edit` instead. HTTP 409 means the
+session was cleared but the adapter would not start again — the reason
+is in the error.
+
+**Examples.**
+
+```bash
+# A Zalo personal account that was re-paired on another machine:
+# the dialog/CLI hangs with no QR, so reset the session and pair again.
+$ cremind channels repair <zalo-userbot-id>
+Saved session cleared; pairing again...
+Open Zalo → Settings → scan the QR code, then scan:
+
+  ▄▄▄▄▄▄▄ ▄▄▄ ▄ ▄ ▄▄▄▄▄▄▄
+  …  (rest of the QR)
+✓ Paired successfully.
+
+# Refused on a bot-token channel
+$ cremind channels repair <telegram-bot-id>
+error: This channel has no pairing session to reset
+```
 
 ### `cremind channels groups list`
 
@@ -1775,6 +1836,21 @@ could not be installed (WhatsApp and Zalo userbot install their
 not reach registry.npmjs.org — fix that and re-enable the channel to
 retry), Node not on PATH, or — for Messenger — the Cremind host not being
 publicly reachable so Meta's webhook can't deliver.
+
+**Pairing shows no QR or code at all** — The web dialog sits on
+"Waiting for the adapter to start the pairing flow…", or `pair` prints
+nothing. The saved session was invalidated from the outside: the same
+account was paired in another environment, or the device was revoked
+from the phone. It still looks valid on disk, so the adapter keeps
+restoring it instead of pairing and no new code is ever produced.
+
+Run `cremind channels repair <id>` (or click **Reset & pair again** in
+the pairing dialog, which appears once the flow is detected as stuck).
+It clears the dead session and pairs from scratch, keeping the channel,
+its contacts and its groups. Do **not** delete and re-add the channel —
+that works only because a new channel id gets an empty session
+directory, and it destroys the channel's groups and contact history.
+Applies to WhatsApp userbot, Zalo personal account and Telegram userbot.
 
 **Telegram userbot keeps prompting for the code** — Either the code
 expired (Telegram codes are short-lived; the dialog will say "Code

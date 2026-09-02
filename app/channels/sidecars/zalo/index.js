@@ -273,6 +273,22 @@ async function spoolIncomingMedia(media) {
   }
 }
 
+function withTimeout(promise, ms, message) {
+  // zca-js's cookie login can sit on a dead session without ever settling, and
+  // a login that never resolves emits nothing at all — the pairing dialog then
+  // waits on a flow that was never started. Bound it so a stuck restore fails
+  // like a rejected one and reaches the QR fallback below.
+  let timer = null;
+  return Promise.race([
+    promise.finally(() => { if (timer) clearTimeout(timer); }),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+    }),
+  ]);
+}
+
+const LOGIN_TIMEOUT_MS = 60_000;
+
 async function startZalo() {
   loginAttempt += 1;
   // `selfListen: true` is load-bearing for group discovery, not a debugging
@@ -286,15 +302,37 @@ async function startZalo() {
 
   let captured = null;
   if (saved) {
-    logInfo('restoring saved Zalo session');
-    api = await zalo.login({
-      imei: saved.imei,
-      cookie: saved.cookie,
-      userAgent: saved.userAgent,
-      language: saved.language,
-    });
-  } else {
-    logInfo('no saved session — starting QR login');
+    // A saved session that Zalo has since invalidated — the account paired in
+    // another environment, most often — is indistinguishable on disk from a
+    // good one. Restoring it fails, and because the QR callback lives only on
+    // the other branch, failing here used to mean no QR was ever produced and
+    // the pairing dialog waited forever. Treat a failed restore as proof the
+    // session is dead: drop it and pair from scratch.
+    try {
+      logInfo('restoring saved Zalo session');
+      api = await withTimeout(
+        zalo.login({
+          imei: saved.imei,
+          cookie: saved.cookie,
+          userAgent: saved.userAgent,
+          language: saved.language,
+        }),
+        LOGIN_TIMEOUT_MS,
+        `saved session did not restore within ${LOGIN_TIMEOUT_MS}ms`,
+      );
+    } catch (e) {
+      logErr('login (saved session)', e);
+      api = null;
+      try {
+        fs.unlinkSync(credsFile);
+        logInfo('saved session rejected — credentials cleared, pairing again');
+      } catch (unlinkErr) {
+        logErr('clearing rejected credentials', unlinkErr);
+      }
+    }
+  }
+  if (!api) {
+    logInfo('no usable saved session — starting QR login');
     api = await zalo.loginQR(undefined, (event) => {
       if (!event) return;
       switch (event.type) {

@@ -323,6 +323,28 @@ def channel_auth_events_path(channel_id: str) -> str:
     return f"/api/channels/{quote(channel_id, safe='')}/auth-events"
 
 
+async def repair_channel(client: Client, channel_id: str) -> Channel:
+    """Erase the channel's saved pairing session and restart it pairing.
+
+    The way back from a session the platform invalidated behind our back — the
+    same account paired in another environment, a device revoked. The saved
+    session still looks valid to the adapter, so it keeps restoring it instead
+    of pairing and no QR or code is ever produced. This clears it and restarts
+    the adapter (re-enabling the channel if a remote logout disabled it),
+    keeping the channel's senders and bound groups.
+
+    HTTP 400 if the channel authenticates from its configuration rather than by
+    pairing; HTTP 409 if the session was reset but the adapter would not start,
+    with the reason in the response's ``error``.
+    """
+    resp = await client.post_json(
+        f"/api/channels/{quote(channel_id, safe='')}/repair", {},
+    )
+    if isinstance(resp, dict) and isinstance(resp.get("channel"), dict):
+        return Channel.from_dict(resp["channel"])
+    raise RuntimeError("unexpected /api/channels/{id}/repair response")
+
+
 async def submit_channel_auth_input(
     client: Client,
     channel_id: str,

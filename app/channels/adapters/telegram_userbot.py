@@ -128,10 +128,26 @@ class TelegramUserbotAdapter(BaseChannelAdapter):
         return str(raw).strip()
 
     def _session_path(self) -> Path:
-        base = Path(BaseConfig.CREMIND_SYSTEM_DIR)
-        d = base / self.profile / "telegram" / self.channel_id
+        d = self._session_dir()
         d.mkdir(parents=True, exist_ok=True)
         return d / "session"
+
+    def _session_dir(self) -> Path:
+        return (
+            Path(BaseConfig.CREMIND_SYSTEM_DIR)
+            / self.profile / "telegram" / self.channel_id
+        )
+
+    def reset_session(self) -> None:
+        """Delete the Telethon session so the next start re-runs the code flow.
+
+        Takes the whole per-channel directory rather than the ``.session``
+        file, which clears SQLite's ``-journal``/``-wal``/``-shm`` companions
+        in the same move. Deliberately built from :meth:`_session_dir` and not
+        :meth:`_session_path`, because the latter re-creates the directory as a
+        side effect immediately before we delete it.
+        """
+        self._rmtree_session(str(self._session_dir()))
 
     # ── auth-input bridge ──
 

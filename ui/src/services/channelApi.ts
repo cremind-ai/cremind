@@ -409,6 +409,10 @@ export type ChannelAuthEvent =
   | { kind: 'password_required'; error?: string }
   | { kind: 'ready' }
   | { kind: 'disconnected'; logged_out?: boolean }
+  /** The platform revoked this session from the other side (phone logout,
+   *  session displaced by a login elsewhere). Terminal: only re-pairing
+   *  recovers it. */
+  | { kind: 'unlinked'; reason?: string; logged_out?: boolean; detail?: string }
   | { kind: 'error'; error?: string };
 
 /** @deprecated Use {@link ChannelAuthEvent}; the QR-only union is retained
@@ -502,6 +506,36 @@ export function openChannelAuthStream(
 
 /** @deprecated alias for {@link openChannelAuthStream}. */
 export const openChannelQrStream = openChannelAuthStream;
+
+/**
+ * Erase a channel's saved pairing session and restart it pairing from scratch.
+ *
+ * The way out of a session the platform invalidated behind our back — the same
+ * account paired somewhere else, a device revoked. Such a session still looks
+ * valid to the adapter, which keeps restoring it instead of pairing, so no QR
+ * or code is ever produced. This wipes it and restarts the adapter (re-enabling
+ * the channel if a remote logout had disabled it), keeping the channel's
+ * senders and bound groups — unlike deleting and re-adding it.
+ *
+ * The caller should re-open the auth stream afterwards to pick up the new
+ * adapter's QR / code prompt.
+ */
+export async function repairChannel(
+  agentUrl: string, authToken: string, channelId: string,
+): Promise<ChannelRow> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/channels/${encodeURIComponent(channelId)}/repair`,
+    { method: 'POST', headers: authHeaders(authToken), body: '{}' },
+  );
+  const data = await res.json().catch(() => ({} as any));
+  if (!res.ok) {
+    // A 409 still carries the (reset, but not restarted) channel; the message
+    // is the persisted reason the adapter refused to come back up.
+    throw new Error(data.error || data.message || `Failed to reset the session: ${res.statusText}`);
+  }
+  return data.channel;
+}
 
 /**
  * Submit interactive-pairing input — a verification code or a 2FA

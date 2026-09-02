@@ -1129,11 +1129,13 @@ def channels_pair(
 
     The command exits when pairing succeeds (`ready`), the session is logged
     out remotely, the server returns a fatal error, or you press Ctrl-C.
+
+    If no QR or code ever appears, the saved session was invalidated elsewhere;
+    use `cremind channels repair` to clear it and pair from scratch.
     """
     import asyncio
 
     from app.cli.client._base import Client
-    from app.cli.client.channels import channel_auth_events_path
     from app.cli.config import Config
     from app.cli.output import OutputMode
 
@@ -1143,43 +1145,109 @@ def channels_pair(
 
     async def _run() -> None:
         async with Client(cfg) as client:
-            async for event in client.stream(channel_auth_events_path(channel_id)):
-                payload = event.data if isinstance(event.data, dict) else {}
-                kind = str(payload.get("kind") or "")
+            await _stream_pairing(client, channel_id, mode)
 
-                if mode.json:
-                    sys.stdout.write(event.raw)
-                    if not event.raw.endswith("\n"):
-                        sys.stdout.write("\n")
-                    sys.stdout.flush()
-                    if kind == "ready":
-                        return
-                    continue
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        raise typer.Exit(code=130)
 
-                if kind == "qr":
-                    _render_terminal_qr(str(payload.get("raw") or ""))
-                elif kind == "code_required":
-                    await _prompt_and_submit(
-                        client, channel_id, payload, secret=False,
-                    )
-                elif kind == "password_required":
-                    await _prompt_and_submit(
-                        client, channel_id, payload, secret=True,
-                    )
-                elif kind == "ready":
-                    sys.stdout.write("\n[OK] Paired successfully.\n")
-                    return
-                elif kind == "disconnected":
-                    if payload.get("logged_out"):
-                        sys.stdout.write(
-                            "\nSession was logged out - pair again to re-link.\n"
-                        )
-                        return
-                    sys.stdout.write("\nDisconnected - waiting for reconnect...\n")
-                elif kind == "error":
-                    err = str(payload.get("error") or "")
-                    if err:
-                        sys.stderr.write(f"error: {err}\n")
+
+async def _stream_pairing(client, channel_id: str, mode) -> None:
+    """Follow a channel's pairing stream to completion.
+
+    Renders a QR, prompts for a code / 2FA password, and returns once pairing
+    succeeds or the session is reported logged out. Shared by ``pair`` and
+    ``repair`` — the only difference between them is that ``repair`` clears the
+    saved session first.
+    """
+    from app.cli.client.channels import channel_auth_events_path
+
+    async for event in client.stream(channel_auth_events_path(channel_id)):
+        payload = event.data if isinstance(event.data, dict) else {}
+        kind = str(payload.get("kind") or "")
+
+        if mode.json:
+            sys.stdout.write(event.raw)
+            if not event.raw.endswith("\n"):
+                sys.stdout.write("\n")
+            sys.stdout.flush()
+            if kind == "ready":
+                return
+            continue
+
+        if kind == "qr":
+            _render_terminal_qr(str(payload.get("raw") or ""))
+        elif kind == "code_required":
+            await _prompt_and_submit(
+                client, channel_id, payload, secret=False,
+            )
+        elif kind == "password_required":
+            await _prompt_and_submit(
+                client, channel_id, payload, secret=True,
+            )
+        elif kind == "ready":
+            sys.stdout.write("\n[OK] Paired successfully.\n")
+            return
+        elif kind == "disconnected":
+            if payload.get("logged_out"):
+                sys.stdout.write(
+                    "\nSession was logged out - pair again to re-link.\n"
+                )
+                return
+            sys.stdout.write("\nDisconnected - waiting for reconnect...\n")
+        elif kind == "unlinked":
+            detail = str(payload.get("detail") or "").strip()
+            sys.stdout.write(
+                f"\nSession was unlinked{': ' + detail if detail else ''}\n"
+                "Run `cremind channels repair` to clear it and pair again.\n"
+            )
+            return
+        elif kind == "error":
+            err = str(payload.get("error") or "")
+            if err:
+                sys.stderr.write(f"error: {err}\n")
+
+
+@channels_app.command("repair")
+@graceful_errors
+def channels_repair(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+) -> None:
+    """Clear a channel's saved pairing session and pair it again.
+
+    Use this when `pair` never shows a QR or code. That happens when the saved
+    session was invalidated from the outside — the same account paired in
+    another environment, or the device revoked — because it still looks valid
+    on disk, so the adapter keeps restoring it instead of pairing.
+
+    The channel itself is kept, with its contacts and its groups; only the
+    session is discarded. A channel that a remote logout had disabled is
+    re-enabled. Pairing then continues exactly as in `pair`, so have the phone
+    ready. Channels that authenticate from a configured token have no session
+    to reset and are refused.
+    """
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.channels import repair_channel
+    from app.cli.config import Config
+    from app.cli.output import OutputMode
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    async def _run() -> None:
+        async with Client(cfg) as client:
+            await repair_channel(client, channel_id)
+            if not mode.json:
+                sys.stdout.write(
+                    "Saved session cleared; pairing again...\n",
+                )
+                sys.stdout.flush()
+            await _stream_pairing(client, channel_id, mode)
 
     try:
         asyncio.run(_run())

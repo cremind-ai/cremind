@@ -6,6 +6,7 @@ import {
   createChannel as apiCreateChannel,
   updateChannel as apiUpdateChannel,
   deleteChannel as apiDeleteChannel,
+  repairChannel as apiRepairChannel,
   fetchChannelSenders,
   setSenderAuthenticated as apiSetSenderAuthenticated,
   setSenderConfirmation as apiSetSenderConfirmation,
@@ -137,6 +138,18 @@ export const useChannelsStore = defineStore('channels', {
       await apiDeleteChannel(settings.agentUrl, settings.authToken, channelId);
       this.channels = this.channels.filter((c) => c.id !== channelId);
       this.ensureValidActiveFilter();
+    },
+    /** Wipe a channel's saved pairing session and restart it pairing again.
+     *  Recovers a channel whose session the platform invalidated elsewhere,
+     *  without losing the row (and with it, its senders and bound groups). */
+    async repairChannel(channelId: string): Promise<ChannelRow> {
+      const settings = useSettingsStore();
+      const repaired = await apiRepairChannel(
+        settings.agentUrl, settings.authToken, channelId,
+      );
+      const idx = this.channels.findIndex((c) => c.id === channelId);
+      if (idx >= 0) this.channels[idx] = repaired;
+      return repaired;
     },
     /** Reset ``activeFilter`` to ``main`` if it's no longer a selectable option
      *  (channel deleted, switched to notification mode, ``all`` left with no

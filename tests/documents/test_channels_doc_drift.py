@@ -44,6 +44,7 @@ EXPECTED_COMMANDS = {
     "cremind channels clear-history",
     "cremind channels forget",
     "cremind channels pair",
+    "cremind channels repair",
     "cremind channels delete",
     "cremind channels groups list",
     "cremind channels groups approve",
