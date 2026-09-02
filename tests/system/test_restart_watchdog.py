@@ -50,6 +50,11 @@ def sleeper():
 
 
 def test_a_process_that_exits_is_waited_out_not_timed_out(sleeper) -> None:
+    """Also pins the POSIX zombie hazard: nothing here reaps the child, and an
+    unreaped process answers ``os.kill(pid, 0)`` exactly as a live one does —
+    so a naive poll would sit out the full budget against a corpse and then
+    "escalate" to killing it.
+    """
     proc = sleeper(0.5)
     started = time.monotonic()
 

@@ -164,9 +164,47 @@ def _wait_windows(pid: int, timeout_s: float) -> bool:
         kernel32.CloseHandle(handle)
 
 
+def _reap_if_child(pid: int) -> bool:
+    """Reap ``pid`` if it happens to be our own child. True once it is gone.
+
+    Normally it is our *parent*, which raises ``ChildProcessError`` and leaves
+    the answer to the probes below. It is our child when a caller supervises
+    something it spawned, and then only a wait clears the zombie.
+    """
+    try:
+        reaped, _ = os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        return False
+    return reaped == pid
+
+
+def _is_zombie(pid: int) -> bool:
+    """Whether ``pid`` has exited but nobody has reaped it yet (Linux).
+
+    A zombie answers ``os.kill(pid, 0)`` exactly as a live process does — the
+    table entry survives until its parent waits on it — so a poll trusting the
+    signal alone sits out the entire grace against a process that is already
+    dead, and then "escalates" to killing a corpse. ``/proc`` is Linux-only;
+    everywhere else this is False and the bounded wait stands as the answer.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return False
+    # "<pid> (comm) S ..." — comm can contain spaces and parentheses, so the
+    # state is the first field after the LAST ')'.
+    marker = data.rfind(b")")
+    if marker == -1:
+        return False
+    return data[marker + 2:marker + 3] == b"Z"
+
+
 def _wait_posix(pid: int, timeout_s: float) -> bool:
     deadline = time.monotonic() + timeout_s
     while True:
+        if _reap_if_child(pid):
+            return True
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -175,6 +213,9 @@ def _wait_posix(pid: int, timeout_s: float) -> bool:
             # Alive, owned by another user. Not a supported configuration, but
             # it is emphatically not "exited".
             pass
+        else:
+            if _is_zombie(pid):
+                return True
         if time.monotonic() >= deadline:
             return False
         time.sleep(_POSIX_POLL_S)
