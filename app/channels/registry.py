@@ -332,9 +332,11 @@ class ChannelRegistry:
     def _on_run_task_done(self, channel_id: str, task: asyncio.Task) -> None:
         """Done-callback for an adapter's detached ``_run`` task.
 
-        Deliberate stop/restart cancellation and clean exits are ignored;
-        only a genuine exception schedules the disable path. Runs
-        synchronously on the loop, so the DB write is deferred to a task.
+        Deliberate stop/restart cancellation is ignored — those paths already
+        removed the adapter. An exception schedules the disable path; a *clean*
+        return schedules the reaper, because an adapter whose receive loop
+        returned is just as dead and used to be left registered. Runs
+        synchronously on the loop, so DB work is deferred to a task.
         """
         if task.cancelled():
             return
@@ -342,19 +344,57 @@ class ChannelRegistry:
             exc = task.exception()
         except asyncio.CancelledError:
             return
-        if exc is None:
-            return
+        coro = (
+            self._reap_finished_adapter(channel_id, task) if exc is None
+            else self._handle_run_failure(channel_id, task, exc)
+        )
         try:
             asyncio.create_task(
-                self._handle_run_failure(channel_id, task, exc),
-                name=f"channel-run-failure:{channel_id}",
+                coro,
+                name=f"channel-run-{'reap' if exc is None else 'failure'}:{channel_id}",
             )
         except RuntimeError:
             # Event loop is closing (interpreter shutdown) — nothing to do.
+            coro.close()
             logger.debug(
-                f"channels: run-failure handler skipped for {channel_id} "
+                f"channels: run-done handler skipped for {channel_id} "
                 "(loop closing)",
             )
+
+    async def _reap_finished_adapter(
+        self, channel_id: str, task: asyncio.Task,
+    ) -> None:
+        """Drop an adapter whose ``_run`` returned without raising.
+
+        A sidecar-backed ``_run`` ends this way whenever the Node process dies:
+        the reader loop logs the closed socket and returns normally, so nothing
+        raised and the disable path never fired. The adapter object stayed in
+        ``_adapters`` with a finished task, which made
+        :meth:`get_adapter` hand the ``/auth-events`` SSE a corpse — it answered
+        200, replayed nothing (``_teardown`` cleared the cached event), and left
+        the pairing dialog waiting on a publisher that no longer exists.
+
+        Reaping it makes the endpoint answer honestly ("Adapter not running")
+        so the UI can offer to re-pair. Deliberately does NOT disable the
+        channel or push the disabled-notification: a receive loop that ended is
+        not a configuration failure, and the row must stay enabled for repair
+        to restart it.
+        """
+        async with self._lock:
+            adapter = self._adapters.get(channel_id)
+            # Only reap if this task is still the registered adapter's — a
+            # concurrent restart may already have replaced it with a live one.
+            if adapter is None or adapter._task is not task:  # noqa: SLF001
+                return
+            self._adapters.pop(channel_id, None)
+        logger.info(
+            f"channels: {adapter.channel_type} receive loop ended; "
+            f"adapter unregistered channel_id={channel_id}",
+        )
+        try:
+            await adapter.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception(f"channels: stop failed for {channel_id}")
 
     async def _handle_run_failure(
         self, channel_id: str, task: asyncio.Task, exc: BaseException,

@@ -254,6 +254,18 @@ class ZaloUserbotAdapter(BaseChannelAdapter):
         os.makedirs(media_dir, exist_ok=True)
         return media_dir
 
+    def reset_session(self) -> None:
+        """Delete the saved Zalo session so the next spawn pairs by QR.
+
+        The sidecar reaches its ``loginQR`` branch only when ``loadCreds()``
+        comes back empty; with a ``credentials.json`` present it always tries
+        ``zalo.login(...)`` instead, and a cookie the account invalidated
+        elsewhere fails there with no QR to fall back to. Removing the whole
+        per-channel directory (credentials plus the media spool, which is
+        re-created on every spawn) is what restores the QR path.
+        """
+        self._rmtree_session(os.path.dirname(self._media_spool_dir()))
+
     async def _spawn_sidecar(self) -> None:
         try:
             import websockets  # type: ignore  # noqa: F401
@@ -470,7 +482,15 @@ class ZaloUserbotAdapter(BaseChannelAdapter):
                 f"sender={msg.get('sender_id')} err={msg.get('error')}",
             )
         elif kind == "error":
-            logger.warning(f"zalo[{self.channel_id}]: sidecar error — {msg.get('error')}")
+            detail = msg.get("error")
+            logger.warning(f"zalo[{self.channel_id}]: sidecar error — {detail}")
+            # Also tell whoever is watching the pairing stream. The sidecar
+            # reports a declined QR this way, and a dialog that only ever
+            # showed the spinner left the user waiting on a scan they had
+            # already rejected on the phone.
+            self._publish_auth_event({
+                "kind": "error", "error": str(detail or "Zalo sidecar error"),
+            })
 
     async def _handle_inbound_safe(
         self, sender_id: str, display_name: str | None, text: str,
@@ -638,6 +658,12 @@ class ZaloUserbotAdapter(BaseChannelAdapter):
                 except (asyncio.TimeoutError, ProcessLookupError):
                     try:
                         proc.kill()
+                        # Wait for the kill to land: a repair deletes
+                        # credentials.json right after this returns, and on
+                        # Windows a process that is still exiting keeps the
+                        # file open, so the delete would silently no-op and
+                        # leave the dead session in place.
+                        await asyncio.wait_for(proc.wait(), timeout=5)
                     except Exception:  # noqa: BLE001
                         pass
                 except Exception:  # noqa: BLE001

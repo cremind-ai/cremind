@@ -23,6 +23,7 @@ import asyncio
 import json
 import os
 import secrets
+import shutil
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Sequence
@@ -659,6 +660,48 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         as ``HTTP 409``.
         """
         return False
+
+    def reset_session(self) -> None:
+        """Erase this channel's persisted pairing session.
+
+        Called by the repair endpoint (``POST /api/channels/{id}/repair``)
+        between stopping the adapter and starting it again, so the next start
+        has nothing to restore and must run the interactive flow from scratch.
+
+        This exists because a saved session that the platform has since
+        invalidated — the same account paired somewhere else, a device revoked
+        — is indistinguishable on disk from a good one. Every session-based
+        adapter prefers restoring it, so a dead session means the pairing flow
+        is never entered again and no QR/code is ever produced. Deleting the
+        session is the only way back, and doing it here keeps the channel row
+        (its senders, its bound groups) instead of losing them to the
+        delete-and-recreate that was previously the only recovery.
+
+        Default is a no-op: adapters authenticated by a config token have no
+        session to erase. **Must be called with the adapter stopped** — on
+        Windows a live sidecar still holds its credentials file open.
+        """
+        return None
+
+    def _rmtree_session(self, path: str) -> None:
+        """Remove a persisted-session directory, tolerating a lingering lock.
+
+        The sidecar process was killed moments ago and Windows releases its
+        file handles asynchronously, so a single ``rmtree`` can silently leave
+        the credentials behind — which looks exactly like the bug this is
+        meant to fix. Retry briefly, then say so rather than reporting a reset
+        that didn't happen.
+        """
+        for _ in range(3):
+            shutil.rmtree(path, ignore_errors=True)
+            if not os.path.exists(path):
+                return
+            time.sleep(0.1)
+        if os.path.exists(path):
+            logger.warning(
+                f"channels[{self.channel_type}]: session directory not fully "
+                f"removed (files may still be locked): {path}",
+            )
 
     async def _send_typing(self, sender_id: str) -> None:
         """Tell the platform to show "typing…" to ``sender_id``.

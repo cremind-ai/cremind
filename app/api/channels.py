@@ -209,6 +209,22 @@ def _group_capable_types() -> list[dict]:
         return []
 
 
+def _mode_setup_kind(
+    catalog: dict[str, dict], channel_type: str, mode_id: str,
+) -> str | None:
+    """The ``setup_kind`` (``"qr"`` / ``"code"``) declared by one channel mode.
+
+    ``None`` when the mode pairs by nothing — a bot token in the config, say —
+    which is what tells the repair endpoint there is no session to reset.
+    Same lookup the UI does to decide whether to show a Pair button.
+    """
+    entry = catalog.get(channel_type) or {}
+    for mode in (entry.get("channel") or {}).get("modes") or []:
+        if str(mode.get("id") or "") == str(mode_id or ""):
+            return mode.get("setup_kind") or None
+    return None
+
+
 def _decorate(channel: dict) -> dict:
     """Add live-runtime ``status`` derived from the registry + persisted state.
 
@@ -685,6 +701,130 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
                 status_code=409,
             )
         return JSONResponse({"success": True})
+
+    async def handle_repair_channel(request: Request) -> JSONResponse:
+        """Reset a channel's saved pairing session and start it pairing again.
+
+        The recovery for a session the platform invalidated behind our back —
+        the same account paired in another environment, a device revoked. Such
+        a session still looks valid on disk, so every session-based adapter
+        keeps restoring it and the interactive flow is never entered again: no
+        QR, no code, and a pairing dialog that waits forever. Until now the only
+        way out was deleting the channel (a fresh id gets an empty session
+        directory), which also threw away its senders and bound groups.
+
+        Order is deliberate — **stop, reset, enable, start**. Stopping first
+        kills the sidecar so it releases its credentials file; enabling only
+        after the reset means a crash mid-repair leaves the channel disabled
+        with a clean session (recoverable) rather than enabled with the stale
+        one (the bug). Re-enabling is part of the job because an adapter that
+        detected the remote logout has already flipped the row off.
+
+        The caller opens the auth-events stream once this returns; the fresh
+        adapter caches its first ``qr``/``code_required`` event, so subscribing
+        a moment late still sees it.
+        """
+        unauth = _require_auth(request)
+        if unauth is not None:
+            return unauth
+        profile = _profile_from_request(request)
+        cid = request.path_params["channel_id"]
+        ch = await conversation_storage.get_channel(cid)
+        if not ch:
+            return JSONResponse({"error": "Channel not found"}, status_code=404)
+        if ch["profile"] != profile:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        if ch["channel_type"] == "main":
+            return JSONResponse(
+                {"error": "The main channel has no pairing session"},
+                status_code=400,
+            )
+
+        catalog = load_all_channel_catalogs()
+        if not _mode_setup_kind(catalog, ch["channel_type"], ch.get("mode") or ""):
+            return JSONResponse(
+                {
+                    "error": "This channel has no pairing session to reset",
+                    "message": (
+                        f"{ch['channel_type']} in {ch.get('mode') or 'bot'} mode "
+                        "authenticates from its configuration, not by pairing. "
+                        "Edit its credentials instead."
+                    ),
+                },
+                status_code=400,
+            )
+
+        from app.channels.registry import adapter_class_for_channel_type
+
+        registry = get_channel_registry()
+        # Grab the live instance BEFORE stopping: it already knows its own
+        # session paths, and stopping only ends its task, it doesn't
+        # invalidate the object.
+        try:
+            adapter = registry.get_adapter(cid)
+        except RuntimeError:
+            adapter = None
+        try:
+            await registry.stop_for_channel(cid)
+        except Exception:  # noqa: BLE001
+            logger.exception(f"channels: stop failed for {cid}")
+
+        if adapter is None:
+            # Nothing registered — the run loop died, or the channel was
+            # disabled. A throwaway instance resolves the paths just as well;
+            # no adapter imports its platform SDK at construction time.
+            adapter_cls = adapter_class_for_channel_type(
+                ch["channel_type"], ch.get("mode") or "",
+            )
+            if adapter_cls is None:
+                return JSONResponse(
+                    {"error": "No adapter available to reset this channel"},
+                    status_code=500,
+                )
+            adapter = adapter_cls(ch, conversation_storage)
+        try:
+            adapter.reset_session()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(f"channels: session reset failed for {cid}")
+            return JSONResponse(
+                {"error": f"Failed to reset the saved session: {exc}"},
+                status_code=500,
+            )
+
+        # Clear the markers a remote unlink left behind, so the row is
+        # startable and the UI stops showing it as unlinked.
+        state = dict(ch.get("state") or {})
+        for key in ("link_status", "unlinked_at", "unlinked_reason", "last_error"):
+            state.pop(key, None)
+        updated = await conversation_storage.update_channel(
+            cid, enabled=True, state=state,
+        )
+        if updated is None:
+            updated = {**ch, "enabled": True, "state": state}
+
+        started = await registry.start_for_channel(
+            updated, install_if_missing=True,
+        )
+        logger.info(
+            f"channels: {ch['channel_type']} session reset and restarted "
+            f"channel_id={cid}",
+        )
+        decorated = _decorate(_redact(started, catalog))
+        if not started.get("enabled", True):
+            # start_for_channel disabled it again — a missing SDK, a dead
+            # sidecar. Report the persisted reason instead of a bare success
+            # that leaves the dialog waiting on an adapter that never started.
+            return JSONResponse(
+                {
+                    "channel": decorated,
+                    "error": (
+                        (started.get("state") or {}).get("last_error")
+                        or "The channel failed to start after the reset."
+                    ),
+                },
+                status_code=409,
+            )
+        return JSONResponse({"channel": decorated})
 
     async def handle_list_senders(request: Request) -> JSONResponse:
         unauth = _require_auth(request)
@@ -1338,6 +1478,11 @@ def get_channel_routes(conversation_storage: ConversationStorage) -> list[Route]
         Route(
             "/api/channels/{channel_id}/auth-input",
             endpoint=handle_auth_input,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/channels/{channel_id}/repair",
+            endpoint=handle_repair_channel,
             methods=["POST"],
         ),
         Route(

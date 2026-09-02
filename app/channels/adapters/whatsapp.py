@@ -363,6 +363,17 @@ class WhatsappAdapter(BaseChannelAdapter):
         os.makedirs(media_dir, exist_ok=True)
         return media_dir
 
+    def reset_session(self) -> None:
+        """Delete the saved linked-device session so the next spawn shows a QR.
+
+        Baileys emits a QR only when it finds no registered credentials; with a
+        session the phone has since revoked it reconnects against it instead,
+        forever on most close codes. The auth state is a *directory* of files,
+        so the whole per-channel slice goes — removing only ``creds.json``
+        would leave Baileys with orphaned key files and a half-valid state.
+        """
+        self._rmtree_session(os.path.dirname(self._media_spool_dir()))
+
     async def _spawn_sidecar(self) -> None:
         try:
             import websockets  # type: ignore  # noqa: F401
@@ -539,9 +550,16 @@ class WhatsappAdapter(BaseChannelAdapter):
                     f"sender={msg.get('sender_id')} err={msg.get('error')}",
                 )
         elif kind == "error":
+            detail = msg.get("error")
             logger.warning(
-                f"whatsapp[{self.channel_id}]: sidecar error — {msg.get('error')}",
+                f"whatsapp[{self.channel_id}]: sidecar error — {detail}",
             )
+            # Mirror it onto the pairing stream so a failure during a scan
+            # reaches the dialog instead of leaving it on the spinner.
+            self._publish_auth_event({
+                "kind": "error",
+                "error": str(detail or "WhatsApp sidecar error"),
+            })
 
     async def _note_self_identity(self, msg: dict) -> None:
         """Record which WhatsApp account this linked device speaks as.
@@ -865,6 +883,12 @@ class WhatsappAdapter(BaseChannelAdapter):
                 except (asyncio.TimeoutError, ProcessLookupError):
                     try:
                         proc.kill()
+                        # Wait for the kill to land: a repair deletes the
+                        # Baileys session directory right after this returns,
+                        # and on Windows a process that is still exiting keeps
+                        # its files open, so the delete would silently no-op
+                        # and leave the dead session in place.
+                        await asyncio.wait_for(proc.wait(), timeout=5)
                     except Exception:  # noqa: BLE001
                         pass
                 except Exception:  # noqa: BLE001

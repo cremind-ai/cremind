@@ -42,7 +42,9 @@ class _FakeStorage:
 class _FakeAdapter:
     """Minimal stand-in mirroring the bits ``start_for_channel`` touches."""
 
-    #: ``_run`` coroutine behaviour: "park" (run forever) or "raise".
+    #: ``_run`` coroutine behaviour: "park" (run forever), "raise", or
+    #: "return" (finish cleanly, as a sidecar adapter does when its Node
+    #: process dies and the reader loop swallows the closed socket).
     behaviour = "park"
     instances: list["_FakeAdapter"] = []
 
@@ -58,6 +60,8 @@ class _FakeAdapter:
     async def _run(self) -> None:
         if type(self).behaviour == "raise":
             raise RuntimeError("boom")
+        if type(self).behaviour == "return":
+            return
         await asyncio.Event().wait()  # park until cancelled
 
     async def stop(self) -> None:
@@ -219,6 +223,39 @@ def test_run_failure_disables_channel_via_done_callback(monkeypatch, _patch_regi
         for _cid, kw in storage.updates
     ), storage.updates
     assert _patch_registry  # notification pushed
+
+
+def test_clean_run_return_reaps_adapter(monkeypatch, _patch_registry):
+    """A ``_run`` that returns without raising must unregister the adapter.
+
+    Regression: only an *exception* used to reap it, so a sidecar adapter whose
+    Node process died — its reader loop logs the closed socket and returns
+    normally — stayed in ``_adapters`` with a finished task. ``get_adapter``
+    then handed the ``/auth-events`` SSE that corpse, which answered 200 and
+    streamed keepalives from a publisher that no longer existed, parking the
+    pairing dialog on "Waiting for the adapter…" forever.
+    """
+    storage = _FakeStorage()
+    reg = ChannelRegistry(storage)
+    _FakeAdapter.behaviour = "return"
+    ch = _telegram_channel()
+    storage.channels["c1"] = dict(ch)
+
+    async def main():
+        await reg.start_for_channel(ch, install_if_missing=False)
+        await asyncio.sleep(0.05)  # let the done-callback + reaper run
+
+    asyncio.run(main())
+
+    # The SSE endpoint gates on this being None; it is the whole point.
+    assert reg.get_adapter("c1") is None
+    assert reg.status_for("c1") == "stopped"
+    # Reaping is not a failure: the row must stay enabled so it can be
+    # restarted (by repair), and no "Channel disabled" alarm should fire.
+    assert not any(
+        kw.get("enabled") is False for _cid, kw in storage.updates
+    ), storage.updates
+    assert not _patch_registry, _patch_registry
 
 
 def test_run_failure_skips_when_unlinked(monkeypatch, _patch_registry):

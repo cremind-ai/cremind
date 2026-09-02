@@ -62,6 +62,33 @@ def test_lockfile_is_git_tracked(sidecar):
 
 
 @pytest.mark.parametrize("sidecar", _sidecars(), ids=lambda p: p.name)
+def test_sidecar_sources_are_git_tracked(sidecar):
+    """Same trap as the lockfile, one directory over.
+
+    A sidecar that grew a second module (``index.js`` imports ``./media.js``)
+    keeps working from a checkout whether or not git knows about the new file,
+    and every Python test stays green — but hatchling ships only VCS-tracked
+    files, so on Docker/K8S the import fails and the channel is disabled at
+    spawn.
+    """
+    if not (REPO_ROOT / ".git").exists():
+        pytest.skip("not a git checkout (e.g. running from an sdist)")
+
+    for source in sorted(sidecar.glob("*.js")):
+        rel = source.relative_to(REPO_ROOT).as_posix()
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", rel],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert tracked.returncode == 0, (
+            f"{rel} is not tracked by git, so hatchling will drop it from the "
+            "wheel and the sidecar will fail to start on Docker/K8S installs."
+        )
+
+
+@pytest.mark.parametrize("sidecar", _sidecars(), ids=lambda p: p.name)
 def test_lockfile_matches_its_manifest(sidecar):
     """``npm ci`` refuses a lockfile whose identity drifted from package.json.
 
@@ -106,6 +133,8 @@ _REQUIRED_SOURCE_MARKERS = {
         "media-dir",
         "spoolIncomingMedia",
         "files",
+        "./media.js",             # candidate/retry/header logic lives there
+        "mediaFailureNotice",     # a failed download is text, never silence
     ),
 }
 
@@ -130,17 +159,22 @@ def test_imports_are_declared_dependencies(sidecar):
     pkg = json.loads((sidecar / "package.json").read_text(encoding="utf-8"))
     declared = set(pkg.get("dependencies", {})) | set(pkg.get("devDependencies", {}))
 
-    source = (sidecar / "index.js").read_text(encoding="utf-8")
-    for spec in _SPECIFIER.findall(source):
-        if spec.startswith("node:"):
-            continue
-        # Scoped packages: @scope/name; everything else: first path segment.
-        parts = spec.split("/")
-        name = "/".join(parts[:2]) if spec.startswith("@") else parts[0]
-        if name in _NODE_BUILTINS:
-            continue
-        assert name in declared, (
-            f"{sidecar.name}/index.js imports {name!r}, which is not in "
-            "package.json dependencies — it only resolves as a transitive "
-            "dependency today."
-        )
+    # Every module in the sidecar, not just its entry point: a helper beside
+    # index.js resolves its own imports the same way and can strand the same
+    # undeclared dependency. Relative specifiers ("./media.js") are ignored by
+    # the regex, so only real packages are checked.
+    for source_file in sorted(sidecar.glob("*.js")):
+        source = source_file.read_text(encoding="utf-8")
+        for spec in _SPECIFIER.findall(source):
+            if spec.startswith("node:"):
+                continue
+            # Scoped packages: @scope/name; everything else: first path segment.
+            parts = spec.split("/")
+            name = "/".join(parts[:2]) if spec.startswith("@") else parts[0]
+            if name in _NODE_BUILTINS:
+                continue
+            assert name in declared, (
+                f"{sidecar.name}/{source_file.name} imports {name!r}, which is "
+                "not in package.json dependencies — it only resolves as a "
+                "transitive dependency today."
+            )

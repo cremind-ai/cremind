@@ -30,9 +30,14 @@
  * Media never rides the WebSocket (4 MiB frame cap). Inbound media is
  * downloaded AT RECEIPT into --media-dir and the frame carries
  * {files: [{path, name, mime, size}]}; the parent moves or deletes the
- * spooled file. Outbound "send_file" carries an absolute path — parent and
- * sidecar share the filesystem by design — and is answered with exactly one
- * correlated {kind:"send_file_result", request_id, ok, error?}.
+ * spooled file. Which url is fetched, and how often, is media.js's business.
+ * A media message whose download FAILS still flows: its frame carries a
+ * bracketed notice in `text` instead of the file, because a caption-less photo
+ * that could not be fetched has neither and the parent would drop it — which
+ * is how a photo posted to a bound room reached nobody at all. Outbound
+ * "send_file" carries an absolute path — parent and sidecar share the
+ * filesystem by design — and is answered with exactly one correlated
+ * {kind:"send_file_result", request_id, ok, error?}.
  *
  * Credentials (cookie/imei/userAgent) are persisted per (profile, channel-id)
  * at <working-dir>/<profile>/zalo/<channel-id>/credentials.json so a paired
@@ -46,6 +51,13 @@ import path from 'path';
 import minimist from 'minimist';
 import { WebSocketServer } from 'ws';
 import { Zalo } from 'zca-js';
+
+import {
+  downloadMedia,
+  mediaFailureNotice,
+  mediaFromMessage,
+  thumbnailNotice,
+} from './media.js';
 
 // zca-js LoginQRCallbackEventType values.
 const QR_GENERATED = 0;
@@ -201,77 +213,101 @@ function extractText(content) {
   return '';
 }
 
-// zca-js msgType values that carry a downloadable payload in content.href.
-// Unofficial library — the shapes drift between builds, so detection is
-// defensive and every unrecognised media shape is logged rather than guessed
-// at. Stickers are deliberately absent: they are reactions, not files.
-const MEDIA_MSG_TYPES = new Set([
-  'chat.photo', 'share.file', 'chat.video.msg', 'chat.voice', 'chat.gif',
-]);
-
-function mediaFromMessage(data) {
-  // {url, name, isFile} for a media message, or null. `title` is the FILENAME
-  // on a share.file and (when present) the CAPTION on a photo/video — the
-  // caller uses `isFile` to keep a filename from becoming message text.
-  const content = data && data.content;
-  const msgType = String((data && data.msgType) || '');
-  if (!content || typeof content !== 'object' || !content.href) return null;
-  if (!MEDIA_MSG_TYPES.has(msgType)) {
-    if (msgType) logInfo(`media-like content ignored (msgType=${msgType})`);
-    return null;
+async function mediaHeadersFor(url) {
+  // What zca-js sends on every request it makes itself (utils.js
+  // getDefaultHeaders), minus its JSON Accept. A bare Node fetch presents no
+  // Referer and a User-Agent of "node", which is exactly what a hotlink filter
+  // is built to turn away — and such a host answers 404 as readily as 403.
+  // No Cookie: the jar only holds zalo.me cookies, so a CDN host would get
+  // none anyway, and a hand-set Cookie header follows cross-origin redirects.
+  const headers = {
+    Accept: 'image/*,video/*,audio/*,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    Origin: 'https://chat.zalo.me',
+    Referer: 'https://chat.zalo.me/',
+  };
+  try {
+    const ctx = api && api.getContext ? api.getContext() : null;
+    if (ctx && ctx.userAgent) headers['User-Agent'] = ctx.userAgent;
+  } catch (e) {
+    // Mid-reconnect there is no context; the other headers still stand.
   }
-  const isFile = msgType === 'share.file';
-  let name = isFile ? String(content.title || '').trim() : '';
-  if (!name) {
-    try {
-      const urlPath = new URL(content.href).pathname;
-      name = path.basename(urlPath) || '';
-    } catch (e) { /* fall through */ }
-  }
-  if (!name) {
-    const ext = msgType === 'chat.photo' ? '.jpg'
-      : msgType === 'chat.video.msg' ? '.mp4'
-        : msgType === 'chat.voice' ? '.aac'
-          : msgType === 'chat.gif' ? '.gif' : '';
-    name = `zalo_media${ext}`;
-  }
-  return { url: content.href, name, isFile };
+  return headers;
 }
 
 async function spoolIncomingMedia(media) {
   // Download a media message's payload into the spool NOW (the CDN URLs are
-  // session-scoped) and hand the parent the path. Returns [] for no media,
-  // over-cap media, or a failed download — the message still flows.
-  if (!media) return [];
+  // session-scoped) and hand the parent the path. Returns {files, failure,
+  // degraded}: `files` is empty for a download that never landed, and
+  // `failure` then says why so the caller can tell the agent — losing the
+  // message instead was the bug this replaced.
+  const none = { files: [], failure: null, degraded: false };
+  if (!media) return none;
   try {
-    const resp = await fetch(media.url);
-    if (!resp.ok) {
-      logInfo(`media download failed (${resp.status}) for ${media.name}`);
-      return [];
-    }
-    const declared = Number(resp.headers.get('content-length'));
-    if (Number.isFinite(declared) && declared > mediaMaxBytes) {
-      logInfo(`media skipped (declared ${declared} bytes > cap ${mediaMaxBytes})`);
-      return [];
-    }
-    const buffer = Buffer.from(await resp.arrayBuffer());
-    if (!buffer.length) return [];
-    if (buffer.length > mediaMaxBytes) {
-      logInfo(`media skipped (downloaded ${buffer.length} bytes > cap ${mediaMaxBytes})`);
-      return [];
+    const result = await downloadMedia(media, {
+      maxBytes: mediaMaxBytes,
+      headersFor: mediaHeadersFor,
+    });
+    const trail = result.attempts.map((a) => `${a.source}:${a.status}`).join(',');
+    if (!result.ok) {
+      if (result.capped) {
+        // A cap we chose, not a failure to report: the sender can see the file
+        // arrived at Zalo, and re-sending it smaller is the only fix.
+        logInfo(`media skipped (${result.size} bytes > cap ${mediaMaxBytes}) for ${media.name}`);
+        return none;
+      }
+      // Everything needed to reproduce this with curl from the same host, and
+      // to tell the three causes apart: which client sent it, how old the
+      // message was when we fetched, what each attempt answered, which fields
+      // the message offered, and what keys its params really had.
+      logInfo(
+        `media download failed for ${media.name}: msgType=${media.msgType}`
+        + ` platform=${media.platformType} ageMs=${media.ts ? Date.now() - media.ts : null}`
+        + ` status=${result.status}${result.budgetSpent ? ' budget=spent' : ''}`
+        + ` attempts=${trail} present=${result.present.join(',')}`
+        + ` params_keys=${result.paramKeys.join(',')} urls=${result.urls.join(' ')}`,
+      );
+      return { files: [], failure: result, degraded: false };
     }
     const safeName = path.basename(media.name).replace(/[\\/:*?"<>|]/g, '_') || 'file';
     const spoolName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${safeName}`;
     const spoolPath = path.join(mediaDir, spoolName);
-    fs.writeFileSync(spoolPath, buffer);
-    logInfo(`media spooled ${spoolName} (${buffer.length} bytes)`);
-    const mime = String(resp.headers.get('content-type') || '').split(';')[0] || null;
-    return [{ path: spoolPath, name: safeName, mime, size: buffer.length }];
+    fs.writeFileSync(spoolPath, result.buffer);
+    // `platform` on the success line too: the first PC-app photo that works is
+    // the comparison the failing one never had.
+    const via = result.attempts.length > 1 ? ` via ${result.source} after ${trail}` : '';
+    logInfo(
+      `media spooled ${spoolName} (${result.buffer.length} bytes)`
+      + ` platform=${media.platformType}${via}`,
+    );
+    return {
+      files: [{ path: spoolPath, name: safeName, mime: result.mime, size: result.buffer.length }],
+      failure: null,
+      degraded: Boolean(result.degraded),
+    };
   } catch (e) {
-    logInfo(`media download failed: ${e && (e.message || e)}`);
-    return [];
+    // downloadMedia does not throw and the spool write is the only thing left
+    // that can; catching here keeps the notice path unconditional.
+    logErr('spoolIncomingMedia', e);
+    return { files: [], failure: { status: `error:${e && (e.message || e)}` }, degraded: false };
   }
 }
+
+function withTimeout(promise, ms, message) {
+  // zca-js's cookie login can sit on a dead session without ever settling, and
+  // a login that never resolves emits nothing at all — the pairing dialog then
+  // waits on a flow that was never started. Bound it so a stuck restore fails
+  // like a rejected one and reaches the QR fallback below.
+  let timer = null;
+  return Promise.race([
+    promise.finally(() => { if (timer) clearTimeout(timer); }),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+    }),
+  ]);
+}
+
+const LOGIN_TIMEOUT_MS = 60_000;
 
 async function startZalo() {
   loginAttempt += 1;
@@ -286,15 +322,37 @@ async function startZalo() {
 
   let captured = null;
   if (saved) {
-    logInfo('restoring saved Zalo session');
-    api = await zalo.login({
-      imei: saved.imei,
-      cookie: saved.cookie,
-      userAgent: saved.userAgent,
-      language: saved.language,
-    });
-  } else {
-    logInfo('no saved session — starting QR login');
+    // A saved session that Zalo has since invalidated — the account paired in
+    // another environment, most often — is indistinguishable on disk from a
+    // good one. Restoring it fails, and because the QR callback lives only on
+    // the other branch, failing here used to mean no QR was ever produced and
+    // the pairing dialog waited forever. Treat a failed restore as proof the
+    // session is dead: drop it and pair from scratch.
+    try {
+      logInfo('restoring saved Zalo session');
+      api = await withTimeout(
+        zalo.login({
+          imei: saved.imei,
+          cookie: saved.cookie,
+          userAgent: saved.userAgent,
+          language: saved.language,
+        }),
+        LOGIN_TIMEOUT_MS,
+        `saved session did not restore within ${LOGIN_TIMEOUT_MS}ms`,
+      );
+    } catch (e) {
+      logErr('login (saved session)', e);
+      api = null;
+      try {
+        fs.unlinkSync(credsFile);
+        logInfo('saved session rejected — credentials cleared, pairing again');
+      } catch (unlinkErr) {
+        logErr('clearing rejected credentials', unlinkErr);
+      }
+    }
+  }
+  if (!api) {
+    logInfo('no usable saved session — starting QR login');
     api = await zalo.loginQR(undefined, (event) => {
       if (!event) return;
       switch (event.type) {
@@ -376,8 +434,9 @@ function startListener() {
     try {
       if (!m || m.isSelf) return;
       const data = m.data || {};
-      const media = mediaFromMessage(data);
-      const files = media ? await spoolIncomingMedia(media) : [];
+      const media = mediaFromMessage(data, logInfo);
+      const spooled = media ? await spoolIncomingMedia(media) : null;
+      const files = spooled ? spooled.files : [];
       // For a media message the old extractText would surface content.title —
       // the FILENAME on a share.file — or the raw CDN href as "text". With the
       // file itself flowing, the text is only what the sender actually typed:
@@ -385,6 +444,14 @@ function startListener() {
       let text;
       if (media) {
         text = media.isFile ? '' : String((data.content && data.content.title) || '');
+        // A download that failed must never be silent. The notice is what
+        // carries this message past the empty-message guard below (and the
+        // parent's own), so the agent can tell the sender their photo is not
+        // here rather than answering a message it never saw.
+        const notice = spooled.failure
+          ? mediaFailureNotice(media, spooled.failure)
+          : (spooled.degraded ? thumbnailNotice(media) : '');
+        if (notice) text = text ? `${text}\n${notice}` : notice;
       } else {
         text = extractText(data.content);
       }
