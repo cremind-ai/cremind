@@ -127,7 +127,10 @@ cremind server restart [--yes/-y]
 | `--yes`, `-y`  | bool | `false` | Skip the confirmation prompt.  |
 
 **Behavior.** Active HTTP, SSE, and chat connections drop while the server is
-unavailable. Whether it comes back on its own depends on the install mode,
+unavailable. The stop itself is graceful: the backend finishes its shutdown
+hooks — channel adapters and their sidecars, processes started by agents, open
+terminals — before exiting, and a detached watchdog force-stops it only if that
+hangs (~25s). Whether it comes back on its own depends on the install mode,
 which the command reads first and warns about before confirming:
 
 - **docker** — the container restarts automatically (usually 5–15s).

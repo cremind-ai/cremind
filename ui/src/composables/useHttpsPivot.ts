@@ -43,15 +43,21 @@ export type PivotPhase =
  *  fulfilled fetch off the listener that is on its way out. */
 const INITIAL_DELAY_MS = 2000;
 /** Kubernetes waits far longer before its FIRST probe. The restart is not one
- *  event but a chain: the helper SIGTERMs at +1.5s, the server drains (up to
- *  12s), the container exits, the kubelet restarts it, the entrypoint runs
+ *  event but a chain: the server begins its own graceful shutdown ~1.5s after
+ *  the 202, drains and cleans up (exiting within ~13.5s where a supervisor
+ *  exists; the detached watchdog force-stops it only at +25s if that wedges),
+ *  the container exits, the kubelet restarts it, the entrypoint runs
  *  ``cremind db upgrade``, and only then does the app boot — migrations,
  *  skills, documents, channels — before it binds. Nothing can answer inside
  *  ~15s, so an earlier probe cannot succeed; it can only cost us the tunnel
  *  (a refused in-pod dial ends a ``kubectl port-forward``). */
 const K8S_INITIAL_DELAY_MS = 15_000;
 const PROBE_INTERVAL_MS = 1500;
-const PROBE_BUDGET_MS = 25_000;
+/** Enough for the whole chain above on a supervised native install: a
+ *  graceful exit (up to ~13.5s), the respawn loop's 2s, and the new process's
+ *  boot. The old 25s could brush that, and off Kubernetes a spent budget
+ *  blind-redirects — into an origin nothing is listening on yet. */
+const PROBE_BUDGET_MS = 40_000;
 /** One probe's own timeout. Short: a live listener answers immediately. */
 const PROBE_TIMEOUT_MS = 2000;
 /** On Kubernetes, how long probes may fail (after the initial delay above)

@@ -1,16 +1,24 @@
 """System-level admin endpoints exposed to the Developer page.
 
-  POST /api/system/restart  — admin; spawns a detached helper that
-                              SIGTERMs the backend after the response
-                              has been sent, so the supervisor
-                              (Docker, Electron, …) can bring it back.
+  POST /api/system/restart  — admin; asks the server to shut itself down
+                              gracefully, so the supervisor (Docker,
+                              Electron, the boot service, …) brings it back.
 
-The HTTP server can't kill itself in-process: the connection would
-drop mid-response and the client would see ECONNREFUSED with no
-warning. So this mirrors the upgrade flow's approach — spawn a
-sibling detached subprocess (see :mod:`app.system.restart`) and
-return 202 immediately. The subprocess waits ~1.5 s then sends
-SIGTERM to ``os.getpid()`` of the API process.
+The server can't stop in-process the instant the request arrives: the
+connection would drop mid-response and the client would see
+ECONNREFUSED with no warning. So the handler returns 202 and schedules
+the shutdown a beat later, through
+:func:`app.server.request_graceful_shutdown` — the same path an OS
+signal takes, which drains connections, stops channel adapters and
+their node sidecars, tree-kills managed processes and releases their
+lock files before the process exits.
+
+A detached sibling (:mod:`app.system.restart`) is spawned first, as a
+watchdog: it waits for this process to exit on its own and hard-kills it
+only if the shutdown wedged. That inversion is the point — the previous
+design had the helper do the killing, and on Windows ``os.kill(pid,
+SIGTERM)`` is ``TerminateProcess``, so every restart skipped the cleanup
+above and orphaned whatever the server had spawned.
 """
 
 from __future__ import annotations
@@ -24,19 +32,34 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from app.api._auth import require_admin
+from app.system.restart import DEFAULT_GRACE_S
+from app.utils.logger import logger
+
+
+# How long to let the 202 travel before the listener starts going away.
+# Without it the client sees ECONNREFUSED with no warning.
+_RESPONSE_WINDOW_S = 1.5
 
 
 async def post_system_restart(request: Request) -> JSONResponse:
-    """Spawn the detached restart helper. Returns 202 or 500."""
+    """Spawn the watchdog, then ask ourselves to stop. Returns 202 or 500."""
     denied = require_admin(request)
     if denied is not None:
         return denied
 
-    # Same invocation pattern as ``/api/upgrade/apply`` — ``sys.executable
+    # Same invocation pattern as ``/api/upgrade/apply`` — ``sys.executable``
     # + ``-m app.system.restart`` avoids any PATH ambiguity from console
     # script shims that may not exist on a fresh install.
     python = sys.executable
-    cmd = [python, "-m", "app.system.restart", "--parent-pid", str(os.getpid())]
+    cmd = [
+        python,
+        "-m",
+        "app.system.restart",
+        "--parent-pid",
+        str(os.getpid()),
+        "--grace",
+        str(DEFAULT_GRACE_S),
+    ]
 
     creationflags = 0
     start_new_session = False
@@ -44,8 +67,8 @@ async def post_system_restart(request: Request) -> JSONResponse:
         # Detach so killing this process doesn't take the helper with it.
         creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     else:
-        # POSIX: new session means the child survives the SIGTERM it's
-        # about to send us. Without this the kernel kills our own child
+        # POSIX: new session means the child survives the shutdown it is
+        # about to supervise. Without this the kernel kills our own child
         # when we die.
         start_new_session = True
 
@@ -65,6 +88,22 @@ async def post_system_restart(request: Request) -> JSONResponse:
             status_code=500,
         )
 
+    # Only now, with the watchdog running: if the spawn had failed after the
+    # shutdown was scheduled, a wedged shutdown would have had nothing left to
+    # rescue it. Imported here because ``app.server`` imports this module at
+    # boot — a top-level import would be a cycle.
+    from app import server as _server
+
+    if not _server.request_graceful_shutdown(_RESPONSE_WINDOW_S):
+        logger.warning(
+            "Restart requested with no serving loop to stop; the watchdog "
+            f"will stop this process at the {DEFAULT_GRACE_S}s deadline."
+        )
+
+    # No in-flight guard: a second POST is harmless end-to-end. uvicorn's
+    # ``handle_exit`` only re-sets ``should_exit`` for SIGTERM, a second
+    # hard-exit timer changes nothing, and each watchdog holds its own handle
+    # on this process.
     return JSONResponse(
         {"ok": True, "pid": proc.pid, "status": "restarting"},
         status_code=202,

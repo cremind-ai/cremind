@@ -7,8 +7,10 @@ description: "Make Cremind start automatically at login or boot on a native inst
 A native install has no supervisor. The installer starts `cremind serve` once,
 for the install session, and nothing brings it back — so after a logout or a
 reboot the server is simply gone. The same gap has a second, less obvious
-symptom: Cremind's own restart is a clean *stop*, because a server cannot
-re-exec itself while serving a response. So on an unsupervised install:
+symptom: Cremind's own restart is a *stop*. The backend drains its connections,
+stops channel sidecars and the processes agents started, releases their lock
+files and exits cleanly — but it cannot re-exec itself while serving a
+response. So on an unsupervised install:
 
 - the Developer page's **Restart Server** button stops the backend and it stays
   down;

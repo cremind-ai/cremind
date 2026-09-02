@@ -20,6 +20,8 @@ Compatibility contract — see ``app/__version__.py``:
 
 from __future__ import annotations
 
+import uuid
+
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -29,6 +31,14 @@ from app.__version__ import (
     __version__,
 )
 from app.upgrade.channel import get_channel
+
+
+#: Identity of THIS process, minted once at import. A client waiting out a
+#: restart cannot tell "the new server answered" from "the old one is still
+#: draining" by status code alone — during a graceful shutdown the dying
+#: listener answers perfectly well. A value that changes only by being a
+#: different process is the one probe it cannot satisfy.
+BOOT_ID = uuid.uuid4().hex
 
 
 async def get_version(_request: Request) -> JSONResponse:
@@ -68,6 +78,7 @@ async def get_health(_request: Request) -> JSONResponse:
         "status": status_text,
         "db": db_status,
         "vectorstore": vs_status,
+        "boot_id": BOOT_ID,
     }
     return JSONResponse(body, status_code=200 if overall_ok else 503)
 

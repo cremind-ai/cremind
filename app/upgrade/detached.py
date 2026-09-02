@@ -12,8 +12,11 @@ and lets the new process drive the install / migrate / restart cycle
 on its own. Progress lands in the status file (see
 :mod:`app.upgrade.status`) which the API endpoints poll.
 
-After a successful upgrade the runner kills ``--parent-pid``. What
-happens next depends on how the install is supervised:
+After a successful upgrade the runner asks ``--parent-pid`` to shut down
+gracefully (a sentinel file the server watches; see
+:mod:`app.system.shutdown_watch`), waits for it to go, and falls back to
+SIGTERM if it does not. What happens next depends on how the install is
+supervised:
 
 - Under Docker: the entrypoint's ``wait -n`` exits when ``cremind serve``
   dies, Docker's restart policy brings the container back up, the
@@ -38,6 +41,8 @@ import time
 from typing import Callable
 
 from app.__version__ import __version__ as CURRENT_VERSION
+from app.system.restart import DEFAULT_GRACE_S, wait_for_parent_exit
+from app.system.shutdown_watch import write_shutdown_request
 from app.upgrade import runner, status
 from app.upgrade.runner import UpgradeEvent
 from app.utils import logger
@@ -73,24 +78,36 @@ def _make_callback() -> tuple[Callable[[UpgradeEvent], None], dict[str, str | No
     return _cb, last_failure
 
 
-def _kill_parent(pid: int) -> None:
-    """Best-effort kill of the supervised backend process.
+def _stop_parent(pid: int) -> None:
+    """Ask the backend to stop, so its supervisor relaunches the new wheel.
 
-    Used to trigger a Docker entrypoint restart (which re-runs
-    migrations idempotently and serves the new wheel). On a host with
-    no supervisor, this leaves the backend down — see module docstring.
+    The request is a sentinel file the running server watches for, not a
+    signal: it lets the server take its own graceful path — draining
+    connections, stopping channel sidecars, releasing lock files — which on
+    Windows a signal cannot do at all (``os.kill`` there is
+    ``TerminateProcess``).
+
+    Falls back to the old SIGTERM when the parent is still alive at the
+    deadline. That covers two cases: a shutdown that wedged, and the first
+    upgrade *from* a build whose server predates the sentinel and will
+    therefore never consume it.
     """
     if pid <= 0:
         return
+    from app.config.settings import BaseConfig
+
     try:
-        if sys.platform == "win32":
-            # Windows: no SIGTERM semantics; the entrypoint shell will
-            # exit when the cremind.exe process dies. ``taskkill /F``
-            # would be cleaner but adds a subprocess dependency; the
-            # Python-native path below works for both PIDs.
-            os.kill(pid, signal.SIGTERM)
-        else:
-            os.kill(pid, signal.SIGTERM)
+        write_shutdown_request(BaseConfig.CREMIND_SYSTEM_DIR, source="upgrade")
+    except OSError as e:
+        logger.debug(f"[upgrade:detached] could not write shutdown request: {e}")
+    if wait_for_parent_exit(pid, DEFAULT_GRACE_S):
+        return
+    logger.warning(
+        f"[upgrade:detached] pid {pid} still alive after {DEFAULT_GRACE_S}s; "
+        "falling back to SIGTERM"
+    )
+    try:
+        os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         # Parent already gone (e.g., user killed cremind serve between
         # apply call and restart). Status file already reflects success,
@@ -220,9 +237,9 @@ def _finish_and_restart(parent_pid: int) -> int:
     #      poll after reconnect still sees "done" and transitions the UI.
     logger.info("[upgrade:detached] marking status finished ok=True")
     status.finish(ok=True, exit_code=0)
-    logger.info(f"[upgrade:detached] sending SIGTERM to parent pid={parent_pid}")
-    _kill_parent(parent_pid)
-    logger.info("[upgrade:detached] _kill_parent returned")
+    logger.info(f"[upgrade:detached] asking parent pid={parent_pid} to stop")
+    _stop_parent(parent_pid)
+    logger.info("[upgrade:detached] _stop_parent returned")
     return 0
 
 

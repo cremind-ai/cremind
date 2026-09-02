@@ -26,16 +26,33 @@ import sys
 import time
 from pathlib import Path
 
+from app.system.restart import DEFAULT_GRACE_S, wait_for_parent_exit
+from app.system.shutdown_watch import write_shutdown_request
 
-def _kill_parent(pid: int) -> None:
-    """Best-effort SIGTERM to the supervised backend so it restarts.
 
-    Mirrors app.upgrade.detached._kill_parent. Under Docker/K8s this triggers a
-    container restart; under a bare ``cremind serve`` the backend exits and the
-    user relaunches (the marker + status file persist so the restore completes
-    on the next boot).
+def _stop_parent(pid: int) -> None:
+    """Ask the supervised backend to stop, gracefully, so it restarts.
+
+    Mirrors app.upgrade.detached._stop_parent: a sentinel file the running
+    server watches for, so it takes its own shutdown path (draining, stopping
+    sidecars, releasing lock files) rather than being terminated — which is
+    all a signal can do on Windows. Falls back to SIGTERM if the parent is
+    still there at the deadline, covering both a wedged shutdown and a server
+    old enough not to watch for the sentinel.
+
+    Under Docker/K8s the exit triggers a container restart; under a bare
+    ``cremind serve`` the backend exits and the user relaunches (the marker +
+    status file persist so the restore completes on the next boot).
     """
     if pid <= 0:
+        return
+    from app.config.settings import BaseConfig
+
+    try:
+        write_shutdown_request(BaseConfig.CREMIND_SYSTEM_DIR, source="restore")
+    except OSError:
+        pass
+    if wait_for_parent_exit(pid, DEFAULT_GRACE_S):
         return
     try:
         os.kill(pid, signal.SIGTERM)
@@ -140,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     restore_status.update_phase("restart", "Restarting the service to apply the restore...")
     logger.info("[backup:restore] staged; stopping server to apply on next boot")
     time.sleep(2)
-    _kill_parent(args.parent_pid)
+    _stop_parent(args.parent_pid)
     return 0
 
 
