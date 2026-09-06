@@ -13,11 +13,8 @@
 // What stays here is the wizard's own framing: this is optional, and here is
 // what the restart does next.
 //
-// The step is deliberately skippable. A user who skips it still lands on the
-// HTTPS origin at the end — they just get their browser's interstitial once,
-// which is the honest signal that they have not trusted the CA yet.
 import { computed } from 'vue';
-import { ElAlert, ElMessage } from 'element-plus';
+import { ElAlert, ElCheckbox, ElMessage } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useCopyToClipboard } from '../../composables/useCopyToClipboard';
 import CaTrustPanel from '../shared/CaTrustPanel.vue';
@@ -31,6 +28,7 @@ const props = defineProps<{
    *  what keeps it a non-event instead of a "connection lost" scare. */
   installMode?: string | null;
 }>();
+const confirmed = defineModel<boolean>('confirmed', { default: false });
 
 const { copy, isCopied } = useCopyToClipboard();
 async function copyValue(text: string, key: string) {
@@ -56,12 +54,10 @@ const isKubernetes = computed(
     </p>
 
     <ElAlert type="info" :closable="false" show-icon class="skip-alert">
-      <template #title>This step is optional</template>
-      Skipping it is safe — you will simply have to click through your
-      browser's "your connection is not private" warning the first time you
-      open the HTTPS address, and again on every other device you use. Trusting
-      the CA is a one-off per device, and you can come back to it later under
-      <em>Settings → HTTPS &amp; Certificate</em>.
+      <template #title>Trust is required before activation</template>
+      Verify the SHA-256 fingerprint, then trust this exact CA on the device
+      running this browser. Repeat the trust instructions on every other device
+      that connects to this private Cremind certificate.
     </ElAlert>
 
     <!-- No auth token: the wizard runs inside the pre-setup bootstrap window,
@@ -72,6 +68,10 @@ const isKubernetes = computed(
       :tls="tls"
       :install-mode="installMode"
     />
+
+    <ElCheckbox v-model="confirmed" class="trust-confirm">
+      I verified the fingerprint and trusted this exact CA on this device.
+    </ElCheckbox>
 
     <div class="info-box next-box">
       <strong>What happens next</strong>
@@ -88,7 +88,7 @@ const isKubernetes = computed(
         command in your terminal — on some setups the tunnel does end with the
         restart — and everything continues automatically from there.
       </p>
-      <p v-else>
+      <p v-else-if="!restartSupported">
         When you click <strong>Start Using Cremind</strong> on the final step,
         you'll be asked to restart the server yourself (nothing supervises this
         process, so Cremind can't restart itself without staying down). Once it
@@ -104,7 +104,8 @@ const isKubernetes = computed(
           :title="isCopied('https-url') ? 'Copied!' : 'Copy URL'"
           @click="copyValue(httpsUrl ?? '', 'https-url')"
         ><Icon :icon="isCopied('https-url') ? 'mdi:check' : 'mdi:content-copy'" /></button> —
-        the plain-HTTP address stops answering after the restart.
+        old plain-HTTP bookmarks remain available only as a restricted recovery
+        page that moves eligible sessions to HTTPS; application APIs require HTTPS.
       </p>
     </div>
   </div>
@@ -116,6 +117,7 @@ const isKubernetes = computed(
 .step-description { color: var(--text-secondary); font-size: 0.875rem; margin: 0 0 20px 0; line-height: 1.5; }
 .step-description strong { color: var(--text-primary); }
 .skip-alert { margin-bottom: 24px; }
+.trust-confirm { margin: 18px 0; }
 
 .copy-icon-btn {
   display: inline-flex;

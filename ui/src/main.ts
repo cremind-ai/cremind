@@ -134,6 +134,10 @@ async function boot() {
   app.use(ElementPlus)
   app.use(router)
 
+  // Initial TLS handoff guards restore origin-scoped storage asynchronously.
+  // Do not instantiate App (and its Pinia settings refs) until that restore is
+  // complete, otherwise preferences are cached from the empty HTTPS origin.
+  await router.isReady()
   app.mount('#app')
 
   // Apply theme attribute and highlight.js stylesheet reactively

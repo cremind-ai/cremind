@@ -2,9 +2,21 @@ import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, session, shell } 
 import { fileURLToPath } from 'node:url'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
-import http from 'node:http'
 import https from 'node:https'
 import path from 'node:path'
+import {
+  defaultPortHttpsOrigin,
+  httpOrigin,
+  httpsOrigin,
+  isExpectedDefaultPortTlsStatus,
+  isExpectedLocalCertificate,
+  parseInstallEnv,
+  resolveBackendOrigin,
+  stopOwnedBackend,
+  tlsStatusInstanceId,
+  waitForActivationResponseGrace,
+} from './backendTransport'
+import { filterTransitionState, transitionProfile, type TransitionState } from './transitionState'
 // Pulled in lazily to keep the dev / web build (which doesn't ship
 // electron-updater) functional. The require is wrapped below.
 type AutoUpdaterModule = typeof import('electron-updater')
@@ -63,20 +75,28 @@ const INSTALL_CHANNEL: 'production' | 'test' | 'dev' = __CREMIND_INSTALL_CHANNEL
 // and upgrade apply consistent with it.
 function cremindSubprocessEnv(): NodeJS.ProcessEnv {
   const base = {
+    ...readInstallEnvironment(),
     ...process.env,
     CREMIND_SYSTEM_DIR: systemDirPath(),
     CREMIND_INSTALL_DIR: installDirPath(),
-    // The backend keys its "an external shell owns the origin" checks off this
-    // (app/server.py, app/config/tls_mode.py): it must not bind TLS, and must
-    // not tell the Setup Wizard a switch to https is pending, because this app
-    // loads the UI over http://127.0.0.1 and would simply lose the backend.
-    // The checks predate any writer — declaring it here is what makes them
-    // real. It matters now that the installers persist CREMIND_SSL into the
-    // .env, which a spawned `cremind` can pick up.
+    // Lifecycle ownership only. The public listener may serve HTTP or HTTPS;
+    // restart requests from a desktop renderer are handled by this process.
     CREMIND_ELECTRON_PARENT: '1',
   }
   if (INSTALL_CHANNEL === 'production') return base
   return { ...base, CREMIND_UPGRADE_CHANNEL: INSTALL_CHANNEL }
+}
+
+function readInstallEnvironment(): Record<string, string> {
+  const read = (file: string): Record<string, string> => {
+    try { return parseInstallEnv(fs.readFileSync(file, 'utf8')) } catch { return {} }
+  }
+  const nativePath = path.join(systemDirPath(), '.env')
+  const native = read(nativePath)
+  if (native.INSTALL_MODE === 'docker' || !fs.existsSync(nativePath)) {
+    return { ...read(path.join(installDirPath(), 'docker', '.env')), ...native }
+  }
+  return native
 }
 
 // Test installers are prereleases for testers; DevTools is a feature there.
@@ -96,6 +116,8 @@ function devToolsEnabled(): boolean {
 
 type CremindConfig = {
   agentUrl: string
+  /** Stable, public installation identity used to authenticate port discovery. */
+  backendInstanceId: string
   deploymentType: 'local' | 'server' | 'custom' | ''
   autoUpdate: boolean
   // Mirror of INSTALL_CHANNEL exposed to the renderer via the preload
@@ -109,6 +131,7 @@ type CremindConfig = {
 
 const CONFIG_DEFAULTS: CremindConfig = {
   agentUrl: '',
+  backendInstanceId: '',
   deploymentType: '',
   autoUpdate: true,
   channel: INSTALL_CHANNEL,
@@ -134,6 +157,9 @@ function loadConfig(): CremindConfig {
   // was never connected to ``INSTALL_CHANNEL`` and the row always read
   // the static default of ``'stable'``.
   merged.channel = INSTALL_CHANNEL
+  // Do not let a damaged config weaken closed-app HTTPS discovery. Only ids
+  // previously read from the backend's public TLS status are accepted.
+  if (!/^[a-f0-9]{48}$/.test(merged.backendInstanceId)) merged.backendInstanceId = ''
   return merged
 }
 
@@ -152,7 +178,15 @@ function saveConfig(cfg: CremindConfig): void {
 let runtimeConfig: CremindConfig = { ...CONFIG_DEFAULTS }
 
 function updateConfig(patch: Partial<CremindConfig>): CremindConfig {
-  runtimeConfig = { ...runtimeConfig, ...patch }
+  const nextPatch = { ...patch }
+  if (nextPatch.agentUrl !== undefined
+    && nextPatch.agentUrl !== runtimeConfig.agentUrl
+    && nextPatch.backendInstanceId === undefined) {
+    // A manually selected server must prove its own identity before that value
+    // can authorize a future :80 -> :443 discovery.
+    nextPatch.backendInstanceId = ''
+  }
+  runtimeConfig = { ...runtimeConfig, ...nextPatch }
   saveConfig(runtimeConfig)
   return runtimeConfig
 }
@@ -185,7 +219,7 @@ function reconcileInstallStateWithDisk(): void {
     // and we lost track of it. Adopt the default local agent URL — the
     // user can correct it later via settings if they actually pointed
     // cremind at a remote host.
-    updateConfig({ agentUrl: 'http://localhost:1515', deploymentType: 'local' })
+    updateConfig({ agentUrl: configuredBackendOrigin(), deploymentType: 'local' })
   }
 }
 
@@ -254,21 +288,29 @@ function vncCapable(): boolean {
   )
 }
 
-// App version handler
-ipcMain.handle('get-app-version', () => {
-  return app.getVersion();
-});
-
-// Runtime config handlers. ``cremind:get-config-sync`` is the only sync IPC
-// in the app — invoked once from the preload before the renderer boots so
-// `window.cremind.config` is populated by the time module-level JS runs.
+// Runtime config handlers. The preload invokes ``cremind:get-config-sync``
+// once before the renderer boots, so `window.cremind.config` is available to
+// module-level code from its first line.
 ipcMain.on('cremind:get-config-sync', (event) => {
+  if (!isFirstPartySender(event)) {
+    event.returnValue = {}
+    return
+  }
   event.returnValue = runtimeConfig
 })
-ipcMain.handle('cremind:get-config', () => runtimeConfig)
-ipcMain.handle('cremind:set-config', (_event, patch: Partial<CremindConfig>) => {
-  const next = updateConfig(patch)
+ipcMain.handle('cremind:get-config', (event) => {
+  requireFirstPartySender(event)
+  return runtimeConfig
+})
+ipcMain.handle('cremind:set-config', (event, patch: Partial<CremindConfig>) => {
+  requireFirstPartySender(event)
+  // backendInstanceId is learned from readable backend status, never supplied
+  // by a renderer or user-edited settings form.
+  const { backendInstanceId: _ignored, ...rendererPatch } = patch
+  const next = updateConfig(rendererPatch)
   if (patch.agentUrl !== undefined) {
+    activeBackendOrigin = null
+    requestedBackendOrigin = null
     // Backend host changed — its install_mode may have flipped, so the
     // VNC tray/jumplist entry may need to appear or disappear.
     void fetchCapabilities()
@@ -290,7 +332,8 @@ ipcMain.handle('cremind:set-config', (_event, patch: Partial<CremindConfig>) => 
 // arbitrary URL, or a crafted markdown link could ask us to launch
 // ``file://`` targets or custom protocol handlers.
 const EXTERNAL_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'tel:'])
-ipcMain.handle('cremind:open-external', (_event, rawUrl: unknown) => {
+ipcMain.handle('cremind:open-external', (event, rawUrl: unknown) => {
+  requireFirstPartySender(event)
   if (typeof rawUrl !== 'string') return
   let u: URL
   try {
@@ -361,8 +404,8 @@ function backendPidFilePath(): string {
 // surfaces as ``Error: spawn EINVAL``. We dodge it by reading the
 // install-time shim (``<SYSTEM_DIR>/bin/cremind.cmd``), pulling the
 // underlying ``cremind.exe`` path out of it, and spawning that instead.
-// On POSIX the shim is a ``/bin/sh`` wrapper, which ``spawn`` executes via
-// its shebang.
+// On POSIX the shell wrapper's final exec line identifies the actual venv,
+// including a checkout venv used by a development install.
 function cremindExePath(): string {
   const sys = systemDirPath()
   const bin = path.join(sys, 'bin')
@@ -379,7 +422,12 @@ function cremindExePath(): string {
     // Default install location when the shim is missing or unparseable.
     return path.join(sys, 'venv', 'Scripts', 'cremind.exe')
   }
-  return path.join(bin, 'cremind')
+  try {
+    const shim = fs.readFileSync(path.join(bin, 'cremind'), 'utf8')
+    const match = /^exec\s+["']([^"']+)["']\s+["']\$@["']\s*$/m.exec(shim)
+    if (match) return match[1]
+  } catch { /* missing shim: use the standard native installation path */ }
+  return path.join(sys, 'venv', 'bin', 'cremind')
 }
 
 // Resolve <venv>/Scripts/python.exe (POSIX: <venv>/bin/python). We spawn
@@ -397,22 +445,77 @@ function venvPythonPath(): string {
   return path.join(path.dirname(scripts), 'bin', 'python')
 }
 
-function backendHealthUrl(): string {
-  // The merged app serves /health on the single public origin (default 1515),
-  // which is reachable on the same machine as the backend. We don't parse .env
-  // here — keep this simple.
-  return 'http://127.0.0.1:1515/health'
+let activeBackendOrigin: string | null = null
+let requestedBackendOrigin: string | null = null
+
+function configuredBackendOrigin(): string {
+  let enabled = false
+  try {
+    const transition = JSON.parse(fs.readFileSync(path.join(systemDirPath(), 'tls', 'transition.json'), 'utf8'))
+    enabled = transition.version === 1 && ['activating', 'active'].includes(transition.phase)
+  } catch { /* .env remains authoritative when there is no settings transition. */ }
+  const env = { ...readInstallEnvironment(), ...process.env }
+  let configured = runtimeConfig.agentUrl
+  // Older desktop builds saved localhost but always loaded 127.0.0.1. Keep
+  // that renderer origin for ordinary local installs so their existing auth
+  // store survives the app upgrade. A supplied certificate owns its hostname.
+  if (runtimeConfig.deploymentType === 'local' && !env.CREMIND_SSL_CERTFILE) {
+    try {
+      const url = new URL(configured)
+      if (url.hostname === 'localhost') { url.hostname = '127.0.0.1'; configured = url.origin }
+    } catch { /* first run */ }
+  }
+  return resolveBackendOrigin(
+    configured,
+    env,
+    fs.existsSync(path.join(systemDirPath(), 'bootstrap.toml'))
+      || (env.INSTALL_MODE === 'docker' && configured.startsWith('https:')),
+    enabled,
+  )
 }
 
-function isBackendHealthy(): Promise<boolean> {
-  return new Promise((resolve) => {
-    const req = http.get(backendHealthUrl(), { timeout: 1500 }, (res) => {
-      res.resume()
-      resolve((res.statusCode ?? 0) < 400)
-    })
-    req.on('error', () => resolve(false))
-    req.on('timeout', () => { req.destroy(); resolve(false) })
+function backendHealthUrl(origin = backendSpaUrl()): string {
+  return `${origin}/health`
+}
+
+/** The same Chromium session verifies renderer and main-process requests. */
+async function backendFetch(url: string, method = 'GET', timeout = 2000): Promise<GlobalResponse> {
+  return session.defaultSession.fetch(url, {
+    method, cache: 'no-store', redirect: 'manual', credentials: 'omit',
+    signal: AbortSignal.timeout(timeout),
   })
+}
+
+const MAX_TLS_STATUS_BYTES = 64 * 1024
+
+async function readTlsStatus(origin: string): Promise<unknown | null> {
+  try {
+    const response = await backendFetch(`${origin}/api/tls/status`)
+    if (!response.ok) return null
+    const body = await response.text()
+    if (!body || body.length > MAX_TLS_STATUS_BYTES) return null
+    const parsed: unknown = JSON.parse(body)
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed : null
+  } catch { return null }
+}
+
+async function rememberBackendIdentity(origin: string): Promise<unknown | null> {
+  const status = await readTlsStatus(origin)
+  const instanceId = tlsStatusInstanceId(status)
+  if (instanceId && runtimeConfig.backendInstanceId !== instanceId) {
+    updateConfig({ backendInstanceId: instanceId })
+  }
+  return status
+}
+
+async function isBackendHealthy(origin = backendSpaUrl()): Promise<boolean> {
+  try {
+    const response = await backendFetch(backendHealthUrl(origin))
+    if (response.status !== 200) return false
+    const body = await response.json() as { status?: string }
+    return body.status === 'ok' || body.status === 'healthy'
+  } catch { return false }
 }
 
 async function waitForBackendHealthy(timeoutMs = 30000): Promise<boolean> {
@@ -424,14 +527,52 @@ async function waitForBackendHealthy(timeoutMs = 30000): Promise<boolean> {
   return false
 }
 
+async function discoverBackend(): Promise<boolean> {
+  const origin = backendSpaUrl()
+  if (await isBackendHealthy(origin)) {
+    await rememberBackendIdentity(origin)
+    backendReady()
+    return true
+  }
+  // The backend can be switched by a browser/CLI while Electron is closed.
+  // Its HTTP recovery listener redirects /health; adopt verified HTTPS on the
+  // same authority instead of treating that redirect as a healthy HTTP app.
+  if (!requestedBackendOrigin && origin.startsWith('http:')) {
+    const secure = httpsOrigin(origin)
+    if (await isBackendHealthy(secure)) {
+      await rememberBackendIdentity(secure)
+      activeBackendOrigin = secure
+      backendReady()
+      return true
+    }
+    // A reverse proxy commonly moves the default public HTTP port (80) to the
+    // default HTTPS port (443). This cannot be inferred from a redirect or a
+    // successful health response alone: require the installation identity we
+    // cached while HTTP was readable and an exact active transition document
+    // fetched over Chromium's normally verified HTTPS connection.
+    const defaultSecure = defaultPortHttpsOrigin(origin)
+    const expectedInstanceId = runtimeConfig.backendInstanceId
+    if (defaultSecure && defaultSecure !== secure && expectedInstanceId
+      && await isBackendHealthy(defaultSecure)) {
+      const status = await readTlsStatus(defaultSecure)
+      if (isExpectedDefaultPortTlsStatus(status, origin, defaultSecure, expectedInstanceId)) {
+        activeBackendOrigin = defaultSecure
+        updateConfig({ agentUrl: defaultSecure, backendInstanceId: expectedInstanceId })
+        backendReady()
+        return true
+      }
+    }
+  }
+  return false
+}
+
 // Origin of the backend's bundled SPA. The backend now serves the SPA, API,
 // A2A, and OAuth as ONE same-origin app on the single public port (default
 // 1515 — see ``app/server.py``); the internal API bind (1112) is loopback-only.
-// The Electron shell pivots here once the backend is healthy. When
-// CREMIND_UI_PORT is overridden on the backend, the shell would need a matching
-// override here; today we hardcode the default, same as backendHealthUrl().
+// The installer environment, persisted desktop config and verified transitions
+// supply the actual protocol and port for both API requests and renderer loads.
 function backendSpaUrl(): string {
-  return 'http://127.0.0.1:1515'
+  return requestedBackendOrigin || activeBackendOrigin || configuredBackendOrigin()
 }
 
 // Path the Electron shell loads from the backend's SPA listener. The
@@ -449,17 +590,10 @@ const ELECTRON_RENDERER_PATH = '/electron-renderer/'
 // detect the miss explicitly and fall back to the asar copy (which is
 // also __IS_ELECTRON__: true and at least keeps the titlebar working
 // until the user upgrades to a wheel that includes ui-electron).
-function electronRendererAvailable(): Promise<boolean> {
-  return new Promise((resolve) => {
-    const url = `${backendSpaUrl()}${ELECTRON_RENDERER_PATH}index.html`
-    const req = http.request(url, { method: 'HEAD', timeout: 1500 }, (res) => {
-      res.resume()
-      resolve((res.statusCode ?? 0) < 400)
-    })
-    req.on('error', () => resolve(false))
-    req.on('timeout', () => { req.destroy(); resolve(false) })
-    req.end()
-  })
+async function electronRendererAvailable(): Promise<boolean> {
+  try {
+    return (await backendFetch(`${backendSpaUrl()}${ELECTRON_RENDERER_PATH}index.html`, 'HEAD')).status === 200
+  } catch { return false }
 }
 
 // Decide where to load a window's renderer from. The asar copy of the
@@ -494,7 +628,7 @@ async function loadMainContent(w: BrowserWindow, hash: string): Promise<void> {
     void w.loadURL(VITE_DEV_SERVER_URL + hash)
     return
   }
-  if (await isBackendHealthy()) {
+  if (await discoverBackend()) {
     const targetPath = (await electronRendererAvailable()) ? ELECTRON_RENDERER_PATH : '/'
     void w.loadURL(`${backendSpaUrl()}${targetPath}${hash}`)
     return
@@ -510,6 +644,7 @@ async function loadMainContent(w: BrowserWindow, hash: string): Promise<void> {
 // redundant navigation that would wipe SPA state.
 async function pivotFileWindowsToBackend(): Promise<void> {
   if (!(await isBackendHealthy())) return
+  backendReady()
   // Same path-preference as loadMainContent: /electron-renderer/ when
   // it's there, otherwise the web bundle at /. Both share the http
   // origin, so the auth token created by the Setup Wizard's pivot
@@ -518,22 +653,701 @@ async function pivotFileWindowsToBackend(): Promise<void> {
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed()) continue
     const url = win.webContents.getURL()
-    if (!url.startsWith('file://')) continue
+    if (!url.startsWith('file://') || !isFirstPartyUrl(url)) continue
     const hashIdx = url.indexOf('#')
     const winHash = hashIdx >= 0 ? url.slice(hashIdx) : '#/'
     void win.loadURL(`${backendSpaUrl()}${targetPath}${winHash}`)
   }
 }
 
-async function startBackend(): Promise<{ ok: boolean; error?: string }> {
+function isFirstPartyUrl(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl)
+    if (url.protocol === 'file:') {
+      return path.resolve(fileURLToPath(url)) === path.resolve(RENDERER_DIST, 'index.html')
+    }
+    if (!httpOrigin(rawUrl) || !['/', '/index.html', ELECTRON_RENDERER_PATH, `${ELECTRON_RENDERER_PATH}index.html`].includes(url.pathname)) return false
+    const allowedOrigins = [
+      VITE_DEV_SERVER_URL,
+      runtimeConfig.agentUrl,
+      activeBackendOrigin,
+      requestedBackendOrigin,
+      configuredBackendOrigin(),
+    ]
+    // Scheme is part of the trust boundary. During a managed transition the
+    // old HTTP renderer stays admitted through runtimeConfig.agentUrl while
+    // the verified HTTPS renderer is admitted through the requested, active,
+    // or canonical configured origin.
+    return allowedOrigins.some((candidate) => candidate
+      && httpOrigin(candidate) === url.origin)
+  } catch { return false }
+}
+
+function isFirstPartySender(event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent): boolean {
+  const frame = event.senderFrame
+  if (!frame || frame.parent !== null) return false
+  const win = BrowserWindow.getAllWindows().find((candidate) => (
+    !candidate.isDestroyed() && candidate.webContents === event.sender
+  ))
+  if (!win || windowKinds.get(win) === 'vnc') return false
+  const currentUrl = event.sender.getURL()
+  try {
+    const frameUrl = new URL(frame.url)
+    const current = new URL(currentUrl)
+    // SPA routing can update the hash between Electron's event snapshot and
+    // getURL(). Scheme, authority, path, and query must still match exactly.
+    frameUrl.hash = ''
+    current.hash = ''
+    if (frameUrl.href !== current.href) return false
+  } catch { return false }
+  return isFirstPartyUrl(currentUrl)
+}
+
+function requireFirstPartySender(
+  event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent,
+): void {
+  if (!isFirstPartySender(event)) {
+    throw new Error('Only a top-level Cremind app window can use this operation.')
+  }
+}
+
+type HttpsMigrationOptions = { nextOrigin: string; transitionId?: string; instanceId?: string }
+
+function validHttpsTarget(
+  sourceUrl: string,
+  rawTarget: unknown,
+  expected?: Pick<HttpsMigrationOptions, 'transitionId' | 'instanceId'>,
+): string | null {
+  if (typeof rawTarget !== 'string') return null
+  const target = httpOrigin(rawTarget)
+  if (!target || !target.startsWith('https:')) return null
+  const source = httpOrigin(sourceUrl) || httpOrigin(runtimeConfig.agentUrl)
+  if (!source) return null
+  if (target === httpsOrigin(source)) return target
+  // A reverse proxy can map the old HTTP port to a different HTTPS port. Only
+  // admit that destination when the renderer supplies the backend-issued
+  // transition and installation identities; migrateAppWindowsToHttps verifies
+  // both against readable status at the exact target before persisting it.
+  if (!expected?.transitionId || !expected.instanceId) return null
+  const from = new URL(source)
+  const to = new URL(target)
+  return from.protocol === 'http:' && from.hostname === to.hostname ? target : null
+}
+
+function installLocalCertificateVerification(): void {
+  session.defaultSession.setCertificateVerifyProc((request, callback) => {
+    // Only fill the missing local CA trust. Expiry, revocation, name errors and
+    // every unrelated connection keep Chromium's usual verification result.
+    if (request.errorCode !== -202) return callback(-3)
+    const env = { ...readInstallEnvironment(), ...process.env }
+    if (['docker', 'kubernetes'].includes(env.INSTALL_MODE ?? '')
+      || env.CREMIND_SSL_CERTFILE || env.CREMIND_SSL_KEYFILE) return callback(-3)
+    try {
+      if (request.hostname !== new URL(backendSpaUrl()).hostname.replace(/^\[|\]$/g, '')) return callback(-3)
+      const tlsDir = path.join(systemDirPath(), 'tls')
+      const trusted = isExpectedLocalCertificate(
+        request.certificate.data,
+        fs.readFileSync(path.join(tlsDir, 'cert.pem'), 'utf8'),
+        fs.readFileSync(path.join(tlsDir, 'ca.pem'), 'utf8'),
+        request.hostname,
+      )
+      callback(trusted ? 0 : -3)
+    } catch { callback(-3) }
+  })
+}
+
+type PendingCapture = {
+  sourceUrl: string
+  resolve: (state: TransitionState) => void
+  reject: (error: Error) => void
+  timer: ReturnType<typeof setTimeout>
+  acknowledged?: boolean
+  promise?: Promise<TransitionState>
+}
+const CAPTURE_ACK_TIMEOUT_MS = 1_500
+const CAPTURE_COMPLETION_TIMEOUT_MS = 5 * 60_000
+const pendingCaptures = new Map<number, PendingCapture>()
+type PreparedWindowHandoff = {
+  sourceUrl: string
+  targetOrigin: string
+  transitionId: string
+  route: string
+  profile: string | null
+  ticket: string | null
+  state: TransitionState
+  redeemedToken?: string
+  redeemedRoute?: string
+  renewalAttempted?: boolean
+}
+const preparedWindowHandoffs = new Map<number, PreparedWindowHandoff>()
+const preparedTransitions = new Set<string>()
+const armedHttpsTransitions = new Map<string, Promise<void>>()
+const httpsTransitionFailures = new Map<string, string>()
+const pendingHandoffs = new Map<number, {
+  targetOrigin: string; expires: number; state: TransitionState
+}>()
+
+function clearPreparedTransition(transitionId: string): void {
+  preparedTransitions.delete(transitionId)
+  httpsTransitionFailures.delete(transitionId)
+  for (const [id, record] of preparedWindowHandoffs) {
+    if (record.transitionId === transitionId) preparedWindowHandoffs.delete(id)
+  }
+  releaseHttpsMigrationGates()
+}
+
+ipcMain.on('cremind:https:captured', (event, state: unknown) => {
+  const pending = pendingCaptures.get(event.sender.id)
+  if (!pending || !isFirstPartySender(event)) return
+  const sourceUrl = event.sender.getURL()
+  if (httpOrigin(sourceUrl) !== httpOrigin(pending.sourceUrl)) return
+  clearTimeout(pending.timer)
+  pendingCaptures.delete(event.sender.id)
+  try { pending.resolve(filterTransitionState(sourceUrl, state)) }
+  catch { pending.reject(new Error('A draft is too large to migrate safely. Save it before retrying.')) }
+})
+
+ipcMain.on('cremind:https:capture-ack', (event) => {
+  const pending = pendingCaptures.get(event.sender.id)
+  if (!pending || pending.acknowledged || !isFirstPartySender(event)) return
+  clearTimeout(pending.timer)
+  pending.acknowledged = true
+  pending.timer = setTimeout(() => {
+    if (pendingCaptures.get(event.sender.id) !== pending) return
+    pendingCaptures.delete(event.sender.id)
+    pending.reject(new Error(
+      'A Cremind window did not finish its pending upload within five minutes. Finish or cancel that upload, then retry HTTPS activation.',
+    ))
+  }, CAPTURE_COMPLETION_TIMEOUT_MS)
+})
+
+ipcMain.on('cremind:https:capture-failed', (event) => {
+  const pending = pendingCaptures.get(event.sender.id)
+  if (!pending || !isFirstPartySender(event)) return
+  clearTimeout(pending.timer)
+  pendingCaptures.delete(event.sender.id)
+  pending.reject(new Error('A Cremind window could not prepare its draft or upload for migration. Finish its work and retry.'))
+})
+
+// The preload imports state before the renderer's stores or router can read it.
+// The handoff belongs to one WebContents and is never written to config or a URL.
+ipcMain.on('cremind:https:consume-sync', (event) => {
+  event.returnValue = null
+  const pending = pendingHandoffs.get(event.sender.id)
+  if (!pending || !isFirstPartySender(event)) return
+  if (pending.expires < Date.now()) { pendingHandoffs.delete(event.sender.id); return }
+  if (httpOrigin(event.senderFrame.url) !== pending.targetOrigin) return
+  pendingHandoffs.delete(event.sender.id)
+  event.returnValue = pending.state
+})
+
+function captureWindowState(win: BrowserWindow): Promise<TransitionState> {
+  const windowId = win.webContents.id
+  const previous = pendingCaptures.get(windowId)?.promise
+  if (previous) return previous
+  const promise = new Promise<TransitionState>((resolve, reject) => {
+    const contents = win.webContents
+    const id = contents.id
+    const sourceUrl = contents.getURL()
+    const timer = setTimeout(() => {
+      pendingCaptures.delete(id)
+      resolve({ local: {}, session: {} })
+    }, CAPTURE_ACK_TIMEOUT_MS)
+    pendingCaptures.set(id, { sourceUrl, resolve, reject, timer })
+    contents.once('destroyed', () => {
+      const pending = pendingCaptures.get(id)
+      if (!pending) return
+      clearTimeout(pending.timer)
+      pendingCaptures.delete(id)
+      pending.resolve({ local: {}, session: {} })
+    })
+    contents.send('cremind:https:capture')
+  })
+  const pending = pendingCaptures.get(windowId)
+  if (pending) pending.promise = promise
+  return promise
+}
+
+function releaseHttpsMigrationGates(): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed() && windowKinds.get(win) !== 'vnc'
+      && isFirstPartyUrl(win.webContents.getURL())) {
+      win.webContents.send('cremind:https:released')
+    }
+  }
+}
+
+function safeWindowRoute(sourceUrl: string): string {
+  try {
+    const route = new URL(sourceUrl).hash.slice(1) || '/'
+    return route.startsWith('/') && !route.startsWith('//') && !route.includes('\\')
+      && route.length <= 8192 ? route : '/'
+  } catch { return '/' }
+}
+
+function withoutCapturedToken(sourceUrl: string, state: TransitionState): TransitionState {
+  const local = Object.fromEntries(
+    Object.entries(state.local).filter(([key]) => !key.startsWith('agent_token_')
+      && key !== 'profile_id' && key !== 'logged_in_profiles'),
+  )
+  return filterTransitionState(sourceUrl, { local, session: state.session })
+}
+
+async function mintElectronHandoff(
+  sourceUrl: string,
+  state: TransitionState,
+  options: HttpsMigrationOptions,
+): Promise<PreparedWindowHandoff> {
+  const route = safeWindowRoute(sourceUrl)
+  const profile = transitionProfile(sourceUrl, state.local.profile_id)
+  const token = profile ? state.local[`agent_token_${profile}`] : null
+  const sourceOrigin = httpOrigin(sourceUrl) || httpOrigin(runtimeConfig.agentUrl)
+  const record: PreparedWindowHandoff = {
+    sourceUrl,
+    targetOrigin: options.nextOrigin,
+    transitionId: options.transitionId!,
+    route,
+    profile,
+    ticket: null,
+    state: withoutCapturedToken(sourceUrl, state),
+  }
+  // An expired or signed-out window is still moved, but lands on HTTPS login
+  // with its route preserved. No old bearer is copied into the new origin.
+  if (!token || !sourceOrigin) return record
+  const preferences = Object.fromEntries(
+    Object.entries(state.local).filter(([key]) => !key.startsWith('agent_token_')
+      && key !== 'profile_id' && key !== 'logged_in_profiles'),
+  )
+  const response = await session.defaultSession.fetch(`${sourceOrigin}/api/tls/handoff`, {
+    method: 'POST',
+    cache: 'no-store',
+    redirect: 'manual',
+    credentials: 'omit',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      transition_id: options.transitionId,
+      source_origin: sourceOrigin,
+      target_origin: options.nextOrigin,
+      route,
+      state: {
+        mount: new URL(sourceUrl).pathname.startsWith(ELECTRON_RENDERER_PATH)
+          ? ELECTRON_RENDERER_PATH : '/',
+        preferences,
+        drafts: state.session,
+      },
+    }),
+    signal: AbortSignal.timeout(5000),
+  })
+  if (response.status === 401) return record
+  if (!response.ok) {
+    let detail = ''
+    try { detail = String((await response.json() as { error?: string }).error || '') } catch { /* no JSON */ }
+    throw new Error(detail || `Session handoff preparation failed with HTTP ${response.status}.`)
+  }
+  const payload = await response.json() as { ticket?: string }
+  if (!payload.ticket || !/^[A-Za-z0-9_-]{43}$/.test(payload.ticket)) {
+    throw new Error('The server returned an invalid HTTPS handoff ticket.')
+  }
+  record.ticket = payload.ticket
+  return record
+}
+
+let httpsPreparation: Promise<BackendResult> | null = null
+
+async function prepareHttpsMigration(options: HttpsMigrationOptions): Promise<BackendResult> {
+  if (!options.transitionId || !options.instanceId) {
+    return { ok: false, error: 'The HTTPS transition and installation identities are required.' }
+  }
+  if (preparedTransitions.has(options.transitionId)) {
+    // A previous owned restart attempt may have failed after activation.
+    // Refresh noncredential state under a new gate, retain the private ticket,
+    // and re-arm main without trying to use the now-obsolete HTTP bearer.
+    try {
+      const windows = BrowserWindow.getAllWindows().filter(win => !win.isDestroyed()
+        && windowKinds.get(win) !== 'vnc' && isFirstPartyUrl(win.webContents.getURL()))
+      await Promise.all(windows.map(async (win) => {
+        const existing = preparedWindowHandoffs.get(win.webContents.id)
+        if (!existing || existing.transitionId !== options.transitionId) return
+        const sourceUrl = win.webContents.getURL()
+        existing.sourceUrl = sourceUrl
+        existing.route = safeWindowRoute(sourceUrl)
+        existing.state = withoutCapturedToken(sourceUrl, await captureWindowState(win))
+      }))
+      httpsTransitionFailures.delete(options.transitionId)
+      armElectronHttpsTransition(options)
+      return { ok: true }
+    } catch (error) {
+      releaseHttpsMigrationGates()
+      return { ok: false, error: String(error) }
+    }
+  }
+  if (httpsPreparation) return httpsPreparation
+  const appWindows = BrowserWindow.getAllWindows().filter(win => !win.isDestroyed()
+    && windowKinds.get(win) !== 'vnc' && isFirstPartyUrl(win.webContents.getURL()))
+  httpsPreparation = (async () => {
+    try {
+      const records = await Promise.all(appWindows.map(async (win) => {
+        const sourceUrl = win.webContents.getURL()
+        const state = await captureWindowState(win)
+        return [win.webContents.id, await mintElectronHandoff(sourceUrl, state, options)] as const
+      }))
+      for (const [id, record] of records) preparedWindowHandoffs.set(id, record)
+      preparedTransitions.add(options.transitionId!)
+      armElectronHttpsTransition(options)
+      return { ok: true }
+    } catch (error) {
+      releaseHttpsMigrationGates()
+      return { ok: false, error: String(error) }
+    } finally {
+      httpsPreparation = null
+    }
+  })()
+  return httpsPreparation
+}
+
+ipcMain.handle('cremind:server:prepare-https', async (event, options?: HttpsMigrationOptions): Promise<BackendResult> => {
+  if (!isFirstPartySender(event)) return { ok: false, error: 'Only a Cremind app window can prepare a migration.' }
+  const target = validHttpsTarget(event.sender.getURL(), options?.nextOrigin, options)
+  if (!target || !options) return { ok: false, error: 'Invalid HTTPS destination.' }
+  return prepareHttpsMigration({ ...options, nextOrigin: target })
+})
+
+ipcMain.handle('cremind:server:release-https', async (event): Promise<BackendResult> => {
+  if (!isFirstPartySender(event)) return { ok: false, error: 'Only a Cremind app window can release a migration.' }
+  releaseHttpsMigrationGates()
+  return { ok: true }
+})
+
+let httpsMigration: Promise<BackendResult> | null = null
+
+function armElectronHttpsTransition(options: HttpsMigrationOptions): void {
+  const transitionId = options.transitionId
+  if (!transitionId || armedHttpsTransitions.has(transitionId)) return
+  httpsTransitionFailures.delete(transitionId)
+  const task = (async () => {
+    // Observe the durable transition rather than relying on the settings
+    // renderer surviving the activation response. On a remote install the
+    // old HTTP endpoint becomes recovery-only and returns 426; that is also a
+    // signal to begin the verified HTTPS wait without trying to own its process.
+    let activating = false
+    while (!activating) {
+      if (backendProcess && backendProcess.exitCode === null) {
+        try {
+          const stored = JSON.parse(fs.readFileSync(path.join(systemDirPath(), 'tls', 'transition.json'), 'utf8'))
+          if (stored.id === transitionId && stored.phase === 'cancelled') {
+            clearPreparedTransition(transitionId)
+            return
+          }
+          activating = stored.id === transitionId && ['activating', 'active'].includes(stored.phase)
+        } catch { /* activation has not been persisted yet */ }
+      } else {
+        const source = httpOrigin(runtimeConfig.agentUrl)
+        if (source) {
+          try {
+            const response = await backendFetch(`${source}/api/tls/status`, 'GET', 1000)
+            if (response.status === 426) activating = true
+            else if (response.ok) {
+              const status = await response.json() as { transition?: { id?: string; phase?: string } }
+              if (status.transition?.id === transitionId && status.transition.phase === 'cancelled') {
+                clearPreparedTransition(transitionId)
+                return
+              }
+              activating = status.transition?.id === transitionId
+                && ['activating', 'active'].includes(status.transition.phase || '')
+            }
+          } catch { /* keep the main-process watcher alive */ }
+        }
+      }
+      if (!activating) await new Promise(resolve => setTimeout(resolve, 250))
+    }
+
+    const owned = backendProcess
+    if (owned && owned.exitCode === null) {
+      // tls.py durably publishes "activating" before it returns HTTP 202.
+      // Stopping the child in the same polling turn can reset that response
+      // and leave the renderer unsure whether activation committed. Keep the
+      // original child alive for the server's response window, then restart
+      // whichever owned generation still needs moving to HTTPS.
+      await waitForActivationResponseGrace()
+      requestedBackendOrigin = options.nextOrigin
+      if (backendProcess === owned && owned.exitCode === null
+        && !(await stopOwnedBackend(owned, killProcessTreeSync))) {
+        httpsTransitionFailures.set(transitionId, 'Electron could not stop its HTTP backend. Finish active work or restart the desktop app, then retry.')
+        releaseHttpsMigrationGates()
+        throw new Error('Electron could not stop its HTTP backend for the HTTPS restart.')
+      }
+      activeBackendOrigin = null
+      const started = await startBackend()
+      if (!started.ok) {
+        httpsTransitionFailures.set(transitionId, started.error || 'Electron could not start its HTTPS backend. Fix the server error, then retry.')
+        releaseHttpsMigrationGates()
+        throw new Error(started.error || 'Electron could not start its HTTPS backend.')
+      }
+    }
+    httpsTransitionFailures.delete(transitionId)
+    await coordinateHttpsMigration(options.nextOrigin, options)
+  })()
+    .catch((error) => {
+      if (!httpsTransitionFailures.has(transitionId)) {
+        httpsTransitionFailures.set(transitionId, String(error))
+        releaseHttpsMigrationGates()
+      }
+      console.error('HTTPS transition coordinator failed:', error)
+    })
+    .finally(() => { armedHttpsTransitions.delete(transitionId) })
+  armedHttpsTransitions.set(transitionId, task)
+}
+
+function httpsLoginRoute(profile: string | null, route: string): string {
+  if (!profile || !/^[a-z0-9_-]{1,64}$/.test(profile)) return route
+  return `/login/${encodeURIComponent(profile)}?redirect=${encodeURIComponent(route)}`
+}
+
+async function redeemElectronHandoff(
+  record: PreparedWindowHandoff,
+): Promise<{ route: string; state: TransitionState }> {
+  if (record.redeemedToken && record.profile) {
+    return {
+      route: record.redeemedRoute || record.route,
+      state: filterTransitionState(record.sourceUrl, {
+        local: { ...record.state.local, [`agent_token_${record.profile}`]: record.redeemedToken },
+        session: record.state.session,
+      }),
+    }
+  }
+  if (!record.ticket) {
+    return { route: httpsLoginRoute(record.profile, record.route), state: record.state }
+  }
+  const response = await session.defaultSession.fetch(`${record.targetOrigin}/api/tls/handoff/redeem`, {
+    method: 'POST', cache: 'no-store', redirect: 'manual', credentials: 'omit',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ticket: record.ticket }),
+    signal: AbortSignal.timeout(5000),
+  })
+  const payload = await response.json().catch(() => ({})) as {
+    profile?: string; token?: string; route?: string; error?: string
+  }
+  if (response.status === 401) {
+    // Local Electron can recover a still-valid session after a long trust or
+    // rollout delay without retaining the obsolete HTTP bearer. Activation
+    // atomically reissues the on-host token file for the new transport epoch;
+    // use it only in main-process memory and only over the verified target.
+    if (!record.renewalAttempted && record.profile && backendProcess?.exitCode === null) {
+      record.renewalAttempted = true
+      try {
+        const currentToken = fs.readFileSync(
+          path.join(systemDirPath(), 'tokens', `${record.profile}.token`),
+          'utf8',
+        ).trim()
+        const sourceOrigin = httpOrigin(record.sourceUrl) || httpOrigin(runtimeConfig.agentUrl)
+        if (currentToken && sourceOrigin) {
+          const renewed = await session.defaultSession.fetch(`${record.targetOrigin}/api/tls/handoff`, {
+            method: 'POST', cache: 'no-store', redirect: 'manual', credentials: 'omit',
+            headers: { Authorization: `Bearer ${currentToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              transition_id: record.transitionId,
+              source_origin: sourceOrigin,
+              target_origin: record.targetOrigin,
+              route: record.route,
+              state: {
+                mount: new URL(record.sourceUrl).pathname.startsWith(ELECTRON_RENDERER_PATH)
+                  ? ELECTRON_RENDERER_PATH : '/',
+                preferences: record.state.local,
+                drafts: record.state.session,
+              },
+            }),
+            signal: AbortSignal.timeout(5000),
+          })
+          if (renewed.ok) {
+            const renewedPayload = await renewed.json() as { ticket?: string }
+            if (renewedPayload.ticket && /^[A-Za-z0-9_-]{43}$/.test(renewedPayload.ticket)) {
+              record.ticket = renewedPayload.ticket
+              return redeemElectronHandoff(record)
+            }
+          }
+        }
+      } catch { /* expired/revoked/local-file failure falls through to login */ }
+    }
+    record.ticket = null
+    const profile = typeof payload.profile === 'string' ? payload.profile : record.profile
+    const route = typeof payload.route === 'string' ? safeWindowRoute(`http://cremind.invalid/#${payload.route}`) : record.route
+    return { route: httpsLoginRoute(profile, route), state: record.state }
+  }
+  if (!response.ok || !payload.profile || !payload.token
+    || (record.profile !== null && payload.profile !== record.profile)) {
+    throw new Error(payload.error || `HTTPS session handoff failed with HTTP ${response.status}.`)
+  }
+  record.profile = payload.profile
+  record.redeemedToken = payload.token
+  record.redeemedRoute = typeof payload.route === 'string'
+    ? safeWindowRoute(`http://cremind.invalid/#${payload.route}`) : record.route
+  return {
+    route: record.redeemedRoute,
+    state: filterTransitionState(record.sourceUrl, {
+      local: { ...record.state.local, [`agent_token_${record.profile}`]: record.redeemedToken },
+      session: record.state.session,
+    }),
+  }
+}
+
+async function migrateAppWindowsToHttps(
+  target: string,
+  options: HttpsMigrationOptions & { portChanged: boolean },
+): Promise<BackendResult> {
+  let expected = { transitionId: options.transitionId, instanceId: options.instanceId }
+  if (!expected.transitionId || !expected.instanceId) {
+    try {
+      const stored = JSON.parse(fs.readFileSync(path.join(systemDirPath(), 'tls', 'transition.json'), 'utf8'))
+      if (stored.version === 1 && httpOrigin(stored.target_origin) === target) {
+        expected = { transitionId: expected.transitionId || stored.id, instanceId: expected.instanceId || stored.instance_id }
+      }
+    } catch { /* remote installations carry identity in the IPC request */ }
+  }
+  const ready = async (): Promise<boolean> => {
+    if (!(await isBackendHealthy(target))) return false
+    if (!expected.transitionId && !expected.instanceId) return true
+    try {
+      const response = await backendFetch(`${target}/api/tls/status`)
+      if (!response.ok) return false
+      const status = await response.json() as {
+        serving_https?: boolean; ready?: boolean; instance_id?: string;
+        transition?: { id?: string; phase?: string; target_origin?: string; same_public_port?: boolean }
+      }
+      return status.serving_https === true && status.transition?.phase === 'active'
+        && status.ready !== false
+        && (!expected.transitionId || status.transition.id === expected.transitionId)
+        && (!expected.instanceId || status.instance_id === expected.instanceId)
+        && httpOrigin(status.transition.target_origin) === target
+        && (!options.portChanged || status.transition.same_public_port === false)
+    } catch { return false }
+  }
+  // Keep this retry loop in the main process. The settings renderer may be
+  // closed, suspended or reloaded while a certificate is being trusted or a
+  // Kubernetes rollout is reconnecting; migration must still finish for all
+  // remaining Cremind windows once the exact HTTPS transition is ready.
+  while (!(await ready())) {
+    const coordinatorError = options.transitionId
+      ? httpsTransitionFailures.get(options.transitionId) : null
+    if (coordinatorError) return { ok: false, error: coordinatorError }
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+  }
+  const candidates = BrowserWindow.getAllWindows().filter((win) => {
+    if (win.isDestroyed() || windowKinds.get(win) === 'vnc') return false
+    const source = win.webContents.getURL()
+    return isFirstPartyUrl(source)
+      && (httpOrigin(source) === target || validHttpsTarget(source, target, options) === target)
+  })
+  const snapshots = await Promise.all(candidates.map(async (win) => {
+    const source = win.webContents.getURL()
+    const prepared = preparedWindowHandoffs.get(win.webContents.id)
+    let record: PreparedWindowHandoff
+    if (prepared && prepared.transitionId === options.transitionId
+      && prepared.targetOrigin === target) {
+      record = prepared
+    } else {
+      record = {
+        sourceUrl: source,
+        targetOrigin: target,
+        transitionId: options.transitionId || '',
+        route: safeWindowRoute(source),
+        profile: transitionProfile(source),
+        ticket: null,
+        state: withoutCapturedToken(source, await captureWindowState(win)),
+      }
+    }
+    const restored = await redeemElectronHandoff(record)
+    return { win, source, ...restored }
+  }))
+  const verifiedInstanceId = tlsStatusInstanceId({ instance_id: expected.instanceId })
+    || runtimeConfig.backendInstanceId
+  updateConfig({ agentUrl: target, backendInstanceId: verifiedInstanceId })
+  activeBackendOrigin = target
+  requestedBackendOrigin = null
+  await Promise.all(snapshots.map(async ({ win, source, state, route }) => {
+    if (win.isDestroyed() || win.webContents.getURL() !== source) return
+    const from = new URL(source)
+    const destination = new URL(target)
+    destination.pathname = from.protocol === 'file:' ? ELECTRON_RENDERER_PATH : from.pathname
+    destination.search = from.search
+    destination.hash = `#${route}`
+    const id = win.webContents.id
+    while (!win.isDestroyed()) {
+      pendingHandoffs.set(id, { targetOrigin: target, expires: Date.now() + 60000, state })
+      const expiry = setTimeout(() => pendingHandoffs.delete(id), 60000)
+      expiry.unref()
+      try {
+        await win.loadURL(destination.toString())
+        clearTimeout(expiry)
+        break
+      } catch (loadError) {
+        clearTimeout(expiry)
+        pendingHandoffs.delete(id)
+        const detail = String(loadError).replace(/[<>&]/g, '')
+        const recovery = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>HTTPS recovery</title><style>body{font:16px system-ui;max-width:680px;margin:10vh auto;padding:24px;line-height:1.5}code{word-break:break-all}</style><h1>Cremind is retrying HTTPS</h1><p>The secure server was verified, but this window could not finish loading it. Cremind will keep retrying. Check the server and certificate, then leave this window open.</p><p><code>${detail}</code></p>`
+        await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(recovery)}`).catch(() => undefined)
+        await new Promise(resolve => setTimeout(resolve, 3000))
+      }
+    }
+  }))
+  if (options.transitionId) {
+    preparedTransitions.delete(options.transitionId)
+    for (const [id, record] of preparedWindowHandoffs) {
+      if (record.transitionId === options.transitionId) preparedWindowHandoffs.delete(id)
+    }
+  }
+  void fetchCapabilities()
+  return { ok: true, agentUrl: target }
+}
+
+function coordinateHttpsMigration(
+  target: string,
+  options: HttpsMigrationOptions,
+): Promise<BackendResult> {
+  const source = httpOrigin(runtimeConfig.agentUrl)
+  const portChanged = Boolean(source && target !== httpsOrigin(source))
+  if (!httpsMigration) {
+    httpsMigration = migrateAppWindowsToHttps(target, { ...options, portChanged })
+      .catch((error: unknown) => ({ ok: false, error: String(error) }))
+      .then((result) => {
+        if (!result.ok) releaseHttpsMigrationGates()
+        return result
+      })
+      .finally(() => { httpsMigration = null })
+  }
+  return httpsMigration
+}
+
+ipcMain.handle('cremind:server:migrate-https', async (event, options?: HttpsMigrationOptions): Promise<BackendResult> => {
+  if (!isFirstPartySender(event)) return { ok: false, error: 'Only a Cremind app window can migrate its session.' }
+  if (!options?.transitionId || !options.instanceId) {
+    return { ok: false, error: 'The HTTPS transition and installation identities are required.' }
+  }
+  const target = validHttpsTarget(event.sender.getURL(), options?.nextOrigin, options)
+  if (!target) return { ok: false, error: 'HTTPS must use this Cremind server\'s host and public port.' }
+  return coordinateHttpsMigration(target, { ...options, nextOrigin: target })
+})
+
+type BackendResult = { ok: boolean; error?: string; agentUrl?: string }
+
+function backendReady(): BackendResult {
+  const agentUrl = backendSpaUrl()
+  activeBackendOrigin = agentUrl
+  requestedBackendOrigin = null
+  if (runtimeConfig.agentUrl !== agentUrl) {
+    updateConfig({ agentUrl, backendInstanceId: runtimeConfig.backendInstanceId })
+  }
+  return { ok: true, agentUrl }
+}
+
+async function startBackend(): Promise<BackendResult> {
   // Already responding? Adopt the running instance and skip the spawn.
-  if (await isBackendHealthy()) {
-    return { ok: true }
+  if (await discoverBackend()) {
+    return backendReady()
   }
   // Already spawned but not healthy yet? Just wait.
   if (backendProcess && backendProcess.exitCode === null) {
     const ok = await waitForBackendHealthy()
-    return ok ? { ok: true } : { ok: false, error: 'backend did not become healthy' }
+    return ok ? backendReady() : { ok: false, error: 'backend did not become healthy' }
   }
 
   // Spawn via the venv interpreter rather than cremind.exe so that
@@ -586,10 +1400,13 @@ async function startBackend(): Promise<{ ok: boolean; error?: string }> {
   if (!ok) {
     return { ok: false, error: `backend at ${backendHealthUrl()} did not respond after 30s` }
   }
-  return { ok: true }
+  return backendReady()
 }
 
-ipcMain.handle('cremind:server:start', async () => startBackend())
+ipcMain.handle('cremind:server:start', async (event): Promise<BackendResult> => {
+  if (!isFirstPartySender(event)) return { ok: false, error: 'Only a Cremind app window can start its backend.' }
+  return startBackend()
+})
 
 // Restart the backend in-process. The Developer page's Restart Server
 // button routes here when running under Electron — without this
@@ -602,19 +1419,28 @@ ipcMain.handle('cremind:server:start', async () => startBackend())
 // spawned?" guard takes the cold path), then call startBackend()
 // which spawns a fresh ``cremind serve`` and polls /health until it
 // returns 200.
-ipcMain.handle('cremind:server:restart', async (): Promise<{ ok: boolean; error?: string }> => {
-  const existing = backendProcess
-  if (existing && existing.exitCode === null) {
-    // Wait for the exit hook before respawning so the new child isn't
-    // racing the old one for the listening port.
-    const exited = new Promise<void>((resolve) => {
-      existing.once('exit', () => resolve())
-      // Safety net — exit hook should fire within a second of SIGTERM.
-      setTimeout(() => resolve(), 5000)
-    })
-    try { existing.kill('SIGTERM') } catch { /* already gone */ }
-    await exited
+ipcMain.handle('cremind:server:restart', async (event, options?: HttpsMigrationOptions): Promise<BackendResult> => {
+  if (!isFirstPartySender(event)) return { ok: false, error: 'Only a Cremind app window can restart its backend.' }
+  if (options?.nextOrigin) {
+    const next = validHttpsTarget(event.sender.getURL(), options.nextOrigin)
+    if (!next) return { ok: false, error: 'Invalid HTTPS destination.' }
+    requestedBackendOrigin = next
+    const transitionId = options.transitionId
+    if (!transitionId || !preparedTransitions.has(transitionId)) {
+      requestedBackendOrigin = null
+      return { ok: false, error: 'Prepare every Electron window before restarting the backend for HTTPS.' }
+    }
   }
+  const existing = backendProcess
+  if (!existing || existing.exitCode !== null) {
+    requestedBackendOrigin = null
+    return { ok: false, error: 'This backend is managed outside the desktop app. Restart it with its service or container manager.' }
+  }
+  if (!(await stopOwnedBackend(existing, killProcessTreeSync))) {
+    requestedBackendOrigin = null
+    return { ok: false, error: 'The previous backend did not stop. Finish its work and retry the restart.' }
+  }
+  activeBackendOrigin = null
   return startBackend()
 })
 
@@ -637,21 +1463,30 @@ ipcMain.handle('cremind:server:restart', async (): Promise<{ ok: boolean; error?
 //     installed the previous version. We leave the (old) backend
 //     running and surface the failure to the renderer.
 ipcMain.handle('cremind:backend-upgrade:apply', async (event, payload?: { targetVersion?: string }) => {
+  requireFirstPartySender(event)
   return runBackendUpgrade(event.sender, payload?.targetVersion)
 })
 
-ipcMain.handle('cremind:installer:detect', async () => detectInstallEnvironment())
+ipcMain.handle('cremind:installer:detect', async (event) => {
+  requireFirstPartySender(event)
+  return detectInstallEnvironment()
+})
 
-ipcMain.handle('cremind:installer:list-versions', async () => listInstallVersions())
+ipcMain.handle('cremind:installer:list-versions', async (event) => {
+  requireFirstPartySender(event)
+  return listInstallVersions()
+})
 
 ipcMain.handle('cremind:installer:run', async (event, payload: InstallerRunPayload) => {
+  requireFirstPartySender(event)
   if (installerProcess) {
     throw new Error('An install is already running.')
   }
   return runInstaller(event.sender, payload)
 })
 
-ipcMain.handle('cremind:installer:cancel', () => {
+ipcMain.handle('cremind:installer:cancel', (event) => {
+  requireFirstPartySender(event)
   if (!installerProcess) return false
   // SIGTERM gives the script a chance to clean up; if it ignores it,
   // Node will SIGKILL the orphan when the Electron app exits.
@@ -660,6 +1495,7 @@ ipcMain.handle('cremind:installer:cancel', () => {
 })
 
 ipcMain.handle('cremind:installer:uninstall', async (event, mode: 'keep' | 'purge') => {
+  requireFirstPartySender(event)
   if (uninstallerProcess) {
     throw new Error('An uninstall is already running.')
   }
@@ -670,6 +1506,8 @@ ipcMain.handle('cremind:installer:uninstall', async (event, mode: 'keep' | 'purg
 })
 
 type InstallerEnvironment = {
+  hasExistingInstall: boolean
+  existingSsl: '' | 'auto' | 'after-setup'
   os: 'linux' | 'macos' | 'windows' | 'unknown'
   arch: string
   hasDocker: boolean
@@ -686,6 +1524,8 @@ type InstallerRunPayload = {
   deployment: 'local' | 'server' | 'custom'
   appHost?: string
   mode: 'docker' | 'native'
+  /** Explicit opt-in; true uses the installer’s trust-first setup flow. */
+  ssl?: boolean
   /** Docker mode only: include the VNC Desktop UI (cremind/cremind-desktop)
    *  or install the headless basic image (cremind/cremind). Undefined ⇒ let
    *  the install script decide (default desktop / previous choice on re-run). */
@@ -728,7 +1568,12 @@ async function detectInstallEnvironment(): Promise<InstallerEnvironment> {
   // non-zero exits so the UI gets a clean ``hasX = false`` rather than an
   // exception per check.
   const platform = process.platform
+  const previous = { ...readInstallEnvironment(), ...process.env }
+  const previousMode = (previous.CREMIND_SSL ?? '').trim().toLowerCase()
   const detected: InstallerEnvironment = {
+    hasExistingInstall: installMarkerExists(),
+    existingSsl: previousMode === 'after-setup' ? 'after-setup'
+      : ['auto', 'true', '1', 'yes'].includes(previousMode) || Boolean(previous.CREMIND_SSL_CERTFILE && previous.CREMIND_SSL_KEYFILE) ? 'auto' : '',
     os: platform === 'linux' ? 'linux'
        : platform === 'darwin' ? 'macos'
        : platform === 'win32' ? 'windows'
@@ -952,6 +1797,9 @@ async function runInstaller(
   if (payload.deployment === 'server' && !payload.appHost) {
     throw new Error('Server deployment requires a public host (IP or domain).')
   }
+  if (payload.ssl !== undefined && typeof payload.ssl !== 'boolean') {
+    throw new Error('HTTPS selection must be true or false.')
+  }
 
   // Resolve which install script to run.
   //
@@ -995,6 +1843,9 @@ async function runInstaller(
     '--unattended',
     '--no-launch',
   ]
+  // An omitted choice preserves an existing install's mode; the scripts make
+  // an omitted choice on a fresh install HTTP. A changed checkbox is explicit.
+  if (typeof payload.ssl === 'boolean') args.push('--ssl', payload.ssl ? 'after-setup' : 'none')
   if (payload.appHost) args.push('--host', payload.appHost)
   // Docker desktop-UI choice. Only meaningful for docker mode; pass it
   // explicitly both ways when the wizard asked, rather than relying on the
@@ -1157,9 +2008,14 @@ async function runInstaller(
           resolvedAgentUrl = `http://${payload.appHost!}:1515`
         }
         updateConfig({
-          agentUrl: resolvedAgentUrl,
+          agentUrl: resolveBackendOrigin(
+            resolvedAgentUrl,
+            { ...readInstallEnvironment(), ...process.env },
+            fs.existsSync(path.join(systemDirPath(), 'bootstrap.toml')),
+          ),
           deploymentType: payload.deployment,
         })
+        activeBackendOrigin = null
       }
       send('cremind:installer:done', { exitCode })
       resolve({ exitCode })
@@ -1452,7 +2308,7 @@ async function runBackendUpgrade(
         for (const win of BrowserWindow.getAllWindows()) {
           if (win.isDestroyed()) continue
           const url = win.webContents.getURL()
-          if (!url.startsWith('http://') && !url.startsWith('https://')) continue
+          if (!isFirstPartyUrl(url)) continue
           try {
             await win.webContents.executeJavaScript(
               `try { sessionStorage.setItem('cremind:just_updated', '${stamp}') } catch {}`,
@@ -1576,6 +2432,9 @@ function vncUrlFromAgentUrl(agentUrl: string): string | null {
     // noVNC is served from the same host as the agent, but on the
     // docker-compose default port 6080. (See NOVNC_PORT:-6080 in
     // install/templates/docker-compose.yml.tmpl.)
+    // noVNC owns a separate HTTP listener. Enabling TLS on Cremind's public
+    // origin does not enable TLS on port 6080.
+    u.protocol = 'http:'
     u.port = '6080'
     u.pathname = '/vnc.html'
     u.search = ''
@@ -1588,69 +2447,30 @@ function vncUrlFromAgentUrl(agentUrl: string): string | null {
   }
 }
 
-function fetchCapabilities(): Promise<void> {
-  return new Promise<void>((resolve) => {
-    const finish = () => {
-      rebuildTrayMenu()
-      rebuildJumpList()
-      rebuildDockMenu()
-      resolve()
-    }
+async function fetchCapabilities(): Promise<void> {
+  try {
     if (!runtimeConfig.agentUrl) {
       installMode = null
       imageFlavor = null
       uiFeatures = null
-      finish()
       return
     }
-    let url: URL
-    try {
-      // ``/tray-capabilities`` is the deliberately-public sibling of
-      // ``/capabilities``. The Electron main process can't share the
-      // renderer's session cookies, so the admin-gated capabilities
-      // endpoint stops being reachable as soon as setup completes —
-      // which silently disabled the tray gate on every post-setup
-      // launch (test build looked fine because setup hadn't completed
-      // yet; dev mode never worked).
-      url = new URL('/api/services/tray-capabilities', runtimeConfig.agentUrl)
-    } catch {
-      finish()
-      return
+    const response = await backendFetch(`${runtimeConfig.agentUrl}/api/services/tray-capabilities`, 'GET', 4000)
+    if (!response.ok) return
+    const parsed = await response.json() as {
+      install_mode?: 'docker' | 'native' | null
+      image_flavor?: 'desktop' | 'basic' | null
+      ui_features?: string[]
     }
-    const client = url.protocol === 'https:' ? https : http
-    const req = client.get(url.toString(), { timeout: 4000 }, (res) => {
-      if ((res.statusCode ?? 0) >= 400) { res.resume(); finish(); return }
-      let body = ''
-      res.setEncoding('utf8')
-      res.on('data', (chunk) => { body += chunk })
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(body) as {
-            install_mode?: 'docker' | 'native' | null
-            image_flavor?: 'desktop' | 'basic' | null
-            ui_features?: string[]
-          }
-          installMode = parsed.install_mode ?? null
-          // Absent (older backend) → null → treated as desktop for Docker
-          // installs by vncCapable(). Only an explicit 'basic' hides VNC.
-          imageFlavor = parsed.image_flavor ?? null
-          // Distinguish "field absent" (older backend, fall back to
-          // hide-gated) from "field present but empty" (backend says
-          // it ships none of these features — also hide). Either way
-          // a missing entry hides the menu item; the only state that
-          // shows it is an explicit listing in ``ui_features``.
-          uiFeatures = Array.isArray(parsed.ui_features)
-            ? new Set(parsed.ui_features)
-            : null
-        } catch { /* leave state unchanged on parse failure */ }
-        finish()
-      })
-    })
-    // Network errors or timeouts: keep last-known installMode to avoid
-    // flickering the VNC entry off during transient outages.
-    req.on('error', () => finish())
-    req.on('timeout', () => { req.destroy(); finish() })
-  })
+    installMode = parsed.install_mode ?? null
+    imageFlavor = parsed.image_flavor ?? null
+    uiFeatures = Array.isArray(parsed.ui_features) ? new Set(parsed.ui_features) : null
+  } catch { /* retain known capabilities during a temporary restart */ }
+  finally {
+    rebuildTrayMenu()
+    rebuildJumpList()
+    rebuildDockMenu()
+  }
 }
 
 // ── Windows taskbar jumplist ────────────────────────────────────────────
@@ -1974,7 +2794,8 @@ function setupAutoUpdater(): void {
   }
 }
 
-ipcMain.handle('cremind:updater:check', async () => {
+ipcMain.handle('cremind:updater:check', async (event) => {
+  requireFirstPartySender(event)
   if (!updater) return { status: 'unavailable' }
   try {
     const result = await updater.checkForUpdates()
@@ -1987,7 +2808,8 @@ ipcMain.handle('cremind:updater:check', async () => {
   }
 })
 
-ipcMain.handle('cremind:updater:download', async () => {
+ipcMain.handle('cremind:updater:download', async (event) => {
+  requireFirstPartySender(event)
   if (!updater) return { ok: false, error: 'updater unavailable' }
   try {
     await updater.downloadUpdate()
@@ -1997,7 +2819,8 @@ ipcMain.handle('cremind:updater:download', async () => {
   }
 })
 
-ipcMain.handle('cremind:updater:install', () => {
+ipcMain.handle('cremind:updater:install', (event) => {
+  requireFirstPartySender(event)
   if (!updater) return { ok: false, error: 'updater unavailable' }
   // ``isSilent=false, isForceRunAfter=true`` → quit + install + relaunch.
   setImmediate(() => updater!.quitAndInstall(false, true))
@@ -2134,6 +2957,7 @@ if (!gotSingleInstanceLock) {
     // Reconcile with <SYSTEM_DIR>/.env so a deleted install dir re-triggers
     // the first-run installer instead of falling through to a broken UI.
     reconcileInstallStateWithDisk();
+    installLocalCertificateVerification();
     // First-run / re-install detection. ``userData`` (which holds
     // localStorage, IndexedDB, cookies) is NOT cleared by the Windows
     // uninstaller and is shared across all channels — without this,

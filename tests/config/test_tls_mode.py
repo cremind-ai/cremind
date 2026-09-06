@@ -112,9 +112,9 @@ def test_no_public_bind_is_never_pending():
     assert _facts(public_port=0).pending_https is False
 
 
-def test_electron_is_never_pending(monkeypatch):
+def test_electron_can_prepare_https(monkeypatch):
     monkeypatch.setenv("CREMIND_ELECTRON_PARENT", "1")
-    assert _facts().pending_https is False
+    assert _facts().pending_https is True
 
 
 @pytest.mark.parametrize(

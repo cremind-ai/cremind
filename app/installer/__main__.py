@@ -48,6 +48,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--channel", default="", choices=["", "production", "test", "dev"])
     p.add_argument("--deployment", default="")
     p.add_argument("--mode", default="")
+    p.add_argument("--ssl", default="", choices=["", "none", "auto", "after-setup"])
+    p.add_argument("--ssl-inherited", default="0", choices=["0", "1"])
+    p.add_argument("--native-env", default="", help="Previous native installation's .env path.")
+    p.add_argument("--docker-env", default="", help="Previous Docker installation's .env path.")
     p.add_argument(
         "--desktop",
         default="",
@@ -104,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         deployment=args.deployment,
         app_host=args.app_host,
         mode=args.mode,
+        ssl_choice=args.ssl,
         desktop=args.desktop,
         vnc_password=args.vnc_password,
         custom_listen_host=args.custom_listen_host,
@@ -120,6 +125,9 @@ def main(argv: list[str] | None = None) -> int:
             has_docker=args.has_docker == "1",
             electron_version=args.electron_version,
             vnc_password_preset=args.vnc_password_set == "1",
+            ssl_inherited=args.ssl_inherited == "1",
+            native_env=args.native_env,
+            docker_env=args.docker_env,
         )
     except KeyboardInterrupt:
         _write_cancel_marker(args.output)

@@ -3,7 +3,8 @@
  *
  * Guards against open-redirect and cross-profile jumps: the value must be an
  * internal absolute path (a single leading ``/``, never protocol-relative
- * ``//``) whose first path segment is exactly ``profile``. That rule means
+ * ``//``) that is either the profile-neutral root or whose first path segment
+ * is exactly ``profile``. That rule means
  *   - re-logging-in as a *different* profile never lands on someone else's page
  *     (falls back to that profile's default destination instead), and
  *   - we never bounce back into an auth screen (``/login/...`` / ``/setup...``).
@@ -21,6 +22,7 @@ export function safeRedirectTarget(raw: unknown, profile: string): string | null
   if (!raw.startsWith('/') || raw.startsWith('//')) return null;
 
   const path = raw.split('?')[0].split('#')[0];
+  if (path === '/') return raw;
   let seg = path.split('/')[1] || '';
   try {
     seg = decodeURIComponent(seg);

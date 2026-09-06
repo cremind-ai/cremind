@@ -21,6 +21,7 @@
  */
 
 import { fetchBlueprintBlob } from './blueprintApi';
+import { trackMigrationUpload } from './migrationReadiness';
 
 export interface UploadResult {
   url: string; // relative Hub path, e.g. /blueprints/<canonical>
@@ -70,37 +71,39 @@ export async function uploadBlueprintToHub(opts: UploadOptions): Promise<UploadR
     const token = await waitForToken(tab, hubOrigin, opts.timeoutMs ?? 5 * 60_000);
 
     // (4) Upload cross-origin with the Bearer token (no cookies).
-    const form = new FormData();
-    form.append('file', new File([blob], opts.name, { type: 'application/gzip' }));
-    const res = await fetch(`${hubBase}/api/blueprints`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-      credentials: 'omit',
-      body: form,
-    });
-    if (!res.ok) {
-      let msg = res.statusText;
-      try {
-        const body = await res.json();
-        msg = body?.message || body?.error || msg;
-      } catch {
-        /* keep statusText */
+    return await trackMigrationUpload(async () => {
+      const form = new FormData();
+      form.append('file', new File([blob], opts.name, { type: 'application/gzip' }));
+      const res = await fetch(`${hubBase}/api/blueprints`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        credentials: 'omit',
+        body: form,
+      });
+      if (!res.ok) {
+        let msg = res.statusText;
+        try {
+          const body = await res.json();
+          msg = body?.message || body?.error || msg;
+        } catch {
+          /* keep statusText */
+        }
+        throw new Error(`Upload failed: ${msg}`);
       }
-      throw new Error(`Upload failed: ${msg}`);
-    }
-    const body = (await res.json()) as { url: string };
-    const abs = `${hubBase}${body.url}`;
+      const body = (await res.json()) as { url: string };
+      const abs = `${hubBase}${body.url}`;
 
-    // (5) Land on the uploaded (draft) Hub page — reuse the same tab.
-    if (window.cremind?.openExternal) {
-      window.cremind.openExternal(abs);
-      if (!tab.closed) tab.close();
-    } else if (!tab.closed) {
-      tab.location.href = abs;
-    } else {
-      window.open(abs, '_blank');
-    }
-    return { url: body.url, hubUrl: abs };
+      // (5) Land on the uploaded (draft) Hub page — reuse the same tab.
+      if (window.cremind?.openExternal) {
+        window.cremind.openExternal(abs);
+        if (!tab.closed) tab.close();
+      } else if (!tab.closed) {
+        tab.location.href = abs;
+      } else {
+        window.open(abs, '_blank');
+      }
+      return { url: body.url, hubUrl: abs };
+    });
   } catch (e) {
     if (!tab.closed) tab.close();
     throw e;

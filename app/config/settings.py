@@ -393,7 +393,7 @@ class BaseConfig:
     SSL_CERTFILE = os.environ.get("CREMIND_SSL_CERTFILE", "")
     SSL_KEYFILE = os.environ.get("CREMIND_SSL_KEYFILE", "")
     SSL_KEYFILE_PASSWORD = os.environ.get("CREMIND_SSL_KEYFILE_PASSWORD", "")
-    SSL_MODE = os.environ.get("CREMIND_SSL", "")  # "" | "auto"
+    SSL_MODE = os.environ.get("CREMIND_SSL", "")  # "" | "auto" | "after-setup"
     SSL_AUTO_HOSTS = _csv_list(os.environ.get("CREMIND_SSL_AUTO_HOSTS", ""))
 
     # ── Application-level (TOML defaults, overridable via SQLite) ──
@@ -503,7 +503,9 @@ class BaseConfig:
         ``serial`` is the profile's revocation counter, carried as the ``tsr``
         claim; it defaults to the profile's current value. Pass it explicitly
         when the authoritative value doesn't come from the live DB — restore
-        reads it out of the archive.
+        reads it out of the archive. The current transport epoch is always
+        added so a completed HTTP-to-HTTPS transition can retire old-origin
+        credentials independently of per-profile revocation.
         """
         import jwt
         from datetime import datetime, timedelta, timezone
@@ -522,11 +524,26 @@ class BaseConfig:
                 serial = current_serial(profile)
             except Exception:  # noqa: BLE001
                 serial = 0
+        # Transport generation zero accepts legacy JWTs with no ``tep`` claim.
+        # The first explicit HTTP -> HTTPS activation advances it and thereby
+        # invalidates every bearer left behind in HTTP-origin browser storage.
+        from app.auth.tokens import (
+            TOKEN_TRANSPORT_EPOCH_CLAIM,
+            current_transport_epoch,
+        )
+
+        transport_epoch = current_transport_epoch()
+        if transport_epoch is None:
+            raise RuntimeError(
+                "TLS transition metadata is unreadable; refusing to mint a "
+                "credential without its transport epoch."
+            )
         now = datetime.now(timezone.utc)
         payload = {
             "sub": profile,
             "profile": profile,
             "tsr": int(serial),
+            TOKEN_TRANSPORT_EPOCH_CLAIM: transport_epoch,
             "iat": now,
             "exp": now + timedelta(hours=hours),
         }

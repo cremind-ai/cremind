@@ -66,7 +66,7 @@ def test_every_subcommand_and_flag_is_documented():
         name = command.name or (command.callback.__name__ if command.callback else "")
         assert name, "a tls subcommand has no resolvable name"
         documented_names.add(name)
-        assert f"cremind tls {name}" in text, f"subcommand {name!r} is undocumented"
+        assert f"### `cremind tls {name}`" in text, f"subcommand {name!r} lacks its own documentation section"
 
         for param in inspect.signature(command.callback).parameters.values():
             default = param.default
@@ -76,7 +76,7 @@ def test_every_subcommand_and_flag_is_documented():
                 if decl.startswith("--"):
                     assert decl in text, f"flag {decl} of `tls {name}` is undocumented"
 
-    assert documented_names == {"export", "fingerprint", "trust"}
+    assert documented_names == {"export", "fingerprint", "trust", "status", "prepare", "enable", "cancel"}
 
 
 def test_the_doc_lists_every_platform_the_command_supports():

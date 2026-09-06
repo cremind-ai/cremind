@@ -130,8 +130,8 @@ def _root(
 
 
 # Top-level commands that never call the server — never prompt for a profile.
-# `tls` reads a certificate off disk and hands it to the OS trust store; it
-# exists precisely for the case where nothing can talk to the server yet.
+# `tls` certificate commands run offline; status is public. Its administrative
+# prepare/enable/cancel subcommands are explicitly excluded below.
 # `boot` registers an OS service for a server that may not be running — or
 # even installed — yet, for the same reason.
 _TOKEN_FREE_COMMANDS = {"version", "setup", "serve", "tls", "boot"}
@@ -162,10 +162,12 @@ def _should_resolve_profile(ctx: typer.Context) -> bool:
     sub = ctx.invoked_subcommand
     if sub is None:  # bare `cremind` → help
         return False
-    if sub in _TOKEN_FREE_COMMANDS:
-        return False
     argv = sys.argv[1:]
     if "-h" in argv or "--help" in argv:
+        return False
+    if sub == "tls" and _group_subcommand(argv, "tls") in {"prepare", "enable", "cancel"}:
+        return True
+    if sub in _TOKEN_FREE_COMMANDS:
         return False
     if sub == "profile" and _group_subcommand(argv, "profile") in _PROFILE_SESSION_SUBCOMMANDS:
         return False

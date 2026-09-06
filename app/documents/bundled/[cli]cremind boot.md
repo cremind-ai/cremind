@@ -15,7 +15,7 @@ response. So on an unsupervised install:
 - the Developer page's **Restart Server** button stops the backend and it stays
   down;
 - an in-app **upgrade** applies and then leaves nothing running;
-- `CREMIND_SSL=after-setup` — the installer default — cannot make its switch
+- `CREMIND_SSL=after-setup` — the opt-in HTTPS installer choice — cannot make its switch
   from HTTP to HTTPS, because that switch *is* a restart.
 
 `cremind boot enable` fixes all of it by handing the job to the operating

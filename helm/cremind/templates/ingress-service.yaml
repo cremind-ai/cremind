@@ -1,0 +1,28 @@
+{{- if .Values.ingress.enabled -}}
+{{- $proxyOn := include "cremind.proxyEnabled" . -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cremind.ingressServiceName" . }}
+  labels:
+    {{- include "cremind.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # This ClusterIP separates the controller path from the user-facing Service,
+  # so remote LoadBalancer clients and ordinary public port-forwards cannot
+  # enter nginx through its edge listener. Cluster workloads can reach a
+  # ClusterIP, so Ingress TLS requires ingress.trustedProxyCidrs to restrict
+  # this peer set to the controller.
+  type: ClusterIP
+  selector:
+    {{- include "cremind.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: {{ ternary "edge-http" "ui" (ne $proxyOn "") }}
+      protocol: TCP
+      appProtocol: http
+{{- end }}

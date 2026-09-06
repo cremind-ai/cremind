@@ -28,6 +28,9 @@ class TuiResult:
     deployment: str = ""
     app_host: str = ""
     mode: str = ""
+    # Empty = not asked; keep = preserve inherited/existing TLS settings.
+    # Kept separate from the shell's SSL_MODE / SSL_EXPLICIT flag variables.
+    ssl_choice: str = ""
     # Docker desktop-UI choice: "" unset (let the shell decide), "1" desktop,
     # "0" basic. Only meaningful when mode == "docker".
     desktop: str = ""
@@ -49,6 +52,7 @@ class TuiResult:
             "DEPLOYMENT": self.deployment,
             "APP_HOST": self.app_host,
             "MODE": self.mode,
+            "SSL_CHOICE": self.ssl_choice,
             "DESKTOP_UI": self.desktop,
             "VNC_PASSWORD_INPUT": self.vnc_password,
             "CUSTOM_listen_host": self.custom_listen_host,

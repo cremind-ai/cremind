@@ -1,6 +1,61 @@
 import { ipcRenderer, contextBridge } from 'electron'
+import { filterTransitionState, transitionLocalKeys, transitionProfile, type TransitionState } from './transitionState'
 
-const listeners = new WeakMap<Function, (event: any, ...args: any[]) => void>()
+let beforeMigration: (() => Promise<string | void>) | null = null
+let migrationReleased: (() => void) | null = null
+
+// Restore the one-window handoff before Vue imports any store. Main verifies
+// WebContents + destination origin and consumes this memory-only value once.
+try {
+  const transferred = ipcRenderer.sendSync('cremind:https:consume-sync') as TransitionState | null
+  if (transferred) {
+    const state = filterTransitionState(window.location.href, transferred)
+    for (const [key, value] of Object.entries(state.local)) {
+      if (key === 'logged_in_profiles') {
+        let previous: string[] = []
+        try {
+          const parsed = JSON.parse(localStorage.getItem(key) || '[]')
+          if (Array.isArray(parsed)) previous = parsed.filter((entry) => typeof entry === 'string')
+        } catch { /* damaged or unavailable old storage */ }
+        localStorage.setItem(key, JSON.stringify([...new Set([...previous, ...JSON.parse(value)])]))
+      } else localStorage.setItem(key, value)
+    }
+    for (const [key, value] of Object.entries(state.session)) sessionStorage.setItem(key, value)
+  }
+} catch { /* blocked storage should still allow navigation and sign-in */ }
+
+ipcRenderer.on('cremind:https:capture', async () => {
+  ipcRenderer.send('cremind:https:capture-ack')
+  let windowProfile: string | void
+  try { windowProfile = await beforeMigration?.() } catch {
+    ipcRenderer.send('cremind:https:capture-failed')
+    return
+  }
+  const state: TransitionState = { local: {}, session: {} }
+  try {
+    // A just-finished Setup Wizard has no profile in its route yet.
+    const activeProfile = typeof windowProfile === 'string'
+      ? windowProfile : localStorage.getItem('profile_id') || undefined
+    if (activeProfile) state.local.profile_id = activeProfile
+    for (const key of transitionLocalKeys(window.location.href, activeProfile)) {
+      const value = localStorage.getItem(key)
+      if (value !== null) state.local[key] = value
+    }
+    const grace = sessionStorage.getItem('cremind:just_updated')
+    if (grace) state.session['cremind:just_updated'] = grace
+    const profile = transitionProfile(window.location.href, activeProfile)
+    if (profile) {
+      for (let i = 0; i < sessionStorage.length; i += 1) {
+        const key = sessionStorage.key(i)
+        if (key?.startsWith(`cremind:draft:${profile}:`)) state.session[key] = sessionStorage.getItem(key) || ''
+      }
+    }
+  } catch { /* a storage-restricted window migrates without a session */ }
+  try { ipcRenderer.send('cremind:https:captured', filterTransitionState(window.location.href, state)) }
+  catch { ipcRenderer.send('cremind:https:capture-failed') }
+})
+
+ipcRenderer.on('cremind:https:released', () => migrationReleased?.())
 
 // Snapshot the runtime config synchronously so the renderer can read the
 // agent URL during module init (before any async IPC could resolve).
@@ -102,13 +157,29 @@ contextBridge.exposeInMainWorld('cremind', {
   // ``cremind serve`` and resolves once the health endpoint is reachable
   // (or rejects with an error string).
   server: {
-    start: (): Promise<{ ok: boolean; error?: string }> =>
+    prepareHttpsMigration: (options: { nextOrigin: string; transitionId: string; instanceId: string }): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke('cremind:server:prepare-https', options),
+    onBeforeMigration: (callback: () => Promise<string | void>) => {
+      beforeMigration = callback
+      return () => { if (beforeMigration === callback) beforeMigration = null }
+    },
+    onMigrationReleased: (callback: () => void) => {
+      migrationReleased = callback
+      return () => { if (migrationReleased === callback) migrationReleased = null }
+    },
+    releaseHttpsMigration: (): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke('cremind:server:release-https'),
+    start: (): Promise<{ ok: boolean; error?: string; agentUrl?: string }> =>
       ipcRenderer.invoke('cremind:server:start'),
     // Kills + respawns the backend child. Used by the Developer
     // page's Restart Server button under Electron; web/Docker builds
     // hit POST /api/system/restart directly instead.
-    restart: (): Promise<{ ok: boolean; error?: string }> =>
-      ipcRenderer.invoke('cremind:server:restart'),
+    restart: (options?: { nextOrigin?: string; transitionId?: string; instanceId?: string }): Promise<{ ok: boolean; error?: string; agentUrl?: string }> =>
+      ipcRenderer.invoke('cremind:server:restart', options),
+    // Main verifies HTTPS and migrates every Cremind window with a private,
+    // one-use handoff. OAuth, VNC and document-preview windows are excluded.
+    migrateHttps: (options: { nextOrigin: string; transitionId?: string; instanceId?: string }): Promise<{ ok: boolean; error?: string; agentUrl?: string }> =>
+      ipcRenderer.invoke('cremind:server:migrate-https', options),
   },
 
   // Backend upgrade bridge — runs ``cremind upgrade --yes`` as a child
@@ -181,34 +252,4 @@ contextBridge.exposeInMainWorld('cremind', {
       }
     },
   },
-})
-
-// --------- Expose some API to the Renderer process ---------
-contextBridge.exposeInMainWorld('ipcRenderer', {
-  on(...args: Parameters<typeof ipcRenderer.on>) {
-    const [channel, listener] = args
-    const wrapper = (event: any, ...args: any[]) => listener(event, ...args)
-    listeners.set(listener, wrapper)
-    return ipcRenderer.on(channel, wrapper)
-  },
-  off(...args: Parameters<typeof ipcRenderer.off>) {
-    const [channel, listener] = args
-    const wrapper = listeners.get(listener)
-    if (wrapper) {
-      listeners.delete(listener)
-      return ipcRenderer.off(channel, wrapper)
-    }
-    return ipcRenderer
-  },
-  send(...args: Parameters<typeof ipcRenderer.send>) {
-    const [channel, ...omit] = args
-    return ipcRenderer.send(channel, ...omit)
-  },
-  invoke(...args: Parameters<typeof ipcRenderer.invoke>) {
-    const [channel, ...omit] = args
-    return ipcRenderer.invoke(channel, ...omit)
-  },
-
-  // You can expose other APTs you need here.
-  // ...
 })

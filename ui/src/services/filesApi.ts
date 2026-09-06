@@ -1,5 +1,10 @@
 // Wrappers around the file-tree backend endpoints in app/api/files.py.
 
+import {
+  trackMigrationUpload,
+  type MigrationUploadLease,
+} from './migrationReadiness';
+
 export interface DirectoryEntry {
   name: string;
   path: string;
@@ -121,26 +126,28 @@ export async function uploadFiles(
   conversationId?: string,
 ): Promise<UploadResult[]> {
   if (!files.length) return [];
-  const base = resolveBaseUrl(agentUrl);
-  const form = new FormData();
-  form.append('path', targetDir);
-  if (conversationId) form.append('conversation_id', conversationId);
-  for (const f of files) form.append('files', f, f.name);
-  // Note: do NOT set Content-Type — the browser writes the multipart boundary.
-  const res = await fetch(`${base}/api/files/upload`, {
-    method: 'POST',
-    headers: authHeaders(token),
-    body: form,
+  return trackMigrationUpload(async () => {
+    const base = resolveBaseUrl(agentUrl);
+    const form = new FormData();
+    form.append('path', targetDir);
+    if (conversationId) form.append('conversation_id', conversationId);
+    for (const f of files) form.append('files', f, f.name);
+    // Note: do NOT set Content-Type — the browser writes the multipart boundary.
+    const res = await fetch(`${base}/api/files/upload`, {
+      method: 'POST',
+      headers: authHeaders(token),
+      body: form,
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new DirectoryAccessError(
+        res.status,
+        data.error || `Upload failed: ${res.statusText}`,
+      );
+    }
+    const data = await res.json();
+    return (data.results || []) as UploadResult[];
   });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new DirectoryAccessError(
-      res.status,
-      data.error || `Upload failed: ${res.statusText}`,
-    );
-  }
-  const data = await res.json();
-  return (data.results || []) as UploadResult[];
 }
 
 export interface TempUploadResult extends UploadResult {
@@ -157,27 +164,30 @@ export async function uploadTempFiles(
   token: string,
   conversationId: string,
   files: File[],
+  migrationLease?: MigrationUploadLease,
 ): Promise<TempUploadResult[]> {
   if (!files.length) return [];
-  const base = resolveBaseUrl(agentUrl);
-  const form = new FormData();
-  form.append('conversation_id', conversationId);
-  for (const f of files) form.append('files', f, f.name);
-  // Note: do NOT set Content-Type — the browser writes the multipart boundary.
-  const res = await fetch(`${base}/api/files/upload-temp`, {
-    method: 'POST',
-    headers: authHeaders(token),
-    body: form,
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new DirectoryAccessError(
-      res.status,
-      data.error || `Upload failed: ${res.statusText}`,
-    );
-  }
-  const data = await res.json();
-  return (data.results || []) as TempUploadResult[];
+  return trackMigrationUpload(async () => {
+    const base = resolveBaseUrl(agentUrl);
+    const form = new FormData();
+    form.append('conversation_id', conversationId);
+    for (const f of files) form.append('files', f, f.name);
+    // Note: do NOT set Content-Type — the browser writes the multipart boundary.
+    const res = await fetch(`${base}/api/files/upload-temp`, {
+      method: 'POST',
+      headers: authHeaders(token),
+      body: form,
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new DirectoryAccessError(
+        res.status,
+        data.error || `Upload failed: ${res.statusText}`,
+      );
+    }
+    const data = await res.json();
+    return (data.results || []) as TempUploadResult[];
+  }, migrationLease);
 }
 
 export async function deleteEntry(

@@ -32,13 +32,16 @@ set `image.repository`.
 ### Single entry point
 
 An in-pod **nginx reverse-proxy sidecar** fronts the whole workflow on **one
-port** so you never forward more than one: it routes `/api` + `/health` to the
-backend, `/vnc/` to the agent's desktop (noVNC — desktop flavor only), and
-everything else to the SPA. That is the only port an Ingress targets, and the SPA
-calls the backend **same-origin**, so everyday use works behind a single
-port-forward *or* a single Ingress hostname. (The Service declares one other
-port, `1455`, which carries no application traffic — it exists so a port-forward
-can reach the transient Codex OAuth callback listener; see
+user-facing port** so you never forward more than one: it routes `/api` +
+`/health` to the backend, `/vnc/` to the agent's desktop (noVNC — desktop
+flavor only), and everything else to the SPA. The SPA calls the backend
+**same-origin**, so everyday use works behind a single port-forward or a single
+Ingress hostname. An enabled Ingress targets a separate, private ClusterIP and
+nginx listener. That trust boundary lets the sidecar accept the controller's
+forwarded HTTP/HTTPS scheme while the public Service always discards a
+client-supplied scheme. (The public Service declares one other port, `1455`,
+which carries no application traffic — it exists so a port-forward can reach
+the transient Codex OAuth callback listener; see
 [Sign in with ChatGPT](#sign-in-with-chatgpt-codex-oauth).)
 
 Under [`cremind.ssl`](#https-in-pod-tls) the same sidecar runs as a **layer-4
@@ -134,14 +137,20 @@ NodePort, where no public CA will ever issue a certificate.
 ```bash
 helm install cremind oci://registry-1.docker.io/cremind/cremind \
   --version <X.Y.Z> --namespace cremind --create-namespace \
-  --set cremind.ssl=after-setup
+  --set cremind.ssl=true
 ```
 
-`cremind.ssl` makes the server generate a local CA and sign its own certificate
+HTTP is the default (`cremind.ssl=""`). Set `cremind.ssl=true` to opt into
+the trust-first HTTPS flow (`after-setup`); `false` or the compatible string
+`none` explicitly selects HTTP.
+The empty default preserves legacy `CREMIND_SSL` entries in `extraEnv`; remove
+a conflicting legacy entry before setting the boolean toggle.
+
+Enabling `cremind.ssl` makes the server generate a local CA and sign its own certificate
 under `/root/.cremind/tls/` at first boot, then serve HTTPS (and HTTP/2) on
 1515 itself. `auto` does that from the very first byte; `after-setup` waits
 until the Setup Wizard has finished (see [No-warning first
-load](#no-warning-first-load) — it is the better default for Kubernetes). One
+load](#no-warning-first-load) — it is the recommended opt-in for a new Kubernetes install). One
 flag is enough either way — the chart adjusts everything that depends on it:
 
 | | `cremind.ssl=""` (default) | `cremind.ssl=auto` | `cremind.ssl=after-setup` |
@@ -163,6 +172,123 @@ restarts the pod. The server logs which phase it booted in.
 `cremind.ssl` and `ingress.enabled` are mutually exclusive and the chart
 rejects the combination: an Ingress controller speaks plain HTTP to the backend
 and cannot portably re-encrypt to a private CA. Pick one place to terminate.
+
+### Switch an existing HTTP install to HTTPS
+
+Open **Settings > Security** while still connected over HTTP. Prepare the
+certificate, download the public CA, verify its displayed SHA-256 fingerprint,
+and follow the trust instructions on every device that opens Cremind. Keep the
+private CA key inside the system PVC. If you use a LAN hostname or IP, include
+it in `cremind.sslAutoHosts` so the server certificate covers the address.
+
+For an install reached through a port-forward or NodePort, update the Helm
+release using its current chart version (substitute your release, namespace,
+and version below). An already completed setup switches immediately with
+`auto`, so finish certificate trust first:
+
+```bash
+helm list --namespace cremind
+helm upgrade cremind oci://registry-1.docker.io/cremind/cremind \
+  --version <current-chart-version> --namespace cremind --reuse-values \
+  --set cremind.ssl=auto
+kubectl --namespace cremind rollout status deployment/cremind --timeout=5m
+kubectl --namespace cremind port-forward svc/cremind 1515:80 1455:1455 6080:6080
+```
+
+Omit `6080:6080` for the basic image. If `cremind.appUrl` or
+`cremind.atlassianRedirectUri` was explicitly set, pass its matching HTTPS URL
+on the upgrade too. Remove any conflicting `CREMIND_SSL` entry in `extraEnv`.
+Reopen the port-forward after rollout: a Helm upgrade replaces the pod, which
+closes a tunnel to the old pod. Then open `https://localhost:1515` (or the same
+LAN address/port with `https://`). Cremind tabs waiting for the switch resume
+when the HTTPS address is reachable and trusted; a browser suspended during
+the change may need to be brought to the foreground.
+
+Use Helm for this change: it updates the HTTP proxy to the TCP relay, Service
+routing, probes, URLs, and noVNC port together. Changing only `CREMIND_SSL`
+inside the container leaves the HTTP proxy and probes speaking the wrong
+protocol. Keep `proxy.enabled=true` so later app-only restarts preserve the
+port-forward.
+
+For **Ingress** deployments, leave in-pod TLS disabled. The chart marks this as
+edge-managed TLS, so **Settings > Security** does not create or ask users to
+trust a private Cremind CA. Create a certificate Secret whose SAN covers the
+Ingress hostname, then update the hostname, Secret, public URL, proxy, Service,
+and probes in one Helm release:
+
+```bash
+kubectl --namespace cremind create secret tls cremind-tls \
+  --cert=/path/to/fullchain.pem --key=/path/to/privkey.pem
+helm upgrade cremind oci://registry-1.docker.io/cremind/cremind \
+  --version <current-chart-version> --namespace cremind --reuse-values \
+  --set ingress.enabled=true \
+  --set ingress.host=cremind.example.com \
+  --set 'ingress.tls[0].hosts[0]=cremind.example.com' \
+  --set ingress.tls[0].secretName=cremind-tls \
+  --set-string ingress.trustedProxyCidrs=<controller-source-cidr> \
+  --set cremind.appUrl=https://cremind.example.com
+kubectl --namespace cremind rollout status deployment/cremind --timeout=5m
+kubectl --namespace cremind get ingress cremind
+curl --fail https://cremind.example.com/api/tls/status
+```
+
+After activation, `http://cremind.example.com/<old-route>` should return the
+uncached recovery document, and an HTTP API request should return status 426.
+If either is redirected by the controller, disable its redirect/HSTS setting
+before relying on old bookmark recovery.
+
+Replace the release, namespace, host, Secret, chart source, and version with
+the existing release's values. If cert-manager owns the Secret, keep its
+annotations and issuer workflow instead of creating the Secret by hand. Remove
+any legacy `CREMIND_SSL` entry from `cremind.extraEnv`; `cremind.ssl` must stay
+empty or `false` because the Ingress and in-pod TLS remain mutually exclusive.
+
+Do **not** enable a permanent HTTP-to-HTTPS redirect or HSTS while HTTP
+recovery is enabled. After activation, Cremind uses HTTP document navigation
+as a small, uncached recovery page for old bookmarks and suspended tabs, while
+refusing plaintext API calls. The chart sets nginx-ingress's `ssl-redirect` and
+`force-ssl-redirect` annotations to `"false"` when TLS is present unless you
+explicitly supply either annotation. For another Ingress controller, configure
+its equivalent policy so ports 80 and 443 both reach Cremind. Keep the HTTP
+route available after activation; the recovery page moves the browser session
+to HTTPS without carrying credentials in the redirect. The sidecar also sends
+plaintext `/vnc/` navigation through that recovery path and refuses the
+plaintext noVNC WebSocket, so the desktop cannot bypass the HTTPS boundary.
+
+The default sidecar uses separate public and edge listeners. Direct Service,
+NodePort, LoadBalancer, and port-forward clients cannot forge
+`X-Forwarded-Proto: https`; nginx overwrites it with the actual plaintext
+scheme. Only the private Ingress backend listener accepts the controller's
+exact `http` or `https` value. It also preserves the full public Host header,
+including a custom port such as `:8443`, so APP_URL, CORS and handoff origins
+continue to match.
+
+A ClusterIP is reachable by workloads inside the cluster, so Ingress TLS
+requires `ingress.trustedProxyCidrs` even with the sidecar. Set it to the narrow
+source IPs or CIDRs used by the Ingress controller. nginx rejects other peers
+on the edge listener and restores the original client address only through that
+trusted chain. Wildcards, the whole cluster pod range, and `/0` networks defeat
+that boundary and must not be used.
+
+If you set `proxy.enabled=false`, that listener boundary no longer exists.
+Set `ingress.trustedProxyCidrs` to a narrow, comma-separated list of the Ingress
+controller's source IPs/CIDRs so Uvicorn can accept its forwarding headers. The
+chart rejects wildcard and `/0` trust. Prefer the default sidecar when controller
+addresses are dynamic.
+
+If the rollout or Ingress is unavailable, inspect it with:
+
+```bash
+kubectl --namespace cremind describe ingress cremind
+kubectl --namespace cremind get pods
+kubectl --namespace cremind logs deployment/cremind -c cremind --tail=200
+```
+
+If you were also using a port-forward for setup or recovery, a Helm upgrade can
+replace its pod. Reopen it after the rollout with `kubectl --namespace cremind
+port-forward svc/cremind 1515:80`, then use the public HTTPS hostname once the
+Ingress is healthy. The Security page keeps its verification step visible until
+the HTTPS status response matches this installation and transition.
 
 ### No-warning first load
 
@@ -252,8 +378,9 @@ or by hand:
 | Debian/Ubuntu | `sudo cp cremind-ca.pem /usr/local/share/ca-certificates/cremind-local-ca.crt && sudo update-ca-certificates` |
 | RHEL/Fedora | `sudo cp cremind-ca.pem /etc/pki/ca-trust/source/anchors/cremind-local-ca.crt && sudo update-ca-trust extract` |
 
-Firefox keeps its own trust store — import under Settings → Privacy & Security
-→ Certificates → View Certificates → Authorities.
+If Firefox still warns after OS trust, import the same CA under Settings →
+Privacy & Security → Certificates → View Certificates → Authorities. Some
+Linux packages use a separate NSS store.
 
 ### Reaching the pod by another name
 
@@ -345,7 +472,7 @@ embeddings.
 | `cremind.installMode` | `kubernetes` | Drives external-only service modes. |
 | `cremind.setupWizardEnv` | `kubernetes` | Pre-fills the wizard. |
 | `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http(s)://localhost:1515`. |
-| `cremind.ssl` | `""` | `auto` = in-pod HTTPS with a generated local CA from the first boot; `after-setup` = the same, but plain HTTP until the Setup Wizard finishes so the CA is trusted before any https page loads (recommended when a browser is involved). Both switch the sidecar to an L4 passthrough relay and reject `ingress.enabled`. See [HTTPS](#https-in-pod-tls). |
+| `cremind.ssl` | `""` | HTTP by default; boolean `false` or string `none` explicitly disables in-pod TLS, while boolean `true` selects `after-setup`. `auto` = in-pod HTTPS with a generated local CA from the first boot; `after-setup` = the same, but plain HTTP until the Setup Wizard finishes so the CA is trusted before any https page loads (recommended when a browser is involved). Both switch the sidecar to an L4 passthrough relay and reject `ingress.enabled`. See [HTTPS](#https-in-pod-tls). |
 | `cremind.sslAutoHosts` | `""` | Extra SANs (CSV) for the generated certificate, for names beyond localhost/pod. |
 | `persistence.system.*` | `5Gi`, RWO | `bootstrap.toml`, tokens, profiles. |
 | `persistence.venv.*` | `8Gi`, RWO | Wizard-installed Python deps (LLM SDKs, embeddings). |
@@ -354,10 +481,13 @@ embeddings.
 | `postgresql.enabled` | `true` | Bundled Bitnami PostgreSQL. |
 | `qdrant.enabled` / `chromadb.enabled` | `false` | Enable when turning on embeddings. |
 | `proxy.enabled` | `true` | nginx sidecar. Without `cremind.ssl` it is the single-entry L7 proxy (UI + API + noVNC on one port; noVNC routes only on the desktop flavor). With `cremind.ssl` it is an L4 TCP passthrough relay that keeps a port-forward alive across app restarts, and noVNC moves to Service port 6080. `false` removes it and points the Service at the app. |
+| `proxy.edgePort` | `8082` | Pod-private nginx listener referenced by the Ingress backend Service. It separates public Service traffic from the controller's forwarded scheme and must differ from `proxy.port`. |
 | `proxy.adminPort` | `8081` | Relay mode only: pod-internal port carrying the sidecar's own `/healthz` for its probes. Never on the Service. |
 | `service.port` | `80` | The one Service port (fronts the proxy). |
 | `cremind.codexCallbackPort` | `1455` | Codex OAuth callback. Not really a knob — OpenAI hard-codes `localhost:1455`. Exposed as a second Service port purely so `port-forward svc/… 1455:1455` resolves; see [Sign in with ChatGPT](#sign-in-with-chatgpt-codex-oauth). |
-| `ingress.enabled` | `false` | One hostname for everything (UI at `/`; noVNC at `/vnc/` on the desktop flavor). |
+| `ingress.enabled` | `false` | One hostname for everything (UI at `/`; noVNC at `/vnc/` on the desktop flavor). Sets `CREMIND_TLS_TERMINATION=edge`; mutually exclusive with in-pod `cremind.ssl`. |
+| `ingress.tls` | `[]` | Edge certificate hosts and Secret. When nonempty, nginx-ingress redirects default to `"false"` so Cremind's restricted HTTP recovery page remains reachable; explicit annotations win. Other controllers need the equivalent dual HTTP/HTTPS policy. |
+| `ingress.trustedProxyCidrs` | `""` | Exact controller source IPs/CIDRs. Required when Ingress TLS is enabled; blocks other cluster peers from the edge listener and safely restores the original client IP. With `proxy.enabled=false`, it is passed to Uvicorn. Wildcards and `/0` networks are rejected. |
 
 ## How the storage constraints are enforced
 

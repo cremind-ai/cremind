@@ -629,6 +629,9 @@ def _resolve_tls(
     # so the wizard itself runs over plain HTTP and can hand the user the CA to
     # trust before any HTTPS page loads. Past that point it is exactly auto.
     generated = auto or (after_setup and bootstrap_exists())
+    from app.config.tls_mode import edge_tls_termination
+    if edge_tls_termination():
+        return None  # The explicitly configured Ingress/proxy owns public TLS.
 
     if not certfile and not keyfile and not (auto or after_setup):
         if mode:
@@ -655,14 +658,6 @@ def _resolve_tls(
             "proxy fronts this process."
         )
         return None
-    if os.environ.get("CREMIND_ELECTRON_PARENT") is not None:
-        logger.warning(
-            "TLS is configured but this process was started by the Electron app, "
-            "which loads the UI over http://127.0.0.1 — ignoring TLS. It applies "
-            "to server deployments."
-        )
-        return None
-
     if after_setup and not generated and not certfile and not keyfile:
         # The wizard phase. Generate the CA now anyway — eagerly, before
         # serving anything — so /ca.pem and its fingerprint are live while the
@@ -746,7 +741,8 @@ def _mk_hypercorn_config(host: str, port: int, certfile: str, keyfile: str):
     from hypercorn.config import Config as HypercornConfig
 
     cfg = HypercornConfig()
-    cfg.bind = [f"{host}:{port}"]
+    bind_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    cfg.bind = [f"{bind_host}:{port}"]
     cfg.certfile = certfile
     cfg.keyfile = keyfile
     if BaseConfig.SSL_KEYFILE_PASSWORD:
@@ -889,6 +885,9 @@ async def main(
     # not a recomputation — between the wizard writing bootstrap.toml and the
     # restart landing, recomputing would claim HTTPS while we serve plain HTTP.
     record_boot_tls(tls is not None)
+    if tls is not None:
+        from app.config.tls_transition import mark_active
+        mark_active()
 
     # 0''. Purge stale exec_shell stdout directories from previous runs.
     cleanup_stdout_on_startup()
@@ -899,8 +898,9 @@ async def main(
     #     file must never block boot.
     try:
         from app.utils.uploads_tmp import wipe_all_on_startup
+        from app.config.tls_transition import retained_upload_paths
 
-        wipe_all_on_startup()
+        wipe_all_on_startup(preserve=retained_upload_paths())
     except Exception as e:  # noqa: BLE001
         logger.debug(f"[boot] uploads_tmp wipe best-effort failed: {e}")
 
@@ -1083,7 +1083,11 @@ async def main(
 
     from app.middleware import ConnectionHeaderFilter
 
+    from app.api.tls_recovery import EdgeTlsRecovery, TlsHandoffCors
+
     middleware_stack = [
+        Middleware(EdgeTlsRecovery),
+        Middleware(TlsHandoffCors),
         # Outermost, so it also covers the SPA fallback, the mounted A2A app,
         # and the routes appended to the live app after storage boots.
         Middleware(ConnectionHeaderFilter),
@@ -1668,7 +1672,7 @@ async def main(
         # Hypercorn always runs the ASGI lifespan — it has no "off" switch — so
         # here the PUBLIC server owns it and the loopback keeps lifespan="off".
         # Same invariant as the plain-HTTP path: _on_shutdown runs exactly once.
-        from hypercorn.asyncio import serve as hypercorn_serve
+        from app.system.tls_listener import serve_with_http_recovery as hypercorn_serve
 
         certfile, keyfile = tls
         hypercorn_config = _mk_hypercorn_config(host, public_port, certfile, keyfile)

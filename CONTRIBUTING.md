@@ -230,12 +230,13 @@ first thing Cremind ever shows is an interstitial. `after-setup` removes it:
 CREMIND_SSL=after-setup uv run cremind serve
 ```
 
-This is what the installers pick by default (`install.sh --ssl none` /
-`install.ps1 -Ssl none` opts out), so a normal install lands here without
-anyone setting a variable — they write `CREMIND_SSL` into the `.env` they
-render, and the `cremind` shim they put on `PATH` loads that `.env` so a
-later `cremind serve` in a fresh terminal keeps the setting. The env var
-above is for this repo's own runs, where no installer has been involved.
+The installers default to plain HTTP. Select **Enable HTTPS (SSL)**, pass
+`install.sh --ssl after-setup`, or pass `install.ps1 -Ssl after-setup` to opt
+into this flow. The installers persist `CREMIND_SSL` in the canonical `.env`,
+and the `cremind` shim loads that file so later restarts keep the selected
+mode. Use `--ssl auto` / `-Ssl auto` only when HTTPS must be active from the
+first boot and certificate trust is already handled. The env var above is for
+this repo's own runs, where no installer has been involved.
 
 1. **Until the wizard completes** (`bootstrap.toml` does not exist yet) the
    server serves plain HTTP. The CA and server certificate are generated at
@@ -271,14 +272,17 @@ involved and there is no first-run interstitial to avoid.
 
 ### What this does not cover
 
-ACME/Let's Encrypt automation, certificate hot-reload (restart to rotate),
-mTLS, and an HTTP→HTTPS redirect listener are all out of scope — put a proxy in
-front if you need them. TLS is also ignored in two cases, with a warning:
-`CREMIND_UI_PORT=0` (an external proxy owns the origin) and the Electron
-desktop app (it loads the UI over `http://127.0.0.1:1515`). On Kubernetes, put
-TLS on the Ingress when you have a domain; without one, the chart's
-`cremind.ssl=auto` / `cremind.ssl=after-setup` run this same in-pod TLS and its
-post-install notes cover trusting the CA.
+ACME/Let's Encrypt automation, certificate hot-reload (restart to rotate), and
+mTLS remain out of scope; put a proxy in front if you need them. After HTTPS
+activation, a same-port dispatcher relays TLS to Hypercorn while serving a
+limited plaintext recovery page for old HTTP bookmarks and session handoffs.
+Plaintext application API requests are rejected. With `CREMIND_UI_PORT=0`, an
+external proxy owns the origin and TLS. The Electron app supports HTTPS: its
+main process loads the canonical environment, validates the expected local
+certificate, restarts the backend, and moves Cremind windows to the verified
+HTTPS origin. On Kubernetes, put TLS on the Ingress when you have a domain;
+without one, the chart's `cremind.ssl=auto` / `cremind.ssl=after-setup` modes
+run this same in-pod TLS mode, and its post-install notes cover trusting the CA.
 
 `after-setup`'s final restart is also not something Cremind can always perform
 itself. Docker Compose restarts the container and kubelet restarts the pod, so

@@ -276,15 +276,15 @@ def test_the_ca_fingerprint_is_published_once_generated(monkeypatch, tmp_path) -
     assert fingerprint == fingerprint.upper()
 
 
-def test_electron_is_never_pending(monkeypatch, tmp_path) -> None:
-    """The server refuses TLS under Electron, so the wizard must not pivot."""
+def test_electron_can_prepare_https(monkeypatch, tmp_path) -> None:
+    """Desktop windows now support the same HTTPS transition."""
     _tls_env(monkeypatch, tmp_path, "after-setup", serving=False)
     monkeypatch.setenv("CREMIND_ELECTRON_PARENT", "1")
 
     tls = _capabilities(monkeypatch)["tls"]
 
-    assert tls["pending_https"] is False
-    assert tls["https_url"] is None
+    assert tls["pending_https"] is True
+    assert tls["https_url"] == "https://localhost:1515"
 
 
 def test_plain_http_reports_nothing_pending(monkeypatch, tmp_path) -> None:

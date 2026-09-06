@@ -14,8 +14,8 @@
     .\install.ps1 -Deployment server -Host 100.120.175.90
 
 .EXAMPLE
-    # Plain HTTP, opting out of the HTTPS default:
-    .\install.ps1 -Ssl none
+    # Enable HTTPS after trusting the certificate during setup:
+    .\install.ps1 -Ssl after-setup
 
 .PARAMETER Deployment
     'local', 'server', or 'custom'. Skips the deployment-type prompt.
@@ -43,23 +43,22 @@
 .PARAMETER Ssl
     TLS on the public origin (port 1515). One of:
 
-      after-setup  (default) Plain HTTP while the Setup Wizard runs, then a
+      after-setup  Plain HTTP while the Setup Wizard runs, then a
                    restart into HTTPS. The wizard hands you the local CA and
                    walks you through trusting it BEFORE any https page exists,
                    so the first https load never warns.
       auto         HTTPS from the first boot, with the same generated CA.
                    Browsers warn until it is trusted — the Setup Wizard is
                    already behind the certificate.
-      none         Plain HTTP. Opt out of TLS entirely.
+      none         (default) Plain HTTP. Enable HTTPS later in Settings > Security.
 
-    A re-install keeps the previous choice unless you pass this flag; an
-    already-set $env:CREMIND_SSL is honoured when the flag is absent.
+    A re-install keeps the previous choice unless you pass this flag. An
+    already-set $env:CREMIND_SSL or certificate pair is an explicit override
+    and is persisted when the flag is absent.
 
-    Custom/container deployments do not take the after-setup default — their
-    URLs are yours, so they stay on plain HTTP unless you pass this flag,
-    which still applies to them. Electron-driven installs ignore it outright:
-    the desktop app loads the UI over http://127.0.0.1, where the server does
-    not serve TLS at all.
+    Interactive installs offer Enable HTTPS (SSL), which selects after-setup.
+    Unattended installs use HTTP unless TLS is explicitly configured.
+    Electron-driven installs support the same HTTPS modes.
 
 .PARAMETER Desktop
     (Docker mode) Include the VNC Desktop UI — pulls cremind/cremind-desktop
@@ -161,7 +160,7 @@ param(
     [string] $WizardPreset = '',
     [ValidateSet('','docker','native')] [string] $Mode = '',
     # TLS on the public origin. '' = not specified (fresh installs default to
-    # 'after-setup'; a re-install carries the previous choice forward). See
+    # plain HTTP; a re-install carries the previous choice forward). See
     # the ── ssl mode ── section below for the full precedence chain.
     [ValidateSet('','none','auto','after-setup')] [string] $Ssl = '',
     # Docker mode only: include the VNC Desktop UI? -Desktop pulls
@@ -1127,6 +1126,11 @@ function Invoke-InstallerTuiBootstrap {
     if ($Channel)         { $tuiArgs.Add('--channel');          $tuiArgs.Add($Channel) }
     if ($Deployment)      { $tuiArgs.Add('--deployment');       $tuiArgs.Add($Deployment) }
     if ($Mode)            { $tuiArgs.Add('--mode');             $tuiArgs.Add($Mode) }
+    if ($Ssl)             { $tuiArgs.Add('--ssl');              $tuiArgs.Add($Ssl) }
+    $tuiArgs.Add('--ssl-inherited')
+    $tuiArgs.Add($(if ($env:CREMIND_SSL -or $env:CREMIND_SSL_CERTFILE -or $env:CREMIND_SSL_KEYFILE) { '1' } else { '0' }))
+    $tuiArgs.Add('--native-env'); $tuiArgs.Add($EnvFile)
+    $tuiArgs.Add('--docker-env'); $tuiArgs.Add((Join-Path (Join-Path $CremindInstallDir 'docker') '.env'))
     if ($DesktopUi)       { $tuiArgs.Add('--desktop');          $tuiArgs.Add($DesktopUi) }
     if ($VncPassword)     { $tuiArgs.Add('--vnc-password');     $tuiArgs.Add($VncPassword) }
     # Always sent (never empty): tells the TUI whether an empty password
@@ -1183,6 +1187,7 @@ function Invoke-InstallerTuiBootstrap {
                     'DEPLOYMENT'           { if (-not $Deployment)     { Set-Variable -Scope Script Deployment $v } }
                     'APP_HOST'             { if (-not $AppHost)        { Set-Variable -Scope Script AppHost $v } }
                     'MODE'                 { if (-not $Mode)           { Set-Variable -Scope Script Mode $v } }
+                    'SSL_CHOICE'           { if (-not $Ssl -and $v -in @('none', 'auto', 'after-setup')) { Set-Variable -Scope Script Ssl $v } }
                     'DESKTOP_UI'           { if (-not $DesktopUi)      { Set-Variable -Scope Script DesktopUi $v } }
                     'VNC_PASSWORD_INPUT'   { if (-not $VncPassword)    { Set-Variable -Scope Script VncPassword $v } }
                     'CUSTOM_listen_host'   { if (-not $ListenHost)     { Set-Variable -Scope Script ListenHost $v } }
@@ -1474,10 +1479,38 @@ if ($Mode -eq 'docker' -and $DesktopUi -ne '0' -and -not $VncPassword -and -not 
 # with TLS on — it binds loopback only, for the CLI and the skills. This
 # helper is about the PUBLIC origin, so don't reach for it there.
 #
-# ANY non-empty CREMIND_SSL reads as https here, ``after-setup`` included:
-# this answers "what is the public origin", which for after-setup is https
-# once the wizard has run — the steady state every written file must carry.
-# For "what is it serving this minute" use Get-CremindBootScheme below.
+# Only a mode the server recognises as enabled reads as HTTPS here.
+# ``true``/``1``/``yes`` are compatibility aliases for ``auto``;
+# ``false``/``0``/``no``/``none`` mean HTTP. Keep this aligned with
+# app.config.tls_mode.effective_ssl_mode.
+function Normalize-CremindSslMode {
+    param([AllowEmptyString()][string] $Mode = '')
+    $value = "$Mode".Trim().ToLowerInvariant()
+    if ($value -in @('true', '1', 'yes')) { return 'auto' }
+    if ($value -in @('false', '0', 'no', 'none')) { return '' }
+    return $value
+}
+
+function Test-CremindSslModeEnabled {
+    param([AllowEmptyString()][string] $Mode = '')
+    return (Normalize-CremindSslMode $Mode) -in @('auto', 'after-setup')
+}
+
+function Get-CremindEnvValue {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Key
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return '' }
+    $pattern = '^\s*(?:export\s+)?' + [regex]::Escape($Key) + '\s*=(.*)$'
+    foreach ($line in (Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+        $text = "$line"
+        if ($text.TrimStart().StartsWith('#')) { continue }
+        if ($text -match $pattern) { return $Matches[1].Trim() }
+    }
+    return ''
+}
+
 function Get-CremindScheme {
     param([string] $EnvPath = '')
     $sslMode = $env:CREMIND_SSL
@@ -1494,7 +1527,7 @@ function Get-CremindScheme {
             }
         }
     }
-    if ($sslMode -or $sslCert) { return 'https' }
+    if ((Test-CremindSslModeEnabled $sslMode) -or $sslCert) { return 'https' }
     return 'http'
 }
 
@@ -1542,8 +1575,9 @@ function Get-CremindBootScheme {
             }
         }
     }
+    $sslMode = Normalize-CremindSslMode $sslMode
     if ((-not $sslCert) -and $sslMode -eq 'after-setup' -and -not $SetupComplete) { return 'http' }
-    if ($sslMode -or $sslCert) { return 'https' }
+    if ((Test-CremindSslModeEnabled $sslMode) -or $sslCert) { return 'https' }
     return 'http'
 }
 
@@ -1704,56 +1738,49 @@ function Set-CremindEnvSslMode {
 #   1. -Ssl on the command line. ``none`` is a real answer, not "unset": it
 #      clears an inherited CREMIND_SSL so the opt-out can't be undone by a
 #      variable left in the shell.
-#   2. An inherited $env:CREMIND_SSL / CREMIND_SSL_CERTFILE — the pre-flag
+#   2. An inherited $env:CREMIND_SSL / certificate pair — the pre-flag
 #      way of asking, still honoured.
 #   3. The previous install's choice. Docker regenerates its bundle every
 #      run, so the old docker\.env is read before it's overwritten; a native
 #      .env is kept as-is and carries itself. An install that predates this
 #      flag has no CREMIND_SSL line and reads as "http", which is what it
 #      was — upgrades never flip scheme behind the user's back.
-#   4. Default: after-setup. Plain HTTP while the wizard runs, then a restart
-#      into HTTPS with the CA already trusted.
-#
-# Two cases opt out of (4), both because HTTPS can't work or isn't ours to
-# decide — NOT merely because nobody is watching. Electron loads the UI over
-# http://127.0.0.1 and the server ignores TLS there entirely (app/server.py),
-# so the flag is refused rather than silently ignored; and a custom/container
-# install carries operator-supplied URLs that we must not rewrite unasked (an
-# explicit -Ssl still wins there, because then they did ask).
-#
-# -Unattended is deliberately NOT one of them: it means "don't prompt", and
-# nothing about the default needs a prompt. The wizard is opened by a human
-# afterwards in either case, so an unattended install that quietly came up on
-# plain HTTP while the same command without the flag came up on TLS would be a
-# difference nobody could see coming.
+#   4. Fresh installs use HTTP. Interactive installs offer Enable HTTPS,
+#      which selects after-setup; unattended installs require -Ssl to opt in.
+#      The TUI only asks for fresh installs, after the install mode is known.
+#      Electron uses the same choices and precedence as browser installs.
+$PreviousSslEnv = if ($Mode -eq 'docker') {
+    Join-Path (Join-Path $CremindInstallDir 'docker') '.env'
+} else {
+    $EnvFile
+}
+$InheritedSslMode = "$env:CREMIND_SSL"
+$InheritedSslCertFile = "$env:CREMIND_SSL_CERTFILE"
+$InheritedSslKeyFile = "$env:CREMIND_SSL_KEYFILE"
+$InheritedSslKeyFilePassword = "$env:CREMIND_SSL_KEYFILE_PASSWORD"
+$InheritedSslAutoHosts = "$env:CREMIND_SSL_AUTO_HOSTS"
+# Retain whether the process supplied a transport override after the
+# environment is normalized below. Native installs must persist this choice
+# just like the regenerated Docker bundle does.
+$SslEnvironmentExplicit = [bool]($InheritedSslMode -or $InheritedSslCertFile -or $InheritedSslKeyFile)
+$PreviousSslCertFile = Get-CremindEnvValue -Path $PreviousSslEnv -Key 'CREMIND_SSL_CERTFILE'
+$PreviousSslKeyFile = Get-CremindEnvValue -Path $PreviousSslEnv -Key 'CREMIND_SSL_KEYFILE'
+$PreviousSslKeyFilePassword = Get-CremindEnvValue -Path $PreviousSslEnv -Key 'CREMIND_SSL_KEYFILE_PASSWORD'
+$PreviousSslAutoHosts = Get-CremindEnvValue -Path $PreviousSslEnv -Key 'CREMIND_SSL_AUTO_HOSTS'
+
 $SslExplicit = ($Ssl -ne '')
 $SslMode = ''
-if ($env:CREMIND_INSTALLER_FRONTEND -eq 'electron') {
-    if ($SslExplicit -and $Ssl -ne 'none') {
-        Write-Warn2 "-Ssl $Ssl ignored: the desktop app loads the UI over http://127.0.0.1, where the server does not serve TLS."
-    }
-    $SslMode = ''
-    # Clear here rather than leaning on the tail below, which only clears for
-    # an explicit flag: an inherited CREMIND_SSL would otherwise survive and
-    # put https:// into APP_URL for an origin the desktop app never uses.
-    Remove-Item Env:CREMIND_SSL -ErrorAction SilentlyContinue
-    Remove-Item Env:CREMIND_SSL_CERTFILE -ErrorAction SilentlyContinue
-} elseif ($SslExplicit) {
-    if ($Ssl -ne 'none') { $SslMode = $Ssl }
-} elseif ($env:CREMIND_SSL -or $env:CREMIND_SSL_CERTFILE) {
+if ($SslExplicit) {
+    $SslMode = Normalize-CremindSslMode $Ssl
+} elseif ($env:CREMIND_SSL -or $env:CREMIND_SSL_CERTFILE -or $env:CREMIND_SSL_KEYFILE) {
     $SslMode = "$env:CREMIND_SSL"
 } else {
     # $null distinguishes "no previous install to learn from" (fall through
     # to the default) from "previous install said plain HTTP" (keep it).
     $PrevSslMode = $null
-    if ($Mode -eq 'docker') {
-        $PrevSslEnv = Join-Path (Join-Path $CremindInstallDir 'docker') '.env'
-    } else {
-        $PrevSslEnv = $EnvFile
-    }
-    if (Test-Path -LiteralPath $PrevSslEnv) {
+    if (Test-Path -LiteralPath $PreviousSslEnv) {
         $PrevSslMode = ''
-        foreach ($line in (Get-Content -LiteralPath $PrevSslEnv -ErrorAction SilentlyContinue)) {
+        foreach ($line in (Get-Content -LiteralPath $PreviousSslEnv -ErrorAction SilentlyContinue)) {
             $t = "$line".Trim()
             if (-not $t -or $t.StartsWith('#')) { continue }
             if ($t -match '^CREMIND_SSL\s*=(.*)$') {
@@ -1764,35 +1791,67 @@ if ($env:CREMIND_INSTALLER_FRONTEND -eq 'electron') {
     }
     if ($null -ne $PrevSslMode) {
         $SslMode = $PrevSslMode
-    } elseif ($Deployment -eq 'custom') {
-        # ``container`` is already folded into ``custom`` by the alias block
-        # above, so it needs no separate case here.
-        $SslMode = ''
     } else {
-        $SslMode = 'after-setup'
+        $SslMode = ''
+        if (-not $Unattended) {
+            Write-Host ""
+            Write-Host 'HTTP is the default. HTTPS encrypts connections and enables HTTP/2.'
+            Write-Host 'Setup will guide you through trusting the certificate before switching.'
+            Write-Host 'You can also enable HTTPS later in Settings > Security.'
+            $SslAnswer = Read-Host 'Enable HTTPS (SSL)? [y/N]'
+            if ($SslAnswer -match '^(?i:y|yes)$') {
+                $SslMode = 'after-setup'
+                $SslExplicit = $true
+            }
+        }
     }
 }
+$SslMode = Normalize-CremindSslMode $SslMode
+
+# Docker's template is regenerated on every install, so stage all independent
+# TLS inputs before that file is replaced. A process-level transport selector
+# overrides the previous bundle. An explicit -Ssl value also wins the pair.
+if ($SslExplicit) {
+    $ResolvedSslCertFile = ''
+    $ResolvedSslKeyFile = ''
+    $ResolvedSslKeyFilePassword = ''
+} elseif ($InheritedSslMode -or $InheritedSslCertFile -or $InheritedSslKeyFile) {
+    $ResolvedSslCertFile = $InheritedSslCertFile
+    $ResolvedSslKeyFile = $InheritedSslKeyFile
+    $ResolvedSslKeyFilePassword = $InheritedSslKeyFilePassword
+} else {
+    $ResolvedSslCertFile = $PreviousSslCertFile
+    $ResolvedSslKeyFile = $PreviousSslKeyFile
+    $ResolvedSslKeyFilePassword = $PreviousSslKeyFilePassword
+}
+$ResolvedSslAutoHosts = if ($InheritedSslAutoHosts) { $InheritedSslAutoHosts } else { $PreviousSslAutoHosts }
 if ($SslMode) {
     $env:CREMIND_SSL = $SslMode
-} elseif ($SslExplicit) {
+} elseif ($SslExplicit -or $InheritedSslMode) {
     # An explicit ``none`` has to beat the environment, or Get-CremindScheme
     # still answers https from a leftover variable and the opt-out is a lie.
-    if ($env:CREMIND_SSL_CERTFILE) {
+    if ($SslExplicit -and $env:CREMIND_SSL_CERTFILE) {
         Write-Warn2 "-Ssl none: ignoring the inherited CREMIND_SSL_CERTFILE — this install serves plain HTTP."
     }
     Remove-Item Env:CREMIND_SSL -ErrorAction SilentlyContinue
-    Remove-Item Env:CREMIND_SSL_CERTFILE -ErrorAction SilentlyContinue
 }
+Remove-Item Env:CREMIND_SSL_CERTFILE -ErrorAction SilentlyContinue
+Remove-Item Env:CREMIND_SSL_KEYFILE -ErrorAction SilentlyContinue
+Remove-Item Env:CREMIND_SSL_KEYFILE_PASSWORD -ErrorAction SilentlyContinue
+Remove-Item Env:CREMIND_SSL_AUTO_HOSTS -ErrorAction SilentlyContinue
+if ($ResolvedSslCertFile) { $env:CREMIND_SSL_CERTFILE = $ResolvedSslCertFile }
+if ($ResolvedSslKeyFile) { $env:CREMIND_SSL_KEYFILE = $ResolvedSslKeyFile }
+if ($ResolvedSslKeyFilePassword) { $env:CREMIND_SSL_KEYFILE_PASSWORD = $ResolvedSslKeyFilePassword }
+if ($ResolvedSslAutoHosts) { $env:CREMIND_SSL_AUTO_HOSTS = $ResolvedSslAutoHosts }
 
 # ── boot service ──────────────────────────────────────────────────────────
 #
 # Whether to register a logon Scheduled Task that starts ``cremind serve`` and
 # restarts it when it exits. Resolved here, next to the ssl block, because
-# both are settings the .env carries forward and both are ignored under the
-# Electron front-end.
+# both are settings the .env carries forward; Electron manages its own
+# backend lifecycle.
 #
-# Default ON for native installs. That is a bigger default than -Ssl's, and
-# deliberately so: without a supervisor the in-app restart and the after-setup
+# Default ON for native installs: without a supervisor the in-app restart and the after-setup
 # HTTPS switch leave the server down, which reads as a bug rather than as a
 # missing feature.
 #
@@ -2079,10 +2138,23 @@ if ($Mode -eq 'docker') {
     # APP_URL still said https://. Written even when empty, so a re-install can
     # tell "previous install chose plain HTTP" from "no previous install".
     Add-Content -Path $EnvDocker -Value "CREMIND_SSL=$SslMode" -Encoding utf8
+    # Preserve custom-certificate and password inputs across the template
+    # rewrite. A certificate pair enables TLS independently of CREMIND_SSL.
+    if ($ResolvedSslCertFile) {
+        Add-Content -Path $EnvDocker -Value "CREMIND_SSL_CERTFILE=$ResolvedSslCertFile" -Encoding utf8
+    }
+    if ($ResolvedSslKeyFile) {
+        Add-Content -Path $EnvDocker -Value "CREMIND_SSL_KEYFILE=$ResolvedSslKeyFile" -Encoding utf8
+    }
+    if ($ResolvedSslKeyFilePassword) {
+        Add-Content -Path $EnvDocker -Value "CREMIND_SSL_KEYFILE_PASSWORD=$ResolvedSslKeyFilePassword" -Encoding utf8
+    }
     # Generated certificates cover localhost, the container's hostname and its
     # detected IPs — none of which is the name a server deployment is reached
     # by. Mirrors the commented AUTO_HOSTS pairs in server.env.tmpl.
-    if ($SslMode -and $Deployment -eq 'server' -and $AppHost) {
+    if ($ResolvedSslAutoHosts) {
+        Add-Content -Path $EnvDocker -Value "CREMIND_SSL_AUTO_HOSTS=$ResolvedSslAutoHosts" -Encoding utf8
+    } elseif ($SslMode -and $Deployment -eq 'server' -and $AppHost) {
         Add-Content -Path $EnvDocker -Value "CREMIND_SSL_AUTO_HOSTS=$AppHost" -Encoding utf8
     }
 
@@ -2864,9 +2936,23 @@ if (-not (Test-Path $EnvFile)) {
     # nothing, leaving a fresh .env exactly as the template shipped it.
     if ($SslMode) {
         Add-Content -Path $EnvFile -Value "CREMIND_SSL=$SslMode" -Encoding utf8
-        if ($Deployment -eq 'server' -and $AppHost) {
-            Add-Content -Path $EnvFile -Value "CREMIND_SSL_AUTO_HOSTS=$AppHost" -Encoding utf8
-        }
+    }
+    # Environment-supplied custom certificates must survive the installing
+    # process. The canonical .env is what boot services, Electron, and later
+    # shell invocations load after the initial installer exits.
+    if ($ResolvedSslCertFile) {
+        Add-Content -Path $EnvFile -Value "CREMIND_SSL_CERTFILE=$ResolvedSslCertFile" -Encoding utf8
+    }
+    if ($ResolvedSslKeyFile) {
+        Add-Content -Path $EnvFile -Value "CREMIND_SSL_KEYFILE=$ResolvedSslKeyFile" -Encoding utf8
+    }
+    if ($ResolvedSslKeyFilePassword) {
+        Add-Content -Path $EnvFile -Value "CREMIND_SSL_KEYFILE_PASSWORD=$ResolvedSslKeyFilePassword" -Encoding utf8
+    }
+    if ($ResolvedSslAutoHosts) {
+        Add-Content -Path $EnvFile -Value "CREMIND_SSL_AUTO_HOSTS=$ResolvedSslAutoHosts" -Encoding utf8
+    } elseif ($SslMode -and $Deployment -eq 'server' -and $AppHost) {
+        Add-Content -Path $EnvFile -Value "CREMIND_SSL_AUTO_HOSTS=$AppHost" -Encoding utf8
     }
     # Record the boot-service choice so a re-install doesn't silently undo an
     # opt-out. Nothing in the app reads this key — only the block above does.
@@ -2879,28 +2965,24 @@ if (-not (Test-Path $EnvFile)) {
     # make the flag a no-op on every re-install. Only an explicit flag
     # reaches here — the resolution above already carried an unflagged
     # re-install's previous choice forward from this same file.
-    if ($SslExplicit) {
+    if ($SslExplicit -or $SslEnvironmentExplicit) {
         Set-CremindEnvSslMode -Path $EnvFile -Mode $SslMode
-        if ($SslMode -and $Deployment -eq 'server' -and $AppHost) {
+        # A mode-only override clears a previous custom pair because those
+        # paths enable TLS independently. A supplied pair is written back so
+        # the first supervised restart keeps the requested certificate.
+        Set-CremindEnvKey -Path $EnvFile -Key 'CREMIND_SSL_CERTFILE' -Value $ResolvedSslCertFile
+        Set-CremindEnvKey -Path $EnvFile -Key 'CREMIND_SSL_KEYFILE' -Value $ResolvedSslKeyFile
+        Set-CremindEnvKey -Path $EnvFile -Key 'CREMIND_SSL_KEYFILE_PASSWORD' -Value $ResolvedSslKeyFilePassword
+        if ($SslExplicit -and $SslMode -and $Deployment -eq 'server' -and $AppHost) {
             Set-CremindEnvKey -Path $EnvFile -Key 'CREMIND_SSL_AUTO_HOSTS' -Value $AppHost
+        } elseif ($ResolvedSslAutoHosts) {
+            Set-CremindEnvKey -Path $EnvFile -Key 'CREMIND_SSL_AUTO_HOSTS' -Value $ResolvedSslAutoHosts
         }
         Set-CremindEnvUrlScheme -Path $EnvFile -Scheme $UrlScheme
-        if (-not $SslMode) {
-            # ``-Ssl none`` turns off the mode we own, but a certificate PAIR
-            # in the kept file is a separate, equally valid way to ask for TLS
-            # (the server templates document it as option 1), and clearing an
-            # inherited env var upstream did nothing about a line in the file.
-            # Rewriting the URLs to http:// while that pair still binds TLS
-            # would leave the install describing an origin it does not serve —
-            # worse than doing nothing. Leave the URLs alone and say so.
-            $KeptCertLine = Select-String -Path $EnvFile -Pattern '^CREMIND_SSL_CERTFILE\s*=\s*\S' -Quiet
-            if ($KeptCertLine) {
-                Write-Warn2 "-Ssl none: $EnvFile still sets CREMIND_SSL_CERTFILE, which serves TLS on its own. Left APP_URL/CORS on https:// to match — comment that line out if you meant plain HTTP."
-            } else {
-                Set-CremindEnvUrlSchemeDowngrade -Path $EnvFile
-            }
+        if ($UrlScheme -eq 'http') {
+            Set-CremindEnvUrlSchemeDowngrade -Path $EnvFile
         }
-        Write-Warn2 "Updated CREMIND_SSL (and the APP_URL/CORS scheme) in the existing $EnvFile to match -Ssl."
+        Write-Warn2 "Updated TLS settings (and the APP_URL/CORS scheme) in the existing $EnvFile to match the explicit installer environment or -Ssl choice."
     }
     # Unconditional, unlike -Ssl above: the resolution block already read the
     # old value out of this very file, so writing it back is either a no-op or

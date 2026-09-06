@@ -426,6 +426,8 @@ const handleSend = async (text: string) => {
 
         <GroupComposer
           :members="members"
+          :profile="settingsStore.profileId"
+          :group-id="props.groupId!"
           :disabled="!canPost"
           :sending="store.sending"
           disabled-hint="Only the admin and this group's member profiles can post here."

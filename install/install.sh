@@ -36,19 +36,16 @@
 #   --allowed-origins LIST      (custom deployment) Override CORS_ALLOWED_ORIGINS.
 #   --wizard-preset ID          (custom deployment) Override SETUP_WIZARD_ENV.
 #   --ssl none|auto|after-setup TLS on the public origin (port 1515).
-#                               ``after-setup`` (the default) serves plain
-#                               HTTP while the Setup Wizard runs, hands you
-#                               the local CA to trust, then restarts into
-#                               HTTPS — so the first https page never warns.
-#                               ``auto`` is HTTPS from the first boot (the
-#                               wizard itself is already behind the untrusted
-#                               certificate). ``none`` opts out of TLS.
-#                               A re-install keeps the previous choice unless
-#                               you pass this flag. custom/container
-#                               deployments do not take the after-setup
-#                               default — their URLs are yours, so they stay
-#                               on plain HTTP unless you pass this flag,
-#                               which still applies to them.
+#                               Default: ``none`` (HTTP). Select Enable HTTPS
+#                               during installation or pass ``after-setup``
+#                               to trust the local CA in the Setup Wizard,
+#                               then restart into HTTPS. ``auto`` serves
+#                               HTTPS from the first boot; trust its CA before
+#                               opening the wizard. A re-install keeps the
+#                               previous choice unless you pass this flag.
+#                               Inherited CREMIND_SSL or certificate settings
+#                               are explicit overrides and are persisted.
+#                               Also supported by Electron-driven installs.
 #   --boot-service              Register a login/boot service (systemd user
 #   --no-boot-service           unit on Linux, LaunchAgent on macOS) that
 #                               starts ``cremind serve`` and restarts it if it
@@ -179,13 +176,14 @@ PREV_VNC_PASSWORD=""
 VNC_PASSWORD_RE='^[A-Za-z0-9@%_+=:,.-]{6,8}$'
 # TLS on the public origin, from --ssl. SSL_MODE holds the flag's raw value
 # until the ── ssl mode ── block resolves it (fresh installs default to
-# ``after-setup``); SSL_EXPLICIT records whether the operator actually asked,
+# plain HTTP); SSL_EXPLICIT records whether the operator actually asked,
 # which is what separates "plain HTTP by choice" from "not specified".
 # Deliberately NOT named like any key app/installer/output.py emits — the TUI
 # read-back sources its output file, and a collision would silently clobber
 # a flag the operator passed on the command line.
 SSL_MODE=""
 SSL_EXPLICIT=0
+SSL_CHOICE=""
 # Boot service, from --boot-service / --no-boot-service. Same shape as the
 # SSL pair above, and named to avoid the same TUI-output collision.
 # BOOT_SERVICE holds the raw request until the ── boot service ── block
@@ -1043,6 +1041,8 @@ tui_run_bootstrap() {
     local vnc_pw_preset=0
     [ -n "$PREV_VNC_PASSWORD" ] && vnc_pw_preset=1
 
+    local ssl_inherited=0
+    if [ -n "${CREMIND_SSL:-}" ] || [ -n "${CREMIND_SSL_CERTFILE:-}" ] || [ -n "${CREMIND_SSL_KEYFILE:-}" ]; then ssl_inherited=1; fi
     local tui_out
     tui_out="$(mktemp 2>/dev/null || echo "$CREMIND_INSTALL_DIR/.tui-out")"
     # shellcheck disable=SC2064
@@ -1057,6 +1057,10 @@ tui_run_bootstrap() {
             --channel "$CHANNEL" \
             --deployment "$DEPLOYMENT" \
             --mode "$MODE" \
+            --ssl "$SSL_MODE" \
+            --ssl-inherited "$ssl_inherited" \
+            --native-env "$ENV_FILE" \
+            --docker-env "$CREMIND_INSTALL_DIR/docker/.env" \
             --desktop "$DESKTOP_UI" \
             --vnc-password "$VNC_PASSWORD_INPUT" \
             --vnc-password-set "$vnc_pw_preset" \
@@ -1079,6 +1083,10 @@ tui_run_bootstrap() {
             --channel "$CHANNEL" \
             --deployment "$DEPLOYMENT" \
             --mode "$MODE" \
+            --ssl "$SSL_MODE" \
+            --ssl-inherited "$ssl_inherited" \
+            --native-env "$ENV_FILE" \
+            --docker-env "$CREMIND_INSTALL_DIR/docker/.env" \
             --desktop "$DESKTOP_UI" \
             --vnc-password "$VNC_PASSWORD_INPUT" \
             --vnc-password-set "$vnc_pw_preset" \
@@ -1416,10 +1424,43 @@ fi
 # with TLS on — it binds loopback only, for the CLI and the skills. This
 # helper is about the PUBLIC origin, so don't reach for it there.
 #
-# ANY non-empty CREMIND_SSL reads as https here, ``after-setup`` included:
-# this answers "what is the public origin", which for after-setup is https
-# once the wizard has run — the steady state every written file must carry.
-# For "what is it serving this minute" use cremind_boot_scheme below.
+# Only a mode the server recognises as enabled reads as HTTPS here.
+# ``true``/``1``/``yes`` are compatibility aliases for ``auto``;
+# ``false``/``0``/``no``/``none`` mean HTTP. This must mirror
+# app.config.tls_mode.effective_ssl_mode or the installer can print/write an
+# HTTPS URL for a server that deliberately binds plain HTTP.
+normalize_cremind_ssl_mode() {
+    local value
+    # BaseConfig strips surrounding whitespace before interpreting the mode.
+    # Do the same here so an inherited value such as ``CREMIND_SSL=' false '``
+    # cannot make the installer and the server disagree about the listener.
+    value="$(printf '%s' "${1:-}" \
+        | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+        | tr '[:upper:]' '[:lower:]')"
+    case "$value" in
+        true|1|yes) printf 'auto' ;;
+        false|0|no|none|"") printf '' ;;
+        *) printf '%s' "$value" ;;
+    esac
+}
+
+cremind_ssl_mode_enabled() {
+    case "$(normalize_cremind_ssl_mode "${1:-}")" in
+        auto|after-setup) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Read one uncommented dotenv assignment. The TLS keys passed here are fixed
+# installer constants, so interpolating the key into the anchored expression
+# cannot turn user input into a pattern.
+read_cremind_env_value() {
+    local env_file="$1" key="$2"
+    [ -f "$env_file" ] || return 0
+    grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$env_file" 2>/dev/null \
+        | head -1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true
+}
+
 cremind_scheme() {
     local env_file="${1:-}" ssl_mode ssl_cert
     ssl_mode="${CREMIND_SSL:-}"
@@ -1434,7 +1475,7 @@ cremind_scheme() {
                 | head -1 | cut -d= -f2- | tr -d '[:space:]' || true)"
         fi
     fi
-    if [ -n "$ssl_mode" ] || [ -n "$ssl_cert" ]; then
+    if cremind_ssl_mode_enabled "$ssl_mode" || [ -n "$ssl_cert" ]; then
         printf 'https'
     else
         printf 'http'
@@ -1480,9 +1521,10 @@ cremind_boot_scheme() {
                 | head -1 | cut -d= -f2- | tr -d '[:space:]' || true)"
         fi
     fi
+    ssl_mode="$(normalize_cremind_ssl_mode "$ssl_mode")"
     if [ -z "$ssl_cert" ] && [ "$ssl_mode" = "after-setup" ] && [ "$setup_complete" != "1" ]; then
         printf 'http'
-    elif [ -n "$ssl_mode" ] || [ -n "$ssl_cert" ]; then
+    elif cremind_ssl_mode_enabled "$ssl_mode" || [ -n "$ssl_cert" ]; then
         printf 'https'
     else
         printf 'http'
@@ -1514,85 +1556,118 @@ cremind_health_ok() {
 #   1. --ssl on the command line. ``none`` is a real answer, not "unset": it
 #      clears an inherited CREMIND_SSL so the opt-out can't be undone by a
 #      variable left in the shell.
-#   2. An inherited CREMIND_SSL / CREMIND_SSL_CERTFILE — the pre-flag way of
+#   2. An inherited CREMIND_SSL / certificate pair — the pre-flag way of
 #      asking, still honoured.
 #   3. The previous install's choice. Docker regenerates its bundle every
 #      run, so the old docker/.env is read before it's overwritten; a native
 #      .env is kept as-is and carries itself. An install that predates this
 #      flag has no CREMIND_SSL line and reads as "http", which is what it
 #      was — upgrades never flip scheme behind the user's back.
-#   4. Default: after-setup. Plain HTTP while the wizard runs, then a restart
-#      into HTTPS with the CA already trusted.
-#
-# Two cases opt out of (4), both because HTTPS can't work or isn't ours to
-# decide — NOT merely because nobody is watching. The Cremind desktop app runs
-# this script on macOS/Linux (ui/electron/main.ts) and loads the UI over
-# http://127.0.0.1, where the server ignores TLS entirely (app/server.py), so
-# the flag is refused rather than silently ignored; and a custom install
-# carries operator-supplied URLs that we must not rewrite unasked
-# (``container`` is already folded into ``custom`` by the alias block above).
-# An explicit --ssl still wins for custom, because then they did ask.
-#
-# --unattended is deliberately NOT one of them: it means "don't prompt", and
-# nothing about the default needs a prompt. The wizard is opened by a human
-# afterwards in either case, so an unattended install that quietly came up on
-# plain HTTP while the same command without the flag came up on TLS would be a
-# difference nobody could see coming. (The desktop app happens to pass
-# --unattended, but it is the Electron arm above that exempts it, on purpose:
-# the reason is "TLS cannot work here", not "nobody is watching".)
-if [ "${CREMIND_INSTALLER_FRONTEND:-}" = "electron" ]; then
-    if [ "$SSL_EXPLICIT" = "1" ] && [ "$SSL_MODE" != "none" ]; then
-        warn "--ssl $SSL_MODE ignored: the desktop app loads the UI over http://127.0.0.1, where the server does not serve TLS."
-    fi
-    SSL_MODE=""
-    unset CREMIND_SSL CREMIND_SSL_CERTFILE
-elif [ "$SSL_EXPLICIT" = "1" ]; then
-    if [ "$SSL_MODE" = "none" ]; then SSL_MODE=""; fi
-elif [ -n "${CREMIND_SSL:-}" ] || [ -n "${CREMIND_SSL_CERTFILE:-}" ]; then
+#   4. Fresh installs use HTTP. Interactive installs offer Enable HTTPS,
+#      which selects after-setup; unattended installs require --ssl to opt in.
+#      The TUI only asks for fresh installs, after the install mode is known.
+#      Electron uses the same choices and precedence as browser installs.
+if [ "$MODE" = "docker" ]; then
+    PREVIOUS_SSL_ENV="$CREMIND_INSTALL_DIR/docker/.env"
+else
+    PREVIOUS_SSL_ENV="$ENV_FILE"
+fi
+INHERITED_SSL_MODE="${CREMIND_SSL:-}"
+INHERITED_SSL_CERTFILE="${CREMIND_SSL_CERTFILE:-}"
+INHERITED_SSL_KEYFILE="${CREMIND_SSL_KEYFILE:-}"
+INHERITED_SSL_KEYFILE_PASSWORD="${CREMIND_SSL_KEYFILE_PASSWORD:-}"
+INHERITED_SSL_AUTO_HOSTS="${CREMIND_SSL_AUTO_HOSTS:-}"
+# A non-empty process transport setting is the environment form of an
+# explicit installer choice. Keep that fact after the values below are
+# normalized/unset so native installs can persist the override just like the
+# regenerated Docker bundle does.
+SSL_ENVIRONMENT_EXPLICIT=0
+if [ -n "$INHERITED_SSL_MODE" ] || [ -n "$INHERITED_SSL_CERTFILE" ] || [ -n "$INHERITED_SSL_KEYFILE" ]; then
+    SSL_ENVIRONMENT_EXPLICIT=1
+fi
+PREVIOUS_SSL_CERTFILE="$(read_cremind_env_value "$PREVIOUS_SSL_ENV" CREMIND_SSL_CERTFILE)"
+PREVIOUS_SSL_KEYFILE="$(read_cremind_env_value "$PREVIOUS_SSL_ENV" CREMIND_SSL_KEYFILE)"
+PREVIOUS_SSL_KEYFILE_PASSWORD="$(read_cremind_env_value "$PREVIOUS_SSL_ENV" CREMIND_SSL_KEYFILE_PASSWORD)"
+PREVIOUS_SSL_AUTO_HOSTS="$(read_cremind_env_value "$PREVIOUS_SSL_ENV" CREMIND_SSL_AUTO_HOSTS)"
+
+if [ "$SSL_EXPLICIT" = "0" ] && [ -n "$SSL_CHOICE" ] && [ "$SSL_CHOICE" != "keep" ]; then
+    SSL_MODE="$SSL_CHOICE"
+    SSL_EXPLICIT=1
+fi
+if [ "$SSL_EXPLICIT" = "1" ]; then
+    SSL_MODE="$(normalize_cremind_ssl_mode "$SSL_MODE")"
+elif [ -n "${CREMIND_SSL:-}" ] || [ -n "${CREMIND_SSL_CERTFILE:-}" ] || [ -n "${CREMIND_SSL_KEYFILE:-}" ]; then
     SSL_MODE="${CREMIND_SSL:-}"
 else
     # prev_ssl unset = no previous install to learn from (fall through to the
     # default); set-but-empty = a previous install that chose plain HTTP.
     unset prev_ssl
-    if [ "$MODE" = "docker" ]; then
-        prev_env="$CREMIND_INSTALL_DIR/docker/.env"
-    else
-        prev_env="$ENV_FILE"
-    fi
-    if [ -f "$prev_env" ]; then
+    if [ -f "$PREVIOUS_SSL_ENV" ]; then
         # ``|| true``: no match makes grep exit 1, which under
         # ``set -o pipefail`` would take the whole install down.
-        prev_ssl="$(grep -E '^[[:space:]]*CREMIND_SSL[[:space:]]*=' "$prev_env" 2>/dev/null \
-            | head -1 | cut -d= -f2- | tr -d '[:space:]' || true)"
+        prev_ssl="$(read_cremind_env_value "$PREVIOUS_SSL_ENV" CREMIND_SSL)"
     fi
     if [ -n "${prev_ssl+x}" ]; then
         SSL_MODE="$prev_ssl"
-    elif [ "$DEPLOYMENT" = "custom" ]; then
-        SSL_MODE=""
     else
-        SSL_MODE="after-setup"
+        SSL_MODE=""
+        if [ "$UNATTENDED" -eq 0 ] && [ -e /dev/tty ]; then
+            printf '\nHTTP is the default. HTTPS encrypts connections and enables HTTP/2.\n'
+            printf 'Setup will guide you through trusting the certificate before switching.\n'
+            printf 'You can also enable HTTPS later in Settings > Security.\n'
+            ssl_answer=""
+            read -r -p "Enable HTTPS (SSL)? [y/N]: " ssl_answer </dev/tty || ssl_answer=""
+            case "$ssl_answer" in
+                y|Y|yes|YES) SSL_MODE="after-setup"; SSL_EXPLICIT=1 ;;
+            esac
+        fi
     fi
 fi
+SSL_MODE="$(normalize_cremind_ssl_mode "$SSL_MODE")"
+
+# Docker's template is regenerated on every install, so stage all independent
+# TLS inputs before that file is replaced. A non-empty process value wins the
+# previous file. Only an explicit HTTP flag clears a prior certificate pair.
+if [ "$SSL_EXPLICIT" = "1" ]; then
+    RESOLVED_SSL_CERTFILE=""
+    RESOLVED_SSL_KEYFILE=""
+    RESOLVED_SSL_KEYFILE_PASSWORD=""
+elif [ -n "$INHERITED_SSL_MODE" ] || [ -n "$INHERITED_SSL_CERTFILE" ] || [ -n "$INHERITED_SSL_KEYFILE" ]; then
+    # A process-level transport selector is an explicit override of the old
+    # Docker bundle, including the absence of a previous custom pair.
+    RESOLVED_SSL_CERTFILE="$INHERITED_SSL_CERTFILE"
+    RESOLVED_SSL_KEYFILE="$INHERITED_SSL_KEYFILE"
+    RESOLVED_SSL_KEYFILE_PASSWORD="$INHERITED_SSL_KEYFILE_PASSWORD"
+else
+    RESOLVED_SSL_CERTFILE="$PREVIOUS_SSL_CERTFILE"
+    RESOLVED_SSL_KEYFILE="$PREVIOUS_SSL_KEYFILE"
+    RESOLVED_SSL_KEYFILE_PASSWORD="$PREVIOUS_SSL_KEYFILE_PASSWORD"
+fi
+RESOLVED_SSL_AUTO_HOSTS="${INHERITED_SSL_AUTO_HOSTS:-$PREVIOUS_SSL_AUTO_HOSTS}"
 if [ -n "$SSL_MODE" ]; then
     export CREMIND_SSL="$SSL_MODE"
-elif [ "$SSL_EXPLICIT" = "1" ]; then
+elif [ "$SSL_EXPLICIT" = "1" ] || [ -n "$INHERITED_SSL_MODE" ]; then
     # An explicit ``none`` has to beat the environment, or cremind_scheme
     # still answers https from a leftover variable and the opt-out is a lie.
-    if [ -n "${CREMIND_SSL_CERTFILE:-}" ]; then
+    if [ "$SSL_EXPLICIT" = "1" ] && [ -n "${CREMIND_SSL_CERTFILE:-}" ]; then
         warn "--ssl none: ignoring the inherited CREMIND_SSL_CERTFILE — this install serves plain HTTP."
     fi
-    unset CREMIND_SSL CREMIND_SSL_CERTFILE
+    unset CREMIND_SSL
 fi
+unset CREMIND_SSL_CERTFILE CREMIND_SSL_KEYFILE CREMIND_SSL_KEYFILE_PASSWORD CREMIND_SSL_AUTO_HOSTS
+if [ -n "$RESOLVED_SSL_CERTFILE" ]; then export CREMIND_SSL_CERTFILE="$RESOLVED_SSL_CERTFILE"; fi
+if [ -n "$RESOLVED_SSL_KEYFILE" ]; then export CREMIND_SSL_KEYFILE="$RESOLVED_SSL_KEYFILE"; fi
+if [ -n "$RESOLVED_SSL_KEYFILE_PASSWORD" ]; then export CREMIND_SSL_KEYFILE_PASSWORD="$RESOLVED_SSL_KEYFILE_PASSWORD"; fi
+if [ -n "$RESOLVED_SSL_AUTO_HOSTS" ]; then export CREMIND_SSL_AUTO_HOSTS="$RESOLVED_SSL_AUTO_HOSTS"; fi
 
 # ── boot service ─────────────────────────────────────────────────────────
 #
 # Whether to register a login/boot service (systemd user unit / LaunchAgent)
 # that starts ``cremind serve`` and restarts it when it exits. Resolved here,
 # next to the ssl block, because both are settings the .env carries forward
-# and both are ignored under the Electron front-end.
+# while Electron manages its own backend lifecycle.
 #
-# Default ON for native installs. That is a bigger default than --ssl's, and
-# deliberately so: without a supervisor the in-app restart and the after-setup
+# Default ON for native installs: without a supervisor the in-app restart and the after-setup
 # HTTPS switch leave the server down, which reads as a bug rather than as a
 # missing feature.
 #
@@ -1925,10 +2000,24 @@ EOF
     # when empty, so a re-install can tell "previous install chose plain HTTP"
     # from "no previous install".
     printf 'CREMIND_SSL=%s\n' "$SSL_MODE" >>"$DOCKER_DIR/.env"
+    # Preserve a prior custom-certificate installation (or explicit process
+    # overrides) across the template rewrite. These inputs independently
+    # enable TLS even when CREMIND_SSL itself is empty.
+    if [ -n "$RESOLVED_SSL_CERTFILE" ]; then
+        printf 'CREMIND_SSL_CERTFILE=%s\n' "$RESOLVED_SSL_CERTFILE" >>"$DOCKER_DIR/.env"
+    fi
+    if [ -n "$RESOLVED_SSL_KEYFILE" ]; then
+        printf 'CREMIND_SSL_KEYFILE=%s\n' "$RESOLVED_SSL_KEYFILE" >>"$DOCKER_DIR/.env"
+    fi
+    if [ -n "$RESOLVED_SSL_KEYFILE_PASSWORD" ]; then
+        printf 'CREMIND_SSL_KEYFILE_PASSWORD=%s\n' "$RESOLVED_SSL_KEYFILE_PASSWORD" >>"$DOCKER_DIR/.env"
+    fi
     # Generated certificates cover localhost, the container's hostname and
     # its detected IPs — none of which is the name a server deployment is
     # reached by. Mirrors the commented AUTO_HOSTS pairs in server.env.tmpl.
-    if [ -n "$SSL_MODE" ] && [ "$DEPLOYMENT" = "server" ] && [ -n "$APP_HOST" ]; then
+    if [ -n "$RESOLVED_SSL_AUTO_HOSTS" ]; then
+        printf 'CREMIND_SSL_AUTO_HOSTS=%s\n' "$RESOLVED_SSL_AUTO_HOSTS" >>"$DOCKER_DIR/.env"
+    elif [ -n "$SSL_MODE" ] && [ "$DEPLOYMENT" = "server" ] && [ -n "$APP_HOST" ]; then
         printf 'CREMIND_SSL_AUTO_HOSTS=%s\n' "$APP_HOST" >>"$DOCKER_DIR/.env"
     fi
     chmod 600 "$DOCKER_DIR/.env"
@@ -2779,9 +2868,23 @@ if [ ! -f "$ENV_FILE" ]; then
     # nothing, leaving a fresh .env exactly as the template shipped it.
     if [ -n "$SSL_MODE" ]; then
         printf 'CREMIND_SSL=%s\n' "$SSL_MODE" >> "$ENV_FILE"
-        if [ "$DEPLOYMENT" = "server" ] && [ -n "$APP_HOST" ]; then
-            printf 'CREMIND_SSL_AUTO_HOSTS=%s\n' "$APP_HOST" >> "$ENV_FILE"
-        fi
+    fi
+    # Environment-supplied custom certificates are first-class installer
+    # overrides too. Persist them in the canonical native .env so a boot
+    # service, Electron restart, or later shell does not fall back to HTTP.
+    if [ -n "$RESOLVED_SSL_CERTFILE" ]; then
+        printf 'CREMIND_SSL_CERTFILE=%s\n' "$RESOLVED_SSL_CERTFILE" >> "$ENV_FILE"
+    fi
+    if [ -n "$RESOLVED_SSL_KEYFILE" ]; then
+        printf 'CREMIND_SSL_KEYFILE=%s\n' "$RESOLVED_SSL_KEYFILE" >> "$ENV_FILE"
+    fi
+    if [ -n "$RESOLVED_SSL_KEYFILE_PASSWORD" ]; then
+        printf 'CREMIND_SSL_KEYFILE_PASSWORD=%s\n' "$RESOLVED_SSL_KEYFILE_PASSWORD" >> "$ENV_FILE"
+    fi
+    if [ -n "$RESOLVED_SSL_AUTO_HOSTS" ]; then
+        printf 'CREMIND_SSL_AUTO_HOSTS=%s\n' "$RESOLVED_SSL_AUTO_HOSTS" >> "$ENV_FILE"
+    elif [ -n "$SSL_MODE" ] && [ "$DEPLOYMENT" = "server" ] && [ -n "$APP_HOST" ]; then
+        printf 'CREMIND_SSL_AUTO_HOSTS=%s\n' "$APP_HOST" >> "$ENV_FILE"
     fi
     # Record the boot-service choice so a re-install doesn't silently undo an
     # opt-out. Nothing in the app reads this key — only the block above does.
@@ -2794,27 +2897,25 @@ else
     # make the flag a no-op on every re-install. Only an explicit flag
     # reaches here — the resolution above already carried an unflagged
     # re-install's previous choice forward from this same file.
-    if [ "$SSL_EXPLICIT" = "1" ]; then
+    if [ "$SSL_EXPLICIT" = "1" ] || [ "$SSL_ENVIRONMENT_EXPLICIT" = "1" ]; then
         upsert_env_key "$ENV_FILE" CREMIND_SSL "$SSL_MODE"
-        if [ -n "$SSL_MODE" ] && [ "$DEPLOYMENT" = "server" ] && [ -n "$APP_HOST" ]; then
+        # A mode-only override must clear a previous custom pair; otherwise
+        # the certificate paths independently keep TLS enabled and defeat an
+        # explicit false/none value. Conversely, a supplied pair must survive
+        # the installing process and its first supervised restart.
+        upsert_env_key "$ENV_FILE" CREMIND_SSL_CERTFILE "$RESOLVED_SSL_CERTFILE"
+        upsert_env_key "$ENV_FILE" CREMIND_SSL_KEYFILE "$RESOLVED_SSL_KEYFILE"
+        upsert_env_key "$ENV_FILE" CREMIND_SSL_KEYFILE_PASSWORD "$RESOLVED_SSL_KEYFILE_PASSWORD"
+        if [ "$SSL_EXPLICIT" = "1" ] && [ -n "$SSL_MODE" ] && [ "$DEPLOYMENT" = "server" ] && [ -n "$APP_HOST" ]; then
             upsert_env_key "$ENV_FILE" CREMIND_SSL_AUTO_HOSTS "$APP_HOST"
+        elif [ -n "$RESOLVED_SSL_AUTO_HOSTS" ]; then
+            upsert_env_key "$ENV_FILE" CREMIND_SSL_AUTO_HOSTS "$RESOLVED_SSL_AUTO_HOSTS"
         fi
         apply_url_scheme_to_env "$ENV_FILE"
-        if [ -z "$SSL_MODE" ]; then
-            # ``--ssl none`` turns off the mode we own, but a certificate PAIR
-            # in the kept file is a separate, equally valid way to ask for TLS
-            # (the server templates document it as option 1), and clearing an
-            # inherited env var upstream did nothing about a line in the file.
-            # Rewriting the URLs to http:// while that pair still binds TLS
-            # would leave the install describing an origin it does not serve —
-            # worse than doing nothing. Leave the URLs alone and say so.
-            if grep -qE '^CREMIND_SSL_CERTFILE[[:space:]]*=[[:space:]]*[^[:space:]]' "$ENV_FILE" 2>/dev/null; then
-                warn "--ssl none: $ENV_FILE still sets CREMIND_SSL_CERTFILE, which serves TLS on its own. Left APP_URL/CORS on https:// to match — comment that line out if you meant plain HTTP."
-            else
-                downgrade_url_scheme_in_env "$ENV_FILE"
-            fi
+        if [ "$URL_SCHEME" = "http" ]; then
+            downgrade_url_scheme_in_env "$ENV_FILE"
         fi
-        warn "Updated CREMIND_SSL (and the APP_URL/CORS scheme) in the existing $ENV_FILE to match --ssl."
+        warn "Updated TLS settings (and the APP_URL/CORS scheme) in the existing $ENV_FILE to match the explicit installer environment or --ssl choice."
     fi
     # Unconditional, unlike --ssl above: the resolution block already read the
     # old value out of this very file, so writing it back is either a no-op or

@@ -58,6 +58,30 @@ ServiceAccount name.
 {{- end -}}
 
 {{/*
+Private ClusterIP Service referenced by the chart's Ingress. Keeping it
+separate from the user-facing Service lets nginx trust forwarded scheme
+headers on one listener without letting a public port-forward or LoadBalancer
+client spoof HTTPS. Multi-tenant clusters can restrict its peers with
+ingress.trustedProxyCidrs.
+*/}}
+{{- define "cremind.ingressServiceName" -}}
+{{- $base := include "cremind.fullname" . | trunc 55 | trimSuffix "-" -}}
+{{- printf "%s-ingress" $base -}}
+{{- end -}}
+
+{{/* Keep upgrades using --reuse-values safe when edgePort did not exist. */}}
+{{- define "cremind.edgePort" -}}
+{{- .Values.proxy.edgePort | default 8082 -}}
+{{- end -}}
+
+{{/* Edge HTTPS may use ingress.tls or a controller-managed default cert. */}}
+{{- define "cremind.ingressHttps" -}}
+{{- $tlsConfigured := gt (len (.Values.ingress.tls | default list)) 0 -}}
+{{- $httpsAppUrl := hasPrefix "https://" (.Values.cremind.appUrl | default "") -}}
+{{- if and .Values.ingress.enabled (or $tlsConfigured $httpsAppUrl) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
 Image repository, auto-selected from the desktop flavor toggle unless
 explicitly overridden via image.repository:
   image.repository set     -> that value (wins over the toggle)
@@ -131,7 +155,7 @@ appears in cremind.extraEnv.
 
 {{/*
 Effective CREMIND_SSL mode ("", "auto" or "after-setup"). The first-class
-cremind.ssl value wins; when it is unset a CREMIND_SSL entry in
+cremind.ssl value wins (true = after-setup, false/none = HTTP); when it is unset a CREMIND_SSL entry in
 cremind.extraEnv is honoured, because that was the only way to ask for in-pod
 TLS before this knob existed and those releases must keep rendering.
 cremind.validateSsl rejects contradictions and unsupported values.
@@ -143,12 +167,41 @@ one stretch between first boot and the Setup Wizard finishing, and the server
 logs that phase; the rendered manifests describe the install it becomes, which
 is what an agent card / OAuth callback / CORS origin has to say.
 */}}
+{{- define "cremind.normalizeSslMode" -}}
+{{- $value := lower (trim (. | default "" | toString)) -}}
+{{- if has $value (list "" "none" "false" "0" "no") -}}
+{{- "" -}}
+{{- else if has $value (list "true" "1" "yes") -}}
+{{- "auto" -}}
+{{- else -}}
+{{- $value -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* The chart's true choice is intentionally guided after-setup. Legacy
+       CREMIND_SSL=true meant auto in the backend, so keep first-class value
+       normalization separate from the compatibility path above. */ -}}
+{{- define "cremind.normalizeChartSslMode" -}}
+{{- $value := lower (trim (. | default "" | toString)) -}}
+{{- if has $value (list "" "none" "false" "0" "no") -}}
+{{- "" -}}
+{{- else if has $value (list "true" "1" "yes") -}}
+{{- "after-setup" -}}
+{{- else -}}
+{{- $value -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "cremind.sslMode" -}}
 {{- $mode := .Values.cremind.ssl | default "" -}}
-{{- if not $mode -}}
+{{- if kindIs "bool" .Values.cremind.ssl -}}
+{{- $mode = ternary "after-setup" "" .Values.cremind.ssl -}}
+{{- else if $mode -}}
+{{- $mode = include "cremind.normalizeChartSslMode" $mode -}}
+{{- else -}}
 {{- range .Values.cremind.extraEnv -}}
 {{- if eq .name "CREMIND_SSL" -}}
-{{- $mode = (.value | default "") -}}
+{{- $mode = include "cremind.normalizeSslMode" (.value | default "") -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -212,11 +265,11 @@ OR in the pod); and an explicit http:// appUrl while the pod serves https
 {{- define "cremind.validateSsl" -}}
 {{- $mode := include "cremind.sslMode" . -}}
 {{- if not (has $mode (list "" "auto" "after-setup")) -}}
-{{- fail (printf "cremind.ssl (or CREMIND_SSL via extraEnv) must be \"\", \"auto\" or \"after-setup\", got %q. Bring-your-own-certificate TLS is not supported in-pod — terminate TLS at the Ingress instead." $mode) -}}
+{{- fail (printf "cremind.ssl must be false/none (HTTP), true (after-setup), \"\", \"auto\" or \"after-setup\"; CREMIND_SSL via extraEnv accepts the same string modes. Got %q. Bring-your-own-certificate TLS is not supported in-pod — terminate TLS at the Ingress instead." $mode) -}}
 {{- end -}}
-{{- if .Values.cremind.ssl -}}
+{{- if or (kindIs "bool" .Values.cremind.ssl) .Values.cremind.ssl -}}
 {{- range .Values.cremind.extraEnv -}}
-{{- if and (eq .name "CREMIND_SSL") (ne (.value | default "") $.Values.cremind.ssl) -}}
+{{- if and (eq .name "CREMIND_SSL") (ne (include "cremind.normalizeSslMode" (.value | default "")) $mode) -}}
 {{- fail "CREMIND_SSL in cremind.extraEnv contradicts cremind.ssl. Remove the extraEnv entry — cremind.ssl is the supported knob." -}}
 {{- end -}}
 {{- end -}}
@@ -226,5 +279,45 @@ OR in the pod); and an explicit http:// appUrl while the pod serves https
 {{- end -}}
 {{- if and $mode (hasPrefix "http://" (.Values.cremind.appUrl | default "")) -}}
 {{- fail "cremind.appUrl is http:// but the pod serves TLS (cremind.ssl=auto or after-setup). Use https:// or leave appUrl blank to auto-derive https://localhost:1515. Under after-setup the plain-HTTP stretch before the Setup Wizard finishes is temporary; APP_URL states the steady state." -}}
+{{- end -}}
+{{- if and .Values.ingress.enabled (gt (len (.Values.ingress.tls | default list)) 0) (hasPrefix "http://" (.Values.cremind.appUrl | default "")) -}}
+{{- fail "cremind.appUrl is http:// but ingress.tls configures edge HTTPS. Use the certificate's https:// hostname or leave appUrl blank to auto-derive it." -}}
+{{- end -}}
+{{- $edgePort := int (include "cremind.edgePort" .) -}}
+{{- if and .Values.ingress.enabled .Values.proxy.enabled (or (lt $edgePort 1024) (gt $edgePort 65535)) -}}
+{{- fail "proxy.edgePort must be an unprivileged TCP port from 1024 through 65535." -}}
+{{- end -}}
+{{- $edgeCollisions := list (int .Values.proxy.port) (int .Values.cremind.apiPort) (int .Values.cremind.uiPort) (int .Values.cremind.codexCallbackPort) -}}
+{{- if .Values.desktop.enabled -}}
+{{- $edgeCollisions = append $edgeCollisions 80 -}}
+{{- $edgeCollisions = append $edgeCollisions 5900 -}}
+{{- end -}}
+{{- if and .Values.ingress.enabled .Values.proxy.enabled (has $edgePort $edgeCollisions) -}}
+{{- fail "proxy.edgePort must differ from proxy.port and every Cremind/noVNC container listener. The separate listener is the trust boundary that prevents direct HTTP clients from spoofing the Ingress HTTPS scheme." -}}
+{{- end -}}
+{{- $trustedProxyCidrs := .Values.ingress.trustedProxyCidrs | default "" | toString -}}
+{{- if $trustedProxyCidrs -}}
+{{- range splitList "," $trustedProxyCidrs -}}
+{{- $trustedProxy := trim . -}}
+{{- if or (not $trustedProxy) (not (regexMatch "^[0-9A-Fa-f:.*]+(/[0-9]{1,3})?$" $trustedProxy)) -}}
+{{- fail "ingress.trustedProxyCidrs must contain only comma-separated IP addresses or CIDR networks." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range .Values.cremind.extraEnv -}}
+{{- if eq .name "FORWARDED_ALLOW_IPS" -}}
+{{- if and $.Values.ingress.enabled $.Values.proxy.enabled -}}
+{{- fail "Do not set FORWARDED_ALLOW_IPS in cremind.extraEnv when the Ingress sidecar is enabled. Set ingress.trustedProxyCidrs for controller-to-sidecar trust; Cremind must trust only the sidecar's loopback connection." -}}
+{{- end -}}
+{{- if and $trustedProxyCidrs (ne $trustedProxyCidrs (.value | default "" | toString)) -}}
+{{- fail "FORWARDED_ALLOW_IPS in cremind.extraEnv contradicts ingress.trustedProxyCidrs. Keep the trusted proxy addresses in one place." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and (include "cremind.ingressHttps" .) (not $trustedProxyCidrs) -}}
+{{- fail "Ingress TLS requires ingress.trustedProxyCidrs. List only the Ingress controller source IPs/CIDRs; the dedicated ClusterIP edge listener is otherwise reachable by other pods that could spoof HTTPS. FORWARDED_ALLOW_IPS in cremind.extraEnv is not a substitute because the sidecar and app have different peers." -}}
+{{- end -}}
+{{- if and .Values.ingress.enabled (or (contains "*" $trustedProxyCidrs) (contains "/0" $trustedProxyCidrs)) -}}
+{{- fail "Wildcard or /0 FORWARDED_ALLOW_IPS is unsafe with Ingress TLS. Set ingress.trustedProxyCidrs to only the Ingress controller source IPs/CIDRs." -}}
 {{- end -}}
 {{- end -}}

@@ -1,7 +1,8 @@
 """Session-token verification, rotation, and on-disk token files.
 
 The JWT-facing half of the revocation feature; :mod:`app.auth.serial` owns the
-counter this checks against.
+counter this checks against.  The ``tep`` transport epoch invalidates bearer
+tokens left in the former HTTP browser origin when HTTPS is activated.
 
 :func:`verify_token` is the one function every decode site should call — the
 HTTP middleware, the A2A call-context builder, the WebSocket handshake, and the
@@ -11,10 +12,11 @@ directly is a hole through which a revoked token still works.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import jwt
 
@@ -31,6 +33,14 @@ _PROFILE_NAME_PATTERN = re.compile(r"^[a-z0-9_-]+$")
 
 _TOKEN_SUFFIX = ".token"
 
+#: JWT claim binding a credential to the installation's current public
+#: transport generation.  Generation zero is the compatibility generation:
+#: tokens minted before this feature have no claim and remain valid until an
+#: administrator activates the HTTP -> HTTPS transition.  Activation advances
+#: the generation atomically with the durable transition, invalidating every
+#: bearer that could still be present in the old HTTP origin's storage.
+TOKEN_TRANSPORT_EPOCH_CLAIM = "tep"
+
 
 def _validate_profile_name(profile: str) -> str:
     if not profile:
@@ -40,15 +50,63 @@ def _validate_profile_name(profile: str) -> str:
     return profile
 
 
+def current_transport_epoch() -> int | None:
+    """Return the durable public-transport generation, or ``None`` on damage.
+
+    The epoch lives in ``tls/transition.json`` so the switch to ``activating``
+    and the credential boundary are one atomic file replacement.  A missing
+    transition (and an older transition without the field) is generation zero
+    for upgrade compatibility.  A present but malformed file fails closed:
+    accepting generation zero then would make HTTP-era credentials usable
+    again after an operator or disk error damaged the security boundary.
+    """
+    path = Path(BaseConfig.CREMIND_SYSTEM_DIR) / "tls" / "transition.json"
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return 0
+    except OSError as error:
+        logger.error(f"[auth] cannot read TLS transport epoch: {error}")
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as error:
+        logger.error(f"[auth] invalid TLS transition metadata: {error}")
+        return None
+    if not isinstance(value, dict) or value.get("version") != 1:
+        logger.error("[auth] invalid TLS transition metadata version")
+        return None
+    epoch = value.get("transport_epoch", 0)
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+        logger.error("[auth] invalid TLS transport epoch")
+        return None
+    return epoch
+
+
+def transport_epoch_matches(payload: dict[str, Any]) -> bool:
+    """Whether ``payload`` belongs to the current public transport epoch."""
+    current = current_transport_epoch()
+    if current is None:
+        return False
+    # Missing means generation zero so tokens from releases predating this
+    # claim remain usable on ordinary upgrades.  They stop working at the
+    # first explicit HTTP -> HTTPS activation, when the epoch becomes one.
+    claimed = payload.get(TOKEN_TRANSPORT_EPOCH_CLAIM, 0)
+    if isinstance(claimed, bool) or not isinstance(claimed, int):
+        return False
+    return claimed == current
+
+
 # ── verification ───────────────────────────────────────────────────────────
 
 
 def verify_token(token: str, *, secret: str | None = None) -> dict[str, Any] | None:
     """Decode and fully validate a session JWT; ``None`` if it isn't usable.
 
-    Checks the signature, ``exp``, **and** the profile's token serial, so a
-    token that was revoked by ``cremind auth regenerate`` fails here even
-    though it is still perfectly well-signed and unexpired.
+    Checks the signature, ``exp``, profile token serial, and installation
+    transport epoch.  A token revoked by ``cremind auth regenerate`` or left
+    behind in HTTP storage after HTTPS activation therefore fails even though
+    it is still perfectly well-signed and unexpired.
 
     ``secret`` lets a caller pass a secret it already resolved (the auth
     middleware does, once per request). When it resolves to empty — setup mode,
@@ -63,6 +121,13 @@ def verify_token(token: str, *, secret: str | None = None) -> dict[str, Any] | N
     except jwt.InvalidTokenError as e:
         logger.warning(f"[auth] JWT decode failed: {e}")
         return None
+    if not transport_epoch_matches(payload):
+        profile = payload.get("profile") or payload.get("sub") or ""
+        logger.warning(
+            f"[auth] rejected a token from an obsolete transport epoch for "
+            f"profile {profile!r}"
+        )
+        return None
     if not serial_matches(payload):
         profile = payload.get("profile") or payload.get("sub") or ""
         logger.warning(
@@ -72,6 +137,86 @@ def verify_token(token: str, *, secret: str | None = None) -> dict[str, Any] | N
         )
         return None
     return payload
+
+
+def reissue_token_files_for_epoch(epoch: int) -> Callable[[], None]:
+    """Re-sign valid on-host tokens for ``epoch`` without extending them.
+
+    Browser sessions migrate through private handoff tickets.  The token files
+    are the recovery/login and local-CLI counterpart: leaving them at the old
+    epoch would make ``cremind`` fail immediately after activation.  Invalid,
+    expired, revoked, or misnamed files stay untouched.
+
+    All replacements are atomic.  The returned callback restores the exact
+    prior bytes if the transition metadata cannot subsequently be persisted.
+    """
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+        raise ValueError("A positive transport epoch is required.")
+    current = current_transport_epoch()
+    if current is None:
+        raise OSError("The current TLS transport epoch cannot be read safely.")
+    if epoch != current + 1:
+        raise ValueError("The transport epoch must advance by exactly one.")
+    key = BaseConfig.get_jwt_secret()
+    if not key:
+        raise RuntimeError("No JWT secret is configured for token migration.")
+
+    replacements: list[tuple[str, bytes, str]] = []
+    directory = tokens_dir()
+    try:
+        paths = sorted(directory.glob(f"*{_TOKEN_SUFFIX}"))
+    except OSError:
+        raise
+    for path in paths:
+        profile = path.name[: -len(_TOKEN_SUFFIX)]
+        try:
+            _validate_profile_name(profile)
+        except ValueError:
+            continue
+        try:
+            original = path.read_bytes()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            # A valid token may be behind this unreadable path.  Activating and
+            # silently leaving it obsolete would strand local CLI recovery.
+            raise
+        try:
+            raw = original.decode("ascii").strip()
+            claims = jwt.decode(raw, key, algorithms=["HS256"])
+        except (UnicodeError, ValueError, jwt.InvalidTokenError):
+            continue
+        if ((claims.get("profile") or claims.get("sub")) != profile
+                or claims.get("sub") != profile
+                or not transport_epoch_matches(claims)
+                or not serial_matches(claims)):
+            continue
+        migrated = dict(claims)
+        migrated[TOKEN_TRANSPORT_EPOCH_CLAIM] = epoch
+        replacements.append(
+            (profile, original, jwt.encode(migrated, key, algorithm="HS256"))
+        )
+
+    changed: list[tuple[str, bytes]] = []
+    try:
+        for profile, original, migrated in replacements:
+            # Do not overwrite a concurrent token rotation that happened after
+            # the snapshot.  Abort the activation so a retry can re-stage that
+            # credential instead of leaving the CLI with an obsolete file.
+            if token_file_path(profile).read_bytes() != original:
+                raise OSError(f"Token file for {profile!r} changed during HTTPS activation.")
+            write_token_file(profile, migrated)
+            changed.append((profile, original))
+    except BaseException:
+        for profile, original in reversed(changed):
+            write_token_file(profile, original.decode("ascii").strip())
+        raise
+
+    def rollback() -> None:
+        for profile, original in reversed(changed):
+            write_token_file(profile, original.decode("ascii").strip())
+
+    return rollback
 
 
 # ── token files ────────────────────────────────────────────────────────────

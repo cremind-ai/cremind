@@ -20,6 +20,21 @@ data:
   # on first boot (see _helpers.tpl assertNoDbProvider).
   INSTALL_MODE: {{ .Values.cremind.installMode | quote }}
   SETUP_WIZARD_ENV: {{ .Values.cremind.setupWizardEnv | quote }}
+  {{- if .Values.ingress.enabled }}
+  # The Ingress owns the public certificate. This tells the HTTPS upgrade
+  # workflow to prepare an edge transition (no private Cremind CA) even while
+  # the browser is still reaching Settings over HTTP.
+  CREMIND_TLS_TERMINATION: "edge"
+  {{- if .Values.proxy.enabled }}
+  # nginx connects over this pod's explicit 127.0.0.1 upstream. Controller
+  # CIDRs belong to nginx's edge-listener ACL, not Uvicorn's trust list.
+  FORWARDED_ALLOW_IPS: "127.0.0.1"
+  {{- else if .Values.ingress.trustedProxyCidrs }}
+  # With no sidecar, Uvicorn sees the controller directly. Trust only the
+  # operator-supplied controller source addresses, never every peer.
+  FORWARDED_ALLOW_IPS: {{ .Values.ingress.trustedProxyCidrs | quote }}
+  {{- end }}
+  {{- end }}
   # Release channel the in-app updater reports and queries. Auto-derived from
   # the image tag: an RC chart (installed via `helm install --devel`) → test,
   # a stable chart → production. get_channel() reads this at runtime; there is

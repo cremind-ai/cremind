@@ -135,7 +135,7 @@ export function openEmbeddingStateStream(
   onError?: (e: any) => void,
 ): EmbeddingStateStreamHandle {
   return createSharedStream<EmbeddingStateSnapshot>({
-    key: 'cremind:embedding',
+    publicKey: 'cremind:embedding',
     bufferSize: 1,
     openRaw: (handleEvent, handleError) =>
       openEmbeddingStateStreamRaw(agentUrl, handleEvent, handleError),

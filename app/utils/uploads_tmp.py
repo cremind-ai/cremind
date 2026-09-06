@@ -12,9 +12,9 @@ any widening of the trust boundary.
 
 The tree is ephemeral by design:
 
-* ``wipe_all_on_startup`` clears every profile's ``uploads_tmp`` on boot —
-  pending uploads don't survive a restart (a file the user asked to *save*
-  has already been moved into their working directory by then).
+* ``wipe_all_on_startup`` normally clears every profile's ``uploads_tmp`` on
+  boot. A bounded HTTPS migration grace period preserves drafts in suspended
+  tabs; valid handoff tickets also preserve their exact referenced files.
 * ``prune_idle`` removes per-conversation directories whose newest file has
   not been touched within the inactivity threshold, run periodically by
   ``app.events.uploads_cleanup``.
@@ -165,16 +165,40 @@ def is_inside_conversation_tmp(profile: str, conversation_id: str, abs_path: str
 
 # ── cleanup ──────────────────────────────────────────────────────────────
 
-def wipe_all_on_startup() -> int:
-    """Remove every profile's ``uploads_tmp`` tree. Returns dirs removed."""
+def wipe_all_on_startup(preserve: set[str] | None = None) -> int:
+    """Clear uploads unless a bounded transport-recovery grace period applies."""
+    from app.config.tls_transition import startup_upload_recovery_window
+    if startup_upload_recovery_window():
+        # Some discarded/suspended tabs cannot mint a ticket before restart.
+        # Keep their existing per-profile files; authorization and the normal
+        # idle pruner are unchanged. The deadline never extends on a reboot.
+        return 0
     base = BaseConfig.CREMIND_SYSTEM_DIR
     if not base or not os.path.isdir(base):
         return 0
     removed = 0
+    preserve = preserve or set()
     for path in glob.glob(os.path.join(base, "*", UPLOADS_TMP_DIRNAME)):
         if not os.path.isdir(path):
             continue
         try:
+            root_path = os.path.realpath(path)
+            retained = {item for item in preserve if item.startswith(root_path + os.sep)}
+            if retained:
+                # A prepared HTTPS handoff may own individual attachments.
+                # Delete everything else without following directory symlinks.
+                for root, dirs, files in os.walk(path, topdown=False, followlinks=False):
+                    for name in files:
+                        candidate = os.path.join(root, name)
+                        if os.path.realpath(candidate) not in retained:
+                            os.unlink(candidate)
+                    for name in dirs:
+                        candidate = os.path.join(root, name)
+                        if os.path.islink(candidate):
+                            os.unlink(candidate)
+                        elif not os.listdir(candidate):
+                            os.rmdir(candidate)
+                continue
             shutil.rmtree(path, ignore_errors=True)
             removed += 1
         except Exception as exc:  # noqa: BLE001
@@ -198,8 +222,13 @@ def prune_idle(threshold_seconds: float | None = None) -> int:
     threshold = threshold_seconds if threshold_seconds is not None else idle_threshold_seconds()
     now = time.time()
     removed = 0
+    from app.config.tls_transition import retained_upload_paths
+    retained = retained_upload_paths()
     for conv_dir in glob.glob(os.path.join(base, "*", UPLOADS_TMP_DIRNAME, "*")):
         if not os.path.isdir(conv_dir):
+            continue
+        real_dir = os.path.realpath(conv_dir)
+        if any(path.startswith(real_dir + os.sep) for path in retained):
             continue
         newest = _newest_mtime(conv_dir)
         if now - newest <= threshold:

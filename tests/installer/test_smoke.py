@@ -355,6 +355,7 @@ def test_run_with_all_values_prepopulated(loaded_catalog: catalog.Catalog) -> No
         mode="docker",
         desktop="1",
         vnc_password="abc123",
+        ssl_choice="none",
     )
     # Strip the confirm screen so the test doesn't open a dialog.
     original = tui._SCREENS
@@ -375,6 +376,55 @@ def test_run_with_all_values_prepopulated(loaded_catalog: catalog.Catalog) -> No
     assert result.version_spec == "0.2.1"
     assert result.deployment == "local"
     assert result.mode == "docker"
+
+
+@pytest.mark.parametrize("mode", ["none", "auto", "after-setup"])
+def test_ssl_flag_skips_prompt(mode, loaded_catalog, monkeypatch) -> None:
+    monkeypatch.setattr(tui, "_radio", lambda **kwargs: pytest.fail("flag must skip prompt"))
+    state, action = tui.screen_ssl(TuiResult(ssl_choice=mode), _ctx(loaded_catalog))
+    assert action == "skip"
+    assert state.ssl_choice == mode
+
+
+@pytest.mark.parametrize("selected", ["none", "after-setup"])
+def test_fresh_ssl_choice_defaults_to_http(selected, loaded_catalog, monkeypatch) -> None:
+    def choose(**kwargs):
+        assert kwargs["default"] == "none"
+        assert [value for value, label in kwargs["values"]] == ["none", "after-setup"]
+        assert "Settings > Security" in kwargs["text"]
+        return selected, "advance"
+
+    monkeypatch.setattr(tui, "_radio", choose)
+    state, action = tui.screen_ssl(TuiResult(mode="native"), _ctx(loaded_catalog))
+    assert action == "advance"
+    assert state.ssl_choice == selected
+    assert state.as_env_dict()["SSL_CHOICE"] == selected
+
+
+@pytest.mark.parametrize("mode", ["native", "docker"])
+def test_ssl_preserves_previous_install_for_selected_mode(mode, tmp_path, loaded_catalog, monkeypatch) -> None:
+    previous = tmp_path / ".env"
+    previous.write_text("CREMIND_SSL=auto\n", encoding="utf-8")
+    ctx = _ctx(loaded_catalog, **{f"{mode}_env": str(previous)})
+    monkeypatch.setattr(tui, "_radio", lambda **kwargs: pytest.fail("existing mode must not prompt"))
+    state, action = tui.screen_ssl(TuiResult(mode=mode), ctx)
+    assert (state.ssl_choice, action) == ("keep", "skip")
+
+
+def test_ssl_does_not_inherit_other_install_mode(tmp_path, loaded_catalog, monkeypatch) -> None:
+    native = tmp_path / "native.env"
+    native.write_text("CREMIND_SSL=auto\n", encoding="utf-8")
+    monkeypatch.setattr(tui, "_radio", lambda **kwargs: ("none", "advance"))
+    state, action = tui.screen_ssl(
+        TuiResult(mode="docker"), _ctx(loaded_catalog, native_env=str(native))
+    )
+    assert (state.ssl_choice, action) == ("none", "advance")
+
+
+def test_ssl_preserves_inherited_settings(loaded_catalog, monkeypatch) -> None:
+    monkeypatch.setattr(tui, "_radio", lambda **kwargs: pytest.fail("inherited mode must not prompt"))
+    state, action = tui.screen_ssl(TuiResult(), _ctx(loaded_catalog, ssl_inherited=True))
+    assert (state.ssl_choice, action) == ("keep", "skip")
 
 
 # ── run() loop: back / skip / history logic (scripted screens, no dialogs) ──

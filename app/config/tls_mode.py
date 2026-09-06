@@ -1,33 +1,15 @@
-"""What TLS this process is serving, and what it will serve next.
+"""TLS boot facts shared by the server, installer and HTTPS settings.
 
-``CREMIND_SSL`` has three values:
+New installations default to HTTP (an unset/false CREMIND_SSL). Explicit true
+or auto enables a locally signed certificate immediately. Legacy after-setup
+installations keep HTTP for the wizard and enable TLS after bootstrap.toml
+exists. A later settings-page activation persists true and restarts the public
+listener. Electron supports the same public HTTPS listener; the dedicated
+internal CLI listener remains plain HTTP. CREMIND_UI_PORT=0 delegates TLS to
+an external proxy.
 
-``""``
-    Plain HTTP. What an unset variable means — though not what a fresh
-    install gets: the installers default to ``after-setup`` and write it
-    into the ``.env`` they render (``--ssl none`` opts out).
-``"auto"``
-    HTTPS from the first boot, with a certificate signed by a CA generated
-    into ``<system dir>/tls/``. Browsers warn until that CA is trusted, and
-    the very first page a user opens — the Setup Wizard — is already behind
-    the untrusted certificate.
-``"after-setup"``
-    Plain HTTP until the Setup Wizard completes, then HTTPS. The CA is still
-    generated at the first boot, so the wizard can hand it to the user and
-    walk them through trusting it *before* any HTTPS page is loaded. On
-    completion the wizard restarts the server, which comes back serving TLS
-    to a browser that already trusts the chain — no warning, ever.
-
-TLS is bound once, at process start (hypercorn with a certificate, or uvicorn
-without), so the "after" in after-setup is a real restart rather than a live
-flip. ``bootstrap.toml`` existing is what marks setup as done.
-
-This module is the single source of truth for that decision. ``server`` owns
-the boot-time resolution (``_resolve_tls``) because only it can validate paths
-and exit; the request handlers that report TLS state to the Setup Wizard need
-the same answers but cannot import ``server`` (it imports the API modules).
-So the *facts* live here — importable from both, dependency-free, and pinned
-against ``_resolve_tls`` by a test that walks the whole matrix.
+The actual bound transport is recorded once at boot, so a pending restart
+cannot make status incorrectly claim the current HTTP listener is HTTPS.
 """
 
 from __future__ import annotations
@@ -49,7 +31,12 @@ _boot_serving_https: bool = False
 
 def effective_ssl_mode() -> str:
     """``CREMIND_SSL`` normalised for comparison (may be an unknown value)."""
-    return BaseConfig.SSL_MODE.strip().lower()
+    mode = BaseConfig.SSL_MODE.strip().lower()
+    if mode in ("true", "1", "yes"):
+        return MODE_AUTO
+    if mode in ("false", "0", "no", "none"):
+        return ""
+    return mode
 
 
 def env_supervised() -> bool:
@@ -71,16 +58,13 @@ def env_supervised() -> bool:
 
 
 def environment_forces_plain_http(public_port: int) -> bool:
-    """True when nothing this process does can result in TLS being served.
+    """A loopback-only deployment delegates its public TLS to an external proxy."""
+    return public_port == 0 or edge_tls_termination()
 
-    Two deployments own the public origin themselves and terminate TLS in
-    front of us: a proxy fronting a loopback-only bind (``CREMIND_UI_PORT=0``),
-    and the Electron desktop app (which loads the UI over ``http://127.0.0.1``).
-    ``_resolve_tls`` warns and bails for both; the predicate is shared so that
-    what the wizard is told matches what the server will do — a server that can
-    never serve TLS must never advertise a pending switch to it.
-    """
-    return public_port == 0 or os.environ.get("CREMIND_ELECTRON_PARENT") is not None
+
+def edge_tls_termination() -> bool:
+    """Explicit deployment-owned TLS (for example a Helm Ingress)."""
+    return os.environ.get("CREMIND_TLS_TERMINATION", "").strip().lower() == "edge"
 
 
 def https_origin_from_app_url(app_url: str) -> str:
@@ -163,7 +147,8 @@ def compute_tls_facts(
         # does (it sets CREMIND_SUPERVISED). A bare ``cremind serve`` in a
         # terminal simply stays down, so the wizard must ask the operator
         # instead of killing their server.
-        restart_supported=supervised or install_mode in ("docker", "kubernetes"),
+        restart_supported=supervised or install_mode in ("docker", "kubernetes")
+        or os.environ.get("CREMIND_ELECTRON_PARENT") is not None,
     )
 
 

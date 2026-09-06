@@ -21,8 +21,10 @@ import type { ConversationSummary } from './conversationApi';
 import type { EmbeddingStateSnapshot } from './embeddingStateStream';
 import type { ProcessRow } from './processApi';
 import type { EventNotificationEntry } from './skillEventsApi';
+import type { TlsTransition } from './configApi';
 import {
   createSharedStream,
+  credentialFreeAuthScope,
   type SharedStreamHandle,
   type SharedStreamRawHandle,
 } from './sharedStream';
@@ -43,6 +45,7 @@ type ConvEventCallback = (event: ConversationStreamEvent) => void;
 type SettingsCallback = (e: { ts: number }) => void;
 type ProcessesCallback = (rows: ProcessRow[]) => void;
 type EmbeddingCallback = (snap: EmbeddingStateSnapshot) => void;
+type TransportCallback = (transition: TlsTransition) => void;
 
 interface NotifFrame { event: 'notification'; data: EventNotificationEntry; }
 interface ConvsFrame { event: 'conversations-list'; data: ConversationsListSnapshot; }
@@ -54,6 +57,7 @@ interface SettingsStateFrame { event: 'settings-state'; data: Record<string, nev
 interface ProcessesFrame { event: 'processes'; data: { processes?: ProcessRow[] }; }
 interface EmbeddingFrame { event: 'embedding-state'; data: EmbeddingStateSnapshot; }
 interface ReadyFrame { event: 'ready'; data: Record<string, never>; }
+interface TransportFrame { event: 'transport-change'; data: TlsTransition; }
 type ProfileEventsFrame =
   | NotifFrame
   | ConvsFrame
@@ -61,6 +65,7 @@ type ProfileEventsFrame =
   | SettingsStateFrame
   | ProcessesFrame
   | EmbeddingFrame
+  | TransportFrame
   | ReadyFrame;
 
 /**
@@ -87,12 +92,14 @@ interface Connection {
   settingsSubs: Set<SettingsCallback>;
   processesSubs: Set<ProcessesCallback>;
   embeddingSubs: Set<EmbeddingCallback>;
+  transportSubs: Set<TransportCallback>;
   lastSnapshot: ConversationsListSnapshot | null;
   // Last folded-in snapshots, replayed to late subscribers so a component
   // mounting after connect renders immediately instead of waiting for the
   // next mutation. Mirror `lastSnapshot` for the conversations list.
   lastProcesses: ProcessRow[] | null;
   lastEmbedding: EmbeddingStateSnapshot | null;
+  lastTransport: TlsTransition | null;
   // Whether at least one settings-state frame has been seen on this
   // connection — gates the synthetic late-subscriber ping (see
   // subscribeSettingsState).
@@ -186,6 +193,8 @@ function openProfileEventsRaw(
                 onEvent({ event: 'processes', data });
               } else if (eventName === 'embedding-state') {
                 onEvent({ event: 'embedding-state', data: data as EmbeddingStateSnapshot });
+              } else if (eventName === 'transport-change') {
+                onEvent({ event: 'transport-change', data: data as TlsTransition });
               } else if (eventName === 'ready') {
                 onEvent({ event: 'ready', data: {} });
               }
@@ -296,6 +305,11 @@ function dispatchFrame(conn: Connection, frame: ProfileEventsFrame) {
     for (const cb of conn.embeddingSubs) {
       try { cb(frame.data); } catch (e) { console.warn('[profileEventsStream] embedding sub threw', e); }
     }
+  } else if (frame.event === 'transport-change') {
+    conn.lastTransport = frame.data;
+    for (const cb of conn.transportSubs) {
+      try { cb(frame.data); } catch (e) { console.warn('[profileEventsStream] transport sub threw', e); }
+    }
   } else if (frame.event === 'ready') {
     // The replay phase of a (re)connect just ended. The backend replays the
     // full ring of every *active* conversation before emitting `ready`, so
@@ -312,7 +326,7 @@ function dispatchFrame(conn: Connection, frame: ProfileEventsFrame) {
 
 function startShared(conn: Connection) {
   conn.shared = createSharedStream<ProfileEventsFrame>({
-    key: `cremind:profile-events:${conn.authToken}:${conn.channelType ?? 'all'}`,
+    publicKey: `cremind:profile-events:${credentialFreeAuthScope(conn.authToken)}:${conn.channelType ?? 'all'}`,
     bufferSize: 256,
     openRaw: (handleEvent, handleError) =>
       openProfileEventsRaw(conn, handleEvent, handleError),
@@ -340,9 +354,11 @@ function ensureConnection(
       settingsSubs: new Set(),
       processesSubs: new Set(),
       embeddingSubs: new Set(),
+      transportSubs: new Set(),
       lastSnapshot: null,
       lastProcesses: null,
       lastEmbedding: null,
+      lastTransport: null,
       settingsPinged: false,
       notifCursor: sinceMs,
       convBuffers: new Map(),
@@ -373,6 +389,7 @@ function maybeClose(key: string, conn: Connection) {
     || conn.settingsSubs.size > 0
     || conn.processesSubs.size > 0
     || conn.embeddingSubs.size > 0
+    || conn.transportSubs.size > 0
   ) return;
   if (conn.shared) conn.shared.close();
   connections.delete(key);
@@ -527,6 +544,27 @@ export function subscribeEmbeddingState(
   return {
     close() {
       conn.embeddingSubs.delete(onState);
+      maybeClose(key, conn);
+    },
+  };
+}
+
+/** Subscribe to a system-wide HTTP→HTTPS transition on the profile's existing SSE. */
+export function subscribeTransportChange(
+  agentUrl: string,
+  authToken: string,
+  onChange: TransportCallback,
+): ProfileEventsSubHandle {
+  const { conn, key } = ensureConnection(agentUrl, authToken, undefined, Date.now());
+  conn.transportSubs.add(onChange);
+  if (conn.lastTransport) {
+    try { onChange(conn.lastTransport); } catch (e) {
+      console.warn('[profileEventsStream] transport late-replay threw', e);
+    }
+  }
+  return {
+    close() {
+      conn.transportSubs.delete(onChange);
       maybeClose(key, conn);
     },
   };

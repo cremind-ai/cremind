@@ -126,6 +126,8 @@ type InstallEnv = {
   hasPython: boolean;
   pythonVersion: string;
   channel: 'production' | 'test' | 'dev';
+  hasExistingInstall?: boolean;
+  existingSsl?: '' | 'auto' | 'after-setup';
 };
 
 const installEnv = ref<InstallEnv | null>(null);
@@ -133,6 +135,10 @@ const detectingInstallEnv = ref(false);
 const installDeployment = ref<'local' | 'server' | 'custom'>('local');
 const installAppHost = ref('');
 const installMode = ref<'docker' | 'native'>('native');
+// Fresh installs use HTTP. Opting in selects the trust-first `after-setup`
+// mode; the lower-level installer flags still expose immediate `auto` HTTPS.
+const installHttps = ref(false);
+const installHttpsTouched = ref(false);
 // Docker mode only: include the VNC Desktop UI (cremind/cremind-desktop) or
 // install the headless basic image (cremind/cremind). Default on = desktop.
 const installDesktopUi = ref(true);
@@ -293,6 +299,7 @@ async function continueToSetupWizard() {
         currentStep.value = installerSteps.length - 1;
         return;
       }
+      if (result.agentUrl) await settingsStore.setAgentUrl(result.agentUrl);
     }
     // Sync the agentUrl now that the backend is up. ``setAgentUrl``
     // persists through to runtimeConfig (main-process JSON file via
@@ -318,18 +325,11 @@ async function continueToSetupWizard() {
     // re-fires from the module-load belt-and-suspenders below (and
     // from App.vue's onMounted) once the SPA boots on the new origin.
     //
-    // Install stage stays on the asar — only the *setup* stage moves
-    // to http. The user has not entered any wizard data at this seam.
-    //
-    // ``http`` (not ``https``) is correct here and must stay hardcoded:
-    // the backend deliberately refuses TLS when it was started by the
-    // Electron app — ``_resolve_tls`` in app/server.py returns None with
-    // a warning whenever ``CREMIND_ELECTRON_PARENT`` is set, precisely
-    // because the shell loads the UI over http://127.0.0.1. TLS applies
-    // to server deployments only, and those never take this branch (they
-    // are already on an http(s) origin, not ``file:``).
+    // Install stage stays on the asar; only the setup stage moves to the
+    // backend's resolved HTTP or HTTPS origin. The user has not entered any
+    // wizard data at this seam.
     if (window.location.protocol === 'file:') {
-      window.location.replace('http://127.0.0.1:1515/#/setup');
+      window.location.replace(`${settingsStore.agentUrl}/#/setup`);
       return;
     }
     embeddingStatusStore.connect(settingsStore.agentUrl);
@@ -371,6 +371,10 @@ async function startInstallerRun() {
       appHost:
         installDeployment.value === 'server' ? installAppHost.value.trim() : undefined,
       mode: installMode.value,
+      // Omission preserves an existing install's TLS mode. A fresh install
+      // still defaults to HTTP in the scripts; touching the checkbox makes the
+      // user's true/false override explicit.
+      ssl: installHttpsTouched.value ? installHttps.value : undefined,
       // Docker mode only: forward the desktop-UI toggle. Omitted for native
       // so the script's default applies.
       desktopUi: installMode.value === 'docker' ? installDesktopUi.value : undefined,
@@ -511,11 +515,13 @@ const serviceCapabilities = ref<ServiceCapabilitiesResponse | null>(null);
 // No extra fetch: ``runPostInstallSetupChecks`` already loads
 // /api/services/capabilities pre-token and is awaited before the first
 // render, so the ``tls`` block is here by the time ``setupSteps`` is read.
-// A server without the block (older release, or one that can never serve
-// TLS — Electron, CREMIND_UI_PORT=0) leaves ``tlsPending`` false and the
-// whole feature invisible.
+// A server without the block (an older release, or a deployment whose edge
+// manages the transition separately) leaves ``tlsPending`` false and the whole
+// feature invisible. Electron follows the same TLS state and moves its windows
+// through main-process IPC.
 const tlsStatus = computed(() => serviceCapabilities.value?.tls ?? null);
 const tlsPending = computed(() => Boolean(tlsStatus.value?.pending_https));
+const secureTrustConfirmed = ref(false);
 
 // Snapshot of the TLS hand-off fields from the setup response, captured in
 // ``handleCompleteSetup`` and consumed by ``handleFinish``. Kept separate
@@ -526,6 +532,7 @@ const finishTls = ref<{
   pending: boolean;
   nextOrigin: string | null;
   restartSupported: boolean;
+  management: 'native' | 'electron' | 'external';
 } | null>(null);
 
 const pivot = useHttpsPivot();
@@ -564,18 +571,6 @@ const exportAgentUrl = computed(() => (
   finishTls.value?.pending ? pivotTargetUrl.value : settingsStore.agentUrl
 ));
 
-/** Leave the pivot and enter Cremind on the plain-HTTP origin instead. The
- *  session is already active (``handleFinish`` sets the token before it
- *  starts the pivot), so this is always a working fallback. */
-function continueOnHttp() {
-  pivot.cancelManualProbe();
-  // ``handleFinish`` closed this before the restart; we are staying on the
-  // HTTP origin after all, and the SPA does not remount on a route change, so
-  // nothing else would bring it back.
-  embeddingStatusStore.connect(settingsStore.agentUrl);
-  router.push(`/${profileName.value}`);
-}
-
 /** "Retry restart" on the failed pane. */
 async function retryHttpsPivot() {
   if (!finishTls.value) return;
@@ -586,6 +581,8 @@ async function retryHttpsPivot() {
     profile: profileName.value,
     profileToken: generatedToken.value,
     installMode: serviceCapabilities.value?.install_mode ?? null,
+    management: finishTls.value.management,
+    destinationRoute: `/${profileName.value}`,
   });
 }
 
@@ -756,6 +753,8 @@ async function detectInstallEnvironment() {
   detectingInstallEnv.value = true;
   try {
     installEnv.value = await bridge.detect();
+    installHttps.value = Boolean(installEnv.value.existingSsl);
+    installHttpsTouched.value = false;
     // Seed installMode from the catalog-driven recommendation. Falls
     // back to 'native' when no mode's requirements are satisfied
     // (theoretical, since native declares no requires).
@@ -1037,6 +1036,11 @@ async function handleNext() {
     return;
   }
 
+  if (key === 'secure' && !secureTrustConfirmed.value) {
+    ElMessage.error('Trust the exact certificate authority on this device and confirm it before continuing.');
+    return;
+  }
+
   // Existing setup-step gates.
   if (key === 'embedding' && embeddingConfig.value?.enabled) {
     if (embeddingConfig.value.provider === 'gemma' && !embeddingConfig.value.hf_token.trim()) {
@@ -1148,6 +1152,8 @@ async function handleCompleteSetup() {
       nextOrigin: result.next_origin ?? tlsStatus.value?.https_url ?? null,
       restartSupported:
         result.restart_supported ?? tlsStatus.value?.restart_supported ?? false,
+      management: result.tls_management
+        ?? 'native',
     };
 
     // Fire-and-forget: the downloadable config bundle wants Docker
@@ -1263,6 +1269,8 @@ async function handleFinish() {
     // so the composable switches to tell-and-keep-watching instead of
     // redirecting into an origin nothing is tunnelling to.
     installMode: serviceCapabilities.value?.install_mode ?? null,
+    management: finishTls.value.management,
+    destinationRoute: `/${profileName.value}`,
   };
   if (!finishTls.value.restartSupported) {
     // Nothing supervises this process — restarting it would just leave it
@@ -1587,10 +1595,8 @@ async function downloadConfigFile(format: ExportFormat) {
       </div>
 
       <!-- ── HTTPS pivot (CREMIND_SSL=after-setup) ────────────────────
-           Setup is finished and the session is already active on this
-           (plain-HTTP) origin, so every branch below is a safe place to
-           stop: "Continue on HTTP for now" always lands the user in a
-           working Cremind. -->
+           Activation is already persisted when this appears. Keep the
+           recovery page mounted until the verified HTTPS listener answers. -->
       <div v-if="currentStage === 'https-pivot'" class="stage-transition https-pivot">
         <template v-if="pivotPhase === 'restarting'">
           <div class="stage-transition-spinner"></div>
@@ -1668,7 +1674,10 @@ async function downloadConfigFile(format: ExportFormat) {
             ><Icon :icon="isPivotCopied('pivot-url') ? 'mdi:check' : 'mdi:content-copy'" /></button>
             this page moves there and you stay signed in.
           </p>
-          <ElButton @click="continueOnHttp">Continue on HTTP for now</ElButton>
+          <ElAlert type="info" :closable="false" show-icon>
+            Keep this page open after restarting. It will verify the secure
+            listener and restore this session automatically.
+          </ElAlert>
         </template>
 
         <template v-else-if="pivotPhase === 'failed'">
@@ -1681,15 +1690,14 @@ async function downloadConfigFile(format: ExportFormat) {
           >
             <p>{{ pivotError || 'The restart request was rejected.' }}</p>
             <p>
-              Setup itself completed and you're signed in — this only affects
-              the switch to HTTPS. Retry, or continue on the plain-HTTP
-              address and restart the server yourself later; it will come back
-              on <code>{{ pivotTargetUrl }}</code>.
+              Setup itself completed. Retry the activation; this page will
+              stay available while Cremind verifies the secure listener and
+              restores your session at <code>{{ pivotTargetUrl }}</code>.
             </p>
           </ElAlert>
           <div class="pivot-actions">
             <ElButton type="primary" @click="retryHttpsPivot">Retry restart</ElButton>
-            <ElButton @click="continueOnHttp">Continue on HTTP</ElButton>
+            <ElButton @click="pivot.redirectNow()">Open HTTPS recovery</ElButton>
           </div>
         </template>
       </div>
@@ -1844,6 +1852,16 @@ async function downloadConfigFile(format: ExportFormat) {
               <span class="installer-hint">
                 {{ installCatalog?.docker_desktop?.hint
                   ?? 'Adds an XFCE desktop inside the container so you can watch the agent work. Uncheck to install the smaller headless image (cremind/cremind).' }}
+              </span>
+            </ElFormItem>
+            <ElFormItem>
+              <ElCheckbox v-model="installHttps" @change="installHttpsTouched = true">
+                Enable HTTPS (SSL)
+              </ElCheckbox>
+              <span class="installer-hint">
+                Off by default. When enabled, setup starts over HTTP so you can
+                trust Cremind's certificate first, then every app window moves
+                to HTTPS after setup finishes.
               </span>
             </ElFormItem>
             <!-- The install runs --unattended, so the script can never ask
@@ -2029,10 +2047,9 @@ async function downloadConfigFile(format: ExportFormat) {
           :configs="channelConfigs"
           @update="handleChannelConfigsUpdate"
         />
-        <!-- Skippable by design: no gate on Next, ``handleNext`` falls
-             through to the generic advance. -->
         <StepSecureInstall
           v-else-if="currentStepKey === 'secure'"
+          v-model:confirmed="secureTrustConfirmed"
           :agent-url="settingsStore.agentUrl"
           :tls="tlsStatus"
           :install-mode="serviceCapabilities?.install_mode ?? null"
@@ -2224,9 +2241,12 @@ async function downloadConfigFile(format: ExportFormat) {
           <ElButton
             v-if="!isLastStep"
             type="primary"
-            :disabled="currentStepKey === 'llm' && !canAdvanceFromLLM"
+            :disabled="(currentStepKey === 'llm' && !canAdvanceFromLLM)
+              || (currentStepKey === 'secure' && !secureTrustConfirmed)"
             :title="currentStepKey === 'llm' && !canAdvanceFromLLM
-              ? 'Choose a Model first — the assistant needs one to answer.' : ''"
+              ? 'Choose a Model first — the assistant needs one to answer.'
+              : currentStepKey === 'secure' && !secureTrustConfirmed
+                ? 'Trust and confirm the exact CA before activating HTTPS.' : ''"
             @click="handleNext"
           >
             Next

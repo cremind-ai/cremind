@@ -21,6 +21,28 @@ iwr -useb https://cremind.io/install.ps1 | iex
 iwr -useb https://raw.githubusercontent.com/cremind-ai/cremind/main/install/install.ps1 | iex
 ```
 
+## HTTP and HTTPS
+
+Fresh installs use **HTTP** by default. Select **Enable HTTPS (SSL)** in the
+installer to have the Setup Wizard guide you through trusting Cremind's local
+certificate before switching to HTTPS. The same choice is available in the
+terminal TUI, text prompts, and Electron installer.
+
+For scripts, pass `--ssl after-setup` (PowerShell: `-Ssl after-setup`).
+`--ssl auto` / `-Ssl auto` serves HTTPS from the first boot; trust the local
+CA before opening its HTTPS page. `none` explicitly selects HTTP. Unattended
+installs use HTTP unless a flag or inherited TLS configuration enables HTTPS.
+A re-install preserves the existing transport configuration unless you pass
+an explicit SSL flag. An inherited `CREMIND_SSL` or custom certificate pair is
+also treated as an explicit override and written to the canonical install
+environment. Custom URLs remain yours unless you enable in-app TLS.
+
+To enable HTTPS after an HTTP installation, open **Settings > Security**. It
+explains the benefits, certificate trust, activation, and restart steps for
+your installation. For Kubernetes, use the [Helm HTTPS instructions](../helm/cremind/README.md#switch-an-existing-http-install-to-https):
+`cremind.ssl=true` selects the same trust-first setup flow, while `auto`
+enables HTTPS immediately. The chart defaults to HTTP.
+
 ## Two install modes
 
 The scripts detect Docker and ask which mode you want:
@@ -55,7 +77,7 @@ shows no radio (it's local-only).
    install" step shows the manual command, and any *other* device you browse
    from needs that path anyway. A re-install detects the CA is already
    trusted and skips the prompt.
-7. Open `http://<host>:1515/#/setup` in your browser. *(Desktop image only:* also print the noVNC URL + VNC password.*)* On the `after-setup` TLS default this stays `http://` — finishing the wizard restarts the container into `https://`.
+7. Open `http://<host>:1515/#/setup` in your browser. *(Desktop image only:* also print the noVNC URL + VNC password.*)* When HTTPS was selected (`after-setup`), this stays `http://` — finishing the wizard restarts the container into `https://`.
 
 The bundle defines four services. Only `cremind` is started at install
 time; the others are activated by the wizard:
@@ -91,7 +113,7 @@ docker compose down -v             # stop and delete all data
 4. Generate `~/.cremind/.env` from [`templates/local.env`](templates/local.env), [`templates/server.env.tmpl`](templates/server.env.tmpl) (with `__APP_HOST__` substituted), or [`templates/custom.env.tmpl`](templates/custom.env.tmpl) (with the four advanced-field placeholders substituted). The installer also appends `INSTALL_MODE=docker|native` so the backend's Setup Wizard can filter per-service deployment modes, and the resolved `CREMIND_SSL` (see `--ssl`).
 5. Generate `~/.cremind/bootstrap.toml` selecting SQLite, and run
    `cremind db upgrade` to apply Alembic migrations — **unless** the install
-   is on the `after-setup` TLS default, in which case both are left to the
+   explicitly selected `after-setup` TLS, in which case both are left to the
    Setup Wizard. `bootstrap.toml` existing is what tells the server setup is
    finished and TLS should be bound, so writing one here would put the wizard
    itself behind a certificate nothing trusts yet. The server boots in
@@ -120,7 +142,7 @@ docker compose down -v             # stop and delete all data
    the service is registered without being started and takes over once that
    one stops.
 8. Open `http://<host>:1515/#/setup` in your browser. (Still `http://` on the
-   `after-setup` default — the switch to `https://` happens when the wizard
+   opt-in `after-setup` mode — the switch to `https://` happens when the wizard
    finishes.) On a native install the wizard's "Secure this install" step
    trusts the CA in **one click**: the server runs on this machine, so it
    hands the CA to your OS trust store itself (`POST /api/tls/trust`) —
@@ -157,7 +179,7 @@ container-friendly defaults) for one release; new scripts should use
 | `--mode docker\|native`              | Skip the mode prompt. `--docker` and `--native` are aliases. |
 | `--desktop` / `--no-desktop`         | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `--unattended`; a re-install keeps the previous choice. `--no-desktop` pulls the headless `cremind/cremind`. |
 | `--vnc-password PW`                  | (docker + desktop) Password for the VNC Desktop. 6–8 chars from `[A-Za-z0-9@%_+=:,.-]`. Interactive installs ask for it (twice) instead; unattended runs fall back to the previous install's password, else a generated one. An invalid value is a hard error in every mode. |
-| `--ssl none\|auto\|after-setup`      | TLS on the public origin. Default `after-setup`: plain HTTP for the wizard, which hands you the CA to trust, then a restart into HTTPS with no warning. `auto` is HTTPS from boot one; `none` opts out. A re-install keeps the previous choice. `custom` deployments keep plain HTTP (their URLs are yours) unless you pass this flag. |
+| `--ssl none\|auto\|after-setup`      | TLS on the public origin. Default `none` (HTTP). Select Enable HTTPS or pass `after-setup` for certificate trust during the wizard followed by HTTPS. `auto` is HTTPS from boot one. A re-install preserves its previous choice unless this flag is supplied. Works with native, Docker, custom, and Electron installs. |
 | `--boot-service` / `--no-boot-service` | (native) Register a login/boot service that starts `cremind serve` and restarts it if it stops. Default: on — it is also what makes the in-app restart and the after-setup HTTPS switch work. A re-install keeps a previous opt-out. Ignored for docker (the daemon supervises the container) and for Electron-driven installs. Manage it later with `cremind boot`. |
 | `--no-launch`                        | Don't open the wizard at the end. |
 | `--unattended`                       | Use defaults; never prompt. Implies `--mode docker` if Docker is present. |
@@ -176,7 +198,7 @@ container-friendly defaults) for one release; new scripts should use
 | `-Mode docker\|native`              | Skip the mode prompt. |
 | `-Desktop` / `-NoDesktop`           | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `-Unattended`; a re-install keeps the previous choice. `-NoDesktop` pulls the headless `cremind/cremind`. |
 | `-VncPassword PW`                   | (docker + desktop) Password for the VNC Desktop. 6–8 chars from `[A-Za-z0-9@%_+=:,.-]`. Interactive installs ask for it (twice) instead; unattended runs fall back to the previous install's password, else a generated one. An invalid value is a hard error in every mode. |
-| `-Ssl none\|auto\|after-setup`      | TLS on the public origin. Default `after-setup`: plain HTTP for the wizard, which hands you the CA to trust, then a restart into HTTPS with no warning. `auto` is HTTPS from boot one; `none` opts out. A re-install keeps the previous choice. `custom` deployments keep plain HTTP (their URLs are yours) unless you pass this flag. |
+| `-Ssl none\|auto\|after-setup`      | TLS on the public origin. Default `none` (HTTP). Select Enable HTTPS or pass `after-setup` for certificate trust during the wizard followed by HTTPS. `auto` is HTTPS from boot one. A re-install preserves its previous choice unless this flag is supplied. Works with native, Docker, custom, and Electron installs. |
 | `-BootService` / `-NoBootService`   | (native) Register a logon Scheduled Task that starts `cremind serve` and restarts it if it stops. Default: on — it is also what makes the in-app restart and the after-setup HTTPS switch work. A re-install keeps a previous opt-out. Ignored for docker and for Electron-driven installs. Manage it later with `cremind boot`. |
 | `-NoLaunch`                         | Don't open the wizard at the end. |
 | `-Unattended`                       | Use defaults; never prompt. |

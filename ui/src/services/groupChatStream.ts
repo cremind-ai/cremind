@@ -14,6 +14,7 @@
 import type { GroupChat, GroupMessage } from './groupChatApi';
 import {
   createSharedStream,
+  credentialFreeAuthScope,
   type SharedStreamHandle,
   type SharedStreamRawHandle,
 } from './sharedStream';
@@ -267,7 +268,7 @@ export function openGroupChatStream(
 ): GroupChatStreamHandle {
   const reportStatus = onStatus ?? (() => {});
   const shared: SharedStreamHandle = createSharedStream<GroupStreamFrame>({
-    key: `cremind:group-chat:${authToken}:${groupId}`,
+    publicKey: `cremind:group-chat:${credentialFreeAuthScope(authToken)}:${groupId}`,
     bufferSize: 256,
     openRaw: (handleEvent) =>
       openGroupChatRaw(agentUrl, authToken, groupId, since, handleEvent, reportStatus),

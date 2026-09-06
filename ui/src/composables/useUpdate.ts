@@ -652,7 +652,8 @@ export function useUpdate() {
     // and carries the post-upgrade backend restart itself. Docker installs
     // MUST use the web HTTP POST — there's no venv on the host; the backend
     // (inside the container) runs the upgrade and Docker's restart policy
-    // brings it back up. Pure-web (non-Electron) users always use HTTP.
+    // brings it back up. Browser clients use the current configured HTTP or
+    // HTTPS origin for the same API call.
     const installMode = await getInstallMode()
     const useElectronIpc =
       isElectron()

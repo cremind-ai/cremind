@@ -27,6 +27,8 @@ declare const __CREMIND_INSTALL_CHANNEL__: 'production' | 'test' | 'dev';
 // Always defined under Electron. Undefined under the web build, so callers
 // must guard with optional chaining and fall back to ``import.meta.env``.
 type CremindInstallerEnvironment = {
+  hasExistingInstall: boolean
+  existingSsl: '' | 'auto' | 'after-setup'
   os: 'linux' | 'macos' | 'windows' | 'unknown'
   arch: string
   hasDocker: boolean
@@ -39,6 +41,8 @@ type CremindInstallerRunPayload = {
   deployment: 'local' | 'server' | 'custom'
   appHost?: string
   mode: 'docker' | 'native'
+  /** Explicit HTTPS opt-in. The installer uses the trust-first after-setup flow. */
+  ssl?: boolean
   /** Docker mode only: include the VNC Desktop UI (true → cremind-desktop)
    *  or the headless basic image (false → cremind/cremind). */
   desktopUi?: boolean
@@ -113,15 +117,24 @@ type CremindUpdaterBridge = {
 }
 
 type CremindServerBridge = {
+  /** Wait for every app window before activation stops its HTTP requests. */
+  prepareHttpsMigration: (options: { nextOrigin: string; transitionId: string; instanceId: string }) => Promise<{ ok: boolean; error?: string }>
+  /** Wait for this window's uploads/drafts; return its active profile for setup routes. */
+  onBeforeMigration: (callback: () => Promise<string | void>) => () => void
+  /** Release the renderer upload gate after an activation attempt is aborted. */
+  onMigrationReleased: (callback: () => void) => () => void
+  releaseHttpsMigration: () => Promise<{ ok: boolean; error?: string }>
   // Spawn ``cremind serve`` (idempotent — no-op when something already
   // answers /health). Returns ``{ ok: true }`` once the backend's
   // health endpoint is reachable, or ``{ ok: false, error }`` if it
   // failed to start.
-  start: () => Promise<{ ok: boolean; error?: string }>
+  start: () => Promise<{ ok: boolean; error?: string; agentUrl?: string }>
   // SIGTERM the running backend child and respawn it. Used by the
   // Developer page's Restart Server button under Electron. Resolves
   // once the new backend's /health returns 200.
-  restart: () => Promise<{ ok: boolean; error?: string }>
+  restart: (options?: { nextOrigin?: string; transitionId?: string; instanceId?: string }) => Promise<{ ok: boolean; error?: string; agentUrl?: string }>
+  /** Verify HTTPS, persist its origin and move all first-party app windows. */
+  migrateHttps: (options: { nextOrigin: string; transitionId?: string; instanceId?: string }) => Promise<{ ok: boolean; error?: string; agentUrl?: string }>
 }
 
 // In-app ``cremind upgrade`` flow. ``apply`` spawns the CLI under the

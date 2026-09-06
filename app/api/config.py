@@ -271,6 +271,7 @@ def _setup_tls_next_steps(request: Request) -> dict:
     setup flow (same reason as :func:`_kubernetes_sqlite_rejection`).
     """
     from app.config.tls_mode import current_tls_facts, https_origin_from_app_url
+    from app.config.tls_transition import management
 
     facts = current_tls_facts()
     next_origin = None
@@ -284,6 +285,7 @@ def _setup_tls_next_steps(request: Request) -> dict:
         "tls_pending": facts.pending_https,
         "next_origin": next_origin,
         "restart_supported": facts.restart_supported,
+        "tls_management": management(),
     }
 
 

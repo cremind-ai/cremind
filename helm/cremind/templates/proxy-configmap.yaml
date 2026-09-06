@@ -23,18 +23,87 @@ data:
         ''      close;
     }
 
-    # An Ingress terminates TLS in front of us, so this sidecar only ever sees
-    # plain http on its own port — $scheme would tell the app "http" even when
-    # the browser is on https. Trust the edge's X-Forwarded-Proto when there is
-    # one, and fall back to our own scheme for the bare `port-forward` case.
-    map $http_x_forwarded_proto $forwarded_proto {
-        default $http_x_forwarded_proto;
-        ''      $scheme;
+    # The public listener is also used by port-forward and LoadBalancer clients,
+    # so it ignores client-supplied forwarding headers. The Ingress reaches a
+    # different, ClusterIP-only listener; only that port accepts an exact
+    # http/https scheme supplied by the controller. Unknown values fall back to
+    # the real nginx connection scheme (plain HTTP). The same boundary applies
+    # to X-Forwarded-For so direct clients cannot forge a private client address.
+    map "$server_port:$http_x_forwarded_proto" $forwarded_proto {
+        default                              $scheme;
+{{- if .Values.ingress.enabled }}
+        "{{ include "cremind.edgePort" . }}:http"  http;
+        "{{ include "cremind.edgePort" . }}:https" https;
+{{- end }}
+    }
+
+    # Once the Ingress owns HTTPS, plaintext traffic on its private edge
+    # listener must reach Cremind's restricted recovery middleware. Without
+    # this bit, nginx's /vnc, /websockify and /healthz locations would serve
+    # content before the app could refuse plaintext operations. The public
+    # Service listener stays outside this path so ordinary HTTP installs keep
+    # their full proxy and desktop routes.
+    map "$server_port:$forwarded_proto" $edge_plaintext_recovery {
+        default                              0;
+{{- if include "cremind.ingressHttps" . }}
+        "{{ include "cremind.edgePort" . }}:http"  1;
+{{- end }}
+    }
+
+    # noVNC and its WebSocket are application surfaces too. Divert them on
+    # both the private Ingress listener and the public Service listener after
+    # edge HTTPS is configured. /healthz uses the narrower map above because
+    # kubelet probes the public listener and still needs a sidecar-local check.
+    map "$server_port:$forwarded_proto" $plaintext_special_recovery {
+        default                              0;
+{{- if include "cremind.ingressHttps" . }}
+        "{{ .Values.proxy.port }}:http"             1;
+        "{{ include "cremind.edgePort" . }}:http"  1;
+{{- end }}
+    }
+
+{{- $trustedProxyCidrs := .Values.ingress.trustedProxyCidrs | default "" | toString }}
+{{- if and .Values.ingress.enabled $trustedProxyCidrs }}
+
+    # Optional strict cluster boundary. `geo` checks the socket peer retained
+    # by the realip module; only configured controller addresses may enter the
+    # edge listener. real_ip_recursive then derives one client address from the
+    # controller's X-Forwarded-For chain instead of forwarding a spoofable chain.
+    geo $realip_remote_addr $edge_peer_trusted {
+        default 0;
+{{ range splitList "," $trustedProxyCidrs }}
+        {{ trim . | quote }} 1;
+{{ end }}
+    }
+
+    map "$server_port:$edge_peer_trusted" $reject_untrusted_edge {
+        default 0;
+        "{{ include "cremind.edgePort" . }}:0" 1;
+    }
+{{- end }}
+
+    # $host normalizes away an explicit public port. Preserve the validated
+    # HTTP Host header so custom origins (for example https://host:8443) still
+    # match APP_URL, CORS and HTTPS handoff tickets exactly.
+    map $http_host $forwarded_host {
+        default $http_host;
+        ''      $host;
     }
 
     server {
         listen {{ .Values.proxy.port }};
+{{- if .Values.ingress.enabled }}
+        listen {{ include "cremind.edgePort" . }};
+{{- end }}
         server_name _;
+{{- if and .Values.ingress.enabled $trustedProxyCidrs }}
+{{ range splitList "," $trustedProxyCidrs }}
+        set_real_ip_from {{ trim . | quote }};
+{{ end }}
+        real_ip_header X-Forwarded-For;
+        real_ip_recursive on;
+        if ($reject_untrusted_edge) { return 403; }
+{{- end }}
 
         # Emit relative Location headers. With the default (on), nginx expands a
         # redirect into $scheme://$host:{{ .Values.proxy.port }}/… — leaking the
@@ -45,17 +114,25 @@ data:
 
         # Proxy-local health for the sidecar's own probes (doesn't depend on
         # the backend being up).
-        location = /healthz { return 200 "ok\n"; }
+        error_page 418 = @cremind_recovery;
+        location = /healthz {
+            if ($edge_plaintext_recovery) { return 418; }
+            return 200 "ok\n";
+        }
 {{- if .Values.desktop.enabled }}
 
         # noVNC desktop viewer (desktop flavor only). websockify serves the
         # noVNC web bundle (relative asset paths, so they resolve under /vnc/)
         # and the VNC WebSocket on :80.
-        location = /vnc { return 302 /vnc/vnc.html; }
+        location = /vnc {
+            if ($plaintext_special_recovery) { return 418; }
+            return 302 /vnc/vnc.html;
+        }
         location /vnc/ {
+            if ($plaintext_special_recovery) { return 418; }
             proxy_pass http://127.0.0.1:80/;
             proxy_http_version 1.1;
-            proxy_set_header Host $host;
+            proxy_set_header Host $forwarded_host;
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection $connection_upgrade;
             proxy_read_timeout 3600s;
@@ -66,15 +143,34 @@ data:
         # websockify. Without this the upgrade falls through to the app and the
         # viewer reports "Failed to connect to server" (close code 1006).
         location = /websockify {
+            if ($plaintext_special_recovery) { return 418; }
             proxy_pass http://127.0.0.1:80;
             proxy_http_version 1.1;
-            proxy_set_header Host $host;
+            proxy_set_header Host $forwarded_host;
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection $connection_upgrade;
             proxy_read_timeout 3600s;
             proxy_send_timeout 3600s;
         }
 {{- end }}
+
+        # Internal redirect target for plaintext requests received through an
+        # HTTPS-enabled Ingress. Preserve the original path and trusted
+        # forwarding metadata so EdgeTlsRecovery can return its uncached HTML
+        # page for navigation and 426/close for APIs and WebSockets.
+        location @cremind_recovery {
+            proxy_pass http://127.0.0.1:1515;
+            proxy_http_version 1.1;
+            proxy_set_header Host $forwarded_host;
+            proxy_set_header X-Forwarded-For $remote_addr;
+            proxy_set_header X-Forwarded-Proto $forwarded_proto;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
 
         # Everything else → the single-origin cremind app on 1515: the SPA,
         # /api (REST + Server-Sent Events + the /api/processes/<pid>/ws
@@ -84,8 +180,8 @@ data:
         location / {
             proxy_pass http://127.0.0.1:1515;
             proxy_http_version 1.1;
-            proxy_set_header Host $host;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header Host $forwarded_host;
+            proxy_set_header X-Forwarded-For $remote_addr;
             proxy_set_header X-Forwarded-Proto $forwarded_proto;
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection $connection_upgrade;

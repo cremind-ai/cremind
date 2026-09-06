@@ -41,12 +41,13 @@ from app.utils.logger import logger
 _RESPONSE_WINDOW_S = 1.5
 
 
-async def post_system_restart(request: Request) -> JSONResponse:
-    """Spawn the watchdog, then ask ourselves to stop. Returns 202 or 500."""
-    denied = require_admin(request)
-    if denied is not None:
-        return denied
+def schedule_system_restart() -> int:
+    """Arm the detached watchdog and schedule a graceful server shutdown.
 
+    TLS activation calls this after every browser handoff has been prepared,
+    so a renderer crash between persistence and a second API call cannot leave
+    a supervised native installation stuck on HTTP.
+    """
     # Same invocation pattern as ``/api/upgrade/apply`` — ``sys.executable``
     # + ``-m app.system.restart`` avoids any PATH ambiguity from console
     # script shims that may not exist on a fresh install.
@@ -72,21 +73,15 @@ async def post_system_restart(request: Request) -> JSONResponse:
         # when we die.
         start_new_session = True
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-            start_new_session=start_new_session,
-            close_fds=True,
-        )
-    except OSError as e:
-        return JSONResponse(
-            {"error": f"Failed to spawn restart helper: {e}"},
-            status_code=500,
-        )
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+        start_new_session=start_new_session,
+        close_fds=True,
+    )
 
     # Only now, with the watchdog running: if the spawn had failed after the
     # shutdown was scheduled, a wedged shutdown would have had nothing left to
@@ -99,13 +94,29 @@ async def post_system_restart(request: Request) -> JSONResponse:
             "Restart requested with no serving loop to stop; the watchdog "
             f"will stop this process at the {DEFAULT_GRACE_S}s deadline."
         )
+    return proc.pid
+
+
+async def post_system_restart(request: Request) -> JSONResponse:
+    """Spawn the watchdog, then ask ourselves to stop. Returns 202 or 500."""
+    denied = require_admin(request)
+    if denied is not None:
+        return denied
+
+    try:
+        pid = schedule_system_restart()
+    except OSError as e:
+        return JSONResponse(
+            {"error": f"Failed to spawn restart helper: {e}"},
+            status_code=500,
+        )
 
     # No in-flight guard: a second POST is harmless end-to-end. uvicorn's
     # ``handle_exit`` only re-sets ``should_exit`` for SIGTERM, a second
     # hard-exit timer changes nothing, and each watchdog holds its own handle
     # on this process.
     return JSONResponse(
-        {"ok": True, "pid": proc.pid, "status": "restarting"},
+        {"ok": True, "pid": pid, "status": "restarting"},
         status_code=202,
     )
 

@@ -5,6 +5,7 @@
 // Type-only: the setup response echoes the channel rows it created, in the
 // same shape the channels API returns them.
 import type { ChannelRow } from './channelApi';
+import { trackMigrationUpload } from './migrationReadiness';
 
 function resolveBaseUrl(agentUrl: string): string {
   if (agentUrl.startsWith('http://') || agentUrl.startsWith('https://')) {
@@ -105,6 +106,251 @@ export interface TrustLocalCaResult {
   error?: string;
   /** Copy-pasteable fallback commands when the server-side attempt failed. */
   manual_commands?: string[];
+}
+
+export type TlsTransitionPhase = 'prepared' | 'quiescing' | 'activating' | 'active' | 'cancelled';
+
+/** Public, credential-free information used while the server changes origin. */
+export interface TlsTransition {
+  version: 1;
+  id: string;
+  phase: TlsTransitionPhase;
+  source_origin: string;
+  target_origin: string;
+  instance_id: string;
+  ca_sha256: string | null;
+  certificate_kind?: 'none' | 'local' | 'custom' | 'external';
+  certificate_sha256?: string | null;
+  same_public_port?: boolean;
+  public_port?: number;
+  created_at: number;
+  expires_at: number | null;
+}
+
+export interface TlsRuntimeStatus {
+  instance_id: string;
+  serving_https: boolean;
+  ready?: boolean;
+  certificate_error?: string | null;
+  mode: '' | 'auto' | 'after-setup' | 'custom';
+  install_mode: string;
+  management: 'native' | 'electron' | 'external';
+  /** True after activation persistence; the client chooses the correct
+   * supervisor (REST, Electron IPC, or deployment command). */
+  restart_required?: boolean;
+  /** A supervised native backend durably armed its own delayed restart. */
+  restart_scheduled?: boolean;
+  /** Activation persisted, but the supervisor could not schedule restart. */
+  restart_error?: string | null;
+  /** Number of enrolled tabs still saving uploads and private handoffs. */
+  quiesce_pending?: number;
+  restart_supported: boolean;
+  transition: TlsTransition | null;
+  ca_sha256: string | null;
+  certificate_kind?: 'none' | 'local' | 'custom' | 'external';
+  certificate_sha256?: string | null;
+  same_public_port?: boolean;
+  public_port?: number;
+  https_url: string | null;
+  instructions?: string[];
+}
+
+export interface TlsHandoffState {
+  route?: string;
+  mount?: '/' | '/electron-renderer/';
+  draft?: unknown;
+  drafts?: Record<string, string>;
+  preferences?: Record<string, string>;
+}
+
+export interface TlsHandoffResult {
+  ticket: string;
+  expires_at: number;
+}
+
+export interface TlsHandoffRedeemResult {
+  profile: string;
+  token: string;
+  route: string;
+  state?: TlsHandoffState | null;
+}
+
+/** A valid one-use ticket whose original profile session has expired or was
+ * revoked. Profile and route are safe recovery metadata; no credential is
+ * included in this error. */
+export class TlsHandoffSessionError extends Error {
+  constructor(
+    message: string,
+    public readonly profile: string,
+    public readonly route: string,
+  ) {
+    super(message);
+    this.name = 'TlsHandoffSessionError';
+  }
+}
+
+/** HTTP failure from a TLS transition endpoint. Callers use only the status
+ * code to choose a credential-free login fallback after a session expires. */
+export class TlsApiError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message);
+    this.name = 'TlsApiError';
+  }
+}
+
+async function tlsJson<T>(
+  url: string,
+  init?: RequestInit,
+): Promise<T> {
+  const res = await fetch(url, { cache: 'no-store', ...init });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const message = typeof body?.error === 'string' ? body.error : `${res.status} ${res.statusText}`;
+    throw new TlsApiError(message, res.status);
+  }
+  return body as T;
+}
+
+export function fetchTlsStatus(agentUrl: string): Promise<TlsRuntimeStatus> {
+  return tlsJson<TlsRuntimeStatus>(`${resolveBaseUrl(agentUrl)}/api/tls/status`);
+}
+
+export function prepareHttps(
+  agentUrl: string,
+  token: string,
+  sourceOrigin = window.location.origin,
+): Promise<TlsRuntimeStatus> {
+  return tlsJson<TlsRuntimeStatus>(`${resolveBaseUrl(agentUrl)}/api/tls/prepare`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ source_origin: sourceOrigin }),
+  });
+}
+
+export async function activateHttps(
+  agentUrl: string,
+  token: string,
+  transitionId: string,
+  certificateSha256: string | null,
+  restart = true,
+  onQuiescing?: (status: TlsRuntimeStatus) => void,
+  continueWaiting: () => boolean = () => true,
+): Promise<TlsRuntimeStatus> {
+  const deadline = Date.now() + 5 * 60_000;
+  while (true) {
+    const result = await tlsJson<TlsRuntimeStatus>(`${resolveBaseUrl(agentUrl)}/api/tls/activate`, {
+      method: 'POST',
+      headers: authHeaders(token),
+      body: JSON.stringify({
+        transition_id: transitionId,
+        certificate_sha256: certificateSha256,
+        restart,
+      }),
+    });
+    if (result.transition?.phase !== 'quiescing') return result;
+    onQuiescing?.(result);
+    if (!continueWaiting()) throw new Error('HTTPS activation was cancelled.');
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `${result.quiesce_pending ?? 'Some'} Cremind tab(s) did not finish preparing for HTTPS. `
+        + 'Finish or cancel uploads in those tabs, close obsolete tabs, or cancel and retry the switch.',
+      );
+    }
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
+}
+
+export function registerTlsClient(
+  agentUrl: string,
+  token: string,
+  tabId: string,
+): Promise<TlsRuntimeStatus> {
+  return tlsJson<TlsRuntimeStatus>(`${resolveBaseUrl(agentUrl)}/api/tls/client`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ tab_id: tabId }),
+  });
+}
+
+export function unregisterTlsClient(
+  agentUrl: string,
+  token: string,
+  tabId: string,
+  keepalive = false,
+): Promise<TlsRuntimeStatus> {
+  return tlsJson<TlsRuntimeStatus>(`${resolveBaseUrl(agentUrl)}/api/tls/client`, {
+    method: 'DELETE',
+    headers: authHeaders(token),
+    body: JSON.stringify({ tab_id: tabId }),
+    keepalive,
+  });
+}
+
+export function acknowledgeTlsReady(
+  agentUrl: string,
+  token: string,
+  tabId: string,
+  transitionId: string,
+): Promise<TlsRuntimeStatus> {
+  return tlsJson<TlsRuntimeStatus>(`${resolveBaseUrl(agentUrl)}/api/tls/ready`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ tab_id: tabId, transition_id: transitionId }),
+  });
+}
+
+export function cancelHttps(
+  agentUrl: string,
+  token: string,
+  transitionId: string,
+): Promise<TlsRuntimeStatus> {
+  return tlsJson<TlsRuntimeStatus>(`${resolveBaseUrl(agentUrl)}/api/tls/cancel`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ transition_id: transitionId }),
+  });
+}
+
+export function createTlsHandoff(
+  agentUrl: string,
+  token: string,
+  payload: {
+    transition_id: string;
+    source_origin: string;
+    target_origin: string;
+    route: string;
+    state?: TlsHandoffState;
+  },
+): Promise<TlsHandoffResult> {
+  return tlsJson<TlsHandoffResult>(`${resolveBaseUrl(agentUrl)}/api/tls/handoff`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function redeemTlsHandoff(
+  targetOrigin: string,
+  ticket: string,
+): Promise<TlsHandoffRedeemResult> {
+  const res = await fetch(`${targetOrigin.replace(/\/$/, '')}/api/tls/handoff/redeem`, {
+    method: 'POST',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ticket }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (res.status === 401 && typeof body?.profile === 'string' && typeof body?.route === 'string') {
+    throw new TlsHandoffSessionError(
+      typeof body?.error === 'string' ? body.error : 'The original session expired.',
+      body.profile,
+      body.route,
+    );
+  }
+  if (!res.ok) {
+    throw new Error(typeof body?.error === 'string' ? body.error : `${res.status} ${res.statusText}`);
+  }
+  return body as TlsHandoffRedeemResult;
 }
 
 /** One-click CA trust — ``POST /api/tls/trust``. The fingerprint echo is
@@ -251,6 +497,8 @@ export interface CompleteSetupResponse {
   next_origin?: string | null;
   /** Whether the wizard may trigger that restart itself. */
   restart_supported?: boolean;
+  /** Which supervisor owns the server process used by the HTTPS pivot. */
+  tls_management?: 'native' | 'electron' | 'external';
 }
 
 export async function completeSetup(
@@ -1237,19 +1485,21 @@ export async function importSkillArchive(
   token: string,
   file: File
 ): Promise<SkillImportResult> {
-  const base = resolveBaseUrl(agentUrl);
-  const formData = new FormData();
-  formData.append('file', file);
-  // Note: no Content-Type header — the browser sets the multipart boundary.
-  const headers: Record<string, string> = {};
-  if (token) headers['Authorization'] = `Bearer ${token}`;
-  const res = await fetch(`${base}/api/skills/import/archive`, {
-    method: 'POST',
-    headers,
-    body: formData,
+  return trackMigrationUpload(async () => {
+    const base = resolveBaseUrl(agentUrl);
+    const formData = new FormData();
+    formData.append('file', file);
+    // Note: no Content-Type header — the browser sets the multipart boundary.
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const res = await fetch(`${base}/api/skills/import/archive`, {
+      method: 'POST',
+      headers,
+      body: formData,
+    });
+    if (!res.ok) throw new Error(await readError(res, 'Failed to import skill'));
+    return res.json();
   });
-  if (!res.ok) throw new Error(await readError(res, 'Failed to import skill'));
-  return res.json();
 }
 
 /** Import skills from a public GitHub repository URL. */

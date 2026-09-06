@@ -9,6 +9,7 @@ guards the ways that rule could silently fail open.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -80,6 +81,50 @@ def test_legacy_token_without_claim_is_accepted_at_serial_zero(db):
     from app.auth import verify_token
 
     assert verify_token(_legacy_token()) is not None
+
+
+def test_http_era_token_is_rejected_after_transport_epoch_advances(db):
+    from app.auth import verify_token
+    from app.config.settings import BaseConfig
+
+    old_http_token = _legacy_token()
+    tls_dir = Path(BaseConfig.CREMIND_SYSTEM_DIR) / "tls"
+    tls_dir.mkdir(parents=True)
+    (tls_dir / "transition.json").write_text(
+        '{"version":1,"phase":"activating","transport_epoch":1}',
+        encoding="utf-8",
+    )
+
+    assert verify_token(old_http_token) is None
+    current, _ = BaseConfig.mint_token("admin")
+    claims = pyjwt.decode(current, _SECRET, algorithms=["HS256"])
+    assert claims["tep"] == 1
+    assert verify_token(current) is not None
+
+
+@pytest.mark.parametrize("claim", ["1", 1.0, None, [], {}, True])
+def test_non_integer_transport_epoch_claims_are_rejected(db, claim):
+    from app.auth import verify_token
+
+    now = datetime.now(timezone.utc)
+    malformed = pyjwt.encode(
+        {"sub": "admin", "profile": "admin", "tsr": 0, "tep": claim,
+         "iat": now, "exp": now + timedelta(hours=1)},
+        _SECRET, algorithm="HS256",
+    )
+    assert verify_token(malformed) is None
+
+
+def test_malformed_transport_metadata_fails_closed(db):
+    from app.auth import verify_token
+    from app.config.settings import BaseConfig
+
+    tls_dir = Path(BaseConfig.CREMIND_SYSTEM_DIR) / "tls"
+    tls_dir.mkdir(parents=True)
+    (tls_dir / "transition.json").write_text("{damaged", encoding="utf-8")
+    assert verify_token(_legacy_token()) is None
+    with pytest.raises(RuntimeError, match="transport epoch"):
+        BaseConfig.mint_token("admin")
 
 
 def test_legacy_token_is_revoked_after_one_rotation(db):

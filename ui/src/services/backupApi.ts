@@ -14,6 +14,8 @@
 // Follows the resolveBaseUrl + authHeaders + fetch convention of the other
 // services. agentUrl / authToken come from the settings Pinia store.
 
+import { trackMigrationUpload } from './migrationReadiness';
+
 function resolveBaseUrl(agentUrl: string): string {
   if (agentUrl.startsWith('http://') || agentUrl.startsWith('https://')) {
     return agentUrl;
@@ -158,14 +160,16 @@ export async function downloadBackup(agentUrl: string, authToken: string, name: 
 export async function uploadBackup(
   agentUrl: string, authToken: string, file: File,
 ): Promise<{ name: string; size_bytes: number; manifest: ManifestSummary }> {
-  const form = new FormData();
-  form.append('file', file, file.name);
-  const res = await fetch(`${resolveBaseUrl(agentUrl)}/api/backup/upload`, {
-    method: 'POST',
-    headers: authHeaders(authToken, false),
-    body: form,
+  return trackMigrationUpload(async () => {
+    const form = new FormData();
+    form.append('file', file, file.name);
+    const res = await fetch(`${resolveBaseUrl(agentUrl)}/api/backup/upload`, {
+      method: 'POST',
+      headers: authHeaders(authToken, false),
+      body: form,
+    });
+    return jsonOrThrow(res, 'Failed to upload backup');
   });
-  return jsonOrThrow(res, 'Failed to upload backup');
 }
 
 export async function startRestore(

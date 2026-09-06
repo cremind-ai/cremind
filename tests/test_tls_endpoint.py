@@ -10,6 +10,8 @@ parameterised path would be a private-key disclosure.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from starlette.applications import Starlette
 from starlette.authentication import AuthCredentials, AuthenticationBackend
@@ -80,7 +82,8 @@ def test_no_sibling_file_is_reachable(system_dir, client):
     ensure_local_tls(str(system_dir))
 
     paths = [route.path for route in get_tls_routes()]
-    assert paths == ["/ca.pem", "/api/tls/trust"]
+    assert "/ca.pem" in paths
+    assert all("{" not in path for path in paths)
     # There is no route that could resolve these, with or without traversal.
     for probe in ("/ca.key", "/tls/ca.key", "/key.pem", "/ca.pem/../ca.key"):
         assert client.get(probe).status_code == 404
@@ -296,11 +299,35 @@ def test_trust_requires_the_fingerprint_echo(system_dir, native_env, monkeypatch
     assert client.post(
         "/api/tls/trust", content=b"ca_sha256=x",
         headers={"content-type": "application/x-www-form-urlencoded"},
-    ).status_code == 400
+    ).status_code == 415
     wrong = "AA:" * 31 + "AA"
     assert client.post(
         "/api/tls/trust", json={"ca_sha256": wrong}
     ).status_code == 409
+    assert calls == []
+
+
+def test_trust_rejects_cross_origin_and_simple_content_type_before_running_tools(
+    system_dir, native_env, monkeypatch,
+):
+    ensure_local_tls(str(system_dir))
+    calls = _stub_plan(monkeypatch)
+    body = json.dumps({"ca_sha256": _fingerprint(system_dir)})
+    client = _trust_client()
+
+    cross_site = client.post(
+        "/api/tls/trust",
+        content=body,
+        headers={"content-type": "application/json", "origin": "https://attacker.example"},
+    )
+    simple = client.post(
+        "/api/tls/trust",
+        content=body,
+        headers={"content-type": "text/plain", "origin": "http://testserver"},
+    )
+
+    assert cross_site.status_code == 403
+    assert simple.status_code == 415
     assert calls == []
 
 

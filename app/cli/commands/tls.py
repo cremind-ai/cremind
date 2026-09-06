@@ -1,16 +1,21 @@
-"""`cremind tls ...` — trust the CA behind ``CREMIND_SSL=auto``.
+"""`cremind tls ...` — enable HTTPS and manage the device's CA trust.
 
-Like ``cremind db``, these don't go through the HTTP API: they read a file
-under ``<system dir>/tls/`` and hand it to the operating system's trust store.
-That is deliberate — the whole point of the command is the case where an HTTP
-client *cannot* talk to the server yet, because its certificate is not trusted.
-So there is no client wrapper in ``app/cli/client/``; there is nothing to call.
+Status, prepare, enable and cancel use the running server through
+``app.cli.client.tls``. Administrative changes require the admin token.
+Trust, export and fingerprint instead read a certificate under
+``<system dir>/tls/`` and remain usable offline without a session. That local
+path matters when an HTTPS client cannot reach the server yet because its
+certificate is not trusted.
 
 Subcommands:
 
   tls export       Copy the local CA certificate out (file or stdout).
   tls fingerprint  Show the CA's SHA-256 fingerprint, as browsers display it.
   tls trust        Install the CA into this device's OS trust store.
+  tls status       Inspect current HTTPS state and deployment instructions.
+  tls prepare      Prepare a certificate and an authenticated transition.
+  tls enable       Activate HTTPS, optionally restarting supervised native installs.
+  tls cancel       Cancel a prepared transition before activation.
 
 ``trust`` is a one-off per device. A certificate is trusted because it chains
 to a root the *device* already has, so nothing the server does can skip this
@@ -31,7 +36,7 @@ import typer
 
 tls_app = typer.Typer(
     name="tls",
-    help="Trust, export, and fingerprint the CREMIND_SSL=auto local CA.",
+    help="Enable HTTPS, inspect its status, and trust or export the local CA.",
     no_args_is_help=True,
 )
 
@@ -40,9 +45,89 @@ tls_app = typer.Typer(
 _TOOL_TIMEOUT = 120
 
 _FIREFOX_NOTE = (
-    "Firefox keeps its own trust store — import the same file under Settings → "
+    "If Firefox still warns after OS trust, import the same file under Settings → "
     "Privacy & Security → Certificates → View Certificates → Authorities."
 )
+
+
+def _remote_tls(ctx: typer.Context, action: str, source_origin: str | None = None,
+                *, restart: bool = False) -> None:
+    import asyncio
+    from app.cli.client._base import Client
+    from app.cli.client import tls as tls_client
+    from app.cli.commands._helpers import graceful_errors
+    from app.cli.output import print_json, print_kv
+
+    @graceful_errors
+    def run():
+        cfg = ctx.obj["cfg"]
+        if action != "status":
+            cfg.require_token()
+
+        async def call():
+            async with Client(cfg) as client:
+                if action == "status":
+                    return await tls_client.status(client)
+                if action == "prepare":
+                    return await tls_client.prepare(client, source_origin)
+                current = await tls_client.status(client)
+                transition = current.get("transition") or {}
+                if not transition.get("id"):
+                    from app.cli.config import ConfigError
+                    raise ConfigError("Run cremind tls prepare, then trust the CA before enabling HTTPS.")
+                if action == "cancel":
+                    return await tls_client.cancel(client, transition["id"])
+                result = await tls_client.activate(
+                    client,
+                    transition["id"],
+                    current.get("certificate_sha256") or current.get("ca_sha256"),
+                    restart=restart,
+                )
+                if result.get("restart_scheduled"):
+                    result["restart_requested"] = True
+                return result
+
+        result = asyncio.run(call())
+        if ctx.obj["mode"].json:
+            print_json(result)
+        else:
+            print_kv([(key, str(result.get(key, ""))) for key in (
+                "serving_https", "https_url", "management", "certificate_kind", "certificate_sha256", "restart_supported")])
+            if result.get("certificate_error"):
+                typer.echo(result["certificate_error"])
+            for instruction in result.get("instructions", []):
+                typer.echo(instruction)
+            if result.get("restart_required") and not result.get("restart_requested"):
+                typer.echo("HTTPS is prepared. Restart through the desktop app or follow the deployment instructions above.")
+    run()
+
+
+@tls_app.command("status")
+def tls_status(ctx: typer.Context) -> None:
+    """Show HTTP/HTTPS status, certificate fingerprint and deployment steps."""
+    _remote_tls(ctx, "status")
+
+
+@tls_app.command("prepare")
+def tls_prepare(ctx: typer.Context, source_origin: Optional[str] = typer.Option(
+        None, "--source-origin", help="The HTTP browser origin (not the internal CLI port).")) -> None:
+    """Generate the certificate and prepare a switch; requires the admin profile."""
+    _remote_tls(ctx, "prepare", source_origin)
+
+
+@tls_app.command("enable")
+def tls_enable(ctx: typer.Context, yes: bool = typer.Option(False, "--yes", "-y"),
+               restart: bool = typer.Option(True, "--restart/--no-restart")) -> None:
+    """Activate prepared HTTPS and restart a supervised native install."""
+    if not yes and not typer.confirm("Have you verified and trusted the certificate issuer on each device and saved your work? Enable HTTPS now?", default=False):
+        raise typer.Exit(1)
+    _remote_tls(ctx, "enable", restart=restart)
+
+
+@tls_app.command("cancel")
+def tls_cancel(ctx: typer.Context) -> None:
+    """Cancel a prepared switch before activation; requires the admin profile."""
+    _remote_tls(ctx, "cancel")
 
 
 def _default_ca_path() -> Path:

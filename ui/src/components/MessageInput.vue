@@ -6,6 +6,7 @@ import { useSettingsStore } from '../stores/settings';
 import { useChatStore } from '../stores/chat';
 import { fetchSystemVars, fetchAgentNames } from '../services/configApi';
 import { uploadTempFiles } from '../services/filesApi';
+import { beginMigrationUpload, migrationReadiness } from '../services/migrationReadiness';
 import { CHAT_MODES, chatModeMeta, type ChatMode } from '../constants/chatModes';
 import MentionMenu, { type MentionItem } from './MentionMenu.vue';
 
@@ -48,7 +49,79 @@ const fileInputRef = ref<HTMLInputElement | null>(null);
 const attachments = ref<Attachment[]>([]);
 const uploading = ref(false);
 
+// Drafts are per tab, profile, and conversation. sessionStorage deliberately
+// avoids copying one tab's unfinished message into another; the HTTPS handoff
+// transfers these allowlisted keys for this tab only.
+const draftKey = computed(() => {
+  const profile = settingsStore.profileId || 'unknown';
+  const conversation = props.conversationId ?? chatStore.activeConversationId ?? 'new';
+  return `cremind:draft:${profile}:${conversation}`;
+});
+
+function loadDraft() {
+  try {
+    const raw = sessionStorage.getItem(draftKey.value);
+    if (!raw) {
+      inputText.value = '';
+      attachments.value = [];
+      return;
+    }
+    const parsed = JSON.parse(raw) as { text?: unknown; attachments?: unknown };
+    inputText.value = typeof parsed.text === 'string' ? parsed.text : '';
+    attachments.value = Array.isArray(parsed.attachments)
+      ? parsed.attachments.filter((a): a is Attachment => Boolean(
+        a && typeof a === 'object'
+        && typeof (a as Attachment).name === 'string'
+        && typeof (a as Attachment).path === 'string',
+      ))
+      : [];
+  } catch {
+    inputText.value = '';
+    attachments.value = [];
+  }
+}
+
+watch(draftKey, (nextKey, previousKey) => {
+  // ensureConversation() assigns the real id while an upload is in flight.
+  // Carry the live composer atomically from :new before loading the new key;
+  // otherwise the key watcher clears the text and the finished attachment is
+  // restored into a different draft during an HTTPS migration.
+  if (uploading.value && previousKey?.endsWith(':new') && nextKey !== previousKey) {
+    try {
+      if (inputText.value || attachments.value.length > 0) {
+        sessionStorage.setItem(nextKey, JSON.stringify({
+          text: inputText.value,
+          attachments: attachments.value,
+        }));
+      }
+      sessionStorage.removeItem(previousKey);
+    } catch { /* storage may be unavailable */ }
+    return;
+  }
+  loadDraft();
+}, { immediate: true });
+watch([inputText, attachments], () => {
+  try {
+    if (!inputText.value && attachments.value.length === 0) {
+      sessionStorage.removeItem(draftKey.value);
+    } else {
+      sessionStorage.setItem(draftKey.value, JSON.stringify({
+        text: inputText.value,
+        attachments: attachments.value,
+      }));
+    }
+  } catch { /* storage may be unavailable */ }
+}, { deep: true });
+
 const triggerUpload = () => {
+  if (migrationReadiness.migrating.value) {
+    ElNotification({
+      title: 'HTTPS switch in progress',
+      message: 'Wait for this tab to reopen securely before starting another upload.',
+      type: 'info',
+    });
+    return;
+  }
   if (props.disabled || props.isProcessing || uploading.value) return;
   fileInputRef.value?.click();
 };
@@ -59,12 +132,14 @@ const onFilesPicked = async (event: Event) => {
   // Reset the input value so picking the same file again re-fires `change`.
   input.value = '';
   if (!files.length) return;
+  if (migrationReadiness.migrating.value) return;
 
   // Gate send for the WHOLE provision+upload window. Set before awaiting
   // ensureConversation so a quick Enter can't (a) send a message before the
   // attachment is pushed (dropping it), or (b) create a second conversation
   // while the first is still being provisioned for the upload.
   uploading.value = true;
+  const migrationUploadDone = beginMigrationUpload();
   try {
     // Files must land in a real conversation's temp dir. When embedded, upload
     // to the given run conversation; otherwise ensure the active one exists
@@ -75,7 +150,7 @@ const onFilesPicked = async (event: Event) => {
       return;
     }
     const results = await uploadTempFiles(
-      settingsStore.agentUrl, settingsStore.authToken, cid, files,
+      settingsStore.agentUrl, settingsStore.authToken, cid, files, migrationUploadDone,
     );
     for (const r of results) {
       if (r.status === 'error' || !r.path) {
@@ -96,6 +171,7 @@ const onFilesPicked = async (event: Event) => {
     });
   } finally {
     uploading.value = false;
+    migrationUploadDone();
   }
 };
 
@@ -394,6 +470,7 @@ const submit = () => {
     emit('send', { text: inputText.value, attachments: [...attachments.value] });
     inputText.value = '';
     attachments.value = [];
+    try { sessionStorage.removeItem(draftKey.value); } catch { /* ignore */ }
     closeMenu();
     nextTick(adjustHeight);
   }

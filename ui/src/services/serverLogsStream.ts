@@ -16,7 +16,7 @@
  * 6-per-origin cap.
  */
 
-import { createSharedStream, type SharedStreamHandle, type SharedStreamRawHandle } from './sharedStream';
+import { createSharedStream, credentialFreeAuthScope, type SharedStreamHandle, type SharedStreamRawHandle } from './sharedStream';
 
 export interface LogEntry {
   ts: string;
@@ -155,7 +155,7 @@ export function openServerLogsStream(
   const handle = createSharedStream<LogFrame>({
     // Namespace by token so an admin tab (leader) never broadcasts admin's
     // logs to a different profile's follower. Mirrors processesStream.
-    key: `cremind:server-logs:${authToken || 'anon'}`,
+    publicKey: `cremind:server-logs:${authToken ? credentialFreeAuthScope(authToken) : 'anon'}`,
     // Strictly greater than the backend ring (_RING_CAP = 500) so a late
     // follower's replay from the leader covers at least the backend
     // backfill, `ready` marker included.

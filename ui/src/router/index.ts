@@ -5,6 +5,8 @@ import {
 import ChatView from '../views/ChatView.vue';
 import { useSettingsStore } from '../stores/settings';
 import { PROFILE_ROUTES } from './profileRoutes';
+import { redeemTlsHandoff, TlsHandoffSessionError } from '../services/configApi';
+import { restoreTransitionState } from '../services/httpsTransition';
 
 declare module 'vue-router' {
   interface RouteMeta {
@@ -14,44 +16,54 @@ declare module 'vue-router' {
 
 const APP_NAME = __IS_ELECTRON__ ? 'Cremind App' : 'Cremind Web UI';
 
-// How long a hand-off URL stays usable. The Setup Wizard consumes it within
-// seconds of minting it; anything older is a bookmarked or leaked URL being
-// replayed, and gets bounced to the login screen instead of importing a
-// token.
-const HANDOFF_MAX_AGE_MS = 10 * 60_000;
-
 /**
- * Consume the cross-origin session hand-off from the Setup Wizard's HTTPS
- * pivot (``CREMIND_SSL=after-setup``).
+ * Consume an opaque, one-use cross-origin HTTPS handoff.
  *
  * ``localStorage`` is per-origin, so the token minted while the wizard ran on
- * ``http://host:1515`` does not exist on ``https://host:1515``. The wizard
- * therefore redirects here with the token in the URL *fragment* — the SPA uses
- * ``createWebHashHistory``, so the fragment is the route and, being a
- * fragment, is never sent to the server or written to its logs.
+ * ``http://host:1515`` does not exist on ``https://host:1515``. The URL carries
+ * only a short-lived ticket; the profile token stays in the private system
+ * directory until this HTTPS-only endpoint consumes it.
  *
- * This guard always redirects, so the token-bearing URL is replaced in history
- * rather than left sitting in the address bar and the back stack.
+ * This guard always redirects, immediately removing the ticket from both the
+ * address bar and browser history.
  */
-function consumeSetupHandoff(to: RouteLocationNormalized) {
-  const token = typeof to.query.token === 'string' ? to.query.token : '';
-  const profile = typeof to.query.profile === 'string' ? to.query.profile : '';
-  if (!token || !profile) {
+async function consumeSetupHandoff(to: RouteLocationNormalized) {
+  const ticket = typeof to.query.ticket === 'string' ? to.query.ticket : '';
+  if (!ticket) {
     return { path: '/', replace: true };
   }
-  const ts = Number.parseInt(
-    typeof to.query.ts === 'string' ? to.query.ts : '',
-    10,
-  );
-  if (!Number.isFinite(ts) || Date.now() - ts > HANDOFF_MAX_AGE_MS) {
-    // Expired or malformed: land on the login screen WITHOUT importing the
-    // token. The user still has it (the wizard made them save the config
-    // export), and a replayed URL buys an attacker nothing.
-    return { path: `/login/${profile}`, replace: true };
+  // The opaque ticket is still sensitive one-use material. Remove it before
+  // the network request so a slow certificate check never leaves it visible,
+  // copyable, or present in the back stack.
+  const clean = new URL(window.location.href);
+  clean.hash = `#${to.path}`;
+  window.history.replaceState(window.history.state, '', clean);
+  try {
+    const handoff = await redeemTlsHandoff(window.location.origin, ticket);
+    restoreTransitionState(handoff.state, handoff.profile);
+    useSettingsStore().setTokenForProfile(handoff.profile, handoff.token);
+    const requested = typeof handoff.route === 'string' && handoff.route.startsWith('/')
+      ? handoff.route
+      : `/${handoff.profile}`;
+    // A ticket is profile-bound. Never restore a route under a different
+    // profile even if a malformed/stale client supplied one when minting it.
+    const routeProfile = requested.split('/').filter(Boolean)[0] ?? '';
+    return requested === '/' || routeProfile === handoff.profile
+      ? requested : `/${handoff.profile}`;
+  } catch (error) {
+    if (error instanceof TlsHandoffSessionError) {
+      const requested = error.route.startsWith('/') ? error.route : `/${error.profile}`;
+      const routeProfile = requested.split('/').filter(Boolean)[0] ?? '';
+      const redirect = requested === '/' || routeProfile === error.profile
+        ? requested : `/${error.profile}`;
+      return {
+        path: `/login/${error.profile}`,
+        query: { redirect },
+        replace: true,
+      };
+    }
+    return { path: '/', query: { https_handoff: 'expired' }, replace: true };
   }
-  useSettingsStore().setTokenForProfile(profile, token);
-  // The PROFILE_ROUTES guard below activates the profile on this navigation.
-  return { path: `/${profile}`, replace: true };
 }
 
 const routes = [
@@ -82,6 +94,13 @@ const routes = [
     name: 'setup-handoff',
     component: () => import('../views/SetupHandoff.vue'),
     meta: { title: 'Signing in' },
+    beforeEnter: consumeSetupHandoff,
+  },
+  {
+    path: '/tls-handoff',
+    name: 'tls-handoff',
+    component: () => import('../views/SetupHandoff.vue'),
+    meta: { title: 'Moving to HTTPS' },
     beforeEnter: consumeSetupHandoff,
   },
   // Login route for a specific profile

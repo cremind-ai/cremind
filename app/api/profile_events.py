@@ -63,6 +63,8 @@ from app.events.processes_bus import get_processes_stream_bus
 from app.events.profile_stream_fanout import get_profile_stream_fanout
 from app.events.settings_state_bus import get_settings_state_stream_bus
 from app.events.stream_bus import get_event_stream_bus
+from app.events.transport_state_bus import get_transport_state_bus
+from app.config.tls_transition import public_transition
 from app.storage.conversation_storage import ConversationStorage
 from app.tools.builtin.exec_shell import list_processes
 
@@ -141,6 +143,8 @@ def get_profile_events_routes(
         # profile-keyed, so every subscriber sees the same stream.
         emb_bus = get_embedding_state_stream_bus()
         emb_queue = emb_bus.subscribe()
+        transport_bus = get_transport_state_bus()
+        transport_queue = transport_bus.subscribe()
 
         replay = get_event_notifications().since(profile, since_ms)
         conv_snapshots = await get_event_stream_bus().snapshot_for_profile(profile)
@@ -152,6 +156,7 @@ def get_profile_events_routes(
             settings_task: asyncio.Task | None = None
             proc_task: asyncio.Task | None = None
             emb_task: asyncio.Task | None = None
+            transport_task: asyncio.Task | None = None
             try:
                 for entry in replay:
                     yield _event_frame("notification", entry)
@@ -173,6 +178,9 @@ def get_profile_events_routes(
                 yield _event_frame(
                     "embedding-state", _augment_with_enabled(embedding_state.to_dict()),
                 )
+                transition = public_transition()
+                if transition:
+                    yield _event_frame("transport-change", transition)
                 yield _event_frame("ready", {})
 
                 notif_task = asyncio.ensure_future(notif_queue.get())
@@ -181,12 +189,13 @@ def get_profile_events_routes(
                 settings_task = asyncio.ensure_future(settings_queue.get())
                 proc_task = asyncio.ensure_future(proc_queue.get())
                 emb_task = asyncio.ensure_future(emb_queue.get())
+                transport_task = asyncio.ensure_future(transport_queue.get())
 
                 while True:
                     done, _pending = await asyncio.wait(
                         [
                             notif_task, convs_task, fanout_task,
-                            settings_task, proc_task, emb_task,
+                            settings_task, proc_task, emb_task, transport_task,
                         ],
                         return_when=asyncio.FIRST_COMPLETED,
                         timeout=15.0,
@@ -231,13 +240,16 @@ def get_profile_events_routes(
                                 "embedding-state", _augment_with_enabled(entry),
                             )
                             emb_task = asyncio.ensure_future(emb_queue.get())
+                        elif task is transport_task:
+                            yield _event_frame("transport-change", task.result())
+                            transport_task = asyncio.ensure_future(transport_queue.get())
 
                     if await request.is_disconnected():
                         return
             finally:
                 for task in (
                     notif_task, convs_task, fanout_task,
-                    settings_task, proc_task, emb_task,
+                    settings_task, proc_task, emb_task, transport_task,
                 ):
                     if task is not None and not task.done():
                         task.cancel()
@@ -247,6 +259,7 @@ def get_profile_events_routes(
                 settings_bus.unsubscribe(profile, settings_queue)
                 proc_bus.unsubscribe(profile, proc_queue)
                 emb_bus.unsubscribe(emb_queue)
+                transport_bus.unsubscribe(transport_queue)
 
         headers = {
             "Cache-Control": "no-cache",

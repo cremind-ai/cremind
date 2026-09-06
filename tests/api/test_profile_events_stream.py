@@ -56,6 +56,7 @@ def _patch_sources(monkeypatch: pytest.MonkeyPatch) -> None:
     singletons.
     """
     monkeypatch.setattr(profile_events, "list_processes", lambda profile: [{"pid": "p1"}])
+    monkeypatch.setattr(profile_events, "public_transition", lambda: None)
     monkeypatch.setattr(
         profile_events, "_augment_with_enabled", lambda snap: {**snap, "enabled": True},
     )
@@ -165,6 +166,34 @@ def test_connect_phase_emits_folded_snapshots(monkeypatch: pytest.MonkeyPatch) -
         for name in ("settings-state", "processes", "embedding-state"):
             assert names.index(name) < names.index("ready")
 
+    asyncio.run(run())
+
+
+def test_transport_replay_and_live_announcement_reach_two_profiles(monkeypatch):
+    _patch_sources(monkeypatch)
+    payload = {"id": "switch-1", "phase": "prepared", "target_origin": "https://localhost:1515"}
+    monkeypatch.setattr(profile_events, "public_transition", lambda: payload)
+
+    async def run():
+        bus = profile_events.get_transport_state_bus()
+        before = len(bus._subs)
+        streams = []
+        try:
+            for profile in ("admin", "alice"):
+                request = _make_request({"v": False})
+                request.user.username = profile
+                response = await _make_handler()(request)
+                stream = response.body_iterator
+                streams.append(stream)
+                assert ("transport-change", payload) in await _collect_until_ready(stream)
+            active = {**payload, "phase": "activating"}
+            bus.publish(active)
+            for stream in streams:
+                assert await _pull_event(stream) == ("transport-change", active)
+        finally:
+            for stream in streams:
+                await stream.aclose()
+        assert len(bus._subs) == before
     asyncio.run(run())
 
 

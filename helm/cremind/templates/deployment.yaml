@@ -207,6 +207,13 @@ spec:
             {{- if $proxyOn }}
             - name: http
               containerPort: {{ .Values.proxy.port }}
+            {{- if .Values.ingress.enabled }}
+            # Exposed by the chart through the private Ingress backend Service.
+            # nginx trusts the controller's sanitized forwarding scheme here
+            # while the public `http` listener always overwrites client headers.
+            - name: edge-http
+              containerPort: {{ include "cremind.edgePort" . }}
+            {{- end }}
             {{- else }}
             - name: relay
               containerPort: {{ .Values.proxy.port }}

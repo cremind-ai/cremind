@@ -5,7 +5,7 @@
 // members and KEEPS the `@` on insert: `@handle` is how an agent recognises it
 // was addressed, so dropping the sigil (as the chat composer does) would make
 // every mention read as an ordinary name.
-import { computed, nextTick, ref } from 'vue';
+import { computed, nextTick, ref, watch } from 'vue';
 import { Icon } from '@iconify/vue';
 import MentionMenu, { type MentionItem } from '../MentionMenu.vue';
 
@@ -15,6 +15,9 @@ const props = withDefaults(defineProps<{
   /** Shown instead of the composer when the viewer may not post. */
   disabledHint?: string;
   sending?: boolean;
+  /** Browser handoffs persist one draft per viewer and room. */
+  profile: string;
+  groupId: string;
 }>(), {
   disabled: false,
   disabledHint: '',
@@ -25,6 +28,20 @@ const emit = defineEmits<{ send: [text: string] }>();
 
 const inputText = ref('');
 const taRef = ref<HTMLTextAreaElement | null>(null);
+const draftKey = computed(() => `cremind:draft:${props.profile}:group-${props.groupId}`);
+
+watch(draftKey, () => {
+  try { inputText.value = sessionStorage.getItem(draftKey.value) ?? ''; }
+  catch { inputText.value = ''; }
+  nextTick(adjustHeight);
+}, { immediate: true });
+
+watch(inputText, (value) => {
+  try {
+    if (value) sessionStorage.setItem(draftKey.value, value);
+    else sessionStorage.removeItem(draftKey.value);
+  } catch { /* storage may be unavailable */ }
+});
 
 // Matches the two-party chat's composer, so switching between the two does not
 // move the send button up and down the screen.
@@ -96,12 +113,12 @@ const updateMenuPosition = () => {
   menuPos.value = computeCaretCoords(ta, triggerStart.value);
 };
 
-const adjustHeight = () => {
+function adjustHeight() {
   const ta = taRef.value;
   if (!ta) return;
   ta.style.height = 'auto';
   ta.style.height = `${Math.max(MIN_HEIGHT_PX, Math.min(ta.scrollHeight, MAX_HEIGHT_PX))}px`;
-};
+}
 
 const insertSelection = (item: MentionItem) => {
   const ta = taRef.value;

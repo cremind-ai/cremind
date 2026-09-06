@@ -272,9 +272,8 @@ const orderedTargets = computed(() => {
           class="trust-error"
         >
           <template #title>Could not trust the certificate</template>
-          {{ trustError }} You can run the manual command below instead — or
-          <template v-if="isSettings">keep accepting the browser warning.</template>
-          <template v-else>skip this step and accept the one-time browser warning.</template>
+          {{ trustError }} Run the manual command below, verify the SHA-256
+          fingerprint, and restart the browser before proceeding.
         </ElAlert>
       </template>
     </div>
@@ -377,10 +376,24 @@ const orderedTargets = computed(() => {
     </template>
 
     <div class="info-box">
-      <strong>Using Firefox?</strong> Firefox keeps its own trust store and
-      ignores the system one. Import the same file under
-      <em>Settings → Privacy &amp; Security → Certificates → View Certificates
-      → Authorities</em>.
+      <strong>Browser trust</strong>
+      <p>
+        Chrome and Edge use the operating-system trust store. Safari uses the
+        Apple trust store. Restart the browser after importing the CA if an
+        already-open tab still warns.
+      </p>
+      <p>
+        Firefox normally follows the platform trust store on current releases.
+        If it still warns, import the same file under
+        <em>Settings → Privacy &amp; Security → Certificates → View Certificates
+        → Authorities</em> and allow it to identify websites.
+      </p>
+      <p>
+        On iOS/iPadOS, install the downloaded profile and then enable full trust
+        under <em>Settings → General → About → Certificate Trust Settings</em>.
+        On Android, install it as a CA certificate under the device security
+        settings. Managed devices may prohibit user-installed roots.
+      </p>
     </div>
 
     <div v-if="isSettings && httpsUrl" class="info-box">

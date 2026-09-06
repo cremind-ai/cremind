@@ -253,26 +253,27 @@ def _tls_capabilities(request: Request) -> dict:
 
     ``pending_https`` carries the whole decision for the UI: it is true only
     when this server really will switch to HTTPS on its next boot, and false
-    wherever TLS can never happen (Electron, ``CREMIND_UI_PORT=0``) — so the
+    wherever TLS can never happen (``CREMIND_UI_PORT=0``) — so the
     wizard gating on it inherits those exclusions without sniffing the
     environment itself.
     """
     from app.api.tls import local_trust_capabilities
     from app.config.settings import BaseConfig
-    from app.config.tls_auto import ca_fingerprint_sha256
     from app.config.tls_mode import current_tls_facts, https_origin_from_app_url
+    from app.config.tls_transition import certificate_info
 
     facts = current_tls_facts()
+    edge_https = getattr(getattr(request, "url", None), "scheme", "http") == "https" and not facts.serving_https
     https_url = (
         https_origin_from_app_url(BaseConfig.APP_URL)
-        if (facts.serving_https or facts.pending_https)
+        if (facts.serving_https or edge_https or facts.pending_https)
         else None
     )
     return {
-        "mode": facts.mode,
-        "serving_https": facts.serving_https,
+        "mode": "custom" if BaseConfig.SSL_CERTFILE and BaseConfig.SSL_KEYFILE else facts.mode,
+        "serving_https": facts.serving_https or edge_https,
         "pending_https": facts.pending_https,
-        "ca_sha256": ca_fingerprint_sha256(BaseConfig.CREMIND_SYSTEM_DIR),
+        "ca_sha256": certificate_info(external=edge_https)["ca_sha256"],
         "https_url": https_url or None,
         "restart_supported": facts.restart_supported,
         # Whether THIS server can put the CA into THIS device's trust store —

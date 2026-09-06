@@ -14,6 +14,8 @@
 //
 // Follows the resolveBaseUrl + authHeaders + fetch convention of backupApi.ts.
 
+import { trackMigrationUpload } from './migrationReadiness';
+
 function resolveBaseUrl(agentUrl: string): string {
   if (agentUrl.startsWith('http://') || agentUrl.startsWith('https://')) {
     return agentUrl;
@@ -279,15 +281,17 @@ export async function deleteBlueprint(agentUrl: string, authToken: string, name:
 export async function uploadBlueprint(
   agentUrl: string, authToken: string, file: File, replace = false,
 ): Promise<ImportSession> {
-  const form = new FormData();
-  form.append('file', file, file.name);
-  const q = replace ? '?replace=true' : '';
-  const res = await fetch(`${resolveBaseUrl(agentUrl)}/api/blueprints/import/upload${q}`, {
-    method: 'POST',
-    headers: authHeaders(authToken, false),
-    body: form,
+  return trackMigrationUpload(async () => {
+    const form = new FormData();
+    form.append('file', file, file.name);
+    const q = replace ? '?replace=true' : '';
+    const res = await fetch(`${resolveBaseUrl(agentUrl)}/api/blueprints/import/upload${q}`, {
+      method: 'POST',
+      headers: authHeaders(authToken, false),
+      body: form,
+    });
+    return jsonOrThrow(res, 'Failed to upload blueprint');
   });
-  return jsonOrThrow(res, 'Failed to upload blueprint');
 }
 
 export async function getImportSession(agentUrl: string, authToken: string): Promise<ImportSession | null> {

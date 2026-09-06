@@ -183,6 +183,7 @@ def write_credentials_file(
     *,
     system_dir: Path | None = None,
     install_dir: Path | None = None,
+    force_mode: str | None = None,
 ) -> Path:
     """Regenerate ``<install_dir>/credentials.toml`` from current disk state.
 
@@ -209,7 +210,7 @@ def write_credentials_file(
         bootstrap_path = Path(BaseConfig.CREMIND_SYSTEM_DIR) / "bootstrap.toml"
 
     docker_vars = parse_docker_env(docker_env)
-    install_mode = "docker" if docker_vars else "native"
+    install_mode = force_mode or ("docker" if docker_vars else "native")
 
     payload: dict[str, Any] = {
         "generated_at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -244,6 +245,7 @@ def write_credentials_file(
         cors = native_vars.get("CORS_ALLOWED_ORIGINS", "")
         wizard_env = native_vars.get("SETUP_WIZARD_ENV", "")
         api_port = _int_or(api_port, native_vars.get("PORT"))
+        spa_port = _int_or(spa_port, native_vars.get("CREMIND_UI_PORT"))
 
     payload["app"] = {
         "api_url": api_url,

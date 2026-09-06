@@ -1,11 +1,25 @@
 {{- if .Values.ingress.enabled -}}
+{{- $annotations := deepCopy (.Values.ingress.annotations | default dict) -}}
+{{- if include "cremind.ingressHttps" . -}}
+{{- /* nginx-ingress normally redirects every HTTP request as soon as TLS is
+       configured. Cremind deliberately keeps HTTP document navigation alive
+       as a restricted recovery surface for old bookmarks and suspended tabs.
+       Other controllers ignore these nginx-specific annotations; operators
+       can override either value explicitly for a controller-specific policy. */ -}}
+{{- if not (hasKey $annotations "nginx.ingress.kubernetes.io/ssl-redirect") -}}
+{{- $_ := set $annotations "nginx.ingress.kubernetes.io/ssl-redirect" "false" -}}
+{{- end -}}
+{{- if not (hasKey $annotations "nginx.ingress.kubernetes.io/force-ssl-redirect") -}}
+{{- $_ := set $annotations "nginx.ingress.kubernetes.io/force-ssl-redirect" "false" -}}
+{{- end -}}
+{{- end -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: {{ include "cremind.fullname" . }}
   labels:
     {{- include "cremind.labels" . | nindent 4 }}
-  {{- with .Values.ingress.annotations }}
+  {{- with $annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
@@ -25,7 +39,7 @@ spec:
             pathType: {{ .Values.ingress.pathType }}
             backend:
               service:
-                name: {{ include "cremind.fullname" . }}
+                name: {{ include "cremind.ingressServiceName" . }}
                 port:
-                  number: {{ .Values.service.port }}
+                  number: 80
 {{- end }}

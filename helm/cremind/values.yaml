@@ -97,7 +97,9 @@ cremind:
   # Override if you port-forward to a different local port or front it with
   # another URL.
   appUrl: ""
-  # In-pod HTTPS. "" (the default) serves plain HTTP; with a real domain put
+  # In-pod HTTPS. "" (the default) or false serves plain HTTP. Set true to
+  # enable HTTPS after certificate trust during setup (same as "after-setup").
+  # With a real domain put
   # TLS on the Ingress instead (see the ingress section). "auto" makes the
   # server generate a local CA and sign its own certificate under
   # <systemDir>/tls/ at first boot (both persist on the system PVC) and serve
@@ -131,11 +133,14 @@ cremind:
   # tcpSocket, the only check that is true in BOTH phases (an httpGet would
   # fail on one side of the flip and restart-loop the pod).
   #
-  # Only "", "auto" and "after-setup" are accepted: bring-your-own certificates
+  # Boolean true/false and "", "none", "auto", "after-setup" are accepted. An explicit
+  # false overrides the legacy extraEnv mode (remove a conflicting entry).
+  # Keep the empty default for old releases that configured TLS in extraEnv.
+  # Bring-your-own certificates
   # belong on an Ingress. Releases predating this knob that set CREMIND_SSL
   # through cremind.extraEnv keep working (the chart reads it, including
   # after-setup), but move them over when convenient.
-  ssl: ""                        # -> CREMIND_SSL ("" = http, "auto" = in-pod https, "after-setup" = http until setup finishes, then https)
+  ssl: ""                        # HTTP by default; true = after-setup, false/"none" = HTTP, "auto" = HTTPS from first boot
   # Extra subject-alternative names for the auto-generated certificate, as a
   # comma-separated list of hostnames/IPs. The certificate already covers
   # localhost and the pod's own hostname/IPs; add whatever name the browser
@@ -231,6 +236,9 @@ extraVolumeMounts: []
 #                          /.well-known + A2A POST / — incl. SSE + WebSocket)
 # Containers in a pod share localhost, so the proxy reaches 127.0.0.1:{1515,80}.
 # The internal API bind (1112) is loopback-only and is not proxied.
+# When ingress.enabled, its dedicated ClusterIP Service targets edgePort while
+# the user-facing Service targets port. Only edgePort accepts a validated
+# forwarded scheme from the controller; direct clients cannot spoof HTTPS.
 #
 # With cremind.ssl set the same sidecar switches to a LAYER-4 TCP passthrough
 # relay (no routes, no /vnc/): bytes flow untouched between the browser and the
@@ -250,6 +258,13 @@ proxy:
     tag: "1.27-alpine"
     pullPolicy: IfNotPresent
   port: 8080
+  # L7 mode + ingress.enabled only: a pod-private listener reached through a
+  # dedicated ClusterIP Service by the Ingress controller. Only this listener
+  # accepts the controller's sanitized X-Forwarded-Proto; the public listener
+  # above overwrites client-supplied forwarding headers. Keep the ports
+  # different or the chart rejects the release. Templates fall back to 8082
+  # when this key is absent in an older release upgraded with --reuse-values.
+  edgePort: 8082
   # Relay-mode only (cremind.ssl set): a second, pod-internal port carrying the
   # sidecar's own /healthz for its probes. Never exposed on the Service. The
   # templates default this to 8081 if absent, so `helm upgrade --reuse-values`
@@ -260,7 +275,8 @@ proxy:
     limits: { cpu: 200m, memory: 128Mi }
 
 ## @section Service
-# Exposes ONLY the reverse-proxy port — one port for UI + API + noVNC.
+# The user-facing Service exposes one application port for UI + API + noVNC.
+# ingress.enabled creates a second ClusterIP referenced as the Ingress backend.
 service:
   type: ClusterIP
   port: 80          # external Service port -> proxy container port
@@ -273,14 +289,31 @@ service:
 # TLS for a real domain belongs here, on the Ingress — that is also where
 # HTTP/2 to the browser comes from, since ingress controllers serve it by
 # default. For domain-less installs (a port-forward, a NodePort) use in-pod TLS
-# instead: cremind.ssl=auto, above. The two are mutually exclusive and the
+# instead: cremind.ssl=true for guided setup, or auto from first boot. The two
+# are mutually exclusive and the
 # chart rejects ingress.enabled together with cremind.ssl — an Ingress
 # controller speaks plain HTTP to the backend and cannot portably re-encrypt to
 # the pod's private CA.
+#
+# When ingress.enabled, the chart sets CREMIND_TLS_TERMINATION=edge so the
+# Settings > Security workflow expects a certificate Secret at the edge and
+# does not generate a Cremind private CA. With ingress.tls configured, the
+# template also defaults nginx-ingress's ssl-redirect and force-ssl-redirect
+# annotations to "false". That preserves a restricted plaintext recovery page
+# for old HTTP bookmarks and suspended tabs after activation; Cremind rejects
+# plaintext API traffic. Explicit annotation values always win. For another
+# controller, configure its equivalent "serve both HTTP and HTTPS" policy;
+# do not install a permanent redirect or HSTS while recovery is enabled.
 ingress:
   enabled: false
   className: ""
   annotations: {}
+  # Controller source IPs/CIDRs (comma-separated). Required for Ingress TLS:
+  # it restricts the dedicated ClusterIP edge listener to the controller and
+  # enables safe original-client address restoration. Without the sidecar it
+  # is passed to Uvicorn for the same trust boundary. Wildcard and /0 networks
+  # are rejected. Obtain the controller pod/node source range from your cluster.
+  trustedProxyCidrs: ""
   host: cremind.local
   path: /
   pathType: Prefix

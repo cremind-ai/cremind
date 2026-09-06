@@ -6,7 +6,7 @@
        state APP_URL and the port name describe). They differ for exactly one
        mode: after-setup serves plain HTTP until the Setup Wizard completes. */}}
 {{- $browseScheme := ternary "http" $scheme (eq $sslMode "after-setup") }}
-{{- $ingScheme := ternary "https" "http" (gt (len (.Values.ingress.tls | default list)) 0) }}
+{{- $ingScheme := ternary "https" "http" (ne (include "cremind.ingressHttps" .) "") }}
 Cremind has been deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
 
 This is a single-replica deployment that boots straight into the Setup Wizard
@@ -61,6 +61,22 @@ noVNC moves to its own port — see below.
    {{ $ingScheme }}://{{ .Values.ingress.host }}{{ .Values.ingress.path }}#/setup
 {{- if .Values.desktop.enabled }}
    (the agent's desktop is at {{ $ingScheme }}://{{ .Values.ingress.host }}/vnc/vnc.html)
+{{- end }}
+{{- if include "cremind.ingressHttps" . }}
+
+   TLS terminates at the Ingress. Cremind keeps HTTP document navigation as a
+   restricted recovery page for old bookmarks and suspended tabs; plaintext
+   API calls are refused after HTTPS activation. The chart disables automatic
+   redirects for nginx-ingress unless you supplied those annotations. For a
+   different controller, disable its permanent HTTP redirect and HSTS policy
+   so recovery requests continue to reach Cremind.
+
+   The Ingress targets a private Service/listener that accepts the controller's
+   forwarding scheme. The public Service used by port-forward always ignores
+   client-supplied X-Forwarded-Proto, so plaintext cannot impersonate HTTPS.
+   ingress.trustedProxyCidrs is required for Ingress TLS because a ClusterIP
+   remains reachable by cluster workloads. Keep it limited to the controller's
+   source CIDRs so nginx blocks other peers and safely restores the client.
 {{- end }}
 {{- else }}
 

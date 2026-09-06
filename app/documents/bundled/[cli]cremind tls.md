@@ -1,8 +1,8 @@
 ---
-description: "Fix the browser's HTTPS certificate warning — \"Your connection is not private\", ERR_CERT_AUTHORITY_INVALID, NET::ERR_CERT_AUTHORITY_INVALID, \"not secure\" — on a Cremind server running with CREMIND_SSL=auto or CREMIND_SSL=after-setup, by trusting the Cremind Local CA it generates. `cremind tls trust` installs that CA into the Windows, macOS, or Linux trust store (one-off per device); `cremind tls export` copies ca.pem out to hand to another machine; `cremind tls fingerprint` prints its SHA-256 to compare against what the browser shows. Other devices download the CA from https://<host>:1515/ca.pem. Runs entirely locally — no server call, no token. Distinct from supplying your own certificate through CREMIND_SSL_CERTFILE/CREMIND_SSL_KEYFILE, and from terminating TLS at an Ingress or reverse proxy."
+description: "Enable HTTPS after the default HTTP installation and fix ERR_CERT_AUTHORITY_INVALID or connection is not private by trusting ca.pem for CREMIND_SSL=auto, CREMIND_SSL=true or CREMIND_SSL=after-setup. cremind tls status reports transport and deployment instructions; prepare generates or validates a certificate; enable persists and activates HTTPS; cancel stops a prepared switch. Administrative mutations require an admin token. Trust, export and fingerprint operate locally without a token to install the Cremind CA in the device trust store. Covers native, Electron, Docker and Kubernetes with persistent certificate and browser-session migration."
 ---
 
-# `cremind tls` — Trust the local HTTPS certificate authority
+# `cremind tls` — Enable HTTPS and trust the local certificate authority
 
 When Cremind serves HTTPS with `CREMIND_SSL=auto` or `CREMIND_SSL=after-setup`,
 it generates its own certificate authority in `<CREMIND_SYSTEM_DIR>/tls/` and
@@ -33,16 +33,118 @@ Certificate**, which offers the same one-click trust, the same fingerprint,
 and the same CA download. These commands are how you do the same thing by
 hand, on another device, or after the fact.
 
-These commands run entirely on the local machine — they read a file and hand it
+The certificate commands (`trust`, `export`, `fingerprint`) run entirely on the local machine — they read a file and hand it
 to the operating system. They never call the Cremind API and need no token,
 because the whole point is the moment when nothing can talk to the server yet.
+
+## Enable HTTPS after installing over HTTP
+
+The administrative commands are `cremind tls prepare`, `cremind tls enable` and
+`cremind tls cancel`. Select the admin profile with the root `--profile admin` flag.
+The enable command accepts `--yes` and `--restart/--no-restart`.
+
+New installations use HTTP unless HTTPS was explicitly selected. HTTPS encrypts
+sessions and application data in transit and enables browser secure-context APIs.
+
+1. Run `cremind --profile admin tls prepare` against the running server.
+2. For a generated certificate, run `cremind tls fingerprint` and verify the CA
+   fingerprint. Trust the CA on every device with `cremind tls trust`, or export
+   it for another device. Supplied certificates and Ingress certificates use
+   their issuer's trust instructions; they do not use a Cremind CA.
+3. Save your work, then run `cremind --profile admin tls enable --yes`.
+   The command first waits for every registered browser tab or Electron window
+   to finish current uploads and save its own private session handoff; the old
+   HTTP server and token epoch remain usable until that barrier completes.
+   A supervised native server restarts automatically. `--no-restart` saves and
+   announces the switch for a later manual restart. Electron restarts through the
+   desktop app. Docker and Kubernetes print host/Helm instructions instead of
+   changing deployment-owned configuration.
+4. Open or suspended Cremind tabs that joined the preparation retain their
+   route and session when they move to HTTPS. An old HTTP bookmark, or a fully
+   discarded tab that had no private handoff, opens a credential-free recovery
+   page and then the HTTPS login with its intended route retained. Untrusted
+   certificates or a disconnected port-forward leave retry instructions.
+
+Activation changes the token transport epoch. On-host token files are reissued
+without extending their expiry, and browser handoffs receive matching HTTPS
+tokens. If a shell exported the old token in `CREMIND_TOKEN`, unset it and let
+the CLI read the reissued profile token (or export the new canonical value)
+before the next authenticated command.
+
+Native activation also changes an unset, bundled-default, or matching HTTP
+`CREMIND_ATLASSIAN_REDIRECT_URI` to its HTTPS callback. The activation output
+prints the exact URI; add it to the allowed redirect URI in the Atlassian
+developer console before linking Jira or Confluence. An unrelated custom fixed
+callback is preserved.
+
+`cremind tls status` reports the current transport, target address, CA fingerprint
+and installation-specific instructions without requiring a token.
+`cremind --profile admin tls prepare --source-origin http://host:1515` overrides
+which browser origin the local CLI prepares (the internal CLI port stays HTTP).
+`cremind --profile admin tls cancel` cancels a prepared switch before activation;
+it does not disable an already active HTTPS server.
+
+For Ingress TLS, `CREMIND_TLS_TERMINATION=edge` identifies certificate ownership
+before HTTPS is enabled. Update `ingress.tls` in Helm values and the public HTTPS
+`APP_URL`; keep in-pod SSL disabled. Apply the chart's proxy, service and probe
+changes together. Keep HTTP document requests reaching Cremind's recovery page
+instead of forcing an immediate redirect that loses old-origin browser storage.
+For in-pod Kubernetes TLS, set `cremind.ssl=auto` instead and retain the system PVC.
 
 ## Global flags
 
 `cremind tls` accepts the root-level `--json` flag. No `CREMIND_TOKEN` and no
-profile are needed.
+profile are needed for status, trust, export or fingerprint. Prepare, enable and cancel require the admin profile.
 
 ## Subcommands
+
+### `cremind tls status`
+
+```bash
+cremind tls status
+```
+
+Reports the current public transport, HTTPS target, deployment manager,
+certificate type and SHA-256 fingerprint, restart support, transition phase,
+and the exact native, Docker, Kubernetes, or Ingress commands needed next.
+This read-only command does not require a token. The CLI still reaches its
+loopback management listener over HTTP even when the public app uses HTTPS.
+
+### `cremind tls prepare`
+
+```bash
+cremind --profile admin tls prepare [--source-origin URL]
+```
+
+Generates or validates the certificate and records an authenticated transition
+while the HTTP application remains available. `--source-origin` is the public
+HTTP origin to move, such as `http://cremind.lan:1515`; omit it when the
+configured public origin is correct. The source hostname must be covered by a
+generated or supplied certificate before activation can succeed.
+
+### `cremind tls enable`
+
+```bash
+cremind --profile admin tls enable [--yes|-y] [--restart|--no-restart]
+```
+
+Activates the transition prepared by `cremind tls prepare`. It verifies the
+recorded certificate fingerprint, waits for registered tabs and windows to
+finish uploads and save handoffs, persists managed native settings, and then
+restarts when supervision is available. `--yes` skips the trust-and-save
+confirmation. `--restart` is the default; `--no-restart` persists the change
+and prints the exact manual restart command. Docker and Kubernetes remain
+deployment-managed and print recreation or Helm rollout commands instead.
+
+### `cremind tls cancel`
+
+```bash
+cremind --profile admin tls cancel
+```
+
+Cancels a prepared or quiescing transition and tells participating tabs to
+release their upload gates. It does not turn an already active HTTPS server
+back to HTTP.
 
 ### `cremind tls trust`
 
@@ -116,8 +218,8 @@ The commands above default to a CA on the local filesystem. When Cremind runs
 in a container or a cluster, fetch it first:
 
 ```bash
-# From the running server, in a browser or with curl (click through the
-# warning once — the CA is public material, this is safe):
+# From the running server, in a browser or with curl. This transport is not
+# authenticated yet, so compare the fingerprint out of band before trust:
 curl -k -o cremind-ca.pem https://<host>:1515/ca.pem
 
 # Docker
@@ -145,9 +247,10 @@ why they are the better option when available.
 
 ## Firefox and Chromium on Linux
 
-Firefox ships its own trust store and ignores the system one. Import the same
-file under **Settings → Privacy & Security → Certificates → View Certificates →
-Authorities**. Some Chromium builds on Linux use an NSS store the same way.
+Current Firefox releases normally follow the platform trust store. If the
+warning remains, import the same file under **Settings → Privacy & Security →
+Certificates → View Certificates → Authorities**. Some Chromium packages on
+Linux use an NSS store and may also need an explicit import.
 
 ## Troubleshooting
 
@@ -165,5 +268,4 @@ Authorities**. Some Chromium builds on Linux use an NSS store the same way.
   expected until the Setup Wizard completes: the CA already exists and the
   wizard hands it over, then the server restarts into HTTPS. Otherwise
   `CREMIND_SSL` is ignored when `CREMIND_UI_PORT=0` (an external proxy owns
-  the origin) and under the Electron desktop app — nothing needs trusting in
-  either of those cases.
+  the origin); the proxy owns certificate trust there. The Electron desktop app supports HTTPS — trust the CA on its device before enabling TLS.

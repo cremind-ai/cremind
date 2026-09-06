@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import datetime as _dt
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Callable, Literal
 
 from prompt_toolkit.application import Application
@@ -605,6 +606,33 @@ def screen_desktop(state: TuiResult, ctx: "Context") -> ScreenResult:
     return replace(state, desktop=value or ""), "advance"
 
 
+def screen_ssl(state: TuiResult, ctx: "Context") -> ScreenResult:
+    """Offer HTTPS on fresh installs; preserve flags and existing settings."""
+    if state.ssl_choice:
+        return state, "skip"
+    previous_env = ctx.docker_env if state.mode == "docker" else ctx.native_env
+    if ctx.ssl_inherited or (previous_env and Path(previous_env).is_file()):
+        return replace(state, ssl_choice="keep"), "skip"
+    value, action = _radio(
+        title="Cremind · HTTPS",
+        text=(
+            "Enable HTTPS (SSL)?\n\n"
+            "HTTP is the default. You can enable HTTPS later in Settings > Security.\n"
+            "HTTPS encrypts connections and enables HTTP/2. If enabled, setup\n"
+            "first guides you through trusting the local certificate, then switches to HTTPS."
+        ),
+        values=[
+            ("none", "HTTP — default"),
+            ("after-setup", "Enable HTTPS (SSL) — trust the certificate during setup"),
+        ],
+        default="none",
+        allow_back=ctx.can_go_back,
+    )
+    if action != "advance":
+        return state, action
+    return replace(state, ssl_choice=value or "none"), "advance"
+
+
 # The one rule for a VNC password, shared by every front-end. install.sh and
 # install.ps1 carry the same regex literally (a drift test pins the three
 # copies together), and the Electron wizard validates against it too.
@@ -707,6 +735,11 @@ def screen_confirm(state: TuiResult, ctx: "Context") -> ScreenResult:
         ("Version", version_label),
         ("Deployment", state.deployment),
         ("Mode", state.mode),
+        ("HTTPS (SSL)", {
+            "after-setup": "enabled after certificate trust in setup",
+            "auto": "enabled from first boot",
+            "keep": "keep existing transport settings",
+        }.get(state.ssl_choice, "off (HTTP)")),
     ]
     if state.mode == "docker":
         rows.append(("Desktop UI", "yes" if state.desktop != "0" else "no (basic image)"))
@@ -751,6 +784,9 @@ class Context:
     # True when a previous install already has a VNC password on disk, which
     # makes an empty entry mean "keep that one" instead of being rejected.
     vnc_password_preset: bool = False
+    ssl_inherited: bool = False
+    native_env: str = ""
+    docker_env: str = ""
     # Set by the driver before each screen call: True when there is a previous
     # *prompted* screen to return to. Screens forward it as ``allow_back``.
     can_go_back: bool = False
@@ -767,6 +803,7 @@ _SCREENS: list[Callable[[TuiResult, Context], ScreenResult]] = [
     screen_mode,
     screen_desktop,
     screen_vnc_password,
+    screen_ssl,
     screen_confirm,
 ]
 
@@ -779,6 +816,9 @@ def run(
     has_docker: bool,
     electron_version: str,
     vnc_password_preset: bool = False,
+    ssl_inherited: bool = False,
+    native_env: str = "",
+    docker_env: str = "",
 ) -> TuiResult | None:
     """Drive the screen list; return the final TuiResult or ``None`` on cancel.
 
@@ -795,6 +835,9 @@ def run(
         has_docker=has_docker,
         electron_version=electron_version,
         vnc_password_preset=vnc_password_preset,
+        ssl_inherited=ssl_inherited,
+        native_env=native_env,
+        docker_env=docker_env,
     )
     state = initial
     cursor = 0

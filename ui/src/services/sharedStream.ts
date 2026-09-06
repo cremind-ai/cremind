@@ -11,14 +11,14 @@
  * `createSharedStream` solves this by ensuring at most ONE tab per stream key
  * actually holds the SSE connection. That tab is the "leader"; other tabs are
  * "followers" that receive each event over a `BroadcastChannel`. Leader
- * election uses the Web Locks API — when the leader tab closes (or crashes),
- * the browser releases the lock and the next waiting tab transparently takes
- * over.
+ * election uses the Web Locks API when available. Plain HTTP LAN pages commonly
+ * lack that secure-context API, so they use a short localStorage lease instead.
+ * When the leader closes or its lease expires, another tab takes over.
  *
  * Late joiners receive a snapshot of recent events from the leader's ring
  * buffer so they don't miss anything emitted before they subscribed. If a
- * browser lacks `navigator.locks` or `BroadcastChannel`, sharing degrades and
- * each tab opens its own raw stream — i.e. legacy behaviour, no regression.
+ * browser lacks `BroadcastChannel`, sharing degrades and each tab opens its own
+ * raw stream.
  */
 
 export interface SharedStreamHandle {
@@ -30,8 +30,9 @@ export interface SharedStreamRawHandle {
 }
 
 export interface SharedStreamOptions<TEvent> {
-  /** Stable identifier shared across tabs (e.g. `cremind:conv:<id>`). */
-  key: string;
+  /** Stable, credential-free identifier shared across tabs. It is exposed in
+   * BroadcastChannel and Web Locks names, so bearer tokens must never appear. */
+  publicKey: string;
   /**
    * Opens the underlying SSE stream. Only invoked in the leader tab.
    * Must call `onEvent` for each parsed payload and `onError` on terminal
@@ -80,9 +81,32 @@ type ChannelMessage<TEvent> =
 
 function isSharingSupported(): boolean {
   if (typeof navigator === 'undefined') return false;
-  if (typeof BroadcastChannel === 'undefined') return false;
-  const locks = (navigator as Navigator & { locks?: LockManager }).locks;
-  return typeof locks?.request === 'function';
+  return typeof BroadcastChannel !== 'undefined';
+}
+
+/** Derive a nonsecret, collision-free-enough stream scope from JWT claims.
+ * JWT payload claims are not credentials; the signed token and its signature
+ * never enter a channel, lock, or persistent-storage name. */
+export function credentialFreeAuthScope(authToken: string): string {
+  try {
+    const parts = authToken.split('.');
+    if (parts.length !== 3) return 'invalid-session';
+    const encoded = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = encoded + '='.repeat((4 - (encoded.length % 4)) % 4);
+    const bytes = Uint8Array.from(atob(padded), char => char.charCodeAt(0));
+    const claims = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
+    const profile = typeof claims.sub === 'string' ? claims.sub
+      : typeof claims.profile === 'string' ? claims.profile : '';
+    if (!profile) return 'invalid-session';
+    const serial = Number.isInteger(claims.tsr) ? String(claims.tsr) : '0';
+    const issued = typeof claims.iat === 'number' || typeof claims.iat === 'string'
+      ? String(claims.iat) : 'unknown';
+    const expires = typeof claims.exp === 'number' || typeof claims.exp === 'string'
+      ? String(claims.exp) : 'unknown';
+    return `profile=${encodeURIComponent(profile)}:serial=${serial}:iat=${encodeURIComponent(issued)}:exp=${encodeURIComponent(expires)}`;
+  } catch {
+    return 'invalid-session';
+  }
 }
 
 export function createSharedStream<TEvent>(
@@ -95,14 +119,15 @@ export function createSharedStream<TEvent>(
     return { close: () => handle.close() };
   }
 
-  const channelName = `cremind-stream:${opts.key}`;
-  const lockName = `cremind-stream-lock:${opts.key}`;
+  const channelName = `cremind-stream:${opts.publicKey}`;
+  const lockName = `cremind-stream-lock:${opts.publicKey}`;
   const channel = new BroadcastChannel(channelName);
 
   let closed = false;
   let isLeader = false;
   let rawHandle: SharedStreamRawHandle | null = null;
   let resolveLockHeld: (() => void) | null = null;
+  let leaseTimer: ReturnType<typeof setInterval> | null = null;
   const lockController = new AbortController();
   const buffer: TEvent[] = [];
 
@@ -142,8 +167,8 @@ export function createSharedStream<TEvent>(
 
   channel.addEventListener('message', onMessage);
 
-  const becomeLeader = async () => {
-    if (closed) return;
+  const startLeader = () => {
+    if (closed || isLeader) return;
     isLeader = true;
 
     const handleEvent = (e: TEvent) => {
@@ -167,19 +192,80 @@ export function createSharedStream<TEvent>(
       // ignore
     }
 
+  };
+
+  const stopLeader = () => {
+    if (!isLeader) return;
+    isLeader = false;
+    rawHandle?.close();
+    rawHandle = null;
+    buffer.splice(0);
+  };
+
+  const becomeLeader = async () => {
+    startLeader();
     await new Promise<void>(resolve => {
       resolveLockHeld = resolve;
     });
+    stopLeader();
   };
 
-  const locks = (navigator as Navigator & { locks: LockManager }).locks;
-  locks
-    .request(lockName, { mode: 'exclusive', signal: lockController.signal }, becomeLeader)
-    .catch((err: any) => {
+  const locks = (navigator as Navigator & { locks?: LockManager }).locks;
+  if (typeof locks?.request === 'function') {
+    locks
+      .request(lockName, { mode: 'exclusive', signal: lockController.signal }, becomeLeader)
+      .catch((err: any) => {
+        if (closed) return;
+        if (err?.name === 'AbortError') return;
+        if (opts.onError) opts.onError(err);
+      });
+  } else {
+    // Web Locks is a secure-context API, so LAN installs commonly lack it
+    // while still having BroadcastChannel. Use a short localStorage lease to
+    // retain one SSE connection per origin on plain HTTP.
+    // publicKey contains no credential, so retaining it verbatim avoids the
+    // profile-crossing collision risk of a short noncryptographic hash.
+    const leaseKey = `cremind-stream-lease:${opts.publicKey}`;
+    const owner = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    const ttlMs = 6000;
+    const tickMs = 2000;
+    const parseLease = () => {
+      try {
+        return JSON.parse(localStorage.getItem(leaseKey) ?? 'null') as {
+          owner?: string;
+          expires?: number;
+        } | null;
+      } catch { return null; }
+    };
+    const elect = () => {
       if (closed) return;
-      if (err?.name === 'AbortError') return;
-      if (opts.onError) opts.onError(err);
-    });
+      const now = Date.now();
+      const existing = parseLease();
+      if (existing?.owner === owner || !existing?.expires || existing.expires <= now) {
+        try {
+          localStorage.setItem(leaseKey, JSON.stringify({ owner, expires: now + ttlMs }));
+          const won = parseLease()?.owner === owner;
+          if (won) startLeader();
+          else stopLeader();
+        } catch {
+          // Storage-disabled browsers cannot coordinate safely. Open a raw
+          // stream as the established legacy fallback.
+          startLeader();
+        }
+      } else {
+        stopLeader();
+      }
+    };
+    elect();
+    leaseTimer = setInterval(elect, tickMs);
+    window.addEventListener('storage', elect);
+    (channel as BroadcastChannel & { __cremindLeaseCleanup?: () => void }).__cremindLeaseCleanup = () => {
+      window.removeEventListener('storage', elect);
+      try {
+        if (parseLease()?.owner === owner) localStorage.removeItem(leaseKey);
+      } catch { /* ignore */ }
+    };
+  }
 
   // Follower bootstrap: ask any current leader for its buffered tail. Run on
   // a microtask so the message listener above is wired up before we post.
@@ -197,9 +283,10 @@ export function createSharedStream<TEvent>(
       if (closed) return;
       closed = true;
       channel.removeEventListener('message', onMessage);
+      if (leaseTimer !== null) clearInterval(leaseTimer);
+      (channel as BroadcastChannel & { __cremindLeaseCleanup?: () => void }).__cremindLeaseCleanup?.();
       if (isLeader) {
-        rawHandle?.close();
-        rawHandle = null;
+        stopLeader();
         resolveLockHeld?.();
       } else {
         lockController.abort();

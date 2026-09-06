@@ -22,6 +22,7 @@ import type { ScheduleEventSubscription } from './calendarApi';
 import type { EventRun, EventRunStatus } from './eventRunsApi';
 import {
   createSharedStream,
+  credentialFreeAuthScope,
   type SharedStreamHandle,
   type SharedStreamRawHandle,
 } from './sharedStream';
@@ -235,7 +236,7 @@ function dispatchFrame(conn: Connection, frame: AdminFrame) {
 
 function startShared(conn: Connection) {
   conn.shared = createSharedStream<AdminFrame>({
-    key: 'cremind:admin-events',
+    publicKey: `cremind:admin-events:${credentialFreeAuthScope(conn.authToken)}`,
     bufferSize: 4,
     openRaw: (handleEvent, handleError) => openAdminEventsRaw(conn, handleEvent, handleError),
     onEvent: (frame) => dispatchFrame(conn, frame),

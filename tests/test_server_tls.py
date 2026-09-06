@@ -112,14 +112,11 @@ def test_no_public_bind_falls_back_to_plain_http(tls_env, pair) -> None:
     assert "CREMIND_UI_PORT=0" in said[0]
 
 
-def test_electron_ignores_tls(tls_env, pair) -> None:
-    """The desktop shell loads the UI over http://127.0.0.1:1515; honouring TLS
-    here would break its health check for no gain."""
+def test_electron_supports_tls(tls_env, pair) -> None:
+    """Desktop public windows support TLS; the internal CLI bind stays HTTP."""
     cert, key = pair
     tls_env.setenv("CREMIND_ELECTRON_PARENT", "1234")
-    said = _warnings(tls_env)
-    assert server._resolve_tls(cert, key, 1515) is None
-    assert "Electron" in said[0]
+    assert server._resolve_tls(cert, key, 1515) == (cert, key)
 
 
 def test_an_http_app_url_is_called_out(tls_env, pair) -> None:
@@ -249,13 +246,13 @@ def test_after_setup_generates_nothing_when_tls_can_never_happen(
     assert not (tmp_path / "tls").exists()
 
 
-def test_after_setup_generates_nothing_under_electron(tls_env, tmp_path) -> None:
+def test_after_setup_prepares_ca_under_electron(tls_env, tmp_path) -> None:
     _warnings(tls_env)
     _after_setup(tls_env, tmp_path, bootstrap=False)
     tls_env.setenv("CREMIND_ELECTRON_PARENT", "1")
 
     assert server._resolve_tls(None, None, 1515) is None
-    assert not (tmp_path / "tls").exists()
+    assert (tmp_path / "tls" / "ca.pem").exists()
 
 
 def test_an_unknown_mode_warns_instead_of_silently_serving_http(tls_env) -> None:

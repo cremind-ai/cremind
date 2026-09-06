@@ -54,15 +54,8 @@ def _paths(system_dir: str) -> dict[str, str]:
     }
 
 
-def ca_fingerprint_sha256(system_dir: str) -> str | None:
-    """SHA-256 of the local CA certificate, or ``None`` if there isn't one.
-
-    Colon-separated uppercase hex over the DER — the format certificate
-    viewers show, so a user can compare what the Setup Wizard displays against
-    what their browser and OS trust dialog show, and against
-    ``cremind tls fingerprint``.
-    """
-    path = _paths(system_dir)["ca_cert"]
+def _certificate_fingerprint_sha256(path: str) -> str | None:
+    """Colon-separated SHA-256 over one PEM certificate's DER bytes."""
     try:
         with open(path, "rb") as fh:
             cert = x509.load_pem_x509_certificate(fh.read())
@@ -72,6 +65,22 @@ def ca_fingerprint_sha256(system_dir: str) -> str | None:
         cert.public_bytes(serialization.Encoding.DER)
     ).hexdigest().upper()
     return ":".join(digest[i:i + 2] for i in range(0, len(digest), 2))
+
+
+def ca_fingerprint_sha256(system_dir: str) -> str | None:
+    """SHA-256 of the local CA certificate, or ``None`` if there isn't one.
+
+    Colon-separated uppercase hex over the DER — the format certificate
+    viewers show, so a user can compare what the Setup Wizard displays against
+    what their browser and OS trust dialog show, and against
+    ``cremind tls fingerprint``.
+    """
+    return _certificate_fingerprint_sha256(_paths(system_dir)["ca_cert"])
+
+
+def leaf_fingerprint_sha256(system_dir: str) -> str | None:
+    """SHA-256 of the generated server leaf prepared for activation."""
+    return _certificate_fingerprint_sha256(_paths(system_dir)["cert"])
 
 
 def _write_private(path: str, data: bytes) -> None:
@@ -321,6 +330,17 @@ def ensure_local_tls(system_dir: str, extra_hosts: list[str] | None = None) -> t
     """
     paths = _paths(system_dir)
     os.makedirs(paths["dir"], exist_ok=True)
+
+    # Aliases discovered from authenticated browser tabs must survive future
+    # leaf renewal too, including a Helm install whose environment is managed
+    # outside this process. The manifest lives on the same persistent volume.
+    from urllib.parse import urlsplit
+    from app.config.tls_transition import load_transition
+    transition = load_transition(system_dir)
+    if transition and transition.get("phase") != "cancelled":
+        extra_hosts = list(extra_hosts or []) + [
+            urlsplit(source).hostname or "" for source in transition.get("source_origins", [])
+        ]
 
     names, ips = _local_hostnames(extra_hosts)
 

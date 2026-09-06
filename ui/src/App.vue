@@ -11,6 +11,31 @@ import NavRail from './components/NavRail.vue';
 import ConversationsPanel from './components/ConversationsPanel.vue';
 import UpdateBanner from './components/UpdateBanner.vue';
 import FloatingTodoLayer from './components/plan/FloatingTodoLayer.vue';
+import {
+  httpsTransitionState,
+  installHttpsTransitionCoordinator,
+} from './services/httpsTransition';
+import {
+  beginMigrationGate,
+  installMigrationReadinessResponder,
+  migrationReadiness,
+  waitForMigrationReady,
+} from './services/migrationReadiness';
+
+// Keep these refs top-level so Vue unwraps them in the template. Refs reached
+// through a plain object's properties are otherwise exposed as Ref objects.
+const httpsPhase = httpsTransitionState.phase;
+const httpsError = httpsTransitionState.error;
+const httpsTransition = httpsTransitionState.transition;
+const migrationInProgress = migrationReadiness.migrating;
+const httpsRecoveryUrl = computed(() => {
+  const target = httpsTransition.value?.target_origin;
+  if (!target) return '';
+  const mount = window.location.pathname.startsWith('/electron-renderer')
+    ? '/electron-renderer/' : '/';
+  const route = window.location.hash.slice(1) || '/';
+  return `${target.replace(/\/$/, '')}${mount}#${route}`;
+});
 
 const route = useRoute();
 const router = useRouter();
@@ -18,6 +43,11 @@ const chatStore = useChatStore();
 const groupChatStore = useGroupChatStore();
 const settingsStore = useSettingsStore();
 const embeddingStatusStore = useEmbeddingStatusStore();
+let stopHttpsCoordinator: (() => void) | null = null;
+let stopElectronMigrationGuard: (() => void) | null = null;
+let stopElectronMigrationRelease: (() => void) | null = null;
+let releaseElectronMigrationGate: (() => void) | null = null;
+let stopMigrationResponder: (() => void) | null = null;
 
 // Detect if running in Electron
 const isElectron = computed(() => {
@@ -81,6 +111,21 @@ const applyTheme = () => {
 
 watch(() => settingsStore.theme, applyTheme);
 
+watch(
+  () => [settingsStore.agentUrl, settingsStore.authToken] as const,
+  ([agentUrl, token]) => {
+    stopHttpsCoordinator?.();
+    stopHttpsCoordinator = null;
+    // Every renderer registers with the backend's pre-activation barrier.
+    // Electron still delegates the private, per-window handoff and process
+    // restart to its main process.
+    if (agentUrl) {
+      stopHttpsCoordinator = installHttpsTransitionCoordinator(agentUrl, token ?? '');
+    }
+  },
+  { immediate: true },
+);
+
 // Async post-navigation handling: server-side profile validation + chat
 // reset/connect. Synchronous token activation and login redirect for missing
 // tokens are handled by the router beforeEach guard, so views always see a
@@ -143,10 +188,37 @@ watch(
 
 onUnmounted(() => {
   embeddingStatusStore.disconnect();
+  stopHttpsCoordinator?.();
+  stopElectronMigrationGuard?.();
+  stopElectronMigrationRelease?.();
+  releaseElectronMigrationGate?.();
+  stopMigrationResponder?.();
 });
 
 onMounted(async () => {
   applyTheme();
+  stopMigrationResponder = installMigrationReadinessResponder();
+  stopElectronMigrationRelease = window.cremind?.server?.onMigrationReleased?.(
+    () => {
+      releaseElectronMigrationGate?.();
+      releaseElectronMigrationGate = null;
+    },
+  ) ?? null;
+  stopElectronMigrationGuard = window.cremind?.server?.onBeforeMigration?.(
+    async () => {
+      if (!releaseElectronMigrationGate) {
+        releaseElectronMigrationGate = beginMigrationGate();
+      }
+      try {
+        await waitForMigrationReady(5 * 60_000);
+        return settingsStore.profileId || undefined;
+      } catch (error) {
+        releaseElectronMigrationGate();
+        releaseElectronMigrationGate = null;
+        throw error;
+      }
+    },
+  ) ?? null;
   // Subscribe once to the embedding-state SSE stream. Per-page views
   // read from this store reactively instead of opening their own
   // streams, and the underlying connection is shared across browser
@@ -242,6 +314,59 @@ const handleLogout = () => {
         </p>
       </div>
     </div>
+
+    <div
+      v-if="httpsPhase === 'waiting'
+        || httpsPhase === 'moving'
+        || httpsPhase === 'attention'"
+      v-show="route.name !== 'security-settings'
+        && route.name !== 'setup'
+        && route.name !== 'setup-profile'"
+      class="embedding-overlay https-transition-overlay"
+    >
+      <div class="embedding-overlay-card">
+        <div v-if="httpsPhase !== 'attention'" class="spinner"></div>
+        <h2>{{ httpsPhase === 'attention'
+          ? 'HTTPS needs your attention'
+          : 'Switching this tab to HTTPS' }}</h2>
+        <p class="phase-line">
+          <template v-if="httpsPhase === 'attention'">
+            {{ httpsError || 'The secure address could not be verified.' }}
+          </template>
+          <template v-else>
+            Waiting for the secure server, then this tab will reopen at the same page.
+          </template>
+        </p>
+        <p class="hint">
+          If your browser shows a certificate warning, trust the Cremind CA on this
+          device. On Kubernetes, rerun the port-forward command after the rollout.
+        </p>
+        <a
+          v-if="httpsPhase === 'attention'
+            && httpsRecoveryUrl"
+          class="transition-link"
+          :href="httpsRecoveryUrl"
+          target="_blank"
+          rel="noopener noreferrer"
+        >Open the HTTPS address</a>
+      </div>
+    </div>
+
+    <div
+      v-if="migrationInProgress && httpsPhase === 'idle'
+        && route.name !== 'security-settings'
+        && route.name !== 'setup'
+        && route.name !== 'setup-profile'"
+      class="embedding-overlay https-transition-overlay"
+    >
+      <div class="embedding-overlay-card">
+        <div class="spinner"></div>
+        <h2>Preparing tabs for HTTPS</h2>
+        <p class="phase-line">
+          Finishing active uploads and saving each tab's draft before the server restarts.
+        </p>
+      </div>
+    </div>
   </div>
 
 </template>
@@ -318,6 +443,12 @@ const handleLogout = () => {
   color: var(--text-secondary);
   line-height: 1.55;
   margin: 0;
+}
+.transition-link {
+  display: inline-block;
+  margin-top: 16px;
+  color: var(--primary-color);
+  font-weight: 600;
 }
 
 .spinner {

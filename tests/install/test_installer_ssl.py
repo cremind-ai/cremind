@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -62,9 +64,181 @@ def test_flag_documented_in_both_help_texts() -> None:
     assert "--ssl none|auto|after-setup" in header
 
 
-def test_default_is_after_setup_in_both() -> None:
-    assert "$SslMode = 'after-setup'" in _ps1()
-    assert 'SSL_MODE="after-setup"' in _sh()
+def _ssl_resolution(script: str) -> str:
+    # Include the real normalisation/scheme helpers as well as the resolution
+    # block so the extracted script exercises the same alias semantics that
+    # build APP_URL and the health target in a full install.
+    start = script.index("# Only a mode the server recognises")
+    end = re.search(r"\n# [^\n]* boot service [^\n]*\n", script[start:])
+    assert end
+    return script[start:start + end.start()]
+
+
+def _shell(kind: str) -> str:
+    if kind == "ps1":
+        executable = shutil.which("pwsh") or shutil.which("powershell")
+    elif os.name != "nt":
+        executable = shutil.which("bash")
+    else:
+        # Windows' system32/bash.exe is a WSL launcher, not a local shell.
+        candidates = [
+            Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe",
+            Path.home() / "scoop/apps/git/current/bin/bash.exe",
+        ]
+        executable = next((str(p) for p in candidates if p.is_file()), None)
+    if not executable:
+        pytest.skip(f"{kind} shell unavailable")
+    return executable
+
+
+@pytest.mark.parametrize("kind", ["sh", "ps1"])
+@pytest.mark.parametrize("deployment", ["local", "server", "custom"])
+@pytest.mark.parametrize("frontend", ["", "electron"])
+def test_fresh_install_defaults_to_http(kind, deployment, frontend, tmp_path) -> None:
+    mode, ssl, cert = _resolve_ssl(kind, tmp_path, deployment=deployment, frontend=frontend)
+    assert (mode, ssl, cert) == ("", "", "")
+
+
+def _resolve_ssl(kind, root, *, flag="", inherited="", certificate="", keyfile="",
+                 key_password="", auto_hosts="", previous=None, deployment="local",
+                 frontend="", install_mode="native", choice="", full=False):
+    """Execute the real resolution block without installing or starting anything."""
+    native_env = root / "native.env"
+    docker_dir = root / "docker"
+    docker_dir.mkdir(exist_ok=True)
+    target_env = docker_dir / ".env" if install_mode == "docker" else native_env
+    if previous is not None:
+        target_env.write_text(previous, encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CREMIND_SSL")}
+    env.update(
+        CREMIND_SSL=inherited,
+        CREMIND_SSL_CERTFILE=certificate,
+        CREMIND_SSL_KEYFILE=keyfile,
+        CREMIND_SSL_KEYFILE_PASSWORD=key_password,
+        CREMIND_SSL_AUTO_HOSTS=auto_hosts,
+        CREMIND_INSTALLER_FRONTEND=frontend,
+    )
+    variables = {
+        "ENV_FILE": native_env.as_posix(), "CREMIND_INSTALL_DIR": root.as_posix(),
+        "MODE": install_mode, "DEPLOYMENT": deployment,
+        "SSL_MODE": flag, "SSL_CHOICE": choice,
+    }
+    if kind == "sh":
+        prelude = "set -euo pipefail\nwarn() { :; }\nUNATTENDED=1\n"
+        prelude += f"SSL_EXPLICIT={int(bool(flag))}\n"
+        prelude += "".join(f"{key}={shlex.quote(value)}\n" for key, value in variables.items())
+        body = prelude + _ssl_resolution(_sh())
+        body += ('\nprintf "RESULT=%s|%s|%s|%s|%s|%s|%s\\n" '
+                 '"$SSL_MODE" "${CREMIND_SSL:-}" "${CREMIND_SSL_CERTFILE:-}" '
+                 '"${CREMIND_SSL_KEYFILE:-}" "${CREMIND_SSL_KEYFILE_PASSWORD:-}" '
+                 '"${CREMIND_SSL_AUTO_HOSTS:-}" "$(cremind_scheme)"\n')
+        command = [_shell(kind)]
+    else:
+        names = {"ENV_FILE": "EnvFile", "CREMIND_INSTALL_DIR": "CremindInstallDir",
+                 "MODE": "Mode", "DEPLOYMENT": "Deployment", "SSL_MODE": "Ssl"}
+        prelude = "$ErrorActionPreference = 'Stop'\nfunction Write-Warn2 { param($message) }\n$Unattended = $true\n"
+        for key, name in names.items():
+            prelude += f"${name} = '" + variables[key].replace("'", "''") + "'\n"
+        body = prelude + _ssl_resolution(_ps1())
+        body += ('\nWrite-Output "RESULT=$SslMode|$env:CREMIND_SSL|$env:CREMIND_SSL_CERTFILE|'
+                 '$env:CREMIND_SSL_KEYFILE|$env:CREMIND_SSL_KEYFILE_PASSWORD|'
+                 '$env:CREMIND_SSL_AUTO_HOSTS|$(Get-CremindScheme)"\n')
+        command = [_shell(kind), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]
+    script = root / f"resolve.{kind}"
+    script.write_text(body, encoding="utf-8-sig" if kind == "ps1" else "utf-8", newline="\n")
+    result = subprocess.run([*command, script.as_posix()], capture_output=True, text=True, env=env, timeout=20)
+    assert result.returncode == 0, result.stderr
+    line = next(line for line in result.stdout.splitlines() if line.startswith("RESULT="))
+    values = tuple(line.removeprefix("RESULT=").split("|"))
+    return values if full else values[:3]
+
+
+@pytest.mark.parametrize("kind", ["sh", "ps1"])
+@pytest.mark.parametrize("flag, expected", [("none", ""), ("auto", "auto"), ("after-setup", "after-setup")])
+def test_explicit_ssl_works_in_electron_and_overrides_inherited_mode(kind, flag, expected, tmp_path) -> None:
+    mode, ssl, _ = _resolve_ssl(kind, tmp_path, flag=flag, inherited="auto", frontend="electron")
+    assert (mode, ssl) == (expected, expected)
+
+
+@pytest.mark.parametrize("kind", ["sh", "ps1"])
+@pytest.mark.parametrize("install_mode", ["native", "docker"])
+@pytest.mark.parametrize("previous, expected", [("APP_URL=http://localhost:1515\n", ""),
+                                                 ("CREMIND_SSL=\n", ""),
+                                                 ("CREMIND_SSL=none\n", ""),
+                                                 ("CREMIND_SSL=false\n", ""),
+                                                 ("CREMIND_SSL=0\n", ""),
+                                                 ("CREMIND_SSL=no\n", ""),
+                                                 ("CREMIND_SSL=auto\n", "auto"),
+                                                 ("CREMIND_SSL=after-setup\n", "after-setup")])
+def test_reinstall_keeps_previous_transport(kind, install_mode, previous, expected, tmp_path) -> None:
+    mode, ssl, _ = _resolve_ssl(kind, tmp_path, previous=previous, install_mode=install_mode)
+    assert (mode, ssl) == (expected, expected)
+
+
+@pytest.mark.parametrize("kind", ["sh", "ps1"])
+@pytest.mark.parametrize("value", ["none", "false", "0", "no", "FALSE", " false "])
+def test_false_like_ssl_aliases_stay_http(kind, value, tmp_path) -> None:
+    state = _resolve_ssl(kind, tmp_path, inherited=value, full=True)
+    assert state[0:2] == ("", "")
+    assert state[6] == "http"
+
+
+@pytest.mark.parametrize("kind", ["sh", "ps1"])
+@pytest.mark.parametrize("value", ["true", "1", "yes", "TRUE", " true "])
+def test_true_like_ssl_aliases_are_canonical_auto(kind, value, tmp_path) -> None:
+    state = _resolve_ssl(kind, tmp_path, inherited=value, full=True)
+    assert state[0:2] == ("auto", "auto")
+    assert state[6] == "https"
+
+
+@pytest.mark.parametrize("kind", ["sh", "ps1"])
+def test_docker_reinstall_stages_complete_custom_tls_configuration(kind, tmp_path) -> None:
+    previous = """\
+CREMIND_SSL=
+CREMIND_SSL_CERTFILE=/certs/fullchain.pem
+CREMIND_SSL_KEYFILE=/certs/privkey.pem
+CREMIND_SSL_KEYFILE_PASSWORD=correct-horse
+CREMIND_SSL_AUTO_HOSTS=chat.example.test,10.0.0.8
+"""
+    state = _resolve_ssl(
+        kind, tmp_path, previous=previous, install_mode="docker", full=True,
+    )
+    assert state == (
+        "", "", "/certs/fullchain.pem", "/certs/privkey.pem", "correct-horse",
+        "chat.example.test,10.0.0.8", "https",
+    )
+
+
+@pytest.mark.parametrize("kind", ["sh", "ps1"])
+def test_process_custom_tls_overrides_previous_docker_pair(kind, tmp_path) -> None:
+    previous = "CREMIND_SSL_CERTFILE=/old/cert.pem\nCREMIND_SSL_KEYFILE=/old/key.pem\n"
+    state = _resolve_ssl(
+        kind, tmp_path, previous=previous, install_mode="docker",
+        certificate="/new/cert.pem", keyfile="/new/key.pem", full=True,
+    )
+    assert state[2:4] == ("/new/cert.pem", "/new/key.pem")
+    assert state[6] == "https"
+
+
+@pytest.mark.parametrize("kind", ["sh", "ps1"])
+def test_explicit_http_clears_inherited_certificate(kind, tmp_path) -> None:
+    assert _resolve_ssl(kind, tmp_path, flag="none", inherited="auto", certificate="/certs/server.pem") == ("", "", "")
+
+
+@pytest.mark.parametrize("kind", ["sh", "ps1"])
+def test_explicit_http_clears_previous_docker_certificate(kind, tmp_path) -> None:
+    previous = "CREMIND_SSL_CERTFILE=/certs/server.pem\nCREMIND_SSL_KEYFILE=/certs/server.key\n"
+    state = _resolve_ssl(
+        kind, tmp_path, flag="none", previous=previous, install_mode="docker", full=True,
+    )
+    assert state[0:5] == ("", "", "", "", "")
+    assert state[6] == "http"
+
+
+@pytest.mark.parametrize("choice, expected", [("none", ""), ("after-setup", "after-setup")])
+def test_tui_choice_is_applied_without_overwriting_flags(choice, expected, tmp_path) -> None:
+    assert _resolve_ssl("sh", tmp_path, choice=choice)[:2] == (expected, expected)
+    assert _resolve_ssl("sh", tmp_path, choice=choice, flag="auto")[:2] == ("auto", "auto")
 
 
 # ── persistence: the choice must outlive the installing shell ─────────────
@@ -88,6 +262,37 @@ def test_docker_stamp_writes_even_when_empty() -> None:
     """An empty stamp is how a re-install tells "chose http" from "no prior install"."""
     assert 'Add-Content -Path $EnvDocker -Value "CREMIND_SSL=$SslMode"' in _ps1()
     assert "printf 'CREMIND_SSL=%s\\n' \"$SSL_MODE\" >>\"$DOCKER_DIR/.env\"" in _sh()
+
+
+def test_docker_rewrite_restores_every_tls_input() -> None:
+    ps1, sh = _ps1(), _sh()
+    for suffix in ("CERTFILE", "KEYFILE", "KEYFILE_PASSWORD", "AUTO_HOSTS"):
+        assert f"CREMIND_SSL_{suffix}=$ResolvedSsl" in ps1
+        assert f"CREMIND_SSL_{suffix}=%s\\n' \"$RESOLVED_SSL_" in sh
+
+
+def test_native_install_persists_environment_tls_overrides() -> None:
+    """Process-level TLS settings must survive the installer's own process.
+
+    The native boot service and Electron launch from the canonical ``.env``;
+    merely exporting a certificate or mode while installing loses HTTPS on
+    the first restart. Reinstalls must also let a false-like environment mode
+    clear an older certificate pair and HTTPS URL.
+    """
+    ps1, sh = _ps1(), _sh()
+    assert "$SslExplicit -or $SslEnvironmentExplicit" in ps1
+    assert '[ "$SSL_EXPLICIT" = "1" ] || [ "$SSL_ENVIRONMENT_EXPLICIT" = "1" ]' in sh
+
+    for suffix in ("CERTFILE", "KEYFILE", "KEYFILE_PASSWORD"):
+        assert f'Add-Content -Path $EnvFile -Value "CREMIND_SSL_{suffix}=$ResolvedSsl' in ps1
+        assert f"printf 'CREMIND_SSL_{suffix}=%s\\n' \"$RESOLVED_SSL_" in sh
+        assert f"Set-CremindEnvKey -Path $EnvFile -Key 'CREMIND_SSL_{suffix}'" in ps1
+        assert f'upsert_env_key "$ENV_FILE" CREMIND_SSL_{suffix} "$RESOLVED_SSL_' in sh
+
+    assert 'Add-Content -Path $EnvFile -Value "CREMIND_SSL_AUTO_HOSTS=$ResolvedSslAutoHosts"' in ps1
+    assert "printf 'CREMIND_SSL_AUTO_HOSTS=%s\\n' \"$RESOLVED_SSL_AUTO_HOSTS\" >> \"$ENV_FILE\"" in sh
+    assert "if ($UrlScheme -eq 'http')" in ps1
+    assert '[ "$URL_SCHEME" = "http" ]' in sh
 
 
 # ── the after-setup gate (both halves) ────────────────────────────────────
@@ -119,7 +324,7 @@ def test_boot_scheme_accounts_for_completed_setup() -> None:
     probes http:// against a TLS listener, burns its whole budget, and then
     hands the user a wizard URL that cannot load. Latent before the flag —
     ``after-setup`` had to be exported by hand every run — and reachable on
-    every upgrade now that it is the default and is written into the .env.
+    every upgrade of an install that opted into it and wrote it into the .env.
     """
     ps1, sh = _ps1(), _sh()
     # Native: the host can see the marker, so the helper takes it as input.
@@ -260,34 +465,41 @@ def test_none_clears_inherited_env_in_both() -> None:
     """Otherwise the opt-out is a lie: the scheme helper still answers https."""
     ps1, sh = _ps1(), _sh()
     assert "Remove-Item Env:CREMIND_SSL -ErrorAction SilentlyContinue" in ps1
-    assert "unset CREMIND_SSL CREMIND_SSL_CERTFILE" in sh
+    assert "unset CREMIND_SSL" in sh
+    assert "unset CREMIND_SSL_CERTFILE CREMIND_SSL_KEYFILE" in sh
 
 
-def test_electron_is_exempt_in_both_installers() -> None:
-    """The desktop app runs install.sh on macOS/Linux and install.ps1 on Windows.
+def test_tui_ssl_is_forwarded_and_read_in_both_installers() -> None:
+    ps1, sh = _ps1(), _sh()
+    assert "'SSL_CHOICE'" in ps1
+    assert "'none', 'auto', 'after-setup'" in ps1
+    for script in (ps1, sh):
+        assert "--ssl-inherited" in script
+        assert "--native-env" in script
+        assert "--docker-env" in script
+        assert "Enable HTTPS (SSL)? [y/N]" in script
+        assert "CREMIND_INSTALLER_FRONTEND" not in _ssl_resolution(script)
 
-    It loads the UI over http://127.0.0.1, where the server refuses to bind
-    TLS at all, so an https APP_URL there describes an origin that will never
-    exist. Both scripts must exempt it — and must clear an INHERITED
-    CREMIND_SSL too, or the exemption leaks.
+
+def test_explicit_none_clears_kept_custom_certificate_before_downgrade() -> None:
+    """An explicit HTTP choice must also disable certificate-driven TLS.
+
+    Certificate paths independently enable the TLS listener, so leaving them
+    in a kept .env while rewriting APP_URL to HTTP would make ``none`` a lie.
+    Both installers clear the full pair (and an optional key password) first.
     """
     ps1, sh = _ps1(), _sh()
-    assert "$env:CREMIND_INSTALLER_FRONTEND -eq 'electron'" in ps1
-    assert '[ "${CREMIND_INSTALLER_FRONTEND:-}" = "electron" ]' in sh
-    for script, unset in ((ps1, "Remove-Item Env:CREMIND_SSL_CERTFILE"),
-                          (sh, "unset CREMIND_SSL CREMIND_SSL_CERTFILE")):
-        # Once in the Electron arm, once in the explicit-none tail.
-        assert script.count(unset) >= 2, unset
-
-
-def test_none_does_not_downgrade_urls_when_a_certfile_still_serves_tls() -> None:
-    """A cert pair in a kept .env is a separate, documented way to ask for TLS.
-
-    Rewriting APP_URL to http:// while that pair still binds TLS would leave
-    the install describing an origin it does not serve.
-    """
-    assert "^CREMIND_SSL_CERTFILE\\s*=\\s*\\S" in _ps1()
-    assert "^CREMIND_SSL_CERTFILE[[:space:]]*=[[:space:]]*[^[:space:]]" in _sh()
+    resolved_names = {
+        "CREMIND_SSL_CERTFILE": "ResolvedSslCertFile",
+        "CREMIND_SSL_KEYFILE": "ResolvedSslKeyFile",
+        "CREMIND_SSL_KEYFILE_PASSWORD": "ResolvedSslKeyFilePassword",
+    }
+    for key, resolved in resolved_names.items():
+        suffix = key.removeprefix("CREMIND_SSL_")
+        assert f"Set-CremindEnvKey -Path $EnvFile -Key '{key}' -Value ${resolved}" in ps1
+        assert f'upsert_env_key "$ENV_FILE" {key} "$RESOLVED_SSL_{suffix}"' in sh
+    assert "if ($SslExplicit) {\n    $ResolvedSslCertFile = ''" in ps1
+    assert 'if [ "$SSL_EXPLICIT" = "1" ]; then\n    RESOLVED_SSL_CERTFILE=""' in sh
 
 
 # ── host-side CA trust (docker) ───────────────────────────────────────────
@@ -319,7 +531,7 @@ def test_host_ca_trust_is_offered_not_forced() -> None:
 
 def test_host_ca_trust_skips_unattended_and_electron() -> None:
     """--unattended has nobody to consent, and under Electron the server
-    never serves TLS — both must skip the block entirely."""
+    manages certificate trust in the desktop app — both must skip the block entirely."""
     ps1, sh = _ps1(), _sh()
     m = re.search(
         r"if \(\$env:CREMIND_INSTALLER_FRONTEND -ne 'electron' -and "
