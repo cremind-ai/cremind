@@ -16,11 +16,15 @@ from starlette.testclient import TestClient
 from app.api.tls import get_tls_routes
 from app.api.tls_recovery import EdgeTlsRecovery, TlsHandoffCors, recovery_app
 from app.config.settings import BaseConfig
+from app.config.tls_steps import CHART_REFERENCE, running_chart_version
 from app.config import tls_clients, tls_mode, tls_transition as transition
 from app.config.tls_auto import ensure_local_tls as real_ensure_local_tls
 from app.server import JWTAuthBackend
 
 SECRET = "tls-transition-test-secret-only-32plus"
+# The runbook pins the chart that shipped the build answering the request, so
+# the expected command moves with app/__version__.py rather than being frozen.
+CHART_VERSION = running_chart_version()
 
 
 @pytest.fixture
@@ -466,8 +470,8 @@ def test_external_activation_never_rewrites_deployment_environment(client, envir
         pytest.param(
             "kubernetes", {},
             [
-                "helm list --namespace <namespace>",
-                "helm upgrade <release> <chart> --version <chart-version> "
+                "helm list --all-namespaces",
+                f"helm upgrade <release> {CHART_REFERENCE} --version {CHART_VERSION} "
                 "--namespace <namespace> --reuse-values --set cremind.ssl=auto",
                 "kubectl --namespace <namespace> rollout status deployment/<release> --timeout=5m",
                 "kubectl --namespace <namespace> port-forward svc/<release> 1515:80",
@@ -477,10 +481,10 @@ def test_external_activation_never_rewrites_deployment_environment(client, envir
         pytest.param(
             "kubernetes", {"CREMIND_TLS_TERMINATION": "edge", "CREMIND_UI_PORT": "80"},
             [
-                "helm list --namespace <namespace>",
+                "helm list --all-namespaces",
                 "kubectl --namespace <namespace> create secret tls cremind-tls "
                 "--cert=<path-to-fullchain.pem> --key=<path-to-privkey.pem>",
-                "helm upgrade <release> <chart> --version <chart-version> "
+                f"helm upgrade <release> {CHART_REFERENCE} --version {CHART_VERSION} "
                 "--namespace <namespace> --reuse-values -f <your-values.yaml>",
                 "kubectl --namespace <namespace> rollout status deployment/<release> --timeout=5m",
                 "kubectl --namespace <namespace> get ingress <release>",

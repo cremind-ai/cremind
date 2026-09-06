@@ -117,10 +117,16 @@ loopback management listener over HTTP even when the public app uses HTTPS.
 The deployment steps print in the order to follow them, grouped as **Before you
 start**, **Run in order** and **What to expect** when the list is long enough to
 need the separation. Plain lines say what to edit or what to expect; lines
-indented by four spaces are the exact commands to run, and can be pasted as-is
-once `<placeholders>` such as `<namespace>`, `<release>`, `<chart>` and
-`<chart-version>` are replaced — the `helm list` command in the list prints
-those values. With `--json` the same list is the `steps` array of
+indented by four spaces are the exact commands to run.
+
+Anything the server can know is already filled in, including the chart
+reference (`oci://registry-1.docker.io/cremind/cremind`) and the `--version`
+pin, which carries the chart version matching the running build — keep that pin,
+because without it Helm resolves whatever the registry calls latest, skipping
+pre-release charts entirely. That leaves `<release>` and `<namespace>`, which
+`helm list --all-namespaces` (the first command in the Kubernetes runbooks)
+prints, plus the certificate paths and values file on the Ingress runbook.
+With `--json` the same list is the `steps` array of
 `{"kind": "note" | "command", "text": ...}` objects; the flat `instructions`
 array beside it is the same text, kept for older clients. On a server already
 serving HTTPS the list is empty unless the certificate needs replacing, in which

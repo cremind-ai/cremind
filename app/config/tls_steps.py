@@ -30,6 +30,14 @@ carries.
 
 from __future__ import annotations
 
+import re
+
+
+#: Where the chart is published. ``helm push`` in ``release-rc.yml`` and
+#: ``release-prod.yml`` targets ``oci://registry-1.docker.io/cremind``, and the
+#: chart is named ``cremind``. Fixed for every published build, so the command
+#: carries it rather than making the operator look it up.
+CHART_REFERENCE = "oci://registry-1.docker.io/cremind/cremind"
 
 #: Restart through a supervisor that will bring the process back.
 RESTART_COMMAND = "cremind server restart --yes"
@@ -82,10 +90,60 @@ def flatten(steps: list[dict]) -> list[str]:
     return [step["text"] for step in steps]
 
 
+_PEP440_RC = re.compile(r"^(\d+\.\d+\.\d+(?:\.\d+)?)rc(\d+)(?:\.dev(\d+))?$")
+
+
+def pep440_to_semver(version: str) -> str:
+    """This build's version as the chart's SemVer2 spelling.
+
+    ``0.0.17rc9.dev4`` → ``0.0.17-rc.9.dev.4``; a stable version is already
+    SemVer2 and passes through. Helm rejects the PEP 440 form outright, so the
+    two spellings of one release cannot be used interchangeably.
+
+    Deliberately duplicated from ``scripts/sync_ui_version.py``, which the
+    release workflow uses to stamp the chart: ``scripts/`` is not packaged into
+    the wheel (``pyproject.toml`` ships ``packages = ["app"]``), so a running
+    server cannot import it. ``tests/config/test_tls_steps.py`` pins the two
+    implementations equal.
+    """
+    match = _PEP440_RC.match(version)
+    if not match:
+        return version
+    base, rc, dev = match.group(1), match.group(2), match.group(3)
+    return f"{base}-rc.{rc}.dev.{dev}" if dev is not None else f"{base}-rc.{rc}"
+
+
+def running_chart_version() -> str:
+    """The chart version that shipped the build answering this request."""
+    from app.__version__ import __version__
+
+    return pep440_to_semver(__version__)
+
+
 # ── the runbook, per deployment mode ─────────────────────────────────────
 
 
-def _ingress_steps(https_url: str) -> list[dict]:
+def _chart_note(chart_version: str) -> dict:
+    """Why the chart reference and version are already filled in.
+
+    Both are knowable from here — the registry is fixed and the version is this
+    build's own — so the operator only has to supply what is genuinely local to
+    their install. The escape hatches matter though: a chart installed from a
+    checkout has a different source, and an install whose image tag was pinned
+    by hand can be running a build its chart never shipped.
+    """
+    return note(
+        "The chart reference and version above are already filled in for this "
+        f"build ({chart_version}). Keep the --version pin: without it Helm "
+        "resolves whatever the registry calls latest — skipping pre-release "
+        "charts entirely — instead of the version you are running. Use a local "
+        "path in place of the registry reference if you installed from a "
+        "checkout, and the chart version helm list reports for this release if "
+        "it differs from the one above."
+    )
+
+
+def _ingress_steps(https_url: str, chart_version: str) -> list[dict]:
     """Kubernetes with an Ingress terminating TLS.
 
     No port-forward anywhere: the public hostname *is* the HTTPS address here,
@@ -120,23 +178,23 @@ def _ingress_steps(https_url: str) -> list[dict]:
         ),
         note(
             "Then run these commands in order from a machine with helm and kubectl "
-            "access, replacing <namespace>, <release>, <chart>, <chart-version> and "
-            "the certificate paths (the first command prints the release and chart "
-            "version; the chart source is the OCI reference or local path you "
-            "installed from). Skip the create-secret command when cert-manager or "
+            "access, replacing <release> and <namespace> with the NAME and "
+            "NAMESPACE the first command prints, plus the certificate paths and "
+            "your values file. Skip the create-secret command when cert-manager or "
             "another issuer already owns the Secret. One Helm upgrade moves the "
             "proxy, Service, probes and public URL together; changing only the "
             "container environment breaks routing."
         ),
-        command("helm list --namespace <namespace>"),
+        command("helm list --all-namespaces"),
         command(
             "kubectl --namespace <namespace> create secret tls cremind-tls "
             "--cert=<path-to-fullchain.pem> --key=<path-to-privkey.pem>"
         ),
         command(
-            "helm upgrade <release> <chart> --version <chart-version> "
+            f"helm upgrade <release> {CHART_REFERENCE} --version {chart_version} "
             "--namespace <namespace> --reuse-values -f <your-values.yaml>"
         ),
+        _chart_note(chart_version),
         command(
             "kubectl --namespace <namespace> rollout status "
             "deployment/<release> --timeout=5m"
@@ -157,7 +215,7 @@ def _ingress_steps(https_url: str) -> list[dict]:
     ]
 
 
-def _kubernetes_steps(https_url: str) -> list[dict]:
+def _kubernetes_steps(https_url: str, chart_version: str) -> list[dict]:
     """Kubernetes terminating TLS inside the pod (``cremind.ssl=auto``)."""
     return [
         note(
@@ -173,19 +231,19 @@ def _kubernetes_steps(https_url: str) -> list[dict]:
         ),
         note(
             "Then run these commands in order from a machine with helm and kubectl "
-            "access, replacing <namespace>, <release>, <chart> and <chart-version> "
-            "with the values the first command prints (the chart source is the OCI "
-            "reference or local path you installed from). The Deployment and "
-            "Service carry the release name, or <release>-cremind when the release "
-            "name does not contain cremind. Upgrade through Helm so the proxy "
-            "sidecar, Service, probes and URLs change together; editing only the "
-            "container environment breaks routing."
+            "access, replacing <release> and <namespace> with the NAME and "
+            "NAMESPACE the first command prints. The Deployment and Service carry "
+            "the release name, or <release>-cremind when the release name does not "
+            "contain cremind. Upgrade through Helm so the proxy sidecar, Service, "
+            "probes and URLs change together; editing only the container "
+            "environment breaks routing."
         ),
-        command("helm list --namespace <namespace>"),
+        command("helm list --all-namespaces"),
         command(
-            "helm upgrade <release> <chart> --version <chart-version> "
+            f"helm upgrade <release> {CHART_REFERENCE} --version {chart_version} "
             "--namespace <namespace> --reuse-values --set cremind.ssl=auto"
         ),
+        _chart_note(chart_version),
         command(
             "kubectl --namespace <namespace> rollout status "
             "deployment/<release> --timeout=5m"
@@ -328,19 +386,22 @@ def deployment_steps(
     restart_supported: bool,
     activating: bool,
     https_url: str,
+    chart_version: str,
 ) -> list[dict]:
     """What this deployment has to do to finish the switch to HTTPS.
 
-    Empty for a supervised native install and for Electron: those restart
-    themselves, so there is nothing for the operator to run.
+    ``chart_version`` is this build's own, in the chart's SemVer2 spelling —
+    see :func:`running_chart_version`. Empty for a supervised native install
+    and for Electron: those restart themselves, so there is nothing for the
+    operator to run.
     """
     if manager == "external":
         if edge:
-            return _ingress_steps(https_url)
+            return _ingress_steps(https_url, chart_version)
         if install_mode == "docker":
             return _docker_steps(https_url)
         if install_mode == "kubernetes":
-            return _kubernetes_steps(https_url)
+            return _kubernetes_steps(https_url, chart_version)
         return _reverse_proxy_steps(restart_supported, https_url)
     if manager == "native" and not restart_supported:
         return _unsupervised_native_steps(activating, https_url)

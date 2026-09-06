@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from app.config.tls_steps import (
+    CHART_REFERENCE,
     DOCKER_RECREATE_COMMAND,
     RESTART_COMMAND,
     SERVE_COMMAND,
@@ -21,16 +22,20 @@ from app.config.tls_steps import (
     deployment_steps,
     flatten,
     note,
+    pep440_to_semver,
+    running_chart_version,
 )
 
 HTTPS_URL = "https://cremind.lan:1515"
 ATLASSIAN = "Atlassian developer console"
+CHART_VERSION = "0.0.17-rc.9.dev.4"
 
 
 def _steps(**overrides) -> list[dict]:
     kwargs = {
         "manager": "external", "install_mode": "kubernetes", "edge": False,
         "restart_supported": True, "activating": False, "https_url": HTTPS_URL,
+        "chart_version": CHART_VERSION,
     }
     kwargs.update(overrides)
     return deployment_steps(**kwargs)
@@ -87,10 +92,10 @@ def test_flatten_is_the_legacy_instruction_list():
         pytest.param(
             {"edge": True},
             [
-                "helm list --namespace <namespace>",
+                "helm list --all-namespaces",
                 "kubectl --namespace <namespace> create secret tls cremind-tls "
                 "--cert=<path-to-fullchain.pem> --key=<path-to-privkey.pem>",
-                "helm upgrade <release> <chart> --version <chart-version> "
+                f"helm upgrade <release> {CHART_REFERENCE} --version {CHART_VERSION} "
                 "--namespace <namespace> --reuse-values -f <your-values.yaml>",
                 "kubectl --namespace <namespace> rollout status "
                 "deployment/<release> --timeout=5m",
@@ -102,8 +107,8 @@ def test_flatten_is_the_legacy_instruction_list():
         pytest.param(
             {"install_mode": "kubernetes"},
             [
-                "helm list --namespace <namespace>",
-                "helm upgrade <release> <chart> --version <chart-version> "
+                "helm list --all-namespaces",
+                f"helm upgrade <release> {CHART_REFERENCE} --version {CHART_VERSION} "
                 "--namespace <namespace> --reuse-values --set cremind.ssl=auto",
                 "kubectl --namespace <namespace> rollout status "
                 "deployment/<release> --timeout=5m",
@@ -201,6 +206,69 @@ def test_the_unsupervised_native_note_matches_the_phase(activating, opening):
         restart_supported=False, activating=activating,
     )
     assert steps[0]["text"].startswith(opening)
+
+
+@pytest.mark.parametrize("kwargs", [{"edge": True}, {"install_mode": "kubernetes"}])
+def test_helm_commands_carry_the_chart_source_and_version(kwargs):
+    """Both are knowable from here, so the operator never looks them up."""
+    upgrade = next(
+        s["text"] for s in _steps(**kwargs)
+        if s["kind"] == "command" and s["text"].startswith("helm upgrade")
+    )
+    assert f"{CHART_REFERENCE} --version {CHART_VERSION}" in upgrade
+    assert "<chart>" not in upgrade and "<chart-version>" not in upgrade
+    # Only what is genuinely local to the install is left to fill in.
+    assert "<release>" in upgrade and "<namespace>" in upgrade
+
+
+@pytest.mark.parametrize("kwargs", [{"edge": True}, {"install_mode": "kubernetes"}])
+def test_the_first_helm_command_does_not_need_the_namespace_it_reports(kwargs):
+    """`helm list --namespace <ns>` was circular: it is how you FIND the ns."""
+    first = next(s["text"] for s in _steps(**kwargs) if s["kind"] == "command")
+    assert first == "helm list --all-namespaces"
+
+
+@pytest.mark.parametrize("kwargs", [{"edge": True}, {"install_mode": "kubernetes"}])
+def test_the_pre_filled_chart_carries_its_escape_hatches(kwargs):
+    """A pinned version, a checkout install and a mismatched chart all differ
+    from the common case, and silently guessing wrong is worse than a note."""
+    joined = " ".join(flatten(_steps(**kwargs)))
+    assert CHART_VERSION in joined
+    assert "--version pin" in joined and "calls latest" in joined
+    assert "checkout" in joined and "helm list reports" in joined
+
+
+def test_the_chart_version_is_the_semver_spelling_of_this_build():
+    from app.__version__ import __version__
+
+    assert running_chart_version() == pep440_to_semver(__version__)
+
+
+@pytest.mark.parametrize(
+    ("pep440", "semver"),
+    [
+        ("0.0.17rc9.dev4", "0.0.17-rc.9.dev.4"),
+        ("0.0.17rc9", "0.0.17-rc.9"),
+        ("0.0.2.1rc1.dev1", "0.0.2.1-rc.1.dev.1"),
+        ("0.0.16", "0.0.16"),          # a stable version is already SemVer2
+        ("0.0.17.dev1", "0.0.17.dev1"),  # not an RC shape: passed through
+    ],
+)
+def test_pep440_to_semver_matches_the_release_workflows_translation(pep440, semver):
+    """Helm rejects the PEP 440 spelling, so a drift here would print a chart
+    version that does not resolve. The release workflow stamps the chart with
+    scripts/sync_ui_version.py, which the wheel cannot import — hence the copy."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    try:
+        from sync_ui_version import pep440_to_semver as canonical
+    finally:
+        sys.path.pop(0)
+
+    assert pep440_to_semver(pep440) == semver
+    assert canonical(pep440) == pep440_to_semver(pep440)
 
 
 def test_docker_names_the_installers_own_compose_folder():

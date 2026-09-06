@@ -357,6 +357,7 @@ def tls_status_payload(request: Request) -> dict:
     from app.config.tls_mode import current_tls_facts, edge_tls_termination
     from app.config.tls_steps import (
         atlassian_callback_step, certificate_repair_steps, deployment_steps, flatten,
+        running_chart_version,
     )
     from app.config.tls_transition import (
         certificate_info, https_target, instance_id, load_transition, management, mark_active, port_facts, public_transition, validate_custom_certificate,
@@ -397,7 +398,7 @@ def tls_status_payload(request: Request) -> dict:
             manager=manager, install_mode=mode, edge=edge_tls_termination(),
             restart_supported=facts.restart_supported,
             activating=bool(transition and transition.get("phase") == "activating"),
-            https_url=https_url,
+            https_url=https_url, chart_version=running_chart_version(),
         )
     migrated_atlassian = transition.get("atlassian_redirect_uri_migrated") if transition else None
     if isinstance(migrated_atlassian, str) and migrated_atlassian:
