@@ -14,44 +14,104 @@ is_default = true
 [provider.auth_methods.fields]
 api_key = { description = "Together AI API Key", type = "string", secret = true, required = true }
 
-# Cache pricing: Together AI prompt caching applies a ~50% cached-input discount
-# (0.50x input) on repeated prefixes, with no separate cache-write fee.
+# Cache pricing: Together AI caches repeated prefixes automatically, but the
+# cached-input rate is published PER MODEL — real ratios run ~0.10x-0.21x of
+# input, never a flat 0.50x. Only models that publish a cached-input price
+# support cached billing at all; the rest bill every input token at the standard
+# rate and carry prompt_cache = false. No separate cache-write fee on any of them.
 
 [[models]]
-id = "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+id = "moonshotai/Kimi-K3"
 context_window = 1048576
-display_name = "Llama 4 Maverick 17B 128E"
+display_name = "Kimi K3"
+supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 vision = true
-input_price_per_1m = 0.27
-output_price_per_1m = 0.85
-cache_read_price_per_1m = 0.135   # 0.50x input
+input_price_per_1m = 3.00
+output_price_per_1m = 15.00
+cache_read_price_per_1m = 0.30    # published rate, 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
-id = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
-context_window = 1048576
-display_name = "Llama 4 Scout 17B 16E"
+id = "Qwen/Qwen3.8-2.4T-A95B"
+context_window = 1000000
+display_name = "Qwen3.8 Max"
+supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 vision = true
-input_price_per_1m = 0.18
-output_price_per_1m = 0.59
-cache_read_price_per_1m = 0.09    # 0.50x input
+input_price_per_1m = 2.00
+output_price_per_1m = 6.00
+reasoning_effort = ["low", "high", "xhigh"]
+cache_read_price_per_1m = 0.25    # published rate, 0.125x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
+# Context window is exactly 1048575 (2^20 - 1) on both GLM-5.3 rows -- that is the
+# figure Together's serverless-models table publishes, not 1048576. The model page's
+# "1M" is the rounded marketing number. Re-verified live 2026-09-06 against
+# docs.together.ai/docs/serverless-models, where the neighbouring Kimi K3 and
+# DeepSeek V4 rows do read 1048576, so the odd value is per-model, not a typo.
+# Do not "round up" -- context_window is the hard ceiling compaction sizes against.
+[[models]]
+id = "zai-org/GLM-5.3"
+context_window = 1048575
+display_name = "GLM-5.3"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+input_price_per_1m = 1.40
+output_price_per_1m = 4.40
+reasoning_effort = ["low", "high", "max"]
+cache_read_price_per_1m = 0.26    # published rate, ~0.19x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "deepseek-ai/DeepSeek-V4-Pro-0813"
+context_window = 1048576
+display_name = "DeepSeek V4 Pro"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+input_price_per_1m = 1.32
+output_price_per_1m = 3.96
+cache_read_price_per_1m = 0.13    # published rate, ~0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "MiniMaxAI/MiniMax-M3"
+context_window = 524288
+display_name = "MiniMax M3"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.30
+output_price_per_1m = 1.20
+cache_read_price_per_1m = 0.06    # published rate, 0.20x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# Retained, not refreshed. Checked live 2026-09-06: this exact id appears in
+# neither Together's serverless-models table nor its pricing page, and the
+# deprecation list retires only the different string "Qwen/Qwen3-235B-A22B"
+# (inference removal 2026-06-29, fine-tuning 2026-07-29 -- both already past, so
+# the keep-a-future-shutdown rule does not apply here either way). The one 235B
+# row Together still prices is "Qwen3 235B A22B Instruct 2507 FP8 Throughput" at
+# $0.20/$0.60, a different endpoint, so the $0.50/$1.50 below stays unverified
+# rather than being overwritten with another model's rate.
+# The former cache_read_price_per_1m = 0.25 is gone: it was a fabricated 0.50x
+# carry-over, and Together publishes no cached-input column for ANY 235B variant.
+# This entry now bills every input token at the standard rate, like the other
+# prompt_cache = false rows here.
 [[models]]
 id = "Qwen/Qwen3-235B-A22B-FP8"
 context_window = 262144
 display_name = "Qwen 3 235B"
 supports_reasoning = true
 group_hint = "high"
-prompt_cache = true
+prompt_cache = false              # no cached-input rate published; all input bills at standard
 input_price_per_1m = 0.50
 output_price_per_1m = 1.50
-cache_read_price_per_1m = 0.25    # 0.50x input
-cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "openai/gpt-oss-120b"
@@ -59,19 +119,63 @@ context_window = 131072
 display_name = "GPT-OSS 120B"
 supports_reasoning = true
 group_hint = "high"
-prompt_cache = true
+prompt_cache = false              # no cached-input rate published; all input bills at standard
 input_price_per_1m = 0.15
 output_price_per_1m = 0.60
-cache_read_price_per_1m = 0.075   # 0.50x input
+
+[[models]]
+id = "zai-org/GLM-5.3-Flash"
+context_window = 1048575          # exactly as published; see the GLM-5.3 note above
+display_name = "GLM-5.3 Flash"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.15
+output_price_per_1m = 0.50
+reasoning_effort = ["low", "high", "max"]
+cache_read_price_per_1m = 0.03    # published rate, 0.20x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
-id = "moonshotai/Kimi-K2.5"
-context_window = 262144
-display_name = "Kimi K2.5"
-group_hint = "high"
+id = "deepseek-ai/DeepSeek-V4-Flash-0731"
+context_window = 1048576
+display_name = "DeepSeek V4 Flash"
+supports_reasoning = true
+group_hint = "low"
 prompt_cache = true
-input_price_per_1m = 0.50
-output_price_per_1m = 2.80
-cache_read_price_per_1m = 0.25    # 0.50x input
+input_price_per_1m = 0.14
+output_price_per_1m = 0.28
+reasoning_effort = ["low", "high", "max"]
+cache_read_price_per_1m = 0.03    # published rate, ~0.21x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "Qwen/Qwen3.5-9B"
+context_window = 262144
+display_name = "Qwen3.5 9B"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = false              # no cached-input rate published; all input bills at standard
+vision = true
+input_price_per_1m = 0.17
+output_price_per_1m = 0.25
+
+# group_hint resolved to "high". Leaving it unset made this the only entry in the
+# whole provider catalog with no tier, so its usage rows grouped under nothing on
+# the dashboard. "low" is the wrong call: at $1.04/$1.04 it is ~7x the input price
+# of the Flash models tagged "low" here, and the sibling catalogs reserve "low" for
+# genuinely small models (vllm.toml tags Llama 3.1 8B "low"). The identical model at
+# the identical $1.04/$1.04 and 131072 window is already tagged "high" in both
+# huggingface.toml and vllm.toml, so "high" is what keeps the tier consistent
+# across catalogs. Price and window re-verified 2026-09-06 on together.ai/pricing
+# and the serverless-models table; the pricing row shows no cached-input column.
+[[models]]
+id = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+context_window = 131072
+display_name = "Llama 3.3 70B Instruct Turbo"
+group_hint = "high"
+supports_reasoning = false
+prompt_cache = false              # no cached-input rate published; all input bills at standard
+input_price_per_1m = 1.04
+output_price_per_1m = 1.04

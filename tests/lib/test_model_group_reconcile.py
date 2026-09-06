@@ -26,13 +26,13 @@ class FakeConfigStorage:
 
 def test_clears_incompatible_openai_group_on_codex_switch():
     st = FakeConfigStorage()
-    st.set("llm_config", "model_group.high", "github-copilot/gpt-4.1")
+    st.set("llm_config", "model_group.high", "github-copilot/gpt-5.5")
     st.set("llm_config", "model_group.low", "openai/gpt-4.1-mini")  # api_key-only
     cleared = reconcile_model_groups_for_auth(st, "openai", "codex_oauth", profile="admin")
     assert cleared == ["low"]
     assert st.get("llm_config", "model_group.low") is None
     # A group belonging to another provider is untouched.
-    assert st.get("llm_config", "model_group.high") == "github-copilot/gpt-4.1"
+    assert st.get("llm_config", "model_group.high") == "github-copilot/gpt-5.5"
 
 
 def test_keeps_codex_eligible_openai_group():
@@ -45,7 +45,7 @@ def test_keeps_codex_eligible_openai_group():
 
 def test_reverse_direction_clears_codex_only_model_on_api_key_switch():
     st = FakeConfigStorage()
-    st.set("llm_config", "model_group.low", "openai/gpt-5.6-sol")  # codex-only
+    st.set("llm_config", "model_group.low", "openai/gpt-5.3-codex-spark")  # codex-only
     cleared = reconcile_model_groups_for_auth(st, "openai", "api_key", profile="admin")
     assert cleared == ["low"]
     assert st.get("llm_config", "model_group.low") is None
@@ -53,9 +53,9 @@ def test_reverse_direction_clears_codex_only_model_on_api_key_switch():
 
 def test_ignores_groups_of_other_providers():
     st = FakeConfigStorage()
-    st.set("llm_config", "model_group.high", "github-copilot/gpt-4.1")
+    st.set("llm_config", "model_group.high", "github-copilot/gpt-5.5")
     st.set("llm_config", "model_group.low", "anthropic/claude-opus-4-8")
     cleared = reconcile_model_groups_for_auth(st, "openai", "codex_oauth", profile="admin")
     assert cleared == []
-    assert st.get("llm_config", "model_group.high") == "github-copilot/gpt-4.1"
+    assert st.get("llm_config", "model_group.high") == "github-copilot/gpt-5.5"
     assert st.get("llm_config", "model_group.low") == "anthropic/claude-opus-4-8"

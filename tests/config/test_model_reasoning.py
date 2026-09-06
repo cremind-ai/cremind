@@ -8,34 +8,57 @@ the models we expect.
 
 from __future__ import annotations
 
-from app.config import model_supports_reasoning
+from app.config import load_provider_catalog, model_supports_reasoning
+
+
+def _assert_catalogued(provider: str, model: str) -> None:
+    """Fail loudly if ``model`` is no longer in ``provider``'s catalog.
+
+    ``model_supports_reasoning`` returns False for *unknown* models too, so a
+    False-case naming a model a catalog refresh has dropped keeps passing while
+    proving nothing. Every case below is pinned to an id the TOML really carries.
+    """
+    ids = {m.get("id") for m in (load_provider_catalog(provider).get("models") or [])}
+    assert model in ids, f"{provider}/{model} is no longer in the provider catalog"
 
 
 def test_reasoning_model_flagged_true():
-    # o-series and GPT-5.x are reasoning models; Claude 4.x supports extended thinking.
-    assert model_supports_reasoning("openai", "o3") is True
-    assert model_supports_reasoning("openai", "gpt-5.4") is True
-    assert model_supports_reasoning("anthropic", "claude-opus-4-7") is True
-    assert model_supports_reasoning("xai", "grok-3-mini") is True
+    # GPT-6 / GPT-5.x are reasoning models; Claude 4.x supports extended thinking.
+    for provider, model in [
+        ("openai", "gpt-6-astra"),
+        ("openai", "gpt-5.4"),
+        ("anthropic", "claude-opus-4-7"),
+        ("xai", "grok-3-mini"),
+    ]:
+        _assert_catalogued(provider, model)
+        assert model_supports_reasoning(provider, model) is True
 
 
 def test_non_reasoning_model_flagged_false():
-    # GPT-4.1 / Claude 3.5 Haiku / Gemini 2.0 are not reasoning models.
-    assert model_supports_reasoning("openai", "gpt-4.1") is False
-    assert model_supports_reasoning("anthropic", "claude-3-5-haiku-20241022") is False
-    assert model_supports_reasoning("vertexai", "google/gemini-2.0-flash") is False
+    # Plain chat models across three provider families. Note there is no
+    # Anthropic case: every model in anthropic.toml supports extended thinking,
+    # so the old ``claude-3-5-haiku-20241022`` assertion could only be repointed
+    # out of that catalog (Mistral Large stands in as the other-vendor case).
+    # Same for vertexai/google-gemini — every Gemini entry is reasoning-capable.
+    for provider, model in [
+        ("openai", "gpt-4.1"),
+        ("mistral", "mistral-large-latest"),
+        ("groq", "llama-3.3-70b-versatile"),
+    ]:
+        _assert_catalogued(provider, model)
+        assert model_supports_reasoning(provider, model) is False
 
 
 def test_provider_prefix_is_stripped():
     # The model id may arrive prefixed with ``<provider>/``.
-    assert model_supports_reasoning("openai", "openai/o3") is True
+    assert model_supports_reasoning("openai", "openai/gpt-6-astra") is True
     assert model_supports_reasoning("openai", "openai/gpt-4.1") is False
 
 
 def test_unknown_or_blank_defaults_false():
     # Unknown/custom models default to non-reasoning so the think-tool is enabled.
     assert model_supports_reasoning("openai", "totally-made-up-model") is False
-    assert model_supports_reasoning("", "o3") is False
+    assert model_supports_reasoning("", "gpt-6-astra") is False
     assert model_supports_reasoning("openai", "") is False
 
 

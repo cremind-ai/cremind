@@ -289,7 +289,7 @@ def test_complete_reconciles_stale_model_group(monkeypatch):
     monkeypatch.setattr(bus, "publish_settings_state_changed", lambda p: None)
 
     storage = FakeConfigStorage()
-    storage.set("llm_config", "model_group.high", "github-copilot/gpt-4.1")
+    storage.set("llm_config", "model_group.high", "github-copilot/gpt-5.5")
     storage.set("llm_config", "model_group.low", "openai/gpt-4.1-mini")  # api_key-only
     h = _handlers(storage, monkeypatch)
     state = _register_pending(storage)
@@ -299,7 +299,7 @@ def test_complete_reconciles_stale_model_group(monkeypatch):
     assert _body(resp)["status"] == "complete"
     # Stale incompatible low is cleared (falls back to high); high is untouched.
     assert storage.get("llm_config", "model_group.low") is None
-    assert storage.get("llm_config", "model_group.high") == "github-copilot/gpt-4.1"
+    assert storage.get("llm_config", "model_group.high") == "github-copilot/gpt-5.5"
 
 
 def test_complete_bare_query_accepted(monkeypatch):

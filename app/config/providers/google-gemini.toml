@@ -15,7 +15,12 @@ is_default = true
 api_key = { description = "Gemini API Key", type = "string", secret = true, required = true }
 
 # Cache pricing: Gemini implicit caching (2.5+) bills cached input at 0.10x the
-# input rate (90% discount) with no separate cache-write fee.
+# input rate (90% discount) with no separate cache-write fee. Gemini's per-hour
+# cached-token storage fee has no slot in this schema and is not modelled.
+#
+# Promotional pricing: the 3.6 / 3.7 / 3.8 Flash rates below are introductory
+# and DOUBLE on 2027-01-01. Re-check this file in early January 2027 or those
+# three entries silently report half the real cost.
 
 [[models]]
 id = "gemini-3.1-pro-preview"
@@ -28,7 +33,68 @@ vision = true
 audio = true
 input_price_per_1m = 2.00
 output_price_per_1m = 12.00
+reasoning_effort = ["low", "medium", "high"]
 cache_read_price_per_1m = 0.20    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "gemini-3.8-flash"
+context_window = 1048576
+display_name = "Gemini 3.8 Flash"
+group_hint = "low"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+audio = true
+input_price_per_1m = 0.75         # promo rate; 1.50 from 2027-01-01
+output_price_per_1m = 3.75        # promo rate; 7.50 from 2027-01-01
+reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.075   # 0.10x input; 0.15 from 2027-01-01
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "gemini-3.7-flash"
+context_window = 1048576
+display_name = "Gemini 3.7 Flash"
+group_hint = "low"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+audio = true
+input_price_per_1m = 0.75         # promo rate; 1.50 from 2027-01-01
+output_price_per_1m = 3.75        # promo rate; 7.50 from 2027-01-01
+reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.075   # 0.10x input; 0.15 from 2027-01-01
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "gemini-3.6-flash"
+context_window = 1048576
+display_name = "Gemini 3.6 Flash"
+group_hint = "low"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+audio = true
+input_price_per_1m = 0.75         # promo rate; 1.50 from 2027-01-01
+output_price_per_1m = 3.75        # promo rate; 7.50 from 2027-01-01
+reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.075   # 0.10x input; 0.15 from 2027-01-01
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "gemini-3.5-flash"
+context_window = 1048576
+display_name = "Gemini 3.5 Flash"
+group_hint = "low"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+audio = true
+input_price_per_1m = 1.50
+output_price_per_1m = 9.00
+reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.15    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
@@ -42,11 +108,27 @@ vision = true
 audio = true
 input_price_per_1m = 0.50
 output_price_per_1m = 3.00
+reasoning_effort = ["low", "medium", "high"]
 cache_read_price_per_1m = 0.05    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
-id = "gemini-3.1-flash-lite-preview"
+id = "gemini-3.5-flash-lite"
+context_window = 1048576
+display_name = "Gemini 3.5 Flash Lite"
+group_hint = "low"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+audio = true
+input_price_per_1m = 0.30
+output_price_per_1m = 2.50
+reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.03    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "gemini-3.1-flash-lite"
 context_window = 1048576
 display_name = "Gemini 3.1 Flash Lite"
 group_hint = "low"
@@ -93,19 +175,6 @@ context_window = 1048576
 display_name = "Gemini 2.5 Flash Lite"
 group_hint = "low"
 supports_reasoning = true
-prompt_cache = true
-vision = true
-audio = true
-input_price_per_1m = 0.10
-output_price_per_1m = 0.40
-cache_read_price_per_1m = 0.01    # 0.10x input
-cache_write_price_per_1m = 0.0    # no separate cache-write fee
-
-[[models]]
-id = "gemini-2.0-flash"
-context_window = 1048576
-display_name = "Gemini 2.0 Flash"
-group_hint = "low"
 prompt_cache = true
 vision = true
 audio = true

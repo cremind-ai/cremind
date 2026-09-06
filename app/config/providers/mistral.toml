@@ -17,9 +17,13 @@ api_key = { description = "Mistral API Key", type = "string", secret = true, req
 # Cache pricing: Mistral bills cached tokens at 0.10x the input rate (90%
 # discount) with no separate cache-write fee.
 
+# Reasoning: Mistral exposes only two effort settings — "high" (a full thinking
+# chunk precedes the answer) and "none" (minimal thinking, chunk omitted). Do not
+# pad these arrays to the usual low/medium/high triple.
+
 [[models]]
 id = "mistral-large-latest"
-context_window = 131072
+context_window = 262144
 display_name = "Mistral Large 3"
 group_hint = "high"
 prompt_cache = true
@@ -31,30 +35,80 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "mistral-medium-latest"
-context_window = 131072
-display_name = "Mistral Medium 3.1"
+context_window = 262144
+display_name = "Mistral Medium 3.5"
+supports_reasoning = true
+reasoning_effort = ["none", "high"]
 group_hint = "high"
 prompt_cache = true
 vision = true
-input_price_per_1m = 0.40
-output_price_per_1m = 2.00
-cache_read_price_per_1m = 0.04    # 0.10x input
+input_price_per_1m = 1.50
+output_price_per_1m = 7.50
+cache_read_price_per_1m = 0.15    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "mistral-small-latest"
-context_window = 131072
-display_name = "Mistral Small"
+context_window = 262144
+display_name = "Mistral Small 4"
+supports_reasoning = true
+reasoning_effort = ["none", "high"]
+group_hint = "low"
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.15
+output_price_per_1m = 0.60
+cache_read_price_per_1m = 0.015   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# Cheapest tier — the whole Ministral 3 family (14B / 8B / 3B, all v25.12 GA,
+# 256k context, text+vision). Mistral documents no reasoning_effort for the plain
+# Ministral aliases (only the Small/Medium models take it), so no reasoning is
+# claimed here. Input and output bill at the same rate across the family.
+[[models]]
+id = "ministral-14b-latest"
+context_window = 262144
+display_name = "Ministral 3 14B"
+group_hint = "low"
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.20
+output_price_per_1m = 0.20
+cache_read_price_per_1m = 0.02    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "ministral-8b-latest"
+context_window = 262144
+display_name = "Ministral 3 8B"
+group_hint = "low"
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.15
+output_price_per_1m = 0.15
+cache_read_price_per_1m = 0.015   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "ministral-3b-latest"
+context_window = 262144
+display_name = "Ministral 3 3B"
 group_hint = "low"
 prompt_cache = true
 vision = true
 input_price_per_1m = 0.10
-output_price_per_1m = 0.30
+output_price_per_1m = 0.10
 cache_read_price_per_1m = 0.01    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 # Voxtral: audio-input model — accepts spoken audio (plus text) in chat
 # completions via the `input_audio` content part. Not a vision model.
+# Current, not deprecated: Mistral lists Voxtral Small (v25.07) as GA under Audio
+# models, and it is absent from the deprecated & retired table (the retired
+# "Voxtral Mini" / "Voxtral Mini Transcribe" entries are different models).
+# Its token rates come from the model page; the pricing table's "Cached input"
+# column has no Voxtral row, so the cache fields below are the site-wide 0.10x
+# rule applied by hand — inert unless the API actually reports cached tokens.
 [[models]]
 id = "voxtral-small-latest"
 context_window = 32768
@@ -63,13 +117,13 @@ group_hint = "high"
 prompt_cache = true
 audio = true
 input_price_per_1m = 0.10
-output_price_per_1m = 0.30
+output_price_per_1m = 0.40
 cache_read_price_per_1m = 0.01    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
 id = "codestral-latest"
-context_window = 262144
+context_window = 131072
 display_name = "Codestral"
 group_hint = "high"
 prompt_cache = true
@@ -78,25 +132,16 @@ output_price_per_1m = 0.90
 cache_read_price_per_1m = 0.03    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
+# Third-party open-weight model hosted by Mistral without modification, for
+# long-context coding and agentic work. Text only, and Mistral documents no
+# reasoning_effort for it. Public Preview, so the surface can move.
 [[models]]
-id = "magistral-medium-latest"
-context_window = 40960
-display_name = "Magistral Medium"
-supports_reasoning = true
+id = "zai-glm-5-2"
+context_window = 1000000
+display_name = "Z.ai GLM 5.2"
 group_hint = "high"
 prompt_cache = true
-input_price_per_1m = 2.00
-output_price_per_1m = 5.00
-cache_read_price_per_1m = 0.20    # 0.10x input
-cache_write_price_per_1m = 0.0    # no separate cache-write fee
-
-[[models]]
-id = "devstral-latest"
-context_window = 131072
-display_name = "Devstral 2"
-group_hint = "high"
-prompt_cache = true
-input_price_per_1m = 0.40
-output_price_per_1m = 0.90
-cache_read_price_per_1m = 0.04    # 0.10x input
+input_price_per_1m = 1.40
+output_price_per_1m = 4.40
+cache_read_price_per_1m = 0.14    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee

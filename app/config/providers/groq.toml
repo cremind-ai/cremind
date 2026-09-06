@@ -14,27 +14,58 @@ is_default = true
 [provider.auth_methods.fields]
 api_key = { description = "Groq API Key", type = "string", secret = true, required = true }
 
-# Cache pricing: Groq prompt caching (currently GPT-OSS models only) discounts
-# cached input by 50% (0.50x input) with no separate cache-write fee. Models with
-# prompt_cache = false do not cache, so they carry no cache pricing.
+# Cache pricing: the 0.50x cache-read rates below are Groq's own PUBLISHED rate,
+# not the estimator's fallback multiplier that happens to share the number.
+# console.groq.com/docs/prompt-caching states "a 50% discount for cached input
+# tokens" and "Prompt caching is provided at no additional cost" — hence
+# cache_read = 0.50x input and cache_write = 0.0. Do not "correct" these to the
+# 0.10x/0.25x rates other OpenAI-compatible providers use; Groq really is 0.50x.
+# Caching covers the GPT-OSS family only, so models with prompt_cache = false
+# carry no cache pricing.
+#
+# Note: the Qwen3.x models take a narrower reasoning_effort vocabulary than the
+# GPT-OSS pair — "none"/"default" (plus low/medium/high on qwen3.8) rather than
+# the low/medium/high triple. Pass these through verbatim.
+# (Verified against console.groq.com/docs/reasoning on 2026-09-06.)
+#
+# Entries with no *_price_per_1m fields are priced "Contact Sales" by Groq
+# (Enterprise tier). Omitting the fields is deliberate: pricing.py then reports
+# source = "unknown" and leaves the cost null rather than inventing a rate.
 
 [[models]]
-id = "llama-3.3-70b-versatile"
-context_window = 131072
-display_name = "Llama 3.3 70B Versatile"
+id = "minimaxai/minimax-m2.7"
+context_window = 196608
+display_name = "MiniMax M2.7 (Enterprise)"
 prompt_cache = false
+supports_reasoning = true
 group_hint = "high"
-input_price_per_1m = 0.59
-output_price_per_1m = 0.79
+# Preview model, 196,608 ctx / 131,072 max output. Reasoning is "interleaved
+# thinking" with no published reasoning_effort vocabulary, so none is declared.
+# Pricing is "Contact Sales" — no rate is quotable.
 
 [[models]]
-id = "llama-3.1-8b-instant"
-context_window = 131072
-display_name = "Llama 3.1 8B Instant"
+id = "qwen/qwen3.8-27b"
+context_window = 131042           # as published by Groq (not 131072)
+display_name = "Qwen3.8 27B"
 prompt_cache = false
-group_hint = "low"
-input_price_per_1m = 0.05
-output_price_per_1m = 0.08
+supports_reasoning = true
+group_hint = "high"
+vision = true
+input_price_per_1m = 0.80
+output_price_per_1m = 4.00
+reasoning_effort = ["none", "default", "low", "medium", "high"]
+
+[[models]]
+id = "qwen/qwen3.6-27b"
+context_window = 131072
+display_name = "Qwen3.6 27B"
+prompt_cache = false
+supports_reasoning = true
+group_hint = "high"
+vision = true
+input_price_per_1m = 0.60
+output_price_per_1m = 3.00
+reasoning_effort = ["none", "default"]
 
 [[models]]
 id = "openai/gpt-oss-120b"
@@ -46,7 +77,7 @@ group_hint = "high"
 input_price_per_1m = 0.15
 output_price_per_1m = 0.60
 reasoning_effort = ["low", "medium", "high"]
-cache_read_price_per_1m = 0.075   # 0.50x input
+cache_read_price_per_1m = 0.075   # 0.50x input — Groq's published 50% cache discount
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
@@ -59,28 +90,44 @@ group_hint = "low"
 input_price_per_1m = 0.075
 output_price_per_1m = 0.30
 reasoning_effort = ["low", "medium", "high"]
-cache_read_price_per_1m = 0.0375  # 0.50x input
+cache_read_price_per_1m = 0.0375  # 0.50x input — Groq's published 50% cache discount
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
-[[models]]
-id = "meta-llama/llama-4-scout-17b-16e-instruct"
-context_window = 131072
-display_name = "Llama 4 Scout 17B 16E"
-prompt_cache = false
-group_hint = "high"
-vision = true
-input_price_per_1m = 0.11
-output_price_per_1m = 0.34
+# Restored 2026-09-06. console.groq.com/docs/deprecations gives both a shutdown
+# date of 08/16/26, but that shutdown did not remove them: both are still listed
+# under **Production Models** on console.groq.com/docs/models today, and their
+# own model pages carry an "Enterprise" tier badge with no deprecation notice.
+# What actually changed is the tier — their price column now reads "Contact
+# Sales", so no rate is quotable and the price fields are intentionally absent.
+# A previous pass deleted them on the strength of the deprecations row alone;
+# they are still served, so they stay.
 
 [[models]]
-id = "qwen/qwen3-32b"
+id = "llama-3.3-70b-versatile"
 context_window = 131072
-display_name = "Qwen3 32B"
+display_name = "Llama 3.3 70B Versatile (Enterprise)"
 prompt_cache = false
-supports_reasoning = true
 group_hint = "high"
-input_price_per_1m = 0.29
-output_price_per_1m = 0.59
 
-# Removed moonshotai/kimi-k2-instruct: deprecated by Groq on 2025-10-10
-# (replacement: openai/gpt-oss-120b). See console.groq.com/docs/deprecations.
+[[models]]
+id = "llama-3.1-8b-instant"
+context_window = 131072
+display_name = "Llama 3.1 8B Instant (Enterprise)"
+prompt_cache = false
+group_hint = "low"
+
+# Removed — gone from console.groq.com/docs/models entirely, and past the
+# shutdown date published on console.groq.com/docs/deprecations:
+#   meta-llama/llama-4-scout-17b-16e-instruct  (shutdown 07/17/26)
+#   qwen/qwen3-32b                             (shutdown 07/17/26)
+#   moonshotai/kimi-k2-instruct                (shutdown 10/10/25)
+# llama-4-scout was the only vision model here; the Qwen3.x pair replaces that
+# coverage.
+#
+# Deliberately not carried, though Groq serves them: the guard/classifier models
+# (openai/gpt-oss-safeguard-20b, meta-llama/llama-prompt-guard-2-22m and -86m)
+# are content-moderation classifiers, not general-purpose chat models — Groq
+# lists gpt-oss-safeguard-20b as the replacement for meta-llama/llama-guard-4-12b
+# — and the speech models (whisper-large-v3*, canopylabs/orpheus-*) are priced
+# per hour / per character, which this catalog's per-1M-token fields cannot
+# express. The groq/compound* agentic systems are likewise out of scope here.

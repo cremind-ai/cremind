@@ -142,14 +142,14 @@ class _FakeRegistry:
 
 def test_agent_wires_builtin_tools_guidance_into_prompt(monkeypatch):
     # End-to-end: __init__ computes _builtin_tools_guidance from the live tools and
-    # _build_instruction injects it. openai/o3 reasons natively, so the REASONING
+    # _build_instruction injects it. openai/gpt-6-astra reasons natively, so the REASONING
     # STEP block is absent and the section is byte-identical across steps.
     monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
     monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
 
-    llm = SimpleNamespace(provider_name="openai", model_name="o3")  # native reasoning
+    llm = SimpleNamespace(provider_name="openai", model_name="gpt-6-astra")  # native reasoning
     registry = _FakeRegistry(
         [_grp("exec_shell", "exec_shell", leaves=_EXEC_LEAVES, name="Shell Executor")]
     )

@@ -104,7 +104,14 @@ def _clear_memo():
 # --- name sniffing -------------------------------------------------------
 
 
-@pytest.mark.parametrize("model", ["gpt-5.4-mini", "gpt-5.4", "o3", "o4-mini", "o1"])
+# All but ``o1`` are ids openai.toml actually carries (o3 / o4-mini both have
+# future shutdown dates and are still served); ``o1`` is kept deliberately as a
+# family-match case for an id the catalog no longer lists, since gateways and
+# proxies route model ids Cremind never catalogues.
+@pytest.mark.parametrize(
+    "model",
+    ["gpt-6-astra", "gpt-5.4-mini", "gpt-5.4", "chat-latest", "o3", "o4-mini", "o1"],
+)
 def test_openai_reasoning_models_send_max_completion_tokens(model):
     p, calls = _make_provider(model)
     _run_stream(p, max_tokens=32768)

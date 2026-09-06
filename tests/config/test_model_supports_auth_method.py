@@ -26,10 +26,12 @@ def test_dual_and_codex_only_models():
     assert model_supports_auth_method("openai", "gpt-5.4", "api_key") is True
     assert model_supports_auth_method("openai", "gpt-5.4", "codex_oauth") is True
     assert model_supports_auth_method("openai", "gpt-5.4-mini", "codex_oauth") is True
-    # Codex-only models can't run under the API-key path.
+    # gpt-5.6-sol graduated to a first-class API model, so it is dual too.
     assert model_supports_auth_method("openai", "gpt-5.6-sol", "codex_oauth") is True
-    assert model_supports_auth_method("openai", "gpt-5.6-sol", "api_key") is False
+    assert model_supports_auth_method("openai", "gpt-5.6-sol", "api_key") is True
+    # Codex-only models can't run under the API-key path.
     assert model_supports_auth_method("openai", "gpt-5.3-codex-spark", "codex_oauth") is True
+    assert model_supports_auth_method("openai", "gpt-5.3-codex-spark", "api_key") is False
 
 
 def test_permissive_defaults():
@@ -52,13 +54,13 @@ def test_models_for_auth_method_filters_real_catalog():
     codex_ids = {m["id"] for m in models_for_auth_method(catalog, "codex_oauth")}
     apikey_ids = {m["id"] for m in models_for_auth_method(catalog, "api_key")}
     # Codex set includes the codex-only + dual models, excludes api_key-only ones.
-    assert "gpt-5.6-sol" in codex_ids
+    assert "gpt-5.3-codex-spark" in codex_ids
     assert "gpt-5.4" in codex_ids
     assert "gpt-4.1-mini" not in codex_ids
     # API-key set includes the api_key-only + dual models, excludes codex-only ones.
     assert "gpt-4.1-mini" in apikey_ids
     assert "gpt-5.4" in apikey_ids
-    assert "gpt-5.6-sol" not in apikey_ids
+    assert "gpt-5.3-codex-spark" not in apikey_ids
 
 
 def test_models_for_auth_method_no_filter_when_auth_none():

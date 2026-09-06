@@ -14,12 +14,122 @@ is_default = true
 [provider.auth_methods.fields]
 api_key = { description = "NVIDIA API Key", type = "string", secret = true, required = true }
 
+# Pricing is 0.00 across the board on purpose, and that choice is a BET. State it
+# plainly, because pricing.py cannot: _rates_from_catalog() decides the source
+# with `source = "catalog" if input_per_1m is not None else "unknown"`, and a
+# PRESENT 0.0 is not None. So every NVIDIA turn is reported as a confident
+# source="catalog", total_usd = 0.00 — not an honest None/"unknown". The bet is
+# that the hosted endpoint never starts billing; the day it does, Cremind keeps
+# reporting exactly $0.00 with no signal that the number went stale. (Deleting
+# the two price fields would flip the report to source="unknown" / total None,
+# which is the honest-but-useless alternative; 0.00 is kept because free really
+# is the published price today.)
+#
+# Re-verified against first-party sources on 2026-09-06 — the bet still holds:
+#   * build.nvidia.com advertises "Free inference with leading models" and shows
+#     no rates; there is no pricing page at all (build.nvidia.com/pricing 404s).
+#   * developer.nvidia.com/nim offers Developer Program members "free access to
+#     NIM API endpoints for unlimited prototyping, powered by DGX Cloud". Hosted
+#     usage is metered as per-CALL credits under an RPM cap, never as tokens.
+#   * The NIM FAQ (docs.api.nvidia.com/nim/docs/product) prices only the paid
+#     SELF-HOSTED path — NVIDIA AI Enterprise licences "start at $4500 per GPU
+#     per year or ~ $1 per GPU per hour in the cloud" — i.e. per GPU, not per
+#     token, and not applicable to integrate.api.nvidia.com at all.
+# Several third-party aggregators do publish per-token "NVIDIA NIM" rates. None
+# of them cite an NVIDIA page, and NVIDIA contradicts them, so they are not used.
+#
+# Re-check trigger: the first time build.nvidia.com grows a pricing page or a
+# paid pay-as-you-go tier, every entry below under-reports cost by 100%.
+#
+# No prompt-caching feature is documented for these OpenAI-compatible endpoints,
+# so prompt_cache stays false and the cache rate fields are omitted (with input at
+# 0.00 every multiplier fallback resolves to 0.0 anyway).
+#
+# context_window here is the max INPUT the hosted endpoint serves. Where NVIDIA
+# publishes an exact "Input Context Length (ISL)" it is used verbatim; where the
+# reference only says "1M" it is read as 1,048,576, which is how NVIDIA's own
+# Nemotron 3 Ultra guide spells 1M ("a 1,048,576-token (1M) context window").
+
 [[models]]
-id = "meta/llama-3.3-70b-instruct"
-context_window = 131072
-display_name = "Llama 3.3 70B"
+id = "nvidia/nemotron-3-ultra-550b-a55b"
+context_window = 262144
+display_name = "Nemotron 3 Ultra 550B"
+supports_reasoning = true
 group_hint = "high"
 prompt_cache = false
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "nvidia/nemotron-3-super-120b-a12b"
+context_window = 262144
+display_name = "Nemotron 3 Super 120B"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = false
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+# NVIDIA's NIM reference prints the exact figure — "Input Context Length (ISL):
+# 1,000,000" — not a rounded 1M, so the served cap is 1,000,000 and NOT 1,048,576.
+# At 1,048,576 compaction's 8,000-token default reserve leaves a 1,040,576-token
+# prompt, 40,576 over the cap, and the endpoint rejects the request.
+[[models]]
+id = "deepseek-ai/deepseek-v4-pro-0813"
+context_window = 1000000
+display_name = "DeepSeek V4 Pro"
+supports_reasoning = true
+reasoning_effort = ["low", "high", "max"]   # NVIDIA's published set skips "medium"
+group_hint = "high"
+prompt_cache = false
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+# Same family, same doc set: the reference gives the ISL as "One million tokens"
+# and its sibling above spells that out as 1,000,000, so 1,000,000 it is.
+[[models]]
+id = "deepseek-ai/deepseek-v4-flash-0731"
+context_window = 1000000
+display_name = "DeepSeek V4 Flash"
+supports_reasoning = true
+reasoning_effort = ["low", "high", "max"]   # NVIDIA's published set skips "medium"
+group_hint = "high"
+prompt_cache = false
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "moonshotai/kimi-k3"
+context_window = 1048576
+display_name = "Kimi K3"
+supports_reasoning = true
+reasoning_effort = ["low", "high", "max"]   # NVIDIA's published set skips "medium"
+group_hint = "high"
+prompt_cache = false
+vision = true
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "minimaxai/minimax-m3"
+context_window = 1048576
+display_name = "MiniMax M3"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = false
+vision = true
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "meta/muse-glimmer-30b"
+context_window = 131072
+display_name = "Muse Glimmer 30B"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "high", "xhigh"]
+group_hint = "high"
+prompt_cache = false
+vision = true
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
@@ -32,19 +142,16 @@ prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
-[[models]]
-id = "meta/llama-4-scout-17b-16e-instruct"
-context_window = 1048576
-display_name = "Llama 4 Scout"
-group_hint = "high"
-prompt_cache = false
-vision = true
-input_price_per_1m = 0.00
-output_price_per_1m = 0.00
-
+# Qwen publishes 32,768 tokens natively, "extensible up to 131,072 tokens with
+# YaRN" — 131,072 is the ceiling any deployment of these weights can serve, so the
+# 262,144 this entry used to claim was DOUBLE the maximum and would have been
+# rejected at the top of the window. NB: this id no longer appears in the live
+# integrate.api.nvidia.com/v1/models listing, though its build.nvidia.com page and
+# NGC container (qwen3-235b-a22b-fp8) both still exist and nothing published marks
+# it retired. Kept for that reason — re-confirm it is served before relying on it.
 [[models]]
 id = "qwen/qwen3-235b-a22b"
-context_window = 262144
+context_window = 131072
 display_name = "Qwen 3 235B"
 supports_reasoning = true
 group_hint = "high"
@@ -56,12 +163,59 @@ output_price_per_1m = 0.00
 # video) input alongside text and reasons over it via chat completions.
 [[models]]
 id = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
-context_window = 131072
+context_window = 262144
 display_name = "Nemotron 3 Nano Omni 30B"
 supports_reasoning = true
 group_hint = "high"
 prompt_cache = false
 vision = true
 audio = true
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "nvidia/nemotron-3.5-lightning-30b-a3b"
+context_window = 1048576
+display_name = "Nemotron 3.5 Lightning 30B"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = false
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+# NB: the served id transposes the segments ("nemotron-nano-3"); the
+# build.nvidia.com page slug is "nemotron-3-nano-30b-a3b" and would 404 here.
+[[models]]
+id = "nvidia/nemotron-nano-3-30b-a3b"
+context_window = 262144
+display_name = "Nemotron 3 Nano 30B"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = false
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "openai/gpt-oss-20b"
+context_window = 131072
+display_name = "GPT-OSS 20B"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "high"]
+group_hint = "low"
+prompt_cache = false
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+# Gemma 4 is reasoning-capable, but thinking is toggled by a <|think|> token in
+# the system prompt rather than an API parameter, so supports_reasoning stays
+# false — that keeps the substitute "think" tool enabled, which is the correct
+# behaviour here. Same reasoning applies to Nemotron Ultra 253B above.
+[[models]]
+id = "google/gemma-4-31b-it"
+context_window = 262144
+display_name = "Gemma 4 31B"
+group_hint = "low"
+prompt_cache = false
+vision = true
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00

@@ -32,19 +32,59 @@ def test_anthropic_explicit_cache_prices_from_catalog():
         ("google-gemini", "gemini-2.5-pro", 0.125, 0.0),
         # xAI publishes a FLAT cached rate ($0.20/M) — not a 0.5x-input multiple;
         # this only resolves correctly because the catalog value overrides the
-        # OpenAI-family default.
-        ("xai", "grok-4", 0.20, 0.0),
-        # MiniMax charges a cache WRITE fee (1.25x) despite being OpenAI-family
-        # (whose default write multiplier is 0.0) — proves the explicit write
-        # price overrides the family default.
-        ("minimax", "MiniMax-M2.7", 0.06, 0.375),
+        # OpenAI-family default (which would derive 1.25 * 0.50 = $0.625/M).
+        ("xai", "grok-4.3", 0.20, 0.0),
+        # Anthropic's Fable 5.1 caches reads at 0.025x, not the family's 0.10x —
+        # the explicit catalog value overrides the *Anthropic* multiplier too
+        # (which would derive 10.00 * 0.10 = $1.00/M, billing 4x high).
+        ("anthropic", "claude-fable-5-1", 0.25, 12.50),
     ],
 )
 def test_representative_family_cache_rates(provider, model, exp_read, exp_write):
     r = get_model_rates(provider, model)
+    # ``source == "catalog"`` also pins these to ids the TOML really carries: a
+    # model dropped by a catalog refresh resolves to "unknown" and fails here
+    # rather than passing on derived-from-nothing rates.
     assert r.source == "catalog"
     assert r.cache_read_per_1m == pytest.approx(exp_read)
     assert r.cache_write_per_1m == pytest.approx(exp_write)
+
+
+def test_explicit_cache_write_overrides_family_default(monkeypatch):
+    """An explicit ``cache_write_price_per_1m`` beats the family multiplier.
+
+    This used to be guarded by a real catalog entry (``minimax/MiniMax-M2.7``
+    carried a $0.375/M write against the OpenAI family's 0.0x default). The
+    2026-09 catalog refresh zeroed it — MiniMax's $0.375/M prices the *explicit*
+    cache_control path, which Cremind never takes — and no shipped entry can
+    stand in: every remaining non-zero explicit write is an Anthropic model at
+    exactly the family's own 1.25x, so an explicit value there is
+    indistinguishable from the derived one. The branch is therefore guarded
+    synthetically, the same way the derive-from-multiplier path already is.
+    """
+    synthetic = {"models": [{
+        "id": "explicit-write-x",
+        "input_price_per_1m": 1.00,
+        "output_price_per_1m": 2.00,
+        "cache_read_price_per_1m": 0.02,   # 0.02x — not the openai family's 0.50x
+        "cache_write_price_per_1m": 0.30,  # nonzero — the openai family default is 0.0
+    }]}
+    monkeypatch.setattr(pricing, "load_provider_catalog", lambda _p: synthetic)
+    get_model_rates.cache_clear()
+    try:
+        # OpenAI family (read 0.50x, write 0.0x): both explicit values must win.
+        r = get_model_rates("openai", "explicit-write-x")
+        assert r.source == "catalog"
+        assert r.cache_read_per_1m == pytest.approx(0.02)
+        assert r.cache_write_per_1m == pytest.approx(0.30)
+
+        # Anthropic family (read 0.10x, write 1.25x): same values, so the
+        # override is proven independent of which multipliers it displaces.
+        a = get_model_rates("anthropic", "explicit-write-x")
+        assert a.cache_read_per_1m == pytest.approx(0.02)
+        assert a.cache_write_per_1m == pytest.approx(0.30)
+    finally:
+        get_model_rates.cache_clear()
 
 
 # ── the four-way cost formula sums disjoint components ──────────────────────

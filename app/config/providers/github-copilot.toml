@@ -21,68 +21,346 @@ kind = "api_key"
 [provider.auth_methods.fields]
 api_key = { description = "GitHub Token", type = "string", secret = true, required = true }
 
+# ---------------------------------------------------------------------------
+# Pricing basis (re-verified 2026-09-06 against GitHub's live docs source)
+# ---------------------------------------------------------------------------
+# Every rate below is GitHub's OWN published Copilot rate, copied row by row --
+# not an upstream vendor list price. Source: the "Models and pricing for GitHub
+# Copilot" reference (/copilot/reference/copilot-billing/models-and-pricing),
+# generated from github/docs `data/tables/copilot/models-and-pricing.yml`, whose
+# header reads "This file defines per-token pricing for AI models available in
+# GitHub Copilot. Prices are per 1 million tokens." GitHub charges that table in
+# AI credits at "1 AI credit = $0.01 USD", so the published figures are dollars
+# per 1M tokens and drop straight into these fields.
+#
+# Premium-request MULTIPLIERS and a flat per-request price are NOT the basis
+# here. Request-based billing became legacy on 2026-06-01 and now covers only
+# Pro / Pro+ subscribers still on an existing annual plan
+# (/copilot/reference/copilot-billing/request-based-billing-legacy/*); every
+# other subscriber is on usage-based billing, which is per-token. GitHub Models
+# -- the separately retired token-priced product -- is a different product and
+# has no bearing on this transport.
+#
+# Some rates coincide with the upstream vendor's list price because GitHub
+# resells at provider list pricing; several deliberately do not, which is the
+# check that these came from GitHub and not from the vendor:
+#   * the Gemini Flash rows are a GitHub promotion through 2026-12-31,
+#   * Grok's cached input is 0.25x input, not the usual 0.10x,
+#   * Claude Fable 5.1's cached input is 0.025x input, not 0.10x like Fable 5.
+#
+# Rates below are the STANDARD/Default tier. The OpenAI, Google and xAI rows
+# also carry a Long-context tier (roughly 2x input, 1.5x output) that applies
+# above the context_window recorded here, which this catalog does not use.
+#
+# cache_read_price_per_1m is GitHub's published "Cached Input" column, set
+# explicitly so pricing.py's conservative 0.50x fallback does not over-estimate.
+# cache_write_price_per_1m is 0.0 on every entry: "github-copilot" is not in
+# pricing.py's _FAMILY_BY_PROVIDER, so it resolves to the OpenAI-compatible
+# family, whose usage payload always reports cache_creation as 0 -- GitHub's
+# published Anthropic cache-write rates ($12.50 Fable / $6.25 Opus / $3.75
+# Sonnet 4.6 / $2.50 Sonnet 5 / $1.25 Haiku) would never be multiplied by a
+# non-zero token count on this transport.
+#
+# ---------------------------------------------------------------------------
+# Model ids, context windows, and what is deliberately absent
+# ---------------------------------------------------------------------------
+# GitHub documents model NAMES ("GPT-6 Astra") but publishes no API id strings
+# and no context limits anywhere in its docs. Ids here come from, in order of
+# preference:
+#   1. github/gh-aw-firewall `src/copilot-model.ts` -- a GitHub-owned repo whose
+#      SUPPORTED_COPILOT_MODELS set is documented as the "single source of truth
+#      for all Copilot CLI completion models";
+#   2. the models.dev `github-copilot` catalog (api=https://api.githubcopilot.com),
+#      which is derived from the live /models response and is also the only
+#      source for per-model context / max-input limits.
+# A model whose id cannot be sourced from one of those is left out rather than
+# guessed: a wrong id is a runtime 400, a missing one is only a gap.
+#
+# context_window is the Default pricing tier's boundary wherever GitHub
+# publishes one (the OpenAI and xAI rows), because that is the boundary above
+# which the recorded rate stops being the charged rate; otherwise it is the
+# model's limit from models.dev. GitHub's 1M-token context is an opt-in extended
+# capability scoped to "Visual Studio Code and Copilot CLI only" and reached
+# through a separate id (e.g. the reported claude-opus-4.7-1m-internal), so the
+# Claude 4.x rows record their 200K default rather than that 1M ceiling.
+# max_output_tokens is set only where models.dev publishes a max-input cap below
+# the context window, so that context_window - max_output_tokens never exceeds
+# the input the API will accept.
+#
+# Documented-but-absent models, and why:
+#   * gpt-5.3-codex, gpt-5.4-mini, gpt-5.6-luna, gpt-5.6-sol, gpt-5.6-terra --
+#     reachable only on Copilot's /responses endpoint. GitHubCopilotLLMProvider
+#     subclasses OpenAILLMProvider and only ever calls /chat/completions, which
+#     answers `400 model "<id>" is not accessible via the /chat/completions
+#     endpoint` for all five (github/copilot-cli#2177 and #4337; the gpt-5.4-mini
+#     case is called out in github/gh-aw-firewall docs/model-api-mapping.json).
+#   * gpt-6-astra -- the id is established, but nothing establishes that it
+#     answers on /chat/completions, and every newer OpenAI model on Copilot that
+#     has been tested does not. Needs one live probe before it is listed.
+#   * Gemini 3.5 Flash, Gemini 3.6 Flash, Kimi K2.7 Code -- retired 2026-10-02;
+#     MAI-Code-1-Flash -- retired 2026-09-10 (github.blog changelog 2026-09-03
+#     and github/docs data/tables/copilot/model-deprecation-history.yml). Each is
+#     superseded by a row listed below at the same or a lower rate, so they are
+#     not worth adding weeks before they stop answering.
+#   * GPT-5.4 nano -- "currently only available in the Codex Visual Studio Code
+#     extension (Copilot Pro+ only) and is not available in Copilot Chat".
+#   * Claude Fable 5 / 5.1 need an enterprise or organization administrator to
+#     enable them explicitly, and Anthropic retains prompts and outputs for them
+#     by default; they are listed, but expect a policy error on an account that
+#     has not turned them on.
+
+[[models]]
+id = "gpt-5.5"
+context_window = 272000
+display_name = "GPT-5.5 (via Copilot)"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+vision = true
+input_price_per_1m = 5.00
+output_price_per_1m = 30.00
+cache_read_price_per_1m = 0.50    # 0.10x input
+cache_write_price_per_1m = 0.0    # no cache-creation reported
+
 [[models]]
 id = "gpt-5.4"
-context_window = 1050000
+context_window = 272000
 display_name = "GPT-5.4 (via Copilot)"
 supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 vision = true
-input_price_per_1m = 0.00
-output_price_per_1m = 0.00
+input_price_per_1m = 2.50
+output_price_per_1m = 15.00
+cache_read_price_per_1m = 0.25    # 0.10x input
+cache_write_price_per_1m = 0.0    # no cache-creation reported
 
+# GitHub's "Lightweight" OpenAI row and the cheapest chat-completions model on
+# this transport. models.dev caps its input at 128K inside a 264K window, so the
+# reply reserve is sized to hold the prompt at or below that cap.
 [[models]]
-id = "claude-sonnet-4.6"
+id = "gpt-5-mini"
+context_window = 264000
+max_output_tokens = 136000
+display_name = "GPT-5 mini (via Copilot)"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.25
+output_price_per_1m = 2.00
+cache_read_price_per_1m = 0.025   # 0.10x input
+cache_write_price_per_1m = 0.0    # no cache-creation reported
+
+# Anthropic's Fable line is GitHub's most expensive Anthropic row ($10/$50) and
+# needs an admin to enable it. Fable 5.1's cached-input rate is GitHub's
+# published $0.25 -- an outlier at 0.025x input, where every other Anthropic row
+# is 0.10x -- so it is recorded as published rather than derived.
+[[models]]
+id = "claude-fable-5.1"
 context_window = 1000000
-display_name = "Claude Sonnet 4.6 (via Copilot)"
+display_name = "Claude Fable 5.1 (via Copilot)"
 supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 vision = true
-input_price_per_1m = 0.00
-output_price_per_1m = 0.00
+input_price_per_1m = 10.00
+output_price_per_1m = 50.00
+cache_read_price_per_1m = 0.25    # 0.025x input -- GitHub's published rate
+cache_write_price_per_1m = 0.0    # no cache-creation reported
 
 [[models]]
-id = "claude-opus-4.7"
+id = "claude-fable-5"
 context_window = 1000000
-display_name = "Claude Opus 4.7 (via Copilot)"
+display_name = "Claude Fable 5 (via Copilot)"
 supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 vision = true
-input_price_per_1m = 0.00
-output_price_per_1m = 0.00
+input_price_per_1m = 10.00
+output_price_per_1m = 50.00
+cache_read_price_per_1m = 1.00    # 0.10x input
+cache_write_price_per_1m = 0.0    # no cache-creation reported
 
 [[models]]
-id = "gpt-4o"
-context_window = 128000
-display_name = "GPT-4o (via Copilot)"
+id = "claude-opus-5"
+context_window = 1000000
+display_name = "Claude Opus 5 (via Copilot)"
+supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 vision = true
-input_price_per_1m = 0.00
-output_price_per_1m = 0.00
+input_price_per_1m = 5.00
+output_price_per_1m = 25.00
+cache_read_price_per_1m = 0.50    # 0.10x input
+cache_write_price_per_1m = 0.0    # no cache-creation reported
 
 [[models]]
-id = "gpt-4.1"
-context_window = 1047576
-display_name = "GPT-4.1 (via Copilot)"
+id = "claude-sonnet-5"
+context_window = 1000000
+display_name = "Claude Sonnet 5 (via Copilot)"
+supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 vision = true
 input_price_per_1m = 2.00
-output_price_per_1m = 8.00
-cache_read_price_per_1m = 0.50    # 0.25x input
-cache_write_price_per_1m = 0.0    # no separate cache-write fee
+output_price_per_1m = 10.00
+cache_read_price_per_1m = 0.20    # 0.10x input
+cache_write_price_per_1m = 0.0    # no cache-creation reported
 
 [[models]]
-id = "gemini-2.5-pro"
-context_window = 1048576
-display_name = "Gemini 2.5 Pro (via Copilot)"
+id = "claude-opus-4.8"
+context_window = 200000
+display_name = "Claude Opus 4.8 (via Copilot)"
 supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 vision = true
-input_price_per_1m = 0.00
-output_price_per_1m = 0.00
+input_price_per_1m = 5.00
+output_price_per_1m = 25.00
+cache_read_price_per_1m = 0.50    # 0.10x input
+cache_write_price_per_1m = 0.0    # no cache-creation reported
+
+# Retires 2026-10-02 across all Copilot experiences; GitHub's suggested
+# replacement is Claude Opus 5, which is listed above at the same rate. Kept
+# because the shutdown date is still in the future -- drop this row after that
+# date, not before.
+[[models]]
+id = "claude-opus-4.7"
+context_window = 200000
+display_name = "Claude Opus 4.7 (via Copilot, retires 2026-10-02)"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+vision = true
+input_price_per_1m = 5.00
+output_price_per_1m = 25.00
+cache_read_price_per_1m = 0.50    # 0.10x input
+cache_write_price_per_1m = 0.0    # no cache-creation reported
+
+# "Claude Sonnet 4.6 was retired on September 1, 2026, but remains available to
+# individual Copilot subscribers on annual Copilot Pro and Copilot Pro+ plans.
+# It is not available to subscribers on monthly plans." -- footnote on the
+# supported-models reference, which also carries it in the model retirement
+# history table (retirement date 2026-09-01, alternative Claude Sonnet 5). It
+# still has a live billing row in GitHub's pricing table, so it keeps one here;
+# Claude Sonnet 5 is the successor and is cheaper (2.00/10.00).
+[[models]]
+id = "claude-sonnet-4.6"
+context_window = 200000
+display_name = "Claude Sonnet 4.6 (via Copilot, retired - annual plans only)"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+vision = true
+input_price_per_1m = 3.00
+output_price_per_1m = 15.00
+cache_read_price_per_1m = 0.30    # 0.10x input
+cache_write_price_per_1m = 0.0    # no cache-creation reported
+
+[[models]]
+id = "claude-haiku-4.5"
+context_window = 200000
+display_name = "Claude Haiku 4.5 (via Copilot)"
+group_hint = "low"
+prompt_cache = true
+vision = true
+input_price_per_1m = 1.00
+output_price_per_1m = 5.00
+cache_read_price_per_1m = 0.10    # 0.10x input
+cache_write_price_per_1m = 0.0    # no cache-creation reported
+
+# PROMOTIONAL PRICING on both Gemini rows through 2026-12-31. GitHub's
+# non-promotional Google row is Gemini 3.5 Flash at 1.50 / 0.15 / 9.00, so
+# expect roughly 2x input and 2.4x output when the promotion lapses -- re-check
+# these rates in Jan 2027. Both models take 1M tokens of context but accept at
+# most 936K of it as input, so the reply reserve is sized to that difference.
+[[models]]
+id = "gemini-3.8-flash"
+context_window = 1000000
+max_output_tokens = 64000
+display_name = "Gemini 3.8 Flash (via Copilot)"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.75
+output_price_per_1m = 3.75
+cache_read_price_per_1m = 0.075   # 0.10x input
+cache_write_price_per_1m = 0.0    # Google table has no cache-write column
+
+[[models]]
+id = "gemini-3.7-flash"
+context_window = 1000000
+max_output_tokens = 64000
+display_name = "Gemini 3.7 Flash (via Copilot)"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.75
+output_price_per_1m = 3.75
+cache_read_price_per_1m = 0.075   # 0.10x input
+cache_write_price_per_1m = 0.0    # Google table has no cache-write column
+
+# xAI rows are priced in two tiers on a 500K-token model: 2.00 / 0.50 / 6.00 at
+# or below 200K input, then 4.00 / 1.00 / 12.00 above it. context_window is the
+# 200K boundary so the recorded rate is always the rate actually charged.
+# Cached input is 0.25x here, not the 0.10x the other vendors use.
+[[models]]
+id = "grok-4.6"
+context_window = 200000
+display_name = "Grok 4.6 (via Copilot)"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+vision = true
+input_price_per_1m = 2.00
+output_price_per_1m = 6.00
+cache_read_price_per_1m = 0.50    # 0.25x input
+cache_write_price_per_1m = 0.0    # xAI table has no cache-write column
+
+[[models]]
+id = "grok-4.5"
+context_window = 200000
+display_name = "Grok 4.5 (via Copilot)"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+vision = true
+input_price_per_1m = 2.00
+output_price_per_1m = 6.00
+cache_read_price_per_1m = 0.50    # 0.25x input
+cache_write_price_per_1m = 0.0    # xAI table has no cache-write column
+
+# Open-weight row, hosted by GitHub on Fireworks AI. Replaces Kimi K2.7 Code,
+# which retires 2026-10-02.
+[[models]]
+id = "kimi-k3"
+context_window = 1048576
+display_name = "Kimi K3 (via Copilot)"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+vision = true
+input_price_per_1m = 3.00
+output_price_per_1m = 15.00
+cache_read_price_per_1m = 0.30    # 0.10x input
+cache_write_price_per_1m = 0.0    # no cache-creation reported
+
+# Microsoft's lightweight coding row, hosted on Microsoft Azure. Replaces
+# MAI-Code-1-Flash, which retires 2026-09-10. Takes at most 128K of its 256K
+# window as input, so the reply reserve is sized to the remaining half.
+[[models]]
+id = "mai-code-1.1-flash"
+context_window = 256000
+max_output_tokens = 128000
+display_name = "MAI-Code-1.1-Flash (via Copilot)"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.20
+output_price_per_1m = 1.20
+cache_read_price_per_1m = 0.02    # 0.10x input
+cache_write_price_per_1m = 0.0    # no cache-creation reported

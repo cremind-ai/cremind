@@ -15,24 +15,156 @@ account_id = { description = "Cloudflare Account ID", type = "string", secret = 
 gateway_id = { description = "Cloudflare AI Gateway ID", type = "string", secret = false, required = true }
 api_key = { description = "Cloudflare API Token", type = "string", secret = true, required = true }
 
+# Model ids carry a {provider}/{model} prefix, per Cloudflare's 2026-09-01 model-
+# name standardization ("anthropic claude-haiku-4-5-20251001" -> "anthropic/
+# claude-haiku-4.5"). That form resolves on the Unified API endpoint
+# (.../compat/chat/completions), NOT on the per-provider passthrough
+# (.../openai) that app/lib/llm/factory.py currently builds. Until that suffix
+# changes, the non-OpenAI entries below are unreachable — the passthrough
+# forwards to api.openai.com and only serves OpenAI models. (Confirmed still
+# true: factory.py builds ".../{account_id}/{gateway_id}/openai".)
+#
+# Every id below is the {provider}/{model} pair Cloudflare's own model catalog
+# publishes, re-checked 2026-09-06 — the bare upstream id would not resolve. The
+# gateway catalog carries newer OpenAI, Anthropic and Google models than the ones
+# selected here; the selection, not the id spelling, is the thing to revisit.
+
+# Pricing is pass-through. Cloudflare publishes no per-token rate of its own
+# (every model page says "View pricing in the Cloudflare dashboard") and states
+# that "inference pricing from providers is passed through with no markup — you
+# pay the same per-token rates as you would directly with the provider", so every
+# rate below is the upstream vendor's own published STANDARD-tier price (not
+# batch, not free tier). Unified Billing adds a 5% fee on purchased credits; that
+# is a credit-purchase fee, not a per-token rate, so it is deliberately absent
+# from these fields and estimates run ~5% under a credit-paid invoice.
+
+# Cache pricing: cloudflare-ai-gateway is NOT listed in _FAMILY_BY_PROVIDER
+# (app/lib/llm/pricing.py), so every entry here resolves to the OpenAI-compatible
+# family — openai_usage_breakdown() always reports cache_creation as 0. That makes
+# cache_write_price_per_1m = 0.0 correct even for the Anthropic models below,
+# whose upstream vendor really does bill a 1.25x ephemeral write rate: on this
+# path that rate multiplies a structurally-zero token count. IF ANYONE EVER ADDS
+# cloudflare-ai-gateway TO _FAMILY_BY_PROVIDER, the four Anthropic entries become
+# wrong and must gain real write rates. Cached-read rates are set explicitly on
+# every entry (all 0.10x input here) so the conservative 0.50x OpenAI-family
+# fallback never applies.
+
+# Context windows follow the UPSTREAM VENDOR's published spec, not Cloudflare's
+# model-page spec table: the gateway is a pass-through that does not alter the
+# model, and its spec rows are demonstrably unreliable (the openai/gpt-5.4-mini
+# page prints 128,000 — which is OpenAI's max-OUTPUT figure — and omits the vision
+# row that OpenAI publishes).
+
+# Long-context surcharge — NOT representable in this schema. openai/gpt-5.4
+# reprices the WHOLE request at 2x input and 1.5x output once the prompt passes
+# 272K input tokens; the rate below is the standard (<272K) tier, so a very long
+# conversation is under-costed by roughly 2x on input. Same limitation as
+# providers/openai.toml. The Anthropic entries have no equivalent exposure —
+# Claude 4.6 and later carry the full 1M window at standard pricing.
+
+# High tier
 [[models]]
-id = "gpt-5.4"
+id = "openai/gpt-5.4"
 context_window = 1050000
+max_output_tokens = 128000    # OpenAI publishes no separate max-input cap for gpt-5.4, only "1,050,000 context window / 128,000 max output tokens" — the window is shared, so the reply is reserved out of it, leaving 922,000 for the prompt
 display_name = "GPT-5.4 (via CF Gateway)"
 supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 vision = true
-input_price_per_1m = 0.00
-output_price_per_1m = 0.00
+input_price_per_1m = 2.50
+output_price_per_1m = 15.00
+cache_read_price_per_1m = 0.25    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
-id = "claude-sonnet-4.6"
+id = "anthropic/claude-opus-5"
+context_window = 1000000
+display_name = "Claude Opus 5 (via CF Gateway)"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+vision = true
+input_price_per_1m = 5.00
+output_price_per_1m = 25.00
+cache_read_price_per_1m = 0.50    # 0.10x input
+cache_write_price_per_1m = 0.0    # Anthropic bills $6.25 here, but cache_creation is always 0 on this path
+
+[[models]]
+id = "anthropic/claude-sonnet-5"
+context_window = 1000000
+display_name = "Claude Sonnet 5 (via CF Gateway)"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+vision = true
+input_price_per_1m = 2.00
+output_price_per_1m = 10.00
+cache_read_price_per_1m = 0.20    # 0.10x input
+cache_write_price_per_1m = 0.0    # Anthropic bills $2.50 here, but cache_creation is always 0 on this path
+
+# Claude Sonnet 4.6 is "Active" upstream, not legacy or deprecated: Anthropic's
+# model-status table gives it Deprecated = N/A and a tentative retirement "Not
+# sooner than February 17, 2027". Superseded by Claude Sonnet 5 above, but fully
+# supported — keep it.
+[[models]]
+id = "anthropic/claude-sonnet-4.6"
 context_window = 1000000
 display_name = "Claude Sonnet 4.6 (via CF Gateway)"
 supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 vision = true
-input_price_per_1m = 0.00
-output_price_per_1m = 0.00
+input_price_per_1m = 3.00
+output_price_per_1m = 15.00
+cache_read_price_per_1m = 0.30    # 0.10x input
+cache_write_price_per_1m = 0.0    # Anthropic bills $3.75 here, but cache_creation is always 0 on this path
+
+# Low tier
+[[models]]
+id = "openai/gpt-5.4-mini"
+context_window = 400000
+max_output_tokens = 128000    # 400,000 window − 128,000 reply = 272,000 max input (OpenAI's documented cap)
+display_name = "GPT-5.4 Mini (via CF Gateway)"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.75
+output_price_per_1m = 4.50
+cache_read_price_per_1m = 0.075   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# Claude Haiku 4.5 carries the nearest-term retirement commitment in this file
+# (not sooner than 2026-10-15) — revisit before then.
+[[models]]
+id = "anthropic/claude-haiku-4.5"
+context_window = 200000
+display_name = "Claude Haiku 4.5 (via CF Gateway)"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = true
+vision = true
+input_price_per_1m = 1.00
+output_price_per_1m = 5.00
+cache_read_price_per_1m = 0.10    # 0.10x input
+cache_write_price_per_1m = 0.0    # Anthropic bills $1.25 here, but cache_creation is always 0 on this path
+
+# PRICES DOUBLE ON 2027-01-01 by Google's own published schedule: input
+# $0.75 -> $1.50, output $3.75 -> $7.50, cache read $0.075 -> $0.15. This entry
+# has a hard expiry — revisit it before then or every Gemini cost row silently
+# under-reports by 2x. NOTE the prefix is `google/`, not `google-ai-studio/`;
+# Cloudflare's own compat examples show both, but only `google/` matches the
+# Model ID its model catalog publishes.
+[[models]]
+id = "google/gemini-3.7-flash"
+context_window = 1048576
+display_name = "Gemini 3.7 Flash (via CF Gateway)"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.75
+output_price_per_1m = 3.75
+cache_read_price_per_1m = 0.075   # 0.10x input
+cache_write_price_per_1m = 0.0    # Google bills cache storage per hour, not a creation-token fee

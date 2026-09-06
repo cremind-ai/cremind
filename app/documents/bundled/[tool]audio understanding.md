@@ -13,10 +13,10 @@ when the model that would run it accepts audio input. Audio is sent as an
 `input_audio` content part; supported formats are WAV, MP3, M4A, AAC, OGG, FLAC,
 and WebM (no transcoding — oversized or unsupported files are rejected).
 
-Not every model accepts audio. Audio-capable models include OpenAI `gpt-audio`,
-Google Gemini (2.0/2.5/3.x), xAI `grok-4-1-fast`, Mistral `voxtral-small-latest`,
-Qwen `qwen3-omni-flash`, and NVIDIA Nemotron Omni. Anthropic (Claude) models have
-no audio input. Choosing a model that can't hear surfaces a clear
+Not every model accepts audio. Audio-capable models include OpenAI `gpt-audio-1.5`
+and `gpt-audio`, Google Gemini (2.5/3.x), Mistral `voxtral-small-latest`, Qwen
+`qwen3-omni-flash`, and NVIDIA Nemotron Omni. Anthropic (Claude) and xAI (Grok)
+models have no audio input. Choosing a model that can't hear surfaces a clear
 `AudioNotSupported` error rather than a silent failure.
 
 ## Tool Variables

@@ -14,13 +14,148 @@ is_default = true
 api_key = { description = "LiteLLM API Key", type = "string", secret = true, required = true }
 base_url = { description = "LiteLLM Base URL", type = "string", secret = false, required = false, default = "http://localhost:4000/v1" }
 
+# LiteLLM proxies someone else's models, so this list is a SAMPLE of the
+# upstreams a proxy usually fronts (OpenAI, Anthropic, Google), not a mirror of
+# LiteLLM's ~3,800-entry cost map. The ids are LiteLLM's own cost-map keys: bare
+# for OpenAI and Anthropic, "gemini/"-prefixed for Google, because the bare
+# gemini-* keys resolve to Vertex AI in that map and would price against the
+# wrong route. A proxy configured for wildcard routing wants the fully-prefixed
+# form throughout (openai/gpt-5.4, anthropic/claude-opus-5); a proxy with named
+# aliases wants whatever the operator called them. A wrong id here fails loudly
+# as a proxy "model not found", never silently.
+#
+# Prices are the upstream vendor's list price, matching LiteLLM's
+# model_prices_and_context_window.json. An operator can override any of them per
+# model in config.yaml (model_info.input_cost_per_token), so treat these as
+# defaults to reconcile against the proxy's own /spend numbers. They replace the
+# 0.00/0.00 this file used to carry: pricing.py reads a PRESENT 0.0 as a real
+# catalog rate, so every LiteLLM turn was costed at exactly $0.00 — a silent
+# under-count for a proxy fronting paid models.
+#
+# Cache pricing: every model below discounts cached input to 0.10x the input
+# rate. cache_write_price_per_1m is 0.0 throughout — pricing.py picks the family
+# from the Cremind provider name, and "litellm" is not in _FAMILY_BY_PROVIDER, so
+# it falls into the OpenAI-compatible family whose usage breakdown always reports
+# cache_creation as 0. Anthropic's real 5-minute cache writes ($6.25 / $2.50 /
+# $1.25 per 1M for Opus 5 / Sonnet 5 / Haiku 4.5) can never be applied on this
+# path and are therefore under-reported; that is a transport limit, not a typo.
+#
+# Only base-tier rates are listed. gpt-5.4 above 272K input tokens bills 2x input
+# / 1.5x output, and Gemini 3.1 Pro above 200k bills $4.00/$18.00; this schema has
+# no context-tier concept, so long prompts under-report.
+#
+# max_output_tokens is the reserve compaction holds back for the reply, so the
+# hard prompt ceiling is context_window - max_output_tokens. It is set on the two
+# OpenAI entries because OpenAI publishes a max-INPUT cap that sits BELOW the
+# advertised window: GPT-5.4 Mini is a 400,000-token window with a documented
+# "Maximum input tokens: 272,000". Without the 128,000 reserve compaction targets
+# 0.85 * 400,000 and would hand the proxy a ~392,000-token prompt that the
+# upstream rejects outright, so the reserve is load-bearing, not decorative.
+# The Anthropic and Gemini entries deliberately carry NO reserve and fall back to
+# DEFAULT_RESPONSE_RESERVE: Anthropic's 1M / 200K figure is the combined
+# input+output window (no separate input cap), and Google publishes 1,048,576 as
+# the INPUT limit with the 65,536-token output counted outside it. Neither has a
+# max-input cap below its context_window, so neither can overflow the same way.
+
+# ── OpenAI upstream ────────────────────────────────────────────────────────
 [[models]]
 id = "gpt-5.4"
 context_window = 1050000
+max_output_tokens = 128000        # 1,050,000 window − 128,000 reply = 922,000 max input
 display_name = "GPT-5.4 (via LiteLLM)"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "high"]
+group_hint = "high"
+prompt_cache = true
+vision = true
+input_price_per_1m = 2.50
+output_price_per_1m = 15.00
+cache_read_price_per_1m = 0.25    # 0.10x input
+cache_write_price_per_1m = 0.0    # OpenAI-shaped usage reports no cache-creation tokens
+
+[[models]]
+id = "gpt-5.4-mini"
+context_window = 400000
+max_output_tokens = 128000        # 400,000 window − 128,000 reply = 272,000 max input (OpenAI's documented cap)
+display_name = "GPT-5.4 Mini (via LiteLLM)"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "high"]
+group_hint = "low"
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.75
+output_price_per_1m = 4.50
+cache_read_price_per_1m = 0.075   # 0.10x input
+cache_write_price_per_1m = 0.0    # OpenAI-shaped usage reports no cache-creation tokens
+
+# ── Anthropic upstream ─────────────────────────────────────────────────────
+# Flat pricing across the full 1M window (no >200K premium band on 4.6+ models).
+[[models]]
+id = "claude-opus-5"
+context_window = 1000000
+display_name = "Claude Opus 5 (via LiteLLM)"
 supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
 vision = true
-input_price_per_1m = 0.00
-output_price_per_1m = 0.00
+input_price_per_1m = 5.00
+output_price_per_1m = 25.00
+cache_read_price_per_1m = 0.50    # 0.10x input
+cache_write_price_per_1m = 0.0    # real rate is 6.25, but this path reports no cache-creation tokens
+
+[[models]]
+id = "claude-sonnet-5"
+context_window = 1000000
+display_name = "Claude Sonnet 5 (via LiteLLM)"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+vision = true
+input_price_per_1m = 2.00         # launch "introductory" rate; now the standard price
+output_price_per_1m = 10.00       # the scheduled 2026-09-01 rise to 3.00/15.00 was cancelled
+cache_read_price_per_1m = 0.20    # 0.10x input
+cache_write_price_per_1m = 0.0    # real rate is 2.50, but this path reports no cache-creation tokens
+
+# Retirement is "not sooner than 2026-10-15" — the shortest-lived entry here.
+# Re-check before the next refresh.
+[[models]]
+id = "claude-haiku-4-5"
+context_window = 200000
+display_name = "Claude Haiku 4.5 (via LiteLLM)"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = true
+vision = true
+input_price_per_1m = 1.00
+output_price_per_1m = 5.00
+cache_read_price_per_1m = 0.10    # 0.10x input
+cache_write_price_per_1m = 0.0    # real rate is 1.25, but this path reports no cache-creation tokens
+
+# ── Google Gemini upstream (the "gemini/" prefix is load-bearing) ───────────
+[[models]]
+id = "gemini/gemini-3.1-pro-preview"
+context_window = 1048576
+display_name = "Gemini 3.1 Pro (via LiteLLM)"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+vision = true
+audio = true
+input_price_per_1m = 2.00         # prompts <= 200k; 4.00 above
+output_price_per_1m = 12.00       # prompts <= 200k; 18.00 above
+cache_read_price_per_1m = 0.20    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "gemini/gemini-3.8-flash"
+context_window = 1048576
+display_name = "Gemini 3.8 Flash (via LiteLLM)"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = true
+vision = true
+audio = true
+input_price_per_1m = 0.75         # promo rate; 1.50 from 2027-01-01
+output_price_per_1m = 3.75        # promo rate; 7.50 from 2027-01-01
+cache_read_price_per_1m = 0.075   # 0.10x input; 0.15 from 2027-01-01
+cache_write_price_per_1m = 0.0    # no separate cache-write fee

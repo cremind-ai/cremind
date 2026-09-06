@@ -62,8 +62,8 @@ def test_non_reasoning_model_keeps_tool_and_injects_guidance(monkeypatch):
 
 
 def test_reasoning_model_drops_tool_and_omits_guidance(monkeypatch):
-    # openai/o3 is flagged supports_reasoning in the catalog.
-    agent = _build(monkeypatch, "openai", "o3")
+    # openai/gpt-6-astra is flagged supports_reasoning in the catalog.
+    agent = _build(monkeypatch, "openai", "gpt-6-astra")
     assert "reasoning" not in agent._tools_by_id
     assert "calc" in agent._tools_by_id  # other tools untouched
     assert agent._inject_reasoning_guidance is False
@@ -158,14 +158,14 @@ def test_no_search_tools_omits_block():
 
 def test_agent_wires_search_guidance_into_prompt(monkeypatch):
     # End-to-end: __init__ computes _search_guidance from the live tools and
-    # _build_instruction injects it. openai/o3 is native-reasoning so the
+    # _build_instruction injects it. openai/gpt-6-astra is native-reasoning so the
     # REASONING STEP block is absent and only the search block is present.
     monkeypatch.setattr(ra, "resolve_agent_config", lambda profile: _fake_cfg())
     monkeypatch.setattr(ra, "read_persona_file", lambda profile: "PERSONA")
     monkeypatch.setattr(ra, "get_user_working_directory", lambda: "/work")
     monkeypatch.setattr(ra, "get_context", lambda *a, **k: None)
 
-    llm = SimpleNamespace(provider_name="openai", model_name="o3")
+    llm = SimpleNamespace(provider_name="openai", model_name="gpt-6-astra")
     registry = _FakeRegistry([_grp(*_DOC), _grp(*_MEM), _grp(*_WEB)])
     agent = ra.ReasoningAgent(llm=llm, registry=registry, profile="default", context_id="ctx")
 

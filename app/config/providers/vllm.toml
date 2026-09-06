@@ -10,6 +10,92 @@ hint = "vLLM runs locally, no credentials needed"
 kind = "none"
 is_default = true
 
+# vLLM is self-hosted, so this is a REPRESENTATIVE SAMPLE, not a catalog. vLLM
+# serves whatever weights the operator points --model at, under whatever name
+# --served-model-name gives it, so no list here can ever be complete — it is kept
+# short on purpose rather than grown toward a parity that does not exist.
+#
+# Ids are the upstream Hugging Face repo ids, which is what vLLM reports from
+# /v1/models when --served-model-name is not set. They are CASE-SENSITIVE and each
+# was confirmed against huggingface.co on 2026-09-06. In particular
+# google/gemma-4-31B-it really does capitalise the B — the Gemma 4 repos do where
+# the Gemma 3 ones (google/gemma-3-27b-it) do not — so "gemma-4-31b-it" is a 404.
+# NVIDIA's hosted copy of the same weights is lowercase; that is their namespace,
+# not this one.
+#
+# Pricing is 0.00 because it is genuinely free, not because it is unknown: the
+# weights run on the operator's own GPUs and nothing is billed per token, so the
+# 0.00 pricing.py surfaces (a PRESENT 0.0 yields source="catalog",
+# total_usd = 0.00) is the truth. Omitting the fields would instead report
+# source="unknown" / total None — "we don't know" — which is strictly worse than
+# "it's free". GPU-hours are a real cost but not a per-token one, and this schema
+# cannot express them.
+#
+# prompt_cache is false throughout: vLLM's automatic prefix caching is real, but
+# it reports no cached-token counts in the OpenAI-compatible usage block, so the
+# four-way breakdown has nothing to bill at a cache rate.
+#
+# context_window is each model's published native length — the most a vLLM server
+# can serve without a RoPE/YaRN override. It is NOT necessarily what your server
+# serves: --max-model-len decides that, and a prompt over it is REJECTED with a
+# 400, not truncated. Trim these to your own --max-model-len if you serve less.
+
+[[models]]
+id = "Qwen/Qwen3.8-27B"
+context_window = 262144
+display_name = "Qwen 3.8 27B"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "xhigh"]
+group_hint = "high"
+prompt_cache = false
+vision = true
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "google/gemma-4-31B-it"
+context_window = 262144
+display_name = "Gemma 4 31B"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = false
+vision = true
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "Qwen/Qwen3.6-35B-A3B"
+context_window = 262144
+display_name = "Qwen 3.6 35B-A3B"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = false
+vision = true
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "openai/gpt-oss-120b"
+context_window = 131072
+display_name = "GPT-OSS 120B"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "high"]
+group_hint = "high"
+prompt_cache = false
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "openai/gpt-oss-20b"
+context_window = 131072
+display_name = "GPT-OSS 20B"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "high"]
+group_hint = "low"
+prompt_cache = false
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
 [[models]]
 id = "meta-llama/Llama-3.3-70B-Instruct"
 context_window = 131072
@@ -30,7 +116,7 @@ output_price_per_1m = 0.00
 
 [[models]]
 id = "Qwen/Qwen3-32B"
-context_window = 131072
+context_window = 40960
 display_name = "Qwen 3 32B"
 supports_reasoning = true
 group_hint = "high"
@@ -38,9 +124,16 @@ prompt_cache = false
 input_price_per_1m = 0.00
 output_price_per_1m = 0.00
 
+# The one entry deliberately BELOW its published length. Meta's card advertises a
+# 10M context, but vLLM's own Llama 4 guidance is that reaching it needs multiple
+# nodes (tensor / pipeline parallel) because KV cache grows linearly with context
+# and dominates memory past 1M tokens. 1,000,000 is the largest window a realistic
+# single-node deployment serves; raise it only if you actually pass a bigger
+# --max-model-len. Erring low only makes compaction fire early — erring high makes
+# vLLM reject the request outright, so do not "correct" this upward to 10485760.
 [[models]]
 id = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
-context_window = 1048576
+context_window = 1000000
 display_name = "Llama 4 Scout"
 group_hint = "high"
 prompt_cache = false

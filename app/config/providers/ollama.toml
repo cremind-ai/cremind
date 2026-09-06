@@ -10,6 +10,120 @@ hint = "Ollama runs locally, no credentials needed"
 kind = "none"
 is_default = true
 
+# Ollama is self-hosted, so this is a REPRESENTATIVE SAMPLE of the library, not a
+# catalog. `ollama pull` fetches anything on ollama.com/library, and a user's own
+# tags, quantisations and Modelfiles will never appear here — the list is kept
+# deliberately short rather than grown toward parity it can never reach.
+#
+# Ids are Ollama library tags in `<model>:<tag>` form, the exact string that
+# `ollama run` and the /v1 model field take; a wrong tag fails loudly as a pull
+# error, never silently. Every id below, and every context_window, was confirmed
+# against its ollama.com/library/<model>/tags page on 2026-09-06.
+#
+# Pricing is 0.00 because it is genuinely free, not because it is unknown. Ollama
+# runs the weights on the user's own hardware and bills nothing per token, so the
+# 0.00 that pricing.py surfaces (a PRESENT 0.0 yields source="catalog",
+# total_usd = 0.00) is the truth. That is why these fields stay present: omitting
+# them would make _rates_from_catalog() report source="unknown" / total None, i.e.
+# "we don't know", which is strictly worse than "it's free". Electricity and
+# hardware are real costs but they are not per-token and this schema cannot
+# express them.
+#
+# prompt_cache is false throughout: Ollama does reuse a KV-cache prefix between
+# turns, but reports no cached-token counts in its OpenAI-compatible usage block,
+# so the four-way breakdown has nothing to bill at a cache rate.
+#
+# context_window is each tag's published MAXIMUM, which is not what a default
+# `ollama run` gives you — Ollama's own default num_ctx is much smaller and it
+# silently truncates rather than erroring. Raise it (OLLAMA_CONTEXT_LENGTH, or a
+# Modelfile `PARAMETER num_ctx`) or compaction will size the prompt for a window
+# the server is not actually serving.
+
+[[models]]
+id = "gemma4:31b"
+context_window = 262144
+display_name = "Gemma 4 31B"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = false
+vision = true
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "gemma4:12b"
+context_window = 262144
+display_name = "Gemma 4 12B"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = false
+vision = true
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "qwen3.5:27b"
+context_window = 262144
+display_name = "Qwen 3.5 27B"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = false
+vision = true
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "qwen3.5:9b"
+context_window = 262144
+display_name = "Qwen 3.5 9B"
+supports_reasoning = true
+group_hint = "low"
+prompt_cache = false
+vision = true
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "gpt-oss:120b"
+context_window = 131072
+display_name = "GPT-OSS 120B"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "high"]
+group_hint = "high"
+prompt_cache = false
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "gpt-oss:20b"
+context_window = 131072
+display_name = "GPT-OSS 20B"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "high"]
+group_hint = "low"
+prompt_cache = false
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "deepseek-r1:32b"
+context_window = 131072
+display_name = "DeepSeek-R1 32B"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = false
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
+[[models]]
+id = "qwen3-coder:30b"
+context_window = 262144
+display_name = "Qwen 3 Coder 30B"
+group_hint = "high"
+prompt_cache = false
+input_price_per_1m = 0.00
+output_price_per_1m = 0.00
+
 [[models]]
 id = "llama3.3:70b"
 context_window = 131072
@@ -30,7 +144,7 @@ output_price_per_1m = 0.00
 
 [[models]]
 id = "qwen3:32b"
-context_window = 131072
+context_window = 40960
 display_name = "Qwen 3 32B"
 supports_reasoning = true
 group_hint = "high"
@@ -40,7 +154,7 @@ output_price_per_1m = 0.00
 
 [[models]]
 id = "qwen3:8b"
-context_window = 131072
+context_window = 40960
 display_name = "Qwen 3 8B"
 supports_reasoning = true
 group_hint = "low"

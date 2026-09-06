@@ -100,13 +100,13 @@ def test_documentation_search_falls_back_to_high_when_low_unset(monkeypatch):
 
 def test_low_falls_back_to_high_when_auth_incompatible():
     mgr = ModelGroupManager(_FakeConfig({
-        "model_group.high": "github-copilot/gpt-4.1",   # no per-model auth_methods → ok
+        "model_group.high": "github-copilot/gpt-5.5",   # no per-model auth_methods → ok
         "model_group.low": "openai/gpt-4.1-mini",        # api_key-only → 400s on Codex
         "openai.auth_method": "codex_oauth",
     }))
     # Incompatible low self-heals to the high group instead of resolving the
     # doomed openai/gpt-4.1-mini.
-    assert mgr.get_provider_and_model("low") == ("github-copilot", "gpt-4.1")
+    assert mgr.get_provider_and_model("low") == ("github-copilot", "gpt-5.5")
 
 
 def test_documentation_search_falls_back_when_low_incompatible(monkeypatch):
@@ -114,17 +114,17 @@ def test_documentation_search_falls_back_when_low_incompatible(monkeypatch):
     # built on an auth-incompatible model.
     captured = _capture_provider_and_model(monkeypatch)
     mgr = ModelGroupManager(_FakeConfig({
-        "model_group.high": "github-copilot/gpt-4.1",
+        "model_group.high": "github-copilot/gpt-5.5",
         "model_group.low": "openai/gpt-4.1-mini",
         "openai.auth_method": "codex_oauth",
     }))
     mgr.create_llm_for_tool("documentation_search")
-    assert (captured["provider"], captured["model"]) == ("github-copilot", "gpt-4.1")
+    assert (captured["provider"], captured["model"]) == ("github-copilot", "gpt-5.5")
 
 
 def test_codex_eligible_low_is_left_intact():
     mgr = ModelGroupManager(_FakeConfig({
-        "model_group.high": "github-copilot/gpt-4.1",
+        "model_group.high": "github-copilot/gpt-5.5",
         "model_group.low": "openai/gpt-5.4-mini",   # dual auth → valid under Codex
         "openai.auth_method": "codex_oauth",
     }))
@@ -150,7 +150,7 @@ def test_high_incompatible_auth_raises_setup_required():
 def test_low_incompatible_but_api_key_ok():
     # openai on api_key: gpt-4.1-mini is fine — the guard must not over-fire.
     mgr = ModelGroupManager(_FakeConfig({
-        "model_group.high": "github-copilot/gpt-4.1",
+        "model_group.high": "github-copilot/gpt-5.5",
         "model_group.low": "openai/gpt-4.1-mini",
         "openai.auth_method": "api_key",
     }))

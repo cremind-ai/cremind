@@ -10,7 +10,10 @@ from typing import Any, Callable, Optional
 
 from app.api import llm as llm_api
 
-_CODEX_ONLY = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.3-codex-spark"}
+# The GPT-6 / GPT-5.6 / GPT-5.5 models are served on BOTH paths; gpt-5.3-codex-spark
+# is the only model the Codex backend serves and the API does not.
+_CODEX_ONLY = {"gpt-5.3-codex-spark"}
+_API_KEY_ONLY = "gpt-5.4-nano"
 
 
 class FakeConfigStorage:
@@ -74,7 +77,7 @@ def test_models_query_override_codex(monkeypatch):
     ids = _model_ids(resp)
     assert _CODEX_ONLY.issubset(ids)
     assert "gpt-5.4" in ids  # shared model visible under both
-    assert "o3" not in ids   # api_key-only hidden
+    assert _API_KEY_ONLY not in ids  # api_key-only hidden
 
 
 def test_models_default_is_api_key(monkeypatch):
@@ -83,7 +86,7 @@ def test_models_default_is_api_key(monkeypatch):
     resp = asyncio.run(h[("/api/llm/providers/{name}/models", "GET")](_make_request(name="openai")))
     ids = _model_ids(resp)
     assert _CODEX_ONLY.isdisjoint(ids)  # codex-only hidden by default
-    assert "gpt-5.4" in ids and "o3" in ids
+    assert "gpt-5.4" in ids and _API_KEY_ONLY in ids
 
 
 def test_models_stored_auth_method_honored(monkeypatch):
@@ -102,13 +105,13 @@ def test_model_count_reflects_active_method(monkeypatch):
     h = _handlers(storage, monkeypatch)
     resp = asyncio.run(h[("/api/llm/providers", "GET")](_make_request()))
     openai = next(p for p in _body(resp)["providers"] if p["name"] == "openai")
-    assert openai["model_count"] == 7  # 5 codex-only + 2 shared
+    assert openai["model_count"] == 8  # 1 codex-only + 7 shared
 
 
 def test_auth_switch_clears_stale_model_group(monkeypatch):
     import asyncio
     storage = FakeConfigStorage()
-    storage.set("llm_config", "model_group.high", "openai/o3")        # api_key-only
+    storage.set("llm_config", "model_group.high", f"openai/{_API_KEY_ONLY}")  # api_key-only
     storage.set("llm_config", "model_group.low", "openai/gpt-5.4")    # shared → still valid
     h = _handlers(storage, monkeypatch)
     resp = asyncio.run(h[("/api/llm/providers/{name}", "PUT")](

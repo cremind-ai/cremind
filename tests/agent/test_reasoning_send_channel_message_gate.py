@@ -60,7 +60,7 @@ def _build_agent(monkeypatch, *, any_channel, notification_channel=False):
     monkeypatch.setattr(
         reg, "has_notification_channel", lambda profile: notification_channel,
     )
-    llm = SimpleNamespace(provider_name="openai", model_name="o3")
+    llm = SimpleNamespace(provider_name="openai", model_name="gpt-6-astra")
     registry = _FakeRegistry([
         _grp("send_channel_message", "send_channel_message", hidden=True,
              name="Send Channel Message"),

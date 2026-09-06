@@ -24,14 +24,42 @@ kind = "api_key"
 [provider.auth_methods.fields]
 api_key = { description = "MiniMax API Key", type = "string", secret = true, required = true }
 
-# Cache pricing: MiniMax bills cache reads at 0.20x the input rate and (unlike
-# most OpenAI-compatible APIs) charges 1.25x for cache writes. The write rate is
-# recorded for accuracy; it is currently not exercised because the OpenAI-style
-# usage breakdown reports cache-creation tokens as 0.
+# Cache pricing: MiniMax publishes a flat cached-read rate per model generation
+# rather than a multiple of the input rate - $0.06/M for M3 and the M2.7 pair,
+# $0.03/M for the M2.5 generation and older - so every entry sets
+# cache_read_price_per_1m explicitly. The ratio each one works out to is noted
+# inline; it differs between a model and its -highspeed twin only because the
+# highspeed input rate is doubled while the read rate is not.
+#
+# Cache writes are free: the OpenAI-compatible endpoint Cremind talks to performs
+# *passive* caching, which MiniMax's prompt-caching doc bills with "no cache
+# write charges". The $0.375/M "prompt caching write" column on the pay-as-you-go
+# table bills the *explicit* (Anthropic-style cache_control) path, which Cremind
+# never takes - note that M3, the one model supporting passive but not explicit
+# caching, is also the one row with no cache-write price at all. Either way the
+# OpenAI-style usage breakdown reports cache-creation tokens as 0, so
+# cache_write_price_per_1m is inert at runtime for every model here.
+
+[[models]]
+id = "MiniMax-M3"
+context_window = 1000000
+display_name = "MiniMax M3"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+vision = true
+# Standard tier, <=512k input, at MiniMax's "permanent 50% off" rate (list price
+# is exactly 2x these numbers). Input beyond 512k is also billed at 2x, and a
+# "priority" service tier costs 1.5x; flat per-model pricing expresses neither,
+# so very long contexts are under-recorded in the usage tracker.
+input_price_per_1m = 0.30
+output_price_per_1m = 1.20
+cache_read_price_per_1m = 0.06    # 0.20x input
+cache_write_price_per_1m = 0.0    # passive caching: writes are free
 
 [[models]]
 id = "MiniMax-M2.7"
-context_window = 1000000
+context_window = 204800
 display_name = "MiniMax M2.7"
 supports_reasoning = true
 group_hint = "high"
@@ -39,20 +67,42 @@ prompt_cache = true
 input_price_per_1m = 0.30
 output_price_per_1m = 1.20
 cache_read_price_per_1m = 0.06    # 0.20x input
-cache_write_price_per_1m = 0.375  # 1.25x input
+cache_write_price_per_1m = 0.0    # passive caching: writes are free
+
+[[models]]
+id = "MiniMax-M2.7-highspeed"
+context_window = 204800
+display_name = "MiniMax M2.7 High-Speed"
+supports_reasoning = true
+group_hint = "high"
+prompt_cache = true
+# Same weights as M2.7 at roughly 100 tps, billed at 2x its input/output rates -
+# a latency pick, not a cheap tier.
+input_price_per_1m = 0.60
+output_price_per_1m = 2.40
+cache_read_price_per_1m = 0.06    # 0.10x input
+cache_write_price_per_1m = 0.0    # passive caching: writes are free
 
 [[models]]
 id = "MiniMax-M2.5"
-context_window = 1000000
+context_window = 204800
 display_name = "MiniMax M2.5"
 supports_reasoning = true
 group_hint = "high"
 prompt_cache = true
-input_price_per_1m = 0.12
-output_price_per_1m = 0.95
-cache_read_price_per_1m = 0.024   # 0.20x input
-cache_write_price_per_1m = 0.15   # 1.25x input
+input_price_per_1m = 0.30
+output_price_per_1m = 1.20
+cache_read_price_per_1m = 0.03    # 0.10x input
+cache_write_price_per_1m = 0.0    # passive caching: writes are free
 
+# MiniMax no longer lists M1 anywhere it publishes: not in the model enum, not in
+# the pay-as-you-go price table, and not among the models its prompt-caching doc
+# supports on either the passive or the explicit path. It has published no
+# retirement notice for it either, so the entry stays. The rates below match
+# nothing MiniMax currently publishes - re-check them (or the model's
+# availability) before relying on the recorded cost. In particular the 0.50
+# cache-write this entry used to carry was the Anthropic 1.25x-input formula
+# applied by hand, not a MiniMax rate; MiniMax has never published one for M1.
 [[models]]
 id = "MiniMax-M1"
 context_window = 1000000
@@ -63,4 +113,4 @@ prompt_cache = true
 input_price_per_1m = 0.40
 output_price_per_1m = 1.76
 cache_read_price_per_1m = 0.08    # 0.20x input
-cache_write_price_per_1m = 0.50   # 1.25x input
+cache_write_price_per_1m = 0.0    # no published rate; passive writes are free

@@ -14,12 +14,59 @@ is_default = true
 [provider.auth_methods.fields]
 api_key = { description = "Perplexity API Key", type = "string", secret = true, required = true }
 
+# ============================================================================
+# DEPRECATION — THIS ENTIRE PROVIDER GOES DARK ON 2026-09-27.
+# That is 21 days after this file was last verified (2026-09-06). Not one model:
+# every model below stops serving on that date, and this provider stops working.
+#
+# Verbatim banner on both docs.perplexity.ai/getting-started/pricing and
+# .../getting-started/models, confirmed live on 2026-09-06:
+#     "Sonar Chat Completions is now Agent API. Sonar will be supported until
+#      September 27, 2026."
+# Announced 2026-08-13 with a 45-day migration window. Existing contractual
+# commitments to Sonar are honoured to the end of their term; nothing else is.
+#
+# The models below are DELIBERATELY KEPT: they answer and bill normally until the
+# 27th, so removing them now would break working configs. Do not delete them
+# ahead of the date.
+#
+# The successor is NOT a base_url edit. Same host, different path AND a different
+# wire protocol:
+#   Sonar (today)  POST /v1/sonar — takes `messages`, returns `choices`
+#                  (OpenAI chat-completions shaped, which is why this provider
+#                  works against the generic OpenAI-compatible client)
+#   Agent API      POST /v1/agent — takes `input`, returns a typed `output` array
+#                  (Responses shaped; `responses.create()`, answer text at
+#                  `output_text`, streaming as typed SSE events, not `delta.content`)
+# Cutting over therefore needs a dedicated provider implementation, not a config
+# change. Migration guide:
+#   https://docs.perplexity.ai/docs/agent-api/migrate-from-sonar/overview
+# ============================================================================
+
+# Cache pricing: the Sonar API publishes NO cached-token rate at all. Its pricing
+# table carries only id / label / input / output / request columns (plus citation,
+# reasoning and searchQueries for Deep Research) — there is no cache column, and
+# the docs' machine-readable rate object has no `cache` key for these four models.
+# So prompt_cache = false on every entry and both cache price keys stay omitted.
+#
+# Do NOT "correct" this from the $0.25 or $0.0625 figures that appear elsewhere on
+# that same pricing page. Those belong to `perplexity/sonar`, a DIFFERENT product
+# on the Agent API surface (see the deprecation note above), whose row reads
+# input $0.25 / output $2.50 / cache $0.0625. The $0.25 there is an INPUT price,
+# not a cache rate, and that row is not the `sonar` entry below ($1 in / $1 out).
+# Re-verified against the live pricing page on 2026-09-06.
+#
+# Prices below are the standard token tier only. Sonar, Sonar Pro and Sonar
+# Reasoning Pro additionally bill a per-request search fee ($5-$14 per 1K requests
+# depending on search context size) that has no key in this schema.
+
 [[models]]
 id = "sonar-pro"
 context_window = 200000
 display_name = "Sonar Pro"
 group_hint = "high"
 prompt_cache = false
+vision = true
 input_price_per_1m = 3.00
 output_price_per_1m = 15.00
 
@@ -42,6 +89,10 @@ prompt_cache = false
 input_price_per_1m = 2.00
 output_price_per_1m = 8.00
 
+# Cost here is structurally under-stated: on top of the input/output rates below,
+# Deep Research separately meters citation tokens ($2/1M), reasoning tokens ($3/1M)
+# and search queries ($5/1K), none of which this schema can express. A single query
+# can emit far more reasoning + citation tokens than answer tokens.
 [[models]]
 id = "sonar-deep-research"
 context_window = 128000
@@ -51,3 +102,4 @@ group_hint = "high"
 prompt_cache = false
 input_price_per_1m = 2.00
 output_price_per_1m = 8.00
+reasoning_effort = ["low", "medium", "high"]

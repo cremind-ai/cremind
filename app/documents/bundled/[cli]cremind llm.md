@@ -348,7 +348,7 @@ $ cremind llm model-groups set --high anthropic/claude-haiku-4-5-20251001 --plan
 $ cremind llm model-groups set --default-provider openai --high openai/gpt-5
 
 # Turn on the Specialized Audio Model feature and point it at an audio-capable model
-$ cremind llm model-groups set --audio-enabled --audio openai/gpt-audio
+$ cremind llm model-groups set --audio-enabled --audio openai/gpt-audio-1.5
 ```
 
 ### `cremind llm device-code start`

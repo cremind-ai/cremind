@@ -14,31 +14,180 @@ is_default = true
 [provider.auth_methods.fields]
 api_key = { description = "Chutes API Key", type = "string", secret = true, required = true }
 
+# The served catalog is now entirely confidential-compute: every id Chutes lists
+# carries a "-TEE" suffix and reports confidential_compute=true. Select on that
+# flag rather than on the name suffix, in case non-TEE chutes return later.
+#
+# Cache pricing: the OpenAI-compatible catalog (GET /v1/models) publishes a
+# per-model `input_cache_read` rate, which is 0.10x input on every served model.
+# There is no separate cache-write fee, and usage reports cache_creation as 0.
+
 [[models]]
-id = "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+id = "moonshotai/Kimi-K3-TEE"
 context_window = 1048576
-display_name = "Llama 4 Maverick"
+display_name = "Kimi K3"
 group_hint = "high"
-prompt_cache = false
-vision = true
-input_price_per_1m = 0.22
-output_price_per_1m = 0.88
-
-[[models]]
-id = "Qwen/Qwen3-235B-A22B"
-context_window = 262144
-display_name = "Qwen 3 235B"
 supports_reasoning = true
-group_hint = "high"
-prompt_cache = false
-input_price_per_1m = 0.50
-output_price_per_1m = 1.50
+prompt_cache = true
+vision = true
+input_price_per_1m = 3.00
+output_price_per_1m = 15.00
+cache_read_price_per_1m = 0.30    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
-id = "moonshotai/Kimi-K2.5"
-context_window = 262144
-display_name = "Kimi K2.5"
+id = "zai-org/GLM-5.2-TEE"
+context_window = 1048576
+display_name = "GLM-5.2"
 group_hint = "high"
-prompt_cache = false
-input_price_per_1m = 0.60
+supports_reasoning = true
+prompt_cache = true
+input_price_per_1m = 1.25
+output_price_per_1m = 3.95
+cache_read_price_per_1m = 0.125   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# Previous GLM generation, still served. context_length and max_model_len agree
+# at 202,752 in the catalog payload (the pricing page rounds it to "203K").
+[[models]]
+id = "zai-org/GLM-5.1-TEE"
+context_window = 202752
+display_name = "GLM-5.1"
+group_hint = "high"
+supports_reasoning = true
+prompt_cache = true
+input_price_per_1m = 0.98
+output_price_per_1m = 3.08
+cache_read_price_per_1m = 0.098   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "deepseek-ai/DeepSeek-V4-Flash-0731-TEE"
+context_window = 1048576
+display_name = "DeepSeek V4 Flash"
+group_hint = "high"
+supports_reasoning = true
+prompt_cache = true
+input_price_per_1m = 0.44
+output_price_per_1m = 1.32
+cache_read_price_per_1m = 0.044   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# Symmetric pricing: input and output both bill at $1.00/1M.
+[[models]]
+id = "deepseek-ai/DeepSeek-V3.2-TEE"
+context_window = 131072
+display_name = "DeepSeek V3.2"
+group_hint = "high"
+supports_reasoning = true
+prompt_cache = true
+input_price_per_1m = 1.00
+output_price_per_1m = 1.00
+cache_read_price_per_1m = 0.10    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "Qwen/Qwen3.5-397B-A17B-TEE"
+context_window = 262144
+display_name = "Qwen 3.5 397B"
+group_hint = "high"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.45
 output_price_per_1m = 3.00
+cache_read_price_per_1m = 0.045   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "moonshotai/Kimi-K2.6-TEE"
+context_window = 262144
+display_name = "Kimi K2.6"
+group_hint = "high"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.58
+output_price_per_1m = 3.40
+cache_read_price_per_1m = 0.058   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# Prices are published to four decimals; carried verbatim rather than rounded.
+[[models]]
+id = "Qwen/Qwen3-235B-A22B-Thinking-2507-TEE"
+context_window = 262144
+display_name = "Qwen 3 235B Thinking"
+group_hint = "high"
+supports_reasoning = true
+prompt_cache = true
+input_price_per_1m = 0.2989
+output_price_per_1m = 1.1957
+cache_read_price_per_1m = 0.02989 # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "Qwen/Qwen3.8-27B-TEE"
+context_window = 262144
+display_name = "Qwen 3.8 27B"
+group_hint = "low"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.32
+output_price_per_1m = 2.50
+cache_read_price_per_1m = 0.032   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "Qwen/Qwen3.6-27B-TEE"
+context_window = 262144
+display_name = "Qwen 3.6 27B"
+group_hint = "low"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.30
+output_price_per_1m = 2.00
+cache_read_price_per_1m = 0.03    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# Context sources disagree on this one model: the catalog payload carries
+# max_model_len 262144 but context_length 131072, while the pricing page says
+# 131K and llms.txt says 128K. We take the lower figure — an over-stated window
+# fails at the API, an under-stated one only leaves headroom unused.
+[[models]]
+id = "google/gemma-4-31B-turbo-TEE"
+context_window = 131072
+display_name = "Gemma 4 31B Turbo"
+group_hint = "low"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+input_price_per_1m = 0.12
+output_price_per_1m = 0.37
+cache_read_price_per_1m = 0.012   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# Smallest chute served. The 40,960 window is the vendor's own figure (both
+# context_length and max_model_len), not a rounding of 41K.
+[[models]]
+id = "Qwen/Qwen3-32B-TEE"
+context_window = 40960
+display_name = "Qwen 3 32B"
+group_hint = "low"
+supports_reasoning = true
+prompt_cache = true
+input_price_per_1m = 0.104
+output_price_per_1m = 0.416
+cache_read_price_per_1m = 0.0104  # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# Removed 2026-09-06: meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8,
+# Qwen/Qwen3-235B-A22B and moonshotai/Kimi-K2.5 were carried here pending a probe
+# of the live endpoint. GET https://llm.chutes.ai/v1/models (the exact base_url
+# above) now returns 14 chutes, every one of them "-TEE", and llms.txt agrees id
+# for id; none of the three appears in either. They are non-selectable ids, not
+# models with a pending shutdown date, so they are dropped rather than annotated.
+# Chutes also serves unsloth/Mistral-Nemo-Instruct-2407-TEE and
+# Nemotron-3-Nano-Omni-30B-TEE; both report context_length null (max_model_len
+# 131072) and neither advertises reasoning, so they are left out deliberately.

@@ -53,7 +53,14 @@ def is_context_overflow(err: Any) -> bool:
 #      slugs, models that don't exist yet): the first request 400s, we memo the
 #      endpoint+model, and every request after that uses the right name.
 
-_MAX_COMPLETION_TOKEN_FAMILIES = ("gpt-5", "o1", "o3", "o4")
+_MAX_COMPLETION_TOKEN_FAMILIES = ("gpt-5", "gpt-6", "o1", "o3", "o4")
+
+# Model ids that belong to the same set but carry no family prefix to match on.
+# ``chat-latest`` is OpenAI's unversioned "latest instant ChatGPT model" pointer;
+# it used to be catalogued as ``gpt-5.3-chat-latest`` and so was covered by the
+# ``gpt-5`` family above, but OpenAI renamed it to the bare slug — matching it
+# needs an exact id, not a prefix.
+_MAX_COMPLETION_TOKEN_IDS = frozenset({"chat-latest"})
 
 _UNSUPPORTED_MAX_TOKENS_MARKERS = (
     "max_completion_tokens",
@@ -74,6 +81,8 @@ def _bare_model_id(model_name: str) -> str:
 def uses_max_completion_tokens(model_name: str) -> bool:
     """Whether ``model_name`` belongs to a family that rejects ``max_tokens``."""
     model = _bare_model_id(model_name)
+    if model in _MAX_COMPLETION_TOKEN_IDS:
+        return True
     return any(
         model == fam or model.startswith(fam + "-") or model.startswith(fam + ".")
         for fam in _MAX_COMPLETION_TOKEN_FAMILIES

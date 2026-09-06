@@ -15,46 +15,101 @@ is_default = true
 api_key = { description = "xAI API Key", type = "string", secret = true, required = true }
 
 # Cache pricing: xAI publishes a flat cached-input rate per model (no separate
-# cache-write fee). Grok 4-class models cache at $0.20/M; Grok 4.1 Fast at
-# $0.05/M; Grok 3 / 3 Mini at 0.25x the input rate.
+# cache-write fee), and the ratio to the input rate differs per model, so every
+# cached rate below is written out explicitly instead of derived. Note also that
+# xAI prices each text model in two tiers split at 200k prompt tokens, and the
+# higher tier applies to the whole request; the rates below are the standard
+# (< 200k) tier, so cost is understated ~2x on prompts past 200k.
+
+# Retired 2026-05-15 12:00 PM PT per xAI's migration notice
+# (docs.x.ai/developers/migration/may-15-retirement) — do NOT re-add:
+#   grok-3, grok-4-0709 (the snapshot behind the `grok-4` alias),
+#   grok-4-1-fast-reasoning, grok-4-1-fast-non-reasoning,
+#   grok-4-fast-reasoning, grok-4-fast-non-reasoning, grok-code-fast-1.
+# That shutdown date is in the PAST, and all of these are now absent from
+# both docs.x.ai/developers/models and .../pricing. Their slugs still
+# resolve, but xAI serves them from grok-4.3 and bills at grok-4.3's rates,
+# so carrying them at their historical prices would badly over-bill (grok-3
+# at $3/$15 against an actual $1.25/$2.50).
 
 [[models]]
-id = "grok-4"
-context_window = 256000
-display_name = "Grok 4"
+id = "grok-4.6"
+context_window = 500000
+display_name = "Grok 4.6"
 group_hint = "high"
 supports_reasoning = true
+reasoning_effort = ["low", "medium", "high", "xhigh"]
 prompt_cache = true
 vision = true
 input_price_per_1m = 2.00
 output_price_per_1m = 6.00
-cache_read_price_per_1m = 0.20    # published flat cached-input rate
+cache_read_price_per_1m = 0.50    # published cached-input rate, 0.25x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
-id = "grok-4-1-fast"
+id = "grok-4.5"
+context_window = 500000
+display_name = "Grok 4.5"
+group_hint = "high"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "high"]
+prompt_cache = true
+vision = true
+input_price_per_1m = 2.00
+output_price_per_1m = 6.00
+cache_read_price_per_1m = 0.30    # published cached-input rate, 0.15x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "grok-4.3"
 context_window = 1000000
-display_name = "Grok 4.1 Fast"
+display_name = "Grok 4.3"
 group_hint = "low"
 supports_reasoning = true
 prompt_cache = true
 vision = true
-audio = true
-input_price_per_1m = 0.20
-output_price_per_1m = 0.50
-cache_read_price_per_1m = 0.05    # published flat cached-input rate
+input_price_per_1m = 1.25
+output_price_per_1m = 2.50
+cache_read_price_per_1m = 0.20    # published cached-input rate, 0.16x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
+# Deliberately omitted (live and published, not overlooked):
+# grok-4.20-0309-reasoning, grok-4.20-0309-non-reasoning and
+# grok-4.20-multi-agent-0309. All three are dated beta snapshots carrying
+# grok-4.3's exact terms — 1M context, $1.25 in / $0.20 cached / $2.50 out —
+# so they add no cost, context or capability tier the catalogue lacks, and
+# xAI itself ranks them below grok-4.3. The non-reasoning variant is covered
+# too: grok-4.3 accepts reasoning effort "none" (it is the documented
+# migration target for the retired *-non-reasoning slugs). The multi-agent
+# slug is also ambiguous — the pricing table calls it
+# grok-4.20-multi-agent-0309, the reasoning guide grok-4.20-multi-agent.
+# Revisit only if xAI prices the 4.20 line apart from grok-4.3.
+
 [[models]]
-id = "grok-3"
-context_window = 131072
-display_name = "Grok 3"
-group_hint = "high"
+id = "grok-build-0.1"
+context_window = 256000
+display_name = "Grok Build 0.1"
+group_hint = "low"
+supports_reasoning = true
 prompt_cache = true
-input_price_per_1m = 3.00
-output_price_per_1m = 15.00
-cache_read_price_per_1m = 0.75    # 0.25x input
+vision = true
+input_price_per_1m = 1.00
+output_price_per_1m = 2.00
+cache_read_price_per_1m = 0.20    # published cached-input rate, 0.20x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# UNCONFIRMED — kept under the no-removal-without-a-notice rule, but every
+# price below is historical, not currently published. As of 2026-09-06
+# grok-3-mini appears on neither docs.x.ai/developers/models nor
+# .../pricing, and its model page 307-redirects to the models index and
+# renders "Model not found" — the same treatment xAI gave grok-3, grok-4 and
+# grok-4-1-fast, which ARE confirmed retired. Unlike those, grok-3-mini is
+# named in no retirement notice: it is absent from the May 15 migration page
+# and from the release notes, and no later retirement page exists. So it is
+# delisted rather than formally retired, and it is kept here only because no
+# notice justifies removing it. Verify against a live API key before relying
+# on these rates; if the slug now redirects like its siblings, it is billed
+# at grok-4.3's rates and this entry should be deleted.
 
 [[models]]
 id = "grok-3-mini"

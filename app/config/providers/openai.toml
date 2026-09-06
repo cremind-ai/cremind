@@ -23,20 +23,131 @@ kind = "oauth"
 # No `fields` table: the browser flow captures the tokens; there is nothing to
 # type. Tokens are stored server-side under ``openai.oauth_*`` keys.
 
-# Cache pricing: the GPT-5 family discounts cached input to 0.10x the input rate;
-# GPT-4.1 and the o-series cache at 0.25x. OpenAI does not charge separately for
-# cache creation.
+# Cache pricing: the GPT-5.x and GPT-6 families discount cached input to 0.10x the
+# input rate; GPT-4.1 and most of the o-series cache at 0.25x, with o3-mini the
+# outlier at 0.50x. The Pro models and gpt-audio publish NO cached-input discount
+# at all (OpenAI's pricing table prints an em dash in their cached column), so
+# their cache_read_price_per_1m is set EQUAL to the input rate —
+# omitting it would make pricing.py apply the conservative 0.50x OpenAI-family
+# fallback and *under*-bill cached reads. Cremind's openai_usage_breakdown()
+# always reports cache_creation as 0, so cache_write_price_per_1m = 0.0 is the
+# correct (and, in practice, unreachable) write rate for every entry here.
+
+# Announced shutdowns (developers.openai.com/api/docs/deprecations, re-checked
+# 2026-09-06). Several entries below carry a "shutdown YYYY-MM-DD" note. A model
+# whose shutdown date is still in the FUTURE is served today and stays listed:
+# deleting it breaks every user pinned to it for no gain. Drop an entry only once
+# its date has actually passed, and re-check this file as each date comes up.
+
+# Long-context surcharge — NOT representable in this schema. Every GPT-5.4 /
+# GPT-5.5 / GPT-5.6 / GPT-6 model reprices the WHOLE request at 2x input and 1.5x
+# output once the prompt passes 272K input tokens. The rates below are the
+# standard (<272K) tier. With context_window at 1,050,000 the compaction
+# threshold (0.85 * window ≈ 892K) sits inside the 2x band, so a very long
+# conversation is under-costed by roughly 2x on input. A real fix needs a
+# tiered-price field in app/lib/llm/pricing.py.
 
 # parallel_tool_calls: lets the model request several tool calls in one turn (the
 # agent then runs the leaf calls concurrently). Defaults to true for unflagged
 # models. The listed OpenAI models accept the request parameter under tool_choice
 # "auto"; set it to false to opt out a model that rejects it.
 
-# Latest flagship models (GPT-5.4 series)
+# Latest flagship models (GPT-6 / GPT-5.6 / GPT-5.5). These are served by BOTH
+# the standard API (api_key) and the ChatGPT Codex backend (codex_oauth), so they
+# carry real per-token prices — unlike the plan-covered Codex-only block below.
+[[models]]
+id = "gpt-6-astra"
+display_name = "GPT-6 Astra"
+context_window = 1050000
+max_output_tokens = 128000    # 1,050,000 window − 128,000 reply = 922,000 max input
+group_hint = "high"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "high"]
+prompt_cache = true
+vision = true
+auth_methods = ["api_key", "codex_oauth"]
+input_price_per_1m = 10.00
+output_price_per_1m = 50.00
+cache_read_price_per_1m = 1.00    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "gpt-5.6-sol"
+display_name = "GPT 5.6 Sol"
+context_window = 1050000
+max_output_tokens = 128000
+group_hint = "high"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "high"]
+prompt_cache = true
+vision = true
+auth_methods = ["api_key", "codex_oauth"]
+# Promotional pricing, published as running at least through 2026-11-21 — re-check
+# these three rates before that date.
+input_price_per_1m = 4.00
+output_price_per_1m = 20.00
+cache_read_price_per_1m = 0.40    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "gpt-5.6-terra"
+display_name = "GPT 5.6 Terra"
+context_window = 1050000
+max_output_tokens = 128000
+group_hint = "high"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "high"]
+prompt_cache = true
+vision = true
+auth_methods = ["api_key", "codex_oauth"]
+input_price_per_1m = 2.00
+output_price_per_1m = 12.00
+cache_read_price_per_1m = 0.20    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "gpt-5.6-luna"
+display_name = "GPT 5.6 Luna"
+context_window = 1050000
+max_output_tokens = 128000
+group_hint = "low"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "high"]
+prompt_cache = true
+vision = true
+auth_methods = ["api_key", "codex_oauth"]
+input_price_per_1m = 0.20
+output_price_per_1m = 1.20
+cache_read_price_per_1m = 0.02    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "gpt-5.5"
+display_name = "GPT 5.5"
+context_window = 1050000
+max_output_tokens = 128000
+group_hint = "high"
+supports_reasoning = true
+reasoning_effort = ["low", "medium", "high"]
+prompt_cache = true
+vision = true
+auth_methods = ["api_key", "codex_oauth"]
+input_price_per_1m = 5.00
+output_price_per_1m = 30.00
+cache_read_price_per_1m = 0.50    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# GPT-5.4 series. UNRESOLVED: OpenAI's Codex docs announce that gpt-5.4 and
+# gpt-5.4-mini retire from the Codex backend on 2026-08-31 (migrate to
+# gpt-5.6-terra / -luna) while the same page still lists both as active with API
+# availability. The API itself is unaffected either way. Because the sources
+# contradict each other, codex_oauth is left in place here — drop it from these
+# two entries once a live Codex request confirms the retirement.
 [[models]]
 id = "gpt-5.4"
 display_name = "GPT-5.4"
 context_window = 1050000
+max_output_tokens = 128000    # 1,050,000 window − 128,000 reply = 922,000 max input
 group_hint = "high"
 supports_reasoning = true
 reasoning_effort = ["low", "medium", "high"]
@@ -54,6 +165,7 @@ cache_write_price_per_1m = 0.0    # no separate cache-write fee
 id = "gpt-5.4-mini"
 display_name = "GPT-5.4 Mini"
 context_window = 400000
+max_output_tokens = 128000    # 400,000 window − 128,000 reply = 272,000 max input
 group_hint = "low"
 supports_reasoning = true
 reasoning_effort = ["low", "medium", "high"]
@@ -70,6 +182,7 @@ id = "gpt-5.4-nano"
 display_name = "GPT-5.4 Nano"
 auth_methods = ["api_key"]
 context_window = 400000
+max_output_tokens = 128000    # 400,000 window − 128,000 reply = 272,000 max input
 group_hint = "low"
 supports_reasoning = true
 prompt_cache = true
@@ -79,47 +192,96 @@ output_price_per_1m = 1.25
 cache_read_price_per_1m = 0.02    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
+# RESPONSES-API-ONLY — LISTED BUT NOT INVOCABLE ON THE api_key PATH.
+# GPT-5.4 Pro is served on v1/responses only. Verified 2026-09-06: the api_key
+# runtime app/lib/llm/openai.py issues chat.completions.create at both of its
+# request sites and has no Responses path at all; the only Responses translator
+# under app/lib/llm/ is openai_codex.py, which targets the ChatGPT Codex backend
+# (chatgpt.com/backend-api/codex/responses), not api.openai.com. Selecting this
+# model therefore fails at request time.
+# KNOWN INCONSISTENCY, deliberate: gpt-5.5-pro was left OUT of this catalog for
+# exactly this defect, while this entry and o3-pro below are kept under the
+# caveat. The split is not a judgement that these two work — it is that they
+# predate this refresh and may already be selected in a live profile, and
+# dropping a model a user is pinned to is the riskier change. Resolve all three
+# the same way once app/lib/llm/openai.py grows a Responses path; until then do
+# not add new Responses-only models here.
+# Pro models publish no cached-input discount, hence prompt_cache = false and a
+# cache_read rate equal to input.
 [[models]]
 id = "gpt-5.4-pro"
 display_name = "GPT-5.4 Pro"
 auth_methods = ["api_key"]
 context_window = 1050000
+max_output_tokens = 128000    # 1,050,000 window − 128,000 reply = 922,000 max input
 group_hint = "high"
 supports_reasoning = true
-prompt_cache = true
+reasoning_effort = ["medium", "high"]
+prompt_cache = false
 vision = true
 input_price_per_1m = 30.00
 output_price_per_1m = 180.00
-cache_read_price_per_1m = 3.00    # 0.10x input
+cache_read_price_per_1m = 30.00   # no cached discount — cached reads bill at the full input rate
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
-# GPT-5.3 series
+# Specialized models
+# chat-latest is the unversioned "latest instant ChatGPT model" pointer: it is a
+# moving snapshot whose behaviour changes without the id changing, and it is not
+# a reasoning model (the agent auto-enables its substitute think tool).
 [[models]]
-id = "gpt-5.3-chat-latest"
-display_name = "GPT-5.3"
+id = "chat-latest"
+display_name = "ChatGPT Latest"
 auth_methods = ["api_key"]
-context_window = 128000
+context_window = 400000
+max_output_tokens = 128000    # 400,000 window − 128,000 reply = 272,000 max input
 group_hint = "high"
 prompt_cache = true
 vision = true
-input_price_per_1m = 1.75
-output_price_per_1m = 14.00
-cache_read_price_per_1m = 0.175   # 0.10x input
+input_price_per_1m = 5.00
+output_price_per_1m = 30.00
+cache_read_price_per_1m = 0.50    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 # Audio-input model: accepts spoken audio (plus text) in chat completions via
 # the OpenAI `input_audio` content part. Text/audio only — not a vision model.
+# COST CAVEAT: the rates below are the TEXT token rates. Audio tokens bill
+# separately at $32.00 in / $64.00 out per 1M (12.8x and 6.4x the text rates) and
+# this schema has no second token class, so an audio-heavy turn is materially
+# under-costed. No cached-input rate is published for either token class, so
+# prompt_cache / cache_read_price_per_1m are deliberately omitted.
+[[models]]
+id = "gpt-audio-1.5"
+display_name = "GPT Audio 1.5"
+auth_methods = ["api_key"]
+context_window = 128000
+max_output_tokens = 16384
+group_hint = "low"
+audio = true
+input_price_per_1m = 2.50
+output_price_per_1m = 10.00
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# Shutdown 2027-01-20 (announced 2026-07-20; substitute: gpt-audio-1.5 above).
+# The date is in the future, so the previous-generation audio model is still
+# served and stays listed. Chat Completions is its ONLY supported endpoint, so
+# unlike the Pro entries it is genuinely invocable on the api_key path.
+# Same COST CAVEAT as gpt-audio-1.5: the rates below are TEXT tokens. Audio
+# tokens bill separately at $32.00 in / $64.00 out per 1M and this schema has no
+# second token class, so an audio-heavy turn is materially under-costed. OpenAI
+# publishes an em dash in this model's cached-input column, so cache_read is set
+# equal to input per the convention noted at the top of this file.
 [[models]]
 id = "gpt-audio"
 display_name = "GPT Audio"
 auth_methods = ["api_key"]
 context_window = 128000
+max_output_tokens = 16384
 group_hint = "low"
-prompt_cache = true
+prompt_cache = false
 audio = true
 input_price_per_1m = 2.50
 output_price_per_1m = 10.00
-cache_read_price_per_1m = 0.25    # 0.10x input
+cache_read_price_per_1m = 2.50    # no cached discount — cached reads bill at the full input rate
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 # Previous-generation models still supported in the API
@@ -149,6 +311,8 @@ output_price_per_1m = 1.60
 cache_read_price_per_1m = 0.10    # 0.25x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
+# Shutdown 2026-10-23 (announced 2026-04-22; substitute: gpt-5.6-luna). The date
+# is in the future, so the model is still served and stays listed.
 [[models]]
 id = "gpt-4.1-nano"
 display_name = "GPT-4.1 Nano"
@@ -162,7 +326,25 @@ output_price_per_1m = 0.40
 cache_read_price_per_1m = 0.025   # 0.25x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
-# Reasoning models (o-series)
+# ── Reasoning models (o-series) ────────────────────────────────────────────
+# Every model in this block has an announced shutdown date that is still in the
+# FUTURE as of 2026-09-06, so all four remain served and remain listed. Dates
+# from developers.openai.com/api/docs/deprecations (re-checked 2026-09-06):
+#   o3-pro   2026-12-11  snapshot o3-pro-2025-06-10 → gpt-5.6-sol (reasoning.mode: pro)
+#   o3       2026-12-11  snapshot o3-2025-04-16     → gpt-5.6-sol
+#   o4-mini  2026-10-23                             → gpt-5.6-terra
+#   o3-mini  2026-10-23                             → gpt-5.6-sol
+# All four publish a 200,000 context window and 100,000 max output tokens, with
+# NO separate max-input cap. max_output_tokens is therefore deliberately absent:
+# nothing here can build a prompt the API rejects, so compaction's 8,000 default
+# reserve is safe. It is merely small relative to the 100,000 these models may
+# emit — a reserve-tuning question, not a hard cap, so it is left alone.
+
+# Shutdown 2026-12-11. RESPONSES-API-ONLY — LISTED BUT NOT INVOCABLE on the
+# api_key path: o3-pro supports only v1/responses and v1/batch, and the api_key
+# runtime calls chat.completions exclusively. Same defect as gpt-5.4-pro above;
+# see that entry's note for why it is kept rather than dropped. Publishes no
+# cached-input discount, hence prompt_cache = false and cache_read equal to input.
 [[models]]
 id = "o3-pro"
 display_name = "o3 Pro"
@@ -170,14 +352,15 @@ auth_methods = ["api_key"]
 context_window = 200000
 group_hint = "high"
 supports_reasoning = true
-prompt_cache = true
+prompt_cache = false
 vision = true
 input_price_per_1m = 20.00
 output_price_per_1m = 80.00
 reasoning_effort = ["low", "medium", "high"]
-cache_read_price_per_1m = 5.00    # 0.25x input
+cache_read_price_per_1m = 20.00   # no cached discount — cached reads bill at the full input rate
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
+# Shutdown 2026-12-11.
 [[models]]
 id = "o3"
 display_name = "o3"
@@ -193,6 +376,8 @@ reasoning_effort = ["low", "medium", "high"]
 cache_read_price_per_1m = 0.50    # 0.25x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
+# Shutdown 2026-10-23. The rates below were previously carrying OpenAI's Batch
+# tier (exactly half of standard); corrected 2026-09-06 to the standard tier.
 [[models]]
 id = "o4-mini"
 display_name = "o4 Mini"
@@ -202,12 +387,14 @@ group_hint = "high"
 supports_reasoning = true
 prompt_cache = true
 vision = true
-input_price_per_1m = 0.55
-output_price_per_1m = 2.20
+input_price_per_1m = 1.10
+output_price_per_1m = 4.40
 reasoning_effort = ["low", "medium", "high"]
-cache_read_price_per_1m = 0.1375  # 0.25x input
+cache_read_price_per_1m = 0.275   # 0.25x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
+# Shutdown 2026-10-23. Text-only — no vision, unlike the rest of this block.
+# o3-mini is the one o-series model whose cached input is 0.50x, not 0.25x.
 [[models]]
 id = "o3-mini"
 display_name = "o3 Mini"
@@ -219,66 +406,25 @@ prompt_cache = true
 input_price_per_1m = 1.10
 output_price_per_1m = 4.40
 reasoning_effort = ["low", "medium", "high"]
-cache_read_price_per_1m = 0.275   # 0.25x input
+cache_read_price_per_1m = 0.55    # 0.50x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
-# ── ChatGPT Codex models (auth_method = codex_oauth) ───────────────────────
+# ── ChatGPT Codex-only models (auth_method = codex_oauth) ──────────────────
 # Served by https://chatgpt.com/backend-api/codex/responses under the signed-in
-# user's ChatGPT plan (Plus/Pro/Team), NOT api.openai.com. Reached only when the
-# OpenAI provider's active auth method is "Sign in with ChatGPT". Usage is
-# covered by the plan, so there is NO per-token billing: price fields are
-# intentionally ABSENT (cost = unknown, never a misleading $0.00 — see
-# app/lib/llm/pricing.py "never silently zero"). Context windows are conservative
-# published values; the reasoning loop's clip-and-retry self-corrects if off.
+# user's ChatGPT plan, NOT api.openai.com. Reached only when the OpenAI
+# provider's active auth method is "Sign in with ChatGPT". Usage is covered by
+# the plan, so there is NO per-token billing: price fields are intentionally
+# ABSENT (cost = unknown, never a misleading $0.00 — see app/lib/llm/pricing.py
+# "never silently zero"). The GPT-6 / GPT-5.6 / GPT-5.5 models above are now
+# served on BOTH paths and so live in the priced section instead; this block is
+# what the Codex backend serves and the API does not.
 
-[[models]]
-id = "gpt-5.6-sol"
-display_name = "GPT 5.6 Sol"
-context_window = 272000
-max_output_tokens = 128000
-group_hint = "high"
-supports_reasoning = true
-reasoning_effort = ["low", "medium", "high"]
-prompt_cache = true
-vision = true
-auth_methods = ["codex_oauth"]
-
-[[models]]
-id = "gpt-5.6-terra"
-display_name = "GPT 5.6 Terra"
-context_window = 272000
-max_output_tokens = 128000
-group_hint = "high"
-supports_reasoning = true
-reasoning_effort = ["low", "medium", "high"]
-prompt_cache = true
-vision = true
-auth_methods = ["codex_oauth"]
-
-[[models]]
-id = "gpt-5.6-luna"
-display_name = "GPT 5.6 Luna"
-context_window = 272000
-max_output_tokens = 128000
-group_hint = "high"
-supports_reasoning = true
-reasoning_effort = ["low", "medium", "high"]
-prompt_cache = true
-vision = true
-auth_methods = ["codex_oauth"]
-
-[[models]]
-id = "gpt-5.5"
-display_name = "GPT 5.5"
-context_window = 272000
-max_output_tokens = 128000
-group_hint = "high"
-supports_reasoning = true
-reasoning_effort = ["low", "medium", "high"]
-prompt_cache = true
-vision = true
-auth_methods = ["codex_oauth"]
-
+# Availability is narrower than the codex_oauth hint implies: this is a
+# text-only research preview limited to ChatGPT Pro accounts, so a Plus or Team
+# user who picks it will be rejected by the backend. Its context window and max
+# output are not published anywhere — the values below are conservative
+# placeholders and the reasoning loop's clip-and-retry self-corrects if they are
+# off.
 [[models]]
 id = "gpt-5.3-codex-spark"
 display_name = "GPT 5.3 Codex Spark"

@@ -40,6 +40,74 @@ reasoning_effort = ["low", "medium", "high"]
 cache_read_price_per_1m = 0.20    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
+# Introductory pricing on the three current Flash models (3.8 / 3.7 / 3.6):
+# 0.75 / 3.75 / 0.075 hold through 2026-12-31 only. On 2027-01-01 they double to
+# 1.50 / 7.50 / 0.15 — re-price all three entries by then.
+# Vertex files these three under "shorter availability" (retire 45 days after a
+# replacement ships); none has an announced retirement date as of 2026-09-06.
+[[models]]
+id = "google/gemini-3.8-flash"
+context_window = 1048576
+display_name = "Gemini 3.8 Flash"
+group_hint = "high"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+audio = true
+input_price_per_1m = 0.75
+output_price_per_1m = 3.75
+reasoning_effort = ["low", "medium", "high"]   # "minimal" is rejected by this model
+cache_read_price_per_1m = 0.075   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "google/gemini-3.7-flash"
+context_window = 1048576
+display_name = "Gemini 3.7 Flash"
+group_hint = "high"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+audio = true
+input_price_per_1m = 0.75
+output_price_per_1m = 3.75
+reasoning_effort = ["low", "medium", "high"]   # "minimal" is rejected by this model
+cache_read_price_per_1m = 0.075   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# Google's named replacement for the retired gemini-2.0-flash.
+[[models]]
+id = "google/gemini-3.6-flash"
+context_window = 1048576
+display_name = "Gemini 3.6 Flash"
+group_hint = "high"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+audio = true
+input_price_per_1m = 0.75
+output_price_per_1m = 3.75
+reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.075   # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+# Not on the introductory rate: 3.5 Flash bills at its standard 1.50 / 9.00 on
+# Vertex, and is the replacement Google names for gemini-2.5-pro.
+[[models]]
+id = "google/gemini-3.5-flash"
+context_window = 1048576
+display_name = "Gemini 3.5 Flash"
+group_hint = "high"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+audio = true
+input_price_per_1m = 1.50
+output_price_per_1m = 9.00
+reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.15    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
 [[models]]
 id = "google/gemini-3-flash-preview"
 context_window = 1048576
@@ -56,7 +124,22 @@ cache_read_price_per_1m = 0.05    # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
 [[models]]
-id = "google/gemini-3.1-flash-lite-preview"
+id = "google/gemini-3.5-flash-lite"
+context_window = 1048576
+display_name = "Gemini 3.5 Flash Lite"
+group_hint = "low"
+supports_reasoning = true
+prompt_cache = true
+vision = true
+audio = true
+input_price_per_1m = 0.30
+output_price_per_1m = 2.50
+reasoning_effort = ["low", "medium", "high"]
+cache_read_price_per_1m = 0.03    # 0.10x input
+cache_write_price_per_1m = 0.0    # no separate cache-write fee
+
+[[models]]
+id = "google/gemini-3.1-flash-lite"
 context_window = 1048576
 display_name = "Gemini 3.1 Flash Lite"
 group_hint = "low"
@@ -70,6 +153,10 @@ reasoning_effort = ["low", "medium", "high"]
 cache_read_price_per_1m = 0.025   # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
 
+# The 2.5 family retires on Vertex on 2026-10-20 (Vertex AI "Model versions and
+# lifecycle" table). Still served today; drop these three after that date.
+# Google's named replacements: 2.5 Pro -> Gemini 3.5 Flash, 2.5 Flash -> Gemini
+# 3.5 Flash-Lite or 3.1 Flash-Lite, 2.5 Flash-Lite -> Gemini 3.1 Flash-Lite.
 [[models]]
 id = "google/gemini-2.5-pro"
 context_window = 1048576
@@ -110,17 +197,4 @@ audio = true
 input_price_per_1m = 0.10
 output_price_per_1m = 0.40
 cache_read_price_per_1m = 0.01    # 0.10x input
-cache_write_price_per_1m = 0.0    # no separate cache-write fee
-
-[[models]]
-id = "google/gemini-2.0-flash"
-context_window = 1048576
-display_name = "Gemini 2.0 Flash"
-group_hint = "low"
-prompt_cache = true
-vision = true
-audio = true
-input_price_per_1m = 0.15
-output_price_per_1m = 0.60
-cache_read_price_per_1m = 0.015   # 0.10x input
 cache_write_price_per_1m = 0.0    # no separate cache-write fee
