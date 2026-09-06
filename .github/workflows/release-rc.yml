@@ -97,6 +97,20 @@ jobs:
       - name: Check installer_tui.pyz is fresh
         run: python install/scripts/build_installer_tui.py --check
 
+      # The Helm transport tests render the chart directly.  Chart.lock is
+      # committed but its downloaded dependencies are not, so prepare the
+      # clean runner just as the later chart-publishing job does.
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: Build Helm chart dependencies for render tests
+        run: |
+          helm repo add qdrant https://qdrant.github.io/qdrant-helm
+          helm repo add chromadb https://amikos-tech.github.io/chromadb-chart/
+          helm dependency build helm/cremind
+
       - name: Install uv
         uses: astral-sh/setup-uv@v3
 
