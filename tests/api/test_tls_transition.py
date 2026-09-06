@@ -334,8 +334,15 @@ def test_supervisor_schedule_failure_returns_committed_manual_recovery(
     assert payload["transition"]["phase"] == "activating"
     assert payload["restart_required"] is True
     assert payload["restart_scheduled"] is False
-    assert "cremind server restart --yes" in payload["restart_error"]
+    # The recovery command is a step of its own, so the copy button on it yields
+    # a runnable line instead of the sentence explaining why it is needed.
+    assert payload["restart_error"].startswith("HTTPS was saved")
+    assert "cremind server restart --yes" not in payload["restart_error"]
+    assert payload["steps"][-1] == {"kind": "command", "text": "cremind server restart --yes"}
     assert payload["restart_error"] in payload["instructions"]
+    assert payload["instructions"][-2:] == [
+        payload["restart_error"], "cremind server restart --yes",
+    ]
 
 
 @pytest.mark.parametrize("install_mode", ["docker", "kubernetes"])
@@ -450,6 +457,115 @@ def test_external_activation_never_rewrites_deployment_environment(client, envir
     assert ("CREMIND_ATLASSIAN_REDIRECT_URI" if mode == "docker"
             else "cremind.atlassianRedirectUri") in guidance
     assert not (environment / ".env").exists()
+
+
+@pytest.mark.parametrize(
+    ("install_mode", "extra_env", "expected_commands"),
+    [
+        pytest.param("docker", {}, ["docker compose up -d --force-recreate cremind"], id="docker"),
+        pytest.param(
+            "kubernetes", {},
+            [
+                "helm list --namespace <namespace>",
+                "helm upgrade <release> <chart> --version <chart-version> "
+                "--namespace <namespace> --reuse-values --set cremind.ssl=auto",
+                "kubectl --namespace <namespace> rollout status deployment/<release> --timeout=5m",
+                "kubectl --namespace <namespace> port-forward svc/<release> 1515:80",
+            ],
+            id="kubernetes-in-pod",
+        ),
+        pytest.param(
+            "kubernetes", {"CREMIND_TLS_TERMINATION": "edge", "CREMIND_UI_PORT": "80"},
+            [
+                "helm list --namespace <namespace>",
+                "kubectl --namespace <namespace> create secret tls cremind-tls "
+                "--cert=<path-to-fullchain.pem> --key=<path-to-privkey.pem>",
+                "helm upgrade <release> <chart> --version <chart-version> "
+                "--namespace <namespace> --reuse-values -f <your-values.yaml>",
+                "kubectl --namespace <namespace> rollout status deployment/<release> --timeout=5m",
+                "kubectl --namespace <namespace> get ingress <release>",
+                "curl --fail https://testserver/api/tls/status",
+            ],
+            id="ingress",
+        ),
+        pytest.param("native", {}, ["cremind serve"], id="unsupervised-native"),
+        pytest.param(
+            "native", {"CREMIND_UI_PORT": "0"}, ["cremind serve"], id="reverse-proxy",
+        ),
+        pytest.param(
+            "native", {"CREMIND_UI_PORT": "0", "CREMIND_SUPERVISED": "1"},
+            ["cremind server restart --yes"], id="reverse-proxy-supervised",
+        ),
+    ],
+)
+def test_status_steps_keep_commands_bare_and_ordered(
+    client, monkeypatch, install_mode, extra_env, expected_commands,
+):
+    """Only a command may carry a copy button, so only a command may be a
+    command: the UI pastes ``text`` verbatim into someone's terminal."""
+    monkeypatch.setenv("INSTALL_MODE", install_mode)
+    for key, value in extra_env.items():
+        monkeypatch.setenv(key, value)
+
+    payload = client.get("/api/tls/status").json()
+
+    steps = payload["steps"]
+    assert steps, "a deployment that must act needs a runbook"
+    assert payload["instructions"] == [step["text"] for step in steps]
+    for step in steps:
+        assert step["kind"] in ("note", "command")
+        assert step["text"] and "`" not in step["text"]
+        if step["kind"] == "command":
+            assert "\n" not in step["text"]
+            assert not step["text"].endswith(".")
+            assert not step["text"].startswith("Run ")
+    assert [s["text"] for s in steps if s["kind"] == "command"] == expected_commands
+    # The closing note tells the operator where the server will answer.
+    assert steps[-1]["kind"] == "note" and payload["https_url"] in steps[-1]["text"]
+
+
+def test_supervised_native_status_has_nothing_to_run(client, monkeypatch):
+    """It restarts itself, so a runbook would be busywork."""
+    monkeypatch.setenv("CREMIND_SUPERVISED", "1")
+    payload = client.get("/api/tls/status").json()
+    assert payload["steps"] == [] and payload["instructions"] == []
+
+
+def test_unsupervised_native_note_follows_the_phase(client, monkeypatch):
+    before = client.get("/api/tls/status").json()["steps"]
+    assert before[0]["text"].startswith("After activation")
+
+    value = prepared(client)
+    result = client.post(
+        "/api/tls/activate",
+        json={"transition_id": value["id"], "restart": False}, headers=auth(),
+    ).json()
+
+    assert result["steps"][0]["text"].startswith("HTTPS settings are saved")
+
+
+def test_an_https_server_lists_only_certificate_repair_steps(
+    client, environment, monkeypatch,
+):
+    """Re-running the enable runbook against a server already on HTTPS was the
+    illogical part; a broken certificate needs a reload, nothing more."""
+    monkeypatch.setenv("INSTALL_MODE", "docker")
+    value = prepared(client)
+    client.post("/api/tls/activate", json={"transition_id": value["id"]}, headers=auth())
+    monkeypatch.setattr(tls_mode, "_boot_serving_https", True)
+
+    healthy = client.get("https://testserver:80/api/tls/status").json()
+    assert healthy["serving_https"] and healthy["steps"] == []
+
+    monkeypatch.setattr(BaseConfig, "SSL_CERTFILE", str(environment / "missing.pem"))
+    monkeypatch.setattr(BaseConfig, "SSL_KEYFILE", str(environment / "missing.key"))
+    broken = client.get("https://testserver:80/api/tls/status").json()
+
+    assert broken["certificate_error"]
+    assert [step["kind"] for step in broken["steps"]] == ["note", "command"]
+    assert broken["steps"][0]["text"].startswith("Once the replacement certificate")
+    assert broken["steps"][1]["text"] == "docker compose up -d --force-recreate cremind"
+    assert "CREMIND_SSL=auto" not in " ".join(broken["instructions"])
 
 
 def test_electron_is_managed_but_never_self_restarts(client, environment, monkeypatch):

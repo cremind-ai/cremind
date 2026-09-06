@@ -387,3 +387,122 @@ def test_json_mode_requires_explicit_consent(runner, monkeypatch, sysdir):
 
     assert result.exit_code == 1
     assert "--yes" in result.output
+
+
+# ── status: the deployment runbook ───────────────────────────────────────
+
+
+def _stub_status(monkeypatch, payload: dict) -> None:
+    """Answer `tls status` from a fixed payload.
+
+    `_remote_tls` imports the client module inside the function body, so the
+    name resolves at call time and patching the module attribute is enough.
+    Client() itself opens no socket, so nothing else needs stubbing.
+    """
+    import app.cli.client.tls as tls_client
+
+    async def fake_status(_client):
+        return payload
+
+    monkeypatch.setattr(tls_client, "status", fake_status)
+
+
+_STEPS_PAYLOAD = {
+    "serving_https": False,
+    "https_url": "https://cremind.lan:1515",
+    "management": "external",
+    "certificate_kind": "local",
+    "restart_supported": True,
+    "steps": [
+        {"kind": "note", "text": "Edit the .env file on the Docker host first."},
+        {"kind": "command", "text": "docker compose up -d --force-recreate cremind"},
+        {"kind": "note", "text": "Cremind then answers at https://cremind.lan:1515."},
+    ],
+    "instructions": [
+        "Edit the .env file on the Docker host first.",
+        "docker compose up -d --force-recreate cremind",
+        "Cremind then answers at https://cremind.lan:1515.",
+    ],
+}
+
+
+def test_status_indents_commands_so_they_stand_out_from_prose(runner, monkeypatch, sysdir):
+    """The indent is the terminal's version of the UI's copy button: it says
+    which lines are meant to be run, and which are there to be read."""
+    _stub_status(monkeypatch, _STEPS_PAYLOAD)
+
+    result = _invoke(runner, monkeypatch, ["tls", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "\nEdit the .env file on the Docker host first.\n" in result.output
+    assert "\n    docker compose up -d --force-recreate cremind\n" in result.output
+    # The bare, un-indented spelling must not also appear.
+    assert "\ndocker compose up -d --force-recreate cremind\n" not in result.output
+    for heading in ("Before you start:", "Run in order:", "What to expect:"):
+        assert heading in result.output
+
+
+def test_status_leaves_a_command_only_runbook_unlabelled(runner, monkeypatch, sysdir):
+    """One group needs no heading to separate it from anything."""
+    _stub_status(monkeypatch, {
+        **_STEPS_PAYLOAD,
+        "steps": [{"kind": "command", "text": "cremind serve"}],
+        "instructions": ["cremind serve"],
+    })
+
+    result = _invoke(runner, monkeypatch, ["tls", "status"])
+
+    assert result.exit_code == 0
+    assert "\n    cremind serve\n" in result.output
+    assert "Run in order:" not in result.output
+
+
+def test_status_falls_back_to_the_flat_list_from_an_older_server(runner, monkeypatch, sysdir):
+    """A slim `pip install cremind` may be newer than the server it talks to."""
+    _stub_status(monkeypatch, {
+        "serving_https": False,
+        "https_url": "https://cremind.lan:1515",
+        "management": "external",
+        "restart_supported": True,
+        "instructions": ["Set CREMIND_SSL=auto.", "kubectl rollout status deployment/x"],
+    })
+
+    result = _invoke(runner, monkeypatch, ["tls", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "\nSet CREMIND_SSL=auto.\n" in result.output
+    assert "\nkubectl rollout status deployment/x\n" in result.output
+    assert "Run in order:" not in result.output
+
+
+def test_status_never_repeats_a_restart_error_carried_in_both_fields(
+    runner, monkeypatch, sysdir,
+):
+    """An older server puts restart_error in `instructions` too; it is echoed
+    from its own field, so the fallback must not print it twice."""
+    _stub_status(monkeypatch, {
+        "serving_https": False,
+        "https_url": "https://cremind.lan:1515",
+        "management": "native",
+        "restart_supported": True,
+        "restart_error": "HTTPS was saved, but the supervised restart failed.",
+        "instructions": ["HTTPS was saved, but the supervised restart failed."],
+    })
+
+    result = _invoke(runner, monkeypatch, ["tls", "status"])
+
+    assert result.exit_code == 0
+    assert result.output.count("HTTPS was saved, but the supervised restart failed.") == 1
+
+
+def test_status_json_carries_the_typed_steps(runner, monkeypatch, sysdir):
+    _stub_status(monkeypatch, _STEPS_PAYLOAD)
+
+    result = _invoke(runner, monkeypatch, ["--json", "tls", "status"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["steps"][1] == {
+        "kind": "command", "text": "docker compose up -d --force-recreate cremind",
+    }
+    assert payload["instructions"] == [s["text"] for s in payload["steps"]]

@@ -5,6 +5,7 @@ import { ElCheckbox, ElMessage } from 'element-plus';
 import { Icon } from '@iconify/vue';
 
 import CaTrustPanel from '../components/shared/CaTrustPanel.vue';
+import DeploymentSteps from '../components/shared/DeploymentSteps.vue';
 import { useHttpsPivot } from '../composables/useHttpsPivot';
 import {
   cancelHttps,
@@ -30,7 +31,6 @@ const tls = ref<TlsStatus | null>(null);
 const installMode = ref<string | null>(null);
 const trustConfirmed = ref(false);
 const commandsVisible = ref(false);
-const copied = ref<string | null>(null);
 const pivot = useHttpsPivot();
 const { phase: pivotPhase, error: pivotError, forwardHint } = pivot;
 const migrationReady = migrationReadiness.ready;
@@ -61,24 +61,11 @@ const canActivate = computed(() =>
   isPrepared.value && trustConfirmed.value && migrationReady.value && !working.value,
 );
 
-const instructions = computed(() => {
-  if (runtime.value?.instructions?.length) return runtime.value.instructions;
-  const mode = (installMode.value ?? '').toLowerCase();
-  if (mode === 'kubernetes') {
-    return [
-      'helm upgrade <release> <chart> --reuse-values --set cremind.ssl=auto',
-      'kubectl rollout status deployment/<deployment> --timeout=5m',
-      'kubectl port-forward svc/<service> 1515:80',
-    ];
-  }
-  if (mode === 'docker') {
-    return [
-      'Set CREMIND_SSL=auto in the Docker .env file.',
-      'docker compose up -d --force-recreate cremind',
-    ];
-  }
-  return ['Restart Cremind with: cremind serve'];
-});
+// The server decides what to show and in what order, and marks each line a note
+// or a command; only commands get a copy button (see DeploymentSteps). There is
+// no client-side fallback list any more — guessing at deployment commands here
+// was how prose and commands ended up mixed in the first place.
+const deploymentSteps = computed(() => runtime.value?.steps ?? []);
 
 async function load() {
   loading.value = true;
@@ -188,16 +175,6 @@ async function cancel() {
   }
 }
 
-async function copyCommand(command: string, key: string) {
-  try {
-    await navigator.clipboard.writeText(command);
-    copied.value = key;
-    setTimeout(() => { if (copied.value === key) copied.value = null; }, 1500);
-  } catch {
-    ElMessage.error('Could not copy the command');
-  }
-}
-
 onMounted(load);
 </script>
 
@@ -245,15 +222,11 @@ onMounted(load);
             <h2>HTTPS certificate needs attention</h2>
             <p>{{ runtime?.certificate_error || 'The configured certificate is not ready for this address.' }}</p>
             <p>
-              Keep the plaintext recovery page open, replace or renew the certificate so it
-              covers this hostname, then restart Cremind and verify the HTTPS address again.
+              Keep the plaintext recovery page open and replace or renew the certificate so
+              it covers this hostname, then follow the steps below and verify the HTTPS
+              address again.
             </p>
-            <div v-for="(command, index) in instructions" :key="index" class="command-row">
-              <code>{{ command }}</code>
-              <button @click="copyCommand(command, `error-${index}`)">
-                <Icon :icon="copied === `error-${index}` ? 'mdi:check' : 'mdi:content-copy'" />
-              </button>
-            </div>
+            <DeploymentSteps :steps="deploymentSteps" />
           </div>
         </section>
 
@@ -353,30 +326,23 @@ onMounted(load);
             <template v-if="isExternal || commandsVisible || runtime?.restart_supported === false">
               <h2>{{ isExternal ? 'Apply HTTPS to the deployment' : 'Restart Cremind to finish' }}</h2>
               <p v-if="isExternal">
-                Certificate preparation is complete. Run these commands from the deployment
-                host. Kubernetes must update its proxy, Service, and probes together; simply
-                changing the container environment will break routing.
+                HTTPS is prepared and this server is waiting for the deployment change. Read
+                the notes in order, then run each command from the deployment host; only the
+                highlighted command boxes are meant to be pasted into a terminal.
               </p>
               <p v-else>
-                HTTPS settings and session handoffs are saved. Run the command below from
+                HTTPS settings and session handoffs are saved. Follow the steps below from
                 this installation; keep this page open while the secure listener starts.
               </p>
-              <p v-if="pivotPhase === 'waiting'" class="notice">
+              <!-- Manual activation never reaches the 'waiting' phase — enterManualMode
+                   leaves it at 'manual' — so this notice checks both. -->
+              <p v-if="pivotPhase === 'waiting' || pivotPhase === 'manual'" class="notice">
                 Cremind is checking the HTTPS address. Keep this page open while you apply
                 the deployment change; every Electron window or browser tab will move after
                 the expected secure server is reachable.
               </p>
               <p v-if="pivotError" class="inline-error">{{ pivotError }}</p>
-              <div v-for="(command, index) in instructions" :key="index" class="command-row">
-                <code>{{ command }}</code>
-                <button @click="copyCommand(command, String(index))">
-                  <Icon :icon="copied === String(index) ? 'mdi:check' : 'mdi:content-copy'" />
-                </button>
-              </div>
-              <p v-if="installMode === 'kubernetes'" class="notice">
-                The rollout replaces the pod and may close kubectl port-forward. Run the shown
-                port-forward command again; this page will continue when HTTPS becomes reachable.
-              </p>
+              <DeploymentSteps :steps="deploymentSteps" />
             </template>
             <template v-else>
               <div class="spinner"></div>
@@ -434,9 +400,6 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .trust-confirm { margin-top: 16px; white-space: normal; }
 .inline-error, .upload-wait, .notice { padding: 10px 14px; border-radius: 6px; background: var(--el-color-warning-light-9); color: var(--el-color-warning-dark-2); margin-bottom: 14px; }
 .error-card, .inline-error { border-color: var(--el-color-danger); }
-.command-row { display: flex; align-items: flex-start; gap: 8px; margin: 10px 0; padding: 10px 12px; background: var(--hover-bg); border-radius: 6px; }
-.command-row code { flex: 1; white-space: pre-wrap; word-break: break-word; }
-.command-row button { border: 0; background: none; color: var(--text-secondary); cursor: pointer; }
 code { background: var(--hover-bg); padding: 2px 5px; border-radius: 4px; }
 .fingerprint { word-break: break-all; }
 .spinner { width: 30px; height: 30px; border: 3px solid var(--border-color); border-top-color: var(--primary-color); border-radius: 50%; animation: spin .9s linear infinite; }

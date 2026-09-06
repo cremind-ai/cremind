@@ -355,6 +355,9 @@ def _prepare(source: str, *, external: bool = False) -> dict:
 
 def tls_status_payload(request: Request) -> dict:
     from app.config.tls_mode import current_tls_facts, edge_tls_termination
+    from app.config.tls_steps import (
+        atlassian_callback_step, certificate_repair_steps, deployment_steps, flatten,
+    )
     from app.config.tls_transition import (
         certificate_info, https_target, instance_id, load_transition, management, mark_active, port_facts, public_transition, validate_custom_certificate,
     )
@@ -379,55 +382,26 @@ def tls_status_payload(request: Request) -> dict:
         transition = load_transition()
     mode = (os.environ.get("INSTALL_MODE") or "native").lower()
     manager = "external" if edge_https else management()
-    instructions: list[str] = []
-    if manager == "external":
-        if edge_tls_termination():
-            instructions = [
-                "Configure the Ingress or reverse proxy's TLS certificate and secret for the public hostname; keep Cremind's in-pod SSL disabled.",
-                "Update ingress.tls in your existing Helm values, including the HTTPS host and certificate secret.",
-                "Allow the public HTTPS `/api/oauth/callback` URI in the Atlassian developer console before linking Jira or Confluence; set cremind.atlassianRedirectUri when it differs from the chart-derived URL.",
-                "helm upgrade <release> <chart> --namespace <namespace> --reuse-values -f <your-values.yaml>",
-                "kubectl rollout status deployment/<deployment> --namespace <namespace> --timeout=5m",
-                "kubectl port-forward --namespace <namespace> svc/<service> 1515:80",
-                "Set the HTTPS public APP_URL and preserve the public Host header. Forward the scheme only from explicitly trusted proxy addresses (FORWARDED_ALLOW_IPS); never trust arbitrary forwarded headers.",
-                "Keep automatic HTTP redirects disabled so old HTTP document requests reach Cremind's session-recovery page. The recovery endpoint refuses plaintext API requests after activation.",
-                "Apply the updated proxy, service and probe configuration together. Use the certificate issuer's trust instructions on every device; no Cremind CA is needed.",
-            ]
-        elif mode == "docker":
-            instructions = [
-                "In the host's Docker Compose .env, set CREMIND_SSL=true and change APP_URL to the HTTPS origin.",
-                "For explicit CORS_ALLOWED_ORIGINS, retain the old HTTP origin and add the new HTTPS origin.",
-                "Set CREMIND_ATLASSIAN_REDIRECT_URI to the HTTPS `/api/oauth/callback` URL and allow that exact URI in the Atlassian developer console before linking Jira or Confluence.",
-                "Keep the system-directory volume mounted so the CA and transition survive container replacement.",
-                "Run docker compose up -d --force-recreate cremind from the Compose project directory.",
-            ]
-        elif mode == "kubernetes":
-            instructions = [
-                "Set cremind.ssl=auto in your existing Helm values and use the HTTPS public origin for APP_URL.",
-                "If cremind.atlassianRedirectUri is customized, change it to the HTTPS `/api/oauth/callback` URL and allow that exact URI in the Atlassian developer console.",
-                "Run helm upgrade <release> <chart> --namespace <namespace> --reuse-values --set cremind.ssl=auto.",
-                "kubectl rollout status deployment/<deployment> --namespace <namespace> --timeout=5m",
-                "kubectl port-forward --namespace <namespace> svc/<service> 1515:80",
-                "Use the updated chart so the application, relay, service and probes change together; retain your existing deployment values.",
-                "Retain the system-directory PVC and keep the relay enabled for old HTTP URL recovery.",
-                "Re-run the port-forward command if the tunnel closes during rollout.",
-            ]
-        else:
-            instructions = [
-                "Configure the reverse proxy's HTTPS certificate and HTTPS public APP_URL.",
-                "Change CREMIND_ATLASSIAN_REDIRECT_URI to the public HTTPS `/api/oauth/callback` URL and allow that exact URI in the Atlassian developer console before linking Jira or Confluence.",
-                "Keep the proxy's old HTTP endpoint forwarding recovery document requests to Cremind; refuse plaintext API writes.",
-                "Reload the proxy after trusting its certificate on each client device.",
-            ]
-    elif not facts.restart_supported and manager != "electron":
-        instructions = ["After activation, stop the current server process, then run `cremind serve` from the same installation to read the saved HTTPS settings."]
+    https_url = https_target(_source_origin(request))
+    # Steps are a typed runbook (note vs command) so that only real shell lines
+    # get a copy button; ``instructions`` below stays as its flat rendering for
+    # clients older than that split.  A server already on HTTPS has nothing to
+    # enable, so it offers repair steps or nothing at all.
+    if serving_https:
+        steps = certificate_repair_steps(
+            manager=manager, install_mode=mode,
+            restart_supported=facts.restart_supported,
+        ) if certificate_error else []
+    else:
+        steps = deployment_steps(
+            manager=manager, install_mode=mode, edge=edge_tls_termination(),
+            restart_supported=facts.restart_supported,
+            activating=bool(transition and transition.get("phase") == "activating"),
+            https_url=https_url,
+        )
     migrated_atlassian = transition.get("atlassian_redirect_uri_migrated") if transition else None
     if isinstance(migrated_atlassian, str) and migrated_atlassian:
-        instructions.append(
-            "If Jira or Confluence account linking is configured, add the new "
-            f"callback `{migrated_atlassian}` to the allowed redirect URI in "
-            "the Atlassian developer console before linking an account."
-        )
+        steps.append(atlassian_callback_step(migrated_atlassian))
     expected = transition.get("quiesce_expected", {}) if transition else {}
     raw_acknowledged = transition.get("quiesce_acked", []) if transition else []
     acknowledged = (
@@ -450,8 +424,9 @@ def tls_status_payload(request: Request) -> dict:
         "quiesce_pending": quiesce_pending,
         **certificate_info(external=edge_https),
         **port_facts(external=edge_https),
-        "https_url": https_target(_source_origin(request)),
-        "instructions": instructions, "local_trust": local_trust_capabilities(request),
+        "https_url": https_url,
+        "steps": steps, "instructions": flatten(steps),
+        "local_trust": local_trust_capabilities(request),
     }
 
 
@@ -777,8 +752,7 @@ async def post_tls_activate(request: Request) -> JSONResponse:
                 except OSError as error:
                     restart_error = (
                         "HTTPS was saved, but the supervised restart could not "
-                        f"be scheduled: {error}. Run `cremind server restart --yes` "
-                        "from this installation."
+                        f"be scheduled: {error}."
                     )
         status = {
             **tls_status_payload(request),
@@ -787,9 +761,15 @@ async def post_tls_activate(request: Request) -> JSONResponse:
             "restart_error": restart_error,
         }
         if restart_error:
-            status["instructions"] = [*status.get("instructions", []), restart_error]
+            # The recovery command is its own step, so it stays copy-pasteable;
+            # the flat list keeps both parts for clients that read only it.
+            from app.config.tls_steps import RESTART_COMMAND, command
+            status["steps"] = [*status.get("steps", []), command(RESTART_COMMAND)]
+            status["instructions"] = [
+                *status.get("instructions", []), restart_error, RESTART_COMMAND,
+            ]
         # Electron owns process lifetime through the main-process coordinator;
-        # containers and Kubernetes use the deployment commands in this status.
+        # containers and Kubernetes use the `steps` in this status.
         return JSONResponse(status, status_code=202, headers={"Cache-Control": "no-store"})
     except (ValueError, OSError, RuntimeError) as error:
         return JSONResponse({"error": str(error)}, status_code=400)

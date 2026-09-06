@@ -127,6 +127,16 @@ export interface TlsTransition {
   expires_at: number | null;
 }
 
+/** One line of deployment guidance. Only a `command` is a shell line, and only
+ *  a `command` is ever copyable — a `note` is prose the user reads, so giving
+ *  it a copy button is what made the activation step unreadable. Built by
+ *  ``app/config/tls_steps.py``; commands arrive bare (no "Run " prefix, no
+ *  trailing period, no backticks) so the clipboard text runs as-is. */
+export interface TlsInstructionStep {
+  kind: 'note' | 'command';
+  text: string;
+}
+
 export interface TlsRuntimeStatus {
   instance_id: string;
   serving_https: boolean;
@@ -152,6 +162,10 @@ export interface TlsRuntimeStatus {
   same_public_port?: boolean;
   public_port?: number;
   https_url: string | null;
+  /** The deployment runbook, in the order to follow it. */
+  steps?: TlsInstructionStep[];
+  /** Legacy flat rendering of `steps`, kept on the wire for CLIs older than
+   *  the note/command split. The SPA reads `steps`. */
   instructions?: string[];
 }
 

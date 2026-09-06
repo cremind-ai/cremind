@@ -89,7 +89,11 @@ before HTTPS is enabled. Update `ingress.tls` in Helm values and the public HTTP
 `APP_URL`; keep in-pod SSL disabled. Apply the chart's proxy, service and probe
 changes together. Keep HTTP document requests reaching Cremind's recovery page
 instead of forcing an immediate redirect that loses old-origin browser storage.
-For in-pod Kubernetes TLS, set `cremind.ssl=auto` instead and retain the system PVC.
+The status output lists the Secret, Helm upgrade, rollout and verification
+commands (`kubectl get ingress`, `curl --fail https://<host>/api/tls/status`) in
+the order to run them; no port-forward is involved, because the public hostname
+is the HTTPS address. For in-pod Kubernetes TLS, set `cremind.ssl=auto` instead
+and retain the system PVC.
 
 ## Global flags
 
@@ -109,6 +113,18 @@ certificate type and SHA-256 fingerprint, restart support, transition phase,
 and the exact native, Docker, Kubernetes, or Ingress commands needed next.
 This read-only command does not require a token. The CLI still reaches its
 loopback management listener over HTTP even when the public app uses HTTPS.
+
+The deployment steps print in the order to follow them, grouped as **Before you
+start**, **Run in order** and **What to expect** when the list is long enough to
+need the separation. Plain lines say what to edit or what to expect; lines
+indented by four spaces are the exact commands to run, and can be pasted as-is
+once `<placeholders>` such as `<namespace>`, `<release>`, `<chart>` and
+`<chart-version>` are replaced — the `helm list` command in the list prints
+those values. With `--json` the same list is the `steps` array of
+`{"kind": "note" | "command", "text": ...}` objects; the flat `instructions`
+array beside it is the same text, kept for older clients. On a server already
+serving HTTPS the list is empty unless the certificate needs replacing, in which
+case it holds only the restart to run once the new certificate is in place.
 
 ### `cremind tls prepare`
 
@@ -135,6 +151,10 @@ restarts when supervision is available. `--yes` skips the trust-and-save
 confirmation. `--restart` is the default; `--no-restart` persists the change
 and prints the exact manual restart command. Docker and Kubernetes remain
 deployment-managed and print recreation or Helm rollout commands instead.
+
+When a supervised restart cannot be scheduled, the output prints the failure and
+then `cremind server restart --yes` as a command step of its own, so the recovery
+line can be copied and run without editing the sentence around it.
 
 ### `cremind tls cancel`
 

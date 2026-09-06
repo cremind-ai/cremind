@@ -12,7 +12,7 @@ Subcommands:
   tls export       Copy the local CA certificate out (file or stdout).
   tls fingerprint  Show the CA's SHA-256 fingerprint, as browsers display it.
   tls trust        Install the CA into this device's OS trust store.
-  tls status       Inspect current HTTPS state and deployment instructions.
+  tls status       Inspect current HTTPS state and the deployment steps (commands indented).
   tls prepare      Prepare a certificate and an authenticated transition.
   tls enable       Activate HTTPS, optionally restarting supervised native installs.
   tls cancel       Cancel a prepared transition before activation.
@@ -48,6 +48,47 @@ _FIREFOX_NOTE = (
     "If Firefox still warns after OS trust, import the same file under Settings → "
     "Privacy & Security → Certificates → View Certificates → Authorities."
 )
+
+# The server groups its runbook by position: what to edit, what to run, what to
+# expect. Headings appear only when there is more than one group to separate.
+_STEP_HEADINGS = ("Before you start", "Run in order", "What to expect")
+# Four spaces, not a "$ " prompt: selecting the line in a terminal must yield a
+# command that runs as-is.
+_COMMAND_INDENT = "    "
+
+
+def _print_steps(steps: list) -> None:
+    """Render the server's ``steps`` so commands stand out from prose.
+
+    Notes print flush-left, commands indented. Grouping is derived from where
+    the commands sit, so the wire format stays two fields wide.
+    """
+    items = [
+        step for step in steps
+        if isinstance(step, dict) and str(step.get("text") or "").strip()
+    ]
+    command_positions = [
+        index for index, step in enumerate(items) if step.get("kind") == "command"
+    ]
+    if command_positions:
+        first, last = command_positions[0], command_positions[-1]
+        groups = [items[:first], items[first:last + 1], items[last + 1:]]
+    else:
+        groups = [items, [], []]
+    labelled = [
+        (heading, group)
+        for heading, group in zip(_STEP_HEADINGS, groups) if group
+    ]
+    show_headings = len(labelled) > 1
+    for heading, group in labelled:
+        if show_headings:
+            typer.echo(f"{heading}:")
+        for step in group:
+            text = str(step["text"]).strip()
+            if step.get("kind") == "command":
+                typer.echo(f"{_COMMAND_INDENT}{text}")
+            else:
+                typer.echo(text)
 
 
 def _remote_tls(ctx: typer.Context, action: str, source_origin: str | None = None,
@@ -95,8 +136,17 @@ def _remote_tls(ctx: typer.Context, action: str, source_origin: str | None = Non
                 "serving_https", "https_url", "management", "certificate_kind", "certificate_sha256", "restart_supported")])
             if result.get("certificate_error"):
                 typer.echo(result["certificate_error"])
-            for instruction in result.get("instructions", []):
-                typer.echo(instruction)
+            if result.get("restart_error"):
+                typer.echo(result["restart_error"])
+            steps = result.get("steps")
+            if isinstance(steps, list) and steps:
+                _print_steps(steps)
+            else:
+                # A server older than the note/command split publishes only the
+                # flat list; restart_error was already echoed above.
+                for instruction in result.get("instructions") or []:
+                    if instruction != result.get("restart_error"):
+                        typer.echo(instruction)
             if result.get("restart_required") and not result.get("restart_requested"):
                 typer.echo("HTTPS is prepared. Restart through the desktop app or follow the deployment instructions above.")
     run()
