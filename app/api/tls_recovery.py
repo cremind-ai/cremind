@@ -153,7 +153,7 @@ async function recover(){
     ||typeof status.transition.id!=='string'||(expectedTransition&&status.transition.id!==expectedTransition))throw Error('The HTTPS address is not ready for the expected Cremind transition.');
   expectedTransition=status.transition.id;
   location.replace(destination);
- }catch(error){message.textContent=error.message+' Trust the certificate issuer on this device, check that the server or port-forward is running, then retry.';}
+ }catch(error){message.textContent=error.message+' This page cannot reach the secure address from here, which usually means this device does not trust the certificate yet. Use Open HTTPS page below and continue past the browser warning to get in now, or trust the CA first to stop the warning. If the server or the port-forward is simply not running, start it and retry.';}
  finally{busy=false;}
 }
 document.getElementById('retry').onclick=recover;recover();
@@ -177,6 +177,15 @@ document.getElementById('retry').onclick=recover;recover();
             "For your security, this plaintext recovery page never reads or transfers login credentials. "
             "You may need to sign in again after it preserves this page's route.</p>"
             "<button id='retry'>Retry connection</button> <a id='open'>Open HTTPS page</a>"
+            # The way in when the certificate cannot be trusted on this device.
+            # Without this the page reads as a dead end, which is how a stalled
+            # switch turns into "I cannot reach my data".
+            "<p><strong>Locked out?</strong> Cremind is already answering on the "
+            "secure address; this plaintext page is all that is left here, and "
+            "it deliberately cannot carry application data. Open the HTTPS page "
+            "above and accept the browser's certificate warning to get in right "
+            "now — trusting the CA below removes the warning for good, but you "
+            "do not have to do it first.</p>"
             + advice +
             "<noscript>Enable JavaScript to restore the existing session, or change http:// to https:// in the address bar.</noscript>"
             f"<script>{script}</script></body></html>")

@@ -816,6 +816,29 @@ def test_plaintext_recovery_never_executes_api(client):
         assert denied.headers["cache-control"] == "no-store"
 
 
+def test_plaintext_recovery_offers_a_way_in_when_the_certificate_is_untrusted(client):
+    """This page is reached only once HTTPS is genuinely up, so a device that
+    cannot verify the certificate would otherwise read it as a dead end and be
+    stranded away from its own data. Continuing past the browser warning is a
+    real way in, and the page has to say so."""
+    result = TestClient(recovery_app).get("/")
+
+    assert result.status_code == 200
+    assert "Locked out?" in result.text
+    assert "accept the browser's certificate warning" in result.text
+    # Trusting the CA is the durable fix, not a precondition for getting in.
+    assert "you do not have to do it first" in result.text
+    # The escape must not become a plaintext transport for application data.
+    assert "deliberately cannot carry application data" in result.text
+    assert TestClient(recovery_app).get("/api/me").status_code == 426
+    # Static-only additions must leave the pinned script hash intact.
+    script = result.text.split("<script>", 1)[1].split("</script>", 1)[0]
+    digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
+    assert f"script-src 'sha256-{digest}'" in result.headers["content-security-policy"]
+    # An interstitial can only be clicked through when HSTS is absent.
+    assert "strict-transport-security" not in result.headers
+
+
 def test_native_public_http_becomes_recovery_only_as_soon_as_activation_is_committed(
     client, environment, monkeypatch,
 ):

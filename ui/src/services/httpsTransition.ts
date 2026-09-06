@@ -1,4 +1,4 @@
-import { readonly, ref } from 'vue';
+import { computed, readonly, ref } from 'vue';
 
 import {
   acknowledgeTlsReady,
@@ -20,6 +20,11 @@ import {
 } from './migrationReadiness';
 
 const TRANSITION_KEY = 'cremind:https-transition';
+// Which transition the user has chosen to stop being covered by. Deliberately
+// persistent and per-origin rather than per-tab: the overlay it hides comes
+// back on every reload and in every new tab, so a per-tab record would just
+// repeat the lockout it exists to end.
+const DISMISS_KEY = 'cremind:https-overlay-dismissed';
 const TICKET_PREFIX = 'cremind:https-ticket:';
 const DRAFT_PREFIX = 'cremind:draft:';
 const CHANNEL_NAME = 'cremind:https-transition';
@@ -69,6 +74,66 @@ export interface StoredTicket {
 function safeParse<T>(raw: string | null): T | null {
   if (!raw) return null;
   try { return JSON.parse(raw) as T; } catch { return null; }
+}
+
+// ── the escape hatch ──────────────────────────────────────────────────────
+//
+// A switch that never completes used to cover the whole application with a
+// modal that had no exit and survived every reload, so a user whose HTTPS
+// address never came up could not reach their own data to get it out. The
+// overlay is now something they can put away.
+//
+// Dismissal only hides the explanation; it never stops the migration. The
+// poll in `waitForTarget` and every resume path keep running, so a dismissed
+// tab still moves itself to HTTPS the moment the secure address answers.
+
+interface DismissRecord { id: string; at: number }
+
+/** The transition this tab is currently waiting on, if it knows of one.
+ *
+ * Reads through to the durable record on purpose: `resume()` can raise the
+ * overlay from the saved transition alone, without ever populating `active`,
+ * and that is exactly the stranded state dismissal has to work in. */
+function currentTransitionId(): string {
+  if (active.value?.id) return active.value.id;
+  try {
+    return safeParse<TlsTransition>(localStorage.getItem(TRANSITION_KEY))?.id ?? '';
+  } catch { return ''; }
+}
+
+function readDismissed(): DismissRecord | null {
+  try { return safeParse<DismissRecord>(localStorage.getItem(DISMISS_KEY)); } catch { return null; }
+}
+
+const dismissedRecord = ref<DismissRecord | null>(readDismissed());
+
+/** True only while the dismissal still refers to what is on screen.
+ *
+ * Matching on the id means a *different* transition shows the overlay again
+ * with no clearing step to forget: the conservative direction is re-showing,
+ * which the user can dismiss again, never silently hiding something new. */
+const overlayDismissed = computed(() =>
+  dismissedRecord.value !== null && dismissedRecord.value.id === currentTransitionId());
+
+/** Put the overlay away and keep using this page. */
+export function dismissHttpsOverlay(): void {
+  const record: DismissRecord = { id: currentTransitionId(), at: Date.now() };
+  dismissedRecord.value = record;
+  // Written after the ref: `storage` events do not fire in the writing tab,
+  // so this tab must update itself directly and use the event only to follow
+  // its siblings.
+  try { localStorage.setItem(DISMISS_KEY, JSON.stringify(record)); } catch { /* storage may be unavailable */ }
+}
+
+/** Bring the full explanation back. */
+export function restoreHttpsOverlay(): void {
+  dismissedRecord.value = null;
+  try { localStorage.removeItem(DISMISS_KEY); } catch { /* storage may be unavailable */ }
+}
+
+function forgetDismissal(): void {
+  dismissedRecord.value = null;
+  try { localStorage.removeItem(DISMISS_KEY); } catch { /* best effort */ }
 }
 
 function normalizeOrigin(value: string): string | null {
@@ -147,6 +212,9 @@ function rememberTransition(t: TlsTransition): boolean {
     if (t.phase === 'cancelled') localStorage.removeItem(TRANSITION_KEY);
     else localStorage.setItem(TRANSITION_KEY, JSON.stringify(t));
   } catch { /* storage may be unavailable */ }
+  // A cancelled switch has nothing left to hide, and leaving the record would
+  // pre-dismiss an unrelated transition that later reuses this id.
+  if (t.phase === 'cancelled') forgetDismissal();
   try { channel?.postMessage(t); } catch { /* best effort */ }
   return true;
 }
@@ -600,6 +668,7 @@ export function installHttpsTransitionCoordinator(
       // A reachable source with another installation or transition makes this
       // browser record stale. Do not use its destination.
       try { localStorage.removeItem(TRANSITION_KEY); } catch { /* best effort */ }
+      forgetDismissal();
       return;
     } catch (e) {
       sourceRecoveryOnly = e instanceof TlsApiError && e.status === 426;
@@ -629,6 +698,14 @@ export function installHttpsTransitionCoordinator(
     }
   };
   const resumeListener = () => { void resume(); };
+  // Dismissing in one tab settles the others: `storage` fires only in the tabs
+  // that did not write, which is exactly the sync wanted here.
+  const dismissListener = (event: StorageEvent) => {
+    if (event.key === DISMISS_KEY || event.key === null) {
+      dismissedRecord.value = readDismissed();
+    }
+  };
+  window.addEventListener('storage', dismissListener);
   window.addEventListener('online', resumeListener);
   window.addEventListener('pageshow', resumeListener);
   window.addEventListener('focus', resumeListener);
@@ -644,6 +721,7 @@ export function installHttpsTransitionCoordinator(
     subscription?.close();
     subscription = null;
     setMigrationTicketPreparer(null);
+    window.removeEventListener('storage', dismissListener);
     window.removeEventListener('online', resumeListener);
     window.removeEventListener('pageshow', resumeListener);
     window.removeEventListener('focus', resumeListener);
@@ -660,4 +738,7 @@ export const httpsTransitionState = {
   phase: readonly(phase),
   error: readonly(error),
   transition: readonly(active),
+  /** Whether the user has put the blocking explanation away for what is on
+   *  screen. The switch itself carries on regardless. */
+  overlayDismissed,
 };

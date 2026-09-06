@@ -12,8 +12,10 @@ import ConversationsPanel from './components/ConversationsPanel.vue';
 import UpdateBanner from './components/UpdateBanner.vue';
 import FloatingTodoLayer from './components/plan/FloatingTodoLayer.vue';
 import {
+  dismissHttpsOverlay,
   httpsTransitionState,
   installHttpsTransitionCoordinator,
+  restoreHttpsOverlay,
 } from './services/httpsTransition';
 import {
   beginMigrationGate,
@@ -27,7 +29,16 @@ import {
 const httpsPhase = httpsTransitionState.phase;
 const httpsError = httpsTransitionState.error;
 const httpsTransition = httpsTransitionState.transition;
+const httpsOverlayDismissed = httpsTransitionState.overlayDismissed;
 const migrationInProgress = migrationReadiness.migrating;
+// Either blocking card is showing something the user has put away. The chip
+// that replaces them is what keeps dismissal from ever being a one-way door.
+const httpsOverlayPending = computed(() =>
+  (['waiting', 'moving', 'attention'].includes(httpsPhase.value)
+    || (migrationInProgress.value && httpsPhase.value === 'idle'))
+  && route.name !== 'security-settings'
+  && route.name !== 'setup'
+  && route.name !== 'setup-profile');
 const httpsRecoveryUrl = computed(() => {
   const target = httpsTransition.value?.target_origin;
   if (!target) return '';
@@ -316,9 +327,9 @@ const handleLogout = () => {
     </div>
 
     <div
-      v-if="httpsPhase === 'waiting'
+      v-if="(httpsPhase === 'waiting'
         || httpsPhase === 'moving'
-        || httpsPhase === 'attention'"
+        || httpsPhase === 'attention') && !httpsOverlayDismissed"
       v-show="route.name !== 'security-settings'
         && route.name !== 'setup'
         && route.name !== 'setup-profile'"
@@ -339,21 +350,33 @@ const handleLogout = () => {
         </p>
         <p class="hint">
           If your browser shows a certificate warning, trust the Cremind CA on this
-          device. On Kubernetes, rerun the port-forward command after the rollout.
+          device, or open the secure address and continue past the warning. On
+          Kubernetes, rerun the port-forward command after the rollout.
         </p>
-        <a
-          v-if="httpsPhase === 'attention'
-            && httpsRecoveryUrl"
-          class="transition-link"
-          :href="httpsRecoveryUrl"
-          target="_blank"
-          rel="noopener noreferrer"
-        >Open the HTTPS address</a>
+        <div class="transition-actions">
+          <a
+            v-if="httpsPhase === 'attention' && httpsRecoveryUrl"
+            class="transition-link"
+            :href="httpsRecoveryUrl"
+            target="_blank"
+            rel="noopener noreferrer"
+          >Open the HTTPS address</a>
+          <button class="transition-dismiss" @click="dismissHttpsOverlay()">
+            Keep using this page
+          </button>
+        </div>
+        <!-- The switch is not cancelled by dismissing it, so say so rather
+             than letting the move arrive as a surprise mid-edit. -->
+        <p class="hint">
+          Your data is untouched on the server — this only changes the address the
+          browser uses. This tab still moves to HTTPS on its own once the secure
+          address answers, so finish anything you are in the middle of.
+        </p>
       </div>
     </div>
 
     <div
-      v-if="migrationInProgress && httpsPhase === 'idle'
+      v-if="migrationInProgress && httpsPhase === 'idle' && !httpsOverlayDismissed
         && route.name !== 'security-settings'
         && route.name !== 'setup'
         && route.name !== 'setup-profile'"
@@ -365,8 +388,24 @@ const handleLogout = () => {
         <p class="phase-line">
           Finishing active uploads and saving each tab's draft before the server restarts.
         </p>
+        <div class="transition-actions">
+          <button class="transition-dismiss" @click="dismissHttpsOverlay()">
+            Keep using this page
+          </button>
+        </div>
       </div>
     </div>
+
+    <!-- Nothing the user put away is ever gone: this brings it back. -->
+    <button
+      v-if="httpsOverlayDismissed && httpsOverlayPending"
+      class="https-transition-chip"
+      @click="restoreHttpsOverlay()"
+    >
+      {{ httpsPhase === 'attention'
+        ? 'HTTPS switch needs attention'
+        : 'HTTPS switch pending' }}
+    </button>
   </div>
 
 </template>
@@ -446,10 +485,51 @@ const handleLogout = () => {
 }
 .transition-link {
   display: inline-block;
-  margin-top: 16px;
   color: var(--primary-color);
   font-weight: 600;
 }
+
+.transition-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+
+.transition-dismiss {
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-primary);
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.transition-dismiss:hover { border-color: var(--primary-color); color: var(--primary-color); }
+
+/* Deliberately unobtrusive but always present while a switch is pending, so
+   the explanation is one click away rather than dismissed for good. */
+.https-transition-chip {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 2000;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  padding: 7px 14px;
+  background: var(--surface-color);
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgb(0 0 0 / 18%);
+}
+.https-transition-chip:hover { color: var(--primary-color); border-color: var(--primary-color); }
 
 .spinner {
   width: 32px;
