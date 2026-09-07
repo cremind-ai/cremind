@@ -137,6 +137,34 @@ class ChannelGroupStorage:
                 return None
             return await self._group_to_dict(session, row)
 
+    async def list_groups_by_platform_chat(
+        self, platform_chat_id: str,
+    ) -> list[dict[str, Any]]:
+        """Every row for one platform chat, across ALL channels and profiles.
+
+        The one lookup here that deliberately ignores ``channel_id``. Every
+        other one is scoped to a single channel, because a group belongs to
+        exactly one channel of exactly one profile — this asks the opposite
+        question: which *other* Cremind channels are sitting in this same room?
+        That cross-channel view is the whole point. It is what lets
+        :mod:`app.channels.groups.relay` hand one agent's post to the sibling
+        agents whose transport will never be told about it (a Telegram bot is
+        not delivered another bot's messages), and it is why the query is on
+        ``platform_chat_id`` alone.
+
+        Ordered oldest-first so repeated calls agree with each other; the caller
+        matches rows against live adapters rather than relying on the order.
+        """
+        if not platform_chat_id:
+            return []
+        async with self.async_session_maker() as session:
+            rows = (await session.execute(
+                select(ChannelGroupModel)
+                .where(ChannelGroupModel.platform_chat_id == str(platform_chat_id))
+                .order_by(ChannelGroupModel.created_at.asc())
+            )).scalars().all()
+            return [await self._group_to_dict(session, r) for r in rows]
+
     async def get_group_by_conversation(
         self, conversation_id: str,
     ) -> dict[str, Any] | None:

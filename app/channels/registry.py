@@ -499,6 +499,31 @@ class ChannelRegistry:
         """
         return [a for a in list(self._adapters.values()) if a.profile == profile]
 
+    def adapters_for_channel_type(
+        self, channel_type: str,
+    ) -> list[BaseChannelAdapter]:
+        """Live (enabled + started) adapters of one PLATFORM, **any profile**.
+
+        :meth:`adapters_for_profile` sliced the other way: not "what can this
+        profile reach" but "who else of ours is on this platform right now".
+        Only that second question can find the other Cremind agent sitting in
+        the same Telegram group, because it belongs to a different profile by
+        definition — one profile's channel is in a group at most once.
+
+        Exists for :func:`app.channels.groups.relay.relay_candidates`, which
+        asks it before every message the agent posts into a room. It is the
+        cheap synchronous pre-check: an install with a single channel of this
+        type gets an empty list back and never pays the database query it would
+        otherwise take to discover there was nobody to relay to. Same snapshot
+        rationale as its neighbours — the copy guards a caller iterating
+        outside ``self._lock`` against a concurrent size change.
+        """
+        return [
+            a
+            for a in list(self._adapters.values())
+            if a.channel_type == channel_type
+        ]
+
 
 _instance: ChannelRegistry | None = None
 

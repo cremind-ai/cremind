@@ -33,4 +33,7 @@ Modules:
 - :mod:`app.channels.groups.inbound` — the decision pipeline
 - :mod:`app.channels.groups.dispatch` — conversation + park-then-enqueue delivery
 - :mod:`app.channels.groups.origin` — what the prompt is told about the room
+- :mod:`app.channels.groups.relay` — one Cremind agent's post to the others in
+  the room, where the platform withholds it (a Telegram bot is never delivered
+  another bot's messages)
 """

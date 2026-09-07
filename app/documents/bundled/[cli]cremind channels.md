@@ -1,5 +1,5 @@
 ---
-description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders` with their token usage, wipe one subscriber's conversation history with `clear-history`, delete a client completely with `forget` (as if they had never messaged — conversation, messages, automations, contact details and access all removed), run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), recover a **stuck pairing** with `repair` when `pair` shows no QR or code at all — the symptom of a saved session invalidated from the outside, typically because the same WhatsApp/Zalo/Telegram account was paired in another environment or the device was revoked from the phone; `repair` clears the dead session and re-pairs while **keeping the channel**, its contacts and its groups, which deleting and re-adding the channel would have destroyed, set a channel's push-notification filter with `notify-filter`, push an ad-hoc message out to a notification channel with `send` (attach files with `--file`), send a direct message to specific individual clients — one person or a bulk list, addressed by platform id or **phone number** — with `message` (also `--file`-capable), record a contact's phone number with `set-phone`, decide per client whether the agent must ask before messaging them with `set-confirm` (the profile-wide default is `channels.confirm_before_send` in Settings → Config → Channels; turn it off so unattended automations can send without stopping to ask), `approve`/`revoke` who may subscribe to a notification channel, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). All channels gate access with the same per-channel **authentication** method — open, passcode, one-time code (`otp`), admin approval, or allowlist — controlling who may chat (bot/userbot) or subscribe (notification); `approve`/`revoke` authorize individual senders and work in every mode. A notification channel can also receive one-off messages you send with `cremind channels send` — the same delivery the agent's `send_notification` tool uses when you ask it to 'notify me on Telegram'. Separately, `cremind channels message` sends to **named individuals** rather than to subscribers: give it sender ids or phone numbers (one `--to`, or a JSON list for a bulk campaign such as thanking every customer in a spreadsheet), and each delivered message is saved into that client's own conversation so the agent has the context later; it previews by default and only sends with `--send`, and only WhatsApp can message someone who has never written first. Channels carry **files in both directions**: a user attaching a photo or document on the platform hands it to the agent (staged into the conversation's temporary upload folder, size-capped), the agent's own created files (reports, screenshots, conversions) are auto-delivered back with its reply, and `send`/`message` push files outward with `--file` — platforms that can't carry a file deliver a text notice naming it instead. Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. A channel can also take part in **group chats** — real Telegram, Discord, Slack, WhatsApp or Zalo groups full of real people that this profile's account has been added to: opt in per channel with `--group-chats`, then approve each group with `cremind channels groups approve` (new groups arrive `pending` with a high-priority notification and the agent reads nothing until you approve), and tune it with `channels groups list`/`members`/`policy`/`allow`/`deny`/`respond`/`refresh`/`block`/`forget`. In an approved group the agent replies when mentioned and otherwise only when a cheap relevance check says the message is for it, while everything else is still stored as context. This is **not** `cremind group`, which is Cremind's own rooms where several profiles' agents talk to each other; the two features share nothing. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
+description: "Connect and manage external **messaging channels** — Telegram, WhatsApp, Discord, Slack, Messenger, and Zalo: `list` connected channels, `add` one from a JSON config, `edit` a channel's settings, `enable`/`disable` it, list its `senders` with their token usage, wipe one subscriber's conversation history with `clear-history`, delete a client completely with `forget` (as if they had never messaged — conversation, messages, automations, contact details and access all removed), run the interactive `pair` flow (QR code in the terminal, or a Telegram verification code and 2FA password), recover a **stuck pairing** with `repair` when `pair` shows no QR or code at all — the symptom of a saved session invalidated from the outside, typically because the same WhatsApp/Zalo/Telegram account was paired in another environment or the device was revoked from the phone; `repair` clears the dead session and re-pairs while **keeping the channel**, its contacts and its groups, which deleting and re-adding the channel would have destroyed, set a channel's push-notification filter with `notify-filter`, push an ad-hoc message out to a notification channel with `send` (attach files with `--file`), send a direct message to specific individual clients — one person or a bulk list, addressed by platform id or **phone number** — with `message` (also `--file`-capable), record a contact's phone number with `set-phone`, decide per client whether the agent must ask before messaging them with `set-confirm` (the profile-wide default is `channels.confirm_before_send` in Settings → Config → Channels; turn it off so unattended automations can send without stopping to ask), `approve`/`revoke` who may subscribe to a notification channel, `delete` a channel and cascade-remove its conversations, and dump the `catalog` of supported platforms. Channels can run in conversational `bot`/`userbot` mode or a push-only `notification` mode that forwards Cremind's automation/event alerts to a chat with a configurable filter (importance, kind, source, specific automation/conversation, keyword, quiet hours). All channels gate access with the same per-channel **authentication** method — open, passcode, one-time code (`otp`), admin approval, or allowlist — controlling who may chat (bot/userbot) or subscribe (notification); `approve`/`revoke` authorize individual senders and work in every mode. A notification channel can also receive one-off messages you send with `cremind channels send` — the same delivery the agent's `send_notification` tool uses when you ask it to 'notify me on Telegram'. Separately, `cremind channels message` sends to **named individuals** rather than to subscribers: give it sender ids or phone numbers (one `--to`, or a JSON list for a bulk campaign such as thanking every customer in a spreadsheet), and each delivered message is saved into that client's own conversation so the agent has the context later; it previews by default and only sends with `--send`, and only WhatsApp can message someone who has never written first. Channels carry **files in both directions**: a user attaching a photo or document on the platform hands it to the agent (staged into the conversation's temporary upload folder, size-capped), the agent's own created files (reports, screenshots, conversions) are auto-delivered back with its reply, and `send`/`message` push files outward with `--file` — platforms that can't carry a file deliver a text notice naming it instead. Zalo offers both an official Bot API mode and a QR-paired personal-account mode; Messenger requires a publicly-reachable HTTPS host for its webhook. A channel can also take part in **group chats** — real Telegram, Discord, Slack, WhatsApp or Zalo groups full of real people that this profile's account has been added to: opt in per channel with `--group-chats`, then approve each group with `cremind channels groups approve` (new groups arrive `pending` with a high-priority notification and the agent reads nothing until you approve), and tune it with `channels groups list`/`members`/`policy`/`allow`/`deny`/`respond`/`brakes`/`refresh`/`block`/`forget`. In an approved group the agent replies when mentioned and otherwise only when a cheap relevance check says the message is for it, while everything else is still stored as context. Several of **your own profiles' bots can sit in one group and hold a conversation with each other**: Telegram never shows a bot another bot's messages — no privacy-mode setting changes that, which is why two of your own Telegram bots used to answer a person once and then ignore each other completely — so Cremind relays its own agents' group posts between its channels in-process, bounded by the **loop brakes** (agent posts per minute, and how many bot messages may follow one another before the agent goes quiet and waits for a human) that you read and change with `channels groups brakes` — an exchange held in the platform's own group, in front of the people in it, not in a Cremind room. This is **not** `cremind group`, which is Cremind's own rooms where several profiles' agents talk to each other; the two features share nothing. Use this to link a Telegram/Discord/Slack bot or other chat platform to Cremind; the auto-created `*main*` channel cannot be removed."
 ---
 
 # `cremind channels` — External Messaging Channel Management
@@ -53,7 +53,7 @@ The group covers these operations:
   every per-sender authentication state.**
 - **`groups`** — Approve and manage the **platform group chats** this
   channel's account has been added to: `list`, `approve`/`block`/`forget`,
-  `members`, `policy`, `allow`/`deny`, `respond` and `refresh` (see
+  `members`, `policy`, `allow`/`deny`, `respond`, `brakes` and `refresh` (see
   **Group chats on a channel** below).
 - **`catalog`** — Dump the TOML-driven catalog (one entry per
   supported channel type, each describing which modes, which auth
@@ -332,13 +332,55 @@ while Cremind was down, and gets the normal pending row and notification.
 
 A group can contain other automated accounts — including another Cremind
 profile's agent, which is a supported way to use this — and two assistants being
-endlessly helpful at each other is the failure mode. Two caps stop it:
+endlessly helpful at each other is the failure mode.
+
+On the Telegram **bot** transport that support used to be quietly hollow.
+Telegram never delivers a message written by one bot to another bot: no
+`/setprivacy` setting and no admin promotion changes it, because the rule is
+about who wrote the message rather than about what the bot is allowed to read.
+So two of your own Cremind bots in one group each answered the person who asked
+them and then fell silent, neither having heard a word of the other's reply.
+Cremind now covers that gap itself. When one of its channels posts into an
+approved group, the post is handed **in-process** to its other channels that
+belong in the same group, where it arrives as an ordinary message from the bot
+that wrote it — stored, judged for relevance, and answered like anybody else's.
+The boundaries are exact:
+
+- **Same platform only.** A Telegram post is handed to Telegram channels; it
+  never crosses into a Discord or Slack group.
+- **Only where the other channel has approved that same group for itself.** A
+  channel with no approved row for the chat hears nothing, deliberately:
+  relaying to it would conjure a pending group, and a decision for you to make,
+  about a room the platform never told it about.
+- **Only what the room hears the agent say** — the interim reply and the final
+  answer. Thinking-Process steps and the files the agent sends are not relayed,
+  which is the same line the rate cap below draws.
+- **A third-party bot in the group stays invisible.** The relay carries
+  Cremind's own posts between Cremind's own channels; a message from somebody
+  else's bot is one Telegram never hands over, and nothing here can recover it.
+- **A userbot needs no relay and gets none.** A personal account is delivered
+  everything a group says, other bots included, so the userbot transports —
+  and Discord and Slack, which deliver bot posts to bots — never had the
+  problem in the first place.
+
+Two profiles are otherwise strangers, and this does not change that: the only
+thing handed across is a message the bot had already posted into a room both
+channels are approved in, which every member of that group can read anyway. It
+is also not a bridge — nothing new is sent to the platform, and the post goes
+nowhere but the Cremind channels already standing in that same group.
+
+What keeps such an exchange from running forever is two caps:
 
 - **20 agent posts per minute**, per group.
 - **8 consecutive bot-authored messages** with no human in between, after which
   the agent goes quiet until a person posts. Only reachable on platforms that
   flag bot authorship: **Telegram, Discord and Slack**. WhatsApp and Zalo report
   no such flag, so only the rate cap applies there.
+
+Both a relayed message and the agent's own posts advance that streak, so at the
+default of 8 two agents talking to each other go quiet after roughly four turns
+apiece and wait for a person. `cremind channels groups brakes` reads the two
+caps and changes them for one group when you want a longer — or shorter — leash.
 
 A braked agent is quiet, not blind: messages keep being stored throughout.
 
@@ -349,7 +391,7 @@ account joins the group, looks perfectly healthy, and hears nothing.
 
 | Platform | Put in the group | The setup step that is easy to miss | Reports a join? | Lists existing groups? | Member roster |
 |----------|------------------|--------------------------------------|-----------------|------------------------|---------------|
-| Telegram (bot) | add the bot to the group | @BotFather → `/setprivacy` → **Disable**, or make the bot a group admin — otherwise it only ever receives messages that mention or reply to it | yes | no — the Bot API cannot enumerate | **administrators only** (the Bot API cannot enumerate a group), plus whoever has posted |
+| Telegram (bot) | add the bot to the group | @BotFather → `/setprivacy` → **Disable**, or make the bot a group admin — otherwise it only ever receives messages that mention or reply to it; neither setting makes a bot see *another* bot, which is why Cremind relays its own agents' posts between its channels (see **Loop brakes**) | yes | no — the Bot API cannot enumerate | **administrators only** (the Bot API cannot enumerate a group), plus whoever has posted |
 | Telegram (userbot) | the paired personal account must be a member | none beyond pairing | yes | yes | full |
 | Discord | invite the bot to the server and give it access to the channel | enable **MESSAGE CONTENT INTENT** (Developer Portal → Bot → Privileged Gateway Intents), or messages arrive with an empty body; add **SERVER MEMBERS** for a complete roster | no per channel — joining a *server* raises one notification pointing at the picker | yes — every readable text channel, as `Server / #channel` | full with the Server Members intent, partial without |
 | Slack | `/invite` the app into the channel | add `channels:history`, `groups:history`, `channels:read` (plus `groups:read` for private channels), subscribe to `message.channels` / `message.groups` **and `member_joined_channel`**, then **reinstall** — a DM-only install does not cover channels | yes | yes | full |
@@ -1563,6 +1605,75 @@ allow
 deny
 ```
 
+### `cremind channels groups brakes`
+
+**Purpose.** Show or change one group's two loop brakes: how fast the agent may
+post, and how long it may keep talking when no human is joining in.
+
+**Syntax.**
+
+```bash
+cremind channels groups brakes <channel_id> <group>
+                               [--posts-per-minute N] [--bot-streak N]
+```
+
+**Flags.**
+
+| Flag | Type | Default | Meaning |
+|------|------|---------|---------|
+| `--posts-per-minute` | int | unchanged | How many messages the agent may post into this group in a minute (`max_agent_posts_per_minute`; `20` out of the box, `0`–`600`). |
+| `--bot-streak` | int | unchanged | How many bot-authored messages in a row — the agent's own posts included — may pass before it stops replying and waits for a person (`max_consecutive_bot_messages`; `8` out of the box, `0`–`1000`). |
+
+**Behavior.** With **no flag at all** it changes nothing and prints the caps in
+force, so it is also the read command — and a read really is a read: it does not
+resend the settings, so `updated_at` is left alone. With either flag it patches
+only that key, the group's settings being read first and sent back merged, so
+the member policy, the respond mode and the cap you did not name keep their
+values. Prints `id`, `title`, `posts_per_minute` and `bot_streak` in a block of
+its own, which is why the other group commands' output is unchanged. A negative
+number is refused before the round trip; one over the ceiling comes back as the
+server's own error. `0` is legal and means the brake is on from the first
+message — the blunt way to mute the agent in one room while still keeping its
+transcript, where `block` would stop reading it altogether.
+
+The two caps guard different things. The **rate** cap is about noise — an agent
+posting twenty times a minute is malfunctioning whoever it is talking to. The
+**streak** cap is about company: it counts every bot-authored message since a
+person last spoke, so it is the one that ends a conversation between two
+assistants, including two of your own profiles' agents relayed to each other
+(see **Loop brakes**). Only platforms that flag bot authorship — Telegram,
+Discord and Slack — can reach it at all.
+
+A braked agent is quiet, not deaf: every message still lands in the group's
+conversation, so the turn that resumes reads the whole thread rather than
+picking up mid-air. **A person posting resets the streak to zero** and the agent
+starts answering again on its own; nothing has to be un-braked by hand. You hear
+about it **once per episode** — a single `Paused in <title>` notification when a
+brake first engages, not one per suppressed message — and the next human message
+arms that notification again.
+
+The caps are per group and live in the group's settings blob, so they survive a
+`cremind serve` restart. The running counts behind them do not: they are
+in-memory, and a restart begins from a clean streak.
+
+**Example.**
+
+```bash
+# What is in force right now — no flag, so nothing is changed
+$ cremind channels groups brakes e2e8...d4f1 "Ops room"
+id                7c0f...e1
+title             Ops room
+posts_per_minute  20
+bot_streak        8
+
+# Let two of your own profiles' bots hold a much longer exchange
+$ cremind channels groups brakes e2e8...d4f1 "Ops room" --bot-streak 40
+id                7c0f...e1
+title             Ops room
+posts_per_minute  20
+bot_streak        40
+```
+
 ### `cremind channels groups refresh`
 
 **Purpose.** Ask the platform who is in a group, now.
@@ -1956,4 +2067,5 @@ step is silent by design, which is why nothing shows up in the group itself:
 
 A loop brake is the sixth possibility: 20 agent posts a minute, or 8 consecutive
 bot-authored messages with no human, and the agent stays quiet until a person
-posts.
+posts. `cremind channels groups brakes <id> <group>` shows both caps for that
+group and raises them when a longer unattended exchange is what you wanted.

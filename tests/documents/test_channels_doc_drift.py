@@ -55,6 +55,7 @@ EXPECTED_COMMANDS = {
     "cremind channels groups allow",
     "cremind channels groups deny",
     "cremind channels groups respond",
+    "cremind channels groups brakes",
     "cremind channels groups refresh",
     "cremind channels groups available",
     "cremind channels groups add",

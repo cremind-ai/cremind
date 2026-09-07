@@ -13,6 +13,18 @@ answered. An account in a group chat is a participant: it answers what is put to
 the room as well as what is put to it by name, and stays out only of exchanges
 that are demonstrably somebody else's.
 
+That has to hold when the other member is itself an assistant. The rule "another
+assistant's message is noise" used to be nearly free on the Telegram bot
+transport, which never delivered one bot another bot's messages at all; now
+:mod:`app.channels.groups.relay` hands a Cremind agent's post to the sibling
+Cremind channels in the same group, so the judge sees them. Read as "never
+answer an assistant" it would silence exactly the conversation a group asks for
+— told "introduce yourselves and talk to each other", both agents post an
+introduction and each would then dismiss the other's as noise and never speak
+again. So what decides is who a message is AIMED at, not who typed it, and the
+only assistant post still worth declining is a redundant second answer to a
+question somebody else already answered.
+
 Two failure directions, deliberately treated differently:
 
 *A wrong answer* is recoverable — it is one message in a chat, and the loop
@@ -63,7 +75,11 @@ _SYSTEM_PROMPT = (
     "the assistant said;\n"
     "- it asks about something the assistant said, did, or knows about;\n"
     "- several members could answer and the assistant is the best placed of "
-    "them.\n\n"
+    "them;\n"
+    "- another assistant wrote it and it is addressed to this one — by name or "
+    "handle, as a question to it, or as the next turn of an exchange the two "
+    "are already having. A member being automated changes nothing here; what "
+    "counts is who the message is aimed at.\n\n"
     "Answer relevant=false when:\n"
     "- the message is addressed to another member by name (the members are "
     "listed for you) and not also to the assistant;\n"
@@ -72,8 +88,9 @@ _SYSTEM_PROMPT = (
     "- it is an acknowledgement or a closing remark aimed at somebody else "
     "('thanks Sam', 'ok', 'got it');\n"
     "- the assistant has already answered this and nothing new is being asked;\n"
-    "- it is another assistant's answer to the same question — two assistants "
-    "replying to each other is noise, so do not join in.\n\n"
+    "- it is another assistant's answer to somebody ELSE's question and this "
+    "assistant has nothing to add — a second, redundant answer to a question "
+    "already answered is noise, so do not pile on.\n\n"
     "When a message is aimed at the group as a whole, answer relevant=true. "
     "Answer relevant=false only when the message is clearly for somebody else.\n"
     f"Report your decision by calling the {_TOOL_NAME} function."

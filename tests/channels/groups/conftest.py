@@ -97,6 +97,22 @@ class FakeChannelGroupStorage:
             out.append(await self.get_group(gid))
         return out
 
+    async def list_groups_by_platform_chat(
+        self, platform_chat_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Every row for one chat, across ALL channels — the relay's lookup.
+
+        The one query that deliberately ignores ``channel_id``, so it has to be
+        faked as such: a version that filtered by channel would answer "nobody
+        else is in this room" for every install and the relay tests would pass
+        against a relay that never relayed anything.
+        """
+        return [
+            await self.get_group(gid)
+            for gid, row in self.groups.items()
+            if row["platform_chat_id"] == str(platform_chat_id)
+        ]
+
     async def update_group(self, group_id: str, **fields: Any):
         row = self.groups.get(group_id)
         if row is None:
@@ -206,6 +222,12 @@ class RoomAdapter(BaseChannelAdapter):
     supports_group_chats = True
     supports_group_roster = True
     reports_sender_is_bot = True
+    # It stands in for the Telegram *bot* transport, which is the one that
+    # withholds other bots' posts — so it declares the same gap, and every test
+    # that drives a reply through this adapter exercises the sibling relay the
+    # way production does. Defaulting to True here would have left the relay
+    # untested on the only transport that needs it.
+    receives_bot_posts = False
 
     def __init__(self, channel, storage, roster=None):
         super().__init__(channel, storage)
@@ -244,10 +266,20 @@ def make_adapter(
     self_id: str = "bot-1",
     storage: Optional[FakeConversationStorage] = None,
     roster=None,
+    channel_id: str = "ch-1",
+    profile: str = "admin",
 ) -> RoomAdapter:
+    """One channel, defaulted to the single-channel install the tests assume.
+
+    ``channel_id`` and ``profile`` are spelled out rather than hard-coded
+    because the sibling relay needs a SECOND Cremind channel in the same room,
+    and a sibling is by definition another profile's channel — one profile is in
+    a group at most once. Every existing caller takes the defaults and stays the
+    ``admin``/``ch-1`` adapter it always was.
+    """
     channel = {
-        "id": "ch-1",
-        "profile": "admin",
+        "id": channel_id,
+        "profile": profile,
         "channel_type": "telegram",
         "mode": "bot",
         "config": {"group_chats_enabled": enabled},

@@ -1451,7 +1451,6 @@ def channel_groups_list(
     from app.cli.client.channels import list_channel_groups
     from app.cli.config import Config
     from app.cli.output import OutputMode, Table, print_json
-    from app.cli.output.formatting import epoch_seconds_field
 
     cfg: Config = ctx.obj["cfg"]
     mode: OutputMode = ctx.obj["mode"]
@@ -1630,7 +1629,6 @@ def channel_groups_members(
     from app.cli.client.channels import resolve_channel_group
     from app.cli.config import Config
     from app.cli.output import OutputMode, Table, print_json
-    from app.cli.output.formatting import epoch_seconds_field
 
     cfg: Config = ctx.obj["cfg"]
     mode: OutputMode = ctx.obj["mode"]
@@ -1667,15 +1665,22 @@ def channel_groups_members(
 
 def _patch_group_settings(
     ctx: typer.Context, channel_id: str, group: str, build: Any,
+    render: Any = None,
 ) -> None:
-    """Resolve a group, build a settings patch from its current one, send it."""
+    """Resolve a group, build a settings patch from its current one, send it.
+
+    ``render`` prints the updated row in text mode and defaults to the member
+    policy block, which is what four of the five callers want. `groups brakes`
+    edits keys the policy block does not mention, so it passes its own renderer
+    rather than having its two caps appended to everybody else's output.
+    """
     from app.cli.client._base import Client
     from app.cli.client.channels import (
         resolve_channel_group,
         set_channel_group_settings,
     )
     from app.cli.config import Config
-    from app.cli.output import OutputMode, print_json, print_kv
+    from app.cli.output import OutputMode, print_json
 
     cfg: Config = ctx.obj["cfg"]
     mode: OutputMode = ctx.obj["mode"]
@@ -1693,11 +1698,18 @@ def _patch_group_settings(
     if mode.json:
         print_json(updated)
         return
-    policy = _policy_of(updated)
-    settings = updated.get("settings") or {}
+    (render or _render_policy)(updated)
+
+
+def _render_policy(group: dict[str, Any]) -> None:
+    """The who-does-the-agent-answer block the four policy commands print."""
+    from app.cli.output import print_kv
+
+    policy = _policy_of(group)
+    settings = group.get("settings") or {}
     print_kv([
-        ("id", str(updated.get("id") or "")),
-        ("title", str(updated.get("title") or "")),
+        ("id", str(group.get("id") or "")),
+        ("title", str(group.get("title") or "")),
         ("respond_mode", str(settings.get("respond_mode") or "")),
         ("policy_mode", policy["mode"]),
         ("allow", ", ".join(policy["allow"])),
@@ -1808,6 +1820,135 @@ def channel_groups_respond(
         return {"respond_mode": respond_mode}
 
     _patch_group_settings(ctx, channel_id, group, build)
+
+
+def _brakes_of(group: dict[str, Any]) -> dict[str, int]:
+    """The two loop brakes on a group, with the server's own defaults.
+
+    The API normalises a group's settings on the way out, so both keys are
+    there and numeric in practice; the fallbacks are for a row that reached us
+    some other way, where an unreadable cap should read as the default rather
+    than as a traceback. They repeat the numbers in
+    `app/channels/groups/constants.py` rather than importing them because
+    nothing under `app/cli` may reach into the server packages (see the
+    docstring in `app/cli/main.py`) — a slim `pip install cremind` has no
+    `app.channels` to import.
+    """
+
+    def cap(value: Any, fallback: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    settings = group.get("settings") or {}
+    return {
+        "posts_per_minute": cap(settings.get("max_agent_posts_per_minute"), 20),
+        "bot_streak": cap(settings.get("max_consecutive_bot_messages"), 8),
+    }
+
+
+def _render_brakes(group: dict[str, Any]) -> None:
+    """The caps block `groups brakes` prints, on a read and after an edit."""
+    from app.cli.output import print_kv
+
+    brakes = _brakes_of(group)
+    print_kv([
+        ("id", str(group.get("id") or "")),
+        ("title", str(group.get("title") or "")),
+        ("posts_per_minute", str(brakes["posts_per_minute"])),
+        ("bot_streak", str(brakes["bot_streak"])),
+    ])
+
+
+@groups_app.command("brakes")
+@graceful_errors
+def channel_groups_brakes(
+    ctx: typer.Context,
+    channel_id: str = typer.Argument(..., help="Channel id."),
+    group: str = typer.Argument(..., help="Group id, chat id, or unique title."),
+    posts_per_minute: Optional[int] = typer.Option(
+        None,
+        "--posts-per-minute",
+        help="Replies a minute before the agent pauses (0-600, default 20).",
+    ),
+    bot_streak: Optional[int] = typer.Option(
+        None,
+        "--bot-streak",
+        help=(
+            "Bot messages since a person spoke before the agent pauses "
+            "(0-1000, default 8)."
+        ),
+    ),
+) -> None:
+    """How long the agent may keep talking in a group before it pauses.
+
+    Two caps stop a room running away with itself. `--posts-per-minute`
+    (default 20) is how often the agent may answer in this group; `--bot-streak`
+    (default 8) is how many messages from automated accounts — its own replies
+    included — may go by since a person last spoke. Reach either and the agent
+    goes quiet and sends you one "Paused in <group>" notification. Quiet, not
+    deaf: it still reads and stores everything said there, so nothing is missed
+    and it needs no restarting. Anybody who is not a bot posting resets the
+    streak, and the agent picks up where it left off.
+
+    Raising `--bot-streak` is what lets two of your own agents hold a longer
+    conversation, which on Telegram is the interesting case: every message
+    either of them posts counts, so the default of 8 ends an exchange after
+    about four rounds each. `0` for either cap silences the agent in this group
+    altogether.
+
+    With neither flag this changes nothing and reads the current caps back.
+    """
+    # Typer parses `--bot-streak -5` happily, and a negative cap is a typo
+    # rather than an intention, so say so before spending a round trip on it.
+    # The upper bounds stay the server's to enforce — checking them here too
+    # would be a second copy of 600/1000 to keep in step with
+    # `app/channels/groups/policy.py`, and an over-large value already comes
+    # back as that module's own 400.
+    for flag, value in (
+        ("--posts-per-minute", posts_per_minute),
+        ("--bot-streak", bot_streak),
+    ):
+        if value is not None and value < 0:
+            typer.echo(f"{flag} cannot be negative", err=True)
+            raise typer.Exit(code=1)
+
+    if posts_per_minute is None and bot_streak is None:
+        # A read. Sending an empty patch would round-trip to the same values,
+        # but it would also rewrite the row and stamp `updated_at`, and asking
+        # a question should not count as an edit.
+        from app.cli.client._base import Client
+        from app.cli.client.channels import resolve_channel_group
+        from app.cli.config import Config
+        from app.cli.output import OutputMode, print_json
+
+        cfg: Config = ctx.obj["cfg"]
+        mode: OutputMode = ctx.obj["mode"]
+        cfg.require_token()
+
+        async def _run() -> dict[str, Any]:
+            async with Client(cfg) as client:
+                return await resolve_channel_group(client, channel_id, group)
+
+        found = _run_group_async(_run())
+        if mode.json:
+            print_json(found)
+            return
+        _render_brakes(found)
+        return
+
+    def build(_found: dict[str, Any]) -> dict[str, Any]:
+        # Only the flags that were given: the server merges a settings patch
+        # one level deep, so an omitted cap keeps whatever it is set to.
+        patch: dict[str, Any] = {}
+        if posts_per_minute is not None:
+            patch["max_agent_posts_per_minute"] = posts_per_minute
+        if bot_streak is not None:
+            patch["max_consecutive_bot_messages"] = bot_streak
+        return patch
+
+    _patch_group_settings(ctx, channel_id, group, build, _render_brakes)
 
 
 @groups_app.command("refresh")

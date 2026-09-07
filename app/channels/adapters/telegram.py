@@ -56,6 +56,12 @@ class TelegramAdapter(BaseChannelAdapter):
     supports_group_roster = True
     supports_group_join_events = True
     reports_sender_is_bot = True
+    # Telegram never hands a bot a message written by another bot — a Bot FAQ
+    # rule, not a privacy-mode setting, so disabling privacy mode or making the
+    # bot an admin changes nothing (``_is_self`` below already says so). Two of
+    # this user's own agents in one group would therefore never hear each other,
+    # which is what :mod:`app.channels.groups.relay` exists to fix.
+    receives_bot_posts = False
     supports_file_send = True
 
     def __init__(self, channel: dict, storage: Any) -> None:

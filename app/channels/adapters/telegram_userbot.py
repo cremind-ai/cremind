@@ -88,6 +88,10 @@ class TelegramUserbotAdapter(BaseChannelAdapter):
     supports_group_roster = True
     supports_group_join_events = True
     reports_sender_is_bot = True
+    # Spelled out although it is the default: a real account is in the room like
+    # any other member and is delivered everything posted there, bots included,
+    # so it needs no in-process relay to hear Cremind's other agents.
+    receives_bot_posts = True
     # A real account's dialog list names every group it is in.
     supports_group_listing = True
     # MTProto has none of the Bot API's 20/50 MB file caps.

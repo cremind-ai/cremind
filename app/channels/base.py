@@ -119,7 +119,11 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
     ``supports_group_chats`` and gain a second, independent entry point:
     :meth:`_handle_group_inbound` for a message addressed to a platform group,
     which goes through :mod:`app.channels.groups` rather than the per-sender
-    conversation pipeline.
+    conversation pipeline. ``receives_bot_posts`` then says whether that room's
+    traffic includes what OTHER bots post; where it does not, this class relays
+    its own agent's posts to Cremind's other channels in the same room, because
+    otherwise two of the user's own agents can sit in one group and never hear
+    each other (see :meth:`_relay_group_post`).
 
     ``bold_markup`` / ``italic_markup`` exist because one markdown dialect does
     not travel: a single-asterisk ``*bold*`` is bold on Telegram, italic on
@@ -160,6 +164,16 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
     # False disables the consecutive-bot-messages brake, which has nothing to
     # count without it.
     reports_sender_is_bot: bool = False
+
+    # Whether this transport delivers OTHER bots' posts to this account. True
+    # for anything that behaves like a member of the room — every real account,
+    # and the bot APIs that make no distinction. False means the platform
+    # withholds them, so a second Cremind agent in the same group is invisible
+    # to this one and their exchange ends after a single reply each.
+    # :mod:`app.channels.groups.relay` fills that gap in-process, handing this
+    # channel's own posts to Cremind's other channels in the same approved
+    # group; a third-party bot stays as invisible as the platform made it.
+    receives_bot_posts: bool = True
 
     # Whether this transport can deliver a FILE outward. Read off the CLASS
     # like ``supports_group_chats`` (dry-run previews consult it before any
@@ -204,6 +218,23 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         # across the acquire boundary, so removing an "unlocked" entry could
         # hand out two parallel locks.
         self._inbound_locks: dict[str, asyncio.Lock] = {}
+        # Sibling relays (see :meth:`_relay_group_post`). Two structures because
+        # they answer two different questions. ``_relay_tails`` holds the TAIL of
+        # one FIFO chain PER ROOM, keyed by ``ReplyTarget.key`` like ``_inflight``
+        # is, which each new relay for that room waits on so two posts from one
+        # turn reach a sibling in the order the room heard them. Per room and not
+        # per adapter, because that ordering is a property of a destination: this
+        # channel may be answering in several rooms at once, and one chain across
+        # all of them would park room Y's relay behind room X's, which waits on
+        # another adapter's whole inbound pipeline — its roster refresh and its
+        # relevance judge. ``_relay_tasks`` is every relay task this adapter OWNS
+        # and shutdown must therefore cancel: the outbound chain links it spawned
+        # (a tail alone is one task of a chain whose earlier links may still be
+        # waiting) and the inbound deliveries another channel's relay handed it,
+        # which run in here, under these group locks, and so are ours to end and
+        # nobody else's.
+        self._relay_tails: dict[str, asyncio.Task] = {}
+        self._relay_tasks: set[asyncio.Task] = set()
 
         # Sender ids we've already raised an operator "access request"
         # notification for (``approval`` conversational auth), to avoid
@@ -290,6 +321,25 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         for fwd in inflight:
             try:
                 await fwd
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        # The sibling relays go the same way, and for the same reason: one still
+        # waiting on its predecessor would outlive the adapter and post into a
+        # room this channel has stopped serving. An in-flight relay is lost at
+        # shutdown exactly as an in-flight inbound is — and the relayed inbounds
+        # in here are this adapter's own, handed over by another channel but
+        # executing under these locks, so they die with it and with nothing else.
+        # Both structures are emptied first, so nothing chains a replacement onto
+        # a chain that is already being torn down.
+        relays = list(self._relay_tasks)
+        self._relay_tasks.clear()
+        self._relay_tails.clear()
+        for relay in relays:
+            if not relay.done():
+                relay.cancel()
+        for relay in relays:
+            try:
+                await relay
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         sweep = self._group_sweep_task
@@ -762,12 +812,22 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 )
             await asyncio.sleep(interval)
 
-    async def _send_reply(self, target: ReplyTarget, text: str) -> None:
-        """Send one bubble to wherever this run is answering."""
+    async def _send_reply(self, target: ReplyTarget, text: str) -> bool:
+        """Send one bubble to wherever this run is answering.
+
+        Returns whether it actually reached the destination. The two paths
+        answer that differently because they treat failure differently: a room
+        send swallows a transport error to keep the rest of a multi-bubble
+        message going (:meth:`send_to_chat_chunked`) and so has to report the
+        outcome instead of raising it, while the 1:1 path raises, which means
+        reaching the return at all is the answer. Most callers ignore it — a
+        failed reply is already logged where it happened — but anything that
+        tells a THIRD party what the destination heard has to ask.
+        """
         if target.is_group:
-            await self.send_to_chat_chunked(target.address, text)
-        else:
-            await self._send_chunked(target.address, text)
+            return await self.send_to_chat_chunked(target.address, text)
+        await self._send_chunked(target.address, text)
+        return True
 
     async def _send_reply_file(
         self, target: ReplyTarget, path: str, *,
@@ -883,24 +943,35 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             f"{self.channel_type} channels cannot send to a chat id",
         )
 
-    async def send_to_chat_chunked(self, chat_id: str, text: str) -> None:
+    async def send_to_chat_chunked(self, chat_id: str, text: str) -> bool:
         """Send ``text`` to a room as one or more messages, each within the cap.
 
         The room-addressed twin of :meth:`_send_chunked`, and swallowing failures
         for the same reason: a mirrored group message is one bubble among
         several, and abandoning the rest because one failed leaves the room with
         half a conversation.
+
+        Returns whether the room heard ANY of it. Swallowing the exception is
+        right for the room and wrong for everything downstream of it: a caller
+        that reads "sent" off a call which quietly delivered nothing goes on to
+        act as though the room has the message. The one caller that must not is
+        the sibling relay (:meth:`_relay_group_post`) — handing another agent a
+        post the platform rejected invents a message nobody in the room can see,
+        and it will answer it.
         """
         text = (text or "").strip()
         if not text:
-            return
+            return False
+        delivered = False
         for chunk in _split_for_messaging(text, _MAX_MESSAGE_CHARS):
             try:
                 await self.send_to_chat(chat_id, chunk)
+                delivered = True
             except Exception:  # noqa: BLE001
                 logger.exception(
                     f"channels[{self.channel_type}]: send to chat {chat_id} failed",
                 )
+        return delivered
 
     async def send_file_to_chat(
         self, chat_id: str, path: str, *,
@@ -923,6 +994,88 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
             logger.exception(
                 f"channels[{self.channel_type}]: file send to chat {chat_id} failed",
             )
+
+    def _relay_group_post(self, target: ReplyTarget, text: str) -> None:
+        """Hand a post we just made in a room to Cremind's other agents in it.
+
+        The outbound counterpart of :meth:`_handle_group_inbound`, and only
+        meaningful where the platform withholds bot posts from bots (see
+        ``receives_bot_posts``): everywhere else the siblings are delivered the
+        message natively and this finds nobody to tell. The candidate check runs
+        first and synchronously, so the common case — a single channel, or a
+        transport that needs no relay — costs one list comprehension and creates
+        no task at all.
+
+        The relays are chained per ROOM rather than fired off independently,
+        because a single turn can post twice into one room — an interim reply at
+        a flow break, then the final answer — and each relay does an async lookup
+        before it delivers anything. Two of them racing on that lookup would hand
+        the sibling the room's messages in whichever order the database answered,
+        which is how an agent ends up reading "Done." before "Working on it."
+
+        One chain per room and not one per adapter, because that is the whole of
+        what the ordering argument covers: two posts into the same room. A relay
+        awaits the sibling's entire inbound pipeline, roster refresh and
+        relevance judge included, so a single chain would hold every other room's
+        posts behind whichever room's sibling is slowest — and a person posting
+        into that other room meanwhile IS delivered natively, so the sibling
+        would read the reply before the message it answered. That inversion is
+        the very thing the chain exists to prevent.
+
+        Fully guarded: a relay is bookkeeping on top of a message the room has
+        already received, and a failure here must never cost the caller its
+        turn.
+        """
+        try:
+            from app.channels.groups.relay import relay_candidates
+
+            candidates = relay_candidates(self, target)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                f"channels[{self.channel_type}]: could not look for relay "
+                "siblings",
+                exc_info=True,
+            )
+            return
+        if not candidates:
+            return
+
+        previous = self._relay_tails.get(target.key)
+
+        async def _chained_relay() -> None:
+            from app.channels.groups.relay import relay_agent_post
+
+            # ``asyncio.wait`` rather than ``await previous``: awaiting the
+            # predecessor directly adopts its outcome, so a relay that failed or
+            # was cancelled would raise into this task instead of merely being
+            # over — and catching CancelledError to cope with that would swallow
+            # this task's OWN cancellation at shutdown. All this needs to know is
+            # that the previous post has been dealt with.
+            if previous is not None and not previous.done():
+                await asyncio.wait({previous})
+            await relay_agent_post(self, target, text, candidates=candidates)
+
+        task = asyncio.create_task(
+            _chained_relay(),
+            name=f"channel-relay:{self.channel_type}:{target.key}",
+        )
+        self._relay_tasks.add(task)
+        task.add_done_callback(self._relay_tasks.discard)
+        self._relay_tails[target.key] = task
+
+        def _drop_tail(done: asyncio.Task, key: str = target.key) -> None:
+            """Forget this room's tail once it is over, but only if it still is.
+
+            A later post may already have chained onto it and taken the slot, and
+            popping the key then would let the post after THAT start with no
+            predecessor to wait for — losing the ordering for the room this all
+            exists to keep in order. Without the prune the dict would instead
+            hold one finished task per room the channel has ever spoken in.
+            """
+            if self._relay_tails.get(key) is done:
+                self._relay_tails.pop(key, None)
+
+        task.add_done_callback(_drop_tail)
 
     async def _handle_group_inbound(
         self,
@@ -1657,6 +1810,45 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
         seen_file_uris: set[str] = set()
         auto_files = self._auto_send_files_enabled()
 
+        def note_group_post(text: str, delivered: bool) -> None:
+            """Record one thing the agent actually said out loud in a room.
+
+            Called only for a message that really went out, so a turn that
+            stayed silent does not spend the room's rate budget — the counter is
+            the flood brake, read when the NEXT message arrives.
+
+            There are exactly two of these per turn, an interim reply at a flow
+            break and the final answer, and the same line divides both halves of
+            this. Reasoning steps stay out because counting them would make
+            "answer with steps" silence the room (see ``flush_step``), and they
+            stay out of the relay for the matching reason: the event-trigger
+            header and the files a run produced are Cremind's own scaffolding
+            around an answer, not the answer, and a sibling agent handed them
+            would be reading our plumbing as somebody's words. What the room
+            hears the agent *say* is what a sibling needs to hear.
+
+            The relay is the other half of the same fact: on a transport that
+            withholds bot posts from bots, the other Cremind agents in this very
+            room are never told we spoke unless we tell them
+            (:mod:`app.channels.groups.relay`).
+
+            ``delivered`` splits the two halves, because a send the platform
+            refused means opposite things to them. The counter still counts it:
+            it is a flood brake, an attempt spends the transport's budget
+            whether or not it landed, and over-counting errs towards the room
+            going quiet — the safe direction. The relay must not: it would hand
+            another profile's agent a message no one in the room can see, and
+            since a relayed line normally names that agent it would answer,
+            out loud, a post that was never made. A rate-limited or
+            posting-restricted bot would go on manufacturing that conversation
+            for as long as the restriction stood.
+            """
+            if not (target.is_group and target.group_id):
+                return
+            self.groups.note_agent_post(target.group_id)
+            if delivered:
+                self._relay_group_post(target, text)
+
         async def flush_step(step: dict) -> None:
             """Send one reasoning step as its own bubble.
 
@@ -1705,11 +1897,10 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 f"channels[{self.channel_type}]: flush_interim sending "
                 f"len={len(text)} to={target.key} conv={conversation_id}"
             )
-            await self._send_reply(target, text)
+            delivered = await self._send_reply(target, text)
             outcome = "sent"
             sent_any = True
-            if target.is_group and target.group_id:
-                self.groups.note_agent_post(target.group_id)
+            note_group_post(text, delivered)
 
         def effective_final(text: str) -> str:
             """What ``flush_final`` would send: fallback applied, then stripped.
@@ -1767,13 +1958,14 @@ class BaseChannelAdapter(NotificationDeliveryMixin, ABC):
                 f"channels[{self.channel_type}]: flush_final sending "
                 f"len={len(text)} to={target.key} conv={conversation_id}"
             )
-            await self._send_reply(target, prefix + text)
+            delivered = await self._send_reply(target, prefix + text)
             outcome = "sent"
             sent_any = True
-            if target.is_group and target.group_id:
-                # Counted only on a message that actually went out, so a turn
-                # that stayed silent does not spend the room's rate budget.
-                self.groups.note_agent_post(target.group_id)
+            # The BARE text, never ``prefix + text``: the detail-mode
+            # "*Response*" header is presentation for the room's readers, not
+            # part of what the agent said, and a sibling agent handed it would
+            # read Cremind's own formatting back as somebody's words.
+            note_group_post(text, delivered)
 
         async def deliver_pending_files() -> None:
             """Send the run's created files, after the final answer.

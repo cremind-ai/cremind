@@ -179,6 +179,82 @@ def test_listing_can_be_narrowed_to_one_status(tmp_path: Path) -> None:
     assert [g["id"] for g in only_pending] == [pending_id]
 
 
+# ── the one lookup that crosses channels ──────────────────────────────────
+#
+# Every other lookup in this class is scoped to one channel, because a group row
+# belongs to exactly one channel of exactly one profile. ``list_groups_by_
+# platform_chat`` asks the opposite question — *which other Cremind channels are
+# sitting in this same room?* — and it exists because Telegram never hands a bot
+# a message written by another bot. Two profiles' bots in one group would answer
+# the human once each and then never hear each other, so
+# ``app.channels.groups.relay`` walks these rows to hand one agent's post to the
+# siblings the platform will never tell. Scope it to a channel by accident and
+# the relay finds only the sender's own row, i.e. nobody, and the silence comes
+# back with nothing to show for it.
+
+
+def test_one_chat_id_finds_the_row_of_every_channel_in_that_room(
+    tmp_path: Path,
+) -> None:
+    store = _storage(tmp_path)
+    eng = store.provider.sync_engine()
+    now = time.time() * 1000
+    with eng.begin() as c:
+        c.execute(text(
+            "INSERT INTO profiles (id,name,created_at,updated_at) "
+            "VALUES ('p2','dog',:n,:n)"
+        ), {"n": now})
+        c.execute(text(
+            "INSERT INTO channels (id,profile,channel_type,mode,auth_mode,"
+            "response_mode,enabled,created_at,updated_at) VALUES "
+            "('ch2','dog','telegram','bot','none','normal',1,:n,:n)"
+        ), {"n": now})
+
+    async def _run():
+        await _create(store)
+        await _create(store, channel_id="ch2", profile="dog")
+        # A second room one of them is also in: the query is on the chat, not on
+        # the channel, so this is the row that proves it still filters.
+        elsewhere = await _create(store, platform_chat_id="-2002", title="Other")
+        return await store.list_groups_by_platform_chat("-1001"), elsewhere["id"]
+
+    found, elsewhere_id = asyncio.run(_run())
+    assert {g["channel_id"] for g in found} == {"ch1", "ch2"}
+    assert {g["profile"] for g in found} == {"admin", "dog"}
+    assert all(g["platform_chat_id"] == "-1001" for g in found)
+    assert elsewhere_id not in {g["id"] for g in found}
+
+
+def test_a_chat_no_channel_is_in_finds_nothing(tmp_path: Path) -> None:
+    """The single-bot install, and the answer the relay treats as "nobody to
+    tell" — it must be an empty list, never a None the caller iterates."""
+    store = _storage(tmp_path)
+
+    async def _run():
+        await _create(store)
+        return await store.list_groups_by_platform_chat("-9999")
+
+    assert asyncio.run(_run()) == []
+
+
+def test_a_missing_chat_id_is_answered_without_asking_the_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blank id would match no row anyway, so the guard is not about
+    correctness: this runs on the hot path of every line an agent says out loud
+    in a room, and a transport that reported no chat id must not cost a database
+    round-trip per post. Raising from the session maker is how "no query" is
+    stated as an assertion rather than trusted."""
+    store = _storage(tmp_path)
+
+    def _boom(_self):
+        raise AssertionError("the empty-id guard answered too late")
+
+    monkeypatch.setattr(ChannelGroupStorage, "async_session_maker", property(_boom))
+
+    assert asyncio.run(store.list_groups_by_platform_chat("")) == []
+
+
 def test_a_patch_leaves_the_fields_it_does_not_name(tmp_path: Path) -> None:
     """``None`` means "not supplied", not "set to null" — a caller changing the
     status must not blank the title on its way past."""

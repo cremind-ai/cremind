@@ -19,6 +19,11 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from app.channels.adapters.telegram import TelegramAdapter
+# Safe with neither optional extra installed: both adapter modules import their
+# SDK lazily, inside the methods that actually talk to it. That is the same
+# premise the ``_ptb`` fixture below rests on, which stands python-telegram-bot
+# up as modules rather than importing it.
+from app.channels.adapters.telegram_userbot import TelegramUserbotAdapter
 
 _CHAT_ID = -1001234
 
@@ -628,3 +633,39 @@ def test_a_message_shaped_unexpectedly_reads_as_not_mentioned():
     )
 
     assert adapter._is_mentioned(msg) is False
+
+
+# --- receives_bot_posts ------------------------------------------------------
+#
+# Reading these two as a tautology ("the test asserts what the class body says")
+# misses what the flag is for. It is the only input to
+# ``app.channels.groups.relay.relay_candidates``, which decides whether Cremind
+# hands one of its own agents' group posts to its other channels sitting in the
+# same room. Both ways of getting it wrong are silent — nothing raises, nothing
+# is logged, a conversation simply behaves oddly in a group nobody is watching —
+# so the two values are pinned against the platform's behaviour here rather than
+# left to whoever next edits an adapter's class body to remember.
+
+
+def test_the_bot_transport_is_never_handed_another_bots_post():
+    """A Telegram bot is not delivered a message written by another bot. It is a
+    platform rule rather than a setting — no privacy-mode switch and no admin
+    promotion changes it — which is why ``_is_self`` above can be so sure about
+    the echo case.
+
+    Flip this to True and ``relay_candidates`` stops finding this channel, so two
+    of the user's own bots put in one group go back to answering the human once
+    each and then falling silent at each other forever, each convinced the room
+    went quiet."""
+    assert TelegramAdapter.receives_bot_posts is False
+
+
+def test_a_real_account_is_handed_bot_posts_like_any_other_member():
+    """The userbot transport signs in as a person, so the room delivers it
+    everything posted there, bots included.
+
+    Flip this to False and every post one Cremind agent makes arrives at this one
+    twice: once from Telegram, once from the relay. The agent reads its
+    neighbour's line as two separate messages, may answer both, and burns the
+    consecutive-bot brake at double speed."""
+    assert TelegramUserbotAdapter.receives_bot_posts is True
