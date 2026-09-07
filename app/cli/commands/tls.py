@@ -15,7 +15,7 @@ Subcommands:
   tls status       Inspect current HTTPS state and the deployment steps (commands indented).
   tls prepare      Prepare a certificate and an authenticated transition.
   tls enable       Activate HTTPS, optionally restarting supervised native installs.
-  tls cancel       Cancel a prepared transition before activation.
+  tls cancel       Cancel a switch whose HTTPS listener has not started yet.
 
 ``trust`` is a one-off per device. A certificate is trusted because it chains
 to a root the *device* already has, so nothing the server does can skip this
@@ -138,6 +138,10 @@ def _remote_tls(ctx: typer.Context, action: str, source_origin: str | None = Non
                 typer.echo(result["certificate_error"])
             if result.get("restart_error"):
                 typer.echo(result["restart_error"])
+            if result.get("activation_error"):
+                typer.echo(result["activation_error"])
+            if result.get("revert_error"):
+                typer.echo(result["revert_error"])
             steps = result.get("steps")
             if isinstance(steps, list) and steps:
                 _print_steps(steps)
@@ -149,6 +153,14 @@ def _remote_tls(ctx: typer.Context, action: str, source_origin: str | None = Non
                         typer.echo(instruction)
             if result.get("restart_required") and not result.get("restart_requested"):
                 typer.echo("HTTPS is prepared. Restart through the desktop app or follow the deployment instructions above.")
+            # Until HTTPS actually answers, staying on HTTP is still an option —
+            # and the operator has no other way of knowing that.
+            if (result.get("can_cancel")
+                    and (result.get("transition") or {}).get("phase") == "activating"):
+                typer.echo(
+                    "This switch is waiting for the deployment change. To stay on "
+                    "HTTP instead: cremind --profile admin tls cancel"
+                )
     run()
 
 
@@ -175,9 +187,46 @@ def tls_enable(ctx: typer.Context, yes: bool = typer.Option(False, "--yes", "-y"
 
 
 @tls_app.command("cancel")
-def tls_cancel(ctx: typer.Context) -> None:
-    """Cancel a prepared switch before activation; requires the admin profile."""
-    _remote_tls(ctx, "cancel")
+def tls_cancel(
+    ctx: typer.Context,
+    local: bool = typer.Option(
+        False,
+        "--local",
+        help="Cancel in the system directory directly, for when no server is running.",
+    ),
+) -> None:
+    """Cancel a switch whose HTTPS listener has not started yet.
+
+    ``--local`` is the way back when activation persisted and the restart into
+    HTTPS then failed: there is no server left to ask, but nothing has been
+    invalidated either, so restoring the previous settings is a complete undo.
+    It refuses once HTTPS has served — at that point sessions are already tied
+    to the new transport and only a deployment change can go back.
+    """
+    if not local:
+        _remote_tls(ctx, "cancel")
+        return
+
+    from app.cli.output import print_json, print_kv
+
+    # Imported in-body, like every other server-side import in this package: the
+    # slim `pip install cremind` must not pull server config in to run a command
+    # that does not need it.
+    from app.config.tls_transition import cancel_locally
+
+    try:
+        result = cancel_locally()
+    except (ValueError, OSError) as error:
+        typer.secho(str(error), fg="red", err=True)
+        raise typer.Exit(1) from None
+    if ctx.obj["mode"].json:
+        print_json(result)
+        return
+    print_kv([
+        ("Phase", result["phase"]),
+        ("Previous settings restored", "yes" if result["reverted"] else "not needed"),
+    ])
+    typer.echo("The HTTPS switch was cancelled. Start Cremind again to serve HTTP.")
 
 
 def _default_ca_path() -> Path:

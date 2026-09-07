@@ -139,6 +139,45 @@ def verify_token(token: str, *, secret: str | None = None) -> dict[str, Any] | N
     return payload
 
 
+def preflight_token_files() -> None:
+    """Raise if :func:`reissue_token_files_for_epoch` could not run right now.
+
+    HTTPS activation commits durable, hard-to-reverse changes (the native
+    ``.env``, the transition file) before the on-host credentials are re-signed
+    at first HTTPS service. Discovering only then that the tokens directory is
+    unreadable or read-only would strand the CLI and every ``exec_shell`` spawn
+    with no way back, so the same failures are provoked here — while the caller
+    can still abort with nothing changed.
+
+    Deliberately no signature or claim checks: an expired or foreign token file
+    is skipped by the reissue rather than being an error.
+    """
+    directory = tokens_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        paths = sorted(directory.glob(f"*{_TOKEN_SUFFIX}"))
+    except OSError as error:
+        raise OSError(
+            f"The token directory {directory} cannot be read or created: {error}."
+        ) from error
+    for path in paths:
+        try:
+            path.read_bytes()
+        except OSError as error:
+            raise OSError(f"The token file {path} cannot be read: {error}.") from error
+    probe = directory / f".preflight-{os.getpid()}.tmp"
+    try:
+        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+    except OSError as error:
+        raise OSError(f"The token directory {directory} is not writable: {error}.") from error
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
 def reissue_token_files_for_epoch(epoch: int) -> Callable[[], None]:
     """Re-sign valid on-host tokens for ``epoch`` without extending them.
 

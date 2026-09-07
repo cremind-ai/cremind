@@ -353,6 +353,35 @@ def _prepare(source: str, *, external: bool = False) -> dict:
     })
 
 
+def _cancellable(request: Request, transition: dict | None) -> bool:
+    """Whether this switch can still be called off through this request.
+
+    Cancel is the promise that nothing has been invalidated yet, so it stops
+    being offered the moment HTTPS genuinely serves. It is also withheld while a
+    restart is already armed: the native supervisor and Electron's coordinator
+    stop consulting the transition file once they have seen ``activating``, so a
+    cancel accepted then would be reverted underneath them.
+    """
+    from app.config.tls_mode import boot_serving_https, edge_tls_termination
+    from app.config.tls_transition import awaiting_operator, management
+    if not transition:
+        return False
+    if transition["phase"] in ("prepared", "quiescing"):
+        return True
+    if not awaiting_operator(transition):
+        return False
+    if request.url.scheme == "https" or boot_serving_https():
+        return False
+    # On a deployment-managed install these two facts change only through the
+    # operator's own deployment change, so their presence proves the switch
+    # already landed and HTTPS is live in front of this process. Cancelling then
+    # would leave HTTPS serving on the old boundary forever.
+    if management() == "external" and (edge_tls_termination()
+                                       or BaseConfig.APP_URL.startswith("https://")):
+        return False
+    return True
+
+
 def tls_status_payload(request: Request) -> dict:
     from app.config.tls_mode import current_tls_facts, edge_tls_termination
     from app.config.tls_steps import (
@@ -423,6 +452,8 @@ def tls_status_payload(request: Request) -> dict:
         "restart_supported": facts.restart_supported or manager == "electron",
         "transition": public_transition(transition),
         "quiesce_pending": quiesce_pending,
+        "can_cancel": _cancellable(request, transition),
+        "activation_error": transition.get("activation_error") if transition else None,
         **certificate_info(external=edge_https),
         **port_facts(external=edge_https),
         "https_url": https_url,
@@ -556,10 +587,12 @@ async def post_tls_prepare(request: Request) -> JSONResponse:
 
 async def post_tls_activate(request: Request) -> JSONResponse:
     from app.api._auth import require_admin
-    from app.auth.tokens import current_transport_epoch, reissue_token_files_for_epoch
+    from app.auth.tokens import current_transport_epoch, preflight_token_files
     from app.config.tls_transition import (
+        ACTIVATION_KEYS,
         UPLOAD_RECOVERY_TTL,
         certificate_info,
+        discard_native_rollback,
         load_transition,
         management,
         persist_native,
@@ -678,9 +711,10 @@ async def post_tls_activate(request: Request) -> JSONResponse:
             if not isinstance(previous_created_at, (int, float)):
                 previous_created_at = 0
             value["created_at"] = max(time.time(), previous_created_at + 0.000001)
+            # ``transport_epoch`` is not in this list: only a completed advance
+            # ever writes it, and it must never move backwards.
             for key in ("quiesce_expected", "quiesce_acked", "quiesce_closed",
-                        "quiesce_enrollment_until", "transport_epoch",
-                        "upload_recovery_until", "atlassian_redirect_uri_migrated"):
+                        "quiesce_enrollment_until", *ACTIVATION_KEYS):
                 value.pop(key, None)
             try:
                 save_transition(value)
@@ -688,41 +722,55 @@ async def post_tls_activate(request: Request) -> JSONResponse:
                 # Preserve the original persistence error. The previous
                 # transition file remains complete and restart-safe.
                 pass
+            discard_native_rollback()
 
         manager = management()
+        current_epoch = current_transport_epoch()
+        if current_epoch is None:
+            restore_prepared()
+            raise OSError("TLS transition metadata is unreadable; HTTPS activation was not started.")
+        # The credential boundary moves when HTTPS first serves, not here (see
+        # ``advance_transport_epoch``): until the deployment change lands, the
+        # HTTP application has to keep working or its administrator is locked
+        # away from their own data. Provoke now, while this request can still
+        # abort with nothing changed, the failures that would otherwise strand
+        # the on-host credentials at that later, unattended moment.
+        try:
+            preflight_token_files()
+        except OSError:
+            restore_prepared()
+            raise
         try:
             rollback = persist_native(value) if manager != "external" else None
         except Exception:
             restore_prepared()
             raise
-        current_epoch = current_transport_epoch()
-        if current_epoch is None:
-            if rollback:
-                rollback()
-            restore_prepared()
-            raise OSError("TLS transition metadata is unreadable; HTTPS activation was not started.")
-        # Reissue the on-host recovery/CLI credentials before publishing the
-        # new epoch. Browser sessions already hold private handoff tickets from
-        # the preparation barrier and are re-signed only when redeemed on HTTPS.
-        token_rollback = None
-        try:
-            token_rollback = reissue_token_files_for_epoch(current_epoch + 1)
-        except Exception:
-            if rollback:
-                rollback()
-            restore_prepared()
-            raise
+        # Native services may restart any upgrade after their canonical env is
+        # persisted. Docker/Kubernetes may self-restart only during the
+        # install-time after-setup flow, where their deployment was already
+        # rendered for TLS. A later external upgrade must recreate the container
+        # or Helm release so proxy/Service/probes move too. Electron always owns
+        # its child process in main, including the install-time after-setup
+        # switch. Decided before the durable write so the first announcement
+        # already tells tabs whether anyone is coming to finish this.
+        restart_requested = data.get("restart", True) is not False
+        from app.config.tls_mode import current_tls_facts
+        restart_facts = current_tls_facts()
+        can_schedule = restart_facts.restart_supported and (
+            manager == "native"
+            or (manager == "external" and restart_facts.pending_https)
+        )
         for key in ("quiesce_expected", "quiesce_acked", "quiesce_closed",
                     "quiesce_enrollment_until"):
             value.pop(key, None)
         value["phase"] = "activating"
-        value["transport_epoch"] = current_epoch + 1
+        value["pending_transport_epoch"] = current_epoch + 1
+        value["restart_planned"] = (restart_requested and can_schedule) or manager == "electron"
+        value["activated_at"] = time.time()
         value["upload_recovery_until"] = time.time() + UPLOAD_RECOVERY_TTL
         try:
             save_transition(value)  # durable + published BEFORE shutdown
         except Exception:
-            if token_rollback:
-                token_rollback()
             if rollback:
                 rollback()
             restore_prepared()
@@ -731,30 +779,23 @@ async def post_tls_activate(request: Request) -> JSONResponse:
         clear_tls_clients()
         restart_scheduled = False
         restart_error = None
-        if data.get("restart", True) is not False:
-            from app.config.tls_mode import current_tls_facts
-            restart_facts = current_tls_facts()
-            # Native services may restart any upgrade after their canonical
-            # env is persisted. Docker/Kubernetes may self-restart only during
-            # the install-time after-setup flow, where their deployment was
-            # already rendered for TLS. A later external upgrade must recreate
-            # the container or Helm release so proxy/Service/probes move too.
-            # Electron always owns its child process in main, including the
-            # install-time after-setup switch.
-            can_schedule = restart_facts.restart_supported and (
-                manager == "native"
-                or (manager == "external" and restart_facts.pending_https)
-            )
-            if can_schedule:
+        if restart_requested and can_schedule:
+            try:
+                from app.api.system import schedule_system_restart
+                schedule_system_restart()
+                restart_scheduled = True
+            except OSError as error:
+                restart_error = (
+                    "HTTPS was saved, but the supervised restart could not "
+                    f"be scheduled: {error}."
+                )
+                # Nothing is coming to finish this, so say so: the runbook and
+                # the cancel button are gated on it.
                 try:
-                    from app.api.system import schedule_system_restart
-                    schedule_system_restart()
-                    restart_scheduled = True
-                except OSError as error:
-                    restart_error = (
-                        "HTTPS was saved, but the supervised restart could not "
-                        f"be scheduled: {error}."
-                    )
+                    update_transition(lambda current: {**current, "restart_planned": False})
+                    value = load_transition() or value
+                except (ValueError, OSError):
+                    pass
         status = {
             **tls_status_payload(request),
             "restart_required": not restart_scheduled,
@@ -777,8 +818,22 @@ async def post_tls_activate(request: Request) -> JSONResponse:
 
 
 async def post_tls_cancel(request: Request) -> JSONResponse:
+    """Call off a switch that has not invalidated anything yet.
+
+    Available through the whole preparation *and* while activation waits for a
+    deployment change that has not landed: that window can last hours, and
+    without a way out of it an operator who changed their mind — or whose Helm
+    upgrade will never come — has no route back to their own data.
+    """
     from app.api._auth import require_admin
-    from app.config.tls_transition import load_transition, save_transition
+    from app.config.tls_transition import (
+        ACTIVATION_KEYS,
+        discard_native_rollback,
+        load_transition,
+        management,
+        revert_native,
+        save_transition,
+    )
     denied = require_admin(request)
     if denied is not None:
         return denied
@@ -787,8 +842,16 @@ async def post_tls_cancel(request: Request) -> JSONResponse:
         value = load_transition()
         if not value or value["id"] != data.get("transition_id"):
             raise ValueError("The HTTPS transition was not found.")
-        if value["phase"] not in ("prepared", "quiescing", "cancelled"):
-            return JSONResponse({"error": "HTTPS activation has started. Use the recovery instructions to finish it."}, status_code=409)
+        if value["phase"] != "cancelled" and not _cancellable(request, value):
+            from app.config.tls_transition import awaiting_operator
+            message = (
+                "A restart into HTTPS is already scheduled for this switch; wait "
+                "for it to finish."
+                if value["phase"] == "activating" and not awaiting_operator(value)
+                else "HTTPS is already being served for this switch, so it can no "
+                     "longer be cancelled. Open the HTTPS address to continue."
+            )
+            return JSONResponse({"error": message}, status_code=409)
         expected = value.get("quiesce_expected", {})
         raw_acknowledged = value.get("quiesce_acked", [])
         acknowledged = (
@@ -796,15 +859,30 @@ async def post_tls_cancel(request: Request) -> JSONResponse:
             if isinstance(raw_acknowledged, list) else set()
         )
         unresponsive = set(expected).difference(acknowledged) if isinstance(expected, dict) else set()
+        activating = value["phase"] == "activating"
         value["phase"] = "cancelled"
         for key in ("quiesce_expected", "quiesce_acked", "quiesce_closed",
-                    "quiesce_enrollment_until"):
+                    "quiesce_enrollment_until", *ACTIVATION_KEYS):
             value.pop(key, None)
         save_transition(value)
         from app.config.tls_clients import remove as remove_tls_clients
         remove_tls_clients(unresponsive)
-        return JSONResponse(tls_status_payload(request))
-    except ValueError as error:
+        # After the durable phase change: a failed restore is worth reporting,
+        # but it must not leave the switch half-cancelled.
+        revert_error = None
+        if activating and management() != "external":
+            try:
+                revert_native(value["id"])
+            except OSError as error:
+                revert_error = (
+                    f"The switch was cancelled, but the previous settings could not "
+                    f"be restored: {error} Check CREMIND_SSL and APP_URL in the "
+                    f"system directory's .env before restarting."
+                )
+        else:
+            discard_native_rollback()
+        return JSONResponse({**tls_status_payload(request), "revert_error": revert_error})
+    except (ValueError, OSError) as error:
         return JSONResponse({"error": str(error)}, status_code=400)
 
 
@@ -832,11 +910,17 @@ async def post_tls_handoff(request: Request) -> JSONResponse:
 
 
 async def post_tls_redeem(request: Request) -> JSONResponse:
-    from app.config.tls_transition import HandoffSessionExpired, redeem_ticket
+    from app.config.tls_mode import boot_serving_https
+    from app.config.tls_transition import HandoffSessionExpired, mark_active, redeem_ticket
     if request.url.scheme != "https":
         return JSONResponse({"error": "Session handoffs can only be received over HTTPS."}, status_code=403)
     try:
         data = await _body(request)
+        # HTTPS is demonstrably serving, so move the boundary before re-signing
+        # anything: a status call normally does it first, but redemption must
+        # not depend on that ordering or it would hand back a token for an
+        # epoch that is about to be retired.
+        mark_active(source=_source_origin(request), external=not boot_serving_https())
         return JSONResponse(redeem_ticket(data.get("ticket"), _request_origin(request)),
                             headers={"Cache-Control": "no-store"})
     except HandoffSessionExpired as error:
@@ -844,5 +928,5 @@ async def post_tls_redeem(request: Request) -> JSONResponse:
                             status_code=401, headers={"Cache-Control": "no-store"})
     except PermissionError as error:
         return JSONResponse({"error": str(error)}, status_code=401)
-    except ValueError as error:
+    except (ValueError, OSError) as error:
         return JSONResponse({"error": str(error)}, status_code=400)

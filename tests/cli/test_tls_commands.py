@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -506,3 +507,121 @@ def test_status_json_carries_the_typed_steps(runner, monkeypatch, sysdir):
         "kind": "command", "text": "docker compose up -d --force-recreate cremind",
     }
     assert payload["instructions"] == [s["text"] for s in payload["steps"]]
+
+
+# ── an outstanding switch ────────────────────────────────────────────────
+
+
+def test_status_says_staying_on_http_is_still_an_option(runner, monkeypatch, sysdir):
+    """The runbook alone reads as "you must finish this now".
+
+    While the deployment change is outstanding the HTTP application is still
+    serving and the switch can still be called off, and the terminal is where
+    an operator on a Kubernetes install is most likely to be looking.
+    """
+    _stub_status(monkeypatch, {
+        **_STEPS_PAYLOAD,
+        "can_cancel": True,
+        "transition": {"phase": "activating", "awaiting_operator": True},
+    })
+
+    result = _invoke(runner, monkeypatch, ["tls", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "waiting for the deployment change" in result.output
+    assert "cremind --profile admin tls cancel" in result.output
+
+
+def test_status_reports_a_switch_that_could_not_finish(runner, monkeypatch, sysdir):
+    _stub_status(monkeypatch, {
+        **_STEPS_PAYLOAD,
+        "activation_error": "HTTPS is serving, but the on-host token files could not be re-signed: disk full.",
+    })
+
+    result = _invoke(runner, monkeypatch, ["tls", "status"])
+
+    assert result.exit_code == 0
+    assert "could not be re-signed" in result.output
+
+
+def test_status_stays_quiet_about_cancelling_when_it_is_not_possible(
+    runner, monkeypatch, sysdir,
+):
+    _stub_status(monkeypatch, {**_STEPS_PAYLOAD, "can_cancel": False})
+
+    result = _invoke(runner, monkeypatch, ["tls", "status"])
+
+    assert result.exit_code == 0
+    assert "tls cancel" not in result.output
+
+
+# ── offline cancel ───────────────────────────────────────────────────────
+
+
+def _waiting_switch(sysdir, *, pending: bool = True) -> dict:
+    """A transition file exactly as `tls enable` leaves one behind."""
+    from app.config.tls_transition import instance_id, save_transition
+    from app.config.settings import BaseConfig
+
+    BaseConfig.CREMIND_SYSTEM_DIR = str(sysdir)
+    value = {
+        "version": 1, "id": "B" * 32, "phase": "activating",
+        "instance_id": instance_id(), "source_origin": "http://cremind.lan:1515",
+        "source_origins": ["http://cremind.lan:1515"],
+        "target_origin": "https://cremind.lan:1515",
+        "created_at": time.time(), "expires_at": None, "management": "native",
+    }
+    if pending:
+        value["pending_transport_epoch"] = 1
+    else:
+        value["transport_epoch"] = 1
+    return save_transition(value, announce=False)
+
+
+def test_local_cancel_is_the_way_back_when_the_server_will_not_start(
+    runner, monkeypatch, sysdir,
+):
+    """Activation persisted, the restart into HTTPS failed, nothing is running.
+
+    Without this there is no way back at all: the API needs a server, and the
+    operator is left hand-editing .env to reach their own data.
+    """
+    from app.config.settings import BaseConfig
+    from app.config import tls_transition
+
+    monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(sysdir))
+    monkeypatch.setattr(BaseConfig, "CREMIND_INSTALL_DIR", str(sysdir / "install"))
+    _waiting_switch(sysdir)
+    (sysdir / ".env").write_text("CREMIND_SSL=true\nAPP_URL=https://cremind.lan:1515\n", encoding="utf-8")
+    tls_transition._write_native_rollback(
+        "B" * 32, b"CREMIND_SSL=false\nAPP_URL=http://cremind.lan:1515\n", None,
+        {"APP_URL": "http://cremind.lan:1515", "SSL_AUTO_HOSTS": [], "CORS_ALLOWED_ORIGINS": []},
+        {"CREMIND_SSL": None},
+    )
+
+    result = _invoke(runner, monkeypatch, ["tls", "cancel", "--local"])
+
+    assert result.exit_code == 0, result.output
+    assert tls_transition.load_transition()["phase"] == "cancelled"
+    assert (sysdir / ".env").read_text() == "CREMIND_SSL=false\nAPP_URL=http://cremind.lan:1515\n"
+    assert not (sysdir / "tls" / "native-rollback.json").exists()
+    assert "cancelled" in result.output
+
+
+def test_local_cancel_refuses_once_https_has_served(runner, monkeypatch, sysdir):
+    """Past that point sessions are bound to the new transport.
+
+    Rewriting the phase would not bring them back, and would leave the
+    installation claiming an HTTP posture it no longer has.
+    """
+    from app.config.settings import BaseConfig
+    from app.config import tls_transition
+
+    monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(sysdir))
+    _waiting_switch(sysdir, pending=False)
+
+    result = _invoke(runner, monkeypatch, ["tls", "cancel", "--local"])
+
+    assert result.exit_code == 1
+    assert "already been served" in result.output
+    assert tls_transition.load_transition()["phase"] == "activating"

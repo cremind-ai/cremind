@@ -73,6 +73,7 @@ from app.config.settings import BaseConfig, set_dynamic_config_storage
 from app.config.tls_mode import (
     MODE_AFTER_SETUP,
     MODE_AUTO,
+    boot_serving_https,
     effective_ssl_mode,
     env_supervised,
     https_origin_from_app_url,
@@ -887,7 +888,16 @@ async def main(
     record_boot_tls(tls is not None)
     if tls is not None:
         from app.config.tls_transition import mark_active
+
+        # Storage is not up yet, so a pending credential-boundary advance is
+        # deferred to the post-storage hook below rather than done here.
         mark_active()
+    try:
+        from app.config.tls_transition import discard_orphan_native_rollback
+
+        discard_orphan_native_rollback()
+    except Exception as e:  # noqa: BLE001 - housekeeping must never block boot
+        logger.debug(f"[boot] TLS rollback-record housekeeping skipped: {e}")
 
     # 0''. Purge stale exec_shell stdout directories from previous runs.
     cleanup_stdout_on_startup()
@@ -1543,6 +1553,20 @@ async def main(
             state.on_first_setup = on_first_setup
             state.connect_persisted_tool = _connect_persisted_tool
             state.storage_ready = True
+
+            # 10a. HTTPS is bound and storage now answers, so a switch that was
+            #      waiting for this listener can finally move the credential
+            #      boundary: re-sign the on-host token files and retire the
+            #      bearers left in the old HTTP origin. Before the adapters
+            #      start, and never fatal — a damaged transition file is
+            #      repairable, a half-booted server is not.
+            if boot_serving_https():
+                try:
+                    from app.config.tls_transition import mark_active
+
+                    mark_active()
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to complete the HTTPS transport-epoch advance")
 
             # 11. Start in-process channel adapters for every enabled
             #     non-main channel. Schema (and auto-created main channels)

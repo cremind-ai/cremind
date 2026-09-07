@@ -2,9 +2,20 @@
 
 Transition announcements are public metadata. Sessions are never announced: each
 tab authenticates separately and receives its own opaque, expiring ticket.
+
+The credential boundary moves with the *transport*, not with the click.
+Activation records ``pending_transport_epoch`` and nothing else: until a
+listener genuinely answers HTTPS, the plaintext application keeps serving on the
+old epoch and the switch can still be cancelled. :func:`advance_transport_epoch`
+performs the boundary move — re-signing the on-host token files and retiring
+every bearer left in the HTTP origin — the first time HTTPS actually serves.
+Doing it at activation instead would strand an operator whose deployment change
+has not landed yet: no HTTPS to reach, no HTTP application left, no way back to
+their data.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -33,6 +44,30 @@ _PREFERENCES = frozenset(("theme", "auto_connect", "conversations_panel_collapse
                           "eventRunDrawerMaximized"))
 _PUBLIC = ("version", "id", "phase", "source_origin", "target_origin", "instance_id",
            "ca_sha256", "certificate_kind", "certificate_sha256", "same_public_port", "public_port", "created_at", "expires_at")
+#: How long a scheduled restart may take before the switch is reported as
+#: waiting for a human. A supervised restart lands well inside this
+#: (``app.system.restart`` waits ``DEFAULT_GRACE_S`` = 25s), but a watchdog that
+#: never came back must not hide the deployment runbook and the cancel button
+#: forever.
+RESTART_GRACE_SECONDS = 90
+#: Minimum spacing between retries of a failed boundary advance. Plaintext tabs
+#: poll the HTTPS target every 1.5s, and each attempt decodes every token file.
+ACTIVATION_RETRY_SECONDS = 30
+#: Keys describing one in-flight activation attempt; cancelling or rolling back
+#: drops them together. ``transport_epoch`` is deliberately absent: only a
+#: completed advance writes it, and it must never move backwards.
+ACTIVATION_KEYS = (
+    "pending_transport_epoch", "restart_planned", "activated_at",
+    "activation_error", "activation_error_at", "upload_recovery_until",
+    "atlassian_redirect_uri_migrated",
+)
+#: The only environment keys :func:`persist_native` rewrites, and therefore the
+#: only ones :func:`revert_native` restores. The rollback record is a rollback
+#: record, never a general-purpose environment loader.
+_NATIVE_ENV_KEYS = frozenset((
+    "CREMIND_SSL", "APP_URL", "CREMIND_UI_PORT", "CORS_ALLOWED_ORIGINS",
+    "CREMIND_SSL_AUTO_HOSTS", "CREMIND_ATLASSIAN_REDIRECT_URI",
+))
 
 
 class HandoffSessionExpired(PermissionError):
@@ -162,14 +197,62 @@ def load_transition(system_dir: str | None = None) -> dict | None:
         epoch = value.get("transport_epoch", 0)
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
             raise ValueError
+        # A pending epoch must be exactly the next one. Anything else — a hand
+        # edit, a partially applied write — would make every advance attempt
+        # fail inside ``reissue_token_files_for_epoch`` while HTTPS serves the
+        # application on the old boundary, which is worse than refusing to load.
+        pending = value.get("pending_transport_epoch")
+        if pending is not None and (isinstance(pending, bool)
+                                    or not isinstance(pending, int)
+                                    or pending != epoch + 1):
+            raise ValueError
+        planned = value.get("restart_planned")
+        if planned is not None and not isinstance(planned, bool):
+            raise ValueError
+        for key in ("activated_at", "activation_error_at"):
+            stamp = value.get(key)
+            if stamp is not None and (isinstance(stamp, bool)
+                                      or not isinstance(stamp, (int, float))):
+                raise ValueError
     except (TypeError, ValueError):
         raise OSError("TLS transition metadata is invalid; refusing to reset its credential boundary.") from None
     return value
 
 
+def awaiting_operator(value: dict | None) -> bool:
+    """Whether this switch is waiting for a person to change the deployment.
+
+    True for the cases where nothing will happen on its own: a Docker, Helm or
+    reverse-proxy change the operator has to apply, an unsupervised native
+    restart, ``--no-restart``, and a scheduled restart that never came back.
+    While it holds, the plaintext application stays available and the switch can
+    still be cancelled, so this is what the UI and CLI offer a way out from.
+    """
+    if not value or value.get("phase") != "activating":
+        return False
+    if "pending_transport_epoch" not in value:
+        return False
+    if not value.get("restart_planned"):
+        return True
+    activated_at = value.get("activated_at")
+    if not isinstance(activated_at, (int, float)) or isinstance(activated_at, bool):
+        return True
+    return time.time() - activated_at > RESTART_GRACE_SECONDS
+
+
 def public_transition(value: dict | None = None) -> dict | None:
     value = value if value is not None else load_transition()
-    return {key: value.get(key) for key in _PUBLIC} if value else None
+    if not value:
+        return None
+    # Both derived fields are safe to announce and necessary to act on: a tab
+    # that cannot tell "waiting for the operator" from "moving now" either
+    # blocks the whole UI on an HTTPS address that does not exist, or hides a
+    # failure the administrator is the only one who can fix.
+    return {
+        **{key: value.get(key) for key in _PUBLIC},
+        "awaiting_operator": awaiting_operator(value),
+        "activation_error": value.get("activation_error"),
+    }
 
 
 def save_transition(value: dict, *, announce: bool = True) -> dict:
@@ -308,6 +391,107 @@ def register_source(value: dict, source: str) -> dict:
     return update_transition(add_alias, announce=False)
 
 
+def _may_advance_boundary(*, external: bool) -> bool:
+    """Whether this process/request is entitled to move the credential boundary.
+
+    ``external`` means the ASGI scheme said https although this process never
+    bound TLS. uvicorn trusts ``X-Forwarded-Proto`` from loopback by default, so
+    on a deployment that does not delegate TLS that claim can be forged by any
+    local peer — and moving the boundary kills every session, re-signs the
+    on-host token files and locks plaintext. Accept the claim only where an
+    external terminator is the documented topology (an Ingress, or a reverse
+    proxy in front of a loopback-only bind); everywhere else this process must
+    have bound TLS itself.
+    """
+    from app.config.tls_mode import _public_port, boot_serving_https, edge_tls_termination
+    if boot_serving_https():
+        return True
+    return external and (edge_tls_termination() or _public_port() == 0)
+
+
+def advance_transport_epoch() -> dict | None:
+    """Move the credential boundary now that HTTPS is genuinely serving.
+
+    Re-signs the on-host token files into the pending epoch and publishes it, so
+    every bearer left behind in the old HTTP origin's storage stops working.
+    Returns the updated metadata, or ``None`` when nothing moved — already
+    advanced, storage not ready yet, or a failure recorded for a later retry.
+
+    Called from :func:`mark_active`, which every HTTPS status poll, the
+    post-storage boot hook and ticket redemption already reach, so a transient
+    obstacle simply means the next call does it.
+
+    A ``phase`` of ``active`` is accepted as well as ``activating``: an older
+    release completes a switch without advancing anything, so a downgrade in the
+    middle of one would otherwise leave HTTP-era bearers valid over HTTPS
+    permanently.
+    """
+    from app.runtime import get_state
+    from app.utils.logger import logger
+
+    with _lock:
+        value = load_transition()
+        pending = value.get("pending_transport_epoch") if value else None
+        if not value or pending is None or value["phase"] not in ("activating", "active"):
+            return None
+        # Re-signing needs the JWT secret and the profile serials, both of which
+        # come from the database. Worse than waiting: an empty serial snapshot
+        # reads as "every profile is at serial 0", and every rotated profile's
+        # token file would be silently skipped and left dead at the old epoch.
+        if not get_state().storage_ready:
+            logger.info("[tls] HTTPS is serving; deferring the transport-epoch advance until storage is ready")
+            return None
+        failed_at = value.get("activation_error_at")
+        if (isinstance(failed_at, (int, float)) and not isinstance(failed_at, bool)
+                and 0 <= time.time() - failed_at < ACTIVATION_RETRY_SECONDS):
+            return None
+        try:
+            from app.auth.serial import all_serials, invalidate_serial_cache
+            from app.auth.tokens import reissue_token_files_for_epoch
+            invalidate_serial_cache()
+            all_serials(force=True, strict=True)
+            rollback = reissue_token_files_for_epoch(pending)
+        except ValueError as error:
+            # Another writer advanced between the read above and here; the next
+            # call re-reads and finds no pending epoch. Not a failure to record.
+            logger.warning(f"[tls] transport-epoch advance skipped: {error}")
+            return None
+        except Exception as error:  # noqa: BLE001 - reported, then retried
+            logger.error(f"[tls] could not re-sign on-host token files for HTTPS: {error}")
+            failure = dict(value)
+            failure["activation_error"] = (
+                "HTTPS is serving, but the on-host token files could not be "
+                f"re-signed: {error}. Fix the system directory and restart, or "
+                "retry from Settings → HTTPS."
+            )
+            failure["activation_error_at"] = time.time()
+            try:
+                _write(directory() / "transition.json", failure)
+            except OSError:
+                return None
+            updated = failure
+        else:
+            updated = dict(value)
+            updated["transport_epoch"] = pending
+            for key in ("pending_transport_epoch", "restart_planned", "activated_at",
+                        "activation_error", "activation_error_at"):
+                updated.pop(key, None)
+            try:
+                _write(directory() / "transition.json", updated)
+            except Exception:
+                # The files already carry the new epoch. Put them back, or the
+                # CLI and every exec_shell spawn lose their credential with the
+                # boundary still recorded as un-moved.
+                rollback()
+                raise
+            # Past this point the switch cannot be cancelled, so the record of
+            # how to undo it (which holds a copy of .env) must not linger.
+            discard_native_rollback()
+    from app.events.transport_state_bus import get_transport_state_bus
+    get_transport_state_bus().publish(public_transition(updated))
+    return updated if "pending_transport_epoch" not in updated else None
+
+
 def mark_active(*, source: str | None = None, external: bool = False) -> None:
     from app.config.tls_mode import boot_serving_https
     if not external and not boot_serving_https():
@@ -315,6 +499,7 @@ def mark_active(*, source: str | None = None, external: bool = False) -> None:
     cleanup_tickets()
     value = load_transition()
     if not value:
+        discard_orphan_native_rollback()
         source = source or http_source(BaseConfig.APP_URL)
         save_transition({"version": 1, "id": secrets.token_urlsafe(24), "phase": "active",
                          "source_origin": source, "source_origins": [source],
@@ -327,6 +512,17 @@ def mark_active(*, source: str | None = None, external: bool = False) -> None:
     # A public HTTPS probe is evidence of a working transport, not permission
     # to activate or resurrect an administrator's prepared/cancelled change.
     if value["phase"] not in ("activating", "active"):
+        return
+    if _may_advance_boundary(external=external):
+        advanced = advance_transport_epoch()
+        if advanced is not None:
+            value = advanced
+    if "pending_transport_epoch" in value:
+        # HTTPS answers, but the boundary has not moved: storage is not ready, a
+        # failure was recorded, or this deployment must not trust the scheme it
+        # was told. Staying at ``activating`` keeps plaintext serving and keeps
+        # cancel available; marking it active here would lock users out of a
+        # switch that never actually completed.
         return
     # An already-active transition keeps its stable id and recovery deadline,
     # but factual certificate/port metadata must follow later renewals and
@@ -354,6 +550,159 @@ def management() -> str:
     if mode in ("docker", "kubernetes") or _public_port() == 0 or edge_tls_termination():
         return "external"
     return "electron" if os.environ.get("CREMIND_ELECTRON_PARENT") is not None else "native"
+
+
+def _native_rollback_path() -> Path:
+    return directory() / "native-rollback.json"
+
+
+def _write_native_rollback(transition_id, env_bytes, credentials_bytes, attrs, environ) -> None:
+    """Persist everything :func:`persist_native`'s in-process rollback holds.
+
+    That closure lives only as long as the activating request. Cancelling can
+    happen much later — from another tab, another process, or the offline CLI
+    after a failed restart — so the same inputs have to survive on disk for as
+    long as the switch can still be undone.
+    """
+    _write(_native_rollback_path(), {
+        "version": 1,
+        "transition_id": transition_id,
+        "env": base64.b64encode(env_bytes).decode("ascii") if env_bytes is not None else None,
+        "credentials": (base64.b64encode(credentials_bytes).decode("ascii")
+                        if credentials_bytes is not None else None),
+        "attrs": {
+            "APP_URL": attrs["APP_URL"],
+            "SSL_AUTO_HOSTS": list(attrs["SSL_AUTO_HOSTS"]),
+            "CORS_ALLOWED_ORIGINS": list(attrs["CORS_ALLOWED_ORIGINS"]),
+        },
+        "environ": {key: item for key, item in environ.items() if key in _NATIVE_ENV_KEYS},
+    })
+
+
+def discard_native_rollback() -> None:
+    """Drop the rollback record: the switch it belonged to is over either way."""
+    _native_rollback_path().unlink(missing_ok=True)
+
+
+def discard_orphan_native_rollback() -> None:
+    """Drop a record left behind by a switch that no longer exists.
+
+    It holds a copy of ``.env`` (and therefore credentials), so it must not
+    outlive the window in which it can still be applied — including when an
+    operator abandons a switch by deleting the transition file by hand.
+    """
+    path = _native_rollback_path()
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        path.unlink(missing_ok=True)
+        return
+    try:
+        value = load_transition()
+    except OSError:
+        return  # damaged metadata is repairable; do not destroy the way back
+    if (not value or value.get("phase") != "activating"
+            or "pending_transport_epoch" not in value
+            or not isinstance(record, dict)
+            or record.get("transition_id") != value.get("id")):
+        path.unlink(missing_ok=True)
+
+
+def revert_native(transition_id: str) -> bool:
+    """Undo :func:`persist_native` from the durable record. ``True`` if applied.
+
+    Restores only the keys ``persist_native`` writes, so a tampered record
+    cannot turn a cancel into an arbitrary environment change.
+    """
+    path = _native_rollback_path()
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError) as error:
+        raise OSError("The HTTPS rollback record cannot be read.") from error
+    if not isinstance(record, dict) or record.get("version") != 1:
+        raise OSError("The HTTPS rollback record is invalid.")
+    if record.get("transition_id") != transition_id:
+        raise OSError("The HTTPS rollback record belongs to a different switch.")
+    attrs = record.get("attrs") or {}
+    environ = record.get("environ") or {}
+    try:
+        env_bytes = base64.b64decode(record["env"]) if record.get("env") is not None else None
+        creds_bytes = (base64.b64decode(record["credentials"])
+                       if record.get("credentials") is not None else None)
+    except (TypeError, ValueError) as error:
+        raise OSError("The HTTPS rollback record is corrupt.") from error
+
+    def restore_file(destination: Path, data: bytes | None) -> None:
+        if data is None:
+            destination.unlink(missing_ok=True)
+            return
+        temporary = destination.with_name(f".{destination.name}.restore-{secrets.token_hex(8)}")
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    restore_file(Path(BaseConfig.CREMIND_SYSTEM_DIR) / ".env", env_bytes)
+    restore_file(Path(BaseConfig.CREMIND_INSTALL_DIR) / "credentials.toml", creds_bytes)
+    if isinstance(attrs.get("APP_URL"), str):
+        BaseConfig.APP_URL = attrs["APP_URL"]
+    if isinstance(attrs.get("SSL_AUTO_HOSTS"), list):
+        BaseConfig.SSL_AUTO_HOSTS = list(attrs["SSL_AUTO_HOSTS"])
+    if isinstance(attrs.get("CORS_ALLOWED_ORIGINS"), list):
+        BaseConfig.CORS_ALLOWED_ORIGINS = list(attrs["CORS_ALLOWED_ORIGINS"])
+    for key, item in environ.items():
+        if key not in _NATIVE_ENV_KEYS:
+            continue
+        if item is None:
+            os.environ.pop(key, None)
+        elif isinstance(item, str):
+            os.environ[key] = item
+    path.unlink(missing_ok=True)
+    return True
+
+
+def cancel_locally(transition_id: str | None = None) -> dict:
+    """Cancel a still-waiting switch with no server running. Returns the result.
+
+    The last resort for the one case the recovery page cannot help with:
+    activation persisted, the restart into HTTPS failed, and there is now no
+    server left to send ``POST /api/tls/cancel`` to. Safe exactly while the
+    boundary has not moved — no session has been invalidated yet, so restoring
+    the configuration is a complete undo rather than a half-measure.
+    """
+    with _lock:
+        value = load_transition()
+        if not value:
+            raise ValueError("No HTTPS transition was found for this installation.")
+        if transition_id and value.get("id") != transition_id:
+            raise ValueError("That transition id does not match this installation's switch.")
+        if value["phase"] == "cancelled":
+            return {"transition_id": value["id"], "phase": "cancelled", "reverted": False}
+        if value["phase"] in ("activating", "active") and "pending_transport_epoch" not in value:
+            raise ValueError(
+                "HTTPS has already been served for this switch, so cancelling "
+                "cannot undo it. Change the deployment back to HTTP instead."
+            )
+        if value["phase"] not in ("prepared", "quiescing", "activating"):
+            raise ValueError(f"A switch in the {value['phase']} phase cannot be cancelled.")
+        reverted = revert_native(value["id"]) if management() != "external" else False
+        cancelled = dict(value)
+        cancelled["phase"] = "cancelled"
+        for key in (*ACTIVATION_KEYS, "quiesce_expected", "quiesce_acked",
+                    "quiesce_closed", "quiesce_enrollment_until"):
+            cancelled.pop(key, None)
+        _write(directory() / "transition.json", cancelled)
+    discard_native_rollback()
+    return {"transition_id": cancelled["id"], "phase": "cancelled", "reverted": reverted}
 
 
 def persist_native(value: dict):
@@ -434,6 +783,12 @@ def persist_native(value: dict):
     if callback_update is not None:
         updates[atlassian_key] = callback_update
     original_env = {key: os.environ.get(key) for key in updates}
+    # Before anything is modified. Everything the rollback needs is already
+    # known, so a system directory that cannot take this record fails the
+    # activation with the installation untouched — rather than leaving a
+    # rewritten .env behind with no way to put it back.
+    _write_native_rollback(value.get("id"), original_bytes, original_creds,
+                           original_attrs, original_env)
 
     def restore_file(destination, data):
         if data is None:

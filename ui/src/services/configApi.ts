@@ -125,6 +125,15 @@ export interface TlsTransition {
   public_port?: number;
   created_at: number;
   expires_at: number | null;
+  /** The switch is recorded but waiting for a person to change the deployment
+   *  (a Helm or Compose upgrade, an unsupervised restart). While this holds the
+   *  HTTP application is still serving on the old token epoch and nothing has
+   *  been invalidated, so a tab must not block on an HTTPS address that does
+   *  not exist yet — and the switch can still be cancelled. */
+  awaiting_operator?: boolean;
+  /** HTTPS came up but the on-host token files could not be re-signed; the
+   *  switch is stuck until an administrator fixes it. */
+  activation_error?: string | null;
 }
 
 /** One line of deployment guidance. Only a `command` is a shell line, and only
@@ -154,6 +163,13 @@ export interface TlsRuntimeStatus {
   restart_error?: string | null;
   /** Number of enrolled tabs still saving uploads and private handoffs. */
   quiesce_pending?: number;
+  /** Whether this switch can still be called off from here. False once HTTPS
+   *  genuinely serves, and while a restart into it is already armed. */
+  can_cancel?: boolean;
+  /** Mirrors `transition.activation_error` for clients that read the top level. */
+  activation_error?: string | null;
+  /** A cancel that could not put the previous native settings back. */
+  revert_error?: string | null;
   restart_supported: boolean;
   transition: TlsTransition | null;
   ca_sha256: string | null;

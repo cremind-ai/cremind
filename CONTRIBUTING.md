@@ -273,10 +273,13 @@ involved and there is no first-run interstitial to avoid.
 ### What this does not cover
 
 ACME/Let's Encrypt automation, certificate hot-reload (restart to rotate), and
-mTLS remain out of scope; put a proxy in front if you need them. After HTTPS
-activation, a same-port dispatcher relays TLS to Hypercorn while serving a
-limited plaintext recovery page for old HTTP bookmarks and session handoffs.
-Plaintext application API requests are rejected. With `CREMIND_UI_PORT=0`, an
+mTLS remain out of scope; put a proxy in front if you need them. Once a listener
+actually serves HTTPS, a same-port dispatcher relays TLS to Hypercorn while
+serving a limited plaintext recovery page for old HTTP bookmarks and session
+handoffs, and plaintext application API requests are rejected. Recording the
+switch is a separate, earlier moment: until the deployment change lands the HTTP
+application keeps serving on the old token epoch and the switch can still be
+cancelled, so an operator is never left with neither transport. With `CREMIND_UI_PORT=0`, an
 external proxy owns the origin and TLS. The Electron app supports HTTPS: its
 main process loads the canonical environment, validates the expected local
 certificate, restarts the backend, and moves Cremind windows to the verified

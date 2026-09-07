@@ -1,5 +1,5 @@
 ---
-description: "Enable HTTPS after the default HTTP installation and fix ERR_CERT_AUTHORITY_INVALID or connection is not private by trusting ca.pem for CREMIND_SSL=auto, CREMIND_SSL=true or CREMIND_SSL=after-setup. cremind tls status reports transport and deployment instructions; prepare generates or validates a certificate; enable persists and activates HTTPS; cancel stops a prepared switch. Administrative mutations require an admin token. Trust, export and fingerprint operate locally without a token to install the Cremind CA in the device trust store. Covers native, Electron, Docker and Kubernetes with persistent certificate and browser-session migration."
+description: "Enable HTTPS after the default HTTP installation and fix ERR_CERT_AUTHORITY_INVALID or connection is not private by trusting ca.pem for CREMIND_SSL=auto, CREMIND_SSL=true or CREMIND_SSL=after-setup. cremind tls status reports transport and deployment instructions; prepare generates or validates a certificate; enable persists and activates HTTPS; cancel stops a switch at any point before HTTPS actually serves, and cancel --local does it offline when the server will not start. The HTTP application keeps working until the deployment change lands, so an outstanding switch never locks anyone out. Administrative mutations require an admin token. Trust, export and fingerprint operate locally without a token to install the Cremind CA in the device trust store. Covers native, Electron, Docker and Kubernetes with persistent certificate and browser-session migration."
 ---
 
 # `cremind tls` — Enable HTTPS and trust the local certificate authority
@@ -41,7 +41,8 @@ because the whole point is the moment when nothing can talk to the server yet.
 
 The administrative commands are `cremind tls prepare`, `cremind tls enable` and
 `cremind tls cancel`. Select the admin profile with the root `--profile admin` flag.
-The enable command accepts `--yes` and `--restart/--no-restart`.
+The enable command accepts `--yes` and `--restart/--no-restart`; cancel accepts
+`--local`.
 
 New installations use HTTP unless HTTPS was explicitly selected. HTTPS encrypts
 sessions and application data in transit and enables browser secure-context APIs.
@@ -65,11 +66,21 @@ sessions and application data in transit and enables browser secure-context APIs
    page and then the HTTPS login with its intended route retained. Untrusted
    certificates or a disconnected port-forward leave retry instructions.
 
-Activation changes the token transport epoch. On-host token files are reissued
-without extending their expiry, and browser handoffs receive matching HTTPS
-tokens. If a shell exported the old token in `CREMIND_TOKEN`, unset it and let
-the CLI read the reissued profile token (or export the new canonical value)
-before the next authenticated command.
+Docker, Kubernetes and reverse-proxy installs stay on HTTP until you apply the
+deployment change, and that wait is safe: the HTTP application keeps serving,
+existing sessions keep working, and `cremind tls cancel` still calls the whole
+thing off. `cremind tls status` says `awaiting_operator` while that is the case.
+Nothing is invalidated until a listener genuinely answers HTTPS.
+
+The token transport epoch changes at that moment, not when you run `enable`.
+On-host token files are reissued without extending their expiry, and browser
+handoffs receive matching HTTPS tokens. If a shell exported the old token in
+`CREMIND_TOKEN`, unset it and let the CLI read the reissued profile token (or
+export the new canonical value) before the next authenticated command.
+
+Do not roll a Cremind release back while a switch is waiting: an older build
+completes it without moving the token epoch, which would leave credentials from
+the HTTP era valid on the secure origin. Cancel first, then downgrade.
 
 Native activation also changes an unset, bundled-default, or matching HTTP
 `CREMIND_ATLASSIAN_REDIRECT_URI` to its HTTPS callback. The activation output
@@ -81,8 +92,10 @@ callback is preserved.
 and installation-specific instructions without requiring a token.
 `cremind --profile admin tls prepare --source-origin http://host:1515` overrides
 which browser origin the local CLI prepares (the internal CLI port stays HTTP).
-`cremind --profile admin tls cancel` cancels a prepared switch before activation;
-it does not disable an already active HTTPS server.
+`cremind --profile admin tls cancel` cancels a switch at any point before HTTPS
+actually serves — including one already waiting for a deployment change — and
+restores the settings a native activation wrote. It does not disable an already
+active HTTPS server.
 
 For Ingress TLS, `CREMIND_TLS_TERMINATION=edge` identifies certificate ownership
 before HTTPS is enabled. Update `ingress.tls` in Helm values and the public HTTPS
@@ -132,6 +145,12 @@ array beside it is the same text, kept for older clients. On a server already
 serving HTTPS the list is empty unless the certificate needs replacing, in which
 case it holds only the restart to run once the new certificate is in place.
 
+Three fields describe an outstanding switch: `transition.awaiting_operator` is
+true while it waits for a deployment change (so the HTTP application is still
+serving and nothing has been invalidated), `can_cancel` says whether calling it
+off is still possible, and `activation_error` reports the rare case where HTTPS
+came up but the on-host token files could not be re-signed.
+
 ### `cremind tls prepare`
 
 ```bash
@@ -166,11 +185,29 @@ line can be copied and run without editing the sentence around it.
 
 ```bash
 cremind --profile admin tls cancel
+cremind tls cancel --local
 ```
 
-Cancels a prepared or quiescing transition and tells participating tabs to
-release their upload gates. It does not turn an already active HTTPS server
-back to HTTP.
+| Flag | Default | Meaning |
+|---|---|---|
+| `--local` | off | Cancel in the system directory directly, without a running server. Needs no token. |
+
+Cancels a transition and tells participating tabs to release their upload gates.
+It works while the switch is prepared or quiescing, and also after `enable` for
+as long as HTTPS has not actually started serving — the window in which a
+Docker, Kubernetes or reverse-proxy install waits for its deployment change, and
+in which nothing has been invalidated yet. On a native or Electron install it
+also restores the `.env` and credentials that activation rewrote.
+
+It is refused once a listener answers HTTPS, and while a supervised restart into
+HTTPS is already armed (a restart that never lands releases the block after
+90 seconds). It does not turn an already active HTTPS server back to HTTP.
+
+`--local` is the way back when activation persisted and the restart into HTTPS
+then failed, leaving no server to ask: it applies the same rollback offline and
+marks the switch cancelled. It refuses when HTTPS has already served, because at
+that point sessions are bound to the new transport and only a deployment change
+can move them back.
 
 ### `cremind tls trust`
 

@@ -84,6 +84,28 @@ def prepared(client):
     return response.json()["transition"]
 
 
+def storage_ready(monkeypatch):
+    """Let the credential boundary move: advancing it re-signs the token files.
+
+    That needs the JWT secret and the profile serials, both of which come from
+    the database — so a switch waits rather than silently skipping every rotated
+    profile's credential.
+    """
+    from app import runtime
+    monkeypatch.setattr(runtime.get_state(), "storage_ready", True)
+    monkeypatch.setattr("app.auth.serial.all_serials", lambda **_kwargs: {"admin": 3, "alice": 3})
+
+
+def served_https(monkeypatch):
+    """Simulate this process genuinely answering HTTPS, with storage available.
+
+    Both halves matter: the boundary moves when a listener really serves TLS,
+    and only then if the token files can be re-signed.
+    """
+    monkeypatch.setattr(tls_mode, "_boot_serving_https", True)
+    storage_ready(monkeypatch)
+
+
 def ticket_body(value):
     return {"transition_id": value["id"], "source_origin": "http://testserver",
             "target_origin": "https://testserver:80", "route": "/alice/c/conversation?tab=files",
@@ -126,15 +148,31 @@ def test_activate_atomically_persists_native_settings_and_schedules_restart(clie
     assert "http://cremind.lan:1515,https://cremind.lan:1515" in content
     assert "CREMIND_ATLASSIAN_REDIRECT_URI=https://testserver:80/api/oauth/callback" in content
     assert transition.load_transition()["phase"] == "activating"
-    assert client.post("/api/tls/cancel", json={"transition_id": value["id"]}, headers=auth()).status_code == 426
-    assert client.post(
-        f"http://127.0.0.1:{BaseConfig.PORT}/api/tls/cancel",
-        json={"transition_id": value["id"]}, headers=auth(),
-    ).status_code == 409
+    # A restart is already armed and the supervisor stops consulting the
+    # transition file once it has seen this phase, so a cancel accepted now
+    # would be undone underneath it.
+    armed = client.post("/api/tls/cancel", json={"transition_id": value["id"]}, headers=auth())
+    assert armed.status_code == 409 and "already scheduled" in armed.json()["error"]
+    assert client.get("/api/tls/status").json()["can_cancel"] is False
+
+    # A restart that never lands must not strand the operator on a switch that
+    # can neither complete nor be called off.
+    stale = transition.load_transition()
+    stale["activated_at"] = time.time() - transition.RESTART_GRACE_SECONDS - 1
+    transition.save_transition(stale)
+    assert client.get("/api/tls/status").json()["can_cancel"] is True
+    cancelled = client.post("/api/tls/cancel", json={"transition_id": value["id"]}, headers=auth())
+    assert cancelled.status_code == 200
+    assert cancelled.json()["transition"]["phase"] == "cancelled"
+    assert cancelled.json()["revert_error"] is None
+    # Cancelling puts the native settings back in full, not just the phase.
+    assert (environment / ".env").read_text() == "KEEP_ME=one\nCREMIND_SSL=false\nAPP_URL=http://testserver\n"
+    assert BaseConfig.APP_URL == "http://testserver"
+    assert not (environment / "tls" / "native-rollback.json").exists()
 
 
 def test_activation_quiesces_registered_tabs_before_changing_token_epoch(
-    client, environment,
+    client, environment, monkeypatch,
 ):
     from app.auth.tokens import verify_token
 
@@ -183,6 +221,11 @@ def test_activation_quiesces_registered_tabs_before_changing_token_epoch(
     )
     assert second.status_code == 202
     assert second.json()["transition"]["phase"] == "activating"
+    # The boundary moves with the transport, not with the click: while the
+    # deployment change is outstanding this tab's session has to keep working.
+    assert verify_token(alice_token) is not None
+    served_https(monkeypatch)
+    transition.mark_active()
     assert verify_token(alice_token) is None
 
 
@@ -316,6 +359,10 @@ def test_activate_can_leave_supervised_native_restart_to_operator(client, enviro
     assert result.status_code == 202
     assert result.json()["restart_required"] is True
     assert result.json()["restart_scheduled"] is False
+    # Supervision exists but was declined, so nobody is coming to finish this:
+    # the operator gets the runbook and the way out, not a spinner.
+    assert result.json()["transition"]["awaiting_operator"] is True
+    assert result.json()["can_cancel"] is True
 
 
 def test_supervisor_schedule_failure_returns_committed_manual_recovery(
@@ -347,6 +394,11 @@ def test_supervisor_schedule_failure_returns_committed_manual_recovery(
     assert payload["instructions"][-2:] == [
         payload["restart_error"], "cremind server restart --yes",
     ]
+    # The restart that was supposed to finish this is not coming, so the switch
+    # is immediately a waiting one: runnable command, and a way to back out.
+    assert payload["transition"]["awaiting_operator"] is True
+    assert payload["can_cancel"] is True
+    assert transition.load_transition()["restart_planned"] is False
 
 
 @pytest.mark.parametrize("install_mode", ["docker", "kubernetes"])
@@ -369,7 +421,9 @@ def test_after_setup_container_activation_schedules_supervised_restart(
     assert scheduled == [True]
 
 
-def test_activation_reissues_token_files_without_extending_sessions(client, environment):
+def test_token_files_are_reissued_when_https_starts_serving_not_at_activation(
+    client, environment, monkeypatch,
+):
     from app.auth.tokens import token_file_path, verify_token, write_token_file
 
     expires = int(time.time()) + 1800
@@ -379,7 +433,19 @@ def test_activation_reissues_token_files_without_extending_sessions(client, envi
 
     result = client.post("/api/tls/activate", json={"transition_id": value["id"]}, headers=auth())
     assert result.status_code == 202, result.text
-    assert transition.load_transition()["transport_epoch"] == 1
+    # Activation records where the boundary is going and stops there. Moving it
+    # now would kill every session while the only reachable server is still the
+    # plaintext one — the lockout this ordering exists to prevent.
+    recorded = transition.load_transition()
+    assert recorded["pending_transport_epoch"] == 1 and "transport_epoch" not in recorded
+    assert token_file_path("alice").read_text(encoding="utf-8") == old
+    assert verify_token(old) is not None
+
+    served_https(monkeypatch)
+    transition.mark_active()
+    advanced = transition.load_transition()
+    assert advanced["transport_epoch"] == 1 and "pending_transport_epoch" not in advanced
+    assert advanced["phase"] == "active"
 
     migrated = token_file_path("alice").read_text(encoding="utf-8")
     claims = jwt.decode(migrated, SECRET, algorithms=["HS256"])
@@ -637,7 +703,7 @@ def test_handoff_preserves_own_profile_claims_route_and_draft_after_restart(clie
     assert "alice" not in ticket and token("alice") not in ticket
     assert client.post("/api/tls/handoff/redeem", json={"ticket": ticket}).status_code == 403
     assert client.post("/api/tls/activate", json={"transition_id": value["id"]}, headers=auth()).status_code == 202
-    monkeypatch.setattr(tls_mode, "_boot_serving_https", True)
+    served_https(monkeypatch)
     # The state is re-read from disk: no process-local registry is needed.
     transition.mark_active()
     result = client.post("https://testserver:80/api/tls/handoff/redeem", json={"ticket": ticket})
@@ -839,11 +905,17 @@ def test_plaintext_recovery_offers_a_way_in_when_the_certificate_is_untrusted(cl
     assert "strict-transport-security" not in result.headers
 
 
-def test_native_public_http_becomes_recovery_only_as_soon_as_activation_is_committed(
+def test_plaintext_serves_the_app_until_a_listener_actually_serves_https(
     client, environment, monkeypatch,
 ):
-    # Keep the process running so this exercises the vulnerable interval
-    # between durable activation and a native supervisor restart.
+    """Nothing is taken away while the switch is still waiting to be applied.
+
+    The process keeps running and never binds TLS, which is exactly the interval
+    a Docker or Kubernetes operator lives in between clicking Activate and
+    running the deployment change. Cutting the plaintext application off here
+    left them with no HTTPS to reach and no HTTP left either — locked away from
+    their own data with no way to back it up.
+    """
     value = prepared(client)
     response = client.post(
         "/api/tls/activate",
@@ -853,16 +925,273 @@ def test_native_public_http_becomes_recovery_only_as_soon_as_activation_is_commi
     assert response.status_code == 202
     assert transition.load_transition()["phase"] == "activating"
 
-    # The old public listener may render only the recovery document. In
-    # particular, login and status must not mint or expose an authenticated
-    # application surface over plaintext after the token epoch changed.
-    assert client.get("/").status_code == 200
-    assert client.get("/api/tls/status").status_code == 426
-    assert client.post("/api/auth/login", json={}).status_code == 426
+    status = client.get("/api/tls/status")
+    assert status.status_code == 200
+    assert status.json()["serving_https"] is False
+    assert status.json()["transition"]["awaiting_operator"] is True
+    assert status.json()["can_cancel"] is True
+    # 404 from this fixture's route table, never the recovery app's 426.
+    assert client.get("/").status_code != 426
+    assert client.post("/api/auth/login", json={}).status_code != 426
+    # And the session that started the switch still authenticates.
+    assert client.post(
+        "/api/tls/client", json={"tab_id": "alice-browser-tab-001"},
+        headers={"Authorization": f"Bearer {token('alice')}"},
+    ).status_code == 200
 
     # The separate loopback API remains usable by the local CLI/operator.
     internal = f"http://127.0.0.1:{BaseConfig.PORT}/api/tls/status"
     assert client.get(internal).status_code == 200
+
+    # Once HTTPS genuinely serves, the boundary moves and plaintext closes: a
+    # login here would otherwise mint a credential valid on the secure origin.
+    served_https(monkeypatch)
+    transition.mark_active()
+    assert transition.load_transition()["phase"] == "active"
+    assert client.get("/api/tls/status").status_code == 426
+    assert client.post("/api/auth/login", json={}).status_code == 426
+    assert client.get("/").status_code == 200
+    assert client.get(internal).status_code == 200
+
+
+def test_a_waiting_switch_can_be_called_off_and_gives_the_old_transport_back(
+    client, environment, monkeypatch,
+):
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
+    value = prepared(client)
+    alice = token("alice")
+    assert client.post("/api/tls/activate", json={"transition_id": value["id"]},
+                       headers=auth()).status_code == 202
+    assert client.get("/api/tls/status").json()["can_cancel"] is True
+
+    cancelled = client.post("/api/tls/cancel", json={"transition_id": value["id"]}, headers=auth())
+    assert cancelled.status_code == 200
+    assert cancelled.json()["transition"]["phase"] == "cancelled"
+    assert cancelled.json()["can_cancel"] is False
+    stored = transition.load_transition()
+    assert "pending_transport_epoch" not in stored and "transport_epoch" not in stored
+    # Nothing had been invalidated, so calling it off is a complete undo.
+    from app.auth.tokens import verify_token
+    assert verify_token(alice) is not None
+    assert client.get("/api/tls/status").status_code == 200
+
+
+@pytest.mark.parametrize("url", ["https://testserver:80", "internal"])
+def test_cancel_is_refused_once_https_serves(client, environment, monkeypatch, url):
+    value = prepared(client)
+    assert client.post("/api/tls/activate", json={"transition_id": value["id"], "restart": False},
+                       headers=auth()).status_code == 202
+    served_https(monkeypatch)
+    transition.mark_active()
+
+    base = f"http://127.0.0.1:{BaseConfig.PORT}" if url == "internal" else url
+    refused = client.post(f"{base}/api/tls/cancel", json={"transition_id": value["id"]}, headers=auth())
+    assert refused.status_code == 409
+    assert "no longer be cancelled" in refused.json()["error"]
+    assert transition.load_transition()["phase"] == "active"
+
+
+def test_cancel_is_refused_after_an_external_deployment_change_landed(
+    client, environment, monkeypatch,
+):
+    """The Ingress already serves HTTPS; only the epoch has not caught up.
+
+    Cancelling here would leave the secure origin serving on the old boundary
+    with every HTTP-era bearer still valid, so the switch has to go forward.
+    """
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
+    value = prepared(client)
+    assert client.post("/api/tls/activate", json={"transition_id": value["id"]},
+                       headers=auth()).status_code == 202
+    monkeypatch.setenv("CREMIND_TLS_TERMINATION", "edge")
+    monkeypatch.setattr(BaseConfig, "APP_URL", "https://testserver")
+
+    refused = client.post("/api/tls/cancel", json={"transition_id": value["id"]}, headers=auth())
+    assert refused.status_code == 409
+    assert client.get("/api/tls/status").json()["can_cancel"] is False
+
+
+def test_a_forged_https_scheme_cannot_move_the_credential_boundary(
+    client, environment, monkeypatch,
+):
+    """uvicorn trusts ``X-Forwarded-Proto`` from loopback by default.
+
+    On a deployment that does not delegate TLS, honouring that claim would let
+    any local peer kill every session, re-sign the on-host token files and lock
+    plaintext — recreating this very lockout on demand.
+    """
+    value = prepared(client)
+    alice = token("alice")
+    assert client.post("/api/tls/activate", json={"transition_id": value["id"], "restart": False},
+                       headers=auth()).status_code == 202
+    storage_ready(monkeypatch)
+
+    assert client.get("https://testserver:80/api/tls/status").status_code == 200
+    stored = transition.load_transition()
+    assert stored["phase"] == "activating" and stored["pending_transport_epoch"] == 1
+    assert "transport_epoch" not in stored
+    from app.auth.tokens import verify_token
+    assert verify_token(alice) is not None
+    assert client.get("/api/tls/status").status_code == 200
+
+
+def test_the_boundary_waits_for_storage_before_retiring_any_session(
+    client, environment, monkeypatch,
+):
+    value = prepared(client)
+    alice = token("alice")
+    assert client.post("/api/tls/activate", json={"transition_id": value["id"], "restart": False},
+                       headers=auth()).status_code == 202
+    # HTTPS is up but the database is not: re-signing consults the profile
+    # serials, and an empty snapshot would silently skip every rotated
+    # profile's token file and strand it at the old epoch forever.
+    monkeypatch.setattr(tls_mode, "_boot_serving_https", True)
+    transition.mark_active()
+    assert transition.load_transition()["phase"] == "activating"
+    from app.auth.tokens import verify_token
+    assert verify_token(alice) is not None
+
+    storage_ready(monkeypatch)
+    transition.mark_active()
+    assert transition.load_transition()["phase"] == "active"
+    assert verify_token(alice) is None
+
+
+def test_the_boundary_waits_for_a_readable_serial_snapshot(client, environment, monkeypatch):
+    value = prepared(client)
+    assert client.post("/api/tls/activate", json={"transition_id": value["id"], "restart": False},
+                       headers=auth()).status_code == 202
+    served_https(monkeypatch)
+
+    def unavailable(**_kwargs):
+        raise RuntimeError("database is not reachable")
+
+    monkeypatch.setattr("app.auth.serial.all_serials", unavailable)
+    transition.mark_active()
+    stored = transition.load_transition()
+    assert stored["phase"] == "activating" and stored["pending_transport_epoch"] == 1
+    assert "could not be re-signed" in stored["activation_error"]
+
+    monkeypatch.setattr("app.auth.serial.all_serials", lambda **_kwargs: {"admin": 3, "alice": 3})
+    stored["activation_error_at"] = time.time() - transition.ACTIVATION_RETRY_SECONDS - 1
+    transition.save_transition(stored)
+    transition.mark_active()
+    advanced = transition.load_transition()
+    assert advanced["phase"] == "active" and advanced["transport_epoch"] == 1
+    assert "activation_error" not in advanced
+
+
+def test_a_failed_reissue_is_reported_throttled_and_retried(client, environment, monkeypatch):
+    value = prepared(client)
+    assert client.post("/api/tls/activate", json={"transition_id": value["id"], "restart": False},
+                       headers=auth()).status_code == 202
+    served_https(monkeypatch)
+    attempts = []
+
+    def broken(epoch):
+        attempts.append(epoch)
+        raise OSError("tokens directory vanished")
+
+    monkeypatch.setattr("app.auth.tokens.reissue_token_files_for_epoch", broken)
+    transition.mark_active()
+    status = client.get("/api/tls/status").json()
+    assert status["activation_error"] and "could not be re-signed" in status["activation_error"]
+    assert status["transition"]["activation_error"] == status["activation_error"]
+    assert transition.load_transition()["phase"] == "activating"
+
+    # Plaintext tabs poll every 1.5s and each attempt decodes every token file.
+    transition.mark_active()
+    transition.mark_active()
+    assert attempts == [1]
+
+
+def test_a_release_rollback_that_completed_the_switch_is_repaired(
+    client, environment, monkeypatch,
+):
+    """An older release marks a switch active without moving the boundary.
+
+    Left alone, every HTTP-era bearer would stay valid over HTTPS for good, so
+    the advance also runs for an ``active`` transition that still has a pending
+    epoch recorded.
+    """
+    value = prepared(client)
+    alice = token("alice")
+    assert client.post("/api/tls/activate", json={"transition_id": value["id"], "restart": False},
+                       headers=auth()).status_code == 202
+    rolled_back = transition.load_transition()
+    rolled_back["phase"] = "active"
+    transition.save_transition(rolled_back)
+
+    served_https(monkeypatch)
+    transition.mark_active()
+    repaired = transition.load_transition()
+    assert repaired["transport_epoch"] == 1 and "pending_transport_epoch" not in repaired
+    from app.auth.tokens import verify_token
+    assert verify_token(alice) is None
+
+
+def test_a_redeemed_handoff_never_hands_back_a_doomed_epoch(client, environment, monkeypatch):
+    value = prepared(client)
+    ticket = client.post("/api/tls/handoff", json=ticket_body(value),
+                         headers={"Authorization": f"Bearer {token('alice')}"}).json()["ticket"]
+    assert client.post("/api/tls/activate", json={"transition_id": value["id"], "restart": False},
+                       headers=auth()).status_code == 202
+    # No status call first: redemption must not depend on something else having
+    # advanced the boundary, or it would return a token about to be retired.
+    served_https(monkeypatch)
+    result = client.post("https://testserver:80/api/tls/handoff/redeem", json={"ticket": ticket})
+    assert result.status_code == 200, result.text
+    assert jwt.decode(result.json()["token"], SECRET, algorithms=["HS256"])["tep"] == 1
+    assert transition.load_transition()["phase"] == "active"
+
+
+def test_a_pending_epoch_that_does_not_follow_the_current_one_is_refused(environment):
+    path = environment / "tls" / "transition.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    base = {
+        "version": 1, "id": "A" * 32, "phase": "activating",
+        "instance_id": transition.instance_id(), "source_origin": "http://testserver",
+        "source_origins": ["http://testserver"], "target_origin": "https://testserver:80",
+        "created_at": time.time(), "expires_at": None,
+    }
+    path.write_text(json.dumps({**base, "transport_epoch": 0, "pending_transport_epoch": 5}),
+                    encoding="utf-8")
+    with pytest.raises(OSError, match="credential boundary"):
+        transition.load_transition()
+    path.write_text(json.dumps({**base, "transport_epoch": 0, "pending_transport_epoch": 1}),
+                    encoding="utf-8")
+    assert transition.load_transition()["pending_transport_epoch"] == 1
+
+
+def test_an_upgrade_mid_switch_keeps_the_lock_of_the_release_that_activated(
+    client, environment, monkeypatch,
+):
+    """A file written by the previous release already moved the boundary.
+
+    It carries ``transport_epoch`` and no pending field, so every session is
+    already dead: plaintext must stay closed, or a login there would mint a
+    token valid on the secure origin.
+    """
+    value = prepared(client)
+    old_style = transition.load_transition()
+    old_style["phase"] = "activating"
+    old_style["transport_epoch"] = 1
+    transition.save_transition(old_style)
+
+    assert client.get("/api/tls/status").status_code == 426
+    assert client.get("/").status_code == 200
+    assert client.post("/api/tls/cancel", json={"transition_id": value["id"]},
+                       headers=auth()).status_code == 426
+
+    served_https(monkeypatch)
+    from app.auth.tokens import token_file_path, write_token_file
+    write_token_file("alice", token("alice"))
+    before = token_file_path("alice").read_bytes()
+    transition.mark_active()
+    assert transition.load_transition()["phase"] == "active"
+    assert transition.load_transition()["transport_epoch"] == 1
+    # Nothing to re-sign: that release did it at activation time.
+    assert token_file_path("alice").read_bytes() == before
 
 
 def test_plaintext_recovery_rejects_an_invalid_redirect_origin(environment):
@@ -1094,7 +1423,7 @@ def test_public_https_status_never_activates_or_resurrects_an_unapproved_transit
 def test_active_transition_refreshes_certificate_and_port_facts_without_replacing_identity(client, monkeypatch):
     value = prepared(client)
     assert client.post("/api/tls/activate", json={"transition_id": value["id"]}, headers=auth()).status_code == 202
-    monkeypatch.setattr(tls_mode, "_boot_serving_https", True)
+    served_https(monkeypatch)
     transition.mark_active()
     first = transition.load_transition()
     deadline = first["upload_recovery_until"]
@@ -1174,7 +1503,19 @@ def test_http_edge_prepare_uses_external_certificate_and_recovers_after_activati
     assert response.status_code == 202 and "ingress.tls" in " ".join(response.json()["instructions"])
     assert "Atlassian developer console" in " ".join(response.json()["instructions"])
     assert not (environment / "tls" / "ca.pem").exists() and not (environment / ".env").exists()
-    # A raw header has no authority; only the server's trusted proxy layer can set the scope.
+    # The Ingress has not been updated yet, so this pod is still the only way
+    # in: it keeps serving, and a raw header cannot move the boundary to change
+    # that. The Helm upgrade may be hours away, or may never come.
+    storage_ready(monkeypatch)
+    waiting = client.get("/api/tls/status", headers={"X-Forwarded-Proto": "https"})
+    assert waiting.status_code == 200
+    assert waiting.json()["transition"]["awaiting_operator"] is True
+    assert client.post("/api/tls/handoff", json=data, headers=auth("alice")).status_code == 200
+
+    # The rollout lands: the Ingress now terminates HTTPS and says so through
+    # the trusted proxy layer, which is what closes the plaintext surface.
+    status = client.get("https://testserver/api/tls/status").json()
+    assert status["serving_https"] and status["ready"] and status["transition"]["phase"] == "active"
     assert client.get("/api/tls/status", headers={"X-Forwarded-Proto": "https"}).status_code == 426
     assert client.post("/api/tls/handoff", json=data, headers=auth("alice")).status_code == 426
     page = client.get("/")

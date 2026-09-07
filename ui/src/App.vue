@@ -39,6 +39,14 @@ const httpsOverlayPending = computed(() =>
   && route.name !== 'security-settings'
   && route.name !== 'setup'
   && route.name !== 'setup-profile');
+// Only the admin profile can reach the HTTPS settings page (the router bounces
+// everyone else), so for other profiles the chip states the situation without
+// pretending to offer an action.
+const httpsPendingActionable = computed(() => currentProfile.value === 'admin');
+function openHttpsSettings(): void {
+  if (!currentProfile.value) return;
+  void router.push({ name: 'security-settings', params: { profile: currentProfile.value } });
+}
 const httpsRecoveryUrl = computed(() => {
   const target = httpsTransition.value?.target_origin;
   if (!target) return '';
@@ -406,6 +414,21 @@ const handleLogout = () => {
         ? 'HTTPS switch needs attention'
         : 'HTTPS switch pending' }}
     </button>
+
+    <!-- A switch waiting on a deployment change blocks nothing: this says it is
+         still open, and takes the admin to the steps or the way out. -->
+    <component
+      :is="httpsPendingActionable ? 'button' : 'div'"
+      v-if="httpsPhase === 'pending' && route.name !== 'security-settings'
+        && route.name !== 'setup' && route.name !== 'setup-profile'"
+      class="https-transition-chip https-pending-chip"
+      :title="httpsPendingActionable
+        ? 'Open HTTPS settings to see the remaining steps, or cancel the switch'
+        : 'An administrator has to apply the deployment change, or cancel it'"
+      @click="httpsPendingActionable && openHttpsSettings()"
+    >
+      {{ httpsError ? 'HTTPS switch needs attention' : 'HTTPS switch waiting for the deployment change' }}
+    </component>
   </div>
 
 </template>
@@ -530,6 +553,9 @@ const handleLogout = () => {
   box-shadow: 0 2px 10px rgb(0 0 0 / 18%);
 }
 .https-transition-chip:hover { color: var(--primary-color); border-color: var(--primary-color); }
+/* Not an alert: nothing is broken and nothing is blocked while it shows. */
+.https-pending-chip { font-weight: 500; cursor: default; }
+button.https-pending-chip { cursor: pointer; }
 
 .spinner {
   width: 32px;

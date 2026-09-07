@@ -232,10 +232,21 @@ kubectl --namespace cremind get ingress cremind
 curl --fail https://cremind.example.com/api/tls/status
 ```
 
-After activation, `http://cremind.example.com/<old-route>` should return the
-uncached recovery document, and an HTTP API request should return status 426.
-If either is redirected by the controller, disable its redirect/HSTS setting
-before relying on old bookmark recovery.
+Two distinct moments, easily confused. Recording the switch (the Settings page,
+or `cremind tls enable`) changes nothing about how the pod serves: HTTP keeps
+working, existing sessions keep working, and `cremind tls cancel` still calls the
+whole thing off — which is what makes it safe to record the switch first and
+apply the chart change afterwards, or never. Only once a listener actually
+answers HTTPS does the boundary move.
+
+After that, `http://cremind.example.com/<old-route>` should return the uncached
+recovery document, and an HTTP API request should return status 426. If either
+is redirected by the controller, disable its redirect/HSTS setting before
+relying on old bookmark recovery.
+
+Do not roll the Cremind image back while a switch is waiting: an older build
+completes it without moving the token epoch, leaving HTTP-era credentials valid
+on the secure origin. Cancel first, then downgrade.
 
 Replace the release, namespace, host, Secret, chart source, and version with
 the existing release's values. If cert-manager owns the Secret, keep its

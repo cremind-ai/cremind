@@ -26,6 +26,7 @@ const settingsStore = useSettingsStore();
 const loading = ref(true);
 const working = ref(false);
 const loadError = ref<string | null>(null);
+const revertError = ref<string | null>(null);
 const runtime = ref<TlsRuntimeStatus | null>(null);
 const tls = ref<TlsStatus | null>(null);
 const installMode = ref<string | null>(null);
@@ -158,6 +159,7 @@ async function cancel() {
   if (!transition.value) return;
   pivot.cancelManualProbe();
   working.value = true;
+  revertError.value = null;
   try {
     runtime.value = await cancelHttps(
       settingsStore.agentUrl,
@@ -167,7 +169,10 @@ async function cancel() {
     await window.cremind?.server?.releaseHttpsMigration?.();
     trustConfirmed.value = false;
     commandsVisible.value = false;
-    ElMessage.success('HTTPS preparation cancelled. Cremind remains on HTTP.');
+    // A cancel that could not put the previous settings back is still a
+    // cancel, but the operator has to know before the next restart.
+    revertError.value = runtime.value.revert_error ?? null;
+    ElMessage.success('HTTPS switch cancelled. Cremind stays on HTTP.');
   } catch (e) {
     loadError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -215,6 +220,11 @@ onMounted(load);
         </section>
 
         <div v-if="loadError" class="inline-error">{{ loadError }}</div>
+        <!-- Above the card branches on purpose: once the server serves HTTPS the
+             success card wins, and a switch that could not finish would have
+             nowhere left to report itself. -->
+        <div v-if="runtime?.activation_error" class="inline-error">{{ runtime.activation_error }}</div>
+        <div v-if="revertError" class="inline-error">{{ revertError }}</div>
 
         <section v-if="hasCertificateError" class="state-card error-card">
           <Icon icon="mdi:certificate-alert-outline" class="large-icon" />
@@ -335,14 +345,25 @@ onMounted(load);
                 this installation; keep this page open while the secure listener starts.
               </p>
               <!-- Manual activation never reaches the 'waiting' phase — enterManualMode
-                   leaves it at 'manual' — so this notice checks both. -->
-              <p v-if="pivotPhase === 'waiting' || pivotPhase === 'manual'" class="notice">
-                Cremind is checking the HTTPS address. Keep this page open while you apply
-                the deployment change; every Electron window or browser tab will move after
-                the expected secure server is reachable.
+                   leaves it at 'manual' — and after a reload the pivot is idle, which is
+                   exactly the case this page most needs to explain. -->
+              <p
+                v-if="transition?.awaiting_operator || pivotPhase === 'waiting' || pivotPhase === 'manual'"
+                class="notice"
+              >
+                Cremind checks the HTTPS address in the background, so you can leave this
+                page and keep using Cremind meanwhile. Every browser tab and Electron
+                window moves on its own once the secure server answers; a session older
+                than ten minutes signs in again there. To stay on HTTP instead, cancel the
+                switch below.
               </p>
               <p v-if="pivotError" class="inline-error">{{ pivotError }}</p>
               <DeploymentSteps :steps="deploymentSteps" />
+              <div v-if="runtime?.can_cancel" class="actions">
+                <button class="secondary-btn" :disabled="working" @click="cancel">
+                  Cancel HTTPS switch
+                </button>
+              </div>
             </template>
             <template v-else>
               <div class="spinner"></div>
@@ -354,8 +375,9 @@ onMounted(load);
                 : 'Every open Cremind tab will reopen at its current page after the secure listener is verified.') }}</p>
               <p v-if="forwardHint">Rerun your Kubernetes port-forward and confirm this device trusts the CA.</p>
               <button
-                v-if="transition?.phase === 'quiescing'"
+                v-if="runtime?.can_cancel"
                 class="secondary-btn"
+                :disabled="working"
                 @click="cancel"
               >Cancel HTTPS switch</button>
               <button

@@ -102,6 +102,93 @@ def test_http_era_token_is_rejected_after_transport_epoch_advances(db):
     assert verify_token(current) is not None
 
 
+def test_the_boundary_advance_re_signs_every_live_token_against_a_real_database(
+    db, monkeypatch,
+):
+    """The end of the switch, exercised against a real DB rather than a stub.
+
+    Everywhere else the serial snapshot is mocked, which would hide the failure
+    that matters most here: the reissue skips any profile whose ``tsr`` does not
+    match, so reading serials wrongly leaves that profile's on-host credential
+    dead at the old epoch with no error raised anywhere.
+    """
+    import app.runtime as runtime
+    from app.auth.serial import bump_serial
+    from app.auth.tokens import token_file_path, verify_token, write_token_file
+    from app.config import tls_mode, tls_transition
+    from app.config.settings import BaseConfig
+
+    # bob has been rotated; admin never has. Both must survive the switch.
+    bump_serial("bob")
+    admin, _ = BaseConfig.mint_token("admin")
+    bob, _ = BaseConfig.mint_token("bob")
+    write_token_file("admin", admin)
+    write_token_file("bob", bob)
+
+    tls_transition.save_transition({
+        "version": 1, "id": "C" * 32, "phase": "activating",
+        "instance_id": tls_transition.instance_id(),
+        "source_origin": "http://cremind.lan:1515",
+        "source_origins": ["http://cremind.lan:1515"],
+        "target_origin": "https://cremind.lan:1515",
+        "created_at": 0, "expires_at": None, "pending_transport_epoch": 1,
+    }, announce=False)
+    monkeypatch.setattr(tls_mode, "_boot_serving_https", True)
+    monkeypatch.setattr(runtime.get_state(), "storage_ready", True)
+
+    tls_transition.mark_active()
+
+    stored = tls_transition.load_transition()
+    assert stored["phase"] == "active" and stored["transport_epoch"] == 1
+    for profile, previous in (("admin", admin), ("bob", bob)):
+        migrated = token_file_path(profile).read_text(encoding="utf-8")
+        assert migrated != previous, f"{profile}'s on-host token was left behind"
+        assert verify_token(migrated) is not None
+        assert verify_token(previous) is None
+        old_claims = pyjwt.decode(previous, _SECRET, algorithms=["HS256"])
+        new_claims = pyjwt.decode(migrated, _SECRET, algorithms=["HS256"])
+        assert new_claims["tep"] == 1
+        # A transport change is not a login: expiry and revocation state stand.
+        assert new_claims["exp"] == old_claims["exp"]
+        assert new_claims["tsr"] == old_claims["tsr"]
+
+
+def test_the_boundary_will_not_move_while_the_database_is_unreachable(db, monkeypatch):
+    """An empty serial snapshot would silently skip every rotated profile."""
+    import app.auth.serial as serial_mod
+    import app.runtime as runtime
+    from app.auth.tokens import token_file_path, write_token_file
+    from app.config import tls_mode, tls_transition
+    from app.config.settings import BaseConfig
+
+    serial_mod.bump_serial("bob")
+    bob, _ = BaseConfig.mint_token("bob")
+    write_token_file("bob", bob)
+    tls_transition.save_transition({
+        "version": 1, "id": "D" * 32, "phase": "activating",
+        "instance_id": tls_transition.instance_id(),
+        "source_origin": "http://cremind.lan:1515",
+        "source_origins": ["http://cremind.lan:1515"],
+        "target_origin": "https://cremind.lan:1515",
+        "created_at": 0, "expires_at": None, "pending_transport_epoch": 1,
+    }, announce=False)
+    monkeypatch.setattr(tls_mode, "_boot_serving_https", True)
+    monkeypatch.setattr(runtime.get_state(), "storage_ready", True)
+
+    def unreachable(*_args, **_kwargs):
+        raise RuntimeError("database is gone")
+
+    monkeypatch.setattr(serial_mod, "get_database_provider", unreachable)
+    serial_mod.invalidate_serial_cache()
+    tls_transition.mark_active()
+
+    stored = tls_transition.load_transition()
+    assert stored["phase"] == "activating"
+    assert stored["pending_transport_epoch"] == 1
+    assert "could not be re-signed" in stored["activation_error"]
+    assert token_file_path("bob").read_text(encoding="utf-8") == bob
+
+
 @pytest.mark.parametrize("claim", ["1", 1.0, None, [], {}, True])
 def test_non_integer_transport_epoch_claims_are_rejected(db, claim):
     from app.auth import verify_token

@@ -52,7 +52,17 @@ function preferenceKeys(profile: string): string[] {
   ];
 }
 
-export type HttpsTransitionPhase = 'idle' | 'preparing' | 'waiting' | 'moving' | 'attention';
+/** `pending` is the deliberately non-blocking one: the switch is recorded but
+ *  waiting for a deployment change, so this tab keeps working normally and only
+ *  shows a chip. Blocking here would be the lockout, not a safeguard. */
+export type HttpsTransitionPhase =
+  'idle' | 'pending' | 'preparing' | 'waiting' | 'moving' | 'attention';
+/** How often a waiting tab looks for the secure address. Slow on purpose: the
+ *  deployment change can be hours away and nothing is blocked meanwhile. */
+const PENDING_PROBE_MS = 30_000;
+/** Re-mint a handoff before it expires (server TTL is 600s), so a tab that
+ *  waited out a long rollout still lands on its own page instead of a login. */
+const TICKET_REFRESH_MS = 90_000;
 
 const phase = ref<HttpsTransitionPhase>('idle');
 const error = ref<string | null>(null);
@@ -158,6 +168,10 @@ function sameTransition(a: TlsTransition | null, b: TlsTransition): boolean {
   return Boolean(a
     && a.id === b.id
     && a.phase === b.phase
+    // Same phase, different meaning: this flip is what moves a tab between
+    // "carry on, a person has to act" and "the secure address is coming".
+    && a.awaiting_operator === b.awaiting_operator
+    && a.activation_error === b.activation_error
     && a.source_origin === b.source_origin
     && a.target_origin === b.target_origin
     && a.instance_id === b.instance_id
@@ -209,8 +223,12 @@ function rememberTransition(t: TlsTransition): boolean {
     && t.created_at <= previous.created_at) return false;
   active.value = t;
   try {
-    if (t.phase === 'cancelled') localStorage.removeItem(TRANSITION_KEY);
-    else localStorage.setItem(TRANSITION_KEY, JSON.stringify(t));
+    if (t.phase === 'cancelled') {
+      localStorage.removeItem(TRANSITION_KEY);
+      // The ticket it minted is single-use and bound to this transition, so it
+      // is dead material now rather than something to keep for later.
+      sessionStorage.removeItem(ticketKey(t.id));
+    } else localStorage.setItem(TRANSITION_KEY, JSON.stringify(t));
   } catch { /* storage may be unavailable */ }
   // A cancelled switch has nothing left to hide, and leaving the record would
   // pre-dismiss an unrelated transition that later reuses this id.
@@ -441,6 +459,46 @@ async function prepareThisClient(
   }
 }
 
+/** Watch for the secure address without blocking anything.
+ *
+ * The counterpart to `waitForTarget` for a switch that is waiting on a person:
+ * same verification, far slower, and the page stays completely usable while it
+ * runs. It also keeps this tab's handoff fresh, because the server ticket
+ * expires in ten minutes and a rollout can easily take longer — without that,
+ * waiting patiently would cost the user their page and their drafts.
+ */
+async function probeTargetSlowly(
+  transition: TlsTransition,
+  agentUrl: string,
+  token: string,
+  generation: number,
+) {
+  while (generation === pollGeneration) {
+    await new Promise(resolve => setTimeout(resolve, PENDING_PROBE_MS));
+    if (generation !== pollGeneration) return;
+    if (token && document.visibilityState === 'visible'
+      && !getCachedTlsHandoff(transition.id, TICKET_REFRESH_MS)) {
+      // Best effort: a tab that cannot mint one just signs in again on HTTPS.
+      try { await primeTlsHandoff(transition, agentUrl, token, true); } catch { /* not fatal */ }
+    }
+    try {
+      const status = await fetchTlsStatus(transition.target_origin);
+      const target = status.transition ? localTransition(status.transition) : null;
+      if (
+        status.serving_https
+        && status.ready !== false
+        && status.instance_id === transition.instance_id
+        && target?.phase === 'active'
+        && sameTransitionIdentity(transition, target)
+      ) {
+        if (generation !== pollGeneration) return;
+        await handleHttpsTransition(target, agentUrl, token);
+        return;
+      }
+    } catch { /* the deployment change has not landed yet */ }
+  }
+}
+
 async function moveThisTab(
   transition: TlsTransition,
   agentUrl: string,
@@ -537,6 +595,21 @@ export async function handleHttpsTransition(
     error.value = null;
     return;
   }
+  if (transition.phase === 'activating' && transition.awaiting_operator) {
+    // There is nothing to move to yet and nothing has been invalidated: a
+    // person still has to change the deployment, which can take hours. This
+    // tab therefore carries on working and only shows a chip — blocking it on
+    // an HTTPS address that does not exist is the lockout, not a safeguard.
+    if (window.location.protocol !== 'http:') return;
+    quiesceGateRelease?.();
+    quiesceGateRelease = null;
+    releaseBrowserMigration(transition.id);
+    const generation = ++pollGeneration;
+    phase.value = 'pending';
+    error.value = transition.activation_error ?? null;
+    void probeTargetSlowly(transition, agentUrl, token, generation);
+    return;
+  }
   await moveThisTab(transition, agentUrl, token);
 }
 
@@ -591,7 +664,9 @@ export function installHttpsTransitionCoordinator(
       if (e instanceof TlsApiError && e.status === 426) {
         // The source's explicit recovery-only response proves activation has
         // crossed the HTTP boundary. Keep polling the already-pinned target.
-        await handleHttpsTransition({ ...pinned, phase: 'activating' }, agentUrl, token);
+        await handleHttpsTransition(
+          { ...pinned, phase: 'activating', awaiting_operator: false }, agentUrl, token,
+        );
         return;
       }
       try {
@@ -686,7 +761,24 @@ export function installHttpsTransitionCoordinator(
         return;
       }
     } catch { /* certificate trust or restart recovery stays on this page */ }
-    if (sourceRecoveryOnly || ['activating', 'active'].includes(saved.phase)) {
+    if (sourceRecoveryOnly) {
+      // A 426 is the source saying it has become recovery-only, which proves
+      // the transport moved on. Stop waiting and go find the secure address.
+      await handleHttpsTransition(
+        { ...saved, phase: 'activating', awaiting_operator: false }, agentUrl, token,
+      );
+      return;
+    }
+    if (['activating', 'active'].includes(saved.phase)) {
+      // Merely unreachable is not the same thing: a replaced pod, a dropped
+      // port-forward, a laptop waking up. A switch that was waiting for its
+      // operator keeps waiting, or every rollout blip raises the blocking
+      // overlay and a transient outage reads as being locked out.
+      if (saved.awaiting_operator) {
+        await handleHttpsTransition(saved, agentUrl, token);
+        scheduleResume();
+        return;
+      }
       await handleHttpsTransition({ ...saved, phase: 'activating' }, agentUrl, token);
       return;
     }

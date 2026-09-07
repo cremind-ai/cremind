@@ -44,18 +44,34 @@ forwarding headers are never used here to grant secure application access.
         internal = (server_port == BaseConfig.PORT and request.url.port == BaseConfig.PORT
                     and local_host and not any(key in request.headers for key in
                         ("forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto")))
-        # Once activation is durable, the old public HTTP process must stop
-        # serving the application immediately, even when a native service or
-        # Docker container has not restarted yet.  Otherwise a caller could
-        # obtain a fresh current-epoch login token over plaintext during that
-        # gap.  A fresh edge-terminated install has no transition to consult,
-        # so its configured HTTPS URL is the additional edge-only signal.
-        # Do not use APP_URL alone for native installs: after-setup writes its
-        # steady-state HTTPS URL before the wizard finishes and still needs the
-        # full HTTP application through the prepared/quiescing phases.
+        # The lock follows the credential boundary, not the button.  Once the
+        # transport epoch has advanced, the old public HTTP surface must stop
+        # serving the application immediately — otherwise a caller could obtain
+        # a fresh current-epoch login token over plaintext.  That is true for an
+        # ``active`` transition and for an ``activating`` one written by a
+        # release that advanced the epoch at activation time (no pending field),
+        # which an upgrade mid-switch can leave behind.
+        #
+        # While a switch is still *waiting* for its deployment change the epoch
+        # has not moved, nothing has been invalidated, and locking here would
+        # strand the administrator: no HTTPS to reach yet, and no HTTP
+        # application left to reach either.  So plaintext keeps serving.
+        #
+        # A fresh edge-terminated install has no transition to consult, so its
+        # configured HTTPS URL is the additional edge-only signal.  Do not use
+        # APP_URL alone for native installs: after-setup writes its steady-state
+        # HTTPS URL before the wizard finishes and still needs the full HTTP
+        # application through the prepared/quiescing phases.
+        awaiting = bool(transition and transition.get("phase") == "activating"
+                        and "pending_transport_epoch" in transition)
+        boundary_moved = bool(transition and (
+            transition.get("phase") == "active"
+            or (transition.get("phase") == "activating"
+                and "pending_transport_epoch" not in transition)))
         enabled = bool(
-            (transition and transition.get("phase") in ("activating", "active"))
-            or (edge_tls_termination() and BaseConfig.APP_URL.startswith("https://"))
+            boundary_moved
+            or (edge_tls_termination() and BaseConfig.APP_URL.startswith("https://")
+                and not awaiting)
         )
         if not secure and not internal and enabled:
             await recovery_app(scope, receive, send)
@@ -145,15 +161,19 @@ link.href=destination;
 let busy=false;
 async function recover(){
  if(busy)return;busy=true;
+ let answered=false;
  try{
   const response=await fetch(targetOrigin+'/api/tls/status',{cache:'no-store',credentials:'omit',signal:AbortSignal.timeout(5000)});
   if(!response.ok)throw Error('HTTPS is not ready yet.');
   const status=await response.json();
+  answered=status.serving_https===true;
   if(!status.serving_https||status.ready===false||status.instance_id!==expected||!status.transition||status.transition.phase!=='active'
     ||typeof status.transition.id!=='string'||(expectedTransition&&status.transition.id!==expectedTransition))throw Error('The HTTPS address is not ready for the expected Cremind transition.');
   expectedTransition=status.transition.id;
   location.replace(destination);
- }catch(error){message.textContent=error.message+' This page cannot reach the secure address from here, which usually means this device does not trust the certificate yet. Use Open HTTPS page below and continue past the browser warning to get in now, or trust the CA first to stop the warning. If the server or the port-forward is simply not running, start it and retry.';}
+ }catch(error){message.textContent=error.message+(answered
+  ?' The secure address answers, but this switch has not finished. Use Open HTTPS page below to sign in there, or check the server log for why activation could not complete.'
+  :' This page cannot reach the secure address from here, which usually means this device does not trust the certificate yet. Use Open HTTPS page below and continue past the browser warning to get in now, or trust the CA first to stop the warning. If you reach Cremind through a port-forward, reopen it: the pod was replaced.');}
  finally{busy=false;}
 }
 document.getElementById('retry').onclick=recover;recover();

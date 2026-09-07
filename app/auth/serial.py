@@ -53,7 +53,7 @@ _snapshot: dict[str, int] | None = None
 _snapshot_at: float = 0.0
 
 
-def all_serials(*, force: bool = False) -> dict[str, int]:
+def all_serials(*, force: bool = False, strict: bool = False) -> dict[str, int]:
     """Every profile's current serial, from a short-lived cached snapshot.
 
     One whole-table read serves every profile, so the auth hot path costs at
@@ -71,6 +71,14 @@ def all_serials(*, force: bool = False) -> dict[str, int]:
     write-invalidation alone cannot reach a second Helm replica or the separate
     OS process behind ``cremind auth regenerate --local``. The rotating process
     itself is always immediately consistent — :func:`bump_serial` invalidates.
+
+    ``strict`` re-raises instead of degrading to the last snapshot (or ``{}``).
+    Authentication must never fail closed on a transient DB blip, so it defaults
+    off — but a caller that *writes* based on the snapshot needs the opposite.
+    :func:`app.auth.tokens.reissue_token_files_for_epoch` skips any profile whose
+    ``tsr`` does not match, so an empty snapshot reads as "everyone is at serial
+    0" and would silently leave every rotated profile's token file behind at the
+    old epoch — a permanent, invisible loss of that credential.
     """
     global _snapshot, _snapshot_at
 
@@ -92,6 +100,8 @@ def all_serials(*, force: bool = False) -> dict[str, int]:
             # "every profile is at serial 0" and quietly accept every revoked
             # token — a transient DB blip must not undo a revocation.
             logger.warning(f"[auth] token-serial snapshot refresh failed: {e}")
+            if strict:
+                raise
             if _snapshot is None:
                 return {}
             _snapshot_at = now  # back off instead of retrying per request
