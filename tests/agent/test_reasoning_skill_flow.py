@@ -592,3 +592,131 @@ def test_plan_execute_subscribe_still_registers(monkeypatch):
     assert called["n"] == 1  # registered in the execution phase
     assert trace[1]["role"] == "tool"
     assert "SUBSCRIBED OK" in trace[1]["content"]
+
+
+# ── a skill reads as a SKILL, not as an ordinary action tool ────────────────
+
+def test_unloaded_skill_spec_is_labelled_and_says_it_only_loads(monkeypatch):
+    """A skill reaches the model as one ordinary-looking function, so nothing in
+    the schema separates "an action I can perform" from "a bundle of instructions
+    I must read first". The spec must say so itself: the `[Skill]` label plus an
+    explicit "calling this only loads, it does not act"."""
+    gmail = _FakeSkillTool("default__gmail", "gmail")  # no events
+    agent = _spec_agent(monkeypatch, [gmail])
+
+    specs, _ = agent._build_tools_and_dispatch()
+    fn = specs[0]["function"]
+
+    assert fn["name"] == "default__gmail"
+    assert fn["description"].startswith("[Skill] ")
+    assert gmail.description in fn["description"]  # the summary is still carried
+    assert "only LOADS" in fn["description"]
+    assert "performs no action" in fn["description"]
+
+    props = fn["parameters"]["properties"]
+    # The param NAME is load-bearing history compatibility: loaded-skill detection
+    # keys on the args SHAPE (a non-`subscribe` arg), and replayed traces from
+    # before the reword still carry this exact key. Only its *description* moved.
+    assert ra.SKILL_REQUEST_ARG == "request"
+    assert set(props) == {ra.SKILL_REQUEST_ARG}
+    assert (
+        "What you intend to do with this skill"
+        in props[ra.SKILL_REQUEST_ARG]["description"]
+    )
+
+
+def test_loaded_event_skill_spec_is_labelled_and_says_it_is_already_loaded(monkeypatch):
+    """Once loaded, the same function is subscribe-only — the description must
+    stop reading like a way to "use" the skill and say the instructions are
+    already in the conversation."""
+    gmail = _FakeSkillTool("default__gmail", "gmail",
+                           events=[{"name": "new_email", "description": "new mail"}])
+    agent = _spec_agent(monkeypatch, [gmail])
+    agent._loaded_skill_ids = {"default__gmail"}
+
+    specs, _ = agent._build_tools_and_dispatch()
+    fn = specs[0]["function"]
+
+    assert fn["description"].startswith("[Skill] ")
+    assert "already loaded" in fn["description"]
+    assert set(fn["parameters"]["properties"]) == {"subscribe"}
+
+
+# ── planning-phase skill loads are RESEARCH, not a licence to act ───────────
+
+_RESEARCH_NOTE = "these instructions are research material"
+_NO_RUN_NOTE = "Do NOT run this skill's scripts"
+
+
+def test_plan_planning_skill_load_is_marked_as_research_material(monkeypatch):
+    """A SKILL.md body is written imperatively ("run this script"), so loading one
+    while planning reads to the model as a hand-off to execution. The planning
+    phase appends a note saying otherwise — and it must ride the tool result
+    UNTRUNCATED (skill loads pass ``truncate=False``), even though ``_build_agent``
+    sets a 5-token result cap."""
+    long_body = "SKILL BODY LINE\n" * 200  # far beyond the tiny truncation cap
+    skill = _FakeSkillTool("default__gmail", "gmail", full_content=long_body)
+    llm = _SkillCallLLM("default__gmail", {"request": "set up a daily digest"})
+    agent = _build_agent(monkeypatch, llm, [skill])
+    agent._mode = "plan"
+    agent._plan_phase = "planning"
+
+    trace = _done(_run(agent, "plan a daily gmail digest", history=[]))["llm_messages"]
+
+    tool_msg = trace[1]
+    assert tool_msg["role"] == "tool"
+    assert _RESEARCH_NOTE in tool_msg["content"]
+    assert _NO_RUN_NOTE in tool_msg["content"]
+    # The note is appended AFTER the body, so its survival also proves the whole
+    # load result escaped the per-tool token clamp.
+    assert long_body in tool_msg["content"]
+    assert tool_msg["content"].index(long_body) < tool_msg["content"].index(_RESEARCH_NOTE)
+
+
+def test_skill_load_has_no_research_note_outside_plan_planning(monkeypatch):
+    """Guard: the note is scoped to the plan PLANNING phase. An ordinary reasoning
+    run — and the plan EXECUTION phase, where running the skill is the whole point
+    — must load the skill with no "do not run this" caveat attached."""
+    for mode, phase in (("reasoning", None), ("plan", "execute")):
+        skill = _FakeSkillTool("default__gmail", "gmail", full_content="BODY")
+        llm = _SkillCallLLM("default__gmail", {"request": "list my emails"})
+        agent = _build_agent(monkeypatch, llm, [skill])
+        agent._mode = mode
+        agent._plan_phase = phase
+
+        trace = _done(_run(agent, "use gmail", history=[]))["llm_messages"]
+
+        tool_msg = trace[1]
+        assert tool_msg["role"] == "tool"
+        assert "BODY" in tool_msg["content"]  # it really is the load result
+        assert _RESEARCH_NOTE not in tool_msg["content"], (mode, phase)
+        assert _NO_RUN_NOTE not in tool_msg["content"], (mode, phase)
+
+
+def test_already_loaded_short_circuit_has_no_research_note(monkeypatch):
+    """Guard: the note belongs to the LOAD result only. The already-loaded
+    short-circuit returns a "don't call me again" stub — appending research
+    framing there would contradict it (and the instructions it points at are
+    already above in history, note included, if this is a planning turn)."""
+    body = "SECRET SKILL INSTRUCTIONS"
+    skill = _FakeSkillTool("default__gmail", "gmail", full_content=body)
+    history = [
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "p1", "type": "function",
+            "function": {"name": "default__gmail",
+                         "arguments": json.dumps({"request": "x"})},
+        }]},
+        {"role": "tool", "tool_call_id": "p1", "content": body},
+    ]
+    llm = _SkillCallLLM("default__gmail", {"request": "use it again"})
+    agent = _build_agent(monkeypatch, llm, [skill])
+    agent._mode = "plan"
+    agent._plan_phase = "planning"
+
+    trace = _done(_run(agent, "plan with gmail", history=history))["llm_messages"]
+
+    tool_msg = trace[1]
+    assert tool_msg["role"] == "tool"
+    assert "already loaded" in tool_msg["content"]  # the short-circuit path
+    assert _RESEARCH_NOTE not in tool_msg["content"]
+    assert _NO_RUN_NOTE not in tool_msg["content"]

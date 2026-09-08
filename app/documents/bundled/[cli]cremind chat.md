@@ -1,5 +1,5 @@
 ---
-description: "Open an interactive full-screen **chat REPL** (TUI) against a new or existing conversation and watch the agent's thinking, text, and tool output stream live. Use this to sit and talk with the agent interactively — keyboard shortcuts, resume a conversation by id, `-t/--title` for a new thread, `--mode plan|reasoning|instant` sets the session's turn mode. Distinct from `cremind conv send`, which scripts a single one-shot message without a prompt."
+description: "Open an interactive full-screen **chat REPL** (TUI) against a new or existing conversation and watch the agent's thinking, text, and tool output stream live. Use this to sit and talk with the agent interactively — keyboard shortcuts, resume a conversation by id, `-t/--title` for a new thread, `--mode plan|reasoning|instant` sets the session's turn mode (plan mode investigates before it asks — loading the relevant skills, searching the docs, running read-only `cremind` list/show/status probes — then asks what is still unclear and proposes a plan to `accept`). Distinct from `cremind conv send`, which scripts a single one-shot message without a prompt."
 ---
 
 # `cremind chat` — Interactive Chat REPL
@@ -92,12 +92,20 @@ cremind chat [<conversation_id>] [-t <title>]
 
 The session's turn mode is fixed at launch with `--mode` (default
 `reasoning`). `--mode plan` runs every message through the Plan-mode
-workflow — the agent asks clarifying questions, proposes a plan file, and
-waits for you to type `accept` before executing (todo checklist updates
-render in the transcript as `[x]` / `[>]` / `[ ]` blocks). `--mode instant`
-disables extended thinking and caps the turn at a single round of tool
-calls (the agent answers right after the first batch of tool results) for
-the fastest replies. The active mode is shown in the status bar.
+workflow. Its planning phase investigates before it asks anything: the
+agent loads the skills that look relevant — loading a skill is read-only,
+it only pulls that skill's own instructions into the conversation —
+searches the documentation, and runs read-only `cremind` commands such
+as `list`, `get`, `show`, `status`, and `catalog` to see what this
+install actually has. Only then does it ask the clarifying questions
+that research could not answer, and it may ask a further round once you
+answer. It proposes a plan file when every step names a real tool,
+skill, or command, and waits for you to type `accept` before executing
+(todo checklist updates render in the transcript as `[x]` / `[>]` /
+`[ ]` blocks). `--mode instant` disables extended thinking and caps the
+turn at a single round of tool calls (the agent answers right after the
+first batch of tool results) for the fastest replies. The active mode is
+shown in the status bar.
 
 ## Behavior
 
@@ -139,8 +147,11 @@ $ cremind chat c_82bc
 
 ```bash
 $ cremind chat c_82bc --mode plan
-# The agent asks clarifying questions; answer them, then type "accept"
-# when it proposes a plan and it executes with live todo updates.
+# The agent investigates first — loads the relevant skills, searches the
+# docs, runs read-only `cremind ... list/show/status` probes — then asks
+# what that research could not answer. Answer it (a further round of
+# questions may follow), then type "accept" on the proposed plan and it
+# executes with live todo updates.
 ```
 
 ### Pipe an answer instead of sitting at a TUI

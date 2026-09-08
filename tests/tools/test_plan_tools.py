@@ -67,6 +67,39 @@ def test_ask_user_question_parks_and_emits():
         plan_state.clear(run_id)
 
 
+def test_ask_user_question_result_steers_multi_round_protocol():
+    """The result text drives investigate -> ask -> keep researching -> write.
+
+    After the answers land the model must keep researching and only re-ask when
+    something essential is still open; otherwise it goes straight to
+    ``write_plan``. Both halves of that fork must be spelled out in the result,
+    since it is the only steering the model sees on the resumed turn.
+    """
+    from app.tools.builtin.ask_user_question import AskUserQuestionTool
+    run_id = "msg:c1:askprotocol"
+    tool = AskUserQuestionTool()
+
+    async def _run():
+        token = current_task_id_var.set(run_id)
+        try:
+            return await tool.run({"questions": [{"question": "Which calendar?"}]})
+        finally:
+            current_task_id_var.reset(token)
+
+    try:
+        text = _text(asyncio.run(_run()))
+        low = text.lower()
+        # The turn still has to stop here (guarded by the existing test too).
+        assert "end your turn" in low
+        # ...but the loop back into research is now explicit.
+        assert "ask again only if something essential is still unclear" in low
+        assert "continue researching" in low
+        # ...and the exit is named, so the model knows where "no longer unclear" leads.
+        assert "write_plan" in text
+    finally:
+        plan_state.clear(run_id)
+
+
 def test_ask_user_question_clamps_to_four():
     from app.tools.builtin.ask_user_question import AskUserQuestionTool
     run_id = "msg:c1:ask4"
@@ -149,6 +182,46 @@ def test_update_todos_bad_status_defaults_pending():
         assert todos[0]["status"] == "pending"
     finally:
         plan_state.clear(run_id)
+
+
+# ── tool descriptions (the planning protocol the model actually reads) ────
+
+def test_ask_user_question_description_requires_investigating_first():
+    """Questions come *after* investigation, and may come more than once.
+
+    The old wording let the model open a planning turn with questions, before it
+    knew which skills existed. The description is the only place that ordering
+    reaches the model at tool-selection time.
+    """
+    from app.tools.builtin.ask_user_question import AskUserQuestionTool
+    desc = AskUserQuestionTool().description
+
+    assert "AFTER you have investigated" in desc
+    # The investigation it means: skills, docs, live state — not a vague "look around".
+    low = desc.lower()
+    assert "skill" in low and "documentation" in low
+    # Asking is not one-shot: a later turn may ask again.
+    assert "again on a later turn" in low
+    # Only user-owned decisions belong here.
+    assert "never something a loaded skill, a document or a listing" in low
+
+
+def test_write_plan_description_requires_grounded_steps():
+    """Every plan step must name a capability the research actually verified.
+
+    Read ``.description`` only — ``run()`` resolves a conversation and writes a
+    file, neither of which belongs in a unit test.
+    """
+    from app.tools.builtin.write_plan import WritePlanTool
+    desc = WritePlanTool().description
+
+    assert "as verified in that research" in desc
+    # The steps must be concrete: a named tool, skill, or CLI command.
+    assert "name the concrete tool, skill, or `cremind` command" in desc
+    # ...and explicitly not something the model imagined the system could do.
+    assert "not a capability you assumed" in desc
+    # Ordering: research and answers first, then the plan.
+    assert "only once your research is complete" in desc
 
 
 # ── tool config / schema guards ───────────────────────────────────────────

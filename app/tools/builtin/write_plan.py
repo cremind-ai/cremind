@@ -34,11 +34,14 @@ class WritePlanTool(BuiltInTool):
     name: str = "write_plan"
     description: str = (
         "Plan mode only: save your detailed implementation plan as a Markdown "
-        "file and show it to the user for approval. Provide `filename` (a short "
-        "name like 'refactor-auth.md'), an optional `title`, and `markdown` (the "
-        "full plan). Calling this ends your turn — do not call any other tool "
-        "afterwards. The user reviews the plan and Accepts or Cancels; on Accept "
-        "you resume in the execution phase and carry it out."
+        "file and show it to the user for approval. Call this only once your "
+        "research is complete and your questions are answered — every step must "
+        "name the concrete tool, skill, or `cremind` command that performs it, as "
+        "verified in that research, not a capability you assumed. Provide "
+        "`filename` (a short name like 'refactor-auth.md'), an optional `title`, "
+        "and `markdown` (the full plan). Calling this ends your turn — do not call "
+        "any other tool afterwards. The user reviews the plan and Accepts or "
+        "Cancels; on Accept you resume in the execution phase and carry it out."
     )
     parameters: Dict[str, Any] = {
         "type": "object",

@@ -8,6 +8,15 @@ queued as an ``ask_user_question`` UI event. The reasoning loop then ends the
 turn — the questions become the parked state and the user's answers, typed into
 the composer's question form, arrive as the next turn and resume planning.
 
+Questions come AFTER research, and there may be more than one round. The planning
+guidance orders the phase investigate → ask → keep researching → write, so this
+tool is for what the user alone can decide, never for what a loaded skill, a
+document, or a read-only listing already answers; and a later turn may call it
+again when the answers raise a new essential question. Nothing here enforces the
+round count — the state machine already supports it (``_compute_plan_phase``
+returns ``planning`` after an ``awaiting_answers`` turn, and the UI replaces its
+pending question set on each event), so this is a prompt-level protocol.
+
 Lifecycle is *system-managed*: the tool is ``hidden`` (never shown in Settings)
 and the reasoning agent exposes it only during a Plan-mode planning turn. It is a
 plan-mode analog of :mod:`app.tools.builtin.request_user_input` (which is
@@ -37,13 +46,18 @@ TOOL_CONFIG: ToolConfig = {
 class AskUserQuestionTool(BuiltInTool):
     name: str = "ask_user_question"
     description: str = (
-        "Plan mode only: ask the user 1-4 clarifying questions before writing a "
-        "plan. Each question has a short label, an optional longer description, "
-        "and a list of selectable options (each with a label + short description); "
-        "the user may also answer in free text. Calling this shows the questions "
-        "in a form and ends your turn — do not call any other tool afterwards. The "
-        "user's answers arrive as your next turn. Ask only what you genuinely need "
-        "to produce a good plan."
+        "Plan mode only: ask the user 1-4 clarifying questions, AFTER you have "
+        "investigated what this system offers for the request — loaded the "
+        "relevant skills, searched the documentation, and listed live state. Ask "
+        "only what the user alone can decide (their preferences, scope, accounts, "
+        "trade-offs), never something a loaded skill, a document or a listing "
+        "already answers. Each question has a short label, an optional longer "
+        "description, and a list of selectable options (each with a label + short "
+        "description); the user may also answer in free text. Calling this shows "
+        "the questions in a form and ends your turn — do not call any other tool "
+        "afterwards. The user's answers arrive as your next turn, and you may call "
+        "this again on a later turn if those answers raise a new essential "
+        "question."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -147,8 +161,10 @@ class AskUserQuestionTool(BuiltInTool):
 
         return BuiltInToolResult(content=[{"type": "text", "text": (
             "Your questions have been shown to the user in a form. End your turn "
-            "now — do not call any more tools. The user's answers will arrive as "
-            "your next turn, and you can then write the plan."
+            "now — do not call any more tools. Their answers will arrive as your "
+            "next turn: continue researching what those answers imply (load any "
+            "skill or document they point to), then ask again only if something "
+            "essential is still unclear; otherwise call `write_plan`."
         )}])
 
 

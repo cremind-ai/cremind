@@ -1,5 +1,5 @@
 ---
-description: "Manage **conversations** and stream agent replies from the terminal: create, list, fetch history, rename or change its id (`rename`, `set-id`), delete or delete-all, and `send` a message with `--mode plan|reasoning|instant` (Plan mode asks clarifying questions and writes a plan you approve before it executes), plus attach, cancel an in-flight run, decline a pending plan (`plan-cancel`), inspect memory and running summary, force compaction, and per-conversation token usage. Use this to script one-shot messages and manage threads — distinct from `cremind chat` (the interactive REPL)."
+description: "Manage **conversations** and stream agent replies from the terminal: create, list, fetch history, rename or change its id (`rename`, `set-id`), delete or delete-all, and `send` a message with `--mode plan|reasoning|instant` (Plan mode investigates first — loading the relevant skills, searching the docs and listing live state — then asks clarifying questions, in more than one round when your answers raise new ones, and writes a plan you approve before it executes), plus attach, cancel an in-flight run, decline a pending plan (`plan-cancel`), inspect memory and running summary, force compaction, and per-conversation token usage. Use this to script one-shot messages and manage threads — distinct from `cremind chat` (the interactive REPL)."
 ---
 
 # `cremind conv` — Conversation Management and Streaming
@@ -265,7 +265,7 @@ cremind conv send <id> <message> [--raw] [--mode plan|reasoning|instant] [--no-r
 | Flag              | Type   | Default     | Meaning                                                          |
 |-------------------|--------|-------------|------------------------------------------------------------------|
 | `--raw`           | bool   | `false`     | Plain-text streaming (no TUI). Pipe-friendly.                    |
-| `--mode`          | choice | `reasoning` | Turn mode. `plan`: the agent researches read-only, asks clarifying questions, writes a plan file for your approval, then executes it with live todo updates. `reasoning`: today's default behavior. `instant`: fastest — extended thinking is disabled and the agent may use at most one round of tool calls before it must answer. |
+| `--mode`          | choice | `reasoning` | Turn mode. `plan`: the agent investigates read-only first — loading every relevant skill, searching the documentation, and listing live state — then asks clarifying questions, comes back with a further question round if your answers raise new essential ones, writes a plan file for your approval, and executes it with live todo updates. `reasoning`: today's default behavior. `instant`: fastest — extended thinking is disabled and the agent may use at most one round of tool calls before it must answer. |
 | `--no-reasoning`  | bool   | `false`     | **Deprecated** alias for `--mode instant`. Note: on older releases this flag was accepted but had no effect; it now genuinely disables extended thinking and caps tool use at one round. |
 
 The root `--json` flag overrides `--raw` and selects the JSON-per-line
@@ -337,16 +337,24 @@ Plan mode is a multi-turn workflow; each reply is a new `conv send` on the
 same conversation with `--mode plan`:
 
 1. `cremind conv send <id> "refactor the auth module" --mode plan`
-   The agent researches read-only, then ends the turn with clarifying
-   questions. In `--raw` mode the assistant text streams on stdout; the
-   numbered questions, their options, and a reply hint print on stderr.
+   The agent researches read-only first — loading every relevant skill,
+   searching the documentation, and running read-only
+   `cremind ... list/get/show/status/catalog` commands to inspect live
+   state — and only then ends the turn with clarifying questions. In
+   `--raw` mode the assistant text streams on stdout; the numbered
+   questions, their options, and a reply hint print on stderr.
 2. Answer by sending a normal message:
    `cremind conv send <id> "1: option b; 2: only the login flow" --mode plan`
-3. The agent writes a plan file (saved under
-   `~/.cremind/<profile>/plans/<conversation_id>/`) and ends the turn
+3. The agent may come back with a **further round of questions** if your
+   answers raise new essential ones — it first keeps researching whatever
+   they point to, then asks again. Answer it the same way, with another
+   `cremind conv send <id> "..." --mode plan`.
+4. Only once every step names a real tool, skill, or `cremind` command does
+   the agent write a plan file (saved under
+   `~/.cremind/<profile>/plans/<conversation_id>/`) and end the turn
    awaiting approval. The plan body streams as assistant text; the saved
    path and an accept hint print on stderr.
-4. Approve: `cremind conv send <id> "accept" --mode plan` — the agent
+5. Approve: `cremind conv send <id> "accept" --mode plan` — the agent
    executes the plan, emitting `todos` checklist updates as it goes
    (`[x]` done / `[>]` in progress / `[ ]` pending, on stderr in raw mode).
    Decline: `cremind conv plan-cancel <id>` rejects the pending plan without
