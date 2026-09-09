@@ -1952,10 +1952,15 @@ export interface CodexDeviceLoginStatus {
   user_code?: string | null;
 }
 
+/** Start the flow. ``signal`` exists because starting it means spawning a CLI
+ *  on the server: the route bounds itself, but a request that never answers at
+ *  all (a wedged child, a proxy that swallowed the response) has no bound on
+ *  this side, and the caller is left showing "starting" for good. */
 export async function startCodexDeviceLogin(
   agentUrl: string,
   token: string,
   profile?: string,
+  signal?: AbortSignal,
 ): Promise<CodexDeviceLoginStart> {
   const base = resolveBaseUrl(agentUrl);
   // The server resolves the profile from the bearer token; the query is only
@@ -1966,6 +1971,7 @@ export async function startCodexDeviceLogin(
     method: 'POST',
     headers: authHeaders(token),
     body: JSON.stringify({}),
+    signal,
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));

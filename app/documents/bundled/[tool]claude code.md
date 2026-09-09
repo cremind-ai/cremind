@@ -1,5 +1,5 @@
 ---
-description: "The Claude Code built-in tool and its permission mode: the permission modes (bypassPermissions, acceptEdits, default, plan, dontAsk, auto) come live from the installed Claude Agent SDK — the same modes the Claude Code CLI cycles through with Shift+Tab — so what each allows and how to change one, listed with cremind tools options claude_code. Plus how to choose the model from the account's live model list (cremind tools options claude_code, or the status sub-tool's models field) and its other Tool Variables (model, permission mode, max turns, max budget USD, Anthropic API key, CLI path, allowed/disallowed tools, max concurrent tasks). Also covers how to install Claude Code on this server without shell access — the claude_code feature / Claude Agent SDK wheel that bundles the CLI, one click from the Coding Agents section of Settings → Tools & Skills or `cremind features install claude_code` — plus how to sign in / log in to Claude Code and which credential it uses, checked with `cremind tools coding-agents --probe`. Signing in is the `claude` CLI's own login, NOT Settings → LLM Providers (the Anthropic provider there is Cremind's own reasoning credential and Claude Code never reads it): Settings → Tools & Skills → Coding Agents → Claude Code → Sign in runs `claude auth login` in a built-in terminal, or run `cremind tools coding-agents login claude_code` on the server host; sign out with Sign out or `cremind tools coding-agents logout claude_code`. The login is per profile, in that profile's own CLI home (CLAUDE_CONFIG_DIR under the Cremind System Directory), and a profile that never signs in inherits the server's shared login; the credential order is the CLAUDE_CODE_API_KEY tool variable, then ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN in the server environment, then this profile's login, then the shared one (sources tool_variable_api_key, env_anthropic_api_key, env_oauth_token, profile_claude_login, host_claude_login). Adds that Claude Code is disabled by default, and how to write a new Cremind skill with Claude Code (delegating skill authoring to it against the skill-creator contract). Troubleshooting a blocked run: symptoms like Cannot write while in plan mode, approve/exit plan mode on your side, ExitPlanMode not available, or a coding task that only planned and made no changes mean CLAUDE_CODE_PERMISSION_MODE is a read-only or approval mode (plan, default, dontAsk) and the fix is `cremind tools set-var claude_code CLAUDE_CODE_PERMISSION_MODE=bypassPermissions`, not any UI toggle or `claude` CLI command; also covers a resumed session that returns no output (start a fresh task without session_id) and a resumed session_id that cannot be found after a sign-in, because transcripts live under the CLI home that ran them. Distinct from the general `cremind tools` CLI reference."
+description: "The Claude Code built-in tool and its permission mode: the permission modes (bypassPermissions, acceptEdits, default, plan, dontAsk, auto) come live from the installed Claude Agent SDK — the same modes the Claude Code CLI cycles through with Shift+Tab — so what each allows and how to change one, listed with cremind tools options claude_code. Plus how to choose the model from the account's live model list (cremind tools options claude_code, or the status sub-tool's models field) and its other Tool Variables (model, permission mode, max turns, max budget USD, Anthropic API key, long-lived OAuth token, CLI path, allowed/disallowed tools, max concurrent tasks). Also covers how to install Claude Code on this server without shell access — the claude_code feature / Claude Agent SDK wheel that bundles the CLI, one click from the Coding Agents section of Settings → Tools & Skills or `cremind features install claude_code` — plus how to sign in / log in to Claude Code and which credential it uses, checked with `cremind tools coding-agents --probe`. Signing in is the `claude` CLI's own login, NOT Settings → LLM Providers (the Anthropic provider there is Cremind's own reasoning credential and Claude Code never reads it): Settings → Tools & Skills → Coding Agents → Claude Code → Sign in runs the real `claude auth login` under a PTY in a built-in terminal (in a container Cremind strips DISPLAY from it so the CLI prints the URL instead of trying to open a browser on the VNC desktop), or run `cremind tools coding-agents login claude_code` on the server host; sign out with Sign out or `cremind tools coding-agents logout claude_code`. Signing in headless, on a server with no reachable browser: `claude auth login` has no headless flag, so run `claude setup-token` on any machine that has a browser and paste that long-lived token into the same Sign-in dialog, or set it as the CLAUDE_CODE_OAUTH_TOKEN tool variable. The login is per profile, in that profile's own CLI home (CLAUDE_CONFIG_DIR under the Cremind System Directory), and a profile that never signs in inherits the server's shared login; the credential order is the CLAUDE_CODE_OAUTH_TOKEN tool variable (the CLI prefers it over an API key when both are set), then the CLAUDE_CODE_API_KEY tool variable, then ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN in the server environment, then this profile's login, then the shared one (sources tool_variable_oauth_token, tool_variable_api_key, env_anthropic_api_key, env_oauth_token, profile_claude_login, host_claude_login). Adds that Claude Code is disabled by default, and how to write a new Cremind skill with Claude Code (delegating skill authoring to it against the skill-creator contract). Troubleshooting a blocked run: symptoms like Cannot write while in plan mode, approve/exit plan mode on your side, ExitPlanMode not available, or a coding task that only planned and made no changes mean CLAUDE_CODE_PERMISSION_MODE is a read-only or approval mode (plan, default, dontAsk) and the fix is `cremind tools set-var claude_code CLAUDE_CODE_PERMISSION_MODE=bypassPermissions`, not any UI toggle or `claude` CLI command; also covers a resumed session that returns no output (start a fresh task without session_id) and a resumed session_id that cannot be found after a sign-in, because transcripts live under the CLI home that ran them. Distinct from the general `cremind tools` CLI reference."
 ---
 
 # Claude Code Tool
@@ -64,34 +64,48 @@ sub-tool returns as `credential_source`):
 
 | Order | `credential_source` | Where it comes from |
 |-------|---------------------|---------------------|
-| 1 | `tool_variable_api_key` | The `CLAUDE_CODE_API_KEY` Tool Variable below (this profile's). |
-| 2 | `env_anthropic_api_key` | `ANTHROPIC_API_KEY` in the **server's** environment (shared by every profile). |
-| 3 | `env_oauth_token` | `CLAUDE_CODE_OAUTH_TOKEN` in the server's environment. |
-| 4 | `profile_claude_login` | This profile's **own** `claude auth login` (`credential_scope: profile`). |
-| 5 | `host_claude_login` | The server's **shared** login, inherited by any profile without one (`credential_scope: shared`). |
+| 1 | `tool_variable_oauth_token` | The `CLAUDE_CODE_OAUTH_TOKEN` Tool Variable below (this profile's) — a long-lived token from `claude setup-token`. |
+| 2 | `tool_variable_api_key` | The `CLAUDE_CODE_API_KEY` Tool Variable below (this profile's). |
+| 3 | `env_anthropic_api_key` | `ANTHROPIC_API_KEY` in the **server's** environment (shared by every profile). |
+| 4 | `env_oauth_token` | `CLAUDE_CODE_OAUTH_TOKEN` in the server's environment. |
+| 5 | `profile_claude_login` | This profile's **own** `claude auth login` (`credential_scope: profile`). |
+| 6 | `host_claude_login` | The server's **shared** login, inherited by any profile without one (`credential_scope: shared`). |
 | — | `none` | Nothing is visible — sign in, or set a key. |
 
 A key beats a login on purpose: setting `CLAUDE_CODE_API_KEY` is a deliberate
-statement about which account pays for coding work.
+statement about which account pays for coding work. The pasted long-lived token
+beats the key for a different reason — the `claude` CLI itself prefers
+`CLAUDE_CODE_OAUTH_TOKEN` over `ANTHROPIC_API_KEY` when both are set, so
+Cremind reports the one the run will actually use.
 
 ### Signing in
 
-The login belongs to the CLI, so Cremind runs the CLI for you. Three doors, all
+The login belongs to the CLI, so Cremind runs the CLI for you. Four doors, all
 equivalent:
 
 - **UI (no shell access needed)** — **Settings → Tools & Skills → Coding Agents
-  → Claude Code → Sign in**. Cremind opens a built-in terminal already running
-  `claude auth login` against this profile's own CLI home; answer its prompts
-  (it prints a URL and reads back the pasted code, so a server with no browser
-  is fine). **Check sign-in** re-runs the live probe, and **Sign out** reverses
-  it.
+  → Claude Code → Sign in**. Cremind opens a built-in terminal running the real
+  `claude auth login` under a PTY, against this profile's own CLI home, and you
+  answer its prompts there. In a container Cremind removes `DISPLAY` from that
+  terminal's environment, so the CLI cannot try to open a browser on the VNC
+  desktop and prints the URL for you to open elsewhere instead. **Check
+  sign-in** re-runs the live probe, and **Sign out** reverses it.
+- **A pasted long-lived token (no browser on the server at all)** — if the
+  terminal login still cannot get you in, run `claude setup-token` on any
+  machine that *does* have a browser (it needs a Claude subscription) and paste
+  the token it prints into the same Sign-in dialog, or set it as the
+  `CLAUDE_CODE_OAUTH_TOKEN` Tool Variable. `claude auth login` has no headless
+  flag, so on a server nothing can reach a browser from, this is the way in.
 - **A shell on the server** — `cremind tools coding-agents login claude_code`
   runs the same `claude auth login` in your terminal with the right home
-  already set. It refuses when `cremind` is pointed at a *remote* server,
-  because the credential would land on the wrong machine.
+  already set, and inside a container it drops `DISPLAY` exactly as the built-in
+  terminal does, so it prints the URL rather than opening a browser on the VNC
+  desktop. It refuses when `cremind` is pointed at a *remote* server, because
+  the credential would land on the wrong machine.
 - **Sign out from anywhere** — `cremind tools coding-agents logout claude_code`
   (no binary needed locally; the server runs `claude auth logout` and removes
-  the credential file).
+  the credential file). A pasted token is not a login, so it is cleared by
+  emptying the Tool Variable, not by signing out.
 
 ### Where the login lives, and who inherits it
 
@@ -225,9 +239,11 @@ profile signs in with its own (see *Where the login lives*).
 **"No Claude Code credential is available for this profile."** Nothing in the
 tier list resolved. Sign in — Settings → Tools & Skills → Coding Agents →
 Claude Code → Sign in, or `cremind tools coding-agents login claude_code` on the
-server host — or set `CLAUDE_CODE_API_KEY` / `ANTHROPIC_API_KEY`. Pasting a key
-under Settings → LLM Providers → Anthropic does **not** help; that credential is
-Cremind's own reasoning model's, and this tool never reads it.
+server host — or, when no browser can reach the server, paste a
+`claude setup-token` token as `CLAUDE_CODE_OAUTH_TOKEN`, or set
+`CLAUDE_CODE_API_KEY` / `ANTHROPIC_API_KEY`. Pasting a key under Settings → LLM
+Providers → Anthropic does **not** help; that credential is Cremind's own
+reasoning model's, and this tool never reads it.
 
 ## Choosing a model
 
@@ -283,14 +299,15 @@ Every variable is optional; the table gives its exact name and default.
 | `CLAUDE_CODE_PERMISSION_MODE` | string (dynamic list) | `bypassPermissions` | See the permission modes above; list the live values with `cremind tools options claude_code`. |
 | `CLAUDE_CODE_MAX_TURNS` | number | `0` | Maximum agent turns per task. `0` = unlimited. |
 | `CLAUDE_CODE_MAX_BUDGET_USD` | number | `0` | Maximum API spend (USD) per task. `0` = unlimited. |
-| `CLAUDE_CODE_API_KEY` | string (secret) | `""` | Anthropic API key for Claude Code. Empty = fall back to `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` in the server environment, then this profile's own `claude auth login`, then the server's shared login. Never the profile's Anthropic LLM-provider credentials — see *Credentials*. |
+| `CLAUDE_CODE_API_KEY` | string (secret) | `""` | Anthropic API key for Claude Code. Empty = fall back to `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` in the server environment, then this profile's own `claude auth login`, then the server's shared login. A `CLAUDE_CODE_OAUTH_TOKEN` Tool Variable wins over this key. Never the profile's Anthropic LLM-provider credentials — see *Credentials*. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | string (secret) | `""` | Long-lived Claude Code token from running `claude setup-token` on a machine that has a browser (needs a Claude subscription), pasted here — the way to sign in on a server where no browser can be opened. Outranks every other tier, because the CLI prefers it over an API key. Empty = fall back to the tiers below it in *Credentials*. |
 | `CLAUDE_CODE_CLI_PATH` | string | `""` | Absolute path to an external Claude Code CLI binary. Empty = the SDK's bundled CLI. |
 | `CLAUDE_CODE_ALLOWED_TOOLS` | string | `""` | Comma-separated allowlist of Claude Code tools (e.g. `Read,Edit,Bash`). Empty = all standard tools. |
 | `CLAUDE_CODE_DISALLOWED_TOOLS` | string | `""` | Comma-separated denylist of Claude Code tools. Empty = none denied. |
 | `CLAUDE_CODE_MAX_CONCURRENT_TASKS` | number | `2` | Maximum Claude Code tasks running at once across all conversations. |
 
-`CLAUDE_CODE_API_KEY` is a secret: its value is masked everywhere it is read
-back (shown as set/not set, never the value).
+`CLAUDE_CODE_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are secrets: their values are
+masked everywhere they are read back (shown as set/not set, never the value).
 
 To view the live schema and the current per-profile values:
 

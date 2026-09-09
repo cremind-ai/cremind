@@ -28,7 +28,7 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Set
+from typing import Any, Deque, Dict, Iterable, List, Optional, Set
 from uuid import uuid4
 
 from starlette.requests import Request
@@ -65,6 +65,16 @@ _MAX_TERMINALS_PER_PROFILE = 10
 # was closed by a crash, or spawned but never attached). Lazy — checked on
 # every create/list, no background timer.
 _DETACHED_REAP_SECONDS = 24 * 3600
+# How long a terminal stays readable after its process has died. An exited
+# terminal has to outlive its own death, because the client that wants to read
+# it may not have attached yet: ``create_terminal`` starts the pump before the
+# 201 is even written, and the browser opens the WebSocket a round trip later.
+# A login binary that dies immediately (a bad path, an unwritable
+# CLAUDE_CONFIG_DIR, a wrong-arch binary on the K8s venv PVC) would otherwise be
+# gone from the registry before the socket arrived, and the user would get a
+# blank box and a toast instead of the command's own error text - which, when
+# the thing that exited was a sign-in command, *is* the answer they came for.
+_EXITED_LINGER_SECONDS = 60
 
 
 @dataclass
@@ -85,6 +95,9 @@ class TerminalInfo:
     # Monotonic timestamp of when subscribers last dropped to zero; None while
     # at least one WS is attached. Drives the detached-reap sweep.
     detached_since: Optional[float] = None
+    # Monotonic timestamp of when the process was reaped, set by the pump's
+    # finally. Drives the linger window a late client reads the scrollback in.
+    exited_at: Optional[float] = None
 
 
 # Private registry — never the exec_shell ``_process_registry``.
@@ -202,7 +215,18 @@ async def _pump_output(info: TerminalInfo) -> None:
             info.process.close_master()
         except Exception:  # noqa: BLE001
             pass
-        _terminal_registry.pop(info.terminal_id, None)
+        info.exited_at = time.monotonic()
+        # Only forget the terminal when someone was actually watching it: the
+        # ``__closed`` above has already told every attached client the exit
+        # code, so the entry has done its job. With nobody attached that
+        # broadcast went nowhere, and popping now is what turns a login binary
+        # that died in the first millisecond into a 1008 on the WebSocket the
+        # browser is still opening. Leaving it for ``_reap_stale`` costs one
+        # dead entry for a minute and buys the user the error text.
+        async with info.lock:
+            watched = bool(info.subscribers)
+        if watched:
+            _terminal_registry.pop(info.terminal_id, None)
 
 
 async def _terminate(info: TerminalInfo) -> None:
@@ -222,9 +246,27 @@ async def _terminate(info: TerminalInfo) -> None:
 
 
 def _reap_stale() -> None:
-    """Schedule termination of terminals detached longer than the reap window."""
+    """Collect the two kinds of terminal nobody is coming back for.
+
+    A live one detached longer than the reap window is *terminated*, and the
+    pump's finally does the rest of the cleanup once the process dies.
+
+    An already-exited one past its linger window is simply *popped*. Termination
+    is the wrong verb for a corpse and would in fact leave it here forever:
+    ``_terminate`` on a dead process raises into its own ``except`` and never
+    removes the entry, so the one case this sweep was added for - a terminal the
+    pump deliberately left behind for a client that never attached - would be
+    the one case it could not clean up.
+    """
     now = time.monotonic()
     for info in list(_terminal_registry.values()):
+        if (
+            info.exit_code is not None
+            and info.exited_at is not None
+            and (now - info.exited_at) > _EXITED_LINGER_SECONDS
+        ):
+            _terminal_registry.pop(info.terminal_id, None)
+            continue
         if (
             info.detached_since is not None
             and (now - info.detached_since) > _DETACHED_REAP_SECONDS
@@ -263,6 +305,7 @@ async def create_terminal(
     extra_env: Dict[str, str],
     argv: Optional[List[str]] = None,
     title: Optional[str] = None,
+    drop_env: Optional[Iterable[str]] = None,
 ) -> TerminalInfo:
     """Spawn a PTY session, register it, and start pumping its output.
 
@@ -281,6 +324,14 @@ async def create_terminal(
     it runs, and burning a number on it would make the user's next shell jump
     from "Terminal 1" to "Terminal 3".
 
+    ``drop_env`` names variables to take *out* of the inherited environment
+    (applied before ``extra_env``, which therefore still wins). It is a separate
+    parameter because an overlay cannot express absence: the sign-in route uses
+    it to remove ``DISPLAY`` inside a container, and no value of ``DISPLAY``
+    means "there is no display". It is honoured on the ``argv`` path only - a
+    bare shell is the user's own terminal and is meant to inherit their
+    environment whole, desktop included.
+
     Raises :class:`TerminalLimitReached` when the profile is at the cap; a
     spawn failure propagates (already logged) for the caller to render.
     """
@@ -293,7 +344,15 @@ async def create_terminal(
 
     _reap_stale()
 
-    live = [i for i in _terminal_registry.values() if i.profile == profile]
+    # Only *live* terminals count against the cap. An exited one lingering for
+    # its readable window holds no process and no fd, so letting a corpse
+    # occupy a slot would let a handful of failed sign-ins answer the next
+    # sign-in with a 409 - a cap message in place of the error the user was
+    # trying to read.
+    live = [
+        i for i in _terminal_registry.values()
+        if i.profile == profile and i.exit_code is None
+    ]
     if len(live) >= _MAX_TERMINALS_PER_PROFILE:
         raise TerminalLimitReached(
             f"Too many open terminals (max {_MAX_TERMINALS_PER_PROFILE})."
@@ -303,6 +362,7 @@ async def create_terminal(
         if argv:
             proc = await spawn_argv_pty(
                 list(argv), cwd, cols=cols, rows=rows, extra_env=extra_env,
+                drop_env=drop_env,
             )
             shell = os.path.basename(argv[0])
         else:
@@ -381,6 +441,12 @@ def get_terminal_routes() -> list:
             return unauth
         profile = _profile_from_request(request)
         _reap_stale()
+        # A lingering exited terminal is deliberately left OUT of the listing.
+        # This is the UI's list of shell tabs to restore, and every row it
+        # returns is labelled "running" - a dead sign-in terminal offered as a
+        # live shell would be a lie, and reopening it gives the user a tab that
+        # accepts no input. The one client that has business reading a corpse
+        # already holds its id from the 201, and the WebSocket serves it there.
         terminals = [
             {
                 "terminal_id": i.terminal_id,
@@ -406,6 +472,14 @@ def get_terminal_routes() -> list:
             return JSONResponse({"error": "Terminal not found"}, status_code=404)
         if profile and info.profile and info.profile != profile:
             return JSONResponse({"error": "Forbidden"}, status_code=403)
+        if info.exit_code is not None:
+            # Already dead and only lingering to be read. Close means the user
+            # is done reading - the sign-in dialog calls this on dismiss - so
+            # this is the one place that can retire it early instead of leaving
+            # it for the linger window to expire. Still ``ok``: nothing failed,
+            # and a 404 on the second click of one button reads as a bug.
+            _terminal_registry.pop(tid, None)
+            return JSONResponse({"ok": True})
         await _terminate(info)
         return JSONResponse({"ok": True})
 
@@ -428,6 +502,12 @@ def get_terminal_routes() -> list:
 
         profile = payload.get("profile") or payload.get("sub") or ""
 
+        # Swept before the lookup, not after: an entry the pump left behind for
+        # a client that never came must not be served once its readable window
+        # has passed, and this handler is the only path a lingering corpse is
+        # reachable through.
+        _reap_stale()
+
         info = _terminal_registry.get(tid)
         if info is None:
             logger.info(f"terminal ws rejected: unknown terminal id {tid!r}")
@@ -449,6 +529,29 @@ def get_terminal_routes() -> list:
                 "type": "snapshot",
                 "chunks": [{"type": "stdout", "data": chunk} for chunk in snapshot],
             })
+
+            # Anything the pump fanned out between ``_subscribe`` and here is
+            # sitting in this subscriber's queue and is NOT in the snapshot
+            # above: the snapshot and the pump's ring-append are atomic under
+            # ``info.lock``, so a chunk written after the snapshot exists only
+            # in the queue. Forward those before deciding whether the terminal
+            # is finished, or a command that died during the handshake loses
+            # the very output it died printing - which, for a sign-in, is the
+            # answer the user was waiting for.
+            overflowed = False
+            while True:
+                try:
+                    pending = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                ptype = pending.get("type")
+                if ptype in ("stdout", "stderr"):
+                    await websocket.send_json(pending)
+                elif ptype == "overflow":
+                    overflowed = True
+                # A queued ``status`` is superseded by the authoritative one
+                # sent below, and ``__closed`` is answered by the exit branch.
+
             await websocket.send_json({
                 "type": "status",
                 "data": {
@@ -460,6 +563,29 @@ def get_terminal_routes() -> list:
                     "exit_code": info.exit_code,
                 },
             })
+
+            if overflowed:
+                # The ring dropped chunks while this client was mid-handshake,
+                # so the scrollback it just received has a hole in it. Same
+                # verdict as the streaming path: say so and close 1011 rather
+                # than let it read as a faithful transcript.
+                await websocket.send_json({"type": "overflow"})
+                await websocket.close(code=1011)
+                return
+
+            if info.exit_code is not None:
+                # The pump has already finished, so nothing will ever put
+                # ``__closed`` on this queue - entering ``pump_to_client``
+                # would park the socket open until the browser gave up. The
+                # scrollback and the exit code have just been sent, which is
+                # everything this terminal will ever say, so say goodbye
+                # properly (1000, not the 1008 that used to greet a login
+                # binary that died before the socket arrived) and retire the
+                # entry rather than leaving it for the linger window: it has
+                # now been read by the one client that was waiting for it.
+                await websocket.close(code=1000)
+                _terminal_registry.pop(info.terminal_id, None)
+                return
 
             async def pump_to_client() -> None:
                 while True:

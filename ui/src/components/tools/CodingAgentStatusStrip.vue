@@ -47,6 +47,10 @@ const emit = defineEmits<{
  */
 const CREDENTIAL_LABELS: Record<string, string> = {
   tool_variable_api_key: 'API key (tool variable)',
+  // A subscription token pasted in from a machine that has a browser — the way
+  // a headless server gets signed in at all, so it must not read as the raw
+  // label when it is the credential actually in use.
+  tool_variable_oauth_token: 'Subscription token (tool variable)',
   profile_claude_login: 'Signed in (this profile)',
   profile_codex_login: 'Signed in (this profile)',
   host_claude_login: 'Signed in (shared server login)',

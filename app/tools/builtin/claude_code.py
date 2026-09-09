@@ -110,9 +110,24 @@ TOOL_CONFIG: ToolConfig = {
                 "Anthropic API key for Claude Code. Empty = fall back to the server "
                 "environment (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN), then the "
                 "CLI's own login - this profile's `claude auth login`, else the "
-                "server's shared one. Independent of Settings -> LLM Providers: the "
+                "server's shared one. A CLAUDE_CODE_OAUTH_TOKEN set below wins over "
+                "this key, because that is which of the two the CLI itself uses. "
+                "Independent of Settings -> LLM Providers: the "
                 "Anthropic provider configured there is Cremind's own reasoning "
                 "credential and is never used for coding tasks."
+            ),
+            "type": "string",
+            "secret": True,
+            "default": "",
+        },
+        Var.OAUTH_TOKEN: {
+            "description": (
+                "Long-lived Claude Code authentication token, from running `claude "
+                "setup-token` on any machine that has a browser (it needs a Claude "
+                "subscription) and pasting the result here. This is how you sign in "
+                "on a server where no browser can be opened - `claude auth login` "
+                "has no headless mode. The CLI prefers this token over an API key "
+                "when both are set. Empty = fall back to the tiers below."
             ),
             "type": "string",
             "secret": True,
@@ -479,8 +494,9 @@ class ClaudeCodeStatusTool(BuiltInTool):
         "Report whether Claude Code is ready to use, and list the Claude models "
         "available to the resolved account, WITHOUT starting a coding task. Shows "
         "whether the SDK is installed, which credential source is configured "
-        "(the CLAUDE_CODE_API_KEY tool variable, the server environment, or the "
-        "`claude` CLI's own login: this profile's, or the server's shared one), "
+        "(the CLAUDE_CODE_OAUTH_TOKEN or CLAUDE_CODE_API_KEY tool variable, the "
+        "server environment, or the `claude` CLI's own login: this profile's, or "
+        "the server's shared one), "
         "which CLI home that login lives in, and the account's available `models`. "
         "Use it to answer 'is Claude Code set up?' AND 'which models can Claude "
         "Code use?'. For the full list plus how to change the model, run "
@@ -553,8 +569,9 @@ class ClaudeCodeStatusTool(BuiltInTool):
         else:
             payload["message"] = (
                 "Claude Code is installed, but no credential is visible to Cremind: "
-                f"the CLI home {info['cli_home']} holds no login, and there is no "
-                "CLAUDE_CODE_API_KEY tool variable and no key in the server "
+                f"the CLI home {info['cli_home']} holds no login, there is no "
+                "CLAUDE_CODE_OAUTH_TOKEN and no CLAUDE_CODE_API_KEY tool variable, "
+                "and no key in the server "
                 "environment. Pass probe=true to check for certain (on macOS the "
                 "login lives in the Keychain, where Cremind cannot see it). "
                 + runner._SIGN_IN_REMEDIATION

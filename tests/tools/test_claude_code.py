@@ -914,6 +914,51 @@ def test_status_with_tool_variable_key(monkeypatch, _clean_registry):
     assert sc["cli_home"] == str(_clean_registry.shared)
 
 
+def test_status_with_a_pasted_setup_token(monkeypatch, _clean_registry):
+    """A `claude setup-token` token pasted into the tool variable is a credential.
+
+    It is the only door left on a server no browser can reach, so "is Claude
+    Code set up?" has to say yes for it - and has to name it, not the API key
+    beside it: the CLI prefers the token when both are exported, so naming the
+    key would describe a credential the run will not use.
+    """
+    _no_sdk_stream(monkeypatch)
+    res = asyncio.run(_status_tool(
+        _profile="default",
+        _variables={
+            "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-pasted",
+            "CLAUDE_CODE_API_KEY": "sk-test",
+        },
+    ))
+    sc = res.structured_content
+    assert sc["credentials_configured"] is True
+    assert sc["credential_source"] == "tool_variable_oauth_token"
+    # A token, like a key, has no login scope to sign out of.
+    assert sc["credential_scope"] is None
+    assert sc["cli_home"] == str(_clean_registry.shared)
+
+
+def test_every_variable_has_a_default_and_the_secrets_are_marked():
+    """The schema and the runner's defaults are one thing seen from two sides.
+
+    A variable declared in ``TOOL_CONFIG`` but missing from ``VAR_DEFAULTS`` is
+    absent from every merged variable dict, so the feature it configures reads
+    as unset until someone sets it by hand. And a credential variable without
+    ``secret`` is rendered - and read back - in the clear.
+    """
+    from app.tools.builtin.claude_code import TOOL_CONFIG
+    from app.tools.builtin.claude_code_runner import VAR_DEFAULTS
+
+    declared = TOOL_CONFIG["required_config"]
+    assert set(declared) == set(VAR_DEFAULTS)
+    for name in ("CLAUDE_CODE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+        assert declared[name]["secret"] is True
+        assert declared[name]["default"] == ""
+    # The token's description is where a user finds the browser-free door, so
+    # it must name the command that produces one.
+    assert "setup-token" in declared["CLAUDE_CODE_OAUTH_TOKEN"]["description"]
+
+
 def test_status_probe_authenticated(monkeypatch):
     """The probe reports the CLI's own answer, account and all."""
     _no_sdk_stream(monkeypatch)

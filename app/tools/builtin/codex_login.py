@@ -55,6 +55,19 @@ _START_TIMEOUT = 30.0
 # child process holding a code the user can no longer use.
 _LOGIN_TIMEOUT = 900.0
 
+# Telling the app-server to abandon an attempt is a JSON-RPC round trip whose
+# reply is awaited on an unbounded queue read inside a worker thread, so a child
+# that is wedged or dead-without-answering never answers at all - and this await
+# sits on the HTTP request path twice in :func:`start` (a second sign-in
+# cancelling the first, and the start timeout). The attempt dies with the task
+# and the ``AsyncCodex`` context regardless, so waiting forever to be TOLD it
+# was cancelled buys nothing and costs the sign-in the user is asking for.
+# Timing out here does not stop the worker thread - ``asyncio.wait_for`` can
+# only abandon the ``to_thread`` wrapper - so the cost of the bound is one
+# leaked thread parked on a reply that is never coming, which is cheaper than a
+# request that never returns.
+_CANCEL_TIMEOUT = 10.0
+
 # How long a finished session stays readable. The UI polls every few seconds
 # and needs to see the terminal status once; 10 minutes is far past that and
 # still short enough that a browser tab left open overnight cannot resurrect a
@@ -302,7 +315,16 @@ async def _cancel_handle(session: CodexLoginSession) -> None:
     if handle is None:
         return
     try:
-        await handle.cancel()
+        await asyncio.wait_for(handle.cancel(), timeout=_CANCEL_TIMEOUT)
+    except asyncio.TimeoutError:
+        # A silent app-server is the same non-answer as a failed one, and both
+        # are swallowed for the same reason: the caller is either starting a new
+        # sign-in or tearing this one down, and neither can be held hostage by a
+        # child process that has stopped replying.
+        logger.debug(
+            "codex-login: the app-server did not acknowledge the cancel within "
+            f"{int(_CANCEL_TIMEOUT)}s; abandoning it"
+        )
     except Exception:  # noqa: BLE001
         logger.debug("codex-login: cancelling the login handle failed", exc_info=True)
 

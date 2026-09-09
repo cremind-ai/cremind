@@ -22,7 +22,7 @@ import platform
 import queue
 import re
 import threading
-from typing import Optional
+from typing import Iterable, Optional
 
 from app.tools.builtin.exec_shell_rtk import maybe_rewrite_command
 from app.utils.logger import logger
@@ -356,10 +356,37 @@ class _WindowsPtyProcess(PtyProcess):
 # Spawn helpers
 # ---------------------------------------------------------------------------
 
+def _apply_env_overrides(
+    env: dict[str, str],
+    drop_env: Optional[Iterable[str]],
+    extra_env: Optional[dict[str, str]],
+) -> None:
+    """Remove ``drop_env`` from ``env`` in place, then overlay ``extra_env``.
+
+    ``drop_env`` exists because an overlay cannot express absence. The Coding
+    Agents sign-in terminal has to run ``claude auth login`` with *no*
+    ``DISPLAY``: in a container the display belongs to the VNC desktop the
+    entrypoint exported, and a CLI that can see one opens a browser there
+    instead of printing the paste-a-code URL into the terminal the user is
+    actually looking at. No value of ``DISPLAY`` says "there is no display", so
+    the variable has to leave the environment entirely.
+
+    ``extra_env`` is applied last so a caller that deliberately sets one of the
+    dropped names still wins over its own drop list, rather than the two
+    silently cancelling in whichever order they happen to be written.
+    """
+    if drop_env:
+        for name in drop_env:
+            env.pop(name, None)
+    if extra_env:
+        env.update(extra_env)
+
+
 async def _spawn_unix_pty(
     command: str, working_dir: str, cols: int, rows: int, system: str,
     extra_env: Optional[dict[str, str]] = None,
     argv: Optional[list[str]] = None,
+    drop_env: Optional[Iterable[str]] = None,
 ) -> PtyProcess:
     import fcntl
     import pty
@@ -383,8 +410,7 @@ async def _spawn_unix_pty(
         env["LINES"] = str(rows)
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
-        if extra_env:
-            env.update(extra_env)
+        _apply_env_overrides(env, drop_env, extra_env)
 
         proc = await asyncio.create_subprocess_exec(
             *spawn_argv,
@@ -408,6 +434,7 @@ async def _spawn_windows_pty(
     command: str, working_dir: str, cols: int, rows: int, system: str,
     extra_env: Optional[dict[str, str]] = None,
     argv: Optional[list[str]] = None,
+    drop_env: Optional[Iterable[str]] = None,
 ) -> PtyProcess:
     try:
         import winpty  # type: ignore  # PyPI package: `pywinpty`; import name: `winpty`
@@ -425,8 +452,7 @@ async def _spawn_windows_pty(
     env["LINES"] = str(rows)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
-    if extra_env:
-        env.update(extra_env)
+    _apply_env_overrides(env, drop_env, extra_env)
     # ``argv`` overrides the default ``[shell, *flags, command]`` so callers can
     # launch a bare interactive shell (no ``-Command``). Default path unchanged.
     spawn_argv = argv if argv is not None else [shell, *flags, command]
@@ -499,6 +525,7 @@ async def spawn_argv_pty(
     argv: list[str], working_dir: str, cols: int = 80, rows: int = 24,
     system: Optional[str] = None,
     extra_env: Optional[dict[str, str]] = None,
+    drop_env: Optional[Iterable[str]] = None,
 ) -> PtyProcess:
     """Spawn an explicit argv under a PTY, with no shell in between.
 
@@ -513,6 +540,12 @@ async def spawn_argv_pty(
     quoting of the path, and closing the terminal kills the login rather than a
     shell that outlives it.
 
+    ``drop_env`` names variables the child must not merely see a different value
+    for but must not see at all, which is why it cannot be folded into
+    ``extra_env``: the sign-in caller uses it to take ``DISPLAY`` away inside a
+    container, so the login CLI prints its URL here instead of opening a browser
+    on a VNC desktop nobody is watching.
+
     No RTK rewrite and no classifier, so like the bare-shell spawner the caller
     streams I/O straight to the UI. Returns the process only; the caller knows
     what it launched (``os.path.basename(argv[0])`` is the display name).
@@ -523,10 +556,12 @@ async def spawn_argv_pty(
     spawn_argv = list(argv)
     if system == "Windows":
         return await _spawn_windows_pty(
-            "", working_dir, cols, rows, system, extra_env=extra_env, argv=spawn_argv,
+            "", working_dir, cols, rows, system, extra_env=extra_env,
+            argv=spawn_argv, drop_env=drop_env,
         )
     return await _spawn_unix_pty(
-        "", working_dir, cols, rows, system, extra_env=extra_env, argv=spawn_argv,
+        "", working_dir, cols, rows, system, extra_env=extra_env,
+        argv=spawn_argv, drop_env=drop_env,
     )
 
 

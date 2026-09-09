@@ -378,7 +378,22 @@ class BuiltInToolAdapter:
                 if metadata and "variables" in metadata:
                     tool_args["_variables"] = metadata["variables"]
 
-                logger.info(f"Built-in adapter executing tool '{tool_name}' with args: {tool_args}")
+                # Tool Variables are resolved WITH secrets - that is the whole
+                # point of handing them to the tool - so their values must never
+                # reach a sink. This line goes to logs/app.log and, through the
+                # unconditional DEBUG bus sink, to the Developer log stream in
+                # the browser, which would put API keys and pasted sign-in
+                # tokens in front of anyone who can read either. The names are
+                # what makes this line useful when a tool runs unconfigured; the
+                # values never were.
+                logged_args = dict(tool_args)
+                variables = logged_args.get("_variables")
+                if isinstance(variables, dict):
+                    logged_args["_variables"] = f"<{len(variables)} variable(s): " \
+                        f"{', '.join(sorted(variables))}>"
+                logger.info(
+                    f"Built-in adapter executing tool '{tool_name}' with args: {logged_args}"
+                )
 
                 tool = self._tools_by_name.get(tool_name)
                 if not tool:

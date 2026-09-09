@@ -55,6 +55,11 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from app.api._auth import is_admin
+# The MODULE, never ``is_container`` by name: the sign-in terminal's environment
+# turns on that answer, and app/config/coding_cli_homes.py reaches it the same
+# way so a test (or a caller that knows better) can patch one attribute and have
+# every reader of it agree.
+from app.config import runtime_env
 from app.runtime import BootedState
 from app.utils.logger import logger
 
@@ -571,6 +576,18 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
         env = dict(build_system_env(profile))
         env.update(_home_env(profile, scope))
 
+        # In a container the display belongs to the VNC desktop, not to the
+        # person who clicked Sign in in a browser tab: the desktop image's
+        # entrypoint exports DISPLAY=:0 to the server process, and a PTY child
+        # inherits it. These CLIs only print the paste-a-code URL when they
+        # cannot open a browser, so with a display in scope the login opens
+        # Chrome on a desktop nobody is watching and the terminal the user is
+        # looking at just sits there. Removing the variables is the only way to
+        # say it - an environment overlay cannot express absence. On a native
+        # install the browser opening is exactly what the user wants, so the
+        # list stays empty there.
+        drop_env = _login_drop_env() or None
+
         try:
             info = await create_terminal(
                 profile,
@@ -580,6 +597,7 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
                 extra_env=env,
                 argv=argv,
                 title=f"Sign in to {spec['display_name']}",
+                drop_env=drop_env,
             )
         except TerminalLimitReached as exc:
             return JSONResponse({"tool_id": tool_id, "error": str(exc)}, status_code=409)
@@ -700,6 +718,11 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
             "status_argv": list(runner.status_argv(binary)) if binary else [],
             "profile_env": _home_env(profile, "profile", tool_id=tool_id),
             "shared_env": _home_env(profile, "shared", tool_id=tool_id),
+            # Names to take OUT of the environment before running the login, so
+            # a shell sign-in on the server behaves like the one in the browser
+            # terminal. The server answers this because only it knows whether it
+            # is running in one of our images.
+            "drop_env": _login_drop_env(),
             "server_hostname": socket.gethostname(),
             "system_dir": str(BaseConfig.CREMIND_SYSTEM_DIR),
             "platform": sys.platform,
@@ -836,6 +859,29 @@ def _cli_home(tool_id: str, profile: str, scope: str) -> Path:
     return Path(
         homes.shared_codex_home() if scope == "shared" else homes.profile_codex_home(profile)
     )
+
+
+def _login_drop_env() -> list[str]:
+    """Variables an interactive CLI sign-in must NOT inherit, or ``[]``.
+
+    In a container the display belongs to the VNC desktop, not to the person
+    signing in: the desktop image's entrypoint exports ``DISPLAY=:0`` to the
+    server process and every child inherits it. These CLIs only print the
+    paste-a-code URL when they cannot open a browser, so with a display in scope
+    the login opens Chrome on a desktop nobody is watching while the terminal the
+    user is actually looking at sits there in silence - which is exactly how this
+    reads on Kubernetes. Removing the variables is the only way to say "there is
+    no browser here"; an environment overlay cannot express absence.
+
+    On a native install the browser opening is precisely what the user wants, so
+    the list is empty there.
+
+    Both sign-in doors ask this one function - the built-in terminal here, and
+    ``cremind tools coding-agents login`` through the ``/cli`` payload - because
+    a fix that only reached the door with a UI would leave the shell door broken
+    on the very hosts that need it most.
+    """
+    return ["DISPLAY", "WAYLAND_DISPLAY", "BROWSER"] if runtime_env.is_container() else []
 
 
 def _home_env(profile: str, scope: str, *, tool_id: str | None = None) -> dict[str, str]:

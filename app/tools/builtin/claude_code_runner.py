@@ -17,8 +17,9 @@ user-facing :class:`~app.agent.agent_activity.AgentActivity` feed.
 Credentials are the CLI's, not the profile's LLM settings. Claude Code
 authenticates the way the ``claude`` CLI does - from its own
 ``CLAUDE_CONFIG_DIR`` (see :mod:`app.config.coding_cli_homes`), the tool's own
-API-key variable, or the server environment. It deliberately does NOT read the
-profile's Anthropic provider credentials: a user who signs in to Claude Code
+API-key or pasted-``setup-token`` variable, or the server environment. It
+deliberately does NOT read the profile's Anthropic provider credentials: a user
+who signs in to Claude Code
 with their Claude subscription and separately configures an Anthropic API key
 for Cremind's own reasoning model expects those to stay separate, and the old
 chain silently billed coding tasks to the second one.
@@ -80,8 +81,11 @@ _DELEGATION_APPEND = (
 _SIGN_IN_REMEDIATION = (
     "Sign in: Settings -> Tools & Skills -> Coding Agents -> Claude Code -> Sign in "
     "(runs `claude auth login` in the built-in terminal), or "
-    "`cremind tools coding-agents login claude_code` on the server host; or set "
-    "CLAUDE_CODE_API_KEY / ANTHROPIC_API_KEY."
+    "`cremind tools coding-agents login claude_code` on the server host; with no "
+    "browser reachable from the server, run `claude setup-token` on any machine "
+    "that has one and paste the token into the same dialog (the "
+    "CLAUDE_CODE_OAUTH_TOKEN tool variable); or set CLAUDE_CODE_API_KEY / "
+    "ANTHROPIC_API_KEY."
 )
 
 
@@ -93,6 +97,7 @@ class Var:
     MAX_TURNS = "CLAUDE_CODE_MAX_TURNS"
     MAX_BUDGET_USD = "CLAUDE_CODE_MAX_BUDGET_USD"
     API_KEY = "CLAUDE_CODE_API_KEY"
+    OAUTH_TOKEN = "CLAUDE_CODE_OAUTH_TOKEN"
     CLI_PATH = "CLAUDE_CODE_CLI_PATH"
     ALLOWED_TOOLS = "CLAUDE_CODE_ALLOWED_TOOLS"
     DISALLOWED_TOOLS = "CLAUDE_CODE_DISALLOWED_TOOLS"
@@ -105,6 +110,7 @@ VAR_DEFAULTS: Dict[str, Any] = {
     Var.MAX_TURNS: 0,
     Var.MAX_BUDGET_USD: 0,
     Var.API_KEY: "",
+    Var.OAUTH_TOKEN: "",
     Var.CLI_PATH: "",
     Var.ALLOWED_TOOLS: "",
     Var.DISALLOWED_TOOLS: "",
@@ -203,10 +209,16 @@ def resolve_auth_env(variables: dict, profile: str) -> Dict[str, str]:
     only where the CLI looks for a login, it is also where it keeps this
     profile's session transcripts, so a run left to inherit the server
     operator's home would resume the wrong profile's sessions and write its own
-    into a directory another profile can read. The tool's own API-key variable
-    is layered on top when set; everything else (a key in the server
-    environment, an OAuth token, the login inside the resolved home) is already
-    visible to the CLI and needs no override from us.
+    into a directory another profile can read. The tool's own API-key and
+    long-lived-token variables are layered on top when set; everything else (a
+    key in the server environment, an OAuth token, the login inside the resolved
+    home) is already visible to the CLI and needs no override from us.
+
+    Both key variables may be exported together, and that is not a conflict to
+    resolve here: the CLI itself prefers ``CLAUDE_CODE_OAUTH_TOKEN`` over
+    ``ANTHROPIC_API_KEY`` (see the precedence note above
+    :data:`_CLI_KEY_AUTH_METHODS`), so blanking one of them would only take a
+    decision away from the binary that makes it.
 
     Never raises: a credential *failure* is reported later, from the SDK result
     or from :func:`auth_status`, where the user can be told what to do about it.
@@ -217,6 +229,9 @@ def resolve_auth_env(variables: dict, profile: str) -> Dict[str, str]:
     explicit = str((variables or {}).get(Var.API_KEY) or "").strip()
     if explicit:
         overrides["ANTHROPIC_API_KEY"] = explicit
+    token = str((variables or {}).get(Var.OAUTH_TOKEN) or "").strip()
+    if token:
+        overrides["CLAUDE_CODE_OAUTH_TOKEN"] = token
     return overrides
 
 
@@ -277,7 +292,11 @@ def _construct_options(sdk, kwargs: Dict[str, Any]):
 # login because an operator who sets CLAUDE_CODE_API_KEY is stating which account
 # should be billed for coding work; the CLI logins are what a user without a key
 # signs in with, per profile first and the server's shared login as the inherited
-# fallback.
+# fallback. The pasted `claude setup-token` token leads the whole list because
+# the CLI itself prefers it over an API key when both are exported (measured -
+# see the precedence note above :data:`_CLI_KEY_AUTH_METHODS`), and a tier
+# ranking that named the key while the binary ran on the token would describe a
+# credential no run uses.
 #
 # This is a statement of intent, not an observation of the binary, and it must
 # never be used to decide WHICH CREDENTIAL TO CHECK: an ANTHROPIC_API_KEY the
@@ -286,6 +305,7 @@ def _construct_options(sdk, kwargs: Dict[str, Any]):
 # the CLI instead (``authMethod``); this ranking answers the different, local
 # question "what can Cremind see, and what would it hand a run?".
 _KEY_CREDENTIAL_SOURCES = frozenset({
+    "tool_variable_oauth_token",
     "tool_variable_api_key",
     "env_anthropic_api_key",
     "env_oauth_token",
@@ -295,6 +315,8 @@ _LOGIN_CREDENTIAL_SOURCES = frozenset({"profile_claude_login", "host_claude_logi
 
 def _source_for_home(variables: dict, home) -> Optional[str]:
     """The credential tier Cremind ranks first, given an already-resolved home."""
+    if str((variables or {}).get(Var.OAUTH_TOKEN) or "").strip():
+        return "tool_variable_oauth_token"
     if str((variables or {}).get(Var.API_KEY) or "").strip():
         return "tool_variable_api_key"
     if os.environ.get("ANTHROPIC_API_KEY"):
@@ -437,6 +459,9 @@ def _headers_for_source(
     token lives in the macOS Keychain - which is a reason not to make the call at
     all, never a reason to fall back to a different credential.
     """
+    if source == "tool_variable_oauth_token":
+        token = str((variables or {}).get(Var.OAUTH_TOKEN) or "").strip()
+        return _oauth_headers(token) if token else {}
     if source == "tool_variable_api_key":
         key = str((variables or {}).get(Var.API_KEY) or "").strip()
         return _api_key_headers(key) if key else {}
@@ -471,7 +496,12 @@ def _build_models_headers(variables: dict, profile: str) -> Tuple[Dict[str, str]
     is the right question for the model dropdown and the WRONG one for the
     sign-in probe - only the CLI knows which credential a run would use.
     """
-    for source in ("tool_variable_api_key", "env_anthropic_api_key", "env_oauth_token"):
+    for source in (
+        "tool_variable_oauth_token",
+        "tool_variable_api_key",
+        "env_anthropic_api_key",
+        "env_oauth_token",
+    ):
         headers = _headers_for_source(variables, profile, source)
         if headers:
             return headers, source
@@ -906,6 +936,11 @@ async def auth_status(
             *status_argv(binary),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # Left unset, the child inherits the SERVER's stdin. A credential
+            # probe that stops to read a terminal nobody is typing into would
+            # burn the whole timeout and then be killed, and the user is told
+            # "could not tell" where an answer was available all along.
+            stdin=asyncio.subprocess.DEVNULL,
             env=env,
         )
     except FileNotFoundError as exc:
@@ -978,6 +1013,21 @@ async def auth_status(
 # and every actual run failing. So the credential's TIER, not the order the
 # checks happen to run in, decides which check is authoritative.
 #
+# The same binary also settles which of two present key credentials it uses, and
+# the answer is the TOKEN. Observed against the bundled CLI (2.1.207) with a
+# scratch ``CLAUDE_CONFIG_DIR``: ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN
+# both set prints ``{"loggedIn": true, "authMethod": "oauth_token",
+# "apiKeySource": "ANTHROPIC_API_KEY"}`` - it names the key it can see and then
+# authenticates with the token anyway - while either one alone prints that one's
+# own ``authMethod``. That is why the ``tool_variable_oauth_token`` tier is
+# ranked above ``tool_variable_api_key`` rather than below it: a user who pastes
+# a setup-token while a key is still configured must be told about the token,
+# because that is what the run will use. The pre-existing
+# ``env_anthropic_api_key``-before-``env_oauth_token`` order is left as it is -
+# it is a statement of billing intent like the rest of the ranking, and the
+# ``prefer_oauth_token`` branch of :func:`_visible_key_source` already corrects
+# it wherever an actual verdict is being formed.
+#
 # The tier itself comes from the CLI's own ``authMethod`` and NOT from
 # :func:`credential_source`. Cremind's ranking puts a key in the server
 # environment above the CLI's own login, which is a statement about billing
@@ -1032,10 +1082,20 @@ def _visible_key_source(variables: dict, *, prefer_oauth_token: bool = False) ->
 
     ``prefer_oauth_token`` is set when the CLI said ``oauth_token``: with both
     variables present the default ranking would hand back the API key, and the
-    probe would then judge a credential the CLI is not using.
+    probe would then judge a credential the CLI is not using. Within that branch
+    the tool variable comes before the environment for the same reason - when a
+    user has pasted a ``claude setup-token`` token, that is the token
+    :func:`resolve_auth_env` exported into the process the CLI just answered
+    for, so it is the one its ``oauth_token`` verdict is about.
     """
-    if prefer_oauth_token and os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
-        return "env_oauth_token"
+    if prefer_oauth_token:
+        pasted = str((variables or {}).get(Var.OAUTH_TOKEN) or "").strip()
+        if pasted:
+            return "tool_variable_oauth_token"
+        if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+            return "env_oauth_token"
+    if str((variables or {}).get(Var.OAUTH_TOKEN) or "").strip():
+        return "tool_variable_oauth_token"
     if str((variables or {}).get(Var.API_KEY) or "").strip():
         return "tool_variable_api_key"
     if os.environ.get("ANTHROPIC_API_KEY"):
@@ -1226,6 +1286,10 @@ async def logout(variables: dict, profile: str, *, scope: str = "profile") -> Di
                 *logout_argv(binary),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # As with the status probe: an inherited server stdin lets a
+                # confirmation prompt hold the command open until the timeout
+                # kills it, which reads to the user as a sign-out that failed.
+                stdin=asyncio.subprocess.DEVNULL,
                 env={**os.environ, "CLAUDE_CONFIG_DIR": str(target)},
             )
             await asyncio.wait_for(proc.communicate(), timeout=_LOGOUT_TIMEOUT)

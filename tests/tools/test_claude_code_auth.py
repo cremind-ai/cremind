@@ -2,11 +2,16 @@
 
 Three things are pinned here, and each one had a way of going wrong:
 
-* **Which credential wins, and whose it is.** The tiers are key-first (tool
-  variable, then the server environment), then the CLI's own login - this
-  profile's, and only then the server's shared one. Two profiles are used
-  throughout, because every bug this design exists to prevent (one profile
-  reading, or overwriting, another's login) is invisible with one.
+* **Which credential wins, and whose it is.** The tiers are key-first (the
+  pasted ``claude setup-token`` token, then the API-key tool variable, then the
+  server environment), then the CLI's own login - this profile's, and only then
+  the server's shared one. Two profiles are used throughout, because every bug
+  this design exists to prevent (one profile reading, or overwriting, another's
+  login) is invisible with one.
+* **The pasted token leads because the CLI itself prefers it.** With
+  ``ANTHROPIC_API_KEY`` and ``CLAUDE_CODE_OAUTH_TOKEN`` both exported the
+  bundled binary reports ``authMethod`` ``oauth_token``, so ranking the key
+  first would name a credential no run uses.
 * **``resolve_auth_env`` always states the home.** A run that inherits an
   unstated ``CLAUDE_CONFIG_DIR`` authenticates - and resumes sessions - out of
   whichever home the server process happened to have.
@@ -135,7 +140,13 @@ def _patch_exec(monkeypatch, *, proc=None, error=None, calls=None):
     """Replace the process spawn with a fake, optionally recording each call."""
     async def _spawn(*argv, **kwargs):
         if calls is not None:
-            calls.append({"argv": list(argv), "env": dict(kwargs.get("env") or {})})
+            calls.append({
+                "argv": list(argv),
+                "env": dict(kwargs.get("env") or {}),
+                # The whole kwargs, not just the env: how the child's stdio is
+                # wired is part of the contract (see the stdin tests below).
+                "kwargs": dict(kwargs),
+            })
         if error is not None:
             raise error
         return proc
@@ -172,6 +183,39 @@ def test_resolve_auth_env_layers_the_tool_api_key(homes):
     assert env["ANTHROPIC_API_KEY"] == "sk-tool"
     # ... and still names the home: the key authenticates, the home holds the
     # sessions, and dropping one for the other is what the old code did.
+    assert env["CLAUDE_CONFIG_DIR"] == str(homes.shared)
+
+
+def test_resolve_auth_env_exports_a_pasted_setup_token(homes):
+    """The browser-free door: a ``claude setup-token`` token pasted into Cremind.
+
+    ``claude auth login`` has no headless flag, so on a server nothing can reach
+    a browser from, this variable is the only way in - and it only works if it
+    actually reaches the child's environment under the name the CLI reads.
+    """
+    env = runner.resolve_auth_env({Var.OAUTH_TOKEN: " sk-ant-oat01-pasted "}, "alice")
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-pasted"
+    assert env["CLAUDE_CONFIG_DIR"] == str(homes.shared)
+
+    # Blank (the default) must not export the variable at all: an empty
+    # CLAUDE_CODE_OAUTH_TOKEN is a credential as far as the CLI is concerned,
+    # and it would shadow the login in the home we just pointed it at.
+    env = runner.resolve_auth_env({Var.OAUTH_TOKEN: "   "}, "alice")
+    assert env == {"CLAUDE_CONFIG_DIR": str(homes.shared)}
+
+
+def test_resolve_auth_env_exports_both_key_variables(homes):
+    """Both may be set, and neither is blanked out.
+
+    The CLI picks the token over the key when it sees both (measured against the
+    bundled binary), so removing one here would take that decision away from the
+    only component that can make it.
+    """
+    env = runner.resolve_auth_env(
+        {Var.API_KEY: "sk-tool", Var.OAUTH_TOKEN: "oat-pasted"}, "alice",
+    )
+    assert env["ANTHROPIC_API_KEY"] == "sk-tool"
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oat-pasted"
     assert env["CLAUDE_CONFIG_DIR"] == str(homes.shared)
 
 
@@ -246,6 +290,77 @@ def test_key_tiers_beat_a_cli_login(homes, monkeypatch):
     assert runner.credential_source({}, "alice") == "env_oauth_token"
 
 
+def test_a_pasted_token_outranks_every_other_tier(homes, monkeypatch):
+    """The token tier leads, and it leads because the BINARY makes it lead.
+
+    With ``ANTHROPIC_API_KEY`` and ``CLAUDE_CODE_OAUTH_TOKEN`` both exported the
+    bundled CLI answers ``authMethod: "oauth_token"``, and
+    :func:`resolve_auth_env` exports both whenever both are set. So a ranking
+    that put the API key first would print "API key" on the card while every run
+    authenticated with the token - the same class of lie as naming an unrelated
+    environment key over a profile's own login.
+    """
+    _sign_in(homes.system / "alice" / "coding-cli" / "claude", "alice-tok")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-env")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oat-env")
+
+    info = runner.credential_info(
+        {Var.API_KEY: "sk-tool", Var.OAUTH_TOKEN: "oat-pasted"}, "alice",
+    )
+    assert info["source"] == "tool_variable_oauth_token"
+    # Like the other key tiers: nothing to sign out of, nobody to attribute.
+    assert info["scope"] is None
+    assert info["account_hint"] is None
+    assert info["cli_home"] == str(homes.system / "alice" / "coding-cli" / "claude")
+
+    # Alone against each of the tiers it is supposed to beat, one at a time.
+    assert runner.credential_source({Var.OAUTH_TOKEN: "oat"}, "alice") == (
+        "tool_variable_oauth_token"
+    )
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+    assert runner.credential_source({Var.OAUTH_TOKEN: "oat"}, "alice") == (
+        "tool_variable_oauth_token"
+    )
+    # ... and a blank one is not a credential, so the login below it wins.
+    assert runner.credential_source({Var.OAUTH_TOKEN: "  "}, "alice") == (
+        "profile_claude_login"
+    )
+
+
+def test_headers_for_a_pasted_token_are_oauth_headers(homes):
+    """A tier asked for BY NAME must produce that tier's own secret, or nothing.
+
+    ``{}`` for a blank variable is the load-bearing half: it tells
+    :func:`probe_auth` there is nothing to validate, where returning some other
+    tier's headers would answer a question nobody asked.
+    """
+    headers = runner._headers_for_source(
+        {Var.OAUTH_TOKEN: " oat-pasted "}, "alice", "tool_variable_oauth_token",
+    )
+    assert headers == {
+        "Authorization": "Bearer oat-pasted",
+        "anthropic-version": runner._ANTHROPIC_VERSION,
+        "anthropic-beta": runner._OAUTH_BETA,
+    }
+    assert "x-api-key" not in headers
+
+    assert runner._headers_for_source({}, "alice", "tool_variable_oauth_token") == {}
+    assert runner._headers_for_source(
+        {Var.OAUTH_TOKEN: "   "}, "alice", "tool_variable_oauth_token",
+    ) == {}
+
+
+def test_models_headers_use_the_credential_a_run_would(homes):
+    """The model dropdown has to be the same account the coding task runs as."""
+    headers, source = runner._build_models_headers(
+        {Var.API_KEY: "sk-tool", Var.OAUTH_TOKEN: "oat-pasted"}, "alice",
+    )
+    assert source == "tool_variable_oauth_token"
+    assert headers["Authorization"] == "Bearer oat-pasted"
+    assert "x-api-key" not in headers
+
+
 # -- auth_status --------------------------------------------------------------
 
 
@@ -274,6 +389,21 @@ def test_auth_status_can_be_pointed_at_one_home(monkeypatch, homes):
 
     asyncio.run(runner.auth_status(CLI_VARS, "alice", config_dir=target))
     assert calls[0]["env"]["CLAUDE_CONFIG_DIR"] == str(target)
+
+
+def test_auth_status_never_waits_on_the_servers_stdin(monkeypatch, homes):
+    """The probe must not be able to sit there reading the server's terminal.
+
+    ``stdin`` left unspecified is inherited from the Cremind process. A CLI that
+    decides to ask something would then block on a terminal nobody is typing
+    into, burn the whole 15s timeout and be killed - and the user is told
+    "could not tell" instead of getting the answer that was there all along.
+    """
+    calls = []
+    _patch_exec(monkeypatch, proc=_json_proc(REAL_STATUS_JSON), calls=calls)
+
+    asyncio.run(runner.auth_status(CLI_VARS, "alice"))
+    assert calls[0]["kwargs"]["stdin"] == asyncio.subprocess.DEVNULL
 
 
 def test_auth_status_reports_a_signed_out_cli(monkeypatch):
@@ -578,6 +708,54 @@ def test_probe_validates_the_credential_the_cli_names(monkeypatch, homes):
     assert "x-api-key" not in calls[0]
 
 
+def test_probe_prefers_the_pasted_token_over_the_environments(monkeypatch, homes):
+    """``oauth_token`` can name two different tokens; only one was handed over.
+
+    Cremind exports the pasted tool variable into the very process the CLI just
+    answered for, so when it says ``oauth_token`` that is the token it means -
+    even with a ``CLAUDE_CODE_OAUTH_TOKEN`` of the host's own in the
+    environment. Validating the host's instead would judge a credential this
+    profile's runs never touch.
+    """
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oat-host")
+    _patch_status(monkeypatch, logged_in=True, auth_method="oauth_token")
+    calls = []
+    _patch_fetch(monkeypatch, rows=[{"id": "m1"}], calls=calls)
+
+    out = asyncio.run(runner.probe_auth(
+        None, cwd="", variables={Var.OAUTH_TOKEN: "oat-pasted"}, profile="alice",
+    ))
+    assert out["credential_source"] == "tool_variable_oauth_token"
+    assert out["logged_in"] is True
+    assert out["credential_verified"] is True
+    assert calls[0]["Authorization"] == "Bearer oat-pasted"
+
+    # Without the tool variable the same branch still finds the host's token.
+    assert runner._visible_key_source({}, prefer_oauth_token=True) == "env_oauth_token"
+
+
+def test_probe_validates_the_token_not_the_key_when_both_are_pasted(monkeypatch, homes):
+    """The measured CLI precedence, end to end.
+
+    Both tool variables set, the CLI reports ``oauth_token`` (that is what it
+    really does with both exported), so the token is what gets checked and what
+    the payload speaks for.
+    """
+    _patch_status(monkeypatch, logged_in=True, auth_method="oauth_token")
+    calls = []
+    _patch_fetch(monkeypatch, error=_rejection(401), calls=calls)
+
+    out = asyncio.run(runner.probe_auth(
+        None, cwd="",
+        variables={Var.API_KEY: "sk-tool", Var.OAUTH_TOKEN: "oat-pasted"},
+        profile="alice",
+    ))
+    assert out["credential_source"] == "tool_variable_oauth_token"
+    assert out["logged_in"] is False
+    assert calls[0]["Authorization"] == "Bearer oat-pasted"
+    assert "x-api-key" not in calls[0]
+
+
 def test_probe_validates_against_the_base_url_the_cli_would_call(monkeypatch, homes):
     """A gateway install: ``ANTHROPIC_BASE_URL`` moves the endpoint.
 
@@ -771,6 +949,18 @@ def test_logout_shared_scope_targets_the_server_home(monkeypatch, homes):
     assert not credentials.exists()
     # The profile's own login is untouched by a shared sign-out.
     assert (homes.system / "alice" / "coding-cli" / "claude" / ".credentials.json").exists()
+
+
+def test_logout_never_waits_on_the_servers_stdin(monkeypatch, homes):
+    """Same hazard as the status probe, and a worse read: a sign-out held open
+    by a confirmation prompt on the server's terminal times out, and the user is
+    told the sign-out failed."""
+    _sign_in(homes.system / "alice" / "coding-cli" / "claude", "alice-tok")
+    calls = []
+    _patch_exec(monkeypatch, proc=_FakeProcess(), calls=calls)
+
+    asyncio.run(runner.logout(CLI_VARS, "alice", scope="profile"))
+    assert calls[0]["kwargs"]["stdin"] == asyncio.subprocess.DEVNULL
 
 
 def test_logout_removes_the_credential_even_when_the_cli_fails(monkeypatch, homes):

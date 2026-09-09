@@ -54,6 +54,25 @@ class FakeDeviceCodeHandle:
         self.cancelled = True
 
 
+class WedgedCancelHandle(FakeDeviceCodeHandle):
+    """A handle whose ``cancel()`` never answers, like a dead app-server.
+
+    The SDK's cancel is a JSON-RPC round trip whose reply is read off an
+    unbounded queue in a worker thread, so a child process that has stopped
+    answering never completes the await at all. This is the shape that used to
+    wedge the sign-in request itself, because the cancel is on the request path
+    whenever a second sign-in supersedes the first.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.cancel_entered = asyncio.Event()
+
+    async def cancel(self):
+        self.cancel_entered.set()
+        await asyncio.Event().wait()
+
+
 def _install_login_sdk(monkeypatch, *, handle=None, account_resp=None):
     """Install a fake ``openai_codex`` exposing the login/logout surface."""
 
@@ -254,6 +273,54 @@ def test_a_second_start_cancels_the_first(monkeypatch):
         assert first.cancelled is True
         assert two.status == "pending"
         assert login.get(one.login_id) is one  # still readable, so the UI can say why
+        await login.cancel(two.login_id)
+
+    asyncio.run(body())
+
+
+def test_a_cancel_the_app_server_never_answers_still_ends_the_session(monkeypatch):
+    """A silent app-server must not be able to hold the cancel open.
+
+    Driven through ``asyncio.wait_for`` so losing the bound fails the test in
+    seconds instead of hanging the suite.
+    """
+    handle = WedgedCancelHandle()
+    _install_login_sdk(monkeypatch, handle=handle)
+    monkeypatch.setattr(login, "_CANCEL_TIMEOUT", 0.05)
+
+    async def body():
+        session = await login.start("lee", {})
+        assert session.status == "pending"
+        assert await asyncio.wait_for(login.cancel(session.login_id), timeout=5) is True
+        assert handle.cancel_entered.is_set()  # the RPC was sent; only the reply is missing
+        assert session.status == "cancelled"
+        assert session.task.done()
+
+    asyncio.run(body())
+
+
+def test_a_wedged_cancel_does_not_block_the_next_sign_in(monkeypatch):
+    """The bug this bound exists for: ``start`` cancels the previous attempt
+    while the HTTP request waits, so an unanswerable cancel showed up as a
+    sign-in dialog stuck on "starting" with no way out."""
+    first = WedgedCancelHandle()
+    second = FakeDeviceCodeHandle()
+    handles = [first, second]
+    mod = _install_login_sdk(monkeypatch, handle=None)
+    monkeypatch.setattr(login, "_CANCEL_TIMEOUT", 0.05)
+
+    async def _next_handle(self):
+        return handles.pop(0)
+
+    mod.AsyncCodex.login_chatgpt_device_code = _next_handle
+
+    async def body():
+        one = await login.start("lee", {})
+        two = await asyncio.wait_for(login.start("lee", {}), timeout=5)
+        assert two.login_id != one.login_id
+        assert two.status == "pending"
+        assert two.user_code == "ABCD-EFGH"  # a live code for the NEW attempt
+        assert one.status == "cancelled"
         await login.cancel(two.login_id)
 
     asyncio.run(body())

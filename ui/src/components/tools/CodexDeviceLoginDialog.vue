@@ -40,6 +40,17 @@ const emit = defineEmits<{
  *  fast one would only hammer the server for the whole wait. */
 const POLL_MS = 3000;
 
+/**
+ * How long to wait for the start request itself.
+ *
+ * The route bounds its own work at thirty seconds, so this sits just above that
+ * on purpose: a real server-side timeout still answers first and reports its own
+ * reason, which is always better than ours. This deadline only catches the
+ * request that never answers at all — without it "Starting the sign-in…" stays
+ * on screen for the rest of the session.
+ */
+const START_TIMEOUT_MS = 45000;
+
 const settings = useSettingsStore();
 const { copy, isCopied } = useCopyToClipboard();
 
@@ -54,11 +65,19 @@ const account = ref<Record<string, unknown> | null>(null);
 const cancelling = ref(false);
 
 let poller: ReturnType<typeof setInterval> | null = null;
+let startTimer: ReturnType<typeof setTimeout> | null = null;
 
 function stopPolling() {
   if (poller !== null) {
     clearInterval(poller);
     poller = null;
+  }
+}
+
+function clearStartDeadline() {
+  if (startTimer !== null) {
+    clearTimeout(startTimer);
+    startTimer = null;
   }
 }
 
@@ -77,21 +96,60 @@ const accountLine = computed(() => {
   return parts.join(' · ');
 });
 
+/**
+ * Which sign-in attempt is the live one.
+ *
+ * Starting a sign-in spawns a `codex app-server` child that holds a device code
+ * for fifteen minutes, and the request can legitimately be in flight for tens of
+ * seconds, so two overlapping attempts are easy to produce: close and reopen, or
+ * unmount (which leaves `modelValue` true, because the page never lowers it).
+ * They would share `poller` and `startTimer` — and since `poller` is overwritten
+ * rather than cleared, the superseded interval could never be stopped again by
+ * anything, not even unmount. So each attempt carries a number: only the newest
+ * may claim those handles, and an older one cancels the login it started instead
+ * of abandoning it. Whether the deadline fired is likewise per attempt, so an
+ * abort that belonged to a superseded request cannot relabel this one's failure.
+ */
+let attemptSeq = 0;
+
 async function start() {
   stopPolling();
+  clearStartDeadline();
+  const attempt = ++attemptSeq;
   phase.value = 'starting';
   detail.value = '';
   account.value = null;
   loginId.value = '';
   verificationUrl.value = '';
   userCode.value = '';
+  let timedOut = false;
+  const controller = new AbortController();
+  const deadline = setTimeout(() => {
+    if (attempt === attemptSeq) startTimer = null;
+    timedOut = true;
+    controller.abort();
+  }, START_TIMEOUT_MS);
+  startTimer = deadline;
   try {
-    const res = await startCodexDeviceLogin(settings.agentUrl, settings.authToken);
+    const res = await startCodexDeviceLogin(
+      settings.agentUrl, settings.authToken, undefined, controller.signal,
+    );
     // The route answers 200 with `error` when the CLI was reachable but the
     // flow refused to start — a reason beats a bare failure.
     if (res.error) {
-      phase.value = 'error';
-      detail.value = res.error;
+      if (attempt === attemptSeq) {
+        phase.value = 'error';
+        detail.value = res.error;
+      }
+      return;
+    }
+    // The dialog this login belongs to is gone — closed, reopened onto a newer
+    // attempt, or unmounted (which leaves `modelValue` true, so it cannot be
+    // the test). Keeping the login would leave the server's app-server child
+    // alive for the full fifteen minutes with nobody watching it, and this is
+    // the only moment its id is known.
+    if (attempt !== attemptSeq || !props.modelValue) {
+      void cancelCodexDeviceLogin(settings.agentUrl, settings.authToken, res.login_id);
       return;
     }
     loginId.value = res.login_id;
@@ -100,8 +158,16 @@ async function start() {
     phase.value = 'pending';
     poller = setInterval(() => { void tick(); }, POLL_MS);
   } catch (e) {
+    if (attempt !== attemptSeq) return;
+    // `timedOut` is this attempt's own, so a deadline that belonged to a
+    // superseded request cannot relabel this one's failure.
+    detail.value = timedOut
+      ? 'The server did not answer the sign-in request. Try again.'
+      : messageOf(e);
     phase.value = 'error';
-    detail.value = messageOf(e);
+  } finally {
+    clearTimeout(deadline);
+    if (startTimer === deadline) startTimer = null;
   }
 }
 
@@ -124,7 +190,11 @@ async function tick() {
       phase.value = res.status;
       return;
     }
-    phase.value = res.status;
+    // The server reports 'starting' until the CLI has answered, and a slow first
+    // poll can still carry it after a code is already on screen. Moving back to
+    // the "Starting…" panel would take away a code the user is part-way through
+    // typing, so the phase only ever goes forwards.
+    if (res.status !== 'starting' || phase.value !== 'pending') phase.value = res.status;
   } catch (e) {
     // Includes the 404 a server restart produces, which the API client already
     // words as an interrupted sign-in. Either way there is nothing left to poll.
@@ -162,18 +232,34 @@ function onVisibilityChange(value: boolean) {
  *  for the rest of the fifteen minutes, so closing releases it. */
 function releaseIfPending() {
   stopPolling();
+  clearStartDeadline();
   if (loginId.value && (phase.value === 'pending' || phase.value === 'starting')) {
     void cancelCodexDeviceLogin(settings.agentUrl, settings.authToken, loginId.value);
     loginId.value = '';
   }
 }
 
+// `immediate` is load-bearing, not a nicety: the page mounts this dialog behind
+// a `v-if` in the same tick that it sets the flag it binds to `modelValue`, so
+// the component is created with `modelValue` already true and a lazy watch never
+// sees a change. That is what made the very first click show "Starting the
+// sign-in…" for ever, having asked the server for nothing at all. With
+// `modelValue` false at creation the release branch is a no-op.
 watch(() => props.modelValue, (open) => {
   if (open) void start();
   else releaseIfPending();
-});
+}, { immediate: true });
 
-onBeforeUnmount(releaseIfPending);
+// Unmount is the one close the page never announces: it flips the `v-if` while
+// leaving `modelValue` true, so an in-flight start() would still read the dialog
+// as open, adopt the login and arm a poller inside a component that no longer
+// exists. Retiring the attempt number sends that result down the cancel path
+// instead. The request itself is deliberately NOT aborted: its response carries
+// the only copy of the login id, and cancelling the sign-in needs it.
+onBeforeUnmount(() => {
+  attemptSeq += 1;
+  releaseIfPending();
+});
 </script>
 
 <template>

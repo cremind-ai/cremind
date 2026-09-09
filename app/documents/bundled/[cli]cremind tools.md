@@ -1,5 +1,5 @@
 ---
-description: "Configure the tools the Cremind agent can call, from the `cremind tools` CLI: enable or disable a tool, set its Tool Variables (env-style key=value — API keys, limits, modes), list the live option values of a tool's dynamic variables (`options` — e.g. the Claude models available to the logged-in account), get or set its JSON Tool Arguments, and toggle a grouped tool's sub-tools (\"leaves\"). Answers the coding-delegate questions with `coding-agents`: is Claude Code installed, is Codex signed in or logged in, which credential each one resolves to, and how to install the Claude Code or Codex CLI on this server without shell access. Signs a coding delegate in and out from the terminal: `cremind tools coding-agents login claude_code` runs the vendor CLI's own sign-in (`claude auth login`, `codex login --device-auth`) on the server host, and `cremind tools coding-agents logout codex` signs out from anywhere; `--shared` targets the server-wide login that profiles without one of their own inherit, instead of this profile's. Explains how to change any tool's settings and how the agent configures tools itself by running these commands in its shell. Distinct from each tool's own `[tool] …` reference doc (which lists that one tool's full variables and allowed values, e.g. Claude Code's permission modes) and from `cremind agents` (registering MCP/A2A servers)."
+description: "Configure the tools the Cremind agent can call, from the `cremind tools` CLI: enable or disable a tool, set its Tool Variables (env-style key=value — API keys, limits, modes), list the live option values of a tool's dynamic variables (`options` — e.g. the Claude models available to the logged-in account), get or set its JSON Tool Arguments, and toggle a grouped tool's sub-tools (\"leaves\"). Answers the coding-delegate questions with `coding-agents`: is Claude Code installed, is Codex signed in or logged in, which credential each one resolves to, and how to install the Claude Code or Codex CLI on this server without shell access. Signs a coding delegate in and out from the terminal: `cremind tools coding-agents login claude_code` runs the vendor CLI's own sign-in (`claude auth login`, `codex login --device-auth`) on the server host, and `cremind tools coding-agents logout codex` signs out from anywhere; `--shared` targets the server-wide login that profiles without one of their own inherit, instead of this profile's. Signing Claude Code in headless, where no browser can reach the server: `claude auth login` has no headless flag, so run `claude setup-token` on a machine that has a browser and paste the long-lived token in — `cremind tools set-var claude_code CLAUDE_CODE_OAUTH_TOKEN=<token>`, the `tool_variable_oauth_token` credential source. Explains how to change any tool's settings and how the agent configures tools itself by running these commands in its shell. Distinct from each tool's own `[tool] …` reference doc (which lists that one tool's full variables and allowed values, e.g. Claude Code's permission modes) and from `cremind agents` (registering MCP/A2A servers)."
 ---
 
 # `cremind tools` — Tool & Skill Configuration
@@ -68,10 +68,11 @@ its installed / enabled / credential state (and whether the credential is this
 profile's own login or the shared server one), installs a missing SDK in place,
 runs the same sign-in probe behind **Check sign-in**, and does the sign-in
 itself: **Sign in** opens a device code for Codex, or a built-in terminal
-running `claude auth login` for Claude Code. **Sign out** is the counterpart of
-`cremind tools coding-agents logout`. Nothing here links to Settings → LLM
-Providers — those credentials are Cremind's own reasoning models', and the
-coding CLIs never read them.
+running `claude auth login` for Claude Code — whose dialog also takes a pasted
+`claude setup-token` token, for a server no browser can reach. **Sign out** is
+the counterpart of `cremind tools coding-agents logout`. Nothing here links to
+Settings → LLM Providers — those credentials are Cremind's own reasoning
+models', and the coding CLIs never read them.
 
 ## The agent can configure tools itself
 
@@ -405,20 +406,23 @@ under `probe`).
 rejected.
 
 **Credential sources.** A key set *for the tool* beats a CLI login, and a
-profile's own login beats the server's shared one:
+profile's own login beats the server's shared one. Claude Code's pasted
+long-lived token leads even the key, because the `claude` CLI itself prefers
+`CLAUDE_CODE_OAUTH_TOKEN` over `ANTHROPIC_API_KEY` when both are set:
 
-| Value                    | What it means                                                                       |
-|--------------------------|-------------------------------------------------------------------------------------|
-| `tool_variable_api_key`  | The tool's own `CLAUDE_CODE_API_KEY` / `CODEX_API_KEY` variable (this profile's).    |
-| `env_anthropic_api_key`  | Claude Code: `ANTHROPIC_API_KEY` in the server's environment.                        |
-| `env_oauth_token`        | Claude Code: `CLAUDE_CODE_OAUTH_TOKEN` in the server's environment.                  |
-| `env_codex_api_key`      | Codex: `CODEX_API_KEY` in the server's environment.                                  |
-| `env_openai_api_key`     | Codex: `OPENAI_API_KEY` in the server's environment.                                 |
-| `profile_claude_login`   | Claude Code: **this profile's own** `claude auth login` (`credential_scope: profile`).|
-| `profile_codex_login`    | Codex: **this profile's own** `codex login` (`credential_scope: profile`).           |
-| `host_claude_login`      | Claude Code: the **shared** server login, inherited (`credential_scope: shared`).     |
-| `host_codex_login`       | Codex: the **shared** server login, inherited (`credential_scope: shared`).           |
-| `none`                   | Nothing is visible — sign in (see below), or set a key.                              |
+| Value                       | What it means                                                                       |
+|-----------------------------|-------------------------------------------------------------------------------------|
+| `tool_variable_oauth_token` | Claude Code: the tool's own `CLAUDE_CODE_OAUTH_TOKEN` variable (this profile's) — a long-lived `claude setup-token` token. |
+| `tool_variable_api_key`     | The tool's own `CLAUDE_CODE_API_KEY` / `CODEX_API_KEY` variable (this profile's).    |
+| `env_anthropic_api_key`     | Claude Code: `ANTHROPIC_API_KEY` in the server's environment.                        |
+| `env_oauth_token`           | Claude Code: `CLAUDE_CODE_OAUTH_TOKEN` in the server's environment.                  |
+| `env_codex_api_key`         | Codex: `CODEX_API_KEY` in the server's environment.                                  |
+| `env_openai_api_key`        | Codex: `OPENAI_API_KEY` in the server's environment.                                 |
+| `profile_claude_login`      | Claude Code: **this profile's own** `claude auth login` (`credential_scope: profile`).|
+| `profile_codex_login`       | Codex: **this profile's own** `codex login` (`credential_scope: profile`).           |
+| `host_claude_login`         | Claude Code: the **shared** server login, inherited (`credential_scope: shared`).     |
+| `host_codex_login`          | Codex: the **shared** server login, inherited (`credential_scope: shared`).           |
+| `none`                      | Nothing is visible — sign in (see below), or set a key.                              |
 
 Any `env_*` source is a server-wide key shared by every profile; the two
 `profile_*` and two `host_*` sources are CLI logins, and only those carry a
@@ -433,17 +437,31 @@ removed — a profile that relied on it must sign in to Codex itself once.
 
 **Signing in.** The sign-in is the vendor CLI's own (`claude auth login`,
 `codex login --device-auth`); Cremind only says which binary to run and which
-home the credential goes into. Three doors:
+home the credential goes into. Four doors:
 
 - **No shell access** — **Settings → Tools & Skills → Coding Agents →**
   the agent's card **→ Sign in**. Codex shows a device code and a link to
-  confirm in any browser; Claude Code opens a built-in terminal already running
-  `claude auth login`.
+  confirm in any browser; Claude Code opens a built-in terminal running the real
+  `claude auth login` under a PTY. In a container Cremind removes `DISPLAY` from
+  that terminal's environment, so the CLI cannot try to open a browser on the
+  VNC desktop and prints the URL for you to open elsewhere instead.
+- **No browser can reach the server at all** (Claude Code) — `claude auth login`
+  has no headless flag, so run `claude setup-token` on any machine that *does*
+  have a browser (it needs a Claude subscription) and paste the token it prints
+  into the same Sign-in dialog, or set it directly:
+  `cremind tools set-var claude_code CLAUDE_CODE_OAUTH_TOKEN=<token>`. That is
+  the `tool_variable_oauth_token` source above.
 - **A shell on the server** — `cremind tools coding-agents login claude_code`
   (or `codex`). It runs the login in *this* terminal (inheriting stdin/stdout,
   so the printed URL and the pasted code behave exactly as they would outside
-  Cremind), then re-probes and prints `Signed in as …`.
-- **Signing out** — `cremind tools coding-agents logout claude_code`.
+  Cremind), then re-probes and prints `Signed in as …`. Inside a container it
+  drops the same variables the built-in terminal does — the server names them —
+  so a shell sign-in in a pod prints the URL rather than opening a browser on
+  the VNC desktop.
+- **Signing out** — `cremind tools coding-agents logout claude_code`. A pasted
+  token is not a login, so it is cleared by emptying the variable
+  (`cremind tools set-var claude_code CLAUDE_CODE_OAUTH_TOKEN=`), not by
+  `logout`.
 
 `login` only works **where the CLI actually lives**. `cremind` pointed at a
 remote server refuses rather than writing a credential into the wrong machine's

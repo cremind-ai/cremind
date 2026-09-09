@@ -30,6 +30,14 @@ const workingDir = ref<string>('');
 const status = ref<ProcessStatus | 'connecting' | 'disconnected'>('connecting');
 const exitCode = ref<number | null>(null);
 const isPty = ref<boolean>(false);
+// A running process that has written nothing is indistinguishable from a
+// healthy one by status alone, and that is exactly the shape of the worst
+// failure a hosted CLI has: on a server with no reachable browser, a login
+// command takes its open-a-browser path and prints not one byte, leaving a
+// black box and no explanation. Parents that can offer a way out (see
+// tools/CodingAgentTerminalLoginDialog.vue) need to know silence apart from
+// output, so the flag is exposed rather than kept private to the renderer.
+const outputSeen = ref<boolean>(false);
 
 let term: Terminal | null = null;
 let fitAddon: FitAddon | null = null;
@@ -112,6 +120,10 @@ async function waitForToken(maxMs = 5000): Promise<boolean> {
 async function connect() {
   if (!termEl.value) return;
 
+  // A reconnect (pid change) replays its own scrollback, so what the previous
+  // stream printed says nothing about this one.
+  outputSeen.value = false;
+
   const ok = await waitForToken();
   if (!ok) {
     status.value = 'disconnected';
@@ -182,8 +194,14 @@ async function connect() {
     const t = msg.type as string;
     if (t === 'snapshot') {
       const chunks = (msg.chunks as Array<{ type: string; data: string }>) || [];
-      for (const c of chunks) writeChunk(c.type, c.data);
+      for (const c of chunks) {
+        // An empty snapshot is what a process that has printed nothing looks
+        // like, so only a chunk that carries something counts as output.
+        if (c.data) outputSeen.value = true;
+        writeChunk(c.type, c.data);
+      }
     } else if (t === 'stdout' || t === 'stderr') {
+      outputSeen.value = true;
       writeChunk(t, (msg.data as string) || '');
     } else if (t === 'status') {
       const data = (msg.data as Record<string, unknown>) || {};
@@ -288,7 +306,7 @@ async function confirmStop() {
   status.value = 'exited';
 }
 
-defineExpose({ confirmStop, status, command, workingDir, isPty, exitCode });
+defineExpose({ confirmStop, status, command, workingDir, isPty, exitCode, outputSeen });
 </script>
 
 <template>

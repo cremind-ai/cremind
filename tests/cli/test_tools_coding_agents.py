@@ -248,6 +248,57 @@ def test_login_runs_the_argv_with_the_profile_home(
     assert "dev@example.com" in result.output
 
 
+def test_login_drops_the_environment_the_server_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A shell sign-in inside our image must not inherit the desktop's display.
+
+    The desktop flavour exports ``DISPLAY=:0`` for the VNC session, and a login
+    that can see a display opens a browser on that desktop instead of printing
+    the URL the user's terminal is waiting for - the same failure the built-in
+    terminal was fixed for. The server decides (only it knows it is in a
+    container) and this command obeys, so both sign-in doors behave alike.
+    """
+    from app.cli.main import app
+
+    descriptor = _local_descriptor(tmp_path)
+    descriptor["drop_env"] = ["DISPLAY", "WAYLAND_DISPLAY", "BROWSER"]
+    _patch_cli_descriptor(monkeypatch, descriptor)
+    spawned = _patch_subprocess(monkeypatch)
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setenv("CREMIND_TEST_AMBIENT", "kept")
+
+    result = CliRunner().invoke(
+        app, ["--token", "t", "tools", "coding-agents", "login", "claude_code"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "DISPLAY" not in spawned["env"]
+    # Only the named variables go: the login still needs the rest of the
+    # environment it was started from.
+    assert spawned["env"]["CREMIND_TEST_AMBIENT"] == "kept"
+    assert spawned["env"]["CLAUDE_CONFIG_DIR"] == descriptor["profile_env"]["CLAUDE_CONFIG_DIR"]
+
+
+def test_login_keeps_the_display_when_the_server_names_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """On a native install the browser opening is the point, and an older server
+    omits the key entirely - both mean "take nothing away"."""
+    from app.cli.main import app
+
+    descriptor = _local_descriptor(tmp_path)
+    descriptor.pop("drop_env", None)
+    _patch_cli_descriptor(monkeypatch, descriptor)
+    spawned = _patch_subprocess(monkeypatch)
+    monkeypatch.setenv("DISPLAY", ":0")
+
+    result = CliRunner().invoke(
+        app, ["--token", "t", "tools", "coding-agents", "login", "claude_code"],
+    )
+    assert result.exit_code == 0, result.output
+    assert spawned["env"]["DISPLAY"] == ":0"
+
+
 def test_login_shared_targets_the_server_wide_home(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:

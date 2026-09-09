@@ -649,13 +649,21 @@ def coding_agents_login(
     env_key = "shared_env" if shared else "profile_env"
     overrides = info.get(env_key)
     env = dict(os.environ)
+    # Dropped before the overrides are layered on, so a variable the server
+    # deliberately sets can never be removed by this. Inside one of our images
+    # the server reports DISPLAY and friends here: the desktop flavour exports
+    # DISPLAY=:0 for the VNC session, and a login that can see a display opens a
+    # browser on that desktop instead of printing the URL this terminal is
+    # waiting to show. Older servers omit the key and nothing is dropped.
+    for name in info.get("drop_env") or []:
+        env.pop(str(name), None)
     if isinstance(overrides, dict):
         env.update({str(k): str(v) for k, v in overrides.items()})
 
     # subprocess.call, not run(capture_output=...): the whole point is that the
-    # child inherits this terminal. Both CLIs print a URL and then read the
-    # pasted code from stdin, so capturing either stream would hang the login
-    # behind output the user never sees.
+    # child inherits this terminal. With no browser it can open, each CLI prints
+    # a URL and reads the pasted code from stdin, so capturing either stream
+    # would hang the login behind output the user never sees.
     typer.echo(f"Running: {' '.join(argv)}", err=True)
     code = subprocess.call(argv, env=env)
     if code != 0:

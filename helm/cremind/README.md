@@ -135,6 +135,13 @@ through its own CLI, not through Cremind's provider credentials. Sign in from
 approve on any device (no port to forward), and Claude Code opens a terminal in
 the browser that runs `claude auth login` inside the pod.
 
+`claude auth login` has no headless flag, so if nothing in the pod can reach a
+browser, sign Claude Code in with a pasted token instead: run
+`claude setup-token` on your own machine (it needs a Claude subscription) and
+paste what it prints into the same Sign-in dialog, or set it as the
+`CLAUDE_CODE_OAUTH_TOKEN` tool variable. It is a per-profile credential like any
+other, so it needs no cluster-side environment variable and no restart.
+
 The chart points both CLIs at the system PVC (`CLAUDE_CONFIG_DIR` and
 `CODEX_HOME` under `<cremind.systemDir>/coding-cli/`), so a sign-in survives pod
 replacement and `helm upgrade`. Their own defaults would put it in the container

@@ -21,7 +21,9 @@ both read:
   had expired);
 - ``login-terminal`` spawns the login binary itself under the PTY with the
   profile's home FORCED, and ``shared`` - the login every other profile
-  inherits - is admin-only;
+  inherits - is admin-only; inside a container it also takes ``DISPLAY`` away,
+  or the CLI opens a browser on the VNC desktop instead of printing the URL
+  into the terminal the user is looking at;
 - ``logout`` refuses to sign a profile out of a login it does not own, which is
   the one refusal the UI cannot be trusted to make on its own (the CLI hits the
   same route).
@@ -901,10 +903,14 @@ class _TerminalRecorder:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def __call__(self, profile, *, cwd, cols, rows, extra_env, argv=None, title=None):
+    async def __call__(
+        self, profile, *, cwd, cols, rows, extra_env, argv=None, title=None,
+        drop_env=None,
+    ):
         self.calls.append({
             "profile": profile, "cwd": cwd, "cols": cols, "rows": rows,
             "extra_env": extra_env, "argv": argv, "title": title,
+            "drop_env": drop_env,
         })
         return SimpleNamespace(
             terminal_id="term-abc", title=title or "Terminal 1", shell="claude",
@@ -1011,6 +1017,58 @@ def test_login_terminal_409_when_the_feature_is_absent(
     )
     assert resp.status_code == 409
     assert recorder.calls == []
+
+
+def test_login_terminal_takes_the_display_away_inside_a_container(
+    tmp_path: Path, monkeypatch, sdk_present,
+) -> None:
+    """In a pod the display belongs to the VNC desktop, not to the person who
+    clicked Sign in in a browser tab.
+
+    The desktop image's entrypoint exports ``DISPLAY=:0`` to the server process
+    and a PTY child inherits it, so ``claude auth login`` took its open-a-browser
+    path and opened Chrome on a desktop nobody was watching - while the terminal
+    the user was actually looking at printed nothing. The CLI only prints the
+    paste-a-code URL when it cannot open a browser, and no *value* of ``DISPLAY``
+    says "there is no display", so the variables have to leave the environment
+    rather than be overridden."""
+    _with_cli(monkeypatch, claude_code_runner, "/opt/claude")
+    monkeypatch.setattr(runtime_env, "is_container", lambda: True, raising=False)
+    recorder = _TerminalRecorder()
+    monkeypatch.setattr(terminals_api, "create_terminal", recorder)
+
+    resp = asyncio.run(
+        _login_terminal_handler(SimpleNamespace(registry=_make_registry(tmp_path)))(
+            _req(path_params={"tool_id": "claude_code"})
+        )
+    )
+    assert resp.status_code == 201
+    dropped = recorder.calls[0]["drop_env"]
+    assert "DISPLAY" in dropped
+    # Wayland and an explicit browser command are the same mistake by another
+    # name, so they go with it.
+    assert "WAYLAND_DISPLAY" in dropped
+    assert "BROWSER" in dropped
+
+
+def test_login_terminal_leaves_a_native_install_its_browser(
+    tmp_path: Path, monkeypatch, sdk_present,
+) -> None:
+    """Nothing is dropped off a container: on a native install the user's own
+    browser opening on their own desktop is precisely the sign-in they want,
+    and taking DISPLAY away would replace it with a URL to copy by hand."""
+    _with_cli(monkeypatch, claude_code_runner, "/opt/claude")
+    monkeypatch.setattr(runtime_env, "is_container", lambda: False, raising=False)
+    recorder = _TerminalRecorder()
+    monkeypatch.setattr(terminals_api, "create_terminal", recorder)
+
+    resp = asyncio.run(
+        _login_terminal_handler(SimpleNamespace(registry=_make_registry(tmp_path)))(
+            _req(path_params={"tool_id": "claude_code"})
+        )
+    )
+    assert resp.status_code == 201
+    assert not recorder.calls[0]["drop_env"]
 
 
 def test_login_terminal_reports_the_per_profile_cap(
@@ -1165,6 +1223,32 @@ def test_cli_payload_describes_the_binary_and_both_homes(
     assert Path(body["system_dir"]) == tmp_path
     assert body["server_hostname"]
     assert body["platform"] == sys.platform
+
+
+def test_cli_payload_tells_a_shell_sign_in_what_not_to_inherit(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The shell door needs the same display fix as the browser one.
+
+    ``cremind tools coding-agents login`` runs the login in the user's own
+    terminal, building its environment from ``os.environ`` - which inside our
+    image carries the desktop's ``DISPLAY``. Fixing only the built-in terminal
+    would leave the shell sign-in silently opening Chrome on the VNC desktop on
+    exactly the hosts this feature exists for, so the server names the variables
+    to drop and both doors obey it.
+    """
+    _with_cli(monkeypatch, claude_code_runner, "/opt/claude")
+    handler = _cli_handler(SimpleNamespace(registry=_make_registry(tmp_path)))
+
+    monkeypatch.setattr(runtime_env, "is_container", lambda: True, raising=False)
+    resp = asyncio.run(handler(_req(path_params={"tool_id": "claude_code"})))
+    assert set(_body(resp)["drop_env"]) == {"DISPLAY", "WAYLAND_DISPLAY", "BROWSER"}
+
+    # On a native install the browser opening is the whole point, so nothing is
+    # taken away and the CLI has nothing to do.
+    monkeypatch.setattr(runtime_env, "is_container", lambda: False, raising=False)
+    resp = asyncio.run(handler(_req(path_params={"tool_id": "claude_code"})))
+    assert _body(resp)["drop_env"] == []
 
 
 def test_cli_payload_without_a_binary_offers_no_command(
