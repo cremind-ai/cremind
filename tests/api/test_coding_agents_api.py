@@ -381,7 +381,13 @@ def test_credential_source_is_per_profile(tmp_path: Path) -> None:
     assert other["claude_code"]["credential_source"] is None
 
 
-def test_a_profiles_own_login_is_reported_with_its_home_and_account(tmp_path: Path) -> None:
+def test_a_profiles_own_login_is_reported_with_its_home_and_account(
+    tmp_path: Path, sdk_present,
+) -> None:
+    # The summary asserted below is the one an INSTALLED agent gets; without
+    # the extra, every row says "not installed" instead and the credential
+    # sentence never appears. Pinned, not inherited from the venv running the
+    # tests: the optional extras are present on a dev box and absent in CI.
     _sign_in_claude(_profile_claude_home(tmp_path), email="dev@example.com")
     row = _by_id(_agents(tmp_path))["claude_code"]
     assert row["credential_source"] == "profile_claude_login"
@@ -391,9 +397,14 @@ def test_a_profiles_own_login_is_reported_with_its_home_and_account(tmp_path: Pa
     assert "this profile's own login" in row["message"]
 
 
-def test_an_inherited_server_login_is_reported_as_shared(tmp_path: Path) -> None:
+def test_an_inherited_server_login_is_reported_as_shared(
+    tmp_path: Path, sdk_present,
+) -> None:
     """A profile that never signed in still gets the server's login - and has
-    to be told that is whose it is, because it is not one it can sign out."""
+    to be told that is whose it is, because it is not one it can sign out.
+
+    ``sdk_present`` for the same reason as the test above: the sentence only
+    exists on an installed row."""
     _sign_in_codex(_shared_codex_home(tmp_path))
     row = _by_id(_agents(tmp_path))["codex"]
     assert row["credential_source"] == "host_codex_login"
