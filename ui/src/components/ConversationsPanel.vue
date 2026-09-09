@@ -21,8 +21,11 @@ const emit = defineEmits<{
   newChat: [];
 }>();
 
-// Lazy-load channels the first time the panel mounts with auth — the filter
-// dropdown shows "main" until they load, which is the right default.
+// Lazy-load channels the first time the panel mounts with auth. The panel
+// starts on the "all" view, so the list is unfiltered from the first frame;
+// the dropdown itself only renders once the channels arrive and leave more
+// than one option to pick from (and ``ensureValidActiveFilter`` drops the
+// filter back to "main" when they don't).
 watch(
   () => [settingsStore.authToken, settingsStore.profileId] as const,
   ([token, profileId]) => {

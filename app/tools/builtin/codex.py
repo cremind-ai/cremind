@@ -36,7 +36,6 @@ from app.tools.builtin.codex_runner import (
     Var,
     CodexConcurrencyError,
     _as_int,
-    credential_source,
     get_task,
     known_task_ids,
     load_sdk,
@@ -105,11 +104,12 @@ TOOL_CONFIG: ToolConfig = {
         },
         Var.API_KEY: {
             "description": (
-                "OpenAI API key for Codex. Empty = fall back to the profile's OpenAI "
-                "LLM credentials, then the server environment (CODEX_API_KEY / "
-                "OPENAI_API_KEY) or a host `codex login`. A key supplied here is "
-                "installed into a Cremind-managed CODEX_HOME, never your own "
-                "~/.codex."
+                "OpenAI API key for Codex. Empty = fall back to the server "
+                "environment (CODEX_API_KEY / OPENAI_API_KEY) and then to the "
+                "`codex login` for this profile, with the server's shared login as "
+                "the fallback. A key supplied here is installed into a "
+                "Cremind-managed CODEX_HOME, never your own ~/.codex, and the "
+                "profile's LLM Provider credentials are never used."
             ),
             "type": "string",
             "secret": True,
@@ -468,13 +468,14 @@ class CodexStatusTool(BuiltInTool):
     description: str = (
         "Report whether Codex is ready to use, and list the Codex models available "
         "to the resolved account — WITHOUT starting a coding task. Shows whether the "
-        "SDK is installed, which OpenAI credential source is configured (tool "
-        "variable, this profile's LLM settings, the server environment, or a host "
-        "`codex login`), and the account's available `models`. Use it to answer 'is "
-        "Codex set up?' AND 'which models can Codex use?'. For the full list plus how "
-        "to change the model, run `cremind tools options codex` / `cremind tools "
-        "set-var codex CODEX_MODEL=<id>` via the Shell Executor. Pass probe=true to "
-        "check the active account credential (no coding task, no token spend)."
+        "SDK is installed, which OpenAI credential source is configured (the tool "
+        "variable, the server environment, this profile's own `codex login`, or the "
+        "server's shared login) and which CLI home it comes from, plus the account's "
+        "available `models`. Use it to answer 'is Codex set up?' AND 'which models "
+        "can Codex use?'. For the full list plus how to change the model, run "
+        "`cremind tools options codex` / `cremind tools set-var codex "
+        "CODEX_MODEL=<id>` via the Shell Executor. Pass probe=true to check the "
+        "active account credential (no coding task, no token spend)."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -505,7 +506,13 @@ class CodexStatusTool(BuiltInTool):
 
         profile = arguments.get("_profile") or "default"
         variables = merge_variables(arguments.get("_variables"))
-        source = credential_source(variables, profile)
+        # One resolution, four facts: which credential, whose it is, the CLI
+        # home it lives in and the account label recorded there. Reported
+        # together because "signed in" alone is what made users doubt the card:
+        # a profile borrowing the server's login and a profile with its own both
+        # read as "signed in" while only one of them can sign out.
+        info = runner.credential_info(variables, profile)
+        source = info["source"]
         configured = source is not None
 
         # Report the sandbox the run would ACTUALLY use (coerced + any
@@ -515,6 +522,9 @@ class CodexStatusTool(BuiltInTool):
             "available": True,
             "sdk_installed": True,
             "credential_source": source,
+            "credential_scope": info["scope"],
+            "cli_home": info["cli_home"],
+            "account_hint": info["account_hint"],
             "credentials_configured": configured,
             "effective_sandbox": sandbox,
         }
@@ -532,9 +542,9 @@ class CodexStatusTool(BuiltInTool):
         else:
             payload["message"] = (
                 "Codex is installed, but no OpenAI credential is visible to Cremind "
-                "(no CODEX_API_KEY tool variable, no OpenAI provider in this "
-                "profile's LLM settings, no key in the server environment, and no "
-                "host `codex login`). Pass probe=true to check for certain."
+                "(no CODEX_API_KEY tool variable, no key in the server environment, "
+                "and no `codex login` in this profile's CLI home or the server's). "
+                "Pass probe=true to check for certain. " + runner._SIGN_IN_REMEDIATION
             )
 
         # List the account's available models (cached, never raises) so the agent
@@ -562,14 +572,14 @@ class CodexStatusTool(BuiltInTool):
             result = await probe_auth(sdk, cwd=cwd, variables=variables, profile=profile)
             payload["logged_in"] = result.get("logged_in")
             payload["probe_detail"] = result.get("detail")
+            # The account the probe actually got back, not the hint read off
+            # disk: on the one call that spoke to the credential, say who it
+            # belongs to.
+            payload["account"] = result.get("account")
             if result.get("logged_in") is True:
                 payload["message"] = "Codex has an active account credential and is ready to use."
             elif result.get("logged_in") is False:
-                payload["message"] = (
-                    "Codex is NOT authenticated. Set the CODEX_API_KEY tool variable, "
-                    "configure the OpenAI provider under Settings → LLM, or run `codex "
-                    "login` on the server host."
-                )
+                payload["message"] = "Codex is NOT authenticated. " + runner._SIGN_IN_REMEDIATION
             else:
                 payload["message"] = (
                     "Could not determine Codex's login status: "

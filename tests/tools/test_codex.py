@@ -95,8 +95,13 @@ def install_fake_sdk(
     account_resp: Any = None,
     models_resp: Any = None,
     thread_id: str = "thread-1",
+    login_handle: Any = None,
 ):
-    """Install a fake ``openai_codex`` whose turn streams ``produce(handle)``."""
+    """Install a fake ``openai_codex`` whose turn streams ``produce(handle)``.
+
+    ``login_handle`` is what ``login_chatgpt_device_code()`` returns (the
+    device-code sign-in in :mod:`app.tools.builtin.codex_login` drives it), and
+    ``logout()`` records that it was called on the instance."""
     import enum as _enum
 
     mod = types.ModuleType("openai_codex")
@@ -142,9 +147,13 @@ def install_fake_sdk(
             return AsyncTurnHandle(self._produce)
 
     class AsyncCodex:
+        instances: list = []
+
         def __init__(self, config=None):
             self.config = config
             self.logged_in_key = None
+            self.logged_out = False
+            AsyncCodex.instances.append(self)
 
         async def __aenter__(self):
             if aenter_error is not None:
@@ -156,6 +165,12 @@ def install_fake_sdk(
 
         async def login_api_key(self, key):
             self.logged_in_key = key
+
+        async def login_chatgpt_device_code(self):
+            return login_handle
+
+        async def logout(self):
+            self.logged_out = True
 
         async def account(self):
             return account_resp
@@ -184,9 +199,18 @@ def install_fake_sdk(
 @pytest.fixture(autouse=True)
 def _clean_registry(monkeypatch, tmp_path):
     """Isolate the module registry, keep the activity feed hermetic, and
-    neutralise ambient credentials (so ``resolve_auth`` doesn't pick up the
-    developer's real OpenAI key / host ``codex login``). ``list_models`` is
-    stubbed to an empty success so the status leaf never spawns a real client."""
+    neutralise ambient credentials. ``list_models`` is stubbed to an empty
+    success so the status leaf never spawns a real client.
+
+    Credential isolation is the ordinary environment one now, not a patch of
+    private module constants: ``CODEX_HOME`` names the shared CLI home and
+    ``CREMIND_SYSTEM_DIR`` the per-profile ones, both under ``tmp_path``, so
+    ``resolve_auth`` can reach neither the developer's own ``codex login`` nor
+    their real system directory. ``is_container`` is pinned False so the
+    container-only legacy ``~/.codex`` tier stays out of the way when the suite
+    itself runs inside a container.
+    """
+    from app.config import runtime_env
     from app.tools.builtin import codex_runner as r
     import app.agent.agent_activity as aa
 
@@ -206,8 +230,9 @@ def _clean_registry(monkeypatch, tmp_path):
     monkeypatch.setattr(aa.AgentActivity, "_publish_now", _noop)
     monkeypatch.setattr(aa.AgentActivity, "_patch_persisted", _noop)
     monkeypatch.setattr(aa.AgentActivity, "_schedule_flush", lambda self: None)
-    monkeypatch.setattr(r.BaseConfig, "get_provider_api_key", lambda *a, **k: None)
-    monkeypatch.setattr(r, "_CODEX_AUTH_PATH", tmp_path / "no_codex_auth.json")
+    monkeypatch.setattr(r.BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path / "system"))
+    monkeypatch.setattr(runtime_env, "is_container", lambda *a, **k: False)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "shared-codex"))
     monkeypatch.delenv("CODEX_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(r, "list_models", _empty_models)
@@ -517,15 +542,20 @@ from app.tools.builtin.codex_runner import list_models as _real_list_models  # n
 def test_resolve_auth_isolates_home_per_credential(monkeypatch, tmp_path):
     from app.tools.builtin import codex_runner as r
 
-    # (the autouse fixture already nulls profile creds + env vars)
+    # (the autouse fixture already nulls the env keys and points both homes at
+    # tmp_path)
     a_aaa = r.resolve_auth({r.Var.API_KEY: "sk-AAA"}, "admin")
     a_bbb = r.resolve_auth({r.Var.API_KEY: "sk-BBB"}, "admin")
     a_aaa2 = r.resolve_auth({r.Var.API_KEY: "sk-AAA"}, "admin")
-    # Distinct keys → distinct CODEX_HOME; same key → same CODEX_HOME.
+    # Distinct keys -> distinct CODEX_HOME; same key -> same CODEX_HOME.
     assert a_aaa.env_overrides["CODEX_HOME"] != a_bbb.env_overrides["CODEX_HOME"]
     assert a_aaa.env_overrides["CODEX_HOME"] == a_aaa2.env_overrides["CODEX_HOME"]
-    # No key → ambient host store, no managed-home override.
-    assert r.resolve_auth({}, "admin").env_overrides == {}
+    # No key -> the CLI login home, ALWAYS named. Leaving CODEX_HOME unset used
+    # to mean "whatever ~/.codex the server user has", which on a multi-profile
+    # server is the one home no profile's run may land in.
+    assert r.resolve_auth({}, "admin").env_overrides == {
+        "CODEX_HOME": str(tmp_path / "shared-codex"),
+    }
 
 
 def test_list_models_times_out_gracefully(monkeypatch, tmp_path):
@@ -829,7 +859,11 @@ def test_failed_turn_auth_error_is_classified(monkeypatch, tmp_path):
     sc = res.structured_content
     assert sc["status"] == "failed"
     assert sc["error"] == "AuthenticationError"
-    assert "codex login" in sc["remediation"].lower()
+    # The remediation names the doors that still exist. Settings -> LLM stopped
+    # being one of them when the provider credential tiers were removed.
+    assert "cremind tools coding-agents login codex" in sc["remediation"]
+    assert "CODEX_API_KEY" in sc["remediation"]
+    assert "Settings -> LLM" not in sc["remediation"]
 
 
 def test_failed_turn_generic_stays_generic(monkeypatch, tmp_path):
@@ -930,6 +964,14 @@ def test_default_disabled_and_feature_gated():
     assert TOOL_CONFIG["requires_feature"] == "codex"
 
 
+def _skill_creator_group(tool_id: str = "default__skill_creator"):
+    """Stand-in for the enabled skill-creator skill as the registry exposes it:
+    ``ToolType.SKILL`` plus the profile-prefixed tool_id the model calls."""
+    from app.tools import ToolType
+
+    return SimpleNamespace(tool_type=ToolType.SKILL, tool_id=tool_id)
+
+
 def test_guidance_codex_only():
     from app.agent.reasoning_agent import _build_coding_delegation_guidance
 
@@ -943,6 +985,26 @@ def test_guidance_codex_only():
     assert "codex__stop" in text
     assert "codex__status" in text
     assert "claude_code__" not in text
+    # No skill-creator enabled -> no skill-authoring clause to arbitrate.
+    assert "SKILL AUTHORING" not in text
+
+
+def test_guidance_codex_only_with_skill_creator():
+    # Codex is the only delegate, so the "ask which path" clause must offer it
+    # (and nothing else) as the delegation option.
+    from app.agent.reasoning_agent import _build_coding_delegation_guidance
+
+    class Group:
+        config_name = "codex"
+        tool_id = "codex"
+
+    text = _build_coding_delegation_guidance([Group(), _skill_creator_group()])
+    assert "SKILL AUTHORING" in text
+    assert "`default__skill_creator`" in text
+    assert "Codex (`codex__run`)" in text
+    assert "Claude Code" not in text
+    assert "target='skills'" in text
+    assert "codex__wait" in text  # the delegation body is untouched
 
 
 def test_guidance_both_agents():
@@ -961,6 +1023,38 @@ def test_guidance_both_agents():
     assert "codex__run" in text
     # The peer-preference sentence is present when both are on.
     assert "peers" in text
+    assert "SKILL AUTHORING" not in text
+
+
+def test_guidance_both_agents_with_skill_creator():
+    # With both delegates on, the choice the user is offered names both run
+    # functions, and the brief points at "the chosen agent's run function"
+    # rather than picking one for them.
+    from app.agent.reasoning_agent import _build_coding_delegation_guidance
+
+    class Claude:
+        config_name = "claude_code"
+        tool_id = "claude_code"
+
+    class Codex:
+        config_name = "codex"
+        tool_id = "codex"
+
+    text = _build_coding_delegation_guidance(
+        [Claude(), Codex(), _skill_creator_group()]
+    )
+    assert "SKILL AUTHORING" in text
+    assert "Claude Code (`claude_code__run`) or Codex (`codex__run`)" in text
+    assert "the chosen agent's run function" in text
+    assert "`default__skill_creator`" in text
+
+
+def test_guidance_skill_creator_alone_stays_empty():
+    # A profile with skill-creator but no coding delegate keeps the historical
+    # (empty) prompt — the clause is a delegation rule, not a skills rule.
+    from app.agent.reasoning_agent import _build_coding_delegation_guidance
+
+    assert _build_coding_delegation_guidance([_skill_creator_group()]) == ""
 
 
 # ── status leaf (answers "is Codex set up / logged in?") ──────────────────────
@@ -1001,11 +1095,15 @@ def test_status_with_tool_variable_key(monkeypatch):
 
 
 def test_status_host_codex_login(monkeypatch, tmp_path):
-    from app.tools.builtin import codex_runner as r
+    """A login in the SHARED home is reported as the server's, not the profile's.
 
-    auth = tmp_path / "auth.json"
-    auth.write_text('{"OPENAI_API_KEY": "host-key"}')
-    monkeypatch.setattr(r, "_CODEX_AUTH_PATH", auth)
+    The scope is the half that matters here: a profile borrowing the operator's
+    login reads "signed in" exactly like one that signed in itself, and only
+    the latter has anything it can sign out of.
+    """
+    shared = tmp_path / "shared-codex"
+    shared.mkdir(parents=True, exist_ok=True)
+    (shared / "auth.json").write_text('{"OPENAI_API_KEY": "host-key"}')
 
     async def produce(handle):
         if False:
@@ -1016,14 +1114,50 @@ def test_status_host_codex_login(monkeypatch, tmp_path):
     sc = res.structured_content
     assert sc["credentials_configured"] is True
     assert sc["credential_source"] == "host_codex_login"
+    assert sc["credential_scope"] == "shared"
+    assert sc["cli_home"] == str(shared)
+    assert sc["account_hint"] == {"type": "api_key"}
 
 
-def test_status_probe_authenticated(monkeypatch, tmp_path):
+def test_status_profile_codex_login_beats_the_shared_one(monkeypatch, tmp_path):
+    """A profile that signed in itself authenticates from its OWN home."""
+    from app.tools.builtin import codex_runner as r
+
+    shared = tmp_path / "shared-codex"
+    shared.mkdir(parents=True, exist_ok=True)
+    (shared / "auth.json").write_text('{"OPENAI_API_KEY": "shared-key"}')
+    own = r.profile_codex_home("lee")
+    own.mkdir(parents=True, exist_ok=True)
+    (own / "auth.json").write_text('{"tokens": {"access_token": "lee-token"}}')
+
     async def produce(handle):
         if False:
             yield
 
-    account = SimpleNamespace(account=SimpleNamespace(), requires_openai_auth=False)
+    install_fake_sdk(monkeypatch, produce)
+    res = asyncio.run(_status_tool(_profile="lee", _variables={}))
+    sc = res.structured_content
+    assert sc["credential_source"] == "profile_codex_login"
+    assert sc["credential_scope"] == "profile"
+    assert sc["cli_home"] == str(own)
+
+
+def test_status_probe_ignores_requires_openai_auth(monkeypatch, tmp_path):
+    """An account plus ``requires_openai_auth=True`` still means signed in.
+
+    This is the shape the real bundled binary returns in EVERY reachable state
+    — empty home, API-key home, ChatGPT home, even straight after the SDK's own
+    ``login_api_key`` succeeded — so gating ``logged_in`` on the flag made it
+    permanently False and told users to re-credential a credential Codex was
+    actively using. ``account`` alone decides it; this pins that, because the
+    two cases below both vary ``account`` as well and so cannot catch a
+    regression here on their own.
+    """
+    async def produce(handle):
+        if False:
+            yield
+
+    account = SimpleNamespace(account=SimpleNamespace(), requires_openai_auth=True)
     install_fake_sdk(monkeypatch, produce, account_resp=account)
     res = asyncio.run(
         _status_tool(probe=True, working_directory=str(tmp_path),
@@ -1032,6 +1166,51 @@ def test_status_probe_authenticated(monkeypatch, tmp_path):
     sc = res.structured_content
     assert sc["logged_in"] is True
     assert "ready" in sc["message"].lower()
+
+
+def test_status_probe_authenticated(monkeypatch, tmp_path):
+    async def produce(handle):
+        if False:
+            yield
+
+    # ``account`` is a pydantic RootModel union in the real SDK, so the account
+    # fields live under ``.root``; reading them off the wrapper would show a
+    # signed-in account with no name on it.
+    chatgpt = SimpleNamespace(type="chatgpt", email="lee@example.com", plan_type="pro")
+    account = SimpleNamespace(
+        account=SimpleNamespace(root=chatgpt), requires_openai_auth=False,
+    )
+    install_fake_sdk(monkeypatch, produce, account_resp=account)
+    res = asyncio.run(
+        _status_tool(probe=True, working_directory=str(tmp_path),
+                     _profile="default", _variables={"CODEX_API_KEY": "sk-x"})
+    )
+    sc = res.structured_content
+    assert sc["logged_in"] is True
+    assert "ready" in sc["message"].lower()
+    assert sc["account"] == {
+        "type": "chatgpt", "email": "lee@example.com", "plan_type": "pro",
+    }
+
+
+def test_status_probe_reports_an_api_key_account(monkeypatch, tmp_path):
+    """The SDK's camelCase discriminators are translated once, here."""
+    async def produce(handle):
+        if False:
+            yield
+
+    account = SimpleNamespace(
+        account=SimpleNamespace(root=SimpleNamespace(type="apiKey")),
+        requires_openai_auth=True,
+    )
+    install_fake_sdk(monkeypatch, produce, account_resp=account)
+    res = asyncio.run(
+        _status_tool(probe=True, working_directory=str(tmp_path),
+                     _profile="default", _variables={"CODEX_API_KEY": "sk-x"})
+    )
+    sc = res.structured_content
+    assert sc["logged_in"] is True
+    assert sc["account"] == {"type": "api_key", "email": None, "plan_type": None}
 
 
 def test_status_probe_not_authenticated(monkeypatch, tmp_path):
@@ -1048,6 +1227,8 @@ def test_status_probe_not_authenticated(monkeypatch, tmp_path):
     sc = res.structured_content
     assert sc["logged_in"] is False
     assert "not authenticated" in sc["message"].lower()
+    assert sc["account"] is None
+    assert "cremind tools coding-agents login codex" in sc["message"]
 
 
 def test_status_includes_models(monkeypatch):

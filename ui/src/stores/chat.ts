@@ -417,7 +417,9 @@ interface ChatState {
    *  after it an empty list means genuinely no conversations. */
   conversationsLoaded: boolean;
   activeConversationId: string | null;
-  /** Conversation list filter — channel_type ('main', 'telegram', etc.). */
+  /** Conversation list filter — a channel_type ('main', 'telegram', …) or the
+   *  virtual ``all``, which is the default and asks the backend for every
+   *  channel at once. */
   channelFilter: string;
   /** Per-conversation channel id cache.
    *
@@ -456,7 +458,7 @@ export const useChatStore = defineStore('chat', {
     conversations: [],
     conversationsLoaded: false,
     activeConversationId: null,
-    channelFilter: 'main',
+    channelFilter: 'all',
     channelIdsByConversation: {},
   }),
 

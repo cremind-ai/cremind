@@ -37,7 +37,7 @@ from app.tools.builtin.claude_code_runner import (
     Var,
     ClaudeCodeConcurrencyError,
     _as_int,
-    credential_source,
+    credential_info,
     get_task,
     known_task_ids,
     load_sdk,
@@ -107,9 +107,12 @@ TOOL_CONFIG: ToolConfig = {
         },
         Var.API_KEY: {
             "description": (
-                "Anthropic API key for Claude Code. Empty = fall back to the "
-                "profile's Anthropic LLM credentials, then the server environment "
-                "or `claude login`."
+                "Anthropic API key for Claude Code. Empty = fall back to the server "
+                "environment (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN), then the "
+                "CLI's own login - this profile's `claude auth login`, else the "
+                "server's shared one. Independent of Settings -> LLM Providers: the "
+                "Anthropic provider configured there is Cremind's own reasoning "
+                "credential and is never used for coding tasks."
             ),
             "type": "string",
             "secret": True,
@@ -474,16 +477,16 @@ class ClaudeCodeStatusTool(BuiltInTool):
     name: str = "status"
     description: str = (
         "Report whether Claude Code is ready to use, and list the Claude models "
-        "available to the resolved account — WITHOUT starting a coding task. Shows "
-        "whether the SDK is installed, which Anthropic credential source is "
-        "configured (tool variable, this profile's LLM settings, the server "
-        "environment, or a host `claude login`), and the account's available "
-        "`models`. Use it to answer 'is Claude Code set up?' AND 'which models can "
-        "Claude Code use?'. For the full list plus how to change the model, run "
+        "available to the resolved account, WITHOUT starting a coding task. Shows "
+        "whether the SDK is installed, which credential source is configured "
+        "(the CLAUDE_CODE_API_KEY tool variable, the server environment, or the "
+        "`claude` CLI's own login: this profile's, or the server's shared one), "
+        "which CLI home that login lives in, and the account's available `models`. "
+        "Use it to answer 'is Claude Code set up?' AND 'which models can Claude "
+        "Code use?'. For the full list plus how to change the model, run "
         "`cremind tools options claude_code` / `cremind tools set-var claude_code "
-        "CLAUDE_CODE_MODEL=<id>` via the Shell Executor. Pass probe=true to run a "
-        "tiny live check that definitively confirms authentication (one minimal API "
-        "call, no file changes)."
+        "CLAUDE_CODE_MODEL=<id>` via the Shell Executor. Pass probe=true to ask "
+        "the CLI itself who is signed in (local, unbilled, no file changes)."
     )
     parameters: Dict[str, Any] = {
         "type": "object",
@@ -491,9 +494,10 @@ class ClaudeCodeStatusTool(BuiltInTool):
             "probe": {
                 "type": "boolean",
                 "description": (
-                    "When true, run a minimal live check to definitively confirm "
-                    "Claude Code can authenticate (a single tiny request, no tools, "
-                    "no edits). Use this to answer 'is Claude logged in?' for sure."
+                    "When true, run `claude auth status` (and, for an API-key "
+                    "credential, one unbilled model listing) to definitively confirm "
+                    "Claude Code can authenticate. Local and free - use it to answer "
+                    "'is Claude logged in?' for sure."
                 ),
             },
         },
@@ -514,7 +518,8 @@ class ClaudeCodeStatusTool(BuiltInTool):
 
         profile = arguments.get("_profile") or "default"
         variables = merge_variables(arguments.get("_variables"))
-        source = credential_source(variables, profile)
+        info = credential_info(variables, profile)
+        source = info["source"]
         configured = source is not None
 
         mode = variables.get(Var.PERMISSION_MODE) or "bypassPermissions"
@@ -522,6 +527,14 @@ class ClaudeCodeStatusTool(BuiltInTool):
             "available": True,
             "sdk_installed": True,
             "credential_source": source,
+            # Always reported, credential or not: "which home does this profile
+            # authenticate from?" is the question behind every confusing answer
+            # here (a profile borrowing the server's login, a session that only
+            # resumes under the home it was created in), and the model cannot
+            # ask a follow-up question about a field that isn't there.
+            "credential_scope": info["scope"],
+            "cli_home": info["cli_home"],
+            "account_hint": info["account_hint"],
             "credentials_configured": configured,
             "effective_permission_mode": mode,
         }
@@ -531,16 +544,20 @@ class ClaudeCodeStatusTool(BuiltInTool):
         if advisory is not None:
             payload["permission_advisory"] = advisory
         if configured:
+            scope_note = f", {info['scope']} scope" if info["scope"] else ""
             payload["message"] = (
                 f"Claude Code is installed and a credential is configured "
-                f"({source}). Pass probe=true to confirm it actually authenticates."
+                f"({source}{scope_note}, CLI home {info['cli_home']}). Pass probe=true "
+                "to confirm it actually authenticates (local check, costs nothing)."
             )
         else:
             payload["message"] = (
-                "Claude Code is installed, but no Anthropic credential is visible to "
-                "Cremind (no CLAUDE_CODE_API_KEY tool variable, no Anthropic provider "
-                "in this profile's LLM settings, no key in the server environment, and "
-                "no host `claude login`). Pass probe=true to check for certain."
+                "Claude Code is installed, but no credential is visible to Cremind: "
+                f"the CLI home {info['cli_home']} holds no login, and there is no "
+                "CLAUDE_CODE_API_KEY tool variable and no key in the server "
+                "environment. Pass probe=true to check for certain (on macOS the "
+                "login lives in the Keychain, where Cremind cannot see it). "
+                + runner._SIGN_IN_REMEDIATION
             )
 
         # List the account's available models (cached, never raises) so the agent
@@ -559,27 +576,43 @@ class ClaudeCodeStatusTool(BuiltInTool):
         )
 
         if arguments.get("probe"):
-            raw_cwd = arguments.get("_working_directory") or get_user_working_directory()
-            cwd = os.path.abspath(os.path.expanduser(str(raw_cwd)))
-            try:
-                os.makedirs(cwd, exist_ok=True)
-            except OSError:
-                pass
-            result = await probe_auth(sdk, cwd=cwd, variables=variables, profile=profile)
+            # No working directory is prepared any more: the probe asks the CLI
+            # who is signed in (and, for a key, lists models) rather than running
+            # a real one-turn coding query, so there is nothing to run it *in*.
+            result = await probe_auth(sdk, cwd="", variables=variables, profile=profile)
             payload["logged_in"] = result.get("logged_in")
             payload["probe_detail"] = result.get("detail")
+            # The verdict is ABOUT a credential, and it is not always the one
+            # `credential_info` guessed: that is Cremind's ranking, while the
+            # probe asks `claude auth status` which credential the CLI would
+            # really use. Overwrite the guess with the answer, or a card would
+            # show "API key (tool variable)" next to a tick earned by the OAuth
+            # login. `credential_verified` keeps the two claims apart - True
+            # only when the API itself answered, so a held-but-expired login
+            # cannot read as a working one.
+            if result.get("credential_source") is not None:
+                payload["credential_source"] = result["credential_source"]
+            payload["credential_verified"] = result.get("credential_verified")
+            # The account the CLI itself reported, not the hint read off disk:
+            # on the one call that actually asked, say who the login belongs to.
+            # Always present on a probe (None when there is nothing to report),
+            # matching the Codex leaf so one card can render both.
+            account = result.get("account")
+            payload["account"] = account
             if result.get("logged_in") is True:
-                payload["message"] = "Claude Code is authenticated and ready to use."
+                who = (account or {}).get("email") or info["cli_home"]
+                payload["message"] = (
+                    f"Claude Code is authenticated and ready to use ({who})."
+                )
             elif result.get("logged_in") is False:
                 payload["message"] = (
-                    "Claude Code is NOT authenticated. Set the CLAUDE_CODE_API_KEY tool "
-                    "variable, configure the Anthropic provider under Settings → LLM, or "
-                    "run `claude login` on the server host."
+                    "Claude Code is NOT authenticated. " + runner._SIGN_IN_REMEDIATION
                 )
             else:
                 payload["message"] = (
-                    "Could not determine Claude Code's login status: "
-                    + str(result.get("detail") or "the live check did not complete.")
+                    "Could not determine Claude Code's login status (this is not the "
+                    "same as being signed out): "
+                    + str(result.get("detail") or "the check did not complete.")
                 )
         return BuiltInToolResult(structured_content=payload)
 

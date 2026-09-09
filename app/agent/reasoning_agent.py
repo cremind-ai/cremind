@@ -49,6 +49,7 @@ from app.config import (
     model_supports_vision,
     vision_feature_enabled,
 )
+from app.config.runtime_env import runtime_environment_prompt_line
 from app.config.settings import get_user_working_directory
 from app.config.user_config import resolve_agent_config, resolve_memory_config
 from app.constants import ChatCompletionTypeEnum
@@ -69,6 +70,7 @@ from app.tools import (
     ToolType,
 )
 from app.tools.base import make_leaf_name
+from app.tools.ids import slugify
 from app.skills.scanner import generate_dir_tree
 from app.types import ReasoningStreamResponseType
 from app.utils.common import truncate_to_tokens
@@ -110,7 +112,7 @@ SKILL_LOAD_REQUEST = "Load skill '{name}' instructions (SKILL.md)"
 SYSTEM_TEMPLATE = '''{persona_description}
 
 Current OS: {current_os}
-Current User Working Directory: `{current_user_working_directory}`
+{runtime_environment}Current User Working Directory: `{current_user_working_directory}`
 If the user refers to a file or folder OUTSIDE this working directory (any other
 absolute path on disk), do NOT refuse or ask them to move it: call
 `change_working_directory` (target='custom', path=<the absolute directory>) to
@@ -964,6 +966,99 @@ def _both_agents_guidance(claude: dict, codex: dict) -> str:
     )
 
 
+# Slug the skill-creator skill registers under. Skills take the tool_id
+# ``<profile>__<slug>`` (``ToolRegistry.register_skill_sync``), so the profile
+# prefix is whatever profile owns the copy -- never hardcode the whole id.
+_SKILL_CREATOR_SLUG = slugify("skill-creator")
+
+
+def _skill_creator_tool_id(tools) -> Optional[str]:
+    """The enabled skill-creator skill's REAL tool_id, or None when it is off.
+
+    Matched the way ``_build_skills_guidance`` finds skills (``ToolType.SKILL``)
+    and then by slug, accepting both the canonical ``<profile>__skill_creator``
+    and a bare ``skill_creator`` (a skill registered before the profile prefix
+    existed keeps its stored id). The id we return is the exact function name the
+    model sees in its tools block, so the guidance can name it verbatim -- a
+    guessed name would send the model looking for a function that isn't there.
+    """
+    for tool in tools:
+        if getattr(tool, "tool_type", None) is not ToolType.SKILL:
+            continue
+        tool_id = getattr(tool, "tool_id", "") or ""
+        if tool_id == _SKILL_CREATOR_SLUG or tool_id.endswith(f"__{_SKILL_CREATOR_SLUG}"):
+            return tool_id
+    return None
+
+
+def _skill_authoring_clause(agents: List[Tuple[str, str]], skill_tool_id: str) -> str:
+    """The "who writes the skill?" rule, appended to the delegation guidance only
+    when a coding delegate AND the skill-creator skill are both enabled.
+
+    Without it the two enabled paths collide: the delegation rule above says ANY
+    file-writing work goes to a coding agent, while skill-creator says the agent
+    should scaffold the skill itself. Both are defensible and the user has a real
+    preference (delegating costs a coding-agent run but survives a long build),
+    so the model must ASK instead of silently picking one.
+
+    ``agents`` is ``[(display name, run function)]`` in prompt order; the string
+    depends only on that and on ``skill_tool_id``, both of which come from the
+    run's enabled tool set, so the block stays byte-stable within a run exactly
+    like ``_PERMISSION_PLAYBOOK``.
+
+    That byte-stability is also why path (b) describes the skills root instead of
+    hard-requiring ``change_working_directory``'s ``skills`` target: that target
+    is withdrawn from the enum as soon as any skill is loaded
+    (``change_working_directory.create_prepare_tools``), which is exactly the
+    state this clause is reached in when the user arrives through skill-creator's
+    own "two ways to build a skill" section. The clause cannot branch on
+    ``_loaded_skill_ids`` to compensate — that set changes on every skill load and
+    would bust the prompt cache — so it states the root's identity (the parent
+    every installed skill is a sibling under, which is how skill-creator's
+    SKILL.md defines it too) and names ``skills`` only as the shortcut it is.
+    """
+    named = " or ".join(f"{label} (`{run_fn}`)" for label, run_fn in agents)
+    run_call = (
+        "the chosen agent's run function"
+        if len(agents) > 1
+        else f"`{agents[0][1]}`"
+    )
+    return (
+        "SKILL AUTHORING — ASK WHICH PATH FIRST: when the user asks you to "
+        "create, build or scaffold a new Cremind skill, do NOT start writing one "
+        "and do NOT treat it as an ordinary coding task. Ask the user ONCE which "
+        f"path they want: (a) you build it yourself with the `{skill_tool_id}` "
+        f"skill, or (b) you delegate it to {named} — the delegate reads the same "
+        "skill-creator material and writes the files itself. Ask once, then "
+        "follow their answer.\n"
+        f"For (a): call `{skill_tool_id}` to load the skill and follow its "
+        "instructions.\n"
+        "For (b): FIRST land in this profile's skills root — the one directory "
+        "every installed skill sits in as a sibling, `skill-creator` included. "
+        "`change_working_directory` goes straight there with target='skills' "
+        "whenever that option is offered; it is withdrawn once any skill is "
+        "loaded, and then a loaded skill's own target lands one level below the "
+        "root, so take the PARENT of the directory that call reports and re-enter "
+        f"it with target='custom'. THEN call {run_call} with "
+        "a brief that (1) names the target directory `<skills root>/<skill-name>` "
+        "with the name lowercase and hyphenated, and requires checking for a "
+        "collision with an existing directory before creating it; (2) tells the "
+        "coding agent to READ `skill-creator/SKILL.md` and "
+        "`skill-creator/references/spec.md`, `events.md` and `templates.md` "
+        "BEFORE writing anything, because together they are the complete Cremind "
+        "skill contract, and to build the smallest tier that satisfies the need; "
+        "(3) requires running `uv run skill-creator/scripts/validate.py "
+        "<skill-name>` from the skills root and getting PASS before it reports "
+        "back; (4) forbids writing anything outside the skills root and forbids "
+        "modifying any existing or built-in skill, skill-creator included.\n"
+        "After the delegate finishes, the skills watcher hot-loads the new "
+        "directory within about a second: verify with `cremind skill-events "
+        "events <skill-name>` through the Shell Executor tool, then tell the user "
+        "the skill is live and that its variables are filled in under Settings → "
+        "Tools & Skills."
+    )
+
+
 def _build_coding_delegation_guidance(tools) -> str:
     """Coding-delegation guidance, present ONLY when a coding-delegate tool
     (``claude_code`` and/or ``codex``) is enabled for this run, naming the exact
@@ -975,6 +1070,11 @@ def _build_coding_delegation_guidance(tools) -> str:
     historical single-agent prompt), only Codex (the same body, Codex-worded), or
     both (a neutral rule that hard-requires delegating coding to one of them and
     lets the model pick per task). Wrapped ``'\\n...\\n'`` like the other blocks.
+
+    The skill-authoring clause rides along at the end, and only when the
+    skill-creator skill is ALSO enabled: it exists to resolve the collision
+    between this block and that skill, so with either half missing there is
+    nothing to resolve and the prompt stays as it was.
     """
     claude = _coding_agent_fns(tools, "claude_code")
     codex = _coding_agent_fns(tools, "codex")
@@ -987,6 +1087,15 @@ def _build_coding_delegation_guidance(tools) -> str:
         body = _single_agent_guidance(codex, agent="CODEX", extra="Codex")
     else:
         return ""
+
+    skill_creator = _skill_creator_tool_id(tools)
+    if skill_creator:
+        agents = [
+            (label, fns["run"])
+            for label, fns in (("Claude Code", claude), ("Codex", codex))
+            if fns
+        ]
+        body += "\n" + _skill_authoring_clause(agents, skill_creator)
     return "\n" + body + "\n"
 
 
@@ -1100,10 +1209,11 @@ def _build_skills_guidance(tools) -> str:
 # ``cremind channels groups <verb>`` (depth 3), which the position rule below
 # rejects anyway.
 _PLAN_READONLY_CLI_VERBS: frozenset = frozenset({
-    "capabilities", "catalog", "check", "current", "cwd", "exportable",
-    "get", "get-args", "heads", "health", "history", "inspect", "leaves",
-    "list", "me", "memory", "models", "options", "schema", "senders",
-    "settings", "show", "status", "usage", "version", "which",
+    "capabilities", "catalog", "check", "coding-agents", "current", "cwd",
+    "environment", "exportable", "get", "get-args", "heads", "health",
+    "history", "inspect", "leaves", "list", "me", "memory", "models",
+    "options", "schema", "senders", "settings", "show", "status", "usage",
+    "version", "which",
 })
 
 # Command GROUPS refused outright, whatever the verb. ``cremind auth show
@@ -1141,24 +1251,126 @@ _PLAN_READONLY_CLI_GROUPS: Dict[str, frozenset] = {
     "setup server-config": frozenset({"get"}),
 }
 
-# Options that turn an allowed read into something that never ends. A tailing
+# Leaves under a group whose own NAME is a read-only verb, which must not ride
+# in on it. ``coding-agents`` is on the verb list above, so the "second word is
+# a read-only verb" rule returns True without ever looking at the third — which
+# is fine while the command is a flat listing and becomes a hole the moment it
+# grows sub-commands. ``cremind tools coding-agents login claude_code`` runs the
+# delegate's own CLI login as a subprocess and writes OAuth credentials into the
+# profile's CLI home; ``logout`` deletes them, and with ``--shared`` it signs out
+# the server-wide login every other profile inherits. Both are state changes in a
+# phase the user was told changes nothing.
+#
+# A MAPPING of group path -> refused leaves rather than a global set of leaf
+# names: ``login`` means something different in every group that might grow one,
+# and a global refusal would be a rule nobody could reason about later.
+#
+# ``tests/agent/test_plan_mode_gating.py`` walks the real CLI tree and fails when
+# a new leaf appears under one of these groups without a ruling here, so a
+# sub-command added tomorrow cannot quietly inherit the group's free pass.
+_PLAN_REJECTED_CLI_SUBCOMMANDS: Dict[str, frozenset] = {
+    "tools coding-agents": frozenset({"login", "logout"}),
+}
+
+# Options that change what an admitted read DOES rather than what it prints.
+# Rejected wherever they appear in the command, since a flag's position does not
+# change what it does. Two kinds live here.
+#
+# The first turns an allowed read into something that never ends. A tailing
 # command makes exec_shell classify the call as ``long_running``: it mints a
 # process id, creates a log directory and a state file, and keeps the child
 # alive in the process registry for a 24-hour TTL — so the "read-only" planning
 # phase would leave a process running and disk state behind, outliving the plan
-# the user then rejects. Rejected wherever they appear in the command, since a
-# flag's position does not change what it does.
+# the user then rejects.
+#
+# The second makes an admitted read perform WORK on the server. ``cremind tools
+# coding-agents`` is a pure config read, but the same command with ``--probe``
+# POSTs to ``/api/coding-agents/<id>/probe``, which runs the delegate's status
+# leaf live: for Codex that spawns the ``codex app-server`` child process and
+# talks to it, and for Claude Code it runs ``claude auth status`` in a
+# subprocess. Neither touches the user's OpenAI provider rows any more — the
+# ChatGPT-to-Codex credential bridge that used to rotate a single-use refresh
+# token mid-probe is gone — but "starts processes on the server" is still not
+# what the planning phase promised the user, and a probe under a first-run CLI
+# home can sit there until its timeout. Only the probing form is refused; the
+# plain listing stays available to the planner.
+#
 # ``tests/agent/test_plan_mode_gating.py`` walks the real CLI tree and fails if
-# an admitted command ever gains a streaming or file-writing option that is not
-# listed here, so this stays a maintained invariant rather than a snapshot.
+# an admitted command ever gains a streaming, file-writing or work-performing
+# option that is not listed here, so this stays a maintained invariant rather
+# than a snapshot.
 _PLAN_REJECTED_CLI_OPTIONS: frozenset = frozenset({
     "--follow", "-f", "-F", "--stream", "--tail", "--watch",
     "--out", "-o", "--output", "--file",
+    "--probe",
 })
 
 # Anything that could chain, redirect, or substitute a SECOND command onto the
 # first. A read-only verb is only read-only if it is the whole command.
 _SHELL_METACHARACTERS = ";&|<>`$(){}\n\r"
+
+# Characters that leave the SHELL's word list different from ``text.split()``.
+#
+# This predicate judges ``text.split()`` tokens, but exec_shell hands the SAME
+# string to ``/bin/bash -c`` / ``powershell -Command``. Wherever those two
+# disagree about WHERE THE WORDS ARE, the predicate is reading a different
+# command from the one that runs, and every rule below -- allow-list as much as
+# deny-list -- is then looking at the wrong words.
+#
+# An earlier version of this comment claimed the asymmetry was dangerous only
+# for the deny-lists, because a quoted token stops matching an allow-list and so
+# fails closed. That was wrong. Quoting does not only change what a word SAYS,
+# it changes HOW MANY words there are, and the command word here is located by
+# POSITION: ``cremind -p x\ me clean working`` is five words to bash (``-p``
+# carrying the value ``x me``, then the irreversible ``clean working``) and six
+# tokens to ``str.split()``, so the leading-flag loop consumed one token too few
+# and the whole positional window slid one place left onto an attacker-chosen
+# ``me``. The allow-list matched happily -- on a word the shell never treats as a
+# verb at all.
+#
+# So the rule is not "normalise the quoting", it is: never judge a string whose
+# tokenisation cannot be predicted. Quotes and backslashes JOIN two of our
+# tokens into one word (and are then removed); the glob characters ``*``, ``?``,
+# ``[`` and ``]`` hand the word count to the FILESYSTEM -- in a directory
+# holding a file named ``logout``,
+# ``cremind tools coding-agents *`` IS the sign-out. None of them is ever needed
+# to spell a read-only ``cremind`` listing, so all of them are refused outright.
+# The one cost, recorded honestly: a Windows path argument written with
+# backslashes has to be re-spelled with forward slashes during planning.
+_SHELL_WORD_MANGLING_CHARS = "'\"\\*?[]"
+
+# The whitespace bash actually splits words on. Default IFS is space, tab and
+# newline, and ``_SHELL_METACHARACTERS`` already refuses newline, so a word
+# boundary the shell will honour is one of these two characters.
+#
+# ``str.split()`` also splits on NBSP, vertical tab, form feed and every other
+# Unicode space, which is the same window slide as above reachable without a
+# single quoting character: ``cremind -p x<NBSP>me clean working`` was admitted
+# and ran the wipe. Refusing the whole class (``str.isspace()`` is exactly the
+# set ``str.split()`` splits on, so this cannot be outgrown by a new codepoint)
+# is what keeps the two tokenisations identical. PowerShell does split on NBSP,
+# so this form hit the bash deployments only -- Linux, Docker and Kubernetes.
+_SHELL_WORD_SEPARATORS = " \t"
+
+# Quoting characters the shell collapses before ``cremind`` ever sees the word.
+# Redundant by construction now that the characters themselves are refused
+# above, and deliberately kept: the deny-list lookups below are the rules where
+# a token that stops matching gets ADMITTED (``cremind tools coding-agents
+# "logout"`` once missed the leaf set, fell through to ``coding-agents`` being a
+# read-only verb, and returned True while the shell ran the real sign-out), so
+# they keep testing the COLLAPSED word and stay correct on their own if the
+# blanket refusal is ever relaxed.
+_SHELL_QUOTING_CHARS = str.maketrans("", "", "'\"\\")
+
+
+def _unquoted(token: str) -> str:
+    """The word the shell will actually hand to ``cremind``.
+
+    For deny-list lookups only, never for an allow-list check, where the
+    literal token has to match and quoting correctly means "refuse".
+    """
+    return token.translate(_SHELL_QUOTING_CHARS)
+
 
 # Root-level flags accepted before the command group (see ``cremind --help``),
 # split by whether they consume the FOLLOWING token as their value. Knowing this
@@ -1189,28 +1401,52 @@ def _is_readonly_cremind_command(command: str) -> bool:
     ``cremind <group> <verb>`` (``cremind channels catalog --json``) and
     ``cremind <known nested group> <verb>`` (``cremind llm providers models``),
     optionally behind the root flags above. Everything else — a second chained
-    command, a shell metacharacter, an unknown leading flag, a blocked group, an
-    unknown nested group, or a verb that is not on the read-only list — is
-    rejected. Pure and side-effect free so it can be unit-tested directly.
+    command, a shell metacharacter, an unknown leading flag, a blocked group, a
+    refused sub-command of an otherwise admitted group, an unknown nested group,
+    or a verb that is not on the read-only list — is rejected. Pure and
+    side-effect free so it can be unit-tested directly.
     """
     if not isinstance(command, str):
         return False
-    text = command.strip()
+    # Strip only the whitespace the shell itself ignores at the ends of a
+    # command. A bare ``.strip()`` would also eat an NBSP or a form feed off
+    # either end, hiding from the check below the very thing it is looking for.
+    text = command.strip(" \t\r\n")
     if not text:
         return False
     if any(ch in text for ch in _SHELL_METACHARACTERS):
+        return False
+    # Refuse anything whose shell tokenisation cannot be predicted, BEFORE any
+    # rule reads a token: a word boundary the shell does not honour (or one it
+    # invents) re-aligns the positional window, and then every allow-list below
+    # is matching words that are not the ones being run. See the two constants.
+    if any(ch.isspace() and ch not in _SHELL_WORD_SEPARATORS for ch in text):
+        return False
+    if any(ch in text for ch in _SHELL_WORD_MANGLING_CHARS):
         return False
     tokens = text.split()
     if tokens[0] != "cremind":
         return False
     # A rejected option anywhere disqualifies the command: the verb says what is
-    # being read, the options say whether it ever stops or writes a file.
-    if any(t.partition("=")[0] in _PLAN_REJECTED_CLI_OPTIONS for t in tokens[1:]):
+    # being read, the options say whether it ever stops, writes a file, or goes
+    # off and does the work the read was only supposed to describe. Un-quoted
+    # first, so `--"probe"` and `--pro\be` are the `--probe` the shell will run.
+    if any(_unquoted(t).partition("=")[0] in _PLAN_REJECTED_CLI_OPTIONS for t in tokens[1:]):
         return False
 
     rest = tokens[1:]
     i = 0
     while i < len(rest) and rest[i].startswith("-"):
+        if rest[i] == "--":
+            # POSIX end-of-options. Click stops parsing options here and drops
+            # the marker, so option-skipping stops here too and the filter below
+            # removes it. Breaking rather than skipping it inside the loop is
+            # what keeps ``cremind -p -- tools coding-agents logout x`` honest:
+            # Click hands a ``--`` popped as an option VALUE to the flag (it is
+            # only end-of-options when the parser reads it as an argument of its
+            # own), so ``-p`` must still eat it above, and ``logout`` must still
+            # be found where it really sits.
+            break
         flag, sep, _value = rest[i].partition("=")
         if flag in _CREMIND_ROOT_FLAGS_BOOL:
             i += 1
@@ -1218,14 +1454,44 @@ def _is_readonly_cremind_command(command: str) -> bool:
             # ``--profile=admin`` carries its value; ``--profile admin`` eats the
             # next token. A trailing flag with no value runs i past the end, and
             # the emptiness check below then rejects the command.
+            #
+            # Only the exact flag word is accepted, never a short-option cluster
+            # (``-padmin`` is profile ``admin`` to Click, ``-hp admin`` eats a
+            # following word): the unknown-flag branch refuses those instead of
+            # this loop guessing how many tokens they consume.
             i += 1 if sep else 2
         else:
             return False  # unknown flag before the command word
-    rest = rest[i:]
+    # Bare ``--`` tokens are dropped so the positional analysis reads the words
+    # Click reads. This cannot newly ADMIT anything: after the loop the window
+    # is exactly the sequence Click resolves sub-commands from, and removing the
+    # marker aligns the two rather than shifting one past the other. It only
+    # ever makes a leaf VISIBLE that was hiding behind the marker --
+    # ``cremind tools coding-agents -- logout claude_code`` really does run the
+    # sign-out, and the fixed-position leaf rule saw ``--`` and missed it.
+    rest = [t for t in rest[i:] if t != "--"]
     if not rest:
         return False
 
-    if rest[0] in _PLAN_BLOCKED_CLI_GROUPS:
+    # Checked before anything admits the command, because the rules below stop
+    # reading at the second word: a leaf under a group whose own name is a
+    # read-only verb would be waved through on the group and never inspected.
+    # The pair and the leaf are both un-quoted for the lookup, so no spelling
+    # the shell collapses to a refused leaf can miss the set.
+    #
+    # The leaf is looked for ANYWHERE after the pair, not at a fixed position:
+    # any option of the group that takes a value (``--probe`` is refused
+    # outright, but this must not depend on knowing every option's arity) would
+    # otherwise push the leaf out of a fixed window. Over-refusing here costs
+    # nothing -- no listing the planner needs names ``login`` or ``logout``.
+    if len(rest) >= 3:
+        refused_leaves = _PLAN_REJECTED_CLI_SUBCOMMANDS.get(
+            f"{_unquoted(rest[0])} {_unquoted(rest[1])}", frozenset()
+        )
+        if refused_leaves and any(_unquoted(t) in refused_leaves for t in rest[2:]):
+            return False
+
+    if _unquoted(rest[0]) in _PLAN_BLOCKED_CLI_GROUPS:
         return False
     if rest[0] in _PLAN_READONLY_CLI_VERBS:
         return True
@@ -1821,6 +2087,13 @@ class ReasoningAgent:
         instruction = SYSTEM_TEMPLATE.format(
             persona_description=read_persona_file(self.profile),  # raw; resolved below
             current_os=platform.system(),
+            # "Am I in Docker?", "is VNC on?", "which release channel is this?"
+            # are fixed for the life of the process, so the line is byte-stable
+            # within a run -- which is why it can live in the cached SYSTEM_TEMPLATE
+            # instead of being appended like the mode/event blocks. The helper
+            # returns no trailing newline; add one so the next template line is
+            # not glued to it.
+            runtime_environment=runtime_environment_prompt_line() + "\n",
             current_user_working_directory=cwd,
             reasoning_guidance=REASONING_GUIDANCE if self._inject_reasoning_guidance else "",
             builtin_tools_guidance=self._builtin_tools_guidance,
@@ -2681,7 +2954,10 @@ class ReasoningAgent:
                         "NOT executed. Do not try to carry out the task yet. In "
                         "this phase the shell runs ONLY a single read-only "
                         "`cremind <group> <list|get|show|status|catalog|...>` "
-                        "command (no pipes, no chaining, no stdin); everything "
+                        "command, spelled plainly: no pipes, no chaining, no "
+                        "stdin, no quotes or backslashes, and ordinary spaces "
+                        "between the words (a command whose words the shell "
+                        "would split differently is refused unread); everything "
                         "else waits for the execution phase. Keep researching "
                         "instead: LOAD the skills relevant to this request (a "
                         "skill call only loads its instructions), search the "

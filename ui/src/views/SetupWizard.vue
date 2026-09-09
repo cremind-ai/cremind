@@ -31,8 +31,8 @@ import {
   type InstallSecrets,
 } from '../services/configApi';
 import {
-  buildExport,
-  exportMimeType,
+  assembleConfigSnapshot,
+  downloadConfigExport,
   type ConfigExportSnapshot,
   type ExportFormat,
 } from '../utils/configExport';
@@ -447,6 +447,17 @@ const checkingStatus = ref(true);
 // deployment instead of the unmutated form defaults.
 function reconcileInstallStateFromSecrets(secrets: InstallSecrets | null) {
   if (!secrets || !secrets.available) return;
+  // Kubernetes folds into 'docker' here on purpose: these two refs answer
+  // "container or host process?" and "which installer questions apply?", and
+  // ``installMode`` is also posted to the Electron installer bridge, which has
+  // no Helm branch. The chart is named in the exported file instead — see
+  // ``exportDeployment``. Written out rather than left to fall through to
+  // ``secrets.deployment`` (which happens to say "docker" too) so the fold is
+  // a decision the next reader can see rather than a coincidence.
+  if (secrets.install_mode === 'kubernetes') {
+    installMode.value = 'docker';
+    return;
+  }
   const mode = (secrets.install_mode === 'docker' || secrets.install_mode === 'native')
     ? secrets.install_mode
     : secrets.deployment;
@@ -462,6 +473,24 @@ function reconcileInstallStateFromSecrets(secrets: InstallSecrets | null) {
     installDeployment.value = env;
   }
 }
+
+// What the exported config file calls this deployment. Only the export widens
+// to 'kubernetes': ``installDeployment`` stays local/server/custom because the
+// Electron installer bridge consumes it verbatim, but a file that said "local"
+// for a Helm install would describe the wrong thing to the one reader who has
+// lost the cluster.
+const exportDeployment = computed<ConfigExportSnapshot['deployment']['type']>(
+  () => (installSecrets.value?.install_mode === 'kubernetes'
+    ? 'kubernetes'
+    : installDeployment.value),
+);
+
+// The chart states the namespace and Service, so the reconnect line can be the
+// real command instead of "the same one you ran". Empty on an older chart that
+// injects no identity, and off Kubernetes entirely.
+const pivotPortForward = computed(
+  () => installSecrets.value?.kubernetes?.port_forward ?? '',
+);
 
 // Collected config from each step.
 // ``serverConfig`` may carry a nested ``postgres`` object when the admin
@@ -1313,159 +1342,25 @@ const embeddingBlocking = computed(() => {
 const embeddingFailed = computed(() => embeddingStatus.value === 'failed');
 
 function buildConfigSnapshot(): ConfigExportSnapshot {
-  const server = serverConfig.value as Record<string, any>;
-  const dbProvider: 'postgres' | 'sqlite' = server.db_provider === 'postgres'
-    ? 'postgres'
-    : 'sqlite';
-
-  let postgres: ConfigExportSnapshot['database']['postgres'] | undefined;
-  if (dbProvider === 'postgres') {
-    const pg = (server.postgres ?? {}) as Record<string, any>;
-    const secrets = installSecrets.value;
-    postgres = {
-      host: String(pg.host ?? secrets?.pg_host ?? 'localhost'),
-      port: Number(pg.port ?? secrets?.pg_port ?? 5432),
-      database: String(pg.database ?? secrets?.pg_database ?? 'cremind'),
-      user: String(pg.user ?? secrets?.pg_user ?? 'cremind'),
-      password: String(pg.password ?? secrets?.pg_password ?? ''),
-      sslmode: pg.sslmode ? String(pg.sslmode)
-        : (secrets?.pg_sslmode ?? undefined),
-    };
-  }
-
-  const workingDir = String(server.user_working_dir ?? '~/Documents');
-  const systemDir = String(server.system_dir ?? '~/.cremind');
-  const sqlitePath = `${systemDir.replace(/[\\/]+$/, '')}/storage/cremind.db`;
-
-  // Vector store info lives in embeddingConfig (the wizard's local ref
-  // submitted to /api/config/setup) — NOT serverConfig. The flat
-  // ``vectorstore.*`` keys only land in the SQLite server_config table
-  // after persist_embedding_config runs, and the wizard never refetches.
-  const vs = embeddingConfig.value?.vectorstore;
-  const vectorProvider: 'qdrant' | 'chroma' | 'none' = (
-    embeddingConfig.value?.enabled
-    && (vs?.provider === 'qdrant' || vs?.provider === 'chroma')
-  ) ? vs!.provider : 'none';
-
-  let qdrant: ConfigExportSnapshot['vectorStore']['qdrant'] | undefined;
-  if (vectorProvider === 'qdrant' && vs) {
-    qdrant = {
-      host: String(vs.qdrant.host ?? 'localhost'),
-      port: Number(vs.qdrant.port ?? 6333),
-      api_key: vs.qdrant.api_key ? String(vs.qdrant.api_key) : undefined,
-      https: Boolean(vs.qdrant.https),
-    };
-  }
-
-  let chroma: ConfigExportSnapshot['vectorStore']['chroma'] | undefined;
-  if (vectorProvider === 'chroma' && vs) {
-    // Same persist-vs-http translation as
-    // app/lib/embedding_lifecycle.py:120 (Native → persistent file;
-    // Docker / External → http endpoint).
-    const mode: 'http' | 'persistent' =
-      vs.chroma.deployment_mode === 'native' ? 'persistent' : 'http';
-    chroma = {
-      mode,
-      host: vs.chroma.host || undefined,
-      port: vs.chroma.port ?? undefined,
-      ssl: vs.chroma.ssl ?? undefined,
-      api_key: vs.chroma.api_key ? String(vs.chroma.api_key) : undefined,
-      persist_path: vs.chroma.persist_path
-        ? String(vs.chroma.persist_path) : undefined,
-    };
-  }
-
-  const includeVnc = installMode.value === 'docker'
-    && Boolean(installSecrets.value?.vnc_password);
-
-  let vnc: ConfigExportSnapshot['vnc'] | undefined;
-  if (includeVnc) {
-    const secrets = installSecrets.value!;
-    // Derive the host from APP_URL so server / custom deployments show a
-    // host the user can actually reach. APP_URL is provided by the
-    // install-secrets endpoint from the cremind container's env. Falls
-    // back to localhost for local installs (APP_URL absent or missing
-    // host portion).
-    let host = 'localhost';
-    if (secrets.app_url) {
-      const m = secrets.app_url.match(/^[a-z]+:\/\/([^/:]+)/i);
-      if (m && m[1]) host = m[1];
-    }
-    // Kubernetes usually runs a single pod behind an nginx proxy that fronts
-    // the SPA, API and noVNC on ONE port, with the desktop at /vnc/vnc.html on
-    // the app origin (e.g. http://localhost:1515/vnc/vnc.html for the
-    // documented `port-forward svc/cremind 1515:80`, or https://<host>/...
-    // behind an Ingress). But the chart bypasses that sidecar when the pod
-    // terminates TLS itself, and noVNC then answers on its own Service port
-    // instead — indistinguishable from here, so the chart tells us via
-    // CREMIND_NOVNC_URL and that wins whenever it is set.
-    // See helm/cremind/templates/{proxy-configmap,configmap}.yaml.
-    if (secrets.install_mode === 'kubernetes') {
-      let origin = 'http://localhost:1515';
-      if (secrets.app_url) {
-        try { origin = new URL(secrets.app_url).origin; } catch { /* keep default */ }
-      }
-      vnc = {
-        password: secrets.vnc_password as string,
-        host,
-        novnc_url: secrets.novnc_url || `${origin}/vnc/vnc.html`,
-        resolution: secrets.resolution || undefined,
-        environment: 'kubernetes',
-      };
-    } else {
-      const novncPort = secrets.novnc_port ?? 6080;
-      const vncPort = secrets.vnc_port ?? 5900;
-      vnc = {
-        password: secrets.vnc_password as string,
-        host,
-        novnc_port: novncPort,
-        vnc_port: vncPort,
-        novnc_url: `http://${host}:${novncPort}/vnc.html`,
-        vnc_endpoint: `${host}:${vncPort}`,
-        resolution: secrets.resolution || undefined,
-        environment: 'docker',
-      };
-    }
-  }
-
-  const customFields = installDeployment.value === 'custom'
-    ? { ...installCustomValues.value } : undefined;
-
-  return {
+  return assembleConfigSnapshot({
     profile: profileName.value,
     token: generatedToken.value,
     tokenExpiresAt: tokenExpiresAt.value,
     agentUrl: exportAgentUrl.value,
     agentUrlPendingHttps: Boolean(finishTls.value?.pending),
     generatedAt: new Date().toISOString(),
-    deployment: {
-      type: installDeployment.value,
-      mode: installMode.value,
-      customFields,
-    },
-    vnc,
-    workingDir,
-    systemDir,
-    database: {
-      provider: dbProvider,
-      postgres,
-      sqlite: dbProvider === 'sqlite' ? { path: sqlitePath } : undefined,
-    },
-    vectorStore: {
-      provider: vectorProvider,
-      qdrant,
-      chroma,
-    },
-    embedding: {
-      enabled: Boolean(embeddingConfig.value?.enabled),
-      provider: embeddingConfig.value?.provider,
-    },
+    installDeployment: exportDeployment.value,
+    installMode: installMode.value,
+    installCustomValues: installCustomValues.value,
+    installSecrets: installSecrets.value,
+    serverConfig: serverConfig.value,
+    embeddingConfig: embeddingConfig.value,
     channels: createdChannels.value.map((ch) => ({
       type: String((ch as any).channel_type ?? ''),
       mode: String((ch as any).mode ?? ''),
       id: String((ch as any).id ?? ''),
     })),
-  };
+  });
 }
 
 async function downloadConfigFile(format: ExportFormat) {
@@ -1488,19 +1383,7 @@ async function downloadConfigFile(format: ExportFormat) {
       installSecrets.value = null;
     }
   }
-  const snapshot = buildConfigSnapshot();
-  const content = buildExport(format, snapshot);
-  const mime = exportMimeType(format);
-  const filename = `cremind-${profileName.value}-config.${format}`;
-  const blob = new Blob([content], { type: `${mime};charset=utf-8` });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  downloadConfigExport(format, buildConfigSnapshot(), profileName.value);
   // Recovering credentials, paths, and the JWT token without the export
   // is painful, so we gate "Start Using Cremind" on this flag — the user
   // must trigger at least one download before they can leave the wizard.
@@ -1632,6 +1515,19 @@ async function downloadConfigFile(format: ExportFormat) {
                 <code>kubectl port-forward</code> may have ended with the
                 restart — re-run the same command in your terminal and this
                 page continues on its own the moment it's back.
+              </p>
+              <!-- Printed only when the chart told the pod its own namespace
+                   and Service; an older chart knows neither, and the sentence
+                   above stands on its own there. -->
+              <p v-if="pivotPortForward">
+                <code>{{ pivotPortForward }}</code><button
+                  type="button"
+                  class="copy-icon-btn"
+                  :class="{ copied: isPivotCopied('pivot-forward') }"
+                  :title="isPivotCopied('pivot-forward') ? 'Copied!' : 'Copy command'"
+                  aria-label="Copy the port-forward command"
+                  @click="copyPivotValue(pivotPortForward, 'pivot-forward')"
+                ><Icon :icon="isPivotCopied('pivot-forward') ? 'mdi:check' : 'mdi:content-copy'" /></button>
               </p>
               <p>
                 Or the server is already up and this browser doesn't trust its

@@ -241,8 +241,25 @@ async function tlsJson<T>(
   return body as T;
 }
 
-export function fetchTlsStatus(agentUrl: string): Promise<TlsRuntimeStatus> {
-  return tlsJson<TlsRuntimeStatus>(`${resolveBaseUrl(agentUrl)}/api/tls/status`);
+/** Read the live TLS state and its deployment runbook.
+ *
+ *  The token is optional, and the call must keep working without one: the
+ *  pre-sign-in recovery page polls this, and during the HTTPS handoff the
+ *  transition code polls the *target* origin, where this browser holds no
+ *  session yet. Pass it wherever the SPA has one, because what comes back
+ *  depends on who asked — the Kubernetes ``kubernetes`` identity, and the
+ *  runbook naming the real namespace / release / Deployment instead of
+ *  placeholders, are admin-only (see ``tls_status_payload``). An anonymous
+ *  Settings page therefore renders the very placeholder runbook the identity
+ *  feature exists to remove.
+ *
+ *  Only the bearer, never a Content-Type: this is a GET, and the token-less
+ *  cross-origin polls above stay CORS-simple with no headers at all.
+ */
+export function fetchTlsStatus(agentUrl: string, token?: string): Promise<TlsRuntimeStatus> {
+  const headers: Record<string, string> = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  return tlsJson<TlsRuntimeStatus>(`${resolveBaseUrl(agentUrl)}/api/tls/status`, { headers });
 }
 
 export function prepareHttps(
@@ -587,7 +604,74 @@ export async function requestServerRestart(
   }
 }
 
+// ── Deployment identity and desktop access ──
+//
+// Both blocks travel on ``GET /api/system/environment`` *and* on
+// ``GET /api/config/install-secrets``, in the same shape. The Setup Wizard
+// only ever reads install-secrets and the Developer page reads the
+// environment, so a fact carried by one endpoint alone would be missing from
+// half the places that describe the same install.
+
+/** What a pod cannot work out about itself. The chart states it in
+ *  ``CREMIND_K8S_*`` and the app echoes it here, so the UI can print
+ *  ``kubectl --namespace lee-cremind port-forward svc/cremind 1515:80``
+ *  instead of ``<namespace>`` / ``<release>`` placeholders.
+ *
+ *  The whole block is null off Kubernetes. Individual fields stay null on an
+ *  older chart that injects no identity env — ``source`` says how much is
+ *  known: ``chart`` (stated outright) or ``inferred`` (read off the pod name
+ *  and the service-account namespace file, which cannot recover the release). */
+export interface KubernetesIdentity {
+  namespace?: string | null;
+  /** Helm release name — the argument ``helm upgrade`` takes. */
+  release?: string | null;
+  /** Deployment name, which the chart also uses as the Service name. */
+  workload?: string | null;
+  service?: string | null;
+  service_port?: number | null;
+  source?: 'chart' | 'inferred' | null;
+  /** Ready-to-paste reconnect command; null unless the namespace and the
+   *  Service are both known. */
+  port_forward?: string | null;
+}
+
+/** One bare ``kubectl port-forward`` line and the URL it makes reachable. */
+export interface VncPortForwardCommand {
+  label: string;
+  /** A single shell line — no "Run " prefix, no trailing period — so
+   *  ``DeploymentSteps`` can copy it verbatim. */
+  command: string;
+  open_url: string;
+}
+
+/** How the VNC desktop is reached on this install. Only the server knows how
+ *  noVNC was wired (its own published port, the Kubernetes proxy sidecar's
+ *  path, or a TCP relay that needs a tunnel), so it names the shape and the
+ *  browser fills in the address it actually used — see ``utils/vncDesktop.ts``.
+ *
+ *  ``enabled`` false (native installs, and the basic image) means there is no
+ *  desktop at all: ``access`` is null and the card stays hidden. */
+export interface VncAccess {
+  enabled: boolean;
+  /** ``direct`` — noVNC on its own port on the same host as Cremind;
+   *  ``same_origin`` — served by the proxy sidecar on Cremind's own origin;
+   *  ``port_forward`` — reachable only through the tunnel below. */
+  access: 'direct' | 'same_origin' | 'port_forward' | null;
+  novnc_path?: string | null;
+  novnc_port?: number | null;
+  /** Absolute URL when the deployment states one (the chart's
+   *  ``CREMIND_NOVNC_URL``); null when the browser has to compose it. */
+  novnc_url?: string | null;
+  port_forward_commands?: VncPortForwardCommand[];
+  /** Why this install is reached that way — including, for ``direct``, that
+   *  Cremind's own HTTPS does not cover the noVNC port. */
+  scheme_note?: string | null;
+}
+
 export interface InstallSecrets {
+  /** Container or host process — that is the only question this field
+   *  answers, so a Kubernetes install reports ``docker``. ``install_mode``
+   *  below is what names the deployment. */
   deployment: 'docker' | 'native';
   available: boolean;
   // Docker runtime block — populated when the backend detects a docker
@@ -606,6 +690,11 @@ export interface InstallSecrets {
   // Set by deployments that know where noVNC answers (the Helm chart), for
   // the cases the browser cannot infer — see the API's comment.
   novnc_url?: string | null;
+  // Which database backend bootstrap.toml records. The Developer page's
+  // config re-download needs it because ``/api/config/server`` deliberately
+  // never returns it — ``db_provider`` is a bootstrap-only key. Optional: a
+  // server older than this field simply omits it and the caller falls back.
+  db_provider?: string | null;
   // Postgres block — populated when the Setup Wizard configured Postgres
   // (bootstrap.toml has db_provider="postgres").
   pg_host?: string | null;
@@ -615,6 +704,12 @@ export interface InstallSecrets {
   pg_database?: string | null;
   pg_sslmode?: string | null;
   pg_deployment_mode?: 'docker' | 'external' | null;
+  /** Which cluster object this install is, and how to reach its desktop —
+   *  the same blocks ``/api/system/environment`` reports. Repeated here
+   *  because the Setup Wizard never calls that endpoint: it builds the whole
+   *  config file out of install-secrets. Null / absent on older servers. */
+  kubernetes?: KubernetesIdentity | null;
+  vnc?: VncAccess | null;
 }
 
 export async function fetchInstallSecrets(
@@ -1661,6 +1756,357 @@ export async function streamFeaturesInstall(
     failed: lastDone.failed ?? [],
     error: (lastDone.error as string | null | undefined) ?? null,
   };
+}
+
+// ── Runtime environment ──
+
+/** What ``GET /api/system/environment`` reports about the running install:
+ *  how it was installed, how it is deployed, and where its data lives.
+ *
+ *  Every field is optional because the endpoint's shape grows over time and
+ *  this SPA is served by whatever backend the user upgraded to — a missing
+ *  field must render as "unknown", never break the card. */
+export interface SystemEnvironment {
+  /** Upgrade channel this install follows: production | test | dev. */
+  release_channel?: string | null;
+  /** How Cremind was installed: docker | native | kubernetes. */
+  install_mode?: string | null;
+  /** How it is deployed: local | server | custom | kubernetes. */
+  deployment?: string | null;
+  /** Whether the process runs inside a container. */
+  container?: boolean | null;
+  /** Which image was built: basic (headless) or desktop (VNC). */
+  image_flavor?: string | null;
+  /** Whether the VNC desktop is part of this deployment. */
+  vnc_enabled?: boolean | null;
+  /** Whether something restarts the process for us (Docker, Kubernetes, a
+   *  boot service) — the same fact the Restart card warns about. */
+  supervised?: boolean | null;
+  /** Whether the backend was launched by the Electron shell. */
+  electron?: boolean | null;
+  os?: string | null;
+  os_release?: string | null;
+  python_version?: string | null;
+  backend_version?: string | null;
+  app_url?: string | null;
+  system_dir?: string | null;
+  install_dir?: string | null;
+  host?: string | null;
+  /** The zone this profile's schedules really fire in, resolved per caller:
+   *  its own ``system.timezone``, else the admin's, else ``CREMIND_TIMEZONE``,
+   *  else the host clock. Never blank, so it is the timezone worth showing. */
+  effective_timezone?: string | null;
+  /** The ``CREMIND_TIMEZONE`` boot default on its own — blank on most
+   *  installs, and only one of the inputs to the resolved zone above. */
+  boot_timezone?: string | null;
+  /** The custom-deployment .env values (listen host, public URL, allowed
+   *  origins, wizard preset) — only meaningful when ``deployment`` is
+   *  ``custom``, and what the config export re-emits as its custom fields. */
+  deployment_custom_fields?: Record<string, string> | null;
+  /** Which namespace, Helm release and Deployment / Service this pod is. Null
+   *  off Kubernetes, and null per field on a chart too old to state them. */
+  kubernetes?: KubernetesIdentity | null;
+  /** How to reach the VNC desktop, or ``enabled: false`` when there is none. */
+  vnc?: VncAccess | null;
+}
+
+export async function fetchSystemEnvironment(
+  agentUrl: string,
+  token: string,
+): Promise<SystemEnvironment> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/system/environment`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to load environment: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+// ── Coding agents (Claude Code / Codex) ──
+
+/** How a coding agent is signed in.
+ *
+ *  The login belongs to the agent's own CLI, not to Cremind's LLM provider
+ *  settings — the Claude CLI keeps its credential independently of the
+ *  Anthropic provider — so this describes a command to run, never a route
+ *  into Settings. */
+export interface CodingAgentSignIn {
+  /** ``terminal`` — Cremind runs ``cli_login`` in a built-in PTY and the user
+   *  answers its prompts there; ``device_code`` — the card shows a URL and a
+   *  code and waits. */
+  method: 'terminal' | 'device_code';
+  label: string;
+  instructions: string;
+  /** The same commands as a user would type them on the server host, for the
+   *  "or run this on the server" line. */
+  cli_login: string;
+  cli_logout: string;
+}
+
+export interface CodingAgentStatus {
+  tool_id: string;
+  display_name: string;
+  /** Optional-dependency key to hand ``streamFeaturesInstall``. */
+  feature_key: string;
+  extras: string[];
+  sdk_installed: boolean;
+  requires_restart_after_install: boolean;
+  enabled: boolean;
+  /** Non-secret label of where the credential comes from
+   *  (``profile_setup_token``, ``host_claude_login``, …). Null when the
+   *  agent has no credential at all. */
+  credential_source: string | null;
+  /** Whose login that credential is: ``profile`` (this profile signed in
+   *  itself) or ``shared`` (the server-wide login every profile inherits).
+   *  Null when no CLI login is in play — an API key has no scope, and a
+   *  profile that never signed in and has no fallback has nothing to scope. */
+  credential_scope: 'profile' | 'shared' | null;
+  /** The CLI home the login lives in (``CLAUDE_CONFIG_DIR`` / ``CODEX_HOME``),
+   *  so the card can say where signing out would take effect. */
+  cli_home: string | null;
+  /** Non-secret account summary read off that home — email, plan, org. Null
+   *  when nothing is signed in, or when the home says nothing about it. */
+  account_hint: Record<string, unknown> | null;
+  /** Whether the CLI binary is actually present on this server. The SDK can
+   *  be installed while the binary is not, and sign-in needs the binary — so
+   *  this gates the Sign-in button independently of ``sdk_installed``. */
+  cli_available: boolean;
+  credentials_configured: boolean;
+  sign_in: CodingAgentSignIn;
+  /** Human-readable summary of the state above. */
+  message: string;
+}
+
+export async function fetchCodingAgents(
+  agentUrl: string,
+  token: string,
+): Promise<{ agents: CodingAgentStatus[] }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/coding-agents`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to list coding agents: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+/** Run the agent's own live sign-in check. The payload is whatever the
+ *  tool's status leaf reports (``logged_in``, a detail message, the resolved
+ *  credential source) — the same structure the agent sees, so the UI and the
+ *  chat answer can never disagree. */
+export async function probeCodingAgent(
+  agentUrl: string,
+  token: string,
+  toolId: string,
+  opts?: { fresh?: boolean },
+): Promise<Record<string, unknown>> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/coding-agents/${encodeURIComponent(toolId)}/probe`,
+    {
+      method: 'POST',
+      headers: authHeaders(token),
+      // A probe spawns the CLI, so the server holds its answer for a few
+      // seconds. ``fresh`` is what an explicit "Check sign-in" click — or the
+      // moment a login dialog closes — must send: the user has just changed
+      // the thing being reported, and the cached answer predates the change.
+      body: JSON.stringify(opts?.fresh ? { fresh: true } : {}),
+    },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to check sign-in: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+// ── Codex device-code sign-in ──
+//
+// The server holds the live SDK handle (and the ``codex app-server`` child it
+// spawned) for up to fifteen minutes; ``login_id`` is the only handle the
+// browser ever gets, and it dies with the server process.
+
+export interface CodexDeviceLoginStart {
+  login_id: string;
+  verification_url: string;
+  user_code: string;
+  /** Seconds the code stays valid. */
+  expires_in: number;
+  /** Set instead of the fields above when the CLI could be reached but the
+   *  flow refused to start — a 200 with a reason beats a bare 500. */
+  error?: string | null;
+}
+
+export interface CodexDeviceLoginStatus {
+  login_id: string;
+  status: 'starting' | 'pending' | 'success' | 'error' | 'cancelled';
+  detail?: string | null;
+  /** Non-secret account summary once ``status`` is ``success``. */
+  account?: Record<string, unknown> | null;
+  verification_url?: string | null;
+  user_code?: string | null;
+}
+
+export async function startCodexDeviceLogin(
+  agentUrl: string,
+  token: string,
+  profile?: string,
+): Promise<CodexDeviceLoginStart> {
+  const base = resolveBaseUrl(agentUrl);
+  // The server resolves the profile from the bearer token; the query is only
+  // ever a redundant statement of the same fact, so it is left off unless the
+  // caller passes one explicitly.
+  const params = profile ? `?profile=${encodeURIComponent(profile)}` : '';
+  const res = await fetch(`${base}/api/coding-agents/codex/login${params}`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({}),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to start sign-in: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function getCodexDeviceLogin(
+  agentUrl: string,
+  token: string,
+  loginId: string,
+): Promise<CodexDeviceLoginStatus> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/coding-agents/codex/login/${encodeURIComponent(loginId)}`,
+    { headers: authHeaders(token) },
+  );
+  // The session lives only in the server's memory, so a restart mid-login
+  // answers 404 rather than an error status. Say what happened instead of
+  // leaving the dialog spinning on "failed to check".
+  if (res.status === 404) {
+    throw new Error('Sign-in interrupted (the server restarted). Start again.');
+  }
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to check sign-in: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function cancelCodexDeviceLogin(
+  agentUrl: string,
+  token: string,
+  loginId: string,
+): Promise<void> {
+  const base = resolveBaseUrl(agentUrl);
+  await fetch(
+    `${base}/api/coding-agents/codex/login/${encodeURIComponent(loginId)}/cancel`,
+    { method: 'POST', headers: authHeaders(token) },
+  ).catch(() => { /* best-effort cleanup — the session times out anyway */ });
+}
+
+// ── Terminal sign-in, sign-out, and what the CLI looks like on the server ──
+
+/** A PTY running the agent's own ``login`` command. Same fields as a
+ *  ``TerminalRow`` from ``terminalApi.ts`` (the dialog hands ``terminal_id``
+ *  to ``TerminalSession``), plus what the login is for. */
+export interface CodingAgentLoginTerminal {
+  terminal_id: string;
+  title: string;
+  shell: string;
+  working_dir: string;
+  /** Unix seconds (wall clock) when the terminal was created. */
+  created_at: number;
+  tool_id: string;
+  scope: 'profile' | 'shared';
+  /** The CLI home this login will land in. */
+  cli_home: string;
+  /** The argv the PTY is running, joined for display. */
+  command: string;
+}
+
+/** Open a terminal already running the agent's login command.
+ *
+ *  ``scope`` defaults to this profile's own CLI home; ``shared`` writes the
+ *  server-wide login every profile falls back to and is admin-only. */
+export async function openCodingAgentLoginTerminal(
+  agentUrl: string,
+  token: string,
+  toolId: string,
+  opts: { scope?: 'profile' | 'shared'; cols?: number; rows?: number } = {},
+): Promise<CodingAgentLoginTerminal> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/coding-agents/${encodeURIComponent(toolId)}/login-terminal`,
+    { method: 'POST', headers: authHeaders(token), body: JSON.stringify(opts) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to open the sign-in terminal: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function logoutCodingAgent(
+  agentUrl: string,
+  token: string,
+  toolId: string,
+  opts?: { scope?: 'profile' | 'shared' },
+): Promise<{ ok: boolean; scope: 'profile' | 'shared'; detail?: string | null }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/coding-agents/${encodeURIComponent(toolId)}/logout`,
+    { method: 'POST', headers: authHeaders(token), body: JSON.stringify(opts ?? {}) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to sign out: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+/** Where the agent's CLI is on the server and how it would be invoked there.
+ *
+ *  This is what makes ``cremind tools coding-agents login`` able to refuse
+ *  politely: the CLI compares this binary and system dir against its own
+ *  machine and, when they are not the same box, tells the user which host to
+ *  run the login on instead of execing something that isn't there. */
+export interface CodingAgentCli {
+  tool_id: string;
+  /** Absolute path on the server, or null when no binary was found. */
+  binary: string | null;
+  binary_source: 'tool_variable' | 'bundled' | 'path' | null;
+  login_argv: string[];
+  logout_argv: string[];
+  status_argv: string[];
+  /** Environment that points the CLI at this profile's home, and at the
+   *  shared one — exported before the login is exec'd. */
+  profile_env: Record<string, string>;
+  shared_env: Record<string, string>;
+  server_hostname: string;
+  system_dir: string;
+  platform: string;
+}
+
+export async function getCodingAgentCli(
+  agentUrl: string,
+  token: string,
+  toolId: string,
+): Promise<CodingAgentCli> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/coding-agents/${encodeURIComponent(toolId)}/cli`,
+    { headers: authHeaders(token) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to look up the CLI: ${res.statusText}`);
+  }
+  return res.json();
 }
 
 // ── System Variables ──

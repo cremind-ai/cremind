@@ -29,11 +29,17 @@ import {
   type UpdateChannelPayload,
 } from '../services/channelApi';
 
-// The default conversation filter: built-in web/CLI conversations live on
-// the implicit ``main`` channel. The filter dropdown shows ``main`` plus any
-// external channels the user has registered, and an ``all`` virtual option
-// (only when at least one external channel exists) that shows conversations
-// across every channel sorted by recency.
+// Built-in web/CLI conversations live on the implicit ``main`` channel. The
+// filter dropdown shows ``main`` plus any external channels the user has
+// registered, and an ``all`` virtual option (only when at least one external
+// channel exists) that shows conversations across every channel sorted by
+// recency.
+//
+// ``all`` is the default view: a user who wired up Telegram or WhatsApp
+// expects to see those conversations on arrival, not an empty-looking list
+// hiding them behind a dropdown they never opened. ``main`` is what you get
+// when there is no external channel at all — with a single option the
+// dropdown isn't even rendered, so the two are indistinguishable there.
 export const MAIN_CHANNEL_TYPE = 'main';
 export const ALL_CHANNELS_FILTER = 'all';
 
@@ -41,7 +47,7 @@ export const useChannelsStore = defineStore('channels', {
   state: () => ({
     catalog: {} as Record<string, ChannelCatalogEntry>,
     channels: [] as ChannelRow[],
-    activeFilter: MAIN_CHANNEL_TYPE as string,
+    activeFilter: ALL_CHANNELS_FILTER as string,
     loading: false,
     // Platform group chats, per channel. Loaded eagerly for every channel with
     // the feature on, because the pending badge has to show on a COLLAPSED card
@@ -151,13 +157,17 @@ export const useChannelsStore = defineStore('channels', {
       if (idx >= 0) this.channels[idx] = repaired;
       return repaired;
     },
-    /** Reset ``activeFilter`` to ``main`` if it's no longer a selectable option
-     *  (channel deleted, switched to notification mode, ``all`` left with no
-     *  conversational externals, …). ``filterOptions`` is the source of truth. */
+    /** Re-point ``activeFilter`` at a selectable option when the current one
+     *  disappeared (channel deleted, switched to notification mode, ``all``
+     *  left with no conversational externals, …). ``filterOptions`` is the
+     *  source of truth. Prefers ``all`` — the default view — and only lands on
+     *  ``main`` when there is no external channel to combine it with. */
     ensureValidActiveFilter() {
       const valid = new Set(this.filterOptions.map((o) => o.value));
       if (!valid.has(this.activeFilter)) {
-        this.activeFilter = MAIN_CHANNEL_TYPE;
+        this.activeFilter = valid.has(ALL_CHANNELS_FILTER)
+          ? ALL_CHANNELS_FILTER
+          : MAIN_CHANNEL_TYPE;
       }
     },
     async fetchSenders(channelId: string): Promise<ChannelSenderRow[]> {
@@ -314,7 +324,7 @@ export const useChannelsStore = defineStore('channels', {
     resetForProfileSwitch() {
       this.catalog = {};
       this.channels = [];
-      this.activeFilter = MAIN_CHANNEL_TYPE;
+      this.activeFilter = ALL_CHANNELS_FILTER;
       this.groupsByChannel = {};
       this.groupsEnabledByChannel = {};
       this.groupsLoading = {};

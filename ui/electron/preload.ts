@@ -87,6 +87,11 @@ contextBridge.exposeInMainWorld('cremind', {
   // for clicked external anchors; the main process enforces a scheme allowlist.
   openExternal: (url: string) => ipcRenderer.invoke('cremind:open-external', url),
 
+  // Open the backend's noVNC desktop in the same dedicated window the tray
+  // entry uses, instead of a browser tab. Main re-validates the scheme (and
+  // refuses credentials) before loading anything.
+  openVncDesktop: (url: string) => ipcRenderer.invoke('cremind:open-vnc', url),
+
   // First-run installer bridge — fronts the IPC handlers in
   // electron/main.ts. ``run`` returns a promise that resolves with the
   // installer's exit code; while it's pending, ``onLog`` callbacks

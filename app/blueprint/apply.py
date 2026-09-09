@@ -132,6 +132,36 @@ async def delete_target_profile(profile_name: str, deps: Deps) -> None:
         await deps.conversation_storage.delete_profile(profile_name)
     except Exception:  # noqa: BLE001
         logger.exception(f"[blueprint] delete_profile failed for '{profile_name}'")
+
+    # The same on-disk credential cleanup ``handle_delete_profile`` does in
+    # app/api/profiles.py, and for the same reason: this path bypasses that
+    # handler entirely, so without it an aborted import leaves the rolled-back
+    # profile's coding-CLI logins - long-lived OAuth refresh tokens in plaintext
+    # under <SYSDIR>/<profile>/coding-cli that nothing revokes upstream -
+    # sitting under a profile that no longer exists and can no longer be
+    # enumerated back to. A pending device-code sign-in is cancelled first: it
+    # would otherwise write a fresh ``auth.json`` into the tree we just removed.
+    try:
+        from app.tools.builtin import codex_login
+
+        await codex_login.cancel_for_profile(profile_name)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            f"[blueprint] cancelling a pending Codex sign-in failed for "
+            f"'{profile_name}'",
+            exc_info=True,
+        )
+    try:
+        from app.config import coding_cli_homes
+
+        await asyncio.to_thread(
+            coding_cli_homes.remove_profile_cli_homes, profile_name
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            f"[blueprint] coding-CLI login cleanup failed for '{profile_name}'"
+        )
+
     if deps.registry is not None:
         try:
             await teardown_profile_skills(

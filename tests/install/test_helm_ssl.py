@@ -15,10 +15,17 @@ HELM = shutil.which("helm")
 pytestmark = pytest.mark.skipif(not HELM, reason="Helm is not installed")
 
 
-def _render(*values: str, succeeds: bool = True, set_strings: tuple[str, ...] = ()):
+def _render(
+    *values: str,
+    succeeds: bool = True,
+    set_strings: tuple[str, ...] = (),
+    namespace: str | None = None,
+):
     command = [HELM, "template", "transport-test", str(ROOT / "helm/cremind"),
                "--set", "fullnameOverride=cremind",
                "--set", "readinessProbe.enabled=true", "--set", "livenessProbe.enabled=true"]
+    if namespace is not None:
+        command.extend(["--namespace", namespace])
     for value in values:
         command.extend(["--set", value])
     for value in set_strings:
@@ -378,3 +385,95 @@ def test_external_edge_certificate_also_gets_recovery_policy() -> None:
     annotations = rendered["ingress"]["metadata"]["annotations"]
     assert annotations["nginx.ingress.kubernetes.io/ssl-redirect"] == "false"
     assert annotations["nginx.ingress.kubernetes.io/force-ssl-redirect"] == "false"
+
+
+def test_configmap_states_the_release_identity_the_pod_cannot_infer() -> None:
+    """The chart is the only party that knows who this release is.
+
+    A pod can read its own namespace off the service-account mount and guess a
+    workload name from its hostname, but the Helm *release* name is not a pod
+    field at all and the Deployment/Service name is ``cremind.fullname`` — a
+    template the cluster never stores. Without these four keys the HTTPS
+    runbook on Settings and the exported config file can only print
+    ``<release>``/``<namespace>`` and ask the operator to substitute them.
+    """
+    rendered = _render(namespace="lee-cremind")
+    env = rendered["env"]
+
+    assert env["CREMIND_K8S_NAMESPACE"] == "lee-cremind"
+    assert env["CREMIND_K8S_RELEASE"] == "transport-test"
+    # One name covers `deployment/...`, `svc/...` and `get ingress ...`, so the
+    # app renders all three from a single value. Pin that they really are one.
+    assert (
+        env["CREMIND_K8S_WORKLOAD"]
+        == rendered["deployment"]["metadata"]["name"]
+        == rendered["service"]["metadata"]["name"]
+        == "cremind"
+    )
+    assert int(env["CREMIND_K8S_SERVICE_PORT"]) == rendered["service"]["spec"]["ports"][0]["port"] == 80
+
+
+def test_release_identity_follows_a_custom_service_port() -> None:
+    """The port-forward command the app prints must match the real Service."""
+    rendered = _render("service.port=8080")
+    assert int(rendered["env"]["CREMIND_K8S_SERVICE_PORT"]) == 8080
+    assert rendered["service"]["spec"]["ports"][0]["port"] == 8080
+
+
+@pytest.mark.parametrize(
+    "app_url, expected",
+    [
+        ("", "http://localhost:1515/vnc/vnc.html"),
+        ("https://cremind.example", "https://cremind.example/vnc/vnc.html"),
+        ("https://cremind.example/", "https://cremind.example/vnc/vnc.html"),
+        ("https://cremind.example///", "https://cremind.example/vnc/vnc.html"),
+        ("https://cremind.example/cremind", "https://cremind.example/cremind/vnc/vnc.html"),
+        ("https://cremind.example/cremind/", "https://cremind.example/cremind/vnc/vnc.html"),
+    ],
+    ids=["derived", "bare-origin", "trailing-slash", "many-slashes", "sub-path", "sub-path-slash"],
+)
+def test_novnc_url_is_composed_from_a_normalised_app_url(app_url: str, expected: str) -> None:
+    """``cremind.appUrl`` is a free-text value and this key concatenates onto it.
+
+    A trailing slash used to render ``https://cremind.example//vnc/vnc.html``,
+    and the app reads this string back to tell the proxy shape from the in-pod
+    TLS relay: a doubled slash made a proxy install advertise the relay's
+    tunnel commands for a Service port it does not publish. Trimming here stops
+    the value being produced at all; ``app/config/runtime_env.py`` still has to
+    forgive it, because an install already running keeps what it stored.
+    """
+    rendered = _render(*([f"cremind.appUrl={app_url}"] if app_url else []))
+
+    assert rendered["env"]["CREMIND_NOVNC_URL"] == expected
+    # APP_URL is normalised with it: it is the origin the agent card and the
+    # CORS/OAuth callbacks are built from, and they concatenate onto it too.
+    assert not rendered["env"]["APP_URL"].endswith("/")
+
+
+def test_relay_novnc_url_ignores_the_app_url_entirely() -> None:
+    """With in-pod TLS there is no /vnc/ route: websockify owns its own port.
+
+    Pinned next to the proxy cases because these two strings are the whole
+    signal the app has for telling the shapes apart.
+    """
+    rendered = _render("cremind.ssl=auto", "cremind.appUrl=https://cremind.example/")
+
+    assert rendered["env"]["CREMIND_NOVNC_URL"] == "http://localhost:6080/vnc.html"
+    assert any(
+        port["name"] == "novnc" and port["port"] == 6080
+        for port in rendered["service"]["spec"]["ports"]
+    )
+
+
+def test_coding_cli_homes_live_on_the_system_volume() -> None:
+    """Claude Code and Codex sign-ins must survive a rollout.
+
+    Their defaults (``~/.claude``, ``~/.codex``) are in the container
+    filesystem, which a new pod throws away — a user who signed in through the
+    terminal would be signed out by the next ``helm upgrade``. Deriving both
+    from ``cremind.systemDir`` parks them on the PVC.
+    """
+    env = _render("cremind.systemDir=/srv/state")["env"]
+    assert env["CREMIND_SYSTEM_DIR"] == "/srv/state"
+    assert env["CLAUDE_CONFIG_DIR"] == "/srv/state/coding-cli/claude"
+    assert env["CODEX_HOME"] == "/srv/state/coding-cli/codex"

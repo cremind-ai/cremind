@@ -17,7 +17,7 @@ from app.api.tls import get_tls_routes
 from app.api.tls_recovery import EdgeTlsRecovery, TlsHandoffCors, recovery_app
 from app.config.settings import BaseConfig
 from app.config.tls_steps import CHART_REFERENCE, running_chart_version
-from app.config import tls_clients, tls_mode, tls_transition as transition
+from app.config import runtime_env, tls_clients, tls_mode, tls_transition as transition
 from app.config.tls_auto import ensure_local_tls as real_ensure_local_tls
 from app.server import JWTAuthBackend
 
@@ -49,6 +49,19 @@ def environment(monkeypatch, tmp_path):
     monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
     monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
     monkeypatch.delenv("CREMIND_TLS_TERMINATION", raising=False)
+    # The Kubernetes runbook now prints whatever this pod knows about itself,
+    # so a suite running *inside* a cluster would otherwise assert against that
+    # cluster's namespace and Deployment: the placeholder cases below would
+    # fail there and nowhere else. Every source of an identity is cut off:
+    # the chart's four variables, the two the kubelet injects, and the mounted
+    # service-account namespace file. Each test states its own.
+    for key in ("CREMIND_K8S_NAMESPACE", "CREMIND_K8S_RELEASE",
+                "CREMIND_K8S_WORKLOAD", "CREMIND_K8S_SERVICE_PORT",
+                "KUBERNETES_SERVICE_HOST", "HOSTNAME"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        runtime_env, "_SA_NAMESPACE_FILE", tmp_path / "no-such-namespace",
+    )
     monkeypatch.setattr("app.auth.tokens.serial_matches", lambda claims: claims.get("tsr") == 3)
     # Certificate generation itself has a separate real-files test below.
     monkeypatch.setattr("app.config.tls_auto.ensure_local_tls", lambda *_args: ("cert", "key"))
@@ -545,6 +558,21 @@ def test_external_activation_never_rewrites_deployment_environment(client, envir
             id="kubernetes-in-pod",
         ),
         pytest.param(
+            "kubernetes",
+            {"CREMIND_K8S_NAMESPACE": "lee-cremind", "CREMIND_K8S_RELEASE": "cremind",
+             "CREMIND_K8S_WORKLOAD": "cremind", "CREMIND_K8S_SERVICE_PORT": "80"},
+            [
+                # The chart states who this pod is, so nothing is left to
+                # substitute and the release-finding command disappears with it.
+                f"helm upgrade cremind {CHART_REFERENCE} --version {CHART_VERSION} "
+                "--namespace lee-cremind --reuse-values --set cremind.ssl=auto",
+                "kubectl --namespace lee-cremind rollout status "
+                "deployment/cremind --timeout=5m",
+                "kubectl --namespace lee-cremind port-forward svc/cremind 1515:80",
+            ],
+            id="kubernetes-in-pod-identity",
+        ),
+        pytest.param(
             "kubernetes", {"CREMIND_TLS_TERMINATION": "edge", "CREMIND_UI_PORT": "80"},
             [
                 "helm list --all-namespaces",
@@ -577,7 +605,10 @@ def test_status_steps_keep_commands_bare_and_ordered(
     for key, value in extra_env.items():
         monkeypatch.setenv(key, value)
 
-    payload = client.get("/api/tls/status").json()
+    # As the admin: the identity cases below are about what the runbook prints
+    # once the pod's own names are known, and those names are admin-only (see
+    # test_cluster_identity_and_its_names_never_reach_an_anonymous_status).
+    payload = client.get("/api/tls/status", headers=auth()).json()
 
     steps = payload["steps"]
     assert steps, "a deployment that must act needs a runbook"
@@ -592,6 +623,99 @@ def test_status_steps_keep_commands_bare_and_ordered(
     assert [s["text"] for s in steps if s["kind"] == "command"] == expected_commands
     # The closing note tells the operator where the server will answer.
     assert steps[-1]["kind"] == "note" and payload["https_url"] in steps[-1]["text"]
+
+
+def test_status_publishes_the_identity_its_runbook_was_rendered_from(client, monkeypatch):
+    """The names inside those commands are facts about the install, so they
+    ride the payload too: a client can label the runbook with the release it
+    is about, and say so when the pod could only infer it.
+
+    Asked as the admin throughout: the identity is admin-only, so an anonymous
+    poll would report ``None`` here for the wrong reason."""
+    assert client.get("/api/tls/status", headers=auth()).json()["kubernetes"] is None
+
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
+    monkeypatch.setenv("CREMIND_K8S_NAMESPACE", "lee-cremind")
+    monkeypatch.setenv("CREMIND_K8S_RELEASE", "cremind")
+    monkeypatch.setenv("CREMIND_K8S_WORKLOAD", "cremind")
+    payload = client.get("/api/tls/status", headers=auth()).json()
+
+    assert payload["kubernetes"] == {
+        "namespace": "lee-cremind", "release": "cremind", "workload": "cremind",
+        "service": "cremind", "service_port": 80, "source": "chart",
+        "port_forward":
+            "kubectl --namespace lee-cremind port-forward svc/cremind 1515:80",
+    }
+    assert payload["kubernetes"]["port_forward"] in payload["instructions"]
+
+
+def test_cluster_identity_and_its_names_never_reach_an_anonymous_status(
+    client, monkeypatch,
+):
+    """Who is asking decides what the runbook is allowed to name.
+
+    Status has to stay reachable without a token - the plaintext recovery page
+    and the pre-sign-in wizard poll it - so the gate cannot live on the route.
+    The namespace, the Helm release and the Deployment name are the same
+    cluster facts ``/api/system/environment`` and ``/api/config/install-secrets``
+    keep admin-only, and a ready-to-run ``helm upgrade`` naming the release is
+    the last thing an anonymous caller should be handed. Everyone else gets the
+    placeholder runbook a chart too old to state its own names already
+    produces, so nothing new has to be built for that path.
+    """
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
+    monkeypatch.setenv("CREMIND_K8S_NAMESPACE", "lee-cremind")
+    monkeypatch.setenv("CREMIND_K8S_RELEASE", "cremind-prod")
+    monkeypatch.setenv("CREMIND_K8S_WORKLOAD", "cremind-prod")
+
+    anonymous = client.get("/api/tls/status").json()
+
+    assert anonymous["kubernetes"] is None
+    assert "lee-cremind" not in json.dumps(anonymous)
+    assert "cremind-prod" not in json.dumps(anonymous)
+    assert "helm list --all-namespaces" in anonymous["instructions"]
+    assert (
+        f"helm upgrade <release> {CHART_REFERENCE} --version {CHART_VERSION} "
+        "--namespace <namespace> --reuse-values --set cremind.ssl=auto"
+    ) in anonymous["instructions"]
+    # What the recovery page reads has to keep answering without a token.
+    assert anonymous["serving_https"] is False and anonymous["ready"] is False
+    assert {"instance_id", "transition", "certificate_sha256", "quiesce_pending",
+            "can_cancel"} <= set(anonymous)
+
+    # A signed-in member is no more entitled to cluster topology than a
+    # stranger: everywhere else this identity is admin-gated, not auth-gated.
+    member = client.get("/api/tls/status", headers=auth("alice")).json()
+    assert member["kubernetes"] is None
+    assert "lee-cremind" not in json.dumps(member)
+
+    admin = client.get("/api/tls/status", headers=auth()).json()
+
+    assert admin["kubernetes"]["namespace"] == "lee-cremind"
+    assert admin["kubernetes"]["release"] == "cremind-prod"
+    assert (
+        f"helm upgrade cremind-prod {CHART_REFERENCE} --version {CHART_VERSION} "
+        "--namespace lee-cremind --reuse-values --set cremind.ssl=auto"
+    ) in admin["instructions"]
+    # Nothing is left to substitute, so the release-finding command is gone.
+    assert "helm list --all-namespaces" not in admin["instructions"]
+
+
+def test_an_operator_env_that_is_not_a_name_never_reaches_a_command(client, monkeypatch):
+    """cremind.extraEnv takes anything; a value with a newline in it would make
+    command() raise and turn this endpoint into a 500."""
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
+    monkeypatch.setenv("CREMIND_K8S_NAMESPACE", "lee-cremind\nrm -rf /")
+    monkeypatch.setenv("CREMIND_K8S_WORKLOAD", "Cremind Prod")
+
+    # As the admin: only that view renders an identity at all, so only it can
+    # reach command() with whatever the operator put in extraEnv.
+    payload = client.get("/api/tls/status", headers=auth()).json()
+
+    assert payload["kubernetes"]["namespace"] is None
+    assert payload["kubernetes"]["workload"] is None
+    assert "rm -rf" not in " ".join(payload["instructions"])
+    assert "helm list --all-namespaces" in payload["instructions"]
 
 
 def test_supervised_native_status_has_nothing_to_run(client, monkeypatch):

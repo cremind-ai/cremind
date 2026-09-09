@@ -1,5 +1,5 @@
 ---
-description: "Enable HTTPS after the default HTTP installation and fix ERR_CERT_AUTHORITY_INVALID or connection is not private by trusting ca.pem for CREMIND_SSL=auto, CREMIND_SSL=true or CREMIND_SSL=after-setup. cremind tls status reports transport and deployment instructions; prepare generates or validates a certificate; enable persists and activates HTTPS; cancel stops a switch at any point before HTTPS actually serves, and cancel --local does it offline when the server will not start. The HTTP application keeps working until the deployment change lands, so an outstanding switch never locks anyone out. Administrative mutations require an admin token. Trust, export and fingerprint operate locally without a token to install the Cremind CA in the device trust store. Covers native, Electron, Docker and Kubernetes with persistent certificate and browser-session migration."
+description: "Enable HTTPS after the default HTTP installation and fix ERR_CERT_AUTHORITY_INVALID or connection is not private by trusting ca.pem for CREMIND_SSL=auto, CREMIND_SSL=true or CREMIND_SSL=after-setup. cremind tls status reports transport and deployment instructions, and answers without a token, but names the real Kubernetes namespace, release and Deployment only for the admin profile; prepare generates or validates a certificate; enable persists and activates HTTPS; cancel stops a switch at any point before HTTPS actually serves, and cancel --local does it offline when the server will not start. The HTTP application keeps working until the deployment change lands, so an outstanding switch never locks anyone out. Administrative mutations require an admin token. Trust, export and fingerprint operate locally without a token to install the Cremind CA in the device trust store. Covers native, Electron, Docker and Kubernetes with persistent certificate and browser-session migration."
 ---
 
 # `cremind tls` — Enable HTTPS and trust the local certificate authority
@@ -89,7 +89,9 @@ developer console before linking Jira or Confluence. An unrelated custom fixed
 callback is preserved.
 
 `cremind tls status` reports the current transport, target address, CA fingerprint
-and installation-specific instructions without requiring a token.
+and installation-specific instructions without requiring a token — but run it as
+`cremind --profile admin tls status` on Kubernetes, or the commands come back
+with `<namespace>` and `<release>` still in them.
 `cremind --profile admin tls prepare --source-origin http://host:1515` overrides
 which browser origin the local CLI prepares (the internal CLI port stays HTTP).
 `cremind --profile admin tls cancel` cancels a switch at any point before HTTPS
@@ -111,7 +113,9 @@ and retain the system PVC.
 ## Global flags
 
 `cremind tls` accepts the root-level `--json` flag. No `CREMIND_TOKEN` and no
-profile are needed for status, trust, export or fingerprint. Prepare, enable and cancel require the admin profile.
+profile are needed for status, trust, export or fingerprint — though on
+Kubernetes `status` fills the real cluster names into its commands only for the
+admin profile (see below). Prepare, enable and cancel require the admin profile.
 
 ## Subcommands
 
@@ -119,13 +123,20 @@ profile are needed for status, trust, export or fingerprint. Prepare, enable and
 
 ```bash
 cremind tls status
+cremind --profile admin tls status
 ```
 
 Reports the current public transport, HTTPS target, deployment manager,
 certificate type and SHA-256 fingerprint, restart support, transition phase,
 and the exact native, Docker, Kubernetes, or Ingress commands needed next.
-This read-only command does not require a token. The CLI still reaches its
-loopback management listener over HTTP even when the public app uses HTTPS.
+This read-only command answers without a token — it has to, because the
+plaintext recovery page and the pre-setup wizard poll the same endpoint before
+anyone can sign in — but an unauthenticated caller gets a *narrower* answer:
+no `kubernetes` block, and a Kubernetes runbook that still has `<namespace>`
+and `<release>` in it. Add `--profile admin` to get the filled-in one. A
+signed-in non-admin profile is treated the same as an anonymous caller here.
+The CLI still reaches its loopback management listener over HTTP even when the
+public app uses HTTPS.
 
 The deployment steps print in the order to follow them, grouped as **Before you
 start**, **Run in order** and **What to expect** when the list is long enough to
@@ -136,9 +147,35 @@ Anything the server can know is already filled in, including the chart
 reference (`oci://registry-1.docker.io/cremind/cremind`) and the `--version`
 pin, which carries the chart version matching the running build — keep that pin,
 because without it Helm resolves whatever the registry calls latest, skipping
-pre-release charts entirely. That leaves `<release>` and `<namespace>`, which
-`helm list --all-namespaces` (the first command in the Kubernetes runbooks)
-prints, plus the certificate paths and values file on the Ingress runbook.
+pre-release charts entirely.
+
+On Kubernetes the release name, namespace and Deployment/Service are filled in
+too — **for the admin profile** — whenever the chart states them
+(`CREMIND_K8S_NAMESPACE`, `_RELEASE`, `_WORKLOAD` — see `cremind server
+environment`, whose `kubernetes.source` row says `chart` in that case). The
+commands then read `helm upgrade cremind … --namespace lee-cremind`, `kubectl …
+rollout status deployment/cremind` and `port-forward svc/cremind 1515:80` with
+no placeholder left in them, **there is no `helm list` step at all**, and only
+the certificate paths and values file on the Ingress runbook are yours to fill
+in.
+
+Which namespace, release and Deployment this is are cluster facts, and
+`cremind server environment` and the install secrets keep them admin-only; the
+runbook does not get to publish them to anyone who can reach the port just
+because status answers before sign-in. So without an admin token the `kubernetes`
+block is `null` and the commands keep their placeholders, exactly as below. The
+web UI's **Settings → HTTPS & Certificate** page sends the admin session token
+for the same reason, and shows the filled-in runbook.
+
+An **older chart** states nothing, so the pod can only read its namespace and
+its own Deployment name off itself and `<release>` stays a placeholder. Then —
+and only then, or when the caller is not the admin — `helm list
+--all-namespaces` is the runbook's first command, and the note above the list
+tells you which placeholders to substitute from what it prints. A partly
+inferred identity (`kubernetes.source: inferred`) keeps that first command for
+the same reason: the Deployment name below it came from the pod's hostname
+rather than from the chart, and `helm list` is what confirms which release owns
+it.
 With `--json` the same list is the `steps` array of
 `{"kind": "note" | "command", "text": ...}` objects; the flat `instructions`
 array beside it is the same text, kept for older clients. On a server already

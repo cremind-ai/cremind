@@ -9,16 +9,41 @@ entries — pre-protocol backends predate the SPA routes too, so showing
 a menu item the SPA can't service is the regression we're guarding
 against (the cross-version-install case v0.1.9-test9's ``--version``
 flag enables).
+
+The last section reaches over to ``/api/system/environment``: the tray
+descriptor and that endpoint answer the *same* questions about the *same*
+process, for the two commands (``cremind server capabilities`` and ``server
+environment``) a user runs interchangeably. Whether they agree is a property of
+the pair, so it is tested here rather than on either side alone.
 """
 
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from app.api import features as features_api
+from app.config import runtime_env
+
+
+@pytest.fixture(autouse=True)
+def _uncached_runtime_env(monkeypatch: pytest.MonkeyPatch):
+    """The tray descriptor answers from the shared runtime description.
+
+    That description is lru_cached for the life of the process (it feeds the
+    agent's prompt-cached system prompt), so without a clear around every case
+    the first install described here would leak into all the others. The
+    container marker is pointed at a path that cannot exist because CI itself
+    may run inside a container, where ``/.dockerenv`` would turn every native
+    row here into a Docker one.
+    """
+    monkeypatch.setattr(runtime_env, "_CONTAINER_MARKER", Path("/nonexistent/.dockerenv"))
+    runtime_env.describe_runtime_environment.cache_clear()
+    yield
+    runtime_env.describe_runtime_environment.cache_clear()
 
 
 def _make_request(client_host: str | None = None) -> object:
@@ -46,6 +71,33 @@ def _stub_state(monkeypatch: pytest.MonkeyPatch, *, setup_complete: bool = False
         ),
     )
     monkeypatch.setattr(features_api, "get_state", lambda: fake_state)
+
+
+# Everything the shared description reads that a dev box (or a CI runner
+# inside a container) may already have set. The VNC half was added when the
+# descriptor moved into that description: a stray ``CREMIND_NOVNC_URL`` or
+# ``CREMIND_SSL`` from a real install flips the access shape a case here is
+# pinning, and the four ``CREMIND_K8S_`` keys plus ``KUBERNETES_SERVICE_HOST``
+# / ``HOSTNAME`` would let a real cluster name itself inside these rows.
+_SCRUBBED_ENV = (
+    "CREMIND_ELECTRON_PARENT", "CREMIND_SUPERVISED", "VNC_PASSWORD",
+    "CREMIND_NOVNC_URL", "NOVNC_PORT", "CREMIND_SSL",
+    "CREMIND_TLS_TERMINATION", "CREMIND_COMPOSE_ENV_FILE", "APP_URL",
+    "CREMIND_K8S_NAMESPACE", "CREMIND_K8S_RELEASE", "CREMIND_K8S_WORKLOAD",
+    "CREMIND_K8S_SERVICE_PORT", "KUBERNETES_SERVICE_HOST", "HOSTNAME",
+)
+
+
+def _install(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    """Pin the install the tray descriptor should describe.
+
+    It reads the shared runtime description, which resolves the mode from
+    ``INSTALL_MODE`` itself — patching ``features_api.get_active_install_mode``
+    (still the source for the wizard's own endpoint) would not reach it.
+    """
+    monkeypatch.setenv("INSTALL_MODE", mode)
+    for name in _SCRUBBED_ENV:
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_ui_features_list_matches_electron_tray_entries() -> None:
@@ -115,8 +167,7 @@ def test_tray_capabilities_returns_features_without_auth(
     completes. Set ``setup_complete=True`` to prove the new endpoint
     skips the admin gate that breaks ``/api/services/capabilities``."""
     _stub_state(monkeypatch, setup_complete=True)
-    monkeypatch.setattr(features_api, "get_active_install_mode", lambda: "native")
-    monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
+    _install(monkeypatch, "native")
 
     response = asyncio.run(features_api.get_tray_capabilities(_make_request()))
     import json
@@ -138,13 +189,60 @@ def test_tray_capabilities_reports_a_boot_service(
     their backend will stay down.
     """
     _stub_state(monkeypatch, setup_complete=True)
-    monkeypatch.setattr(features_api, "get_active_install_mode", lambda: "native")
+    _install(monkeypatch, "native")
     monkeypatch.setenv("CREMIND_SUPERVISED", "1")
 
     response = asyncio.run(features_api.get_tray_capabilities(_make_request()))
     import json
 
     assert json.loads(response.body)["supervised"] is True
+
+
+def test_tray_capabilities_reports_a_container_as_supervised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same question, same answer as ``/api/system/environment``.
+
+    Nothing in install/ or helm/ sets ``CREMIND_SUPERVISED`` for a container —
+    compose sets ``restart: unless-stopped`` and the kubelet restarts the pod
+    instead — so reading only that variable here told a Docker user their
+    backend would stay down while the environment endpoint said the opposite
+    about the very same process.
+    """
+    _stub_state(monkeypatch, setup_complete=True)
+    _install(monkeypatch, "docker")
+    monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
+
+    response = asyncio.run(features_api.get_tray_capabilities(_make_request()))
+    import json
+
+    body = json.loads(response.body)
+    assert body["supervised"] is True
+    assert body["supervised"] is runtime_env.describe_runtime_environment()["supervised"]
+
+
+def test_tray_install_mode_matches_the_environment_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-flavor Docker image writes no INSTALL_MODE, only VNC_PASSWORD.
+
+    ``get_active_install_mode()`` returns None there, so the tray descriptor
+    used to say "unknown install" while ``server environment`` said "docker"
+    about the same container. Both now read the one shared description — which
+    also lets the Electron client offer "Open VNC Desktop" on those images,
+    every one of which has the desktop.
+    """
+    _stub_state(monkeypatch, setup_complete=True)
+    monkeypatch.delenv("INSTALL_MODE", raising=False)
+    monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
+    monkeypatch.setenv("VNC_PASSWORD", "secret")
+
+    response = asyncio.run(features_api.get_tray_capabilities(_make_request()))
+    import json
+
+    body = json.loads(response.body)
+    assert body["install_mode"] == "docker"
+    assert body["vnc_enabled"] is True
 
 
 # ── image_flavor gate (drives Electron's "Open VNC Desktop" entry) ─────────
@@ -181,7 +279,7 @@ def test_tray_capabilities_includes_image_flavor(
     """The tray descriptor must carry ``image_flavor`` so Electron can hide
     "Open VNC Desktop" on the basic image."""
     _stub_state(monkeypatch, setup_complete=True)
-    monkeypatch.setattr(features_api, "get_active_install_mode", lambda: "docker")
+    _install(monkeypatch, "docker")
     monkeypatch.setenv("CREMIND_IMAGE_FLAVOR", "basic")
 
     response = asyncio.run(features_api.get_tray_capabilities(_make_request()))
@@ -206,6 +304,91 @@ def test_service_capabilities_includes_image_flavor(
 
     body = json.loads(response.body)
     assert body["image_flavor"] is None
+
+
+# ── the ``vnc`` descriptor (drives "Open VNC Desktop") ────────────────────
+#
+# This endpoint answers with no token at all, so what it may say about the
+# desktop is exactly four fields: is there one, how is it reached, on what
+# path, on what port. Namespaces, Service names, ready-to-run kubectl lines
+# and the composed URL are cluster topology and stay admin-only.
+
+_PUBLIC_VNC_KEYS = {"enabled", "access", "novnc_path", "novnc_port"}
+
+
+def _tray() -> dict:
+    import json
+
+    return json.loads(
+        asyncio.run(features_api.get_tray_capabilities(_make_request())).body
+    )
+
+
+def test_tray_capabilities_publishes_the_public_vnc_subset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Docker: enough to open the desktop, and nothing else.
+
+    The Electron shell used to gate its menu entry on ``install_mode ==
+    'docker' && image_flavor != 'basic'`` and then guess ``localhost:6080``.
+    It reads ``vnc.access`` now, so the four fields below are load-bearing.
+    """
+    from app.config.settings import BaseConfig
+
+    _stub_state(monkeypatch, setup_complete=True)
+    _install(monkeypatch, "docker")
+    # A pre-flavor image sets neither, and both make the desktop go away.
+    monkeypatch.delenv("CREMIND_IMAGE_FLAVOR", raising=False)
+    # ``_novnc_port`` walks the installer's docker/.env when NOVNC_PORT is
+    # unset; a dev box with a real install would otherwise answer from it.
+    monkeypatch.setattr(
+        BaseConfig, "CREMIND_INSTALL_DIR", str(tmp_path), raising=False,
+    )
+
+    vnc = _tray()["vnc"]
+
+    assert set(vnc) == _PUBLIC_VNC_KEYS
+    assert vnc == {
+        "enabled": True,
+        "access": "direct",
+        "novnc_path": "/vnc.html",
+        "novnc_port": 6080,
+    }
+
+
+def test_tray_capabilities_hides_the_kubernetes_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The relay shape is the one with something worth hiding.
+
+    With in-pod TLS the sidecar stops proxying noVNC, so the full descriptor
+    carries two ``kubectl port-forward`` lines naming the namespace and the
+    Service. An unauthenticated caller gets the shape and the port — enough to
+    know a tunnel is needed — and none of the names.
+    """
+    import json
+
+    _stub_state(monkeypatch, setup_complete=True)
+    _install(monkeypatch, "kubernetes")
+    monkeypatch.setenv("CREMIND_IMAGE_FLAVOR", "desktop")
+    monkeypatch.setenv("CREMIND_NOVNC_URL", "http://localhost:6080/vnc.html")
+    monkeypatch.setenv("CREMIND_K8S_NAMESPACE", "lee-cremind")
+    monkeypatch.setenv("CREMIND_K8S_RELEASE", "cremind")
+    monkeypatch.setenv("CREMIND_K8S_WORKLOAD", "cremind")
+
+    body = _tray()
+    vnc = body["vnc"]
+
+    assert set(vnc) == _PUBLIC_VNC_KEYS
+    assert vnc == {
+        "enabled": True,
+        "access": "port_forward",
+        "novnc_path": "/vnc.html",
+        "novnc_port": 6080,
+    }
+    # Not merely absent from ``vnc``: absent from the whole response.
+    assert "kubernetes" not in body
+    assert "lee-cremind" not in json.dumps(body)
 
 
 # ── the ``tls`` block ────────────────────────────────────────────────────
@@ -380,3 +563,100 @@ def test_local_trust_refused_without_a_ca(monkeypatch, tmp_path) -> None:
         monkeypatch, tmp_path, install_mode="native", client_host="127.0.0.1",
     )
     assert lt["supported"] is False
+
+
+# ── agreement with /api/system/environment ───────────────────────────────
+
+
+def _admin_environment(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """The admin-gated environment body, as ``cremind server environment`` sees it."""
+    from app.api import system as system_api
+
+    request = SimpleNamespace(
+        headers={}, cookies={}, client=None,
+        user=SimpleNamespace(is_authenticated=True, username="admin"),
+    )
+    response = asyncio.run(system_api.get_system_environment(request))
+    import json
+
+    return json.loads(response.body)
+
+
+def test_both_endpoints_describe_one_container_the_same_way(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Docker install where ``server capabilities`` said "supervised: false"
+    and ``server environment`` said "supervised: true" was describing one
+    process two ways — the same trap for ``install_mode``."""
+    _stub_state(monkeypatch, setup_complete=True)
+    _install(monkeypatch, "docker")
+
+    import json
+
+    tray = json.loads(
+        asyncio.run(features_api.get_tray_capabilities(_make_request())).body
+    )
+    environment = _admin_environment(monkeypatch)
+
+    assert tray["supervised"] is environment["supervised"] is True
+    assert tray["install_mode"] == environment["install_mode"] == "docker"
+
+
+def test_tray_vnc_access_matches_the_environment_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One desktop, one answer about how it is reached.
+
+    The tray descriptor decides whether the Electron menu entry exists; the
+    admin endpoint decides what the Developer page's card renders. They read
+    the same block, and the only difference must be how much of it travels —
+    the commands and the URL stay behind the admin gate.
+    """
+    import json
+
+    _stub_state(monkeypatch, setup_complete=True)
+    _install(monkeypatch, "kubernetes")
+    monkeypatch.setenv("CREMIND_IMAGE_FLAVOR", "desktop")
+    monkeypatch.setenv("CREMIND_NOVNC_URL", "http://localhost:6080/vnc.html")
+    monkeypatch.setenv("CREMIND_K8S_NAMESPACE", "lee-cremind")
+    monkeypatch.setenv("CREMIND_K8S_RELEASE", "cremind")
+    monkeypatch.setenv("CREMIND_K8S_WORKLOAD", "cremind")
+
+    tray = json.loads(
+        asyncio.run(features_api.get_tray_capabilities(_make_request())).body
+    )["vnc"]
+    environment = _admin_environment(monkeypatch)["vnc"]
+
+    assert tray["access"] == environment["access"] == "port_forward"
+    assert tray["enabled"] is environment["enabled"] is True
+    assert tray["novnc_port"] == environment["novnc_port"] == 6080
+    # What the admin endpoint adds on top, and the tray must not.
+    assert environment["port_forward_commands"], "the relay shape needs a tunnel"
+    assert environment["novnc_url"] == "http://localhost:6080/vnc.html"
+    assert "port_forward_commands" not in tray and "novnc_url" not in tray
+
+
+def test_environment_reports_the_zone_schedules_actually_fire_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``CREMIND_TIMEZONE`` is blank on a normal install, and the timezone the
+    admin set on the Config page lives in ``user_config`` — so reporting the
+    env var alone rendered "system default" on the Environment card while the
+    scheduler was firing in Asia/Tokyo.
+    """
+    from app.config import timezone as timezone_config
+
+    _install(monkeypatch, "native")
+    monkeypatch.delenv("CREMIND_TIMEZONE", raising=False)
+    monkeypatch.setattr(
+        timezone_config, "get_dynamic",
+        lambda _t, _k, profile=None: "Asia/Tokyo" if profile == "admin" else None,
+    )
+
+    body = _admin_environment(monkeypatch)
+
+    assert body["effective_timezone"] == "Asia/Tokyo"
+    assert body["boot_timezone"] == ""
+    # The pre-split field answered a different question under a name that
+    # claimed this one; leaving it would keep every consumer guessing.
+    assert "timezone" not in body

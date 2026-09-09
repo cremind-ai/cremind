@@ -35,6 +35,17 @@ on disk is driven by the same watch stream as `cremind files watch`.
 - `--conversation <id>` widens the allowlist to include the directory that
   conversation was switched into with `change_working_directory` — needed only
   when the file lives outside the static roots.
+- **Coding-agent logins are never served.** The Claude Code and Codex CLIs keep
+  their sign-in under `coding-cli/` (per profile at
+  `<system>/<profile>/coding-cli/`, server-wide at `<system>/coding-cli/` or
+  wherever `CLAUDE_CONFIG_DIR` / `CODEX_HOME` point — on a native install
+  `~/.claude` and `~/.codex`). Those trees hold OAuth refresh tokens and API
+  keys, so every route refuses them: `list` omits them entirely, `download`,
+  `move`, `mkdir`, `delete`, `watch` and `set-cwd` return `403 Access denied`,
+  and a `--conversation` override does **not** widen the rule. `move` also
+  refuses a directory that *contains* one, and `move` / `mkdir` refuse to
+  create a new directory wearing a store's name. To sign an agent in or out,
+  use `cremind tools coding-agents login|logout` — not the file routes.
 
 ## Global flags
 

@@ -20,7 +20,15 @@ import { Icon } from '@iconify/vue';
 import { useCopyToClipboard } from '../../composables/useCopyToClipboard';
 import type { TlsInstructionStep } from '../../services/configApi';
 
-const props = defineProps<{ steps: TlsInstructionStep[] }>();
+const props = withDefaults(defineProps<{
+  steps: TlsInstructionStep[];
+  /** Render one untitled group instead of the three-part runbook. Not every
+   *  caller is a runbook: the Desktop card's "Reach it from your machine" is
+   *  a note and one command, and "Before you start" / "Run in order" over two
+   *  lines reads as ceremony. Only the headings go — the command numbering
+   *  and the copy buttons are exactly the same. */
+  flat?: boolean;
+}>(), { flat: false });
 
 // Not navigator.clipboard directly: this page is served over plain HTTP until
 // HTTPS is activated, and that API is undefined in an insecure context. The
@@ -47,8 +55,15 @@ const rendered = computed<RenderStep[]>(() => {
   }));
 });
 
-const groups = computed(() => {
+interface StepGroup {
+  /** Null in the flat form, which has nothing to head. */
+  title: string | null;
+  steps: RenderStep[];
+}
+
+const groups = computed<StepGroup[]>(() => {
   const items = rendered.value;
+  if (props.flat) return items.length ? [{ title: null, steps: items }] : [];
   const positions = items
     .map((step, position) => (step.kind === 'command' ? position : -1))
     .filter((position) => position >= 0);
@@ -60,17 +75,18 @@ const groups = computed(() => {
     ]
     : [items, [], []];
   return slices
-    .map((steps, i) => ({ title: HEADINGS[i], steps }))
+    .map((steps, i) => ({ title: HEADINGS[i] as string | null, steps }))
     .filter((group) => group.steps.length > 0);
 });
 
 // A lone command, or a list with no commands at all, reads better unlabelled.
+// The flat form lands here too: it is always exactly one group.
 const showHeadings = computed(() => groups.value.length > 1);
 </script>
 
 <template>
   <div v-if="steps.length" class="deployment-steps">
-    <div v-for="group in groups" :key="group.title" class="step-group">
+    <div v-for="group in groups" :key="group.title ?? 'flat'" class="step-group">
       <h4 v-if="showHeadings" class="group-title">{{ group.title }}</h4>
       <template v-for="step in group.steps" :key="step.key">
         <p v-if="step.kind === 'note'" class="step-note">{{ step.text }}</p>

@@ -274,19 +274,53 @@ def test_the_mode_is_read_case_insensitively(tls_env, tmp_path) -> None:
     assert server._resolve_tls(None, None, 1515) is not None
 
 
-def test_supervised_environments(monkeypatch) -> None:
+def test_supervised_environments(monkeypatch, tmp_path) -> None:
     """Kubernetes counts: the wizard now asks for a restart deliberately, and a
-    wedged shutdown there stops the kubelet bringing the pod back at all."""
+    wedged shutdown there stops the kubelet bringing the pod back at all.
+
+    The container signals have to be neutralised explicitly, not left to the
+    ambient environment: the empty-INSTALL_MODE case falls through to the
+    VNC_PASSWORD / ``/.dockerenv`` fallback, so running this suite inside the
+    desktop image (which bakes ``VNC_PASSWORD``) or any container would flip it
+    to True with no code change. ``Docker`` and ``podman`` pin the
+    normalisation — the sibling copy matches the install catalog exactly and
+    treats an unknown or mis-cased value as absent, so this one must too, and
+    with no container signal present "absent" means unsupervised.
+    """
     monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
     monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
+    monkeypatch.delenv("VNC_PASSWORD", raising=False)
+    monkeypatch.setattr(server, "_CONTAINER_MARKER", tmp_path / "absent")
     for mode, expected in (
         ("docker", True),
         ("kubernetes", True),
         ("native", False),
+        ("custom", False),
         ("", False),
+        ("Docker", False),
+        ("podman", False),
     ):
         monkeypatch.setenv("INSTALL_MODE", mode)
         assert server._supervised_env() is expected, mode
+
+
+def test_a_legacy_container_counts_as_supervised(monkeypatch, tmp_path) -> None:
+    """An install whose ``.env`` predates INSTALL_MODE is still the Docker
+    install whose restart policy brings us back.
+
+    ``app.config.runtime_env.supervised`` already says so, and this copy drives
+    the shutdown path — a disagreement means the prompt line promises a restart
+    while the server takes the clean-shutdown branch with no hard-exit timer.
+    An unknown mode must reach the same fallback, since the catalog-backed copy
+    treats it as absent.
+    """
+    monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
+    monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
+    monkeypatch.setattr(server, "_CONTAINER_MARKER", tmp_path / "absent")
+    monkeypatch.setenv("VNC_PASSWORD", "changeme")
+    for mode in ("", "Docker", "podman"):
+        monkeypatch.setenv("INSTALL_MODE", mode)
+        assert server._supervised_env() is True, mode
 
 
 def test_a_boot_service_counts_as_a_supervisor(monkeypatch) -> None:

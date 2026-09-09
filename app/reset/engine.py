@@ -177,6 +177,9 @@ async def _clean_memory(profile: str, deps: Deps) -> int:
 
 
 async def _clean_llm_config(profile: str, deps: Deps) -> int:
+    # Rows only. The coding-agent CLI logins are no longer part of the LLM
+    # provider's credential - they belong to the tools, and the ``tool_configs``
+    # component below takes them.
     return deps.config_storage.delete_by_prefix("llm_config", "", profile=profile)
 
 
@@ -186,10 +189,14 @@ async def _clean_app_settings(profile: str, deps: Deps) -> int:
 
 async def _clean_tool_configs(profile: str, deps: Deps) -> dict[str, int]:
     """Remove the profile's tool/MCP customization: per-tool config + variables,
-    enable-state, user-registered a2a/mcp tools, and autostart processes."""
+    enable-state, user-registered a2a/mcp tools, autostart processes, and the
+    coding-agent CLI logins."""
     from app.storage import get_tool_storage, get_autostart_storage
     ts = get_tool_storage()
-    removed = {"tool_configs": 0, "profile_tools": 0, "tools": 0, "autostart": 0}
+    removed = {
+        "tool_configs": 0, "profile_tools": 0, "tools": 0, "autostart": 0,
+        "coding_cli_logins": 0,
+    }
 
     # per-tool config rows (arg/variable/llm/meta scopes, incl. skill env vars)
     tool_ids = {row["tool_id"] for row in ts.list_config_keys(profile)}
@@ -231,6 +238,26 @@ async def _clean_tool_configs(profile: str, deps: Deps) -> dict[str, int]:
     for row in astore.list(profile):
         if astore.delete(row["id"], profile):
             removed["autostart"] += 1
+
+    # The coding-agent CLIs keep their login on disk, not in a config row: a
+    # ``.credentials.json`` / ``auth.json`` under <SYSDIR>/<profile>/coding-cli
+    # holding a long-lived OAuth refresh token in plaintext that nothing revokes
+    # upstream. Resetting the tool rows without that tree would leave the
+    # credential behind - outliving the reset and riding out in the next backup,
+    # for a user who asked for the tools to go back to defaults. A pending
+    # device-code sign-in goes first: it holds an open ``codex app-server``
+    # child that would write a fresh ``auth.json`` into the tree afterwards.
+    try:
+        from app.tools.builtin import codex_login
+        await codex_login.cancel_for_profile(profile)
+    except Exception:  # noqa: BLE001
+        logger.debug("clean: cancelling a pending Codex sign-in failed", exc_info=True)
+    try:
+        from app.config import coding_cli_homes
+        if await asyncio.to_thread(coding_cli_homes.remove_profile_cli_homes, profile):
+            removed["coding_cli_logins"] = 1
+    except Exception:  # noqa: BLE001
+        logger.debug("clean: removing the coding-CLI logins failed", exc_info=True)
     return removed
 
 

@@ -1,5 +1,5 @@
 ---
-description: "Configure the tools the Cremind agent can call, from the `cremind tools` CLI: enable or disable a tool, set its Tool Variables (env-style key=value — API keys, limits, modes), list the live option values of a tool's dynamic variables (`options` — e.g. the Claude models available to the logged-in account), get or set its JSON Tool Arguments, and toggle a grouped tool's sub-tools (\"leaves\"). Explains how to change any tool's settings and how the agent configures tools itself by running these commands in its shell. Distinct from each tool's own `[tool] …` reference doc (which lists that one tool's full variables and allowed values, e.g. Claude Code's permission modes) and from `cremind agents` (registering MCP/A2A servers)."
+description: "Configure the tools the Cremind agent can call, from the `cremind tools` CLI: enable or disable a tool, set its Tool Variables (env-style key=value — API keys, limits, modes), list the live option values of a tool's dynamic variables (`options` — e.g. the Claude models available to the logged-in account), get or set its JSON Tool Arguments, and toggle a grouped tool's sub-tools (\"leaves\"). Answers the coding-delegate questions with `coding-agents`: is Claude Code installed, is Codex signed in or logged in, which credential each one resolves to, and how to install the Claude Code or Codex CLI on this server without shell access. Signs a coding delegate in and out from the terminal: `cremind tools coding-agents login claude_code` runs the vendor CLI's own sign-in (`claude auth login`, `codex login --device-auth`) on the server host, and `cremind tools coding-agents logout codex` signs out from anywhere; `--shared` targets the server-wide login that profiles without one of their own inherit, instead of this profile's. Explains how to change any tool's settings and how the agent configures tools itself by running these commands in its shell. Distinct from each tool's own `[tool] …` reference doc (which lists that one tool's full variables and allowed values, e.g. Claude Code's permission modes) and from `cremind agents` (registering MCP/A2A servers)."
 ---
 
 # `cremind tools` — Tool & Skill Configuration
@@ -14,6 +14,10 @@ The group's surface area is small but covers every angle of tool config:
 
 - **Inspection** — `list`, `get`, `options` (live option values for a tool's
   dynamic variables, e.g. Claude Code's available models).
+- **Coding delegates** — `coding-agents`, a one-screen readiness report for
+  Claude Code and Codex: installed, enabled, which credential, and (with
+  `--probe`) whether the account is actually signed in. Its `login` and
+  `logout` subcommands sign this profile in and out of the delegate's own CLI.
 - **Lifecycle for A2A / MCP tools** — `enable`, `disable`.
 - **Per-tool configuration** — `set-var` (env-style variables),
   `set-args` (a structured JSON arguments object).
@@ -34,8 +38,8 @@ each profile can carry its own configuration.
 |-------------|---------------------------------------------------------------------------|-----------------------|
 | `built-in`  | Compiled into the server (filesystem, shell, etc.).                       | Optional ones only    |
 | `intrinsic` | Agent-control verbs the loop emits (e.g. `final_answer`, `think`).        | No                    |
-| `mcp`       | MCP server registered via `cremind agents add --type mcp`.                    | Yes                   |
-| `a2a`       | Peer A2A agent registered via `cremind agents add --type a2a`.                | Yes                   |
+| `mcp`       | MCP server registered via `cremind agents add --url <url>` (or `--json-config '<json>'` for a stdio server). | Yes |
+| `a2a`       | Peer A2A agent. `cremind agents add` registers MCP servers only, so an `a2a` row comes from an existing registration (a restored blueprint, an older install) rather than from a command you can run. | Yes |
 | `skill`     | Local skill discovered from a SKILL.md directory.                         | Yes                   |
 
 Use `--type` on `cremind tools list` to filter by these labels.
@@ -57,17 +61,29 @@ account's available models (the same list as `cremind tools options`). Tool
 rows additionally expose a **Register long-running app** action that maps to
 `cremind tools register-long-running`.
 
+A **Coding Agents** *section* sits at the top of the same page — its own section
+above *Built-in Tools*, which no longer lists Claude Code or Codex — and is the
+UI counterpart of `cremind tools coding-agents`. Each agent gets a card showing
+its installed / enabled / credential state (and whether the credential is this
+profile's own login or the shared server one), installs a missing SDK in place,
+runs the same sign-in probe behind **Check sign-in**, and does the sign-in
+itself: **Sign in** opens a device code for Codex, or a built-in terminal
+running `claude auth login` for Claude Code. **Sign out** is the counterpart of
+`cremind tools coding-agents logout`. Nothing here links to Settings → LLM
+Providers — those credentials are Cremind's own reasoning models', and the
+coding CLIs never read them.
+
 ## The agent can configure tools itself
 
 The Cremind assistant can run any `cremind tools` command through its Shell
 Executor tool — the shell it spawns already has `CREMIND_SERVER` and
 `CREMIND_TOKEN` set for the active profile, so no flags are needed. That is how
 the agent answers "what permission modes can Claude Code use?" (via
-`cremind tools options claude_code --json`, or by searching its documentation)
+`cremind --json tools options claude_code`, or by searching its documentation)
 and applies "set Claude Code's permission mode to plan" (via
 `cremind tools set-var claude_code CLAUDE_CODE_PERMISSION_MODE=plan`). It is also
 how the agent handles "use Opus for Claude Code": discover the account's models
-with `cremind tools options claude_code --json`, match the requested name against
+with `cremind --json tools options claude_code`, match the requested name against
 the returned ids/labels, then apply it with `cremind tools set-var claude_code
 CLAUDE_CODE_MODEL=<id>`. For the full list of a tool's variables and their
 allowed values, see the per-tool reference docs below.
@@ -81,6 +97,7 @@ get its full variable list, allowed values, defaults, and CLI recipes:
 | Tool | `tool_id` | Reference doc | Notable variables |
 |------|-----------|---------------|-------------------|
 | Claude Code | `claude_code` | *Claude Code Tool* | `CLAUDE_CODE_PERMISSION_MODE` and `CLAUDE_CODE_MODEL` (both dynamic lists via `options`), budget, API key |
+| Codex | `codex` | *Codex Tool* | `CODEX_SANDBOX` and `CODEX_MODEL` (both dynamic lists via `options`), reasoning effort, API key |
 | Shell Executor | `exec_shell` | *Shell Executor Tool* | large-output mode, timeouts, RTK; `os` argument |
 | System File | `system_file` | *System File Tool* | read/list/search/grep caps |
 | Browser | `browser` | *Browser Tool* | headless, channel (enum), CDP URL |
@@ -92,13 +109,24 @@ get its full variable list, allowed values, defaults, and CLI recipes:
 | AccuWeather Weather | `accuweather_weather` | *AccuWeather Weather Tool* | AccuWeather API key |
 | Documentation Search | `documentation_search` | *Documentation Search Tool* | `DEFAULT_TOP_K` |
 
-For any tool not listed, `cremind tools get <tool_id> --json` prints its live
+For any tool not listed, `cremind --json tools get <tool_id>` prints its live
 variable schema (including any `enum` of allowed values) and current per-profile
 values.
 
 ## Global flags
 
-All `cremind tools` subcommands accept the root-level `--json` flag.
+`--json` forces JSON output instead of the default human-readable table. It is a
+**root** flag, so it goes *before* the subcommand — `cremind tools list --json`
+is rejected with `No such option: --json`:
+
+```bash
+cremind --json tools list
+```
+
+The one `--json` that belongs *after* a subcommand is `set-args --json '<obj>'`,
+which is that command's own option: it takes a JSON value rather than switching
+the output format.
+
 `CREMIND_TOKEN` is required for every subcommand.
 
 ## Subcommands
@@ -325,6 +353,173 @@ CLAUDE_CODE_PERMISSION_MODE    plan                 plan (read-only planning, no
 $ cremind tools set-var claude_code CLAUDE_CODE_MODEL=claude-sonnet-4-5
 ```
 
+### `cremind tools coding-agents`
+
+**Purpose.** Answer "is Claude Code installed?", "is Codex signed in?" and
+"which credential is each coding agent using?" in one command. Three separate
+things have to line up before the assistant can delegate coding work, and this
+is the only place that shows all three side by side:
+
+1. the **SDK is installed** on the server (the `claude_code` / `codex` feature —
+   the SDK wheel bundles the CLI binary, so installing the feature *is*
+   installing the Claude Code / Codex CLI; there is no separate `npm install`);
+2. the **tool is enabled** for the active profile;
+3. a **credential resolves** for the active profile.
+
+**Syntax.** `coding-agents` is a group that is also a command: run it bare for
+the table, or with a subcommand to change the sign-in.
+
+```bash
+cremind tools coding-agents [--probe]
+cremind tools coding-agents login  <claude_code|codex> [--shared]
+cremind tools coding-agents logout <claude_code|codex> [--shared]
+```
+
+**Flags** (on the bare form):
+
+| Flag       | Type | Default | Meaning                                                                                     |
+|------------|------|---------|---------------------------------------------------------------------------------------------|
+| `--probe`  | bool | `false` | Also run each installed agent's live sign-in check (one cheap request per agent — no coding task, no file changes, no token spend for Codex). Bypasses the server's 15-second probe cache, so it is also the right thing to run straight after a sign-in. |
+
+**Behavior.** Renders a five-column table, one row per agent, always in the
+order `claude_code`, `codex` — an agent whose feature is not installed still
+gets a row, because that is exactly the case worth reporting:
+
+| Column       | Meaning                                                                                     |
+|--------------|-----------------------------------------------------------------------------------------------|
+| `AGENT`      | `claude_code` or `codex` (the `tool_id`).                                                    |
+| `INSTALLED`  | `yes` if the SDK (and its bundled CLI binary) is importable on the server.                   |
+| `ENABLED`    | `yes` if the tool is switched on **for the active profile**.                                 |
+| `CREDENTIAL` | The resolved credential source, or `none`. See the table below.                              |
+| `LOGGED_IN`  | `-` without `--probe` (not checked); otherwise `yes` / `no` / `unknown`.                      |
+
+A one-line human summary per agent — naming the single next step — is written to
+stderr under the table, so it stays out of a piped table but is still visible.
+With `--json`, returns the raw agent objects (including `feature_key`, `extras`,
+`requires_restart_after_install`, `sign_in`, `credential_scope`, `cli_home`,
+`account_hint`, `cli_available`, and, with `--probe`, the full probe payload
+under `probe`).
+
+`LOGGED_IN unknown` is **not** "logged out": the check ran but could not decide
+(a timeout, or the CLI binary was not found). Only `no` means the credential was
+rejected.
+
+**Credential sources.** A key set *for the tool* beats a CLI login, and a
+profile's own login beats the server's shared one:
+
+| Value                    | What it means                                                                       |
+|--------------------------|-------------------------------------------------------------------------------------|
+| `tool_variable_api_key`  | The tool's own `CLAUDE_CODE_API_KEY` / `CODEX_API_KEY` variable (this profile's).    |
+| `env_anthropic_api_key`  | Claude Code: `ANTHROPIC_API_KEY` in the server's environment.                        |
+| `env_oauth_token`        | Claude Code: `CLAUDE_CODE_OAUTH_TOKEN` in the server's environment.                  |
+| `env_codex_api_key`      | Codex: `CODEX_API_KEY` in the server's environment.                                  |
+| `env_openai_api_key`     | Codex: `OPENAI_API_KEY` in the server's environment.                                 |
+| `profile_claude_login`   | Claude Code: **this profile's own** `claude auth login` (`credential_scope: profile`).|
+| `profile_codex_login`    | Codex: **this profile's own** `codex login` (`credential_scope: profile`).           |
+| `host_claude_login`      | Claude Code: the **shared** server login, inherited (`credential_scope: shared`).     |
+| `host_codex_login`       | Codex: the **shared** server login, inherited (`credential_scope: shared`).           |
+| `none`                   | Nothing is visible — sign in (see below), or set a key.                              |
+
+Any `env_*` source is a server-wide key shared by every profile; the two
+`profile_*` and two `host_*` sources are CLI logins, and only those carry a
+`credential_scope`, an `account_hint` (the signed-in email / plan / org) and
+something to sign out of.
+
+The profile's credentials under **Settings → LLM Providers** are deliberately
+**not** in this list. They are Cremind's own reasoning models' credentials; the
+`claude` and `codex` CLIs never read them, and the earlier bridge that reused an
+OpenAI "Sign in with ChatGPT" login for Codex (`profile_chatgpt_login`) has been
+removed — a profile that relied on it must sign in to Codex itself once.
+
+**Signing in.** The sign-in is the vendor CLI's own (`claude auth login`,
+`codex login --device-auth`); Cremind only says which binary to run and which
+home the credential goes into. Three doors:
+
+- **No shell access** — **Settings → Tools & Skills → Coding Agents →**
+  the agent's card **→ Sign in**. Codex shows a device code and a link to
+  confirm in any browser; Claude Code opens a built-in terminal already running
+  `claude auth login`.
+- **A shell on the server** — `cremind tools coding-agents login claude_code`
+  (or `codex`). It runs the login in *this* terminal (inheriting stdin/stdout,
+  so the printed URL and the pasted code behave exactly as they would outside
+  Cremind), then re-probes and prints `Signed in as …`.
+- **Signing out** — `cremind tools coding-agents logout claude_code`.
+
+`login` only works **where the CLI actually lives**. `cremind` pointed at a
+remote server refuses rather than writing a credential into the wrong machine's
+home directory:
+
+```text
+The codex CLI lives on the Cremind server (cremind-7c9f4), not on this machine,
+so the sign-in has to happen there. Run this same command on that host, or sign
+in without a shell: Settings -> Tools & Skills -> Coding Agents -> Sign in does
+it from a browser.
+```
+
+`logout` has no such limit — the server runs the CLI's own logout against the
+home and removes the credential file — so it works from a remote `cremind`.
+
+**Login scope.** A login is **per profile**, written to
+`<CREMIND_SYSTEM_DIR>/<profile>/coding-cli/{claude,codex}`. A profile that never
+signed in inherits the **server's shared login** (`$CLAUDE_CONFIG_DIR` /
+`$CODEX_HOME`, else `~/.claude` / `~/.codex` on a native install, else
+`<CREMIND_SYSTEM_DIR>/coding-cli/…` in a container, where it survives an image
+upgrade or a pod replacement).
+
+| Flag (on `login` / `logout`) | Type | Default | Meaning |
+|------------------------------|------|---------|---------|
+| `--shared`                   | bool | `false` | Act on the **server-wide** login every profile without one of its own inherits, instead of this profile's. |
+
+`logout --shared` is **admin-only** (the server refuses it otherwise) and signs
+out every profile that was inheriting it. `login --shared` needs no such check
+because it needs something stronger: a shell on the server host, where the
+operator can write that home anyway. Signing in from the *browser* with the
+shared scope is admin-only too.
+
+Signing out a profile that has no login of its own is refused (HTTP 409) rather
+than silently signing the whole server out:
+
+```text
+This profile has no Codex login of its own - it uses the shared server login in
+/root/.cremind/coding-cli/codex. Only an admin can sign that out (scope=shared).
+```
+
+Credentials and the enabled flag are **per profile**, so this command reports
+the active profile's answer, never the server's.
+
+**Installing a missing agent.** `INSTALLED no` is fixed with
+`cremind features install claude_code` (or `codex`) — that pulls the SDK wheel,
+CLI binary included, with no restart needed. Then `cremind tools enable
+claude_code` to switch it on for the profile.
+
+**Examples.**
+
+```bash
+$ cremind tools coding-agents
+AGENT        INSTALLED  ENABLED  CREDENTIAL           LOGGED_IN
+claude_code  yes        yes      host_claude_login    -
+codex        no         no       none                 -
+(claude_code: Claude Code is installed, enabled, and using host_claude_login, the shared server login.)
+(codex: Codex is not installed on this server. Install the 'codex' feature to add it - no shell access needed.)
+
+# Install the missing one, enable it, sign this profile in, then confirm
+$ cremind features install codex
+$ cremind tools enable codex
+$ cremind tools coding-agents login codex
+Running: /opt/venv/bin/codex login --device-auth
+...
+Signed in as dev@example.com (pro, chatgpt).
+
+$ cremind tools coding-agents --probe
+AGENT        INSTALLED  ENABLED  CREDENTIAL           LOGGED_IN
+claude_code  yes        yes      host_claude_login    yes
+codex        yes        yes      profile_codex_login  yes
+
+# Sign this profile out again (works from a remote cremind too)
+$ cremind tools coding-agents logout codex
+Signed out of codex (profile).
+```
+
 ### `cremind tools set-args`
 
 **Purpose.** Replace the tool's structured arguments object — for tools
@@ -507,13 +702,13 @@ $ cremind tools get skill.review-pr
 ### Find the tool ids of every disabled MCP server
 
 ```bash
-$ cremind tools list --type mcp --json | jq -r '.[] | select(.enabled==false) | .tool_id'
+$ cremind --json tools list --type mcp | jq -r '.[] | select(.enabled==false) | .tool_id'
 ```
 
 ### Spin up a skill's daemon and immediately attach to its console
 
 ```bash
-$ pid=$(cremind tools register-long-running skill.daily-brief --json | jq -r .process_id)
+$ pid=$(cremind --json tools register-long-running skill.daily-brief | jq -r .process_id)
 $ cremind proc attach "$pid"
 ```
 

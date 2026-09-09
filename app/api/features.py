@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import queue
 import threading
 from typing import Any
@@ -27,6 +26,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from app.api._auth import require_admin
+from app.config import runtime_env
 from app.config.install_catalog import (
     apply_mode_rule_to_services,
     get_active_install_mode,
@@ -190,15 +190,13 @@ UI_FEATURES: tuple[str, ...] = (
 def get_image_flavor() -> str | None:
     """The Docker image flavor this container was built as, or ``None``.
 
-    Read from the ``CREMIND_IMAGE_FLAVOR`` env var baked into each image
-    (``desktop`` for cremind/cremind-desktop, ``basic`` for cremind/cremind).
-    Returns ``None`` for native installs and for pre-flavor images that
-    predate the var — the Electron client treats ``None`` as "desktop" for
-    Docker installs, which is correct because every pre-flavor image is a
-    desktop image.
+    The implementation moved to :mod:`app.config.runtime_env`, which owns every
+    other install fact too; this stays as the name the Electron-facing
+    endpoints below (and their tests) already call. Uncached on both sides on
+    purpose — a caller that sets ``CREMIND_IMAGE_FLAVOR`` and asks again must
+    get the new answer.
     """
-    raw = os.environ.get("CREMIND_IMAGE_FLAVOR", "").strip().lower()
-    return raw if raw in ("desktop", "basic") else None
+    return runtime_env.get_image_flavor()
 
 
 async def get_service_capabilities(request: Request) -> JSONResponse:
@@ -290,10 +288,27 @@ async def get_tray_capabilities(_request: Request) -> JSONResponse:
     process.
 
     Returns the fields the Electron main process needs to gate its menu
-    entries: the active install mode and image flavor (together drive the
-    "Open VNC Desktop" entry — shown only on Docker installs whose image is
-    the desktop flavor) and the list of UI feature names the bundled SPA
-    exposes (drives Process Manager / Events / Channels).
+    entries: the ``vnc`` descriptor that drives the "Open VNC Desktop" entry,
+    and the list of UI feature names the bundled SPA exposes (drives Process
+    Manager / Events / Channels). It also carries the handful of install facts
+    that need no token - deployment, release channel, whether there is a VNC
+    desktop, whether this is a container - so ``cremind server capabilities``
+    can describe a server it has no admin token for.
+
+    That entry is gated on ``vnc.access`` now, which is what makes it work on
+    Kubernetes: the old gate was "Docker install whose image is the desktop
+    flavor", so a pod never offered the desktop at all, and the shell that did
+    open one aimed at ``localhost:6080`` where nothing listens until a tunnel
+    exists. ``install_mode`` and ``image_flavor`` stay in the payload because
+    an older Electron shell reads only those two and still has to run against
+    a new backend.
+
+    What travels here is only the public subset (see
+    ``runtime_env.public_vnc_descriptor``): enough to decide whether the menu
+    entry belongs and what it would open. This endpoint answers before anyone
+    has signed in, so the namespace, the Service name, the ready-to-run
+    ``kubectl`` commands and the composed URL stay on the admin-gated
+    ``/api/system/environment`` and ``/api/config/install-secrets``.
 
     Deliberately unauthenticated. The Electron main process can't share
     the renderer's session cookies, so the admin-gated
@@ -303,20 +318,47 @@ async def get_tray_capabilities(_request: Request) -> JSONResponse:
     metadata with no security value; the richer capabilities endpoint
     stays admin-gated for the Setup Wizard's deeper payload.
     """
-    from app.config.tls_mode import env_supervised
+    env = runtime_env.describe_runtime_environment()
 
     return JSONResponse({
-        "install_mode": get_active_install_mode(),
+        # The same install mode ``/api/system/environment`` reports, so the two
+        # commands that read them (``server capabilities`` and ``server
+        # environment``) cannot disagree about the same machine. It differs
+        # from ``get_active_install_mode()`` — which the Setup Wizard's own
+        # endpoint above keeps, because there ``None`` means "apply no
+        # service-mode filter" — only on an install whose ``.env`` predates the
+        # INSTALL_MODE key: a pre-flavor Docker image, which this reports as
+        # the ``docker`` it is instead of ``null``. That also lets the Electron
+        # client offer "Open VNC Desktop" on those images, which is right —
+        # every pre-flavor image is a desktop image.
+        "install_mode": env["install_mode"],
         # desktop / basic / None. None (native or a pre-flavor image) is
         # treated as desktop for Docker installs by the Electron client.
         "image_flavor": get_image_flavor(),
         "ui_features": list(UI_FEATURES),
-        # Whether something restarts this process when it exits. On a native
-        # install that is the boot service (`cremind boot enable`), which
-        # install_mode alone cannot reveal — the Developer page's restart
-        # warning would otherwise tell a supervised user their backend stays
-        # down.
-        "supervised": env_supervised(),
+        # Whether something restarts this process when it exits — the broad
+        # question, from the shared description: a container's restart policy
+        # or the kubelet counts, so does Electron, and so does the boot service
+        # (`cremind boot enable`) that install_mode alone cannot reveal. Both
+        # consumers ask it that way (the Developer page's restart dialog and
+        # `cremind server restart` pick their caveat from it), and reading only
+        # CREMIND_SUPERVISED here — which nothing in install/ or helm/ sets for
+        # a container — told a Docker user their backend would stay down while
+        # /api/system/environment said the opposite about the same process.
+        "supervised": env["supervised"],
+        # Non-secret install facts from the shared description. Nothing here
+        # names a path, a host or a credential — the admin-gated
+        # /api/system/environment carries those.
+        "deployment": env["deployment"],
+        "release_channel": env["release_channel"],
+        "vnc_enabled": env["vnc_enabled"],
+        "container": env["container"],
+        # {enabled, access, novnc_path, novnc_port} and nothing else: the
+        # single place that draws the line between what an unauthenticated
+        # caller may know about the desktop and what stays admin-only is
+        # public_vnc_descriptor, so a field added to the full descriptor later
+        # cannot leak out through here by accident.
+        "vnc": runtime_env.public_vnc_descriptor(env["vnc"]),
     })
 
 

@@ -21,11 +21,14 @@ Design notes specific to Codex (vs the Claude Agent SDK):
   and speaks JSON-RPC. One client per task (matching Claude's per-session
   ``ClaudeSDKClient``) so each task's env / ``CODEX_HOME`` / profile auth is
   isolated and cleanup is a context-manager exit.
-* **Auth** — the app-server authenticates from ``$CODEX_HOME/auth.json``. A host
-  ``codex login`` works out of the box; an explicit/profile/env API key is
-  installed via ``login_api_key()`` into a Cremind-managed ``CODEX_HOME`` so we
-  never clobber the user's own ``~/.codex``. All of this lives in
-  :func:`resolve_auth` — the single auth seam.
+* **Auth** - the app-server reads ``$CODEX_HOME/auth.json`` ONCE, at startup, so
+  ``CODEX_HOME`` is always pointed at a home BEFORE the client is constructed:
+  either a Cremind-managed per-key home (an API key is then installed into the
+  running server via ``login_api_key()``, an RPC, so that half comes after the
+  spawn) or the profile's / the server's own ``codex login`` home resolved by
+  :mod:`app.config.coding_cli_homes`. :func:`resolve_auth` +
+  :func:`prepare_auth` are the single auth seam; :mod:`app.tools.builtin.
+  codex_login` is the sign-in that fills a login home in the first place.
 * **Approval** — pinned to ``ApprovalMode.deny_all`` (never pauses): the server
   is headless, so an approval-seeking mode would stall. The user-facing knob is
   the filesystem ``Sandbox`` instead.
@@ -37,8 +40,8 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
-import json
 import os
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -46,6 +49,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.agent.agent_activity import AgentActivity
+from app.config.coding_cli_homes import (
+    codex_login_present,
+    profile_codex_home,
+    read_codex_account_hint,
+    resolve_codex_home,
+    shared_codex_home,
+)
 from app.config.settings import BaseConfig
 from app.tools.builtin.codex_activity import apply_notification
 from app.utils.logger import logger
@@ -107,15 +117,25 @@ class CodexConcurrencyError(Exception):
 class CodexAuth:
     """Resolved Codex credentials for one task/probe.
 
-    ``env_overrides`` are merged over the app-server subprocess env (chiefly
-    ``CODEX_HOME`` when an explicit key is used); ``api_key``, when set, is
-    installed via ``login_api_key()`` into that home; ``source`` is a non-secret
-    label reusing the :func:`credential_source` vocabulary.
+    ``env_overrides`` are merged over the app-server subprocess env and ALWAYS
+    carry ``CODEX_HOME`` now: either a Cremind-managed per-key home or the CLI
+    login home :mod:`app.config.coding_cli_homes` resolved for this profile.
+    Leaving it unset used to mean "authenticate from the ambient ``~/.codex``",
+    which on a multi-profile server is the one thing that must never happen -
+    every profile would have run as whichever account signed in last.
+
+    ``api_key``, when set, is installed via ``login_api_key()`` into that home;
+    ``source`` is a non-secret label reusing the :func:`credential_source`
+    vocabulary; ``scope`` is ``"profile"`` / ``"shared"`` for the two login
+    tiers and None for the key tiers (a key is not a login anyone can sign out
+    of, so labelling it with a scope would invite a "Sign out" button that
+    could not work).
     """
 
     env_overrides: Dict[str, str] = field(default_factory=dict)
     api_key: Optional[str] = None
     source: Optional[str] = None
+    scope: Optional[str] = None
 
 
 @dataclass
@@ -200,6 +220,17 @@ def _enum_value(value: Any) -> str:
 
 
 # ── auth ───────────────────────────────────────────────────────────────────────
+#
+# Four tiers, no LLM-provider lookups. A Codex credential is either a key the
+# operator/profile typed for THIS tool (or exported to the server), or a
+# ``codex login`` the user made in the CLI - and the CLI login is owned by
+# :mod:`app.config.coding_cli_homes`, not by this module. The bridge that used
+# to materialise a profile's "Sign in with ChatGPT" LLM tokens as a Codex
+# ``auth.json`` is gone: it made one refresh-token chain shared state between
+# the LLM transport and a subprocess that rotates it behind our back, and a
+# task killed between the CLI's refresh and our read-back left the profile's
+# OpenAI provider holding a spent single-use token. Users of it sign in again
+# through :mod:`app.tools.builtin.codex_login` (device code) or the CLI.
 def _managed_codex_home(auth: "CodexAuth") -> Path:
     """Cremind-owned ``CODEX_HOME`` for an installed API key, so the user's own
     ``~/.codex`` is never touched.
@@ -216,31 +247,58 @@ def _managed_codex_home(auth: "CodexAuth") -> Path:
     return home
 
 
-def resolve_auth(variables: dict, profile: str) -> CodexAuth:
-    """Resolve OpenAI credentials for a Codex run/probe. Never raises.
+# The Codex CLI's own credential file, inside whichever ``CODEX_HOME`` is in
+# play. Named once because three places have to agree on it: the login markers
+# in :mod:`app.config.coding_cli_homes`, :func:`logout`, and the app-server
+# itself, which reads it exactly once at spawn.
+_AUTH_JSON_NAME = "auth.json"
 
-    Order: explicit tool variable → profile's OpenAI LLM key → server env
-    (``CODEX_API_KEY`` / ``OPENAI_API_KEY``) → host ``codex login`` store. Any
-    resolved key is installed into a Cremind-managed ``CODEX_HOME``; when no key
-    is found the app-server authenticates from the ambient ``$CODEX_HOME`` /
-    ``~/.codex/auth.json`` (host ``codex login``). Auth *failures* are surfaced
-    later from the SDK result.
+_LOGOUT_TIMEOUT = 15.0
+
+# Said once, in the two places a user meets a missing/refused credential (the
+# failed-run payload and the model listing). It names the three real doors -
+# the card, the CLI, a key - and no longer points at Settings -> LLM, which
+# stopped being a Codex credential when the provider tiers were removed and
+# would now send the user to change a setting that cannot help.
+_SIGN_IN_REMEDIATION = (
+    "Sign in from Settings -> Tools & Skills -> Coding Agents -> Codex -> Sign in "
+    "(a device code you confirm in a browser), or run `cremind tools coding-agents "
+    "login codex` on the server host. An OpenAI API key also works: set the "
+    "CODEX_API_KEY tool variable, or CODEX_API_KEY / OPENAI_API_KEY in the server "
+    "environment."
+)
+_NO_CREDENTIAL_REMEDIATION = (
+    "No Codex credential is available for this profile. " + _SIGN_IN_REMEDIATION
+)
+
+
+def resolve_auth(variables: dict, profile: str) -> CodexAuth:
+    """Resolve Codex credentials for a run/probe. Never raises.
+
+    Order: the ``CODEX_API_KEY`` tool variable -> ``CODEX_API_KEY`` in the
+    server environment -> ``OPENAI_API_KEY`` in the server environment -> the
+    CLI login home for this profile (its own ``codex login`` first, the
+    server's shared one as the fallback). A key beats a login because it is the
+    credential someone typed *for this tool*; the profile's own login beats the
+    server's because it is the account that profile chose.
+
+    The profile's LLM-provider credentials are deliberately NOT a tier any
+    more. There used to be two of them - the OpenAI API key and the "Sign in
+    with ChatGPT" login - and both were surprises: configuring an OpenAI model
+    for chatting silently also handed the Codex tool a paid coding agent on
+    that key, and the ChatGPT bridge made one single-use refresh-token chain
+    shared state between the LLM transport and a subprocess that rotates it
+    behind our back. Codex now authenticates the way the Codex CLI does.
+
+    ``CODEX_HOME`` is always set on the way out (see :class:`CodexAuth`); auth
+    *failures* are surfaced later, from the SDK result.
     """
-    # Resolve the key + source first, then point CODEX_HOME at a per-credential
-    # managed dir derived from the fingerprint (see _managed_codex_home).
     api_key: Optional[str] = None
     source: Optional[str] = None
 
     explicit = str(variables.get(Var.API_KEY) or "").strip()
     if explicit:
         api_key, source = explicit, "tool_variable_api_key"
-    if api_key is None:
-        try:
-            prof_key = BaseConfig.get_provider_api_key("openai", profile=profile)
-            if prof_key:
-                api_key, source = prof_key, "profile_openai_api_key"
-        except Exception:  # noqa: BLE001
-            logger.debug("codex: profile auth resolution failed", exc_info=True)
     if api_key is None:
         env_codex = os.environ.get("CODEX_API_KEY")
         if env_codex:
@@ -255,10 +313,22 @@ def resolve_auth(variables: dict, profile: str) -> CodexAuth:
         auth.env_overrides = {"CODEX_HOME": str(_managed_codex_home(auth))}
         return auth
 
-    # No key found — authenticate from the ambient host ``codex login`` store
-    # (``~/.codex``); do not point CODEX_HOME at the managed dir.
-    source = "host_codex_login" if _read_host_codex_auth() else None
-    return CodexAuth(env_overrides={}, api_key=None, source=source)
+    # No key: authenticate from a CLI login home. Pointing CODEX_HOME at it
+    # even when it holds nothing is deliberate - it is the home a sign-in would
+    # fill, so the run fails against the same directory the card is talking
+    # about instead of against the server user's ambient ``~/.codex``.
+    home = resolve_codex_home(profile)
+    if not home.has_login:
+        # No scope either: the scope labels a credential ("this profile's
+        # login" / "the shared server login"), and with nothing signed in
+        # there is no credential to label - a "shared" scope here would put a
+        # Sign out button on a card that has nothing to sign out.
+        return CodexAuth(env_overrides={"CODEX_HOME": home.path})
+    return CodexAuth(
+        env_overrides={"CODEX_HOME": home.path},
+        source=("profile_codex_login" if home.scope == "profile" else "host_codex_login"),
+        scope=home.scope,
+    )
 
 
 def credential_source(variables: dict, profile: str) -> Optional[str]:
@@ -267,27 +337,180 @@ def credential_source(variables: dict, profile: str) -> Optional[str]:
     return resolve_auth(variables, profile).source
 
 
-# Host ``codex login`` credential store. ``CODEX_HOME`` defaults to ``~/.codex``
-# (``%USERPROFILE%\\.codex`` on Windows). Module-level so tests can monkeypatch
-# it to a temp file.
-_CODEX_AUTH_PATH = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")) / "auth.json"
+def credential_info(variables: dict, profile: str) -> Dict[str, Any]:
+    """``{"source", "scope", "cli_home", "account_hint"}`` for ``profile``.
+
+    The full non-secret description of the credential a run would use - what
+    the Coding Agents card, the ``cremind tools coding-agents`` table and the
+    status leaf print. Never raises and never returns a secret: ``cli_home`` is
+    a directory path and ``account_hint`` is the account label
+    :mod:`app.config.coding_cli_homes` reads out of that home's ``auth.json``.
+
+    The hint is read for the login tiers only. An API-key home holds a key we
+    installed there ourselves, so its hint would be the tautology
+    ``{"type": "api_key"}`` that ``source`` already states - and producing it
+    would mean opening a file containing the key on every status call, for
+    nothing.
+    """
+    auth = resolve_auth(variables, profile)
+    home = auth.env_overrides.get("CODEX_HOME")
+    hint: Optional[dict] = None
+    if home and auth.source in ("profile_codex_login", "host_codex_login"):
+        try:
+            hint = read_codex_account_hint(home)
+        except Exception:  # noqa: BLE001 - a status call must never fail on a hint
+            logger.debug("codex: reading the Codex account hint failed", exc_info=True)
+    return {
+        "source": auth.source,
+        "scope": auth.scope,
+        "cli_home": home,
+        "account_hint": hint,
+    }
 
 
-def _read_host_codex_auth() -> bool:
-    """Best-effort check that the host ``codex login`` store holds a credential.
-    Returns False on any problem (missing file, unreadable, empty)."""
+# -- the codex CLI binary (sign-in / sign-out live here, not in the SDK) ------─
+_CLI_NAME = "codex"
+
+
+def _locate_cli(variables: Optional[dict]) -> Tuple[Optional[str], Optional[str]]:
+    """``(binary, source)`` for the ``codex`` CLI, or ``(None, None)``.
+
+    Same order the SDK itself resolves a binary in, so the CLI a user signs in
+    with is the CLI the app-server later authenticates as: the ``CODEX_BIN``
+    tool variable (an operator pointing at their own build), then the binary the
+    ``codex`` feature ships inside its wheel, then whatever ``codex`` is on
+    PATH. ``source`` is the non-secret label the ``/cli`` route publishes -
+    ``tool_variable`` / ``bundled`` / ``path``.
+
+    ``codex_cli_bin`` is imported inside the function because it arrives with
+    the ``codex`` feature's extras: importing it at module scope would make this
+    module unimportable whenever the feature is not installed, and the built-in
+    has to register (and report itself uninstalled) in exactly that state. Its
+    accessor raises when the wheel is present but the binary is not, hence the
+    broad catch. Never raises.
+    """
+    explicit = str((variables or {}).get(Var.BIN_PATH) or "").strip()
+    if explicit:
+        return explicit, "tool_variable"
     try:
-        path = _CODEX_AUTH_PATH
-        if not path.exists():
-            return False
-        data = json.loads(path.read_text(encoding="utf-8"))
+        from codex_cli_bin import bundled_codex_path
+
+        return str(bundled_codex_path()), "bundled"
     except Exception:  # noqa: BLE001
-        logger.debug("codex: reading host codex credentials failed", exc_info=True)
-        return False
-    if not isinstance(data, dict):
-        return False
-    # auth.json carries either an API key or ChatGPT OAuth tokens.
-    return bool(data.get("OPENAI_API_KEY") or data.get("tokens") or data.get("openai_api_key"))
+        logger.debug("codex: no bundled codex binary available", exc_info=True)
+    found = shutil.which(_CLI_NAME)
+    if found:
+        return found, "path"
+    return None, None
+
+
+def find_cli(variables: Optional[dict] = None) -> Optional[str]:
+    """The ``codex`` binary this install would run, or None if there is none.
+
+    Deliberately the same signature and return shape as
+    :func:`app.tools.builtin.claude_code_runner.find_cli`, so the sign-in
+    routes and the ``cremind tools coding-agents`` commands drive both coding
+    agents through one code path instead of two.
+    """
+    return _locate_cli(variables)[0]
+
+
+def cli_binary_source(variables: Optional[dict] = None) -> Optional[str]:
+    """Where :func:`find_cli`'s answer came from: ``tool_variable`` /
+    ``bundled`` / ``path``, or None when there is no binary."""
+    return _locate_cli(variables)[1]
+
+
+def login_argv(binary: str) -> List[str]:
+    """``codex login --device-auth``.
+
+    The device-code flow, never the plain ``codex login``: the plain one opens
+    a browser and waits on a loopback redirect, which is nothing on a headless
+    server (and on the desktop image would open a browser on the VNC display,
+    not on the user's). ``--device-auth`` prints a URL and a code the user can
+    carry to whatever machine they do have a browser on.
+    """
+    return [binary, "login", "--device-auth"]
+
+
+def logout_argv(binary: str) -> List[str]:
+    return [binary, "logout"]
+
+
+def status_argv(binary: str) -> List[str]:
+    return [binary, "login", "status"]
+
+
+async def logout(variables: dict, profile: str, *, scope: str = "profile") -> Dict[str, Any]:
+    """Sign one CLI home out of Codex. Never raises.
+
+    Returns ``{"ok", "scope", "home", "detail"}``. ``scope="profile"`` targets
+    ``<SYSDIR>/<profile>/coding-cli/codex`` and ``scope="shared"`` the server's
+    own home. The RESOLVED home is deliberately not used: a profile with no
+    login of its own resolves to the shared one, so "Sign out" on its card
+    would have signed the whole server out. The caller states which of the two
+    it means (and the API refuses ``shared`` for a non-admin).
+
+    ``codex logout`` is an RPC on a live app-server, so this spawns one against
+    the target home - which is also why ``CODEX_HOME`` goes into the config env
+    before the client is constructed: the server reads ``auth.json`` once, at
+    spawn, and a home named afterwards would sign out the wrong account.
+
+    ``auth.json`` is unlinked afterwards whatever the RPC did, including when
+    the SDK is missing entirely. The user asked to be signed out; leaving a
+    live OAuth refresh token on disk because an RPC failed is the wrong
+    failure mode. ``ok`` reports the only thing that matters - whether the
+    home still holds a login - and ``detail`` carries what went wrong on the
+    way.
+    """
+    home = Path(shared_codex_home() if scope == "shared" else profile_codex_home(profile))
+    problems: List[str] = []
+
+    sdk, err = load_sdk()
+    if sdk is None:
+        problems.append(f"the Codex SDK is not installed ({err})")
+    else:
+        auth = CodexAuth(env_overrides={"CODEX_HOME": str(home)}, scope=scope)
+
+        async def _run():
+            config = build_config(sdk, variables=variables, auth=auth, cwd=None)
+            async with sdk.AsyncCodex(config) as codex:
+                await codex.logout()
+
+        try:
+            await asyncio.wait_for(_run(), timeout=_LOGOUT_TIMEOUT)
+        except asyncio.TimeoutError:
+            problems.append(f"`codex logout` timed out after {int(_LOGOUT_TIMEOUT)}s")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("codex: the logout RPC failed", exc_info=True)
+            problems.append(f"`codex logout` failed: {exc}")
+
+    try:
+        auth_file = home / _AUTH_JSON_NAME
+        if auth_file.exists():
+            auth_file.unlink()
+    except OSError as exc:
+        problems.append(f"could not remove {home / _AUTH_JSON_NAME}: {exc}")
+
+    _forget_models_cache(str(home))
+    if not codex_login_present(home):
+        return {
+            "ok": True,
+            "scope": scope,
+            "home": str(home),
+            "detail": (
+                f"Signed out of Codex ({'the shared server login' if scope == 'shared' else 'this profile'})."
+            ),
+        }
+    return {
+        "ok": False,
+        "scope": scope,
+        "home": str(home),
+        "detail": (
+            "The Codex login is still present after signing out"
+            + (": " + "; ".join(problems) if problems else ".")
+        ),
+    }
 
 
 # ── SDK config / kwargs construction ───────────────────────────────────────────
@@ -412,16 +635,21 @@ def build_turn_kwargs(sdk, *, variables: dict) -> Dict[str, Any]:
     return _filter_kwargs(sdk.AsyncThread.turn, kwargs)
 
 
-async def _login_if_needed(codex, auth: CodexAuth) -> None:
-    """Install an explicit/profile/env API key into the (managed) CODEX_HOME.
-    A no-op when authenticating from a host ``codex login`` store.
+async def prepare_auth(codex, auth: CodexAuth) -> None:
+    """Install an API-key credential into the running app-server, before any call.
 
-    A login failure is NOT swallowed — it propagates so the caller's exception
+    Only the API-key tier lands here, because ``login_api_key`` is an RPC the
+    already-running server handles. The login tiers are on disk before the
+    server exists - the CLI put them there - and are reached purely through
+    ``CODEX_HOME``, which :func:`build_config` places in the subprocess env
+    BEFORE the client is constructed (the app-server reads ``auth.json`` once,
+    at startup, so a home named afterwards is invisible to it).
+
+    A failure is NOT swallowed - it propagates so the caller's exception
     handling surfaces it (classified as an auth failure where recognizable),
     instead of silently proceeding against whatever the store already held."""
-    if not auth.api_key:
-        return
-    await codex.login_api_key(auth.api_key)
+    if auth.api_key:
+        await codex.login_api_key(auth.api_key)
 
 
 # ── account model listing ──────────────────────────────────────────────────────
@@ -433,9 +661,30 @@ _models_cache: Dict[str, Tuple[float, List[dict]]] = {}
 
 def _cache_key(auth: CodexAuth) -> str:
     """Fingerprint the credential material so cached lists never cross accounts.
-    Never uses the raw secret as a dict key."""
-    material = auth.api_key or f"host:{auth.source or ''}"
+    Never uses the raw secret as a dict key.
+
+    A login tier is fingerprinted by its ``CODEX_HOME``, which is the only
+    thing that distinguishes one login from another from here: the source label
+    alone (what this used to hash) is shared by every profile signed in on its
+    own account, so two profiles with their own logins would have read each
+    other's model list - a cross-profile leak of which models, and therefore
+    which plan, another tenant's account has.
+    """
+    if auth.api_key:
+        material = auth.api_key
+    else:
+        material = f"home:{auth.env_overrides.get('CODEX_HOME') or ''}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _forget_models_cache(home: str) -> None:
+    """Drop the cached model list for one ``CODEX_HOME``.
+
+    Called after a sign-in or a sign-out: the listing is cached per credential
+    for five minutes, so without this the card would keep offering the previous
+    account's models (or a signed-out home's) for the rest of the window.
+    """
+    _models_cache.pop(_cache_key(CodexAuth(env_overrides={"CODEX_HOME": home})), None)
 
 
 async def list_models(
@@ -470,9 +719,11 @@ async def list_models(
                 return {"models": cached_models, "source": auth.source, "cached": True}
 
     async def _fetch():
+        # CODEX_HOME rides in the config env, so it is set before the client
+        # spawns the app-server that reads auth.json.
         config = build_config(sdk, variables=variables, auth=auth, cwd=None)
         async with sdk.AsyncCodex(config) as codex:
-            await _login_if_needed(codex, auth)
+            await prepare_auth(codex, auth)
             return await codex.models()
 
     try:
@@ -491,10 +742,7 @@ async def list_models(
         logger.debug("codex: model listing failed", exc_info=True)
         detail = f"Failed to list Codex models: {exc}"
         if not auth.source:
-            detail = (
-                "No OpenAI credential available. Set CODEX_API_KEY, configure "
-                "OpenAI under Settings -> LLM, or run `codex login` on the host."
-            )
+            detail = _NO_CREDENTIAL_REMEDIATION
         return {"models": [], "error": detail, "source": auth.source}
 
     models = [
@@ -625,42 +873,96 @@ def list_sandbox_modes() -> Dict[str, Any]:
     return {"modes": modes, "source": "openai_codex", "error": None}
 
 
+# The Codex account kinds the SDK models, spelled the way Cremind spells them
+# everywhere else (``read_codex_account_hint``, the card's label map). The SDK
+# uses camelCase discriminators; translating here rather than at three display
+# sites keeps one vocabulary for "what kind of account is this?".
+_ACCOUNT_TYPES = {
+    "apiKey": "api_key",
+    "chatgpt": "chatgpt",
+    "amazonBedrock": "amazon_bedrock",
+}
+
+
+def account_summary(resp: Any) -> Optional[Dict[str, Any]]:
+    """``{"type", "email", "plan_type"}`` from a ``GetAccountResponse``, or None.
+
+    ``resp.account`` is a pydantic ``RootModel`` union (API key / ChatGPT /
+    Bedrock), so the real fields live under ``.root`` - reading ``email`` off
+    the wrapper silently yields None and the card would show a signed-in
+    account with no name on it. Only the non-secret label is taken; nothing
+    here may carry a token or a key, because this travels to the UI and into
+    the CLI's output.
+    """
+    account = getattr(resp, "account", None)
+    if account is None:
+        return None
+    inner = _unwrap(account)
+    kind = _enum_value(getattr(inner, "type", None))
+    return {
+        "type": _ACCOUNT_TYPES.get(kind, kind or None),
+        "email": str(getattr(inner, "email", "") or "").strip() or None,
+        "plan_type": _enum_value(getattr(inner, "plan_type", None)) or None,
+    }
+
+
 async def probe_auth(
     sdk, *, cwd: str, variables: dict, profile: str, timeout: float = 30.0
 ) -> Dict[str, Any]:
-    """Confirm Codex can authenticate by reading the active account (cheap — no
+    """Confirm Codex can authenticate by reading the active account (cheap - no
     coding turn, no token spend).
 
-    Returns ``{"logged_in": bool|None, "detail": str}``. ``logged_in`` is None
-    when the probe could not run (binary missing / timeout).
+    Returns ``{"logged_in": bool|None, "detail": str, "account": dict|None}``.
+    ``logged_in`` is None when the probe could not run (binary missing /
+    timeout); ``account`` is the non-secret summary of the credential that
+    answered, so the card can say WHICH account is signed in rather than only
+    that one is.
     """
     auth = resolve_auth(variables, profile)
 
     async def _run():
+        # CODEX_HOME rides in the config env, so the app-server reads the
+        # intended home's auth.json at spawn.
         config = build_config(sdk, variables=variables, auth=auth, cwd=cwd)
         async with sdk.AsyncCodex(config) as codex:
-            await _login_if_needed(codex, auth)
+            await prepare_auth(codex, auth)
             return await codex.account()
 
     try:
         resp = await asyncio.wait_for(_run(), timeout=timeout)
     except FileNotFoundError as exc:
-        return {"logged_in": None, "detail": f"Codex binary not found: {exc}"}
+        return {"logged_in": None, "detail": f"Codex binary not found: {exc}", "account": None}
     except asyncio.TimeoutError:
-        return {"logged_in": None, "detail": f"Auth probe timed out after {int(timeout)}s."}
+        return {
+            "logged_in": None,
+            "detail": f"Auth probe timed out after {int(timeout)}s.",
+            "account": None,
+        }
     except Exception as exc:  # noqa: BLE001
         text = str(exc)
         if _looks_like_auth_error(text):
-            return {"logged_in": False, "detail": text}
-        return {"logged_in": None, "detail": f"Probe error: {text}"}
+            return {"logged_in": False, "detail": text, "account": None}
+        return {"logged_in": None, "detail": f"Probe error: {text}", "account": None}
 
-    requires_auth = bool(getattr(resp, "requires_openai_auth", False))
     account = getattr(resp, "account", None)
-    if account is not None and not requires_auth:
-        return {"logged_in": True, "detail": "Codex has an active account credential."}
+    # ``account`` alone decides it. ``requires_openai_auth`` reads like "this
+    # credential is unusable" and was gated on for exactly that reason, but the
+    # bundled binary returns True in EVERY reachable state - an empty home, an
+    # API-key home, a ChatGPT home, even immediately after the SDK's own
+    # ``login_api_key`` succeeded - so gating on it made ``logged_in`` always
+    # False and told users to re-credential a credential Codex was actively
+    # using. The SDK ships no description for the field; treat it as a property
+    # of the build, not of the account.
+    if account is not None:
+        return {
+            "logged_in": True,
+            "detail": "Codex has an active account credential.",
+            "account": account_summary(resp),
+        }
     return {
         "logged_in": False,
         "detail": "No Codex account credential is active.",
+        "account": None,
     }
 
 
@@ -821,10 +1123,12 @@ async def _run_session(
     auth: CodexAuth,
 ) -> None:
     try:
+        # CODEX_HOME rides in the config env, so it is in place before the
+        # client spawns the app-server that reads auth.json once.
         config = build_config(sdk, variables=variables, auth=auth, cwd=task.cwd)
         async with sdk.AsyncCodex(config) as codex:
             task.client = codex
-            await _login_if_needed(codex, auth)
+            await prepare_auth(codex, auth)
             thread_kwargs = build_thread_kwargs(
                 sdk, cwd=task.cwd, variables=variables, model=model, resume=bool(session_id),
             )
@@ -1053,11 +1357,7 @@ def _auth_failure_payload(task: CodexTask, *, detail: str, **extra: Any) -> Dict
         task,
         error="AuthenticationError",
         message=("Codex could not authenticate with OpenAI. " + (detail or "")).strip(),
-        remediation=(
-            "Provide credentials one of three ways: set the CODEX_API_KEY tool "
-            "variable; configure the OpenAI provider under Settings → LLM for this "
-            "profile; or run `codex login` on the server host."
-        ),
+        remediation=_SIGN_IN_REMEDIATION,
         **extra,
     )
 

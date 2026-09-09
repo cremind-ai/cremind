@@ -20,6 +20,7 @@ import pytest
 
 from app.api import llm as llm_api
 from app.api import llm_codex_flow as flow
+from app.config import runtime_env
 from app.lib.llm import codex_auth as ca
 
 
@@ -90,13 +91,24 @@ def _free_port() -> int:
 
 
 @pytest.fixture(autouse=True)
-def _reset_flow(monkeypatch):
+def _reset_flow(monkeypatch, tmp_path):
     # Pin deployment detection to "native" for every test unless it says
     # otherwise — CI itself may run inside a container, which would otherwise
     # flip the bind host and the capture hint under the tests' feet.
     monkeypatch.delenv("INSTALL_MODE", raising=False)
     monkeypatch.delenv("VNC_PASSWORD", raising=False)
     monkeypatch.setattr(flow, "_CONTAINER_MARKER", Path("/nonexistent/.dockerenv"))
+    # Same reasoning one level down: the Kubernetes hint now names this pod's
+    # own namespace and Service, so a suite running inside a real cluster would
+    # otherwise inherit that cluster's identity and the older-chart case could
+    # never be observed. Cut off all three sources of one.
+    for key in ("CREMIND_K8S_NAMESPACE", "CREMIND_K8S_RELEASE",
+                "CREMIND_K8S_WORKLOAD", "CREMIND_K8S_SERVICE_PORT",
+                "KUBERNETES_SERVICE_HOST", "HOSTNAME"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        runtime_env, "_SA_NAMESPACE_FILE", tmp_path / "no-such-namespace",
+    )
     flow._pending.clear()
     asyncio.run(flow.stop_listener())
     yield
@@ -194,6 +206,45 @@ def test_start_kubernetes_keeps_loopback_and_tells_user_to_forward(monkeypatch, 
     assert _capture_bind["host"] == "127.0.0.1"
     assert "port-forward" in data["capture_hint"]
     assert "1455:1455" in data["capture_hint"]
+
+
+def test_the_kubernetes_hint_names_this_pods_own_namespace_and_service(
+    monkeypatch, _capture_bind,
+):
+    """It used to read 'svc/cremind' in a namespace the user had to fill in.
+
+    The Service is named after the Helm release, so on any release not called
+    cremind that command answered 'services "cremind" not found', which reads
+    as a broken cluster, not as a hint that guessed.
+    """
+    monkeypatch.setenv("CREMIND_K8S_NAMESPACE", "team-a")
+    monkeypatch.setenv("CREMIND_K8S_RELEASE", "prod")
+    monkeypatch.setenv("CREMIND_K8S_WORKLOAD", "prod-cremind")
+    monkeypatch.setenv("CREMIND_K8S_SERVICE_PORT", "8080")
+    h = _handlers(FakeConfigStorage(), monkeypatch)
+
+    hint = _start_under_mode(monkeypatch, h, "kubernetes")["capture_hint"]
+
+    assert (
+        "kubectl --namespace team-a port-forward svc/prod-cremind 1515:8080 "
+        "1455:1455" in hint
+    )
+    assert "<namespace>" not in hint and "svc/cremind" not in hint
+
+
+def test_an_older_chart_still_gets_the_hint_with_blanks_to_fill_in(
+    monkeypatch, _capture_bind,
+):
+    """A pod started before the chart stated its identity knows none of this,
+    and a visible blank beats a plausible wrong name."""
+    h = _handlers(FakeConfigStorage(), monkeypatch)
+
+    hint = _start_under_mode(monkeypatch, h, "kubernetes")["capture_hint"]
+
+    assert (
+        "kubectl --namespace <namespace> port-forward svc/<release> 1515:80 "
+        "1455:1455" in hint
+    )
 
 
 def test_capture_hint_suppressed_when_listener_did_not_bind(monkeypatch):

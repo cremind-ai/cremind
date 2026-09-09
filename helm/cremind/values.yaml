@@ -82,7 +82,11 @@ cremind:
   # backend binds it on the pod's loopback only for the ~10 minutes a sign-in is
   # pending; `kubectl port-forward` reaches it there. See the README.
   codexCallbackPort: 1455
-  systemDir: /root/.cremind      # -> CREMIND_SYSTEM_DIR (PVC mount; image default)
+  # -> CREMIND_SYSTEM_DIR (PVC mount; image default). Also the root of the
+  # coding CLIs' sign-in: the chart derives CLAUDE_CONFIG_DIR and CODEX_HOME
+  # from it (<systemDir>/coding-cli/{claude,codex}) so a `claude auth login`
+  # or `codex login` survives a rollout instead of dying with the pod.
+  systemDir: /root/.cremind
   # Timezone -> CREMIND_TIMEZONE: the boot default wall-clock zone the scheduler
   # fires time-based events in and the agent reports for "what time is it". The
   # image runs in UTC, so LEAVE THIS BLANK and schedules fire in UTC. Set an IANA

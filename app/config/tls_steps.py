@@ -48,6 +48,20 @@ DOCKER_RECREATE_COMMAND = "docker compose up -d --force-recreate cremind"
 
 _ATLASSIAN_CONSOLE = "Atlassian developer console"
 
+#: What a Kubernetes command says when the pod could not name itself. One
+#: placeholder covers the Deployment and the Service as well as the Helm
+#: release: ``<release>`` is what the operator types into ``helm upgrade``, and
+#: the chart names all three alike. ``app.config.runtime_env`` prints the same
+#: two spellings for the same two unknowns, so one install never shows two
+#: vocabularies for what the operator has to fill in;
+#: ``tests/config/test_tls_steps.py`` pins them equal.
+NAMESPACE_PLACEHOLDER = "<namespace>"
+RELEASE_PLACEHOLDER = "<release>"
+
+#: The chart's ``service.port`` default, used when the identity says nothing:
+#: a pod started by a chart too old to state it still gets a runnable tunnel.
+_DEFAULT_SERVICE_PORT = 80
+
 
 def note(text: str) -> dict:
     """Prose guidance. Rendered as plain text; never copyable."""
@@ -143,12 +157,96 @@ def _chart_note(chart_version: str) -> dict:
     )
 
 
-def _ingress_steps(https_url: str, chart_version: str) -> list[dict]:
+def _kubernetes_names(
+    kubernetes: dict | None,
+) -> tuple[str, str, str, int, bool, bool]:
+    """This pod's own names where it knows them, placeholders where it does not.
+
+    ``kubernetes`` is the identity block :func:`app.config.runtime_env
+    .kubernetes_identity` builds - ``None`` off Kubernetes, and off Kubernetes
+    none of this is rendered anyway. Every value still needs a fallback,
+    because a cluster upgrades the venv PVC in place: this code runs inside
+    pods whose chart states none of it.
+
+    The workload falls back to the *release* rather than to a placeholder of
+    its own. That is the rule the runbook has always stated in prose (the
+    chart names the Deployment and the Service after the release), so an
+    install that knows only its release still gets a runnable
+    ``deployment/...`` line instead of a second blank to fill in.
+
+    ``missing`` means a placeholder survived, i.e. the operator still has to
+    substitute something and ``helm list`` is still the first command;
+    ``inferred`` means the names came from the pod's own hostname and
+    service-account namespace rather than from the chart, which is worth saying
+    out loud because the release name is then genuinely unknown.
+    """
+    identity = kubernetes or {}
+    namespace = identity.get("namespace") or NAMESPACE_PLACEHOLDER
+    release = identity.get("release") or RELEASE_PLACEHOLDER
+    workload = identity.get("workload") or release
+    service_port = identity.get("service_port") or _DEFAULT_SERVICE_PORT
+    missing = (
+        namespace == NAMESPACE_PLACEHOLDER
+        or release == RELEASE_PLACEHOLDER
+        or workload == RELEASE_PLACEHOLDER
+    )
+    inferred = identity.get("source") == "inferred"
+    return namespace, release, workload, service_port, missing, inferred
+
+
+def _names_caveat(workload: str, inferred: bool) -> str:
+    """What is still unsaid about the Deployment/Service name, if anything.
+
+    Two different unknowns, and telling a user the wrong one is the confusion
+    this replaces: with no identity at all the operator has to derive the name
+    from the release themselves, while an inferred identity already printed a
+    real name that came from the pod's hostname; there the open question is
+    which release owns it, which ``helm list`` answers.
+    """
+    if workload == RELEASE_PLACEHOLDER:
+        return (
+            " The Deployment and Service carry the release name, or "
+            f"{RELEASE_PLACEHOLDER}-cremind when the release name does not "
+            "contain cremind."
+        )
+    if inferred:
+        return (
+            f" The Deployment and Service name below ({workload}) was inferred "
+            "from this pod's own name because the chart that installed it does "
+            "not state it, so helm list also shows which release it belongs to."
+        )
+    return ""
+
+
+def _port_forward_command(namespace: str, service: str, service_port: int) -> dict:
+    """The tunnel line, in the one spelling every Cremind screen prints.
+
+    ``runtime_env`` owns it because the chart's NOTES, the VNC card and this
+    runbook all hand out the same command and used to disagree about the flag
+    spelling. Imported inside the function to keep this module importable on
+    its own: it is pure by design, and ``runtime_env`` answers install
+    questions that reach for the settings stack.
+    """
+    from app.config.runtime_env import PORT_FORWARD_LOCAL_PORT, kubernetes_port_forward
+
+    return command(
+        kubernetes_port_forward(
+            namespace, service, PORT_FORWARD_LOCAL_PORT, service_port
+        )
+    )
+
+
+def _ingress_steps(
+    https_url: str, chart_version: str, kubernetes: dict | None = None
+) -> list[dict]:
     """Kubernetes with an Ingress terminating TLS.
 
     No port-forward anywhere: the public hostname *is* the HTTPS address here,
     and the certificate belongs to the Ingress, not to Cremind.
     """
+    namespace, release, workload, _port, missing, inferred = _kubernetes_names(
+        kubernetes
+    )
     return [
         note(
             "Cremind keeps its in-pod TLS disabled here: the Ingress terminates "
@@ -177,33 +275,46 @@ def _ingress_steps(https_url: str, chart_version: str) -> list[dict]:
             "one derived from cremind.appUrl."
         ),
         note(
-            "Then run these commands in order from a machine with helm and kubectl "
-            "access, replacing <release> and <namespace> with the NAME and "
-            "NAMESPACE the first command prints, plus the certificate paths and "
-            "your values file. Skip the create-secret command when cert-manager or "
-            "another issuer already owns the Secret. One Helm upgrade moves the "
-            "proxy, Service, probes and public URL together; changing only the "
+            (
+                "Then run these commands in order from a machine with helm and "
+                f"kubectl access, replacing {RELEASE_PLACEHOLDER} and "
+                f"{NAMESPACE_PLACEHOLDER} with the NAME and NAMESPACE the first "
+                "command prints, plus the certificate paths and your values "
+                "file."
+                if missing else
+                "Then run these commands in order from a machine with helm and "
+                "kubectl access; they already carry this install's own release "
+                f"and run against its namespace {namespace}, so only the "
+                "certificate paths and your values file are left to fill in."
+            )
+            + _names_caveat(workload, inferred)
+            + " Skip the create-secret command when cert-manager or another "
+            "issuer already owns the Secret. One Helm upgrade moves the proxy, "
+            "Service, probes and public URL together; changing only the "
             "container environment breaks routing."
         ),
-        command("helm list --all-namespaces"),
+        *([command("helm list --all-namespaces")] if missing or inferred else []),
         command(
-            "kubectl --namespace <namespace> create secret tls cremind-tls "
+            f"kubectl --namespace {namespace} create secret tls cremind-tls "
             "--cert=<path-to-fullchain.pem> --key=<path-to-privkey.pem>"
         ),
         command(
-            f"helm upgrade <release> {CHART_REFERENCE} --version {chart_version} "
-            "--namespace <namespace> --reuse-values -f <your-values.yaml>"
+            f"helm upgrade {release} {CHART_REFERENCE} --version {chart_version} "
+            f"--namespace {namespace} --reuse-values -f <your-values.yaml>"
         ),
         _chart_note(chart_version),
         command(
-            "kubectl --namespace <namespace> rollout status "
-            "deployment/<release> --timeout=5m"
+            f"kubectl --namespace {namespace} rollout status "
+            f"deployment/{workload} --timeout=5m"
         ),
         note(
             "Verify the rollout: the Ingress should list the host and TLS Secret, "
             "and the status endpoint should answer over HTTPS."
         ),
-        command("kubectl --namespace <namespace> get ingress <release>"),
+        # The Ingress is named after the *fullname*, not the release: with no
+        # identity the two spell the same placeholder, but on an install that
+        # knows itself this is the Deployment's name, never helm's.
+        command(f"kubectl --namespace {namespace} get ingress {workload}"),
         command(f"curl --fail {https_url}/api/tls/status"),
         note(
             f"Cremind then answers at {https_url}; tabs that joined this switch "
@@ -215,8 +326,13 @@ def _ingress_steps(https_url: str, chart_version: str) -> list[dict]:
     ]
 
 
-def _kubernetes_steps(https_url: str, chart_version: str) -> list[dict]:
+def _kubernetes_steps(
+    https_url: str, chart_version: str, kubernetes: dict | None = None
+) -> list[dict]:
     """Kubernetes terminating TLS inside the pod (``cremind.ssl=auto``)."""
+    namespace, release, workload, service_port, missing, inferred = _kubernetes_names(
+        kubernetes
+    )
     return [
         note(
             "Edit your Helm values first: set cremind.ssl=auto, remove any "
@@ -230,30 +346,37 @@ def _kubernetes_steps(https_url: str, chart_version: str) -> list[dict]:
             f"{_ATLASSIAN_CONSOLE} before linking Jira or Confluence."
         ),
         note(
-            "Then run these commands in order from a machine with helm and kubectl "
-            "access, replacing <release> and <namespace> with the NAME and "
-            "NAMESPACE the first command prints. The Deployment and Service carry "
-            "the release name, or <release>-cremind when the release name does not "
-            "contain cremind. Upgrade through Helm so the proxy sidecar, Service, "
-            "probes and URLs change together; editing only the container "
-            "environment breaks routing."
+            (
+                "Then run these commands in order from a machine with helm and "
+                f"kubectl access, replacing {RELEASE_PLACEHOLDER} and "
+                f"{NAMESPACE_PLACEHOLDER} with the NAME and NAMESPACE the first "
+                "command prints."
+                if missing else
+                "Then run these commands in order from a machine with helm and "
+                "kubectl access; they already carry this install's own release "
+                f"and run against its namespace {namespace}."
+            )
+            + _names_caveat(workload, inferred)
+            + " Upgrade through Helm so the proxy sidecar, Service, probes and "
+            "URLs change together; editing only the container environment "
+            "breaks routing."
         ),
-        command("helm list --all-namespaces"),
+        *([command("helm list --all-namespaces")] if missing or inferred else []),
         command(
-            f"helm upgrade <release> {CHART_REFERENCE} --version {chart_version} "
-            "--namespace <namespace> --reuse-values --set cremind.ssl=auto"
+            f"helm upgrade {release} {CHART_REFERENCE} --version {chart_version} "
+            f"--namespace {namespace} --reuse-values --set cremind.ssl=auto"
         ),
         _chart_note(chart_version),
         command(
-            "kubectl --namespace <namespace> rollout status "
-            "deployment/<release> --timeout=5m"
+            f"kubectl --namespace {namespace} rollout status "
+            f"deployment/{workload} --timeout=5m"
         ),
         note(
             "Only if you reach Cremind through kubectl port-forward: the rollout "
             "replaced the pod and closed the old tunnel, so open it again, adding "
             "1455:1455 and 6080:6080 if your previous port-forward had them."
         ),
-        command("kubectl --namespace <namespace> port-forward svc/<release> 1515:80"),
+        _port_forward_command(namespace, workload, service_port),
         note(
             f"When the rollout finishes Cremind answers at {https_url}. Tabs that "
             "joined this switch move there on their own; if a browser warns about "
@@ -387,6 +510,7 @@ def deployment_steps(
     activating: bool,
     https_url: str,
     chart_version: str,
+    kubernetes: dict | None = None,
 ) -> list[dict]:
     """What this deployment has to do to finish the switch to HTTPS.
 
@@ -394,14 +518,20 @@ def deployment_steps(
     see :func:`running_chart_version`. Empty for a supervised native install
     and for Electron: those restart themselves, so there is nothing for the
     operator to run.
+
+    ``kubernetes`` is the pod's own identity (see :func:`_kubernetes_names`),
+    which turns every ``<release>``/``<namespace>`` in the Kubernetes runbooks
+    into the real thing. Optional and defaulting to ``None`` so every non-K8S
+    caller, and the older-chart pod that knows nothing about itself, keeps
+    the placeholder runbook it always had.
     """
     if manager == "external":
         if edge:
-            return _ingress_steps(https_url, chart_version)
+            return _ingress_steps(https_url, chart_version, kubernetes)
         if install_mode == "docker":
             return _docker_steps(https_url)
         if install_mode == "kubernetes":
-            return _kubernetes_steps(https_url, chart_version)
+            return _kubernetes_steps(https_url, chart_version, kubernetes)
         return _reverse_proxy_steps(restart_supported, https_url)
     if manager == "native" and not restart_supported:
         return _unsupervised_native_steps(activating, https_url)
@@ -409,13 +539,20 @@ def deployment_steps(
 
 
 def certificate_repair_steps(
-    *, manager: str, install_mode: str, restart_supported: bool
+    *,
+    manager: str,
+    install_mode: str,
+    restart_supported: bool,
+    kubernetes: dict | None = None,
 ) -> list[dict]:
     """How to load a replaced certificate, for a server already on HTTPS.
 
     Deliberately *only* the reload: the certificate itself is replaced outside
     Cremind, and repeating the enable runbook to a server that already serves
     HTTPS is what made this page confusing.
+
+    ``kubernetes`` fills the pod's own names into the two ``kubectl`` lines,
+    exactly as in :func:`deployment_steps`.
     """
     if install_mode == "docker":
         return [
@@ -426,18 +563,21 @@ def certificate_repair_steps(
             command(DOCKER_RECREATE_COMMAND),
         ]
     if install_mode == "kubernetes":
+        namespace, _release, workload, _port, _missing, _inferred = _kubernetes_names(
+            kubernetes
+        )
         return [
             note(
                 "Once the replacement certificate is in place, restart the pod so "
                 "it loads it:"
             ),
             command(
-                "kubectl --namespace <namespace> rollout restart "
-                "deployment/<release>"
+                f"kubectl --namespace {namespace} rollout restart "
+                f"deployment/{workload}"
             ),
             command(
-                "kubectl --namespace <namespace> rollout status "
-                "deployment/<release> --timeout=5m"
+                f"kubectl --namespace {namespace} rollout status "
+                f"deployment/{workload} --timeout=5m"
             ),
         ]
     if manager == "electron":

@@ -219,6 +219,48 @@ def get_profile_routes(
                     f"Could not remove the token file for deleted profile '{profile_name}'"
                 )
 
+            # A Codex device-code sign-in for this profile may still be waiting
+            # on the user's browser, holding an open ``codex app-server`` child
+            # that would write a fresh ``auth.json`` into the tree we are about
+            # to delete - after we deleted it. Cancel it first, so the order is
+            # "stop producing credentials, then remove them" and not the other
+            # way round. Its own try block: the login module is optional at
+            # runtime (the Codex SDK may not be installed), and an ImportError
+            # here must not cost us the removal below.
+            try:
+                from app.tools.builtin import codex_login
+
+                await codex_login.cancel_for_profile(profile_name)
+            except Exception:  # noqa: BLE001 - never block the delete
+                logger.debug(
+                    f"Could not cancel a pending Codex sign-in for deleted profile "
+                    f"'{profile_name}'",
+                    exc_info=True,
+                )
+
+            # The profile's coding-CLI logins live on disk, not in the DB: the
+            # ``claude``/``codex`` CLIs write ``.credentials.json`` / ``auth.json``
+            # under <SYSDIR>/<profile>/coding-cli, and both hold long-lived OAuth
+            # refresh tokens in plaintext that nothing revokes upstream. Deleting
+            # a profile deliberately does NOT remove its system directory (the
+            # skills tree is kept so the data can be recovered), so unless this
+            # runs the credential outlives the profile and rides out in every
+            # later backup or ``~/.cremind`` copy - for a user who believes the
+            # tenant is gone. Nothing else collects it either: the DB rows go by
+            # FK cascade here, so the clean engine - the other place that pairs
+            # the rows with the tree - never runs for a deletion.
+            try:
+                from app.config import coding_cli_homes
+
+                await asyncio.to_thread(
+                    coding_cli_homes.remove_profile_cli_homes, profile_name
+                )
+            except Exception:  # noqa: BLE001 - never block the delete
+                logger.exception(
+                    f"Could not remove the coding-CLI logins for deleted profile "
+                    f"'{profile_name}'"
+                )
+
             # Group memberships cascade away with the profile row, but the
             # runtime state of its seats (queue worker, stream bus, run
             # binding) and the in-memory group index do not — release them, or

@@ -35,7 +35,6 @@ written by :func:`app.lib.llm.codex_auth.persist_token_response`.
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -104,14 +103,40 @@ _HINT_DOCKER = (
     "different machine than the Docker host, the mapping can't help — paste the "
     "redirect URL below instead."
 )
-_HINT_KUBERNETES = (
-    "This is a Kubernetes install, so automatic capture needs port "
-    f"{codex_auth.CODEX_CALLBACK_PORT} forwarded too: 'kubectl -n <namespace> "
-    f"port-forward svc/cremind 1515:80 {codex_auth.CODEX_CALLBACK_PORT}:"
-    f"{codex_auth.CODEX_CALLBACK_PORT}'. If you reach Cremind through an Ingress "
-    "instead, paste the redirect URL below — or run 'cremind llm codex-oauth "
-    "login' from your own machine, which captures the redirect locally."
-)
+def _kubernetes_hint() -> str:
+    """The port-forward this pod actually needs, named after this pod.
+
+    This used to be a constant reading ``kubectl -n <namespace> port-forward
+    svc/cremind ...``, which was wrong twice over: the namespace was a blank the
+    user had to fill in, and ``cremind`` is only the Service name when the Helm
+    release is called that (the chart names it after the release). A user who
+    pasted it got "services 'cremind' not found" and no way to tell that the
+    command, not their cluster, was at fault.
+
+    The pod now knows its own namespace and Service, so the line is
+    copy-and-run. It falls back to the placeholders when it does not - a pod
+    started by a chart too old to state them - because a visibly blank name is
+    still better than a plausible wrong one; ``app.config.tls_steps`` spells the
+    same two blanks the same way in the HTTPS runbook.
+    """
+    from app.config import runtime_env
+    from app.config.tls_steps import NAMESPACE_PLACEHOLDER, RELEASE_PLACEHOLDER
+
+    port = codex_auth.CODEX_CALLBACK_PORT
+    identity = runtime_env.kubernetes_identity("kubernetes") or {}
+    tunnel = identity.get("port_forward") or runtime_env.kubernetes_port_forward(
+        identity.get("namespace") or NAMESPACE_PLACEHOLDER,
+        identity.get("service") or RELEASE_PLACEHOLDER,
+        runtime_env.PORT_FORWARD_LOCAL_PORT,
+        identity.get("service_port") or 80,
+    )
+    return (
+        "This is a Kubernetes install, so automatic capture needs port "
+        f"{port} forwarded too: '{tunnel} {port}:{port}'. If you reach Cremind "
+        "through an Ingress instead, paste the redirect URL below - or run "
+        "'cremind llm codex-oauth login' from your own machine, which captures "
+        "the redirect locally."
+    )
 
 
 # Last-resort "are we in a container?" signal, used only when INSTALL_MODE is
@@ -123,22 +148,15 @@ _CONTAINER_MARKER = Path("/.dockerenv")
 def _detect_deployment() -> str:
     """Return ``native`` | ``docker`` | ``kubernetes`` for the running install.
 
-    ``INSTALL_MODE`` is authoritative (compose writes ``docker``, the Helm chart
-    writes ``kubernetes``). Only when it is absent — an older Docker ``.env``
-    predating the key — do we fall back to the container marker, mirroring the
-    heuristics in :mod:`app.api.config`.
+    The detection itself lives in :mod:`app.config.runtime_env`, which every
+    other "what kind of install is this?" answer now comes from; only the
+    marker stays local, so this module keeps the single patchable seam its
+    tests pin to when CI itself runs inside a container. Imported inside the
+    function to keep this module's import graph as small as it was.
     """
-    try:
-        from app.config.install_catalog import get_active_install_mode
-        mode = (get_active_install_mode() or "").strip().lower()
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(f"[codex-flow] install-mode lookup failed: {exc}")
-        mode = ""
-    if mode in ("docker", "kubernetes"):
-        return mode
-    if not mode and (os.environ.get("VNC_PASSWORD") or _CONTAINER_MARKER.exists()):
-        return "docker"
-    return "native"
+    from app.config import runtime_env
+
+    return runtime_env.detect_install_mode(container_marker=_CONTAINER_MARKER)
 
 
 def _bind_host(deployment: str) -> str:
@@ -165,7 +183,7 @@ def _capture_hint(deployment: str) -> Optional[str]:
     if deployment == "docker":
         return _HINT_DOCKER
     if deployment == "kubernetes":
-        return _HINT_KUBERNETES
+        return _kubernetes_hint()
     return None
 
 

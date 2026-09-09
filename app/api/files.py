@@ -17,6 +17,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from app.api._auth import is_admin
+from app.config.coding_cli_homes import shared_claude_config_dir, shared_codex_home
 from app.config.settings import BaseConfig, get_user_working_directory
 from app.events import get_event_stream_bus
 from app.utils.context_storage import get_context
@@ -27,6 +28,169 @@ from app.utils.working_directory import (
     persist_working_directory,
     set_in_memory_override,
 )
+
+
+# Directory names under the System Directory that hold coding-agent
+# credentials, and which these routes must therefore never serve to anybody.
+#
+# The sandbox below is a path-traversal guard, not an authorization boundary:
+# it stops a caller escaping the System Directory, but every authenticated
+# profile may read anything *inside* it. That was survivable while the
+# directory held only per-profile working data. It stopped being survivable
+# when the coding agents moved their sign-in here: ``coding-cli`` holds long
+# lived OAuth refresh tokens for a user's Claude and ChatGPT accounts, at the
+# fully predictable path ``<system dir>/<profile>/coding-cli/...``, and
+# ``codex-home`` holds the ``auth.json`` written for an API-key credential. A
+# member profile could list one and download another profile's account.
+#
+# Nothing legitimately browses these: the SPA never asks for them, the runners
+# read them straight off disk, and the sign-in flows write them. So deny them
+# outright rather than trying to work out who is asking. Kept as a name set
+# because there is one store per profile, they are created on demand, and the
+# same names appear both per profile and at the shared root -- there is no list
+# of live paths to enumerate, so the name is the rule.
+_CREDENTIAL_DIR_NAMES = frozenset({"coding-cli", "codex-home"})
+
+
+def _shared_credential_homes() -> tuple[str, ...]:
+    """The install-wide CLI logins, resolved wherever they actually point.
+
+    The per-profile stores are recognisable by name because Cremind chooses
+    their path. The *server's own* login is not: on a native install it is
+    ``~/.claude`` / ``~/.codex``, and the operator (or the Dockerfile, or the
+    Helm chart) can move either with ``CLAUDE_CONFIG_DIR`` / ``CODEX_HOME``.
+    Neither wears a name this module could match and neither need be under the
+    System Directory at all, so a name-only rule left the shared home -- the
+    one credential every profile without its own login runs on -- outside the
+    guard entirely, in a directory (the user's home) that the file tree
+    routinely browses.
+
+    Asked of :mod:`app.config.coding_cli_homes` rather than re-derived here so
+    the guard cannot drift from the code that writes the tokens, and resolved
+    live on every call for the same reason that module reads its environment
+    live: move a home and the guard moves with it.
+    """
+    homes: list[str] = []
+    for resolve in (shared_claude_config_dir, shared_codex_home):
+        try:
+            homes.append(os.path.realpath(str(resolve())))
+        except Exception:  # noqa: BLE001
+            # A home we cannot even name is one we cannot guard; it must not
+            # also take a file listing down with it.
+            logger.debug("files: could not resolve a shared CLI home", exc_info=True)
+    return tuple(homes)
+
+
+def _credential_matcher():
+    """Build the "is this a credential store?" predicate over *resolved* paths.
+
+    Returned as a closure, not called per path, because a directory listing
+    asks it up to ``_DIRECTORY_LIST_CAP`` times and the watch stream once per
+    filesystem event: the shared homes cost a ``realpath`` (and an install-mode
+    lookup) each to resolve, and this way they cost that once per request.
+
+    Callers must pass an already-resolved path -- ``_is_credential_path`` is
+    the entry point that resolves for them. Listing and watch skip that step
+    deliberately: their paths are built from a target that was resolved before
+    the route accepted it.
+    """
+    base = os.path.realpath(BaseConfig.CREMIND_SYSTEM_DIR)
+    homes = _shared_credential_homes()
+
+    def _matches(resolved: str) -> bool:
+        for home in homes:
+            if resolved == home or resolved.startswith(home + os.sep):
+                return True
+        try:
+            relative = os.path.relpath(resolved, base)
+        except ValueError:
+            # Different drive on Windows: not under the System Directory.
+            return False
+        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+            return False
+        segments = relative.replace("\\", "/").split("/")
+        return any(segment in _CREDENTIAL_DIR_NAMES for segment in segments)
+
+    return _matches
+
+
+def _is_credential_path(target: str) -> bool:
+    """Is ``target`` a credential store, or inside one?
+
+    Resolves first so a symlink or a ``..`` cannot walk in sideways, then
+    applies both halves of the rule: any path segment named after a store
+    *under the System Directory* (covering ``<system dir>/coding-cli``,
+    ``<system dir>/codex-home`` and every ``<system dir>/<profile>/coding-cli``
+    without enumerating them), and the shared homes by location.
+    """
+    return _credential_matcher()(os.path.realpath(target))
+
+
+def _child_dirs(parent: str) -> list[os.DirEntry]:
+    """Immediate sub-directories of ``parent``; ``[]`` if it cannot be read.
+
+    ``follow_symlinks=False`` so a link is never descended: a store reached
+    through one is still refused by path, and following links here would turn a
+    bounded scan into an unbounded one.
+    """
+    try:
+        with os.scandir(parent) as it:
+            return [de for de in it if de.is_dir(follow_symlinks=False)]
+    except OSError:
+        return []
+
+
+def _holds_credential_store(target: str) -> bool:
+    """Does a credential store live strictly *below* the resolved ``target``?
+
+    ``_is_credential_path`` answers "is this a store"; this answers "does this
+    contain one", which is the question a move has to ask. Moving a store was
+    already refused, but moving its *parent* was not -- and a profile directory
+    only has to reach the user working directory for the name rule to stop
+    applying, after which ``/open`` serves the tokens like any other file.
+
+    The System Directory side is a bounded scan rather than a recursive walk:
+    ``coding_cli_homes`` writes exactly ``<sysdir>/<name>`` (the install-wide
+    login and the managed Codex homes) and ``<sysdir>/<profile>/<name>``, so
+    two levels find every store a sign-in can have created, while a walk would
+    descend a whole profile's working data -- ``node_modules`` and all -- on
+    every rename in the file tree.
+    """
+    # ``os.sep`` alone: every path compared here has been through ``realpath``,
+    # which normalises the separator, so tolerating the other one would only
+    # mangle a directory whose name legitimately ends in it.
+    prefix = target.rstrip(os.sep) + os.sep
+    if any(home.startswith(prefix) for home in _shared_credential_homes()):
+        return True
+    base = os.path.realpath(BaseConfig.CREMIND_SYSTEM_DIR)
+    # Only scan when the two trees actually overlap: target above the System
+    # Directory, at it, or inside it. Anything else cannot contain a store the
+    # name rule knows about.
+    if not (base == target or base.startswith(prefix) or target.startswith(base + os.sep)):
+        return False
+    for child in _child_dirs(base):
+        if child.name in _CREDENTIAL_DIR_NAMES:
+            if child.path.startswith(prefix):
+                return True
+            continue
+        for grandchild in _child_dirs(child.path):
+            if grandchild.name in _CREDENTIAL_DIR_NAMES and grandchild.path.startswith(prefix):
+                return True
+    return False
+
+
+def _creates_credential_name(path: str) -> bool:
+    """Would creating ``path`` put a store's *name* on disk?
+
+    This is the half ``_resolve_safe`` cannot see: ``/move`` and ``/mkdir``
+    validate the target's parent, and the parent of a brand-new ``coding-cli``
+    is an ordinary directory. By name alone and everywhere -- not only under
+    the System Directory -- because the listing filter is by name and
+    everywhere too: a directory created under this name vanishes from the file
+    tree along with whatever the user then puts in it, and under the System
+    Directory it is the exact path the next sign-in writes a token to.
+    """
+    return os.path.basename(path.rstrip("\\/")) in _CREDENTIAL_DIR_NAMES
 
 
 def _allowed_bases() -> list[str]:
@@ -70,6 +234,10 @@ def _allowed_bases_for_conversation(context_key: str | None) -> list[str]:
 
 
 def _is_inside_allowed(target: str, context_key: str | None = None) -> bool:
+    # Checked before the bases, and never widened by a conversation override:
+    # a credential store is off limits however the caller arrived at it.
+    if _is_credential_path(target):
+        return False
     for base in _allowed_bases_for_conversation(context_key):
         if target == base or target.startswith(base + os.sep):
             return True
@@ -131,6 +299,12 @@ def _safe_resolve(relative_path: str) -> str | None:
     base = os.path.realpath(BaseConfig.CREMIND_SYSTEM_DIR)
     target = os.path.realpath(os.path.join(base, relative_path))
     if target != base and not target.startswith(base + os.sep):
+        return None
+    # The ``{path:path}`` route reaches this without going through
+    # _is_inside_allowed, and it does not filter dotfiles either, so a request
+    # for ``<profile>/coding-cli/claude/.credentials.json`` would otherwise be
+    # served verbatim.
+    if _is_credential_path(target):
         return None
     return target
 
@@ -252,6 +426,7 @@ async def _list_directory(request: Request):
         return JSONResponse({"error": "Not a directory"}, status_code=404)
 
     entries: list[dict] = []
+    is_credential = _credential_matcher()
     try:
         with os.scandir(target) as it:
             for de in it:
@@ -263,6 +438,16 @@ async def _list_directory(request: Request):
                     continue
                 attrs = getattr(st, "st_file_attributes", 0)
                 if _entry_hidden(de.name, attrs, show_hidden):
+                    continue
+                # Opening one is already refused; leaving the name in the
+                # listing would only advertise where the credentials live.
+                # Unlike _entry_hidden this is not a show_hidden toggle. The
+                # name covers the per-profile stores; the path check covers the
+                # shared home, which wears an ordinary name and, on a native
+                # install browsing the user's home, is an ordinary entry here.
+                if de.name in _CREDENTIAL_DIR_NAMES or is_credential(
+                    os.path.join(target, de.name)
+                ):
                     continue
                 entries.append({
                     "name": de.name,
@@ -329,8 +514,22 @@ async def _watch_directory(request: Request):
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue(maxsize=_WATCH_QUEUE_SIZE)
+    is_credential = _credential_matcher()
 
     def _enqueue(payload: dict) -> None:
+        # The observer is recursive, so a watch on the System Directory (or on
+        # a profile directory) sees every write inside a credential store --
+        # and a change frame naming ``.../coding-cli/codex/auth.json`` hands
+        # back exactly what the listing filter is there to withhold. Filtered
+        # at the single choke point all four handlers go through, and on both
+        # ends of a move. No ``realpath``: watchdog builds these paths from the
+        # already-resolved watch root, and this runs once per event.
+        if any(
+            is_credential(os.path.normpath(payload[key]))
+            for key in ("path", "dest_path")
+            if payload.get(key)
+        ):
+            return
         try:
             loop.call_soon_threadsafe(queue.put_nowait, payload)
         except RuntimeError:
@@ -675,6 +874,15 @@ async def _move_entry(request: Request):
         return JSONResponse({"error": "Refusing to move an allowed base"}, status_code=400)
     if not os.path.exists(src_resolved):
         return JSONResponse({"error": "src not found"}, status_code=404)
+    # ``_resolve_safe`` refuses a store as the source; the subtree is the other
+    # half. Carrying a store's *parent* -- a whole profile directory -- into the
+    # user working directory takes the tokens out from under the name rule, and
+    # every read route then serves them as ordinary files.
+    if _holds_credential_store(src_resolved):
+        return JSONResponse(
+            {"error": "Refusing to move a directory that holds a credential store"},
+            status_code=403,
+        )
 
     # Resolve the dest's *parent* against the allowlist (the dest itself
     # doesn't exist yet — realpath would resolve through the missing leaf).
@@ -688,6 +896,11 @@ async def _move_entry(request: Request):
         return JSONResponse({"error": "dest parent is not a directory"}, status_code=404)
 
     dest_resolved = os.path.join(dest_parent_resolved, os.path.basename(dest))
+    # Only the parent was vetted above, so the leaf is still ours to check --
+    # both so a move cannot land *inside* a store and so it cannot mint a new
+    # directory wearing a store's name (which every listing would then hide).
+    if _creates_credential_name(dest_resolved) or _is_credential_path(dest_resolved):
+        return JSONResponse({"error": "Access denied (dest)"}, status_code=403)
     if os.path.exists(dest_resolved):
         return JSONResponse({"error": "dest already exists"}, status_code=409)
 
@@ -737,6 +950,10 @@ async def _mkdir(request: Request):
         return JSONResponse({"error": "Parent is not a directory"}, status_code=404)
 
     target = os.path.join(parent_resolved, os.path.basename(path))
+    # Same leaf rule as ``/move``'s dest: the parent passed the allowlist, the
+    # name has still to be one the file tree will show back to its creator.
+    if _creates_credential_name(target) or _is_credential_path(target):
+        return JSONResponse({"error": "Access denied"}, status_code=403)
     if os.path.exists(target):
         return JSONResponse({"error": "Already exists"}, status_code=409)
     try:
@@ -793,6 +1010,13 @@ async def _set_cwd(request: Request):
     if not os.path.isdir(new_path):
         return JSONResponse({"error": "path does not exist or is not a directory"},
                             status_code=400)
+    # The one route that accepts a path outside the allowlist, so it is also
+    # the one that cannot inherit the credential rule from ``_resolve_safe``
+    # and has to state it. The override would not get the file routes to serve
+    # a store -- they check the rule first, override or no -- but it aims the
+    # agent's own shell, and every tool that follows the cwd, straight at it.
+    if _is_credential_path(new_path):
+        return JSONResponse({"error": "Access denied"}, status_code=403)
 
     # The agent reads the override back under the conversation's context_id,
     # while the durable column and the SSE channel belong to the row — one and
@@ -822,7 +1046,52 @@ async def _set_cwd(request: Request):
 
 
 def get_file_routes() -> list[Route]:
-    """Return routes for the file serving API."""
+    """Return routes for the file serving API.
+
+    Every route in this module, and the credential enforcement point each one
+    passes through. Written out in full because this is the easiest guard in
+    the file to miss: the sandbox is a path-traversal check, so a route added
+    later inherits the sandbox from ``_resolve_safe``/``_is_inside_allowed``
+    *without* anyone having to think about credentials -- unless it resolves a
+    path some other way, in which case it silently inherits neither.
+
+    ``GET  /list``
+        ``_is_inside_allowed`` on the directory, plus the per-entry filter that
+        drops a store from the listing (name, and location for shared homes).
+    ``GET  /cwd``
+        No caller-supplied path: returns the configured working directory.
+    ``POST /cwd``
+        ``_is_credential_path`` **directly**. This route takes paths outside
+        the allowlist on purpose, so it is the one place the rule is restated
+        rather than inherited.
+    ``GET  /watch``
+        ``_is_inside_allowed`` on the directory, plus the per-event filter in
+        ``_enqueue`` -- the observer is recursive, so the gate on the root is
+        not enough on its own.
+    ``GET  /open``
+        ``_is_inside_allowed``.
+    ``POST /upload``
+        ``_resolve_safe`` on the destination directory. The leaf is a client
+        filename written as a *file*, so it can never become a store.
+    ``POST /upload-temp``
+        No caller path at all: the directory is composed server-side from the
+        authenticated profile and the (ownership-checked) conversation.
+    ``DELETE /delete``
+        ``_resolve_safe``, which refuses a store itself. Deliberately *not*
+        subtree-checked: deleting a parent destroys a credential, it never
+        discloses one, and deleting a profile removes these homes on purpose
+        (``coding_cli_homes.remove_profile_cli_homes``).
+    ``POST /move``
+        Both directions. Source: ``_resolve_safe`` (never a store) plus
+        ``_holds_credential_store`` (never a directory containing one).
+        Destination: ``_resolve_safe`` on the parent plus
+        ``_creates_credential_name`` / ``_is_credential_path`` on the leaf
+        (never into a store, never creating one).
+    ``POST /mkdir``
+        ``_resolve_safe`` on the parent plus the same two leaf checks.
+    ``GET  /{path:path}``
+        ``_safe_resolve``, which applies the rule after resolving.
+    """
     # Specific routes must come before the catch-all ``/api/files/{path:path}``
     # so Starlette doesn't dispatch ``/list``, ``/cwd``, ``/watch`` to
     # ``_serve_file``.

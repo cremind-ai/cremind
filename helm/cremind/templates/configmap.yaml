@@ -20,6 +20,23 @@ data:
   # on first boot (see _helpers.tpl assertNoDbProvider).
   INSTALL_MODE: {{ .Values.cremind.installMode | quote }}
   SETUP_WIZARD_ENV: {{ .Values.cremind.setupWizardEnv | quote }}
+  {{- /* Who this release is, told to the app because the app cannot find out.
+         The pod can read its own namespace off the service-account mount and
+         guess a workload name from its hostname, but the Helm RELEASE name is
+         not a pod field at all, and the Deployment/Service name is
+         cremind.fullname — something only the chart knows. Without these, the
+         HTTPS runbook on Settings, the Codex sign-in hint and the exported
+         config file could only print <release>/<namespace> placeholders and
+         ask the operator to substitute them. Same reasoning as
+         CREMIND_NOVNC_URL below: when the browser (or the pod) cannot tell,
+         the chart states it. The Deployment and the Service share one name,
+         so WORKLOAD covers `deployment/...`, `svc/...` and `get ingress ...`.
+         No downward API here: it could supply the namespace and nothing else,
+         and this ConfigMap already rolls the pod through checksum/config. */}}
+  CREMIND_K8S_NAMESPACE: {{ .Release.Namespace | quote }}
+  CREMIND_K8S_RELEASE: {{ .Release.Name | quote }}
+  CREMIND_K8S_WORKLOAD: {{ include "cremind.fullname" . | quote }}
+  CREMIND_K8S_SERVICE_PORT: {{ .Values.service.port | quote }}
   {{- if .Values.ingress.enabled }}
   # The Ingress owns the public certificate. This tells the HTTPS upgrade
   # workflow to prepare an edge transition (no private Cremind CA) even while
@@ -54,6 +71,15 @@ data:
   {{- $appUrl = printf "%s://localhost:1515" (ternary "https" "http" (ne $sslMode "")) }}
   {{- end }}
   {{- end }}
+  {{- /* Trim trailing slashes once, here, because every other key below
+         CONCATENATES onto this value. `cremind.appUrl: https://cremind.example/`
+         rendered CREMIND_NOVNC_URL as `https://cremind.example//vnc/vnc.html`,
+         and the app reads that string back to tell the proxy sidecar apart
+         from the in-pod TLS relay — a doubled slash made a proxy install
+         advertise the relay's tunnels for a Service port it does not publish.
+         APP_URL wants the bare origin for the same reason: the agent card,
+         the CORS origins and the OAuth callbacks are all built on top of it. */ -}}
+  {{- $appUrl = regexReplaceAll "/+$" $appUrl "" }}
   APP_URL: {{ $appUrl | quote }}
   {{- /* Atlassian 3LO single fixed callback. Blank → the skills' own default
          (http://localhost:1515/api/oauth/callback), which they hardcode
@@ -72,6 +98,17 @@ data:
   PORT: {{ .Values.cremind.apiPort | quote }}
   CREMIND_UI_PORT: {{ .Values.cremind.uiPort | quote }}
   CREMIND_SYSTEM_DIR: {{ .Values.cremind.systemDir | quote }}
+  {{- /* Where the Claude Code and Codex CLIs keep their sign-in. Their
+         defaults (~/.claude, ~/.codex) are in the container filesystem, which
+         a rollout throws away — a user who signed in through the terminal
+         would be signed out by the next `helm upgrade`. Parking them on the
+         system PVC makes the shared server login survive pod replacement.
+         Per-profile logins live under <systemDir>/<profile>/coding-cli/ and
+         need no variable; these two name the SHARED fallback, and the app
+         falls back to exactly these paths on its own when an older chart
+         omits them. */}}
+  CLAUDE_CONFIG_DIR: {{ printf "%s/coding-cli/claude" .Values.cremind.systemDir | quote }}
+  CODEX_HOME: {{ printf "%s/coding-cli/codex" .Values.cremind.systemDir | quote }}
   {{- /* Boot-default timezone for the scheduler/clock. Blank → the image OS
          zone (UTC). A per-profile system.timezone override wins over this. */ -}}
   {{- if .Values.cremind.timezone }}

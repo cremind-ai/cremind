@@ -1,5 +1,5 @@
 ---
-description: "Inspect, override, and reset **per-profile agent settings** with `cremind config schema`, `get`, `set`, and `reset`: set the system timezone used by the scheduler and clock, choose whether the agent must ask for approval before messaging channel clients (`channels.confirm_before_send` — turn it off so unattended automations can send without stopping to ask; individual clients can be overridden with `cremind channels set-confirm`), and tune the reasoning-agent loop (max steps, retries, temperature, max tokens, steps history, prompt caching, reasoning-trace replay), conversation compaction, tool-result truncation, and long-term memory. Use this to change how the agent behaves for a profile — including which timezone schedules fire in — distinct from `cremind llm` (which models/providers) and `cremind tools` (per-tool config)."
+description: "Inspect, override, and reset **per-profile agent settings** with `cremind config schema`, `get`, `set`, and `reset`: set the system timezone used by the scheduler and clock, choose whether the agent must ask for approval before messaging channel clients (`channels.confirm_before_send` — turn it off so unattended automations can send without stopping to ask; individual clients can be overridden with `cremind channels set-confirm`), and tune the reasoning-agent loop (max steps, retries, temperature, max tokens, steps history, prompt caching, reasoning-trace replay), conversation compaction, tool-result truncation, and long-term memory. Use this to change how the agent behaves for a profile — including which timezone schedules fire in — distinct from `cremind llm` (which models/providers) and `cremind tools` (per-tool config). Also the home of the Setup Wizard's configuration file: re-download my config, lost my setup file, get my Cremind config file back, recover my token, agent URL, database and VNC connection details — from **Sidebar → Developer → Configuration File**, as `cremind-<profile>-config.md`, `.json` or `.env`. On Kubernetes that file also records which namespace, Helm release and Deployment/Service this install is, and the `kubectl port-forward` command that reconnects to it from your own machine."
 ---
 
 # `cremind config` — Per-Profile Settings Reference
@@ -62,13 +62,59 @@ the top of the page commits all pending edits in one go. The per-group
 tables below list the exact UI label for every key so you can match it
 to the row you see in the card.
 
-## Global flags
+## Re-downloading the setup configuration file
 
-All `cremind config` subcommands accept the root-level `--json` flag, which
-forces JSON output instead of the default human-readable table:
+Distinct from the per-profile settings above: the file the **Setup Wizard**
+hands you on its last step — the JWT token and its expiry, the agent URL,
+project paths, database and vector-store parameters, embedding settings, the
+configured channels, on desktop container installs the VNC password (with the
+noVNC URL, and on Kubernetes the `kubectl port-forward` command that exposes
+it), and on Kubernetes a **Kubernetes** section naming the namespace, the Helm
+release, the Deployment and Service, the Service port, and the port-forward
+command that reconnects to the install from your own machine. The
+wizard offers it exactly once; if you lost it, download it again from:
+
+> **Sidebar → Developer → Configuration File**
+
+Pick a **Format** — `Markdown (.md)` (the default: secrets grouped under a
+"Sensitive" callout, with ready-to-paste connection strings), `JSON (.json)`,
+or `Env file (.env)` — then click **Download**. The browser saves it as
+`cremind-<profile>-config.<ext>`, e.g. `cremind-admin-config.md`. The values
+are read back off the running server, so the file describes the install as it
+is *now*, not as it was at setup.
+
+**It contains your JWT token and passwords in plain text** — store it somewhere
+safe and do not share it. Both the Developer page and the endpoints behind the
+card are **admin-only**: a non-admin profile is redirected away from the page,
+and a non-admin token gets a permission error instead of a file.
+
+The Kubernetes section is only as complete as the chart that installed the pod.
+An older chart states none of the names, so the file says the identity was read
+off the pod rather than stated by the chart and tells you to confirm the release
+with `helm list --all-namespaces` — the Helm release is the one name nothing in
+a pod records. Upgrading the chart fills it in (see `cremind server environment`
+and its `kubernetes.source` row).
+
+There is no CLI command that produces the whole file, but every part of it is
+readable from the terminal:
 
 ```bash
-cremind config get --json
+cremind auth show           # the JWT token for this host's profile
+cremind server environment  # deployment, install mode, VNC, release channel,
+                            # and on Kubernetes the namespace / release /
+                            # Deployment / port-forward command
+cremind config get          # the per-profile settings documented below
+```
+
+## Global flags
+
+`--json` forces JSON output instead of the default human-readable table. It is a
+**root** flag, so it goes *before* the subcommand — no `cremind config`
+subcommand declares one of its own, and `cremind config get --json` is rejected
+with `No such option: --json`:
+
+```bash
+cremind --json config get
 ```
 
 ## Subcommands
@@ -85,13 +131,14 @@ I configure?".
 **Syntax.**
 
 ```bash
-cremind config schema [--json]
+cremind config schema
+cremind --json config schema
 ```
 
 **Behavior.** In the default (table) view, output is grouped by config
 group, with the group's label and description, followed by one line per
-key showing its dotted name, type, and default. With `--json`, the
-schema is emitted as a machine-readable JSON document that also
+key showing its dotted name, type, and default. With the root `--json`
+flag, the schema is emitted as a machine-readable JSON document that also
 includes each key's `min`, `max`, `step`, `label`, and `description`.
 
 **Example (default output, abbreviated).**
@@ -148,8 +195,8 @@ agent.max_steps                  300     200
 $ cremind config get agent.max_steps
 300
 
-# JSON output (full structure including both maps)
-$ cremind config get --json
+# JSON output (full structure including both maps) — --json is a ROOT flag
+$ cremind --json config get
 {"values":{"agent.max_steps":300},"defaults":{"agent.max_steps":200, ...}}
 ```
 
@@ -221,7 +268,7 @@ cremind config reset agent.max_steps
 ## Available config keys
 
 The defaults shown below are the values that apply when no override
-has been set. Run `cremind config schema --json` to confirm the live
+has been set. Run `cremind --json config schema` to confirm the live
 values for your installation.
 
 ### Group `system` — System
@@ -427,7 +474,7 @@ $ cremind config set memory.enabled true
 ### Pipe the schema into `jq`
 
 ```bash
-$ cremind config schema --json | jq '.groups.agent.fields | keys'
+$ cremind --json config schema | jq '.groups.agent.fields | keys'
 [
   "enable_prompt_cache",
   "max_llm_retries",

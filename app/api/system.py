@@ -1,8 +1,24 @@
 """System-level admin endpoints exposed to the Developer page.
 
-  POST /api/system/restart  — admin; asks the server to shut itself down
-                              gracefully, so the supervisor (Docker,
-                              Electron, the boot service, …) brings it back.
+  POST /api/system/restart      — admin; asks the server to shut itself down
+                                  gracefully, so the supervisor (Docker,
+                                  Electron, the boot service, …) brings it
+                                  back.
+  GET  /api/system/environment  — admin; what kind of install this is
+                                  (release channel, Docker/native/Kubernetes,
+                                  VNC, paths), for the Developer page's
+                                  Environment card and the config re-download.
+
+The environment body is :func:`describe_runtime_environment` verbatim plus two
+per-request fields, so the two nested blocks that description grew travel from
+here to the Environment card, to ``cremind server environment`` and into the
+exported config file: ``kubernetes`` (this pod's namespace, Helm release and
+Deployment/Service, with the ``kubectl port-forward`` line that reconnects to
+it) and ``vnc`` (how the desktop is reached, and the commands it takes to get
+there). Both are admin-only on purpose - they name cluster objects and print
+ready-to-run kubectl lines - which is why the unauthenticated tray descriptor
+in :mod:`app.api.features` publishes only
+``runtime_env.public_vnc_descriptor``'s four fields and no identity at all.
 
 The server can't stop in-process the instant the request arrives: the
 connection would drop mid-response and the client would see
@@ -32,6 +48,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from app.api._auth import require_admin
+from app.config.runtime_env import describe_runtime_environment
 from app.system.restart import DEFAULT_GRACE_S
 from app.utils.logger import logger
 
@@ -121,7 +138,70 @@ async def post_system_restart(request: Request) -> JSONResponse:
     )
 
 
+async def get_system_environment(request: Request) -> JSONResponse:
+    """Describe the install this server is running in (admin).
+
+    Same gate as the restart above: the description names the system and
+    install directories, the bind host and the public URL, which is deployment
+    detail an ordinary profile has no business reading. The non-secret subset
+    (install mode, deployment, release channel, VNC) is also published
+    unauthenticated on ``/api/services/tray-capabilities`` for the Electron
+    tray and ``cremind server capabilities``.
+
+    ``deployment_custom_fields`` mirrors the four advanced fields the installer
+    asks for on a ``custom`` deployment (install/catalog.toml) so the Developer
+    page can re-render the Setup Wizard's config export long after setup, when
+    the wizard's own answers are gone.
+
+    Two blocks of the description are nested and deserve naming here because
+    they are why this endpoint is worth calling on a pod. ``kubernetes`` is the
+    identity the chart states (namespace, Helm release, Deployment/Service,
+    Service port) with the ``kubectl port-forward`` command to reach it, or
+    ``None`` anywhere else; ``vnc`` says how the desktop is reached
+    (``direct`` / ``same_origin`` / ``port_forward``) and carries the
+    port-forward commands that shape needs. The identity is deliberately
+    admin-only: it names objects in someone's cluster, so
+    ``/api/services/tray-capabilities`` - which answers with no token at all -
+    gets only the four public VNC fields and never sees this block.
+
+    The handler is free to add fields on top of the description because
+    :func:`describe_runtime_environment` hands back a deep copy; mutating what
+    it returns cannot reach the process-wide cache those nested blocks live in.
+
+    ``effective_timezone`` is added here rather than in the shared description
+    because it is a per-profile answer: :mod:`app.config.timezone` resolves the
+    caller's own ``system.timezone`` row first, then the admin profile's
+    inherited one, and only then the ``CREMIND_TIMEZONE`` boot default the
+    description carries. The zone a schedule fires in is that resolved value —
+    reporting the env var alone said "no timezone configured" on every install
+    where someone had set one on the Config page.
+    """
+    denied = require_admin(request)
+    if denied is not None:
+        return denied
+
+    from app.config.settings import BaseConfig
+    from app.config.timezone import resolve_tz_name
+
+    return JSONResponse({
+        **describe_runtime_environment(),
+        "effective_timezone": resolve_tz_name(
+            getattr(request.user, "username", "") or None
+        ),
+        "deployment_custom_fields": {
+            "listen_host": BaseConfig.HOST,
+            "public_url": BaseConfig.APP_URL,
+            # The raw env string, not BaseConfig's parsed list: the export
+            # writes this back into a .env file verbatim, and the parsed form
+            # defaults to ``["*"]`` where the operator wrote nothing at all.
+            "allowed_origins": os.environ.get("CORS_ALLOWED_ORIGINS", ""),
+            "wizard_preset": os.environ.get("SETUP_WIZARD_ENV", ""),
+        },
+    })
+
+
 def get_system_routes() -> list[Route]:
     return [
         Route("/api/system/restart", post_system_restart, methods=["POST"]),
+        Route("/api/system/environment", get_system_environment, methods=["GET"]),
     ]

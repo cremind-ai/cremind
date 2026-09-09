@@ -7,6 +7,8 @@ guidance) on the active model's native-reasoning capability.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -96,6 +98,69 @@ def test_profile_and_agent_name_rendered_into_prompt(monkeypatch):
     assert "Active profile: default" in prompt   # $CREMIND_PROFILE resolved
     assert "Your name: Aria" in prompt            # $CREMIND_AGENT_NAME resolved
     assert "$CREMIND_" not in prompt              # no literal token leaked
+
+
+# ── runtime-environment line ──────────────────────────────────────────────
+#
+# "Am I running in Docker?", "is the VNC desktop on?", "is this the dev
+# channel?" are questions the agent used to send to the CLI (or guess at). The
+# facts are fixed for the life of the process, so one line of the cached system
+# prompt answers them for free.
+
+# Everything the description reads that could otherwise leak in from the
+# developer machine (or the CI container) running the suite.
+_ENV_KEYS = (
+    "INSTALL_MODE", "CREMIND_IMAGE_FLAVOR", "CREMIND_UPGRADE_CHANNEL", "ENV",
+    "SETUP_WIZARD_ENV", "CREMIND_ELECTRON_PARENT", "CREMIND_SUPERVISED",
+    "VNC_PASSWORD",
+)
+
+
+@pytest.fixture
+def clean_runtime_env(monkeypatch):
+    """An uncached, environment-free runtime description for one case.
+
+    The description is memoised per process, so a case that sets env vars must
+    clear it on the way IN and on the way OUT — otherwise this file's other
+    prompt tests would inherit a fake Docker install. The container marker is
+    pointed at a path that cannot exist because CI itself may run in a
+    container, which would flip every native assertion on the build machine and
+    nowhere else.
+    """
+    from app.config import runtime_env
+
+    for key in _ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(runtime_env, "_CONTAINER_MARKER", Path("/nonexistent/.dockerenv"))
+    runtime_env.describe_runtime_environment.cache_clear()
+    yield runtime_env
+    runtime_env.describe_runtime_environment.cache_clear()
+
+
+def test_runtime_environment_rendered_into_prompt(monkeypatch, clean_runtime_env):
+    monkeypatch.setenv("INSTALL_MODE", "docker")
+    monkeypatch.setenv("CREMIND_IMAGE_FLAVOR", "desktop")
+    monkeypatch.setenv("CREMIND_UPGRADE_CHANNEL", "test")
+    clean_runtime_env.describe_runtime_environment.cache_clear()
+
+    prompt = _build(monkeypatch, "fake", "fake-model")._build_instruction()
+
+    assert "Runtime environment:" in prompt
+    assert "Docker install" in prompt
+    assert "VNC" in prompt
+    assert "test release channel" in prompt
+    # The line is a line: the next template row must not be glued onto it.
+    assert "\nCurrent User Working Directory:" in prompt
+
+
+def test_runtime_environment_absent_safe(monkeypatch, clean_runtime_env):
+    # A dev checkout sets none of the installer's variables. The line must still
+    # render (the prompt is built on every turn — a raise here breaks every
+    # conversation) and must not invent a Docker/VNC install out of nothing.
+    prompt = _build(monkeypatch, "fake", "fake-model")._build_instruction()
+
+    assert "Runtime environment: native install" in prompt
+    assert "VNC" not in prompt
 
 
 # ── fallback-search guidance ──────────────────────────────────────────────
@@ -207,3 +272,105 @@ def test_exposed_names_match_real_tool_definitions():
     assert _DOC_FN in g
     assert _MEM_FN in g
     assert _WEB_FN in g
+
+
+# ── skill-authoring clause ↔ change_working_directory's live enum ─────────────
+def _skill_creator_group(tool_id: str = "default__skill_creator"):
+    """The enabled skill-creator skill as the registry exposes it."""
+    from app.tools import ToolType
+
+    return SimpleNamespace(tool_type=ToolType.SKILL, tool_id=tool_id)
+
+
+def _authoring_clause(*delegates: str) -> str:
+    """The delegation guidance including the skill-authoring clause."""
+    groups = [
+        SimpleNamespace(config_name=name, tool_id=name) for name in (delegates or ("claude_code",))
+    ]
+    return ra._build_coding_delegation_guidance(groups + [_skill_creator_group()])
+
+
+def _offered_targets(monkeypatch, loaded) -> list:
+    """The ``target`` enum ``change_working_directory`` really offers once
+    ``loaded`` skills are in the conversation — the state path (b) is reached in."""
+    import app.tools.builtin.change_working_directory as cwd
+
+    monkeypatch.setattr(
+        cwd,
+        "_get_skill_row",
+        lambda skill_id: {"name": skill_id, "tool_type": "skill", "source": "/s"},
+    )
+    ctx = "clause-enum-ctx"
+    cwd.set_context(ctx, cwd.LOADED_SKILLS_KEY, list(loaded))
+    tools = [{
+        "function": {
+            "name": "change_working_directory",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "enum": list(cwd._TARGETS),
+                        "description": "base",
+                    }
+                },
+            },
+        }
+    }]
+    try:
+        prepared = cwd.get_prepare_tools()("q", tools, context_id=ctx, profile="default")
+        return prepared[0]["function"]["parameters"]["properties"]["target"]["enum"]
+    finally:
+        cwd.clear_context(ctx, cwd.LOADED_SKILLS_KEY)
+
+
+@pytest.mark.parametrize(
+    "loaded",
+    [
+        ["default__skill_creator"],  # arrived via skill-creator's own SKILL.md
+        ["default__gmail"],          # any other skill loaded narrows it too
+    ],
+)
+def test_skill_authoring_clause_names_a_target_the_tool_still_offers(monkeypatch, loaded):
+    # Path (b) is reachable with a skill already loaded, and prepare_tools drops
+    # the generic 'skills' target in exactly that state, so a clause that only
+    # named 'skills' would tell the model to emit an enum member it is not
+    # offered. Whatever the clause names must survive the narrowing.
+    named = set(re.findall(r"target='([a-z_]+)'", _authoring_clause()))
+    offered = _offered_targets(monkeypatch, loaded)
+    assert "skills" not in offered, "the narrowing this clause has to live with is gone"
+    assert named & set(offered), (
+        f"the clause only names withdrawn targets {sorted(named)}; "
+        f"change_working_directory offers {offered}"
+    )
+    assert "custom" in named, "the fallback must be the one target never narrowed away"
+
+
+def test_skill_authoring_clause_does_not_hard_require_the_withdrawn_target():
+    # 'skills' may still be named as the shortcut it is — the tool offers it
+    # whenever nothing is loaded — but never as a step the model must run first.
+    text = _authoring_clause()
+    assert "FIRST call `change_working_directory` with target='skills'" not in text
+    sentence = next(s for s in text.split(". ") if "target='skills'" in s)
+    assert "offered" in sentence and "withdrawn" in sentence, (
+        f"the sentence naming 'skills' must say it can be absent: {sentence!r}"
+    )
+    # The cwd-independent definition of the root, matching skill-creator's SKILL.md.
+    assert "PARENT" in text
+
+
+def test_skill_authoring_clause_is_byte_stable_across_skill_loads(monkeypatch):
+    # The clause rides the prompt-cached system message, so it may depend on the
+    # ENABLED tool set only. Keying it off the loaded set would rewrite the cached
+    # prefix on every skill load — which is why (b) states the rule for both
+    # states instead of rendering whichever target is live.
+    import app.tools.builtin.change_working_directory as cwd
+
+    before = _authoring_clause()
+    ctx = "clause-stable-ctx"
+    cwd.set_context(ctx, cwd.LOADED_SKILLS_KEY, ["default__skill_creator", "default__gmail"])
+    monkeypatch.setattr(ra, "get_context", lambda *a, **k: ["default__skill_creator"])
+    try:
+        assert _authoring_clause() == before
+    finally:
+        cwd.clear_context(ctx, cwd.LOADED_SKILLS_KEY)

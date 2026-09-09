@@ -383,6 +383,8 @@ def _cancellable(request: Request, transition: dict | None) -> bool:
 
 
 def tls_status_payload(request: Request) -> dict:
+    from app.api._auth import is_admin
+    from app.config import runtime_env
     from app.config.tls_mode import current_tls_facts, edge_tls_termination
     from app.config.tls_steps import (
         atlassian_callback_step, certificate_repair_steps, deployment_steps, flatten,
@@ -413,6 +415,27 @@ def tls_status_payload(request: Request) -> dict:
     mode = (os.environ.get("INSTALL_MODE") or "native").lower()
     manager = "external" if edge_https else management()
     https_url = https_target(_source_origin(request))
+    # What this pod is, when it is one: the runbook prints the real namespace,
+    # release and Deployment instead of placeholders the operator has to look
+    # up and substitute by hand. ``kubernetes_identity`` is deliberately
+    # uncached, and every name it returns is already validated as a Kubernetes
+    # object name - an ``extraEnv`` value carrying a newline would otherwise
+    # make ``command()`` raise and turn this endpoint into a 500.
+    #
+    # Admin-only, and the gate is here rather than on the route: this endpoint
+    # must keep answering without a token - the plaintext recovery page and the
+    # pre-sign-in wizard both poll it - so it is the *payload* that has to know
+    # who is asking. Cluster topology and ready-to-run kubectl/helm lines are
+    # what ``/api/system/environment`` and ``/api/config/install-secrets`` keep
+    # behind admin auth, so publishing them to anyone who can reach the port
+    # would undo that. Everyone else gets exactly the runbook a chart too old
+    # to state its own names produces: placeholders, plus ``helm list`` to find
+    # what to substitute.
+    identity = (
+        runtime_env.kubernetes_identity(mode)
+        if mode == "kubernetes" and is_admin(request)
+        else None
+    )
     # Steps are a typed runbook (note vs command) so that only real shell lines
     # get a copy button; ``instructions`` below stays as its flat rendering for
     # clients older than that split.  A server already on HTTPS has nothing to
@@ -420,7 +443,7 @@ def tls_status_payload(request: Request) -> dict:
     if serving_https:
         steps = certificate_repair_steps(
             manager=manager, install_mode=mode,
-            restart_supported=facts.restart_supported,
+            restart_supported=facts.restart_supported, kubernetes=identity,
         ) if certificate_error else []
     else:
         steps = deployment_steps(
@@ -428,6 +451,7 @@ def tls_status_payload(request: Request) -> dict:
             restart_supported=facts.restart_supported,
             activating=bool(transition and transition.get("phase") == "activating"),
             https_url=https_url, chart_version=running_chart_version(),
+            kubernetes=identity,
         )
     migrated_atlassian = transition.get("atlassian_redirect_uri_migrated") if transition else None
     if isinstance(migrated_atlassian, str) and migrated_atlassian:
@@ -448,6 +472,11 @@ def tls_status_payload(request: Request) -> dict:
         "certificate_error": certificate_error,
         "mode": "custom" if BaseConfig.SSL_CERTFILE and BaseConfig.SSL_KEYFILE else facts.mode,
         "install_mode": mode,
+        # ``None`` everywhere but an admin's view of a Kubernetes install (see
+        # above). The steps already read it; it rides the payload too so a
+        # client can label the runbook with the release it is about (and say
+        # when the names were only inferred).
+        "kubernetes": identity,
         "management": manager, "electron_parent": os.environ.get("CREMIND_ELECTRON_PARENT") is not None,
         "restart_supported": facts.restart_supported or manager == "electron",
         "transition": public_transition(transition),

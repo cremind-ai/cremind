@@ -1,5 +1,5 @@
 ---
-description: "Configure **LLM providers and models**: list and `configure` providers (add an API key), add your own **custom OpenAI-compatible providers** (name + base URL + model list) with `create-custom`, browse each provider's available models, assign the high / low / plan / vision / audio / default **model groups** the agent picks from (including a dedicated **plan model** for plan mode, a **vision model** for image_understanding, and an **audio model** for audio_understanding, each with a feature toggle), run the **GitHub Copilot** device-code login, and **Sign in with ChatGPT** (Codex OAuth) for the OpenAI provider via `codex-oauth login` — a browser sign-in that routes requests through your ChatGPT plan's Codex backend instead of an API key. Use this to add a provider (built-in or custom), choose which model the agent uses, enable the Specialized Vision/Audio Model, or authenticate a provider — distinct from `cremind config` (agent behavior) and `cremind agents` (MCP/A2A servers)."
+description: "Configure **LLM providers and models**: list and `configure` providers (add an API key), add your own **custom OpenAI-compatible providers** (name + base URL + model list) with `create-custom`, browse each provider's available models, assign the high / low / plan / vision / audio / default **model groups** the agent picks from (including a dedicated **plan model** for plan mode, a **vision model** for image_understanding, and an **audio model** for audio_understanding, each with a feature toggle), run the **GitHub Copilot** device-code login, and **Sign in with ChatGPT** (Codex OAuth) for the OpenAI provider via `codex-oauth login` — a browser sign-in that routes requests through your ChatGPT plan's Codex backend instead of an API key, storing its tokens in this profile's `llm_config` (`openai.oauth_*`). That ChatGPT sign-in is the OpenAI **provider's**, NOT the Codex coding delegate's: the `codex` tool keeps its own CLI login in that profile's `CODEX_HOME` (`cremind tools coding-agents login codex`) and no longer borrows this one. Also covers a Codex sign-in that never captures on a Docker, Kubernetes or remote install — Cremind renders the `kubectl port-forward` line with this pod's real namespace and Service name (a pod from an older chart falls back to `<namespace>` / `<release>` blanks), or you paste the redirect URL into `codex-oauth complete`. Use this to add a provider (built-in or custom), choose which model the agent uses, enable the Specialized Vision/Audio Model, or authenticate a provider — distinct from `cremind config` (agent behavior), `cremind agents` (MCP/A2A servers), and `cremind tools coding-agents` (the Claude Code / Codex delegates' own logins)."
 ---
 
 # `cremind llm` — LLM Providers, Model Groups, and Device-Code Auth
@@ -34,7 +34,9 @@ The group splits into three subcommand sets:
   remote servers, the CLI itself — or `complete` accepts a redirect URL
   you pasted. When this is the OpenAI provider's active auth method,
   requests run against ChatGPT's Codex backend under your plan — a
-  different model list from the API-key models.
+  different model list from the API-key models. This is the *provider's*
+  ChatGPT login; the Codex coding delegate has a separate one of its own
+  (`cremind tools coding-agents login codex`) and never reads this one.
 
 Provider configuration values like API keys are stored server-side and
 never exposed back to the CLI in subsequent reads — they show up only
@@ -423,7 +425,16 @@ complete (token stored server-side)
 **Purpose.** Sign in with ChatGPT (Codex OAuth) for the OpenAI provider,
 so the agent can use your ChatGPT plan's Codex backend instead of an API
 key. This sets the OpenAI provider's active auth method to Codex OAuth
-and stores the access/refresh tokens server-side (auto-refreshed).
+and stores the access/refresh tokens server-side — in this profile's
+`llm_config` (`openai.oauth_*`), auto-refreshed.
+
+> **Not the Codex coding delegate's sign-in.** The `codex` tool authenticates
+> the way the `codex` CLI does, from a login in that profile's own
+> `CODEX_HOME`, and does **not** read these provider tokens — the bridge that
+> once let it borrow them is gone. Sign that one in with
+> `cremind tools coding-agents login codex` (or Settings → Tools & Skills →
+> Coding Agents → Codex → Sign in with ChatGPT); the Codex Tool
+> (`[tool] codex`) reference doc has the full credential order.
 
 The Codex backend serves a **different, restricted model set** from the
 API-key path (only GPT-5.x-class models). On successful sign-in, any model
@@ -463,8 +474,9 @@ The command polls every 2 s until either side completes, then prints the
 account email and plan. If the server is containerized, its `capture_hint`
 is echoed first — telling you what that deployment needs for the *server*
 listener to be reachable (a published port under Docker, an extra
-`1455:1455` port-forward under Kubernetes); you can ignore it when the CLI
-captures locally. If **neither** side can listen — port 1455 is busy on
+`1455:1455` port-forward under Kubernetes, with the pod's real namespace and
+Service name already filled in — see *Troubleshooting*); you can ignore it
+when the CLI captures locally. If **neither** side can listen — port 1455 is busy on
 both (e.g. the Codex CLI is mid-login) — the command prints the reason and
 prompts you to paste the full redirect URL from your browser's address bar.
 Approving on a *different* machine than the one running this command also
@@ -619,8 +631,28 @@ The server's listener bound fine *inside* the container, but the browser's
 - **Docker** — publish the port. Recent installs already carry
   `- "127.0.0.1:1455:1455"` in the cremind service's `ports`; older ones
   need it added, then `docker compose up -d`.
-- **Kubernetes** — forward it: `kubectl -n <ns> port-forward svc/cremind
-  1515:80 1455:1455`.
+- **Kubernetes** — forward 1455 alongside 1515, and don't compose the command
+  yourself. The `capture_hint` the server returns — echoed by
+  `codex-oauth login` and shown in the UI — already carries **this pod's own
+  namespace and Service name**, so it is copy-and-run as printed:
+
+  ```bash
+  kubectl --namespace team-a port-forward svc/prod-cremind 1515:8080 1455:1455
+  ```
+
+  Only a pod whose chart is too old to state those names falls back to the same
+  blanks the HTTPS runbook prints — fill them from `helm list --all-namespaces`
+  (NAMESPACE and NAME):
+
+  ```bash
+  kubectl --namespace <namespace> port-forward svc/<release> 1515:80 1455:1455
+  ```
+
+  The Service is named after the **Helm release**, not after Cremind, which is
+  why no fixed command belongs here: a hard-coded `cremind` Service name is
+  right only for a release that happens to be called `cremind`, and everyone
+  else gets `services "cremind" not found` with no hint that the command,
+  rather than their cluster, was at fault.
 - **Ingress / any remote URL** — there is no port to forward. Paste the
   redirect URL into the UI's "Having trouble?" box, or run
   `cremind llm codex-oauth login` from your own machine (the CLI captures
@@ -637,7 +669,9 @@ again to start a fresh one.
 The refresh token was revoked or expired (e.g. after a long offline
 period), or you previously pasted a raw access token (which has no refresh
 token). Run `cremind llm codex-oauth login` again. Signing out is
-`cremind llm providers delete-config openai`.
+`cremind llm providers delete-config openai` — which clears the *provider's*
+tokens only; the Codex tool's own login is signed out with
+`cremind tools coding-agents logout codex`.
 
 **`documentation_search` (or another auxiliary tool) returns nothing after
 signing in with ChatGPT** — A model group was still pointing at an

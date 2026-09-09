@@ -17,6 +17,7 @@ async function loadHelper(name) {
 }
 const transport = await loadHelper('backendTransport.ts')
 const stateHelpers = await loadHelper('transitionState.ts')
+const vnc = await loadHelper('vncDesktop.ts')
 
 test('installer dotenv values are parsed without executing or expanding them', () => {
   assert.deepEqual(transport.parseInstallEnv(`﻿# comment
@@ -147,6 +148,52 @@ test('default-port HTTPS discovery requires the exact cached installation and tr
   ), false)
 })
 
+test('the noVNC window URL follows the backend descriptor, with the legacy Docker rule behind it', () => {
+  const url = (descriptor, agentUrl = 'http://cremind.example:1515', mode = 'docker', flavor = 'desktop') =>
+    vnc.vncUrlFor(agentUrl, descriptor, mode, flavor)
+  assert.equal(vnc.VNC_WINDOW_QUERY, 'autoconnect=1&resize=remote')
+  const query = `?${vnc.VNC_WINDOW_QUERY}`
+  assert.equal(url({ enabled: true, access: 'direct', novnc_path: '/vnc.html', novnc_port: 6080 }),
+    `http://cremind.example:6080/vnc.html${query}`)
+  // Cremind's own HTTPS never covers noVNC's separate listener.
+  assert.equal(url({ enabled: true, access: 'direct', novnc_port: 7000 }, 'https://cremind.example'),
+    `http://cremind.example:7000/vnc.html${query}`)
+  assert.equal(url({ enabled: true, access: 'direct' }, 'http://[::1]:1515'), `http://[::1]:6080/vnc.html${query}`)
+  assert.equal(url({ enabled: true, access: 'same_origin', novnc_path: '/vnc/vnc.html' },
+    'https://cremind.example', 'kubernetes', null), `https://cremind.example/vnc/vnc.html${query}`)
+  assert.equal(url({ enabled: true, access: 'same_origin' }, 'http://cremind.example:1515', 'kubernetes', null),
+    `http://cremind.example:1515/vnc/vnc.html${query}`)
+  // A descriptor path is resolved against the origin, so it must never be
+  // able to move the host.
+  assert.equal(url({ enabled: true, access: 'same_origin', novnc_path: '//evil.example/vnc.html' },
+    'https://cremind.example', 'kubernetes', null), `https://cremind.example/vnc/vnc.html${query}`)
+  assert.equal(url({ enabled: true, access: 'port_forward', novnc_port: 6080, novnc_path: '/vnc.html' },
+    'https://cremind.example', 'kubernetes', null), `http://localhost:6080/vnc.html${query}`)
+  assert.equal(url({ enabled: false, access: null, novnc_path: null, novnc_port: null }), null)
+  assert.equal(url({ enabled: true, access: null }), null)
+  assert.equal(url({ enabled: true, access: 'direct' }, ''), null)
+  // Backends older than the descriptor: Docker on a non-basic image meant 6080.
+  const legacy = (mode, flavor) => vnc.vncUrlFor('https://cremind.example:1515', null, mode, flavor)
+  assert.equal(legacy('docker', null), `http://cremind.example:6080/vnc.html${query}`)
+  assert.equal(legacy('docker', 'desktop'), `http://cremind.example:6080/vnc.html${query}`)
+  assert.equal(legacy('docker', 'basic'), null)
+  assert.equal(legacy('native', null), null)
+  assert.equal(legacy('kubernetes', null), null)
+})
+
+test('a renderer-supplied desktop URL is refused unless it is a plain http(s) target', () => {
+  assert.equal(vnc.validVncUrl('http://127.0.0.1:6080/vnc.html'),
+    'http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=remote')
+  // An advertised URL that already carries connect parameters keeps them.
+  assert.equal(vnc.validVncUrl('https://cremind.example/vnc/vnc.html?path=websockify'),
+    'https://cremind.example/vnc/vnc.html?path=websockify')
+  for (const refused of [
+    'file:///etc/passwd', 'javascript:alert(1)', 'about:blank', 'ftp://cremind.example/vnc.html',
+    'http://user:secret@127.0.0.1:6080/vnc.html', 'https://:secret@cremind.example/vnc.html',
+    'not a url', '', 42, null, undefined, {}, ['http://127.0.0.1:6080/vnc.html'],
+  ]) assert.equal(vnc.validVncUrl(refused), null, String(refused))
+})
+
 async function mainHarness(run) {
   const tmp = await mkdtemp(path.join(os.tmpdir(), 'cremind-electron-https-'))
   const savedEnv = { ...process.env }
@@ -154,15 +201,40 @@ async function mainHarness(run) {
   const events = new Map()
   const windows = []
   const loaded = []
+  const created = []
   const recovered = new Map()
   const eventFor = contents => ({ sender: contents, senderFrame: { parent: null, url: contents.getURL() } })
+  // main.ts really constructs windows (tray entries, the VNC bridge), so the
+  // stub has to be a constructor and not only the static lookup that the
+  // first-party sender check uses.
+  class StubBrowserWindow {
+    constructor(options) {
+      this.options = options
+      this.url = ''
+      this.webContents = Object.assign(new EventEmitter(), {
+        id: 500 + created.length, getURL: () => this.url, send() {},
+      })
+      created.push(this)
+      windows.push(this)
+    }
+    loadURL(next) { this.url = next; return Promise.resolve() }
+    loadFile() { return Promise.resolve() }
+    on() { return this }
+    isDestroyed() { return false }
+    isMinimized() { return false }
+    isVisible() { return true }
+    show() {}
+    focus() {}
+    restore() {}
+    static getAllWindows() { return windows }
+  }
   globalThis.__cremindElectronTest = {
     app: {
       isPackaged: true, getPath: () => tmp, setPath() {}, setAppUserModelId() {},
       requestSingleInstanceLock: () => false, quit() {}, setJumpList() {},
     },
     ipcMain: { handle: (name, fn) => handlers.set(name, fn), on: (name, fn) => events.set(name, fn) },
-    BrowserWindow: { getAllWindows: () => windows },
+    BrowserWindow: StubBrowserWindow,
     session: { defaultSession: { fetch: async (url) => new Response(JSON.stringify(
       url.endsWith('/health') ? { status: 'ok' }
         : url.endsWith('/api/tls/status') ? {
@@ -231,7 +303,7 @@ async function mainHarness(run) {
     await writeFile(outfile, result.outputFiles[0].text)
     await import(pathToFileURL(outfile).href)
     await invokeFromApp('cremind:set-config', { agentUrl: 'http://127.0.0.1:1515', deploymentType: 'local' })
-    await run({ handlers, events, makeWindow, loaded, recovered, eventFor, invokeFromApp, tmp })
+    await run({ handlers, events, makeWindow, loaded, created, recovered, eventFor, invokeFromApp, tmp })
     // Capabilities refresh runs in the background after a successful pivot.
     // Let its Electron menu rebuild finish before restoring process.env.
     await new Promise(resolve => setTimeout(resolve, 50))
@@ -289,6 +361,7 @@ test('preload IPC is limited to known top-level Cremind windows on the exact con
     const rejectedOperations = [
       ['cremind:set-config', { autoUpdate: false }],
       ['cremind:open-external', 'https://example.com'],
+      ['cremind:open-vnc', 'http://127.0.0.1:6080/vnc.html'],
       ['cremind:backend-upgrade:apply', {}],
       ['cremind:installer:detect'],
       ['cremind:installer:list-versions'],
@@ -318,6 +391,30 @@ test('preload IPC is limited to known top-level Cremind windows on the exact con
     for (const [channel, payload] of serverOperations) {
       assert.equal((await handlers.get(channel)(externalEvent, payload)).ok, false, channel)
     }
+  })
+})
+
+test('the VNC bridge validates the renderer URL before loading it in the sandboxed desktop window', async () => {
+  await mainHarness(async ({ created, invokeFromApp }) => {
+    for (const refused of [
+      'file:///etc/passwd', 'javascript:alert(1)', 'about:blank',
+      'http://user:secret@127.0.0.1:6080/vnc.html', 'not a url', 42, null,
+    ]) {
+      const result = await invokeFromApp('cremind:open-vnc', refused)
+      assert.equal(result.ok, false, String(refused))
+      assert.ok(result.error)
+    }
+    assert.equal(created.length, 0)
+
+    assert.deepEqual(await invokeFromApp('cremind:open-vnc', 'http://127.0.0.1:6080/vnc.html'), { ok: true })
+    assert.equal(created.length, 1)
+    const [desktop] = created
+    assert.equal(desktop.url, 'http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=remote')
+    assert.equal(desktop.options.title, 'Cremind VNC Desktop')
+    // Third-party content: no preload bridge, isolated and sandboxed.
+    assert.equal(desktop.options.webPreferences.preload, undefined)
+    assert.equal(desktop.options.webPreferences.contextIsolation, true)
+    assert.equal(desktop.options.webPreferences.sandbox, true)
   })
 })
 

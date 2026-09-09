@@ -17,6 +17,7 @@ import {
   waitForActivationResponseGrace,
 } from './backendTransport'
 import { filterTransitionState, transitionProfile, type TransitionState } from './transitionState'
+import { validVncUrl, vncUrlFor, type VncDescriptor } from './vncDesktop'
 // Pulled in lazily to keep the dev / web build (which doesn't ship
 // electron-updater) functional. The require is wrapped below.
 type AutoUpdaterModule = typeof import('electron-updater')
@@ -252,13 +253,19 @@ let mainWin: BrowserWindow | null = null
 let tray: Tray | null = null
 // Populated by fetchCapabilities() once the backend is reachable. Drives
 // the conditional "Open VNC Desktop" entry in the tray / jumplist / dock.
-let installMode: 'docker' | 'native' | null = null
+let installMode: 'docker' | 'native' | 'kubernetes' | null = null
 // The backend's Docker image flavor: 'desktop' (cremind/cremind-desktop),
 // 'basic' (cremind/cremind), or null. null means a native install OR a
 // pre-flavor image (older backend that predates CREMIND_IMAGE_FLAVOR); for
 // Docker installs we treat null as 'desktop' since every pre-flavor image
-// was a desktop image. See vncCapable().
+// was a desktop image. Only consulted when the backend sends no vnc
+// descriptor — see vncUrlFor().
 let imageFlavor: 'desktop' | 'basic' | null = null
+// The backend's noVNC descriptor from tray-capabilities: where the desktop
+// answers on THIS install (Docker port, Kubernetes proxy path, or a relay the
+// user tunnels to). null until the first successful fetch, and on a backend
+// that predates the descriptor — see vncUrlFor's legacy fallback.
+let vncDescriptor: VncDescriptor | null = null
 // Set of UI feature names the backend's bundled SPA exposes. Drives the
 // gating for Process Manager / Events / Channels (and future) tray /
 // jumplist / dock entries. ``null`` means the backend hasn't reported a
@@ -274,18 +281,18 @@ function uiFeatureAvailable(feature: string): boolean {
   return uiFeatures.has(feature)
 }
 
-// Whether to offer the "Open VNC Desktop" entry / window. Requires a Docker
-// install with a resolvable noVNC URL, AND an image flavor that isn't
-// explicitly 'basic'. A null flavor (native is already excluded by
-// installMode; here it means a pre-flavor desktop image) stays capable —
-// every pre-flavor image is a desktop image.
+// Where the tray / jumplist / dock entry would point. The backend's descriptor
+// decides — Docker's own noVNC port, the Kubernetes proxy on our origin, or a
+// relay the user has to tunnel to — so the entry now appears on Kubernetes too.
+// install_mode / image_flavor are only consulted for a backend older than the
+// descriptor, where "Docker + a non-basic image" was the whole rule.
+function vncTarget(): string | null {
+  return vncUrlFor(runtimeConfig.agentUrl, vncDescriptor, installMode, imageFlavor)
+}
+
+// Whether to offer the "Open VNC Desktop" entry / window.
 function vncCapable(): boolean {
-  return (
-    installMode === 'docker' &&
-    imageFlavor !== 'basic' &&
-    Boolean(runtimeConfig.agentUrl) &&
-    vncUrlFromAgentUrl(runtimeConfig.agentUrl) !== null
-  )
+  return vncTarget() !== null
 }
 
 // Runtime config handlers. The preload invokes ``cremind:get-config-sync``
@@ -346,6 +353,24 @@ ipcMain.handle('cremind:open-external', (event, rawUrl: unknown) => {
     return
   }
   void shell.openExternal(u.toString())
+})
+
+// ── VNC desktop bridge ──────────────────────────────────────────────────────
+//
+// The Developer page's "Open desktop" button hands us the noVNC URL the backend
+// advertised. It lands in the same dedicated window the tray opens (no preload,
+// sandboxed, third-party content) rather than the OS browser, so the desktop
+// stays part of the app. Same trust rule as open-external: the renderer's URL is
+// re-checked here, never taken on faith.
+ipcMain.handle('cremind:open-vnc', (event, rawUrl: unknown) => {
+  requireFirstPartySender(event)
+  const url = validVncUrl(rawUrl)
+  if (!url) {
+    console.warn('[cremind] refused open-vnc for', typeof rawUrl === 'string' ? rawUrl : typeof rawUrl)
+    return { ok: false, error: 'That is not a URL Cremind can open as a desktop window.' }
+  }
+  createAppWindow('vnc', url)
+  return { ok: true }
 })
 
 // ── First-run installer bridge ──────────────────────────────────────────────
@@ -2369,9 +2394,11 @@ function downloadFile(url: string, dest: string): Promise<void> {
 //
 // One process, one tray icon, many BrowserWindows. The tray menu, the
 // Windows taskbar jumplist, and the macOS dock menu all surface the
-// same three actions (VNC entry conditional on the backend being the
-// `cremind/cremind-desktop` Docker image). Each click opens a fresh
-// independent window — repeat clicks intentionally do NOT focus an
+// same three actions (VNC entry conditional on the backend reporting a
+// reachable noVNC desktop — the `cremind/cremind-desktop` Docker image or
+// a Kubernetes install with the desktop enabled; install_mode / image_flavor
+// only stand in for backends older than that descriptor). Each click opens
+// a fresh independent window — repeat clicks intentionally do NOT focus an
 // existing window. The single-instance lock + the ``second-instance``
 // handler ensure jumplist re-launches dispatch into the existing
 // process rather than spawning a duplicate (which would yield a second
@@ -2425,45 +2452,28 @@ function openOrFocusPageWindow(kind: PageKind): void {
   createAppWindow(kind)
 }
 
-function vncUrlFromAgentUrl(agentUrl: string): string | null {
-  if (!agentUrl) return null
-  try {
-    const u = new URL(agentUrl)
-    // noVNC is served from the same host as the agent, but on the
-    // docker-compose default port 6080. (See NOVNC_PORT:-6080 in
-    // install/templates/docker-compose.yml.tmpl.)
-    // noVNC owns a separate HTTP listener. Enabling TLS on Cremind's public
-    // origin does not enable TLS on port 6080.
-    u.protocol = 'http:'
-    u.port = '6080'
-    u.pathname = '/vnc.html'
-    u.search = ''
-    u.hash = ''
-    // ``autoconnect`` skips noVNC's connect splash; ``resize=remote`` is
-    // standard UX polish for a windowed viewer.
-    return `${u.toString()}?autoconnect=1&resize=remote`
-  } catch {
-    return null
-  }
-}
-
 async function fetchCapabilities(): Promise<void> {
   try {
     if (!runtimeConfig.agentUrl) {
       installMode = null
       imageFlavor = null
+      vncDescriptor = null
       uiFeatures = null
       return
     }
     const response = await backendFetch(`${runtimeConfig.agentUrl}/api/services/tray-capabilities`, 'GET', 4000)
     if (!response.ok) return
     const parsed = await response.json() as {
-      install_mode?: 'docker' | 'native' | null
+      install_mode?: 'docker' | 'native' | 'kubernetes' | null
       image_flavor?: 'desktop' | 'basic' | null
+      vnc?: VncDescriptor | null
       ui_features?: string[]
     }
     installMode = parsed.install_mode ?? null
     imageFlavor = parsed.image_flavor ?? null
+    // Absent on a backend older than the descriptor — vncUrlFor then falls
+    // back to the install_mode / image_flavor rule.
+    vncDescriptor = parsed.vnc ?? null
     uiFeatures = Array.isArray(parsed.ui_features) ? new Set(parsed.ui_features) : null
   } catch { /* retain known capabilities during a temporary restart */ }
   finally {
@@ -2592,14 +2602,15 @@ function createTray(): void {
   tray.on('click', () => focusMostRecentAppWindow())
 }
 
-function createAppWindow(target: WindowKind): BrowserWindow {
+// ``vncUrl`` is supplied by the cremind:open-vnc bridge, which validated it;
+// the tray / jumplist / dock paths pass nothing and get this install's target.
+function createAppWindow(target: WindowKind, vncUrl?: string): BrowserWindow {
   if (target === 'vnc') {
-    const vncUrl = vncUrlFromAgentUrl(runtimeConfig.agentUrl)
-    if (!vncUrl || !vncCapable()) {
+    const desktopUrl = vncUrl ?? vncTarget()
+    if (!desktopUrl) {
       // Shouldn't reach here — the tray/jumplist gating hides the entry
-      // unless vncCapable() (Docker install, non-basic image, resolvable
-      // noVNC URL). Belt-and-suspenders: fall back to main if a stale
-      // jumplist entry or a basic install requests it anyway.
+      // unless vncCapable(). Belt-and-suspenders: fall back to main if a
+      // stale jumplist entry or an install with no desktop requests it anyway.
       return createAppWindow('main')
     }
     const w = new BrowserWindow({
@@ -2623,7 +2634,7 @@ function createAppWindow(target: WindowKind): BrowserWindow {
       windows.delete(w)
       if (mainWin === w) mainWin = null
     })
-    void w.loadURL(vncUrl)
+    void w.loadURL(desktopUrl)
     return w
   }
 

@@ -11,6 +11,15 @@ bootstrap.toml). It needs to handle four shapes:
 - docker install, SQLite → docker/.env has VNC; no Postgres section.
 - native install → no docker/.env; bootstrap.toml may or may not say
   Postgres. ``deployment`` field reports "native".
+- Kubernetes pod → nothing on disk at all: no compose file, no docker/.env,
+  and on the basic image not even a VNC password. INSTALL_MODE is the only
+  signal, which is why the last section here exists.
+
+The Kubernetes cases also pin the two blocks this endpoint repeats from
+``/api/system/environment`` (``kubernetes`` and ``vnc``). The Setup Wizard
+never calls that endpoint — it runs before an admin token exists — so a pod's
+identity and the way its desktop is reached have to travel through here or the
+exported config file loses them.
 """
 
 from __future__ import annotations
@@ -24,6 +33,7 @@ from typing import Callable
 import pytest
 
 from app.api import config as config_api
+from app.config import runtime_env
 
 
 def _stub_admin_ok(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -31,13 +41,40 @@ def _stub_admin_ok(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # Env vars the endpoint consults — the dev host may have any of these set
-# from running an actual install, which would leak into hermetic tests.
+# from running an actual install, which would leak into hermetic tests. The
+# second group reaches the response through the shared runtime description
+# (the ``kubernetes`` and ``vnc`` blocks), not through the endpoint's own
+# three-source walk, but it leaks exactly the same way.
 _DOCKER_RUNTIME_VARS = (
     "CREMIND_COMPOSE_ENV_FILE",
     "VNC_PASSWORD", "RESOLUTION", "APP_URL", "INSTALL_MODE",
     "CORS_ALLOWED_ORIGINS", "SETUP_WIZARD_ENV",
     "API_PORT", "SPA_PORT", "NOVNC_PORT", "VNC_PORT",
+    "CREMIND_IMAGE_FLAVOR", "CREMIND_NOVNC_URL",
+    "CREMIND_SSL", "CREMIND_TLS_TERMINATION",
+    "CREMIND_K8S_NAMESPACE", "CREMIND_K8S_RELEASE",
+    "CREMIND_K8S_WORKLOAD", "CREMIND_K8S_SERVICE_PORT",
+    "KUBERNETES_SERVICE_HOST", "HOSTNAME",
 )
+
+
+@pytest.fixture(autouse=True)
+def _uncached_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Keep one test's install out of the next one's response.
+
+    The ``vnc`` block comes from the process-wide lru_cache behind
+    :func:`describe_runtime_environment` (it feeds the agent's prompt-cached
+    system prompt), so without a clear on both sides the first case to run here
+    would describe every case after it. The two file probes are pointed at
+    paths that cannot exist for the same reason the cache is cleared: CI may
+    itself run in a container, and a suite running inside a real cluster would
+    otherwise inherit that cluster's namespace.
+    """
+    monkeypatch.setattr(runtime_env, "_CONTAINER_MARKER", tmp_path / "no-dockerenv")
+    monkeypatch.setattr(runtime_env, "_SA_NAMESPACE_FILE", tmp_path / "no-namespace")
+    runtime_env.describe_runtime_environment.cache_clear()
+    yield
+    runtime_env.describe_runtime_environment.cache_clear()
 
 
 def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -392,3 +429,152 @@ def test_compose_env_file_provides_postgres_creds_too(
     assert body["pg_password"] == "runtime-pw"
     assert body["pg_user"] == "u"
     assert body["pg_database"] == "d"
+
+
+# ── Kubernetes ────────────────────────────────────────────────────────────
+#
+# A pod has none of the on-disk sources: no compose file is bind-mounted, the
+# install bundle's docker/.env is a host artefact, and on the basic image the
+# chart writes no VNC password either. INSTALL_MODE is the whole signal.
+
+
+def _k8s_identity_env(
+    monkeypatch: pytest.MonkeyPatch, *, service_port: str = "80",
+) -> None:
+    """The four keys the Helm chart states about the release (C1)."""
+    monkeypatch.setenv("CREMIND_K8S_NAMESPACE", "lee-cremind")
+    monkeypatch.setenv("CREMIND_K8S_RELEASE", "cremind")
+    monkeypatch.setenv("CREMIND_K8S_WORKLOAD", "cremind")
+    monkeypatch.setenv("CREMIND_K8S_SERVICE_PORT", service_port)
+
+
+def test_kubernetes_basic_image_is_a_container_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regression this section exists for.
+
+    ``desktop.enabled=false`` means no VNC_PASSWORD, and a pod has no compose
+    file and no docker/.env — so with ``docker`` as the only mode that counted
+    as a container, this install reported ``deployment: native``,
+    ``available`` only because bootstrap.toml happened to exist, and every
+    container field null. The wizard's config export came out empty on a
+    machine whose own environment said INSTALL_MODE=kubernetes.
+    """
+    install_dir = tmp_path / "install"
+    system_dir = tmp_path / "system"
+    install_dir.mkdir()  # no docker/ inside: a pod has no install bundle
+    system_dir.mkdir()   # and no bootstrap.toml either
+    _stub_admin_ok(monkeypatch)
+    _stub_dirs(monkeypatch, install_dir=install_dir, system_dir=system_dir)
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
+    monkeypatch.setenv("APP_URL", "https://cremind.example")
+    monkeypatch.setenv("CREMIND_IMAGE_FLAVOR", "basic")
+    _k8s_identity_env(monkeypatch)
+
+    body = _call(_get_handler())
+
+    assert body["available"] is True
+    # "container or host process" — a pod answers ``docker`` on purpose; the
+    # wizard's installMode ref and configExport.ts branch on that word.
+    assert body["deployment"] == "docker"
+    assert body["install_mode"] == "kubernetes"
+    assert body["app_url"] == "https://cremind.example"
+    assert body["kubernetes"] == {
+        "namespace": "lee-cremind",
+        "release": "cremind",
+        "workload": "cremind",
+        "service": "cremind",
+        "service_port": 80,
+        "source": "chart",
+        "port_forward": (
+            "kubectl --namespace lee-cremind port-forward svc/cremind 1515:80"
+        ),
+    }
+    # The basic image has no desktop at all, so the card stays hidden.
+    assert body["vnc_password"] is None
+    assert body["vnc"]["enabled"] is False
+    assert body["vnc"]["access"] is None
+
+
+def test_kubernetes_desktop_carries_the_vnc_route_and_its_tunnel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The desktop image adds the password and the chart's noVNC URL.
+
+    Behind the nginx sidecar the desktop is a path on the app origin, and the
+    identity above is what turns "run a port-forward" into a line the operator
+    can paste — including a non-default ``service.port``.
+    """
+    install_dir = tmp_path / "install"
+    system_dir = tmp_path / "system"
+    install_dir.mkdir()
+    system_dir.mkdir()
+    _stub_admin_ok(monkeypatch)
+    _stub_dirs(monkeypatch, install_dir=install_dir, system_dir=system_dir)
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
+    monkeypatch.setenv("APP_URL", "http://cremind.example")
+    monkeypatch.setenv("CREMIND_IMAGE_FLAVOR", "desktop")
+    monkeypatch.setenv("VNC_PASSWORD", "pod-vnc")
+    monkeypatch.setenv("RESOLUTION", "1920x1080")
+    monkeypatch.setenv(
+        "CREMIND_NOVNC_URL", "http://cremind.example/vnc/vnc.html",
+    )
+    _k8s_identity_env(monkeypatch, service_port="8080")
+
+    body = _call(_get_handler())
+
+    assert body["deployment"] == "docker"
+    assert body["install_mode"] == "kubernetes"
+    assert body["vnc_password"] == "pod-vnc"
+    assert body["resolution"] == "1920x1080"
+    assert body["novnc_url"] == "http://cremind.example/vnc/vnc.html"
+    assert body["kubernetes"]["service_port"] == 8080
+    assert body["kubernetes"]["port_forward"] == (
+        "kubectl --namespace lee-cremind port-forward svc/cremind 1515:8080"
+    )
+    vnc = body["vnc"]
+    assert vnc["enabled"] is True
+    assert vnc["access"] == "same_origin"
+    assert vnc["novnc_path"] == "/vnc/vnc.html"
+    # No Ingress here, so the tunnel that carries Cremind carries the desktop.
+    assert [c["command"] for c in vnc["port_forward_commands"]] == [
+        "kubectl --namespace lee-cremind port-forward svc/cremind 1515:8080"
+    ]
+
+
+def test_docker_reports_no_kubernetes_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A container is not a pod: the block must be null, not a half-filled
+    guess an export would print as a kubectl command."""
+    install_dir = tmp_path / "install"
+    system_dir = tmp_path / "system"
+    _write_docker_env(install_dir)
+    system_dir.mkdir()
+    _stub_admin_ok(monkeypatch)
+    _stub_dirs(monkeypatch, install_dir=install_dir, system_dir=system_dir)
+    monkeypatch.setenv("INSTALL_MODE", "docker")
+    # Even with the chart's keys somehow present in the environment.
+    _k8s_identity_env(monkeypatch)
+
+    body = _call(_get_handler())
+
+    assert body["deployment"] == "docker"
+    assert body["kubernetes"] is None
+
+
+def test_native_reports_no_kubernetes_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_dir = tmp_path / "install"
+    system_dir = tmp_path / "system"
+    install_dir.mkdir()
+    _write_bootstrap_sqlite(system_dir)
+    _stub_admin_ok(monkeypatch)
+    _stub_dirs(monkeypatch, install_dir=install_dir, system_dir=system_dir)
+
+    body = _call(_get_handler())
+
+    assert body["deployment"] == "native"
+    assert body["kubernetes"] is None
+    assert body["vnc"]["enabled"] is False

@@ -20,6 +20,37 @@ meets the need:
 This skill itself is a Tier-A example: `SKILL.md` + `references/` + one helper
 script, no `metadata`.
 
+## Two ways to build a skill
+
+When a coding delegate (**Claude Code** or **Codex**) is enabled, **ask the user
+once, before writing anything**: build the skill here with this skill, or hand
+the job to the delegate. Picking the delegate is normal and expected for
+anything past Tier A. With no delegate enabled, build it here; don't ask.
+
+Delegation brief to copy. `<skills root>` is **this skill's parent directory** —
+the profile skills root, where `change_working_directory`'s `skills` target
+lands. Put its absolute path into the brief: the delegate doesn't share this
+file's "cwd is the skill directory" convention, and a `..` resolved from the
+root itself lands outside it, where nothing hot-loads.
+
+```text
+Create a Cremind skill at <skills root>/<name> — lowercase-hyphenated; confirm
+by listing <skills root> that the name is free, and that it is none of the
+reserved built-in names.
+Working from <skills root>, read skill-creator/SKILL.md first, then
+skill-creator/references/spec.md, events.md and templates.md: together they are
+the complete Cremind skill contract.
+Build the smallest tier that satisfies <what the user asked for>.
+Then, from <skills root>, run `uv run skill-creator/scripts/validate.py <name>`
+and report its verdict — do not finish on anything but PASS.
+Write nothing outside <skills root>; never modify an existing or built-in
+skill directory.
+```
+
+Either way the skill hot-loads within ~1s, and only step 8's `cremind
+skill-events events <name>` proves it registered — a PASS is pre-flight, not
+proof.
+
 ## How Cremind skills work (essentials)
 
 - A skill is a **directory with a `SKILL.md`**. It becomes a native tool. When
@@ -58,9 +89,10 @@ skill directory must not be read with System File):
 
 ## Where new skills go, and naming
 
-- Create the skill as a **sibling of this directory**: `../<new-name>/`. This
-  skill lives in the profile skills root, so `..` *is* the skills root. (You can
-  also `change_working_directory` to the `skills` target.)
+- **Building it here, cwd is this skill's own directory** (Cremind anchors it
+  there on load), so `..` *is* the profile skills root: create the skill as a
+  **sibling of this directory**, `../<new-name>/`. (`change_working_directory`
+  to the `skills` target puts you *in* the root instead — same paths, no `../`.)
 - The **directory name must equal the frontmatter `name`** — lowercase,
   hyphen-separated, filesystem-safe.
 - **Check for collisions first:** run `ls ..`. A sibling with that name means it's

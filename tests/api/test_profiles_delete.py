@@ -201,6 +201,93 @@ def test_admin_deleting_unknown_profile_is_404(system_dir):
     assert "not found" in _body(resp)["error"]
 
 
+# ── on-disk cleanup ──────────────────────────────────────────────────────────
+
+
+def _seed_cli_homes(profile: str):
+    """Write both coding-agent logins into ``profile``'s CLI homes.
+
+    Both files, not one: the Claude CLI and the Codex CLI keep their credential
+    in different places under the same root, and a cleanup that only knew about
+    ``auth.json`` would leave a live Claude OAuth token behind.
+    """
+    from app.config import coding_cli_homes
+
+    claude = coding_cli_homes.profile_claude_config_dir(profile)
+    codex = coding_cli_homes.profile_codex_home(profile)
+    claude.mkdir(parents=True, exist_ok=True)
+    codex.mkdir(parents=True, exist_ok=True)
+    (claude / ".credentials.json").write_text(
+        '{"claudeAiOauth": {"accessToken": "live", "refreshToken": "live"}}',
+        encoding="utf-8",
+    )
+    (codex / "auth.json").write_text('{"tokens": {"refresh_token": "live"}}', encoding="utf-8")
+    return coding_cli_homes.profile_cli_root(profile)
+
+
+def test_delete_takes_the_coding_cli_logins_with_it(system_dir):
+    """The refresh tokens on disk must not outlive the profile that owns them.
+
+    Deleting a profile deliberately keeps ``<SYSDIR>/<profile>`` (its skills are
+    recoverable), so nothing else collects these: the DB rows go by FK cascade,
+    which means the clean engine — the other place that pairs rows with the tree
+    — never runs for a deletion.
+    """
+    root = _seed_cli_homes("lee")
+    delete = _handler(_DELETE_PATH, "DELETE", _storage())
+
+    req = _auth(username="admin", path_params={"profile_name": "lee"})
+    resp = asyncio.run(delete(req))
+
+    assert resp.status_code == 200
+    assert not root.exists()
+
+
+def test_delete_leaves_another_profile_credential_alone(system_dir):
+    """Per-profile trees: deleting one tenant must not sign the others out."""
+    _seed_cli_homes("lee")
+    other = _seed_cli_homes("sam")
+    delete = _handler(_DELETE_PATH, "DELETE", _storage())
+
+    req = _auth(username="admin", path_params={"profile_name": "lee"})
+    resp = asyncio.run(delete(req))
+
+    assert resp.status_code == 200
+    assert (other / "codex" / "auth.json").read_text(encoding="utf-8") == (
+        '{"tokens": {"refresh_token": "live"}}'
+    )
+    assert (other / "claude" / ".credentials.json").exists()
+
+
+def test_delete_succeeds_when_the_profile_never_signed_in(system_dir):
+    """No tree to collect is the common case — it must not colour the response."""
+    delete = _handler(_DELETE_PATH, "DELETE", _storage())
+
+    req = _auth(username="admin", path_params={"profile_name": "lee"})
+    resp = asyncio.run(delete(req))
+
+    assert resp.status_code == 200
+    assert _body(resp)["success"] is True
+
+
+def test_credential_cleanup_failure_cannot_block_the_delete(system_dir, monkeypatch):
+    """Best-effort, like every other teardown here: the row is already gone."""
+    from app.config import coding_cli_homes
+
+    def _boom(profile: str) -> bool:
+        raise RuntimeError("disk is on fire")
+
+    monkeypatch.setattr(coding_cli_homes, "remove_profile_cli_homes", _boom)
+    _seed_cli_homes("lee")
+    delete = _handler(_DELETE_PATH, "DELETE", _storage())
+
+    req = _auth(username="admin", path_params={"profile_name": "lee"})
+    resp = asyncio.run(delete(req))
+
+    assert resp.status_code == 200
+    assert _body(resp)["success"] is True
+
+
 # ── create ───────────────────────────────────────────────────────────────────
 
 

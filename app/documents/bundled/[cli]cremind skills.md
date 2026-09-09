@@ -1,5 +1,5 @@
 ---
-description: "Install and remove agent skills with `cremind skills`: `import archive` from a local file, `import github` from a public repo, `import hub` from a Cremind Hub link/name, and `delete` an external skill or reset a built-in one to its shipped default. Skills are *listed* and *configured* via `cremind tools` (each skill is a tool) — this command covers only their install/uninstall lifecycle."
+description: "Install and remove agent skills with `cremind skills`: `import archive` from a local file, `import github` from a public repo, `import hub` from a Cremind Hub link/name, and `delete` an external skill or reset a built-in one to its shipped default. Skills are *listed* and *configured* via `cremind tools` (each skill is a tool) — this command covers only their install/uninstall lifecycle, and *authoring* a brand-new skill is the `skill-creator` skill's job (optionally delegated to Claude Code or Codex), not a CLI command."
 ---
 
 # `cremind skills` — Skill Install / Uninstall
@@ -11,6 +11,14 @@ the web UI's **Tools & Skills** settings page.
 Skills surface as tools, so **listing and configuring** them happens through
 `cremind tools` (`cremind tools list`, `tools get`, `tools set-var`, …). There
 is deliberately no `skills list` here.
+
+**Writing** a new skill is a third thing again, and there is no CLI command for
+it: ask the assistant with the built-in `skill-creator` skill loaded and it
+authors the skill directly in the profile's skills root — either itself, or, when
+Claude Code or Codex is enabled, by delegating the job to that coding agent
+against `skill-creator`'s contract (it asks you once which you prefer). A skill
+written that way hot-loads within ~1s and is never imported; `cremind skills
+import` is only for skills that came from somewhere else.
 
 ## Finding this in the web UI
 

@@ -127,6 +127,21 @@ use either fallback — both complete the exchange server-side:
 - run `cremind llm codex-oauth login` on your own machine against the cluster —
   the CLI binds `1455` locally, catches the redirect there, and relays the code.
 
+### Coding agents (Claude Code, Codex)
+
+These are a separate sign-in from the LLM providers above: each one authenticates
+through its own CLI, not through Cremind's provider credentials. Sign in from
+**Settings → Tools & Skills → Coding Agents** — Codex shows a device code you
+approve on any device (no port to forward), and Claude Code opens a terminal in
+the browser that runs `claude auth login` inside the pod.
+
+The chart points both CLIs at the system PVC (`CLAUDE_CONFIG_DIR` and
+`CODEX_HOME` under `<cremind.systemDir>/coding-cli/`), so a sign-in survives pod
+replacement and `helm upgrade`. Their own defaults would put it in the container
+filesystem, where every rollout would silently sign the user out. Each profile
+gets its own login under `<cremind.systemDir>/<profile>/coding-cli/`; a login
+made in the pod's shell is the shared fallback for profiles that have none.
+
 ## HTTPS (in-pod TLS)
 
 With a real domain, terminate TLS at the Ingress (`ingress.tls`) — that also
@@ -194,6 +209,18 @@ helm upgrade cremind oci://registry-1.docker.io/cremind/cremind \
 kubectl --namespace cremind rollout status deployment/cremind --timeout=5m
 kubectl --namespace cremind port-forward svc/cremind 1515:80 1455:1455 6080:6080
 ```
+
+You should not have to substitute anything by hand. The chart tells the pod who
+this release is — `CREMIND_K8S_NAMESPACE`, `CREMIND_K8S_RELEASE`,
+`CREMIND_K8S_WORKLOAD` (the Deployment, the Service and the Ingress all carry
+that one name) and `CREMIND_K8S_SERVICE_PORT`, all in the env ConfigMap — so
+**Settings > Security** prints this runbook with your real names already filled
+in, and the exported config file (Setup Wizard, or **Developer > Configuration
+File** afterwards) carries them together with the `kubectl port-forward` command
+to reconnect. A chart older than these keys still works: the pod reads its
+namespace off the service-account mount and infers the workload from its pod
+name, marks the answer as inferred, and leaves `<release>` for you to fill in
+after `helm list --all-namespaces`.
 
 Omit `6080:6080` for the basic image. If `cremind.appUrl` or
 `cremind.atlassianRedirectUri` was explicitly set, pass its matching HTTPS URL

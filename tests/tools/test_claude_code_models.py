@@ -20,23 +20,38 @@ import pytest
 
 import app.tools.builtin.claude_code as claude_code
 import app.tools.builtin.claude_code_runner as runner
+from app.config import runtime_env
+from app.config.settings import BaseConfig
 from app.tools.builtin.claude_code_runner import Var
 
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
     """Clear the module cache and neutralise ambient credentials so each test
-    controls the credential chain explicitly."""
+    controls the credential chain explicitly.
+
+    Isolation is by environment: ``CLAUDE_CONFIG_DIR`` is the server's shared
+    CLI home and ``CREMIND_SYSTEM_DIR`` is where per-profile homes hang, so a
+    test creates a credential by writing the file the CLI would have written.
+    """
     runner._models_cache.clear()
-    monkeypatch.setattr(runner, "get_dynamic", lambda *a, **k: None)
-    monkeypatch.setattr(
-        runner.BaseConfig, "get_provider_api_key", lambda *a, **k: None,
-    )
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
-    monkeypatch.setattr(runner, "_CLAUDE_CREDENTIALS_PATH", tmp_path / "nope.json")
+    system_dir = tmp_path / "system"
+    system_dir.mkdir()
+    monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(system_dir))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "shared"))
+    monkeypatch.setattr(runtime_env, "is_container", lambda *a, **k: False)
     yield
     runner._models_cache.clear()
+
+
+def _sign_in(config_dir: Path, token: str) -> Path:
+    """Write the ``.credentials.json`` a completed ``claude auth login`` leaves."""
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path = config_dir / ".credentials.json"
+    path.write_text(json.dumps({"claudeAiOauth": {"accessToken": token}}), encoding="utf-8")
+    return path
 
 
 # ── _build_models_headers: credential tiers ─────────────────────────────────
@@ -49,31 +64,6 @@ def test_headers_tool_variable_api_key():
     assert headers["anthropic-version"] == runner._ANTHROPIC_VERSION
     assert "Authorization" not in headers
     assert source == "tool_variable_api_key"
-
-
-def test_headers_profile_setup_token(monkeypatch):
-    def _dyn(table, key, *a, **k):
-        if key == "anthropic.auth_method":
-            return "setup_token"
-        if key == "anthropic.setup_token":
-            return "oauth-tok"
-        return None
-
-    monkeypatch.setattr(runner, "get_dynamic", _dyn)
-    headers, source = runner._build_models_headers({}, "admin")
-    assert headers["Authorization"] == "Bearer oauth-tok"
-    assert headers["anthropic-beta"] == runner._OAUTH_BETA
-    assert "x-api-key" not in headers
-    assert source == "profile_setup_token"
-
-
-def test_headers_profile_api_key(monkeypatch):
-    monkeypatch.setattr(
-        runner.BaseConfig, "get_provider_api_key", lambda *a, **k: "sk-profile",
-    )
-    headers, source = runner._build_models_headers({}, "admin")
-    assert headers["x-api-key"] == "sk-profile"
-    assert source == "profile_api_key"
 
 
 def test_headers_env_api_key(monkeypatch):
@@ -90,11 +80,28 @@ def test_headers_env_oauth_token(monkeypatch):
     assert source == "env_oauth_token"
 
 
-def test_headers_host_credentials_file(monkeypatch, tmp_path):
-    cred = tmp_path / "creds.json"
-    cred.write_text(json.dumps({"claudeAiOauth": {"accessToken": "host-tok"}}))
-    monkeypatch.setattr(runner, "_CLAUDE_CREDENTIALS_PATH", cred)
+def test_headers_shared_cli_login(tmp_path):
+    """The server's own ``claude auth login`` is the last tier, and its token is
+    read straight out of ``CLAUDE_CONFIG_DIR``."""
+    _sign_in(tmp_path / "shared", "host-tok")
     headers, source = runner._build_models_headers({}, "admin")
+    assert headers["Authorization"] == "Bearer host-tok"
+    assert headers["anthropic-beta"] == runner._OAUTH_BETA
+    assert source == "host_claude_login"
+
+
+def test_headers_profile_cli_login_beats_the_shared_one(tmp_path):
+    """A profile with its own login lists ITS account's models, not the
+    operator's; the two homes must never be crossed."""
+    _sign_in(tmp_path / "shared", "host-tok")
+    _sign_in(tmp_path / "system" / "alice" / "coding-cli" / "claude", "alice-tok")
+
+    headers, source = runner._build_models_headers({}, "alice")
+    assert headers["Authorization"] == "Bearer alice-tok"
+    assert source == "profile_claude_login"
+
+    # A profile that never signed in still borrows the server's login.
+    headers, source = runner._build_models_headers({}, "bob")
     assert headers["Authorization"] == "Bearer host-tok"
     assert source == "host_claude_login"
 
@@ -105,17 +112,15 @@ def test_headers_none_when_no_credential():
     assert source is None
 
 
-def test_credential_source_host_file(monkeypatch, tmp_path):
-    """credential_source() must recognise the host claude-login store too, so the
+def test_credential_source_shared_cli_login(tmp_path):
+    """credential_source() must recognise the shared CLI login too, so the
     status leaf and the model listing agree on what's visible."""
-    cred = tmp_path / "creds.json"
-    cred.write_text(json.dumps({"claudeAiOauth": {"accessToken": "host-tok"}}))
-    monkeypatch.setattr(runner, "_CLAUDE_CREDENTIALS_PATH", cred)
+    _sign_in(tmp_path / "shared", "host-tok")
     assert runner.credential_source({}, "admin") == "host_claude_login"
 
 
 def test_credential_source_none_when_absent():
-    # The _isolate fixture points the credentials path at a nonexistent file.
+    # The _isolate fixture points every CLI home at an empty tmp directory.
     assert runner.credential_source({}, "admin") is None
 
 

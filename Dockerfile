@@ -194,11 +194,22 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
 # chromium runtime when the user enables it. ``PLAYWRIGHT_BROWSERS_PATH``
 # parks the cache inside the working-dir volume so it persists across
 # container recreation.
+#
+# ``CLAUDE_CONFIG_DIR`` / ``CODEX_HOME`` move the coding CLIs' sign-in off the
+# container filesystem and onto the system volume. Their defaults (~/.claude,
+# ~/.codex) live in the writable layer, so a `docker compose down && up` or an
+# image upgrade silently signed the user out of Claude Code and Codex. Setting
+# them here means a login typed in the VNC desktop's terminal, in `docker exec`
+# or in Cremind's own terminal all land in the same place and persist. These
+# name the SHARED server login; per-profile logins live under
+# <CREMIND_SYSTEM_DIR>/<profile>/coding-cli/ and need no variable.
 ENV PATH="/opt/cremind/venv/bin:${PATH}" \
     CREMIND_SYSTEM_DIR=/root/.cremind \
     CREMIND_UI_PORT=1515 \
     HOST=0.0.0.0 \
     PORT=1112 \
+    CLAUDE_CONFIG_DIR=/root/.cremind/coding-cli/claude \
+    CODEX_HOME=/root/.cremind/coding-cli/codex \
     PLAYWRIGHT_BROWSERS_PATH=/root/.cremind/playwright-browsers
 
 WORKDIR /root/.cremind

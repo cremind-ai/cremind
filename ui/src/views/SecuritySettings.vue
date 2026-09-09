@@ -72,8 +72,14 @@ async function load() {
   loading.value = true;
   loadError.value = null;
   try {
+    // Ask as the signed-in admin. /api/tls/status answers without a token too
+    // (the recovery page needs that), but it discloses the Kubernetes identity
+    // — and the runbook naming the real namespace, release and Deployment —
+    // only to an admin. Polling it anonymously from here is what put the
+    // placeholder commands back in front of the one person who shouldn't see
+    // them.
     const [status, caps] = await Promise.all([
-      fetchTlsStatus(settingsStore.agentUrl),
+      fetchTlsStatus(settingsStore.agentUrl, settingsStore.authToken),
       fetchServiceCapabilities(settingsStore.agentUrl, settingsStore.authToken),
     ]);
     runtime.value = status;
@@ -144,7 +150,9 @@ async function activate() {
     onFailure: (message: string) => {
       loadError.value = message;
       working.value = false;
-      void fetchTlsStatus(settingsStore.agentUrl).then((status) => {
+      // Same reason as in load(): a failed activation is exactly when the
+      // operator needs the runbook to name their own cluster.
+      void fetchTlsStatus(settingsStore.agentUrl, settingsStore.authToken).then((status) => {
         runtime.value = status;
       }).catch(() => { /* keep the actionable activation error */ });
     },

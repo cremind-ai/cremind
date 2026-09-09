@@ -570,6 +570,15 @@ def get_llm_routes(state: BootedState) -> list[Route]:
         # sibling (``custom:acme.`` never matches ``custom:acme-2.api_key``).
         deleted = config_storage.delete_by_prefix("llm_config", f"{provider_name}.", profile=profile)
 
+        # Nothing on disk to collect here. Disconnecting the OpenAI provider
+        # used to also delete the Codex tool's ChatGPT credential, because the
+        # tool borrowed this profile's provider login. That bridge is gone: the
+        # Codex tool now authenticates only from its own CLI home (see
+        # app/config/coding_cli_homes.py), signed in through the tool's own card
+        # or `codex login`. Deleting it from here would sign the user out of a
+        # tool they never touched - a different credential, owned by a different
+        # feature, that this action does not speak for.
+
         if _is_custom(provider_name):
             slug = provider_name[len(_CUSTOM_PREFIX):]
             registry = _load_custom_registry(config_storage, profile)

@@ -151,12 +151,17 @@ def _clean_registry(monkeypatch, tmp_path):
     conversation id without touching the DB. Step *tracking* stays real so the
     wait-heartbeat's ``total_steps`` count is exercised.
 
-    Also keep the model listing hermetic for the status leaf: point the host
-    ``claude login`` credentials path at a nonexistent file (so
-    ``credential_source`` doesn't pick up the developer's real login) and stub
-    ``list_models`` to an empty success (so ``status`` never hits the network).
-    Tests that care about the model list re-stub ``list_models`` locally.
+    Credentials are isolated by *environment*, not by patching private module
+    constants: ``CLAUDE_CONFIG_DIR`` + ``CREMIND_SYSTEM_DIR`` are what
+    ``app.config.coding_cli_homes`` reads, so pointing them at ``tmp_path``
+    keeps every credential question off the developer's own ``~/.claude`` and
+    lets a test create a login simply by writing the file. ``is_container`` is
+    pinned False so the container-only legacy ``~`` tier can never fire either.
+    ``list_models`` is stubbed to an empty success so ``status`` never hits the
+    network; tests that care about the model list re-stub it locally.
     """
+    from app.config import runtime_env
+    from app.config.settings import BaseConfig
     from app.tools.builtin import claude_code_runner as r
     import app.agent.agent_activity as aa
 
@@ -176,9 +181,18 @@ def _clean_registry(monkeypatch, tmp_path):
     monkeypatch.setattr(aa.AgentActivity, "_publish_now", _noop)
     monkeypatch.setattr(aa.AgentActivity, "_patch_persisted", _noop)
     monkeypatch.setattr(aa.AgentActivity, "_schedule_flush", lambda self: None)
-    monkeypatch.setattr(r, "_CLAUDE_CREDENTIALS_PATH", tmp_path / "no_creds.json")
     monkeypatch.setattr(r, "list_models", _empty_models)
-    yield
+
+    system_dir = tmp_path / "system"
+    shared = tmp_path / "shared-claude"
+    system_dir.mkdir(exist_ok=True)
+    monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(system_dir))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(shared))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(runtime_env, "is_container", lambda *a, **k: False)
+
+    yield types.SimpleNamespace(system_dir=system_dir, shared=shared)
     r._task_registry.clear()
     r._models_cache.clear()
 
@@ -698,6 +712,62 @@ def test_guidance_present_only_when_enabled():
     assert "cremind tools set-var" in text
     assert "ask the user ONCE" in text
     assert "plan mode" in text  # named in the negation ("no UI 'plan mode' ...")
+    # No skill-creator enabled -> nothing to arbitrate between, so the
+    # skill-authoring clause must not appear.
+    assert "SKILL AUTHORING" not in text
+
+
+def _skill_creator_group(tool_id: str = "default__skill_creator"):
+    """Stand-in for the enabled skill-creator skill as the registry exposes it:
+    ``ToolType.SKILL`` plus the profile-prefixed tool_id the model calls."""
+    from app.tools import ToolType
+
+    return types.SimpleNamespace(tool_type=ToolType.SKILL, tool_id=tool_id)
+
+
+def test_guidance_adds_skill_authoring_choice_with_skill_creator():
+    # Claude Code and skill-creator both enabled: the two rules collide (delegate
+    # all file writing vs. scaffold the skill yourself), so the prompt must tell
+    # the model to ask the user which one to use — naming the real functions.
+    from app.agent.reasoning_agent import _build_coding_delegation_guidance
+
+    class Group:
+        config_name = "claude_code"
+        tool_id = "claude_code"
+
+    text = _build_coding_delegation_guidance([Group(), _skill_creator_group()])
+    assert "SKILL AUTHORING" in text
+    assert "`default__skill_creator`" in text        # path (a): the real skill fn
+    assert "Claude Code (`claude_code__run`)" in text  # path (b): the real run fn
+    assert "Codex" not in text                       # only the enabled delegate
+    assert "target='skills'" in text                 # cwd before delegating
+    assert "skill-creator/references/spec.md" in text
+    assert "validate.py" in text
+    assert "cremind skill-events events" in text
+    # The delegation body itself is untouched by the clause.
+    assert "claude_code__wait" in text
+
+
+def test_guidance_absent_without_a_delegate_even_with_skill_creator():
+    # The clause is a delegation rule: with no coding agent enabled there is
+    # nothing to delegate to, and the whole block stays empty so the prompt is
+    # byte-identical for profiles that only run skills.
+    from app.agent.reasoning_agent import _build_coding_delegation_guidance
+
+    assert _build_coding_delegation_guidance([_skill_creator_group()]) == ""
+
+
+def test_skill_creator_matched_by_slug_not_a_hardcoded_id():
+    # Skills register as ``<profile>__<slug>``; a non-default profile (or a
+    # pre-prefix install carrying the bare slug) must match just the same, and an
+    # unrelated skill must not.
+    from app.agent.reasoning_agent import _skill_creator_tool_id
+
+    assert _skill_creator_tool_id([_skill_creator_group("work__skill_creator")]) == (
+        "work__skill_creator"
+    )
+    assert _skill_creator_tool_id([_skill_creator_group("skill_creator")]) == "skill_creator"
+    assert _skill_creator_tool_id([_skill_creator_group("default__gmail")]) is None
 
 
 # ── auth-failure classification (the not-logged-in case) ──────────────────────
@@ -725,7 +795,11 @@ def test_result_message_auth_error_is_classified(monkeypatch, tmp_path):
     sc = res.structured_content
     assert sc["status"] == "failed"
     assert sc["error"] == "AuthenticationError"
-    assert "claude login" in sc["remediation"].lower()
+    # The remediation points at the CLI's own sign-in (and the API-key escape
+    # hatch), never at Settings -> LLM Providers, which is a different account.
+    assert "claude auth login" in sc["remediation"]
+    assert "cremind tools coding-agents login claude_code" in sc["remediation"]
+    assert "LLM Providers" not in sc["remediation"]
 
 
 def test_result_message_generic_error_stays_generic(monkeypatch, tmp_path):
@@ -778,89 +852,187 @@ def test_status_missing_sdk(monkeypatch):
     assert sc["sdk_installed"] is False
 
 
-def test_status_no_credentials(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
-
+def _no_sdk_stream(monkeypatch):
+    """Install the fake SDK for a leaf that never starts a coding session."""
     async def produce(client):
         if False:
             yield
 
-    install_fake_sdk(monkeypatch, produce)
+    return install_fake_sdk(monkeypatch, produce)
+
+
+def _status_result(**overrides):
+    """An :func:`auth_status` return value (its 7 keys), overridable."""
+    payload = {
+        "logged_in": None,
+        "auth_method": None,
+        "api_provider": None,
+        "email": None,
+        "org_name": None,
+        "subscription_type": None,
+        "detail": "",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _patch_auth_status(monkeypatch, result):
+    from app.tools.builtin import claude_code_runner as r
+
+    async def _status(variables, profile, *, config_dir=None, timeout=15.0):
+        return dict(result)
+
+    monkeypatch.setattr(r, "auth_status", _status)
+
+
+def test_status_no_credentials(monkeypatch, _clean_registry):
+    _no_sdk_stream(monkeypatch)
     res = asyncio.run(_status_tool(_profile="default", _variables={}))
     sc = res.structured_content
     assert sc["available"] is True
     assert sc["credentials_configured"] is False
     assert sc["credential_source"] is None
+    # No login anywhere -> no scope and no account, but the home is still named:
+    # "where would a sign-in land?" is the next question the user has.
+    assert sc["credential_scope"] is None
+    assert sc["account_hint"] is None
+    assert sc["cli_home"] == str(_clean_registry.shared)
     assert "probe=true" in sc["message"]
+    assert "cremind tools coding-agents login claude_code" in sc["message"]
 
 
-def test_status_with_tool_variable_key(monkeypatch):
-    async def produce(client):
-        if False:
-            yield
-
-    install_fake_sdk(monkeypatch, produce)
+def test_status_with_tool_variable_key(monkeypatch, _clean_registry):
+    _no_sdk_stream(monkeypatch)
     res = asyncio.run(
         _status_tool(_profile="default", _variables={"CLAUDE_CODE_API_KEY": "sk-test"})
     )
     sc = res.structured_content
     assert sc["credentials_configured"] is True
     assert sc["credential_source"] == "tool_variable_api_key"
+    # A key has no login scope to sign out of, but it still runs in a CLI home.
+    assert sc["credential_scope"] is None
+    assert sc["cli_home"] == str(_clean_registry.shared)
 
 
-def test_status_probe_authenticated(monkeypatch, tmp_path):
-    async def produce(client):
-        yield ResultMessage(subtype="success", result="OK", is_error=False)
-
-    install_fake_sdk(monkeypatch, produce)
-    res = asyncio.run(
-        _status_tool(probe=True, working_directory=str(tmp_path),
-                     _profile="default", _variables={"CLAUDE_CODE_API_KEY": "sk-x"})
-    )
+def test_status_probe_authenticated(monkeypatch):
+    """The probe reports the CLI's own answer, account and all."""
+    _no_sdk_stream(monkeypatch)
+    _patch_auth_status(monkeypatch, _status_result(
+        logged_in=True,
+        auth_method="claude.ai",
+        api_provider="firstParty",
+        email="dev@example.com",
+        org_name="Acme",
+        subscription_type="max",
+        detail="Signed in as dev@example.com (claude.ai, max).",
+    ))
+    res = asyncio.run(_status_tool(probe=True, _profile="default", _variables={}))
     sc = res.structured_content
     assert sc["logged_in"] is True
+    assert sc["account"] == {
+        "auth_method": "claude.ai",
+        "email": "dev@example.com",
+        "org_name": "Acme",
+        "subscription_type": "max",
+    }
     assert "ready" in sc["message"].lower()
+    assert "dev@example.com" in sc["message"]
 
 
-def test_status_probe_not_authenticated(monkeypatch, tmp_path):
-    async def produce(client):
-        yield ResultMessage(
-            subtype="error_during_execution",
-            result="Could not resolve authentication method.",
-            is_error=True,
-        )
-
-    install_fake_sdk(monkeypatch, produce)
-    res = asyncio.run(
-        _status_tool(probe=True, working_directory=str(tmp_path),
-                     _profile="default", _variables={})
-    )
+def test_status_probe_not_authenticated(monkeypatch):
+    _no_sdk_stream(monkeypatch)
+    _patch_auth_status(monkeypatch, _status_result(
+        logged_in=False, detail="The Claude CLI reports no login in /tmp/home.",
+    ))
+    res = asyncio.run(_status_tool(probe=True, _profile="default", _variables={}))
     sc = res.structured_content
     assert sc["logged_in"] is False
     assert "not authenticated" in sc["message"].lower()
+    assert "claude auth login" in sc["message"]
+    assert sc["account"] is None
 
 
-def test_status_host_claude_login(monkeypatch, tmp_path):
-    """A host ``claude login`` store makes credentials visible even with no tool
-    variable / profile / env credential — the source the Web UI resolves too."""
-    from app.tools.builtin import claude_code_runner as r
+def test_status_probe_unknown_is_not_signed_out(monkeypatch):
+    """``logged_in`` None means "cannot tell": the message must not claim the
+    user is signed out (that sends them to fix a login that may be fine)."""
+    _no_sdk_stream(monkeypatch)
+    _patch_auth_status(monkeypatch, _status_result(
+        detail="`claude auth status` did not answer within 15s.",
+    ))
+    res = asyncio.run(_status_tool(probe=True, _profile="default", _variables={}))
+    sc = res.structured_content
+    assert sc["logged_in"] is None
+    assert "not the same as being signed out" in sc["message"]
+    assert "did not answer" in sc["probe_detail"]
 
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
-    cred = tmp_path / "creds.json"
-    cred.write_text('{"claudeAiOauth": {"accessToken": "host-tok"}}')
-    monkeypatch.setattr(r, "_CLAUDE_CREDENTIALS_PATH", cred)
 
-    async def produce(client):
-        if False:
-            yield
+def test_probe_runs_no_billed_query(monkeypatch):
+    """The probe must never start a coding session.
 
-    install_fake_sdk(monkeypatch, produce)
+    The previous implementation ran a real one-turn SDK query, so every
+    "Check sign-in" click cost money on the user's Anthropic account. Nothing
+    may construct an SDK client on this path.
+    """
+    mod = _no_sdk_stream(monkeypatch)
+    constructed = []
+    original_init = mod.ClaudeSDKClient.__init__
+
+    def _init(self, options=None):
+        constructed.append(options)
+        original_init(self, options)
+
+    monkeypatch.setattr(mod.ClaudeSDKClient, "__init__", _init)
+    _patch_auth_status(monkeypatch, _status_result(logged_in=True, detail="ok"))
+
+    res = asyncio.run(_status_tool(probe=True, _profile="default", _variables={}))
+    assert res.structured_content["logged_in"] is True
+    assert constructed == []
+
+
+def test_status_host_claude_login(monkeypatch, _clean_registry):
+    """The server's shared CLI login is visible to a profile that has none of its
+    own, reported as ``host_claude_login`` with ``shared`` scope, which is what
+    tells the user they are borrowing the operator's account."""
+    _clean_registry.shared.mkdir(parents=True, exist_ok=True)
+    (_clean_registry.shared / ".credentials.json").write_text(
+        '{"claudeAiOauth": {"accessToken": "host-tok"}}', encoding="utf-8",
+    )
+    (_clean_registry.shared / ".claude.json").write_text(
+        '{"oauthAccount": {"emailAddress": "ops@example.com", "organizationName": "Acme"}}',
+        encoding="utf-8",
+    )
+
+    _no_sdk_stream(monkeypatch)
     res = asyncio.run(_status_tool(_profile="default", _variables={}))
     sc = res.structured_content
     assert sc["credentials_configured"] is True
     assert sc["credential_source"] == "host_claude_login"
+    assert sc["credential_scope"] == "shared"
+    assert sc["cli_home"] == str(_clean_registry.shared)
+    assert sc["account_hint"] == {
+        "type": "oauth", "email": "ops@example.com", "org_name": "Acme",
+    }
+
+
+def test_status_profile_claude_login(monkeypatch, _clean_registry):
+    """A profile that signed in itself reports its own home and ``profile``
+    scope, even while the server's shared login also exists."""
+    _clean_registry.shared.mkdir(parents=True, exist_ok=True)
+    (_clean_registry.shared / ".credentials.json").write_text(
+        '{"claudeAiOauth": {"accessToken": "host-tok"}}', encoding="utf-8",
+    )
+    own = _clean_registry.system_dir / "alice" / "coding-cli" / "claude"
+    own.mkdir(parents=True)
+    (own / ".credentials.json").write_text(
+        '{"claudeAiOauth": {"accessToken": "alice-tok"}}', encoding="utf-8",
+    )
+
+    _no_sdk_stream(monkeypatch)
+    res = asyncio.run(_status_tool(_profile="alice", _variables={}))
+    sc = res.structured_content
+    assert sc["credential_source"] == "profile_claude_login"
+    assert sc["credential_scope"] == "profile"
+    assert sc["cli_home"] == str(own)
 
 
 def test_status_includes_models(monkeypatch):

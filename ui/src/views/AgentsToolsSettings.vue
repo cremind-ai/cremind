@@ -16,8 +16,9 @@ import {
   listToolLeaves, setToolLeaves, getToolVariableOptions,
   streamFeaturesInstall, FeatureNotInstalledError,
   deleteSkill, importSkillArchive, importSkillFromGitHub, importSkillFromHub,
+  fetchCodingAgents, probeCodingAgent, logoutCodingAgent,
   type RemoteAgentInfo, type ToolStatus, type ToolLeaf, type VariableOptionsResult,
-  type FeatureNotInstalledDetail, type FeatureInstallEvent,
+  type FeatureNotInstalledDetail, type FeatureInstallEvent, type CodingAgentStatus,
 } from '../services/configApi';
 import {
   registerSkillLongRunningApp, DuplicateAutostartError,
@@ -26,6 +27,9 @@ import { openSettingsStateStream, type SettingsStateStreamHandle } from '../serv
 
 import type { JsonSchema } from '../services/agentApi';
 import { getAuthUrl, unlinkAgent, reconnectAgent } from '../services/agentApi';
+import CodingAgentStatusStrip from '../components/tools/CodingAgentStatusStrip.vue';
+import CodexDeviceLoginDialog from '../components/tools/CodexDeviceLoginDialog.vue';
+import CodingAgentTerminalLoginDialog from '../components/tools/CodingAgentTerminalLoginDialog.vue';
 import ItemCardHeader from '../components/shared/ItemCardHeader.vue';
 import ToolSkillCard from '../components/shared/ToolSkillCard.vue';
 import ToolVariablesForm from '../components/shared/ToolVariablesForm.vue';
@@ -135,12 +139,35 @@ const importFile = ref<File | null>(null);
 const importing = ref(false);
 const archiveInput = ref<HTMLInputElement | null>(null);
 
+// ── Coding agents (Claude Code / Codex) ──
+// Their own section, above the built-in list: a delegate whose feature was
+// never installed has no /api/tools row at all, so there would be no card down
+// there to find it on. The ids are seeded with the two known delegates so the
+// pair never flashes inside Built-in Tools during the first paint, then
+// refreshed from the listing (which is the authority on what a delegate is).
+const codingAgentIds = ref<string[]>(['claude_code', 'codex']);
+const codingAgents = ref<CodingAgentStatus[]>([]);
+const codingAgentsLoading = ref(false);
+const codingAgentsError = ref<string | null>(null);
+/** Per-tool sign-in check state, so each row reports its own answer. */
+const codingProbing = ref<Record<string, boolean>>({});
+const codingProbeResults = ref<Record<string, Record<string, unknown>>>({});
+const codingSigningOut = ref<Record<string, boolean>>({});
+
+// Sign-in dialogs. Which one opens is the agent's own `sign_in.method`: Codex
+// can run a device-code flow headlessly, Claude's CLI only prompts.
+const signInAgent = ref<CodingAgentStatus | null>(null);
+const codexLoginOpen = ref(false);
+const terminalLoginOpen = ref(false);
+
 // Categorized items -- driven by tool_type, not by agent_type
 // Built-in tools list locked (non-disableable) tools first; the sort is
 // stable so tools keep their original relative order within each group.
+// The coding delegates are built-in tools too, but they get their own section
+// above, so they are subtracted here rather than listed twice.
 const builtinItems = computed(() =>
   items.value
-    .filter(i => i.kind === 'builtin')
+    .filter(i => i.kind === 'builtin' && !codingAgentIds.value.includes(i.toolName ?? i.name))
     .sort((a, b) => Number(b.toggleLocked) - Number(a.toggleLocked)),
 );
 const skillItems = computed(() => items.value.filter(i => i.kind === 'skill'));
@@ -198,6 +225,9 @@ function closeLiveSettingsStream() {
 onMounted(async () => {
   window.addEventListener('message', handleAuthMessage);
   openLiveSettingsStream();
+  // Its own endpoint, its own error surface: a coding-agents failure must not
+  // keep the tool list from rendering, so it is not awaited with the rest.
+  void loadCodingAgents();
   loading.value = true;
   try {
     const [agentRes, toolRes] = await Promise.all([
@@ -592,6 +622,178 @@ async function confirmFeatureInstall() {
   }
 }
 
+// ── Coding agents: loading, pairing with the registry, and sign-in ──
+// The section reads its own endpoint (pip extras plus each runner's credential
+// chain), but not its own actions: install and enable go through the very same
+// dialog and toggle every other built-in tool uses, so there is one install
+// flow on this page, not two.
+
+async function loadCodingAgents() {
+  codingAgentsLoading.value = true;
+  try {
+    const res = await fetchCodingAgents(settingsStore.agentUrl, settingsStore.authToken);
+    codingAgents.value = res.agents ?? [];
+    if (codingAgents.value.length > 0) {
+      codingAgentIds.value = codingAgents.value.map(a => a.tool_id);
+    }
+    codingAgentsError.value = null;
+  } catch (e) {
+    codingAgentsError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    codingAgentsLoading.value = false;
+  }
+}
+
+/** Neither delegate installed: the user may well own a Claude or ChatGPT
+ *  account and have no idea Cremind can use it, so say so once at the top
+ *  rather than twice in the rows. */
+const noCodingAgentInstalled = computed(() =>
+  codingAgents.value.length > 0 && codingAgents.value.every(a => !a.sdk_installed),
+);
+
+/** Each delegate paired with its registry row. `standIn` marks a delegate that
+ *  has no row at all (its feature was never installed): there is nothing to
+ *  expand or configure yet, only an Install button. */
+const codingAgentRows = computed(() =>
+  codingAgents.value.map(agent => {
+    const item = itemForCodingAgent(agent);
+    return { agent, item, standIn: !items.value.includes(item) };
+  }),
+);
+
+/** The section is hidden only when the endpoint answered with nothing at all —
+ *  an old server that does not serve it yet. While the first fetch is in
+ *  flight the heading stays, so the two delegates don't appear to be missing. */
+const showCodingAgents = computed(() =>
+  codingAgentsLoading.value || codingAgentRows.value.length > 0 || !!codingAgentsError.value,
+);
+
+function codingAgentStatusTag(row: { agent: CodingAgentStatus; item: UnifiedItem; standIn: boolean }) {
+  if (row.standIn || !row.agent.sdk_installed) {
+    return { label: 'Not installed', type: 'info' as const };
+  }
+  return getBuiltinStatusTag(row.item);
+}
+
+/** The registry row for a coding delegate, or a stand-in for one.
+ *
+ *  A delegate whose feature was never installed has no `/api/tools` row at all
+ *  (its built-in group never registered), so `items` has nothing to hand the
+ *  install dialog — which is exactly the case where the card offers Install.
+ *  The dialog and its post-install enable retry only read these four fields,
+ *  and the reload that follows a successful install replaces the stand-in with
+ *  the real row. */
+function itemForCodingAgent(agent: CodingAgentStatus): UnifiedItem {
+  const existing = items.value.find(i => (i.toolName ?? i.name) === agent.tool_id);
+  if (existing) return existing;
+  return {
+    name: agent.tool_id,
+    toolName: agent.tool_id,
+    displayName: agent.display_name,
+    enabled: agent.enabled,
+  } as UnifiedItem;
+}
+
+function handleCodingAgentInstall(agent: CodingAgentStatus) {
+  openFeatureInstallDialog(itemForCodingAgent(agent), {
+    tool_id: agent.tool_id,
+    feature_key: agent.feature_key,
+    extras: agent.extras,
+    requires_restart_after_install: agent.requires_restart_after_install,
+    message: agent.message,
+  });
+}
+
+async function handleCodingAgentToggle(agent: CodingAgentStatus, enabled: boolean) {
+  // Switching on something that was never installed is a request to install it,
+  // not an error to report: the toggle would only 409 its way into the same
+  // dialog this opens directly.
+  if (enabled && !agent.sdk_installed) {
+    handleCodingAgentInstall(agent);
+    return;
+  }
+  await toggleItemEnabled(itemForCodingAgent(agent), enabled);
+  // Whatever the toggle ended up doing — succeeded, failed and rolled back, or
+  // opened the install dialog — the row's own state is now a guess.
+  await loadCodingAgents();
+}
+
+/** Open the sign-in the delegate's CLI actually supports. */
+function openSignIn(agent: CodingAgentStatus) {
+  signInAgent.value = agent;
+  if (agent.sign_in.method === 'device_code') {
+    codexLoginOpen.value = true;
+  } else {
+    terminalLoginOpen.value = true;
+  }
+}
+
+/** A login just landed (or just ended): the cached probe answer predates it, so
+ *  re-check with `fresh` and refetch the credential chain. */
+async function afterSignInChange(agent: CodingAgentStatus | null) {
+  if (!agent) return;
+  await checkSignIn(agent, true);
+  await loadCodingAgents();
+}
+
+async function signOut(agent: CodingAgentStatus) {
+  const shared = agent.credential_scope === 'shared';
+  const where = agent.cli_home ? `\n\nLogin home: ${agent.cli_home}` : '';
+  try {
+    await ElMessageBox.confirm(
+      shared
+        ? `Sign ${agent.display_name} out of the shared server login?\n\n`
+          + 'That login is the fallback every profile without one of its own '
+          + `inherits, so all of them lose ${agent.display_name} until someone `
+          + `signs in again.${where}`
+        : `Sign ${agent.display_name} out of this profile's login?${where}`,
+      shared ? 'Sign out the shared server login' : 'Sign out',
+      {
+        confirmButtonText: 'Sign out',
+        cancelButtonText: 'Cancel',
+        type: 'warning',
+      },
+    );
+  } catch {
+    return;  // dismissed
+  }
+
+  codingSigningOut.value = { ...codingSigningOut.value, [agent.tool_id]: true };
+  try {
+    const res = await logoutCodingAgent(
+      settingsStore.agentUrl, settingsStore.authToken, agent.tool_id,
+      { scope: shared ? 'shared' : 'profile' },
+    );
+    ElMessage.success(res.detail || `${agent.display_name} signed out.`);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to sign out');
+  } finally {
+    codingSigningOut.value = { ...codingSigningOut.value, [agent.tool_id]: false };
+  }
+  await afterSignInChange(agent);
+}
+
+async function checkSignIn(agent: CodingAgentStatus, fresh = false) {
+  codingProbing.value = { ...codingProbing.value, [agent.tool_id]: true };
+  try {
+    const res = await probeCodingAgent(
+      settingsStore.agentUrl, settingsStore.authToken, agent.tool_id,
+      fresh ? { fresh: true } : undefined,
+    );
+    codingProbeResults.value = { ...codingProbeResults.value, [agent.tool_id]: res };
+  } catch (e) {
+    // The route answers 200 with an `error` field for a probe that blew up
+    // server-side; reaching here means the request never landed, which is
+    // still an answer the row should show.
+    codingProbeResults.value = {
+      ...codingProbeResults.value,
+      [agent.tool_id]: { error: e instanceof Error ? e.message : String(e) },
+    };
+  } finally {
+    codingProbing.value = { ...codingProbing.value, [agent.tool_id]: false };
+  }
+}
+
 async function handleAuthenticate(item: UnifiedItem) {
   try {
     const url = await getAuthUrl(settingsStore.agentUrl, settingsStore.authToken, item.agentName);
@@ -774,6 +976,10 @@ async function reloadAll() {
     ]);
     buildUnifiedItems(agentRes.agents, toolRes.tools);
   } catch { /* ignore */ }
+  // The coding-agents section reads a different endpoint (pip extras plus each
+  // runner's credential chain), so it has to be refetched alongside the tool
+  // list — every settings-state ping and every mutation passes through here.
+  await loadCodingAgents();
 }
 
 function goBack() { router.push(`/${props.profile}/settings`); }
@@ -833,7 +1039,118 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
       <div v-if="loading" class="loading-state">Loading...</div>
 
       <template v-else>
-        <!-- Section 1: Built-in Tools -->
+        <!-- Section 1: Coding Agents. First, and above the built-in list,
+             because an agent that is not installed has no card down there to
+             be found on. -->
+        <div class="section" v-if="showCodingAgents">
+          <h2 class="section-title">
+            <Icon icon="mdi:robot-outline" class="section-icon" /> Coding Agents
+          </h2>
+
+          <p class="section-hint">
+            These let Cremind delegate coding work. They run on the server and
+            keep their own sign-in — independent of Settings → LLM Providers —
+            so install them and sign in from here; no shell access to the
+            machine Cremind runs on is needed.
+          </p>
+
+          <div v-if="noCodingAgentInstalled" class="coding-agents-banner">
+            <Icon icon="mdi:lightbulb-on-outline" class="coding-agents-banner-icon" />
+            <span>
+              Neither Claude Code nor Codex is installed on this server yet. If
+              you already have a Claude or ChatGPT account, install one below and
+              sign in with it — Cremind can then hand it coding work.
+            </span>
+          </div>
+
+          <div
+            v-if="codingAgentsError && codingAgentRows.length === 0"
+            class="coding-agents-note"
+          >
+            <Icon icon="mdi:alert-circle-outline" />
+            <span>{{ codingAgentsError }}</span>
+            <ElButton size="small" :loading="codingAgentsLoading" @click="loadCodingAgents">
+              Retry
+            </ElButton>
+          </div>
+
+          <div
+            v-else-if="codingAgentsLoading && codingAgentRows.length === 0"
+            class="empty-state"
+          >Loading coding agents…</div>
+
+          <div class="items-list">
+            <ToolSkillCard
+              v-for="row in codingAgentRows"
+              :key="row.agent.tool_id"
+              :name="row.agent.display_name"
+              :status-tag="codingAgentStatusTag(row)"
+              :expanded="!!row.item.expanded"
+              :enabled="row.item.enabled"
+              @toggle-expand="row.standIn || toggleExpand(row.item)"
+              @update:enabled="handleCodingAgentToggle(row.agent, $event)"
+            >
+              <template #banner>
+                <CodingAgentStatusStrip
+                  :agent="row.agent"
+                  :probe="codingProbeResults[row.agent.tool_id] ?? null"
+                  :probing="codingProbing[row.agent.tool_id]"
+                  :signing-out="codingSigningOut[row.agent.tool_id]"
+                  :is-admin="props.profile === 'admin'"
+                  @install="handleCodingAgentInstall"
+                  @sign-in="openSignIn"
+                  @check="checkSignIn($event, true)"
+                  @sign-out="signOut"
+                />
+              </template>
+
+              <!-- Same body as any other built-in tool: the delegate is one,
+                   and its variables (model, permission mode, CLI path) have to
+                   stay editable from its own section. -->
+              <template v-if="!row.standIn">
+                <div v-if="Object.keys(row.item.toolConfigFields).length > 0" class="config-section">
+                  <ToolVariablesForm
+                    :fields="row.item.toolConfigFields"
+                    :values="row.item.toolConfigValues"
+                    :dynamic-options="row.item.dynamicOptions"
+                    :dynamic-loading="row.item.dynamicOptionsLoading"
+                    @update:values="row.item.toolConfigValues = $event"
+                  />
+                </div>
+
+                <div v-if="Object.keys(row.item.toolConfigFields).length > 0"
+                     style="display: flex; align-items: center; gap: 8px;">
+                  <ElButton
+                    type="primary"
+                    size="small"
+                    :loading="row.item.saving"
+                    @click="saveItemConfig(row.item)"
+                  >Save</ElButton>
+                </div>
+
+                <LeafToggleSection
+                  v-if="row.item.supportsLeafToggle || row.item.leavesLoading"
+                  :leaves="row.item.leaves"
+                  :loading="row.item.leavesLoading"
+                  :disconnected="row.item.leavesDisconnected"
+                  :parent-enabled="row.item.enabled"
+                  @toggle="(leaf, val) => toggleLeaf(row.item, leaf, val)"
+                  @set-all="(val) => setAllLeaves(row.item, val)"
+                />
+
+                <div
+                  v-if="Object.keys(row.item.toolConfigFields).length === 0
+                    && !row.item.supportsLeafToggle && !row.item.leavesLoading"
+                  class="empty-args"
+                >No configuration required for this tool.</div>
+              </template>
+            </ToolSkillCard>
+          </div>
+        </div>
+
+        <ElDivider v-if="showCodingAgents" />
+
+        <!-- Section 2: Built-in Tools -->
         <div class="section" v-if="builtinItems.length > 0">
           <h2 class="section-title">
             <Icon icon="mdi:toolbox" class="section-icon" /> Built-in Tools
@@ -890,7 +1207,7 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
 
         <ElDivider />
 
-        <!-- Section 2: Skills -->
+        <!-- Section 3: Skills -->
         <div class="section">
           <h2 class="section-title">
             <Icon icon="mdi:creation" class="section-icon" /> Skills
@@ -986,7 +1303,7 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
 
         <ElDivider />
 
-        <!-- Section 3: MCP Server Remote -->
+        <!-- Section 4: MCP Server Remote -->
         <div class="section">
           <h2 class="section-title">
             <Icon icon="mdi:server-network" class="section-icon" /> MCP Server Remote
@@ -1258,6 +1575,22 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
         </ElButton>
       </template>
     </ElDialog>
+
+    <!-- Sign-in dialogs. Each delegate's CLI owns its own login, so these run
+         that CLI (a device code for Codex, a live terminal for Claude Code)
+         rather than sending the user to LLM Providers. -->
+    <CodexDeviceLoginDialog
+      v-if="signInAgent && signInAgent.sign_in.method === 'device_code'"
+      v-model="codexLoginOpen"
+      :agent="signInAgent"
+      @done="afterSignInChange(signInAgent)"
+    />
+    <CodingAgentTerminalLoginDialog
+      v-if="signInAgent && signInAgent.sign_in.method === 'terminal'"
+      v-model="terminalLoginOpen"
+      :agent="signInAgent"
+      @done="afterSignInChange(signInAgent)"
+    />
   </div>
 </template>
 
@@ -1310,6 +1643,38 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
   margin: 0 0 12px 0; display: flex; align-items: center; gap: 8px;
 }
 .section-icon { font-size: 20px; color: var(--primary-color); }
+.section-hint {
+  margin: -4px 0 12px 0;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+/* The suggestion banner is the whole reason an uninstalled delegate is listed
+   at all, so it gets the accent border rather than blending into the page. */
+.coding-agents-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--text-primary);
+  background: var(--hover-bg);
+  border-left: 3px solid var(--primary-color);
+  border-radius: 0 4px 4px 0;
+}
+.coding-agents-banner-icon { color: var(--primary-color); flex-shrink: 0; margin-top: 2px; }
+
+.coding-agents-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 0.85rem;
+  color: var(--danger-color);
+}
 
 .items-list { display: flex; flex-direction: column; gap: 10px; }
 

@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
+from app.config.coding_cli_homes import profile_claude_config_dir, profile_codex_home
 from app.config.settings import BaseConfig, get_user_working_directory
 from app.utils.logger import logger
 
@@ -107,6 +108,31 @@ def _resolve_agent_name(profile: Optional[str]) -> Optional[str]:
     return read_agent_name(profile)
 
 
+def _resolve_claude_config_dir(profile: Optional[str]) -> Optional[str]:
+    """The profile's own Claude Code CLI home - never the shared one.
+
+    Deliberately the PROFILE directory rather than what
+    ``coding_cli_homes.resolve_claude_config_dir`` would pick: this block goes
+    into every shell Cremind spawns (exec_shell, autostart scripts, the built-in
+    terminal), so a member profile that runs ``claude auth login`` in one of
+    them must land in its own home. Resolving here would hand it the server's
+    shared home whenever the profile has no login yet - and the first sign-in
+    from any profile would overwrite the operator's account for everybody. The
+    fallback still exists where it belongs: the *tool* reads the shared login
+    when the profile has none.
+    """
+    if not profile:
+        return None
+    return str(profile_claude_config_dir(profile))
+
+
+def _resolve_codex_home(profile: Optional[str]) -> Optional[str]:
+    """The profile's own Codex CLI home; see :func:`_resolve_claude_config_dir`."""
+    if not profile:
+        return None
+    return str(profile_codex_home(profile))
+
+
 @dataclass(frozen=True)
 class SystemVarSpec:
     name: str
@@ -166,6 +192,26 @@ SYSTEM_VARS: list[SystemVarSpec] = [
             "backend captures the consent redirect into the oauth_inbox; omitted "
             "for non-loopback APP_URL (Desktop clients only accept loopback) so "
             "the skill uses the manual complete-link paste."
+        ),
+    ),
+    SystemVarSpec(
+        name="CLAUDE_CONFIG_DIR",
+        resolve=_resolve_claude_config_dir,
+        description=(
+            "Per-profile Claude Code CLI home, so `claude` in a Cremind shell "
+            "signs this profile in instead of overwriting the server's shared "
+            "login; the tool still falls back to that shared login when the "
+            "profile has none. Omitted when no profile."
+        ),
+    ),
+    SystemVarSpec(
+        name="CODEX_HOME",
+        resolve=_resolve_codex_home,
+        description=(
+            "Per-profile Codex CLI home, so `codex` in a Cremind shell signs "
+            "this profile in instead of overwriting the server's shared login; "
+            "the tool still falls back to that shared login when the profile "
+            "has none. Omitted when no profile."
         ),
     ),
 ]

@@ -1827,11 +1827,27 @@ def get_config_routes(state: BootedState) -> list[Route]:
         Postgres connection info comes from bootstrap.toml (authoritative)
         with fallback to docker/.env's PG_* (Docker provisioner output).
 
-        Returns ``{deployment: "native", available: false}`` when no docker
+        Returns ``{deployment: "native", available: false}`` when no container
         runtime is detectable AND no bootstrap.toml exists.
+
+        ``deployment`` answers "container or host process", not "which
+        orchestrator": a Kubernetes pod reports ``docker`` here on purpose.
+        The Setup Wizard's ``installMode`` ref and
+        ``ui/src/utils/configExport.ts`` both branch on that value to decide
+        whether the exported config file has a container shape at all, and
+        widening it to a third word would silently drop the container block on
+        every pod. ``install_mode`` beside it still says ``kubernetes``, which
+        is what a caller asking about the orchestrator must read.
+
+        The ``kubernetes`` and ``vnc`` blocks are the same ones
+        ``/api/system/environment`` publishes, repeated here because the Setup
+        Wizard never calls that endpoint - it runs before an admin token
+        exists, reads install-secrets once and writes the whole config file
+        from it. One shape, two doors.
         """
         import os
 
+        from app.config import runtime_env
         from app.config.bootstrap import read_bootstrap
         from app.config.credentials_file import parse_docker_env
 
@@ -1879,11 +1895,21 @@ def get_config_routes(state: BootedState) -> list[Route]:
 
         install_mode = (_runtime("INSTALL_MODE") or "").lower()
         vnc_password = _runtime("VNC_PASSWORD")
-        is_docker = (
-            install_mode == "docker" or compose_env_path is not None or docker_env_host.exists() or bool(vnc_password)
+        # ``kubernetes`` belongs in here beside ``docker``. It used to be
+        # missing, and the only Kubernetes signal left was VNC_PASSWORD - which
+        # the chart writes only when ``desktop.enabled`` is true. So a pod
+        # running the basic image reported ``deployment: native`` with
+        # app_url, install_mode, the ports and every other container field
+        # ``None``, while INSTALL_MODE=kubernetes sat right there in its own
+        # environment and the wizard's config export came out empty.
+        is_container = (
+            install_mode in ("docker", "kubernetes")
+            or compose_env_path is not None
+            or docker_env_host.exists()
+            or bool(vnc_password)
         )
 
-        if not is_docker and not bootstrap_path.exists():
+        if not is_container and not bootstrap_path.exists():
             return JSONResponse({"deployment": "native", "available": False})
 
         bootstrap = read_bootstrap()
@@ -1898,24 +1924,26 @@ def get_config_routes(state: BootedState) -> list[Route]:
                     return val
             return file_parsed.get(env_key) or None
 
-        deployment = "docker" if is_docker else "native"
+        deployment = "docker" if is_container else "native"
 
         return JSONResponse(
             {
+                # "container" or "host process" - a Kubernetes pod says
+                # ``docker`` here; see the docstring.
                 "deployment": deployment,
                 "available": True,
-                # Docker runtime block — populated only when we detect a docker
-                # runtime. Values are None on native installs.
+                # Container runtime block: populated only when we detect a
+                # container runtime. Values are None on native installs.
                 "vnc_password": vnc_password,
-                "app_url": _runtime("APP_URL") if is_docker else None,
-                "resolution": _runtime("RESOLUTION") if is_docker else None,
+                "app_url": _runtime("APP_URL") if is_container else None,
+                "resolution": _runtime("RESOLUTION") if is_container else None,
                 "install_mode": install_mode or None,
-                "cors_allowed_origins": _runtime("CORS_ALLOWED_ORIGINS") if is_docker else None,
-                "setup_wizard_env": _runtime("SETUP_WIZARD_ENV") if is_docker else None,
-                "api_port": _runtime_int("API_PORT", 1112) if is_docker else None,
-                "spa_port": _runtime_int("SPA_PORT", 1515) if is_docker else None,
-                "novnc_port": _runtime_int("NOVNC_PORT", 6080) if is_docker else None,
-                "vnc_port": _runtime_int("VNC_PORT", 5900) if is_docker else None,
+                "cors_allowed_origins": _runtime("CORS_ALLOWED_ORIGINS") if is_container else None,
+                "setup_wizard_env": _runtime("SETUP_WIZARD_ENV") if is_container else None,
+                "api_port": _runtime_int("API_PORT", 1112) if is_container else None,
+                "spa_port": _runtime_int("SPA_PORT", 1515) if is_container else None,
+                "novnc_port": _runtime_int("NOVNC_PORT", 6080) if is_container else None,
+                "vnc_port": _runtime_int("VNC_PORT", 5900) if is_container else None,
                 # Where noVNC actually answers, when the deployment knows and
                 # the client cannot work it out. On Kubernetes that depends on
                 # whether the nginx sidecar is fronting it (/vnc/ on the app
@@ -1923,8 +1951,27 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 # (its own Service port) — a distinction invisible from the
                 # browser, so the chart states it.
                 "novnc_url": _runtime("CREMIND_NOVNC_URL"),
+                # Which namespace, Helm release and Deployment/Service this pod
+                # is, so the exported config file can carry the ``kubectl
+                # port-forward`` line that reconnects to it. ``None`` off
+                # Kubernetes - and asked for with an explicit mode rather than
+                # letting the function re-detect, because ``install_mode`` here
+                # is the one this handler resolved from its own three sources.
+                "kubernetes": (
+                    runtime_env.kubernetes_identity("kubernetes")
+                    if install_mode == "kubernetes"
+                    else None
+                ),
+                # How the VNC desktop is reached (and what it takes to get
+                # there). The full descriptor, not the public subset the
+                # unauthenticated tray endpoint gets: this response is
+                # admin-only and already carries the VNC password.
+                "vnc": runtime_env.describe_runtime_environment()["vnc"],
                 # Postgres block — populated from bootstrap.toml when the user
-                # picked Postgres in the wizard.
+                # picked Postgres in the wizard. ``db_provider`` states which
+                # backend was chosen even when it is SQLite, because the
+                # post-setup config re-download has no other way to name it.
+                "db_provider": bootstrap.get("db_provider"),
                 "pg_host": _pg("host", "") if has_postgres else None,
                 "pg_port": int(pg_bootstrap["port"]) if has_postgres and pg_bootstrap.get("port") else None,
                 "pg_user": _pg("user", "PG_USER"),

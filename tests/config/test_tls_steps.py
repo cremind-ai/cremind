@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import pytest
 
+from app.config import runtime_env
 from app.config.tls_steps import (
     CHART_REFERENCE,
     DOCKER_RECREATE_COMMAND,
+    NAMESPACE_PLACEHOLDER,
+    RELEASE_PLACEHOLDER,
     RESTART_COMMAND,
     SERVE_COMMAND,
     atlassian_callback_step,
@@ -29,6 +32,30 @@ from app.config.tls_steps import (
 HTTPS_URL = "https://cremind.lan:1515"
 ATLASSIAN = "Atlassian developer console"
 CHART_VERSION = "0.0.17-rc.9.dev.4"
+
+# What ``runtime_env.kubernetes_identity()`` returns for a pod whose chart
+# states all four names: the shape, key for key, that reaches these builders.
+IDENTITY = {
+    "namespace": "lee-cremind", "release": "cremind", "workload": "cremind",
+    "service": "cremind", "service_port": 80, "source": "chart",
+    "port_forward": "kubectl --namespace lee-cremind port-forward svc/cremind 1515:80",
+}
+# An older chart states nothing, so the pod guesses its namespace from the
+# mounted service-account file and its Deployment from its own hostname. Helm's
+# release name leaves no trace in a pod, so it stays unknown.
+INFERRED = {
+    "namespace": "lee-cremind", "release": None, "workload": "lee-cremind",
+    "service": "lee-cremind", "service_port": 80, "source": "inferred",
+    "port_forward":
+        "kubectl --namespace lee-cremind port-forward svc/lee-cremind 1515:80",
+}
+# A StatefulSet or bare pod: the hostname does not parse, so only the namespace
+# is known and the Deployment name is still the operator's to supply.
+NAMESPACE_ONLY = {
+    "namespace": "lee-cremind", "release": None, "workload": None,
+    "service": None, "service_port": 80, "source": "inferred",
+    "port_forward": None,
+}
 
 
 def _steps(**overrides) -> list[dict]:
@@ -278,6 +305,126 @@ def test_docker_names_the_installers_own_compose_folder():
     assert "~/.cremind/docker" not in first
 
 
+# --- the pod that can name itself -------------------------------------
+#
+# A placeholder is work the operator has to do by hand, and getting it wrong
+# ("services 'cremind' not found") looks like a broken cluster rather than a
+# runbook that guessed. Where the chart states the names, every command must
+# be paste-and-run.
+
+
+def test_a_pod_that_knows_itself_prints_commands_with_nothing_left_to_fill_in():
+    steps = _steps(kubernetes=IDENTITY)
+    assert _commands(steps) == [
+        f"helm upgrade cremind {CHART_REFERENCE} --version {CHART_VERSION} "
+        "--namespace lee-cremind --reuse-values --set cremind.ssl=auto",
+        "kubectl --namespace lee-cremind rollout status "
+        "deployment/cremind --timeout=5m",
+        "kubectl --namespace lee-cremind port-forward svc/cremind 1515:80",
+    ]
+    joined = " ".join(flatten(steps))
+    # No blanks anywhere, so no "replace these with what helm list prints".
+    assert "<" not in joined
+    assert "helm list" not in " ".join(_commands(steps))
+    assert "lee-cremind" in [s["text"] for s in steps if s["kind"] == "note"][2]
+
+
+def test_an_ingress_runbook_names_the_real_ingress_not_the_release():
+    """The Ingress carries the fullname; only the release goes to helm."""
+    steps = _steps(edge=True, kubernetes=IDENTITY)
+    assert _commands(steps) == [
+        "kubectl --namespace lee-cremind create secret tls cremind-tls "
+        "--cert=<path-to-fullchain.pem> --key=<path-to-privkey.pem>",
+        f"helm upgrade cremind {CHART_REFERENCE} --version {CHART_VERSION} "
+        "--namespace lee-cremind --reuse-values -f <your-values.yaml>",
+        "kubectl --namespace lee-cremind rollout status "
+        "deployment/cremind --timeout=5m",
+        "kubectl --namespace lee-cremind get ingress cremind",
+        f"curl --fail {HTTPS_URL}/api/tls/status",
+    ]
+    # The certificate paths and the values file are genuinely the operator's;
+    # the cluster's own names are not.
+    assert NAMESPACE_PLACEHOLDER not in " ".join(flatten(steps))
+    assert RELEASE_PLACEHOLDER not in " ".join(flatten(steps))
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"edge": True}])
+def test_an_inferred_identity_keeps_helm_list_and_says_where_the_name_came_from(kwargs):
+    """The pod guessed its Deployment from its hostname and cannot know the
+    release, so the one command that maps the two must stay."""
+    steps = _steps(kubernetes=INFERRED, **kwargs)
+    commands = _commands(steps)
+    assert commands[0] == "helm list --all-namespaces"
+    upgrade = next(c for c in commands if c.startswith("helm upgrade"))
+    assert upgrade.startswith(f"helm upgrade {RELEASE_PLACEHOLDER} ")
+    assert "--namespace lee-cremind" in upgrade
+    assert any("deployment/lee-cremind" in c for c in commands)
+    joined = " ".join(_notes(steps))
+    assert "inferred from this pod's own name" in joined
+    assert "(lee-cremind)" in joined
+    # That caveat is about a name we printed, not about deriving one.
+    assert "-cremind when the release name does not contain cremind" not in joined
+
+
+def test_a_pod_that_knows_only_its_namespace_still_derives_the_deployment():
+    """Workload falls back to the release, which is the rule the prose states."""
+    steps = _steps(kubernetes=NAMESPACE_ONLY)
+    commands = _commands(steps)
+    assert commands[0] == "helm list --all-namespaces"
+    assert (
+        f"kubectl --namespace lee-cremind rollout status "
+        f"deployment/{RELEASE_PLACEHOLDER} --timeout=5m" in commands
+    )
+    assert (
+        "The Deployment and Service carry the release name"
+        in " ".join(_notes(steps))
+    )
+
+
+def test_a_custom_service_port_reaches_the_tunnel():
+    identity = {**IDENTITY, "service_port": 8080, "port_forward": None}
+    tunnel = next(c for c in _commands(_steps(kubernetes=identity))
+                  if "port-forward" in c)
+    assert tunnel == "kubectl --namespace lee-cremind port-forward svc/cremind 1515:8080"
+
+
+@pytest.mark.parametrize(
+    "kubernetes", [None, IDENTITY, INFERRED, NAMESPACE_ONLY],
+    ids=["unknown", "chart", "inferred", "namespace-only"],
+)
+@pytest.mark.parametrize("kwargs", [{}, {"edge": True}])
+def test_a_named_runbook_is_still_a_well_formed_runbook(kubernetes, kwargs):
+    """Every name is interpolated into a copy button's payload, so the step
+    contract has to hold for the real names exactly as it does for blanks."""
+    steps = _steps(kubernetes=kubernetes, **kwargs)
+    for step in steps:
+        assert step["text"].strip() == step["text"] and "`" not in step["text"]
+        if step["kind"] == "command":
+            assert "\n" not in step["text"] and not step["text"].endswith(".")
+            assert not step["text"].startswith("Run ")
+    assert steps[0]["kind"] == "note" and steps[-1]["kind"] == "note"
+
+
+def test_the_tunnel_is_spelled_by_runtime_env_so_the_two_cannot_drift():
+    """The chart's NOTES, the VNC card and this runbook print one command."""
+    tunnel = next(c for c in _commands(_steps(kubernetes=IDENTITY))
+                  if "port-forward" in c)
+    assert tunnel == runtime_env.kubernetes_port_forward(
+        "lee-cremind", "cremind", runtime_env.PORT_FORWARD_LOCAL_PORT, 80,
+    )
+    assert tunnel == IDENTITY["port_forward"]
+
+
+def test_the_placeholders_are_the_ones_runtime_env_prints():
+    """Two vocabularies for one unknown would read as two different unknowns.
+
+    ``runtime_env`` spells the workload blank ``<release>`` too, because that
+    is what the operator types into ``helm upgrade``.
+    """
+    assert NAMESPACE_PLACEHOLDER == runtime_env._NAMESPACE_PLACEHOLDER
+    assert RELEASE_PLACEHOLDER == runtime_env._WORKLOAD_PLACEHOLDER
+
+
 # ── repairing a certificate on a server already serving HTTPS ────────────
 
 
@@ -306,6 +453,18 @@ def test_certificate_repair_offers_only_the_reload(kwargs, expected_commands):
     # Repair is not re-enabling: none of the enable-time configuration edits.
     joined = " ".join(flatten(steps))
     assert "CREMIND_SSL=auto" not in joined and "cremind.ssl=auto" not in joined
+
+
+def test_certificate_repair_restarts_the_deployment_by_its_real_name():
+    steps = certificate_repair_steps(
+        manager="external", install_mode="kubernetes",
+        restart_supported=True, kubernetes=IDENTITY,
+    )
+    assert _commands(steps) == [
+        "kubectl --namespace lee-cremind rollout restart deployment/cremind",
+        "kubectl --namespace lee-cremind rollout status "
+        "deployment/cremind --timeout=5m",
+    ]
 
 
 def test_a_container_repair_never_mentions_the_native_restart():

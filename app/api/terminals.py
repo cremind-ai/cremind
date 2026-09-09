@@ -11,6 +11,12 @@ them, and they never appear in ``GET /api/processes``.
 The WebSocket protocol is intentionally frame-compatible with the Process
 Manager one (see ``app/api/processes.py``) so the frontend ``TerminalSession``
 component reuses the same message handling.
+
+``create_terminal`` is the one way into this registry. Besides the "New
+terminal" button it also serves the Coding Agents sign-in flow, which runs a
+login binary (``claude auth login``, ``codex login --device-auth``) under the
+same PTY with a forced credential home, because a browser terminal is how a
+user without shell access to the server completes an interactive CLI login.
 """
 
 from __future__ import annotations
@@ -40,7 +46,11 @@ from app.api.processes import (
 )
 from app.config.settings import get_user_working_directory
 from app.config.system_vars import build_system_env
-from app.tools.builtin.exec_shell_pty import PtyProcess, spawn_interactive_shell_pty
+from app.tools.builtin.exec_shell_pty import (
+    PtyProcess,
+    spawn_argv_pty,
+    spawn_interactive_shell_pty,
+)
 from app.utils.logger import logger
 
 # Late-joiner scrollback replayed on (re)connect. Chars, not bytes — a decoded
@@ -82,6 +92,16 @@ _terminal_registry: Dict[str, TerminalInfo] = {}
 # Per-profile monotonic counter for "Terminal N" titles (server-side so the
 # numbering survives frontend reloads and never duplicates).
 _title_counters: Dict[str, int] = {}
+
+
+class TerminalLimitReached(RuntimeError):
+    """The profile already holds ``_MAX_TERMINALS_PER_PROFILE`` live terminals.
+
+    Raised by :func:`create_terminal` instead of returning an error shape, so
+    every caller (the ``POST /api/terminals`` route and the Coding Agents
+    sign-in route) reports the same cap the same way. ``str(exc)`` is the
+    message the UI shows verbatim.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +254,81 @@ async def close_all_terminals() -> None:
                 pass
 
 
+async def create_terminal(
+    profile: str,
+    *,
+    cwd: str,
+    cols: int,
+    rows: int,
+    extra_env: Dict[str, str],
+    argv: Optional[List[str]] = None,
+    title: Optional[str] = None,
+) -> TerminalInfo:
+    """Spawn a PTY session, register it, and start pumping its output.
+
+    Module-level rather than nested in ``handle_create`` because the Coding
+    Agents sign-in route (``POST /api/coding-agents/{id}/login-terminal``)
+    needs a *second* way in: it runs a login binary under the same PTY plumbing
+    (``argv``) with a forced ``CLAUDE_CONFIG_DIR`` / ``CODEX_HOME`` in
+    ``extra_env``, and its terminal must live in the same registry so the same
+    WebSocket, close route, per-profile cap and reap sweep cover it. A parallel
+    spawn path would give sign-in terminals no cap and leave them behind on
+    shutdown.
+
+    ``argv`` empty/None keeps the original behaviour: a bare interactive
+    shell, titled "Terminal N" from the per-profile counter. With an explicit
+    ``title`` the counter is left alone: a sign-in terminal is named after what
+    it runs, and burning a number on it would make the user's next shell jump
+    from "Terminal 1" to "Terminal 3".
+
+    Raises :class:`TerminalLimitReached` when the profile is at the cap; a
+    spawn failure propagates (already logged) for the caller to render.
+    """
+    if argv is not None and not argv:
+        # An empty argv means the caller could not resolve a binary. Silently
+        # falling back to a shell would hand the user a bare prompt in a tab
+        # labelled "Sign in to Claude Code" and a credential home pointed at
+        # nothing that will write to it.
+        raise ValueError("create_terminal: argv must be non-empty when given")
+
+    _reap_stale()
+
+    live = [i for i in _terminal_registry.values() if i.profile == profile]
+    if len(live) >= _MAX_TERMINALS_PER_PROFILE:
+        raise TerminalLimitReached(
+            f"Too many open terminals (max {_MAX_TERMINALS_PER_PROFILE})."
+        )
+
+    try:
+        if argv:
+            proc = await spawn_argv_pty(
+                list(argv), cwd, cols=cols, rows=rows, extra_env=extra_env,
+            )
+            shell = os.path.basename(argv[0])
+        else:
+            proc, shell = await spawn_interactive_shell_pty(
+                cwd, cols=cols, rows=rows, extra_env=extra_env,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"terminal spawn failed (profile={profile!r}): {exc!r}")
+        raise
+
+    if title is None:
+        _title_counters[profile] = _title_counters.get(profile, 0) + 1
+        title = f"Terminal {_title_counters[profile]}"
+    # ``term-`` prefix guarantees the id can never collide with an
+    # exec_shell 8-hex pid in the UI's shared tab keying.
+    tid = "term-" + uuid4().hex[:12]
+    info = TerminalInfo(
+        terminal_id=tid, process=proc, profile=profile, shell=shell,
+        title=title, working_dir=cwd, created_at=time.time(),
+        detached_since=time.monotonic(),  # no subscribers until the WS opens
+    )
+    _terminal_registry[tid] = info
+    info.pump_task = asyncio.create_task(_pump_output(info))
+    return info
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -246,14 +341,6 @@ def get_terminal_routes() -> list:
         if unauth is not None:
             return unauth
         profile = _profile_from_request(request)
-        _reap_stale()
-
-        live = [i for i in _terminal_registry.values() if i.profile == profile]
-        if len(live) >= _MAX_TERMINALS_PER_PROFILE:
-            return JSONResponse(
-                {"error": f"Too many open terminals (max {_MAX_TERMINALS_PER_PROFILE})."},
-                status_code=409,
-            )
 
         try:
             body = await request.json()
@@ -270,32 +357,21 @@ def get_terminal_routes() -> list:
 
         extra_env = build_system_env(profile)
         try:
-            proc, shell = await spawn_interactive_shell_pty(
-                cwd, cols=cols, rows=rows, extra_env=extra_env,
+            info = await create_terminal(
+                profile, cwd=cwd, cols=cols, rows=rows, extra_env=extra_env,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"terminal spawn failed (profile={profile!r}): {exc!r}")
+        except TerminalLimitReached as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        except Exception as exc:  # noqa: BLE001 (already logged by create_terminal)
             return JSONResponse(
                 {"error": f"Failed to spawn terminal: {exc}"}, status_code=500,
             )
 
-        _title_counters[profile] = _title_counters.get(profile, 0) + 1
-        title = f"Terminal {_title_counters[profile]}"
-        # ``term-`` prefix guarantees the id can never collide with an
-        # exec_shell 8-hex pid in the UI's shared tab keying.
-        tid = "term-" + uuid4().hex[:12]
-        info = TerminalInfo(
-            terminal_id=tid, process=proc, profile=profile, shell=shell,
-            title=title, working_dir=cwd, created_at=time.time(),
-            detached_since=time.monotonic(),  # no subscribers until the WS opens
-        )
-        _terminal_registry[tid] = info
-        info.pump_task = asyncio.create_task(_pump_output(info))
         return JSONResponse({
-            "terminal_id": tid,
-            "title": title,
-            "shell": shell,
-            "working_dir": cwd,
+            "terminal_id": info.terminal_id,
+            "title": info.title,
+            "shell": info.shell,
+            "working_dir": info.working_dir,
             "created_at": info.created_at,
         }, status_code=201)
 

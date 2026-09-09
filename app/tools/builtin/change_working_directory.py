@@ -322,8 +322,16 @@ def create_prepare_tools() -> Callable:
                 base_targets = [t for t in _TARGETS if t != "skills"]
                 target_prop["enum"] = base_targets + list(loaded)
                 base_desc = target_prop.get("description") or ""
+                # The tool-level description still advertises 'skills', so say
+                # here that it is gone on purpose and how to reach that folder
+                # anyway — otherwise the omission reads as an oversight and the
+                # model retries a value the enum no longer accepts.
                 target_prop["description"] = (
-                    f"{base_desc}\n\nLoaded skills (skill name: skill id):\n"
+                    f"{base_desc}\n\n'skills' is not offered while skills are "
+                    "loaded — pick the specific skill below instead. To reach "
+                    "the skills root itself, use target='custom' with the "
+                    "PARENT of any loaded skill's directory."
+                    "\n\nLoaded skills (skill name: skill id):\n"
                     + "\n".join(name_lines)
                 ).strip()
             break

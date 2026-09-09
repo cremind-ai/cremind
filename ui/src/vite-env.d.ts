@@ -172,6 +172,11 @@ type CremindBridge = {
   ) => Promise<CremindBridge['config']>
   // Open a URL in the OS default handler (browser / mail client / dialer).
   openExternal: (url: string) => Promise<void>
+  // Open the noVNC desktop in Electron's dedicated VNC window. Optional: the
+  // same SPA is served to plain browsers and to older Electron shells that
+  // have no such bridge, so callers must feature-detect and fall back to
+  // ``window.open``.
+  openVncDesktop?: (url: string) => Promise<{ ok: boolean; error?: string }>
   installer: CremindInstallerBridge
   server: CremindServerBridge
   updater: CremindUpdaterBridge

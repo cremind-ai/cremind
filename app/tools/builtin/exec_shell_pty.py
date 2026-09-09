@@ -495,6 +495,41 @@ async def spawn_interactive_shell_pty(
     return proc, os.path.basename(argv[0])
 
 
+async def spawn_argv_pty(
+    argv: list[str], working_dir: str, cols: int = 80, rows: int = 24,
+    system: Optional[str] = None,
+    extra_env: Optional[dict[str, str]] = None,
+) -> PtyProcess:
+    """Spawn an explicit argv under a PTY, with no shell in between.
+
+    The Coding Agents sign-in flow runs a login binary (``claude auth login``,
+    ``codex login --device-auth``) in a browser terminal so a user with no shell
+    access to the server can complete an interactive CLI login. Going through a
+    shell would be worse than pointless here: the caller has to force
+    ``CLAUDE_CONFIG_DIR`` / ``CODEX_HOME`` in ``extra_env`` so the login lands in
+    the right home, and a user's shell profile (``.bashrc``, a PowerShell
+    profile) is free to export those same variables and silently redirect the
+    credentials somewhere else. Exec'ing the binary directly also means no
+    quoting of the path, and closing the terminal kills the login rather than a
+    shell that outlives it.
+
+    No RTK rewrite and no classifier, so like the bare-shell spawner the caller
+    streams I/O straight to the UI. Returns the process only; the caller knows
+    what it launched (``os.path.basename(argv[0])`` is the display name).
+    """
+    if not argv:
+        raise ValueError("spawn_argv_pty requires a non-empty argv")
+    system = system or _SYSTEM
+    spawn_argv = list(argv)
+    if system == "Windows":
+        return await _spawn_windows_pty(
+            "", working_dir, cols, rows, system, extra_env=extra_env, argv=spawn_argv,
+        )
+    return await _spawn_unix_pty(
+        "", working_dir, cols, rows, system, extra_env=extra_env, argv=spawn_argv,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Runtime detection: did a non-PTY execution fail because a TTY was required?
 #

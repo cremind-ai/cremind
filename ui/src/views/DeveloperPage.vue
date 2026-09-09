@@ -10,6 +10,10 @@ import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
 import { openServerLogsStream, type LogEntry, type ServerLogsStreamHandle } from '../services/serverLogsStream';
 import { useServerRestart } from '../composables/useServerRestart';
+import { downloadTextFile } from '../utils/configExport';
+import EnvironmentCard from '../components/developer/EnvironmentCard.vue';
+import DesktopCard from '../components/developer/DesktopCard.vue';
+import ConfigExportCard from '../components/developer/ConfigExportCard.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -285,16 +289,7 @@ function handleSaveLog() {
   const stamp =
     `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
     `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  const filename = `cremind-logs-${stamp}.log`;
-  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  downloadTextFile(`cremind-logs-${stamp}.log`, content, 'text/plain');
 }
 
 async function handleCopyLog() {
@@ -387,6 +382,14 @@ watch(autoScroll, (on) => {
       <h1>Developer</h1>
       <p>Debugging and development tools.</p>
     </div>
+
+    <EnvironmentCard />
+
+    <!-- Renders nothing unless this install has a desktop, so it costs the
+         other deployments a single environment read. -->
+    <DesktopCard />
+
+    <ConfigExportCard />
 
     <ElCard class="restart-card" shadow="never">
       <template #header>

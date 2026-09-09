@@ -56,6 +56,7 @@ from app.agent.agent import CremindAgent
 from app.agent.executor import CremindAgentExecutor
 from app.api import get_api_routes
 from app.api.backup import get_backup_routes
+from app.api.coding_agents import get_coding_agents_routes
 from app.api.config import get_config_routes
 from app.api.features import get_features_routes
 from app.api.oauth_callback import get_oauth_callback_routes
@@ -433,6 +434,18 @@ async def _do_shutdown() -> None:
         await close_all_terminals()
     except Exception:  # noqa: BLE001
         logger.exception("Error closing user terminals during shutdown")
+    try:
+        from app.tools.builtin import codex_login
+
+        # A Codex device-code sign-in waits up to 15 minutes on the user's
+        # browser, and the wait is held open by a ``codex app-server`` child
+        # process. Left alone it survives this process, so a restart would leak
+        # one child per pending sign-in. Debug, not exception: the module is
+        # only importable when the Codex SDK is installed, and "no Codex here"
+        # is not a shutdown problem worth a traceback in every log.
+        await codex_login.close_all()
+    except Exception:  # noqa: BLE001
+        logger.debug("Error closing Codex sign-in sessions during shutdown", exc_info=True)
 
 
 async def _on_shutdown() -> None:
@@ -538,6 +551,14 @@ def request_graceful_shutdown(delay_s: float = 0.0) -> bool:
     return True
 
 
+# Last-resort "are we in a container?" signal, consulted only when
+# INSTALL_MODE is absent. A copy of app.config.runtime_env._CONTAINER_MARKER,
+# module-level for the same reason: tests point it somewhere that doesn't exist
+# rather than patching Path.exists globally, because CI itself may run inside a
+# container.
+_CONTAINER_MARKER = Path("/.dockerenv")
+
+
 def _supervised_env() -> bool:
     """Is something out there that will restart us if we exit?
 
@@ -555,11 +576,37 @@ def _supervised_env() -> bool:
     ``cremind serve`` in a terminal is NOT supervised — it keeps clean-shutdown
     semantics so Ctrl-C doesn't truncate work, and the wizard asks the operator
     to restart by hand instead.
+
+    A deliberate duplicate of ``app.config.runtime_env.supervised``, which
+    answers the same question for the Developer page and the agent's prompt
+    line: this one runs while we are booting or dying and must not import that
+    module (or anything else optional) to do it. The two must still agree, so
+    the container fallback below is copied from ``detect_install_mode``: an
+    install whose ``.env`` predates ``INSTALL_MODE`` — a legacy compose file, or
+    ``docker run`` on the desktop image — is still the Docker install whose
+    restart policy brings it back, and reading only the variable left this the
+    one place that took the clean-shutdown branch while the prompt line said
+    "restarts supervised". Change either copy and change the other.
     """
-    return (
-        os.environ.get("INSTALL_MODE") in ("docker", "kubernetes")
+    install_mode = (os.environ.get("INSTALL_MODE") or "").strip()
+    # ``get_active_install_mode`` — which the other copy resolves through —
+    # matches the variable against install_catalog.toml EXACTLY and returns None
+    # for anything the catalog does not define, so an unknown or mis-cased value
+    # (``INSTALL_MODE=Docker``, the shape a hand-edited ``.env`` is most likely
+    # to carry) is ABSENT there and falls through to the container fallback.
+    # Deliberately not lower-cased for the same reason: normalising here would
+    # accept a value the catalog rejects and re-open the divergence from the
+    # other direction. Keep this tuple in step with the catalog's mode keys.
+    if install_mode not in ("docker", "kubernetes", "native", "custom"):
+        install_mode = ""
+    if (
+        install_mode in ("docker", "kubernetes")
         or os.environ.get("CREMIND_ELECTRON_PARENT") is not None
         or env_supervised()
+    ):
+        return True
+    return not install_mode and bool(
+        os.environ.get("VNC_PASSWORD") or _CONTAINER_MARKER.exists()
     )
 
 
@@ -970,6 +1017,28 @@ async def main(
     except OSError as e:
         logger.debug(f"[boot] shutdown-marker clear best-effort failed: {e}")
 
+    # 0a'''. Collect the orphaned ChatGPT-bridge homes. Until this release the
+    #        Codex tool could borrow a profile's OpenAI "Sign in with ChatGPT"
+    #        login and materialise it as a managed CODEX_HOME under
+    #        <SYSDIR>/codex-home/chatgpt/<fingerprint-of-profile>/... . The
+    #        bridge is gone (the tool now authenticates only from its own CLI
+    #        home), and with it every piece of code that could locate that tree
+    #        - its path is a fingerprint of the profile name, so no upgrade path
+    #        could ever enumerate it back later. What it holds is a long-lived
+    #        OAuth refresh token in plaintext that nothing revokes upstream, so
+    #        leaving it would strand a live credential under the System
+    #        Directory forever and carry it into every backup. One-time by
+    #        nature: after the first boot the directory does not come back.
+    try:
+        import shutil as _shutil
+
+        _shutil.rmtree(
+            Path(BaseConfig.CREMIND_SYSTEM_DIR) / "codex-home" / "chatgpt",
+            ignore_errors=True,
+        )
+    except Exception as e:  # noqa: BLE001 - housekeeping must never block boot
+        logger.debug(f"[boot] orphaned Codex ChatGPT home purge skipped: {e}")
+
     # 0b. Warm channel sidecars' node_modules. Deliberately off the critical
     #     path: a cold `npm ci` is ~66MB and would delay the bind past the
     #     window the installers wait for /health. Adapters call
@@ -1081,6 +1150,7 @@ async def main(
     routes.extend(get_config_routes(state))
     routes.extend(get_llm_routes(state))
     routes.extend(get_tool_routes(state))
+    routes.extend(get_coding_agents_routes(state))
     routes.extend(get_skill_routes(state))
     routes.extend(get_setup_stream_routes())
     # OAuth callback routes (Google/Atlassian skills + A2A tool auth). Registered
