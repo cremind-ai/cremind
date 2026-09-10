@@ -50,6 +50,53 @@ _CONTAINER_MARKER = Path("/.dockerenv")
 # namespace and every "nothing known" row would fail there and nowhere else.
 _SA_NAMESPACE_FILE = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
 
+# The only portable statement of what this CPU can do, and Linux-only: there is
+# no ``platform`` call that reports instruction-set extensions. Module-level for
+# the third time and the same reason as the two paths above - a test pointing it
+# at a file it wrote is the only way to assert anything about a CPU other than
+# the one running the suite, and every developer's and CI runner's CPU is
+# different.
+_CPUINFO_PATH = Path("/proc/cpuinfo")
+
+#: The four x86-64-v2 flags a virtual CPU can actually be missing.
+#:
+#: This is the set that matters because the Claude Code CLI ships as a Bun
+#: single-file executable built at the x86-64-v2 level, and on a ``qemu64``
+#: virtual CPU - which advertises none of these - every subcommand but
+#: ``--version`` spins forever at 100% CPU instead of failing: the instructions
+#: execute under KVM, but Bun's CPUID-based dispatch sees them absent and takes
+#: a fallback path that never terminates. v2 nominally also requires cx16,
+#: lahf_lm, pni and sse2, and those are on every KVM CPU model including
+#: qemu64, so listing them would only ever produce noise in ``present``.
+X86_64_V2_FLAGS: tuple[str, ...] = ("ssse3", "sse4_1", "sse4_2", "popcnt")
+
+#: x86-64-v3, reported but not required.
+#:
+#: Nothing we run needs these today, so they ride along as diagnosis: a host
+#: that has all of v2 and none of v3 is a modest but working CPU, and saying so
+#: keeps an operator from reading a "missing" list as a verdict. If a future SDK
+#: ever ships a non-baseline build, promoting this set to "required" is a
+#: one-constant change - the level and the missing list already account for it.
+#:
+#: ``abm`` is not a typo for something: it is how Linux spells LZCNT in
+#: /proc/cpuinfo (Advanced Bit Manipulation, the AMD name for the same
+#: instruction), so a probe looking for ``lzcnt`` finds nothing on any host.
+X86_64_V3_FLAGS: tuple[str, ...] = (
+    "avx", "avx2", "bmi1", "bmi2", "fma", "f16c", "movbe", "abm",
+)
+
+# Everything ``present``/``missing`` may mention, in the order they are
+# reported: v2 first, because that is the half a caller acts on.
+_CPU_CANDIDATE_FLAGS: tuple[str, ...] = X86_64_V2_FLAGS + X86_64_V3_FLAGS
+
+# ``flags`` is the x86 spelling and x86 only. aarch64 writes ``Features``, and
+# accepting that line would hand an ARM host an empty ``present`` list and a
+# full ``missing`` one - i.e. would report a perfectly good machine as unable to
+# run anything. The anchored ``^flags`` is what keeps this Linux/x86-only in
+# practice as well as by the platform gate.
+_CPU_FLAGS_RE = re.compile(r"^flags\s*:(?P<flags>.*)$", re.MULTILINE)
+_CPU_MODEL_RE = re.compile(r"^model name\s*:(?P<model>.*)$", re.MULTILINE)
+
 # ``<workload>-<replicaset hash>-<pod suffix>`` - the name a Deployment gives
 # its pods, and the only way a pod started by an older chart can guess its own
 # Deployment name. A StatefulSet pod (``<name>-0``) or a bare pod does not
@@ -713,6 +760,116 @@ def public_vnc_descriptor(vnc: dict) -> dict:
     }
 
 
+# --- the CPU underneath: which instructions a bundled binary may assume ---
+
+
+def _host_platform() -> tuple[str, str]:
+    """``(system, machine)`` for this host, in one patchable place.
+
+    Both halves come straight from :mod:`platform`; the indirection exists so a
+    test can claim to be macOS on arm64 without the suite having to run there.
+    Every "what can this CPU do?" answer below is gated on it, because
+    /proc/cpuinfo's vocabulary is architecture-specific and a file that exists
+    on an ARM box says nothing about x86 extensions.
+    """
+    return platform.system(), platform.machine()
+
+
+def _cpu_facts_unknown(arch: str) -> dict:
+    """The shape :func:`cpu_features` returns when it could not read the flags.
+
+    Every field a caller might branch on is ``None`` or empty rather than a
+    plausible-looking default, because the one thing a consumer must never do
+    with this block is treat "we could not tell" as "the flag is absent": that
+    is how a probe ends up refusing to run on a host where the binary works
+    fine. ``arch`` survives because it is the one fact we always have.
+    """
+    return {
+        "arch": arch,
+        "model": None,
+        "hypervisor": None,
+        "flags_known": False,
+        "present": [],
+        "missing": [],
+        "x86_64_level": None,
+    }
+
+
+@lru_cache(maxsize=1)
+def cpu_features() -> dict:
+    """What this CPU advertises, for deciding whether a bundled binary can run.
+
+    A Cremind install ships third-party single-file executables it did not
+    compile - the Claude Code CLI inside the claude-agent-sdk wheel is one - and
+    those are built for an instruction-set *level*, not for "x86-64". On a
+    Kubernetes node whose hypervisor exposes the ``qemu64`` model, that CLI does
+    not fail: it spins at 100% CPU forever on every subcommand but
+    ``--version``, in userspace, before it writes a single log line. The remedy
+    is on the hypervisor and the operator often does not control it, so the only
+    thing this process can usefully do is name the CPU, name the flags it lacks,
+    and refuse fast instead of hanging - which needs these facts.
+
+    The keys::
+
+        arch          platform.machine(), always present
+        model         the /proc/cpuinfo "model name" line, or None
+        hypervisor    True on a virtual CPU, None when the flags are unknown
+        flags_known   whether present/missing/x86_64_level mean anything at all
+        present       which of X86_64_V2_FLAGS + X86_64_V3_FLAGS this CPU has
+        missing       the rest of that same set, v2 entries first
+        x86_64_level  "v1" | "v2" | "v3", or None
+
+    ``flags_known`` is the gate everything else hangs off, and it is deliberately
+    hard to satisfy: Linux on x86_64, a readable :data:`_CPUINFO_PATH`, and an
+    actual ``flags:`` line in it. Anything else - macOS, Windows, an ARM pod, a
+    kernel that mounts /proc differently, a container that hides it - reports
+    "unknown" and lets every consumer proceed. Precision over recall is the
+    whole point: a false "unknown" costs a slow failure on one broken node, a
+    false "missing" blocks every host where the binary actually works.
+
+    Never raises, for the same reason - it feeds a listing endpoint and a tool
+    catalogue, and a /proc quirk on somebody's kernel must not turn either into
+    a 500. Cached because a CPU does not change under a running process, and
+    because :func:`_describe_cached` embeds it. Callers must treat the result as
+    read-only; it is one shared dict, and only ``describe_runtime_environment``
+    hands out copies of it.
+    """
+    arch = ""
+    try:
+        system, arch = _host_platform()
+        if (system, arch) != ("Linux", "x86_64"):
+            return _cpu_facts_unknown(arch)
+
+        text = _CPUINFO_PATH.read_text(encoding="utf-8", errors="replace")
+        flag_line = _CPU_FLAGS_RE.search(text)
+        if flag_line is None:
+            return _cpu_facts_unknown(arch)
+
+        flags = set(flag_line.group("flags").split())
+        model = _CPU_MODEL_RE.search(text)
+        has_v2 = all(flag in flags for flag in X86_64_V2_FLAGS)
+        has_v3 = has_v2 and all(flag in flags for flag in X86_64_V3_FLAGS)
+        return {
+            "arch": arch,
+            # The name a support conversation needs ("QEMU Virtual CPU version
+            # 2.5+" is the whole diagnosis on the node this was written for).
+            "model": model.group("model").strip() if model else None,
+            # Not a judgement, context: the flags are missing because a
+            # hypervisor chose a CPU model that hides them, so this is the field
+            # that tells an operator where to look for the fix.
+            "hypervisor": "hypervisor" in flags,
+            "flags_known": True,
+            "present": [f for f in _CPU_CANDIDATE_FLAGS if f in flags],
+            "missing": [f for f in _CPU_CANDIDATE_FLAGS if f not in flags],
+            "x86_64_level": "v3" if has_v3 else "v2" if has_v2 else "v1",
+        }
+    except Exception as exc:  # noqa: BLE001
+        from app.utils.logger import logger
+
+        logger.debug(f"[runtime-env] cpu-feature probe failed: {exc}")
+        return _cpu_facts_unknown(arch)
+
+
 @lru_cache(maxsize=1)
 def _describe_cached() -> dict:
     """The facts that cannot change while this process runs.
@@ -753,6 +910,12 @@ def _describe_cached() -> dict:
         # deep-copies rather than shallow-copying what it gets from here.
         "kubernetes": kubernetes,
         "vnc": _describe_vnc(install_mode, vnc_enabled, kubernetes),
+        # A third nested block, and it needs no special handling for the same
+        # reason the two above don't: describe_runtime_environment deep-copies
+        # what it gets from here, so the two lists inside cannot be edited out
+        # from under the next caller. cpu_features() returns one shared dict for
+        # the life of the process, and this is the only path that copies it.
+        "cpu": cpu_features(),
         "supervised": supervised(install_mode),
         "electron": os.environ.get("CREMIND_ELECTRON_PARENT") is not None,
         "os": platform.system(),
@@ -810,9 +973,26 @@ def describe_runtime_environment() -> dict:
     return described
 
 
+def _clear_description_caches() -> None:
+    """Reset every cache the description is assembled from, not just its own.
+
+    ``describe_runtime_environment.cache_clear()`` is the one handle dozens of
+    fixtures already call before pointing the environment at a new install, and
+    it has to keep meaning "forget everything you decided about this machine".
+    :func:`cpu_features` is cached separately - it is called directly by the
+    tool runners, which have no description in hand - so clearing only the outer
+    cache would leave the ``cpu`` block frozen at whatever the first
+    :data:`_CPUINFO_PATH` a test wrote said, in every later case in the file.
+    """
+    _describe_cached.cache_clear()
+    cpu_features.cache_clear()
+
+
 # The cache lives on the private worker, but callers (and tests) only ever see
-# the public name, so hang the standard lru_cache handle off it too.
-describe_runtime_environment.cache_clear = _describe_cached.cache_clear  # type: ignore[attr-defined]
+# the public name, so hang the standard lru_cache handle off it too. Only
+# ``cache_info`` is the raw lru_cache handle; ``cache_clear`` is the two-cache
+# reset above, because the description is no longer built from one cache alone.
+describe_runtime_environment.cache_clear = _clear_description_caches  # type: ignore[attr-defined]
 describe_runtime_environment.cache_info = _describe_cached.cache_info  # type: ignore[attr-defined]
 
 

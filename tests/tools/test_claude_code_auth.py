@@ -70,6 +70,24 @@ REAL_STATUS_JSON = {
 CLI = "/opt/claude/claude"
 CLI_VARS = {Var.CLI_PATH: CLI}
 
+# The CPU facts every test in this file runs on unless it says otherwise: a
+# complete x86-64-v3 host, so :func:`runner.host_blocker` answers None and the
+# machine the suite happens to be on can never decide an assertion here. Without
+# this, the whole file would refuse to spawn anything on a ``qemu64`` CI runner
+# and pass vacuously on an ARM one.
+HEALTHY_CPU = {
+    "arch": "x86_64",
+    "model": "AMD EPYC 7B13",
+    "hypervisor": False,
+    "flags_known": True,
+    "present": list(runtime_env.X86_64_V2_FLAGS + runtime_env.X86_64_V3_FLAGS),
+    "missing": [],
+    "x86_64_level": "v3",
+}
+
+# The model name of the node this whole check exists for.
+QEMU_MODEL = "QEMU Virtual CPU version 2.5+"
+
 
 @pytest.fixture(autouse=True)
 def homes(monkeypatch, tmp_path):
@@ -91,6 +109,9 @@ def homes(monkeypatch, tmp_path):
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     # The container-only legacy ``~`` tier must never fire from a dev box / CI.
     monkeypatch.setattr(runtime_env, "is_container", lambda *a, **k: False)
+    # Same idea one layer down: the host CPU decides whether anything is spawned
+    # at all, so it is this test's to state (see HEALTHY_CPU).
+    monkeypatch.setattr(runtime_env, "cpu_features", lambda: dict(HEALTHY_CPU))
     runner._models_cache.clear()
     yield types.SimpleNamespace(system=system_dir, shared=shared, home=home)
     runner._models_cache.clear()
@@ -1039,3 +1060,175 @@ def test_argv_builders():
     assert runner.login_argv(CLI) == [CLI, "auth", "login"]
     assert runner.logout_argv(CLI) == [CLI, "auth", "logout"]
     assert runner.status_argv(CLI) == [CLI, "auth", "status", "--json"]
+
+
+# -- host_blocker: the one CPU the bundled binary cannot run on ---------------
+#
+# The bundled ``claude`` is a Bun single-file executable built for x86-64-v2. On
+# a ``qemu64`` virtual CPU every subcommand but ``--version`` spins at 100% CPU
+# forever - in userspace, before a log line is written - so the fast refusal
+# below replaces a 15s timeout that ended in "could not tell". Two properties are
+# pinned throughout: the refusal has to NAME the diagnosis (the model, the
+# instructions, the hypervisor knob), and it must never fire on a host where the
+# binary works, which is why the v3-only and flags-unknown cases are here too.
+
+
+def _block_cpu(monkeypatch, *, hypervisor: bool = True, model=QEMU_MODEL, missing=None):
+    """Claim to be running on a CPU that is short of x86-64-v2.
+
+    ``missing`` defaults to everything above the baseline, which is exactly what
+    the real node reports; pass a narrower set to test the boundary.
+    """
+    candidates = list(runtime_env.X86_64_V2_FLAGS + runtime_env.X86_64_V3_FLAGS)
+    absent = list(candidates if missing is None else missing)
+    facts = {
+        "arch": "x86_64",
+        "model": model,
+        "hypervisor": hypervisor,
+        "flags_known": True,
+        "present": [flag for flag in candidates if flag not in absent],
+        "missing": absent,
+        "x86_64_level": "v1",
+    }
+    monkeypatch.setattr(runtime_env, "cpu_features", lambda: dict(facts))
+    return facts
+
+
+def test_host_blocker_names_the_cpu_the_flags_and_the_hypervisor_fix(monkeypatch):
+    """Everything a user needs to act, in the one message every surface shows."""
+    _block_cpu(monkeypatch)
+    blocker = runner.host_blocker(CLI_VARS)
+    assert blocker is not None
+    assert blocker["code"] == runner.HOST_BLOCKER_CPU
+    assert blocker["cpu_model"] == QEMU_MODEL
+    assert blocker["missing"] == list(runtime_env.X86_64_V2_FLAGS)
+    assert blocker["hypervisor"] is True
+
+    message = blocker["message"]
+    assert QEMU_MODEL in message
+    assert "x86-64-v2" in message
+    for flag in runtime_env.X86_64_V2_FLAGS:
+        assert flag in message
+    # Both symptoms are named whichever host this is: an operator has usually
+    # run `claude` by hand already, and the tell is the one they actually saw.
+    assert "100% CPU" in message
+    assert "Illegal instruction" in message
+    assert "virtual CPU" in message
+
+    # The remedy is the hypervisor's, in the vocabulary of each product's own UI.
+    remedy = blocker["remedy"]
+    assert "Proxmox" in remedy
+    assert "host-passthrough" in remedy
+    assert "-cpu host" in remedy
+
+
+def test_host_blocker_on_real_hardware_says_use_another_host(monkeypatch):
+    """No hypervisor means no setting to change, so the advice has to differ."""
+    _block_cpu(monkeypatch, hypervisor=False, model="Intel(R) Xeon(R) CPU E5450")
+    blocker = runner.host_blocker(CLI_VARS)
+    assert blocker["hypervisor"] is False
+    assert "this CPU" in blocker["message"]
+    assert "Proxmox" not in blocker["remedy"]
+    assert "newer host" in blocker["remedy"]
+    # ... and the scope of the check is stated, so nobody moves a working install.
+    assert "Claude Code CLI only" in blocker["remedy"]
+
+
+def test_host_blocker_ignores_a_missing_v3(monkeypatch):
+    """THE precision case: a v2 host runs the binary, so it must not be blocked.
+
+    The wheel ships the baseline build precisely so v2 hosts work. Requiring v3
+    here would take the tool away from every modest-but-working CPU - the exact
+    failure this check exists to avoid on the other side.
+    """
+    _block_cpu(monkeypatch, missing=list(runtime_env.X86_64_V3_FLAGS))
+    assert runner.host_blocker(CLI_VARS) is None
+
+
+def test_host_blocker_says_nothing_when_the_flags_are_unknown(monkeypatch):
+    """macOS, Windows, an ARM pod, a kernel with a different /proc.
+
+    "Could not tell" must never harden into "missing": a false unknown costs one
+    broken node a slow failure, a false blocker costs every host the tool.
+    """
+    monkeypatch.setattr(runtime_env, "cpu_features", lambda: {
+        "arch": "arm64", "model": None, "hypervisor": None, "flags_known": False,
+        "present": [], "missing": [], "x86_64_level": None,
+    })
+    assert runner.host_blocker(CLI_VARS) is None
+
+
+def test_host_blocker_still_blocks_a_cli_path_and_says_so(monkeypatch):
+    """An operator's own build is the same kind of executable.
+
+    Pointing CLAUDE_CODE_CLI_PATH somewhere else is the first thing anyone tries,
+    so the message has to close that door by name rather than leave them to
+    discover a second binary that also spins.
+    """
+    _block_cpu(monkeypatch)
+    blocker = runner.host_blocker({Var.CLI_PATH: "/opt/mine/claude"})
+    assert blocker is not None
+    assert "CLAUDE_CODE_CLI_PATH" in blocker["message"]
+    assert "does not help" in blocker["message"]
+
+
+def test_auth_status_on_a_blocked_host_spawns_nothing(monkeypatch, homes):
+    """The 15s the probe used to burn, and the answer it used to give.
+
+    ``logged_in`` stays None - "cannot tell" - because that is the truth, and the
+    detail is the host message so the card explains itself instead of sending the
+    user off to fix a login.
+    """
+    _block_cpu(monkeypatch)
+    calls = []
+    _patch_exec(monkeypatch, proc=_json_proc(REAL_STATUS_JSON), calls=calls)
+
+    out = asyncio.run(runner.auth_status(CLI_VARS, "alice"))
+    assert out["logged_in"] is None
+    assert "cannot run on this server's CPU" in out["detail"]
+    assert calls == []
+
+
+def test_probe_never_validates_a_key_on_a_blocked_host(monkeypatch, homes):
+    """A readable key would otherwise be validated - and it would pass.
+
+    ``GET /v1/models`` answers for the credential, not for the host, so a probe
+    that reached the API would hand a green "signed in" chip to an install whose
+    every coding task hangs. The credential is still reported, because "which
+    credential would be used?" is a fair question; the verdict is not.
+    """
+    _block_cpu(monkeypatch)
+    calls = []
+    _patch_exec(monkeypatch, proc=_json_proc(BOGUS_KEY_STATUS_JSON), calls=calls)
+    _forbid_network(monkeypatch, "nothing may be validated on a host that cannot run the CLI")
+
+    out = asyncio.run(runner.probe_auth(
+        None, cwd="", variables={**CLI_VARS, Var.API_KEY: "sk-live-and-valid"},
+        profile="alice",
+    ))
+    assert out["logged_in"] is None
+    assert out["credential_verified"] is None
+    assert out["credential_source"] == "tool_variable_api_key"
+    assert "cannot run on this server's CPU" in out["detail"]
+    assert calls == []
+
+
+def test_logout_on_a_blocked_host_still_removes_the_credential(monkeypatch, homes):
+    """The spawn is skipped; the sign-out is not.
+
+    Before, ``claude auth logout`` sat at 100% CPU for its whole timeout, was
+    killed, and the credential file was unlinked anyway - so skipping it changes
+    only how long the user waits. What it must not change is the outcome, and the
+    reason the CLI's own bookkeeping did not run has to be said.
+    """
+    _block_cpu(monkeypatch)
+    alice_home = homes.system / "alice" / "coding-cli" / "claude"
+    credentials = _sign_in(alice_home, "alice-tok")
+    calls = []
+    _patch_exec(monkeypatch, proc=_FakeProcess(), calls=calls)
+
+    out = asyncio.run(runner.logout(CLI_VARS, "alice", scope="profile"))
+    assert out["ok"] is True
+    assert not credentials.exists()
+    assert calls == []
+    assert "cannot run on this server's CPU" in out["detail"]

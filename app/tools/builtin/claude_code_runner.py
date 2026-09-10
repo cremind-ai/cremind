@@ -43,6 +43,12 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 import httpx
 
 from app.agent.agent_activity import AgentActivity
+# Imported as a MODULE, not as ``from ... import cpu_features``: the whole point
+# of :func:`host_blocker` is that a test can claim to be running on a CPU other
+# than the one under the suite, and a name bound at import time could not be
+# moved. ``runtime_env`` is stdlib-only at import time (everything from ``app``
+# is imported inside its functions), so this costs the runner nothing.
+from app.config import runtime_env
 from app.config.coding_cli_homes import (
     claude_login_present,
     profile_claude_config_dir,
@@ -88,6 +94,41 @@ _SIGN_IN_REMEDIATION = (
     "ANTHROPIC_API_KEY."
 )
 
+# The name of the one host condition that stops the CLI before it starts. It
+# rides every payload as ``code`` so a client can branch on the cause without
+# matching on prose, and so a second condition (should one ever be found) is an
+# added constant rather than a new shape.
+HOST_BLOCKER_CPU = "cpu_features"
+
+# What to do about it when a hypervisor is between us and the silicon, which is
+# the case this was written for: the instructions are physically there and the
+# virtual CPU model simply does not advertise them, so the fix is one setting on
+# the host and costs nothing. The three hypervisors are named because an operator
+# who has never had to think about a guest CPU model does not know where the knob
+# is, and the wording of each one is the label in that product's own UI.
+_VM_CPU_REMEDIATION = (
+    "The instructions are almost certainly present on the physical host and only "
+    "hidden by the guest CPU model, so the fix is on the hypervisor: in Proxmox, "
+    "set the VM's Hardware -> Processors -> Type to 'host' (or to 'x86-64-v2-AES' "
+    "if the cluster needs a portable model). In libvirt / virt-manager, use "
+    "<cpu mode='host-passthrough'/> - the \"Copy host CPU configuration\" "
+    "checkbox. With plain QEMU, pass `-cpu host` (or `-cpu x86-64-v3`) instead of "
+    "letting it default to `qemu64`. The node has to be shut down and started "
+    "again afterwards - a live reboot keeps the old CPU model."
+)
+
+# And when the flags really are absent from the hardware. There is no setting to
+# change, so the only honest advice is a different machine - said plainly, with
+# the scope of the check attached so nobody reads it as "Cremind needs a newer
+# CPU" and moves an install that is otherwise perfectly happy.
+_HARDWARE_CPU_REMEDIATION = (
+    "No hypervisor is reporting here, so this looks like real hardware that "
+    "predates the x86-64-v2 instruction level (roughly 2009 and earlier): there "
+    "is no setting to change, and Cremind has to run on a newer host for Claude "
+    "Code to work. This check covers the Claude Code CLI only - the rest of "
+    "Cremind, including the Codex coding agent, is unaffected by it."
+)
+
 
 class Var:
     """required_config variable keys (also imported by the leaf module)."""
@@ -126,6 +167,24 @@ class ClaudeCodeConcurrencyError(Exception):
         self.code = code
         self.message = message
         self.running_task_id = running_task_id
+
+
+class ClaudeCodeHostError(Exception):
+    """Raised by :func:`start_task` when this host cannot run the CLI at all.
+
+    Separate from :class:`ClaudeCodeConcurrencyError` because it is not a
+    "try again later": no task is registered, no activity feed is opened and no
+    SDK client is constructed, since the binary the client would spawn is the
+    thing that cannot run. The whole diagnosis travels on ``blocker`` (the dict
+    :func:`host_blocker` returns) so the leaf can hand the model the CPU model,
+    the missing instructions and the remedy without re-deriving any of it.
+    """
+
+    def __init__(self, blocker: Dict[str, Any]):
+        super().__init__(
+            blocker.get("message") or "This host cannot run the Claude Code CLI."
+        )
+        self.blocker = blocker
 
 
 @dataclass
@@ -827,6 +886,109 @@ def cli_binary_source(variables: Optional[dict] = None) -> Optional[str]:
     return _locate_cli(variables)[1]
 
 
+def host_blocker(variables: Optional[dict] = None) -> Optional[Dict[str, Any]]:
+    """Why this host cannot run the ``claude`` binary at all, or ``None``.
+
+    There is exactly one such reason today, and it is not a Cremind bug we can
+    fix: the CLI inside the claude-agent-sdk wheel is a Bun single-file
+    executable built for the x86-64-v2 instruction level, and on a virtual CPU
+    that advertises none of those instructions - the ``qemu64`` model a
+    default-configured Proxmox / libvirt / QEMU guest gets - every subcommand
+    except ``--version`` spins at 100% CPU forever. Not fails: spins, in
+    userspace, before the CLI writes its first log line, because under KVM the
+    instructions do execute while Bun's CPUID-based dispatch reports them absent
+    and takes a fallback path that never terminates. Measured on such a node:
+    user CPU equal to wall time on one thread, an empty ``/proc/<pid>/syscall``,
+    not a single socket opened, and no ``--debug`` log written at all.
+
+    So every surface asks this first and refuses in milliseconds with the CPU
+    model, the missing instructions and the hypervisor setting that fixes them -
+    where before, the sign-in probe burned its 15s timeout to say "could not
+    tell", the login terminal was a black box, and a coding task hung until the
+    SDK's own timeout.
+
+    ``{"code", "cpu_model", "missing", "hypervisor", "message", "remedy"}``, or
+    ``None`` when nothing is known to be wrong. ``message`` is the one sentence
+    every surface shows and ``remedy`` the fix for the kind of host this is; the
+    other fields are there so a client can render the diagnosis its own way.
+
+    Only x86-64-**v2** is required, deliberately. The wheel ships the baseline
+    build precisely so that v2 hosts work, and a modest-but-real CPU that has
+    all of v2 and none of v3 runs the binary perfectly well - requiring v3 here
+    would block hosts where nothing is wrong. That is also why
+    :func:`app.config.runtime_env.cpu_features` reports the v3 flags without
+    ever acting on them.
+
+    The binary itself is not inspected for the level it was built at, even
+    though the answer is in there somewhere: it is a ~200MB file that would have
+    to be scanned on every coding-agents listing, and what a scan could find -
+    an instruction-set name in a string table - is a heuristic about a build we
+    do not control, not a fact. The CPU's own flag list is cheap (the
+    /proc/cpuinfo read is cached for the life of the process, which matters
+    because the listing calls this once per row) and it is checkable.
+
+    Never raises, and never guesses: ``flags_known`` False - macOS, Windows, an
+    ARM pod, a kernel whose /proc looks different - means every caller carries
+    on and finds out the slow way, which is the right trade. A false "unknown"
+    costs one broken node a slow failure; a false "blocked" takes the tool away
+    from every host where it works.
+    """
+    try:
+        cpu = runtime_env.cpu_features()
+        if not cpu.get("flags_known"):
+            return None
+        absent = set(cpu.get("missing") or ())
+        missing = [flag for flag in runtime_env.X86_64_V2_FLAGS if flag in absent]
+        if not missing:
+            return None
+
+        hypervisor = bool(cpu.get("hypervisor"))
+        model = cpu.get("model") or None
+        # A quoted model name is what a support conversation and a hypervisor
+        # config screen both key on ("QEMU Virtual CPU version 2.5+" is the
+        # whole diagnosis on the node this was written for), so it leads - and
+        # says so plainly when /proc/cpuinfo had no ``model name`` line.
+        model_label = f'"{model}"' if model else "(model unknown)"
+        # "this virtual CPU" is not a flourish: it is the difference between a
+        # setting to change and a machine to replace, and the remedy below picks
+        # the same fork.
+        cpu_label = "this virtual CPU" if hypervisor else "this CPU"
+        # Both failure shapes are named whichever host this is. An operator
+        # reading the message has usually already run `claude` by hand, and the
+        # thing they need to recognise is the symptom they actually saw.
+        pointed_elsewhere = cli_binary_source(variables) == "tool_variable"
+        cli_path_clause = (
+            "pointing CLAUDE_CODE_CLI_PATH at another copy does not help, and "
+            "the copy it points at now is affected in exactly the same way"
+            if pointed_elsewhere
+            else "pointing CLAUDE_CODE_CLI_PATH at another copy does not help"
+        )
+        message = (
+            "The Claude Code CLI cannot run on this server's CPU: it is a Bun "
+            "single-file executable built for the x86-64-v2 instruction level, "
+            f"and {cpu_label} {model_label} advertises none of "
+            f"{', '.join(missing)}; under a hypervisor that makes every "
+            "subcommand spin at 100% CPU forever instead of failing, with only "
+            "`claude --version` still answering, and on real hardware without "
+            'those instructions it dies with "Illegal instruction"; every '
+            f"Claude Code build is the same kind of executable, so {cli_path_clause}."
+        )
+        return {
+            "code": HOST_BLOCKER_CPU,
+            "cpu_model": model,
+            "missing": missing,
+            "hypervisor": hypervisor,
+            "message": message,
+            "remedy": _VM_CPU_REMEDIATION if hypervisor else _HARDWARE_CPU_REMEDIATION,
+        }
+    except Exception:  # noqa: BLE001
+        # This answer gates a listing endpoint, a tool catalogue and every
+        # sign-in surface, so an unexpected shape from the probe must degrade to
+        # "nothing known to be wrong" rather than turn any of them into a 500.
+        logger.debug("claude_code: the host CPU check failed", exc_info=True)
+        return None
+
+
 def login_argv(binary: str) -> List[str]:
     """``claude auth login`` - interactive; must run under a PTY, not here."""
     return [binary, "auth", "login"]
@@ -918,6 +1080,14 @@ async def auth_status(
     leaves us unable to read an answer (no binary, a timeout, no JSON at all)
     returns ``logged_in`` None with the reason.
     """
+    # A host the binary cannot run on is asked nothing at all. This is the
+    # lowest point every login question passes through, and the spawn below is
+    # exactly the call that would sit at 100% CPU until the timeout killed it -
+    # after which the user was told "could not tell" with no idea why.
+    blocked = host_blocker(variables)
+    if blocked is not None:
+        return _auth_status_unknown(blocked["message"])
+
     binary = find_cli(variables)
     if not binary:
         return _auth_status_unknown(
@@ -1213,6 +1383,18 @@ async def probe_auth(sdk, *, cwd: str, variables: dict, profile: str, timeout: f
 
     ``logged_in`` None keeps meaning "cannot tell", never "signed out".
     """
+    # Checked here as well as inside auth_status, and not for the 15s: the key
+    # tier below is settled by an Anthropic API call, which would answer "the
+    # credential works" on a host where nothing can use it. A visible API key
+    # would then earn a green "signed in" chip for an install whose every coding
+    # task hangs - the most misleading answer this function can produce.
+    blocked = host_blocker(variables)
+    if blocked is not None:
+        result = _auth_status_unknown(blocked["message"])
+        result["credential_source"] = credential_source(variables, profile)
+        result["credential_verified"] = None
+        return result
+
     result = dict(await auth_status(variables, profile, timeout=timeout))
 
     tier, source = _probe_credential(variables, profile, result)
@@ -1262,10 +1444,14 @@ async def logout(variables: dict, profile: str, *, scope: str = "profile") -> Di
     ``claude auth logout`` runs first so the CLI's own bookkeeping happens (the
     macOS Keychain entry, the ``.claude.json`` account block), and
     ``.credentials.json`` is then unlinked whatever the command did - including
-    when there is no binary at all. The user asked to be signed out; leaving a
-    live OAuth refresh token on disk because a command failed is the wrong
-    failure mode. ``ok`` reports the only thing that matters - whether the home
-    still reads as signed in - and ``detail`` carries what went wrong on the way.
+    when there is no binary at all, and including on a host whose CPU cannot run
+    it. That last case used to spend 15s at 100% CPU, get killed, and unlink the
+    file anyway; skipping the spawn changes nothing about the outcome and the
+    reason joins ``problems`` so the user is told why the CLI's own bookkeeping
+    did not happen. The user asked to be signed out; leaving a live OAuth
+    refresh token on disk because a command failed is the wrong failure mode.
+    ``ok`` reports the only thing that matters - whether the home still reads as
+    signed in - and ``detail`` carries what went wrong on the way.
 
     The model cache is cleared unconditionally: its entries are keyed by
     credential fingerprint, so a stale entry would keep answering with the
@@ -1276,8 +1462,14 @@ async def logout(variables: dict, profile: str, *, scope: str = "profile") -> Di
     )
     problems: List[str] = []
 
+    blocked = host_blocker(variables)
     binary = find_cli(variables)
-    if not binary:
+    if blocked is not None:
+        problems.append(
+            "the Claude Code CLI cannot run on this server's CPU, so `claude auth "
+            "logout` was skipped and only the stored credential was removed"
+        )
+    elif not binary:
         problems.append("the Claude Code CLI was not found, so only the stored credential was removed")
     else:
         proc = None
@@ -1374,7 +1566,18 @@ async def start_task(
     model: Optional[str] = None,
 ) -> ClaudeCodeTask:
     """Register + spawn a background Claude Code session. May raise
-    :class:`ClaudeCodeConcurrencyError`."""
+    :class:`ClaudeCodeConcurrencyError` or :class:`ClaudeCodeHostError`.
+
+    The host check comes before everything else, registry included: a task that
+    cannot start must leave nothing behind that a later call would find and
+    report as "running", and on the node this was written for it would have sat
+    at 100% CPU until the SDK's own timeout with an activity feed open in front
+    of the user the whole time.
+    """
+    blocker = host_blocker(variables)
+    if blocker is not None:
+        raise ClaudeCodeHostError(blocker)
+
     _cleanup_stale_tasks()
 
     existing = find_running_for_context(context_id)

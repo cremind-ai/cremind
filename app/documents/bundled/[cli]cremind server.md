@@ -1,5 +1,5 @@
 ---
-description: "Is this Cremind running in Docker, native, or Kubernetes — on the dev, test, or production release channel, with the VNC desktop enabled or not? `cremind server environment` and `server capabilities` answer that, plus deployment (local/server/custom), supervisor, backend version, system paths, and the timezone its schedules actually fire in; `server health`, `version`, and `restart` operate the running backend. On Kubernetes `server environment` also answers which namespace this pod is in, which Helm release installed it, and which Deployment and Service it is, and prints the ready-to-run `kubectl port-forward` command that reconnects to it (`kubernetes.namespace`, `kubernetes.release`, `kubernetes.workload`, `kubernetes.service`, `kubernetes.service_port`, `kubernetes.source`, `kubernetes.port_forward`; `source: inferred` means an older chart states no release name — `helm list --all-namespaces` shows it). It also says how to reach the VNC desktop / noVNC / remote desktop: a published Docker port, a path on the same origin behind the Kubernetes nginx proxy, or a `kubectl port-forward` you have to run first, with the URL to open afterwards (`vnc.access`, `vnc.novnc_url`, `vnc.port_forward.1`, `vnc.open_url`, `vnc.note`; `server capabilities` carries the public `vnc_access` word without a token). Distinct from `cremind version`, which prints the locally installed CLI package."
+description: "Is this Cremind running in Docker, native, or Kubernetes — on the dev, test, or production release channel, with the VNC desktop enabled or not? `cremind server environment` and `server capabilities` answer that, plus deployment (local/server/custom), supervisor, backend version, system paths, and the timezone its schedules actually fire in; `server health`, `version`, and `restart` operate the running backend. On Kubernetes `server environment` also answers which namespace this pod is in, which Helm release installed it, and which Deployment and Service it is, and prints the ready-to-run `kubectl port-forward` command that reconnects to it (`kubernetes.namespace`, `kubernetes.release`, `kubernetes.workload`, `kubernetes.service`, `kubernetes.service_port`, `kubernetes.source`, `kubernetes.port_forward`; `source: inferred` means an older chart states no release name — `helm list --all-namespaces` shows it). It also says how to reach the VNC desktop / noVNC / remote desktop: a published Docker port, a path on the same origin behind the Kubernetes nginx proxy, or a `kubectl port-forward` you have to run first, with the URL to open afterwards (`vnc.access`, `vnc.novnc_url`, `vnc.port_forward.1`, `vnc.open_url`, `vnc.note`; `server capabilities` carries the public `vnc_access` word without a token). On a Linux x86_64 server it also names the CPU and the x86-64 instruction level it advertises (`cpu.model`, `cpu.hypervisor`, `cpu.x86_64_level`, `cpu.missing`) — the answer to why the Claude Code CLI (`claude_code`) hangs at 100% CPU on a node whose hypervisor exposes a `qemu64` virtual CPU without SSSE3/SSE4/POPCNT. The check covers Claude Code only: Codex's CLI is built for the plain x86-64 baseline, so it declares no such requirement and is worth trying on such a node — though nobody has yet watched it run on one. Distinct from `cremind version`, which prints the locally installed CLI package."
 ---
 
 # `cremind server` — Server Operations
@@ -191,6 +191,30 @@ page's Environment card shows, in one aligned block:
   overrode the OS zone at boot, and `effective_timezone` above is still the
   answer.
 
+**On a Linux x86_64 server**, four more rows describe the CPU underneath. They
+come from `/proc/cpuinfo`, which is the only place the answer exists, so they
+are absent on a macOS or Windows host and on a non-x86 one — absent means "could
+not tell", never "nothing missing".
+
+- `cpu.model` — the processor as it names itself, e.g. `QEMU Virtual CPU version
+  2.5+` on a hypervisor that exposes the generic `qemu64` model.
+- `cpu.hypervisor` — `true` on a virtual CPU. When something is missing below,
+  this is the row that says where the fix is: the CPU model the hypervisor
+  hands the VM, which is a host-side setting.
+- `cpu.x86_64_level` — `v1`, `v2`, or `v3`. Anything below `v2` cannot run a
+  prebuilt binary compiled for the x86-64-v2 baseline, which is what the
+  bundled Claude Code CLI (`claude_code`) ships as. Codex ships a binary built
+  for the plain x86-64 baseline and is unaffected.
+- `cpu.missing` — which of the flags those binaries assume this CPU does not
+  advertise (`ssse3`, `sse4_1`, `sse4_2`, `popcnt` for v2; `avx`, `avx2`,
+  `bmi1`, `bmi2`, `fma`, `f16c`, `movbe`, `abm` for v3 — `abm` is how Linux
+  spells LZCNT). **Blank is the healthy answer.** A `v1` CPU missing the four v2
+  flags is the signature of the failure worth knowing about: the bundled Claude
+  Code CLI does not error there, it spins at 100% CPU forever on every
+  subcommand and writes no log at all, so this row is what turns "the agent
+  hangs" into a diagnosis. Missing v3 flags alone are informational — nothing
+  Cremind runs needs them.
+
 **On Kubernetes only**, seven more rows say *where in the cluster this pod is*.
 A pod cannot infer any of this — Kubernetes injects no release or Deployment
 name — so the chart states it (`CREMIND_K8S_NAMESPACE`, `_RELEASE`,
@@ -229,8 +253,11 @@ Cremind's scheme; with in-pod TLS the sidecar is a plain TCP relay, so noVNC
 answers on its own Service port over http and has to be tunnelled).
 
 `cremind --json server environment` prints the raw object, including
-`deployment_custom_fields` whatever the deployment is, and the `kubernetes` and
-`vnc` blocks unflattened (`kubernetes` is `null` off Kubernetes).
+`deployment_custom_fields` whatever the deployment is, and the `kubernetes`,
+`vnc` and `cpu` blocks unflattened (`kubernetes` is `null` off Kubernetes; `cpu`
+is always an object, with `flags_known: false` and every other field `null` or
+empty where `/proc/cpuinfo` could not answer, plus the full `present` flag list
+the aligned rows leave out).
 
 A one-line summary is also in the agent's system prompt, so asking the assistant
 "am I on Docker?" or "is VNC on?" in chat is answered directly — this command is
@@ -264,6 +291,21 @@ boot_timezone:
 vnc.access:          direct
 vnc.novnc_url:       http://localhost:6080/vnc.html
 vnc.note:            noVNC listens on its own port over plain http; Cremind's own HTTPS does not cover it.
+cpu.model:           AMD Ryzen 9 5900X 12-Core Processor
+cpu.hypervisor:      true
+cpu.x86_64_level:    v3
+cpu.missing:
+```
+
+A node whose hypervisor hands out the generic virtual CPU model instead looks
+like this — and this is the machine where `claude_code` hangs rather than
+answering:
+
+```bash
+cpu.model:           QEMU Virtual CPU version 2.5+
+cpu.hypervisor:      true
+cpu.x86_64_level:    v1
+cpu.missing:         ssse3, sse4_1, sse4_2, popcnt, avx, avx2, bmi1, bmi2, fma, f16c, movbe, abm
 ```
 
 **Example (Kubernetes, chart-stated identity, desktop behind the nginx proxy).**
@@ -360,6 +402,22 @@ with `cremind boot enable` (a systemd user unit, a launchd LaunchAgent, or a
 logon Scheduled Task) and restarts come back on their own; Docker and Electron
 installs are supervised already. Without it, run `cremind serve` again after
 each restart.
+
+**Claude Code hangs and `cpu.x86_64_level` says `v1`** — The bundled
+`claude_code` CLI is a prebuilt single-file binary compiled for the x86-64-v2
+baseline. A CPU that does not advertise those instructions — the generic
+`qemu64` model a hypervisor hands out when no model is pinned, which `cpu.model`
+and `cpu.hypervisor` identify — makes it spin at 100% CPU forever instead of
+erroring, with nothing in the logs. Nothing in Cremind can fix that: the remedy
+is on the host, by giving the VM a CPU model that passes the flags through
+(`host-passthrough` on libvirt/KVM, `host-model`, or a named model such as
+`Nehalem` or later; on VMware, matching the EVC baseline to the physical CPU
+generation). The check covers Claude Code only — Codex's CLI is built for the
+plain x86-64 baseline and declares no such requirement, so its row keeps
+`cli_blocked: null` on the very same node. Whether Codex actually runs there is
+untested rather than known: the build target says it should, so it is worth
+trying, but nobody has watched it. Until the host is fixed, run Claude Code
+tasks against a different node.
 
 **`server health` exits non-zero** — A subsystem is degraded (HTTP 503). Run it
 again or check `cremind logs tail --level error` for the cause. A `disabled`

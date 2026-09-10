@@ -1,5 +1,5 @@
 ---
-description: "Configure the tools the Cremind agent can call, from the `cremind tools` CLI: enable or disable a tool, set its Tool Variables (env-style key=value — API keys, limits, modes), list the live option values of a tool's dynamic variables (`options` — e.g. the Claude models available to the logged-in account), get or set its JSON Tool Arguments, and toggle a grouped tool's sub-tools (\"leaves\"). Answers the coding-delegate questions with `coding-agents`: is Claude Code installed, is Codex signed in or logged in, which credential each one resolves to, and how to install the Claude Code or Codex CLI on this server without shell access. Signs a coding delegate in and out from the terminal: `cremind tools coding-agents login claude_code` runs the vendor CLI's own sign-in (`claude auth login`, `codex login --device-auth`) on the server host, and `cremind tools coding-agents logout codex` signs out from anywhere; `--shared` targets the server-wide login that profiles without one of their own inherit, instead of this profile's. Signing Claude Code in headless, where no browser can reach the server: `claude auth login` has no headless flag, so run `claude setup-token` on a machine that has a browser and paste the long-lived token in — `cremind tools set-var claude_code CLAUDE_CODE_OAUTH_TOKEN=<token>`, the `tool_variable_oauth_token` credential source. Explains how to change any tool's settings and how the agent configures tools itself by running these commands in its shell. Distinct from each tool's own `[tool] …` reference doc (which lists that one tool's full variables and allowed values, e.g. Claude Code's permission modes) and from `cremind agents` (registering MCP/A2A servers)."
+description: "Configure the tools the Cremind agent can call, from the `cremind tools` CLI: enable or disable a tool, set its Tool Variables (env-style key=value — API keys, limits, modes), list the live option values of a tool's dynamic variables (`options` — e.g. the Claude models available to the logged-in account), get or set its JSON Tool Arguments, and toggle a grouped tool's sub-tools (\"leaves\"). Answers the coding-delegate questions with `coding-agents`: is Claude Code installed, is Codex signed in or logged in, which credential each one resolves to, and how to install the Claude Code or Codex CLI on this server without shell access. Signs a coding delegate in and out from the terminal: `cremind tools coding-agents login claude_code` runs the vendor CLI's own sign-in (`claude auth login`, `codex login --device-auth`) on the server host, and `cremind tools coding-agents logout codex` signs out from anywhere; `--shared` targets the server-wide login that profiles without one of their own inherit, instead of this profile's. Signing Claude Code in headless, where no browser can reach the server: `claude auth login` has no headless flag, so run `claude setup-token` on a machine that has a browser and paste the long-lived token in — `cremind tools set-var claude_code CLAUDE_CODE_OAUTH_TOKEN=<token>`, the `tool_variable_oauth_token` credential source. Diagnoses a coding delegate whose CLI cannot run on the server at all: the Claude Code CLI is an x86-64-v2 binary, so on a virtual machine left on the default `qemu64` guest CPU model (\"QEMU Virtual CPU version 2.5+\", missing ssse3/sse4_1/sse4_2/popcnt) every subcommand spins at 100% CPU forever instead of failing — `claude auth login` hangs, `claude -p` hangs, a delegated coding task hangs, and only `claude --version` answers. Cremind reports that as `cli_blocked` / \"cannot run on this server's CPU\" on the row, in the sign-in refusal and on the Coding Agents card; the fix is the hypervisor's CPU model (Proxmox Type: host, libvirt host-passthrough, QEMU `-cpu host`) plus a node shutdown and start; the check covers Claude Code only, so Codex's row stays un-blocked on the same server and is the option worth trying there. Explains how to change any tool's settings and how the agent configures tools itself by running these commands in its shell. Distinct from each tool's own `[tool] …` reference doc (which lists that one tool's full variables and allowed values, e.g. Claude Code's permission modes) and from `cremind agents` (registering MCP/A2A servers)."
 ---
 
 # `cremind tools` — Tool & Skill Configuration
@@ -398,12 +398,60 @@ A one-line human summary per agent — naming the single next step — is writte
 stderr under the table, so it stays out of a piped table but is still visible.
 With `--json`, returns the raw agent objects (including `feature_key`, `extras`,
 `requires_restart_after_install`, `sign_in`, `credential_scope`, `cli_home`,
-`account_hint`, `cli_available`, and, with `--probe`, the full probe payload
-under `probe`).
+`account_hint`, `cli_available`, `cli_blocked`, and, with `--probe`, the full
+probe payload under `probe`).
 
 `LOGGED_IN unknown` is **not** "logged out": the check ran but could not decide
-(a timeout, or the CLI binary was not found). Only `no` means the credential was
+— a timeout, the CLI binary was not found, or the server's CPU cannot run that
+CLI at all (see below, where the check refuses in milliseconds rather than
+waiting for a binary that never answers). Only `no` means the credential was
 rejected.
+
+**A server whose CPU cannot run the CLI.** The Claude Code CLI inside the SDK
+wheel is a Bun single-file executable built for the **x86-64-v2** instruction
+level. On a virtual machine left on the default guest CPU model — `qemu64`,
+reported as `QEMU Virtual CPU version 2.5+` — that CPU advertises none of
+`ssse3`, `sse4_1`, `sse4_2`, `popcnt`, and every `claude` subcommand except
+`--version` **spins at 100% CPU forever instead of failing**: `claude auth
+login` hangs, `auth status` hangs, a delegated coding task hangs until it times
+out. Cremind checks the CPU before it starts anything, so the report leads with
+that rather than with the install / sign-in / enable advice — on this host all
+of those may be satisfied already and none of them helps:
+
+```text
+$ cremind tools coding-agents
+AGENT        INSTALLED  ENABLED  CREDENTIAL            LOGGED_IN
+claude_code  yes        yes      profile_claude_login  -
+codex        yes        yes      profile_codex_login   -
+(claude_code: The Claude Code CLI cannot run on this server's CPU: it is a Bun single-file executable built for the x86-64-v2 instruction level, and this virtual CPU "QEMU Virtual CPU version 2.5+" advertises none of ssse3, sse4_1, sse4_2, popcnt; ...)
+The instructions are almost certainly present on the physical host and only hidden by the guest CPU model, so the fix is on the hypervisor: in Proxmox, set the VM's Hardware -> Processors -> Type to 'host' ... The node has to be shut down and started again afterwards - a live reboot keeps the old CPU model.
+(codex: Codex is installed, enabled, and using profile_codex_login, this profile's own login.)
+
+$ cremind tools coding-agents login claude_code
+The Cremind server (cremind-7c9f4) cannot run the claude_code CLI at all, so there is no sign-in to run - here or anywhere. The Claude Code CLI cannot run on this server's CPU: ...
+The instructions are almost certainly present on the physical host and only hidden by the guest CPU model, so the fix is on the hypervisor: ...
+```
+
+Nothing is spawned in either case, and `login` exits `1`. The fix is not in
+Cremind: set the guest CPU model to the host's (Proxmox **Hardware → Processors
+→ Type: host**, libvirt `<cpu mode='host-passthrough'/>`, plain QEMU `-cpu
+host`) and then shut the node down and start it again — a live reboot keeps the
+old CPU model. Pointing `CLAUDE_CODE_CLI_PATH` at another copy of the binary
+does not help; every Claude Code build is the same kind of executable. On real
+hardware that predates those instructions (roughly 2009 and earlier) the binary
+dies with `Illegal instruction` instead, and there is no setting to change — the
+host has to be newer.
+
+The check covers the **Claude Code CLI only**. Codex's CLI is a Rust binary
+built for the x86-64 baseline and declares no such requirement, so its row keeps
+`cli_blocked: null` on the very same server — and the rest of Cremind runs there
+untouched. Treat Codex as worth trying rather than as known-good on such a
+host: that is what its build target says, not something anyone has yet watched
+work on a `qemu64` node. With `--json`, `cli_blocked` carries the whole diagnosis —
+`code: "cpu_features"`, `cpu_model`, `missing` (the flags), `hypervisor`,
+`message` and `remedy` — and is `null` on every host where the CLI runs. The
+same field rides the refusal from `login` and from the browser's Sign-in dialog,
+which is what the Coding Agents card renders on the agent's row.
 
 **Credential sources.** A key set *for the tool* beats a CLI login, and a
 profile's own login beats the server's shared one. Claude Code's pasted

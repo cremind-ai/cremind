@@ -5,10 +5,14 @@ client calls are patched there and nothing reaches the network.
 
 ``login`` is the odd one out in the whole CLI: it is the only command that runs
 *another program* in the user's own terminal. What matters about it is not its
-output but the two decisions it makes first — whether the CLI it was told about
-is on THIS machine (signing in on the wrong host writes a credential the server
-will never read), and which home the child is pointed at — so those are what
-these tests pin.
+output but the decisions it makes before the spawn — whether the CLI it was told
+about is on THIS machine (signing in on the wrong host writes a credential the
+server will never read), whether the server says its CPU can run that CLI at all
+(where no copy of the binary would work and the fix is on the hypervisor), and
+which home the child is pointed at — so those are what these tests pin. Each of
+those the CLI *learns*, never computes: modules under ``app/cli`` must not import
+``app.tools``, so a descriptor without the key has to behave exactly as an older
+server made it behave.
 """
 
 from __future__ import annotations
@@ -41,6 +45,24 @@ _AGENTS = [
         "message": "Codex is not installed on this server.",
     },
 ]
+
+_CPU_BLOCKER = {
+    "code": "cpu_features",
+    "cpu_model": "QEMU Virtual CPU version 2.5+",
+    "missing": ["ssse3", "sse4_1", "sse4_2", "popcnt"],
+    "hypervisor": True,
+    "message": (
+        "The Claude Code CLI cannot run on this server's CPU: it is a Bun "
+        "single-file executable built for the x86-64-v2 instruction level, and "
+        'this virtual CPU "QEMU Virtual CPU version 2.5+" advertises none of '
+        "ssse3, sse4_1, sse4_2, popcnt."
+    ),
+    "remedy": (
+        "The fix is on the hypervisor: in Proxmox, set the VM's Hardware -> "
+        "Processors -> Type to 'host'. The node has to be shut down and started "
+        "again afterwards."
+    ),
+}
 
 _SIGNED_IN = {
     "tool_id": "claude_code",
@@ -165,6 +187,31 @@ def test_probe_asks_for_a_fresh_answer(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "yes" in result.output
 
 
+def test_listing_prints_the_remedy_for_a_blocked_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one row whose fix is not something Cremind can do.
+
+    The server keeps the remedy out of ``message`` because it is a paragraph
+    about hypervisor CPU models rather than a clause, so the listing has to
+    render it from ``cli_blocked`` - otherwise the table says the CLI cannot run
+    and never says what to do about it.
+    """
+    from app.cli.main import app
+
+    blocked = [
+        {**_AGENTS[0], "message": _CPU_BLOCKER["message"], "cli_blocked": _CPU_BLOCKER},
+        {**_AGENTS[1], "cli_blocked": None},
+    ]
+    _patch_listing(monkeypatch, agents=blocked)
+    result = CliRunner().invoke(app, ["--token", "t", "tools", "coding-agents"])
+    assert result.exit_code == 0, result.output
+    assert "QEMU Virtual CPU version 2.5+" in result.output
+    assert "Proxmox" in result.output
+    # The unblocked row contributes no second remedy line.
+    assert result.output.count("Proxmox") == 1
+
+
 def test_listing_json_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.cli.main import app
 
@@ -221,6 +268,60 @@ def test_login_refuses_when_the_server_has_no_cli(
     assert result.exit_code == 1, result.output
     assert "features install claude_code" in result.output
     assert spawned == {}
+
+
+def test_login_refuses_on_a_server_whose_cpu_cannot_run_the_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The refusal the other two cannot express.
+
+    Here the binary is present, it is on this very host, and it still cannot
+    run: the bundled Claude Code executable on a CPU without the instructions it
+    was built for spins at 100% CPU forever instead of failing. So neither
+    "install the feature" nor "run this on the server" is the fix, nothing is
+    spawned, and the CPU model and the hypervisor setting go to stderr instead.
+    The CLI cannot work this out itself - it must not import ``app.tools`` - so
+    it obeys the descriptor, exactly as it does for ``drop_env``.
+    """
+    from app.cli.main import app
+
+    _patch_cli_descriptor(
+        monkeypatch, _local_descriptor(tmp_path, cli_blocked=_CPU_BLOCKER),
+    )
+    spawned = _patch_subprocess(monkeypatch)
+
+    result = CliRunner().invoke(
+        app, ["--token", "t", "tools", "coding-agents", "login", "claude_code"],
+    )
+    assert result.exit_code == 1, result.output
+    assert "QEMU Virtual CPU version 2.5+" in result.output
+    assert "Proxmox" in result.output
+    # Named, so a user with two servers knows which one this is about.
+    assert "cremind-7d9f4c" in result.output
+    # And neither of the other two fixes is offered, because neither works.
+    assert "features install" not in result.output
+    assert spawned == {}
+
+
+def test_login_on_an_older_server_without_the_blocker_key_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A server that predates the check sends no ``cli_blocked`` at all, and
+    that has to read as "nothing known to be wrong" - a missing key must never
+    become a refusal, or an upgrade would take the sign-in away from every host
+    where it works."""
+    from app.cli.main import app
+
+    descriptor = _local_descriptor(tmp_path)
+    descriptor.pop("cli_blocked", None)
+    _patch_cli_descriptor(monkeypatch, descriptor)
+    spawned = _patch_subprocess(monkeypatch)
+
+    result = CliRunner().invoke(
+        app, ["--token", "t", "tools", "coding-agents", "login", "claude_code"],
+    )
+    assert result.exit_code == 0, result.output
+    assert spawned["argv"] == descriptor["login_argv"]
 
 
 def test_login_runs_the_argv_with_the_profile_home(

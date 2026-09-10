@@ -36,6 +36,7 @@ from app.tools.builtin import claude_code_runner as runner
 from app.tools.builtin.claude_code_runner import (
     Var,
     ClaudeCodeConcurrencyError,
+    ClaudeCodeHostError,
     _as_int,
     credential_info,
     get_task,
@@ -355,6 +356,19 @@ class ClaudeCodeRunTool(BuiltInTool):
                 "message": exc.message,
                 "task_id": exc.running_task_id,
             })
+        except ClaudeCodeHostError as exc:
+            # Not a failed task - a task that was never started. Nothing is in
+            # the registry and no SDK client exists, because the binary the
+            # client would spawn is precisely what cannot run here: starting it
+            # would hang this coding task until the SDK's own timeout. The
+            # advisory rides along whole so the model can quote the CPU model
+            # and the hypervisor setting to the user instead of retrying.
+            return BuiltInToolResult(structured_content={
+                "error": "HostCannotRunClaudeCode",
+                "message": exc.blocker["message"],
+                "remediation": exc.blocker["remedy"],
+                "host_advisory": exc.blocker,
+            })
         except RuntimeError as exc:
             return _missing_sdk(str(exc))
         except Exception as exc:  # noqa: BLE001
@@ -559,7 +573,18 @@ class ClaudeCodeStatusTool(BuiltInTool):
         advisory = runner._permission_advisory(mode)
         if advisory is not None:
             payload["permission_advisory"] = advisory
-        if configured:
+        # The same shape one step further out: a permission mode can stop a task
+        # from changing anything, and this stops it from starting at all. Said
+        # here because "is Claude Code set up?" is the question a user asks
+        # BEFORE a coding task hangs, and because every credential answer below
+        # is beside the point on a host that cannot run the binary - so
+        # ``available`` flips to False and the message becomes the host's.
+        blocker = runner.host_blocker(variables)
+        if blocker is not None:
+            payload["host_advisory"] = blocker
+            payload["available"] = False
+            payload["message"] = blocker["message"] + " " + blocker["remedy"]
+        elif configured:
             scope_note = f", {info['scope']} scope" if info["scope"] else ""
             payload["message"] = (
                 f"Claude Code is installed and a credential is configured "
@@ -616,21 +641,29 @@ class ClaudeCodeStatusTool(BuiltInTool):
             # matching the Codex leaf so one card can render both.
             account = result.get("account")
             payload["account"] = account
-            if result.get("logged_in") is True:
-                who = (account or {}).get("email") or info["cli_home"]
-                payload["message"] = (
-                    f"Claude Code is authenticated and ready to use ({who})."
-                )
-            elif result.get("logged_in") is False:
-                payload["message"] = (
-                    "Claude Code is NOT authenticated. " + runner._SIGN_IN_REMEDIATION
-                )
-            else:
-                payload["message"] = (
-                    "Could not determine Claude Code's login status (this is not the "
-                    "same as being signed out): "
-                    + str(result.get("detail") or "the check did not complete.")
-                )
+            # On a blocked host the probe checked nothing - it refused before
+            # asking the CLI and before validating any key - so the host message
+            # stays and none of the three verdicts below is spoken. Both
+            # ``logged_in`` and ``credential_verified`` are already None, which
+            # is the "not checked" reading; sending the user off to sign in
+            # again would be a wasted trip, and there is no login to fix.
+            if blocker is None:
+                if result.get("logged_in") is True:
+                    who = (account or {}).get("email") or info["cli_home"]
+                    payload["message"] = (
+                        f"Claude Code is authenticated and ready to use ({who})."
+                    )
+                elif result.get("logged_in") is False:
+                    payload["message"] = (
+                        "Claude Code is NOT authenticated. "
+                        + runner._SIGN_IN_REMEDIATION
+                    )
+                else:
+                    payload["message"] = (
+                        "Could not determine Claude Code's login status (this is not "
+                        "the same as being signed out): "
+                        + str(result.get("detail") or "the check did not complete.")
+                    )
         return BuiltInToolResult(structured_content=payload)
 
 

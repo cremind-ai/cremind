@@ -70,6 +70,10 @@ def _isolated_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     namespace file is pinned the same way and for the same reason: a suite run
     inside a real cluster would otherwise inherit that cluster's namespace, and
     every "the pod cannot name itself" row would pass everywhere but there.
+    ``/proc/cpuinfo`` is the third of them: the CPU flags a build machine
+    advertises are its own, so leaving that path alone would let the runner's
+    hardware decide whether ``x86_64_level`` is ``v2`` or ``v3`` — and every row
+    below would pass or fail depending on whose CPU ran it.
 
     ``CREMIND_INSTALL_DIR`` moves to an empty tmp dir so ``_novnc_port`` cannot
     read the developer's own ``docker/.env``.
@@ -80,6 +84,7 @@ def _isolated_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(runtime_env, "_CONTAINER_MARKER", Path("/nonexistent/.dockerenv"))
     monkeypatch.setattr(runtime_env, "_SA_NAMESPACE_FILE", Path("/nonexistent/namespace"))
+    monkeypatch.setattr(runtime_env, "_CPUINFO_PATH", Path("/nonexistent/cpuinfo"))
     monkeypatch.setattr(BaseConfig, "CREMIND_INSTALL_DIR", str(tmp_path / "install"))
     runtime_env.describe_runtime_environment.cache_clear()
     yield
@@ -1071,28 +1076,282 @@ def test_every_published_command_is_pasteable(
         assert command(line)["text"] == line
 
 
-def test_the_prompt_line_ignores_the_new_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_prompt_line_ignores_the_new_blocks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
     """The agent's line must stay byte-identical for every install it ever was.
 
-    It sits in a prompt-cached system message, so adding cluster names or a
-    port-forward command to it would cost a cache miss on every turn for every
-    Kubernetes user - and the agent can ask ``cremind server environment`` for
-    any of it. Compared against the same install *without* the identity so the
-    only difference under test is the new environment.
+    It sits in a prompt-cached system message, so adding cluster names, a
+    port-forward command or a CPU fingerprint to it would cost a cache miss on
+    every turn for every Kubernetes user - and the agent can ask ``cremind
+    server environment`` for any of it. Compared against the same install
+    *without* the identity so the only difference under test is the new
+    environment.
+
+    The CPU block is here rather than in its own case because it is the same
+    invariant and the same cost: the ``cpu`` facts are read once per process
+    like the rest of the cached description, and a tool refusing to run on this
+    host says so in its own result, not in a system prompt every profile
+    shares.
     """
     _describe(monkeypatch, _K8S)
     before = runtime_env.runtime_environment_prompt_line()
 
+    _cpuinfo(monkeypatch, tmp_path, _QEMU64_CPUINFO)
     described = _describe(
         monkeypatch, {**_CHART_IDENTITY, "CREMIND_NOVNC_URL": _K8S_RELAY_URL}
     )
 
     assert described["kubernetes"]["source"] == "chart"
+    assert described["cpu"]["x86_64_level"] == "v1"
     assert runtime_env.runtime_environment_prompt_line() == before
     line = runtime_env.runtime_environment_prompt_line()
     assert "6080" not in line
     assert "port-forward" not in line
     assert "lee-cremind" not in line
+    assert "QEMU" not in line
+    assert "sse4_1" not in line
+    assert "x86_64" not in line
+
+
+# --- the CPU underneath ------------------------------------------------
+#
+# Every row here exists because a prebuilt binary Cremind ships (the Claude Code
+# CLI, a Bun single-file executable built for x86-64-v2) does not fail on a CPU
+# that hides those instructions - it spins at 100% CPU forever, writing no log.
+# The probe that turns that into a fast refusal must therefore be exactly right
+# in one direction: a *false* "missing" blocks every host where the binary works
+# fine, which is far worse than the slow hang it was meant to prevent. So the
+# cases below spend most of their weight on the ways the answer must come back
+# "could not tell".
+
+
+# The pod's own flag line, quoted from /proc/cpuinfo on the Kubernetes node this
+# work was written for: a QEMU virtual CPU with no ssse3, sse4_1, sse4_2 or
+# popcnt at all - x86-64-v1, in 2026.
+_QEMU64_CPUINFO = """processor\t: 0
+vendor_id\t: AuthenticAMD
+cpu family\t: 6
+model\t\t: 6
+model name\t: QEMU Virtual CPU version 2.5+
+stepping\t: 3
+microcode\t: 0x1000065
+cpu MHz\t\t: 2799.998
+flags\t\t: apic clflush cmov constant_tsc cpuid cpuid_fault cx16 cx8 de fpu \
+fxsr hypervisor lahf_lm lm mca mce mmx msr mtrr nopl nx pae pat pge pni pse \
+pse36 pti sep sse sse2 syscall tsc tsc_known_freq x2apic xtopology
+bugs\t\t: null_seg
+"""
+
+# A physical CPU of any recent generation: everything the probe looks for, so
+# ``missing`` comes back empty and the level reads v3.
+_FULL_HOST_CPUINFO = """processor\t: 0
+vendor_id\t: GenuineIntel
+model name\t: Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz
+flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat \
+pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm pni \
+pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand \
+lahf_lm abm 3dnowprefetch bmi1 avx2 bmi2 erms rdseed adx clflushopt
+"""
+
+# What an ARM box writes instead. There is no ``flags:`` line anywhere in it -
+# the key is ``Features`` - and the names underneath share no vocabulary with
+# x86 at all.
+_AARCH64_CPUINFO = """processor\t: 0
+BogoMIPS\t: 48.00
+Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp \
+cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 asimdfhm
+CPU implementer\t: 0x41
+CPU part\t: 0xd0c
+"""
+
+
+def _cpuinfo(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    text: str,
+    *,
+    machine: str = "x86_64",
+    system: str = "Linux",
+) -> dict:
+    """Answer from ``text`` as if it were this host's /proc/cpuinfo.
+
+    Both halves have to be pinned together: the probe only parses the file at
+    all on Linux/x86_64, so a suite running on Windows or an ARM mac would get
+    "unknown" for every case here no matter what the file said.
+    """
+    path = tmp_path / "cpuinfo"
+    path.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(runtime_env, "_CPUINFO_PATH", path)
+    monkeypatch.setattr(runtime_env, "_host_platform", lambda: (system, machine))
+    runtime_env.describe_runtime_environment.cache_clear()
+    return runtime_env.cpu_features()
+
+
+def test_a_qemu_virtual_cpu_reports_what_it_cannot_do(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The node that started all this, and the only row that must say "no".
+
+    ``hypervisor`` is what turns the finding into an action - the flags are
+    absent because the host handed the VM a generic CPU model, which is a
+    setting on the hypervisor and not anything Cremind can change - and the four
+    v2 flags lead ``missing`` because they are the half that decides whether a
+    baseline-built binary runs at all.
+    """
+    cpu = _cpuinfo(monkeypatch, tmp_path, _QEMU64_CPUINFO)
+
+    assert cpu["flags_known"] is True
+    assert cpu["arch"] == "x86_64"
+    assert cpu["model"] == "QEMU Virtual CPU version 2.5+"
+    assert cpu["hypervisor"] is True
+    assert cpu["missing"][:4] == list(runtime_env.X86_64_V2_FLAGS)
+    assert cpu["x86_64_level"] == "v1"
+    # It advertises nothing this probe looks for, v3 included.
+    assert cpu["present"] == []
+    assert set(cpu["missing"]) == set(
+        runtime_env.X86_64_V2_FLAGS + runtime_env.X86_64_V3_FLAGS
+    )
+
+
+def test_a_full_featured_host_is_missing_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The other end, and the one that must never grow a false positive.
+
+    An empty ``missing`` is what every consumer reads as "let it run", so the
+    flag names have to match /proc/cpuinfo's own spelling exactly - notably
+    ``abm``, which is how Linux reports LZCNT and the reason a probe looking for
+    ``lzcnt`` would call this CPU incapable.
+    """
+    cpu = _cpuinfo(monkeypatch, tmp_path, _FULL_HOST_CPUINFO)
+
+    assert cpu["flags_known"] is True
+    assert cpu["missing"] == []
+    assert cpu["x86_64_level"] == "v3"
+    assert cpu["hypervisor"] is False
+    assert cpu["present"] == list(
+        runtime_env.X86_64_V2_FLAGS + runtime_env.X86_64_V3_FLAGS
+    )
+
+
+def test_a_v2_only_cpu_is_not_reported_as_v3(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A modest but perfectly working CPU: v2 whole, v3 partial.
+
+    Nothing we run needs v3, so this host must read as capable - the level says
+    ``v2`` and the v3 names in ``missing`` are diagnosis, not a verdict. The
+    level cannot be derived from "is anything missing?" for exactly this reason.
+    """
+    trimmed = _FULL_HOST_CPUINFO.replace(" avx2 ", " ").replace(" bmi2 ", " ")
+    cpu = _cpuinfo(monkeypatch, tmp_path, trimmed)
+
+    assert cpu["x86_64_level"] == "v2"
+    assert cpu["missing"] == ["avx2", "bmi2"]
+    assert all(flag in cpu["present"] for flag in runtime_env.X86_64_V2_FLAGS)
+
+
+def test_off_linux_x86_nothing_is_claimed_at_all(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A mac has no /proc at all, and would answer "everything is missing".
+
+    The whole set therefore reads as unknown rather than absent: ``flags_known``
+    False, the two lists empty and the level ``None``. ``arch`` survives because
+    it is the one fact ``platform`` gives us everywhere.
+    """
+    cpu = _cpuinfo(
+        monkeypatch, tmp_path, _FULL_HOST_CPUINFO, system="Darwin", machine="arm64",
+    )
+
+    assert cpu["flags_known"] is False
+    assert cpu["arch"] == "arm64"
+    assert cpu["model"] is None
+    assert cpu["hypervisor"] is None
+    assert cpu["x86_64_level"] is None
+    assert cpu["present"] == [] and cpu["missing"] == []
+
+
+@pytest.mark.parametrize("machine", ["aarch64", "x86_64"])
+def test_an_arm_feature_line_is_not_an_x86_flag_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, machine: str,
+) -> None:
+    """The false positive that would block a working host, tested from both ends.
+
+    aarch64 spells the line ``Features:``, and its names share no vocabulary
+    with x86 - so a probe that accepted any flag-ish line would find none of
+    ``ssse3``/``sse4_1``/``sse4_2``/``popcnt``, report the full v2 set as
+    missing and refuse to run the coding agents on a machine where they are
+    fine. Both gates are asserted independently: the architecture (an ARM host
+    is never parsed) and the key itself (a file with no ``flags:`` line yields
+    nothing even where the architecture says x86).
+    """
+    cpu = _cpuinfo(monkeypatch, tmp_path, _AARCH64_CPUINFO, machine=machine)
+
+    assert cpu["flags_known"] is False, machine
+    assert cpu["missing"] == []
+    assert cpu["x86_64_level"] is None
+
+
+def test_an_unreadable_cpuinfo_is_never_an_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """This block rides a listing endpoint and a tool catalogue.
+
+    A kernel that mounts /proc differently, a container that hides it, a
+    directory where a file was expected - none of those may turn
+    ``/api/system/environment`` or a tool's own status into a 500, so the probe
+    swallows everything and degrades to "could not tell".
+    """
+    monkeypatch.setattr(runtime_env, "_host_platform", lambda: ("Linux", "x86_64"))
+
+    for path in (tmp_path / "absent", tmp_path):  # missing file, then a directory
+        monkeypatch.setattr(runtime_env, "_CPUINFO_PATH", path)
+        runtime_env.describe_runtime_environment.cache_clear()
+        cpu = runtime_env.cpu_features()
+        assert cpu["flags_known"] is False, path
+        assert cpu["arch"] == "x86_64"
+        assert cpu["model"] is None and cpu["x86_64_level"] is None
+
+
+def test_the_cpu_block_rides_the_description(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """One probe, one answer, wherever it is read from.
+
+    ``/api/system/environment`` and ``cremind server environment`` see it
+    through the description; the tool runners call ``cpu_features()`` straight.
+    A second copy of the parsing would be a second verdict about one CPU.
+    """
+    _cpuinfo(monkeypatch, tmp_path, _QEMU64_CPUINFO)
+    described = _describe(monkeypatch, {"INSTALL_MODE": "kubernetes"})
+
+    assert described["cpu"] == runtime_env.cpu_features()
+    assert described["cpu"]["model"] == "QEMU Virtual CPU version 2.5+"
+
+
+def test_cache_clear_resets_the_cpu_probe_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``cache_clear`` on the description has to clear both caches now.
+
+    Dozens of fixtures call it as their one "forget this machine" handle. The
+    CPU facts live in a cache of their own because the tool runners ask for them
+    without a description in hand, so clearing only the outer one would freeze
+    the ``cpu`` block at whatever the first case in a file wrote - which is a
+    test that passes alone and fails in the suite.
+    """
+    _cpuinfo(monkeypatch, tmp_path, _QEMU64_CPUINFO)
+    assert _describe(monkeypatch, {})["cpu"]["x86_64_level"] == "v1"
+
+    (tmp_path / "cpuinfo").write_text(_FULL_HOST_CPUINFO, encoding="utf-8")
+    assert runtime_env.cpu_features()["x86_64_level"] == "v1", "still cached"
+
+    runtime_env.describe_runtime_environment.cache_clear()
+
+    assert runtime_env.cpu_features()["x86_64_level"] == "v3"
+    assert runtime_env.describe_runtime_environment()["cpu"]["missing"] == []
 
 
 # --- the unauthenticated subset ----------------------------------------

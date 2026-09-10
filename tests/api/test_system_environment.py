@@ -45,18 +45,41 @@ _SCRUBBED_ENV = (
 )
 
 
+# The flag line the Kubernetes node this endpoint was extended for really
+# reports: a QEMU virtual CPU advertising none of the x86-64-v2 instructions the
+# prebuilt coding-agent binaries are compiled for.
+_QEMU64_CPUINFO = (
+    "model name\t: QEMU Virtual CPU version 2.5+\n"
+    "flags\t\t: apic clflush cmov constant_tsc cpuid cpuid_fault cx16 cx8 de "
+    "fpu fxsr hypervisor lahf_lm lm mca mce mmx msr mtrr nopl nx pae pat pge "
+    "pni pse pse36 pti sep sse sse2 syscall tsc tsc_known_freq x2apic "
+    "xtopology\n"
+)
+
+
 @pytest.fixture(autouse=True)
 def _uncached_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """One case's install must not describe the next one's.
 
     The description is lru_cached for the life of the process because it feeds
-    the agent's prompt-cached system prompt. The two file probes are pointed at
-    paths that cannot exist for the same reason: ``/.dockerenv`` would make
-    every native row here a Docker one on a containerised CI runner, and the
-    service-account namespace file would name a real cluster.
+    the agent's prompt-cached system prompt. Two of the three file probes are
+    pointed at paths that cannot exist: ``/.dockerenv`` would make every native
+    row here a Docker one on a containerised CI runner, and the service-account
+    namespace file would name a real cluster.
+
+    ``/proc/cpuinfo`` is pinned the other way - at a file this fixture writes,
+    with the host platform forced to the one shape the probe parses - because
+    the body is asserted to *carry* a CPU model and a missing-flag list. Left
+    alone it would answer from the runner's own hardware: nothing at all on a
+    Windows or macOS dev box, and whatever flags the build machine happens to
+    have on Linux.
     """
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text(_QEMU64_CPUINFO, encoding="utf-8")
     monkeypatch.setattr(runtime_env, "_CONTAINER_MARKER", tmp_path / "no-dockerenv")
     monkeypatch.setattr(runtime_env, "_SA_NAMESPACE_FILE", tmp_path / "no-namespace")
+    monkeypatch.setattr(runtime_env, "_CPUINFO_PATH", cpuinfo)
+    monkeypatch.setattr(runtime_env, "_host_platform", lambda: ("Linux", "x86_64"))
     runtime_env.describe_runtime_environment.cache_clear()
     yield
     runtime_env.describe_runtime_environment.cache_clear()
@@ -222,6 +245,32 @@ def test_the_existing_keys_survive_the_two_new_blocks(
     # The description's own fields are still spread in beside them.
     assert body["install_mode"] == "native"
     assert "release_channel" in body and "system_dir" in body
+
+
+def test_the_cpu_facts_reach_the_admin_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one door the CPU fingerprint travels through, and it is admin-only.
+
+    A pod whose node hides the x86-64-v2 instructions makes the bundled Claude
+    Code CLI spin at 100% CPU forever rather than fail, and the remedy is a
+    hypervisor setting the operator may not even control - so the model name and
+    the missing flags have to be *readable*, on the Developer page and in
+    ``cremind server environment``, or the only symptom is "the agent hangs".
+    The unauthenticated tray endpoint deliberately carries none of it; that half
+    of the pairing is pinned in ``tests/api/test_features_capabilities.py``.
+    """
+    _pin_install(monkeypatch, "kubernetes")
+
+    cpu = _environment()["cpu"]
+
+    assert cpu["model"] == "QEMU Virtual CPU version 2.5+"
+    assert cpu["hypervisor"] is True
+    assert cpu["flags_known"] is True
+    assert cpu["x86_64_level"] == "v1"
+    assert cpu["missing"][:4] == ["ssse3", "sse4_1", "sse4_2", "popcnt"]
+    # Same block the runners read directly, not a second parse of the same file.
+    assert cpu == runtime_env.cpu_features()
 
 
 def test_the_handler_cannot_poison_the_cached_description(

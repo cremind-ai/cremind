@@ -636,6 +636,31 @@ def test_tray_vnc_access_matches_the_environment_endpoint(
     assert "port_forward_commands" not in tray and "novnc_url" not in tray
 
 
+def test_the_tray_never_carries_a_cpu_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CPU facts are admin-only, and this endpoint answers with no token.
+
+    ``/api/system/environment`` publishes the CPU model and the instruction-set
+    flags it lacks, because that is the only thing that explains a coding-agent
+    CLI hanging on a node whose hypervisor hides them. None of it belongs here:
+    a model name plus a flag list is a precise fingerprint of the machine and of
+    the hypervisor underneath it, handed to anyone who can reach the port. This
+    endpoint picks its fields explicitly rather than spreading the description,
+    which is what keeps that true - so the assertion is on the whole body, not
+    just on the key.
+    """
+    import json
+
+    _stub_state(monkeypatch, setup_complete=True)
+    _install(monkeypatch, "kubernetes")
+
+    body = _tray()
+
+    assert "cpu" not in body
+    assert "x86_64" not in json.dumps(body)
+
+
 def test_environment_reports_the_zone_schedules_actually_fire_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

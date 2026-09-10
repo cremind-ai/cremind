@@ -37,6 +37,16 @@ The ``probe`` route deliberately does NOT reimplement the live login check; it
 runs the very same status leaf the agent calls (``ClaudeCodeStatusTool`` /
 ``CodexStatusTool``) and returns its structured payload verbatim, so the card
 and the assistant can never disagree about whether a delegate is signed in.
+
+One thing every route asks before anything else: each runner's ``host_blocker``,
+which reports a host that cannot run the delegate's CLI *at all* - today, a CPU
+whose flags the bundled Claude Code executable was not built for, where the
+binary spins at 100% CPU forever instead of failing. That answer leads the
+listing's ``message``, refuses the sign-in terminal with a 409, and rides the
+``/cli`` payload as ``cli_blocked`` so ``cremind tools coding-agents login``
+refuses before it exec's anything. It is deliberately ahead of the install /
+sign-in / enable advice below it: on such a host none of those is the next thing
+standing in the user's way, and none of them would help.
 """
 
 from __future__ import annotations
@@ -234,6 +244,14 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
             "claude_code": claude_code_runner.find_cli,
             "codex": codex_runner.find_cli,
         }
+        # Asked per row rather than once, because it is a per-delegate answer:
+        # Codex declares no instruction-set requirement and its function is a
+        # constant ``None``, while Claude Code's inspects the CPU the bundled
+        # executable would have to run on.
+        host_blocker_fns: dict[str, Callable] = {
+            "claude_code": claude_code_runner.host_blocker,
+            "codex": codex_runner.host_blocker,
+        }
 
         # A tool whose feature was never installed is not in the registry at all
         # (the built-in group never registered), so a missing row means "off",
@@ -260,6 +278,13 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
                 "source": None, "scope": None, "cli_home": None, "account_hint": None,
             }
             cli_available = False
+            # Defaulted before the try for the same reason the try is there at
+            # all - one tool's failure must not break the listing - but the
+            # default matters more here than for the fields above it: "nothing
+            # known to be wrong" is the only honest answer when the check itself
+            # did not finish, and a host condition invented from a failed check
+            # would take the delegate away from a server where it works.
+            cli_blocked: dict[str, Any] | None = None
             try:
                 variables = registry.config.get_variables(
                     tool_id, profile, include_secrets=True,
@@ -270,6 +295,10 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
                 # binary, and an SDK wheel built without one (or a stale
                 # CLI-path variable) would make that button do nothing.
                 cli_available = bool(find_cli_fns[tool_id](variables))
+                # And whether a binary that IS there could run: on a CPU without
+                # the instructions it was built for it neither runs nor fails,
+                # so the row has to say so before it offers a sign-in.
+                cli_blocked = host_blocker_fns[tool_id](variables)
             except Exception:  # noqa: BLE001 - status must never fail on one tool
                 logger.debug(
                     f"coding-agents: credential resolution failed for '{tool_id}'",
@@ -294,6 +323,11 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
                 "account_hint": info.get("account_hint"),
                 "cli_available": cli_available,
                 "credentials_configured": source is not None,
+                # ``None`` on every host where the CLI can run; a whole blocker
+                # dict (code, cpu_model, missing, hypervisor, message, remedy)
+                # where it cannot. The card renders the remedy from here, which
+                # is why ``message`` below does not repeat it.
+                "cli_blocked": cli_blocked,
                 "sign_in": dict(spec["sign_in"]),
                 "message": _summary(
                     spec,
@@ -302,6 +336,7 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
                     source=source,
                     scope=info.get("scope"),
                     cli_available=cli_available,
+                    cli_blocked=cli_blocked,
                 ),
             })
         return JSONResponse({"agents": agents})
@@ -518,6 +553,11 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
         run there would overwrite the operator's login with the member's - the
         one accident the per-profile homes exist to prevent. ``shared`` is
         admin-only for the same reason.
+
+        409 with ``cli_blocked`` when the host cannot run this CLI at all, and
+        ahead of the "no binary" refusal because installing one would not help:
+        a terminal opened on such a host prints nothing at all and burns a core
+        until the user closes the dialog.
         """
         registry, profile, error = _registry_and_profile(request)
         if error is not None:
@@ -547,6 +587,24 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
 
         runner = _runner(tool_id)
         variables = registry.config.get_variables(tool_id, profile, include_secrets=True)
+
+        # Before the "no binary" refusal below, not after it. That refusal names
+        # installing the CLI as the fix, and here installing it is not the fix:
+        # this host cannot run any copy of it. A PTY opened anyway would sit at
+        # 100% CPU printing nothing at all - the black box this replaces - so
+        # nothing is spawned and the whole diagnosis goes back with the refusal.
+        # The remedy joins ``error`` here (unlike the listing's ``message``)
+        # because a 409 body is the only text the dialog gets to show.
+        blocked = runner.host_blocker(variables)
+        if blocked:
+            detail = (
+                f"{blocked.get('message') or ''} {blocked.get('remedy') or ''}"
+            ).strip()
+            return JSONResponse(
+                {"tool_id": tool_id, "error": detail, "cli_blocked": blocked},
+                status_code=409,
+            )
+
         binary = runner.find_cli(variables)
         if not binary:
             return JSONResponse(
@@ -689,9 +747,10 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
         This is what lets ``cremind tools coding-agents login`` refuse politely
         instead of exec'ing something that is not there: the CLI compares
         ``binary`` and ``system_dir`` against its own filesystem and, when they
-        are not the same machine, names the host to run the login on. Nothing
-        here is a secret - paths, argv and two environment variables that are
-        themselves paths.
+        are not the same machine, names the host to run the login on - and
+        ``cli_blocked`` tells it about the other refusal, a binary that is right
+        here and still cannot run. Nothing here is a secret - paths, argv, two
+        environment variables that are themselves paths, and a CPU model.
         """
         registry, profile, error = _registry_and_profile(request)
         if error is not None:
@@ -723,6 +782,12 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
             # terminal. The server answers this because only it knows whether it
             # is running in one of our images.
             "drop_env": _login_drop_env(),
+            # Why the CLI can refuse before it exec's anything. It cannot work
+            # this out itself - modules under ``app/cli`` must not import
+            # ``app.tools`` - and it is the server's CPU that decides, not the
+            # one the user is typing on, so the answer has to travel with the
+            # rest of the descriptor. ``None`` wherever the binary can run.
+            "cli_blocked": runner.host_blocker(variables),
             "server_hostname": socket.gethostname(),
             "system_dir": str(BaseConfig.CREMIND_SYSTEM_DIR),
             "platform": sys.platform,
@@ -1009,11 +1074,24 @@ def _summary(
     source: str | None,
     scope: str | None,
     cli_available: bool,
+    cli_blocked: dict | None = None,
 ) -> str:
     """One sentence naming the single next thing standing between the profile
-    and a working delegate - install, sign in, or switch the tool on."""
+    and a working delegate - a host that cannot run its CLI at all, or else
+    install, sign in, or switch the tool on."""
     name = spec["display_name"]
     login = spec["sign_in"]["cli_login"]
+    # Ahead of all three, because on a host that cannot run the binary all three
+    # can be true at once and none of them is what is in the user's way: the
+    # extra installs, the sign-in completes, the toggle goes on, and the delegate
+    # is exactly as broken as before. The remedy is deliberately NOT appended -
+    # it is a paragraph about hypervisor CPU models, it travels whole on the
+    # row's ``cli_blocked``, and the card and the CLI both render it from there.
+    # Read defensively so a blocker with no prose can never blank out a row's
+    # message: every consumer treats an empty summary as "nothing to say".
+    blocked_message = str((cli_blocked or {}).get("message") or "").strip()
+    if blocked_message:
+        return blocked_message
     if not sdk_installed:
         return (
             f"{name} is not installed on this server. Install the "

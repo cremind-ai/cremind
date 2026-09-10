@@ -59,10 +59,12 @@ const terminalId = ref('');
 const command = ref('');
 const cliHome = ref('');
 const exited = ref(false);
-/** The command is up but has printed nothing for ``SILENT_CLI_MS``, which on a
- *  server almost always means the CLI is waiting on a browser that can never
- *  open. Nothing is broken enough to error on, so it becomes a hint plus the
- *  token fallback rather than a failure. */
+/** The command is up but has printed nothing for ``SILENT_CLI_MS``. Usually the
+ *  CLI is waiting on a browser that can never open on a server; it can also be
+ *  that the binary cannot run on this host at all, which looks identical from
+ *  here — a process burning CPU and saying nothing. Either way nothing is
+ *  broken enough to error on, so it becomes a hint plus the token fallback
+ *  rather than a failure, and the hint names both possibilities. */
 const silentCli = ref(false);
 
 const sessionRef = ref<InstanceType<typeof TerminalSession> | null>(null);
@@ -309,9 +311,11 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-else-if="silentCli" class="login-hint">
-      The command has printed nothing for a while. On a server this almost always
-      means the CLI is trying to open a browser it cannot reach — it will wait
-      like this indefinitely. Use the token fallback below instead.
+      The command has printed nothing for a while. On a server that usually
+      means the CLI is trying to open a browser it cannot reach, and it will
+      wait like this indefinitely. It can also mean the CLI binary cannot run
+      on this server at all — the Coding Agents card says so when Cremind can
+      tell. Either way, use the token fallback below instead.
     </div>
 
     <p v-if="exited" class="login-exited" :class="{ 'login-exited-failed': exitFailed }">

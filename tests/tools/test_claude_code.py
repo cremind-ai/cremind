@@ -159,6 +159,10 @@ def _clean_registry(monkeypatch, tmp_path):
     pinned False so the container-only legacy ``~`` tier can never fire either.
     ``list_models`` is stubbed to an empty success so ``status`` never hits the
     network; tests that care about the model list re-stub it locally.
+    ``host_blocker`` is pinned to None for the same reason ``is_container`` is:
+    it reads the real /proc/cpuinfo, so on a ``qemu64`` CI runner every test in
+    this file would get a refusal instead of the behaviour it is about (see
+    :func:`_block_host` for the tests that want one).
     """
     from app.config import runtime_env
     from app.config.settings import BaseConfig
@@ -182,6 +186,7 @@ def _clean_registry(monkeypatch, tmp_path):
     monkeypatch.setattr(aa.AgentActivity, "_patch_persisted", _noop)
     monkeypatch.setattr(aa.AgentActivity, "_schedule_flush", lambda self: None)
     monkeypatch.setattr(r, "list_models", _empty_models)
+    monkeypatch.setattr(r, "host_blocker", lambda variables=None: None)
 
     system_dir = tmp_path / "system"
     shared = tmp_path / "shared-claude"
@@ -1129,3 +1134,113 @@ def test_status_models_error_passthrough(monkeypatch):
     assert sc["models_error"] == "credential rejected"
     # The credential-source status is independent of the model fetch outcome.
     assert sc["credential_source"] == "tool_variable_api_key"
+
+
+# ── a host whose CPU cannot run the bundled CLI ───────────────────────────────
+#
+# The bundled ``claude`` is a Bun executable built for x86-64-v2; on a ``qemu64``
+# virtual CPU every subcommand but ``--version`` spins at 100% CPU forever. So
+# the leaves must refuse without spawning it - a coding task would otherwise hang
+# until the SDK's own timeout, with an activity feed open in front of the user
+# the whole time - and the status leaf must read as "not checked", never as
+# "signed out".
+
+
+def _block_host(monkeypatch, **overrides):
+    """Pretend :func:`runner.host_blocker` found the qemu64 node.
+
+    The dict is the runner's own contract, faked here rather than driven through
+    /proc so these tests are about the leaves; the blocker's own wording and
+    precision are pinned in ``test_claude_code_auth.py``.
+    """
+    from app.tools.builtin import claude_code_runner as r
+
+    blocker = {
+        "code": r.HOST_BLOCKER_CPU,
+        "cpu_model": "QEMU Virtual CPU version 2.5+",
+        "missing": ["ssse3", "sse4_1", "sse4_2", "popcnt"],
+        "hypervisor": True,
+        "message": "The Claude Code CLI cannot run on this server's CPU: ...",
+        "remedy": "Set the VM's CPU type to 'host' and restart the node.",
+    }
+    blocker.update(overrides)
+    monkeypatch.setattr(r, "host_blocker", lambda variables=None: dict(blocker))
+    return blocker
+
+
+def test_run_refuses_on_a_blocked_host_without_touching_the_sdk(monkeypatch, tmp_path):
+    """No task, no client - the binary the client spawns is what cannot run."""
+    from app.tools.builtin import claude_code_runner as r
+
+    blocker = _block_host(monkeypatch)
+
+    async def produce(client):  # pragma: no cover - the stream is never reached
+        if False:
+            yield
+
+    mod = install_fake_sdk(monkeypatch, produce)
+
+    def _explode(self, options=None):
+        pytest.fail("a blocked host must not construct a Claude Code SDK client")
+
+    monkeypatch.setattr(mod.ClaudeSDKClient, "__init__", _explode)
+
+    res = asyncio.run(_run_tool(
+        prompt="build it", working_directory=str(tmp_path),
+        _context_id="conv-cpu-1", _profile="default", _variables={},
+    ))
+    sc = res.structured_content
+    assert sc["error"] == "HostCannotRunClaudeCode"
+    assert sc["message"] == blocker["message"]
+    assert sc["remediation"] == blocker["remedy"]
+    assert sc["host_advisory"] == blocker
+    # Nothing was registered, so a later wait/stop cannot find a phantom task.
+    assert r.known_task_ids() == []
+
+
+def test_status_reports_the_host_advisory_and_is_unavailable(monkeypatch, _clean_registry):
+    """"Is Claude Code set up?" has to answer this before the credentials.
+
+    The credential fields stay (a user still wants to know what a run WOULD
+    authenticate as), but ``available`` is False and the message is the host's -
+    every other answer on this card is beside the point.
+    """
+    _no_sdk_stream(monkeypatch)
+    blocker = _block_host(monkeypatch)
+
+    res = asyncio.run(_status_tool(_profile="default", _variables={}))
+    sc = res.structured_content
+    assert sc["available"] is False
+    assert sc["host_advisory"] == blocker
+    assert sc["message"] == blocker["message"] + " " + blocker["remedy"]
+    # The SDK is installed; it is the host that cannot run its binary.
+    assert sc["sdk_installed"] is True
+
+
+def test_status_probe_on_a_blocked_host_reads_as_not_checked(monkeypatch, _clean_registry):
+    """The one verdict that must never appear here is "signed out".
+
+    Nothing was asked and nothing was validated, so both verdict fields stay
+    None and the message keeps naming the CPU - sending the user off to sign in
+    again would be a wasted trip, and there may be nothing wrong with the login.
+    """
+    _no_sdk_stream(monkeypatch)
+    blocker = _block_host(monkeypatch)
+
+    res = asyncio.run(_status_tool(probe=True, _profile="default", _variables={}))
+    sc = res.structured_content
+    assert sc["logged_in"] is None
+    assert sc["credential_verified"] is None
+    assert sc["available"] is False
+    assert sc["host_advisory"] == blocker
+    assert sc["message"] == blocker["message"] + " " + blocker["remedy"]
+    assert "NOT authenticated" not in sc["message"]
+
+
+def test_status_carries_no_host_advisory_on_a_healthy_host(monkeypatch):
+    """The other half of precision: a working host says nothing about its CPU."""
+    _no_sdk_stream(monkeypatch)
+    res = asyncio.run(_status_tool(_profile="default", _variables={}))
+    sc = res.structured_content
+    assert sc["available"] is True
+    assert "host_advisory" not in sc

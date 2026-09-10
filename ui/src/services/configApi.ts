@@ -1760,6 +1760,34 @@ export async function streamFeaturesInstall(
 
 // ── Runtime environment ──
 
+/** What the server's CPU can actually execute.
+ *
+ *  This exists because a bundled single-file binary is compiled for a
+ *  microarchitecture level, not merely for x86-64: the Claude Code CLI needs
+ *  x86-64-v2, and on a virtual CPU that reports none of those flags it spins
+ *  for ever instead of failing. So the flags are a first-class fact about the
+ *  install, worth showing next to the OS and the Python version.
+ *
+ *  Every field is optional: the backend only knows any of this on Linux and
+ *  only for x86_64, and an older backend omits the block entirely. */
+export interface CpuFeatures {
+  /** ``platform.machine()`` — ``x86_64``, ``aarch64``, … */
+  arch?: string | null;
+  /** The CPU's own model name, e.g. "QEMU Virtual CPU version 2.5+". */
+  model?: string | null;
+  /** Whether the kernel sees itself running under a hypervisor. */
+  hypervisor?: boolean | null;
+  /** False when the flags could not be read at all — not Linux, not x86_64 —
+   *  in which case ``present``/``missing`` say nothing and must not be shown
+   *  as if they did. */
+  flags_known?: boolean | null;
+  present?: string[];
+  missing?: string[];
+  /** The highest x86-64 microarchitecture level the flags support. Null when
+   *  the flags are unknown. */
+  x86_64_level?: 'v1' | 'v2' | 'v3' | null;
+}
+
 /** What ``GET /api/system/environment`` reports about the running install:
  *  how it was installed, how it is deployed, and where its data lives.
  *
@@ -1808,6 +1836,9 @@ export interface SystemEnvironment {
   kubernetes?: KubernetesIdentity | null;
   /** How to reach the VNC desktop, or ``enabled: false`` when there is none. */
   vnc?: VncAccess | null;
+  /** What this host's CPU supports — the fact that decides whether a bundled
+   *  binary built for a newer microarchitecture level can run here at all. */
+  cpu?: CpuFeatures | null;
 }
 
 export async function fetchSystemEnvironment(
@@ -1846,6 +1877,31 @@ export interface CodingAgentSignIn {
   cli_logout: string;
 }
 
+/** The agent's own command-line tool cannot run on this server's CPU.
+ *
+ *  This is not "not signed in" and not "not installed": the binary is there
+ *  and it is the right binary, but it was built for a microarchitecture level
+ *  the host does not provide, so every invocation of it hangs. Nothing that
+ *  goes through the CLI can work while this is set — not signing in, not the
+ *  sign-in check, not a coding task — and no Cremind-side setting changes
+ *  that, because the fix is on the machine (or its hypervisor). The remedy
+ *  therefore names what an operator has to change, and the UI's job is to say
+ *  so immediately rather than let each surface hang in its own way. */
+export interface CodingAgentHostBlock {
+  /** Which check refused. ``cpu_features`` today; kept open so a future
+   *  blocker can be told apart without reading the prose. */
+  code: string;
+  /** One sentence naming the CPU and the level it is short of — the same
+   *  sentence the backend puts in the listing's ``message``. */
+  message: string;
+  /** What to change on the host to make the CLI runnable. */
+  remedy: string;
+  cpu_model: string | null;
+  /** The microarchitecture flags the CLI needs and this CPU lacks. */
+  missing: string[];
+  hypervisor: boolean;
+}
+
 export interface CodingAgentStatus {
   tool_id: string;
   display_name: string;
@@ -1876,6 +1932,11 @@ export interface CodingAgentStatus {
   cli_available: boolean;
   credentials_configured: boolean;
   sign_in: CodingAgentSignIn;
+  /** Set when this host cannot run the agent's CLI at all, so the card can
+   *  refuse up front instead of offering buttons that would hang. Optional:
+   *  a backend that predates the check omits it, and the page then behaves
+   *  exactly as it did before. */
+  cli_blocked?: CodingAgentHostBlock | null;
   /** Human-readable summary of the state above. */
   message: string;
 }
@@ -2096,6 +2157,10 @@ export interface CodingAgentCli {
   server_hostname: string;
   system_dir: string;
   platform: string;
+  /** Set when the binary above exists but this host cannot execute it, so the
+   *  CLI can refuse before exec'ing something that would never return.
+   *  Optional for the same reason as on the listing row. */
+  cli_blocked?: CodingAgentHostBlock | null;
 }
 
 export async function getCodingAgentCli(

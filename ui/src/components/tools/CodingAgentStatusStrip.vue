@@ -12,7 +12,7 @@
  * confirms, so there is one install/sign-in flow on the page rather than two.
  */
 import { computed } from 'vue';
-import { ElButton, ElTag, ElTooltip } from 'element-plus';
+import { ElAlert, ElButton, ElTag, ElTooltip } from 'element-plus';
 import { Icon } from '@iconify/vue';
 
 import type { CodingAgentStatus } from '../../services/configApi';
@@ -124,9 +124,25 @@ const signOutLabel = computed(() =>
   props.agent.credential_scope === 'shared' ? 'Sign out (shared login)' : 'Sign out',
 );
 
+/**
+ * Set when this server cannot execute the agent's CLI at all — the binary is
+ * present and correct but built for a CPU level this host does not provide, so
+ * every invocation of it hangs instead of answering. It outranks every other
+ * state on this strip: nothing that goes through the CLI can work, and no
+ * setting here changes that. Null on a backend that predates the check, which
+ * is why the strip degrades to exactly its old behaviour.
+ */
+const hostBlock = computed(() => props.agent.cli_blocked ?? null);
+
 /** Why Sign in is unavailable, or '' when it is available. Sign-in runs the
- *  CLI binary, which can be missing even when the SDK is installed. */
+ *  CLI binary, which can be missing even when the SDK is installed — and, on a
+ *  host that cannot run the binary, can be present and still useless. */
 const signInBlockedReason = computed(() => {
+  // The host block comes first because it is the only reason the user cannot
+  // act on: installing the feature or pointing Cremind at another copy of the
+  // binary would just produce a binary that hangs in the same way, so naming
+  // either of those instead would send them down a road with no end.
+  if (hostBlock.value) return hostBlock.value.message;
   if (props.agent.cli_available) return '';
   const name = props.agent.display_name;
   if (!props.agent.sdk_installed) {
@@ -190,7 +206,20 @@ const probeDetail = computed(() =>
       <span>{{ accountLine }}</span>
     </p>
 
-    <p class="agent-message">{{ agent.message }}</p>
+    <!-- The backend already writes the same sentence into `agent.message`, so
+         showing both would tell the user the bad news twice. -->
+    <ElAlert
+      v-if="hostBlock"
+      type="error"
+      :closable="false"
+      show-icon
+      class="agent-host-block"
+    >
+      <template #title>{{ agent.display_name }} cannot run on this server</template>
+      <p class="agent-host-block-line">{{ hostBlock.message }}</p>
+      <p class="agent-host-block-line">{{ hostBlock.remedy }}</p>
+    </ElAlert>
+    <p v-else class="agent-message">{{ agent.message }}</p>
 
     <div class="agent-actions">
       <ElButton
@@ -213,7 +242,7 @@ const probeDetail = computed(() =>
           <ElButton
             type="primary"
             size="small"
-            :disabled="!agent.cli_available"
+            :disabled="!agent.cli_available || Boolean(hostBlock)"
             @click="emit('sign-in', agent)"
           >
             <Icon icon="mdi:login-variant" />&nbsp;{{ agent.sign_in.label }}
@@ -221,6 +250,10 @@ const probeDetail = computed(() =>
         </span>
       </ElTooltip>
 
+      <!-- These two stay live on a blocked host, unlike Sign in. The probe no
+           longer runs the CLI when the host cannot execute it — it answers at
+           once with the reason — and signing out only deletes a credential
+           file, which needs no CLI and is still worth being able to do. -->
       <ElButton size="small" :loading="probing" @click="emit('check', agent)">
         Check sign-in
       </ElButton>
@@ -268,6 +301,28 @@ const probeDetail = computed(() =>
   font-size: 0.82rem;
   line-height: 1.5;
   color: var(--text-secondary);
+}
+
+/* Every colour here is painted from the app's own tokens, including the ones
+   Element Plus would otherwise supply: this project never redeclares the
+   `--el-color-error-*` family, so an untouched error alert keeps Element
+   Plus's light defaults in the dark theme — a pale pink block whose
+   description text, which *is* redeclared, turns near-white and vanishes. */
+.agent-host-block {
+  margin-top: 8px;
+  background: color-mix(in srgb, var(--danger-color) 10%, var(--surface-color));
+  border: 1px solid color-mix(in srgb, var(--danger-color) 45%, var(--border-color));
+}
+.agent-host-block :deep(.el-alert__title),
+.agent-host-block :deep(.el-alert__icon) {
+  color: var(--danger-color);
+}
+.agent-host-block :deep(.el-alert__title) { font-weight: 600; }
+.agent-host-block-line {
+  margin: 6px 0 0 0;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--text-primary);
 }
 
 .agent-actions {

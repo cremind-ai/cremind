@@ -26,7 +26,12 @@ both read:
   into the terminal the user is looking at;
 - ``logout`` refuses to sign a profile out of a login it does not own, which is
   the one refusal the UI cannot be trusted to make on its own (the CLI hits the
-  same route).
+  same route);
+- a host whose CPU cannot run the delegate's CLI is reported on every surface
+  and reported FIRST - the listing's sentence, a 409 from ``login-terminal``
+  with nothing spawned, and ``cli_blocked`` in the ``/cli`` payload so the shell
+  door refuses too. On such a host "install it" / "sign in" / "switch it on"
+  are all still true and all beside the point.
 
 Isolation is by environment: ``CLAUDE_CONFIG_DIR`` / ``CODEX_HOME`` point at
 empty temp directories and ``BaseConfig.CREMIND_SYSTEM_DIR`` at ``tmp_path``, so
@@ -103,14 +108,22 @@ def _no_ambient_credentials(monkeypatch, tmp_path):
 
 @pytest.fixture(autouse=True)
 def _no_cli_binaries(monkeypatch):
-    """No ``claude`` / ``codex`` on this box unless a test says otherwise.
+    """No ``claude`` / ``codex`` on this box, and a CPU that can run both.
 
     ``find_cli`` ends at ``shutil.which``, so a developer with either CLI on
     PATH would otherwise flip ``cli_available`` and let the sign-in routes past
-    their "no binary" refusal."""
+    their "no binary" refusal.
+
+    ``host_blocker`` is pinned to "nothing known to be wrong" for the same
+    reason and one more: it reads the real /proc/cpuinfo, so on a machine that
+    genuinely lacks the x86-64-v2 instructions every assertion in this file
+    about a listing message or a sign-in refusal would change meaning - the
+    blocker leads the summary and precedes both refusals by design. Tests that
+    want that host say so with :func:`_block_host`."""
     for runner in (claude_code_runner, codex_runner):
         monkeypatch.setattr(runner, "find_cli", lambda variables=None: None)
         monkeypatch.setattr(runner, "cli_binary_source", lambda variables=None: None)
+        monkeypatch.setattr(runner, "host_blocker", lambda variables=None: None)
 
 
 @pytest.fixture(autouse=True)
@@ -150,6 +163,43 @@ def sdk_absent(monkeypatch):
 def _with_cli(monkeypatch, runner, binary: str, source: str = "bundled") -> None:
     monkeypatch.setattr(runner, "find_cli", lambda variables=None: binary)
     monkeypatch.setattr(runner, "cli_binary_source", lambda variables=None: source)
+
+
+# The blocker one runner hands back on the node this feature was written for: a
+# QEMU virtual CPU advertising none of the four x86-64-v2 flags the bundled
+# Claude Code executable was built for. Kept as data rather than produced by
+# pointing ``_CPUINFO_PATH`` at a fixture file, because these tests are about
+# what the ROUTES do with a blocker; the CPU probe itself is pinned where it
+# lives (tests/config, tests/tools).
+_CPU_BLOCKER: Dict[str, Any] = {
+    "code": claude_code_runner.HOST_BLOCKER_CPU,
+    "cpu_model": "QEMU Virtual CPU version 2.5+",
+    "missing": ["ssse3", "sse4_1", "sse4_2", "popcnt"],
+    "hypervisor": True,
+    "message": (
+        "The Claude Code CLI cannot run on this server's CPU: it is a Bun "
+        "single-file executable built for the x86-64-v2 instruction level, and "
+        'this virtual CPU "QEMU Virtual CPU version 2.5+" advertises none of '
+        "ssse3, sse4_1, sse4_2, popcnt."
+    ),
+    "remedy": (
+        "The fix is on the hypervisor: in Proxmox, set the VM's Hardware -> "
+        "Processors -> Type to 'host'. The node has to be shut down and started "
+        "again afterwards."
+    ),
+}
+
+
+def _block_host(monkeypatch, runner, blocker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Speak for a host whose CPU cannot run ``runner``'s CLI.
+
+    One runner at a time on purpose: the two delegates answer this question
+    independently (Codex declares no instruction-set requirement at all), and a
+    fixture that blocked both could not show that.
+    """
+    payload = dict(blocker or _CPU_BLOCKER)
+    monkeypatch.setattr(runner, "host_blocker", lambda variables=None: dict(payload))
+    return payload
 
 
 def _seed_profile(storage: ToolStorage, name: str) -> None:
@@ -426,6 +476,60 @@ def test_cli_available_follows_the_binary_not_the_sdk(
     assert agents["codex"]["cli_available"] is False
     assert agents["codex"]["sdk_installed"] is True
     assert "command-line tool is not on this server" in agents["codex"]["message"]
+
+
+def test_a_blocked_host_leads_the_row_even_when_everything_else_is_ready(
+    tmp_path: Path, monkeypatch, sdk_present,
+) -> None:
+    """The ordering claim, stated against the hardest case for it.
+
+    This row has the extra installed, a login of its own, a binary on disk and
+    the tool switched on - every other branch of the summary is either satisfied
+    or irrelevant - and the sentence is still the blocker's. That is the whole
+    point: on this host "signed in and using profile_claude_login" would be true
+    and useless, because the binary that credential is for cannot run.
+    """
+    _with_cli(monkeypatch, claude_code_runner, "/opt/claude")
+    blocker = _block_host(monkeypatch, claude_code_runner)
+    _sign_in_claude(_profile_claude_home(tmp_path))
+    reg = _make_registry(tmp_path)
+    reg.set_profile_tool_enabled("admin", "claude_code", True)
+    agents = _by_id(
+        _body(asyncio.run(_list_handler(SimpleNamespace(registry=reg))(_req())))["agents"]
+    )
+
+    row = agents["claude_code"]
+    assert row["cli_blocked"]["code"] == claude_code_runner.HOST_BLOCKER_CPU
+    assert row["cli_blocked"]["cpu_model"] == "QEMU Virtual CPU version 2.5+"
+    assert row["cli_blocked"]["missing"] == ["ssse3", "sse4_1", "sse4_2", "popcnt"]
+    assert row["message"] == blocker["message"]
+    # The remedy is a paragraph and stays out of the sentence - the card renders
+    # it from ``cli_blocked``, and repeating it here would be the summary's whole
+    # length twice over.
+    assert blocker["remedy"] not in row["message"]
+    assert row["cli_blocked"]["remedy"] == blocker["remedy"]
+    # Everything else on the row is still reported honestly; the blocker decides
+    # what to SAY, not what to hide.
+    assert row["credential_source"] == "profile_claude_login"
+    assert row["enabled"] is True
+    assert row["cli_available"] is True
+
+    # And it is per delegate: Codex is a Rust binary built for the x86-64
+    # baseline, declares no such requirement, and must not inherit its
+    # neighbour's verdict in the same response.
+    assert agents["codex"]["cli_blocked"] is None
+    assert agents["codex"]["message"] != blocker["message"]
+
+
+def test_a_blocked_host_also_leads_the_not_installed_sentence(
+    tmp_path: Path, monkeypatch, sdk_absent,
+) -> None:
+    """Installing the extra is the usual next step and here it is the wrong one:
+    the wheel would arrive with the very executable this CPU cannot run."""
+    blocker = _block_host(monkeypatch, claude_code_runner)
+    row = _by_id(_agents(tmp_path))["claude_code"]
+    assert row["message"] == blocker["message"]
+    assert "not installed" not in row["message"]
 
 
 def test_list_unauthenticated_401(tmp_path: Path) -> None:
@@ -1004,6 +1108,41 @@ def test_login_terminal_409_without_a_cli_binary(
     assert recorder.calls == []
 
 
+def test_login_terminal_409_on_a_host_that_cannot_run_the_cli(
+    tmp_path: Path, monkeypatch, sdk_present,
+) -> None:
+    """Refused before anything is spawned, and refused for the right reason.
+
+    A PTY opened here would print nothing at all and burn a core until the user
+    closed the dialog - the black box this replaces - so ``create_terminal`` must
+    never be reached. The refusal also has to arrive with the remedy in it,
+    because the 409 body is the only text the dialog shows; and it deliberately
+    precedes the "no binary" refusal below, which is why this test leaves the
+    binary absent and still expects the CPU answer rather than that one.
+    """
+    blocker = _block_host(monkeypatch, claude_code_runner)
+    recorder = _TerminalRecorder()
+    monkeypatch.setattr(terminals_api, "create_terminal", recorder)
+
+    resp = asyncio.run(
+        _login_terminal_handler(SimpleNamespace(registry=_make_registry(tmp_path)))(
+            _req(path_params={"tool_id": "claude_code"})
+        )
+    )
+    assert resp.status_code == 409
+    body = _body(resp)
+    assert body["tool_id"] == "claude_code"
+    assert body["error"] == f"{blocker['message']} {blocker['remedy']}"
+    # The two things an operator acts on: the CPU model to recognise, and where
+    # the setting that fixes it lives.
+    assert "QEMU Virtual CPU version 2.5+" in body["error"]
+    assert "Proxmox" in body["error"]
+    assert body["cli_blocked"]["code"] == claude_code_runner.HOST_BLOCKER_CPU
+    # Not the "install the CLI" refusal: that fix does not apply here.
+    assert "command-line tool" not in body["error"]
+    assert recorder.calls == []
+
+
 def test_login_terminal_409_when_the_feature_is_absent(
     tmp_path: Path, monkeypatch, sdk_absent,
 ) -> None:
@@ -1223,6 +1362,9 @@ def test_cli_payload_describes_the_binary_and_both_homes(
     assert Path(body["system_dir"]) == tmp_path
     assert body["server_hostname"]
     assert body["platform"] == sys.platform
+    # The healthy shape, pinned: a payload that never says "not blocked" would
+    # let the CLI's refusal creep in on hosts where the binary runs fine.
+    assert body["cli_blocked"] is None
 
 
 def test_cli_payload_tells_a_shell_sign_in_what_not_to_inherit(
@@ -1249,6 +1391,25 @@ def test_cli_payload_tells_a_shell_sign_in_what_not_to_inherit(
     monkeypatch.setattr(runtime_env, "is_container", lambda: False, raising=False)
     resp = asyncio.run(handler(_req(path_params={"tool_id": "claude_code"})))
     assert _body(resp)["drop_env"] == []
+
+
+def test_cli_payload_carries_the_host_blocker(tmp_path: Path, monkeypatch) -> None:
+    """``cremind tools coding-agents login`` cannot ask the CPU itself - modules
+    under ``app/cli`` must not import ``app.tools`` - and it is the SERVER's CPU
+    that decides, not the one the command is typed on. So the descriptor carries
+    the whole diagnosis and the CLI refuses on it before exec'ing anything."""
+    _with_cli(monkeypatch, claude_code_runner, "/opt/claude")
+    blocker = _block_host(monkeypatch, claude_code_runner)
+    resp = asyncio.run(
+        _cli_handler(SimpleNamespace(registry=_make_registry(tmp_path)))(
+            _req(path_params={"tool_id": "claude_code"})
+        )
+    )
+    body = _body(resp)
+    assert body["cli_blocked"] == blocker
+    # The binary is still reported: it is there, it is just unrunnable, and a
+    # payload that hid it would send the user chasing a missing file instead.
+    assert body["binary"] == "/opt/claude"
 
 
 def test_cli_payload_without_a_binary_offers_no_command(

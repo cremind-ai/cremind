@@ -76,6 +76,32 @@ const k8sWorkloadLine = computed(() => {
   return text(workload ?? service);
 });
 
+// The CPU earns a row here because a bundled single-file binary is compiled
+// for a microarchitecture *level*, not merely for x86-64. A virtual CPU that
+// advertises none of the x86-64-v2 flags makes the Claude Code CLI spin for
+// ever rather than fail, so "which flags does this host have" is the first
+// question a support answer about a hanging coding agent has to settle. The
+// whole block is null off Linux/x86_64 and on backends that predate the check.
+const cpu = computed(() => env.value?.cpu ?? null);
+
+const cpuFeaturesLine = computed(() => {
+  const info = cpu.value;
+  if (!info) return 'unknown';
+  // Not "unknown" on its own: the reader must not read a missing answer as a
+  // deficient CPU when we simply have no way to look on this platform.
+  if (info.flags_known === false) return 'unknown (not Linux/x86_64)';
+  return info.x86_64_level ? `x86-64-${info.x86_64_level}` : 'unknown';
+});
+
+// Naming the absent flags is what turns the level into something actionable —
+// it is the list an operator pastes into a hypervisor CPU-model discussion.
+const cpuMissingHint = computed(() => {
+  const info = cpu.value;
+  if (!info || info.flags_known === false) return '';
+  const missing = info.missing ?? [];
+  return missing.length ? `missing ${missing.join(', ')}` : '';
+});
+
 const osLine = computed(() => {
   const os = text(env.value?.os);
   const release = env.value?.os_release;
@@ -175,6 +201,23 @@ onMounted(() => { void load(); });
 
         <dt>OS</dt>
         <dd>{{ osLine }}</dd>
+
+        <template v-if="cpu">
+          <dt>CPU</dt>
+          <dd>
+            {{ text(cpu.model) }}
+            <span v-if="cpu.hypervisor" class="environment-hint">(virtual machine)</span>
+          </dd>
+
+          <dt>CPU features</dt>
+          <dd>
+            {{ cpuFeaturesLine }}
+            <span v-if="cpuMissingHint" class="environment-hint">({{ cpuMissingHint }})</span>
+            <span v-if="cpu.x86_64_level === 'v1'" class="environment-hint">
+              — below the x86-64-v2 level the Claude Code CLI needs
+            </span>
+          </dd>
+        </template>
 
         <dt>Python</dt>
         <dd>{{ text(env?.python_version) }}</dd>

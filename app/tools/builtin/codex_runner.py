@@ -421,6 +421,28 @@ def cli_binary_source(variables: Optional[dict] = None) -> Optional[str]:
     return _locate_cli(variables)[1]
 
 
+def host_blocker(variables: Optional[dict] = None) -> Optional[Dict[str, Any]]:
+    """Always ``None``: Codex states no instruction-set requirement.
+
+    It exists so that :mod:`app.api.coding_agents` can drive both coding agents
+    through one protocol - ``find_cli`` / ``cli_binary_source`` /
+    ``host_blocker`` - instead of special-casing the one agent that has a host
+    condition to report. Its counterpart in
+    :func:`app.tools.builtin.claude_code_runner.host_blocker` refuses a host
+    whose CPU lacks the x86-64-v2 instructions the bundled Claude Code CLI is
+    built for.
+
+    Codex declares no such requirement because its CLI is a Rust binary built
+    for the x86-64 baseline rather than a Bun executable dispatching on CPUID,
+    so there is no known reason for it to need more than the architecture
+    itself. Honestly: that is what the build targets say, not something anyone
+    has watched work on a ``qemu64`` node. If Codex ever turns out to fail there
+    too, this is where its own condition goes - and until someone has seen it,
+    claiming a blocker here would take the tool away from hosts where it runs.
+    """
+    return None
+
+
 def login_argv(binary: str) -> List[str]:
     """``codex login --device-auth``.
 

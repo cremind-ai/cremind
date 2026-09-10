@@ -142,6 +142,30 @@ paste what it prints into the same Sign-in dialog, or set it as the
 `CLAUDE_CODE_OAUTH_TOKEN` tool variable. It is a per-profile credential like any
 other, so it needs no cluster-side environment variable and no restart.
 
+**Node CPU requirement (Claude Code).** The Claude Code CLI bundled in the SDK
+wheel is a single-file executable built for the **x86-64-v2** instruction level.
+A node whose VM CPU model is the QEMU default — `qemu64`, which the guest reports
+as `QEMU Virtual CPU version 2.5+` — advertises none of `ssse3`, `sse4_1`,
+`sse4_2`, `popcnt`, and there every `claude` subcommand except `--version`
+**spins at 100% CPU forever instead of failing**: the sign-in terminal stays
+blank, and a delegated coding task hangs until it times out. Cremind checks the
+node's CPU up front and says so — on the agent's card in **Coding Agents**, in
+`cremind tools coding-agents` (as the row's message and the `cli_blocked` field)
+and in the sign-in refusal — rather than hanging with it.
+
+The fix is on the hypervisor, not in the chart: give the node's VM the host's CPU
+model (Proxmox **Hardware → Processors → Type: `host`**, libvirt
+`<cpu mode='host-passthrough'/>`, plain QEMU `-cpu host`), then **shut the node
+down and start it again** — a live reboot keeps the old CPU model. Cordon and
+drain first if the cluster has somewhere to move the pod. Nothing on the Cremind
+side can work around it: no pod setting, no image tag and no
+`CLAUDE_CODE_CLI_PATH` pointing at another copy, because every Claude Code build
+is the same kind of executable. The check covers Claude Code only — Codex's CLI
+is a Rust binary built for the x86-64 baseline and declares no such
+requirement, so its row stays un-blocked on the very same node. Whether Codex
+actually runs on a `qemu64` node is untested rather than known, so treat it as
+the option worth trying while the host is being fixed.
+
 The chart points both CLIs at the system PVC (`CLAUDE_CONFIG_DIR` and
 `CODEX_HOME` under `<cremind.systemDir>/coding-cli/`), so a sign-in survives pod
 replacement and `helm upgrade`. Their own defaults would put it in the container
@@ -510,7 +534,7 @@ embeddings.
 |-----|---------|-------|
 | `desktop.enabled` | `true` | `true` → `cremind/cremind-desktop` (VNC desktop); `false` → `cremind/cremind` (headless basic image, drops the noVNC routes/ports/env). |
 | `replicaCount` | `1` | **Fixed at 1.** The chart rejects any other value (single-instance state; VNC = single desktop). |
-| `resources.requests` | `2` CPU, `2Gi` | Minimum guaranteed for the cremind container; the node must have it free. The basic flavor needs less. |
+| `resources.requests` | `2` CPU, `2Gi` | Minimum guaranteed for the cremind container; the node must have it free. The basic flavor needs less. Quantity is not the only requirement: Claude Code also needs an x86-64-v2 node CPU — see [Node CPU requirement](#coding-agents-claude-code-codex). |
 | `image.repository` | `""` → auto | Auto-selected from `desktop.enabled`. Set to override with a specific repo. |
 | `image.tag` | `""` → `appVersion` | The matching image tag (both flavors share it). |
 | _(release channel)_ | auto from `image.tag` | Not a knob. `test` when the effective tag is an RC (`…rcN.devM`, i.e. the `--devel` chart), else `production`; the in-app **Updates** page reports this. Force it via `cremind.extraEnv` (`CREMIND_UPGRADE_CHANNEL`). |

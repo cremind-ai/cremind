@@ -512,14 +512,30 @@ def tools_coding_agents(
         message = string_field(row, "message")
         if message:
             sys.stderr.write(f"({string_field(row, 'tool_id')}: {message})\n")
+        # A host that cannot run the agent's CLI at all is the one row whose fix
+        # is not something Cremind can do for the user, so the fix itself has to
+        # be on screen. It arrives as a separate field because it is a paragraph
+        # about hypervisor CPU models rather than a clause, and the server keeps
+        # it out of ``message`` for exactly that reason. An older server sends no
+        # ``cli_blocked`` at all, which reads as "nothing known to be wrong".
+        blocked = row.get("cli_blocked")
+        remedy = (
+            str(blocked.get("remedy") or "").strip()
+            if isinstance(blocked, dict) else ""
+        )
+        if remedy:
+            sys.stderr.write(f"{remedy}\n")
 
 
 def _logged_in_cell(probe: Optional[dict]) -> str:
     """Render one agent's probe outcome.
 
     ``-`` means "not checked" (no ``--probe``, or the SDK isn't installed);
-    ``unknown`` means the check ran but could not decide — a timeout or a
-    missing binary — which is NOT the same as "logged out".
+    ``unknown`` means the check ran but could not decide — a timeout, a missing
+    binary, or a server whose CPU cannot run the CLI at all (where the check
+    refuses in milliseconds instead of waiting for a binary that never
+    answers) — which is NOT the same as "logged out". The row's ``cli_blocked``
+    field says when it is that last case.
     """
     if not isinstance(probe, dict):
         return "-"
@@ -589,7 +605,9 @@ def coding_agents_login(
 
     That means this only works where the CLI actually lives. When `cremind` is
     pointed at a remote server the command refuses rather than logging you into
-    the wrong machine's home directory.
+    the wrong machine's home directory, and it refuses just as fast when the
+    server reports a CPU its agent's CLI cannot run on — there, no copy of the
+    binary would work and the fix is on the hypervisor.
     """
     import asyncio
     import os
@@ -613,6 +631,30 @@ def coding_agents_login(
     binary = str(info.get("binary") or "")
     system_dir = str(info.get("system_dir") or "")
     hostname = str(info.get("server_hostname") or "")
+
+    # Ahead of both refusals below, because it is the one they cannot express:
+    # the binary may well be here and on the right host and still be unable to
+    # run - the bundled Claude Code CLI on a CPU without the instructions it was
+    # built for neither runs nor fails, it spins forever. Installing a binary or
+    # moving to the server host fixes nothing, so neither is offered. The server
+    # decides (only it knows its own CPU) and this command obeys, the same way
+    # it obeys ``drop_env``; an older server omits the key and nothing changes,
+    # and so does an empty object - a refusal with nothing to say would be worse
+    # than letting the login try.
+    blocked = info.get("cli_blocked")
+    if isinstance(blocked, dict) and blocked:
+        where = f" ({hostname})" if hostname else ""
+        message = str(blocked.get("message") or "").strip()
+        remedy = str(blocked.get("remedy") or "").strip()
+        typer.echo(
+            f"The Cremind server{where} cannot run the {agent} CLI at all, so "
+            f"there is no sign-in to run - here or anywhere."
+            f"{f' {message}' if message else ''}",
+            err=True,
+        )
+        if remedy:
+            typer.echo(remedy, err=True)
+        raise typer.Exit(code=1)
 
     if not binary:
         typer.echo(

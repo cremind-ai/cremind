@@ -289,6 +289,35 @@ def _vnc_rows(vnc: dict, server: str) -> list[tuple[str, str]]:
     return rows
 
 
+def _cpu_rows(cpu: dict) -> list[tuple[str, str]]:
+    """Rows naming the CPU, or none when nothing could be read off it.
+
+    These exist for one failure that looks like nothing else: a hypervisor
+    exposing a `qemu64` virtual CPU hides the x86-64-v2 instructions, and the
+    single-file binaries Cremind ships (the Claude Code CLI) spin at 100% CPU
+    forever instead of failing, with no log line to go on. `cpu.missing` is the
+    row that turns that into an answer, and `cpu.hypervisor` is where to take it
+    — the fix is the node's CPU model, not anything in Cremind.
+
+    Gated on `flags_known` because /proc/cpuinfo is the only place these facts
+    live: off Linux/x86_64 the server reports "could not tell", and four blank
+    rows would read as a probe that broke rather than one that does not apply.
+    An older server omits the block entirely and reaches the same result.
+    """
+    if not cpu.get("flags_known"):
+        return []
+    missing = cpu.get("missing")
+    return [
+        ("cpu.model", _env_cell(cpu.get("model"))),
+        ("cpu.hypervisor", _env_cell(cpu.get("hypervisor"))),
+        ("cpu.x86_64_level", _env_cell(cpu.get("x86_64_level"))),
+        # Blank is the good answer here — every flag we look for is present —
+        # so the row is printed either way rather than appearing only on the
+        # machines that have a problem.
+        ("cpu.missing", ", ".join(missing) if isinstance(missing, list) else ""),
+    ]
+
+
 @server_app.command("environment")
 @graceful_errors
 def server_environment(ctx: typer.Context) -> None:
@@ -309,6 +338,13 @@ def server_environment(ctx: typer.Context) -> None:
     predates those variables. The `vnc.*` rows say how a browser reaches the
     desktop — a published Docker port, a path on this same origin, or a tunnel
     that has to be running first.
+
+    On a Linux x86_64 server the `cpu.*` rows name the CPU model and the
+    x86-64 level it advertises. They matter because the bundled Claude Code CLI
+    is a prebuilt single-file binary needing x86-64-v2: on a virtual CPU that
+    hides those instructions it hangs instead of failing, and `cpu.missing`
+    plus `cpu.hypervisor` is what identifies that. Codex is built for the plain
+    x86-64 baseline and is unaffected.
     """
     import asyncio
 
@@ -349,6 +385,11 @@ def server_environment(ctx: typer.Context) -> None:
     vnc = env.get("vnc")
     if isinstance(vnc, dict):
         rows += _vnc_rows(vnc, cfg.server)
+    # A server too old to probe the CPU sends no block at all, which is the
+    # same "nothing to say" as a Windows or macOS host: print nothing.
+    cpu = env.get("cpu")
+    if isinstance(cpu, dict):
+        rows += _cpu_rows(cpu)
     print_kv(rows)
 
 
