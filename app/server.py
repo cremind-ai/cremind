@@ -1355,10 +1355,13 @@ async def main(
             # synchronous and the watcher arms after it returns.
             document_service = None
             try:
+                # No handles passed on purpose: the service reads the live
+                # embedding model / vector store from ``embedding_state`` on
+                # every call, so a Settings toggle takes effect without a
+                # restart. ``embedding_state`` is already READY or DISABLED by
+                # the time we get here (step 3 above).
                 document_service = DocumentSyncService(
                     working_dir=Path(BaseConfig.CREMIND_SYSTEM_DIR),
-                    vector_store=vector_store,
-                    embedding=embedding,
                 )
                 set_document_service(document_service)
 

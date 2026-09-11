@@ -8,6 +8,11 @@ the vector ``top_k`` (10) after an alphabetical sort, so ``[cli]cremind profile`
 cause of "no relevant result found" for profile/setup/tools/usage/... queries.
 These tests pin that the fallback now surfaces the full system-doc set and only
 truncates (loudly) for a pathologically large per-profile corpus.
+
+Shared docs are never truncated at all: the bundle is authoritative and grows
+with the product, so any fixed cap would eventually hide new system docs the
+same way the old ``top_k`` cap did. Only the user-authored per-profile corpus is
+bounded, by ``FALLBACK_MAX_PROFILE_CANDIDATES``.
 """
 
 from __future__ import annotations
@@ -16,7 +21,10 @@ import logging
 import shutil
 from pathlib import Path
 
-from app.documents.sync import DocumentSyncService, FALLBACK_MAX_CANDIDATES
+from app.documents.sync import (
+    FALLBACK_MAX_PROFILE_CANDIDATES,
+    DocumentSyncService,
+)
 from app.utils.logger import logger
 
 BUNDLED = Path(__file__).resolve().parents[2] / "app" / "documents" / "bundled"
@@ -51,13 +59,13 @@ def test_degraded_fallback_includes_tail_sorted_docs(tmp_path):
     assert len(hits) == count
 
 
-def test_fallback_caps_and_warns_on_oversized_profile_corpus(tmp_path):
+def test_fallback_caps_the_profile_corpus_but_never_the_shared_one(tmp_path):
     svc, sys_count = _svc_with_system_docs(tmp_path)
 
     # Give the profile scope more docs than the cap so truncation must kick in.
     pdir = tmp_path / "admin" / "documents"
     pdir.mkdir(parents=True)
-    overflow = FALLBACK_MAX_CANDIDATES + 5
+    overflow = FALLBACK_MAX_PROFILE_CANDIDATES + 5
     for i in range(overflow):
         (pdir / f"doc{i:03d}.md").write_text(
             f'---\ndescription: "profile scratch doc {i}"\n---\n\nbody {i}\n',
@@ -71,9 +79,26 @@ def test_fallback_caps_and_warns_on_oversized_profile_corpus(tmp_path):
     finally:
         logger.remove(sink_id)
 
-    # Capped, and the truncation is logged (never silent).
-    assert len(hits) == FALLBACK_MAX_CANDIDATES
+    # Every shared doc survives; only the profile's own corpus is capped.
+    assert len(hits) == sys_count + FALLBACK_MAX_PROFILE_CANDIDATES
     assert any("truncated" in m for m in messages)
-    # Shared/system docs are appended first, so they survive truncation.
     names = {h["name"] for h in hits}
     assert "[cli]cremind profile" in names
+    assert len([h for h in hits if h["scope"] == "admin"]) == FALLBACK_MAX_PROFILE_CANDIDATES
+
+
+def test_a_growing_bundle_never_squeezes_shared_docs_out(tmp_path):
+    """The old fixed cap would start hiding system docs once the bundle
+    outgrew it. Shared scope is now unbounded, so headroom is not a concern."""
+    svc, sys_count = _svc_with_system_docs(tmp_path)
+    docs = tmp_path / "documents"
+    for i in range(FALLBACK_MAX_PROFILE_CANDIDATES + 20):
+        (docs / f"extra{i:03d}.md").write_text(
+            f'---\ndescription: "extra shared doc {i}"\n---\n\nbody {i}\n',
+            encoding="utf-8",
+        )
+
+    hits = svc.search(query="anything", profile="admin", limit=10)
+
+    assert len(hits) == sys_count + FALLBACK_MAX_PROFILE_CANDIDATES + 20
+    assert "[cli]cremind profile" in {h["name"] for h in hits}

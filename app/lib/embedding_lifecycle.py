@@ -3,10 +3,9 @@
 The setup wizard and the Embedding Settings page both push a config
 payload through this module. It persists the change, reloads the model
 and vector store if needed, drops every collection that the new store
-doesn't yet contain, and rebuilds the three known caches:
+doesn't yet contain, and rebuilds the known caches:
 
 - ``gg_places_types``         — Google Places type embeddings (336 entries)
-- ``tool_embeddings_<profile>`` — per-profile skill/tool embeddings
 - ``documentation_search``    — shared + per-profile ``.md`` docs
 
 A rebuild always runs after the new model/store come up because the
@@ -265,15 +264,16 @@ def _rebuild_caches(*, agent, embedding, vector_store, profiles: list[str]) -> N
         from app.documents import get_service
         service = get_service()
         if service is not None and vector_store is not None:
-            service._vector_store = vector_store
-            service._embedding = embedding
-            # Force re-creation by clearing the "collection ready" flag —
-            # the new store has no collections yet.
-            service._collection_ready = False
+            # The service resolves its handles from ``embedding_state`` on every
+            # call, but this rebuild runs while the state is still REBUILDING —
+            # ``is_ready()`` stays False until mark_ready() below, so without
+            # pinning the reconcile would resolve to no store and silently index
+            # nothing into the collection we just dropped.
             from app.documents.sync import SHARED_SCOPE
-            service.full_reconcile(SHARED_SCOPE)
-            for profile in profiles:
-                service.full_reconcile(profile)
+            with service.pinned(vector_store=vector_store, embedding=embedding):
+                service.full_reconcile(SHARED_SCOPE)
+                for profile in profiles:
+                    service.full_reconcile(profile)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[embedding] documentation collection reconcile failed; continuing: {e}")
 
