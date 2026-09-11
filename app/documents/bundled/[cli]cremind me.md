@@ -20,7 +20,7 @@ information is shown in the **header / profile badge** of the Cremind web
 UI: the active profile name appears top-right, and hovering it surfaces
 the subject and expiry. If you only need to confirm the active profile,
 the badge is faster; if you need machine-readable claims (timestamps,
-working directories), use `cremind me --json`.
+working directories), use `cremind --json me`.
 
 ## Global flags
 
@@ -28,7 +28,7 @@ working directories), use `cremind me --json`.
 payload as JSON instead of a human-readable key/value table:
 
 ```bash
-cremind me --json
+cremind --json me
 ```
 
 It also obeys the standard CLI environment variables — most importantly
@@ -73,14 +73,14 @@ user_working_dir  /home/li/work
 ### Read just the profile name in a script
 
 ```bash
-$ cremind me --json | jq -r .profile
+$ cremind --json me | jq -r .profile
 admin
 ```
 
 ### Confirm the token is still valid
 
 ```bash
-$ cremind me --json | jq -r '.expires_at | todate'
+$ cremind --json me | jq -r '.expires_at | todate'
 2026-06-01T14:00:00Z
 ```
 

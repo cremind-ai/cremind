@@ -112,7 +112,7 @@ $ cremind clean components --usage --conversations
 $ cremind clean components --usage --yes
 
 # Structured output for pipelines
-$ cremind clean components --schedules --file-watchers --json | jq .cleaned
+$ cremind --json clean components --schedules --file-watchers | jq .cleaned
 ```
 
 ### `cremind clean working`

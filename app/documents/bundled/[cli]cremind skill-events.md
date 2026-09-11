@@ -1,5 +1,5 @@
 ---
-description: "Subscribe to and manage **skill events and notifications**: `list`, `edit`, `pause`, `resume`, or `delete` a skill's event subscriptions for the active profile, `simulate` an event by dropping a markdown file in the watched folder, `stream` events and `notifications` over SSE, browse the events a skill declares (`events <skill>`), and check or start its listener daemon (`listener-status`, `listener-start`). Given an **event id / subscription id** copied from the web UI's Events page, use it here with `edit`, `pause`, `resume`, `delete`, or `simulate` to answer questions about that event or change it. `pause` keeps a subscription but stops it firing (`resume` re-enables it) without touching the skill's shared listener. **Every subscription registered from a conversation reports each run's result back into it as a new turn** — a **standing** one on every occurrence, indefinitely; a **one-shot event task** once, then it terminates. Only a subscription bound to a reserved host conversation (or one since deleted) reports nothing and surfaces as a notification only. `list` shows a task's TASK status and TIMEOUT deadline and `edit --timeout/--no-timeout` adjusts how long it waits. Use this for events emitted by installed skills — distinct from filesystem (`cremind file-watchers`) and time (`cremind calendar`) events."
+description: "Subscribe to and manage **skill events and notifications**: `list`, `edit`, `pause`, `resume`, or `delete` a skill's event subscriptions for the active profile, `simulate` an event by dropping a markdown file in the watched folder, `stream` events and `notifications` over SSE, browse the events a skill declares (`events <skill>`), and check or start its listener daemon (`listener-status`, `listener-start`). An **event id / subscription id** copied from the web UI's Events page works with `edit`, `pause`, `resume`, `delete` and `simulate`; `pause` stops a subscription firing without touching the skill's shared listener. **Every subscription registered from a conversation reports each run's result back into it** — a **standing** one on every occurrence, a **one-shot event task** once; `list` shows a task's status and TIMEOUT and `edit --timeout/--no-timeout` changes it. For events emitted by installed skills — distinct from filesystem (`cremind file-watchers`) and time (`cremind calendar`) events."
 ---
 
 # `cremind skill-events` — Skill Event Subscriptions and Notifications
@@ -116,7 +116,7 @@ Press Ctrl-C to exit cleanly; the server connection is dropped.
 ## Global flags
 
 All `cremind skill-events` subcommands accept the root-level `--json`
-flag. `CREMIND_TOKEN` is required for every subcommand.
+flag. It goes right after `cremind`, before the command group (`cremind --json <group> <command>`); a trailing `--json` is rejected as an unknown option. `CREMIND_TOKEN` is required for every subcommand.
 
 ## Subcommands
 
@@ -508,7 +508,7 @@ $ cremind skill-events list
 ### Tail notifications and pretty-print as they arrive
 
 ```bash
-$ cremind skill-events notifications --json | jq '.summary'
+$ cremind --json skill-events notifications | jq '.summary'
 "Daily brief ready"
 "PR opened: cremind#42"
 ```

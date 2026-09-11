@@ -6,7 +6,11 @@ description: "Inspect and control the vector-embedding subsystem with `cremind e
 
 `cremind embedding` inspects and controls Cremind's vector-embedding subsystem
 — the semantic-search backend behind `documentation_search` and memory recall.
-It mirrors the admin-only **Embedding** settings page.
+It mirrors the admin-only **Embedding** settings page. Turning it off degrades
+those two features rather than disabling them: `documentation_search` hands
+its relevance judge the whole shared library plus up to 50 of the profile's own
+documents instead of a vector-ranked shortlist, and long-term memory search
+returns the stored facts unranked.
 
 The `get` and `set` operations are admin-only. `status` and `initialize` back
 the Setup Wizard's pre-token polling, so they don't require a token; `get`/`set`
@@ -27,7 +31,7 @@ button map to `status`, `get`/`set`, and `initialize` respectively.
 
 ## Global flags
 
-All subcommands accept the root-level `--json` flag.
+All subcommands accept the root-level `--json` flag. It goes right after `cremind`, before the command group (`cremind --json embedding status`). A trailing `--json` is rejected — except on `set`, where a `--json` after the subcommand is that command's own JSON-payload option, not the output switch.
 
 ## Subcommands
 

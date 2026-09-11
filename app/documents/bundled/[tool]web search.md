@@ -26,7 +26,7 @@ Per-profile, three equivalent ways:
 
 - **UI** — Settings → Tools & Skills → Web Search.
 - **CLI** — `cremind tools set-var web_search WEB_SEARCH_PROVIDER=auto DDG_SAFE_SEARCH=off`;
-  `cremind tools get web_search --json` to read current values.
+  `cremind --json tools get web_search` to read current values.
 - **Agent** — the assistant can run those commands via its Shell Executor.
 
 Changes take effect on the tool's next call — no restart. See `cremind tools`

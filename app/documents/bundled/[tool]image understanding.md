@@ -23,7 +23,7 @@ Per-profile, three equivalent ways:
 
 - **UI** — Settings → Tools & Skills → Image Understanding.
 - **CLI** — `cremind tools set-var image_understanding MAX_IMAGE_DIMENSION=1024`;
-  `cremind tools get image_understanding --json` to read current values.
+  `cremind --json tools get image_understanding` to read current values.
 - **Agent** — the assistant can run those commands via its Shell Executor.
 
 Changes take effect on the tool's next call — no restart. See `cremind tools`

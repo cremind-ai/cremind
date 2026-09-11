@@ -21,7 +21,7 @@ Per-profile, three equivalent ways:
 
 - **UI** — Settings → Tools & Skills → Web Fetch.
 - **CLI** — `cremind tools set-var web_fetch WEB_FETCH_MAX_CHARS=50000`;
-  `cremind tools get web_fetch --json` to read the current value.
+  `cremind --json tools get web_fetch` to read the current value.
 - **Agent** — the assistant can run those commands via its Shell Executor.
 
 Changes take effect on the tool's next call — no restart. See `cremind tools`

@@ -29,7 +29,7 @@ Per-profile, three equivalent ways:
 
 - **UI** — Settings → Tools & Skills → Browser.
 - **CLI** — `cremind tools set-var browser BROWSER_HEADLESS=true BROWSER_CHANNEL=chromium`;
-  `cremind tools get browser --json` to read the current values and schema.
+  `cremind --json tools get browser` to read the current values and schema.
 - **Agent** — the assistant can run those commands via its Shell Executor.
 
 Changes take effect on the tool's next launch — no restart. See `cremind tools`

@@ -145,7 +145,7 @@ rows without diffing logs.
 ## Global flags
 
 All `cremind file-watchers` subcommands accept the root-level `--json`
-flag. `CREMIND_TOKEN` is required for every subcommand.
+flag. It goes right after `cremind`, before the command group (`cremind --json <group> <command>`); a trailing `--json` is rejected as an unknown option. `CREMIND_TOKEN` is required for every subcommand.
 
 ## Subcommands
 
@@ -492,7 +492,7 @@ $ cremind file-watchers register --path Lee --action "notify me"
 ### Pipe the snapshot stream into `jq`
 
 ```bash
-$ cremind file-watchers stream --json | jq '.data.subscriptions[] | {name, path: .root_path, armed}'
+$ cremind --json file-watchers stream | jq '.data.subscriptions[] | {name, path: .root_path, armed}'
 {"name":"py-only","path":"C:\\Users\\me\\Documents\\Lee","armed":true}
 ```
 

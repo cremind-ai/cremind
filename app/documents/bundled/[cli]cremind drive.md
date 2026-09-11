@@ -80,7 +80,7 @@ state — do not tell the user to re-link on the strength of a guess.
 
 ```bash
 cremind drive files
-cremind drive files --page-size 100 --json
+cremind --json drive files --page-size 100
 ```
 
 This is the authoritative list — it asks Google what the token can see, so it

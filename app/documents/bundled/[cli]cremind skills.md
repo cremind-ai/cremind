@@ -30,7 +30,7 @@ delete`.
 
 ## Global flags
 
-All subcommands accept the root-level `--json` flag. `CREMIND_TOKEN` is
+All subcommands accept the root-level `--json` flag. It goes right after `cremind`, before the command group (`cremind --json <group> <command>`); a trailing `--json` is rejected as an unknown option. `CREMIND_TOKEN` is
 required.
 
 ## Subcommands

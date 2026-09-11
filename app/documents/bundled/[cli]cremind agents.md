@@ -65,7 +65,7 @@ OAuth/Config tabs.
 
 ## Global flags
 
-All `cremind agents` subcommands accept the root-level `--json` flag.
+All `cremind agents` subcommands accept the root-level `--json` flag. It goes right after `cremind`, before the command group (`cremind --json <group> <command>`); a trailing `--json` is rejected as an unknown option.
 `CREMIND_TOKEN` is required for every subcommand.
 
 ## Subcommands
@@ -348,7 +348,7 @@ $ xdg-open "$(cremind agents auth-url mcp.linear)"
 ### Disable every MCP server for the active profile in one shot
 
 ```bash
-$ for id in $(cremind agents list --json | jq -r '.[].tool_id'); do
+$ for id in $(cremind --json agents list | jq -r '.[].tool_id'); do
     cremind agents disable "$id"
   done
 ```

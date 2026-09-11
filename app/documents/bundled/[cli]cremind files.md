@@ -49,7 +49,7 @@ on disk is driven by the same watch stream as `cremind files watch`.
 
 ## Global flags
 
-All `cremind files` subcommands accept the root-level `--json` flag.
+All `cremind files` subcommands accept the root-level `--json` flag. It goes right after `cremind`, before the command group (`cremind --json <group> <command>`); a trailing `--json` is rejected as an unknown option.
 `CREMIND_TOKEN` is required for every subcommand.
 
 ## Subcommands

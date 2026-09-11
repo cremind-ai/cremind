@@ -101,7 +101,7 @@ To stop the server *once* without unregistering:
 ### `cremind boot status`
 
 ```bash
-cremind boot status [--json]
+cremind [--json] boot status
 ```
 
 Reports whether the service is **registered**, whether it is **running**,

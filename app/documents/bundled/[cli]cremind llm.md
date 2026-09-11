@@ -1,5 +1,5 @@
 ---
-description: "Configure **LLM providers and models**: list and `configure` providers (add an API key), add your own **custom OpenAI-compatible providers** (name + base URL + model list) with `create-custom`, browse each provider's available models, assign the high / low / plan / vision / audio / default **model groups** the agent picks from (including a dedicated **plan model** for plan mode, a **vision model** for image_understanding, and an **audio model** for audio_understanding, each with a feature toggle), run the **GitHub Copilot** device-code login, and **Sign in with ChatGPT** (Codex OAuth) for the OpenAI provider via `codex-oauth login` — a browser sign-in that routes requests through your ChatGPT plan's Codex backend instead of an API key, storing its tokens in this profile's `llm_config` (`openai.oauth_*`). That ChatGPT sign-in is the OpenAI **provider's**, NOT the Codex coding delegate's: the `codex` tool keeps its own CLI login in that profile's `CODEX_HOME` (`cremind tools coding-agents login codex`) and no longer borrows this one. Also covers a Codex sign-in that never captures on a Docker, Kubernetes or remote install — Cremind renders the `kubectl port-forward` line with this pod's real namespace and Service name (a pod from an older chart falls back to `<namespace>` / `<release>` blanks), or you paste the redirect URL into `codex-oauth complete`. Use this to add a provider (built-in or custom), choose which model the agent uses, enable the Specialized Vision/Audio Model, or authenticate a provider — distinct from `cremind config` (agent behavior), `cremind agents` (MCP/A2A servers), and `cremind tools coding-agents` (the Claude Code / Codex delegates' own logins)."
+description: "Configure **LLM providers and models**: list and `configure` providers (add an API key), add **custom OpenAI-compatible providers** with `create-custom`, browse each provider's models, and assign the high / low / plan / vision / audio / default **model groups** the agent picks from (a dedicated plan model, and vision and audio models with their feature toggles). Also runs the **GitHub Copilot** device-code login and **Sign in with ChatGPT** (Codex OAuth) for the OpenAI provider via `codex-oauth login`, which routes requests through your ChatGPT plan instead of an API key; if that sign-in never captures on a Docker, Kubernetes or remote install, use the printed `kubectl port-forward` line or paste the redirect URL into `codex-oauth complete`. That ChatGPT sign-in belongs to the OpenAI provider, NOT the Codex coding delegate, which keeps its own login (`cremind tools coding-agents login codex`). Distinct from `cremind config` (agent behavior), `cremind agents` (MCP/A2A servers), and `cremind tools coding-agents`."
 ---
 
 # `cremind llm` — LLM Providers, Model Groups, and Device-Code Auth
@@ -62,7 +62,7 @@ runs the same Codex OAuth flow as `cremind llm codex-oauth login` (with a
 
 ## Global flags
 
-All `cremind llm` subcommands accept the root-level `--json` flag.
+All `cremind llm` subcommands accept the root-level `--json` flag. It goes right after `cremind`, before the command group (`cremind --json llm providers list`). A trailing `--json` is rejected — except on `providers configure`, where a `--json` after the subcommand is that command's own JSON-payload option, not the output switch.
 `CREMIND_TOKEN` is required for every subcommand in this group.
 
 ## Subcommands
@@ -562,7 +562,7 @@ $ cremind llm providers models anthropic
 ### One-shot GitHub Copilot login
 
 ```bash
-$ resp=$(cremind llm device-code start --json)
+$ resp=$(cremind --json llm device-code start)
 $ echo "$resp" | jq -r .verification_uri
 https://github.com/login/device
 $ echo "$resp" | jq -r .user_code
@@ -575,7 +575,7 @@ $ cremind llm device-code poll "$(echo "$resp" | jq -r .device_code)"
 ### Switch the agent to a faster low-tier model
 
 ```bash
-$ cremind llm model-groups get --json | jq .model_groups
+$ cremind --json llm model-groups get | jq .model_groups
 $ cremind llm model-groups set --low anthropic/claude-haiku-4-5-20251001
 ```
 
@@ -588,7 +588,7 @@ $ cremind llm providers configure anthropic --api-key sk-ant-NEWKEY
 ### Pipe a provider list into `jq` to find unconfigured ones
 
 ```bash
-$ cremind llm providers list --json | jq -r '.[] | select(.configured==false) | .name'
+$ cremind --json llm providers list | jq -r '.[] | select(.configured==false) | .name'
 openai
 ```
 
@@ -640,9 +640,9 @@ The server's listener bound fine *inside* the container, but the browser's
   kubectl --namespace team-a port-forward svc/prod-cremind 1515:8080 1455:1455
   ```
 
-  Only a pod whose chart is too old to state those names falls back to the same
-  blanks the HTTPS runbook prints — fill them from `helm list --all-namespaces`
-  (NAMESPACE and NAME):
+  Only a pod from an older chart, too old to state those names, falls back to
+  the same blanks the HTTPS runbook prints — fill them from
+  `helm list --all-namespaces` (NAMESPACE and NAME):
 
   ```bash
   kubectl --namespace <namespace> port-forward svc/<release> 1515:80 1455:1455

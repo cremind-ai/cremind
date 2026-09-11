@@ -61,7 +61,7 @@ All values are per-profile. Three equivalent ways:
 - **UI** — Settings → Tools & Skills → Shell Executor.
 - **CLI** — `cremind tools set-var exec_shell LARGE_OUTPUT_MODE=manual`;
   `cremind tools set-args exec_shell --json '{"os":"Linux"}'`;
-  `cremind tools get exec_shell --json` to read the current values and schema.
+  `cremind --json tools get exec_shell` to read the current values and schema.
 - **Agent** — the assistant can run those same commands through its own Shell
   Executor (the shell has `CREMIND_SERVER`/`CREMIND_TOKEN` preset).
 

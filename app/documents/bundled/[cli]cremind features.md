@@ -24,7 +24,7 @@ is emitted as one JSON object per line (`{"event": "log|done|error", "data":
 
 ## Global flags
 
-Both subcommands accept the root-level `--json` flag. `CREMIND_TOKEN` is
+Both subcommands accept the root-level `--json` flag. It goes right after `cremind`, before the command group (`cremind --json <group> <command>`); a trailing `--json` is rejected as an unknown option. `CREMIND_TOKEN` is
 required.
 
 ## Subcommands

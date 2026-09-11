@@ -29,7 +29,7 @@ Per-profile, three equivalent ways:
 
 - **UI** — Settings → Tools & Skills → System File.
 - **CLI** — `cremind tools set-var system_file MAX_LIST_ENTRIES=250`;
-  `cremind tools get system_file --json` to read the current values.
+  `cremind --json tools get system_file` to read the current values.
 - **Agent** — the assistant can run those commands via its Shell Executor.
 
 Changes take effect on the tool's next call — no restart. See `cremind tools`

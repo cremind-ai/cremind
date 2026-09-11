@@ -565,7 +565,7 @@ $ cremind group history Ops --after -1 --limit 500
 $ cremind group history Ops --after 13 --follow
 
 # Structured tail
-$ cremind group history Ops --follow --json | jq -r 'select(.type=="message").data.content'
+$ cremind --json group history Ops --follow | jq -r 'select(.type=="message").data.content'
 ```
 
 ## Worked example — Dog, Cat and Chicken

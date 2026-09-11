@@ -33,7 +33,7 @@ Per-profile, three equivalent ways:
 
 - **UI** — Settings → Tools & Skills → Audio Understanding.
 - **CLI** — `cremind tools set-var audio_understanding MAX_AUDIO_BYTES=52428800`;
-  `cremind tools get audio_understanding --json` to read current values.
+  `cremind --json tools get audio_understanding` to read current values.
 - **Agent** — the assistant can run those commands via its Shell Executor.
 
 Changes take effect on the tool's next call — no restart. See `cremind tools`

@@ -57,8 +57,8 @@ conversation corresponds to running `cremind chat <id>`.
 
 `cremind chat` accepts the root-level `--json` flag, but only as a no-op:
 the TUI always renders interactively and ignores `--json`. For
-machine-readable streams use `cremind conv send --json` or
-`cremind conv attach --json`.
+machine-readable streams use `cremind --json conv send` or
+`cremind --json conv attach`.
 
 `CREMIND_TOKEN` is required.
 

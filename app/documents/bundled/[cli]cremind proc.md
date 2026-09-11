@@ -49,7 +49,7 @@ Press Ctrl-C to exit cleanly.
 
 ## Global flags
 
-All `cremind proc` subcommands accept the root-level `--json` flag.
+All `cremind proc` subcommands accept the root-level `--json` flag. It goes right after `cremind`, before the command group (`cremind --json <group> <command>`); a trailing `--json` is rejected as an unknown option.
 `CREMIND_TOKEN` is required for every subcommand.
 
 ## Subcommands
@@ -398,7 +398,7 @@ p_9d72
 ### Find every running listener and tail its output
 
 ```bash
-$ pid=$(cremind proc list --json | jq -r '.[] | select(.command|contains("listen.py")) | .id' | head -n1)
+$ pid=$(cremind --json proc list | jq -r '.[] | select(.command|contains("listen.py")) | .id' | head -n1)
 $ cremind proc attach "$pid"
 ```
 
@@ -418,7 +418,7 @@ $ cremind proc resize p_9d72 --cols $(tput cols) --rows $(tput lines)
 ### Promote a one-off process to autostart
 
 ```bash
-$ pid=$(cremind proc list --json | jq -r '.[] | select(.command|contains("daily-brief"))' | jq -r .id | head -n1)
+$ pid=$(cremind --json proc list | jq -r '.[] | select(.command|contains("daily-brief"))' | jq -r .id | head -n1)
 $ cremind proc autostart add --pid "$pid"
 ```
 
@@ -431,7 +431,7 @@ $ cremind proc autostart run a_8c14
 ### Tail process state changes into `jq`
 
 ```bash
-$ cremind proc stream --json | jq -r 'select(.type=="exited") | "\(.data.id) exited code=\(.data.exit_code)"'
+$ cremind --json proc stream | jq -r 'select(.type=="exited") | "\(.data.id) exited code=\(.data.exit_code)"'
 ```
 
 ## Troubleshooting
@@ -447,7 +447,7 @@ keeps waiting because its stdin is still open. Re-send with
 own, to deliver the EOF that lets it finish.
 
 **`attach` shows garbled output / no response** — The process is not
-running under a PTY. Check `cremind proc list --json | jq '.[] | .is_pty'`.
+running under a PTY. Check `cremind --json proc list | jq '.[] | .is_pty'`.
 Non-PTY processes can still receive `stdin`, but their stdout/stderr
 streams are line-buffered and not interactive.
 

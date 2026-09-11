@@ -79,7 +79,7 @@ claude-opus-4-8    96        1843201       4.12
 # Spend for a single UTC day, total cost only
 $ start=$(date -u -d 2026-06-29 +%s)000
 $ end=$(date -u -d 2026-06-30 +%s)000
-$ cremind usage --start "$start" --end "$end" --json | jq '.totals'
+$ cremind --json usage --start "$start" --end "$end" | jq '.totals'
 ```
 
 ### Admin: inspect another profile, or span all

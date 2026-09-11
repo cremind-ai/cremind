@@ -66,7 +66,7 @@ action lives in the list pane's overflow menu.
 
 All `cremind conv` subcommands accept the root-level `--json` flag, which
 both forces JSON output for non-streaming subcommands *and* selects the
-JSON streaming renderer for `send` / `attach`.
+JSON streaming renderer for `send` / `attach`. It goes right after `cremind`, before the command group (`cremind --json <group> <command>`); a trailing `--json` is rejected as an unknown option.
 
 `CREMIND_TOKEN` is required for every subcommand.
 
@@ -322,7 +322,7 @@ $ cremind conv send c_82bc "Anything urgent?"
 $ cremind conv send c_82bc "Anything urgent?" --raw | tee answer.txt
 
 # Structured event stream
-$ cremind conv send c_82bc "Anything urgent?" --json | jq -r 'select(.type=="text").data.token'
+$ cremind --json conv send c_82bc "Anything urgent?" | jq -r 'select(.type=="text").data.token'
 
 # Fastest answer: no extended thinking, at most one tool round
 $ cremind conv send c_82bc "Summarize in one sentence" --raw --mode instant
@@ -393,7 +393,7 @@ begins.
 **Example.**
 
 ```bash
-$ cremind conv attach c_82bc --json | jq .type
+$ cremind --json conv attach c_82bc | jq .type
 "thinking"
 "text"
 "complete"
@@ -491,7 +491,7 @@ cancelled, or `no active run for that id` if no run was active. With
 `--json`, emits `{"cancelled": true|false}`.
 
 **Note.** This takes a run id, not a conversation id. Use
-`cremind conv list --json` and select the `task_id` of the conversation
+`cremind --json conv list` and select the `task_id` of the conversation
 you want to cancel.
 
 **Examples.**
@@ -502,7 +502,7 @@ $ cremind conv cancel t_19a8
 cancelled
 
 # Cancel whatever is running in conversation c_82bc (one-liner)
-$ run=$(cremind conv list --json | jq -r '.[] | select(.id=="c_82bc") | .task_id')
+$ run=$(cremind --json conv list | jq -r '.[] | select(.id=="c_82bc") | .task_id')
 $ cremind conv cancel "$run"
 ```
 
@@ -692,14 +692,14 @@ $ cremind conv attach c_82bc
 ### Tail every event into a structured log
 
 ```bash
-$ cremind conv attach c_82bc --json >> events.jsonl
+$ cremind --json conv attach c_82bc >> events.jsonl
 ```
 
 ### Cancel any conversation that has been running for >5 minutes (rough sketch)
 
 ```bash
 $ now=$(date +%s)
-$ cremind conv list --json | jq -c '.[] | select(.task_id != "")' | while read row; do
+$ cremind --json conv list | jq -c '.[] | select(.task_id != "")' | while read row; do
     started=$(jq -r .created_at <<<"$row" | xargs -I{} date -d "{}" +%s)
     if (( now - started > 300 )); then
       run=$(jq -r .task_id <<<"$row")

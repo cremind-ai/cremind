@@ -25,7 +25,7 @@ Per-profile, three equivalent ways:
 
 - **UI** — Settings → Tools & Skills → AccuWeather Weather.
 - **CLI** — `cremind tools set-var accuweather_weather ACCUWEATHER_API_KEY=...`;
-  `cremind tools get accuweather_weather --json` to read current state.
+  `cremind --json tools get accuweather_weather` to read current state.
 - **Agent** — the assistant can run those commands via its Shell Executor.
 
 Changes take effect on the tool's next call — no restart. See `cremind tools`

@@ -32,7 +32,7 @@ Per-profile, three equivalent ways:
 - **UI** — Settings → Tools & Skills → Google Places.
 - **CLI** — `cremind tools set-var google_places GOOGLE_MAPS_API_KEY=AIza...`;
   `cremind tools set-args google_places --json '{"latitude":10.77,"longitude":106.7}'`;
-  `cremind tools get google_places --json` to read current values.
+  `cremind --json tools get google_places` to read current values.
 - **Agent** — the assistant can run those commands via its Shell Executor.
 
 Changes take effect on the tool's next call — no restart. See `cremind tools`

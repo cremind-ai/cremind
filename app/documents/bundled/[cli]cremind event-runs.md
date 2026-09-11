@@ -53,7 +53,7 @@ resolve).
 
 ## Global flags
 
-All `cremind event-runs` subcommands accept the root-level `--json` flag.
+All `cremind event-runs` subcommands accept the root-level `--json` flag. It goes right after `cremind`, before the command group (`cremind --json <group> <command>`); a trailing `--json` is rejected as an unknown option.
 `CREMIND_TOKEN` is required for every subcommand. Runs are scoped to the
 caller's own profile.
 
@@ -121,7 +121,7 @@ $ cremind event-runs list --status pending
 $ cremind event-runs list --kind schedule --limit 20
 
 # All runs from one file-watcher subscription, as JSON for scripting
-$ cremind event-runs list --subscription fw_a3f1 --json | jq '.runs[].status'
+$ cremind --json event-runs list --subscription fw_a3f1 | jq '.runs[].status'
 ```
 
 ### `cremind event-runs show`
