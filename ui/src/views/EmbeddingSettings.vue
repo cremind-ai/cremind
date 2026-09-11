@@ -364,7 +364,7 @@ async function restartFromInstallDialog() {
             <div class="field-hint">
               {{ enabled
                   ? 'Configure the model and vector store below. Applying changes will reload + rebuild caches.'
-                  : 'Embedding-dependent features (long-term memory search, semantic Google Places filtering, document search) are disabled.' }}
+                  : 'Semantic ranking is off. Documentation search still works, but its relevance judge reviews the whole shared library plus up to 50 per-profile documents instead of a vector-ranked shortlist; long-term memory search returns the stored facts unranked; Google Places uses a fixed list of common place types.' }}
             </div>
           </template>
 

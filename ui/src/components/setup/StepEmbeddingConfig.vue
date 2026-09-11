@@ -53,11 +53,11 @@ function onUpdate(next: EmbeddingConfigPayload) {
     >
       <template #intro>
         <div class="benefits-box">
-          <strong>What you get when enabled:</strong>
+          <strong>What enabling improves:</strong>
           <ul>
-            <li><strong>Automatic Skill Mode</strong> — Cremind picks the most relevant skills for each request instead of showing the LLM all of them.</li>
+            <li><strong>Documentation search</strong> ranks candidate documents by semantic similarity before the relevance judge reads them, instead of handing it the whole library.</li>
+            <li><strong>Long-term memory search</strong> returns the facts most relevant to the query, so the memory store can grow without every fact riding along.</li>
             <li><strong>Google Places</strong> filters 336 place types down to the most relevant for your query, reducing tokens.</li>
-            <li><strong>Document &amp; tool search</strong> uses semantic similarity for more accurate results.</li>
           </ul>
           <div class="benefits-note">
             First start downloads a model (~500&nbsp;MB for ME5, ~1.2&nbsp;GB for Gemma).
@@ -69,7 +69,7 @@ function onUpdate(next: EmbeddingConfigPayload) {
         <div class="field-hint">
           {{ enabled
             ? 'Configure the embedding model and vector store below.'
-            : 'Skip this step. Automatic Skill Mode will be unavailable; Google Places will use a small static type list.' }}
+            : 'Skip this step. Documentation search and long-term memory search keep working without semantic ranking; Google Places will use a small static type list.' }}
         </div>
       </template>
     </EmbeddingConfigForm>

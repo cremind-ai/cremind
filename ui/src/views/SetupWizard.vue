@@ -1253,7 +1253,7 @@ async function handleFinish() {
   if (embeddingFailed.value) {
     ElMessage.error(
       `Vector embedding failed to initialize: ${embeddingError.value ?? 'unknown error'}. ` +
-      'You can still proceed, but Automatic Skill Mode and other embedding-dependent features will be unavailable.'
+      'You can still proceed without semantic ranking: documentation search and long-term memory search keep working, and Google Places falls back to a small static type list.'
     );
   }
 
@@ -2055,9 +2055,11 @@ async function downloadConfigFile(format: ExportFormat) {
             <strong>Vector embedding failed to initialize</strong>
             <p>{{ embeddingError ?? 'Unknown error.' }}</p>
             <p class="hint">
-              You can still proceed — Automatic Skill Mode and other
-              embedding-dependent features will be unavailable until you
-              fix the backing service or disable Vector Embedding from Settings.
+              You can still proceed — semantic ranking stays unavailable until
+              you fix the backing service or disable Vector Embedding from
+              Settings. Documentation search and long-term memory search keep
+              working without it, and Google Places falls back to a small
+              static type list.
             </p>
           </template>
         </div>
