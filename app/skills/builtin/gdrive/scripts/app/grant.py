@@ -126,8 +126,10 @@ def parse_picked_ids(query: str) -> list[str]:
 def _capture_via_local_server(port_box: dict[str, Any], *, timeout: float) -> str:
     """Serve exactly one redirect on an ephemeral loopback port; return its query.
 
-    Used when there is no backend inbox (a standalone skill run). Mirrors the
-    ephemeral-loopback fallback ``auth.link`` uses.
+    Standalone runs only (no backend inbox). Mirrors the ephemeral-loopback
+    listener ``auth.link`` uses in the same situation — and, like it, is never used
+    under the backend, where a random port in this subprocess is unreachable from
+    the user's browser (see ``run_grant``).
     """
     box: dict[str, Any] = {}
 
@@ -241,6 +243,13 @@ def run_grant(
 ) -> dict[str, Any]:
     """Run the Picker grant flow and report which files became reachable.
 
+    The redirect is received exactly as ``auth.link`` receives it. Under the
+    Cremind backend (``CREMIND_SYSTEM_DIR`` set) this always waits on the backend's
+    OAuth inbox, advertising ``redirect_uri`` or, when the backend injected none,
+    ``auth.DEFAULT_BACKEND_REDIRECT_URI`` — and ``complete-link`` feeds that same
+    waiter when the browser cannot reach the redirect. Only a standalone run opens
+    its own loopback listener.
+
     ``build_service``/``get_file``/``list_files`` are injected so this module stays
     independent of the Drive API wrapper (and testable without it).
     """
@@ -248,13 +257,13 @@ def run_grant(
     state = secrets.token_urlsafe(32)
     verifier, challenge = _pkce()
 
-    use_inbox = bool(redirect_uri) and auth._oauth_inbox_dir() is not None
+    use_inbox = auth._oauth_inbox_dir() is not None
     port_box: dict[str, Any] = {"ready": threading.Event()}
     capture: threading.Thread | None = None
     box: dict[str, Any] = {}
 
     if use_inbox:
-        effective_redirect = redirect_uri or ""
+        effective_redirect = redirect_uri or auth.DEFAULT_BACKEND_REDIRECT_URI
     else:
         # Bind first so the redirect_uri can name the real port.
         def _run() -> None:
@@ -295,6 +304,13 @@ def run_grant(
     print(f"Please visit this URL to choose the files to share with Cremind: {url}", flush=True)
 
     if use_inbox:
+        print(
+            "If the browser shows a connection error after you approve, copy the full "
+            "address from its address bar and, while this command is still waiting, "
+            'run: uv run scripts/__main__.py complete-link --response "<that URL>" '
+            "(keep the double quotes).",
+            flush=True,
+        )
         query = auth._await_oauth_callback(state, timeout=timeout)
     else:
         assert capture is not None
@@ -306,7 +322,11 @@ def run_grant(
 
     params = urllib.parse.parse_qs(query)
     returned_state = (params.get("state") or [""])[0]
-    if returned_state and returned_state != state:
+    # Exact, and required. The inbox file is already keyed by state, so a genuine
+    # response always carries it; the local listener, by contrast, answers
+    # whatever request reaches its port first, and only the state ties that
+    # request to this grant.
+    if returned_state != state:
         raise auth.AuthError("The Picker response did not match this request (state mismatch).")
     picked = parse_picked_ids(query)
     code = (params.get("code") or [""])[0]

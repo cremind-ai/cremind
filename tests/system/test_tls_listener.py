@@ -1,7 +1,10 @@
 """Exercise real HTTP/1, HTTP/2 TLS and plaintext on the same TCP port."""
 import asyncio
+import contextlib
 import socket
 import ssl
+import time
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -13,6 +16,8 @@ from starlette.routing import WebSocketRoute
 from starlette.testclient import TestClient
 from websockets.asyncio.client import connect
 
+from app.api.oauth_callback import get_oauth_callback_routes
+from app.config import tls_mode
 from app.config.settings import BaseConfig
 from app.config.tls_auto import ensure_local_tls
 from app.server import _mk_hypercorn_config
@@ -185,3 +190,187 @@ def test_private_relay_restores_remote_identity_without_trusting_headers():
     client = TestClient(PrivateRelayApp(Starlette(routes=[Route("/api/check", endpoint)]), peers))
     result = client.get("/api/check", headers={"X-Forwarded-For": "127.0.0.1"})
     assert result.json() == {"client": "203.0.113.10", "port": 1515}
+
+
+# ── Google's plaintext loopback callbacks on a TLS port ─────────────────────
+#
+# Google's Desktop client only redirects to http://<loopback>:<port>, so on an
+# HTTPS install the authorization response arrives as plaintext on the very
+# port that speaks TLS. These drive the real relay: plaintext is answered with a
+# 307 to the same host and port over https, and following it reaches the real
+# callback handler over TLS. What that handler finally answers is not pinned
+# (it navigates the browser back into the app) — only its side effects are.
+
+_STATE = "yVuZU8nVnlXUnirYSBheNCnasvVPub"  # matches the callback handlers' state charset
+
+
+def _free_port(host):
+    try:
+        with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET) as probe:
+            probe.bind((host, 0))
+            return probe.getsockname()[1]
+    except OSError:
+        if ":" in host:
+            pytest.skip("IPv6 loopback is unavailable")
+        raise
+
+
+def _authority(host, port):
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+@contextlib.asynccontextmanager
+async def _serving_callbacks(monkeypatch, tmp_path, host):
+    """The real callback routes behind the real same-port relay, over a
+    generated CA whose leaf covers the loopback addresses."""
+    monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path))
+    monkeypatch.setattr(BaseConfig, "SSL_KEYFILE_PASSWORD", "")
+    monkeypatch.delenv("CREMIND_TLS_TERMINATION", raising=False)
+    monkeypatch.delenv("CREMIND_OAUTH_REDIRECT_URI", raising=False)
+    port = _free_port(host)
+    monkeypatch.setenv("CREMIND_UI_PORT", str(port))
+    # This process terminates TLS on its public port: the topology the
+    # recovery redirect keys on.
+    monkeypatch.setattr(tls_mode, "_boot_serving_https", True)
+    monkeypatch.setattr(BaseConfig, "APP_URL", f"https://{_authority(host, port)}")
+    cert, key = ensure_local_tls(str(tmp_path))
+    config = _mk_hypercorn_config(host, port, cert, key)
+    config.graceful_timeout = 0.1
+    stop = asyncio.Event()
+    app = Starlette(routes=get_oauth_callback_routes())
+    task = asyncio.create_task(serve_with_http_recovery(app, config, shutdown_trigger=stop.wait))
+    ssl_context = ssl.create_default_context(cafile=str(tmp_path / "tls" / "ca.pem"))
+    try:
+        async with httpx.AsyncClient(verify=ssl_context, trust_env=False, follow_redirects=False) as client:
+            for _ in range(100):
+                try:
+                    # A 404 is ready enough, and touches no callback handler.
+                    await client.get(f"https://{_authority(host, port)}/readiness-probe")
+                    break
+                except httpx.ConnectError:
+                    await asyncio.sleep(0.02)
+            else:
+                raise AssertionError("TLS listener never became ready")
+            yield port, client
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, 5)
+
+
+async def _plaintext_get(host, port, target):
+    """A raw HTTP/1.1 GET on the TLS port, as a browser following Google would."""
+    reader, writer = await asyncio.open_connection(host, port)
+    try:
+        writer.write(
+            f"GET {target} HTTP/1.1\r\nHost: {_authority(host, port)}\r\n"
+            "Accept: text/html\r\nSec-Fetch-Mode: navigate\r\nConnection: close\r\n\r\n".encode()
+        )
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(), 5)
+    finally:
+        writer.close()
+        with contextlib.suppress(OSError):
+            await writer.wait_closed()
+    head = raw.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+    status_line, *lines = head.split("\r\n")
+    headers = {name.strip().lower(): value.strip()
+               for name, value in (line.split(":", 1) for line in lines)}
+    return int(status_line.split(" ")[1]), headers
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
+def test_plaintext_skill_callback_is_captured_over_https_on_the_same_port(monkeypatch, tmp_path, host):
+    asyncio.run(_exercise_skill_callback(monkeypatch, tmp_path, host))
+
+
+async def _exercise_skill_callback(monkeypatch, tmp_path, host):
+    async with _serving_callbacks(monkeypatch, tmp_path, host) as (port, client):
+        query = f"code=abc&state={_STATE}"
+        status, headers = await _plaintext_get(host, port, f"/api/oauth/callback?{query}")
+        assert status == 307
+        assert headers["location"] == f"https://{_authority(host, port)}/api/oauth/callback?{query}"
+        assert headers["referrer-policy"] == "no-referrer"
+        assert headers["cache-control"] == "no-store"
+        # Plaintext captured nothing; only the HTTPS hop runs the handler.
+        inbox = tmp_path / "oauth_inbox" / f"{_STATE}.txt"
+        assert not inbox.exists()
+
+        response = await client.get(headers["location"])
+        assert 200 <= response.status_code < 400
+        assert inbox.read_text(encoding="utf-8") == query
+
+        # Every other plaintext API on the port is still refused.
+        status, _headers = await _plaintext_get(host, port, f"/api/oauth/a2a/callback?{query}")
+        assert status == 426
+
+
+def test_plaintext_calendar_callback_exchanges_with_the_advertised_redirect(monkeypatch, tmp_path):
+    asyncio.run(_exercise_calendar_callback(monkeypatch, tmp_path))
+
+
+async def _exercise_calendar_callback(monkeypatch, tmp_path):
+    import app.calendar.google_auth as ga
+
+    class Storage:
+        def __init__(self):
+            self.saved = {}
+
+        def save_token(self, agent_name, profile, token, agent_type="a2a", token_kind="access_token"):
+            self.saved[(agent_name, profile, agent_type, token_kind)] = token
+
+    storage = Storage()
+    posted = []
+    monkeypatch.setattr(ga, "_pending", {})
+    monkeypatch.setattr(ga, "get_auth_client_storage", lambda: storage)
+    monkeypatch.setattr(ga.google_discovery, "google_client",
+                        lambda: {"client_id": "cid", "client_secret": "csecret", "scopes": []})
+    monkeypatch.setattr(ga, "_post_token", lambda data: posted.append(dict(data)) or {
+        "access_token": "AT", "refresh_token": "RT", "expires_in": 3600})
+    async with _serving_callbacks(monkeypatch, tmp_path, "127.0.0.1") as (port, client):
+        consent = parse_qs(urlsplit(ga.build_authorize_url("alice")).query)
+        advertised = consent["redirect_uri"][0]
+        state = consent["state"][0]
+        # APP_URL is https; Google is handed http on the same port.
+        assert advertised == f"http://127.0.0.1:{port}{ga.CALLBACK_PATH}"
+
+        target = urlsplit(advertised).path + f"?code=the-code&state={state}"
+        status, headers = await _plaintext_get("127.0.0.1", port, target)
+        assert status == 307
+        assert headers["location"] == f"https://127.0.0.1:{port}{target}"
+        assert posted == []
+
+        response = await client.get(headers["location"])
+        assert 200 <= response.status_code < 400
+        assert len(posted) == 1
+        # Received over https, exchanged with the http URI the consent advertised.
+        assert posted[0]["redirect_uri"] == advertised
+        assert posted[0]["code"] == "the-code"
+        assert storage.saved[(ga.AGENT_NAME, "alice", ga.AGENT_TYPE, ga.ACCESS_TOKEN)] == "AT"
+
+
+def test_plaintext_drive_callback_records_the_picked_files(monkeypatch, tmp_path):
+    asyncio.run(_exercise_drive_callback(monkeypatch, tmp_path))
+
+
+async def _exercise_drive_callback(monkeypatch, tmp_path):
+    import app.drive.grant_flow as gf
+
+    monkeypatch.setattr(gf, "_pending", {})
+    async with _serving_callbacks(monkeypatch, tmp_path, "127.0.0.1") as (port, client):
+        redirect = gf.redirect_uri()
+        assert redirect == f"http://127.0.0.1:{port}{gf.CALLBACK_PATH}"
+        assert gf.capture_is_local() is True
+        gf._pending[_STATE] = {
+            "profile": "alice", "redirect_uri": redirect, "before": set(), "ts": time.time(),
+            "picked": [], "status": "pending", "error": None,
+        }
+        target = f"{gf.CALLBACK_PATH}?state={_STATE}&code=c&picked_file_ids=f1,f2"
+        status, headers = await _plaintext_get("127.0.0.1", port, target)
+        assert status == 307
+        assert headers["location"] == f"https://127.0.0.1:{port}{target}"
+        assert gf._pending[_STATE]["status"] == "pending"
+
+        response = await client.get(headers["location"])
+        assert 200 <= response.status_code < 400
+        assert gf._pending[_STATE]["picked"] == ["f1", "f2"]
+        assert gf._pending[_STATE]["status"] == "captured"

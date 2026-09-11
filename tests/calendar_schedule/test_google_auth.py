@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 import app.calendar.google_auth as ga
+from app.config.settings import BaseConfig
 
 
 class FakeStorage:
@@ -57,13 +58,93 @@ def _wire(monkeypatch):
         ga.google_discovery, "google_client",
         lambda: {"client_id": "cid", "client_secret": "csecret", "scopes": ["openid", "email", "cal"]},
     )
-    monkeypatch.setattr(ga.BaseConfig, "APP_URL", "http://localhost:1515", raising=False)
+    monkeypatch.setattr(BaseConfig, "APP_URL", "http://localhost:1515", raising=False)
+    # The redirect also reads these; a developer shell exporting one would skew
+    # every redirect assertion below.
+    for key in ("CREMIND_OAUTH_REDIRECT_URI", "CREMIND_UI_PORT", "CREMIND_TLS_TERMINATION"):
+        monkeypatch.delenv(key, raising=False)
     # No gcalendar skill link unless a test says so — and never a real one read off
     # the developer's own machine.
     _skill(monkeypatch, effective=False)
     ga._pending.clear()
     return store
 
+
+def _advertised(url: str) -> str:
+    return parse_qs(urlparse(url).query)["redirect_uri"][0]
+
+
+# ── the redirect Google is handed ───────────────────────────────────────────
+
+def test_redirect_is_the_http_loopback_app_url(monkeypatch):
+    _wire(monkeypatch)
+    assert ga.redirect_uri() == "http://localhost:1515" + ga.CALLBACK_PATH
+    assert _advertised(ga.build_authorize_url("alice")) == "http://localhost:1515" + ga.CALLBACK_PATH
+
+
+def test_https_loopback_app_url_advertises_http_on_the_same_port(monkeypatch):
+    """Google refuses an https loopback redirect for the Desktop client; the
+    same-port TLS listener bounces the plaintext callback to the HTTPS handler."""
+    _wire(monkeypatch)
+    for app_url, expected in (
+        ("https://localhost:1515", "http://localhost:1515"),
+        ("https://127.0.0.1:8443/", "http://127.0.0.1:8443"),
+        ("https://[::1]:1515", "http://[::1]:1515"),
+    ):
+        monkeypatch.setattr(BaseConfig, "APP_URL", app_url, raising=False)
+        assert ga.redirect_uri() == expected + ga.CALLBACK_PATH, app_url
+        assert _advertised(ga.build_authorize_url("alice")) == expected + ga.CALLBACK_PATH
+
+
+def test_a_public_app_url_is_never_handed_to_google(monkeypatch):
+    """The shared Desktop client rejects a public hostname with a 400 before
+    consent, which is what advertising the raw APP_URL here used to do."""
+    _wire(monkeypatch)
+    monkeypatch.setattr(BaseConfig, "APP_URL", "https://cremind.example.com", raising=False)
+    url = ga.build_authorize_url("alice")
+    assert url is not None  # no longer "unavailable" on an Ingress install
+    assert _advertised(url) == "http://localhost:1515" + ga.CALLBACK_PATH
+
+    monkeypatch.setenv("CREMIND_UI_PORT", "8080")
+    assert ga.redirect_uri() == "http://localhost:8080" + ga.CALLBACK_PATH
+
+    # The operator's loopback pin names the forwarded address.
+    monkeypatch.setenv("CREMIND_OAUTH_REDIRECT_URI", "http://127.0.0.1:9999/api/oauth/callback")
+    assert ga.redirect_uri() == "http://127.0.0.1:9999" + ga.CALLBACK_PATH
+
+    # So does a LAN or listen-all APP_URL: loopback on its port, never its host.
+    monkeypatch.delenv("CREMIND_OAUTH_REDIRECT_URI")
+    monkeypatch.setattr(BaseConfig, "APP_URL", "http://192.168.1.50:1515", raising=False)
+    assert ga.redirect_uri() == "http://localhost:1515" + ga.CALLBACK_PATH
+
+
+def test_the_exchange_posts_the_advertised_redirect_uri(monkeypatch):
+    """Google compares the exchange's redirect_uri with the authorize request's.
+
+    On an HTTPS install the callback is finally received over https, after the
+    plaintext bounce, and APP_URL may even change before the user approves.
+    Neither may leak into the exchange: it must replay the http URI advertised.
+    """
+    _wire(monkeypatch)
+    monkeypatch.setattr(BaseConfig, "APP_URL", "https://localhost:1515", raising=False)
+    posted = {}
+
+    def fake_post(data):
+        posted.update(data)
+        return {"access_token": "AT", "refresh_token": "RT", "expires_in": 3600}
+
+    monkeypatch.setattr(ga, "_post_token", fake_post)
+    url = ga.build_authorize_url("alice")
+    advertised = _advertised(url)
+    assert advertised == "http://localhost:1515" + ga.CALLBACK_PATH
+
+    monkeypatch.setattr(BaseConfig, "APP_URL", "https://cremind.example.com:9443", raising=False)
+    ga.complete_callback(parse_qs(urlparse(url).query)["state"][0], "the-code")
+    assert posted["redirect_uri"] == advertised
+    assert posted["grant_type"] == "authorization_code" and posted["code"] == "the-code"
+
+
+# ── consent + tokens ────────────────────────────────────────────────────────
 
 def test_build_authorize_url_and_pending(monkeypatch):
     _wire(monkeypatch)

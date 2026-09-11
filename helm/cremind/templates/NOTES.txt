@@ -94,6 +94,11 @@ noVNC moves to its own port — see below.
 
    then browse to:  http://localhost:6080/vnc.html
 {{- end }}
+
+   Keep this forward running while you link a Google account: Google returns
+   the browser to http://localhost:1515{{ if $sslMode }}, which the pod passes
+   on to its HTTPS handler{{ end }} (Calendar connect and the Drive picker use the
+   port in cremind.appUrl instead when it names one).
 {{- end }}
 {{- if eq $sslMode "after-setup" }}
 

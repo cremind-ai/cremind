@@ -18,7 +18,8 @@
     "preview": "vite preview",
     "web:dev": "vite --config vite.config.web.ts",
     "web:build": "vue-tsc && vite build --config vite.config.web.ts && tsup server/index.ts --format esm --external express --external compression --out-dir dist-server",
-    "web:start": "node dist-server/index.js"
+    "web:start": "node dist-server/index.js",
+    "test:regressions": "node --test tests/*.test.mjs electron/https.test.mjs"
   },
   "dependencies": {
     "@a2a-js/sdk": "^0.3.10",

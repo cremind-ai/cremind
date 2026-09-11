@@ -100,6 +100,18 @@ cremind:
   # `port-forward svc/cremind 1515:80`) — https:// there when ssl below is on.
   # Override if you port-forward to a different local port or front it with
   # another URL.
+  # Switching an HTTP release to HTTPS: the helm upgrade Settings → Security
+  # prints passes --set cremind.appUrl=https://... because --reuse-values would
+  # otherwise keep an explicit http:// value, which the ssl check refuses. An
+  # APP_URL entry in extraEnv below silently OVERRIDES this value (the pod's
+  # env: beats the envFrom: ConfigMap, and that check never sees it), so set
+  # the address here, not there.
+  # A localhost value also fixes the port of the Google loopback callback
+  # (skills, Calendar connect, Drive picker): Google's Desktop client accepts
+  # only http://localhost:<port>, which the pod forwards to its HTTPS handler
+  # when ssl is on. Any other value with an explicit port moves only the
+  # Calendar/Drive callback to that port on localhost (the skills stay on 1515).
+  # See "Linking Google accounts" in the README.
   appUrl: ""
   # In-pod HTTPS. "" (the default) or false serves plain HTTP. Set true to
   # enable HTTPS after certificate trust during setup (same as "after-setup").

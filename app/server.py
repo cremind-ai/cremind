@@ -60,6 +60,7 @@ from app.api.coding_agents import get_coding_agents_routes
 from app.api.config import get_config_routes
 from app.api.features import get_features_routes
 from app.api.oauth_callback import get_oauth_callback_routes
+from app.api.oauth_return import get_oauth_return_routes
 from app.api.llm import get_llm_routes
 from app.api.setup_stream import get_setup_stream_routes
 from app.api.skills import get_skill_routes
@@ -1153,13 +1154,17 @@ async def main(
     routes.extend(get_coding_agents_routes(state))
     routes.extend(get_skill_routes(state))
     routes.extend(get_setup_stream_routes())
-    # OAuth callback routes (Google/Atlassian skills + A2A tool auth). Registered
-    # PRE-storage because they only write a per-state inbox file / resolve an
-    # in-process Future (no DB/agent needed) — and account-linking is driven over
-    # the A2A endpoint, itself available pre-storage, so the consent redirect can
-    # arrive before/independently of the post-storage boot. Keeping these routes
-    # pre-storage guarantees they answer whenever a link is in flight.
+    # OAuth callback routes (Google/Atlassian skills, Calendar connect, Drive
+    # Picker). Registered PRE-storage because they only write a per-state inbox
+    # file, run the Calendar exchange or record Drive picks (no DB/agent needed)
+    # — and account-linking is driven over the A2A endpoint, itself available
+    # pre-storage, so the consent redirect can arrive before/independently of
+    # the post-storage boot. Keeping these routes pre-storage guarantees they
+    # answer whenever a link is in flight.
     routes.extend(get_oauth_callback_routes())
+    # The SPA's record/consume half of the consent return. Pre-storage for the
+    # same reason: it must answer whenever a callback above can redirect to it.
+    routes.extend(get_oauth_return_routes())
 
     from app.middleware import ConnectionHeaderFilter
 

@@ -1,11 +1,13 @@
 """Unit test: `complete-link` (auth.submit_callback) writes the OAuth inbox.
 
-The manual paste fallback lets a user finish linking on a remote/Ingress
-deployment where the consent redirect can't reach the backend: they copy the
-URL the browser was sent to, and submit_callback drops its query into the same
-per-state inbox file the backend callback route would have written
-(`<CREMIND_SYSTEM_DIR>/oauth_inbox/<state>.txt`), so the still-running `link`
-picks it up and performs the local PKCE exchange.
+The manual paste fallback lets a user finish linking whenever the consent
+redirect can't reach the backend — a remote/Ingress deployment (where `link`
+advertises the default http://localhost:1515/api/oauth/callback), a
+port-forward that was not running, or an HTTPS install whose forwarded https
+callback the browser refused: they copy the URL the browser was sent to, and
+submit_callback drops its query into the same per-state inbox file the backend
+callback route would have written (`<CREMIND_SYSTEM_DIR>/oauth_inbox/<state>.txt`),
+so the still-running `link` picks it up and performs the local PKCE exchange.
 
 Run standalone (no pytest needed):  python scripts/tests/test_submit_callback.py
 Or via pytest:                      pytest scripts/tests/test_submit_callback.py
@@ -62,6 +64,16 @@ def test_proxied_url_path_writes_inbox():
     _with_system_dir(body)
 
 
+def test_https_forwarded_url_writes_inbox():
+    """On an HTTPS install the backend forwards the http callback to its https
+    twin; if the browser stops there (untrusted CA), that is the address it
+    shows — only the query matters, so it completes the same way."""
+    def body(tmp):
+        auth.submit_callback(f"https://localhost:1515/api/oauth/callback?{_QUERY}")
+        assert (Path(tmp) / "oauth_inbox" / f"{_STATE}.txt").read_text(encoding="utf-8") == _QUERY
+    _with_system_dir(body)
+
+
 def test_bare_query_writes_inbox():
     def body(tmp):
         auth.submit_callback(_QUERY)
@@ -99,6 +111,7 @@ def test_rejects_bad_inputs():
 if __name__ == "__main__":
     test_full_url_writes_inbox()
     test_proxied_url_path_writes_inbox()
+    test_https_forwarded_url_writes_inbox()
     test_bare_query_writes_inbox()
     test_leading_question_mark_query()
     test_rejects_bad_inputs()

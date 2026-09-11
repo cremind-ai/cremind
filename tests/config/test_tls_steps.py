@@ -16,6 +16,7 @@ from app.config.tls_steps import (
     CHART_REFERENCE,
     DOCKER_RECREATE_COMMAND,
     NAMESPACE_PLACEHOLDER,
+    PUBLIC_URL_PLACEHOLDER,
     RELEASE_PLACEHOLDER,
     RESTART_COMMAND,
     SERVE_COMMAND,
@@ -123,7 +124,8 @@ def test_flatten_is_the_legacy_instruction_list():
                 "kubectl --namespace <namespace> create secret tls cremind-tls "
                 "--cert=<path-to-fullchain.pem> --key=<path-to-privkey.pem>",
                 f"helm upgrade <release> {CHART_REFERENCE} --version {CHART_VERSION} "
-                "--namespace <namespace> --reuse-values -f <your-values.yaml>",
+                "--namespace <namespace> --reuse-values -f <your-values.yaml> "
+                f"--set cremind.appUrl={HTTPS_URL}",
                 "kubectl --namespace <namespace> rollout status "
                 "deployment/<release> --timeout=5m",
                 "kubectl --namespace <namespace> get ingress <release>",
@@ -136,7 +138,8 @@ def test_flatten_is_the_legacy_instruction_list():
             [
                 "helm list --all-namespaces",
                 f"helm upgrade <release> {CHART_REFERENCE} --version {CHART_VERSION} "
-                "--namespace <namespace> --reuse-values --set cremind.ssl=auto",
+                "--namespace <namespace> --reuse-values --set cremind.ssl=auto "
+                f"--set cremind.appUrl={HTTPS_URL}",
                 "kubectl --namespace <namespace> rollout status "
                 "deployment/<release> --timeout=5m",
                 "kubectl --namespace <namespace> port-forward svc/<release> 1515:80",
@@ -317,7 +320,8 @@ def test_a_pod_that_knows_itself_prints_commands_with_nothing_left_to_fill_in():
     steps = _steps(kubernetes=IDENTITY)
     assert _commands(steps) == [
         f"helm upgrade cremind {CHART_REFERENCE} --version {CHART_VERSION} "
-        "--namespace lee-cremind --reuse-values --set cremind.ssl=auto",
+        "--namespace lee-cremind --reuse-values --set cremind.ssl=auto "
+        f"--set cremind.appUrl={HTTPS_URL}",
         "kubectl --namespace lee-cremind rollout status "
         "deployment/cremind --timeout=5m",
         "kubectl --namespace lee-cremind port-forward svc/cremind 1515:80",
@@ -326,7 +330,11 @@ def test_a_pod_that_knows_itself_prints_commands_with_nothing_left_to_fill_in():
     # No blanks anywhere, so no "replace these with what helm list prints".
     assert "<" not in joined
     assert "helm list" not in " ".join(_commands(steps))
-    assert "lee-cremind" in [s["text"] for s in steps if s["kind"] == "note"][2]
+    # The note introducing the commands names the namespace they run against.
+    introduction = next(
+        text for text in _notes(steps) if text.startswith("Then run these commands")
+    )
+    assert "lee-cremind" in introduction
 
 
 def test_an_ingress_runbook_names_the_real_ingress_not_the_release():
@@ -336,7 +344,8 @@ def test_an_ingress_runbook_names_the_real_ingress_not_the_release():
         "kubectl --namespace lee-cremind create secret tls cremind-tls "
         "--cert=<path-to-fullchain.pem> --key=<path-to-privkey.pem>",
         f"helm upgrade cremind {CHART_REFERENCE} --version {CHART_VERSION} "
-        "--namespace lee-cremind --reuse-values -f <your-values.yaml>",
+        "--namespace lee-cremind --reuse-values -f <your-values.yaml> "
+        f"--set cremind.appUrl={HTTPS_URL}",
         "kubectl --namespace lee-cremind rollout status "
         "deployment/cremind --timeout=5m",
         "kubectl --namespace lee-cremind get ingress cremind",
@@ -423,6 +432,163 @@ def test_the_placeholders_are_the_ones_runtime_env_prints():
     """
     assert NAMESPACE_PLACEHOLDER == runtime_env._NAMESPACE_PLACEHOLDER
     assert RELEASE_PLACEHOLDER == runtime_env._WORKLOAD_PLACEHOLDER
+
+
+# ── the address the upgrade records as cremind.appUrl ────────────────────
+#
+# --reuse-values keeps whatever appUrl the HTTP install had: an explicit
+# http:// one makes the chart refuse to render under cremind.ssl, and a stale
+# one keeps advertising - and deriving the Google loopback callback from - an
+# address the browser no longer uses. So both Kubernetes upgrades set it.
+
+
+def _upgrade(steps: list[dict]) -> str:
+    return next(c for c in _commands(steps) if c.startswith("helm upgrade"))
+
+
+@pytest.mark.parametrize(
+    "kubernetes", [None, IDENTITY, INFERRED, NAMESPACE_ONLY],
+    ids=["unknown", "chart", "inferred", "namespace-only"],
+)
+@pytest.mark.parametrize(
+    ("kwargs", "tail"),
+    [
+        ({}, f"--reuse-values --set cremind.ssl=auto --set cremind.appUrl={HTTPS_URL}"),
+        (
+            {"edge": True},
+            f"--reuse-values -f <your-values.yaml> --set cremind.appUrl={HTTPS_URL}",
+        ),
+    ],
+    ids=["in-pod", "ingress"],
+)
+def test_every_kubernetes_upgrade_records_the_https_address_as_app_url(
+    kubernetes, kwargs, tail,
+):
+    """Real names or placeholders, the flag rides the one upgrade, after every
+    flag that was already there."""
+    upgrade = _upgrade(_steps(kubernetes=kubernetes, **kwargs))
+    namespace = (kubernetes or {}).get("namespace") or NAMESPACE_PLACEHOLDER
+    release = (kubernetes or {}).get("release") or RELEASE_PLACEHOLDER
+    assert upgrade.startswith(
+        f"helm upgrade {release} {CHART_REFERENCE} --version {CHART_VERSION} "
+        f"--namespace {namespace} --reuse-values "
+    )
+    assert upgrade.endswith(tail)
+    assert upgrade.count("cremind.appUrl=") == 1
+
+
+def test_a_port_forward_on_another_port_keeps_that_port_everywhere():
+    """``https_url`` is this browser's own address, so a tunnel on 8080 yields
+    an appUrl on 8080 - and the reopened tunnel has to listen there too, or the
+    waiting tabs and the Google callback would name a port nothing forwards."""
+    steps = _steps(kubernetes=IDENTITY, https_url="https://localhost:8080")
+    assert _commands(steps) == [
+        f"helm upgrade cremind {CHART_REFERENCE} --version {CHART_VERSION} "
+        "--namespace lee-cremind --reuse-values --set cremind.ssl=auto "
+        "--set cremind.appUrl=https://localhost:8080",
+        "kubectl --namespace lee-cremind rollout status "
+        "deployment/cremind --timeout=5m",
+        "kubectl --namespace lee-cremind port-forward svc/cremind 8080:80",
+    ]
+    assert "https://localhost:8080" in steps[-1]["text"]
+
+
+@pytest.mark.parametrize(
+    ("https_url", "ports"),
+    [
+        ("https://localhost:1515", "1515:80"),
+        ("https://127.0.0.1:9443", "9443:80"),
+        ("https://[::1]:8443", "8443:80"),
+        ("https://localhost:80", "80:80"),         # a tunnel on local port 80
+        ("https://cremind.lan:30443", "1515:80"),  # a NodePort, not a tunnel
+        ("https://10.0.0.5:1515", "1515:80"),
+    ],
+)
+def test_the_reopened_tunnel_listens_where_the_browser_already_looks(https_url, ports):
+    tunnel = next(c for c in _commands(_steps(kubernetes=IDENTITY, https_url=https_url))
+                  if "port-forward" in c)
+    assert tunnel == f"kubectl --namespace lee-cremind port-forward svc/cremind {ports}"
+
+
+@pytest.mark.parametrize("https_url", ["https://[::1]:1515", "https://[fd00::5]:30443"])
+def test_an_ipv6_app_url_is_quoted_against_shell_globbing(https_url):
+    """``[...]`` is a glob to a POSIX shell (zsh refuses the whole line when it
+    matches nothing), so that one argument goes in single quotes."""
+    steps = _steps(https_url=https_url)
+    assert _upgrade(steps).endswith(
+        f"--reuse-values --set cremind.ssl=auto --set 'cremind.appUrl={https_url}'"
+    )
+    for step in steps:  # still one bare, copyable shell line
+        assert step["text"].strip() == step["text"] and "`" not in step["text"]
+
+
+@pytest.mark.parametrize(
+    "https_url", ["https://localhost:1515", "https://127.0.0.1:8080", "https://[::1]:1515"],
+)
+def test_an_ingress_runbook_opened_through_a_tunnel_names_no_loopback_address(https_url):
+    """A loopback address means the admin is looking through a tunnel, which
+    says nothing about the Ingress hostname - and a loopback appUrl would
+    advertise an address no other device reaches. So the operator fills the
+    public host in, like the values file, and is told why."""
+    steps = _steps(edge=True, kubernetes=IDENTITY, https_url=https_url)
+    commands = _commands(steps)
+    # A placeholder is there to be replaced, so it is never quoted.
+    assert _upgrade(steps).endswith(
+        f"-f <your-values.yaml> --set cremind.appUrl={PUBLIC_URL_PLACEHOLDER}"
+    )
+    assert f"curl --fail {PUBLIC_URL_PLACEHOLDER}/api/tls/status" in commands
+    joined = " ".join(flatten(steps))
+    for loopback in ("localhost", "127.0.0.1", "[::1]"):
+        assert loopback not in joined
+    # The tunnel's tabs wait for the HTTPS form of a loopback address, which the
+    # Ingress never serves, so the closing note must not promise they follow.
+    assert PUBLIC_URL_PLACEHOLDER in steps[-1]["text"]
+    assert "cannot follow on its own" in steps[-1]["text"]
+    assert "move there on their own" not in steps[-1]["text"]
+    assert "move there on their own" in _steps(edge=True)[-1]["text"]
+    introduction = next(
+        text for text in _notes(steps) if text.startswith("Then run these commands")
+    )
+    assert "<public-host>" in introduction and "tunnel" in introduction
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "app_url"),
+    [
+        pytest.param({}, HTTPS_URL, id="in-pod"),
+        pytest.param({"edge": True}, HTTPS_URL, id="ingress"),
+        pytest.param(
+            {"edge": True, "https_url": "https://localhost:1515"},
+            PUBLIC_URL_PLACEHOLDER, id="ingress-through-a-tunnel",
+        ),
+    ],
+)
+def test_kubernetes_runbooks_warn_that_extra_env_outranks_the_chart(kwargs, app_url):
+    """An APP_URL in cremind.extraEnv lands in the pod's env:, which beats the
+    ConfigMap the flag writes; an explicit CORS list names only the HTTP origin.
+    Both are edits to make before the upgrade, so the note sits in front of
+    the first command."""
+    steps = _steps(**kwargs)
+    first_command = next(i for i, s in enumerate(steps) if s["kind"] == "command")
+    before = [s["text"] for s in steps[:first_command] if s["kind"] == "note"]
+    override = next(t for t in before if "cremind.extraEnv sets APP_URL" in t)
+    assert app_url in override
+    assert "wins over cremind.appUrl" in override
+    assert "CORS_ALLOWED_ORIGINS" in override
+    assert "HTTPS origin next to the HTTP one" in override
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"install_mode": "docker"},
+    {"install_mode": "native", "restart_supported": True},
+    {"install_mode": "native", "restart_supported": False},
+    {"manager": "native", "install_mode": "native", "restart_supported": False},
+])
+def test_runbooks_without_a_chart_never_mention_its_values(kwargs):
+    """Docker, a reverse proxy and a native install keep their own guidance."""
+    joined = " ".join(flatten(_steps(**kwargs)))
+    assert "cremind.extraEnv" not in joined
+    assert "cremind.appUrl" not in joined
 
 
 # ── repairing a certificate on a server already serving HTTPS ────────────

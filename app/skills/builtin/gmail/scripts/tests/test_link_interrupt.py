@@ -6,6 +6,10 @@ WinSock wait swallows SIGINT until a request arrives, so Ctrl+C was a no-op and
 on a daemon thread and parks the main thread in an interruptible join loop, so the
 signal lands within ~0.5s and surfaces as a clean AuthError.
 
+This is the standalone path only: under the Cremind backend `link` never runs a
+local server — it waits on the backend's OAuth inbox, a plain sleep loop that
+SIGINT interrupts without any thread wrapper.
+
 We simulate Ctrl+C with _thread.interrupt_main() (raises KeyboardInterrupt in the
 main thread, exactly as SIGINT does).
 
@@ -21,7 +25,7 @@ _SCRIPTS = Path(__file__).resolve().parent.parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from app.google import auth
+from app.google import auth  # noqa: E402
 
 
 def test_success_path_returns_creds():

@@ -61,10 +61,12 @@ sessions and application data in transit and enables browser secure-context APIs
    desktop app. Docker and Kubernetes print host/Helm instructions instead of
    changing deployment-owned configuration.
 4. Open or suspended Cremind tabs that joined the preparation retain their
-   route and session when they move to HTTPS. An old HTTP bookmark, or a fully
-   discarded tab that had no private handoff, opens a credential-free recovery
-   page and then the HTTPS login with its intended route retained. Untrusted
-   certificates or a disconnected port-forward leave retry instructions.
+   route and session when they move to HTTPS, including after the pod or
+   container is replaced, as long as the Cremind CA is unchanged. An old HTTP
+   bookmark, or a fully discarded tab that had no private handoff, opens a
+   credential-free recovery page and then the HTTPS login with its intended
+   route retained. Untrusted certificates or a disconnected port-forward leave
+   retry instructions.
 
 Docker, Kubernetes and reverse-proxy installs stay on HTTP until you apply the
 deployment change, and that wait is safe: the HTTP application keeps serving,
@@ -159,13 +161,16 @@ no placeholder left in them, **there is no `helm list` step at all**, and only
 the certificate paths and values file on the Ingress runbook are yours to fill
 in.
 
-Which namespace, release and Deployment this is are cluster facts, and
-`cremind server environment` and the install secrets keep them admin-only; the
-runbook does not get to publish them to anyone who can reach the port just
-because status answers before sign-in. So without an admin token the `kubernetes`
-block is `null` and the commands keep their placeholders, exactly as below. The
-web UI's **Settings → HTTPS & Certificate** page sends the admin session token
-for the same reason, and shows the filled-in runbook.
+Each Helm upgrade also sets `cremind.appUrl` to the HTTPS form of the browser's
+address, port included (`https://<public-host>` when an Ingress page was opened
+through a tunnel), since `--reuse-values` would keep an `http://` one the chart
+refuses. An `APP_URL` in `cremind.extraEnv` overrides it; remove that entry.
+
+Those names are cluster facts that `cremind server environment` and the install
+secrets keep admin-only, so without an admin token the `kubernetes` block is
+`null` and the commands keep their placeholders. The web UI's **Settings →
+HTTPS & Certificate** page sends the admin session token and shows the
+filled-in runbook.
 
 An **older chart** states nothing, so the pod can only read its namespace and
 its own Deployment name off itself and `<release>` stays a placeholder. Then —
@@ -364,6 +369,9 @@ Linux use an NSS store and may also need an explicit import.
   `CREMIND_SSL_AUTO_HOSTS` set on the server.
 - **A `sudo` step failed** — the printed command can be run by hand in a shell
   with the right privileges.
+- **Linking Google after the switch** — Google still returns to
+  `http://localhost:<port>`, which the server redirects to its HTTPS handler.
+  Keep any port-forward open and trust the CA.
 - **The server serves plain HTTP** — with `CREMIND_SSL=after-setup` that is
   expected until the Setup Wizard completes: the CA already exists and the
   wizard hands it over, then the server restarts into HTTPS. Otherwise

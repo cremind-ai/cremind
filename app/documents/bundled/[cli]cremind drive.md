@@ -114,6 +114,14 @@ redirect fails and nothing is detected, the command offers to take the URL the
 browser landed on; `--json` and non-interactive runs are told to use
 `grant-complete` instead.
 
+When the redirect does reach Cremind, the tab lands on Cremind's OAuth return
+page, which reports that Google's response was received. A popup opened by
+**Settings → GSuite → Grant access** closes itself; any other tab moves on to
+the page the grant was started from when one was recorded and this browser is
+signed in to that profile, else to Cremind home. The tab `cremind drive grant`
+opens has no recorded page, so it goes to Cremind home and can simply be
+closed. The command's own output, not that page, confirms the grant.
+
 Grants are permanent until Cremind's Drive access is revoked, which removes
 **all** of them at once — Google offers no per-file revoke, so neither does this
 command. Use **`cremind google unlink gdrive`** to do that (it revokes at Google
@@ -166,4 +174,6 @@ access none of them do.
   tunnel already makes that address reach this server from the user's machine
   (e.g. `kubectl port-forward`), keeping it running while they approve captures
   the redirect automatically, with no `grant-complete` paste. `grant` prints the
-  exact address it will use.
+  exact address it will use. This works on an HTTPS install too: the server
+  redirects that plaintext callback to its own HTTPS handler, so the browser has
+  to trust that certificate (for a generated one, the Cremind CA).

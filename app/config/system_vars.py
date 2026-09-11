@@ -17,57 +17,47 @@ To add a new variable: append one :class:`SystemVarSpec` to
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
 from app.config.coding_cli_homes import profile_claude_config_dir, profile_codex_home
+from app.config.oauth_loopback import google_redirect_uri
 from app.config.settings import BaseConfig, get_user_working_directory
 from app.utils.logger import logger
 
 # Shared backend OAuth callback path for the built-in skills (served by
-# app/api/oauth_callback.py). The Google skills advertise APP_URL + this; the
-# Atlassian skills advertise a single FIXED URL ending in the same path (defaulted
-# in the jira/confluence skill), because its 3LO Web client allows only one
-# registered, exact-match callback per app. One route suffices because the
+# app/api/oauth_callback.py). The Google skills advertise a loopback origin +
+# this; the Atlassian skills advertise a single FIXED URL ending in the same path
+# (defaulted in the jira/confluence skill), because its 3LO Web client allows only
+# one registered, exact-match callback per app. One route suffices because the
 # per-flow ``state`` (not the path) disambiguates the provider/flow.
 _OAUTH_CALLBACK_PATH = "/api/oauth/callback"
 
-# APP_URL origins a Google "Desktop" client will accept as a redirect: an
-# ``http://`` loopback (localhost / 127.0.0.1, any port). A real hostname
-# (Ingress/domain/LAN server) is rejected by Google, so the Google redirect is
-# left unset there and the skill falls back to the manual ``complete-link``
-# paste.
+# The Google skills' redirect follows the rule every Google flow shares
+# (app/config/oauth_loopback.py). Their "Desktop" OAuth client accepts only an
+# ``http://`` loopback redirect — a real hostname (Ingress/domain/LAN) is refused
+# before consent, and so is ``https://localhost`` (the installed-app loopback flow,
+# RFC 8252 §7.3, is specified over plain HTTP).
 #
-# ``http://`` and not ``https?://``: the installed-app loopback flow (RFC 8252
-# §7.3, which is what a Desktop client implements) is specified over plain
-# HTTP, and Google will not accept an https loopback redirect for this client
-# type. That combination stopped being hypothetical when the installers began
-# defaulting local installs to TLS — advertising ``https://localhost:1515/...``
-# would fail at the consent screen with redirect_uri_mismatch, mid-flow and
-# with nothing useful to tell the user. Omitting it instead routes those
-# installs down the same manual-paste path Ingress deployments already use.
-_LOOPBACK_APP_URL_RE = re.compile(r"^http://(127\.0\.0\.1|localhost)(:[0-9]+)?(/|$)")
-
-
-def _app_url_base() -> Optional[str]:
-    """APP_URL trimmed of any trailing slash, or ``None`` when it is the
-    unusable ``http://0.0.0.0:<port>`` listen-all default (not a browser origin)."""
-    url = (BaseConfig.APP_URL or "").strip().rstrip("/")
-    if not url or "://0.0.0.0" in url:
-        return None
-    return url
+# An ``https`` loopback APP_URL — what the installers now default local installs
+# to — still yields a redirect: ``http`` on the SAME host and port. The same-port
+# TLS listener answers that plaintext request by redirecting exactly the Google
+# callback paths on to their HTTPS handler, so the consent redirect lands without
+# Google ever seeing an https URI. Advertising ``https://localhost:1515/...``
+# instead fails mid-flow with redirect_uri_mismatch; omitting the variable, which
+# is what this used to do, pushed every TLS install onto the manual paste.
+#
+# An operator's loopback pin in the server's own environment is honoured next (a
+# port-forward in front of an Ingress install). With neither, the variable is
+# omitted and the backend-managed skills fall back to their built-in
+# ``http://localhost:1515/api/oauth/callback`` — captured when a port-forward
+# makes that address reach this server, otherwise finished with ``complete-link``.
 
 
 def _resolve_google_redirect_uri(_profile: Optional[str]) -> Optional[str]:
-    """Browser-facing Google OAuth redirect for the Google skills:
-    ``<APP_URL>`` + :data:`_OAUTH_CALLBACK_PATH`. Emitted only for a loopback
-    APP_URL (Desktop-client constraint); otherwise omitted so the skill falls
-    back to the manual ``complete-link`` paste."""
-    base = _app_url_base()
-    if not base or not _LOOPBACK_APP_URL_RE.match(base):
-        return None
-    return base + _OAUTH_CALLBACK_PATH
+    """Browser-facing Google OAuth redirect for the Google skills, or ``None``
+    to let each skill apply its own default (see the comment above)."""
+    return google_redirect_uri(_OAUTH_CALLBACK_PATH, fallback=False)
 
 
 def _load_cremind_token(profile: Optional[str]) -> Optional[str]:
@@ -187,11 +177,17 @@ SYSTEM_VARS: list[SystemVarSpec] = [
         name="CREMIND_OAUTH_REDIRECT_URI",
         resolve=_resolve_google_redirect_uri,
         description=(
-            "Browser-facing Google OAuth redirect for the Google skills "
-            "(<APP_URL>/api/oauth/callback). The skill advertises it and the "
-            "backend captures the consent redirect into the oauth_inbox; omitted "
-            "for non-loopback APP_URL (Desktop clients only accept loopback) so "
-            "the skill uses the manual complete-link paste."
+            "Browser-facing Google OAuth redirect for the Google skills: "
+            "http://<loopback host>:<port>/api/oauth/callback, derived from a "
+            "loopback APP_URL (an https one maps to http on the same port, which "
+            "this server redirects to its HTTPS handler — only when this process "
+            "serves that port itself, not behind edge TLS termination or with "
+            "CREMIND_UI_PORT=0) or a loopback operator pin. The skill "
+            "advertises it and the backend captures the consent "
+            "redirect into the oauth_inbox. Omitted otherwise (Google Desktop "
+            "clients accept only http loopback redirects); the skill then uses "
+            "http://localhost:1515/api/oauth/callback, finished by complete-link "
+            "when that address does not reach this server."
         ),
     ),
     SystemVarSpec(

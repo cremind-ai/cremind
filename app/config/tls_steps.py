@@ -30,7 +30,10 @@ carries.
 
 from __future__ import annotations
 
+import ipaddress
 import re
+import shlex
+from urllib.parse import urlsplit
 
 
 #: Where the chart is published. ``helm push`` in ``release-rc.yml`` and
@@ -57,6 +60,14 @@ _ATLASSIAN_CONSOLE = "Atlassian developer console"
 #: ``tests/config/test_tls_steps.py`` pins them equal.
 NAMESPACE_PLACEHOLDER = "<namespace>"
 RELEASE_PLACEHOLDER = "<release>"
+
+#: The Ingress's public origin, when the page that rendered the runbook was
+#: opened through a tunnel (``https://localhost:1515``). That request says
+#: nothing about the hostname the Ingress serves, and a loopback
+#: ``cremind.appUrl`` on an Ingress install would advertise an address no other
+#: device can reach — so the operator fills it in, like the values file.
+PUBLIC_HOST_PLACEHOLDER = "<public-host>"
+PUBLIC_URL_PLACEHOLDER = f"https://{PUBLIC_HOST_PLACEHOLDER}"
 
 #: The chart's ``service.port`` default, used when the identity says nothing:
 #: a pod started by a chart too old to state it still gets a runnable tunnel.
@@ -218,7 +229,90 @@ def _names_caveat(workload: str, inferred: bool) -> str:
     return ""
 
 
-def _port_forward_command(namespace: str, service: str, service_port: int) -> dict:
+def _is_loopback(url: str) -> bool:
+    """Whether ``url`` names this machine: ``localhost``, 127.0.0.0/8 or ``::1``.
+
+    The same three spellings the Google loopback callback treats as loopback.
+    Spelled out here rather than imported so this module stays pure.
+    """
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _tunnel_port(https_url: str) -> int | None:
+    """The local port to reopen the tunnel on, or ``None`` for the default.
+
+    A page opened through ``kubectl port-forward`` carries the tunnel's local
+    port in its own address, and every other line of the runbook follows that
+    address: the ``cremind.appUrl`` the upgrade sets, the HTTPS origin the
+    waiting tabs poll, and the Google callback derived from APP_URL. Reopening
+    the tunnel on the documented 1515 instead would leave all three naming a
+    port nothing forwards. A non-loopback address (a NodePort, a LAN name) is
+    not a port-forward at all, so the default stands there.
+    """
+    if not _is_loopback(https_url):
+        return None
+    try:
+        return urlsplit(https_url).port or 443
+    except ValueError:
+        return None
+
+
+def _app_url_flag(url: str) -> str:
+    """``--set cremind.appUrl=<url>``, single-quoted only when a shell needs it.
+
+    The upgrade sets appUrl explicitly because ``--reuse-values`` would
+    otherwise keep whatever the HTTP install had: an explicit ``http://``
+    appUrl makes the chart refuse to render under ``cremind.ssl``, and APP_URL
+    is what the agent card, the CORS origin and the Google loopback callback
+    are derived from.
+
+    An IPv6 origin (``https://[::1]:1515``) is why the quoting exists: ``[...]``
+    is a glob to a POSIX shell, and zsh aborts the whole command when it
+    matches nothing. ``shlex.quote`` leaves an ordinary origin bare, so the
+    common command reads like the chart README's. The placeholder is never
+    quoted — it is there to be replaced, like ``<your-values.yaml>``.
+    """
+    if url == PUBLIC_URL_PLACEHOLDER:
+        return f"--set cremind.appUrl={url}"
+    return "--set " + shlex.quote(f"cremind.appUrl={url}")
+
+
+def _environment_overrides_note(app_url: str) -> dict:
+    """The two ``cremind.extraEnv`` entries that can quietly undo the upgrade.
+
+    ``extraEnv`` renders into the container's ``env:``, which Kubernetes
+    applies over the chart's ``envFrom:`` ConfigMap, so an ``APP_URL`` there
+    beats ``cremind.appUrl`` whatever the upgrade sets — and the chart's
+    http-vs-https render check reads only ``cremind.appUrl``, so the stale
+    value renders without a word. ``CORS_ALLOWED_ORIGINS`` is the other: the
+    chart never sets it and the server then allows every origin, but an
+    explicit list written for the HTTP install names only the HTTP origin,
+    while the switch has pages on both origins talking to the server. A native
+    activation extends that list itself; on a cluster nobody does, so the
+    runbook has to say it.
+    """
+    return note(
+        "If cremind.extraEnv sets APP_URL, remove that entry or change it to "
+        f"{app_url}: extraEnv becomes the container's own environment, which "
+        "overrides the chart's ConfigMap and so wins over cremind.appUrl. If it "
+        "sets CORS_ALLOWED_ORIGINS, add the HTTPS origin next to the HTTP one for "
+        "every address you open Cremind at; the chart leaves that variable "
+        "unset, which allows every origin."
+    )
+
+
+def _port_forward_command(
+    namespace: str, service: str, service_port: int, local_port: int | None = None
+) -> dict:
     """The tunnel line, in the one spelling every Cremind screen prints.
 
     ``runtime_env`` owns it because the chart's NOTES, the VNC card and this
@@ -226,12 +320,15 @@ def _port_forward_command(namespace: str, service: str, service_port: int) -> di
     spelling. Imported inside the function to keep this module importable on
     its own: it is pure by design, and ``runtime_env`` answers install
     questions that reach for the settings stack.
+
+    ``local_port`` is the port the operator's own tunnel already used (see
+    :func:`_tunnel_port`); ``None`` keeps the documented default.
     """
     from app.config.runtime_env import PORT_FORWARD_LOCAL_PORT, kubernetes_port_forward
 
     return command(
         kubernetes_port_forward(
-            namespace, service, PORT_FORWARD_LOCAL_PORT, service_port
+            namespace, service, local_port or PORT_FORWARD_LOCAL_PORT, service_port
         )
     )
 
@@ -243,9 +340,25 @@ def _ingress_steps(
 
     No port-forward anywhere: the public hostname *is* the HTTPS address here,
     and the certificate belongs to the Ingress, not to Cremind.
+
+    The upgrade ends in ``--set cremind.appUrl=<public origin>`` so a
+    ``--reuse-values`` release cannot keep an HTTP appUrl (see
+    :func:`_app_url_flag`). The public origin is ``https_url`` — the address
+    the admin's browser used — unless that is loopback: then the admin is
+    looking through a tunnel, which says nothing about the Ingress hostname,
+    so the appUrl, the ``curl`` check and the closing note all carry
+    :data:`PUBLIC_URL_PLACEHOLDER` instead of an address only this machine
+    reaches.
     """
     namespace, release, workload, _port, missing, inferred = _kubernetes_names(
         kubernetes
+    )
+    tunnelled = _is_loopback(https_url)
+    public_url = PUBLIC_URL_PLACEHOLDER if tunnelled else https_url
+    fill_in = (
+        f"the certificate paths, your values file and {PUBLIC_HOST_PLACEHOLDER}"
+        if tunnelled else
+        "the certificate paths and your values file"
     )
     return [
         note(
@@ -257,12 +370,13 @@ def _ingress_steps(
         note(
             "Edit your Helm values first: set ingress.enabled=true, ingress.host, "
             "and ingress.tls with the HTTPS host and its certificate Secret; set "
-            "cremind.appUrl to the public HTTPS origin; set "
-            "ingress.trustedProxyCidrs to the Ingress controller's source range "
-            "(it becomes FORWARDED_ALLOW_IPS, so only that proxy may assert the "
-            "HTTPS scheme); leave cremind.ssl empty and remove any CREMIND_SSL "
-            "entry from cremind.extraEnv."
+            "cremind.appUrl to the public HTTPS origin (the upgrade below passes "
+            "it too); set ingress.trustedProxyCidrs to the Ingress controller's "
+            "source range (it becomes FORWARDED_ALLOW_IPS, so only that proxy may "
+            "assert the HTTPS scheme); leave cremind.ssl empty and remove any "
+            "CREMIND_SSL entry from cremind.extraEnv."
         ),
+        _environment_overrides_note(public_url),
         note(
             "Do not enable an HTTP-to-HTTPS redirect or HSTS on the controller: "
             "old HTTP links must still reach Cremind's recovery page, and Cremind "
@@ -279,15 +393,20 @@ def _ingress_steps(
                 "Then run these commands in order from a machine with helm and "
                 f"kubectl access, replacing {RELEASE_PLACEHOLDER} and "
                 f"{NAMESPACE_PLACEHOLDER} with the NAME and NAMESPACE the first "
-                "command prints, plus the certificate paths and your values "
-                "file."
+                f"command prints, plus {fill_in}."
                 if missing else
                 "Then run these commands in order from a machine with helm and "
                 "kubectl access; they already carry this install's own release "
-                f"and run against its namespace {namespace}, so only the "
-                "certificate paths and your values file are left to fill in."
+                f"and run against its namespace {namespace}, so only {fill_in} "
+                "are left to fill in."
             )
             + _names_caveat(workload, inferred)
+            + (
+                f" Replace {PUBLIC_HOST_PLACEHOLDER} with the hostname the Ingress "
+                "serves: this page was opened through a tunnel, so it cannot know "
+                "that name."
+                if tunnelled else ""
+            )
             + " Skip the create-secret command when cert-manager or another "
             "issuer already owns the Secret. One Helm upgrade moves the proxy, "
             "Service, probes and public URL together; changing only the "
@@ -300,7 +419,8 @@ def _ingress_steps(
         ),
         command(
             f"helm upgrade {release} {CHART_REFERENCE} --version {chart_version} "
-            f"--namespace {namespace} --reuse-values -f <your-values.yaml>"
+            f"--namespace {namespace} --reuse-values -f <your-values.yaml> "
+            f"{_app_url_flag(public_url)}"
         ),
         _chart_note(chart_version),
         command(
@@ -315,13 +435,23 @@ def _ingress_steps(
         # identity the two spell the same placeholder, but on an install that
         # knows itself this is the Deployment's name, never helm's.
         command(f"kubectl --namespace {namespace} get ingress {workload}"),
-        command(f"curl --fail {https_url}/api/tls/status"),
+        command(f"curl --fail {public_url}/api/tls/status"),
         note(
-            f"Cremind then answers at {https_url}; tabs that joined this switch "
-            "move there on their own, and devices need only the certificate "
-            "issuer's normal trust chain. An old HTTP link shows the recovery page "
-            "and an HTTP API request returns status 426; if the controller "
-            "redirects instead, disable its redirect or HSTS setting."
+            (
+                # A tab that joined through the tunnel waits for the HTTPS form
+                # of ITS address, which the Ingress never serves.
+                f"Cremind then answers at {public_url}; open it there, because a "
+                "tab that joined this switch through a tunnel cannot follow on its "
+                "own. Devices need only the certificate issuer's normal trust "
+                "chain."
+                if tunnelled else
+                f"Cremind then answers at {public_url}; tabs that joined this "
+                "switch move there on their own, and devices need only the "
+                "certificate issuer's normal trust chain."
+            )
+            + " An old HTTP link shows the recovery page and an HTTP API request "
+            "returns status 426; if the controller redirects instead, disable its "
+            "redirect or HSTS setting."
         ),
     ]
 
@@ -329,17 +459,25 @@ def _ingress_steps(
 def _kubernetes_steps(
     https_url: str, chart_version: str, kubernetes: dict | None = None
 ) -> list[dict]:
-    """Kubernetes terminating TLS inside the pod (``cremind.ssl=auto``)."""
+    """Kubernetes terminating TLS inside the pod (``cremind.ssl=auto``).
+
+    The upgrade sets ``cremind.appUrl`` to ``https_url`` — the HTTPS form of the
+    address this browser uses, port included, so a port-forward on 8080 gets
+    ``https://localhost:8080`` — for the reasons in :func:`_app_url_flag`. The
+    reopened tunnel follows the same port (:func:`_tunnel_port`), so the
+    runbook never names two different local addresses.
+    """
     namespace, release, workload, service_port, missing, inferred = _kubernetes_names(
         kubernetes
     )
     return [
         note(
-            "Edit your Helm values first: set cremind.ssl=auto, remove any "
-            "CREMIND_SSL entry from cremind.extraEnv, and change cremind.appUrl to "
-            "the HTTPS origin if it is set. Add a LAN hostname or IP to "
+            "Edit your Helm values first: set cremind.ssl=auto and cremind.appUrl "
+            f"to {https_url} (the upgrade below passes both too), and remove any "
+            "CREMIND_SSL entry from cremind.extraEnv. Add a LAN hostname or IP to "
             "cremind.sslAutoHosts if you reach Cremind that way."
         ),
+        _environment_overrides_note(https_url),
         note(
             "If cremind.atlassianRedirectUri is customized, change it to the HTTPS "
             f"/api/oauth/callback URL and allow that exact URI in the "
@@ -364,7 +502,8 @@ def _kubernetes_steps(
         *([command("helm list --all-namespaces")] if missing or inferred else []),
         command(
             f"helm upgrade {release} {CHART_REFERENCE} --version {chart_version} "
-            f"--namespace {namespace} --reuse-values --set cremind.ssl=auto"
+            f"--namespace {namespace} --reuse-values --set cremind.ssl=auto "
+            f"{_app_url_flag(https_url)}"
         ),
         _chart_note(chart_version),
         command(
@@ -376,13 +515,16 @@ def _kubernetes_steps(
             "replaced the pod and closed the old tunnel, so open it again, adding "
             "1455:1455 and 6080:6080 if your previous port-forward had them."
         ),
-        _port_forward_command(namespace, workload, service_port),
+        _port_forward_command(
+            namespace, workload, service_port, _tunnel_port(https_url)
+        ),
         note(
             f"When the rollout finishes Cremind answers at {https_url}. Tabs that "
-            "joined this switch move there on their own; if a browser warns about "
-            "the certificate, trust the Cremind CA on that device first. Keep the "
-            "system-directory PVC and proxy.enabled=true so the CA and the relay "
-            "for old HTTP links survive later restarts."
+            "joined this switch move there on their own, even though the new pod "
+            "reissues its server certificate under the same Cremind CA; if a "
+            "browser warns about the certificate, trust the Cremind CA on that "
+            "device first. Keep the system-directory PVC and proxy.enabled=true so "
+            "the CA and the relay for old HTTP links survive later restarts."
         ),
     ]
 
@@ -524,6 +666,11 @@ def deployment_steps(
     into the real thing. Optional and defaulting to ``None`` so every non-K8S
     caller, and the older-chart pod that knows nothing about itself, keeps
     the placeholder runbook it always had.
+
+    ``https_url`` is the HTTPS form of the address the requesting browser used.
+    Both Kubernetes runbooks pass it to ``helm upgrade`` as ``cremind.appUrl``
+    (the Ingress one only when it is not a tunnel's loopback address — see
+    :func:`_ingress_steps`); the other modes only name it.
     """
     if manager == "external":
         if edge:

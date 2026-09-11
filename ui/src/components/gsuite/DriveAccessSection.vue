@@ -10,6 +10,7 @@
  * that Google offers no per-file revoke.
  */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { useRoute } from 'vue-router';
 import {
   ElButton, ElCard, ElInput, ElMessage, ElTable, ElTableColumn, ElTag,
 } from 'element-plus';
@@ -20,9 +21,11 @@ import {
   listDriveFiles, startDriveGrant,
   type DriveFile, type DriveStatus,
 } from '../../services/googleDriveApi';
+import { onOAuthReturn, type OAuthReturnNotice } from '../../services/oauthReturn';
 
 const props = defineProps<{ profile: string }>();
 const settings = useSettingsStore();
+const route = useRoute();
 
 const loading = ref(true);
 // null until the server has actually answered. "Not linked" is only ever
@@ -47,10 +50,15 @@ const manualHint = ref('');
 
 // Polling a grant round: the grant lands with Google on approval, so the server
 // discovers it by re-listing reachable files even when the redirect never
-// arrives. That is why this polls instead of waiting on a callback.
+// arrives. That is why this polls instead of waiting on a callback. When the
+// redirect DOES arrive, the OAuth return page (views/OAuthReturn.vue) tells us,
+// and we poll at once instead of on the next tick.
 const POLL_MS = 2500;
 const MAX_POLLS = 120;
 let pollTimer: number | undefined;
+let polls = 0;
+let pollInFlight = false;
+let stopReturnListener: (() => void) | null = null;
 let popup: Window | null = null;
 
 const linked = computed(() => status.value?.linked === true);
@@ -113,6 +121,8 @@ function stopPolling() {
     window.clearInterval(pollTimer);
     pollTimer = undefined;
   }
+  stopReturnListener?.();
+  stopReturnListener = null;
 }
 
 function finishGrant(count: number) {
@@ -138,6 +148,57 @@ function giveUpWaiting(hint: string) {
   manualHint.value = hint;
 }
 
+/** One status check of the current round; shared by the tick and the return notice. */
+async function pollGrant() {
+  const round = grantState.value;
+  if (pollInFlight || !round || !granting.value) return;
+  pollInFlight = true;
+  try {
+    const out = await getDriveGrant(settings.agentUrl, settings.authToken, round);
+    // The round may have finished, been cancelled or replaced while we waited;
+    // a stale answer must not announce (or abandon) a round that is gone.
+    if (round !== grantState.value || !granting.value) return;
+    if (out.status === 'error') {
+      giveUpWaiting(
+        `${out.error || 'The Google consent was denied.'} You can open the picker again to retry.`,
+      );
+      return;
+    }
+    if (out.status === 'unknown' || out.status === 'timeout') {
+      // The server forgot this round (in-flight grants live in memory, so a
+      // restart drops them). Pasting cannot help — only a fresh round can.
+      giveUpWaiting(
+        'The server no longer recognizes this grant round — it may have restarted. '
+        + 'Cancel and click "Grant access" to start a new one.',
+      );
+      return;
+    }
+    if (out.status === 'completed' && out.files.length) {
+      if (out.note) ElMessage.warning(out.note);
+      finishGrant(out.files.length);
+    }
+  } catch {
+    // A transient poll failure is not fatal; the next tick retries.
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+/**
+ * A return notice only says that SOME Drive consent answered — the channel
+ * reaches every tab of every profile signed in to this browser — so whatever the
+ * outcome, it is a cue to ask the server about OUR round now, never a verdict on
+ * it. A real denial of this round is already recorded server-side
+ * (grant_flow.record_redirect marks it ``error``) and pollGrant reports it;
+ * another tab's or another profile's round leaves ours untouched.
+ */
+function onDriveReturn(notice: OAuthReturnNotice) {
+  if (notice.flow !== 'drive' || !granting.value) return;
+  // Another profile's return cannot concern this profile's round.
+  if (notice.profile && notice.profile !== props.profile) return;
+  void pollGrant();
+}
+
 async function onGrant() {
   if (!settings.agentUrl || !settings.authToken) return;
   // Open the window FIRST, synchronously in the click handler. The authorize URL
@@ -145,10 +206,17 @@ async function onGrant() {
   // token and the browser blocks the popup — so open a blank one now and navigate
   // it once the server answers. Same pattern as services/hubPublish.ts.
   popup = window.open('about:blank', 'cremind-google-drive', 'width=620,height=700');
+  // A new round supersedes any previous one; clearing the state also makes an
+  // answer still in flight for the old round drop itself (see pollGrant).
+  stopPolling();
+  grantState.value = '';
   granting.value = true;
   manualHint.value = '';
   const refs = fileRef.value.trim() ? [fileRef.value.trim()] : undefined;
-  const started = await startDriveGrant(settings.agentUrl, settings.authToken, { fileIds: refs });
+  const started = await startDriveGrant(settings.agentUrl, settings.authToken, {
+    fileIds: refs,
+    returnRoute: route.fullPath,
+  });
   if (started.error || !started.authorize_url || !started.state) {
     if (popup && !popup.closed) popup.close();
     popup = null;
@@ -159,14 +227,17 @@ async function onGrant() {
   grantState.value = started.state;
   grantUrl.value = started.authorize_url;
   captureHint.value = started.capture_hint || '';
+  // Subscribed even when the popup was blocked: "open it here" opens the picker
+  // in a same-origin tab, whose return page reaches us over the BroadcastChannel.
+  stopReturnListener = onOAuthReturn(onDriveReturn, { popup });
   if (popup && !popup.closed) {
     popup.location.href = started.authorize_url;
   } else {
     ElMessage.warning('The browser blocked the Google window — use "open it here" below.');
   }
 
-  let polls = 0;
-  pollTimer = window.setInterval(async () => {
+  polls = 0;
+  pollTimer = window.setInterval(() => {
     polls += 1;
     if (polls > MAX_POLLS) {
       giveUpWaiting(
@@ -175,30 +246,7 @@ async function onGrant() {
       );
       return;
     }
-    try {
-      const out = await getDriveGrant(settings.agentUrl, settings.authToken, grantState.value);
-      if (out.status === 'error') {
-        giveUpWaiting(
-          `${out.error || 'The Google consent was denied.'} You can open the picker again to retry.`,
-        );
-        return;
-      }
-      if (out.status === 'unknown' || out.status === 'timeout') {
-        // The server forgot this round (in-flight grants live in memory, so a
-        // restart drops them). Pasting cannot help — only a fresh round can.
-        giveUpWaiting(
-          'The server no longer recognizes this grant round — it may have restarted. '
-          + 'Cancel and click "Grant access" to start a new one.',
-        );
-        return;
-      }
-      if (out.status === 'completed' && out.files.length) {
-        if (out.note) ElMessage.warning(out.note);
-        finishGrant(out.files.length);
-      }
-    } catch {
-      // A transient poll failure is not fatal; the next tick retries.
-    }
+    void pollGrant();
   }, POLL_MS);
 }
 

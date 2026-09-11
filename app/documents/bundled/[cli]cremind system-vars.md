@@ -73,9 +73,31 @@ here — run the command for the values your profile actually gets.
 | `CREMIND_PROFILE`           | The active profile name; omitted when none is set.                                                        |
 | `CREMIND_AGENT_NAME`        | The agent's display name for this profile; omitted when there is no profile.                              |
 | `CREMIND_TOKEN`             | This profile's Cremind token, so a `cremind` call needs no `--token`; omitted when missing.               |
-| `CREMIND_OAUTH_REDIRECT_URI`| Browser-facing Google OAuth redirect for the Google skills; omitted for a non-loopback `APP_URL`.         |
+| `CREMIND_OAUTH_REDIRECT_URI`| The Google skills' OAuth redirect, always `http://<loopback>:<port>/api/oauth/callback` (see below); omitted when neither `APP_URL` nor a pin yields one. |
 | `CLAUDE_CONFIG_DIR`         | This profile's **own** Claude Code CLI home (see below); omitted when there is no profile.                |
 | `CODEX_HOME`                | This profile's **own** Codex CLI home (see below); omitted when there is no profile.                      |
+
+### `CREMIND_OAUTH_REDIRECT_URI` — `http` even on an HTTPS install
+
+The Google skills share a Google *Desktop* OAuth client, which accepts only an
+`http` loopback redirect (`localhost`, `127.0.0.1`, `[::1]`, any port): a real
+hostname or an `https://` redirect is refused before the consent screen. So the
+value is:
+
+- `APP_URL`'s own loopback origin. An `https` loopback `APP_URL` maps to `http`
+  on the **same** host and port when Cremind serves that port itself — the
+  server answers that plaintext callback by redirecting it to its HTTPS handler,
+  so linking still completes on its own. Behind edge TLS termination
+  (`CREMIND_TLS_TERMINATION=edge`) or with `CREMIND_UI_PORT=0`, the proxy owns
+  that port and will not answer plain HTTP, so an `https` `APP_URL` is skipped
+  there: pin a loopback address that reaches the server (next item).
+- Otherwise a loopback `CREMIND_OAUTH_REDIRECT_URI` pinned in the server's own
+  environment (for example the local end of a `kubectl port-forward` in front
+  of an Ingress install), normalised to `http`.
+- Otherwise omitted. The skill then advertises
+  `http://localhost:1515/api/oauth/callback`: captured automatically when that
+  address reaches the server, finished with the skill's `complete-link` paste
+  when it does not.
 
 ### `CLAUDE_CONFIG_DIR` and `CODEX_HOME` — the coding CLIs' per-profile homes
 

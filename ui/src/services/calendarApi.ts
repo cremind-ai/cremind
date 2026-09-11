@@ -174,14 +174,20 @@ export async function deleteCalendarEvent(agentUrl: string, token: string, id: s
   }
 }
 
+/**
+ * Start the Google Calendar consent. ``returnRoute`` is the page to bring the
+ * consent window back to (the server records it against the consent's state for
+ * the OAuth return route — see services/oauthReturn.ts); the popup is navigated
+ * by script, so no consent-link click is there to record it.
+ */
 export async function connectGoogleCalendar(
-  agentUrl: string, token: string,
+  agentUrl: string, token: string, options: { returnRoute?: string } = {},
 ): Promise<{ authorize_url?: string; error?: string; message?: string }> {
   const base = resolveBaseUrl(agentUrl);
   const res = await fetch(`${base}/api/calendar/google/connect`, {
     method: 'POST',
     headers: authHeaders(token),
-    body: '{}',
+    body: JSON.stringify(options.returnRoute ? { return_route: options.returnRoute } : {}),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {

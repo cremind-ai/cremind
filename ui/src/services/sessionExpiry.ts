@@ -29,8 +29,13 @@ import { getApiOrigin } from './a2aClient';
 // booted seconds earlier, so an in-flight call can 401 transiently while the
 // hand-off guard is still importing the token. Ejecting there would throw away
 // the very session being handed over.
+//
+// ``oauth-return`` is the Google consent landing page (services/oauthReturn.ts).
+// It is public and may open in a tab whose stored token is stale; whatever
+// 401s there, ejecting would replace "Google's response reached Cremind" with a
+// profile selector and lose the page it is about to restore.
 const AUTH_ROUTE_NAMES = new Set([
-  'home', 'login', 'setup', 'setup-profile', 'setup-handoff',
+  'home', 'login', 'setup', 'setup-profile', 'setup-handoff', 'oauth-return',
 ]);
 
 // Idempotency guard so a burst of concurrent 401s (or the SSE retry loop) only
@@ -74,6 +79,11 @@ export function shouldHandle401(url: URL): boolean {
   // ``/``, ``/api/*``, and the agent card under ``/.well-known/``). ``GET /``
   // returns 200 HTML, so the root check only ever matches a real A2A 401.
   const p = url.pathname;
+  // The OAuth return endpoints are best-effort side channels. A consent-context
+  // record that races a token rotation must not log the user out in the middle
+  // of clicking a Google link (the link opens regardless, and the return page
+  // just falls back to home), and consume is unauthenticated by design.
+  if (p.startsWith('/api/oauth/return/')) return false;
   return p === '/' || p.startsWith('/api') || p.startsWith('/.well-known/');
 }
 

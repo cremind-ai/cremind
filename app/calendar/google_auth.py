@@ -11,8 +11,11 @@ The OAuth *client* (id/secret) + calendar scopes still come from cremind-connect
 Flow:
 1. ``build_authorize_url(profile)`` mints a PKCE verifier + ``state``, stashes them
    in an in-process pending map, and returns the Google consent URL.
-2. Google redirects to ``/api/oauth/google-calendar/callback`` (app/api/oauth_callback.py),
-   which calls ``complete_callback(state, code)`` to exchange + persist tokens.
+2. Google redirects to ``/api/oauth/google-calendar/callback`` (app/api/oauth_callback.py)
+   on an ``http`` loopback origin — the only kind the shared Desktop client
+   accepts (:mod:`app.config.oauth_loopback`). On an HTTPS install that plaintext
+   request is bounced by the same-port listener to the HTTPS handler, which calls
+   ``complete_callback(state, code)`` to exchange + persist tokens.
 3. ``get_access_token(profile)`` returns a valid access token, refreshing on demand.
 
 **Two sources, one effective account.** The ``gcalendar`` skill links a Google
@@ -39,7 +42,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from app.config.settings import BaseConfig
+from app.config.oauth_loopback import google_redirect_uri
 from app.calendar import google_discovery, skill_token
 from app.utils.client_storage import (
     ACCESS_TOKEN,
@@ -84,15 +87,20 @@ class GoogleAuthError(RuntimeError):
 # ── redirect / PKCE helpers ─────────────────────────────────────────────────
 
 def redirect_uri() -> Optional[str]:
-    """Browser-facing callback, derived from APP_URL (same basis the skills use).
+    """Browser-facing callback: always an ``http`` loopback URI.
 
-    None when APP_URL is the unusable listen-all default; the connect endpoint
-    then reports "unavailable".
+    This flow uses the same shared Google *Desktop* client as the skills, which
+    accepts loopback redirects only. Handing Google the raw public ``APP_URL``
+    (an Ingress hostname, a LAN address) — which this once did — fails with a
+    400 before the consent screen even renders, and so does ``https://localhost``.
+    The shared rule picks the loopback origin most likely to reach this server:
+    APP_URL's own (an https one maps to http on the same port, which the TLS
+    listener redirects to the HTTPS handler), else the operator's loopback pin,
+    else localhost on the public port — so with ``fallback=True`` there is
+    always one. ``Optional`` survives for the connect endpoint's "unavailable"
+    branch, which :func:`build_authorize_url` still guards.
     """
-    base = (BaseConfig.APP_URL or "").strip().rstrip("/")
-    if not base or "://0.0.0.0" in base:
-        return None
-    return base + CALLBACK_PATH
+    return google_redirect_uri(CALLBACK_PATH, fallback=True)
 
 
 def _pkce() -> tuple[str, str]:
@@ -186,6 +194,10 @@ def complete_callback(state: str, code: str) -> Dict[str, Any]:
     data = {
         "grant_type": "authorization_code",
         "code": code,
+        # The URI the authorize request ADVERTISED (the http loopback one), never
+        # the address this callback was finally received on: on an HTTPS install
+        # the browser arrives over https after the plaintext bounce, but Google
+        # compares this value against the authorize request, exactly.
         "redirect_uri": pend["redirect_uri"],
         "client_id": client["client_id"],
         "client_secret": client["client_secret"],

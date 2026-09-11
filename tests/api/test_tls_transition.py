@@ -550,8 +550,11 @@ def test_external_activation_never_rewrites_deployment_environment(client, envir
             "kubernetes", {},
             [
                 "helm list --all-namespaces",
+                # appUrl is the HTTPS form of the address this request came in
+                # on: the test client's http://testserver keeps its port 80.
                 f"helm upgrade <release> {CHART_REFERENCE} --version {CHART_VERSION} "
-                "--namespace <namespace> --reuse-values --set cremind.ssl=auto",
+                "--namespace <namespace> --reuse-values --set cremind.ssl=auto "
+                "--set cremind.appUrl=https://testserver:80",
                 "kubectl --namespace <namespace> rollout status deployment/<release> --timeout=5m",
                 "kubectl --namespace <namespace> port-forward svc/<release> 1515:80",
             ],
@@ -565,7 +568,8 @@ def test_external_activation_never_rewrites_deployment_environment(client, envir
                 # The chart states who this pod is, so nothing is left to
                 # substitute and the release-finding command disappears with it.
                 f"helm upgrade cremind {CHART_REFERENCE} --version {CHART_VERSION} "
-                "--namespace lee-cremind --reuse-values --set cremind.ssl=auto",
+                "--namespace lee-cremind --reuse-values --set cremind.ssl=auto "
+                "--set cremind.appUrl=https://testserver:80",
                 "kubectl --namespace lee-cremind rollout status "
                 "deployment/cremind --timeout=5m",
                 "kubectl --namespace lee-cremind port-forward svc/cremind 1515:80",
@@ -579,7 +583,8 @@ def test_external_activation_never_rewrites_deployment_environment(client, envir
                 "kubectl --namespace <namespace> create secret tls cremind-tls "
                 "--cert=<path-to-fullchain.pem> --key=<path-to-privkey.pem>",
                 f"helm upgrade <release> {CHART_REFERENCE} --version {CHART_VERSION} "
-                "--namespace <namespace> --reuse-values -f <your-values.yaml>",
+                "--namespace <namespace> --reuse-values -f <your-values.yaml> "
+                "--set cremind.appUrl=https://testserver",
                 "kubectl --namespace <namespace> rollout status deployment/<release> --timeout=5m",
                 "kubectl --namespace <namespace> get ingress <release>",
                 "curl --fail https://testserver/api/tls/status",
@@ -676,7 +681,8 @@ def test_cluster_identity_and_its_names_never_reach_an_anonymous_status(
     assert "helm list --all-namespaces" in anonymous["instructions"]
     assert (
         f"helm upgrade <release> {CHART_REFERENCE} --version {CHART_VERSION} "
-        "--namespace <namespace> --reuse-values --set cremind.ssl=auto"
+        "--namespace <namespace> --reuse-values --set cremind.ssl=auto "
+        "--set cremind.appUrl=https://testserver:80"
     ) in anonymous["instructions"]
     # What the recovery page reads has to keep answering without a token.
     assert anonymous["serving_https"] is False and anonymous["ready"] is False
@@ -695,7 +701,8 @@ def test_cluster_identity_and_its_names_never_reach_an_anonymous_status(
     assert admin["kubernetes"]["release"] == "cremind-prod"
     assert (
         f"helm upgrade cremind-prod {CHART_REFERENCE} --version {CHART_VERSION} "
-        "--namespace lee-cremind --reuse-values --set cremind.ssl=auto"
+        "--namespace lee-cremind --reuse-values --set cremind.ssl=auto "
+        "--set cremind.appUrl=https://testserver:80"
     ) in admin["instructions"]
     # Nothing is left to substitute, so the release-finding command is gone.
     assert "helm list --all-namespaces" not in admin["instructions"]

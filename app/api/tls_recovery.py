@@ -1,7 +1,8 @@
 """Small HTTP recovery surface and narrowly scoped cross-origin handoffs.
 
-Once HTTPS is enabled, plaintext accepts only this document and public CA.
-It never forwards credentials or mutating requests to the real application.
+Once HTTPS is enabled, plaintext accepts only this document, the public CA and a
+redirect of Google's loopback OAuth callbacks to their HTTPS handlers. It never
+forwards credentials or mutating requests to the real application.
 """
 from __future__ import annotations
 
@@ -12,9 +13,81 @@ import ipaddress
 from html import escape
 
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
-from app.config.tls_transition import certificate_info, https_target, instance_id, load_transition, origin
+from app.config.tls_transition import (
+    certificate_info,
+    https_target,
+    instance_id,
+    load_transition,
+    origin,
+    port_facts,
+)
+
+#: Google's loopback OAuth callbacks (app/api/oauth_callback.py). The shared
+#: Google *Desktop* client only redirects to ``http://<loopback>:<port>``, so on
+#: an HTTPS install the browser brings the authorization response here, over
+#: plaintext, to the same port (app/config/oauth_loopback.py). These paths — and
+#: only GETs to them — are redirected to the same path on HTTPS; the handler then
+#: runs over TLS exactly as it would have. Deliberately exact paths, not a
+#: prefix: the A2A callback and every other API stay behind the 426.
+GOOGLE_CALLBACK_PATHS = frozenset((
+    "/api/oauth/callback",
+    "/api/oauth/google-calendar/callback",
+    "/api/oauth/google-drive/callback",
+))
+
+
+def _callback_https_origin(request: Request) -> str:
+    """Where a plaintext Google callback continues over HTTPS.
+
+    When this process serves TLS on the public port itself, the browser is
+    already talking to it: the same host and port, just https (``https_target``
+    keeps a port-forward's local port). Behind an edge proxy the plaintext
+    request reached the pod directly, and ``APP_URL`` is the HTTPS origin that
+    proxy serves. Anything else keeps the request's own address.
+
+    Raises ValueError for a request whose Host is not a usable origin.
+    """
+    from app.config.settings import BaseConfig
+    from app.config.tls_mode import boot_serving_https
+
+    source = origin(str(request.base_url))
+    if boot_serving_https() and port_facts()["same_public_port"]:
+        return https_target(source)
+    if BaseConfig.APP_URL.startswith("https://"):
+        try:
+            return origin(BaseConfig.APP_URL.strip().rstrip("/"))
+        except ValueError:
+            pass  # an APP_URL with a path is no origin; the request's own is
+    return https_target(source)
+
+
+def _google_callback_redirect(request: Request) -> Response:
+    """307 the plaintext callback to HTTPS with its query byte-for-byte.
+
+    Built by hand rather than with ``RedirectResponse``, which percent-quotes
+    the URL: the skills replay this exact query into their token exchange, so
+    it has to arrive as Google sent it. For the same reason the query is the raw
+    ``query_string`` read as latin-1 — which the header encoder maps back to the
+    identical bytes — not ``request.url.query``, which decodes UTF-8 (a stray
+    non-ASCII byte would then fail to encode) and re-splits on ``#``. It cannot
+    smuggle a header: the request line was parsed up to CRLF before it reached
+    us. ``no-referrer`` keeps the authorization code out of the next hop's
+    Referer, and ``no-store`` keeps it out of any cache.
+    """
+    try:
+        target = _callback_https_origin(request)
+    except ValueError:
+        return JSONResponse({"error": "Invalid public origin."}, status_code=400,
+                            headers={"Cache-Control": "no-store"})
+    query = (request.scope.get("query_string") or b"").decode("latin-1")
+    location = f"{target}{request.scope['path']}" + (f"?{query}" if query else "")
+    return Response(status_code=307, headers={
+        "Location": location,
+        "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer",
+    })
 
 
 class EdgeTlsRecovery:
@@ -153,7 +226,7 @@ const message=document.getElementById('message');
 const link=document.getElementById('open');
 const match=route.match(/^\/([a-z0-9_-]+)(?:[/?]|$)/);
 const candidate=match?match[1]:'';
-const profile=['setup','setup-handoff','tls-handoff','login'].includes(candidate)?'':candidate;
+const profile=['setup','setup-handoff','tls-handoff','login','oauth-return'].includes(candidate)?'':candidate;
 const destination=profile
  ? targetOrigin+mount+'#/login/'+encodeURIComponent(profile)+'?redirect='+encodeURIComponent(route)
  : targetOrigin+mount+'#'+route;
@@ -223,7 +296,11 @@ async def recovery_app(scope, receive, send) -> None:
     if scope["type"] != "http":
         return
     request = Request(scope, receive)
-    if request.method in ("GET", "HEAD") and request.url.path == "/ca.pem":
+    # The ASGI path itself, not ``request.url.path``: that one is re-parsed from
+    # the Host header plus path, which a crafted Host can bend.
+    if request.method == "GET" and scope.get("path") in GOOGLE_CALLBACK_PATHS:
+        response = _google_callback_redirect(request)
+    elif request.method in ("GET", "HEAD") and request.url.path == "/ca.pem":
         from app.api.tls import get_ca_pem
         response = await get_ca_pem(request)
     elif (request.method in ("GET", "HEAD")

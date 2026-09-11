@@ -16,8 +16,9 @@ export function transitionProfile(url: string, fallback?: string): string | null
     const segments = route.pathname.split('/').filter(Boolean).map(decodeURIComponent)
     const first = segments[0]
     const profile = (first === 'login' || first === 'setup' ? segments[1] : first) || (typeof fallback === 'string' ? fallback : undefined)
+    // Public routes whose first segment is a route name, not a profile.
     if (!profile || profile === 'setup-handoff' || profile === 'https-handoff' || profile === 'tls-handoff'
-      || profile.length > 128 || /[\/\\\u0000-\u001f]/.test(profile)) return null
+      || profile === 'oauth-return' || profile.length > 128 || /[\/\\\u0000-\u001f]/.test(profile)) return null
     return profile
   } catch { return null }
 }

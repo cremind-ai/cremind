@@ -169,10 +169,19 @@ def cmd_link(args) -> Any:
 
 
 def cmd_complete_link(args) -> Any:
+    """Finish a `link` (or `grant`) still waiting under the Cremind backend by
+    handing it the URL the browser landed on after consent. Works on any install —
+    HTTPS, remote, Ingress, a port-forward that was not running — because it
+    writes the same inbox the backend's callback route would have; run `status`
+    after a `link` to confirm.
+    """
     auth.submit_callback(args.response)
     return {
         "submitted": True,
-        "note": "Linking will complete in the running 'link' command; run 'status' to confirm.",
+        "note": (
+            "Handed to the waiting 'link' (or 'grant') command, which finishes from "
+            "here; after a 'link', run 'status' to confirm."
+        ),
     }
 
 
@@ -528,14 +537,24 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     sp = sub.add_parser("link", help="link a Google account (loopback PKCE)")
-    sp.add_argument("--no-browser", action="store_true")
+    sp.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="standalone runs only: print the consent URL instead of opening a browser "
+        "(under Cremind the URL is always printed, never opened)",
+    )
     sp.set_defaults(func=cmd_link)
 
     sp = sub.add_parser(
         "complete-link",
-        help="finish linking by pasting the URL Google redirected you to (remote/Ingress)",
+        help="finish a waiting `link` or `grant` with the URL the browser landed on "
+        "after consent (any Cremind install, including HTTPS and remote/Ingress)",
     )
-    sp.add_argument("--response", required=True, help="the full redirect URL (or its code=...&state=... query)")
+    sp.add_argument(
+        "--response",
+        required=True,
+        help="the full redirect URL, in double quotes (or its code=...&state=... query)",
+    )
     sp.set_defaults(func=cmd_complete_link)
 
     sub.add_parser("status", help="show link status").set_defaults(func=cmd_status)

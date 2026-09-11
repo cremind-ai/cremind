@@ -76,14 +76,21 @@ uv run scripts/__main__.py link
 ```
 `link` prints a Google consent URL, then waits (in the background) for consent
 to complete. **Surface that URL to the user and ask them to open it and approve
-access.** The consent redirect is received by the always-running Cremind backend
-(its `/api/oauth/callback` route), so linking completes even though the command
-keeps running in the background. Once the user says they've approved, confirm:
+access.** Google then sends the browser to a loopback callback such as
+`http://localhost:1515/api/oauth/callback` — always `http://`, because Google
+accepts only an http loopback redirect here; on an HTTPS install Cremind forwards
+it to its HTTPS handler. The always-running Cremind backend receives it, so
+linking completes even though the command keeps running in the background. The
+browser then shows Cremind's **response received** page (it may close itself or
+return to the Cremind page the user started from). That only means the redirect
+arrived — `link` itself confirms the account once it has exchanged the code.
+Once the user says they've approved, confirm:
 ```bash
 uv run scripts/__main__.py status
 ```
-(`--no-browser` only affects the standalone fallback used when the Cremind
-backend isn't running; under the app the URL is always printed for the user.)
+(`--no-browser` only affects standalone runs outside Cremind, which open their
+own temporary loopback listener; under the app the URL is always printed for the
+user, never opened.)
 
 ## CLI Commands
 Run `uv run scripts/__main__.py <subcommand>`. Output is JSON (human-readable on a TTY; force JSON with `--json`).
@@ -182,6 +189,18 @@ Cremind docs, *Setup → Bring your own Google credentials*.
 
 ## Troubleshooting
 - `Account not linked` → run `uv run scripts/__main__.py link`.
+- The browser shows a connection error after the user approves (a remote or
+  Ingress install, or a `kubectl port-forward` that is not running) → while `link`
+  is still waiting, have the user copy the **full** address from the browser's
+  address bar, then run
+  `uv run scripts/__main__.py complete-link --response "<url>"` (keep the double
+  quotes — the URL contains `&`). It hands Google's response to the waiting
+  `link`, which finishes the exchange; then run `status`. On an HTTPS install the
+  callback is still an `http://localhost:<port>/api/oauth/callback` address
+  (Google requires an http loopback redirect) that Cremind forwards to its HTTPS
+  handler; if the browser warns about the certificate at that step, trust the
+  Cremind CA on that device (Settings → HTTPS & Certificate) and reload, or use
+  `complete-link` with the address shown.
 - `scope_not_granted` (exit 2) → that verb needs a read scope. Use the
   `imap-email` skill, or bring your own credentials (above).
 - `No GOOGLE_CLIENT_SECRET available` → cremind-connect must be reachable (it

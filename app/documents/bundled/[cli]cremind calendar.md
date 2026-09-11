@@ -177,8 +177,10 @@ cremind calendar google disconnect
 
 `connect` prints a Google **authorize URL** — open it in a browser and grant
 access; the OAuth callback completes the link server-side (same pattern as
-`cremind agents auth-url`). If the server can't build the URL (its public URL
-or the Google client isn't configured) it returns `409 unavailable`.
+`cremind agents auth-url`). That callback is always `http://localhost:<port>`
+(Google accepts nothing else), so on a remote install keep a port-forward to
+that port running while approving. If the server can't get the Google client
+from cremind-connect it returns `409 unavailable`.
 `disconnect` drops the stored token.
 
 **The gcalendar skill's link wins.** Linking a Google account through the
@@ -283,10 +285,8 @@ $ cremind calendar schedule status se_4a1f active
 **`409 feature_disabled` on `add`** — The Calendar & Schedule feature is off
 for this profile. Run `cremind calendar enable` first.
 
-**`409 unavailable` on `google connect`** — The server couldn't resolve its
-public URL or the Google client. Google Calendar connect needs the
-cremind-connect Google client and a reachable public server URL; see the
-Calendar & Schedule setup docs.
+**`409 unavailable` on `google connect`** — The server couldn't get the
+cremind-connect Google client; check that it can reach cremind-connect.
 
 **`409 skill_managed` on `google connect`** — This profile is already linked to
 Google through the **gcalendar skill**, and that link is what the calendar uses.

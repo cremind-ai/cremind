@@ -169,12 +169,21 @@ uv run scripts/__main__.py link
 ```
 `link` prints a Google consent URL, then waits (in the background) for consent
 to complete. **Surface that URL to the user and ask them to open it and approve
-access.** The consent redirect is received by the always-running Cremind backend
-(its `/api/oauth/callback` route), so linking completes even though the command
-keeps running in the background. Once the user says they've approved, confirm:
+access.** Google then sends the browser to a loopback callback such as
+`http://localhost:1515/api/oauth/callback` — always `http://`, because Google
+accepts only an http loopback redirect here; on an HTTPS install Cremind forwards
+it to its HTTPS handler. The always-running Cremind backend receives it, so
+linking completes even though the command keeps running in the background. The
+browser then shows Cremind's **response received** page (it may close itself or
+return to the Cremind page the user started from). That only means the redirect
+arrived — `link` itself confirms the account once it has exchanged the code.
+Once the user says they've approved, confirm:
 ```bash
 uv run scripts/__main__.py status
 ```
+(`--no-browser` only affects standalone runs outside Cremind, which open their
+own temporary loopback listener; under the app the URL is always printed for the
+user, never opened.)
 
 ### 2. Grant the files Cremind may touch
 Linking alone grants access to **no existing files**. Run:
@@ -183,10 +192,13 @@ uv run scripts/__main__.py grant                       # user picks anything
 uv run scripts/__main__.py grant --file <drive-url>     # pre-select a known file
 ```
 Like `link`, this prints a URL that **you must show to the user**; it then waits
-for them to pick files and approve. On success it reports each granted file, and
-for a granted folder it reports whether the files inside it came along
-(`children_visible`) — Google does not document that either way, so it is measured
-rather than assumed.
+for them to pick files and approve, receiving Google's redirect through the same
+loopback callback (and the same **response received** page). On success it
+reports each granted file, and for a granted folder it reports whether the files
+inside it came along (`children_visible`) — Google does not document that either
+way, so it is measured rather than assumed. If the browser shows a connection
+error after approving, `complete-link --response "<url>"` finishes a waiting
+`grant` exactly as it does a waiting `link` (see Troubleshooting).
 
 Grants are permanent until the user revokes Cremind at
 <https://myaccount.google.com/connections> (which removes **all** of them —
@@ -403,6 +415,19 @@ the Cremind docs, *Setup → Bring your own Google credentials*.
 
 ## Troubleshooting
 - `Account not linked` → run `uv run scripts/__main__.py link`.
+- The browser shows a connection error after the user approves (a remote or
+  Ingress install, or a `kubectl port-forward` that is not running) → while `link`
+  is still waiting, have the user copy the **full** address from the browser's
+  address bar, then run
+  `uv run scripts/__main__.py complete-link --response "<url>"` (keep the double
+  quotes — the URL contains `&`). It hands Google's response to the waiting
+  `link`, which finishes the exchange; then run `status`. On an HTTPS install the
+  callback is still an `http://localhost:<port>/api/oauth/callback` address
+  (Google requires an http loopback redirect) that Cremind forwards to its HTTPS
+  handler; if the browser warns about the certificate at that step, trust the
+  Cremind CA on that device (Settings → HTTPS & Certificate) and reload, or use
+  `complete-link` with the address shown. The same recovery finishes a waiting
+  `grant`.
 - `drive_file_not_granted` (exit 3) → the file was never granted, or doesn't
   exist. Interactive: run `grant --file <id>` and show the user the URL.
   Unattended: notify and stop (see above).

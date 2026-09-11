@@ -15,6 +15,7 @@ import router from './router'
 import { useSettingsStore } from './stores/settings'
 import { installExternalLinkInterceptor } from './utils/externalLinks'
 import { handleUnauthorized, shouldHandle401 } from './services/sessionExpiry'
+import { consentSessionFor, installOAuthConsentRecorder } from './services/oauthReturn'
 
 document.title = __IS_ELECTRON__ ? 'Cremind App' : 'Cremind Web UI'
 
@@ -133,6 +134,17 @@ async function boot() {
   app.use(pinia)
   app.use(ElementPlus)
   app.use(router)
+
+  // Remember which profile page a Google consent link was clicked on, so the
+  // OAuth return route can put the user back there (services/oauthReturn.ts).
+  // Window capture phase, so it sees the click before the external-link
+  // interceptor above hands it to the OS browser. The settings store is looked
+  // up per click, not here: creating it now would cache preferences before the
+  // TLS hand-off guard below has restored this origin's storage.
+  installOAuthConsentRecorder({
+    router,
+    getSession: () => consentSessionFor(router.currentRoute.value, useSettingsStore(pinia)),
+  })
 
   // Initial TLS handoff guards restore origin-scoped storage asynchronously.
   // Do not instantiate App (and its Pinia settings refs) until that restore is

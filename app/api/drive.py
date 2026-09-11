@@ -4,7 +4,9 @@ Backs the Settings -> GSuite page and the ``cremind drive`` CLI:
 
 - ``GET  /api/drive/status``           — link state, granted scopes, staleness.
 - ``GET  /api/drive/files``            — the files Cremind can actually reach.
-- ``POST /api/drive/grants``           — start a Picker round; returns the URL.
+- ``POST /api/drive/grants``           — start a Picker round; returns the URL
+                                         (optional ``return_route``: the page the
+                                         Picker tab is led back to afterwards).
 - ``GET  /api/drive/grants/{state}``   — what that round has achieved so far.
 - ``POST /api/drive/grants/complete``  — finish from a pasted redirect URL.
 - ``DELETE /api/drive/grants/{state}`` — abandon a round.
@@ -26,6 +28,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from app.drive import grant_flow, skill_token
+from app.utils.logger import logger
 
 
 def _profile_from_request(request: Request) -> str:
@@ -44,6 +47,20 @@ async def _json_body(request: Request) -> Dict[str, Any]:
     except Exception:  # noqa: BLE001
         return {}
     return body if isinstance(body, dict) else {}
+
+
+def _record_consent_return(profile: str, state: str, return_route: str) -> None:
+    """Remember which page opened this Picker round (app/api/oauth_return.py).
+
+    Best-effort by design: losing it only means the Picker tab lands on Cremind
+    home instead of the Drive section — never a failed start.
+    """
+    try:
+        from app.api import oauth_return
+
+        oauth_return.record_context(state, profile=profile, route=return_route, flow="drive")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[drive] consent return not recorded for profile={profile}: {exc}")
 
 
 def _file_ids(body: Dict[str, Any]) -> List[str]:
@@ -111,17 +128,20 @@ def get_drive_routes() -> List[Route]:
         if isinstance(mime_types, str):
             mime_types = [m.strip() for m in mime_types.split(",") if m.strip()]
         try:
-            return JSONResponse(
-                grant_flow.start(
-                    profile,
-                    file_ids=_file_ids(body) or None,
-                    allow_multiple=bool(body.get("allow_multiple", True)),
-                    allow_folders=bool(body.get("allow_folders", True)),
-                    mime_types=mime_types,
-                )
+            started = grant_flow.start(
+                profile,
+                file_ids=_file_ids(body) or None,
+                allow_multiple=bool(body.get("allow_multiple", True)),
+                allow_folders=bool(body.get("allow_folders", True)),
+                mime_types=mime_types,
             )
         except grant_flow.DriveGrantError as exc:
             return JSONResponse({"error": "unavailable", "message": str(exc)}, status_code=409)
+        # Optional ``return_route``: the page to bring the Picker tab back to.
+        return_route = body.get("return_route")
+        if isinstance(return_route, str) and started.get("state"):
+            _record_consent_return(profile, started["state"], return_route)
+        return JSONResponse(started)
 
     async def handle_grant_status(request: Request) -> JSONResponse:
         unauth = _require_auth(request)

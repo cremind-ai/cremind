@@ -21,6 +21,7 @@ import StepProfileCreate from '../components/setup/StepProfileCreate.vue';
 import StepSecureInstall from '../components/setup/StepSecureInstall.vue';
 import RestoreFromBackupCard from '../components/setup/RestoreFromBackupCard.vue';
 import ChannelPairingDialog from '../components/channels/ChannelPairingDialog.vue';
+import HttpsRecoveryHelp from '../components/shared/HttpsRecoveryHelp.vue';
 import { storeToRefs } from 'pinia';
 import {
   completeSetup,
@@ -29,7 +30,9 @@ import {
   fetchInstallSecrets,
   type ServiceCapabilitiesResponse,
   type InstallSecrets,
+  type TlsRuntimeStatus,
 } from '../services/configApi';
+import { tunnelCommand } from '../services/httpsReadiness';
 import {
   assembleConfigSnapshot,
   downloadConfigExport,
@@ -487,9 +490,19 @@ const exportDeployment = computed<ConfigExportSnapshot['deployment']['type']>(
 
 // The chart states the namespace and Service, so the reconnect line can be the
 // real command instead of "the same one you ran". Empty on an older chart that
-// injects no identity, and off Kubernetes entirely.
+// injects no identity, and off Kubernetes entirely. The runbook's own
+// port-forward step (from the activation status) wins over the identity line:
+// it keeps this tab's local port — 8080:80 for a wizard opened on
+// localhost:8080 — where the identity line always says the documented 1515.
+const pivotTunnel = ref<string | null>(null);
+function notePivotStatus(status: TlsRuntimeStatus): void {
+  const line = tunnelCommand(status);
+  // A status assumed after a lost 202 carries no steps, so its line is only the
+  // identity fallback; it must not replace a runbook line already captured.
+  if (line && (status.steps?.length || !pivotTunnel.value)) pivotTunnel.value = line;
+}
 const pivotPortForward = computed(
-  () => installSecrets.value?.kubernetes?.port_forward ?? '',
+  () => pivotTunnel.value ?? installSecrets.value?.kubernetes?.port_forward ?? '',
 );
 
 // Collected config from each step.
@@ -568,8 +581,27 @@ const pivot = useHttpsPivot();
 // Bind the refs at the top level of setup: Vue templates auto-unwrap refs
 // returned directly from setup, but NOT refs reached through a property
 // (``pivot.phase`` would compare a Ref against a string).
-const { phase: pivotPhase, error: pivotError, forwardHint: pivotForwardHint } = pivot;
+const {
+  phase: pivotPhase,
+  error: pivotError,
+  forwardHint: pivotForwardHint,
+  readiness: pivotReadiness,
+  transition: pivotTransition,
+  recoveryUrl: pivotRecoveryUrl,
+} = pivot;
 const { copy: copyPivot, isCopied: isPivotCopied } = useCopyToClipboard();
+// Recovery guidance inputs (shown after the pivot's 45-second hint).
+const pivotCaUrl = computed(() => `${settingsStore.agentUrl.replace(/\/+$/, '')}/ca.pem`);
+const pivotIsKubernetes = computed(() => {
+  const mode = serviceCapabilities.value?.install_mode ?? installSecrets.value?.install_mode ?? null;
+  return mode ? mode === 'kubernetes' : null;
+});
+const pivotRecoveryMessage = computed(() => (
+  pivotReadiness.value?.responded ? pivotReadiness.value.message : null
+));
+const pivotRecoveryReason = computed(() => (
+  pivotReadiness.value && !pivotReadiness.value.ready ? pivotReadiness.value.reason : null
+));
 
 async function copyPivotValue(text: string, key: string) {
   if (!(await copyPivot(text, key))) ElMessage.error('Failed to copy');
@@ -600,7 +632,9 @@ const exportAgentUrl = computed(() => (
   finishTls.value?.pending ? pivotTargetUrl.value : settingsStore.agentUrl
 ));
 
-/** "Retry restart" on the failed pane. */
+/** "Retry restart" on the failed pane. Hands back the transition the failed
+ *  attempt pinned, so a retry after a 202 lost to the restart resumes that
+ *  switch instead of trying to prepare it again. */
 async function retryHttpsPivot() {
   if (!finishTls.value) return;
   await pivot.run({
@@ -611,7 +645,9 @@ async function retryHttpsPivot() {
     profileToken: generatedToken.value,
     installMode: serviceCapabilities.value?.install_mode ?? null,
     management: finishTls.value.management,
+    transition: pivotTransition.value ? { ...pivotTransition.value } : null,
     destinationRoute: `/${profileName.value}`,
+    onActivated: notePivotStatus,
   });
 }
 
@@ -1300,6 +1336,7 @@ async function handleFinish() {
     installMode: serviceCapabilities.value?.install_mode ?? null,
     management: finishTls.value.management,
     destinationRoute: `/${profileName.value}`,
+    onActivated: notePivotStatus,
   };
   if (!finishTls.value.restartSupported) {
     // Nothing supervises this process — restarting it would just leave it
@@ -1499,47 +1536,27 @@ async function downloadConfigFile(format: ExportFormat) {
             migrations and reloads your skills on the way up. You'll be taken
             there automatically.
           </p>
-          <!-- Kubernetes only, and only once the wait has run long enough that
-               "still booting" is no longer a plausible explanation. Two things
-               look identical from here and neither is ours to fix: the
-               `kubectl port-forward` tunnel died with the restart (it survives
-               on the default chart, whose relay sidecar keeps answering while
-               the app is down — but not with proxy.enabled=false or on an
-               older chart), or the server is up and this browser does not
-               trust its certificate. Name both; the button covers the second. -->
-          <template v-if="pivotForwardHint">
-            <ElAlert type="warning" :closable="false" show-icon
-              title="This is taking longer than it should">
-              <p>
-                Two things look the same from this page. Your
-                <code>kubectl port-forward</code> may have ended with the
-                restart — re-run the same command in your terminal and this
-                page continues on its own the moment it's back.
-              </p>
-              <!-- Printed only when the chart told the pod its own namespace
-                   and Service; an older chart knows neither, and the sentence
-                   above stands on its own there. -->
-              <p v-if="pivotPortForward">
-                <code>{{ pivotPortForward }}</code><button
-                  type="button"
-                  class="copy-icon-btn"
-                  :class="{ copied: isPivotCopied('pivot-forward') }"
-                  :title="isPivotCopied('pivot-forward') ? 'Copied!' : 'Copy command'"
-                  aria-label="Copy the port-forward command"
-                  @click="copyPivotValue(pivotPortForward, 'pivot-forward')"
-                ><Icon :icon="isPivotCopied('pivot-forward') ? 'mdi:check' : 'mdi:content-copy'" /></button>
-              </p>
-              <p>
-                Or the server is already up and this browser doesn't trust its
-                certificate yet, which fails the check in exactly the same way.
-                In that case use the button below and accept the browser's
-                warning there.
-              </p>
-            </ElAlert>
-            <ElButton @click="pivot.redirectNow()">
-              Continue to {{ pivotTargetUrl }} anyway
-            </ElButton>
-          </template>
+          <!-- Only once the wait has run long enough that "still booting" is
+               no longer a plausible explanation. Several things look identical
+               from here and none is ours to fix: the `kubectl port-forward`
+               tunnel died with the restart (it survives on the default chart,
+               whose relay sidecar keeps answering while the app is down — but
+               not with proxy.enabled=false or on an older chart), or the
+               server is up and this browser does not trust its certificate.
+               When the secure server did answer, the component says what it
+               reported instead. Its link carries this session's handoff. -->
+          <div v-if="pivotForwardHint" class="pivot-recovery">
+            <HttpsRecoveryHelp
+              :https-url="pivotRecoveryUrl"
+              :ca-url="pivotCaUrl"
+              :show-trust="pivotTransition?.certificate_kind === 'local'"
+              :port-forward="pivotPortForward || null"
+              :kubernetes="pivotIsKubernetes"
+              :reason="pivotRecoveryReason"
+              :message="pivotRecoveryMessage || pivotError"
+              @retry="pivot.retryNow()"
+            />
+          </div>
         </template>
 
         <template v-else-if="pivotPhase === 'redirecting'">
@@ -1574,6 +1591,18 @@ async function downloadConfigFile(format: ExportFormat) {
             Keep this page open after restarting. It will verify the secure
             listener and restore this session automatically.
           </ElAlert>
+          <div v-if="pivotForwardHint" class="pivot-recovery">
+            <HttpsRecoveryHelp
+              :https-url="pivotRecoveryUrl"
+              :ca-url="pivotCaUrl"
+              :show-trust="pivotTransition?.certificate_kind === 'local'"
+              :port-forward="pivotPortForward || null"
+              :kubernetes="pivotIsKubernetes"
+              :reason="pivotRecoveryReason"
+              :message="pivotRecoveryMessage || pivotError"
+              @retry="pivot.retryNow()"
+            />
+          </div>
         </template>
 
         <template v-else-if="pivotPhase === 'failed'">
@@ -2305,6 +2334,7 @@ async function downloadConfigFile(format: ExportFormat) {
 }
 .https-pivot .pivot-alert p { margin: 6px 0 0; line-height: 1.55; }
 .https-pivot .pivot-actions { display: flex; gap: 10px; }
+.https-pivot .pivot-recovery { width: 100%; max-width: 560px; }
 .https-pivot .copy-icon-btn {
   display: inline-flex;
   align-items: center;

@@ -178,6 +178,12 @@ export interface TlsRuntimeStatus {
   same_public_port?: boolean;
   public_port?: number;
   https_url: string | null;
+  /** Which cluster object this pod is. Admin-only on the server (null for an
+   *  anonymous poll, and off Kubernetes); its ``port_forward`` is the exact
+   *  reconnect line the recovery guidance offers after a pod replacement. */
+  kubernetes?: KubernetesIdentity | null;
+  /** The backend was spawned by the Electron app (CREMIND_ELECTRON_PARENT). */
+  electron_parent?: boolean;
   /** The deployment runbook, in the order to follow it. */
   steps?: TlsInstructionStep[];
   /** Legacy flat rendering of `steps`, kept on the wire for CLIs older than
@@ -228,6 +234,45 @@ export class TlsApiError extends Error {
   }
 }
 
+/** A TLS request that did not answer within its bound. Kept apart from a
+ * network failure so the recovery guidance can say "not answering" rather than
+ * "refused": a rollout that is still starting and a dead port-forward look
+ * different to the person reading it, even if both are retried the same way. */
+export class TlsTimeoutError extends Error {
+  constructor(message: string, public readonly timeoutMs: number) {
+    super(message);
+    this.name = 'TlsTimeoutError';
+  }
+}
+
+/** How long one ``/api/tls/status`` read may take.
+ *
+ * A pod being replaced behind ``kubectl port-forward`` (or a proxy whose
+ * upstream is mid-rollout) can accept a connection and then never answer.
+ * An unbounded fetch there parks the whole readiness loop on one request:
+ * no retry, no 45-second guidance, and no move once HTTPS really is up. */
+export const TLS_STATUS_TIMEOUT_MS = 5_000;
+/** Redeeming a handoff happens once, on the page that just loaded over HTTPS. */
+const TLS_REDEEM_TIMEOUT_MS = 15_000;
+/** One activation attempt. The server answers 202 per quiesce poll, so only a
+ * lost or stalled response ever gets near this. */
+const TLS_ACTIVATE_ATTEMPT_TIMEOUT_MS = 30_000;
+
+/** Whether a failed TLS request is worth repeating unchanged: the network
+ * dropped (fetch's TypeError), the request timed out or was aborted, or a
+ * proxy/relay reported its upstream missing (502/503/504) — all of which a
+ * rollout produces for a few seconds and none of which is a real answer. */
+export function isTransientTlsFailure(error: unknown): boolean {
+  if (error instanceof TlsTimeoutError) return true;
+  if (error instanceof TlsApiError) return [502, 503, 504].includes(error.status);
+  if (error instanceof TypeError) return true;
+  return (error as { name?: unknown } | null)?.name === 'AbortError';
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException('The request was aborted.', 'AbortError');
+}
+
 async function tlsJson<T>(
   url: string,
   init?: RequestInit,
@@ -239,6 +284,77 @@ async function tlsJson<T>(
     throw new TlsApiError(message, res.status);
   }
   return body as T;
+}
+
+/** ``tlsJson`` with a hard deadline and an optional caller signal.
+ *
+ * The deadline races the whole exchange (headers and body), not just the
+ * abort: a fetch implementation or relay that ignores the abort still cannot
+ * hold the caller past it. The caller's own abort rejects straight away too,
+ * so a cancelled readiness loop never waits out a request it no longer wants. */
+async function boundedTlsJson<T>(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal?.aborted) throw abortReason(signal);
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let onAbort: (() => void) | null = null;
+  const limit = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new TlsTimeoutError(
+        `No answer within ${Math.round(timeoutMs / 100) / 10} seconds.`,
+        timeoutMs,
+      ));
+    }, Math.max(0, timeoutMs));
+    if (signal) {
+      onAbort = () => {
+        controller.abort(abortReason(signal));
+        reject(abortReason(signal));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+  try {
+    return await Promise.race([
+      tlsJson<T>(url, { ...init, signal: controller.signal }),
+      limit,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+  }
+}
+
+export interface TlsStatusProbeOptions {
+  /** Sent as a bearer only when set: see ``fetchTlsStatus`` for who may. */
+  token?: string;
+  /** Aborts the probe as soon as its caller has moved on. */
+  signal?: AbortSignal;
+  /** Defaults to ``TLS_STATUS_TIMEOUT_MS``. */
+  timeoutMs?: number;
+}
+
+/** Read ``/api/tls/status`` from an explicit origin, bounded and abortable.
+ *
+ * This is the probe the HTTPS readiness checks use against the *target*
+ * origin, where this browser holds no session: callers there pass no token,
+ * which keeps the cross-origin request header-free and CORS-simple. */
+export function probeTlsStatus(
+  origin: string,
+  options: TlsStatusProbeOptions = {},
+): Promise<TlsRuntimeStatus> {
+  const headers: Record<string, string> = {};
+  if (options.token) headers['Authorization'] = `Bearer ${options.token}`;
+  return boundedTlsJson<TlsRuntimeStatus>(
+    `${resolveBaseUrl(origin).replace(/\/+$/, '')}/api/tls/status`,
+    { headers },
+    options.timeoutMs ?? TLS_STATUS_TIMEOUT_MS,
+    options.signal,
+  );
 }
 
 /** Read the live TLS state and its deployment runbook.
@@ -255,11 +371,19 @@ async function tlsJson<T>(
  *
  *  Only the bearer, never a Content-Type: this is a GET, and the token-less
  *  cross-origin polls above stay CORS-simple with no headers at all.
+ *
+ *  Bounded to ``TLS_STATUS_TIMEOUT_MS`` like ``probeTlsStatus``: a status read
+ *  that hangs mid-rollout rejects with ``TlsTimeoutError`` instead of freezing
+ *  whichever page or loop asked.
  */
 export function fetchTlsStatus(agentUrl: string, token?: string): Promise<TlsRuntimeStatus> {
   const headers: Record<string, string> = {};
   if (token) headers['Authorization'] = `Bearer ${token}`;
-  return tlsJson<TlsRuntimeStatus>(`${resolveBaseUrl(agentUrl)}/api/tls/status`, { headers });
+  return boundedTlsJson<TlsRuntimeStatus>(
+    `${resolveBaseUrl(agentUrl)}/api/tls/status`,
+    { headers },
+    TLS_STATUS_TIMEOUT_MS,
+  );
 }
 
 export function prepareHttps(
@@ -274,6 +398,17 @@ export function prepareHttps(
   });
 }
 
+/** Commit (or keep polling) an HTTPS activation.
+ *
+ *  A rollout can drop any single request in this loop — the relay answers 502
+ *  while the pod is replaced, a response is lost as the listener restarts, a
+ *  port-forward blinks. ``POST /api/tls/activate`` is idempotent for the same
+ *  transition id, so such transient failures are retried with backoff inside
+ *  the same five-minute deadline instead of surfacing as "activation failed"
+ *  for a switch the server may already have committed. Anything that is a real
+ *  answer (400/401/409, or 426 once plaintext became recovery-only) still
+ *  throws at once: the caller decides what a committed-but-unacknowledged
+ *  activation means. */
 export async function activateHttps(
   agentUrl: string,
   token: string,
@@ -284,16 +419,28 @@ export async function activateHttps(
   continueWaiting: () => boolean = () => true,
 ): Promise<TlsRuntimeStatus> {
   const deadline = Date.now() + 5 * 60_000;
+  let failures = 0;
   while (true) {
-    const result = await tlsJson<TlsRuntimeStatus>(`${resolveBaseUrl(agentUrl)}/api/tls/activate`, {
-      method: 'POST',
-      headers: authHeaders(token),
-      body: JSON.stringify({
-        transition_id: transitionId,
-        certificate_sha256: certificateSha256,
-        restart,
-      }),
-    });
+    let result: TlsRuntimeStatus;
+    try {
+      result = await boundedTlsJson<TlsRuntimeStatus>(`${resolveBaseUrl(agentUrl)}/api/tls/activate`, {
+        method: 'POST',
+        headers: authHeaders(token),
+        body: JSON.stringify({
+          transition_id: transitionId,
+          certificate_sha256: certificateSha256,
+          restart,
+        }),
+      }, TLS_ACTIVATE_ATTEMPT_TIMEOUT_MS);
+      failures = 0;
+    } catch (error) {
+      if (!isTransientTlsFailure(error) || Date.now() >= deadline) throw error;
+      if (!continueWaiting()) throw new Error('HTTPS activation was cancelled.');
+      failures += 1;
+      await new Promise(resolve => setTimeout(resolve, Math.min(5_000, 500 * 2 ** (failures - 1))));
+      if (!continueWaiting()) throw new Error('HTTPS activation was cancelled.');
+      continue;
+    }
     if (result.transition?.phase !== 'quiescing') return result;
     onQuiescing?.(result);
     if (!continueWaiting()) throw new Error('HTTPS activation was cancelled.');
@@ -376,17 +523,43 @@ export function createTlsHandoff(
   });
 }
 
+/** Exchange a one-use handoff ticket for this origin's session.
+ *
+ *  Bounded: the router awaits this before rendering anything, so a secure
+ *  listener that accepts and never answers (a pod still starting behind a
+ *  relay) would otherwise leave a blank page with no way on. On timeout the
+ *  router falls back to its expired-handoff path like any other failure. */
 export async function redeemTlsHandoff(
   targetOrigin: string,
   ticket: string,
 ): Promise<TlsHandoffRedeemResult> {
-  const res = await fetch(`${targetOrigin.replace(/\/$/, '')}/api/tls/handoff/redeem`, {
-    method: 'POST',
-    cache: 'no-store',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ticket }),
-  });
-  const body = await res.json().catch(() => ({}));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TLS_REDEEM_TIMEOUT_MS);
+  let res: Response;
+  let body: any;
+  try {
+    res = await fetch(`${targetOrigin.replace(/\/$/, '')}/api/tls/handoff/redeem`, {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticket }),
+      signal: controller.signal,
+    });
+    body = await res.json().catch(() => ({}));
+    // An abort that lands while the body streams in reads as an empty JSON
+    // object above; never mistake that for a successful redemption.
+    if (controller.signal.aborted) throw new DOMException('aborted', 'AbortError');
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new TlsTimeoutError(
+        'The secure server did not answer the session handoff in time.',
+        TLS_REDEEM_TIMEOUT_MS,
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
   if (res.status === 401 && typeof body?.profile === 'string' && typeof body?.route === 'string') {
     throw new TlsHandoffSessionError(
       typeof body?.error === 'string' ? body.error : 'The original session expired.',
@@ -464,13 +637,33 @@ export async function fetchServiceCapabilities(
   // an unauthenticated call there 401s silently and breaks the
   // deployment-mode radio.
   token?: string,
+  // Settings → HTTPS bounds this read like its status read: a server that
+  // accepts and never answers must not hold that page on its spinner. The
+  // abort rejects straight away even where the fetch (or a relay) ignores it.
+  options: { signal?: AbortSignal } = {},
 ): Promise<ServiceCapabilitiesResponse> {
   const base = resolveBaseUrl(agentUrl);
-  const res = await fetch(`${base}/api/services/capabilities`, {
-    headers: authHeaders(token ?? ''),
+  const { signal } = options;
+  if (signal?.aborted) throw abortReason(signal);
+  const request = (async (): Promise<ServiceCapabilitiesResponse> => {
+    const res = await fetch(`${base}/api/services/capabilities`, {
+      headers: authHeaders(token ?? ''),
+      signal,
+    });
+    if (!res.ok) throw new Error(`Failed to fetch service capabilities: ${res.statusText}`);
+    return res.json();
+  })();
+  if (!signal) return request;
+  let onAbort: (() => void) | null = null;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(abortReason(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
   });
-  if (!res.ok) throw new Error(`Failed to fetch service capabilities: ${res.statusText}`);
-  return res.json();
+  try {
+    return await Promise.race([request, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener('abort', onAbort);
+  }
 }
 
 export async function resetOrphanedSetup(

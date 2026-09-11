@@ -1,27 +1,43 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { ElCheckbox, ElMessage } from 'element-plus';
 import { Icon } from '@iconify/vue';
 
 import CaTrustPanel from '../components/shared/CaTrustPanel.vue';
 import DeploymentSteps from '../components/shared/DeploymentSteps.vue';
+import HttpsRecoveryHelp from '../components/shared/HttpsRecoveryHelp.vue';
 import { useHttpsPivot } from '../composables/useHttpsPivot';
 import {
   cancelHttps,
   fetchServiceCapabilities,
   fetchTlsStatus,
+  isTransientTlsFailure,
   prepareHttps,
+  TLS_STATUS_TIMEOUT_MS,
+  TlsApiError,
+  type ServiceCapabilitiesResponse,
   type TlsRuntimeStatus,
   type TlsStatus,
+  type TlsTransition,
 } from '../services/configApi';
-import { handleHttpsTransition } from '../services/httpsTransition';
+import {
+  handleHttpsTransition,
+  httpsTransitionState,
+  retryHttpsTransition,
+  savedHttpsTransition,
+} from '../services/httpsTransition';
+import { tunnelCommand } from '../services/httpsReadiness';
 import { migrationReadiness } from '../services/migrationReadiness';
 import { useSettingsStore } from '../stores/settings';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
 const settingsStore = useSettingsStore();
+
+/** Same threshold as the waiting loops: long enough that "still starting" has
+ *  stopped being the likely explanation. */
+const RECOVERY_HELP_AFTER_MS = 45_000;
 
 const loading = ref(true);
 const working = ref(false);
@@ -32,8 +48,27 @@ const tls = ref<TlsStatus | null>(null);
 const installMode = ref<string | null>(null);
 const trustConfirmed = ref(false);
 const commandsVisible = ref(false);
+/** Set when this plaintext page can no longer read its own status — it went
+ *  recovery-only (426) or the server is unreachable — while a switch is known.
+ *  The page then explains the switch instead of dead-ending on an error. */
+const recovery = ref<{ transition: TlsTransition; recoveryOnly: boolean } | null>(null);
+const refreshing = ref(false);
+const slowSwitch = ref(false);
+let slowTimer: ReturnType<typeof setTimeout> | null = null;
 const pivot = useHttpsPivot();
-const { phase: pivotPhase, error: pivotError, forwardHint } = pivot;
+const {
+  phase: pivotPhase,
+  error: pivotError,
+  forwardHint,
+  readiness: pivotReadiness,
+  recoveryUrl: pivotRecoveryUrl,
+} = pivot;
+// Top-level bindings: the template only unwraps refs it can see directly.
+const backgroundReason = httpsTransitionState.reason;
+const backgroundReadiness = httpsTransitionState.readiness;
+const backgroundRecoveryUrl = httpsTransitionState.recoveryUrl;
+const backgroundInstallMode = httpsTransitionState.installMode;
+const backgroundPortForward = httpsTransitionState.portForward;
 const migrationReady = migrationReadiness.ready;
 const pendingUploads = migrationReadiness.pendingUploads;
 
@@ -68,24 +103,128 @@ const canActivate = computed(() =>
 // was how prose and commands ended up mixed in the first place.
 const deploymentSteps = computed(() => runtime.value?.steps ?? []);
 
-async function load() {
-  loading.value = true;
+// ── recovery guidance ─────────────────────────────────────────────────────
+//
+// After 45 seconds of an activating switch — whether this page is running the
+// restart (the pivot's own hint) or only showing the deployment runbook, where
+// nothing on this page is polling — the same help appears: trust, reconnect
+// the port-forward, check again, or open the secure address directly.
+
+watch(
+  () => (transition.value?.phase === 'activating' ? transition.value.id : null),
+  (activatingId) => {
+    if (slowTimer) clearTimeout(slowTimer);
+    slowTimer = null;
+    slowSwitch.value = false;
+    if (activatingId) {
+      slowTimer = setTimeout(() => { slowSwitch.value = true; }, RECOVERY_HELP_AFTER_MS);
+    }
+  },
+  { immediate: true },
+);
+onBeforeUnmount(() => { if (slowTimer) clearTimeout(slowTimer); });
+
+const showRecoveryHelp = computed(() => forwardHint.value || slowSwitch.value);
+/** The pivot's verdict while it runs; otherwise the background coordinator's. */
+const recoveryReadiness = computed(() => pivotReadiness.value ?? backgroundReadiness.value);
+const recoveryReason = computed(() => {
+  if (pivotReadiness.value) return pivotReadiness.value.ready ? null : pivotReadiness.value.reason;
+  return backgroundReason.value ?? (recovery.value ? 'unreachable' : null);
+});
+const recoveryMessage = computed(() => (
+  recoveryReadiness.value?.responded ? recoveryReadiness.value.message : null
+));
+const recoveryUrl = computed(() => pivotRecoveryUrl.value || backgroundRecoveryUrl.value);
+const recoveryCaUrl = computed(() => `${settingsStore.agentUrl.replace(/\/+$/, '')}/ca.pem`);
+const recoveryShowsTrust = computed(() => (
+  (recovery.value?.transition ?? transition.value)?.certificate_kind ?? runtime.value?.certificate_kind
+) === 'local');
+const recoveryPortForward = computed(() => (
+  tunnelCommand(runtime.value) ?? backgroundPortForward.value ?? null
+));
+/** Tri-state for the component: unknown still mentions a tunnel, neutrally. */
+const recoveryKubernetes = computed(() => {
+  const mode = installMode.value ?? runtime.value?.install_mode ?? backgroundInstallMode.value;
+  return mode ? mode === 'kubernetes' : null;
+});
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** Read status as the signed-in admin, riding out a rollout blip. */
+async function readStatus(): Promise<TlsRuntimeStatus> {
+  let failure: unknown = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      // Ask as the signed-in admin. /api/tls/status answers without a token
+      // too (the recovery page needs that), but it discloses the Kubernetes
+      // identity — and the runbook naming the real namespace, release and
+      // Deployment — only to an admin. Polling it anonymously from here is
+      // what put the placeholder commands back in front of the one person who
+      // shouldn't see them.
+      return await fetchTlsStatus(settingsStore.agentUrl, settingsStore.authToken);
+    } catch (e) {
+      failure = e;
+      if (!isTransientTlsFailure(e)) throw e;
+      if (attempt < 2) await sleep(500 * (attempt + 1));
+    }
+  }
+  throw failure;
+}
+
+/** The switch this browser knows about, when the server cannot say itself. */
+function knownTransition(error: unknown): TlsTransition | null {
+  const known = httpsTransitionState.transition.value ?? savedHttpsTransition();
+  if (!known || known.phase === 'cancelled') return null;
+  // 426 is plaintext announcing it became recovery-only: the switch crossed
+  // over whatever phase this browser last recorded. Merely unreachable only
+  // counts once the switch was already activating.
+  if (error instanceof TlsApiError && error.status === 426) return known;
+  return isTransientTlsFailure(error) && ['activating', 'active'].includes(known.phase)
+    ? known : null;
+}
+
+async function load(quiet = false) {
+  if (!quiet) loading.value = true;
   loadError.value = null;
   try {
-    // Ask as the signed-in admin. /api/tls/status answers without a token too
-    // (the recovery page needs that), but it discloses the Kubernetes identity
-    // — and the runbook naming the real namespace, release and Deployment —
-    // only to an admin. Polling it anonymously from here is what put the
-    // placeholder commands back in front of the one person who shouldn't see
-    // them.
-    const [status, caps] = await Promise.all([
-      fetchTlsStatus(settingsStore.agentUrl, settingsStore.authToken),
-      fetchServiceCapabilities(settingsStore.agentUrl, settingsStore.authToken),
+    // A capabilities failure only costs the trust shortcut; never the page.
+    // Bounded like one status read, and a timeout counts as such a failure:
+    // a server that accepts and never answers would otherwise hold this page
+    // on its spinner (or "Check now" disabled) past the status read, so the
+    // recovery view never appeared.
+    const capsAbort = new AbortController();
+    const capsTimer = setTimeout(() => capsAbort.abort(), TLS_STATUS_TIMEOUT_MS);
+    const [statusResult, capsResult] = await Promise.allSettled([
+      readStatus(),
+      fetchServiceCapabilities(settingsStore.agentUrl, settingsStore.authToken, {
+        signal: capsAbort.signal,
+      }),
     ]);
+    clearTimeout(capsTimer);
+    if (statusResult.status === 'rejected') {
+      const known = knownTransition(statusResult.reason);
+      if (!known) throw statusResult.reason;
+      recovery.value = {
+        transition: known,
+        recoveryOnly: statusResult.reason instanceof TlsApiError && statusResult.reason.status === 426,
+      };
+      // Make sure this tab is (still) looking for the secure address; the
+      // coordinator moves it there, with its session, once it answers.
+      retryHttpsTransition();
+      return;
+    }
+    recovery.value = null;
+    const status = statusResult.value;
+    const caps: ServiceCapabilitiesResponse | null = capsResult.status === 'fulfilled'
+      ? capsResult.value : null;
     runtime.value = status;
-    tls.value = caps.tls ?? null;
-    installMode.value = caps.install_mode ?? status.install_mode ?? null;
-    trustConfirmed.value = Boolean(caps.tls?.local_trust?.already_trusted);
+    if (caps) {
+      tls.value = caps.tls ?? null;
+      trustConfirmed.value = Boolean(caps.tls?.local_trust?.already_trusted);
+    }
+    installMode.value = caps?.install_mode ?? status.install_mode ?? installMode.value;
     if (status.transition && ['prepared', 'quiescing'].includes(status.transition.phase)) {
       await handleHttpsTransition(status.transition, settingsStore.agentUrl, settingsStore.authToken);
     }
@@ -93,6 +232,19 @@ async function load() {
     loadError.value = e instanceof Error ? e.message : 'Failed to load HTTPS status';
   } finally {
     loading.value = false;
+  }
+}
+
+/** "Check now": wake whichever wait is running, and re-read this page. */
+async function retryRecovery() {
+  pivot.retryNow();
+  retryHttpsTransition();
+  if (pivotPhase.value !== 'idle' && pivotPhase.value !== 'failed') return;
+  refreshing.value = true;
+  try {
+    await load(true);
+  } finally {
+    refreshing.value = false;
   }
 }
 
@@ -188,7 +340,7 @@ async function cancel() {
   }
 }
 
-onMounted(load);
+onMounted(() => { void load(); });
 </script>
 
 <template>
@@ -201,10 +353,40 @@ onMounted(load);
       <p class="subtitle">Protect the connection between every browser or app window and Cremind.</p>
 
       <div v-if="loading" class="state-card">Loading HTTPS status…</div>
+      <!-- The status read failed, but this browser knows a switch is under way:
+           plaintext went recovery-only, or the server is mid-restart. Explain
+           and offer the way across instead of a dead-end error card. -->
+      <section v-else-if="recovery" class="state-card">
+        <h2>{{ recovery.recoveryOnly
+          ? 'Cremind has moved to HTTPS'
+          : 'Cremind is not answering on this address right now' }}</h2>
+        <p v-if="recovery.recoveryOnly">
+          This plaintext address now serves only the recovery page, so this page cannot
+          read its settings here any more. Continue on the secure address — this tab moves
+          there on its own, keeping its page and session, as soon as this browser can
+          reach it.
+        </p>
+        <p v-else>
+          The server did not answer this page. That is expected for a moment while it
+          restarts into HTTPS or a replaced pod comes up. This tab moves to the secure
+          address on its own, keeping its page and session, once it answers.
+        </p>
+        <HttpsRecoveryHelp
+          :https-url="recoveryUrl"
+          :ca-url="recoveryCaUrl"
+          :show-trust="recoveryShowsTrust"
+          :port-forward="recoveryPortForward"
+          :kubernetes="recoveryKubernetes"
+          :reason="recoveryReason"
+          :message="recoveryMessage"
+          :busy="refreshing"
+          @retry="retryRecovery"
+        />
+      </section>
       <div v-else-if="loadError && !runtime" class="state-card error-card">
         <h2>Could not read HTTPS status</h2>
         <p>{{ loadError }}</p>
-        <button class="secondary-btn" @click="load">Try again</button>
+        <button class="secondary-btn" @click="load()">Try again</button>
       </div>
 
       <template v-else>
@@ -367,6 +549,18 @@ onMounted(load);
               </p>
               <p v-if="pivotError" class="inline-error">{{ pivotError }}</p>
               <DeploymentSteps :steps="deploymentSteps" />
+              <HttpsRecoveryHelp
+                v-if="showRecoveryHelp"
+                :https-url="recoveryUrl"
+                :ca-url="recoveryCaUrl"
+                :show-trust="recoveryShowsTrust"
+                :port-forward="recoveryPortForward"
+                :kubernetes="recoveryKubernetes"
+                :reason="recoveryReason"
+                :message="recoveryMessage"
+                :busy="refreshing"
+                @retry="retryRecovery"
+              />
               <div v-if="runtime?.can_cancel" class="actions">
                 <button class="secondary-btn" :disabled="working" @click="cancel">
                   Cancel HTTPS switch
@@ -381,7 +575,18 @@ onMounted(load);
               <p>{{ pivotError || (transition?.phase === 'quiescing'
                 ? `${runtime?.quiesce_pending ?? 'Some'} tab(s) are finishing uploads and saving private session handoffs before the restart.`
                 : 'Every open Cremind tab will reopen at its current page after the secure listener is verified.') }}</p>
-              <p v-if="forwardHint">Rerun your Kubernetes port-forward and confirm this device trusts the CA.</p>
+              <HttpsRecoveryHelp
+                v-if="showRecoveryHelp && transition?.phase !== 'quiescing'"
+                :https-url="recoveryUrl"
+                :ca-url="recoveryCaUrl"
+                :show-trust="recoveryShowsTrust"
+                :port-forward="recoveryPortForward"
+                :kubernetes="recoveryKubernetes"
+                :reason="recoveryReason"
+                :message="recoveryMessage"
+                :busy="refreshing"
+                @retry="retryRecovery"
+              />
               <button
                 v-if="runtime?.can_cancel"
                 class="secondary-btn"
@@ -428,8 +633,10 @@ p { color: var(--text-secondary); line-height: 1.6; margin: 7px 0; }
 button:disabled { opacity: .55; cursor: not-allowed; }
 .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
 .trust-confirm { margin-top: 16px; white-space: normal; }
-.inline-error, .upload-wait, .notice { padding: 10px 14px; border-radius: 6px; background: var(--el-color-warning-light-9); color: var(--el-color-warning-dark-2); margin-bottom: 14px; }
-.error-card, .inline-error { border-color: var(--el-color-danger); }
+/* App tokens with an explicit colour: the Element Plus warning shades this
+   used before are never redeclared for the dark theme and stayed light there. */
+.inline-error, .upload-wait, .notice { padding: 10px 14px; border-radius: 6px; background: var(--hover-bg); color: var(--text-primary); border-left: 3px solid var(--warning-color); margin-bottom: 14px; }
+.error-card, .inline-error { border-color: var(--danger-color); }
 code { background: var(--hover-bg); padding: 2px 5px; border-radius: 4px; }
 .fingerprint { word-break: break-all; }
 .spinner { width: 30px; height: 30px; border: 3px solid var(--border-color); border-top-color: var(--primary-color); border-radius: 50%; animation: spin .9s linear infinite; }

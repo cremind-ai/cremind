@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { goBackToChat } from '../utils/backToChat';
 import {
@@ -21,6 +21,9 @@ import {
   type CalView, viewRange, titleFor, navigate, weekDays, startOfDay,
 } from '../components/calendar/calendarUtils';
 import { unlinkGoogleSkill } from '../services/googleApi';
+import {
+  onOAuthReturn, type OAuthReturnDelivery, type OAuthReturnNotice,
+} from '../services/oauthReturn';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -107,14 +110,73 @@ watch(() => settings.authToken, async (t, p) => { if (t && !p) { await loadSetti
 function goBack() { goBackToChat(router, props.profile); }
 
 // ── Google connect ───────────────────────────────────────────────────────
+// The consent popup lands on the OAuth return page (views/OAuthReturn.vue),
+// which tells this page the moment Google has answered — by then the server has
+// already exchanged the code, so one settings reload shows the result. The poll
+// stays as the fallback for a popup that never gets that far (closed early, or
+// a consent finished in another browser).
+const CONNECT_POLL_MS = 2500;
+const CONNECT_TIMEOUT_MS = 150000;
+let connectPoll: number | undefined;
+let stopReturnListener: (() => void) | null = null;
+
+function stopConnectWait() {
+  if (connectPoll !== undefined) {
+    window.clearInterval(connectPoll);
+    connectPoll = undefined;
+  }
+  stopReturnListener?.();
+  stopReturnListener = null;
+  connecting.value = false;
+}
+
+/** Reload settings; finish the wait once Google shows as connected. */
+async function checkConnected() {
+  await loadSettings();
+  // ``connecting`` is re-checked AFTER the await: the poll and the return notice
+  // can race here, and only the first one to see "connected" may announce it.
+  if (!connecting.value || !googleConnected.value) return;
+  stopConnectWait();
+  ElMessage.success('Connected Google Calendar');
+  await loadEvents();
+}
+
+/**
+ * A denial leaves nothing server-side for this page to check, so a failure
+ * notice may end the wait — but only one from this page's OWN consent popup, for
+ * this profile. The BroadcastChannel carries every tab's and every profile's
+ * calendar returns: another profile cancelling its own consent must not cancel
+ * ours. Everything else, ``received`` included, just re-reads this profile's
+ * settings, which is harmless whoever the notice was for.
+ */
+function onGoogleReturn(notice: OAuthReturnNotice, { fromPopup }: OAuthReturnDelivery) {
+  if (notice.flow !== 'calendar' || !connecting.value) return;
+  const ours = fromPopup && (notice.profile === null || notice.profile === props.profile);
+  if (notice.outcome === 'received' || !ours) {
+    void checkConnected();
+    return;
+  }
+  stopConnectWait();
+  if (notice.outcome === 'denied') {
+    ElMessage.warning('Google Calendar was not connected — the Google consent was declined or cancelled.');
+  } else if (notice.outcome === 'invalid') {
+    ElMessage.warning('That Google sign-in request expired. Click Connect Google to start a new one.');
+  } else {
+    ElMessage.error('Google answered, but Cremind could not finish connecting Google Calendar. Try again.');
+  }
+}
+
 async function onConnectGoogle() {
   // Open the window FIRST, synchronously — an await before window.open spends the
   // user-gesture token and the browser blocks the popup. The authorize URL does
   // not exist yet, so navigate the blank window once the server answers.
   const authWindow = window.open('about:blank', 'cremind-google-oauth', 'width=520,height=640');
+  stopConnectWait();
   connecting.value = true;
   try {
-    const res = await connectGoogleCalendar(settings.agentUrl, settings.authToken);
+    const res = await connectGoogleCalendar(settings.agentUrl, settings.authToken, {
+      returnRoute: router.currentRoute.value.fullPath,
+    });
     if (res.error || !res.authorize_url) {
       if (authWindow && !authWindow.closed) authWindow.close();
       connecting.value = false;
@@ -122,6 +184,7 @@ async function onConnectGoogle() {
       return;
     }
     if (authWindow && !authWindow.closed) {
+      stopReturnListener = onOAuthReturn(onGoogleReturn, { popup: authWindow });
       authWindow.location.href = res.authorize_url;
     } else {
       connecting.value = false;
@@ -131,21 +194,22 @@ async function onConnectGoogle() {
       return;
     }
     const started = Date.now();
-    const poll = window.setInterval(async () => {
-      await loadSettings();
-      if (googleConnected.value) {
-        window.clearInterval(poll); connecting.value = false;
-        ElMessage.success('Connected Google Calendar');
-        await loadEvents();
-      } else if (Date.now() - started > 150000) {
-        window.clearInterval(poll); connecting.value = false;
+    connectPoll = window.setInterval(() => {
+      if (Date.now() - started > CONNECT_TIMEOUT_MS) {
+        stopConnectWait();
+        return;
       }
-    }, 2500);
+      void checkConnected();
+    }, CONNECT_POLL_MS);
   } catch (err) {
-    connecting.value = false;
+    stopConnectWait();
     ElMessage.error(err instanceof Error ? err.message : String(err));
   }
 }
+// Leaving the page mid-consent must not leave a poll (and a message listener)
+// running against a view that no longer exists.
+onUnmounted(stopConnectWait);
+
 /**
  * The badge is what a user clicks after noticing the *wrong* Google account, so it
  * has to offer the fix rather than describe it. Re-linking still belongs in chat

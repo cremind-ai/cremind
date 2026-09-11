@@ -11,11 +11,13 @@ import NavRail from './components/NavRail.vue';
 import ConversationsPanel from './components/ConversationsPanel.vue';
 import UpdateBanner from './components/UpdateBanner.vue';
 import FloatingTodoLayer from './components/plan/FloatingTodoLayer.vue';
+import HttpsRecoveryHelp from './components/shared/HttpsRecoveryHelp.vue';
 import {
   dismissHttpsOverlay,
   httpsTransitionState,
   installHttpsTransitionCoordinator,
   restoreHttpsOverlay,
+  retryHttpsTransition,
 } from './services/httpsTransition';
 import {
   beginMigrationGate,
@@ -30,15 +32,25 @@ const httpsPhase = httpsTransitionState.phase;
 const httpsError = httpsTransitionState.error;
 const httpsTransition = httpsTransitionState.transition;
 const httpsOverlayDismissed = httpsTransitionState.overlayDismissed;
+const httpsReason = httpsTransitionState.reason;
+const httpsReadiness = httpsTransitionState.readiness;
+// Carries this tab's one-use handoff ticket while it has one, so the explicit
+// link lands on the same page, signed in — not on a bare login screen.
+const httpsRecoveryUrl = httpsTransitionState.recoveryUrl;
+const httpsInstallMode = httpsTransitionState.installMode;
+const httpsPortForward = httpsTransitionState.portForward;
 const migrationInProgress = migrationReadiness.migrating;
+// Pages that explain the switch themselves (Settings → HTTPS, setup), and the
+// public OAuth return page, which must never be covered by another tab's switch.
+const httpsOverlayExcluded = computed(() => [
+  'security-settings', 'setup', 'setup-profile', 'oauth-return',
+].includes(route.name as string));
 // Either blocking card is showing something the user has put away. The chip
 // that replaces them is what keeps dismissal from ever being a one-way door.
 const httpsOverlayPending = computed(() =>
   (['waiting', 'moving', 'attention'].includes(httpsPhase.value)
     || (migrationInProgress.value && httpsPhase.value === 'idle'))
-  && route.name !== 'security-settings'
-  && route.name !== 'setup'
-  && route.name !== 'setup-profile');
+  && !httpsOverlayExcluded.value);
 // Only the admin profile can reach the HTTPS settings page (the router bounces
 // everyone else), so for other profiles the chip states the situation without
 // pretending to offer an action.
@@ -47,14 +59,22 @@ function openHttpsSettings(): void {
   if (!currentProfile.value) return;
   void router.push({ name: 'security-settings', params: { profile: currentProfile.value } });
 }
-const httpsRecoveryUrl = computed(() => {
-  const target = httpsTransition.value?.target_origin;
-  if (!target) return '';
-  const mount = window.location.pathname.startsWith('/electron-renderer')
-    ? '/electron-renderer/' : '/';
-  const route = window.location.hash.slice(1) || '/';
-  return `${target.replace(/\/$/, '')}${mount}#${route}`;
+// The CA download stays on this (plaintext) origin: the recovery listener
+// keeps serving /ca.pem after it stops serving the application.
+const httpsCaUrl = computed(() => {
+  const source = httpsTransition.value?.source_origin ?? window.location.origin;
+  return `${source.replace(/\/$/, '')}/ca.pem`;
 });
+const httpsKubernetes = computed(() =>
+  httpsInstallMode.value ? httpsInstallMode.value === 'kubernetes' : null);
+const httpsRecoveryMessage = computed(() =>
+  httpsReadiness.value?.responded ? httpsReadiness.value.message : null);
+// The recovery steps (trust the CA, reconnect the port-forward, open the secure
+// address) only mean something once the switch has activated. Before that no
+// HTTPS listener exists to trust, tunnel to or open, even though a recovery
+// link can already be composed for a prepared switch.
+const httpsRecoverable = computed(() =>
+  ['activating', 'active'].includes(httpsTransition.value?.phase ?? ''));
 
 const route = useRoute();
 const router = useRouter();
@@ -338,12 +358,10 @@ const handleLogout = () => {
       v-if="(httpsPhase === 'waiting'
         || httpsPhase === 'moving'
         || httpsPhase === 'attention') && !httpsOverlayDismissed"
-      v-show="route.name !== 'security-settings'
-        && route.name !== 'setup'
-        && route.name !== 'setup-profile'"
+      v-show="!httpsOverlayExcluded"
       class="embedding-overlay https-transition-overlay"
     >
-      <div class="embedding-overlay-card">
+      <div class="embedding-overlay-card" :class="{ 'https-attention-card': httpsPhase === 'attention' }">
         <div v-if="httpsPhase !== 'attention'" class="spinner"></div>
         <h2>{{ httpsPhase === 'attention'
           ? 'HTTPS needs your attention'
@@ -356,19 +374,26 @@ const handleLogout = () => {
             Waiting for the secure server, then this tab will reopen at the same page.
           </template>
         </p>
-        <p class="hint">
+        <!-- After 45 seconds: what to fix on this side (or, when the secure
+             server answered, what it said), a retry, and the explicit link —
+             which carries this tab's handoff ticket and opens in this tab. -->
+        <HttpsRecoveryHelp
+          v-if="httpsPhase === 'attention' && httpsRecoveryUrl && httpsRecoverable"
+          :https-url="httpsRecoveryUrl"
+          :ca-url="httpsCaUrl"
+          :show-trust="httpsTransition?.certificate_kind === 'local'"
+          :port-forward="httpsPortForward"
+          :kubernetes="httpsKubernetes"
+          :reason="httpsReason"
+          :message="httpsRecoveryMessage"
+          @retry="retryHttpsTransition()"
+        />
+        <p v-else class="hint">
           If your browser shows a certificate warning, trust the Cremind CA on this
           device, or open the secure address and continue past the warning. On
           Kubernetes, rerun the port-forward command after the rollout.
         </p>
         <div class="transition-actions">
-          <a
-            v-if="httpsPhase === 'attention' && httpsRecoveryUrl"
-            class="transition-link"
-            :href="httpsRecoveryUrl"
-            target="_blank"
-            rel="noopener noreferrer"
-          >Open the HTTPS address</a>
           <button class="transition-dismiss" @click="dismissHttpsOverlay()">
             Keep using this page
           </button>
@@ -385,9 +410,7 @@ const handleLogout = () => {
 
     <div
       v-if="migrationInProgress && httpsPhase === 'idle' && !httpsOverlayDismissed
-        && route.name !== 'security-settings'
-        && route.name !== 'setup'
-        && route.name !== 'setup-profile'"
+        && !httpsOverlayExcluded"
       class="embedding-overlay https-transition-overlay"
     >
       <div class="embedding-overlay-card">
@@ -419,8 +442,7 @@ const handleLogout = () => {
          still open, and takes the admin to the steps or the way out. -->
     <component
       :is="httpsPendingActionable ? 'button' : 'div'"
-      v-if="httpsPhase === 'pending' && route.name !== 'security-settings'
-        && route.name !== 'setup' && route.name !== 'setup-profile'"
+      v-if="httpsPhase === 'pending' && !httpsOverlayExcluded"
       class="https-transition-chip https-pending-chip"
       :title="httpsPendingActionable
         ? 'Open HTTPS settings to see the remaining steps, or cancel the switch'
@@ -429,6 +451,18 @@ const handleLogout = () => {
     >
       {{ httpsError ? 'HTTPS switch needs attention' : 'HTTPS switch waiting for the deployment change' }}
     </component>
+
+    <!-- Saving this tab's handoff before the move. Brief and non-blocking:
+         the page keeps working, and the blocking card follows only once the
+         server is actually switching. -->
+    <div
+      v-if="httpsPhase === 'preparing' && !httpsOverlayExcluded"
+      class="https-transition-chip https-pending-chip"
+      role="status"
+    >
+      <span class="chip-spinner" aria-hidden="true"></span>
+      Preparing this tab for HTTPS…
+    </div>
   </div>
 
 </template>
@@ -506,12 +540,6 @@ const handleLogout = () => {
   line-height: 1.55;
   margin: 0;
 }
-.transition-link {
-  display: inline-block;
-  color: var(--primary-color);
-  font-weight: 600;
-}
-
 .transition-actions {
   display: flex;
   align-items: center;
@@ -556,6 +584,20 @@ const handleLogout = () => {
 /* Not an alert: nothing is broken and nothing is blocked while it shows. */
 .https-pending-chip { font-weight: 500; cursor: default; }
 button.https-pending-chip { cursor: pointer; }
+.chip-spinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--border-color);
+  border-top-color: var(--primary-color);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+/* Room for the recovery steps without turning the card into a page. */
+.embedding-overlay-card.https-attention-card {
+  max-width: 560px;
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+}
 
 .spinner {
   width: 32px;

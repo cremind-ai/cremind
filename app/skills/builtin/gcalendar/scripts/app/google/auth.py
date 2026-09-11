@@ -55,6 +55,20 @@ CREDENTIAL_FILES = (
 # via a crafted ``state`` in a pasted callback URL. Mirrors oauth_callback._STATE_RE.
 _STATE_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
+# The redirect a backend-managed ``link`` (and gdrive's ``grant``) advertises when
+# ``cremind serve`` injected no ``CREMIND_OAUTH_REDIRECT_URI`` — i.e. it could not
+# derive a loopback callback: a non-loopback APP_URL with no operator pin, such as
+# an Ingress install. Google's Desktop client accepts only an http loopback
+# redirect, so this is still the one address worth advertising; on such an
+# install the browser usually cannot reach it and consent ends on a
+# connection-error page — whose address bar still carries ``code`` + ``state``.
+# ``complete-link`` hands that URL to the same inbox waiter, so the flow completes
+# without a listener in this process.
+DEFAULT_BACKEND_REDIRECT_URI = "http://localhost:1515/api/oauth/callback"
+
+# How often the inbox waiter looks for the backend's per-state file.
+_INBOX_POLL_S = 0.5
+
 
 class AuthError(RuntimeError):
     pass
@@ -103,6 +117,44 @@ def _decode_jwt_payload(token: str) -> dict[str, Any]:
         return {}
 
 
+def _require_pkce(flow, auth_url: str) -> None:
+    """Refuse a consent URL that carries no PKCE challenge.
+
+    PKCE is what makes a captured ``code`` worthless on its own: the code rides the
+    browser, the backend's inbox file and any URL pasted into ``complete-link``,
+    and only the ``code_verifier`` held by this process can redeem it. Whether
+    google-auth-oauthlib generates a verifier by default depends on its version
+    (1.2.3's ``from_client_config`` leaves ``autogenerate_code_verifier`` off;
+    later releases turn it on), so ``link`` asks explicitly — and this check turns
+    a library that stopped honouring the request into a loud failure *before* the
+    URL reaches the user.
+    """
+    if not getattr(flow, "code_verifier", None) or "code_challenge=" not in auth_url:
+        raise AuthError(
+            "Refusing to start Google consent without PKCE (the authorization URL "
+            "has no code_challenge). Upgrade google-auth-oauthlib and re-run link."
+        )
+
+
+def _guard_pkce(flow) -> None:
+    """Make ``flow.authorization_url`` itself enforce :func:`_require_pkce`.
+
+    For the ``run_local_server`` path, which builds its consent URL internally
+    and opens the browser straight after: the only seam between the two is its
+    ``self.authorization_url(...)`` call, so the check is shadowed onto the
+    instance there. A raise surfaces through ``_run_local_server_interruptible``
+    as the AuthError it is, and no browser is opened.
+    """
+    build = flow.authorization_url
+
+    def authorization_url(**kwargs):
+        auth_url, state = build(**kwargs)
+        _require_pkce(flow, auth_url)
+        return auth_url, state
+
+    flow.authorization_url = authorization_url
+
+
 def _run_local_server_interruptible(flow, **kwargs) -> Any:
     """Run ``flow.run_local_server`` so that Ctrl+C reliably aborts the wait.
 
@@ -140,8 +192,13 @@ def _run_local_server_interruptible(flow, **kwargs) -> Any:
 
 
 def _oauth_inbox_dir() -> Path | None:
-    """Directory where ``cremind serve``'s persistent loopback listener drops
-    captured authorization responses, or None when not running under the backend."""
+    """Directory where ``cremind serve``'s OAuth callback route drops captured
+    authorization responses, or None when not running under the backend.
+
+    Its presence is also *the* signal that the backend manages this run: the
+    backend injects ``CREMIND_SYSTEM_DIR`` into every skill it spawns, and a
+    backend-managed run always waits on this inbox instead of opening a listener
+    of its own (see :func:`link`)."""
     system_dir = os.environ.get("CREMIND_SYSTEM_DIR", "").strip()
     if not system_dir:
         return None
@@ -173,7 +230,7 @@ def _await_oauth_callback(state: str, *, timeout: float = 600.0) -> str:
                 if "error" in parse_qs(query):
                     raise AuthError("Google consent was denied or returned an error.")
                 return query
-            time.sleep(0.5)
+            time.sleep(_INBOX_POLL_S)
     except KeyboardInterrupt:
         raise AuthError("Linking cancelled (Ctrl+C) before consent completed.")
     raise AuthError(
@@ -183,22 +240,36 @@ def _await_oauth_callback(state: str, *, timeout: float = 600.0) -> str:
 
 
 def _link_via_backend_route(flow, redirect_uri: str) -> Any:
-    """Authorize via the backend's OAuth callback route.
+    """Authorize through the Cremind backend's OAuth callback inbox.
 
-    ``cremind serve`` hosts ``GET /api/oauth/callback`` and injects the
-    browser-facing redirect (``<APP_URL>/api/oauth/callback``) as
-    ``CREMIND_OAUTH_REDIRECT_URI``. The skill advertises it, waits for the backend
-    to capture the consent redirect into ``oauth_inbox/<state>.txt``, then performs
-    the PKCE token exchange locally. The redirect must be a loopback origin —
-    Google Desktop clients reject real hostnames (the chart leaves it unset for
-    non-loopback ``APP_URL`` so we never get here in that case).
+    ``redirect_uri`` is an http loopback callback: the one ``cremind serve``
+    derived from an http *or* https loopback APP_URL (or an operator pin) and
+    injected as ``CREMIND_OAUTH_REDIRECT_URI``, else
+    :data:`DEFAULT_BACKEND_REDIRECT_URI`. It stays http even on an HTTPS install —
+    Google's Desktop flow only accepts http loopback redirects — and the backend
+    forwards that plaintext request to its HTTPS handler. The handler,
+    ``GET /api/oauth/callback``, drops the response into
+    ``oauth_inbox/<state>.txt``; ``complete-link`` writes the very same file when
+    the browser could not reach it. Either way this process picks it up and does
+    the PKCE token exchange itself, so tokens never leave the machine.
     """
     flow.redirect_uri = redirect_uri
     auth_url, state = flow.authorization_url(access_type="offline", prompt="consent")
+    _require_pkce(flow, auth_url)
     print(f"Please visit this URL to authorize this application: {auth_url}", flush=True)
+    print(
+        "If the browser shows a connection error after you approve, copy the full "
+        "address from its address bar and, while this command is still waiting, run: "
+        'uv run scripts/__main__.py complete-link --response "<that URL>" '
+        "(keep the double quotes).",
+        flush=True,
+    )
     query = _await_oauth_callback(state)
-    # oauthlib insists OAuth 2.0 happens over https, so present the response as
-    # such. The path is irrelevant to code extraction — only the query matters.
+    # oauthlib refuses to parse an authorization response that is not https, so
+    # present it as one — only its query is read. The exchange itself sends
+    # ``flow.redirect_uri``, which is deliberately left as advertised: Google
+    # requires it to equal the consent URL's redirect exactly, so an https (or
+    # otherwise rewritten) value would fail the exchange with redirect_uri_mismatch.
     https_base = re.sub(r"^http://", "https://", flow.redirect_uri)
     sep = "&" if "?" in https_base else "?"
     flow.fetch_token(authorization_response=f"{https_base}{sep}{query}")
@@ -220,7 +291,9 @@ def submit_callback(response: str) -> dict[str, Any]:
 
     ``response`` may be a full redirect URL or a bare ``code=...&state=...`` query
     string. Raises ``AuthError`` on a missing/invalid state, a consent error, or
-    when the inbox is unavailable.
+    when the inbox is unavailable. A consent error is still delivered first when
+    its state is valid, exactly as the backend route delivers one, so the waiting
+    ``link`` stops at once instead of sitting out its timeout.
     """
     raw = (response or "").strip()
     if not raw:
@@ -230,10 +303,16 @@ def submit_callback(response: str) -> dict[str, Any]:
     if not query:
         query = raw[1:] if raw.startswith("?") else raw
     params = parse_qs(query)
-    if "error" in params:
-        raise AuthError("Google consent was denied or returned an error.")
     state = (params.get("state") or [""])[0]
-    if not _STATE_RE.match(state):
+    # fullmatch, not match: ``$`` also accepts a trailing newline, and a pasted
+    # ``%0A`` would otherwise become part of the inbox file name.
+    valid_state = _STATE_RE.fullmatch(state) is not None
+    if "error" in params:
+        inbox = _oauth_inbox_dir()
+        if valid_state and inbox is not None:
+            _drop_in_inbox(inbox, state, query)
+        raise AuthError("Google consent was denied or returned an error.")
+    if not valid_state:
         raise AuthError(
             "Could not find a valid 'state' in the pasted response. Paste the "
             "entire URL from your browser's address bar (it contains "
@@ -244,12 +323,17 @@ def submit_callback(response: str) -> dict[str, Any]:
     inbox = _oauth_inbox_dir()
     if inbox is None:
         raise AuthError("CREMIND_SYSTEM_DIR is not set; cannot deliver the OAuth response.")
+    _drop_in_inbox(inbox, state, query)
+    return {"submitted": True, "state": state}
+
+
+def _drop_in_inbox(inbox: Path, state: str, query: str) -> None:
+    """Atomically write ``query`` where :func:`_await_oauth_callback` looks."""
     inbox.mkdir(parents=True, exist_ok=True)
     dst = inbox / f"{state}.txt"
     tmp = dst.with_name(dst.name + ".tmp")
     tmp.write_text(query, encoding="utf-8")
     os.replace(tmp, dst)
-    return {"submitted": True, "state": state}
 
 
 def link(
@@ -261,17 +345,28 @@ def link(
     open_browser: bool = True,
     redirect_uri: str | None = None,
 ) -> dict[str, Any]:
-    """Run the loopback PKCE consent flow and persist tokens locally.
+    """Run Google's installed-app consent flow (PKCE) and persist tokens locally.
 
-    Under ``cremind serve`` the backend hosts the persistent OAuth callback route
-    and injects ``redirect_uri`` (``CREMIND_OAUTH_REDIRECT_URI`` =
-    ``<APP_URL>/api/oauth/callback``). The skill advertises it and waits for
-    the backend to capture the consent redirect, so linking survives the agent
-    turn / subprocess teardown that killed the old per-link server. When
-    ``redirect_uri`` is unset — a standalone CLI run, or a non-loopback ``APP_URL``
-    where a Desktop client can't redirect to the backend — fall back to an
-    ephemeral in-process loopback server (and, for non-loopback deployments, the
-    manual ``complete-link`` paste once the consent URL has been opened).
+    Who receives Google's redirect depends only on whether the Cremind backend
+    manages this run — ``CREMIND_SYSTEM_DIR`` is set, as it always is for
+    agent-run skills:
+
+    * **Backend-managed** — always :func:`_link_via_backend_route`. It advertises
+      ``redirect_uri`` (``CREMIND_OAUTH_REDIRECT_URI``: an http loopback callback
+      the backend derived from an http or https loopback APP_URL, or an operator
+      pin) or, when none was injected, :data:`DEFAULT_BACKEND_REDIRECT_URI`, then
+      waits for the backend's callback route — or ``complete-link`` — to drop the
+      response into the inbox. A listener in this process would be the wrong
+      receiver: the subprocess can be torn down with the agent turn, a random port
+      inside a container is unreachable from the user's browser, and
+      ``run_local_server`` opens a browser before it prints the URL, which fails
+      outright on a headless host.
+    * **Standalone** (``uv run`` outside Cremind) — an ephemeral loopback server on
+      a random localhost port (``run_local_server``). ``open_browser`` only
+      matters here; ``redirect_uri`` is ignored, as there is no inbox to wait on.
+
+    Both paths request PKCE explicitly and refuse to show a consent URL without a
+    ``code_challenge`` (:func:`_require_pkce`).
     """
     from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -281,21 +376,19 @@ def link(
             "client_secret": client_secret,
             "auth_uri": GOOGLE_AUTH_URI,
             "token_uri": GOOGLE_TOKEN_URI,
-            # Ignored: run_local_server overwrites flow.redirect_uri with
-            # http://localhost:<bound-port>/ before building the auth URL.
+            # Placeholder: both paths set flow.redirect_uri before building the
+            # consent URL (run_local_server to http://localhost:<bound-port>/).
             "redirect_uris": ["http://localhost"],
         }
     }
-    flow = InstalledAppFlow.from_client_config(client_config, scopes)
-    if redirect_uri and _oauth_inbox_dir() is not None:
-        # Preferred path under ``cremind serve``: the backend hosts the OAuth
-        # callback route and we wait for it to drop the per-state inbox file, so
-        # consent survives the agent turn / subprocess teardown. The skill still
-        # does the PKCE token exchange.
-        creds = _link_via_backend_route(flow, redirect_uri)
+    # Explicit, never the library default — which has been off (see _require_pkce).
+    flow = InstalledAppFlow.from_client_config(
+        client_config, scopes, autogenerate_code_verifier=True
+    )
+    if _oauth_inbox_dir() is not None:
+        creds = _link_via_backend_route(flow, redirect_uri or DEFAULT_BACKEND_REDIRECT_URI)
     else:
-        # Fallback for a standalone CLI run (no backend): spin up an ephemeral
-        # loopback server in this process on a random localhost port.
+        _guard_pkce(flow)
         creds = _run_local_server_interruptible(
             flow,
             host="localhost",

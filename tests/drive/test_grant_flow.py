@@ -10,6 +10,7 @@ import pytest
 
 import app.drive.grant_flow as gf
 import app.drive.skill_token as st
+from app.config.settings import BaseConfig
 
 DRIVE_FILE = "https://www.googleapis.com/auth/drive.file"
 
@@ -19,11 +20,12 @@ def _wire(monkeypatch, *, linked=True, reachable=None, app_url="http://localhost
         gf.google_discovery, "google_client",
         lambda: {"client_id": "cid", "client_secret": "csecret", "scopes": []},
     )
-    monkeypatch.setattr(gf.BaseConfig, "APP_URL", app_url, raising=False)
-    # Both feed redirect_uri(); a developer machine exporting either would skew
+    monkeypatch.setattr(BaseConfig, "APP_URL", app_url, raising=False)
+    # All three feed redirect_uri(); a developer machine exporting any would skew
     # every redirect assertion below, so start from a known-empty environment.
     monkeypatch.delenv("CREMIND_OAUTH_REDIRECT_URI", raising=False)
     monkeypatch.delenv("CREMIND_UI_PORT", raising=False)
+    monkeypatch.delenv("CREMIND_TLS_TERMINATION", raising=False)
     monkeypatch.setattr(
         gf.skill_token, "status",
         lambda profile: {
@@ -173,6 +175,54 @@ def test_non_loopback_pin_is_ignored(monkeypatch):
         "CREMIND_OAUTH_REDIRECT_URI", "https://test.cremind.io/api/oauth/callback"
     )
     assert gf.redirect_uri() == "http://localhost:1515" + gf.CALLBACK_PATH
+
+
+def test_https_loopback_pin_is_normalised_to_its_http_origin(monkeypatch):
+    """Google would refuse it as given; its host and effective port still name
+    the operator's forward. Portless https is :443, never :80."""
+    _wire(monkeypatch, app_url="https://test.cremind.io")
+    monkeypatch.setenv("CREMIND_OAUTH_REDIRECT_URI", "https://localhost:8443/api/oauth/callback")
+    assert gf.redirect_uri() == "http://localhost:8443" + gf.CALLBACK_PATH
+    monkeypatch.setenv("CREMIND_OAUTH_REDIRECT_URI", "https://localhost/api/oauth/callback")
+    assert gf.redirect_uri() == "http://localhost:443" + gf.CALLBACK_PATH
+    assert gf.capture_is_local() is False
+
+
+def test_https_loopback_app_url_captures_over_http_on_the_same_port(monkeypatch):
+    """The installers' TLS default: the Picker redirects over http to the same
+    port, where the TLS listener bounces it to the HTTPS handler — so capture is
+    local and the UI must not warn about a failing redirect."""
+    _wire(monkeypatch, app_url="https://localhost:1515")
+    assert gf.redirect_uri() == "http://localhost:1515" + gf.CALLBACK_PATH
+    assert gf.capture_is_local() is True
+    assert gf.capture_hint() is None
+    out = gf.start("alice")
+    assert parse_qs(urlparse(out["authorize_url"]).query)["redirect_uri"] == [
+        "http://localhost:1515" + gf.CALLBACK_PATH
+    ]
+    assert out["local_capture"] is True and out["capture_hint"] is None
+
+
+def test_ipv6_and_wider_ipv4_loopback_app_urls_capture_locally(monkeypatch):
+    for app_url, expected in (
+        ("http://[::1]:1515", "http://[::1]:1515"),
+        ("https://[::1]:1515", "http://[::1]:1515"),
+        ("http://127.1.2.3:1515", "http://127.1.2.3:1515"),
+    ):
+        _wire(monkeypatch, app_url=app_url)
+        assert gf.redirect_uri() == expected + gf.CALLBACK_PATH, app_url
+        assert gf.capture_is_local() is True, app_url
+
+
+def test_https_loopback_app_url_behind_an_edge_proxy_is_not_local_capture(monkeypatch):
+    """The proxy owns TLS on that port, so a plaintext redirect there is not
+    ours to bounce — and would hit a TLS-only listener. The redirect falls
+    back to the documented port-forward port, and the UI warns."""
+    _wire(monkeypatch, app_url="https://localhost:8443")
+    monkeypatch.setenv("CREMIND_TLS_TERMINATION", "edge")
+    assert gf.redirect_uri() == "http://localhost:1515" + gf.CALLBACK_PATH
+    assert gf.capture_is_local() is False
+    assert "http://localhost:1515" in gf.capture_hint()
 
 
 def test_docker_server_mode_keeps_the_app_url_port(monkeypatch):

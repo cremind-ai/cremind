@@ -8,8 +8,17 @@ import {
   TlsApiError,
   unregisterTlsClient,
   type TlsHandoffState,
+  type TlsRuntimeStatus,
   type TlsTransition,
 } from './configApi';
+import {
+  httpsReadinessAdvice,
+  probeHttpsReadiness,
+  sameCertificateAuthority,
+  tunnelCommand,
+  type HttpsReadiness,
+  type HttpsReadinessReason,
+} from './httpsReadiness';
 import { subscribeTransportChange, type ProfileEventsSubHandle } from './profileEventsStream';
 import {
   beginMigrationGate,
@@ -64,13 +73,37 @@ const PENDING_PROBE_MS = 30_000;
  *  waited out a long rollout still lands on its own page instead of a login. */
 const TICKET_REFRESH_MS = 90_000;
 
+/** How often an actively waiting tab re-checks the secure address. */
+const PROBE_INTERVAL_MS = 1500;
+
 const phase = ref<HttpsTransitionPhase>('idle');
 const error = ref<string | null>(null);
 const active = ref<TlsTransition | null>(null);
+/** The last readiness verdict from the secure address (null while none ran). */
+const lastReadiness = ref<HttpsReadiness | null>(null);
+/** Why it was not ready, for recovery guidance. */
+const reason = computed<HttpsReadinessReason | null>(() =>
+  lastReadiness.value && !lastReadiness.value.ready ? lastReadiness.value.reason : null);
+/** Deployment facts learned from this tab's own authenticated heartbeats, for
+ *  recovery guidance only. In memory on purpose: the port-forward line names
+ *  cluster objects that are admin-only on the server. */
+const installMode = ref<string | null>(null);
+const portForward = ref<string | null>(null);
+/** Bumped whenever a cached ticket may have changed, so `recoveryUrl` (which
+ *  reads sessionStorage) recomputes. */
+const ticketTick = ref(0);
 
 let subscription: ProfileEventsSubHandle | null = null;
 let channel: BroadcastChannel | null = null;
 let pollGeneration = 0;
+/** Aborts the probes of every loop older than the current poll generation. */
+let probeAbort = new AbortController();
+/** Cuts the current loop's pause short (retry, or a newer generation). */
+let wakeProbe: (() => void) | null = null;
+/** What the last announcement was handled with, so a retry can re-run it. */
+let lastContext: { agentUrl: string; token: string } | null = null;
+/** When this tab started waiting for which transition's secure address. */
+let waitSince: { id: string; at: number } | null = null;
 let quiesceGateRelease: (() => void) | null = null;
 let quiescePreparation: Promise<void> | null = null;
 let quiesceTransitionId: string | null = null;
@@ -182,6 +215,10 @@ function sameTransition(a: TlsTransition | null, b: TlsTransition): boolean {
     && a.public_port === b.public_port);
 }
 
+/** Same switch, same trust: used to decide whether an unauthenticated sibling
+ * announcement may steer this tab's pinned transition. Readiness itself goes
+ * through `evaluateHttpsReadiness`; both pin a generated certificate by its CA,
+ * because a replaced pod renews the leaf under it (see httpsReadiness.ts). */
 function sameTransitionIdentity(a: TlsTransition | null, b: TlsTransition): boolean {
   return Boolean(a
     && a.id === b.id
@@ -189,8 +226,7 @@ function sameTransitionIdentity(a: TlsTransition | null, b: TlsTransition): bool
     && a.source_origin === b.source_origin
     && a.target_origin === b.target_origin
     && a.certificate_kind === b.certificate_kind
-    && a.certificate_sha256 === b.certificate_sha256
-    && a.ca_sha256 === b.ca_sha256
+    && sameCertificateAuthority(a, b)
     && a.same_public_port === b.same_public_port
     && a.public_port === b.public_port);
 }
@@ -239,8 +275,10 @@ function rememberTransition(t: TlsTransition): boolean {
 
 /** Use the hostname/port through which this particular browser reaches the
  * server. Transition announcements are system-wide, so their URL may contain
- * the initiating admin tab's localhost or LAN alias. */
-function localTransition(t: TlsTransition): TlsTransition {
+ * the initiating admin tab's localhost or LAN alias. Unchanged off plain HTTP.
+ * Exported for the Settings/setup pivot, which must reach, link to and bind
+ * tickets to the same address every background tab uses. */
+export function localTransition(t: TlsTransition): TlsTransition {
   if (window.location.protocol !== 'http:') return t;
   try {
     const source = new URL(window.location.origin);
@@ -272,7 +310,10 @@ function transitionMount(): '/' | '/electron-renderer/' {
 
 function currentProfile(route: string): string {
   const first = route.split(/[/?]/).filter(Boolean)[0] ?? '';
-  if (first && !['setup', 'setup-handoff', 'tls-handoff', 'login'].includes(first)) return first;
+  // Public, profile-less routes: their first segment is never a profile.
+  if (first && !['setup', 'setup-handoff', 'tls-handoff', 'login', 'oauth-return'].includes(first)) {
+    return first;
+  }
   try { return localStorage.getItem('profile_id') ?? ''; } catch { return ''; }
 }
 
@@ -367,34 +408,85 @@ export async function primeTlsHandoff(
   };
   const minted = await createTlsHandoff(agentUrl, token, payload);
   sessionStorage.setItem(key, JSON.stringify(minted));
+  ticketTick.value += 1;
   return minted;
 }
 
+// ── polling generations ───────────────────────────────────────────────────
+//
+// Every loop that may navigate this tab (waitForTarget, probeTargetSlowly)
+// belongs to one poll generation. Starting a newer one — a later
+// announcement, a cancellation, a rollback to prepared — aborts the older
+// loop's in-flight probe and wakes its pause, and each loop re-checks its
+// generation after every await and immediately before navigating. A probe
+// that resolves after the switch was cancelled therefore can never move the
+// tab.
+
+function nextPollGeneration(): number {
+  pollGeneration += 1;
+  probeAbort.abort();
+  probeAbort = new AbortController();
+  wakeProbe?.();
+  return pollGeneration;
+}
+
+/** A loop's pause, cut short by `retryHttpsTransition()` or a newer generation. */
+function pauseProbe(ms: number, generation: number): Promise<void> {
+  if (generation !== pollGeneration) return Promise.resolve();
+  const signal = probeAbort.signal;
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const done = () => {
+      if (timer) clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      if (wakeProbe === done) wakeProbe = null;
+      resolve();
+    };
+    timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+    wakeProbe = done;
+  });
+}
+
+function probeTarget(transition: TlsTransition): Promise<HttpsReadiness> {
+  return probeHttpsReadiness(transition, { localize: localTransition, signal: probeAbort.signal });
+}
+
+function noteReadiness(readiness: HttpsReadiness): void {
+  lastReadiness.value = readiness;
+  // Ticket validity is time-based; re-evaluate the recovery link as we go.
+  ticketTick.value += 1;
+}
+
+function noteDeployment(status: TlsRuntimeStatus): void {
+  if (typeof status.install_mode === 'string') installMode.value = status.install_mode;
+  const tunnel = tunnelCommand(status);
+  if (tunnel) portForward.value = tunnel;
+}
+
 async function waitForTarget(transition: TlsTransition, generation: number): Promise<boolean> {
-  phase.value = 'waiting';
-  const started = Date.now();
+  // A focus/online resume restarts this loop for the same switch. Keep the
+  // original start so a tab already showing recovery guidance does not drop
+  // back to a spinner for another 45 seconds every time the window regains
+  // focus — which is exactly when the user returns from fixing the tunnel.
+  const carried = waitSince?.id === transition.id;
+  const started = carried && waitSince ? waitSince.at : Date.now();
+  waitSince = { id: transition.id, at: started };
+  if (phase.value !== 'attention' || Date.now() - started < RECOVERY_HINT_AFTER_MS) {
+    phase.value = 'waiting';
+  }
   while (generation === pollGeneration) {
-    try {
-      const status = await fetchTlsStatus(transition.target_origin);
-      const targetTransition = status.transition
-        ? localTransition(status.transition)
-        : null;
-      if (
-        status.serving_https
-        && status.ready !== false
-        && status.instance_id === transition.instance_id
-        && targetTransition?.phase === 'active'
-        && sameTransitionIdentity(transition, targetTransition)
-      ) return true;
-    } catch {
-      // An untrusted certificate and a server that is still restarting are
-      // indistinguishable to fetch. Keep the current page alive with guidance.
-    }
+    // Bounded: a request the rollout swallows is abandoned after five seconds
+    // and counts as unreachable, so the loop keeps going and keeps explaining.
+    const readiness = await probeTarget(transition);
+    if (generation !== pollGeneration) return false;
+    noteReadiness(readiness);
+    if (readiness.ready) return true;
     if (Date.now() - started >= RECOVERY_HINT_AFTER_MS) {
       phase.value = 'attention';
-      error.value = 'The secure server is still unreachable. Trust the certificate, check the restart, or reopen the Kubernetes port-forward.';
+      error.value = httpsReadinessAdvice(readiness);
     }
-    await new Promise(resolve => setTimeout(resolve, 1500));
+    await pauseProbe(PROBE_INTERVAL_MS, generation);
   }
   return false;
 }
@@ -423,7 +515,17 @@ async function prepareThisClient(
   agentUrl: string,
   token: string,
 ): Promise<void> {
-  if (!token || quiesceTransitionId === transition.id) return;
+  if (!token) return;
+  if (quiesceTransitionId === transition.id) {
+    // Already saved and acknowledged, so this tab is where every acknowledged
+    // tab is. A retry of an overlay left up by a failed status read ends here,
+    // and returning without a phase kept that overlay up for good.
+    if (phase.value === 'attention') {
+      phase.value = 'waiting';
+      error.value = null;
+    }
+    return;
+  }
   if (quiescePreparation) return quiescePreparation;
   const generation = quiesceGeneration;
   quiescePreparation = (async () => {
@@ -474,28 +576,24 @@ async function probeTargetSlowly(
   generation: number,
 ) {
   while (generation === pollGeneration) {
-    await new Promise(resolve => setTimeout(resolve, PENDING_PROBE_MS));
+    await pauseProbe(PENDING_PROBE_MS, generation);
     if (generation !== pollGeneration) return;
     if (token && document.visibilityState === 'visible'
       && !getCachedTlsHandoff(transition.id, TICKET_REFRESH_MS)) {
       // Best effort: a tab that cannot mint one just signs in again on HTTPS.
       try { await primeTlsHandoff(transition, agentUrl, token, true); } catch { /* not fatal */ }
+      if (generation !== pollGeneration) return;
     }
-    try {
-      const status = await fetchTlsStatus(transition.target_origin);
-      const target = status.transition ? localTransition(status.transition) : null;
-      if (
-        status.serving_https
-        && status.ready !== false
-        && status.instance_id === transition.instance_id
-        && target?.phase === 'active'
-        && sameTransitionIdentity(transition, target)
-      ) {
-        if (generation !== pollGeneration) return;
-        await handleHttpsTransition(target, agentUrl, token);
-        return;
-      }
-    } catch { /* the deployment change has not landed yet */ }
+    const readiness = await probeTarget(transition);
+    if (generation !== pollGeneration) return;
+    noteReadiness(readiness);
+    if (readiness.ready && readiness.transition) {
+      await handleHttpsTransition(readiness.transition, agentUrl, token);
+      return;
+    }
+    // A secure server that answers but could not finish is worth saying on
+    // the chip; anything else just means the deployment change has not landed.
+    if (readiness.reason === 'activation-failed') error.value = readiness.message;
   }
 }
 
@@ -505,7 +603,7 @@ async function moveThisTab(
   token: string,
 ) {
   if (window.location.protocol === 'https:') return;
-  const generation = ++pollGeneration;
+  const generation = nextPollGeneration();
   try {
     if (transition.phase === 'prepared') {
       // The pre-activation barrier mints a fresh ticket after uploads settle.
@@ -525,27 +623,34 @@ async function moveThisTab(
         transitionId: transition.id,
         instanceId: transition.instance_id,
       });
+      if (generation !== pollGeneration) return;
       if (!moved.ok) {
         throw new Error(moved.error || 'Electron could not verify and open the HTTPS origin.');
       }
       return;
     }
-    phase.value = 'preparing';
+    // A retry from the recovery overlay keeps it up instead of flashing the
+    // preparing chip; uploads have long settled by then.
+    if (phase.value !== 'attention') phase.value = 'preparing';
     await waitForMigrationReady(5 * 60_000);
-    let ticket = getCachedTlsHandoff(transition.id);
+    if (generation !== pollGeneration) return;
     if (!await waitForTarget(transition, generation)) return;
     // Tickets are minted while the authenticated HTTP source is still live.
     // Never send a bearer token to target_origin: transition metadata is
     // intentionally credential-free and may come from browser storage or BC.
     // A tab whose private ticket expired signs in over verified HTTPS with its
     // intended route retained, as opposed to extending the old session.
-    ticket = getCachedTlsHandoff(transition.id);
-    phase.value = 'moving';
+    // Read the ticket only now: a refresh during the wait may have replaced it.
+    const ticket = getCachedTlsHandoff(transition.id);
     const destination = ticket
       ? handoffUrl(transition, ticket.ticket)
       : expiredSessionUrl(transition);
+    if (generation !== pollGeneration) return;
+    phase.value = 'moving';
     window.location.replace(destination);
   } catch (e) {
+    // A superseded attempt has nothing to report: the newer one owns the tab.
+    if (generation !== pollGeneration) return;
     phase.value = 'attention';
     error.value = e instanceof Error ? e.message : String(e);
   }
@@ -559,14 +664,29 @@ export async function handleHttpsTransition(
   if (!validTransition(transition)) return;
   transition = localTransition(transition);
   if (!validTransition(transition)) return;
+  lastContext = { agentUrl, token };
   if (!rememberTransition(transition)) {
-    // A transient HTTPS fetch or handoff failure leaves the recovery overlay
-    // on the old origin. Focus/online/pageshow must retry the same durable
-    // transition instead of treating it as a duplicate announcement.
-    if (phase.value === 'attention' && active.value?.id === transition.id
-      && transition.phase !== 'prepared' && transition.phase !== 'cancelled') {
-      error.value = null;
-      await moveThisTab(transition, agentUrl, token);
+    // Act on the switch this tab holds, never on the refused frame: that one
+    // is a duplicate, or stale (rememberTransition takes anything newer), and a
+    // stale phase must neither clear nor restart the wait of a switch that has
+    // moved on. Resume paths also re-announce an active switch as activating.
+    const held = active.value;
+    if (phase.value === 'attention' && held?.id === transition.id) {
+      if (held.phase === 'prepared') {
+        // Nothing waits on a switch that is merely prepared, and no retry
+        // path (this one, "Check now", a resume) ever ran for one — so an
+        // overlay left up for it (a status read that timed out) stayed for
+        // good. Put the tab back to work.
+        phase.value = 'idle';
+        error.value = null;
+        lastReadiness.value = null;
+      } else if (held.phase !== 'cancelled') {
+        // A transient HTTPS fetch or handoff failure leaves the recovery
+        // overlay on the old origin. Focus/online/pageshow must retry the same
+        // durable transition instead of treating it as a duplicate.
+        error.value = null;
+        await moveThisTab(held, agentUrl, token);
+      }
     }
     return;
   }
@@ -579,9 +699,11 @@ export async function handleHttpsTransition(
     quiesceGateRelease?.();
     quiesceGateRelease = null;
     releaseBrowserMigration(transition.id);
-    pollGeneration += 1;
+    nextPollGeneration();
+    waitSince = null;
     phase.value = 'idle';
     error.value = null;
+    lastReadiness.value = null;
     return;
   }
   if (transition.phase === 'cancelled') {
@@ -590,9 +712,11 @@ export async function handleHttpsTransition(
     quiesceGateRelease?.();
     quiesceGateRelease = null;
     releaseBrowserMigration(transition.id);
-    pollGeneration += 1;
+    nextPollGeneration();
+    waitSince = null;
     phase.value = 'idle';
     error.value = null;
+    lastReadiness.value = null;
     return;
   }
   if (transition.phase === 'activating' && transition.awaiting_operator) {
@@ -604,13 +728,49 @@ export async function handleHttpsTransition(
     quiesceGateRelease?.();
     quiesceGateRelease = null;
     releaseBrowserMigration(transition.id);
-    const generation = ++pollGeneration;
+    const generation = nextPollGeneration();
     phase.value = 'pending';
     error.value = transition.activation_error ?? null;
     void probeTargetSlowly(transition, agentUrl, token, generation);
     return;
   }
   await moveThisTab(transition, agentUrl, token);
+}
+
+/** Check the secure address again right now.
+ *
+ * Wakes whichever loop is waiting (the blocking wait or the slow pending
+ * probe); when nothing is running — the last attempt ended in `attention`
+ * with an error — it re-runs the move for the transition this tab holds. */
+export function retryHttpsTransition(): void {
+  if (wakeProbe) {
+    wakeProbe();
+    return;
+  }
+  // Otherwise a probe is already in flight, unless the last attempt failed
+  // outright. Only that case needs a new attempt — and never for a switch
+  // still waiting on its operator, which must not start blocking the tab.
+  if (phase.value !== 'attention') return;
+  const transition = active.value ?? savedHttpsTransition();
+  if (!transition || !lastContext || window.location.protocol !== 'http:') return;
+  if (!['activating', 'active'].includes(transition.phase) || transition.awaiting_operator) return;
+  error.value = null;
+  const { agentUrl, token } = lastContext;
+  void moveThisTab(transition, agentUrl, token);
+}
+
+/** The durable transition this browser recorded, localized to this tab's
+ * address — for pages that must explain a switch while the plaintext server
+ * no longer answers them (it went recovery-only, or the pod is gone). */
+export function savedHttpsTransition(): TlsTransition | null {
+  try {
+    const saved = safeParse<TlsTransition>(localStorage.getItem(TRANSITION_KEY));
+    if (!saved || !validTransition(saved) || saved.phase === 'cancelled') return null;
+    const local = localTransition(saved);
+    return validTransition(local) ? local : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Install one coordinator per renderer. No credentials are broadcast. */
@@ -653,12 +813,14 @@ export function installHttpsTransitionCoordinator(
       // from the configured server and use its transition fields, rather than
       // trusting a sibling tab's destination or phase.
       const status = await fetchTlsStatus(agentUrl);
+      if (stopped) return;
       const current = status.transition ? localTransition(status.transition) : null;
       if (current?.id === candidate.id && current.instance_id === candidate.instance_id) {
         await handleHttpsTransition(current, agentUrl, token);
       }
       return;
     } catch (e) {
+      if (stopped) return;
       const pinned = active.value;
       if (!pinned || !sameTransitionIdentity(pinned, candidate)) return;
       if (e instanceof TlsApiError && e.status === 426) {
@@ -669,16 +831,13 @@ export function installHttpsTransitionCoordinator(
         );
         return;
       }
-      try {
-        const targetStatus = await fetchTlsStatus(pinned.target_origin);
-        const target = targetStatus.transition ? localTransition(targetStatus.transition) : null;
-        if (targetStatus.serving_https && targetStatus.ready !== false
-          && target?.phase === 'active'
-          && sameTransitionIdentity(pinned, target)) {
-          await handleHttpsTransition(target, agentUrl, token);
-          return;
-        }
-      } catch { /* a restart or certificate prompt needs another attempt */ }
+      // Never throws; a restart or certificate prompt reads as not ready.
+      const readiness = await probeHttpsReadiness(pinned, { localize: localTransition });
+      if (stopped) return;
+      if (readiness.ready && readiness.transition) {
+        await handleHttpsTransition(readiness.transition, agentUrl, token);
+        return;
+      }
       if (!channelRetryTimer) {
         channelRetryTimer = setTimeout(() => {
           channelRetryTimer = null;
@@ -695,6 +854,11 @@ export function installHttpsTransitionCoordinator(
     if (stopped || !token || window.location.protocol !== 'http:') return;
     try {
       const status = await registerTlsClient(agentUrl, token, migrationTabId);
+      if (stopped) return;
+      // The heartbeat answers as this tab's profile, so an admin's carries
+      // the Kubernetes identity: remember the reconnect line for later, when
+      // the rollout has taken this server away and nobody can be asked.
+      noteDeployment(status);
       if (status.transition) {
         await handleHttpsTransition(status.transition, agentUrl, token);
       }
@@ -734,6 +898,7 @@ export function installHttpsTransitionCoordinator(
     let sourceRecoveryOnly = false;
     try {
       const sourceStatus = await fetchTlsStatus(window.location.origin);
+      if (stopped) return;
       const sourceTransition = sourceStatus.transition;
       if (sourceTransition?.id === saved.id
         && sourceTransition.instance_id === saved.instance_id) {
@@ -748,19 +913,15 @@ export function installHttpsTransitionCoordinator(
     } catch (e) {
       sourceRecoveryOnly = e instanceof TlsApiError && e.status === 426;
     }
-    try {
-      const targetStatus = await fetchTlsStatus(saved.target_origin);
-      const targetTransition = targetStatus.transition
-        ? localTransition(targetStatus.transition)
-        : null;
-      const localSaved = localTransition(saved);
-      if (targetStatus.serving_https && targetStatus.ready !== false
-        && targetTransition?.phase === 'active'
-        && sameTransitionIdentity(localSaved, targetTransition)) {
-        await handleHttpsTransition(targetTransition, agentUrl, token);
-        return;
-      }
-    } catch { /* certificate trust or restart recovery stays on this page */ }
+    if (stopped) return;
+    // Certificate trust or a restart still in progress reads as not ready
+    // and keeps this page, with its guidance, where it is.
+    const readiness = await probeHttpsReadiness(localTransition(saved), { localize: localTransition });
+    if (stopped) return;
+    if (readiness.ready && readiness.transition) {
+      await handleHttpsTransition(readiness.transition, agentUrl, token);
+      return;
+    }
     if (sourceRecoveryOnly) {
       // A 426 is the source saying it has become recovery-only, which proves
       // the transport moved on. Stop waiting and go find the secure address.
@@ -782,8 +943,12 @@ export function installHttpsTransitionCoordinator(
       await handleHttpsTransition({ ...saved, phase: 'activating' }, agentUrl, token);
       return;
     }
-    phase.value = 'attention';
-    error.value = 'The HTTP server is temporarily unreachable. This tab will retry before acknowledging the HTTPS switch.';
+    // Prepared or quiescing, and the source did not answer this once (a read
+    // that timed out mid-rollout, a blip). Nothing has activated, so there is
+    // nothing to block this tab on and no secure address to recover to — the
+    // blocking overlay raised here used to stay up for good, because every
+    // path that clears it again skips a prepared switch. Keep what this tab
+    // shows and read again shortly: the next answer is handled like any other.
     scheduleResume();
     } finally {
       resumeRunning = false;
@@ -826,11 +991,35 @@ export function installHttpsTransitionCoordinator(
   };
 }
 
+/** The explicit "open the secure address" link for this tab, right now: the
+ * one-use handoff when this tab still holds a live ticket (the page, its
+ * drafts and its session come along), else a login on HTTPS that keeps this
+ * route for afterwards. Empty while no switch is known. */
+const recoveryUrl = computed(() => {
+  void ticketTick.value;
+  const known = active.value;
+  const transition = known && known.phase !== 'cancelled' ? known : savedHttpsTransition();
+  if (!transition) return '';
+  const ticket = getCachedTlsHandoff(transition.id);
+  return ticket ? handoffUrl(transition, ticket.ticket) : expiredSessionUrl(transition);
+});
+
 export const httpsTransitionState = {
   phase: readonly(phase),
   error: readonly(error),
   transition: readonly(active),
+  /** Why the secure address was not ready at the last probe, and the whole
+   *  verdict (its `message` is the server's own words when it answered). */
+  reason,
+  readiness: readonly(lastReadiness),
+  /** See `recoveryUrl` above. */
+  recoveryUrl,
+  /** `install_mode` and the Kubernetes reconnect line (admin only), as last
+   *  heard from this server while it still answered. */
+  installMode: readonly(installMode),
+  portForward: readonly(portForward),
   /** Whether the user has put the blocking explanation away for what is on
    *  screen. The switch itself carries on regardless. */
   overlayDismissed,
+  retry: retryHttpsTransition,
 };

@@ -127,6 +127,46 @@ use either fallback — both complete the exchange server-side:
 - run `cremind llm codex-oauth login` on your own machine against the cluster —
   the CLI binds `1455` locally, catches the redirect there, and relays the code.
 
+### Linking Google accounts
+
+The Google skills (`gmail`, `gcalendar`, `gdrive`, `gdocs`, `gsheets`), **Connect
+Google** on the Calendar & Schedule page and the Drive file picker all use
+Cremind's shared Google *Desktop* OAuth client by default, and Google returns
+that client's consent only to a plain-`http` loopback address. So the browser
+comes back to `http://localhost:<port>/api/oauth/...`, never to a cluster
+hostname. The port is `1515` unless `cremind.appUrl` names another one:
+
+- a `localhost` appUrl sets it for every Google flow (except an `https` one on an
+  Ingress install, where the controller owns that port);
+- any other appUrl with an explicit port (a NodePort or LAN address such as
+  `http://192.168.1.50:30080`) moves only **Connect Google** and the Drive picker
+  to that port on `localhost`; the skills stay on `1515`. Forward both ports, or
+  make every flow agree by pinning a loopback `CREMIND_OAUTH_REDIRECT_URI` in
+  `cremind.extraEnv` (see below).
+
+Keep the port-forward running while you approve:
+
+```bash
+kubectl -n cremind port-forward svc/cremind 1515:80
+```
+
+- **Under `cremind.ssl`** the pod still answers that plaintext callback on the
+  same port: it redirects the three Google callback paths, `GET` only, to its
+  own HTTPS handler, so trust the Cremind CA first or the redirect stops at a
+  certificate warning. Every other plaintext API request is still refused.
+- **On an Ingress install** use the same port-forward, or finish a skill link
+  with its `complete-link` paste: copy the
+  `http://localhost:1515/api/oauth/callback?...` URL out of the address bar (the
+  page need not load) and hand it to the skill. A Drive grant has
+  `cremind drive grant-complete` for the same purpose.
+- Forwarding another local port, or want every flow on one port? Pin the
+  callback with a loopback `CREMIND_OAUTH_REDIRECT_URI` in `cremind.extraEnv`,
+  e.g. `http://localhost:8080/api/oauth/callback` — the skills, Connect Google
+  and the Drive picker all follow it.
+
+No hosted broker receives the authorization: Google redirects your browser, the
+tunnel carries the code to the pod, and the token exchange runs there.
+
 ### Coding agents (Claude Code, Codex)
 
 These are a separate sign-in from the LLM providers above: each one authenticates
@@ -236,7 +276,7 @@ and version below). An already completed setup switches immediately with
 helm list --namespace cremind
 helm upgrade cremind oci://registry-1.docker.io/cremind/cremind \
   --version <current-chart-version> --namespace cremind --reuse-values \
-  --set cremind.ssl=auto
+  --set cremind.ssl=auto --set cremind.appUrl=https://localhost:1515
 kubectl --namespace cremind rollout status deployment/cremind --timeout=5m
 kubectl --namespace cremind port-forward svc/cremind 1515:80 1455:1455 6080:6080
 ```
@@ -246,21 +286,37 @@ this release is — `CREMIND_K8S_NAMESPACE`, `CREMIND_K8S_RELEASE`,
 `CREMIND_K8S_WORKLOAD` (the Deployment, the Service and the Ingress all carry
 that one name) and `CREMIND_K8S_SERVICE_PORT`, all in the env ConfigMap — so
 **Settings > Security** prints this runbook with your real names already filled
-in, and the exported config file (Setup Wizard, or **Developer > Configuration
-File** afterwards) carries them together with the `kubectl port-forward` command
-to reconnect. A chart older than these keys still works: the pod reads its
-namespace off the service-account mount and infers the workload from its pod
-name, marks the answer as inferred, and leaves `<release>` for you to fill in
-after `helm list --all-namespaces`.
+in, and with `cremind.appUrl` set to the HTTPS form of the address your browser
+is using, port included. The exported config file (Setup Wizard, or
+**Developer > Configuration File** afterwards) carries the names together with
+the `kubectl port-forward` command to reconnect. A chart older than these keys
+still works: the pod reads its namespace off the service-account mount and
+infers the workload from its pod name, marks the answer as inferred, and leaves
+`<release>` for you to fill in after `helm list --all-namespaces`.
 
-Omit `6080:6080` for the basic image. If `cremind.appUrl` or
+Omit `6080:6080` for the basic image. `cremind.appUrl` is the HTTPS address you
+will open — `https://localhost:1515` for the port-forward above, or the same LAN
+address/port with `https://`; if you forward another local port, use it in both
+places. Pass it even if the chart derived it before: `--reuse-values` keeps an
+explicit `http://` appUrl, which the chart refuses to render under
+`cremind.ssl`, and the Google callback is derived from it. If
 `cremind.atlassianRedirectUri` was explicitly set, pass its matching HTTPS URL
-on the upgrade too. Remove any conflicting `CREMIND_SSL` entry in `extraEnv`.
+on the upgrade too.
+
+Remove any conflicting `CREMIND_SSL` entry in `extraEnv`, and any `APP_URL`
+entry there as well: `extraEnv` becomes the container's own `env:`, which beats
+the ConfigMap, so it silently overrides `cremind.appUrl` (and the chart's
+http/https check never sees it). The chart leaves `CORS_ALLOWED_ORIGINS` unset,
+which allows every origin; if `extraEnv` sets it, list both the HTTP and the
+HTTPS origin in it.
+
 Reopen the port-forward after rollout: a Helm upgrade replaces the pod, which
 closes a tunnel to the old pod. Then open `https://localhost:1515` (or the same
 LAN address/port with `https://`). Cremind tabs waiting for the switch resume
-when the HTTPS address is reachable and trusted; a browser suspended during
-the change may need to be brought to the foreground.
+when the HTTPS address is reachable and trusted — the new pod reissues its
+server certificate, but under the same Cremind CA, so nothing needs trusting
+again. A browser suspended during the change may need to be brought to the
+foreground.
 
 Use Helm for this change: it updates the HTTP proxy to the TCP relay, Service
 routing, probes, URLs, and noVNC port together. Changing only `CREMIND_SSL`
@@ -311,6 +367,11 @@ the existing release's values. If cert-manager owns the Secret, keep its
 annotations and issuer workflow instead of creating the Secret by hand. Remove
 any legacy `CREMIND_SSL` entry from `cremind.extraEnv`; `cremind.ssl` must stay
 empty or `false` because the Ingress and in-pod TLS remain mutually exclusive.
+An `APP_URL` entry there overrides `cremind.appUrl` just as it does for in-pod
+TLS (remove it or make it the public HTTPS origin), and an explicit
+`CORS_ALLOWED_ORIGINS` needs the HTTPS origin next to the HTTP one. Opened
+through a port-forward, **Settings > Security** prints `https://<public-host>`
+for `cremind.appUrl`: a tunnel cannot tell which hostname the Ingress serves.
 
 Do **not** enable a permanent HTTP-to-HTTPS redirect or HSTS while HTTP
 recovery is enabled. After activation, Cremind uses HTTP document navigation
@@ -540,7 +601,7 @@ embeddings.
 | _(release channel)_ | auto from `image.tag` | Not a knob. `test` when the effective tag is an RC (`…rcN.devM`, i.e. the `--devel` chart), else `production`; the in-app **Updates** page reports this. Force it via `cremind.extraEnv` (`CREMIND_UPGRADE_CHANNEL`). |
 | `cremind.installMode` | `kubernetes` | Drives external-only service modes. |
 | `cremind.setupWizardEnv` | `kubernetes` | Pre-fills the wizard. |
-| `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http(s)://localhost:1515`. |
+| `cremind.appUrl` | `""` → auto | A2A card URL; auto-derives the Ingress URL or `http(s)://localhost:1515`. A `localhost` value sets the Google callback port for every flow; any other value with an explicit port sets it for Calendar connect and the Drive picker only ([Linking Google accounts](#linking-google-accounts)). An `APP_URL` in `cremind.extraEnv` overrides it. |
 | `cremind.ssl` | `""` | HTTP by default; boolean `false` or string `none` explicitly disables in-pod TLS, while boolean `true` selects `after-setup`. `auto` = in-pod HTTPS with a generated local CA from the first boot; `after-setup` = the same, but plain HTTP until the Setup Wizard finishes so the CA is trusted before any https page loads (recommended when a browser is involved). Both switch the sidecar to an L4 passthrough relay and reject `ingress.enabled`. See [HTTPS](#https-in-pod-tls). |
 | `cremind.sslAutoHosts` | `""` | Extra SANs (CSV) for the generated certificate, for names beyond localhost/pod. |
 | `persistence.system.*` | `5Gi`, RWO | `bootstrap.toml`, tokens, profiles. |
