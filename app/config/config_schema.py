@@ -289,24 +289,6 @@ CONFIG_SCHEMA: dict[str, ConfigGroup] = {
                 description="An observation longer than this many tokens is cut to its first N tokens and marked as truncated, so the model knows the command succeeded and the rest was dropped by Cremind. Raise it if agents keep re-running commands whose output does not fit.",
                 min=100, max=200000,
             ),
-            "preserve_recent": Field(
-                type="number", default_toml="tool_result.preserve_recent",
-                label="Recent observations kept full",
-                description="The N most recent observations always pass through at full length, regardless of size.",
-                min=0, max=10,
-            ),
-            "head_tokens": Field(
-                type="number", default_toml="tool_result.head_tokens",
-                label="Head excerpt tokens",
-                description="Tokens kept from the beginning of a truncated observation.",
-                min=0, max=10000,
-            ),
-            "tail_tokens": Field(
-                type="number", default_toml="tool_result.tail_tokens",
-                label="Tail excerpt tokens",
-                description="Tokens kept from the end of a truncated observation.",
-                min=0, max=10000,
-            ),
         },
     ),
     "memory": ConfigGroup(

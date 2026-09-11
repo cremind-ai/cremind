@@ -1,5 +1,5 @@
 ---
-description: "Inspect, override, and reset **per-profile agent settings** with `cremind config schema`, `get`, `set`, and `reset`: set the system timezone used by the scheduler and clock, choose whether the agent must ask for approval before messaging channel clients (`channels.confirm_before_send` — turn it off so unattended automations can send without stopping to ask; individual clients can be overridden with `cremind channels set-confirm`), and tune the reasoning-agent loop (max steps, retries, temperature, max tokens, steps history, prompt caching, reasoning-trace replay), conversation compaction, tool-result truncation, and long-term memory. Use this to change how the agent behaves for a profile — including which timezone schedules fire in — distinct from `cremind llm` (which models/providers) and `cremind tools` (per-tool config). Also the home of the Setup Wizard's configuration file: re-download my config, lost my setup file, get my Cremind config file back, recover my token, agent URL, database and VNC connection details — from **Sidebar → Developer → Configuration File**, as `cremind-<profile>-config.md`, `.json` or `.env`. On Kubernetes that file also records which namespace, Helm release and Deployment/Service this install is, and the `kubectl port-forward` command that reconnects to it from your own machine."
+description: "Inspect, override, and reset **per-profile agent settings** with `cremind config schema`, `get`, `set`, and `reset`: the system timezone schedules fire in, whether the agent asks for approval before messaging channel clients (`channels.confirm_before_send`; override per client with `cremind channels set-confirm`), the reasoning-agent loop (max steps, retries, temperature, max tokens, prompt caching, reasoning-trace replay), conversation compaction, tool-result truncation, and long-term memory. Distinct from `cremind llm` (models and providers) and `cremind tools` (per-tool config). Also the home of the Setup Wizard's configuration file — re-download my config, lost my setup file, recover my token, agent URL, database and VNC details — from **Sidebar → Developer → Configuration File** as `cremind-<profile>-config.md`, `.json` or `.env`; on Kubernetes it also records the namespace, Helm release and Service, and the `kubectl port-forward` command that reconnects to the install."
 ---
 
 # `cremind config` — Per-Profile Settings Reference
@@ -11,21 +11,24 @@ freely switch between the two: anything you change in the CLI shows up
 on that page, and anything you change there is visible to `cremind config
 get`.
 
-The settings are grouped into five areas:
+The settings are grouped into six areas:
 
 - **System** — install-level preferences. The **timezone** sets the
   wall-clock zone the scheduler fires time-based events in and the agent
   reports for "what time is it". Leave it as `auto` to inherit the admin
   profile's zone (for profiles that never set their own), then the
   `CREMIND_TIMEZONE` environment variable, then the server's OS zone.
+- **Channels** — how the agent behaves when it messages the people who
+  talk to you through a channel (Telegram, WhatsApp, …); in particular
+  whether it must ask for your approval before each send.
 - **Reasoning Agent** — iteration limits and per-call LLM parameters
   for the agent loop that drives every conversation turn, plus the
   prompt-cache and reasoning-trace-replay switches.
 - **Conversation Compaction** — folds the oldest turns into a running
   summary so long conversations stay within the model's context window.
-- **Tool Result Truncation** — shortens older tool observations before
-  they are re-sent to the reasoning LLM (the full result is always kept
-  in the database and shown in the web UI).
+- **Tool Result Truncation** — clamps each tool result before it is fed
+  back to the reasoning LLM (the full result is always kept in the
+  database and shown in the web UI).
 - **Memory** — long-term, cross-conversation facts about the user.
 
 Every setting has a built-in **default**. When you change a setting
@@ -305,6 +308,8 @@ local zone. An invalid IANA name or offset is rejected by `cremind config set`.
 How the agent behaves when it messages the people who talk to you through a
 channel (Telegram, WhatsApp, …).
 
+**Settings → Config card:** **Channels** (the second card on the page).
+
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `channels.confirm_before_send` | boolean | `true` | Ask for your approval before the agent sends a message to a channel client. |
@@ -341,7 +346,7 @@ message` is unaffected: there `--send` is itself your approval.
 
 Controls the agent loop's iteration limits and per-call LLM parameters.
 
-**Settings → Config card:** **Reasoning Agent** (the second card on the
+**Settings → Config card:** **Reasoning Agent** (the third card on the
 page).
 
 | Key                            | UI label              | Type    | Default | Range          | Meaning                                                                             |
@@ -367,7 +372,7 @@ headless, and event runs that have no popup. A deterministic floor always clamps
 the assembled prompt to the model's window, so it can **never overflow**, even
 when compaction is disabled.
 
-**Settings → Config card:** **Conversation Compaction** (the third card on
+**Settings → Config card:** **Conversation Compaction** (the fourth card on
 the page).
 
 | Key                                   | UI label                    | Type    | Default  | Range           | Meaning                                                                                  |
@@ -384,20 +389,40 @@ the page).
 
 ### Group `tool_result` — Tool Result Truncation
 
-Limits applied to tool observations when they are re-sent to the reasoning
-LLM. The full result is always stored in the database and shown in the web UI;
-only the copy fed back into the next reasoning prompt is shortened.
+A clamp on how much of each tool result reaches the reasoning LLM. **Every**
+tool result is measured as it is handed back to the model — including the
+one from the step that just ran — and anything longer than
+`tool_result.max_tokens` is cut. The clamp keeps the **beginning** of the
+output (there is no tail excerpt) and appends a notice telling the model that
+the command *succeeded*, that only the start is shown, and that the way to see
+more is to **narrow the output** — add filters, lower a `--limit` /
+`--max-results` flag, ask for a compact or summary format, page through it —
+rather than re-run the same command, redirect it to a file, or go read the
+tool's source chasing the missing tail.
 
-**Settings → Config card:** **Tool Result Truncation** (the fourth card on
+**The full result is never lost.** Only the copy fed into the next reasoning
+prompt is clamped; the complete output is always stored in the conversation
+database and rendered in full in the web UI, so you can read what the model
+could not.
+
+**Two exemptions:** loading a skill is never clamped, so the whole `SKILL.md`
+reaches the model and stays in its context; and neither is the result of an
+event task the agent reads early with `get_event_task_results`, which must not
+come back shorter than the same result delivered as its own turn.
+
+Raise `max_tokens` if agents keep re-running commands whose output does not
+fit; lower it if long tool output is crowding out the conversation. Setting
+`tool_result.enabled` to `false` removes the clamp entirely — every result
+goes to the model whole, which can overflow the context window on a single
+noisy command.
+
+**Settings → Config card:** **Tool Result Truncation** (the fifth card on
 the page).
 
 | Key                          | UI label                       | Type    | Default | Range           | Meaning                                                                                  |
 |------------------------------|--------------------------------|---------|---------|-----------------|------------------------------------------------------------------------------------------|
-| `tool_result.enabled`        | Enabled                        | boolean | `true`  | —               | When on, older tool observations are shortened to a head/tail excerpt before being included in the next reasoning prompt. |
-| `tool_result.max_tokens`     | Per-observation token threshold | number | `1000`  | 100 – 200000    | An older observation longer than this many tokens is replaced with a head excerpt + truncation marker + tail excerpt. |
-| `tool_result.preserve_recent`| Recent observations kept full  | number  | `1`     | 0 – 10          | The N most recent observations always pass through at full length, regardless of size.   |
-| `tool_result.head_tokens`    | Head excerpt tokens            | number  | `200`   | 0 – 10000       | Tokens kept from the beginning of a truncated observation.                               |
-| `tool_result.tail_tokens`    | Tail excerpt tokens            | number  | `200`   | 0 – 10000       | Tokens kept from the end of a truncated observation.                                      |
+| `tool_result.enabled`        | Enabled                        | boolean | `true`  | —               | When on, a tool result longer than the threshold below is cut to its first N tokens (plus a truncation notice) before it is fed back to the reasoning LLM. When off, every result is sent whole. |
+| `tool_result.max_tokens`     | Per-observation token threshold | number | `4000`  | 100 – 200000    | A result longer than this many tokens is cut to its first N tokens and marked as truncated, so the model knows the command succeeded and the rest was dropped by Cremind. Raise it if agents keep re-running commands whose output does not fit. |
 
 ### Group `memory` — Memory
 
@@ -407,7 +432,7 @@ summary at the compaction fold (so it **requires Compaction enabled**). When
 Vector Embedding is on, facts are stored in the vector store and retrieved by
 relevance; otherwise they live in a small size-capped queue. Off by default.
 
-**Settings → Config card:** **Memory** (the fifth card on the page).
+**Settings → Config card:** **Memory** (the sixth card on the page).
 
 | Key                              | UI label                   | Type    | Default | Range    | Meaning                                                                                  |
 |----------------------------------|----------------------------|---------|---------|----------|------------------------------------------------------------------------------------------|

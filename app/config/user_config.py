@@ -103,9 +103,6 @@ class AgentRuntimeConfig:
     enable_prompt_cache: bool
     tool_result_enabled: bool
     tool_result_max_tokens: int
-    tool_result_preserve_recent: int
-    tool_result_head_tokens: int
-    tool_result_tail_tokens: int
     replay_reasoning_steps: bool
 
 
@@ -123,9 +120,6 @@ def resolve_agent_config(profile: str) -> AgentRuntimeConfig:
         enable_prompt_cache=bool(agent["enable_prompt_cache"]),
         tool_result_enabled=bool(tool_result["enabled"]),
         tool_result_max_tokens=int(tool_result["max_tokens"]),
-        tool_result_preserve_recent=int(tool_result["preserve_recent"]),
-        tool_result_head_tokens=int(tool_result["head_tokens"]),
-        tool_result_tail_tokens=int(tool_result["tail_tokens"]),
         replay_reasoning_steps=bool(agent["replay_reasoning_steps"]),
     )
 

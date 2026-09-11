@@ -84,9 +84,6 @@ enabled = true
 # as a broken command and costs several wasted retry steps. Results that still
 # exceed it are marked as truncated rather than cut silently.
 max_tokens = 4000
-preserve_recent = 1
-head_tokens = 200
-tail_tokens = 200
 
 [memory]
 enabled = false                # opt-in; setup wizard offers to flip this to true. Requires [compaction] enabled — long-term memory is generated at the compaction fold.
