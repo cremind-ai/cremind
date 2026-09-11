@@ -1,5 +1,5 @@
 ---
-description: "How to write an Cremind documentation file: the required YAML frontmatter shape, how the `description` field drives retrieval in `documentation_search`, body conventions, and how to verify the document is indexed."
+description: "How to write a Cremind documentation file: the required YAML frontmatter shape, how the `description` field drives retrieval in `documentation_search` and its 1,200-character limit, body conventions including the size budget and self-contained sections for long documents, and how to verify the document is indexed."
 ---
 
 # Writing an Cremind Document
@@ -11,13 +11,14 @@ two watched documentation roots:
 - Per-profile: `<CREMIND_WORKING_DIR>/<profile>/documents/*.md`
 
 When a file appears in either tree, the documents watcher parses it and, if
-it is valid, indexes it into the Qdrant collection used by the
+it is valid, indexes it into the vector store (Qdrant or Chroma) used by the
 `documentation_search` built-in tool. What gets embedded is the file's
 identity (its filename, with any leading `[tag]` stripped) followed by its
 `description` — the body is *not* indexed. Retrieval then runs in two
 stages: vector search ranks candidates by that embedded text, and an
 internal LLM judge picks the single best match from the top candidates'
-names + descriptions. The body is read from disk on demand only after the
+names + descriptions (with Vector Embedding off, the judge reviews every
+document instead). The body is read from disk on demand only after the
 judge picks a document.
 
 ## File format
@@ -86,6 +87,11 @@ Guidelines:
 - **Aim for roughly two sentences (~250–350 characters).** Don't enumerate
   every subcommand — list only the ones that disambiguate; the body carries
   the rest.
+- **Never exceed 1,200 characters.** Only the first 1,200 characters of a
+  description are used — for ranking *and* by the judge — so anything past
+  that point does nothing, and the server logs a warning naming the file.
+  (The embedding model truncates silently at its own window; this limit
+  makes the cut explicit.) Bundled docs are held to it by a test.
 - **Quote the value** (`description: "..."`) so colons, hashes, and other
   YAML special characters parse cleanly; escape embedded double quotes as
   `\"`.
@@ -115,6 +121,23 @@ reader who already knows roughly why they're here.
 - Cross-reference other documents or skills by relative path.
 - Don't repeat the description verbatim in the body; the body is for
   detail, the description is for discovery.
+- **Aim for a body under about 3,500 tokens (roughly 14,000 bytes of
+  English).** The agent's default tool-result budget
+  (`tool_result.max_tokens`) is 4,000 tokens, and a `cremind` CLI reference
+  arrives with an agent directive of about 300 tokens in front of it. A
+  longer document still works, but a search then returns only its head, a
+  table of contents with each section's size, and the sections whose headings
+  match the query; the agent reads further sections one at a time with
+  `read_documentation_section` (the text before the first heading is its
+  `Introduction`).
+- **Make every `##` and `###` section stand on its own.** In a long document
+  a section may be the only part the agent reads, so don't lean on "as shown
+  above". Headings must be unique within the file — they are how a section is
+  asked for — and no single `###` should exceed about 3,000 tokens; split a
+  bigger one into several `###` sections.
+- `#` lines inside fenced code blocks (shell comments) are fine: headings
+  inside fences are ignored. Outside a fence, the single `#` is the title and
+  `####` or deeper is ordinary content, not a section of its own.
 
 ## Minimal example
 
@@ -141,8 +164,9 @@ After saving a new document:
 2. Wait ~1 second for the watcher's debounce to pick up the change. No
    server restart is required.
 3. Call the `documentation_search` built-in tool with a query whose
-   keywords appear in your description; the new file should be in the
-   results.
+   keywords appear in your description; it should return your document —
+   whole, or for a long one its head and table of contents, from which
+   `read_documentation_section` reads any section by its heading.
 
 > **System docs are different.** The watcher covers the two documentation
 > roots above. The docs *bundled with Cremind* are mirrored into the shared
