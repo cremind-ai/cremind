@@ -29,13 +29,8 @@ import { getApiOrigin } from './a2aClient';
 // booted seconds earlier, so an in-flight call can 401 transiently while the
 // hand-off guard is still importing the token. Ejecting there would throw away
 // the very session being handed over.
-//
-// ``oauth-return`` is the Google consent landing page (services/oauthReturn.ts).
-// It is public and may open in a tab whose stored token is stale; whatever
-// 401s there, ejecting would replace "Google's response reached Cremind" with a
-// profile selector and lose the page it is about to restore.
 const AUTH_ROUTE_NAMES = new Set([
-  'home', 'login', 'setup', 'setup-profile', 'setup-handoff', 'oauth-return',
+  'home', 'login', 'setup', 'setup-profile', 'setup-handoff',
 ]);
 
 // Idempotency guard so a burst of concurrent 401s (or the SSE retry loop) only

@@ -85,7 +85,7 @@ def test_anything_else_is_not_a_loopback_origin(url):
 @pytest.mark.parametrize(("app_url", "expected"), [
     ("http://localhost:1515", "http://localhost:1515"),
     ("http://localhost:1515/", "http://localhost:1515"),
-    ("http://127.0.0.1:1112", "http://127.0.0.1:1112"),
+    ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
     ("http://[::1]:1515", "http://[::1]:1515"),
     # An https APP_URL maps to http on the SAME port: the same-port TLS listener
     # hands plaintext to the recovery surface, which redirects the callback on.
@@ -99,6 +99,43 @@ def test_a_loopback_app_url_names_the_redirect_origin(monkeypatch, app_url, expe
     assert ol.app_url_loopback_origin() == expected
     assert ol.google_loopback_origin(fallback=False) == expected
     assert ol.google_redirect_uri("/api/oauth/callback", fallback=False) == expected + "/api/oauth/callback"
+
+
+# ── an APP_URL naming the INTERNAL API bind ──────────────────────────────────
+#
+# PORT (1112) binds 127.0.0.1 only and is never published, so in a container it
+# is the container's own loopback — an address the user's browser cannot open.
+# Docker installs have been seen with exactly that APP_URL; Google's redirect
+# has to go to the public bind instead, which serves the same application.
+
+def test_an_app_url_naming_the_internal_bind_falls_back_to_the_public_port(monkeypatch):
+    monkeypatch.setenv("CREMIND_UI_PORT", "1515")
+    monkeypatch.setattr(BaseConfig, "PORT", 1112, raising=False)
+    _app_url(monkeypatch, "http://localhost:1112")
+    assert ol.app_url_loopback_origin() is None
+    assert ol.google_loopback_origin(fallback=False) is None
+    assert ol.google_loopback_origin(fallback=True) == "http://localhost:1515"
+
+
+def test_the_internal_bind_guard_only_applies_when_a_public_port_exists(monkeypatch):
+    """``CREMIND_UI_PORT=0`` serves loopback-only behind an external proxy, and a
+    native install's 127.0.0.1 IS the browser's: neither is a wrong address."""
+    monkeypatch.setattr(BaseConfig, "PORT", 1112, raising=False)
+    monkeypatch.setenv("CREMIND_UI_PORT", "0")
+    _app_url(monkeypatch, "http://localhost:1112")
+    assert ol.app_url_loopback_origin() == "http://localhost:1112"
+
+    # The public bind and the internal one being the same port is not a conflict.
+    monkeypatch.setenv("CREMIND_UI_PORT", "1112")
+    assert ol.app_url_loopback_origin() == "http://localhost:1112"
+
+
+def test_a_pin_still_wins_over_the_public_port_fallback(monkeypatch):
+    monkeypatch.setenv("CREMIND_UI_PORT", "1515")
+    monkeypatch.setattr(BaseConfig, "PORT", 1112, raising=False)
+    _app_url(monkeypatch, "http://localhost:1112")
+    monkeypatch.setenv("CREMIND_OAUTH_REDIRECT_URI", "http://localhost:9090/api/oauth/callback")
+    assert ol.google_loopback_origin(fallback=False) == "http://localhost:9090"
 
 
 @pytest.mark.parametrize("app_url", [

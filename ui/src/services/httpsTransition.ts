@@ -311,6 +311,9 @@ function transitionMount(): '/' | '/electron-renderer/' {
 function currentProfile(route: string): string {
   const first = route.split(/[/?]/).filter(Boolean)[0] ?? '';
   // Public, profile-less routes: their first segment is never a profile.
+  // 'oauth-return' is not a route any more (a consent window closes itself
+  // now), but an old bookmark or history entry still reaches this parser and
+  // must not be mistaken for a profile named after it.
   if (first && !['setup', 'setup-handoff', 'tls-handoff', 'login', 'oauth-return'].includes(first)) {
     return first;
   }

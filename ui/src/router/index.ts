@@ -7,7 +7,6 @@ import { useSettingsStore } from '../stores/settings';
 import { PROFILE_ROUTES } from './profileRoutes';
 import { redeemTlsHandoff, TlsHandoffSessionError } from '../services/configApi';
 import { restoreTransitionState } from '../services/httpsTransition';
-import { stashOAuthReturnQuery } from '../services/oauthReturn';
 
 declare module 'vue-router' {
   interface RouteMeta {
@@ -104,23 +103,10 @@ const routes = [
     meta: { title: 'Moving to HTTPS' },
     beforeEnter: consumeSetupHandoff,
   },
-  // Where the server sends the browser after an OAuth consent callback (see
-  // services/oauthReturn.ts) — Google's, or Atlassian's for the jira/confluence
-  // skills, hence the provider-neutral title. Public on purpose — a consent
-  // finished in another browser has no token — and deliberately NOT in
-  // PROFILE_ROUTES: the profile it returns to comes from the server's record,
-  // never from this URL. The guard lifts the one-time ``ref`` out of the address
-  // before anything renders, so a reload, the back button or a copied URL never
-  // carries it.
-  {
-    path: '/oauth-return',
-    name: 'oauth-return',
-    component: () => import('../views/OAuthReturn.vue'),
-    meta: { title: 'Account sign-in' },
-    beforeEnter: (to: RouteLocationNormalized) => (
-      stashOAuthReturnQuery(to.query) ? { name: 'oauth-return', replace: true } : true
-    ),
-  },
+  // Consent windows used to land here before they closed themselves
+  // (app/api/oauth_close.py). A bookmark or a history entry still can: send it
+  // home rather than letting `/:profile` treat "oauth-return" as a profile.
+  { path: '/oauth-return', redirect: '/' },
   // Login route for a specific profile
   {
     path: '/login/:profile',
@@ -423,15 +409,9 @@ const router = createRouter({
 // bouncing post-setup navigation back to /setup when the bridge
 // snapshot is stale, consult the live Pinia ref as a fallback — it's
 // the same source ``a2aClient.getBaseUrl`` uses.
-//
-// ``oauth-return`` is exempt: it lands in a consent popup that the main process
-// may not hand the configured agent URL to (the config IPC answers only known
-// app windows), and it talks to the server that served it — its own origin —
-// so bouncing it to /setup would strand the provider's response.
 router.beforeEach((to) => {
   const bridge = window.cremind
   if (!bridge) return true
-  if (to.name === 'oauth-return') return true
   if (bridge.config.agentUrl) return true
   if (useSettingsStore().agentUrl) return true
   if (to.name === 'setup' || to.name === 'setup-profile') return true

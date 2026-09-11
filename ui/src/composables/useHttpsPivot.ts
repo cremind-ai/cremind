@@ -30,6 +30,8 @@ import {
 
 export type PivotPhase =
   | 'idle'
+  /** Holding the other tabs of this browser to a stop before activating. */
+  | 'preparing'
   | 'restarting'
   | 'waiting'
   | 'redirecting'
@@ -68,6 +70,12 @@ export interface PivotRunOptions {
   /** Called while the server waits for enrolled tabs to save handoffs. */
   onQuiescing?: (status: TlsRuntimeStatus) => void;
   onFailure?: (message: string) => void;
+  /** Called once when this run stops owning the flow, whatever the reason —
+   *  activated, failed, or quietly superseded by a newer run or a cancel.
+   *  ``onActivated``/``onFailure`` report an OUTCOME and a superseded run has
+   *  none, so anything a caller disabled for the duration (its activate button)
+   *  has to be released here instead. */
+  onSettled?: () => void;
 }
 
 function mountPath(): '/' | '/electron-renderer/' {
@@ -109,11 +117,15 @@ export function useHttpsPivot() {
    *  that it stays up on purpose until the page navigates. */
   let barrierRun: number | null = null;
   let barrierId: string | null = null;
+  /** The barrier round this run registered, so releasing it can never cancel a
+   *  newer run's barrier for the same transition. */
+  let barrierNonce: string | null = null;
 
   function releaseBarrier(): void {
-    if (barrierId) releaseBrowserMigration(barrierId);
+    if (barrierId) releaseBrowserMigration(barrierId, barrierNonce ?? undefined);
     barrierRun = null;
     barrierId = null;
+    barrierNonce = null;
   }
 
   /** Start a new run: everything the previous one had in flight is abandoned,
@@ -453,7 +465,10 @@ export function useHttpsPivot() {
       } else if (!activationAlreadyStarted) {
         barrierRun = run;
         barrierId = transition.id;
-        await waitForBrowserMigrationReady(transition.id);
+        // Visible from the first moment: this wait makes no request, so without
+        // a phase the page would sit on an unchanged card for its duration.
+        phase.value = 'preparing';
+        barrierNonce = await waitForBrowserMigrationReady(transition.id);
         if (!alive(run)) {
           // Superseded while the barrier went up: drop it unless a newer run
           // has already raised its own for this transition.
@@ -518,6 +533,7 @@ export function useHttpsPivot() {
         // Durable now: keep uploads gated until this tab navigates.
         barrierRun = null;
         barrierId = null;
+        barrierNonce = null;
       }
       lastActivatedStatus = activated;
       options.onActivated?.(activated);
@@ -557,15 +573,30 @@ export function useHttpsPivot() {
       // what it held, and the newer run reports its own outcome.
       if (!alive(run)) return;
       void window.cremind?.server?.releaseHttpsMigration?.();
-      if (!activationPersisted && transitionId) releaseBrowserMigration(transitionId);
+      if (!activationPersisted && transitionId) {
+        releaseBrowserMigration(transitionId, barrierNonce ?? undefined);
+      }
       if (barrierRun === run) {
         barrierRun = null;
         barrierId = null;
+        barrierNonce = null;
       }
       phase.value = 'failed';
       const message = e instanceof Error ? e.message : String(e);
       error.value = message;
       options.onFailure?.(message);
+    } finally {
+      // Every exit this run still owns, including the `!alive(run)` returns
+      // above, which report no outcome at all — without it a run that ended
+      // without an outcome would leave whatever the caller disabled for its
+      // duration disabled for good.
+      //
+      // Not when it has been superseded: `begin()` runs inside the newer
+      // caller, which has already taken the flag for its own work, and this
+      // run's continuation only resumes a microtask later. Releasing it there
+      // would un-dim the buttons in the middle of a cancel or a retry — the
+      // very "my click did nothing" shape this is meant to remove.
+      if (alive(run)) options.onSettled?.();
     }
   }
 

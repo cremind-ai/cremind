@@ -531,6 +531,34 @@ async def post_tls_client(request: Request) -> JSONResponse:
         tab_id = tls_clients.validate_tab_id(data.get("tab_id"))
         if request.method == "DELETE":
             tls_clients.unregister(tab_id, profile)
+            # A tab that says goodbye cannot acknowledge a readiness round any
+            # more, and an expectation nobody can meet holds the switch in
+            # ``quiescing`` until someone cancels it. Closing the tab that is
+            # blocking the switch is the obvious remedy, so make it work.
+            #
+            # Only when this tab really is holding one up: every tab close comes
+            # through here, and neither a rewrite of the durable transition nor
+            # (with no transition at all) update_transition's refusal belongs on
+            # that path.
+            from app.config.tls_transition import load_transition, update_transition
+
+            current = load_transition() or {}
+            expected_now = current.get("quiesce_expected")
+            if (current.get("phase") == "quiescing" and isinstance(expected_now, dict)
+                    and expected_now.get(tab_id) == profile):
+                def withdraw(value: dict) -> dict:
+                    # Re-checked under the lock: the round may have closed while
+                    # this request waited for it.
+                    if value.get("phase") == "quiescing":
+                        expected = value.get("quiesce_expected")
+                        if isinstance(expected, dict) and expected.get(tab_id) == profile:
+                            expected.pop(tab_id, None)
+                    return value
+
+                try:
+                    update_transition(withdraw, announce=False)
+                except ValueError:
+                    pass  # the switch ended between the read and the lock
         else:
             # Tabs opening during the short enrollment interval join the same
             # round.  Closing enrollment and adding members are serialized by
@@ -656,11 +684,15 @@ async def post_tls_activate(request: Request) -> JSONResponse:
         # registered renderer finishes its uploads and creates a private
         # handoff.  This also covers activation initiated by the CLI, where no
         # in-page BroadcastChannel barrier can run before the request.
+        # Only clients still heartbeating are held to an acknowledgement: a tab
+        # that went away without unregistering (a closed or crashed browser)
+        # would otherwise keep every future activation in ``quiescing`` until
+        # someone cancelled the switch. See app/config/tls_clients.py.
         started_quiesce = value["phase"] == "prepared"
         if started_quiesce:
-            from app.config.tls_clients import snapshot
+            from app.config.tls_clients import LIVE_WITHIN_SECONDS, snapshot
             value["phase"] = "quiescing"
-            value["quiesce_expected"] = snapshot()
+            value["quiesce_expected"] = snapshot(LIVE_WITHIN_SECONDS)
             value["quiesce_acked"] = []
             value["quiesce_closed"] = False
             value["quiesce_enrollment_until"] = time.time() + QUIESCE_ENROLLMENT_SECONDS
@@ -668,7 +700,7 @@ async def post_tls_activate(request: Request) -> JSONResponse:
             # Take a second snapshot after publishing quiescing. A client that
             # registered between the first snapshot and the durable write saw
             # the previous phase, so its endpoint could not enroll itself.
-            registered = snapshot()
+            registered = snapshot(LIVE_WITHIN_SECONDS)
 
             def enroll_snapshot(current: dict) -> dict:
                 if current.get("id") != data.get("transition_id") or current.get("phase") != "quiescing":

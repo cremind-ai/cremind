@@ -96,6 +96,21 @@ const usesLocalCertificate = computed(() => Boolean(
 const canActivate = computed(() =>
   isPrepared.value && trustConfirmed.value && migrationReady.value && !working.value,
 );
+/** Why the activate button is not pressable, in the user's terms. A disabled
+ *  button that explains nothing is indistinguishable from a broken one — which
+ *  is exactly how an unfinished upload in another tab used to read. */
+const activateBlockedBy = computed(() => {
+  if (working.value) return null;
+  if (!trustConfirmed.value) {
+    return usesLocalCertificate.value
+      ? 'Confirm above that you trusted this CA on this device.'
+      : 'Confirm above that you verified this certificate on this device.';
+  }
+  if (!migrationReady.value) {
+    return `Waiting for ${pendingUploads.value} file upload(s) in this tab to finish.`;
+  }
+  return null;
+});
 
 // The server decides what to show and in what order, and marks each line a note
 // or a command; only commands get a copy button (see DeploymentSteps). There is
@@ -299,8 +314,16 @@ async function activate() {
         || Boolean(status.restart_error);
       working.value = false;
     },
-    onFailure: (message: string) => {
-      loadError.value = message;
+    // Reached on every exit, including a run superseded by another click or by
+    // leaving the page — neither of which reports an outcome.
+    onSettled: () => {
+      working.value = false;
+    },
+    // The message is not stored here: the card renders ``pivotError``, which
+    // already holds it. ``loadError`` would show the same text a second time,
+    // above the page's opening section — off screen for anyone reading the step
+    // they just acted on.
+    onFailure: () => {
       working.value = false;
       // Same reason as in load(): a failed activation is exactly when the
       // operator needs the runbook to name their own cluster.
@@ -509,15 +532,22 @@ onMounted(() => { void load(); });
                   ? 'I verified this exact server certificate and trust chain on this device.'
                   : 'I have a valid edge certificate for this hostname and trust its issuer on this device.' }}
             </ElCheckbox>
-            <p v-if="!migrationReady" class="upload-wait">
-              Waiting for {{ pendingUploads }} file upload(s) to finish
-              before reloading tabs.
+            <p v-if="activateBlockedBy" class="upload-wait">{{ activateBlockedBy }}</p>
+            <!-- The wait before the first request (other tabs finishing their
+                 uploads and saving their sessions) is silent on the network, so
+                 it has to be loud here: without it this card looks unchanged and
+                 the button looks broken. -->
+            <p v-else-if="working" class="upload-wait">
+              {{ pivotPhase === 'preparing'
+                ? 'Letting the other Cremind tabs in this browser finish up…'
+                : 'Preparing the switch…' }}
             </p>
+            <p v-if="pivotError" class="inline-error">{{ pivotError }}</p>
             <div class="actions">
               <button class="secondary-btn" :disabled="working" @click="cancel">Cancel</button>
               <button class="primary-btn" :disabled="!canActivate" @click="activate">
-                <Icon icon="mdi:lock-outline" />
-                {{ isExternal ? 'Show deployment commands' : 'Activate HTTPS' }}
+                <Icon :icon="working ? 'mdi:loading' : 'mdi:lock-outline'" :class="{ spin: working }" />
+                {{ working ? 'Working…' : (isExternal ? 'Show deployment commands' : 'Activate HTTPS') }}
               </button>
             </div>
           </section>

@@ -61,23 +61,6 @@ async def _optional_json(request: Request) -> Dict[str, Any]:
     return body if isinstance(body, dict) else {}
 
 
-def _record_consent_return(profile: str, authorize_url: str, return_route: str) -> None:
-    """Remember which page opened this consent, so the callback can lead back.
-
-    Best-effort by design: losing it only means the consent tab lands on Cremind
-    home instead of the Calendar page — never a failed connect.
-    """
-    try:
-        from urllib.parse import parse_qs, urlsplit
-
-        from app.api import oauth_return
-
-        state = parse_qs(urlsplit(authorize_url).query)["state"][0]
-        oauth_return.record_context(state, profile=profile, route=return_route, flow="calendar")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(f"[calendar] consent return not recorded for profile={profile}: {exc}")
-
-
 def publish_schedule_events_admin_changed(profile: Optional[str]) -> None:
     """Wake the Schedule-Events SSE subscribers so they rebuild + push a snapshot."""
     if not profile:
@@ -414,11 +397,6 @@ def get_calendar_routes(conversation_storage=None) -> list[Route]:
                 },
                 status_code=409,
             )
-        # Optional ``{"return_route": "/<profile>/calendar"}``: the page to bring
-        # the consent tab back to (app/api/oauth_return.py).
-        return_route = (await _optional_json(request)).get("return_route")
-        if isinstance(return_route, str):
-            _record_consent_return(profile, url, return_route)
         return JSONResponse({"authorize_url": url})
 
     async def handle_google_disconnect(request: Request) -> JSONResponse:

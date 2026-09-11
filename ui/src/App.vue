@@ -40,10 +40,9 @@ const httpsRecoveryUrl = httpsTransitionState.recoveryUrl;
 const httpsInstallMode = httpsTransitionState.installMode;
 const httpsPortForward = httpsTransitionState.portForward;
 const migrationInProgress = migrationReadiness.migrating;
-// Pages that explain the switch themselves (Settings → HTTPS, setup), and the
-// public OAuth return page, which must never be covered by another tab's switch.
+// Pages that explain the switch themselves (Settings → HTTPS, setup).
 const httpsOverlayExcluded = computed(() => [
-  'security-settings', 'setup', 'setup-profile', 'oauth-return',
+  'security-settings', 'setup', 'setup-profile',
 ].includes(route.name as string));
 // Either blocking card is showing something the user has put away. The chip
 // that replaces them is what keeps dismissal from ever being a one-way door.

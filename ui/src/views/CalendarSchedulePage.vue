@@ -110,7 +110,7 @@ watch(() => settings.authToken, async (t, p) => { if (t && !p) { await loadSetti
 function goBack() { goBackToChat(router, props.profile); }
 
 // ── Google connect ───────────────────────────────────────────────────────
-// The consent popup lands on the OAuth return page (views/OAuthReturn.vue),
+// The consent popup lands on the page that closes it (app/api/oauth_close.py),
 // which tells this page the moment Google has answered — by then the server has
 // already exchanged the code, so one settings reload shows the result. The poll
 // stays as the fallback for a popup that never gets that far (closed early, or
@@ -143,15 +143,17 @@ async function checkConnected() {
 
 /**
  * A denial leaves nothing server-side for this page to check, so a failure
- * notice may end the wait — but only one from this page's OWN consent popup, for
- * this profile. The BroadcastChannel carries every tab's and every profile's
- * calendar returns: another profile cancelling its own consent must not cancel
- * ours. Everything else, ``received`` included, just re-reads this profile's
+ * notice may end the wait — but only one from this page's OWN consent window.
+ * The BroadcastChannel carries every tab's and every profile's calendar
+ * returns, and the server attributes a response to no profile, so recognising
+ * the window this page opened (``fromPopup``) is the whole of what makes a
+ * notice ours: another profile cancelling its own consent must not cancel ours.
+ * Everything else, ``received`` included, just re-reads this profile's
  * settings, which is harmless whoever the notice was for.
  */
 function onGoogleReturn(notice: OAuthReturnNotice, { fromPopup }: OAuthReturnDelivery) {
   if (notice.flow !== 'calendar' || !connecting.value) return;
-  const ours = fromPopup && (notice.profile === null || notice.profile === props.profile);
+  const ours = fromPopup;
   if (notice.outcome === 'received' || !ours) {
     void checkConnected();
     return;
@@ -174,9 +176,7 @@ async function onConnectGoogle() {
   stopConnectWait();
   connecting.value = true;
   try {
-    const res = await connectGoogleCalendar(settings.agentUrl, settings.authToken, {
-      returnRoute: router.currentRoute.value.fullPath,
-    });
+    const res = await connectGoogleCalendar(settings.agentUrl, settings.authToken);
     if (res.error || !res.authorize_url) {
       if (authWindow && !authWindow.closed) authWindow.close();
       connecting.value = false;

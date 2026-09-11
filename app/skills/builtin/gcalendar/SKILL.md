@@ -80,9 +80,10 @@ access.** Google then sends the browser to a loopback callback such as
 accepts only an http loopback redirect here; on an HTTPS install Cremind forwards
 it to its HTTPS handler. The always-running Cremind backend receives it, so
 linking completes even though the command keeps running in the background. The
-browser then shows Cremind's **response received** page (it may close itself or
-return to the Cremind page the user started from). That only means the redirect
-arrived — `link` itself confirms the account once it has exchanged the code.
+browser then shows Cremind's **response received** page. A window Cremind itself
+opened closes on its own; a tab the user opened by hand stays put and says it can
+be closed. Either way that only means the redirect arrived — `link` itself
+confirms the account once it has exchanged the code.
 Once the user says they've approved, confirm:
 ```bash
 uv run scripts/__main__.py status

@@ -286,12 +286,66 @@ def _resolve_service_credentials(
 
 # ── docker compose up ──────────────────────────────────────────────────────
 
+#: Never withheld from the child, whatever the compose file interpolates: the
+#: docker CLI needs them to find the daemon, its credential helpers and its
+#: config. A compose file naming one of these gets the process value, which is
+#: what it would have had anyway.
+_ESSENTIAL_ENV = frozenset({
+    "PATH", "HOME", "USER", "USERPROFILE", "SYSTEMROOT", "WINDIR", "COMSPEC",
+    "TEMP", "TMP", "TMPDIR", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+    "DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY",
+    "DOCKER_CONTEXT", "SSH_AUTH_SOCK",
+    # A registry pull in a corporate network goes through these.
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "SSL_CERT_FILE", "SSL_CERT_DIR",
+})
+
+
+def _interpolated_names(compose_file: str) -> set[str]:
+    """The variables the compose file substitutes, minus the ones the docker CLI
+    itself needs from the environment.
+
+    Both spellings compose accepts — ``${NAME}`` and bare ``$NAME`` — and
+    neither half of the ``$$`` escape, which compose passes through to the
+    container instead of substituting.
+    """
+    try:
+        text = Path(compose_file).read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    names = set(re.findall(r"(?<!\$)\$\{?([A-Za-z_][A-Za-z0-9_]*)", text))
+    return {name for name in names if name.upper() not in _ESSENTIAL_ENV}
+
+
+def _compose_env(compose_file: str) -> dict[str, str]:
+    """This process's environment, minus everything the compose file reads.
+
+    Compose resolves ``${VAR}`` from the invoking process BEFORE ``--env-file``,
+    and this process is the cremind container — whose own environment was itself
+    set from those same keys (APP_URL, CREMIND_SSL, SPA_PORT, VNC_PASSWORD…).
+    Left in, they silently outrank the file the user edits, so provisioning a
+    sidecar could recreate a service from this container's stale config instead
+    of from the bundle's ``.env`` — and the stale value would then be baked into
+    the new container, outliving the fix. Dropping them makes ``--env-file`` the
+    single source it is meant to be.
+    """
+    interpolated = _interpolated_names(compose_file)
+    env = {key: value for key, value in os.environ.items() if key not in interpolated}
+    # Never inherited: the project identity comes from the bundle's .env, and
+    # letting these through would split or rename the project.
+    for key in ("COMPOSE_PROJECT_NAME", "COMPOSE_PROFILES", "COMPOSE_FILE", "COMPOSE_ENV_FILES"):
+        env.pop(key, None)
+    return env
+
+
 async def _compose_up(compose_file: str, env_file: str, service: str) -> None:
     """Bring a single compose service up (detached).
 
     We pass ``--env-file`` explicitly because the cremind container's
     working dir is not necessarily the compose project dir, so the
-    default ``./.env`` lookup wouldn't find the right file.
+    default ``./.env`` lookup wouldn't find the right file — and an
+    explicit env (see :func:`_compose_env`) so that file is not overruled
+    by this container's own environment.
     """
     cmd = [
         "docker", "compose",
@@ -302,6 +356,7 @@ async def _compose_up(compose_file: str, env_file: str, service: str) -> None:
     logger.info(f"[docker-provisioner] running: {' '.join(cmd)}")
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        env=_compose_env(compose_file),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

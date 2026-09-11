@@ -13,6 +13,16 @@ let responderRefs = 0;
 let ticketPreparer: ((transitionId: string) => Promise<void>) | null = null;
 let localGates = 0;
 const READY_TIMEOUT_MS = 5 * 60_000;
+/** How long the initiating tab waits for the OTHER tabs that answered its
+ *  barrier. Short on purpose: this barrier is a courtesy — it gives each tab a
+ *  chance to finish an upload and mint a handoff before the address changes —
+ *  while the guarantee lives on the server, whose activation does not advance
+ *  the transport epoch until every registered client has acknowledged. A tab
+ *  that cannot answer in this window (its own upload is still running, it was
+ *  frozen by the browser) therefore must not stall the switch silently: the
+ *  wait moves on, the server keeps counting, and the page shows what it is
+ *  waiting for instead of a button that does nothing. */
+const SIBLING_READY_TIMEOUT_MS = 15_000;
 
 export type MigrationUploadLease = () => void;
 
@@ -175,15 +185,19 @@ export function installMigrationReadinessResponder(): () => void {
 }
 
 /** Wait until every active same-origin tab that heard the barrier has finished
- * its current uploads. Suspended tabs recover independently when they wake. */
-export async function waitForBrowserMigrationReady(transitionId: string): Promise<void> {
+ * its current uploads. Suspended tabs recover independently when they wake.
+ *
+ * Returns the nonce this round registered, so its owner can release exactly its
+ * own round later (a newer round for the same transition takes the slot over,
+ * and an abandoned one must not cancel it). */
+export async function waitForBrowserMigrationReady(transitionId: string): Promise<string> {
   migrating.value = true;
   const deadline = Date.now() + READY_TIMEOUT_MS;
   await waitForMigrationReady(Math.max(0, deadline - Date.now()));
-  if (typeof BroadcastChannel === 'undefined') return;
+  const nonce = `${TAB_ID}-${Math.random().toString(36).slice(2)}`;
+  if (typeof BroadcastChannel === 'undefined') return nonce;
   if (!channel) installMigrationReadinessResponder();
 
-  const nonce = `${TAB_ID}-${Math.random().toString(36).slice(2)}`;
   const seen = new Set<string>();
   const ready = new Set<string>();
   const failed = new Set<string>();
@@ -208,13 +222,16 @@ export async function waitForBrowserMigrationReady(transitionId: string): Promis
       send(request);
       await new Promise(resolve => setTimeout(resolve, 200));
     }
+    // A tab that answers `failed` has actively given up on its handoff, which
+    // is worth stopping for. One that simply does not answer is not: it may be
+    // mid-upload or frozen, and the server's own readiness round — which this
+    // barrier only front-runs — keeps waiting for it either way, visibly.
+    const siblingDeadline = Date.now() + SIBLING_READY_TIMEOUT_MS;
     while ([...seen].some(tabId => !ready.has(tabId))) {
       if (failed.size > 0) {
         throw new Error('Another Cremind tab could not save a fresh HTTPS handoff. Finish or cancel its upload, then retry.');
       }
-      if (Date.now() >= deadline) {
-        throw new Error('Another Cremind tab did not finish preparing for HTTPS. Finish its upload or close that tab, then retry.');
-      }
+      if (Date.now() >= siblingDeadline || Date.now() >= deadline) break;
       await new Promise<void>(resolve => {
         wake = resolve;
         setTimeout(resolve, 500);
@@ -222,17 +239,29 @@ export async function waitForBrowserMigrationReady(transitionId: string): Promis
       wake = null;
     }
   } catch (error) {
-    releaseBrowserMigration(transitionId);
+    releaseBrowserMigration(transitionId, nonce);
     throw error;
   } finally {
     channel!.removeEventListener('message', onMessage);
   }
+  return nonce;
 }
 
-export function releaseBrowserMigration(transitionId: string): void {
-  const nonce = ownedRequests.get(transitionId);
-  if (nonce) {
-    send({ kind: 'release', nonce, transitionId, tabId: TAB_ID });
+/**
+ * Drop this tab's barrier for ``transitionId``.
+ *
+ * ``nonce`` names the round being released. Without it the call releases
+ * whatever round this tab currently owns (what a coordinator wants when a
+ * transition is rolled back or cancelled); with it, a round that has already
+ * been superseded releases nothing — otherwise an abandoned attempt would
+ * broadcast the CURRENT round's nonce and every sibling would stop answering
+ * the barrier that is still running.
+ */
+export function releaseBrowserMigration(transitionId: string, nonce?: string): void {
+  const owned = ownedRequests.get(transitionId);
+  if (nonce !== undefined && owned !== undefined && owned !== nonce) return;
+  if (owned) {
+    send({ kind: 'release', nonce: owned, transitionId, tabId: TAB_ID });
     ownedRequests.delete(transitionId);
   }
   for (const [requestNonce, id] of activeRequests) {

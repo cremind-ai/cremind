@@ -257,6 +257,13 @@ const TLS_REDEEM_TIMEOUT_MS = 15_000;
 /** One activation attempt. The server answers 202 per quiesce poll, so only a
  * lost or stalled response ever gets near this. */
 const TLS_ACTIVATE_ATTEMPT_TIMEOUT_MS = 30_000;
+/** Pacing of a readiness round — see ``waitForQuiesceRound``. The first read is
+ * quick because acknowledgements land in well under a second; after that the
+ * status is read once a second, and the round is re-committed (a write) only
+ * when it can actually close or after this much time. */
+const QUIESCE_FIRST_POLL_MS = 250;
+const QUIESCE_POLL_MS = 1_000;
+const QUIESCE_RECOMMIT_AFTER_MS = 5_000;
 
 /** Whether a failed TLS request is worth repeating unchanged: the network
  * dropped (fetch's TypeError), the request timed out or was aborted, or a
@@ -450,7 +457,53 @@ export async function activateHttps(
         + 'Finish or cancel uploads in those tabs, close obsolete tabs, or cancel and retry the switch.',
       );
     }
-    await new Promise(resolve => setTimeout(resolve, 300));
+    await waitForQuiesceRound(
+      agentUrl, token, transitionId, deadline, onQuiescing, continueWaiting,
+    );
+  }
+}
+
+/** Wait out one readiness round without committing anything.
+ *
+ *  Closing the round is ``POST /api/tls/activate``'s job and nothing else's, so
+ *  it has to be repeated until the tabs have acknowledged — but each of those
+ *  posts rewrites (and fsyncs) the durable transition, re-reads the certificate
+ *  chain and wakes every subscribed tab, which is a lot of work to learn a
+ *  number ``GET /api/tls/status`` already publishes for free. So the waiting
+ *  happens on the read: the commit is repeated only when the acknowledgements
+ *  are in, the phase moved, or the slow safety interval elapses. A tab holding a
+ *  five-minute upload therefore costs ~300 status reads instead of ~1000
+ *  transition rewrites.
+ *
+ *  Read failures are ignored: the next activate is the one that decides what a
+ *  server that stopped answering means (it may have restarted into HTTPS). */
+async function waitForQuiesceRound(
+  agentUrl: string,
+  token: string,
+  transitionId: string,
+  deadline: number,
+  onQuiescing?: (status: TlsRuntimeStatus) => void,
+  continueWaiting: () => boolean = () => true,
+): Promise<void> {
+  const until = Math.min(deadline, Date.now() + QUIESCE_RECOMMIT_AFTER_MS);
+  // The first acknowledgements land in well under a second; check quickly once
+  // before settling into the slower poll.
+  let gap = QUIESCE_FIRST_POLL_MS;
+  while (Date.now() < until) {
+    await new Promise(resolve => setTimeout(resolve, gap));
+    gap = QUIESCE_POLL_MS;
+    if (!continueWaiting()) throw new Error('HTTPS activation was cancelled.');
+    let status: TlsRuntimeStatus;
+    try {
+      status = await fetchTlsStatus(agentUrl, token);
+    } catch {
+      return;
+    }
+    if (!continueWaiting()) throw new Error('HTTPS activation was cancelled.');
+    const live = status.transition;
+    if (live?.id !== transitionId || live.phase !== 'quiescing') return;
+    onQuiescing?.(status);
+    if ((status.quiesce_pending ?? 0) === 0) return;
   }
 }
 

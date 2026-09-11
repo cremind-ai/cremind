@@ -1,8 +1,9 @@
-// Unit tests for the OAuth return helpers (ui/src/services/oauthReturn.ts)
-// and the Electron transition's route exclusion. Plain node:test + esbuild, the
-// same pattern as ui/electron/https.test.mjs: bundle the TypeScript, import it
-// from a data: URL, and drive it with fake window / fetch / BroadcastChannel
-// objects so no browser is needed.
+// Unit tests for the OAuth consent helpers (ui/src/services/oauthReturn.ts):
+// recognising a Google consent link, opening it in a window that can close
+// itself, and receiving the notice the closing page posts (app/api/oauth_close.py).
+// Plain node:test + esbuild, the same pattern as ui/electron/https.test.mjs:
+// bundle the TypeScript, import it from a data: URL, and drive it with fake
+// window / BroadcastChannel objects so no browser is needed.
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -17,6 +18,12 @@ async function importCode(code) {
   return import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
 }
 
+const transitionState = await (async () => {
+  const source = await readFile(path.join(ui, 'electron', 'transitionState.ts'), 'utf8')
+  const { code } = await transform(source, { loader: 'ts', format: 'esm' })
+  return importCode(code)
+})()
+
 const oauth = await (async () => {
   const result = await build({
     entryPoints: [path.join(ui, 'src', 'services', 'oauthReturn.ts')],
@@ -25,19 +32,18 @@ const oauth = await (async () => {
   return importCode(result.outputFiles[0].text)
 })()
 
-const transitionState = await (async () => {
-  const source = await readFile(path.join(ui, 'electron', 'transitionState.ts'), 'utf8')
-  const { code } = await transform(source, { loader: 'ts', format: 'esm' })
-  return importCode(code)
-})()
-
 // ── fakes ────────────────────────────────────────────────────────────────────
 
-function fakeWindow(origin = 'https://localhost:1515', opener = null) {
+function fakeWindow(origin = 'https://localhost:1515', opener = null, opened = () => ({})) {
   const listeners = new Map()
   return {
     location: { origin, href: `${origin}/#/`, protocol: new URL(origin).protocol },
     opener,
+    opens: [],
+    open(url, name) {
+      this.opens.push({ url, name })
+      return opened()
+    },
     addEventListener(type, fn, capture) {
       if (!listeners.has(type)) listeners.set(type, [])
       listeners.get(type).push({ fn, capture: !!capture })
@@ -105,6 +111,7 @@ function withGlobals({ window, fetch, BroadcastChannel } = {}) {
   globalThis.BroadcastChannel = BroadcastChannel
 }
 test.afterEach(() => {
+  interference.length = 0
   if (saved.window === undefined) delete globalThis.window
   else globalThis.window = saved.window
   globalThis.fetch = saved.fetch
@@ -203,95 +210,79 @@ test('anything that is not a Cremind loopback Google consent is ignored', () => 
   }
 })
 
-// ── consent recorder ──────────────────────────────────────────────────────────
+// ── consent window opener ────────────────────────────────────────────────────
 
-function recorderHarness(route = { name: 'conversation', params: { profile: 'alice' }, fullPath: '/alice/c/42' }) {
-  const win = fakeWindow()
-  const fetch = fakeFetch()
-  withGlobals({ window: win, fetch, BroadcastChannel: FakeChannel })
-  const router = { currentRoute: { value: route } }
-  const store = {
-    agentUrl: 'https://localhost:1515',
-    getTokenForProfile: profile => (profile === 'alice' ? 'alice-token' : ''),
-  }
-  const uninstall = oauth.installOAuthConsentRecorder({
-    router,
-    getSession: () => oauth.consentSessionFor(router.currentRoute.value, store),
-  })
-  return { win, fetch, router, uninstall }
+function openerHarness({ opened = () => ({ id: 'popup' }), electron = false } = {}) {
+  const win = fakeWindow('https://localhost:1515', null, opened)
+  if (electron) win.cremind = { openExternal: () => {} }
+  withGlobals({ window: win, BroadcastChannel: FakeChannel })
+  return { win, uninstall: oauth.installConsentWindowOpener() }
 }
 
-test('a consent-link click on a profile page records {state, route, flow} with keepalive and the profile token', () => {
-  const { win, fetch, uninstall } = recorderHarness()
+test('a Google consent link opens in a window this page opened, so it can close itself', () => {
+  const { win, uninstall } = openerHarness()
   assert.equal(win.listenerCount('click'), 1)
-  assert.equal(win.listenerCount('auxclick'), 1)
-  win.dispatch('click', clickEvent(anchor(consentUrl({
-    redirect: 'http://localhost:1515/api/oauth/google-drive/callback',
-  }))))
-  assert.equal(fetch.calls.length, 1)
-  const [{ url, init }] = fetch.calls
-  assert.equal(url, 'https://localhost:1515/api/oauth/return/context')
-  assert.equal(init.method, 'POST')
-  assert.equal(init.keepalive, true)
-  assert.equal(init.headers.Authorization, 'Bearer alice-token')
-  assert.equal(init.headers['Content-Type'], 'application/json')
-  assert.deepEqual(JSON.parse(init.body), { state: STATE, route: '/alice/c/42', flow: 'drive' })
-
-  // Middle-click opens links too; other auxiliary buttons do not.
-  win.dispatch('auxclick', clickEvent(anchor(consentUrl()), { type: 'auxclick', button: 1 }))
-  win.dispatch('auxclick', clickEvent(anchor(consentUrl()), { type: 'auxclick', button: 2 }))
-  assert.equal(fetch.calls.length, 2)
-  assert.equal(JSON.parse(fetch.calls[1].init.body).flow, 'skill')
+  const href = consentUrl({ redirect: 'http://localhost:1515/api/oauth/google-drive/callback' })
+  win.dispatch('click', clickEvent(anchor(href)))
+  assert.deepEqual(win.opens, [{ url: href, name: 'cremind-oauth-consent' }])
+  // The anchor's own navigation is cancelled: without that the consent would
+  // ALSO take this tab (the renderer's target="_blank" is applied to a live
+  // DOM, not to these fakes) — and only the scripted window can be closed.
+  assert.deepEqual(interference, ['preventDefault'])
 
   uninstall()
   assert.equal(win.listenerCount('click'), 0)
-  assert.equal(win.listenerCount('auxclick'), 0)
-  win.dispatch('click', clickEvent(anchor(consentUrl())))
-  assert.equal(fetch.calls.length, 2)
-  assert.deepEqual(interference, [])
+  win.dispatch('click', clickEvent(anchor(href)))
+  assert.equal(win.opens.length, 1)
 })
 
-test('the recorder stays silent off profile pages, without a token, and for other links', () => {
-  const { win, fetch, router, uninstall } = recorderHarness()
-  // Other links, a non-anchor click and an SVG anchor (non-string href).
-  win.dispatch('click', clickEvent(anchor('https://example.com/docs')))
-  win.dispatch('click', clickEvent(anchor(consentUrl({ redirect: 'https://cremind.example/api/oauth/callback' }))))
-  win.dispatch('click', clickEvent({ tagName: 'BUTTON' }))
-  win.dispatch('click', clickEvent({ tagName: 'a', href: { baseVal: consentUrl() } }))
-  // Public routes are not profile routes, even when their path names one.
-  for (const value of [
-    { name: 'home', params: {}, fullPath: '/' },
-    { name: 'login', params: { profile: 'alice' }, fullPath: '/login/alice' },
-    { name: 'oauth-return', params: {}, fullPath: '/oauth-return' },
-    { name: 'chat', params: { profile: 'bob' }, fullPath: '/bob' }, // no token for bob
-  ]) {
-    router.currentRoute.value = value
-    win.dispatch('click', clickEvent(anchor(consentUrl())))
+test('a blocked popup leaves the link alone rather than swallowing the click', () => {
+  const { win, uninstall } = openerHarness({ opened: () => null })
+  win.dispatch('click', clickEvent(anchor(consentUrl())))
+  assert.equal(win.opens.length, 1)
+  assert.deepEqual(interference, [], 'the anchor must still open the consent itself')
+  uninstall()
+})
+
+test('only a Cremind loopback Google consent is opened this way', () => {
+  const { win, uninstall } = openerHarness()
+  const untouched = [
+    anchor('https://example.com/docs'),
+    anchor(consentUrl({ redirect: 'https://cremind.example/api/oauth/callback' })),
+    { tagName: 'BUTTON' },
+    { tagName: 'a', href: { baseVal: consentUrl() } },
+  ]
+  for (const target of untouched) win.dispatch('click', clickEvent(target))
+  // Modified and non-primary clicks belong to the browser ("open in new
+  // window", "copy link", middle-click).
+  const consent = anchor(consentUrl())
+  win.dispatch('click', clickEvent(consent, { button: 1 }))
+  for (const key of ['metaKey', 'ctrlKey', 'shiftKey', 'altKey']) {
+    win.dispatch('click', { ...clickEvent(consent), [key]: true })
   }
-  assert.equal(fetch.calls.length, 0)
+  win.dispatch('click', { ...clickEvent(consent), defaultPrevented: true })
+  assert.deepEqual(win.opens, [])
   assert.deepEqual(interference, [])
   uninstall()
 })
 
-test('a failing session lookup or request never breaks the click', async () => {
-  const win = fakeWindow()
-  withGlobals({ window: win, fetch: fakeFetch(() => { throw new TypeError('offline') }) })
-  const uninstall = oauth.installOAuthConsentRecorder({
-    router: { currentRoute: { value: { fullPath: '/alice' } } },
-    getSession: () => { throw new Error('store not ready') },
-  })
+test('under Electron the consent is left to the OS browser', () => {
+  // ui/src/utils/externalLinks.ts hands it to shell.openExternal, and no page
+  // of ours could close a window in another browser anyway.
+  const { win, uninstall } = openerHarness({ electron: true })
+  win.dispatch('click', clickEvent(anchor(consentUrl())))
+  assert.deepEqual(win.opens, [])
+  assert.deepEqual(interference, [])
+  uninstall()
+})
+
+test('a window.open that throws never breaks the link', () => {
+  const win = fakeWindow('https://localhost:1515', null, () => { throw new Error('blocked') })
+  withGlobals({ window: win, BroadcastChannel: FakeChannel })
+  const uninstall = oauth.installConsentWindowOpener()
   assert.doesNotThrow(() => win.dispatch('click', clickEvent(anchor(consentUrl()))))
   assert.deepEqual(interference, [])
   uninstall()
-  assert.equal(
-    await oauth.recordOAuthReturnContext('https://localhost:1515', 'tok', { state: STATE, route: '/alice', flow: 'skill' }),
-    false,
-  )
-  globalThis.fetch = fakeFetch(() => new Response('{"error":"conflict"}', { status: 409 }))
-  assert.equal(
-    await oauth.recordOAuthReturnContext('https://localhost:1515', 'tok', { state: STATE, route: '/alice', flow: 'skill' }),
-    false,
-  )
 })
 
 // ── notify / onOAuthReturn ────────────────────────────────────────────────────
@@ -323,6 +314,22 @@ function collector(seen) {
   return (notice, delivery) => seen.push({ ...notice, ...delivery })
 }
 
+// What the server's closing page does (app/api/oauth_close.py): post the notice
+// to the opener and on the channel, then close. Written out here rather than
+// imported, so these tests pin the wire contract the page has to keep.
+function emitNotice({ flow, outcome, profile = null }) {
+  const payload = { type: 'cremind:oauth-return', flow, outcome, profile }
+  try {
+    const opener = globalThis.window.opener
+    if (opener && opener !== globalThis.window) opener.postMessage(payload, '*')
+  } catch { /* opener closed or inaccessible */ }
+  try {
+    const channel = new globalThis.BroadcastChannel('cremind:oauth-return')
+    channel.postMessage(payload)
+    channel.close()
+  } catch { /* BroadcastChannel unavailable */ }
+}
+
 test('a return notice reaches the opener across origins, carrying only type/flow/outcome/profile', () => {
   const { openerWin, popupWin, popupProxy, posted } = pagePair({ popupOrigin: 'https://127.0.0.1:1515' })
   withGlobals({ window: openerWin, BroadcastChannel: FakeChannel })
@@ -330,7 +337,7 @@ test('a return notice reaches the opener across origins, carrying only type/flow
   const unsubscribe = oauth.onOAuthReturn(collector(seen), { popup: popupProxy })
 
   globalThis.window = popupWin
-  oauth.notifyOAuthReturn({
+  emitNotice({
     flow: 'calendar', outcome: 'received', profile: 'alice', code: 'leak', state: STATE, ref: REF,
   })
   assert.equal(posted.length, 1)
@@ -392,15 +399,15 @@ test('a same-origin popup notice arriving by postMessage and BroadcastChannel is
   const seen = []
   const unsubscribe = oauth.onOAuthReturn(collector(seen), { popup: popupProxy })
   globalThis.window = popupWin
-  oauth.notifyOAuthReturn({ flow: 'drive', outcome: 'received', profile: 'alice' })
+  emitNotice({ flow: 'drive', outcome: 'received', profile: 'alice' })
   assert.deepEqual(seen, [{ flow: 'drive', outcome: 'received', profile: 'alice', fromPopup: true }])
   // A different outcome is a different notice.
-  oauth.notifyOAuthReturn({ flow: 'drive', outcome: 'failed', profile: 'alice' })
+  emitNotice({ flow: 'drive', outcome: 'failed', profile: 'alice' })
   assert.equal(seen.length, 2)
   globalThis.window = openerWin
   unsubscribe()
   globalThis.window = popupWin
-  oauth.notifyOAuthReturn({ flow: 'drive', outcome: 'denied', profile: 'alice' })
+  emitNotice({ flow: 'drive', outcome: 'denied', profile: 'alice' })
   assert.equal(seen.length, 2)
 })
 
@@ -410,7 +417,7 @@ test('a tab without an opener still reaches other same-origin tabs, and nothing 
   const seen = []
   const unsubscribe = oauth.onOAuthReturn(collector(seen))
   globalThis.window = fakeWindow() // the consent tab: opened from a chat link, no opener
-  oauth.notifyOAuthReturn({ flow: 'skill', outcome: 'received' })
+  emitNotice({ flow: 'skill', outcome: 'received' })
   assert.deepEqual(seen, [{ flow: 'skill', outcome: 'received', profile: null, fromPopup: false }])
   globalThis.window = listener
   unsubscribe()
@@ -419,7 +426,7 @@ test('a tab without an opener still reaches other same-origin tabs, and nothing 
   globalThis.window = fakeWindow('https://localhost:1515', {
     postMessage() { throw new Error('opener navigated away') },
   })
-  assert.doesNotThrow(() => oauth.notifyOAuthReturn({ flow: 'skill', outcome: 'denied' }))
+  assert.doesNotThrow(() => emitNotice({ flow: 'skill', outcome: 'denied' }))
 })
 
 test("another profile's return reaches a waiting page only as a hint, never as its popup's verdict", () => {
@@ -431,7 +438,7 @@ test("another profile's return reaches a waiting page only as a hint, never as i
   const seen = []
   const unsubscribe = oauth.onOAuthReturn(collector(seen), { popup: alicePopup })
   globalThis.window = fakeWindow() // bob's return page
-  oauth.notifyOAuthReturn({ flow: 'drive', outcome: 'denied', profile: 'bob' })
+  emitNotice({ flow: 'drive', outcome: 'denied', profile: 'bob' })
   assert.deepEqual(seen, [{ flow: 'drive', outcome: 'denied', profile: 'bob', fromPopup: false }])
   globalThis.window = aliceTab
   unsubscribe()
@@ -465,18 +472,8 @@ test("a popup's own copy is not swallowed when its channel copy lands first", ()
   unsubscribe()
 })
 
-test('notices carry a validated profile, and a receiver drops one it cannot read', () => {
-  // Sender: only a profile the server could have recorded is ever broadcast.
-  withGlobals({ window: fakeWindow(), BroadcastChannel: FakeChannel })
-  const cases = [
-    ['alice', 'alice'], ['a'.repeat(64), 'a'.repeat(64)], ['team_b-2', 'team_b-2'],
-    ['Alice', null], ['a b', null], ['../x', null], ['a'.repeat(65), null], ['', null],
-    [42, null], [undefined, null], [null, null],
-  ]
-  for (const [profile] of cases) oauth.notifyOAuthReturn({ flow: 'skill', outcome: 'received', profile })
-  assert.deepEqual(FakeChannel.posted.map(entry => entry.data.profile), cases.map(([, expected]) => expected))
-
-  // Receiver: absent or null means nobody recorded one; a malformed one drops
+test('a receiver drops a notice whose profile it cannot read', () => {
+  // Absent or null means the server could not attribute the response; a malformed one drops
   // the notice rather than letting it pass as "could be anyone's".
   const listener = fakeWindow()
   withGlobals({ window: listener, BroadcastChannel: undefined })
@@ -498,140 +495,6 @@ test('notices carry a validated profile, and a receiver drops one it cannot read
     ['received', null], ['failed', null], ['denied', 'bob'],
   ])
   unsubscribe()
-})
-
-// ── consume ───────────────────────────────────────────────────────────────────
-
-test('consume redeems a ref without credentials and maps unknown refs to null', async () => {
-  withGlobals({ window: fakeWindow() })
-  globalThis.fetch = fakeFetch(() => new Response(JSON.stringify({
-    outcome: 'received', flow: 'calendar', profile: 'alice', route: '/alice/calendar', message: null,
-  }), { status: 200 }))
-  assert.deepEqual(await oauth.consumeOAuthReturn('https://localhost:1515', REF), {
-    outcome: 'received', flow: 'calendar', profile: 'alice', route: '/alice/calendar', message: null,
-  })
-  const [{ url, init }] = globalThis.fetch.calls
-  assert.equal(url, 'https://localhost:1515/api/oauth/return/consume')
-  assert.equal(init.method, 'POST')
-  assert.equal(init.headers.Authorization, undefined)
-  assert.deepEqual(JSON.parse(init.body), { ref: REF })
-
-  // Context-less refs (a consent nobody recorded) come back with null profile/route.
-  globalThis.fetch = fakeFetch(() => new Response(JSON.stringify({
-    outcome: 'denied', flow: 'skill', profile: null, route: null, message: 'access_denied',
-  }), { status: 200 }))
-  assert.deepEqual(await oauth.consumeOAuthReturn('', REF), {
-    outcome: 'denied', flow: 'skill', profile: null, route: null, message: 'access_denied',
-  })
-  assert.equal(globalThis.fetch.calls[0].url, 'https://localhost:1515/api/oauth/return/consume')
-
-  globalThis.fetch = fakeFetch(() => new Response('{"error":"unknown"}', { status: 404 }))
-  assert.equal(await oauth.consumeOAuthReturn('https://localhost:1515', REF), null)
-  globalThis.fetch = fakeFetch(() => new Response('{"error":"bad"}', { status: 400 }))
-  assert.equal(await oauth.consumeOAuthReturn('https://localhost:1515', REF), null)
-  // An outcome this page cannot act on is not a result...
-  globalThis.fetch = fakeFetch(() => new Response('{"outcome":"linked","flow":"skill"}', { status: 200 }))
-  assert.equal(await oauth.consumeOAuthReturn('https://localhost:1515', REF), null)
-  // ...but a spent ref with a real outcome and an unrecognised flow still is.
-  globalThis.fetch = fakeFetch(() => new Response('{"outcome":"failed","flow":null}', { status: 200 }))
-  assert.deepEqual(await oauth.consumeOAuthReturn('https://localhost:1515', REF), {
-    outcome: 'failed', flow: null, profile: null, route: null, message: null,
-  })
-  // A malformed ref is never sent.
-  globalThis.fetch = fakeFetch()
-  assert.equal(await oauth.consumeOAuthReturn('https://localhost:1515', 'short'), null)
-  assert.equal(await oauth.consumeOAuthReturn('https://localhost:1515', `${'a'.repeat(40)}/../`), null)
-  assert.equal(globalThis.fetch.calls.length, 0)
-  // A server that could not be asked is an error (the page offers a retry),
-  // not "expired".
-  globalThis.fetch = fakeFetch(() => new Response('', { status: 503 }))
-  await assert.rejects(() => oauth.consumeOAuthReturn('https://localhost:1515', REF))
-  globalThis.fetch = fakeFetch(() => { throw new TypeError('network down') })
-  await assert.rejects(() => oauth.consumeOAuthReturn('https://localhost:1515', REF))
-})
-
-// ── return page wording ───────────────────────────────────────────────────────
-
-test("the return page names Google only when the result proves the consent was Google's", () => {
-  const home = { label: 'Cremind home', restores: false }
-  const copyFor = (state, result, extra = {}) => oauth.returnCopy({ state, result, destination: home, ...extra })
-  const text = copy => [copy.title, ...copy.lines].join('\n')
-  const result = over => ({
-    outcome: 'denied', flow: 'skill', profile: null, route: null,
-    message: 'Authorization was not granted (access_denied).', ...over,
-  })
-
-  // /api/oauth/callback also serves the Atlassian skills, so a skill return
-  // nobody recorded may well be Jira's: it must not claim Google answered.
-  const unrecorded = result()
-  assert.equal(oauth.isGoogleReturn(unrecorded), false)
-  const denied = copyFor('denied', unrecorded)
-  assert.equal(denied.title, 'Sign-in was not completed')
-  assert.deepEqual(denied.lines, [
-    'The provider reported that access was not granted, so nothing was linked.',
-    'The provider said: Authorization was not granted (access_denied).',
-    'Ask the agent to link the account again to retry.',
-  ])
-  for (const outcome of ['received', 'denied', 'failed', 'invalid']) {
-    assert.doesNotMatch(text(copyFor(outcome, { ...unrecorded, outcome })), /Google/, outcome)
-  }
-  assert.equal(copyFor('received', { ...unrecorded, outcome: 'received' }).title, 'The sign-in response reached Cremind')
-  assert.equal(
-    copyFor('failed', { ...unrecorded, outcome: 'failed' }).lines[0],
-    'The sign-in response arrived, but Cremind could not process it.',
-  )
-  // An unrecognised flow proves nothing either, even with a profile.
-  assert.equal(oauth.isGoogleReturn(result({ flow: null, profile: 'alice' })), false)
-  assert.doesNotMatch(text(copyFor('denied', result({ flow: null, profile: 'alice' }))), /Google/)
-  // States without a result are always neutral.
-  assert.equal(copyFor('working', null).title, 'Finishing sign-in…')
-  for (const state of ['working', 'unreachable', 'unmatched']) {
-    assert.doesNotMatch(text(copyFor(state, null)), /Google/, state)
-  }
-  assert.equal(
-    copyFor('unmatched', null, { invalidStateCallback: true }).lines[0],
-    'The response did not carry a request Cremind can identify.',
-  )
-  assert.match(copyFor('unreachable', null).lines[0], /^The sign-in response arrived, but this page could not reach/)
-
-  // Calendar and Drive have Google-only callbacks...
-  assert.equal(oauth.isGoogleReturn(result({ flow: 'calendar' })), true)
-  const calendar = copyFor('denied', result({ flow: 'calendar' }))
-  assert.equal(calendar.title, 'Google sign-in was not completed')
-  assert.deepEqual(calendar.lines, [
-    'Google reported that access was not granted, so nothing was linked.',
-    'Google said: Authorization was not granted (access_denied).',
-    'Use Connect Google on the Calendar page to retry.',
-  ])
-  assert.equal(copyFor('received', result({ flow: 'drive', outcome: 'received' })).title, 'Google’s response reached Cremind')
-  assert.match(copyFor('invalid', result({ flow: 'drive', outcome: 'invalid' })).lines[0], /the request Google answered/)
-  // ...and a recorded skill consent is a Google one: the recorder records nothing else.
-  assert.equal(oauth.isGoogleReturn(result({ profile: 'alice' })), true)
-  assert.equal(copyFor('denied', result({ profile: 'alice' })).title, 'Google sign-in was not completed')
-
-  // A restorable page is named on the way back.
-  const back = oauth.returnCopy({
-    state: 'received', result: result({ outcome: 'received', profile: 'alice' }),
-    destination: { label: 'your chat', restores: true },
-  })
-  assert.equal(back.lines[0], 'Returning you to your chat…')
-})
-
-// ── route guard stash ─────────────────────────────────────────────────────────
-
-test('the return route lifts its query exactly once', () => {
-  assert.equal(oauth.stashOAuthReturnQuery({}), false)
-  assert.equal(oauth.takeOAuthReturnQuery(), null)
-  assert.equal(oauth.stashOAuthReturnQuery({ ref: REF }), true)
-  assert.deepEqual(oauth.takeOAuthReturnQuery(), { ref: REF, error: null })
-  assert.equal(oauth.takeOAuthReturnQuery(), null)
-  assert.equal(oauth.stashOAuthReturnQuery({ error: 'invalid_state' }), true)
-  assert.deepEqual(oauth.takeOAuthReturnQuery(), { ref: null, error: 'invalid_state' })
-  // Junk is still stripped from the URL, but nothing usable is kept.
-  assert.equal(oauth.stashOAuthReturnQuery({ ref: 'not a ref', code: 'x', error: '<b>' }), true)
-  assert.deepEqual(oauth.takeOAuthReturnQuery(), { ref: null, error: null })
-  assert.equal(oauth.stashOAuthReturnQuery({ ref: [REF, REF] }), true)
-  assert.deepEqual(oauth.takeOAuthReturnQuery(), { ref: null, error: null })
 })
 
 // ── Electron HTTPS transition ─────────────────────────────────────────────────

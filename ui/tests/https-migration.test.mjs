@@ -500,6 +500,39 @@ function withHandoffs(env) {
   return minted
 }
 
+test('pivot: a superseded run never releases the busy state its successor took', async (t) => {
+  // The caller disables its buttons for the duration of an activation and lets
+  // `onSettled` re-enable them. A run that is superseded — by Cancel, by Retry —
+  // resumes one microtask AFTER the new caller has taken the flag for its own
+  // request, so releasing it there un-dims the buttons mid-request: a second
+  // click, and a page that once again looks like it ignored the first one.
+  const timers = fakeTime(t)
+  const env = installBrowser()
+  const mod = await load('src/composables/useHttpsPivot.ts')
+  const pinned = transition()
+  seedTicket(pinned.id)
+  env.route(TARGET_STATUS, () => json(status({ certificate_sha256: LEAF_A })))  // never ready
+  const pivot = mod.useHttpsPivot()
+
+  const settled = []
+  let busy = true
+  pivot.enterManualMode(pivotOptions({
+    transition: pinned,
+    resumeStatus: status({ phase: 'activating' }),
+    onSettled: () => { settled.push(busy) },
+  }))
+  await advance(timers, 2_000)
+  assert.equal(settled.length, 0, 'a run still probing has not settled')
+
+  // What Cancel does: supersede the run, then take the flag for its own request.
+  pivot.cancelManualProbe()
+  busy = true
+  await advance(timers, 2_000)
+
+  assert.deepEqual(settled, [], 'a superseded run owns nothing left to release')
+  assert.equal(busy, true)
+})
+
 test('pivot: another address probes, links and refreshes its ticket for itself', async (t) => {
   const timers = fakeTime(t)
   const env = installBrowser({ href: `${LAN}/#/alice/c/42` })

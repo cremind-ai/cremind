@@ -24,17 +24,22 @@ from app.config.tls_transition import (
     port_facts,
 )
 
-#: Google's loopback OAuth callbacks (app/api/oauth_callback.py). The shared
+#: Google's loopback OAuth callbacks (app/api/oauth_callback.py), plus the page
+#: they send the consent window on to (app/api/oauth_close.py). The shared
 #: Google *Desktop* client only redirects to ``http://<loopback>:<port>``, so on
 #: an HTTPS install the browser brings the authorization response here, over
 #: plaintext, to the same port (app/config/oauth_loopback.py). These paths — and
 #: only GETs to them — are redirected to the same path on HTTPS; the handler then
-#: runs over TLS exactly as it would have. Deliberately exact paths, not a
-#: prefix: the A2A callback and every other API stay behind the 426.
+#: runs over TLS exactly as it would have. The close page is in the set for the
+#: switch that lands between a callback and its own redirect: it carries no
+#: secret and reads the same over either scheme, so a consent that got that far
+#: should not end on a 426. Deliberately exact paths, not a prefix: the A2A
+#: callback and every other API stay behind the 426.
 GOOGLE_CALLBACK_PATHS = frozenset((
     "/api/oauth/callback",
     "/api/oauth/google-calendar/callback",
     "/api/oauth/google-drive/callback",
+    "/api/oauth/close",
 ))
 
 

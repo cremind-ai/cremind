@@ -6,17 +6,17 @@ Google/Atlassian skills (run as subprocesses) get their consent redirect
 captured into a per-state inbox file; Calendar exchanges in-process; Drive
 records the picked files.
 
-Every handler does its work first and then 303s to the SPA's return view with a
-one-time ref (app/api/oauth_return.py) — never the code or the state.
+Every handler does its work first and then answers with the self-closing page in
+app/api/oauth_close.py — which carries the outcome and nothing about the grant.
 """
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 import app.api.oauth_callback as oc
-import app.api.oauth_return as oret
 import app.calendar.google_auth as ga
 import app.drive.grant_flow as gf
 
@@ -40,17 +40,23 @@ def system_dir(monkeypatch, tmp_path):
 
 
 def _returned(resp) -> dict:
-    """Follow the 303 the way the SPA would: consume the ref it carries."""
+    """Where the consent window is sent — the only thing a callback decides.
+
+    What that destination then shows and closes belongs to
+    tests/api/test_oauth_close.py; here the point is that the browser is moved
+    OFF this URL (it holds a live authorization code) and that what travels is
+    the outcome and nothing else.
+    """
     assert resp.status_code == 303
     location = resp.headers["location"]
-    assert location.startswith("/#/oauth-return?ref=")
-    # The return URL is the one thing the browser keeps in history and may send
-    # as a Referer: it must carry nothing that could be replayed.
-    assert "code=" not in location and "state=" not in location
-    assert _STATE not in location and _CODE not in location
+    assert location.startswith("/api/oauth/close?")
     assert resp.headers["cache-control"] == "no-store"
     assert resp.headers["referrer-policy"] == "no-referrer"
-    return oret.consume(location.split("ref=", 1)[1])
+    for secret in (_CODE, _STATE, "code=", "state="):
+        assert secret not in location
+    query = {key: value[0] for key, value in parse_qs(urlsplit(location).query).items()}
+    return {"outcome": query.get("o"), "flow": query.get("f"),
+            "reason": query.get("r"), "error": query.get("e")}
 
 
 def _run(handler, query: str, params: dict):
@@ -63,15 +69,15 @@ def test_inbox_callback_writes_inbox(system_dir, monkeypatch):
     query = f"state={_STATE}&code=4%2Fabc&scope=email+openid"
     dst = system_dir / "oauth_inbox" / f"{_STATE}.txt"
     seen = []
-    real_complete = oret.complete
+    real_redirect = oc.close_redirect
 
-    def complete_after_the_inbox(state, **kwargs):
+    def redirect_after_the_inbox(**kwargs):
         # Jira/Confluence share this route and the waiting link polls the file:
-        # it must be on disk before anything about the browser's way back runs.
+        # it must be on disk before anything the browser is told.
         seen.append(dst.exists())
-        return real_complete(state, **kwargs)
+        return real_redirect(**kwargs)
 
-    monkeypatch.setattr(oret, "complete", complete_after_the_inbox)
+    monkeypatch.setattr(oc, "close_redirect", redirect_after_the_inbox)
     resp = _run(oc._handle_inbox_callback, query, {"state": _STATE, "code": "4/abc"})
     assert seen == [True]
     assert dst.read_text(encoding="utf-8") == query
@@ -82,8 +88,9 @@ def test_inbox_callback_writes_inbox(system_dir, monkeypatch):
 
 def test_inbox_callback_rejects_bad_state(system_dir):
     resp = _run(oc._handle_inbox_callback, "state=bad+space", {"state": "bad space"})
-    assert resp.status_code == 303
-    assert resp.headers["location"] == "/#/oauth-return?error=invalid_state"
+    result = _returned(resp)
+    # Nothing to retry and nothing to tell a waiting page: no flow was named.
+    assert (result["outcome"], result["flow"], result["reason"]) == ("invalid", None, "nostate")
     inbox = system_dir / "oauth_inbox"
     assert not inbox.exists() or not any(inbox.iterdir())
 
@@ -95,7 +102,13 @@ def test_a_state_with_a_trailing_newline_is_invalid(system_dir, handler):
     """``$`` alone matches before a trailing newline; the state is a filename."""
     state = _STATE + "\n"
     resp = _run(handler, f"state={_STATE}%0A&code=x", {"state": state, "code": "x"})
-    assert resp.headers["location"] == "/#/oauth-return?error=invalid_state"
+    result = _returned(resp)
+    assert result["outcome"] == "invalid"
+    # The route proves the flow even when the state does not; only the shared
+    # skills callback cannot say which one it was.
+    expected = {"_handle_google_calendar_callback": "calendar",
+                "_handle_google_drive_callback": "drive"}.get(handler.__name__)
+    assert result["flow"] == expected
     inbox = system_dir / "oauth_inbox"
     assert not inbox.exists() or not any(inbox.iterdir())
 
@@ -107,8 +120,7 @@ def test_inbox_callback_consent_error_still_captures(system_dir):
     resp = _run(oc._handle_inbox_callback, query, {"state": _STATE, "error": "access_denied"})
     assert (system_dir / "oauth_inbox" / f"{_STATE}.txt").read_text(encoding="utf-8") == query
     result = _returned(resp)
-    assert result["outcome"] == "denied"
-    assert "access_denied" in result["message"]
+    assert (result["outcome"], result["reason"], result["error"]) == ("denied", "denied", "access_denied")
 
 
 def test_a_denial_code_that_is_not_a_token_is_not_echoed(system_dir):
@@ -116,7 +128,8 @@ def test_a_denial_code_that_is_not_a_token_is_not_echoed(system_dir):
     resp = _run(oc._handle_inbox_callback, query, {"state": _STATE, "error": "<script>"})
     result = _returned(resp)
     assert result["outcome"] == "denied"
-    assert "<script>" not in result["message"]
+    # A provider error that is not a token is not passed on at all.
+    assert result["error"] is None
 
 
 def test_an_atlassian_shaped_response_still_lands_in_the_inbox(system_dir):
@@ -136,27 +149,12 @@ def test_an_inbox_write_failure_is_reported_as_failed(system_dir, monkeypatch):
     assert _returned(resp)["outcome"] == "failed"
 
 
-def test_the_recorded_page_comes_back_with_the_outcome(system_dir):
-    oret.record_context(_STATE, profile="alice", route="/alice/c/abc", flow="skill")
+def test_a_captured_response_closes_its_own_window(system_dir):
+    """What the user asked for: the consent window goes away by itself, and the
+    page behind it hears about it on the channel."""
     resp = _run(oc._handle_inbox_callback, f"state={_STATE}&code=x", {"state": _STATE, "code": "x"})
     result = _returned(resp)
-    assert (result["profile"], result["route"], result["outcome"]) == ("alice", "/alice/c/abc", "received")
-
-
-def test_a_broken_return_store_falls_back_to_a_plain_page(system_dir, monkeypatch):
-    """The callback's own work is done; an unwritable store must not hide that."""
-    def broken(*_args, **_kwargs):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(oret, "complete", broken)
-    ok = _run(oc._handle_inbox_callback, f"state={_STATE}&code=x", {"state": _STATE, "code": "x"})
-    assert ok.status_code == 200
-    assert b"Response received" in ok.body
-    assert (system_dir / "oauth_inbox" / f"{_STATE}.txt").exists()
-    denied = _run(oc._handle_inbox_callback, f"state={_STATE}&error=access_denied",
-                  {"state": _STATE, "error": "access_denied"})
-    assert denied.status_code == 200
-    assert b"did not complete" in denied.body
+    assert (result["outcome"], result["flow"]) == ("received", "skill")
 
 
 # ── /api/oauth/google-calendar/callback ─────────────────────────────────────
@@ -169,11 +167,9 @@ def _calendar(query_params: dict):
 def test_calendar_success_exchanges_then_returns(system_dir, monkeypatch):
     calls = []
     monkeypatch.setattr(ga, "complete_callback", lambda state, code: calls.append((state, code)))
-    oret.record_context(_STATE, profile="alice", route="/alice/calendar", flow="calendar")
     result = _returned(_calendar({"state": _STATE, "code": _CODE}))
     assert calls == [(_STATE, _CODE)]
-    assert result == {"outcome": "received", "flow": "calendar", "profile": "alice",
-                      "route": "/alice/calendar", "message": None}
+    assert (result["outcome"], result["flow"]) == ("received", "calendar")
 
 
 def test_calendar_denial_never_exchanges(system_dir, monkeypatch):
@@ -207,9 +203,11 @@ def test_calendar_exchange_failure_is_failed_without_leaking_the_error(system_di
         raise error
 
     monkeypatch.setattr(ga, "complete_callback", fail)
-    result = _returned(_calendar({"state": _STATE, "code": _CODE}))
-    assert result["outcome"] == "failed"
-    assert "secret-detail" not in (result["message"] or "")
+    resp = _calendar({"state": _STATE, "code": _CODE})
+    result = _returned(resp)
+    assert (result["outcome"], result["reason"]) == ("failed", "exchange")
+    # The exception's text is logged, never handed to the browser.
+    assert "secret-detail" not in resp.headers["location"]
 
 
 def test_calendar_bad_state_never_exchanges(system_dir, monkeypatch):
@@ -218,7 +216,7 @@ def test_calendar_bad_state_never_exchanges(system_dir, monkeypatch):
 
     monkeypatch.setattr(ga, "complete_callback", boom)
     resp = _calendar({"state": "../x", "code": _CODE})
-    assert resp.headers["location"] == "/#/oauth-return?error=invalid_state"
+    assert _returned(resp)["outcome"] == "invalid"
 
 
 # ── /api/oauth/google-drive/callback ────────────────────────────────────────
@@ -236,10 +234,9 @@ def test_drive_captured_is_received(system_dir, monkeypatch):
         return {"profile": "alice", "state": _STATE, "status": "captured"}
 
     monkeypatch.setattr(gf, "record_redirect", record)
-    oret.record_context(_STATE, profile="alice", route="/alice/settings/gsuite", flow="drive")
     result = _returned(_drive({"state": _STATE, "picked_file_ids": "f1,f2"}))
     assert seen == [f"state={_STATE}&picked_file_ids=f1,f2"]
-    assert (result["outcome"], result["flow"], result["route"]) == ("received", "drive", "/alice/settings/gsuite")
+    assert (result["outcome"], result["flow"]) == ("received", "drive")
 
 
 def test_drive_error_is_denied(system_dir, monkeypatch):
@@ -264,10 +261,8 @@ def test_drive_unexpected_error_is_failed(system_dir, monkeypatch):
     assert _returned(_drive({"state": _STATE}))["outcome"] == "failed"
 
 
-def test_drive_bad_state_is_redirected_as_invalid(system_dir):
-    resp = _drive({"state": "no"})
-    assert resp.status_code == 303
-    assert resp.headers["location"] == "/#/oauth-return?error=invalid_state"
+def test_drive_bad_state_is_reported_as_invalid(system_dir):
+    assert _returned(_drive({"state": "no"}))["outcome"] == "invalid"
 
 
 def test_the_three_callbacks_are_get_only():

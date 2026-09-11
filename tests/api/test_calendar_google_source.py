@@ -12,7 +12,6 @@ from types import SimpleNamespace
 import pytest
 
 import app.api.calendar as C
-import app.api.oauth_return as oauth_return
 import app.calendar.google_auth as ga
 from app.config.settings import BaseConfig
 
@@ -97,91 +96,6 @@ def test_connect_reports_an_unresolvable_redirect_as_before(monkeypatch):
     resp = asyncio.run(_endpoint("/api/calendar/google/connect", "POST")(_req()))
     assert resp.status_code == 409
     assert _body(resp)["error"] == "unavailable"
-
-
-# ── return_route: bringing the consent tab back to the Calendar page ────────
-
-_STATE = "yVuZU8nVnlXUnirYSBheNCnasvVPub"
-_CONSENT = (
-    "https://accounts.google.com/o/oauth2/v2/auth?client_id=abc.apps.googleusercontent.com"
-    "&redirect_uri=http%3A%2F%2Flocalhost%3A1515%2Fapi%2Foauth%2Fgoogle-calendar%2Fcallback"
-    f"&response_type=code&state={_STATE}&code_challenge_method=S256"
-)
-
-
-def _with_body(body, profile: str = "alice") -> SimpleNamespace:
-    async def read_json():
-        if isinstance(body, Exception):
-            raise body
-        return body
-
-    return SimpleNamespace(user=SimpleNamespace(is_authenticated=True, username=profile),
-                           json=read_json)
-
-
-@pytest.fixture
-def return_store(monkeypatch, tmp_path):
-    monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path))
-    return tmp_path / "oauth_returns"
-
-
-def test_connect_records_where_the_consent_tab_should_return(monkeypatch, return_store):
-    _stub(monkeypatch, status={"connected": False, "email": None, "source": None})
-    monkeypatch.setattr(ga, "build_authorize_url", lambda profile: _CONSENT)
-    resp = asyncio.run(_endpoint("/api/calendar/google/connect", "POST")(
-        _with_body({"return_route": "/alice/calendar?view=month"})))
-    assert resp.status_code == 200
-    assert _body(resp) == {"authorize_url": _CONSENT}, "the response shape is unchanged"
-    result = oauth_return.consume(oauth_return.complete(_STATE, outcome="received", flow="calendar"))
-    assert (result["profile"], result["route"]) == ("alice", "/alice/calendar?view=month")
-
-
-def test_connect_records_under_the_calling_profile_only(monkeypatch, return_store):
-    """bob asking to be returned into alice's pages is returned to his own home."""
-    _stub(monkeypatch, status={"connected": False, "email": None, "source": None})
-    monkeypatch.setattr(ga, "build_authorize_url", lambda profile: _CONSENT)
-    asyncio.run(_endpoint("/api/calendar/google/connect", "POST")(
-        _with_body({"return_route": "/alice/calendar"}, profile="bob")))
-    result = oauth_return.consume(oauth_return.complete(_STATE, outcome="received", flow="calendar"))
-    assert (result["profile"], result["route"]) == ("bob", "/bob")
-
-
-@pytest.mark.parametrize("body", [
-    ValueError("Expecting value: line 1 column 1 (char 0)"),   # empty / non-JSON body
-    {},
-    {"return_route": 42},
-    ["not", "an", "object"],
-])
-def test_connect_without_a_usable_return_route_records_nothing(monkeypatch, return_store, body):
-    _stub(monkeypatch, status={"connected": False, "email": None, "source": None})
-    monkeypatch.setattr(ga, "build_authorize_url", lambda profile: _CONSENT)
-    resp = asyncio.run(_endpoint("/api/calendar/google/connect", "POST")(_with_body(body)))
-    assert resp.status_code == 200
-    assert _body(resp) == {"authorize_url": _CONSENT}
-    assert not return_store.exists() or not any(return_store.iterdir())
-
-
-def test_a_failed_record_never_fails_the_connect(monkeypatch, return_store):
-    _stub(monkeypatch, status={"connected": False, "email": None, "source": None})
-    monkeypatch.setattr(ga, "build_authorize_url", lambda profile: _CONSENT)
-
-    def refuse(*_args, **_kwargs):
-        raise PermissionError("already tracked for another profile")
-
-    monkeypatch.setattr(oauth_return, "record_context", refuse)
-    resp = asyncio.run(_endpoint("/api/calendar/google/connect", "POST")(
-        _with_body({"return_route": "/alice/calendar"})))
-    assert resp.status_code == 200
-    assert _body(resp) == {"authorize_url": _CONSENT}
-
-
-def test_a_consent_url_without_a_state_is_still_returned(monkeypatch, return_store):
-    _stub(monkeypatch, status={"connected": False, "email": None, "source": None})
-    monkeypatch.setattr(ga, "build_authorize_url", lambda profile: "https://accounts.google.com/x")
-    resp = asyncio.run(_endpoint("/api/calendar/google/connect", "POST")(
-        _with_body({"return_route": "/alice/calendar"})))
-    assert _body(resp) == {"authorize_url": "https://accounts.google.com/x"}
-    assert not return_store.exists() or not any(return_store.iterdir())
 
 
 # ── POST /api/calendar/google/disconnect ────────────────────────────────────

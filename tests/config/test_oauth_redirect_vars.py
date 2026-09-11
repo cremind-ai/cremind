@@ -44,8 +44,8 @@ def test_emitted_for_loopback_app_url(monkeypatch):
     monkeypatch.setattr(BaseConfig, "APP_URL", "http://localhost:1515", raising=False)
     assert sv._resolve_google_redirect_uri(None) == "http://localhost:1515" + CALLBACK_PATH
 
-    monkeypatch.setattr(BaseConfig, "APP_URL", "http://127.0.0.1:1112", raising=False)
-    assert sv._resolve_google_redirect_uri(None) == "http://127.0.0.1:1112" + CALLBACK_PATH
+    monkeypatch.setattr(BaseConfig, "APP_URL", "http://127.0.0.1:8080", raising=False)
+    assert sv._resolve_google_redirect_uri(None) == "http://127.0.0.1:8080" + CALLBACK_PATH
 
     # Trailing slash must not double up in the joined URL.
     monkeypatch.setattr(BaseConfig, "APP_URL", "http://localhost:1515/", raising=False)

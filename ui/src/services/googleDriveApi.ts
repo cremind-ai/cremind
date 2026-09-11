@@ -97,15 +97,14 @@ export async function listDriveFiles(
 }
 
 /**
- * Start a Drive picker round. ``returnRoute`` is the page to bring the picker
- * window back to afterwards — the server records it against the round's state
- * for the OAuth return route (services/oauthReturn.ts). Recording is
- * best-effort server-side: it never fails the start.
+ * Start a Drive picker round. The picker window closes itself once the callback
+ * has recorded the picks (app/api/oauth_close.py); this page learns of it
+ * through ``onOAuthReturn`` and by polling the round's status.
  */
 export async function startDriveGrant(
   agentUrl: string,
   token: string,
-  options: { fileIds?: string[]; allowFolders?: boolean; returnRoute?: string } = {},
+  options: { fileIds?: string[]; allowFolders?: boolean } = {},
 ): Promise<DriveGrantStart> {
   const base = resolveBaseUrl(agentUrl);
   const body: Record<string, unknown> = {
@@ -113,7 +112,6 @@ export async function startDriveGrant(
     allow_folders: options.allowFolders !== false,
   };
   if (options.fileIds?.length) body.file_ids = options.fileIds;
-  if (options.returnRoute) body.return_route = options.returnRoute;
   const res = await fetch(`${base}/api/drive/grants`, {
     method: 'POST',
     headers: authHeaders(token),

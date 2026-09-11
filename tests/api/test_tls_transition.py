@@ -242,6 +242,61 @@ def test_activation_quiesces_registered_tabs_before_changing_token_epoch(
     assert verify_token(alice_token) is None
 
 
+def test_a_tab_that_closes_stops_holding_the_switch(client, environment):
+    """Closing the blocking tab is the obvious remedy, so it has to work.
+
+    An expectation nobody can meet keeps a switch in ``quiescing`` for good —
+    the tab is gone, so no acknowledgement is ever coming — and the only way out
+    used to be cancelling the switch and starting again.
+    """
+    value = prepared(client)
+    tab_id = "alice-browser-tab-002"
+    alice = {"Authorization": f"Bearer {token('alice')}"}
+    assert client.post("/api/tls/client", json={"tab_id": tab_id}, headers=alice).status_code == 200
+
+    first = client.post("/api/tls/activate", json={"transition_id": value["id"]}, headers=auth())
+    assert first.json()["quiesce_pending"] == 1
+
+    closed = client.request("DELETE", "/api/tls/client", json={"tab_id": tab_id}, headers=alice)
+    assert closed.status_code == 200
+    assert closed.json()["quiesce_pending"] == 0
+
+    second = client.post("/api/tls/activate", json={"transition_id": value["id"]}, headers=auth())
+    assert second.json()["transition"]["phase"] == "activating"
+
+
+def test_closing_a_tab_outside_a_switch_is_not_an_error(client):
+    """Every tab close comes through here; without a transition there is
+    nothing to withdraw from, and that is not a failure."""
+    alice = {"Authorization": f"Bearer {token('alice')}"}
+    assert client.post(
+        "/api/tls/client", json={"tab_id": "alice-browser-tab-003"}, headers=alice,
+    ).status_code == 200
+    closed = client.request(
+        "DELETE", "/api/tls/client", json={"tab_id": "alice-browser-tab-003"}, headers=alice,
+    )
+    assert closed.status_code == 200
+
+
+def test_activation_only_waits_for_tabs_it_can_still_see(client, monkeypatch):
+    """A browser closed without a ``pagehide`` leaves its registration behind
+    for the registry's whole lifetime. Holding a switch to an acknowledgement
+    from a tab that has been gone for days is how a switch became unfinishable."""
+    now = [1000.0]
+    monkeypatch.setattr(tls_clients.time, "monotonic", lambda: now[0])
+    # After the preparation, which clears the registry for a fresh round.
+    value = prepared(client)
+    tls_clients.register("alice-browser-tab-004", "alice")
+    now[0] += tls_clients.LIVE_WITHIN_SECONDS + 1
+    # Still registered (it keeps its identity and its per-profile slot); it has
+    # only stopped counting as present.
+    assert "alice-browser-tab-004" in tls_clients.snapshot()
+    assert tls_clients.snapshot(tls_clients.LIVE_WITHIN_SECONDS) == {}
+
+    answer = client.post("/api/tls/activate", json={"transition_id": value["id"]}, headers=auth())
+    assert answer.json()["quiesce_pending"] == 0
+
+
 def test_quiesce_tab_id_cannot_be_reassigned_across_profiles(client):
     tab_id = "shared-browser-tab-001"
     assert client.post(

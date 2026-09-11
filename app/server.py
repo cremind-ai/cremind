@@ -60,7 +60,7 @@ from app.api.coding_agents import get_coding_agents_routes
 from app.api.config import get_config_routes
 from app.api.features import get_features_routes
 from app.api.oauth_callback import get_oauth_callback_routes
-from app.api.oauth_return import get_oauth_return_routes
+from app.api.oauth_close import get_oauth_close_routes
 from app.api.llm import get_llm_routes
 from app.api.setup_stream import get_setup_stream_routes
 from app.api.skills import get_skill_routes
@@ -657,6 +657,38 @@ def _resolve_public_port() -> int:
         return 1515
 
 
+def _warn_if_app_url_names_the_internal_bind(public_port: int, internal_port: int) -> None:
+    """Say so when APP_URL points at the port nothing outside can reach.
+
+    The internal bind (``PORT``) listens on 127.0.0.1 only and is never
+    published, so in a container it is the container's own loopback. An APP_URL
+    naming it is therefore an address no browser can open — which breaks Google
+    account linking (the consent redirect derives from APP_URL), the A2A agent
+    card, and any runbook that quotes the public origin. Cremind sends Google to
+    the public bind anyway (app/config/oauth_loopback.py), but only the operator
+    can fix the value itself, and nothing else in a boot log would hint at it.
+    """
+    from urllib.parse import urlsplit
+
+    if not public_port or public_port == internal_port:
+        return  # no public bind, or the two are the same: nothing to confuse
+    try:
+        parts = urlsplit((BaseConfig.APP_URL or "").strip())
+        named = parts.port
+    except ValueError:
+        return
+    if named != internal_port:
+        return
+    logger.warning(
+        f"APP_URL is {BaseConfig.APP_URL!r}, but port {internal_port} is the internal API bind "
+        f"(127.0.0.1 only, never published). The public origin is port {public_port}. "
+        "Google account linking, the agent card and the HTTPS runbook all advertise APP_URL — "
+        f"set it to the address browsers actually use (e.g. http://localhost:{public_port}) "
+        "and restart. Docker: edit APP_URL in the .env next to docker-compose.yml, then "
+        "`docker compose up -d --force-recreate cremind`; Kubernetes: `--set cremind.appUrl=…`."
+    )
+
+
 def _resolve_tls(
     ssl_certfile: str | None,
     ssl_keyfile: str | None,
@@ -920,6 +952,7 @@ async def main(
     #    sidecar and no half-written state behind.
     public_port = _resolve_public_port()
     _require_free_ports(host, public_port, port)
+    _warn_if_app_url_names_the_internal_bind(public_port, port)
     #    Now that the ports are ours, tell the boot service (and the
     #    uninstallers, which have always stopped this PID) which process to
     #    manage. No-op unless something is actually supervising us.
@@ -1162,9 +1195,8 @@ async def main(
     # the post-storage boot. Keeping these routes pre-storage guarantees they
     # answer whenever a link is in flight.
     routes.extend(get_oauth_callback_routes())
-    # The SPA's record/consume half of the consent return. Pre-storage for the
-    # same reason: it must answer whenever a callback above can redirect to it.
-    routes.extend(get_oauth_return_routes())
+    # Where those callbacks send the consent window once their work is done.
+    routes.extend(get_oauth_close_routes())
 
     from app.middleware import ConnectionHeaderFilter
 

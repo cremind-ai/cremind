@@ -22,12 +22,12 @@ under ``<CREMIND_SYSTEM_DIR>/oauth_inbox/<state>.txt``; the skill's waiting
 leave the machine and cremind-connect is never in the token path. Calendar exchanges in this process; Drive only
 records which files were picked.
 
-Every handler does its work first and only then answers — with a 303 to the
-SPA's ``/#/oauth-return`` view carrying a one-time ref (app/api/oauth_return.py)
-and never the code or state. That view closes the consent popup, or leads a
-consent tab back to the page that opened it. It reports "response received", not
-"linked": for the skills the exchange happens later in the waiting link, which is
-what confirms success.
+Every handler does its work first and only then answers — with a 303 to
+app/api/oauth_close.py's page, never with a document at its own URL, which
+carries the authorization code. That page tells whichever page opened the
+consent and then closes the window; nothing navigates into the app. It reports
+"response received", not "linked": for the skills the exchange happens later in
+the waiting link, which is what confirms success.
 
 These routes are registered PRE-storage (app/server.py) so a consent redirect
 can't 404 while storage is still booting or restarting. The inbox and Drive
@@ -39,13 +39,13 @@ from __future__ import annotations
 import os
 import re
 import time
-from typing import Mapping, Optional
+from typing import Optional
 
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, Response
+from starlette.responses import Response
 from starlette.routing import Route
 
-from app.api import oauth_return
+from app.api.oauth_close import close_redirect
 from app.config.settings import BaseConfig
 from app.utils import logger
 
@@ -57,31 +57,6 @@ _STATE_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
 # Drop inbox files older than this so abandoned consent flows don't accumulate.
 _INBOX_TTL_S = 600
-
-# An RFC 6749 ``error`` code is a short token; anything else is not echoed.
-_ERROR_CODE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-
-# Only when the return store itself cannot be written (an unwritable system
-# directory): the callback's own work is already done, so say what we know
-# rather than pretend the response went missing.
-_RECEIVED_HTML = (
-    b"<!doctype html><html><head><meta charset='utf-8'><title>Cremind</title></head>"
-    b"<body style='font-family:sans-serif;text-align:center;padding-top:3rem'>"
-    b"<h1>Response received</h1>"
-    b"<p>Return to Cremind: the page that started this confirms when the account "
-    b"is linked.</p></body></html>"
-)
-_ERROR_HTML = (
-    b"<!doctype html><html><head><meta charset='utf-8'><title>Cremind</title></head>"
-    b"<body style='font-family:sans-serif;text-align:center;padding-top:3rem'>"
-    b"<h1>Authorization did not complete</h1>"
-    b"<p>You can close this window and try linking again from Cremind.</p></body></html>"
-)
-_FALLBACK_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
-# Fixed wording on purpose: exception text is logged, never put in front of the
-# browser.
-_CALENDAR_FAILED = "Google Calendar could not be connected. Try again from the Calendar page."
-
 
 def oauth_inbox_dir() -> str:
     """Directory where captured authorization responses are dropped for skills."""
@@ -114,28 +89,22 @@ def _write_inbox(state: str, query: str) -> None:
     os.replace(tmp, dst)
 
 
-def _denial_message(params: Mapping[str, str]) -> str:
-    code = params.get("error", "")
-    if isinstance(code, str) and _ERROR_CODE_RE.fullmatch(code):
-        return f"Authorization was not granted ({code})."
-    return "Authorization was not granted."
+def _respond(
+    outcome: str,
+    flow: Optional[str],
+    reason: Optional[str] = None,
+    error_code: Optional[str] = None,
+) -> Response:
+    """Answer the consent window: send it to the page that closes it.
 
-
-def _respond(state: str, outcome: str, flow: str, message: Optional[str] = None) -> Response:
-    """Send the consent tab to the SPA's return view with a fresh one-time ref.
-
-    The ref (never the code or the state) is all the URL carries; it resolves to
-    ``outcome`` plus, when the SPA recorded one, the page that opened consent.
+    A redirect, not a page. This handler's own URL carries the authorization
+    code, and a document committed there would leave it in the address bar and
+    in history — for the skills it stays redeemable until the waiting ``link``
+    exchanges it. Only the outcome travels on, in the fixed vocabulary of
+    app/api/oauth_close.py: never the code, the state, or the text of an
+    exception.
     """
-    try:
-        ref = oauth_return.complete(state, outcome=outcome, flow=flow, message=message)
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            f"[oauth-callback] could not record the {flow} return for state={state[:6]}…: {exc}"
-        )
-        body = _RECEIVED_HTML if outcome == "received" else _ERROR_HTML
-        return HTMLResponse(body, status_code=200, headers=_FALLBACK_HEADERS)
-    return oauth_return.return_redirect(ref)
+    return close_redirect(outcome=outcome, flow=flow, reason=reason, error_code=error_code)
 
 
 async def _handle_inbox_callback(request: Request) -> Response:
@@ -152,20 +121,19 @@ async def _handle_inbox_callback(request: Request) -> Response:
     state = params.get("state", "")
     if not _STATE_RE.fullmatch(state):
         logger.warning("[oauth-callback] callback with missing/invalid state; ignoring")
-        return oauth_return.invalid_state_redirect()
+        return _respond("invalid", None, "nostate")
     # request.url.query is the raw, still-encoded query string — exactly what
     # the skill replays into fetch_token.
     try:
         _write_inbox(state, request.url.query)
     except OSError as e:  # noqa: BLE001
         logger.error(f"[oauth-callback] failed to write inbox file: {e}")
-        return _respond(state, "failed", "skill",
-                        "Cremind could not save the authorization response. Try linking again.")
+        return _respond("failed", "skill", "inbox")
     if "error" in params:
         logger.info(f"[oauth-callback] consent returned error for state={state[:6]}…")
-        return _respond(state, "denied", "skill", _denial_message(params))
+        return _respond("denied", "skill", "denied", params.get("error"))
     logger.info(f"[oauth-callback] captured authorization response for state={state[:6]}…")
-    return _respond(state, "received", "skill")
+    return _respond("received", "skill")
 
 
 async def _handle_google_calendar_callback(request: Request) -> Response:
@@ -182,15 +150,14 @@ async def _handle_google_calendar_callback(request: Request) -> Response:
     state = params.get("state", "")
     if not _STATE_RE.fullmatch(state):
         logger.warning("[oauth-callback] google-calendar callback with missing/invalid state")
-        return oauth_return.invalid_state_redirect()
+        return _respond("invalid", "calendar", "nostate")
     if "error" in params:
         logger.info(f"[oauth-callback] google-calendar consent error for state={state[:6]}…")
-        return _respond(state, "denied", "calendar", _denial_message(params))
+        return _respond("denied", "calendar", "denied", params.get("error"))
     code = params.get("code", "")
     if not code:
         logger.warning(f"[oauth-callback] google-calendar callback without a code for state={state[:6]}…")
-        return _respond(state, "failed", "calendar",
-                        "Google's response carried no authorization code. Try connecting again.")
+        return _respond("failed", "calendar", "nocode")
     from app.calendar import google_auth
 
     try:
@@ -198,18 +165,16 @@ async def _handle_google_calendar_callback(request: Request) -> Response:
     except google_auth.GoogleAuthError as exc:
         if "unknown or expired" not in str(exc):
             logger.error(f"[oauth-callback] google-calendar exchange failed: {exc}")
-            return _respond(state, "failed", "calendar", _CALENDAR_FAILED)
+            return _respond("failed", "calendar", "exchange")
         # Expired (ten minutes), already used, or started before a restart
         # emptied the in-memory pending map.
         logger.warning(f"[oauth-callback] google-calendar callback for an unknown state={state[:6]}…")
-        return _respond(state, "invalid", "calendar",
-                        "This Google Calendar consent expired or was already used. "
-                        "Start again from the Calendar page.")
+        return _respond("invalid", "calendar", "expired")
     except Exception as exc:  # noqa: BLE001
         logger.error(f"[oauth-callback] google-calendar exchange failed: {exc}")
-        return _respond(state, "failed", "calendar", _CALENDAR_FAILED)
+        return _respond("failed", "calendar", "exchange")
     logger.info(f"[oauth-callback] google-calendar connected for state={state[:6]}…")
-    return _respond(state, "received", "calendar")
+    return _respond("received", "calendar")
 
 
 async def _handle_google_drive_callback(request: Request) -> Response:
@@ -225,7 +190,7 @@ async def _handle_google_drive_callback(request: Request) -> Response:
     state = params.get("state", "")
     if not _STATE_RE.fullmatch(state):
         logger.warning("[oauth-callback] google-drive callback with missing/invalid state")
-        return oauth_return.invalid_state_redirect()
+        return _respond("invalid", "drive", "nostate")
     from app.drive import grant_flow
 
     try:
@@ -233,18 +198,15 @@ async def _handle_google_drive_callback(request: Request) -> Response:
     except grant_flow.DriveGrantError as exc:
         # record_redirect's only refusal: a state no round is waiting on.
         logger.warning(f"[oauth-callback] google-drive picker response ignored: {exc}")
-        return _respond(state, "invalid", "drive",
-                        "This Drive picker round expired or was already finished. "
-                        "Start again from the Drive section.")
+        return _respond("invalid", "drive", "expired")
     except Exception as exc:  # noqa: BLE001
         logger.error(f"[oauth-callback] google-drive picker response failed: {exc}")
-        return _respond(state, "failed", "drive",
-                        "Cremind could not record the picked files. Try again from the Drive section.")
+        return _respond("failed", "drive", "picks")
     if outcome.get("status") == "error":
         logger.info(f"[oauth-callback] google-drive picker returned an error for state={state[:6]}…")
-        return _respond(state, "denied", "drive", _denial_message(params))
+        return _respond("denied", "drive", "denied", params.get("error"))
     logger.info(f"[oauth-callback] google-drive picker captured for state={state[:6]}…")
-    return _respond(state, "received", "drive")
+    return _respond("received", "drive")
 
 
 def get_oauth_callback_routes() -> list[Route]:

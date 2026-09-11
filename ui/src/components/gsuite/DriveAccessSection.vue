@@ -10,7 +10,6 @@
  * that Google offers no per-file revoke.
  */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
-import { useRoute } from 'vue-router';
 import {
   ElButton, ElCard, ElInput, ElMessage, ElTable, ElTableColumn, ElTag,
 } from 'element-plus';
@@ -25,7 +24,6 @@ import { onOAuthReturn, type OAuthReturnNotice } from '../../services/oauthRetur
 
 const props = defineProps<{ profile: string }>();
 const settings = useSettingsStore();
-const route = useRoute();
 
 const loading = ref(true);
 // null until the server has actually answered. "Not linked" is only ever
@@ -51,8 +49,9 @@ const manualHint = ref('');
 // Polling a grant round: the grant lands with Google on approval, so the server
 // discovers it by re-listing reachable files even when the redirect never
 // arrives. That is why this polls instead of waiting on a callback. When the
-// redirect DOES arrive, the OAuth return page (views/OAuthReturn.vue) tells us,
-// and we poll at once instead of on the next tick.
+// redirect DOES arrive, the page that closes the picker window
+// (app/api/oauth_close.py) tells us, and we poll at once instead of on the
+// next tick.
 const POLL_MS = 2500;
 const MAX_POLLS = 120;
 let pollTimer: number | undefined;
@@ -194,8 +193,9 @@ async function pollGrant() {
  */
 function onDriveReturn(notice: OAuthReturnNotice) {
   if (notice.flow !== 'drive' || !granting.value) return;
-  // Another profile's return cannot concern this profile's round.
-  if (notice.profile && notice.profile !== props.profile) return;
+  // A notice names no profile (the server does not attribute a response to
+  // one), so this is only ever a cue to ask the server about OUR round — which
+  // pollGrant does, with this profile's own token.
   void pollGrant();
 }
 
@@ -215,7 +215,6 @@ async function onGrant() {
   const refs = fileRef.value.trim() ? [fileRef.value.trim()] : undefined;
   const started = await startDriveGrant(settings.agentUrl, settings.authToken, {
     fileIds: refs,
-    returnRoute: route.fullPath,
   });
   if (started.error || !started.authorize_url || !started.state) {
     if (popup && !popup.closed) popup.close();

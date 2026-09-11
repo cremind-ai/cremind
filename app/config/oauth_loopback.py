@@ -114,6 +114,26 @@ def _plaintext_reaches_public_port() -> bool:
     return not edge_tls_termination() and _public_port() != 0
 
 
+def _names_internal_bind(port: int) -> bool:
+    """Whether ``port`` is the internal API bind while a public port exists.
+
+    ``PORT`` (1112) binds 127.0.0.1 only and is never published — in a container
+    that loopback is the container's, not the browser's, so an APP_URL naming it
+    (some installers wrote exactly that) sends Google's redirect to an address
+    the user's browser cannot open. The public bind serves the same application,
+    so it is both reachable and correct.
+
+    Only when a public port is actually bound: with ``CREMIND_UI_PORT=0`` the
+    internal bind is all there is, and on a native install a browser on the same
+    machine reaches it perfectly well.
+    """
+    from app.config.settings import BaseConfig
+    from app.config.tls_mode import _public_port
+
+    public = _public_port()
+    return bool(public) and port == BaseConfig.PORT and port != public
+
+
 def app_url_loopback_origin() -> Optional[str]:
     """Step 1: APP_URL's own loopback origin as Google's ``http`` redirect origin.
 
@@ -129,6 +149,8 @@ def app_url_loopback_origin() -> Optional[str]:
     scheme, host, port = parts
     if scheme == "https" and not _plaintext_reaches_public_port():
         return None
+    if _names_internal_bind(port):
+        return None
     return f"http://{host}:{port}"
 
 
@@ -139,9 +161,10 @@ def _fallback_port() -> int:
     reachable there, not on the container's own bind — except for an ``https``
     APP_URL whose port answers only TLS for us (edge termination, or no public
     bind): that is exactly the address step 1 declined, and naming it here would
-    send Google's plaintext redirect to a TLS-only listener. ``CREMIND_UI_PORT=0``
-    ("serve loopback-only behind an external proxy") names no reachable port, so
-    it — like an unparseable value — falls through to 1515.
+    send Google's plaintext redirect to a TLS-only listener. An APP_URL naming
+    the internal API bind is declined for the same reason (:func:`_names_internal_bind`).
+    ``CREMIND_UI_PORT=0`` ("serve loopback-only behind an external proxy") names
+    no reachable port, so it — like an unparseable value — falls through to 1515.
     """
     from app.config.settings import BaseConfig
 
@@ -150,7 +173,8 @@ def _fallback_port() -> int:
         scheme, port = parts.scheme.lower(), parts.port
     except ValueError:
         scheme, port = "", None
-    if port and not (scheme == "https" and not _plaintext_reaches_public_port()):
+    if (port and not (scheme == "https" and not _plaintext_reaches_public_port())
+            and not _names_internal_bind(port)):
         return port
     try:
         public = int((os.environ.get("CREMIND_UI_PORT") or "").strip())
