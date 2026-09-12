@@ -331,7 +331,11 @@ def test_an_inferred_install_mode_is_said_at_boot(monkeypatch, tmp_path) -> None
 
     from app.config import tls_managed_env as managed
 
+    # Every pod signal has to be cut off explicitly, not left to the ambient
+    # environment: a suite running inside a cluster would otherwise take this
+    # container for a pod, infer nothing, and fail here and nowhere else.
     monkeypatch.delenv("VNC_PASSWORD", raising=False)
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
     marker = tmp_path / "dockerenv"
     marker.write_text("", encoding="utf-8")
     monkeypatch.setattr(managed, "_CONTAINER_MARKER", marker)

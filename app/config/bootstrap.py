@@ -65,9 +65,14 @@ def _bootstrap_path() -> Path:
 def bootstrap_exists() -> bool:
     """True iff a durable provider choice exists (file OR env override).
 
-    Distinguishes "user has committed to a backend" from "we'd silently
-    fall back to SQLite". ``read_bootstrap()`` is unsuitable for this check
-    because it returns ``sqlite`` for both cases.
+    Distinguishes "user has committed to a backend" from "nothing has been
+    chosen yet". ``read_bootstrap()`` is unsuitable for this check because it
+    answers ``sqlite`` for a missing file and *raises* for an unreadable one.
+
+    Note that this only **stats** the file; it never parses it. That is why a
+    corrupt ``bootstrap.toml`` on a Postgres install was so dangerous before
+    ``read_bootstrap`` was made fatal — this said "committed", so the server
+    booted fully, and the provider it booted onto was the SQLite default.
 
     The server uses this signal to decide whether to boot fully (initialize
     storage, run migrations, persist built-in tools) or to enter the
@@ -91,6 +96,11 @@ def read_bootstrap() -> dict[str, Any]:
 
     Missing keys are filled with defaults so callers can index without
     branching on presence.
+
+    A file that exists but cannot be parsed is the one case this refuses:
+    it raises ``RuntimeError`` rather than fall back to the SQLite default,
+    unless ``CREMIND_DB_PROVIDER`` already says which backend to use. See the
+    comment on that branch for why guessing there is unrecoverable.
     """
     path = _bootstrap_path()
     data: dict[str, Any] = {}
