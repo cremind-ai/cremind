@@ -192,9 +192,16 @@ def test_current_facts_take_a_container_that_never_said_its_mode_for_docker(
     monkeypatch.setattr(managed, "_CONTAINER_MARKER", marker)
     assert current_tls_facts(public_port=1515).restart_supported is True
 
-    # An explicit answer still wins over the marker.
+    # And a claim the container contradicts loses to the container: this is the
+    # reported install, where ``INSTALL_MODE=native`` leaked in from the shell
+    # that ran ``docker compose up``. Docker restarts the container regardless,
+    # so promising no restart here is what produced the Ctrl+C runbook.
     monkeypatch.setenv("INSTALL_MODE", "native")
-    assert current_tls_facts(public_port=1515).restart_supported is False
+    assert current_tls_facts(public_port=1515).restart_supported is True
+
+    # A container mode named outright is still taken at its word.
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
+    assert current_tls_facts(public_port=1515).restart_supported is True
 
 
 # ── the anti-drift pin ───────────────────────────────────────────────────

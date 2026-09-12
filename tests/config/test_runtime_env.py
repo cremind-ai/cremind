@@ -85,6 +85,12 @@ def _isolated_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(runtime_env, "_CONTAINER_MARKER", Path("/nonexistent/.dockerenv"))
     monkeypatch.setattr(runtime_env, "_SA_NAMESPACE_FILE", Path("/nonexistent/namespace"))
     monkeypatch.setattr(runtime_env, "_CPUINFO_PATH", Path("/nonexistent/cpuinfo"))
+    # The mode now resolves through the shared resolver, which reads the
+    # service-account mount as well as ``KUBERNETES_SERVICE_HOST`` (deleted
+    # above): a suite run inside a pod would otherwise call every row here
+    # Kubernetes.
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._POD_MARKER", Path("/nonexistent/serviceaccount"))
     monkeypatch.setattr(BaseConfig, "CREMIND_INSTALL_DIR", str(tmp_path / "install"))
     runtime_env.describe_runtime_environment.cache_clear()
     yield
@@ -222,6 +228,32 @@ _CASES = [
         {"VNC_PASSWORD": "secret", "ENV": "local"},
         {"install_mode": "docker", "container": True, "supervised": True},
         id="legacy-docker-env-without-install-mode",
+    ),
+    pytest.param(
+        # A pod whose manifest never set INSTALL_MODE. The kubelet's variable is
+        # injected into every pod regardless, so this is never a guess — and
+        # calling it native would promise no supervisor for a workload the
+        # kubelet restarts.
+        {"KUBERNETES_SERVICE_HOST": "10.96.0.1", "ENV": "production"},
+        {
+            "install_mode": "kubernetes",
+            "container": True,
+            "supervised": True,
+            "deployment": "kubernetes",
+        },
+        id="pod-without-install-mode",
+    ),
+    pytest.param(
+        # The same pod, with a host mode in its environment. A container's
+        # environment is fixed at creation, so the claim loses to the pod.
+        {"INSTALL_MODE": "native", "KUBERNETES_SERVICE_HOST": "10.96.0.1"},
+        {
+            "install_mode": "kubernetes",
+            "container": True,
+            "supervised": True,
+            "deployment": "kubernetes",
+        },
+        id="native-claim-inside-a-pod",
     ),
 ]
 
@@ -425,11 +457,12 @@ def test_prompt_line_never_contradicts_itself_about_the_supervisor(
     the invariant is what matters: container-ness and supervision come from the
     same resolved install mode.
     """
-    _describe(monkeypatch, env)
+    described = _describe(monkeypatch, env)
     line = runtime_env.runtime_environment_prompt_line()
 
-    container_label = "Docker install" in line or "Kubernetes install" in line
-    assert not (container_label and "no supervisor" in line), line
+    # Keyed off the described fact rather than the words, so a row that renders
+    # the wrong label cannot slip past by not saying "Docker install".
+    assert not (described["container"] and "no supervisor" in line), line
 
 
 def test_prompt_line_is_stable_within_a_process(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -444,7 +477,9 @@ def test_prompt_line_is_stable_within_a_process(monkeypatch: pytest.MonkeyPatch)
 # ── install-mode detection (shared with the Codex sign-in flow) ────────────
 
 
-def test_detect_install_mode_honours_a_caller_supplied_marker(tmp_path: Path) -> None:
+def test_detect_install_mode_honours_a_caller_supplied_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
     """``app.api.llm_codex_flow`` keeps its own patchable marker and passes it
     in; a marker that exists means Docker even with no INSTALL_MODE."""
     marker = tmp_path / ".dockerenv"
@@ -452,6 +487,32 @@ def test_detect_install_mode_honours_a_caller_supplied_marker(tmp_path: Path) ->
 
     assert runtime_env.detect_install_mode(container_marker=marker) == "docker"
     assert runtime_env.detect_install_mode(container_marker=tmp_path / "absent") == "native"
+
+    # And a claim the marker contradicts loses to it, so the Codex callback
+    # binds the interface a container needs.
+    monkeypatch.setenv("INSTALL_MODE", "native")
+    assert runtime_env.detect_install_mode(container_marker=marker) == "docker"
+    assert runtime_env.detect_install_mode(container_marker=tmp_path / "absent") == "native"
+
+
+def test_a_container_that_claims_native_is_described_as_docker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The reported install, as the Developer page and the agent's prompt line
+    see it. Both already called it Docker while the HTTPS page called it native;
+    now they agree because they ask the same resolver."""
+    marker = tmp_path / ".dockerenv"
+    marker.write_text("", encoding="utf-8")
+    monkeypatch.setattr(runtime_env, "_CONTAINER_MARKER", marker)
+
+    described = _describe(monkeypatch, {"INSTALL_MODE": "native", "SETUP_WIZARD_ENV": "local"})
+
+    assert described["install_mode"] == "docker"
+    assert described["container"] is True
+    assert described["supervised"] is True
+    line = runtime_env.runtime_environment_prompt_line()
+    assert "Docker install" in line
+    assert "restarts supervised" in line
 
 
 def test_unknown_install_mode_falls_back_to_native(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -38,9 +38,16 @@ def _uncached_runtime_env(monkeypatch: pytest.MonkeyPatch):
     the first install described here would leak into all the others. The
     container marker is pointed at a path that cannot exist because CI itself
     may run inside a container, where ``/.dockerenv`` would turn every native
-    row here into a Docker one.
+    row here into a Docker one. The TLS path resolves the same question through
+    its own copy of the marker plus the pod signals, so those are neutralised
+    too — the ``local_trust`` and ``restart_supported`` rows read that one.
     """
     monkeypatch.setattr(runtime_env, "_CONTAINER_MARKER", Path("/nonexistent/.dockerenv"))
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._CONTAINER_MARKER", Path("/nonexistent/.dockerenv"))
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._POD_MARKER", Path("/nonexistent/serviceaccount"))
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
     runtime_env.describe_runtime_environment.cache_clear()
     yield
     runtime_env.describe_runtime_environment.cache_clear()
@@ -416,6 +423,11 @@ def _tls_env(monkeypatch, tmp_path, mode: str, *, serving: bool) -> None:
     monkeypatch.setattr(BaseConfig, "APP_URL", "http://localhost:1515", raising=False)
     monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
     monkeypatch.delenv("CREMIND_UI_PORT", raising=False)
+    # Container signals outrank a host ``INSTALL_MODE`` now, and the desktop
+    # image bakes ``VNC_PASSWORD``: leaving these in place would make the
+    # native cases below Docker ones wherever this suite happens to run.
+    monkeypatch.delenv("VNC_PASSWORD", raising=False)
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
     monkeypatch.setenv("INSTALL_MODE", "kubernetes")
     tls_mode.record_boot_tls(serving)
 

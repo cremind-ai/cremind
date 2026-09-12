@@ -48,8 +48,16 @@ def environment(monkeypatch, tmp_path):
     monkeypatch.setenv("INSTALL_MODE", "native")
     monkeypatch.setenv("CREMIND_UI_PORT", "1515")
     for key in ("CREMIND_TLS_TERMINATION", "CREMIND_OAUTH_REDIRECT_URI",
-                "CREMIND_ELECTRON_PARENT", "CREMIND_SUPERVISED"):
+                "CREMIND_ELECTRON_PARENT", "CREMIND_SUPERVISED",
+                # The mode is resolved against the environment, so these would
+                # make this "native install" a container one wherever the suite
+                # happens to run.
+                "VNC_PASSWORD", "KUBERNETES_SERVICE_HOST"):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._CONTAINER_MARKER", tmp_path / "no-dockerenv")
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._POD_MARKER", tmp_path / "no-serviceaccount")
     # Nothing here needs a real certificate; never generate one in a test.
     monkeypatch.setattr("app.config.tls_auto.ensure_local_tls", lambda *_args: ("cert", "key"))
     return tmp_path

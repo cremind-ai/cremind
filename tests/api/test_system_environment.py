@@ -79,6 +79,11 @@ def _uncached_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(runtime_env, "_CONTAINER_MARKER", tmp_path / "no-dockerenv")
     monkeypatch.setattr(runtime_env, "_SA_NAMESPACE_FILE", tmp_path / "no-namespace")
     monkeypatch.setattr(runtime_env, "_CPUINFO_PATH", cpuinfo)
+    # The mode resolves through the shared resolver, which reads the
+    # service-account mount as well: a pod-hosted runner would otherwise
+    # describe every row here as Kubernetes.
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._POD_MARKER", tmp_path / "no-serviceaccount")
     monkeypatch.setattr(runtime_env, "_host_platform", lambda: ("Linux", "x86_64"))
     runtime_env.describe_runtime_environment.cache_clear()
     yield

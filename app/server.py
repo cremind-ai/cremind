@@ -72,6 +72,11 @@ from app.api.version import get_version_routes
 from app.auth import verify_token
 from app.config.bootstrap import bootstrap_exists
 from app.config.settings import BaseConfig, set_dynamic_config_storage
+from app.config.tls_managed_env import (
+    INSTALL_MODE_OVERRIDDEN,
+    KNOWN_INSTALL_MODES,
+    resolve_install_mode,
+)
 from app.config.tls_mode import (
     MODE_AFTER_SETUP,
     MODE_AUTO,
@@ -552,11 +557,10 @@ def request_graceful_shutdown(delay_s: float = 0.0) -> bool:
     return True
 
 
-# Last-resort "are we in a container?" signal, consulted only when
-# INSTALL_MODE is absent. A copy of app.config.runtime_env._CONTAINER_MARKER,
-# module-level for the same reason: tests point it somewhere that doesn't exist
-# rather than patching Path.exists globally, because CI itself may run inside a
-# container.
+# The "are we in a container?" signal, handed to the shared resolver below. A
+# copy of app.config.runtime_env._CONTAINER_MARKER, module-level for the same
+# reason: tests point it somewhere that doesn't exist rather than patching
+# Path.exists globally, because CI itself may run inside a container.
 _CONTAINER_MARKER = Path("/.dockerenv")
 
 
@@ -578,36 +582,20 @@ def _supervised_env() -> bool:
     semantics so Ctrl-C doesn't truncate work, and the wizard asks the operator
     to restart by hand instead.
 
-    A deliberate duplicate of ``app.config.runtime_env.supervised``, which
-    answers the same question for the Developer page and the agent's prompt
-    line: this one runs while we are booting or dying and must not import that
-    module (or anything else optional) to do it. The two must still agree, so
-    the container fallback below is copied from ``detect_install_mode``: an
-    install whose ``.env`` predates ``INSTALL_MODE`` — a legacy compose file, or
-    ``docker run`` on the desktop image — is still the Docker install whose
-    restart policy brings it back, and reading only the variable left this the
-    one place that took the clean-shutdown branch while the prompt line said
-    "restarts supervised". Change either copy and change the other.
+    The mode comes from ``tls_managed_env.resolve_install_mode``, the one
+    implementation every reader shares, so this can no longer disagree with the
+    Developer page about the same machine — which it did, for a container whose
+    environment claimed ``INSTALL_MODE=native``: that took the clean-shutdown
+    branch while the prompt line said "restarts supervised". That module is
+    stdlib-only and ``settings`` (imported above) has already loaded it, so
+    nothing optional enters the boot or shutdown path. This module passes its
+    own marker so it stays independently neutralisable in tests.
     """
-    install_mode = (os.environ.get("INSTALL_MODE") or "").strip()
-    # ``get_active_install_mode`` — which the other copy resolves through —
-    # matches the variable against install_catalog.toml EXACTLY and returns None
-    # for anything the catalog does not define, so an unknown or mis-cased value
-    # (``INSTALL_MODE=Docker``, the shape a hand-edited ``.env`` is most likely
-    # to carry) is ABSENT there and falls through to the container fallback.
-    # Deliberately not lower-cased for the same reason: normalising here would
-    # accept a value the catalog rejects and re-open the divergence from the
-    # other direction. Keep this tuple in step with the catalog's mode keys.
-    if install_mode not in ("docker", "kubernetes", "native", "custom"):
-        install_mode = ""
-    if (
-        install_mode in ("docker", "kubernetes")
+    mode, _ = resolve_install_mode(_CONTAINER_MARKER)
+    return (
+        mode in ("docker", "kubernetes")
         or os.environ.get("CREMIND_ELECTRON_PARENT") is not None
         or env_supervised()
-    ):
-        return True
-    return not install_mode and bool(
-        os.environ.get("VNC_PASSWORD") or _CONTAINER_MARKER.exists()
     )
 
 
@@ -685,33 +673,56 @@ def _warn_if_app_url_names_the_internal_bind(public_port: int, internal_port: in
 
 
 def _note_inferred_install_mode() -> None:
-    """Say so when the install mode came from the container, not ``INSTALL_MODE``.
+    """Say so when the environment, not ``INSTALL_MODE``, decided what we are.
 
-    The shipped Compose template sets the variable; ``docker run`` on the image
-    and a hand-written compose file do not. Everything that decides how this
-    process restarts and where an HTTPS switch is persisted then falls back to
-    the container marker (``tls_managed_env.effective_install_mode``), and that
-    inference deserves one line in the log: it is the only place an operator
-    would learn why their install is being treated as Compose, and the fix —
-    saying so in the deployment — is a one-liner.
+    Two cases, both worth exactly one line. The variable said **nothing usable**
+    — the shipped Compose template sets it, but ``docker run`` on the image and
+    a hand-written compose file do not — or it named a **host** mode from inside
+    a container, which a container's environment cannot really be in and which
+    is almost always a leak from the shell that created it. Either way
+    everything that decides how this process restarts and where an HTTPS switch
+    is persisted now follows the environment
+    (``tls_managed_env.resolve_install_mode``), and this is the only place an
+    operator would learn why — and how to make it explicit.
     """
-    from app.config.tls_managed_env import KNOWN_INSTALL_MODES, install_mode_was_inferred
-
-    if not install_mode_was_inferred():
+    mode, how = resolve_install_mode()
+    if not how:
         return
     raw = (os.environ.get("INSTALL_MODE") or "").strip()
-    said = (
-        "INSTALL_MODE is not set" if not raw
-        else f"INSTALL_MODE={raw!r} names no install mode ({', '.join(KNOWN_INSTALL_MODES)})"
+    where = "a Docker container" if mode == "docker" else "a Kubernetes pod"
+    treated = (
+        "a Docker (Compose) install: restarts are expected to be supervised by "
+        "Docker, and an HTTPS switch from Settings → HTTPS & Certificate is "
+        "applied from the system-directory volume"
+        if mode == "docker" else
+        "a Kubernetes install: the kubelet is expected to restart it, and an "
+        "HTTPS switch is a Helm upgrade (cremind.ssl), not something it applies "
+        "to itself"
     )
-    logger.warning(
-        f"{said}, but this process is running in a Docker container, so it is "
-        "treated as a Docker (Compose) install: restarts are expected to be "
-        "supervised by Docker, and an HTTPS switch from Settings → HTTPS & "
-        "Certificate is applied from the system-directory volume. Set "
-        "INSTALL_MODE=docker in the deployment to make that explicit — the "
-        "shipped docker-compose.yml does."
-    )
+    if how == INSTALL_MODE_OVERRIDDEN:
+        said = f"INSTALL_MODE={raw!r} names a host install"
+        remedy = (
+            "The value usually leaks in from the shell that ran `docker compose "
+            "up`: Compose lets a variable already set in that shell override the "
+            "project's .env, and the cremind PowerShell shim of a native install "
+            "leaves INSTALL_MODE=native in the session it ran in. Recreate the "
+            "container from a shell where INSTALL_MODE is not set (PowerShell: "
+            "Remove-Item Env:INSTALL_MODE), or pin INSTALL_MODE=docker in "
+            "docker-compose.yml's environment: block — the shipped template does."
+            if mode == "docker" else
+            "Set INSTALL_MODE=kubernetes in the pod's environment — the shipped "
+            "Helm chart does."
+        )
+    else:
+        said = (
+            "INSTALL_MODE is not set" if not raw
+            else f"INSTALL_MODE={raw!r} names no install mode ({', '.join(KNOWN_INSTALL_MODES)})"
+        )
+        remedy = (
+            f"Set INSTALL_MODE={mode} in the deployment to make that explicit — "
+            f"the shipped {'docker-compose.yml' if mode == 'docker' else 'Helm chart'} does."
+        )
+    logger.warning(f"{said}, but this process is running in {where}, so it is treated as {treated}. {remedy}")
 
 
 async def _watch_https_confirmation() -> None:

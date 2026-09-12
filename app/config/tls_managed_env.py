@@ -19,8 +19,8 @@ Three things make this safe to do without a capability handshake:
   same image, so a server that can honour this file is by definition the server
   that will come back. Nothing has to negotiate with an older entrypoint.
 * **It is loaded only where the container environment is genuinely immutable**
-  (``INSTALL_MODE=docker``, or a Docker container that never said — see
-  :func:`effective_install_mode`). A native install's ``.env`` keeps being the
+  (any Docker container, whatever its ``INSTALL_MODE`` says — see
+  :func:`resolve_install_mode`). A native install's ``.env`` keeps being the
   installer shim's business, and Kubernetes keeps its Helm runbook — there
   ``cremind.ssl`` moves the Service, the probes and the proxy sidecar together,
   which no pod can do to itself.
@@ -64,8 +64,19 @@ _LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$"
 #: importable from here.
 KNOWN_INSTALL_MODES = ("docker", "kubernetes", "native", "custom")
 
-# Last-resort "are we in a container?" signals, consulted only when INSTALL_MODE
-# says nothing usable. ``_CONTAINER_MARKER`` is a copy of
+#: The two host modes. A container signal outranks either of them — see
+#: :func:`resolve_install_mode`.
+_HOST_INSTALL_MODES = ("native", "custom")
+
+#: How :func:`resolve_install_mode` reached its answer. ``SAID`` means the
+#: variable decided (or nothing contradicted it) and nothing needs saying;
+#: the other two are worth one line in the boot log.
+INSTALL_MODE_SAID = ""
+INSTALL_MODE_INFERRED = "inferred"
+INSTALL_MODE_OVERRIDDEN = "overridden"
+
+# The "what is running us?" signals, consulted whenever INSTALL_MODE does not
+# name a container mode. ``_CONTAINER_MARKER`` is a copy of
 # ``app.config.runtime_env._CONTAINER_MARKER``, module-level for the same
 # reason: tests point it somewhere that does not exist rather than patching
 # Path.exists globally, because CI itself may run inside a container. The
@@ -86,49 +97,89 @@ def install_mode() -> str:
     return (os.environ.get("INSTALL_MODE") or "").strip().lower()
 
 
-def effective_install_mode() -> str:
-    """``INSTALL_MODE`` when it names a mode, otherwise what the container says.
+def resolve_install_mode(container_marker: Path | None = None) -> tuple[str, str]:
+    """``(mode, provenance)`` — what is really running us, and who said so.
 
-    The shipped Compose template sets ``INSTALL_MODE=docker``, but the image
-    itself does not: ``docker run`` on it, a hand-written compose file, or a
-    ``.env`` that predates the key all start a container in which the variable
-    is absent. Every other reader of the mode already falls back to the
-    container marker for that case — ``runtime_env.detect_install_mode``, the
-    server's own supervised check, ``cremind boot`` — so the Developer page
-    called such an install "Docker, supervised" while the HTTPS switch, reading
-    only the variable, took it for an unsupervised native install: it wrote its
-    settings into a ``.env`` the container environment shadows and told the
-    operator to press Ctrl+C in a terminal that does not exist. This is the
-    HTTPS path's copy of that fallback, kept here because ``settings.py``
-    imports this module before ``runtime_env`` can be imported.
+    The one implementation of a question three modules used to answer
+    separately (``runtime_env.detect_install_mode``, ``server._supervised_env``
+    and this module), and that they answered differently for the same machine.
+    It lives here because ``settings.py`` imports this module during its own
+    import, so this module may import nothing from ``app``; the others import
+    *it*.
 
-    Mirrors ``detect_install_mode`` with one narrowing: a pod (the kubelet's
-    ``KUBERNETES_SERVICE_HOST``, or the service-account mount) is never
-    inferred to be Docker, so a hand-rolled Kubernetes manifest without the
-    chart's ``INSTALL_MODE`` keeps the behaviour it had rather than gaining a
-    self-restarting switch its Service and probes never made. An unknown value
-    (``podman``, ``compose``) counts as absent, exactly as the install catalog
-    treats it. Returns the empty string when nothing can be said, which every
-    caller reads as native.
+    The rule, in order:
 
-    What the inference cannot see is a restart policy: ``docker run`` with the
-    default ``--restart=no`` is inferred to be Docker all the same, and a
-    switch it applies stops the container until someone starts it again. The
-    confirmation window a self-applied switch carries therefore restarts on
-    the boot that serves HTTPS (see ``reconcile_activation_boot``), so time
-    spent stopped does not count against it.
+    1. ``INSTALL_MODE`` naming a **container** mode (``docker``,
+       ``kubernetes``) wins outright. A deployment author wrote it, and it is
+       the only way a containerd/nerdctl install — which has no
+       ``/.dockerenv`` — can say what it is.
+    2. Otherwise the environment itself decides: a pod (the kubelet's
+       ``KUBERNETES_SERVICE_HOST`` or the service-account mount) is
+       ``kubernetes``; a Docker container (``/.dockerenv``, or the desktop
+       image's baked ``VNC_PASSWORD``) is ``docker``. The pod is checked first
+       because cri-dockerd writes ``/.dockerenv`` into pods too, and inferring
+       Docker there would hand a pod a self-restarting switch its Service and
+       probes never made.
+    3. A container signal therefore **overrides** ``INSTALL_MODE=native`` or
+       ``custom``. That reversal is the point: a container's environment is
+       fixed when the container is created, and a host mode in it is almost
+       always a leak rather than a statement. Compose resolves ``${VAR}`` from
+       the shell that runs ``docker compose up`` *before* the project's
+       ``.env``, and the native install's PowerShell shim used to leave
+       ``INSTALL_MODE=native`` in the session it ran in — so a Docker install
+       created from that window was labelled native, shown a "press Ctrl+C in
+       the terminal" runbook for a terminal that does not exist, and had its
+       HTTPS switch written to a ``.env`` the container environment shadows.
+    4. With no container signal the claim stands: ``native``, ``custom``, or
+       the empty string (which every caller reads as native) for an unset or
+       unrecognised value.
+
+    The provenance says which branch answered: :data:`INSTALL_MODE_SAID` when
+    the variable decided or nothing contradicted it, :data:`INSTALL_MODE_INFERRED`
+    when it said nothing usable, :data:`INSTALL_MODE_OVERRIDDEN` when it named
+    a host mode inside a container. ``app/server.py`` turns the last two into
+    one boot-log line, because an operator would otherwise have no way to learn
+    why their install is being treated as something they did not write.
+
+    ``container_marker`` overrides :data:`_CONTAINER_MARKER` for callers that
+    keep their own patchable copy of it (``runtime_env``, ``server``,
+    ``api.llm_codex_flow``); it exists so each of them stays independently
+    neutralisable in tests, since CI itself may run inside a container.
+
+    What this cannot see is a restart policy: ``docker run`` with the default
+    ``--restart=no`` is Docker all the same, and a switch it applies stops the
+    container until someone starts it again. The confirmation window a
+    self-applied switch carries therefore restarts on the boot that serves
+    HTTPS (see ``reconcile_activation_boot``), so time spent stopped does not
+    count against it.
     """
-    mode = install_mode()
-    if mode in KNOWN_INSTALL_MODES:
-        return mode
-    if os.environ.get("VNC_PASSWORD") or _CONTAINER_MARKER.exists():
-        return "" if _in_a_pod() else "docker"
-    return ""
+    claim = install_mode()
+    if claim not in KNOWN_INSTALL_MODES:
+        claim = ""
+    if claim in ("docker", "kubernetes"):
+        return claim, INSTALL_MODE_SAID
+    marker = container_marker if container_marker is not None else _CONTAINER_MARKER
+    if _in_a_pod():
+        container = "kubernetes"
+    elif os.environ.get("VNC_PASSWORD") or marker.exists():
+        container = "docker"
+    else:
+        container = ""
+    if not container:
+        return claim, INSTALL_MODE_SAID
+    return container, (
+        INSTALL_MODE_OVERRIDDEN if claim in _HOST_INSTALL_MODES else INSTALL_MODE_INFERRED
+    )
 
 
-def install_mode_was_inferred() -> bool:
-    """Whether :func:`effective_install_mode` had to look past ``INSTALL_MODE``."""
-    return install_mode() not in KNOWN_INSTALL_MODES and bool(effective_install_mode())
+def effective_install_mode() -> str:
+    """The mode this process really runs under. See :func:`resolve_install_mode`."""
+    return resolve_install_mode()[0]
+
+
+def install_mode_provenance() -> str:
+    """Who decided the effective mode: said, inferred, or overridden."""
+    return resolve_install_mode()[1]
 
 
 def is_container_install() -> bool:

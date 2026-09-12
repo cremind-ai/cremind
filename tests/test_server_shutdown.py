@@ -114,8 +114,23 @@ def test_on_shutdown_logs_warning_on_timeout() -> None:
 
 
 def _supervise(monkeypatch: pytest.MonkeyPatch, *, on: bool) -> None:
-    for name in ("INSTALL_MODE", "CREMIND_ELECTRON_PARENT", "CREMIND_SUPERVISED"):
+    """Decide whether this process believes something will restart it.
+
+    Every container and pod signal is cut off, not just the variables: with no
+    usable ``INSTALL_MODE`` the answer falls through to them, so a suite running
+    inside a container or a cluster would report "supervised" for the ``on=False``
+    half and fail there and nowhere else. ``server`` keeps its own marker — it is
+    what ``_supervised_env`` passes to the shared resolver — while the pod marker
+    has a single home in ``tls_managed_env``.
+    """
+    import pathlib
+
+    for name in ("INSTALL_MODE", "CREMIND_ELECTRON_PARENT", "CREMIND_SUPERVISED",
+                 "VNC_PASSWORD", "KUBERNETES_SERVICE_HOST"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(server, "_CONTAINER_MARKER", pathlib.Path("/nonexistent/.dockerenv"))
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._POD_MARKER", pathlib.Path("/nonexistent/serviceaccount"))
     if on:
         monkeypatch.setenv("CREMIND_SUPERVISED", "1")
 

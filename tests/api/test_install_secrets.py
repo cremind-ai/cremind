@@ -72,6 +72,13 @@ def _uncached_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """
     monkeypatch.setattr(runtime_env, "_CONTAINER_MARKER", tmp_path / "no-dockerenv")
     monkeypatch.setattr(runtime_env, "_SA_NAMESPACE_FILE", tmp_path / "no-namespace")
+    # The endpoint now resolves the effective mode, which reads its own copy of
+    # the marker and the pod signals.
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._CONTAINER_MARKER", tmp_path / "no-dockerenv")
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._POD_MARKER", tmp_path / "no-serviceaccount")
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
     runtime_env.describe_runtime_environment.cache_clear()
     yield
     runtime_env.describe_runtime_environment.cache_clear()

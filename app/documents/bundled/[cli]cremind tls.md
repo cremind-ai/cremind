@@ -84,11 +84,17 @@ is something the container already does for itself — the entrypoint exits and
 Compose's `restart: unless-stopped` brings it back. Nothing on the Docker host
 has to be edited.
 
-Cremind recognises such an install by `INSTALL_MODE=docker`, which the shipped
-`docker-compose.yml` sets. A container started without it — `docker run` on the
-image, a hand-written compose file, a `.env` that predates the key — is
-recognised by the container itself and treated the same way; the boot log says
-so when that inference was needed. Kubernetes is never inferred.
+Cremind recognises such an install by the container itself, not only by
+`INSTALL_MODE`. The shipped `docker-compose.yml` sets `INSTALL_MODE=docker`, but
+a container started without it — `docker run` on the image, a hand-written
+compose file, a `.env` that predates the key — is treated the same way, and so
+is one whose environment says `INSTALL_MODE=native` or `custom`: a container's
+environment is fixed when the container is created, whatever the variable
+claims, and such a value is usually a leak from the shell that ran `docker
+compose up` (Compose lets a variable set in that shell override the project's
+`.env`). Only `INSTALL_MODE=kubernetes` is taken at its word, and a pod is never
+treated as Docker. The boot log says when the container, not the variable,
+decided.
 
 This is why it goes in the volume rather than the Compose `.env`: a container's
 environment is fixed when the container is *created*, so a restart re-reads

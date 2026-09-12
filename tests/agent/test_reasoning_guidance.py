@@ -113,6 +113,10 @@ _ENV_KEYS = (
     "INSTALL_MODE", "CREMIND_IMAGE_FLAVOR", "CREMIND_UPGRADE_CHANNEL", "ENV",
     "SETUP_WIZARD_ENV", "CREMIND_ELECTRON_PARENT", "CREMIND_SUPERVISED",
     "VNC_PASSWORD",
+    # The kubelet injects this into every pod, and the mode is resolved against
+    # the environment — so a pod-hosted runner would describe a Kubernetes
+    # install in every prompt asserted below.
+    "KUBERNETES_SERVICE_HOST",
 )
 
 
@@ -132,6 +136,8 @@ def clean_runtime_env(monkeypatch):
     for key in _ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(runtime_env, "_CONTAINER_MARKER", Path("/nonexistent/.dockerenv"))
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._POD_MARKER", Path("/nonexistent/serviceaccount"))
     runtime_env.describe_runtime_environment.cache_clear()
     yield runtime_env
     runtime_env.describe_runtime_environment.cache_clear()

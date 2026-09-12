@@ -31,6 +31,15 @@ def _tls_env(monkeypatch, tmp_path):
     monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
     monkeypatch.delenv("CREMIND_UI_PORT", raising=False)
     monkeypatch.setenv("INSTALL_MODE", "kubernetes")
+    # The mode is resolved against the environment now, so a run inside a
+    # container or a pod would answer for these rows instead of the variable —
+    # and the native case below would stop being native.
+    monkeypatch.delenv("VNC_PASSWORD", raising=False)
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._CONTAINER_MARKER", tmp_path / "no-dockerenv")
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._POD_MARKER", tmp_path / "no-serviceaccount")
     tls_mode.record_boot_tls(False)
 
 

@@ -111,9 +111,10 @@ def test_no_other_deployment_reads_it(volume, monkeypatch, mode):
     HTTPS there moves the Service, the probes and the proxy sidecar together,
     so honouring this would let the pod believe in a switch it never made.
 
-    The empty and unknown cases hold only *outside* a container — the fixture
-    neutralises the marker; ``test_a_container_that_never_said_is_still_docker``
-    is the other half."""
+    Every case but ``kubernetes`` holds only *outside* a container — the fixture
+    neutralises the marker. ``test_a_container_that_never_said_is_still_docker``
+    and ``test_the_overlay_is_read_by_a_container_that_claims_native`` are the
+    other half."""
     monkeypatch.setenv("INSTALL_MODE", mode)
     monkeypatch.setenv("APP_URL", "http://localhost:1515")
     write(volume, "APP_URL=https://localhost:1515\n")
@@ -127,12 +128,17 @@ def test_no_other_deployment_reads_it(volume, monkeypatch, mode):
 # ── which container this is, when INSTALL_MODE does not say ───────────────
 
 
-def test_install_mode_is_authoritative_when_it_names_a_mode(volume, monkeypatch):
+def test_a_container_mode_is_authoritative_when_it_names_one(volume, monkeypatch):
+    """``docker`` and ``kubernetes`` are taken at their word even against a
+    contradicting signal: a deployment author wrote them, and they are the only
+    way a containerd install — which has no ``/.dockerenv`` — can say what it
+    is. The host modes are the ones a container's environment cannot really be
+    in; see ``test_a_host_mode_inside_a_container_is_the_container``."""
     in_a_container(volume, monkeypatch)
-    for mode in ("docker", "kubernetes", "native", "custom"):
+    for mode in ("docker", "kubernetes"):
         monkeypatch.setenv("INSTALL_MODE", mode)
         assert managed.effective_install_mode() == mode
-        assert managed.install_mode_was_inferred() is False
+        assert managed.install_mode_provenance() == managed.INSTALL_MODE_SAID
         assert managed.is_container_install() is (mode == "docker")
     # Operators type these by hand; the rest of the HTTPS path always
     # lower-cased the variable, so this keeps doing so.
@@ -153,7 +159,7 @@ def test_a_container_that_never_said_is_still_docker(volume, monkeypatch, raw):
 
     assert managed.effective_install_mode() == "docker"
     assert managed.is_container_install() is True
-    assert managed.install_mode_was_inferred() is True
+    assert managed.install_mode_provenance() == managed.INSTALL_MODE_INFERRED
 
     # And so the overlay is honoured, which is the whole point.
     monkeypatch.setenv("APP_URL", "http://localhost:1515")
@@ -171,25 +177,70 @@ def test_the_desktop_image_s_vnc_password_is_the_same_signal(volume, monkeypatch
     assert managed.is_container_install() is True
 
 
-def test_an_explicit_mode_beats_the_marker(volume, monkeypatch):
-    """A developer running the checkout inside a devcontainer with
-    ``INSTALL_MODE=native`` in their ``.env`` said what they meant."""
+def test_a_host_mode_inside_a_container_is_the_container(volume, monkeypatch):
+    """The reported install, three times over: a Compose container whose
+    environment says ``INSTALL_MODE=native``.
+
+    This used to be honoured, on the reasoning that a developer running the
+    checkout inside a devcontainer said what they meant. But a container's
+    environment is fixed when the container is created, and such a value is
+    almost always a leak rather than a statement: Compose resolves ``${VAR}``
+    from the shell that runs ``docker compose up`` before the project's
+    ``.env``, and the native install's PowerShell shim used to leave
+    ``INSTALL_MODE=native`` in the session it ran in. Believing it told a Docker
+    user to press Ctrl+C in a terminal that does not exist, and wrote the switch
+    into a ``.env`` the container environment shadows.
+
+    The devcontainer developer is not abandoned: their switch now goes to the
+    overlay and applies on their next ``cremind serve``. ``kubernetes`` is still
+    taken at its word."""
     in_a_container(volume, monkeypatch)
-    for mode in ("native", "kubernetes", "custom"):
+    for mode in ("native", "custom"):
         monkeypatch.setenv("INSTALL_MODE", mode)
-        assert managed.effective_install_mode() == mode
-        assert managed.is_container_install() is False
+        assert managed.effective_install_mode() == "docker"
+        assert managed.is_container_install() is True
+        assert managed.install_mode_provenance() == managed.INSTALL_MODE_OVERRIDDEN
+
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
+    assert managed.effective_install_mode() == "kubernetes"
+    assert managed.is_container_install() is False
+    assert managed.install_mode_provenance() == managed.INSTALL_MODE_SAID
+
+
+def test_the_overlay_is_read_by_a_container_that_claims_native(volume, monkeypatch):
+    """The reported install's next boot. Until now ``load_into_environ`` was
+    gated behind the same mistaken reading, so the switch saved in the volume
+    was not even looked at and the container came back on HTTP."""
+    monkeypatch.setenv("INSTALL_MODE", "native")
+    in_a_container(volume, monkeypatch)
+    monkeypatch.setenv("APP_URL", "http://localhost:1515")
+    write(volume, "APP_URL=https://localhost:1515\nCREMIND_SSL=true\n")
+
+    applied = managed.load_into_environ()
+
+    assert applied == {"APP_URL": "https://localhost:1515", "CREMIND_SSL": "true"}
+    import os
+    assert os.environ["APP_URL"] == "https://localhost:1515"
 
 
 @pytest.mark.parametrize("signal", ["serviceaccount", "KUBERNETES_SERVICE_HOST"])
-def test_a_pod_is_never_inferred_to_be_docker(volume, monkeypatch, signal):
+@pytest.mark.parametrize("claim", [None, "native", "custom"])
+def test_a_pod_is_kubernetes_never_docker(volume, monkeypatch, signal, claim):
     """A cluster whose runtime still writes ``/.dockerenv`` (cri-dockerd), or
     the desktop image's baked VNC_PASSWORD, in a hand-rolled manifest without
     the chart's ``INSTALL_MODE``: inferring Docker there would hand the pod a
     self-restarting switch its Service and probes never made. Either pod
     signal is enough — the service-account mount can be opted out of
-    (``automountServiceAccountToken: false``), the kubelet's variable cannot."""
-    monkeypatch.delenv("INSTALL_MODE", raising=False)
+    (``automountServiceAccountToken: false``), the kubelet's variable cannot.
+
+    It answers ``kubernetes`` rather than "nothing known" so that every reader
+    is right about a pod: the kubelet supervises it, its HTTPS runbook is the
+    Helm one, and CA trust is a container's. ``is_container_install`` stays
+    False, so the overlay is still never read there."""
+    if claim is None:
+        monkeypatch.delenv("INSTALL_MODE", raising=False)
+    else:
+        monkeypatch.setenv("INSTALL_MODE", claim)
     in_a_container(volume, monkeypatch)
     if signal == "serviceaccount":
         pod = volume / "serviceaccount"
@@ -198,9 +249,11 @@ def test_a_pod_is_never_inferred_to_be_docker(volume, monkeypatch, signal):
     else:
         monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
 
-    assert managed.effective_install_mode() == ""
+    assert managed.effective_install_mode() == "kubernetes"
     assert managed.is_container_install() is False
-    assert managed.install_mode_was_inferred() is False
+    assert managed.install_mode_provenance() == (
+        managed.INSTALL_MODE_OVERRIDDEN if claim else managed.INSTALL_MODE_INFERRED
+    )
 
 
 def test_the_known_modes_are_the_install_catalog_s():
@@ -220,7 +273,17 @@ def test_no_signal_at_all_is_not_a_container(volume, monkeypatch):
 
     assert managed.effective_install_mode() == ""
     assert managed.is_container_install() is False
-    assert managed.install_mode_was_inferred() is False
+    assert managed.install_mode_provenance() == managed.INSTALL_MODE_SAID
+
+
+def test_a_host_mode_outside_a_container_is_honoured(volume, monkeypatch):
+    """Nothing about a real native install changes: no marker, no VNC password,
+    no pod signal, so the claim stands and nothing is worth logging."""
+    for mode in ("native", "custom"):
+        monkeypatch.setenv("INSTALL_MODE", mode)
+        assert managed.effective_install_mode() == mode
+        assert managed.is_container_install() is False
+        assert managed.install_mode_provenance() == managed.INSTALL_MODE_SAID
 
 
 def test_the_file_is_never_executed_as_shell(volume):

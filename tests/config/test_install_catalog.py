@@ -68,6 +68,22 @@ def test_active_install_mode_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     assert install_catalog.get_active_install_mode() is None
 
 
+def test_active_install_mode_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Matched the way every other reader of the variable matches it.
+
+    A hand-edited ``.env`` carrying ``INSTALL_MODE=Docker`` used to be "no mode
+    at all" here — so the wizard offered the native service matrix — while
+    ``app.config.tls_managed_env`` lower-cased and called the same install
+    Docker.
+    """
+    monkeypatch.setenv("INSTALL_MODE", "  Docker ")
+    assert install_catalog.get_active_install_mode() == "docker"
+
+    monkeypatch.setenv("INSTALL_MODE", "Kubernetes")
+    assert install_catalog.get_active_install_mode() == "kubernetes"
+    assert install_catalog.is_kubernetes_mode() is True
+
+
 # ── Kubernetes mode ──────────────────────────────────────────────────────
 
 

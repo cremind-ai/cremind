@@ -169,6 +169,26 @@ def _trust_client(client_host: str = "127.0.0.1") -> TestClient:
     return TestClient(_ForceClient(app, client_host))
 
 
+@pytest.fixture(autouse=True)
+def _no_container_signals(monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory):
+    """Keep "native install" meaning native, wherever this suite runs.
+
+    ``INSTALL_MODE=native`` is no longer the last word: a container signal
+    outranks it (see ``app.config.tls_managed_env.resolve_install_mode``), so
+    a run inside a container or a pod would turn every native row below into a
+    container one — and one-click CA trust is refused in a container, which
+    would fail these tests there and nowhere else.
+    """
+    import pathlib
+
+    monkeypatch.delenv("VNC_PASSWORD", raising=False)
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._CONTAINER_MARKER", pathlib.Path("/nonexistent/.dockerenv"))
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._POD_MARKER", pathlib.Path("/nonexistent/serviceaccount"))
+
+
 @pytest.fixture
 def native_env(monkeypatch: pytest.MonkeyPatch):
     """A native install, pre-setup — the wizard's situation."""

@@ -200,8 +200,18 @@ def get_active_install_mode() -> str | None:
     but are deliberately absent from ``[modes]`` so the host installers
     never offer them as a pick (the chart sets ``INSTALL_MODE=kubernetes``
     on the pod). See install/catalog.toml.
+
+    Matched case-insensitively, like every other reader of the variable
+    (``app.config.tls_managed_env.resolve_install_mode`` normalises the same
+    way). A hand-edited ``.env`` carrying ``INSTALL_MODE=Docker`` used to be
+    "no mode at all" here and ``docker`` to the rest of the app.
+
+    This stays the mode the deployment *declared*, not the one it turns out to
+    be running under: the Setup Wizard's service-mode filter is about what the
+    installer chose, and :func:`is_kubernetes_mode` below gates storage choices
+    that must never move because of a container marker.
     """
-    raw = os.environ.get(_ACTIVE_MODE_ENV, "").strip()
+    raw = os.environ.get(_ACTIVE_MODE_ENV, "").strip().lower()
     if not raw:
         return None
     catalog = load_install_catalog()

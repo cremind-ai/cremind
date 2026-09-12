@@ -36,10 +36,14 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
-# Last-resort "are we in a container?" signal, used only when INSTALL_MODE is
-# absent (an older Docker ``.env`` predating the key). Module-level so tests can
-# point it somewhere that doesn't exist instead of patching Path.exists
-# globally — CI itself may well run inside a container.
+# The "are we in a container?" signal, consulted whenever INSTALL_MODE does not
+# name a container mode — it is absent (an older Docker ``.env`` predating the
+# key), unrecognised, or names a host mode a container's environment cannot
+# really be in. Module-level so tests can point it somewhere that doesn't exist
+# instead of patching Path.exists globally — CI itself may well run inside a
+# container. This module keeps its own copy and hands it to the shared resolver
+# in ``app.config.tls_managed_env`` so each caller stays independently
+# neutralisable.
 _CONTAINER_MARKER = Path("/.dockerenv")
 
 # The one fact a pod gets for free: the default service-account token is
@@ -194,31 +198,29 @@ _WIZARD_DEPLOYMENTS = {
 def detect_install_mode(container_marker: Path | None = None) -> str:
     """Return ``native`` | ``docker`` | ``kubernetes`` for the running install.
 
-    ``INSTALL_MODE`` is authoritative (compose writes ``docker``, the Helm
-    chart writes ``kubernetes``). Only when it is absent — an older Docker
-    ``.env`` predating the key — do we fall back to the container marker or the
-    ``VNC_PASSWORD`` the desktop image always carries.
+    A thin wrapper over ``app.config.tls_managed_env.resolve_install_mode``,
+    which is the single implementation of this question — see its docstring for
+    the rule. In short: ``INSTALL_MODE`` is authoritative when it names a
+    *container* mode, the environment itself decides otherwise, and a host mode
+    (``native``, ``custom``) inside a container loses to the container, because
+    a container's environment is fixed at creation and such a value is almost
+    always a leak from the shell that created it.
+
+    The only thing added here is this module's vocabulary: ``custom`` and the
+    "nothing is known" answer are both reported as ``native``, as they always
+    have been.
 
     ``container_marker`` overrides :data:`_CONTAINER_MARKER` for callers that
     keep their own patchable copy of it (see
     :mod:`app.api.llm_codex_flow`); it exists for tests, not for production
     callers.
     """
-    try:
-        from app.config.install_catalog import get_active_install_mode
+    from app.config.tls_managed_env import resolve_install_mode
 
-        mode = (get_active_install_mode() or "").strip().lower()
-    except Exception as exc:  # noqa: BLE001
-        from app.utils.logger import logger
-
-        logger.debug(f"[runtime-env] install-mode lookup failed: {exc}")
-        mode = ""
-    if mode in ("docker", "kubernetes"):
-        return mode
-    marker = container_marker if container_marker is not None else _CONTAINER_MARKER
-    if not mode and (os.environ.get("VNC_PASSWORD") or marker.exists()):
-        return "docker"
-    return "native"
+    mode, _ = resolve_install_mode(
+        container_marker if container_marker is not None else _CONTAINER_MARKER
+    )
+    return mode if mode in ("docker", "kubernetes") else "native"
 
 
 def is_container(install_mode: str | None = None) -> bool:

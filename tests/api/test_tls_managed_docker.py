@@ -36,12 +36,25 @@ def compose(environment, monkeypatch):  # noqa: F811
     return environment
 
 
-@pytest.fixture
-def unlabelled(environment, monkeypatch):  # noqa: F811
-    """A container started without ``INSTALL_MODE`` — ``docker run`` on the
-    image, a hand-written compose file, a ``.env`` that predates the key — where
-    only the container marker says what it is."""
-    monkeypatch.delenv("INSTALL_MODE", raising=False)
+@pytest.fixture(params=[None, "native", "custom"], ids=["unset", "says-native", "says-custom"])
+def unlabelled(environment, monkeypatch, request):  # noqa: F811
+    """A container the variable does not correctly describe, in each of the
+    three shapes seen in the wild.
+
+    ``None`` is ``docker run`` on the image, a hand-written compose file, or a
+    ``.env`` that predates the key. The other two are the reported install:
+    Compose resolves ``${VAR}`` from the shell that runs ``docker compose up``
+    before the project's ``.env``, so a stray ``INSTALL_MODE`` in that shell is
+    baked into the container — and the native installer and its ``cremind``
+    PowerShell shim both used to leave one there.
+
+    Either way the container marker is the only thing telling the truth, and
+    every test in this file runs against all three.
+    """
+    if request.param is None:
+        monkeypatch.delenv("INSTALL_MODE", raising=False)
+    else:
+        monkeypatch.setenv("INSTALL_MODE", request.param)
     monkeypatch.setenv("CREMIND_SYSTEM_DIR", str(environment))
     marker = environment / "dockerenv"
     marker.write_text("", encoding="utf-8")
@@ -140,6 +153,63 @@ def test_a_container_that_never_said_install_mode_switches_itself(
     stored = transition.load_transition()
     assert stored["self_applied"] is True
     assert stored["confirmation_deadline"] > 0
+
+
+def test_inside_the_container_only_a_container_mode_keeps_its_manager(
+    unlabelled, monkeypatch,  # noqa: F811
+):
+    """Which claims survive the container, and which lose to it.
+
+    ``kubernetes`` is taken at its word — a chart change no pod can make to
+    itself — and a deployment that owns the public origin stays external
+    whatever it runs in. The host modes lose: that is the fix.
+    """
+    for mode in ("native", "custom"):
+        monkeypatch.setenv("INSTALL_MODE", mode)
+        assert transition.management() == "managed-docker", mode
+        assert transition.canonical_env_path() == overlay(unlabelled), mode
+
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
+    assert transition.management() == "external"
+
+    monkeypatch.setenv("INSTALL_MODE", "docker")
+    monkeypatch.setenv("CREMIND_UI_PORT", "0")
+    assert transition.management() == "external"
+
+
+def test_a_switch_prepared_as_native_by_the_mistaken_reading_activates_as_managed(
+    unlabelled, client, monkeypatch,  # noqa: F811
+):
+    """The record the reported install is actually holding.
+
+    It prepared under a release that read the variable raw, so ``management``
+    was recorded as ``native``. Nothing reads that field back except the
+    stranded-switch check (which looks only for ``external``) — activation asks
+    ``management()`` live — so the administrator does not have to start over:
+    the pending switch simply lands as the Compose switch it always was.
+    """
+    scheduled = []
+    monkeypatch.setattr(
+        "app.api.system.schedule_system_restart", lambda: scheduled.append(True) or 99,
+    )
+    value = prepared(client)
+    stale = {**transition.load_transition(), "management": "native"}
+    transition.save_transition(stale)
+
+    result = client.post(
+        "/api/tls/activate", json={"transition_id": value["id"]}, headers=auth(),
+    )
+
+    assert result.status_code == 202, result.text
+    body = result.json()
+    assert body["management"] == "managed-docker"
+    assert body["restart_scheduled"] is True and scheduled == [True]
+    assert "CREMIND_SSL=true" in overlay(unlabelled).read_text(encoding="utf-8")
+    assert not (unlabelled / ".env").exists()
+    assert not any("cremind serve" in step["text"] for step in body["steps"])
+    assert transition.load_transition()["self_applied"] is True
+    # Not mistaken for a switch that needs calling off: its overlay is there.
+    assert transition.revert_stranded_managed_switch(serving_https=False) is None
 
 
 # ── activation ────────────────────────────────────────────────────────────

@@ -1893,7 +1893,16 @@ def get_config_routes(state: BootedState) -> list[Route]:
             except (TypeError, ValueError):
                 return default
 
-        install_mode = (_runtime("INSTALL_MODE") or "").lower()
+        # The mode this process really runs under, falling back to whatever the
+        # compose ``.env`` on the host says when nothing here can tell (the
+        # Electron app calls this endpoint from outside the container). Reading
+        # the variable alone reported a container whose environment claimed
+        # ``INSTALL_MODE=native`` as a native install, in the one payload the
+        # Developer page's config export and the wizard's mode seed are built
+        # from. See ``app.config.tls_managed_env.resolve_install_mode``.
+        from app.config.tls_managed_env import effective_install_mode
+
+        install_mode = effective_install_mode() or (_runtime("INSTALL_MODE") or "").lower()
         vnc_password = _runtime("VNC_PASSWORD")
         # ``kubernetes`` belongs in here beside ``docker``. It used to be
         # missing, and the only Kubernetes signal left was VNC_PASSWORD - which

@@ -23,6 +23,15 @@ env/
 # the one at the context root and miss every nested tree.
 **/node_modules/
 
+# Built UI output. ``ui/release/`` is the Electron installer tree — gitignored,
+# and on a developer's machine ~2 GB of .exe/.dmg/.AppImage that no stage reads
+# (the image installs the wheel, which carries the prebuilt SPA). Without these
+# the build context is ~2.0 GB instead of ~100 MB.
+ui/release/
+ui/dist/
+ui/dist-web/
+ui/dist-electron/
+
 # IDE
 .vscode/
 .idea/
@@ -72,6 +81,10 @@ docker-compose.yml
 # Misc
 .DS_Store
 *.log
+# Ignore patterns are matched against the context-root-relative path, so the
+# rule above catches only root-level logs — the server's log directory needs
+# naming outright.
+logs/
 
 .playwright-mcp/
 

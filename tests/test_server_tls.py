@@ -278,62 +278,91 @@ def test_supervised_environments(monkeypatch, tmp_path) -> None:
     """Kubernetes counts: the wizard now asks for a restart deliberately, and a
     wedged shutdown there stops the kubelet bringing the pod back at all.
 
-    The container signals have to be neutralised explicitly, not left to the
-    ambient environment: the empty-INSTALL_MODE case falls through to the
-    VNC_PASSWORD / ``/.dockerenv`` fallback, so running this suite inside the
-    desktop image (which bakes ``VNC_PASSWORD``) or any container would flip it
-    to True with no code change. ``Docker`` and ``podman`` pin the
-    normalisation — the sibling copy matches the install catalog exactly and
-    treats an unknown or mis-cased value as absent, so this one must too, and
-    with no container signal present "absent" means unsupervised.
+    Every container and pod signal has to be neutralised explicitly, not left to
+    the ambient environment: without a usable INSTALL_MODE the answer falls
+    through to VNC_PASSWORD / ``/.dockerenv`` / the pod signals, so running this
+    suite inside the desktop image (which bakes ``VNC_PASSWORD``), any
+    container, or a cluster would flip these rows with no code change.
+    ``Docker`` pins the normalisation: the one shared resolver lower-cases, so a
+    hand-edited ``.env`` naming a container mode in the wrong case is that mode
+    everywhere rather than "no mode at all" here and ``docker`` elsewhere.
+    ``podman`` is not a mode we know, and with no container signal present that
+    means unsupervised.
     """
     monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
     monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
     monkeypatch.delenv("VNC_PASSWORD", raising=False)
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
     monkeypatch.setattr(server, "_CONTAINER_MARKER", tmp_path / "absent")
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._POD_MARKER", tmp_path / "no-serviceaccount")
     for mode, expected in (
         ("docker", True),
         ("kubernetes", True),
         ("native", False),
         ("custom", False),
         ("", False),
-        ("Docker", False),
+        ("Docker", True),
         ("podman", False),
     ):
         monkeypatch.setenv("INSTALL_MODE", mode)
         assert server._supervised_env() is expected, mode
 
 
-def test_a_legacy_container_counts_as_supervised(monkeypatch, tmp_path) -> None:
-    """An install whose ``.env`` predates INSTALL_MODE is still the Docker
-    install whose restart policy brings us back.
+def test_a_container_counts_as_supervised_whatever_it_claims(monkeypatch, tmp_path) -> None:
+    """An install whose ``.env`` predates INSTALL_MODE — or whose environment
+    claims a host mode it cannot really be — is still the Docker install whose
+    restart policy brings us back.
 
-    ``app.config.runtime_env.supervised`` already says so, and this copy drives
-    the shutdown path — a disagreement means the prompt line promises a restart
-    while the server takes the clean-shutdown branch with no hard-exit timer.
-    An unknown mode must reach the same fallback, since the catalog-backed copy
-    treats it as absent.
+    ``app.config.runtime_env.supervised`` already said so, and this drives the
+    shutdown path: a disagreement means the prompt line promises a restart while
+    the server takes the clean-shutdown branch with no hard-exit timer. That is
+    exactly what a Compose container whose shell leaked ``INSTALL_MODE=native``
+    used to get.
     """
     monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
     monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._POD_MARKER", tmp_path / "no-serviceaccount")
+
+    # The desktop image's baked password, with no marker.
     monkeypatch.setattr(server, "_CONTAINER_MARKER", tmp_path / "absent")
     monkeypatch.setenv("VNC_PASSWORD", "changeme")
-    for mode in ("", "Docker", "podman"):
+    for mode in ("", "Docker", "podman", "native", "custom"):
         monkeypatch.setenv("INSTALL_MODE", mode)
         assert server._supervised_env() is True, mode
 
+    # The reported install: the marker, and a claim that contradicts it.
+    monkeypatch.delenv("VNC_PASSWORD", raising=False)
+    marker = tmp_path / "dockerenv"
+    marker.write_text("", encoding="utf-8")
+    monkeypatch.setattr(server, "_CONTAINER_MARKER", marker)
+    for mode in ("native", "custom"):
+        monkeypatch.setenv("INSTALL_MODE", mode)
+        assert server._supervised_env() is True, mode
 
-def test_an_inferred_install_mode_is_said_at_boot(monkeypatch, tmp_path) -> None:
-    """One line, only when the container marker had to stand in for
-    INSTALL_MODE: it is the sole place an operator learns why their install is
-    treated as Compose, and the remedy is a one-liner in the deployment."""
+    # A pod is supervised too, by the kubelet, whatever the variable claims.
+    monkeypatch.setattr(server, "_CONTAINER_MARKER", tmp_path / "absent")
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
+    monkeypatch.setenv("INSTALL_MODE", "native")
+    assert server._supervised_env() is True
+
+
+def test_an_inferred_or_overridden_install_mode_is_said_at_boot(monkeypatch, tmp_path) -> None:
+    """One line whenever the environment, not INSTALL_MODE, decided what we are.
+
+    It is the sole place an operator learns why their install is treated as
+    something they did not write — and, for the overridden case, where the
+    stray value most likely came from. Nothing is said when the variable and the
+    environment agree, or when there is nothing to contradict."""
     from loguru import logger
 
     from app.config import tls_managed_env as managed
 
     # Every pod signal has to be cut off explicitly, not left to the ambient
     # environment: a suite running inside a cluster would otherwise take this
-    # container for a pod, infer nothing, and fail here and nowhere else.
+    # container for a pod and fail here and nowhere else.
     monkeypatch.delenv("VNC_PASSWORD", raising=False)
     monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
     marker = tmp_path / "dockerenv"
@@ -350,19 +379,41 @@ def test_an_inferred_install_mode_is_said_at_boot(monkeypatch, tmp_path) -> None
         server._note_inferred_install_mode()
         monkeypatch.setenv("INSTALL_MODE", "podman")
         server._note_inferred_install_mode()
+        # The reported install: a container whose environment says native.
+        monkeypatch.setenv("INSTALL_MODE", "native")
+        server._note_inferred_install_mode()
+        # A pod that never said so, which is a different install and a
+        # different remedy.
+        monkeypatch.delenv("INSTALL_MODE", raising=False)
+        monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
+        server._note_inferred_install_mode()
+        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
         # Outside a container an absent mode means native, and native says nothing.
         monkeypatch.setattr(managed, "_CONTAINER_MARKER", tmp_path / "no-dockerenv")
-        monkeypatch.delenv("INSTALL_MODE", raising=False)
         server._note_inferred_install_mode()
     finally:
         logger.remove(sink)
 
-    assert len(messages) == 2
-    assert "INSTALL_MODE is not set" in messages[0]
-    assert "INSTALL_MODE='podman' names no install mode" in messages[1]
-    for message in messages:
+    assert len(messages) == 4
+    inferred_absent, inferred_unknown, overridden, pod = messages
+
+    assert "INSTALL_MODE is not set" in inferred_absent
+    assert "INSTALL_MODE='podman' names no install mode" in inferred_unknown
+
+    # The override says which value it is disbelieving, where such a value comes
+    # from, and both ways to stop it recurring.
+    assert "INSTALL_MODE='native' names a host install" in overridden
+    assert "docker compose up" in overridden
+    assert "Remove-Item Env:INSTALL_MODE" in overridden
+
+    for message in (inferred_absent, inferred_unknown, overridden):
+        assert "Docker container" in message
         assert "Docker (Compose) install" in message
         assert "INSTALL_MODE=docker" in message
+
+    assert "Kubernetes pod" in pod
+    assert "Kubernetes install" in pod
+    assert "INSTALL_MODE=kubernetes" in pod
 
 
 def test_a_boot_service_counts_as_a_supervisor(monkeypatch) -> None:
