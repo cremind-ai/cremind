@@ -263,14 +263,55 @@ def test_a_single_port_install_has_nothing_to_repair(monkeypatch):
 
 
 @pytest.mark.parametrize("app_url", ["http://localhost:1112", ""])
-def test_no_public_bind_means_the_address_is_not_ours_to_judge(app_url, monkeypatch):
-    """A reverse proxy owns the origin, and the dev loop in CONTRIBUTING.md
-    deliberately points APP_URL at the internal port with CREMIND_UI_PORT=0."""
+@pytest.mark.parametrize(
+    "environment",
+    [{"CREMIND_UI_PORT": "0"}, {"CREMIND_TLS_TERMINATION": "edge"}],
+)
+def test_a_deployment_owned_origin_is_not_ours_to_judge(app_url, environment, monkeypatch):
+    """A reverse proxy owns the address, and the dev loop in CONTRIBUTING.md
+    deliberately points APP_URL at the internal port with CREMIND_UI_PORT=0.
+
+    Both signals have to be honoured, because ``https_target`` reads the raw
+    APP_URL on exactly these deployments: repairing one and not the other would
+    leave the transition's source and target origins naming different ports.
+    """
     monkeypatch.setattr(BaseConfig, "APP_URL", app_url, raising=False)
     monkeypatch.setattr(BaseConfig, "PORT", 1112, raising=False)
-    monkeypatch.setenv("CREMIND_UI_PORT", "0")
+    monkeypatch.setenv("CREMIND_UI_PORT", "1515")
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
 
     assert public_app_url() is BaseConfig.APP_URL
+
+
+@pytest.mark.parametrize("app_url", ["", "   ", "http://[bad", "not a url at all"])
+def test_an_origin_that_reaches_this_server_beats_guessing_at_localhost(
+    app_url, stale, monkeypatch,
+):
+    """With no hostname to keep, ``localhost`` is a guess and the address the
+    administrator is actually using is a fact.
+
+    It is used whole, port included: on a published Compose install that port
+    may be a host-side mapping this process never sees.
+    """
+    monkeypatch.setattr(BaseConfig, "APP_URL", app_url, raising=False)
+
+    assert public_app_url(fallback="http://cremind.example.com:8443") == (
+        "http://cremind.example.com:8443")
+    # No port means the scheme's default port, not this process's public bind.
+    assert public_app_url(fallback="http://cremind.example.com") == (
+        "http://cremind.example.com")
+    # A fallback that is itself unusable changes nothing.
+    assert public_app_url(fallback="") == "http://localhost:1515"
+    assert public_app_url(fallback="nonsense") == "http://localhost:1515"
+
+
+def test_a_usable_app_url_ignores_the_fallback(stale, monkeypatch):
+    """The fallback is for a missing address, never a second opinion about a
+    configured one — the hostname in APP_URL is the operator's choice."""
+    monkeypatch.setattr(BaseConfig, "APP_URL", "http://cremind.lan:1112", raising=False)
+
+    assert public_app_url(fallback="http://192.168.1.9:1515") == "http://cremind.lan:1515"
 
 
 def test_the_internal_port_can_be_supplied_by_a_caller(stale, monkeypatch):

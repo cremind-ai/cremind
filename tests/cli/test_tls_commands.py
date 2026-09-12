@@ -662,3 +662,22 @@ def test_status_says_nothing_about_an_app_url_it_left_alone(runner, monkeypatch,
 
     assert result.exit_code == 0
     assert "internal API port" not in result.output
+
+
+def test_status_reports_an_app_url_that_was_never_set(runner, monkeypatch, sysdir):
+    """A Compose .env missing the key leaves APP_URL empty, so there is no old
+    address to name — and gating the line on one would print nothing at all."""
+    _stub_status(monkeypatch, {
+        **_STEPS_PAYLOAD,
+        "management": "managed-docker",
+        "transition": {
+            "phase": "activating",
+            "app_url_repaired": {"from": "", "to": "https://cremind.lan:1515"},
+        },
+    })
+
+    result = _invoke(runner, monkeypatch, ["tls", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "APP_URL was not set" in result.output
+    assert "https://cremind.lan:1515" in result.output

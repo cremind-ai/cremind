@@ -971,7 +971,11 @@ def persist_native(value: dict):
     # and the failure would only surface later, as broken account linking.
     from app.config.tls_mode import _public_port, public_app_url
     configured = BaseConfig.APP_URL
-    effective = public_app_url()
+    # ``sources`` are the origins the administrator authenticated through, so
+    # when APP_URL carries no usable hostname at all one of them beats guessing
+    # at localhost — and it is the same address CORS and the SAN set are built
+    # from just above, which keeps all three describing one installation.
+    effective = public_app_url(fallback=sources[0])
     app_url = https_target(effective)
     hosts = list(dict.fromkeys(list(BaseConfig.SSL_AUTO_HOSTS)
                               + [urlsplit(source).hostname or "" for source in sources]))

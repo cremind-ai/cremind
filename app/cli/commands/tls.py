@@ -113,11 +113,16 @@ def _switch_outcome(transition: dict) -> list[str]:
 
     lines: list[str] = []
     repaired = transition.get("app_url_repaired")
-    if isinstance(repaired, dict) and repaired.get("from") and repaired.get("to"):
+    if isinstance(repaired, dict) and repaired.get("to"):
+        # ``from`` is empty when APP_URL was never set — a different correction
+        # from a port nobody can reach, and the gate has to be ``to`` alone or
+        # that case prints nothing at all.
+        was = str(repaired.get("from") or "").strip()
         lines.append(
-            f"APP_URL was {repaired['from']}, which names the internal API port "
-            f"no browser can open; this switch set it to {repaired['to']} — the "
-            "address account linking and the agent card now advertise."
+            (f"APP_URL was {was}, which names the internal API port no browser can open; "
+             if was else "APP_URL was not set, so ")
+            + f"this switch set it to {repaired['to']} — the address account linking "
+            "and the agent card now advertise."
             + (" Cancelling the switch puts the old value back."
                if transition.get("phase") == "activating" else "")
         )

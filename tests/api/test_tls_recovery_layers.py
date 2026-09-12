@@ -755,3 +755,30 @@ def test_status_publishes_the_deadline_and_the_reversal(
     assert reverted["auto_reverted"]["reason"] == "the deadline passed"
     assert reverted["confirmation_deadline"] is None
     assert json.dumps(reverted)  # the whole record stays JSON-serialisable
+
+
+def test_an_unset_app_url_takes_the_address_the_admin_actually_reached(
+    client, environment, monkeypatch,
+):
+    """A Compose ``.env`` missing the key hands the container ``APP_URL=``.
+
+    There is no hostname to keep then, and ``localhost`` would be a guess — on
+    a server install a wrong one, baked into the agent card and both OAuth
+    callbacks. The origins that joined this switch are the addresses the
+    administrator authenticated through, and CORS and the SAN set are already
+    built from them.
+    """
+    monkeypatch.setattr(BaseConfig, "APP_URL", "")
+    value = prepared(client)
+
+    result = client.post(
+        "/api/tls/activate", json={"transition_id": value["id"]}, headers=auth(),
+    )
+
+    assert result.status_code == 202, result.text
+    written = (environment / ".env").read_text(encoding="utf-8")
+    assert "APP_URL=https://testserver:80" in written
+    assert "localhost" not in written
+    assert result.json()["transition"]["app_url_repaired"] == {
+        "from": "", "to": "https://testserver:80",
+    }

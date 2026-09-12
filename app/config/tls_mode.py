@@ -113,7 +113,7 @@ def app_url_names_internal_bind(internal_port: int, public_port: int | None = No
         return False
 
 
-def public_app_url(internal_port: int | None = None) -> str:
+def public_app_url(internal_port: int | None = None, *, fallback: str = "") -> str:
     """``APP_URL`` as an address a browser can actually open.
 
     The value is usually returned untouched. Two configurations cannot be used
@@ -123,41 +123,62 @@ def public_app_url(internal_port: int | None = None) -> str:
     * It names the internal bind. Cremind's own v0.0.1 Docker installer wrote
       ``http://localhost:1112`` while that port was still published; the port
       map went away three releases later and nothing rewrites a ``.env`` on
-      upgrade, so installs from that era still carry it.
-    * It is empty or unparseable — Compose substitutes ``${APP_URL}`` with the
-      empty string when the key is missing from the ``.env`` beside
-      ``docker-compose.yml``.
+      upgrade, so installs from that era still carry it. The repair keeps the
+      scheme and the hostname — deliberate installer choices, ``localhost`` for
+      a local install and the operator's own host for a server one — and moves
+      only the port onto the public bind, which is exactly what every installer
+      since has written.
+    * It is empty or unparseable, so there is no hostname to keep. Compose
+      substitutes ``${APP_URL}`` with the empty string when the key is missing
+      from the ``.env`` beside ``docker-compose.yml``. ``fallback`` is for this
+      case and should be an origin known to reach this server — the address the
+      administrator is actually using. Without one the answer is the same
+      ``http://localhost:<public port>`` :class:`BaseConfig` defaults to when
+      the variable is absent altogether, which is a guess, so pass a fallback
+      wherever a better address is in hand.
 
-    The repair keeps the scheme and the hostname, which are deliberate installer
-    choices (``localhost`` for a local install, the operator's host for a server
-    one), and moves only the port onto the public bind — which is exactly what
-    every installer since has written. An empty value falls back to the same
-    ``http://localhost:<public port>`` that :class:`BaseConfig` defaults to when
-    the variable is absent altogether.
+    Nothing is repaired where the public origin is not this process's to
+    describe — no public bind of its own, or a configured edge terminator. The
+    address belongs to whatever is in front, and naming the internal port may
+    even be correct there (the dev loop in CONTRIBUTING.md does exactly that).
 
     Returns ``BaseConfig.APP_URL`` itself when nothing needs repairing, so a
     caller can detect one with ``!=`` and report what it changed.
     """
     from urllib.parse import urlsplit
 
+    def parsed(value: str):
+        try:
+            split = urlsplit((value or "").strip())
+            _ = split.port  # raises on a non-numeric port
+        except ValueError:
+            return None
+        if split.scheme not in ("http", "https") or not split.hostname:
+            return None
+        return split
+
+    def rebuild(split, port: int | None) -> str:
+        host = split.hostname
+        return (f"{split.scheme}://{f'[{host}]' if ':' in host else host}"
+                + (f":{port}" if port is not None else ""))
+
     public = _public_port()
-    if not public:
-        # No public bind of our own: the address belongs to whatever is in
-        # front of us, and naming the internal port may even be correct (the
-        # dev loop in CONTRIBUTING.md does exactly that).
+    if environment_forces_plain_http(public):
         return BaseConfig.APP_URL
-    try:
-        parsed = urlsplit((BaseConfig.APP_URL or "").strip())
-        scheme, host = parsed.scheme, parsed.hostname
-        _ = parsed.port  # raises on a non-numeric port
-    except ValueError:
-        scheme = host = None
-    if not host or scheme not in ("http", "https"):
-        return f"http://localhost:{public}"
+    configured = parsed(BaseConfig.APP_URL)
+    if configured is None:
+        # Nothing to keep. An origin that demonstrably reaches this server is a
+        # fact where ``localhost`` is only a guess, so it is used exactly as it
+        # stands — its port included, which on a published Compose install may
+        # be a host mapping this process never sees, and its *absence* included,
+        # which means the default port for the scheme.
+        supplied = parsed(fallback)
+        return (rebuild(supplied, supplied.port) if supplied is not None
+                else f"http://localhost:{public}")
     if not app_url_names_internal_bind(
             BaseConfig.PORT if internal_port is None else internal_port, public):
         return BaseConfig.APP_URL
-    return f"{scheme}://{f'[{host}]' if ':' in host else host}:{public}"
+    return rebuild(configured, public)
 
 
 def record_boot_tls(serving: bool) -> None:

@@ -616,11 +616,15 @@ onMounted(() => { void load(); });
                  redirect and the Atlassian callback now advertise is not the one
                  this installation was configured with, and nothing else says so. -->
             <p v-if="appUrlRepaired" class="notice">
-              The configured address <strong>{{ appUrlRepaired.from }}</strong> named the
-              internal API port, which listens on this machine only and no browser can
-              open. Cremind switched to <strong>{{ appUrlRepaired.to }}</strong> instead —
-              that is the public address now advertised by account linking and the agent
-              card. Cancelling this switch puts the old value back.
+              <template v-if="appUrlRepaired.from">
+                The configured address <strong>{{ appUrlRepaired.from }}</strong> named the
+                internal API port, which listens on this machine only and no browser can
+                open.
+              </template>
+              <template v-else>This deployment had no public address configured.</template>
+              Cremind used <strong>{{ appUrlRepaired.to }}</strong> instead — that is the
+              public address now advertised by account linking and the agent card.
+              Cancelling this switch puts the old value back.
             </p>
             <template v-if="isExternal || commandsVisible || runtime?.restart_supported === false">
               <h2>{{ isExternal ? 'Apply HTTPS to the deployment' : 'Restart Cremind to finish' }}</h2>
