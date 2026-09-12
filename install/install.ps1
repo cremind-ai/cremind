@@ -3177,8 +3177,17 @@ if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron' -and
         Write-Err2 "Database migration failed - see $LogFile"
         exit 1
     }
+    # ``2>$null`` on a native command is what makes Windows PowerShell 5.1
+    # materialise each stderr line as a NativeCommandError, and under
+    # ``$ErrorActionPreference = 'Stop'`` that terminates — on success. Cremind
+    # logs its startup lines to stderr, so the revision read threw on every
+    # healthy install and was reported as the unreadable "?" this replaces.
     $Revision = ''
-    try { $Revision = "$(& $VenvCremind db current 2>$null | Select-Object -Last 1)".Trim() } catch { }
+    $PrevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $Revision = "$(& $VenvCremind db current 2>$null | Select-Object -Last 1)".Trim() }
+    catch { $Revision = '' }
+    finally { $ErrorActionPreference = $PrevEap }
     if ($Revision) {
         Write-Ok "Database at revision $Revision"
     } else {

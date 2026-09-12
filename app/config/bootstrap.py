@@ -101,10 +101,27 @@ def read_bootstrap() -> dict[str, Any]:
             # not skip it — it reads it as part of the first comment's ``#``.
             data = toml.loads(path.read_text(encoding="utf-8-sig"))
         except Exception as e:
-            # A malformed file is treated as missing — the wizard can rewrite
-            # it. We deliberately avoid raising here so a corrupt bootstrap
-            # never bricks the server's ability to come up on SQLite.
-            logger.warning(f"[boot] bootstrap.toml unreadable; falling back to SQLite: {e}")
+            # Deliberately fatal, unless the environment already says which
+            # backend to use. This file is the record of which database an
+            # installation committed to, and the only other answer available
+            # here is the SQLite default — which for a Postgres install means
+            # booting onto a brand-new empty database beside the real one, with
+            # no profiles and no conversations, looking exactly like total data
+            # loss. Refusing is recoverable; that is not. The message carries
+            # the way out, because this runs before anything is serving.
+            if not os.environ.get("CREMIND_DB_PROVIDER"):
+                logger.error(f"[boot] bootstrap.toml is unreadable: {e}")
+                raise RuntimeError(
+                    f"{path} cannot be parsed: {e}. It records which database "
+                    "this installation uses, so Cremind will not guess. Fix the "
+                    "file, or delete it to choose again in the Setup Wizard, or "
+                    "set CREMIND_DB_PROVIDER (with the CREMIND_POSTGRES_* "
+                    "variables for Postgres) to override it."
+                ) from e
+            logger.warning(
+                f"[boot] bootstrap.toml is unreadable ({e}); using CREMIND_DB_PROVIDER "
+                "and the CREMIND_POSTGRES_* variables instead."
+            )
             data = {}
 
     provider = (data.get("db_provider") or _DEFAULT_PROVIDER).strip().lower()

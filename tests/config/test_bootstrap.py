@@ -76,21 +76,45 @@ def test_a_bom_does_not_lose_the_postgres_credentials(system_dir):
     assert resolved["postgres"]["port"] == 6543
 
 
-def test_a_malformed_file_falls_back_to_sqlite_and_says_so(system_dir):
-    """The fallback the comment in ``read_bootstrap`` promises. Taking it must
-    not itself be fatal — that is what turned a bad file into a boot loop."""
+def test_a_malformed_file_is_refused_rather_than_guessed_at(system_dir):
+    """The only other answer available here is the SQLite default.
+
+    For a Postgres install that would boot onto a brand-new empty database
+    beside the real one — no profiles, no conversations, indistinguishable from
+    total data loss. Refusing is recoverable; that is not. What must never
+    happen is the third option, which is what used to happen: the fallback's own
+    logging raising AttributeError and taking the boot down with a stack trace
+    that named neither the file nor the problem.
+    """
+    (system_dir / "bootstrap.toml").write_text("db_provider = [unterminated\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as refused:
+        bootstrap.read_bootstrap()
+
+    message = str(refused.value)
+    assert "bootstrap.toml" in message
+    # Every way out, because nothing is serving yet to explain it later.
+    assert "Setup Wizard" in message and "CREMIND_DB_PROVIDER" in message
+
+
+def test_the_environment_can_override_a_file_it_cannot_read(system_dir, monkeypatch):
+    """The escape hatch the refusal names has to actually work — and
+    ``resolve_bootstrap`` applies the override only *after* reading the file."""
     from app.utils.logger import logger
 
     (system_dir / "bootstrap.toml").write_text("db_provider = [unterminated\n", encoding="utf-8")
+    monkeypatch.setenv("CREMIND_DB_PROVIDER", "postgres")
+    monkeypatch.setenv("CREMIND_POSTGRES_HOST", "db.internal")
     messages: list[str] = []
     sink = logger.add(lambda message: messages.append(str(message)), level="WARNING")
     try:
-        resolved = bootstrap.read_bootstrap()
+        resolved = bootstrap.resolve_bootstrap()
     finally:
         logger.remove(sink)
 
-    assert resolved["db_provider"] == "sqlite"
-    assert any("bootstrap.toml unreadable" in message for message in messages)
+    assert resolved["db_provider"] == "postgres"
+    assert resolved["postgres"]["host"] == "db.internal"
+    assert any("bootstrap.toml is unreadable" in message for message in messages)
 
 
 def test_the_logger_here_is_loguru_under_the_real_boot_import_order():
