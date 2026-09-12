@@ -677,8 +677,10 @@ def _warn_if_app_url_names_the_internal_bind(public_port: int, internal_port: in
         f"(127.0.0.1 only, never published). The public origin is port {public_port}. "
         "Google account linking, the agent card and the HTTPS runbook all advertise APP_URL — "
         f"set it to the address browsers actually use (e.g. http://localhost:{public_port}) "
-        "and restart. Docker: edit APP_URL in the .env next to docker-compose.yml, then "
-        "`docker compose up -d --force-recreate cremind`; Kubernetes: `--set cremind.appUrl=…`."
+        "and restart. Native, Electron and Docker (Compose) installs can also let Cremind "
+        "correct it: switching to HTTPS from Settings → HTTPS & Certificate (or `cremind tls "
+        "enable`) moves the value onto the public port as it writes the new origin. "
+        "Kubernetes: `--set cremind.appUrl=…`."
     )
 
 

@@ -72,8 +72,8 @@ MAX_FAILED_ACTIVATION_BOOTS = 2
 ACTIVATION_KEYS = (
     "pending_transport_epoch", "restart_planned", "activated_at",
     "activation_error", "activation_error_at", "upload_recovery_until",
-    "atlassian_redirect_uri_migrated", "self_applied", "confirmation_deadline",
-    "failed_boots",
+    "atlassian_redirect_uri_migrated", "app_url_repaired", "self_applied",
+    "confirmation_deadline", "failed_boots",
 )
 #: The only environment keys :func:`persist_native` rewrites, and therefore the
 #: only ones :func:`revert_native` restores. The rollback record is a rollback
@@ -273,6 +273,11 @@ def public_transition(value: dict | None = None) -> dict | None:
         # installation has already been put back.
         "confirmation_deadline": value.get("confirmation_deadline"),
         "auto_reverted": value.get("auto_reverted"),
+        # An APP_URL this switch had to correct before it could derive the new
+        # public origin from it. Announced because the value it replaced is one
+        # the operator never chose (an old installer wrote it) and the one it
+        # wrote is what the agent card and the OAuth callbacks now advertise.
+        "app_url_repaired": value.get("app_url_repaired"),
     }
 
 
@@ -583,7 +588,8 @@ def mark_active(*, source: str | None = None, external: bool = False,
     value = load_transition()
     if not value:
         discard_orphan_native_rollback()
-        source = source or http_source(BaseConfig.APP_URL)
+        from app.config.tls_mode import public_app_url
+        source = source or http_source(public_app_url())
         save_transition({"version": 1, "id": secrets.token_urlsafe(24), "phase": "active",
                          "source_origin": source, "source_origins": [source],
                          "target_origin": https_target(source), "instance_id": instance_id(),
@@ -959,10 +965,16 @@ def persist_native(value: dict):
             for item in (source, https_target(source))
         ]
         cors = list(dict.fromkeys(cors + affected_origins))
-    app_url = https_target(BaseConfig.APP_URL)
+    # The one input the switch derives rather than verifies. A value naming the
+    # internal bind — or missing entirely — would otherwise become the HTTPS
+    # origin in the agent card, the Google redirect and the Atlassian callback,
+    # and the failure would only surface later, as broken account linking.
+    from app.config.tls_mode import _public_port, public_app_url
+    configured = BaseConfig.APP_URL
+    effective = public_app_url()
+    app_url = https_target(effective)
     hosts = list(dict.fromkeys(list(BaseConfig.SSL_AUTO_HOSTS)
                               + [urlsplit(source).hostname or "" for source in sources]))
-    from app.config.tls_mode import _public_port
     updates = {"CREMIND_SSL": "true", "APP_URL": app_url, "CREMIND_UI_PORT": str(_public_port()),
                "CORS_ALLOWED_ORIGINS": ",".join(cors), "CREMIND_SSL_AUTO_HOSTS": ",".join(hosts)}
 
@@ -1064,6 +1076,8 @@ def persist_native(value: dict):
         os.environ[key] = item
     if callback_update is not None:
         value["atlassian_redirect_uri_migrated"] = callback_update
+    if effective != configured:
+        value["app_url_repaired"] = {"from": configured, "to": app_url}
     return rollback
 
 

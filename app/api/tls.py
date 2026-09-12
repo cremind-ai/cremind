@@ -317,9 +317,14 @@ def _request_origin(request: Request) -> str:
 
 def _source_origin(request: Request, supplied: str | None = None) -> str:
     from app.config.tls_transition import http_source
-    # Local CLI talks to the dedicated HTTP port, which is never migrated.
+    # Local CLI talks to the dedicated HTTP port, which is never migrated, so
+    # the public address has to come from the configuration instead of the
+    # request — repaired, because an APP_URL naming that same internal port
+    # would otherwise make the CLI prepare a switch to an origin no browser
+    # can open (see ``public_app_url``).
     if not supplied and request.url.port == BaseConfig.PORT:
-        return http_source(BaseConfig.APP_URL)
+        from app.config.tls_mode import public_app_url
+        return http_source(public_app_url())
     result = http_source(supplied or _request_origin(request))
     if supplied and urlsplit(result).hostname != request.url.hostname and request.url.port != BaseConfig.PORT:
         raise ValueError("Use the hostname through which this device reaches Cremind.")
@@ -365,18 +370,30 @@ def _switch_blocker() -> str | None:
     Atlassian callback. An unreachable value there survives the switch and
     breaks account linking afterwards, long after the cause is obvious.
 
+    Wherever Cremind persists that setting itself — a native or Electron
+    install, and a Compose install whose settings live in the system-directory
+    volume — it repairs the value instead of refusing (``public_app_url``):
+    refusing there would tell an administrator to go and edit a file by hand,
+    which is the very thing those deployments exist to avoid. An ``external``
+    deployment keeps its own environment, so Cremind writes nothing, has nothing
+    to repair, and has to say so.
+
     Returns the message to refuse with, or ``None`` to proceed.
     """
     from app.config.tls_mode import _public_port, app_url_names_internal_bind
+    from app.config.tls_transition import management
 
-    if app_url_names_internal_bind(BaseConfig.PORT):
+    if management() == "external" and app_url_names_internal_bind(BaseConfig.PORT):
         return (
             f"APP_URL is {BaseConfig.APP_URL!r}, but port {BaseConfig.PORT} is the "
             "internal API bind — it listens on 127.0.0.1 only and is never published, "
             "so no browser can open it. Switching to HTTPS would derive the new public "
             "origin, the Google and Atlassian callbacks and the agent card from that "
-            f"address. Set APP_URL to the address browsers actually use (port "
-            f"{_public_port()}) and restart before activating HTTPS."
+            "address. Cremind does not own this deployment's environment, so set "
+            f"APP_URL to the address browsers actually use (port {_public_port()}) "
+            "where the deployment defines it — Kubernetes: `--set cremind.appUrl=…`; "
+            "reverse proxy: APP_URL in Cremind's .env — and restart before activating "
+            "HTTPS."
         )
     return None
 

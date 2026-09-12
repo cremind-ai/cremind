@@ -92,12 +92,14 @@ def app_url_names_internal_bind(internal_port: int, public_port: int | None = No
     published, so in a container it is the container's own loopback. An
     ``APP_URL`` naming it is an address no browser can open.
 
-    Shared by the boot warning and the HTTPS pre-flight so the two can never
+    Shared by the boot warning and the HTTPS switch so the two can never
     disagree about what counts as wrong. Boot only warns — the value may have
-    been wrong for months and refusing to start would be worse. Activation
-    refuses, because the switch *derives* the new HTTPS origin from this value
-    and would bake the unreachable address into the agent card, the OAuth
-    redirects and the Atlassian callback.
+    been wrong for months and refusing to start would be worse. The switch
+    *derives* the new HTTPS origin from this value, so it would otherwise bake
+    the unreachable address into the agent card, the OAuth redirects and the
+    Atlassian callback: where Cremind owns the setting it repairs it instead
+    (:func:`public_app_url`), and where it does not — a deployment that keeps
+    its own environment — it refuses.
     """
     from urllib.parse import urlsplit
 
@@ -109,6 +111,53 @@ def app_url_names_internal_bind(internal_port: int, public_port: int | None = No
         return urlsplit((BaseConfig.APP_URL or "").strip()).port == internal_port
     except ValueError:
         return False
+
+
+def public_app_url(internal_port: int | None = None) -> str:
+    """``APP_URL`` as an address a browser can actually open.
+
+    The value is usually returned untouched. Two configurations cannot be used
+    as they stand, and both are somebody else's mistake rather than this
+    operator's:
+
+    * It names the internal bind. Cremind's own v0.0.1 Docker installer wrote
+      ``http://localhost:1112`` while that port was still published; the port
+      map went away three releases later and nothing rewrites a ``.env`` on
+      upgrade, so installs from that era still carry it.
+    * It is empty or unparseable — Compose substitutes ``${APP_URL}`` with the
+      empty string when the key is missing from the ``.env`` beside
+      ``docker-compose.yml``.
+
+    The repair keeps the scheme and the hostname, which are deliberate installer
+    choices (``localhost`` for a local install, the operator's host for a server
+    one), and moves only the port onto the public bind — which is exactly what
+    every installer since has written. An empty value falls back to the same
+    ``http://localhost:<public port>`` that :class:`BaseConfig` defaults to when
+    the variable is absent altogether.
+
+    Returns ``BaseConfig.APP_URL`` itself when nothing needs repairing, so a
+    caller can detect one with ``!=`` and report what it changed.
+    """
+    from urllib.parse import urlsplit
+
+    public = _public_port()
+    if not public:
+        # No public bind of our own: the address belongs to whatever is in
+        # front of us, and naming the internal port may even be correct (the
+        # dev loop in CONTRIBUTING.md does exactly that).
+        return BaseConfig.APP_URL
+    try:
+        parsed = urlsplit((BaseConfig.APP_URL or "").strip())
+        scheme, host = parsed.scheme, parsed.hostname
+        _ = parsed.port  # raises on a non-numeric port
+    except ValueError:
+        scheme = host = None
+    if not host or scheme not in ("http", "https"):
+        return f"http://localhost:{public}"
+    if not app_url_names_internal_bind(
+            BaseConfig.PORT if internal_port is None else internal_port, public):
+        return BaseConfig.APP_URL
+    return f"{scheme}://{f'[{host}]' if ':' in host else host}:{public}"
 
 
 def record_boot_tls(serving: bool) -> None:

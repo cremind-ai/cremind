@@ -137,11 +137,18 @@ fast as it ever did, and the deadline is only ever reached by one that failed.
 `cremind tls enable --no-restart` opts out of all of this: you have taken over
 the restart, so Cremind will not revert underneath you.
 
-Activation is refused outright if `APP_URL` names the internal API bind (the
-`PORT` value, 127.0.0.1-only and never published). The switch derives the new
-public origin, the Google and Atlassian callbacks and the agent card from that
-address, so an unreachable value there survives the switch and breaks account
-linking afterwards. Fix `APP_URL`, restart, then enable.
+The switch derives the new public origin, the Google and Atlassian callbacks
+and the agent card from `APP_URL`, so an unreachable value there would survive
+the switch and break account linking afterwards. Where Cremind persists that
+setting itself — native, Electron, and a Docker Compose install — activation
+corrects an `APP_URL` that names the internal API bind (the `PORT` value,
+127.0.0.1-only and never published; Cremind's first Docker installer wrote
+`http://localhost:1112`) or is missing altogether: the scheme and hostname are
+kept and the port moves to the public bind. `cremind tls status` and `enable`
+print what changed, the transition reports it as `app_url_repaired`, and
+cancelling restores the old value. Kubernetes and reverse-proxy installs keep
+their own environment, so activation there is still refused with the address to
+set and where to set it.
 
 The token transport epoch changes at that moment, not when you run `enable`.
 On-host token files are reissued without extending their expiry, and browser

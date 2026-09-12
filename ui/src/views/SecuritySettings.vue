@@ -75,6 +75,9 @@ const pendingUploads = migrationReadiness.pendingUploads;
 const transition = computed(() => runtime.value?.transition ?? null);
 /** A switch that already put itself back, and why. */
 const autoReverted = computed(() => transition.value?.auto_reverted ?? null);
+/** An APP_URL the switch had to correct before it could derive the new origin
+ *  from it — the address the agent card and the OAuth callbacks now advertise. */
+const appUrlRepaired = computed(() => transition.value?.app_url_repaired ?? null);
 /** Ticks only while a confirmation deadline is outstanding, so the countdown
  *  below moves without the page polling anything. */
 const nowSeconds = ref(Date.now() / 1000);
@@ -608,6 +611,16 @@ onMounted(() => { void load(); });
               finish the switch. If no browser reaches it in
               {{ confirmationCountdown }}, Cremind restores the previous settings and
               returns to HTTP on its own.
+            </p>
+            <!-- Also outside both panes: the value the agent card, the Google
+                 redirect and the Atlassian callback now advertise is not the one
+                 this installation was configured with, and nothing else says so. -->
+            <p v-if="appUrlRepaired" class="notice">
+              The configured address <strong>{{ appUrlRepaired.from }}</strong> named the
+              internal API port, which listens on this machine only and no browser can
+              open. Cremind switched to <strong>{{ appUrlRepaired.to }}</strong> instead —
+              that is the public address now advertised by account linking and the agent
+              card. Cancelling this switch puts the old value back.
             </p>
             <template v-if="isExternal || commandsVisible || runtime?.restart_supported === false">
               <h2>{{ isExternal ? 'Apply HTTPS to the deployment' : 'Restart Cremind to finish' }}</h2>

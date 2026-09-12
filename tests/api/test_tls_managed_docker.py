@@ -213,3 +213,45 @@ def test_an_unreachable_managed_switch_reverts_itself(
     assert "no browser reached it" in stored["auto_reverted"]["reason"]
     assert not overlay(compose).exists()
     assert restarts == [True]
+
+
+def test_a_stale_installer_app_url_is_repaired_into_the_volume(
+    compose, client, monkeypatch,  # noqa: F811
+):
+    """The reason a Compose install could not switch itself at all.
+
+    Cremind's own v0.0.1 Docker installer wrote ``APP_URL=http://localhost:1112``
+    while that port was still published. The port map went away three releases
+    later and nothing rewrites a deployment's ``.env`` on upgrade, so installs
+    from that era still carry it — and the one thing this feature promises is
+    that nobody has to go and edit that file.
+    """
+    monkeypatch.setattr(BaseConfig, "APP_URL", "http://localhost:1112")
+    monkeypatch.setattr(BaseConfig, "PORT", 1112)
+    monkeypatch.setenv("APP_URL", "http://localhost:1112")
+    value = prepared(client)
+
+    result = client.post(
+        "/api/tls/activate", json={"transition_id": value["id"]}, headers=auth(),
+    )
+
+    assert result.status_code == 202, result.text
+    written = overlay(compose).read_text(encoding="utf-8")
+    assert "APP_URL=https://localhost:1515" in written
+    assert "CREMIND_ATLASSIAN_REDIRECT_URI=https://localhost:1515/api/oauth/callback" in written
+    assert result.json()["transition"]["app_url_repaired"] == {
+        "from": "http://localhost:1112", "to": "https://localhost:1515",
+    }
+
+    # The next boot. A restart re-runs the entrypoint with the container's
+    # creation-time environment, which still carries the stale value — so the
+    # overlay has to keep outranking it rather than retiring itself.
+    for key in managed.MANAGED_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("APP_URL", "http://localhost:1112")
+    assert managed.is_redundant(managed.read(overlay(compose))) is False
+
+    applied = managed.load_into_environ()
+
+    assert applied["APP_URL"] == "https://localhost:1515"
+    assert overlay(compose).exists(), "the deployment has not caught up yet"

@@ -102,12 +102,25 @@ def _switch_outcome(transition: dict) -> list[str]:
     explain why, which looks indistinguishable from a switch that was never
     started.
 
-    Both fields come off the wire (``app/cli/`` must not import server code),
-    and both are absent on an older server, where this prints nothing.
+    A third fact when it applies: the switch corrects an APP_URL that named the
+    internal API port before deriving the new origin from it, and the corrected
+    value is what the agent card and the OAuth callbacks now advertise.
+
+    Every field comes off the wire (``app/cli/`` must not import server code),
+    and all are absent on an older server, where this prints nothing.
     """
     import time
 
     lines: list[str] = []
+    repaired = transition.get("app_url_repaired")
+    if isinstance(repaired, dict) and repaired.get("from") and repaired.get("to"):
+        lines.append(
+            f"APP_URL was {repaired['from']}, which names the internal API port "
+            f"no browser can open; this switch set it to {repaired['to']} — the "
+            "address account linking and the agent card now advertise."
+            + (" Cancelling the switch puts the old value back."
+               if transition.get("phase") == "activating" else "")
+        )
     reverted = transition.get("auto_reverted")
     if isinstance(reverted, dict) and reverted.get("reason"):
         lines.append(f"HTTPS was switched off automatically: {reverted['reason']}")

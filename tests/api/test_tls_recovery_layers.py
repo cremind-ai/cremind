@@ -2,7 +2,8 @@
 
 Five layers, each catching what the one before it cannot:
 
-* **R1** refuses a switch that cannot work, while nothing has changed yet.
+* **R1** repairs a switch it can and refuses one it cannot, while nothing has
+  changed yet.
 * **R2** never exits into a crash loop over a change Cremind itself made.
 * **R3** counts boots that were meant to serve HTTPS and did not.
 * **R4** holds the credential boundary until a real client proves the new
@@ -62,10 +63,10 @@ def self_applied(client, environment, monkeypatch, *, restart=True):
     return transition.load_transition()
 
 
-# ── R1: refuse a switch that cannot work ──────────────────────────────────
+# ── R1: repair what can be repaired, refuse what cannot ───────────────────
 
 
-def test_activation_is_refused_when_app_url_names_the_internal_bind(
+def test_activation_repairs_an_app_url_naming_the_internal_bind(
     client, environment, monkeypatch,
 ):
     """The one input the switch derives rather than verifies.
@@ -74,10 +75,80 @@ def test_activation_is_refused_when_app_url_names_the_internal_bind(
     agent card, the Google callback and the Atlassian callback. Port 1112 binds
     127.0.0.1 inside the container and is never published, so a switch built on
     it produces an installation whose every advertised address is unreachable —
-    and says nothing at the time.
+    and says nothing at the time. Cremind's own first Docker installer wrote
+    exactly that value, so this is a mistake it has to clean up rather than one
+    to hand back: it owns this installation's environment, and refusing here
+    would mean telling an administrator to go and edit a file by hand.
     """
     monkeypatch.setattr(BaseConfig, "APP_URL", "http://localhost:1112")
     monkeypatch.setattr(BaseConfig, "PORT", 1112)
+    value = prepared(client)
+
+    result = client.post(
+        "/api/tls/activate", json={"transition_id": value["id"]}, headers=auth(),
+    )
+    assert result.status_code == 202, result.text
+
+    written = (environment / ".env").read_text(encoding="utf-8")
+    assert "APP_URL=https://localhost:1515" in written
+    assert "CREMIND_ATLASSIAN_REDIRECT_URI=https://localhost:1515/api/oauth/callback" in written
+    assert "1112" not in written
+    assert BaseConfig.APP_URL == "https://localhost:1515"
+    # Announced, because the address account linking now advertises is not the
+    # one this installation was configured with.
+    repaired = {"from": "http://localhost:1112", "to": "https://localhost:1515"}
+    assert transition.load_transition()["app_url_repaired"] == repaired
+    assert result.json()["transition"]["app_url_repaired"] == repaired
+    # Repaired, not forced: the old value is in the rollback record, so the way
+    # back is the same one every other activation has.
+    record = json.loads(
+        (environment / "tls" / "native-rollback.json").read_text(encoding="utf-8"))
+    assert record["attrs"]["APP_URL"] == "http://localhost:1112"
+
+    cancelled = client.post(
+        "/api/tls/cancel", json={"transition_id": value["id"]}, headers=auth(),
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    assert not (environment / ".env").exists()
+    assert BaseConfig.APP_URL == "http://localhost:1112"
+    assert "app_url_repaired" not in transition.load_transition()
+
+
+def test_a_public_origin_on_the_same_port_as_the_internal_bind_is_allowed(
+    client, environment, monkeypatch,
+):
+    """A single-port install is not a misconfiguration.
+
+    ``app_url_names_internal_bind`` only fires where the two ports genuinely
+    differ; naming 1112 when 1112 *is* the public bind is just this install —
+    so there is nothing to repair and nothing to report.
+    """
+    monkeypatch.setattr(BaseConfig, "APP_URL", "http://localhost:1112")
+    monkeypatch.setattr(BaseConfig, "PORT", 1112)
+    monkeypatch.setenv("CREMIND_UI_PORT", "1112")
+    value = prepared(client)
+
+    allowed = client.post(
+        "/api/tls/activate", json={"transition_id": value["id"], "restart": False},
+        headers=auth(),
+    )
+    assert allowed.status_code == 202
+    assert "APP_URL=https://localhost:1112" in (
+        environment / ".env").read_text(encoding="utf-8")
+    assert "app_url_repaired" not in transition.load_transition()
+
+
+def test_an_external_deployment_is_still_refused(client, environment, monkeypatch):
+    """Nothing to repair, because nothing is Cremind's to write.
+
+    A chart or a reverse proxy holds its own environment; persisting a
+    corrected APP_URL into a file this deployment never reads would report a
+    fix that did not happen. So this is the one case that still has to be
+    handed back — with the address to set, and where to set it.
+    """
+    monkeypatch.setattr(BaseConfig, "APP_URL", "http://localhost:1112")
+    monkeypatch.setattr(BaseConfig, "PORT", 1112)
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
     value = prepared(client)
 
     refused = client.post(
@@ -92,24 +163,29 @@ def test_activation_is_refused_when_app_url_names_the_internal_bind(
     assert not (environment / "tls" / "native-rollback.json").exists()
 
 
-def test_a_public_origin_on_the_same_port_as_the_internal_bind_is_allowed(
+def test_the_cli_prepares_the_public_port_on_a_stale_install(
     client, environment, monkeypatch,
 ):
-    """A single-port install is not a misconfiguration.
+    """The CLI reaches the internal port, so its origin comes from APP_URL.
 
-    ``app_url_names_internal_bind`` only fires where the two ports genuinely
-    differ; naming 1112 when 1112 *is* the public bind is just this install.
+    Which means a stale APP_URL would otherwise make ``cremind tls enable``
+    prepare a switch *to* the internal port — the transition, the certificate's
+    SAN set and the URL printed back all naming an address no browser can open.
     """
     monkeypatch.setattr(BaseConfig, "APP_URL", "http://localhost:1112")
     monkeypatch.setattr(BaseConfig, "PORT", 1112)
-    monkeypatch.setenv("CREMIND_UI_PORT", "1112")
-    value = prepared(client)
 
-    allowed = client.post(
-        "/api/tls/activate", json={"transition_id": value["id"], "restart": False},
-        headers=auth(),
+    result = client.post(
+        f"http://127.0.0.1:{BaseConfig.PORT}/api/tls/prepare", json={}, headers=auth(),
     )
-    assert allowed.status_code == 202
+
+    assert result.status_code == 200, result.text
+    value = result.json()["transition"]
+    assert value["source_origin"] == "http://localhost:1515"
+    assert value["target_origin"] == "https://localhost:1515"
+    assert client.get(
+        f"http://127.0.0.1:{BaseConfig.PORT}/api/tls/status",
+    ).json()["https_url"] == "https://localhost:1515"
 
 
 # ── R2: never exit into a crash loop ──────────────────────────────────────

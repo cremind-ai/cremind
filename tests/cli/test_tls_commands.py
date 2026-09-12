@@ -625,3 +625,40 @@ def test_local_cancel_refuses_once_https_has_served(runner, monkeypatch, sysdir)
     assert result.exit_code == 1
     assert "already been served" in result.output
     assert tls_transition.load_transition()["phase"] == "activating"
+
+
+def test_status_reports_an_app_url_the_switch_had_to_correct(runner, monkeypatch, sysdir):
+    """The address account linking now advertises is not the configured one.
+
+    Nothing else in the output would say so: the phase is an ordinary
+    ``activating``, and the operator's own ``.env`` still reads the old value
+    until the switch is confirmed.
+    """
+    _stub_status(monkeypatch, {
+        **_STEPS_PAYLOAD,
+        "management": "managed-docker",
+        "transition": {
+            "phase": "activating",
+            "app_url_repaired": {
+                "from": "http://localhost:1112", "to": "https://localhost:1515",
+            },
+        },
+    })
+
+    result = _invoke(runner, monkeypatch, ["tls", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "http://localhost:1112" in result.output
+    assert "https://localhost:1515" in result.output
+    assert "internal API port" in result.output
+    assert "Cancelling" in result.output
+
+
+def test_status_says_nothing_about_an_app_url_it_left_alone(runner, monkeypatch, sysdir):
+    """An older server sends no such field, and a healthy switch changes nothing."""
+    _stub_status(monkeypatch, {**_STEPS_PAYLOAD, "transition": {"phase": "activating"}})
+
+    result = _invoke(runner, monkeypatch, ["tls", "status"])
+
+    assert result.exit_code == 0
+    assert "internal API port" not in result.output

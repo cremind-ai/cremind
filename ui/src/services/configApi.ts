@@ -145,6 +145,11 @@ export interface TlsTransition {
    *  false when the previous settings could not be put back, which is the one
    *  case that needs an administrator. */
   auto_reverted?: { reason: string; at: number; restored: boolean } | null;
+  /** Set when the switch had to correct APP_URL before deriving the new public
+   *  origin from it — it named the internal API port (an old Docker installer
+   *  wrote that) or was missing. `to` is the https origin now advertised by the
+   *  agent card and the OAuth callbacks; cancelling restores `from`. */
+  app_url_repaired?: { from: string; to: string } | null;
 }
 
 /** One line of deployment guidance. Only a `command` is a shell line, and only

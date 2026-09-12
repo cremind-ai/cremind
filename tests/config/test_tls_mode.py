@@ -19,6 +19,7 @@ from app.config.tls_mode import (
     effective_ssl_mode,
     env_supervised,
     https_origin_from_app_url,
+    public_app_url,
 )
 
 
@@ -201,3 +202,81 @@ def test_facts_agree_with_the_boot_path(
     assert facts.serving_https is serving
     # And a server that is serving TLS is never *also* pending it.
     assert not (facts.serving_https and facts.pending_https)
+
+
+# ── public_app_url ───────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def stale(monkeypatch):
+    """An install whose internal bind and public bind genuinely differ."""
+    monkeypatch.setattr(BaseConfig, "PORT", 1112, raising=False)
+    monkeypatch.setenv("CREMIND_UI_PORT", "1515")
+
+
+@pytest.mark.parametrize(
+    "app_url,expected",
+    [
+        # The value Cremind's own v0.0.1 Docker installer wrote, and the
+        # shapes it takes on a server install or an IPv6 host.
+        ("http://localhost:1112", "http://localhost:1515"),
+        ("https://localhost:1112", "https://localhost:1515"),
+        ("http://cremind.lan:1112/", "http://cremind.lan:1515"),
+        ("http://[::1]:1112", "http://[::1]:1515"),
+        # Compose substitutes ${APP_URL} with the empty string when the key is
+        # missing from the .env beside docker-compose.yml.
+        ("", "http://localhost:1515"),
+        ("   ", "http://localhost:1515"),
+        ("http://[bad", "http://localhost:1515"),
+        ("http://host:notaport", "http://localhost:1515"),
+        ("not a url at all", "http://localhost:1515"),
+    ],
+)
+def test_public_app_url_repairs_an_address_no_browser_can_open(
+    app_url, expected, stale, monkeypatch,
+):
+    monkeypatch.setattr(BaseConfig, "APP_URL", app_url, raising=False)
+
+    assert public_app_url() == expected
+
+
+@pytest.mark.parametrize(
+    "app_url", ["http://localhost:1515", "https://cremind.lan", "http://testserver"],
+)
+def test_public_app_url_leaves_a_reachable_address_exactly_as_it_is(
+    app_url, stale, monkeypatch,
+):
+    """Returned as the same object, so a caller can detect a repair with ``!=``
+    and report only what it actually changed."""
+    monkeypatch.setattr(BaseConfig, "APP_URL", app_url, raising=False)
+
+    assert public_app_url() is BaseConfig.APP_URL
+
+
+def test_a_single_port_install_has_nothing_to_repair(monkeypatch):
+    """Naming 1112 when 1112 *is* the public bind is just this install."""
+    monkeypatch.setattr(BaseConfig, "APP_URL", "http://localhost:1112", raising=False)
+    monkeypatch.setattr(BaseConfig, "PORT", 1112, raising=False)
+    monkeypatch.setenv("CREMIND_UI_PORT", "1112")
+
+    assert public_app_url() is BaseConfig.APP_URL
+
+
+@pytest.mark.parametrize("app_url", ["http://localhost:1112", ""])
+def test_no_public_bind_means_the_address_is_not_ours_to_judge(app_url, monkeypatch):
+    """A reverse proxy owns the origin, and the dev loop in CONTRIBUTING.md
+    deliberately points APP_URL at the internal port with CREMIND_UI_PORT=0."""
+    monkeypatch.setattr(BaseConfig, "APP_URL", app_url, raising=False)
+    monkeypatch.setattr(BaseConfig, "PORT", 1112, raising=False)
+    monkeypatch.setenv("CREMIND_UI_PORT", "0")
+
+    assert public_app_url() is BaseConfig.APP_URL
+
+
+def test_the_internal_port_can_be_supplied_by_a_caller(stale, monkeypatch):
+    """The boot path knows the ports it actually bound; it need not re-read
+    them from configuration that may say something else."""
+    monkeypatch.setattr(BaseConfig, "APP_URL", "http://localhost:9999", raising=False)
+
+    assert public_app_url(9999) == "http://localhost:1515"
+    assert public_app_url(1112) is BaseConfig.APP_URL
