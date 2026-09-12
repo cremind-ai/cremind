@@ -95,7 +95,19 @@ services:
       # How Cremind was installed. Read by the backend's service-mode
       # filter (see install_catalog.toml's [mode_rules]) so the Setup
       # Wizard only offers per-service modes that match the install.
-      INSTALL_MODE: ${INSTALL_MODE:-docker}
+      #
+      # A literal, deliberately not ``${INSTALL_MODE:-docker}``: a compose file
+      # the Docker installer rendered IS a Docker install, and nothing may say
+      # otherwise. Compose resolves ``${VAR}`` from the invoking shell BEFORE
+      # the sibling ``.env``, and that shell is not always clean — the native
+      # ``cremind`` PowerShell shim used to load ~\.cremind\.env
+      # (INSTALL_MODE=native included) into the calling session and never
+      # remove it, so one native ``cremind`` followed by ``docker compose up
+      # -d``, or by the Docker installer itself (which runs in that session),
+      # baked ``native`` into a Docker container. The ``.env`` still carries
+      # ``INSTALL_MODE=docker`` for readers on the host (the desktop app, the
+      # config export's file fallback); it is not consulted for this value.
+      INSTALL_MODE: docker
       # Release channel — the installer writes this into the sibling
       # ``.env`` (production / test / dev). The container's feature
       # installer reads it via ``app.upgrade.channel.get_channel()`` and

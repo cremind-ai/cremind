@@ -2043,6 +2043,20 @@ EOF
 
     ok "Wrote $DOCKER_DIR/docker-compose.yml + .env"
 
+    # ``docker compose`` resolves ``${VAR}`` from the invoking shell BEFORE the
+    # sibling .env. INSTALL_MODE is the one interpolated name that is a constant
+    # here — this branch IS the Docker install — and a shell can carry
+    # ``INSTALL_MODE=native`` from a native install (a sourced .env, an export in
+    # a profile). The compose file rendered above pins the literal, so this
+    # guards an OLD compose file; it mirrors install.ps1, where the leak was real
+    # (its ``cremind`` shim loaded the native .env into the calling session). The
+    # CREMIND_SSL* exports above are the opposite case and stay: they are how the
+    # resolved TLS mode reaches compose.
+    if [ -n "${INSTALL_MODE:-}" ] && [ "$INSTALL_MODE" != "docker" ]; then
+        warn "Ignoring INSTALL_MODE=$INSTALL_MODE from the environment: this is a Docker install."
+    fi
+    unset INSTALL_MODE
+
     # Per-channel pull / build strategy:
     #   production / test → pull the pre-built image from Docker Hub
     #                       and refuse to fall back to a local build.
