@@ -29,6 +29,20 @@ CHART_VERSION = running_chart_version()
 
 @pytest.fixture
 def environment(monkeypatch, tmp_path):
+    import os
+
+    # ``persist_native`` writes the switch straight into ``os.environ``, and
+    # monkeypatch cannot undo that for a key it deleted while absent
+    # (``delenv(..., raising=False)`` records nothing then). Such a value would
+    # outlive the test and be inherited by every later one — the installers'
+    # wrapper tests run a shell and assert the real environment beats the
+    # ``.env``, so a leak here fails a test three directories away.
+    _managed_before = {
+        key: os.environ.get(key) for key in
+        ("CREMIND_SSL", "APP_URL", "CREMIND_UI_PORT", "CORS_ALLOWED_ORIGINS",
+         "CREMIND_SSL_AUTO_HOSTS", "CREMIND_ATLASSIAN_REDIRECT_URI")
+    }
+
     tls_clients.clear()
     monkeypatch.setattr("app.api.tls.QUIESCE_ENROLLMENT_SECONDS", 0.0)
     monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", str(tmp_path))
@@ -84,7 +98,13 @@ def environment(monkeypatch, tmp_path):
     # Certificate generation itself has a separate real-files test below.
     monkeypatch.setattr("app.config.tls_auto.ensure_local_tls", lambda *_args: ("cert", "key"))
     monkeypatch.setattr("app.api.tls.local_trust_capabilities", lambda request: {"supported": False})
-    return tmp_path
+    yield tmp_path
+
+    for key, value in _managed_before.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 @pytest.fixture

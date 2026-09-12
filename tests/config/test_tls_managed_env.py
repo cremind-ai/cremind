@@ -12,6 +12,16 @@ from app.config import tls_managed_env as managed
 
 @pytest.fixture
 def volume(monkeypatch, tmp_path):
+    import os
+
+    # ``load_into_environ`` writes straight into ``os.environ``, and monkeypatch
+    # cannot undo that: ``delenv(..., raising=False)`` records nothing when the
+    # key is already absent, so a value the code under test *adds* would outlive
+    # the test and be inherited by every later one — including the installers'
+    # wrapper tests, which run a shell and assert that the real environment beats
+    # the ``.env``. Snapshot and restore by hand.
+    before = {key: os.environ.get(key) for key in managed.MANAGED_KEYS}
+
     monkeypatch.setenv("CREMIND_SYSTEM_DIR", str(tmp_path))
     monkeypatch.setenv("INSTALL_MODE", "docker")
     for key in managed.MANAGED_KEYS:
@@ -24,7 +34,13 @@ def volume(monkeypatch, tmp_path):
     monkeypatch.setattr(managed, "_CONTAINER_MARKER", tmp_path / "no-dockerenv")
     monkeypatch.setattr(managed, "_POD_MARKER", tmp_path / "no-serviceaccount")
     (tmp_path / "tls").mkdir(parents=True, exist_ok=True)
-    return tmp_path
+    yield tmp_path
+
+    for key, value in before.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 def in_a_container(volume, monkeypatch):
