@@ -36,7 +36,17 @@ from typing import Any
 
 import toml
 
-from app.utils import logger
+# The submodule, not the package attribute. On the real boot path this module
+# is first imported *while* ``app/utils/logger.py`` is still executing — its
+# module-level log line fires the bus sink, which pulls in app.events →
+# app.storage → app.databases.factory → here — so ``app.utils`` does not have
+# its ``logger`` attribute yet and ``from app.utils import logger`` binds the
+# half-initialised module instead of loguru. That turned the deliberately
+# survivable ``except`` below into an AttributeError, and a malformed
+# bootstrap.toml into a boot loop. ``app.utils.logger`` binds the name at its
+# own line 9, long before the cycle starts, so this spelling is always the
+# object.
+from app.utils.logger import logger
 
 
 _DEFAULT_PROVIDER = "sqlite"
@@ -86,7 +96,10 @@ def read_bootstrap() -> dict[str, Any]:
     data: dict[str, Any] = {}
     if path.is_file():
         try:
-            data = toml.loads(path.read_text(encoding="utf-8"))
+            # utf-8-sig: Windows PowerShell 5.1's ``Set-Content -Encoding utf8``
+            # left a BOM on every file older installers wrote, and ``toml`` does
+            # not skip it — it reads it as part of the first comment's ``#``.
+            data = toml.loads(path.read_text(encoding="utf-8-sig"))
         except Exception as e:
             # A malformed file is treated as missing — the wizard can rewrite
             # it. We deliberately avoid raising here so a corrupt bootstrap

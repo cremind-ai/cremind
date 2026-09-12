@@ -3063,9 +3063,22 @@ chmod 600 "$CREDS_FILE"
 # this line put it back and defeat the mode anyway.
 if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ] && [ "$SKIP_BOOTSTRAP_FOR_TLS" = "0" ]; then
     info "Migrating database to current schema"
-    "$VENV_DIR/bin/cremind" db upgrade >>"$LOG_FILE" 2>&1
-    REVISION="$("$VENV_DIR/bin/cremind" db current 2>/dev/null || echo "?")"
-    ok "Database at revision $REVISION"
+    # Both results are checked, because this step used to report success for a
+    # database it had never touched: the migration's own output goes to the log
+    # file, and an unreadable revision was printed as a bare "?" — which is what
+    # a server that cannot start looks like, one line before it fails to start.
+    # ``cremind serve`` runs the same migrations, so there is nothing to gain by
+    # continuing past a failure here (``set -e`` already stopped, silently).
+    if ! "$VENV_DIR/bin/cremind" db upgrade >>"$LOG_FILE" 2>&1; then
+        err "Database migration failed - see $LOG_FILE"
+        exit 1
+    fi
+    REVISION="$("$VENV_DIR/bin/cremind" db current 2>/dev/null || true)"
+    if [ -n "$REVISION" ]; then
+        ok "Database at revision $REVISION"
+    else
+        warn "Could not read the database revision - see $LOG_FILE"
+    fi
 fi
 
 # ── start the server (foreground-detached for the install session) ───────

@@ -36,6 +36,22 @@ def test_parse_docker_env_strips_comments_blank_lines_and_quotes(tmp_path: Path)
     assert parsed["EMPTY"] == ""
 
 
+def test_parse_docker_env_tolerates_a_windows_bom(tmp_path: Path) -> None:
+    """PowerShell 5.1's ``Set-Content -Encoding utf8`` prefixes one.
+
+    Harmless while the first line is a comment, which is why it went unnoticed
+    — but a BOM on a leading ``KEY=`` renames that key, silently dropping it.
+    """
+    env = tmp_path / ".env"
+    env.write_text("VNC_PASSWORD=abc\nAPP_URL=http://example.local:1515\n",
+                   encoding="utf-8-sig")
+
+    parsed = credentials_file.parse_docker_env(env)
+
+    assert parsed["VNC_PASSWORD"] == "abc"
+    assert parsed["APP_URL"] == "http://example.local:1515"
+
+
 def test_parse_docker_env_skips_unrendered_placeholders(tmp_path: Path) -> None:
     """A literal ``__VNC_PASSWORD__`` value means the template never got rendered."""
     env = tmp_path / ".env"
@@ -239,6 +255,27 @@ def test_postgres_section_pulled_from_bootstrap_not_docker_env(tmp_path: Path) -
     assert data["postgres"]["password"] == "from-bootstrap"
     assert data["postgres"]["host"] == "postgres"
     assert data["postgres"]["deployment_mode"] == "docker"
+
+
+def test_postgres_section_survives_a_bom_prefixed_bootstrap(tmp_path: Path) -> None:
+    """A file this reader cannot parse degrades to SQLite with no complaint, so
+    a Windows-written bootstrap.toml would quietly strip the whole section from
+    credentials.toml — the one place an operator looks up those credentials."""
+    system_dir = tmp_path / "system"
+    install_dir = tmp_path / "install"
+    _seed_docker_install(system_dir, install_dir)
+    (system_dir / "bootstrap.toml").write_text(
+        'db_provider = "postgres"\n\n[postgres]\nhost = "postgres"\n'
+        'password = "from-bootstrap"\n',
+        encoding="utf-8-sig",
+    )
+
+    path = credentials_file.write_credentials_file(
+        system_dir=system_dir, install_dir=install_dir,
+    )
+
+    data = toml.loads(path.read_text(encoding="utf-8"))
+    assert data["postgres"]["password"] == "from-bootstrap"
 
 
 def test_no_postgres_section_when_bootstrap_says_sqlite(tmp_path: Path) -> None:

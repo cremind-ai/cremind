@@ -79,7 +79,10 @@ def parse_docker_env(path: Path) -> dict[str, str]:
     leak as a literal). Returns ``{}`` if the file is missing.
     """
     try:
-        text = path.read_text(encoding="utf-8")
+        # utf-8-sig because the installer that wrote this file may have been
+        # Windows PowerShell 5.1, which prefixes a BOM. Harmless while the first
+        # line is a comment; a BOM on a leading ``KEY=`` would rename the key.
+        text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return {}
     out: dict[str, str] = {}
@@ -171,7 +174,10 @@ def _read_bootstrap_from(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {"db_provider": "sqlite", "postgres": {}}
     try:
-        data = toml.loads(path.read_text(encoding="utf-8"))
+        # utf-8-sig for the same reason as ``read_bootstrap``: a BOM from an
+        # older Windows installer is not a corrupt file, and silently reporting
+        # SQLite here would drop the [postgres] section from credentials.toml.
+        data = toml.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
         return {"db_provider": "sqlite", "postgres": {}}
     provider = (data.get("db_provider") or "sqlite").strip().lower()
