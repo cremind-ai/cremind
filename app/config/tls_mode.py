@@ -85,6 +85,32 @@ def https_origin_from_app_url(app_url: str) -> str:
     return "https://" + url
 
 
+def app_url_names_internal_bind(internal_port: int, public_port: int | None = None) -> bool:
+    """Whether ``APP_URL`` points at the port nothing outside can reach.
+
+    The internal bind (``PORT``) listens on 127.0.0.1 only and is never
+    published, so in a container it is the container's own loopback. An
+    ``APP_URL`` naming it is an address no browser can open.
+
+    Shared by the boot warning and the HTTPS pre-flight so the two can never
+    disagree about what counts as wrong. Boot only warns — the value may have
+    been wrong for months and refusing to start would be worse. Activation
+    refuses, because the switch *derives* the new HTTPS origin from this value
+    and would bake the unreachable address into the agent card, the OAuth
+    redirects and the Atlassian callback.
+    """
+    from urllib.parse import urlsplit
+
+    if public_port is None:
+        public_port = _public_port()
+    if not public_port or public_port == internal_port:
+        return False  # no public bind, or the two are the same: nothing to confuse
+    try:
+        return urlsplit((BaseConfig.APP_URL or "").strip()).port == internal_port
+    except ValueError:
+        return False
+
+
 def record_boot_tls(serving: bool) -> None:
     """Record whether this process bound TLS, for later reporting.
 

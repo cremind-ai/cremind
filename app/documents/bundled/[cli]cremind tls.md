@@ -1,5 +1,5 @@
 ---
-description: "Enable HTTPS after the default HTTP installation and fix ERR_CERT_AUTHORITY_INVALID or connection is not private by trusting ca.pem for CREMIND_SSL=auto, CREMIND_SSL=true or CREMIND_SSL=after-setup. cremind tls status reports transport and deployment instructions, and answers without a token, but names the real Kubernetes namespace, release and Deployment only for the admin profile; prepare generates or validates a certificate; enable persists and activates HTTPS; cancel stops a switch at any point before HTTPS actually serves, and cancel --local does it offline when the server will not start. The HTTP application keeps working until the deployment change lands, so an outstanding switch never locks anyone out. Administrative mutations require an admin token. Trust, export and fingerprint operate locally without a token to install the Cremind CA in the device trust store. Covers native, Electron, Docker and Kubernetes with persistent certificate and browser-session migration."
+description: "Enable HTTPS after the default HTTP installation and fix ERR_CERT_AUTHORITY_INVALID or connection is not private by trusting ca.pem for CREMIND_SSL=auto, CREMIND_SSL=true or CREMIND_SSL=after-setup. cremind tls status reports transport and deployment instructions, and answers without a token, but names the real Kubernetes namespace, release and Deployment only for the admin profile; prepare generates or validates a certificate; enable persists and activates HTTPS; cancel stops a switch at any point before HTTPS actually serves, and cancel --local does it offline when the server will not start. The HTTP application keeps working until the deployment change lands, so an outstanding switch never locks anyone out. A switch Cremind applied and restarted itself also undoes itself when it fails: an unusable certificate restores the previous settings and serves HTTP instead of restart-looping, two consecutive restarts that fail to serve HTTPS roll back, and HTTPS that starts but no browser reaches — untrusted CA, unpublished port, missing hostname — is reverted after ten minutes rather than stranding the administrator, because the credential boundary waits for a real client instead of moving when the listener starts. Administrative mutations require an admin token. Trust, export and fingerprint operate locally without a token to install the Cremind CA in the device trust store. Covers native, Electron, Docker and Kubernetes with persistent certificate and browser-session migration."
 ---
 
 # `cremind tls` — Enable HTTPS and trust the local certificate authority
@@ -73,6 +73,44 @@ deployment change, and that wait is safe: the HTTP application keeps serving,
 existing sessions keep working, and `cremind tls cancel` still calls the whole
 thing off. `cremind tls status` says `awaiting_operator` while that is the case.
 Nothing is invalidated until a listener genuinely answers HTTPS.
+
+## A switch that goes wrong undoes itself
+
+Where Cremind both persisted the change and restarted the process — a supervised
+native install running `enable` without `--no-restart` — it also owns the way
+back, and uses it without being asked:
+
+- **The certificate cannot be served.** Rather than exiting (which under a
+  supervisor is an endless restart with no listener at all, and therefore no
+  status endpoint and no recovery page), the server restores the previous
+  settings and starts on plain HTTP. A certificate *you* configured by hand
+  still fails the boot loudly: there is nothing for Cremind to undo.
+- **HTTPS never comes up.** Two consecutive restarts that were meant to serve
+  HTTPS and did not restore the previous settings. A Docker or Kubernetes
+  switch is never counted this way — it is supposed to wait through restarts
+  until you apply the deployment change.
+- **HTTPS comes up but nobody can reach it.** This is the common one: an
+  untrusted CA, an unpublished port, or a hostname missing from the
+  certificate. The credential boundary therefore does **not** move when the
+  listener starts — it waits for a browser to actually arrive, and until it
+  does, nothing is invalidated, plaintext keeps serving the application, and
+  `cremind tls cancel` still works. If no browser arrives within ten minutes
+  the previous settings are restored and the server restarts onto HTTP.
+  `cremind tls status` prints the time remaining while the switch is waiting,
+  and the reason afterwards if it undid itself.
+
+Reaching the HTTPS address as the admin profile, or completing a browser
+handoff, confirms the switch immediately — so an ordinary switch finishes as
+fast as it ever did, and the deadline is only ever reached by one that failed.
+
+`cremind tls enable --no-restart` opts out of all of this: you have taken over
+the restart, so Cremind will not revert underneath you.
+
+Activation is refused outright if `APP_URL` names the internal API bind (the
+`PORT` value, 127.0.0.1-only and never published). The switch derives the new
+public origin, the Google and Atlassian callbacks and the agent card from that
+address, so an unreachable value there survives the switch and breaks account
+linking afterwards. Fix `APP_URL`, restart, then enable.
 
 The token transport epoch changes at that moment, not when you run `enable`.
 On-host token files are reissued without extending their expiry, and browser
@@ -187,11 +225,17 @@ array beside it is the same text, kept for older clients. On a server already
 serving HTTPS the list is empty unless the certificate needs replacing, in which
 case it holds only the restart to run once the new certificate is in place.
 
-Three fields describe an outstanding switch: `transition.awaiting_operator` is
+Five fields describe an outstanding switch: `transition.awaiting_operator` is
 true while it waits for a deployment change (so the HTTP application is still
 serving and nothing has been invalidated), `can_cancel` says whether calling it
 off is still possible, and `activation_error` reports the rare case where HTTPS
 came up but the on-host token files could not be re-signed.
+`transition.confirmation_deadline` is the Unix time by which a browser has to
+reach the HTTPS address, present only on a switch Cremind applied itself and
+will undo on its own; `transition.auto_reverted` is `{reason, at, restored}` on
+a switch that already did undo itself, and is the only record of why an
+installation told to serve HTTPS is serving HTTP again. Both are absent on an
+older server.
 
 ### `cremind tls prepare`
 

@@ -91,6 +91,46 @@ def _print_steps(steps: list) -> None:
                 typer.echo(text)
 
 
+def _switch_outcome(transition: dict) -> list[str]:
+    """What became of a switch that finished, or is running out of time.
+
+    Two facts the operator has no other way to learn. A switch Cremind applied
+    itself waits for a browser to reach the new address and undoes itself if
+    none does, so a status call made in that window has to say how long is
+    left — otherwise "activating" reads as "forever". And once it *has* undone
+    itself the installation is back on HTTP with nothing in the phase to
+    explain why, which looks indistinguishable from a switch that was never
+    started.
+
+    Both fields come off the wire (``app/cli/`` must not import server code),
+    and both are absent on an older server, where this prints nothing.
+    """
+    import time
+
+    lines: list[str] = []
+    reverted = transition.get("auto_reverted")
+    if isinstance(reverted, dict) and reverted.get("reason"):
+        lines.append(f"HTTPS was switched off automatically: {reverted['reason']}")
+        if reverted.get("restored") is False:
+            lines.append(
+                "The previous settings could NOT be restored — check CREMIND_SSL "
+                "and APP_URL in the system directory's .env before restarting."
+            )
+    deadline = transition.get("confirmation_deadline")
+    if (isinstance(deadline, (int, float)) and not isinstance(deadline, bool)
+            and transition.get("phase") == "activating"):
+        remaining = int(deadline - time.time())
+        lines.append(
+            f"Waiting for a browser to reach the HTTPS address ({remaining // 60}m "
+            f"{remaining % 60}s left). If none does, the previous settings are "
+            "restored automatically and this server returns to HTTP."
+            if remaining > 0 else
+            "The confirmation deadline has passed; the previous settings are "
+            "being restored and this server will return to HTTP."
+        )
+    return lines
+
+
 def _remote_tls(ctx: typer.Context, action: str, source_origin: str | None = None,
                 *, restart: bool = False) -> None:
     import asyncio
@@ -142,6 +182,8 @@ def _remote_tls(ctx: typer.Context, action: str, source_origin: str | None = Non
                 typer.echo(result["activation_error"])
             if result.get("revert_error"):
                 typer.echo(result["revert_error"])
+            for line in _switch_outcome(result.get("transition") or {}):
+                typer.echo(line)
             steps = result.get("steps")
             if isinstance(steps, list) and steps:
                 _print_steps(steps)
@@ -157,9 +199,14 @@ def _remote_tls(ctx: typer.Context, action: str, source_origin: str | None = Non
             # and the operator has no other way of knowing that.
             if (result.get("can_cancel")
                     and (result.get("transition") or {}).get("phase") == "activating"):
+                waiting_on = (
+                    "This switch is waiting for a browser to reach the HTTPS address."
+                    if (result.get("transition") or {}).get("confirmation_deadline")
+                    else "This switch is waiting for the deployment change."
+                )
                 typer.echo(
-                    "This switch is waiting for the deployment change. To stay on "
-                    "HTTP instead: cremind --profile admin tls cancel"
+                    f"{waiting_on} To stay on HTTP instead: "
+                    "cremind --profile admin tls cancel"
                 )
     run()
 

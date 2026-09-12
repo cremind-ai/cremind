@@ -353,6 +353,34 @@ def _prepare(source: str, *, external: bool = False) -> dict:
     })
 
 
+def _switch_blocker() -> str | None:
+    """A reason this switch cannot work, checked while nothing has changed yet.
+
+    Activation already proves the certificate end to end — it re-reads the
+    fingerprint, refuses a certificate that moved since preparation, and
+    validates a supplied pair against every origin that joined the switch. What
+    it never checked is the *address*, and that is the one input the switch
+    derives rather than verifies: ``persist_native`` turns ``APP_URL`` into the
+    HTTPS origin it writes into the agent card, the OAuth redirects and the
+    Atlassian callback. An unreachable value there survives the switch and
+    breaks account linking afterwards, long after the cause is obvious.
+
+    Returns the message to refuse with, or ``None`` to proceed.
+    """
+    from app.config.tls_mode import _public_port, app_url_names_internal_bind
+
+    if app_url_names_internal_bind(BaseConfig.PORT):
+        return (
+            f"APP_URL is {BaseConfig.APP_URL!r}, but port {BaseConfig.PORT} is the "
+            "internal API bind — it listens on 127.0.0.1 only and is never published, "
+            "so no browser can open it. Switching to HTTPS would derive the new public "
+            "origin, the Google and Atlassian callbacks and the agent card from that "
+            f"address. Set APP_URL to the address browsers actually use (port "
+            f"{_public_port()}) and restart before activating HTTPS."
+        )
+    return None
+
+
 def _cancellable(request: Request, transition: dict | None) -> bool:
     """Whether this switch can still be called off through this request.
 
@@ -362,22 +390,39 @@ def _cancellable(request: Request, transition: dict | None) -> bool:
     stop consulting the transition file once they have seen ``activating``, so a
     cancel accepted then would be reverted underneath them.
     """
-    from app.config.tls_mode import boot_serving_https, edge_tls_termination
-    from app.config.tls_transition import awaiting_operator, management
+    from app.config.tls_mode import _public_port, boot_serving_https, edge_tls_termination
+    from app.config.tls_transition import awaiting_operator, management, requires_confirmation
     if not transition:
         return False
     if transition["phase"] in ("prepared", "quiescing"):
         return True
     if not awaiting_operator(transition):
         return False
-    if request.url.scheme == "https" or boot_serving_https():
-        return False
-    # On a deployment-managed install these two facts change only through the
-    # operator's own deployment change, so their presence proves the switch
-    # already landed and HTTPS is live in front of this process. Cancelling then
-    # would leave HTTPS serving on the old boundary forever.
-    if management() == "external" and (edge_tls_termination()
-                                       or BaseConfig.APP_URL.startswith("https://")):
+    # Binding TLS is not the same as completing the switch. While a self-applied
+    # switch is still waiting to be confirmed, the boundary has not moved and no
+    # session has been invalidated, so the way back stays open even though this
+    # process is serving HTTPS — that plaintext tab asking to cancel is exactly
+    # the administrator who could not reach the new origin.
+    if not requires_confirmation(transition):
+        if request.url.scheme == "https" or boot_serving_https():
+            return False
+    # On a deployment-managed install the switch can land in front of this
+    # process without it ever knowing, and cancelling then would leave HTTPS
+    # serving on the old boundary forever. Both signals below mean exactly
+    # that: an explicitly configured terminator, or a process with no public
+    # bind of its own — a reverse proxy owns the origin, so this server cannot
+    # observe the transport and ``APP_URL`` is the only evidence there is.
+    #
+    # ``APP_URL`` alone is NOT that evidence. A process holding its own public
+    # bind knows what it is serving, and ``boot_serving_https()`` above has
+    # already answered: still plaintext. Treating an https ``APP_URL`` as proof
+    # there told a Docker operator whose CREMIND_SSL had not taken effect that
+    # "HTTPS is already being served" — refusing the one action that would have
+    # given them their install back, while HTTP was demonstrably serving them
+    # the refusal.
+    if management() == "external" and (
+            edge_tls_termination()
+            or (_public_port() == 0 and BaseConfig.APP_URL.startswith("https://"))):
         return False
     return True
 
@@ -410,7 +455,14 @@ def tls_status_payload(request: Request) -> dict:
     if not transition and facts.pending_https:
         transition = _prepare(_source_origin(request))
     if serving_https:
-        mark_active(source=_source_origin(request), external=edge_https)
+        # An authenticated request carried over the new transport is what
+        # confirms a self-applied switch. The recovery page polls this same
+        # endpoint cross-origin with credentials omitted: that proves TLS
+        # reachability but not that anyone can still *use* the install, so it
+        # deliberately does not count. Requiring the admin session keeps the
+        # proof and the person who would have to undo the switch the same one.
+        mark_active(source=_source_origin(request), external=edge_https,
+                    confirmed=request.url.scheme == "https" and is_admin(request))
         transition = load_transition()
     mode = (os.environ.get("INSTALL_MODE") or "native").lower()
     manager = "external" if edge_https else management()
@@ -647,6 +699,7 @@ async def post_tls_activate(request: Request) -> JSONResponse:
     from app.auth.tokens import current_transport_epoch, preflight_token_files
     from app.config.tls_transition import (
         ACTIVATION_KEYS,
+        CONFIRMATION_DEADLINE_SECONDS,
         UPLOAD_RECOVERY_TTL,
         certificate_info,
         discard_native_rollback,
@@ -679,6 +732,9 @@ async def post_tls_activate(request: Request) -> JSONResponse:
             return JSONResponse({**tls_status_payload(request), "restart_required": value["phase"] != "active"})
         if value["phase"] not in ("prepared", "quiescing"):
             raise ValueError("Prepare HTTPS before activating it.")
+        blocker = _switch_blocker()
+        if blocker:
+            raise ValueError(blocker)
 
         # Keep the old token epoch and full HTTP application alive while every
         # registered renderer finishes its uploads and creates a private
@@ -829,6 +885,22 @@ async def post_tls_activate(request: Request) -> JSONResponse:
         value["restart_planned"] = (restart_requested and can_schedule) or manager == "electron"
         value["activated_at"] = time.time()
         value["upload_recovery_until"] = time.time() + UPLOAD_RECOVERY_TTL
+        # Cremind persisted this change and is about to restart the process
+        # itself, so it holds both halves of an undo nobody else can perform.
+        # That earns the switch a stricter completion rule — the boundary waits
+        # for a client that genuinely reached HTTPS — and, in exchange, a
+        # deadline after which the installation puts itself back.
+        #
+        # Excluded, deliberately: an external manager (no rollback record was
+        # written, so there is nothing to undo), ``--no-restart`` (the operator
+        # took over the timing and must not have it reverted underneath them),
+        # and Electron (its main process owns the child, so a revert-and-exit
+        # here could leave the app with no backend at all).
+        value["self_applied"] = bool(
+            rollback and value["restart_planned"] and manager != "electron"
+        )
+        if value["self_applied"]:
+            value["confirmation_deadline"] = time.time() + CONFIRMATION_DEADLINE_SECONDS
         try:
             save_transition(value)  # durable + published BEFORE shutdown
         except Exception:
@@ -851,9 +923,15 @@ async def post_tls_activate(request: Request) -> JSONResponse:
                     f"be scheduled: {error}."
                 )
                 # Nothing is coming to finish this, so say so: the runbook and
-                # the cancel button are gated on it.
+                # the cancel button are gated on it. The self-applied promise
+                # goes with it — no restart means no HTTPS to confirm, and a
+                # deadline would revert a switch that never got to start.
                 try:
-                    update_transition(lambda current: {**current, "restart_planned": False})
+                    update_transition(lambda current: {
+                        **{key: item for key, item in current.items()
+                           if key not in ("self_applied", "confirmation_deadline")},
+                        "restart_planned": False,
+                    })
                     value = load_transition() or value
                 except (ValueError, OSError):
                     pass
@@ -921,6 +999,17 @@ async def post_tls_cancel(request: Request) -> JSONResponse:
         )
         unresponsive = set(expected).difference(acknowledged) if isinstance(expected, dict) else set()
         activating = value["phase"] == "activating"
+        # Cancel is now reachable on a process that has ALREADY bound TLS:
+        # ``_cancellable`` allows it while a self-applied switch is unconfirmed,
+        # which is exactly the administrator who could not reach the new origin.
+        # That process cannot unbind TLS, and the moment the phase stops being
+        # ``activating`` the relay takes plaintext back to the recovery page —
+        # so without a restart the cancel would revert the configuration, leave
+        # HTTPS serving the old boundary anyway, and close the very surface the
+        # request arrived on. Read before ACTIVATION_KEYS destroys the evidence.
+        from app.config.tls_mode import boot_serving_https
+        from app.config.tls_transition import requires_confirmation
+        restart_onto_http = boot_serving_https() and requires_confirmation(value)
         value["phase"] = "cancelled"
         for key in ("quiesce_expected", "quiesce_acked", "quiesce_closed",
                     "quiesce_enrollment_until", *ACTIVATION_KEYS):
@@ -942,7 +1031,21 @@ async def post_tls_cancel(request: Request) -> JSONResponse:
                 )
         else:
             discard_native_rollback()
-        return JSONResponse({**tls_status_payload(request), "revert_error": revert_error})
+        restart_scheduled = False
+        if restart_onto_http and revert_error is None:
+            try:
+                from app.api.system import schedule_system_restart
+
+                schedule_system_restart()
+                restart_scheduled = True
+            except OSError as error:
+                revert_error = (
+                    "The switch was cancelled and the previous settings restored, but "
+                    f"the restart back onto HTTP could not be scheduled: {error} This "
+                    "server is still serving HTTPS until it is restarted by hand."
+                )
+        return JSONResponse({**tls_status_payload(request), "revert_error": revert_error,
+                             "restart_scheduled": restart_scheduled})
     except (ValueError, OSError) as error:
         return JSONResponse({"error": str(error)}, status_code=400)
 
@@ -972,7 +1075,9 @@ async def post_tls_handoff(request: Request) -> JSONResponse:
 
 async def post_tls_redeem(request: Request) -> JSONResponse:
     from app.config.tls_mode import boot_serving_https
-    from app.config.tls_transition import HandoffSessionExpired, mark_active, redeem_ticket
+    from app.config.tls_transition import (
+        HandoffSessionExpired, mark_active, redeem_ticket, ticket_exists,
+    )
     if request.url.scheme != "https":
         return JSONResponse({"error": "Session handoffs can only be received over HTTPS."}, status_code=403)
     try:
@@ -981,7 +1086,18 @@ async def post_tls_redeem(request: Request) -> JSONResponse:
         # anything: a status call normally does it first, but redemption must
         # not depend on that ordering or it would hand back a token for an
         # epoch that is about to be retired.
-        mark_active(source=_source_origin(request), external=not boot_serving_https())
+        #
+        # A redemption also confirms a self-applied switch — but the *ticket* is
+        # the proof, not the scheme. This route is unauthenticated, the https
+        # check above is satisfied by any client that skips certificate
+        # validation, and on the loopback bind it is satisfied by a forged
+        # X-Forwarded-Proto. An empty body would otherwise advance the boundary
+        # and delete the rollback record, destroying every way back from a
+        # switch nobody can reach. Minting a ticket needs a valid session, so
+        # holding one is the evidence; an expired one still proves the origin
+        # works, which is why the check is existence rather than validity.
+        mark_active(source=_source_origin(request), external=not boot_serving_https(),
+                    confirmed=ticket_exists(data.get("ticket")))
         return JSONResponse(redeem_ticket(data.get("ticket"), _request_origin(request)),
                             headers={"Cache-Control": "no-store"})
     except HandoffSessionExpired as error:

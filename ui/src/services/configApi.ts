@@ -134,6 +134,17 @@ export interface TlsTransition {
   /** HTTPS came up but the on-host token files could not be re-signed; the
    *  switch is stuck until an administrator fixes it. */
   activation_error?: string | null;
+  /** Unix seconds by which a browser has to reach the HTTPS address, on a
+   *  switch Cremind applied itself and will undo on its own if none does.
+   *  Absent on a deployment-managed switch (nobody would be able to undo it)
+   *  and on an older server. While this is set the credential boundary has
+   *  deliberately NOT moved: nothing is invalidated and cancel still works. */
+  confirmation_deadline?: number | null;
+  /** Set on a switch that already undid itself — the only record of why an
+   *  installation told to serve HTTPS is serving HTTP again. `restored` is
+   *  false when the previous settings could not be put back, which is the one
+   *  case that needs an administrator. */
+  auto_reverted?: { reason: string; at: number; restored: boolean } | null;
 }
 
 /** One line of deployment guidance. Only a `command` is a shell line, and only

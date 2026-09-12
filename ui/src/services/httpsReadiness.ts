@@ -137,6 +137,24 @@ export function evaluateHttpsReadiness(
   if (target.phase === 'activating') {
     const failure = target.activation_error || status.activation_error;
     if (failure) return notReady('activation-failed', failure, target);
+    // A self-applied switch deliberately holds the credential boundary until a
+    // real client reaches HTTPS, so it stays `activating` until one does — and
+    // moving this tab there (redeeming its ticket, or signing in) is precisely
+    // what produces the confirmation. Waiting for `active` here would wait for
+    // something only arriving can cause, and the switch would then revert at
+    // its deadline with every tab still sitting on the old origin.
+    //
+    // This probe is the proof the server cannot gather for itself: our own
+    // fetch to the target completed, so this browser reached the address and
+    // trusted the certificate. `confirmation_deadline` is present only in that
+    // state, so a deployment-managed switch keeps `activation-pending`.
+    if (typeof target.confirmation_deadline === 'number') {
+      if (status.ready === false) {
+        return notReady('certificate-invalid',
+          status.certificate_error || 'The secure server\'s certificate is not valid for this address.', target);
+      }
+      return { ready: true, reason: 'ready', responded: true, message: null, transition: target };
+    }
     return notReady('activation-pending',
       'The secure server answers and is finishing the switch.', target);
   }

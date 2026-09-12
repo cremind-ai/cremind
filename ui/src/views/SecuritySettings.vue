@@ -73,6 +73,34 @@ const migrationReady = migrationReadiness.ready;
 const pendingUploads = migrationReadiness.pendingUploads;
 
 const transition = computed(() => runtime.value?.transition ?? null);
+/** A switch that already put itself back, and why. */
+const autoReverted = computed(() => transition.value?.auto_reverted ?? null);
+/** Ticks only while a confirmation deadline is outstanding, so the countdown
+ *  below moves without the page polling anything. */
+const nowSeconds = ref(Date.now() / 1000);
+let countdownTimer: ReturnType<typeof setInterval> | undefined;
+/** How long is left before the switch undoes itself, as "9m 40s", or null when
+ *  no deadline applies — a deployment-managed switch, an older server, or one
+ *  that has already been confirmed. */
+const confirmationCountdown = computed(() => {
+  const deadline = transition.value?.confirmation_deadline;
+  if (typeof deadline !== 'number' || transition.value?.phase !== 'activating') return null;
+  const remaining = Math.max(0, Math.round(deadline - nowSeconds.value));
+  if (remaining <= 0) return 'less than a minute';
+  const minutes = Math.floor(remaining / 60);
+  return minutes ? `${minutes}m ${remaining % 60}s` : `${remaining}s`;
+});
+watch(confirmationCountdown, (value) => {
+  if (value && countdownTimer === undefined) {
+    countdownTimer = setInterval(() => { nowSeconds.value = Date.now() / 1000; }, 1000);
+  } else if (!value && countdownTimer !== undefined) {
+    clearInterval(countdownTimer);
+    countdownTimer = undefined;
+  }
+}, { immediate: true });
+onBeforeUnmount(() => {
+  if (countdownTimer !== undefined) clearInterval(countdownTimer);
+});
 const isExternal = computed(() => runtime.value?.management === 'external');
 const isElectron = computed(() => runtime.value?.management === 'electron');
 const isPrepared = computed(() => transition.value?.phase === 'prepared');
@@ -413,6 +441,22 @@ onMounted(() => { void load(); });
       </div>
 
       <template v-else>
+        <!-- The switch already put itself back. Without this the page shows the
+             ordinary "switch to HTTPS" wizard, which reads as though the attempt
+             never happened and invites the user straight back into it. -->
+        <section v-if="autoReverted" class="state-card reverted-card">
+          <h2>HTTPS was switched off automatically</h2>
+          <p>{{ autoReverted.reason }}</p>
+          <p v-if="autoReverted.restored === false" class="inline-error">
+            The previous settings could not be restored. Check CREMIND_SSL and APP_URL in
+            the system directory's .env before restarting this server.
+          </p>
+          <p v-else>
+            Cremind is serving HTTP again and nothing was lost — no sessions were
+            invalidated. You can fix the cause and try the switch again below.
+          </p>
+        </section>
+
         <section class="benefits-card">
           <div class="benefit-icon"><Icon icon="mdi:shield-lock-outline" /></div>
           <div>
@@ -553,6 +597,18 @@ onMounted(() => { void load(); });
           </section>
 
           <section v-else class="state-card">
+            <!-- Outside both panes on purpose. A self-applied switch is native
+                 and restart-scheduled, so it renders the spinner pane below,
+                 never the runbook pane — and this notice is the only thing that
+                 tells its administrator the wait has a deadline and an
+                 automatic way back. It self-gates on the deadline. -->
+            <p v-if="confirmationCountdown" class="notice">
+              Nothing has been switched over yet — your sessions are untouched and this
+              page still works. Open <strong>{{ recoveryUrl }}</strong> and sign in to
+              finish the switch. If no browser reaches it in
+              {{ confirmationCountdown }}, Cremind restores the previous settings and
+              returns to HTTP on its own.
+            </p>
             <template v-if="isExternal || commandsVisible || runtime?.restart_supported === false">
               <h2>{{ isExternal ? 'Apply HTTPS to the deployment' : 'Restart Cremind to finish' }}</h2>
               <p v-if="isExternal">
@@ -667,6 +723,10 @@ button:disabled { opacity: .55; cursor: not-allowed; }
    used before are never redeclared for the dark theme and stayed light there. */
 .inline-error, .upload-wait, .notice { padding: 10px 14px; border-radius: 6px; background: var(--hover-bg); color: var(--text-primary); border-left: 3px solid var(--warning-color); margin-bottom: 14px; }
 .error-card, .inline-error { border-color: var(--danger-color); }
+/* A reversal is not an error — the installation recovered itself — so it gets
+   the warning edge rather than the danger one, and sits above the wizard it
+   would otherwise be silently inviting the user back into. */
+.reverted-card { border-color: var(--warning-color); }
 code { background: var(--hover-bg); padding: 2px 5px; border-radius: 4px; }
 .fingerprint { word-break: break-all; }
 .spinner { width: 30px; height: 30px; border: 3px solid var(--border-color); border-top-color: var(--primary-color); border-radius: 50%; animation: spin .9s linear infinite; }

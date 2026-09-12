@@ -58,7 +58,16 @@ async def _read_protocol_prefix(reader: asyncio.StreamReader) -> tuple[bool, byt
 
 
 class PrivateRelayApp:
-    """Reject direct private-listener access and restore mapped public peers."""
+    """Reject direct private-listener access and restore mapped public peers.
+
+    Plaintext on the public port normally gets the recovery surface, but not
+    while a switch is still waiting to be confirmed: the credential boundary has
+    not moved, so nothing presented over HTTP has been invalidated, and the tab
+    asking is very often the administrator who could not reach the new origin
+    and needs the cancel button. ``EdgeTlsRecovery`` has always drawn the line
+    at the boundary rather than at the transport; this draws it in the same
+    place for the same-port relay.
+    """
 
     def __init__(self, app, peers):
         self.app = app
@@ -66,6 +75,7 @@ class PrivateRelayApp:
 
     async def __call__(self, scope, receive, send):
         from app.api.tls_recovery import recovery_app
+        from app.config.tls_transition import plaintext_may_serve_app
         from starlette.responses import JSONResponse
         if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
@@ -80,7 +90,10 @@ class PrivateRelayApp:
             return
         client, server, secure = peer
         scope = {**scope, "client": client, "server": server}
-        await (self.app if secure else recovery_app)(scope, receive, send)
+        if secure or plaintext_may_serve_app():
+            await self.app(scope, receive, send)
+            return
+        await recovery_app(scope, receive, send)
 
 
 async def serve_with_http_recovery(app, config, *, shutdown_trigger) -> None:

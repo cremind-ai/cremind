@@ -186,3 +186,41 @@ test('the pinned instance id is the one the fixtures share', () => {
   assert.equal(pinned.instance_id, INSTANCE)
   assert.equal(pinned.ca_sha256, CA)
 })
+
+// A self-applied switch holds the credential boundary until a real client
+// reaches HTTPS, so it stays `activating` until one does — and moving a tab
+// there is what produces that confirmation. Waiting for `active` would wait
+// for something only arriving can cause, and the switch would then revert at
+// its deadline with every tab still on the old origin.
+test('an unconfirmed self-applied switch is ready, because arriving is what confirms it', () => {
+  const waiting = transition({ confirmation_deadline: 1_700_000_600 })
+  const verdict = evaluateHttpsReadiness(waiting, status({ phase: 'activating', confirmation_deadline: 1_700_000_600 }))
+  assert.equal(verdict.ready, true)
+  assert.equal(verdict.reason, 'ready')
+})
+
+test('a deployment-managed switch still waits for the server to finish', () => {
+  const verdict = evaluateHttpsReadiness(pinned, status({ phase: 'activating' }))
+  assert.equal(verdict.ready, false)
+  assert.equal(verdict.reason, 'activation-pending')
+})
+
+test('an unconfirmed switch whose certificate is rejected is still not ready', () => {
+  const waiting = transition({ confirmation_deadline: 1_700_000_600 })
+  const verdict = evaluateHttpsReadiness(waiting, status(
+    { phase: 'activating', confirmation_deadline: 1_700_000_600 },
+    { ready: false, certificate_error: 'not valid for this address' },
+  ))
+  assert.equal(verdict.ready, false)
+  assert.equal(verdict.reason, 'certificate-invalid')
+})
+
+test('an unconfirmed switch that reports an activation failure is not ready', () => {
+  const waiting = transition({ confirmation_deadline: 1_700_000_600 })
+  const verdict = evaluateHttpsReadiness(waiting, status(
+    { phase: 'activating', confirmation_deadline: 1_700_000_600 },
+    { activation_error: 'Token files could not be re-signed.' },
+  ))
+  assert.equal(verdict.ready, false)
+  assert.equal(verdict.reason, 'activation-failed')
+})

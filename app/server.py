@@ -668,16 +668,9 @@ def _warn_if_app_url_names_the_internal_bind(public_port: int, internal_port: in
     the public bind anyway (app/config/oauth_loopback.py), but only the operator
     can fix the value itself, and nothing else in a boot log would hint at it.
     """
-    from urllib.parse import urlsplit
+    from app.config.tls_mode import app_url_names_internal_bind
 
-    if not public_port or public_port == internal_port:
-        return  # no public bind, or the two are the same: nothing to confuse
-    try:
-        parts = urlsplit((BaseConfig.APP_URL or "").strip())
-        named = parts.port
-    except ValueError:
-        return
-    if named != internal_port:
+    if not app_url_names_internal_bind(internal_port, public_port):
         return
     logger.warning(
         f"APP_URL is {BaseConfig.APP_URL!r}, but port {internal_port} is the internal API bind "
@@ -687,6 +680,94 @@ def _warn_if_app_url_names_the_internal_bind(public_port: int, internal_port: in
         "and restart. Docker: edit APP_URL in the .env next to docker-compose.yml, then "
         "`docker compose up -d --force-recreate cremind`; Kubernetes: `--set cremind.appUrl=…`."
     )
+
+
+async def _watch_https_confirmation() -> None:
+    """Undo a self-applied HTTPS switch that nobody ever managed to reach.
+
+    The failure this exists for is the one every other check passes: the
+    certificate is valid, the listener is healthy, the process is serving
+    HTTPS — and no browser can get to it, because the CA is not trusted on that
+    device, the host never published the port, or the address the users type is
+    not in the certificate's SAN set. Nothing on the server can observe any of
+    that. The only evidence is a client that never arrives.
+
+    So the switch carries a deadline, and when it passes with no confirmation
+    the installation puts itself back and restarts onto HTTP. That is the whole
+    of the "it must recover on its own" promise: every other layer catches a
+    server that failed to start, and this one catches a server that started
+    perfectly into an address nobody can open.
+
+    Exits as soon as the switch stops needing confirmation — confirmed,
+    cancelled, or never ours to undo — so the ordinary path costs one poll.
+    """
+    from app.config.tls_transition import (
+        auto_revert, confirmation_overdue, load_transition, requires_confirmation,
+    )
+
+    while True:
+        try:
+            value = load_transition()
+        except OSError:
+            return
+        if not requires_confirmation(value):
+            return
+        deadline = (value or {}).get("confirmation_deadline")
+        if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
+            return  # no deadline recorded: nothing to enforce
+        if confirmation_overdue(value):
+            reason = (
+                "HTTPS started but no browser reached it before the confirmation "
+                "deadline, so the previous settings were restored. Trust the Cremind "
+                "CA on the device you use, check that the HTTPS port is published, "
+                "and add any other hostname you reach Cremind at before trying again."
+            )
+            if auto_revert(reason, transition_id=(value or {}).get("id")):
+                try:
+                    from app.api.system import schedule_system_restart
+
+                    # The reverted configuration only takes effect on a fresh
+                    # process: this one has TLS bound and cannot unbind it.
+                    schedule_system_restart()
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "The HTTPS switch was reverted but the restart onto HTTP "
+                        "could not be scheduled — restart this server by hand."
+                    )
+            return
+        # Poll rather than sleep to the deadline in one go: the ordinary outcome
+        # is a confirmation seconds from now, and this loop should notice and
+        # stop rather than hold a task open for ten minutes.
+        await asyncio.sleep(max(5.0, min(30.0, deadline - time.time())))
+
+
+def _tls_failure(message: str) -> None:
+    """Refuse to serve TLS — by exiting, or by undoing a switch that was ours.
+
+    Exiting is the right answer to a certificate an operator configured by
+    hand: the value is wrong, nothing else here can fix it, and a server that
+    quietly served plain HTTP instead would be worse than one that stopped.
+
+    It is the wrong answer to a switch Cremind itself applied. Under Docker's
+    ``restart: unless-stopped`` — and under any other supervisor — exiting there
+    produces an endless crash loop with no listener at all: no HTTPS, no HTTP,
+    no recovery page, no status endpoint, and nothing to see unless somebody
+    thinks to read the container log. The installation is then unreachable
+    because of a change Cremind made and holds the record to unmake. So it
+    unmakes it and serves plain HTTP, which leaves the administrator a working
+    Cremind and an error explaining what happened.
+
+    Returns only in that second case; otherwise raises ``SystemExit``.
+    """
+    from app.config.tls_transition import auto_revert
+
+    logger.error(message)
+    if auto_revert(
+        f"{message} The previous settings were restored automatically and this "
+        "server started on plain HTTP."
+    ):
+        return
+    raise SystemExit(1)
 
 
 def _resolve_tls(
@@ -763,9 +844,16 @@ def _resolve_tls(
     if generated and not certfile and not keyfile:
         from app.config.tls_auto import ensure_local_tls, tls_dir
 
-        certfile, keyfile = ensure_local_tls(
-            BaseConfig.CREMIND_SYSTEM_DIR, BaseConfig.SSL_AUTO_HOSTS
-        )
+        try:
+            certfile, keyfile = ensure_local_tls(
+                BaseConfig.CREMIND_SYSTEM_DIR, BaseConfig.SSL_AUTO_HOSTS
+            )
+        except Exception as error:  # noqa: BLE001 - reported by _tls_failure
+            _tls_failure(
+                f"Cannot start: the local certificate for CREMIND_SSL={mode} could "
+                f"not be generated in {BaseConfig.CREMIND_SYSTEM_DIR}: {error}"
+            )
+            return None
         logger.info(
             f"CREMIND_SSL={mode} — serving a locally-signed certificate. Browsers "
             "warn until the CA is trusted, once per device: on this machine run "
@@ -781,25 +869,25 @@ def _resolve_tls(
             if not certfile
             else ("CREMIND_SSL_KEYFILE", "CREMIND_SSL_CERTFILE")
         )
-        logger.error(
+        _tls_failure(
             f"Cannot start: {given} is set but {missing} is not — TLS needs both. "
             "Set it, or unset both to serve plain HTTP (or use CREMIND_SSL=auto)."
         )
-        raise SystemExit(1)
+        return None
 
     # Paths are interpolated plainly, not with !r: repr doubles every backslash,
     # which makes a Windows path in an error message hard to read back.
     for label, path in (("certificate", certfile), ("private key", keyfile)):
         if not os.path.isfile(path):
-            logger.error(
+            _tls_failure(
                 f"Cannot start: the TLS {label} does not exist at {path}. "
                 "Fix the path, or unset CREMIND_SSL_CERTFILE/CREMIND_SSL_KEYFILE "
                 "to serve plain HTTP."
             )
-            raise SystemExit(1)
+            return None
         if not os.access(path, os.R_OK):
-            logger.error(f"Cannot start: the TLS {label} at {path} is not readable.")
-            raise SystemExit(1)
+            _tls_failure(f"Cannot start: the TLS {label} at {path} is not readable.")
+            return None
 
     # APP_URL is what the agent card advertises and what OAuth redirects derive
     # from, so an http:// value here sends browsers to a port that now speaks TLS.
@@ -973,6 +1061,18 @@ async def main(
         # Storage is not up yet, so a pending credential-boundary advance is
         # deferred to the post-storage hook below rather than done here.
         mark_active()
+    #    Either way, judge the boot a self-applied switch was counting on. The
+    #    success case is handled above; this is the branch that was missing —
+    #    the restart landed and HTTPS did not come up, which is indistinguishable
+    #    from a switch legitimately waiting for an operator unless somebody
+    #    counts. Two of those in a row and the switch puts the installation back
+    #    rather than restarting into the same failure forever.
+    try:
+        from app.config.tls_transition import reconcile_activation_boot
+
+        reconcile_activation_boot(tls is not None)
+    except Exception as e:  # noqa: BLE001 - never block boot on bookkeeping
+        logger.debug(f"[boot] HTTPS activation reconciliation skipped: {e}")
     try:
         from app.config.tls_transition import discard_orphan_native_rollback
 
@@ -1674,9 +1774,18 @@ async def main(
                 try:
                     from app.config.tls_transition import mark_active
 
-                    mark_active()
+                    # Unconfirmed on purpose: this process binding TLS says
+                    # nothing about whether a browser can reach or trust it.
+                    mark_active(confirmed=False)
                 except Exception:  # noqa: BLE001
                     logger.exception("Failed to complete the HTTPS transport-epoch advance")
+
+            # 10b. …and if it is a switch of ours that nobody has reached yet,
+            #      start the clock that puts the installation back.
+            try:
+                asyncio.create_task(_watch_https_confirmation())
+            except Exception:  # noqa: BLE001 - never fatal to boot
+                logger.exception("Failed to start the HTTPS confirmation watchdog")
 
             # 11. Start in-process channel adapters for every enabled
             #     non-main channel. Schema (and auto-created main channels)

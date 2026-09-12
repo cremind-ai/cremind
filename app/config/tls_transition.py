@@ -53,13 +53,27 @@ RESTART_GRACE_SECONDS = 90
 #: Minimum spacing between retries of a failed boundary advance. Plaintext tabs
 #: poll the HTTPS target every 1.5s, and each attempt decodes every token file.
 ACTIVATION_RETRY_SECONDS = 30
+#: How long a self-applied switch may serve HTTPS unconfirmed before it undoes
+#: itself. Long enough to trust a CA and reopen a browser; short enough that an
+#: abandoned switch does not leave the old origin's sessions valid all
+#: afternoon. Only ever consulted for a switch Cremind applied *and* can undo —
+#: see :func:`requires_confirmation`.
+CONFIRMATION_DEADLINE_SECONDS = 600
+#: Consecutive boots that were supposed to serve HTTPS and did not, before the
+#: switch gives up and puts the installation back. One failure can be a slow
+#: volume or a transient file lock; two in a row is a configuration that will
+#: never come up, and every further restart is just another minute offline.
+MAX_FAILED_ACTIVATION_BOOTS = 2
 #: Keys describing one in-flight activation attempt; cancelling or rolling back
 #: drops them together. ``transport_epoch`` is deliberately absent: only a
-#: completed advance writes it, and it must never move backwards.
+#: completed advance writes it, and it must never move backwards. So is
+#: ``auto_reverted``: it is the record of an attempt that ended, and it has to
+#: outlive the attempt or nobody is ever told why HTTPS went away.
 ACTIVATION_KEYS = (
     "pending_transport_epoch", "restart_planned", "activated_at",
     "activation_error", "activation_error_at", "upload_recovery_until",
-    "atlassian_redirect_uri_migrated",
+    "atlassian_redirect_uri_migrated", "self_applied", "confirmation_deadline",
+    "failed_boots",
 )
 #: The only environment keys :func:`persist_native` rewrites, and therefore the
 #: only ones :func:`revert_native` restores. The rollback record is a rollback
@@ -252,6 +266,13 @@ def public_transition(value: dict | None = None) -> dict | None:
         **{key: value.get(key) for key in _PUBLIC},
         "awaiting_operator": awaiting_operator(value),
         "activation_error": value.get("activation_error"),
+        # When this switch undoes itself if nobody reaches the new origin, and
+        # why it already did. A tab that cannot see the deadline has no way to
+        # tell "still waiting" from "waiting forever", and a tab that cannot see
+        # the reversal reports the switch as merely failed when in fact the
+        # installation has already been put back.
+        "confirmation_deadline": value.get("confirmation_deadline"),
+        "auto_reverted": value.get("auto_reverted"),
     }
 
 
@@ -391,6 +412,59 @@ def register_source(value: dict, source: str) -> dict:
     return update_transition(add_alias, announce=False)
 
 
+def requires_confirmation(value: dict | None) -> bool:
+    """Whether a real client must reach HTTPS before the boundary may move.
+
+    True only for a switch Cremind applied itself and can still undo: the
+    deployment change was ours to make, the rollback record is ours to apply,
+    and nobody else is coming. For those, "this process bound TLS" is the wrong
+    evidence — a certificate the browser will not trust, a port the host does
+    not publish and a SAN set missing the LAN name all bind perfectly and are
+    all unreachable. Advancing on that evidence re-signs every token and
+    deletes the rollback record, so the one person who could fix it is locked
+    out by the act of discovering the problem.
+
+    Deliberately false for a deployment-managed switch. There the operator
+    edited their own deployment and Cremind holds no rollback record, so
+    waiting would buy nothing and a missed confirmation could not be undone.
+    """
+    return bool(value and value.get("self_applied")
+                and "pending_transport_epoch" in value)
+
+
+def confirmation_overdue(value: dict | None, *, now: float | None = None) -> bool:
+    """Whether an unconfirmed self-applied switch has run out of time."""
+    if not requires_confirmation(value):
+        return False
+    deadline = (value or {}).get("confirmation_deadline")
+    if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
+        return False
+    return (now if now is not None else time.time()) >= deadline
+
+
+def plaintext_may_serve_app() -> bool:
+    """Whether the plaintext surface may still serve the real application.
+
+    The credential boundary, not the button, is what closes plaintext: while a
+    switch is merely *waiting* — activated but with its epoch still pending —
+    nothing has been invalidated, so a bearer presented over HTTP is as valid
+    as it ever was and refusing it only strands the administrator who has to
+    fix or cancel the switch. Once the epoch advances, plaintext must stop
+    serving immediately or a caller could mint a fresh current-epoch session
+    over it.
+
+    ``EdgeTlsRecovery`` has always applied exactly this rule for an
+    edge-terminated deployment. This is the same rule for the same-port relay,
+    which until now closed plaintext the instant the process bound TLS.
+    """
+    try:
+        value = load_transition()
+    except OSError:
+        return False  # unreadable metadata: assume the boundary moved
+    return bool(value and value.get("phase") == "activating"
+                and "pending_transport_epoch" in value)
+
+
 def _may_advance_boundary(*, external: bool) -> bool:
     """Whether this process/request is entitled to move the credential boundary.
 
@@ -492,7 +566,16 @@ def advance_transport_epoch() -> dict | None:
     return updated if "pending_transport_epoch" not in updated else None
 
 
-def mark_active(*, source: str | None = None, external: bool = False) -> None:
+def mark_active(*, source: str | None = None, external: bool = False,
+                confirmed: bool = False) -> None:
+    """Record that HTTPS is serving, and advance the boundary when entitled.
+
+    ``confirmed`` says a real client proved the new transport works — an
+    authenticated request that arrived over HTTPS, or a redeemed handoff
+    ticket. The unattended boot hook passes ``False``: this process binding TLS
+    says nothing about whether any browser can reach or trust it. See
+    :func:`requires_confirmation` for which switches insist on the difference.
+    """
     from app.config.tls_mode import boot_serving_https
     if not external and not boot_serving_https():
         return
@@ -513,10 +596,25 @@ def mark_active(*, source: str | None = None, external: bool = False) -> None:
     # to activate or resurrect an administrator's prepared/cancelled change.
     if value["phase"] not in ("activating", "active"):
         return
-    if _may_advance_boundary(external=external):
+    if _may_advance_boundary(external=external) and (
+            confirmed or not requires_confirmation(value)):
         advanced = advance_transport_epoch()
         if advanced is not None:
             value = advanced
+        elif confirmed and "confirmation_deadline" in value:
+            # A client reached the new origin and proved it; only the boundary
+            # move did not happen — storage is not up yet, or it failed and
+            # recorded why. The deadline answers "can anyone reach this?", and
+            # that question now has an answer, so it must stop running: leaving
+            # it armed would revert a switch that demonstrably works and undo a
+            # transport the administrator is already using.
+            try:
+                value = update_transition(lambda current: {
+                    key: item for key, item in current.items()
+                    if key != "confirmation_deadline"
+                })
+            except (ValueError, OSError):
+                pass
     if "pending_transport_epoch" in value:
         # HTTPS answers, but the boundary has not moved: storage is not ready, a
         # failure was recorded, or this deployment must not trust the scheme it
@@ -703,6 +801,98 @@ def cancel_locally(transition_id: str | None = None) -> dict:
         _write(directory() / "transition.json", cancelled)
     discard_native_rollback()
     return {"transition_id": cancelled["id"], "phase": "cancelled", "reverted": reverted}
+
+
+def auto_revert(reason: str, *, transition_id: str | None = None) -> bool:
+    """Put the installation back with nobody asking. ``True`` if it applied.
+
+    The unattended counterpart of cancel, and deliberately narrower: it acts
+    only on a switch Cremind applied and can still undo (:func:`requires_
+    confirmation`), so it can never unmake an operator's own deployment change
+    nor reverse a boundary that has already moved.
+
+    Never raises. Every caller is a boot path or a background task where the
+    alternative to a failed revert is a server that does not come up at all —
+    the switch stays where it was and the error is reported instead.
+    """
+    from app.utils.logger import logger
+    try:
+        with _lock:
+            value = load_transition()
+            if not requires_confirmation(value):
+                return False
+            if transition_id and value.get("id") != transition_id:
+                return False
+            reverted = revert_native(value["id"])
+            cancelled = {key: item for key, item in value.items()
+                         if key not in ACTIVATION_KEYS}
+            cancelled["phase"] = "cancelled"
+            for key in ("quiesce_expected", "quiesce_acked", "quiesce_closed",
+                        "quiesce_enrollment_until"):
+                cancelled.pop(key, None)
+            # Survives the cancel on purpose: this is the only trace of why an
+            # installation that was told to serve HTTPS is serving HTTP again.
+            cancelled["auto_reverted"] = {"reason": reason, "at": time.time(),
+                                          "restored": bool(reverted)}
+            _write(directory() / "transition.json", cancelled)
+        discard_native_rollback()
+    except Exception as error:  # noqa: BLE001 - a boot path has no better answer
+        logger.error(f"[tls] the HTTPS switch could not be undone automatically: {error}")
+        return False
+    logger.warning(f"[tls] HTTPS switch reverted automatically: {reason}")
+    try:
+        from app.events.transport_state_bus import get_transport_state_bus
+        get_transport_state_bus().publish(public_transition(cancelled))
+    except Exception:  # noqa: BLE001 - the durable record is what matters
+        pass
+    return True
+
+
+def reconcile_activation_boot(serving_https: bool) -> str | None:
+    """Judge a boot that a self-applied switch was depending on.
+
+    Boot already handles the success case — HTTPS bound, so ``mark_active``
+    runs. This is the branch that was missing: the restart landed and HTTPS did
+    *not* come up. Nothing else notices, because a transition sitting in
+    ``activating`` is indistinguishable from one legitimately waiting for an
+    operator, so without a counter the installation simply restarts into the
+    same failure forever.
+
+    Returns the reason when the switch was undone, ``None`` otherwise. Only
+    self-applied switches are counted: a Docker or Helm operator's switch is
+    *supposed* to sit through restarts until they apply the change.
+    """
+    from app.utils.logger import logger
+    try:
+        with _lock:
+            value = load_transition()
+            if not requires_confirmation(value):
+                return None
+            if serving_https:
+                if value.get("failed_boots"):
+                    _write(directory() / "transition.json",
+                           {key: item for key, item in value.items() if key != "failed_boots"})
+                return None
+            previous = value.get("failed_boots")
+            attempts = (previous if isinstance(previous, int)
+                        and not isinstance(previous, bool) else 0) + 1
+            if attempts < MAX_FAILED_ACTIVATION_BOOTS:
+                _write(directory() / "transition.json", {**value, "failed_boots": attempts})
+                logger.warning(
+                    f"[tls] this boot was meant to serve HTTPS and did not "
+                    f"({attempts}/{MAX_FAILED_ACTIVATION_BOOTS}); one more and the "
+                    "switch will be undone."
+                )
+                return None
+    except OSError as error:
+        logger.error(f"[tls] could not record a failed HTTPS activation boot: {error}")
+        return None
+    reason = (
+        f"HTTPS did not come up on {MAX_FAILED_ACTIVATION_BOOTS} consecutive "
+        "restarts, so the previous settings were restored. Check the server log "
+        "for why the certificate could not be served, then try the switch again."
+    )
+    return reason if auto_revert(reason) else None
 
 
 def persist_native(value: dict):
@@ -911,6 +1101,25 @@ def mint_ticket(token: str, data: dict) -> dict:
             raise ValueError("This server has too many active HTTPS handoff tickets. Wait for an existing ticket to expire and retry.")
         _write(path, record)
     return {"ticket": ticket, "expires_at": expires}
+
+
+def ticket_exists(ticket: object) -> bool:
+    """Whether this value names a handoff record this installation minted.
+
+    A non-consuming look, and the only thing that makes a redemption *evidence*
+    of anything. The redeem route is unauthenticated by design, so without this
+    an empty body — over a connection whose certificate was never checked, or
+    over the loopback bind with a forged ``X-Forwarded-Proto`` — would confirm
+    a switch and destroy every way back from it. Minting a ticket takes a valid
+    session, so holding one is proof a real client reached the new origin.
+
+    Whether the record is still *current* is :func:`redeem_ticket`'s separate
+    question: an expired ticket is still proof the origin works.
+    """
+    if not isinstance(ticket, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", ticket):
+        return False
+    return (directory() / "handoffs"
+            / f"{hashlib.sha256(ticket.encode()).hexdigest()}.json").exists()
 
 
 def redeem_ticket(ticket: str, target: str) -> dict:
