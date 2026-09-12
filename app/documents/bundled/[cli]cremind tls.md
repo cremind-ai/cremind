@@ -84,6 +84,12 @@ is something the container already does for itself — the entrypoint exits and
 Compose's `restart: unless-stopped` brings it back. Nothing on the Docker host
 has to be edited.
 
+Cremind recognises such an install by `INSTALL_MODE=docker`, which the shipped
+`docker-compose.yml` sets. A container started without it — `docker run` on the
+image, a hand-written compose file, a `.env` that predates the key — is
+recognised by the container itself and treated the same way; the boot log says
+so when that inference was needed. Kubernetes is never inferred.
+
 This is why it goes in the volume rather than the Compose `.env`: a container's
 environment is fixed when the container is *created*, so a restart re-reads
 nothing, and two of the six settings could not be delivered through that file at
@@ -110,6 +116,13 @@ together, so it is a chart change no pod can make to itself.
 Where Cremind both persisted the change and restarted the process — a supervised
 native install running `enable` without `--no-restart` — it also owns the way
 back, and uses it without being asked:
+
+- **The switch was saved as a native one inside a container.** A release that
+  recognised Compose installs by `INSTALL_MODE` alone persisted the switch into a
+  `.env` the container environment shadows, so no restart could ever apply it.
+  The next boot of a release that knows better calls it off, restores the
+  previous settings and says why in `tls status` (`auto_reverted`); run `prepare`
+  and `enable` again and this time it lands.
 
 - **The certificate cannot be served.** Rather than exiting (which under a
   supervisor is an endless restart with no listener at all, and therefore no

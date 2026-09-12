@@ -661,15 +661,21 @@ def management() -> str:
     Kubernetes deliberately stays ``external``: ``cremind.ssl`` moves the
     Service, the probes and the proxy sidecar together, which is a chart change
     no pod can make to itself (and its ServiceAccount has no RBAC to try).
+
+    The install mode is the *effective* one: a Docker container that never
+    said ``INSTALL_MODE`` is still a container whose environment is fixed at
+    creation, and calling it native — as this did when it read the variable
+    raw — persisted the switch into a ``.env`` the container environment
+    shadows and handed the operator a Ctrl+C runbook. See
+    :func:`app.config.tls_managed_env.effective_install_mode`.
     """
-    from app.config.tls_managed_env import is_container_install
+    from app.config.tls_managed_env import effective_install_mode, is_container_install
     from app.config.tls_mode import _public_port, edge_tls_termination
-    mode = (os.environ.get("INSTALL_MODE") or "native").lower()
     if _public_port() == 0 or edge_tls_termination():
         return "external"
     if is_container_install():
         return "managed-docker"
-    if mode in ("docker", "kubernetes"):
+    if effective_install_mode() == "kubernetes":
         return "external"
     return "electron" if os.environ.get("CREMIND_ELECTRON_PARENT") is not None else "native"
 
@@ -691,17 +697,26 @@ def _native_rollback_path() -> Path:
     return directory() / "native-rollback.json"
 
 
-def _write_native_rollback(transition_id, env_bytes, credentials_bytes, attrs, environ) -> None:
+def _write_native_rollback(transition_id, env_bytes, credentials_bytes, attrs, environ,
+                           env_path: Path | None = None) -> None:
     """Persist everything :func:`persist_native`'s in-process rollback holds.
 
     That closure lives only as long as the activating request. Cancelling can
     happen much later — from another tab, another process, or the offline CLI
     after a failed restart — so the same inputs have to survive on disk for as
     long as the switch can still be undone.
+
+    ``env_path`` is the file the ``env`` bytes came from. Recorded because the
+    answer to "which file" can change between the write and the undo: an
+    upgrade that starts recognising a container as a managed install moves
+    :func:`canonical_env_path` from ``.env`` to the overlay, and restoring the
+    old bytes to the new file would plant an unrelated ``.env`` where the next
+    boot reads HTTPS settings from. See :func:`_rollback_env_destination`.
     """
     _write(_native_rollback_path(), {
         "version": 1,
         "transition_id": transition_id,
+        "env_path": str(env_path) if env_path is not None else None,
         "env": base64.b64encode(env_bytes).decode("ascii") if env_bytes is not None else None,
         "credentials": (base64.b64encode(credentials_bytes).decode("ascii")
                         if credentials_bytes is not None else None),
@@ -745,6 +760,39 @@ def discard_orphan_native_rollback() -> None:
         path.unlink(missing_ok=True)
 
 
+def _rollback_env_destination(recorded) -> Path:
+    """The file a rollback record's ``env`` bytes go back to.
+
+    Decided by *which kind* of file the record names — the overlay or the
+    native ``.env`` — and resolved against the current system directory, so a
+    ``cremind relocate`` between the switch and its undo still finds the file.
+    Only those two kinds exist, because they are the only files the switch has
+    ever written; a record naming anything else is refused rather than guessed
+    at, so a tampered record cannot turn a cancel into a write somewhere else.
+
+    A record that predates ``env_path`` (written before ``0.0.17rc16.dev4``) is
+    decided from disk: those releases wrote the overlay before the phase ever
+    became ``activating`` and never wrote both files, so the overlay's presence
+    is the record of where the bytes came from. Not from the raw
+    ``INSTALL_MODE`` those releases chose by — an image upgrade on Compose is a
+    recreate, and the boot log asks the operator to add ``INSTALL_MODE=docker``
+    at exactly that moment, which would have steered a ``.env``-origin record's
+    bytes into the overlay: an override the deployment could never retire.
+    """
+    from app.config.tls_managed_env import managed_env_path
+    overlay = managed_env_path(BaseConfig.CREMIND_SYSTEM_DIR)
+    native = Path(BaseConfig.CREMIND_SYSTEM_DIR) / ".env"
+    if recorded is None:
+        return overlay if overlay.exists() else native
+    if isinstance(recorded, str) and recorded.strip():
+        named = Path(recorded)
+        if named.name == overlay.name and named.parent.name == overlay.parent.name:
+            return overlay
+        if named.name == native.name:
+            return native
+    raise OSError("The HTTPS rollback record names a file the switch never wrote.")
+
+
 def revert_native(transition_id: str) -> bool:
     """Undo :func:`persist_native` from the durable record. ``True`` if applied.
 
@@ -770,6 +818,7 @@ def revert_native(transition_id: str) -> bool:
                        if record.get("credentials") is not None else None)
     except (TypeError, ValueError) as error:
         raise OSError("The HTTPS rollback record is corrupt.") from error
+    env_destination = _rollback_env_destination(record.get("env_path"))
 
     def restore_file(destination: Path, data: bytes | None) -> None:
         if data is None:
@@ -786,7 +835,7 @@ def revert_native(transition_id: str) -> bool:
         finally:
             temporary.unlink(missing_ok=True)
 
-    restore_file(canonical_env_path(), env_bytes)
+    restore_file(env_destination, env_bytes)
     restore_file(Path(BaseConfig.CREMIND_INSTALL_DIR) / "credentials.toml", creds_bytes)
     if isinstance(attrs.get("APP_URL"), str):
         BaseConfig.APP_URL = attrs["APP_URL"]
@@ -840,13 +889,17 @@ def cancel_locally(transition_id: str | None = None) -> dict:
     return {"transition_id": cancelled["id"], "phase": "cancelled", "reverted": reverted}
 
 
-def auto_revert(reason: str, *, transition_id: str | None = None) -> bool:
+def auto_revert(reason: str, *, transition_id: str | None = None,
+                permitted: Callable[[dict | None], bool] = requires_confirmation) -> bool:
     """Put the installation back with nobody asking. ``True`` if it applied.
 
     The unattended counterpart of cancel, and deliberately narrower: it acts
     only on a switch Cremind applied and can still undo (:func:`requires_
     confirmation`), so it can never unmake an operator's own deployment change
-    nor reverse a boundary that has already moved.
+    nor reverse a boundary that has already moved. ``permitted`` is that gate;
+    :func:`revert_stranded_managed_switch` supplies the one other condition
+    under which a switch is provably going nowhere, and it is re-evaluated
+    here, under the lock, rather than trusted from a caller's earlier look.
 
     Never raises. Every caller is a boot path or a background task where the
     alternative to a failed revert is a server that does not come up at all —
@@ -856,7 +909,7 @@ def auto_revert(reason: str, *, transition_id: str | None = None) -> bool:
     try:
         with _lock:
             value = load_transition()
-            if not requires_confirmation(value):
+            if not permitted(value):
                 return False
             if transition_id and value.get("id") != transition_id:
                 return False
@@ -885,6 +938,97 @@ def auto_revert(reason: str, *, transition_id: str | None = None) -> bool:
     return True
 
 
+def stranded_managed_switch(value: dict | None, serving_https: bool) -> bool:
+    """A managed Compose switch that no restart can ever apply.
+
+    A managed switch writes the overlay *before* its phase becomes
+    ``activating``, and the overlay is the only thing a restarted container
+    reads. So a switch that is activating, whose boundary has not moved, on a
+    boot that serves plain HTTP, with no overlay to read, was not saved by this
+    installation's managed path at all — it was saved as a native switch, into
+    a ``.env`` the container environment shadows, by a process that took the
+    container for something else (a release that recognised Compose installs by
+    ``INSTALL_MODE`` alone, or a native system directory later mounted into a
+    container). Nothing is coming to finish it: left alone it sits in
+    ``activating`` for ever behind a spinner promising a restart.
+
+    Not gated on ``self_applied``, because that flag is exactly what the
+    mistaken process never set. Excluded: a switch prepared as ``external`` —
+    the transition records its manager at preparation, and a Compose operator
+    who was handed the recreate runbook by an older release (or by the two
+    Compose shapes that are still external) really is coming, holds no
+    rollback record, and would be told "settings could not be restored" about
+    settings nobody changed. Also excluded once the overlay has retired itself:
+    that boot serves HTTPS and is ruled out first.
+    """
+    if serving_https or not value:
+        return False
+    if value.get("phase") != "activating" or "pending_transport_epoch" not in value:
+        return False
+    if value.get("management") == "external":
+        return False
+    if management() != "managed-docker":
+        return False
+    from app.config.tls_managed_env import managed_env_path
+    return not managed_env_path(BaseConfig.CREMIND_SYSTEM_DIR).exists()
+
+
+STRANDED_MANAGED_SWITCH_REASON = (
+    "This switch was saved as if the server were a native install, so its "
+    "settings went to a file this container's environment overrides and no "
+    "restart could apply them. The previous settings were restored. Switch to "
+    "HTTPS again from Settings → HTTPS & Certificate (or `cremind tls prepare` "
+    "and `cremind tls enable`): this version saves the switch in the "
+    "system-directory volume and restarts the container itself."
+)
+
+STRANDED_OVERLAY_MISSING_REASON = (
+    "The HTTPS settings this switch saved in the system-directory volume are "
+    "no longer there, so no restart could apply them. The previous settings "
+    "were restored. Check that the volume is still mounted at the system "
+    "directory, then switch to HTTPS again from Settings → HTTPS & Certificate "
+    "(or `cremind tls prepare` and `cremind tls enable`)."
+)
+
+
+def _stranded_reason() -> str:
+    """Which of the two ways a managed switch ends up with nothing to read.
+
+    The rollback record says where the switch was persisted: into ``.env``
+    means a process that took the container for a native install wrote it;
+    into the overlay means the overlay has since gone. Read under the lock the
+    caller holds, before the revert discards the record; a record that cannot
+    be read gets the second, more general wording.
+    """
+    try:
+        record = json.loads(_native_rollback_path().read_text(encoding="utf-8"))
+        destination = _rollback_env_destination(record.get("env_path"))
+    except (OSError, ValueError, AttributeError):
+        return STRANDED_OVERLAY_MISSING_REASON
+    if destination == Path(BaseConfig.CREMIND_SYSTEM_DIR) / ".env":
+        return STRANDED_MANAGED_SWITCH_REASON
+    return STRANDED_OVERLAY_MISSING_REASON
+
+
+def revert_stranded_managed_switch(serving_https: bool) -> str | None:
+    """Call off a switch this container can never finish, at boot.
+
+    Returns the reason when a switch was undone, ``None`` otherwise. Runs
+    before :func:`reconcile_activation_boot`, which counts only self-applied
+    switches and would let this one sit unnoticed, and before the boot
+    housekeeping that discards a rollback record — the record is what puts the
+    native ``.env`` back. Never raises; see :func:`auto_revert`.
+    """
+    def permitted(value: dict | None) -> bool:
+        return stranded_managed_switch(value, serving_https)
+
+    with _lock:
+        if not permitted(load_transition()):
+            return None
+        reason = _stranded_reason()
+    return reason if auto_revert(reason, permitted=permitted) else None
+
+
 def reconcile_activation_boot(serving_https: bool) -> str | None:
     """Judge a boot that a self-applied switch was depending on.
 
@@ -898,6 +1042,13 @@ def reconcile_activation_boot(serving_https: bool) -> str | None:
     Returns the reason when the switch was undone, ``None`` otherwise. Only
     self-applied switches are counted: a Docker or Helm operator's switch is
     *supposed* to sit through restarts until they apply the change.
+
+    A boot that does serve HTTPS also restarts the confirmation window. That
+    window measures time spent serving HTTPS with nobody arriving; time the
+    process spent stopped must not count — a ``docker run`` container with no
+    restart policy stops when the switch restarts it, and when the operator
+    starts it again an hour later the first poll would otherwise revert a
+    switch no browser has yet had a chance to reach.
     """
     from app.utils.logger import logger
     try:
@@ -906,9 +1057,11 @@ def reconcile_activation_boot(serving_https: bool) -> str | None:
             if not requires_confirmation(value):
                 return None
             if serving_https:
-                if value.get("failed_boots"):
-                    _write(directory() / "transition.json",
-                           {key: item for key, item in value.items() if key != "failed_boots"})
+                refreshed = {key: item for key, item in value.items() if key != "failed_boots"}
+                if "confirmation_deadline" in value:
+                    refreshed["confirmation_deadline"] = time.time() + CONFIRMATION_DEADLINE_SECONDS
+                if refreshed != value:
+                    _write(directory() / "transition.json", refreshed)
                 return None
             previous = value.get("failed_boots")
             attempts = (previous if isinstance(previous, int)
@@ -1025,7 +1178,7 @@ def persist_native(value: dict):
     # activation with the installation untouched — rather than leaving a
     # rewritten .env behind with no way to put it back.
     _write_native_rollback(value.get("id"), original_bytes, original_creds,
-                           original_attrs, original_env)
+                           original_attrs, original_env, env_path=path)
 
     def restore_file(destination, data):
         if data is None:

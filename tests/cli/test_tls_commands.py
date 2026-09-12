@@ -458,6 +458,37 @@ def test_status_leaves_a_command_only_runbook_unlabelled(runner, monkeypatch, sy
     assert "Run in order:" not in result.output
 
 
+def test_enable_after_a_switch_was_called_off_says_to_prepare_first(runner, monkeypatch, sysdir):
+    """A cancelled switch — by hand, or by the server putting itself back at
+    boot — still carries an id, and activating it is refused by the server
+    with "prepare first". The CLI says so in the operator's own terms, the
+    same words it uses when there is no switch at all, rather than relaying
+    the refusal (which the reverted reason text pointed them straight at)."""
+    monkeypatch.setenv("CREMIND_TOKEN", "token-for-admin")
+    _stub_status(monkeypatch, {
+        "serving_https": False, "management": "managed-docker", "restart_supported": True,
+        "ca_sha256": "ab" * 32,
+        "transition": {
+            "id": "called-off", "phase": "cancelled",
+            "auto_reverted": {"reason": "saved as if native", "at": 1.0, "restored": True},
+        },
+    })
+    activated = []
+
+    async def fake_activate(_client, *args, **kwargs):  # pragma: no cover - must not run
+        activated.append((args, kwargs))
+        return {}
+
+    import app.cli.client.tls as tls_client
+    monkeypatch.setattr(tls_client, "activate", fake_activate)
+
+    result = _invoke(runner, monkeypatch, ["--profile", "admin", "tls", "enable", "--yes"])
+
+    assert result.exit_code != 0
+    assert "cremind tls prepare" in result.output
+    assert activated == []
+
+
 def test_status_falls_back_to_the_flat_list_from_an_older_server(runner, monkeypatch, sysdir):
     """A slim `pip install cremind` may be newer than the server it talks to."""
     _stub_status(monkeypatch, {

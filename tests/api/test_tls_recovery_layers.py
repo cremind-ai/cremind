@@ -293,6 +293,35 @@ def test_a_boot_that_serves_https_clears_the_counter(
     assert transition.load_transition()["phase"] == "activating"
 
 
+def test_a_boot_that_serves_https_restarts_the_confirmation_window(
+    client, environment, monkeypatch,
+):
+    """The window measures time spent serving HTTPS with nobody arriving.
+
+    A ``docker run`` container with no restart policy stops when the switch
+    restarts it; started again by hand an hour later, the first poll would
+    otherwise revert a switch no browser has yet had a chance to reach. Time
+    spent stopped does not count. A boot that does *not* serve HTTPS leaves the
+    deadline alone — it is counted, not excused.
+    """
+    self_applied(client, environment, monkeypatch)
+    stopped_for_an_hour = time.time() - 3600
+    stale = transition.load_transition()
+    stale["confirmation_deadline"] = stopped_for_an_hour
+    transition.save_transition(stale)
+
+    assert transition.reconcile_activation_boot(serving_https=False) is None
+    assert transition.load_transition()["confirmation_deadline"] == stopped_for_an_hour
+
+    assert transition.reconcile_activation_boot(serving_https=True) is None
+
+    refreshed = transition.load_transition()
+    assert refreshed["phase"] == "activating"
+    assert "failed_boots" not in refreshed
+    assert refreshed["confirmation_deadline"] > time.time() + transition.CONFIRMATION_DEADLINE_SECONDS - 5
+    assert transition.confirmation_overdue(refreshed) is False
+
+
 def test_a_switch_waiting_for_an_operator_is_never_counted(
     client, environment, monkeypatch,
 ):

@@ -124,7 +124,7 @@ def _trust_environment_error() -> str | None:
     device is another machine entirely. A native Electron child runs on the
     device itself and uses the same local trust guards as a native server.
     """
-    from app.config.install_catalog import get_active_install_mode
+    from app.config.tls_managed_env import effective_install_mode
     from app.config.tls_mode import _public_port, edge_tls_termination
 
     if _public_port() == 0 or edge_tls_termination():
@@ -133,8 +133,9 @@ def _trust_environment_error() -> str | None:
     if BaseConfig.SSL_CERTFILE and BaseConfig.SSL_KEYFILE:
         return "This server uses a supplied certificate. Trust its issuer instead of a previous Cremind CA."
 
-    mode = (get_active_install_mode() or "").strip().lower()
-    if mode in ("docker", "kubernetes"):
+    # The effective mode, like the rest of this module: a container that never
+    # said INSTALL_MODE can still only write its own trust store.
+    if effective_install_mode() in ("docker", "kubernetes"):
         return (
             "This server runs in a container, so it can only write the "
             "container's trust store — not the one your browser uses. "
@@ -481,7 +482,11 @@ def tls_status_payload(request: Request) -> dict:
         mark_active(source=_source_origin(request), external=edge_https,
                     confirmed=request.url.scheme == "https" and is_admin(request))
         transition = load_transition()
-    mode = (os.environ.get("INSTALL_MODE") or "native").lower()
+    # The effective mode, so the runbook, the CA-trust guidance and the
+    # ``install_mode`` field agree with ``management`` about a container that
+    # never said INSTALL_MODE (see ``tls_managed_env.effective_install_mode``).
+    from app.config.tls_managed_env import effective_install_mode
+    mode = effective_install_mode() or "native"
     manager = "external" if edge_https else management()
     https_url = https_target(_source_origin(request))
     # What this pod is, when it is one: the runbook prints the real namespace,

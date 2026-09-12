@@ -171,11 +171,18 @@ def _remote_tls(ctx: typer.Context, action: str, source_origin: str | None = Non
                     return await tls_client.prepare(client, source_origin)
                 current = await tls_client.status(client)
                 transition = current.get("transition") or {}
-                if not transition.get("id"):
+                if action == "cancel":
+                    if not transition.get("id"):
+                        from app.cli.config import ConfigError
+                        raise ConfigError("There is no HTTPS switch to cancel.")
+                    return await tls_client.cancel(client, transition["id"])
+                # A cancelled switch — by hand, or by the server putting itself
+                # back — still has an id, and activating it is refused with
+                # "prepare first". Say so here, in the words the operator can act
+                # on, instead of relaying that refusal.
+                if not transition.get("id") or transition.get("phase") == "cancelled":
                     from app.cli.config import ConfigError
                     raise ConfigError("Run cremind tls prepare, then trust the CA before enabling HTTPS.")
-                if action == "cancel":
-                    return await tls_client.cancel(client, transition["id"])
                 result = await tls_client.activate(
                     client,
                     transition["id"],

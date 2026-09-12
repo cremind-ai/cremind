@@ -684,6 +684,36 @@ def _warn_if_app_url_names_the_internal_bind(public_port: int, internal_port: in
     )
 
 
+def _note_inferred_install_mode() -> None:
+    """Say so when the install mode came from the container, not ``INSTALL_MODE``.
+
+    The shipped Compose template sets the variable; ``docker run`` on the image
+    and a hand-written compose file do not. Everything that decides how this
+    process restarts and where an HTTPS switch is persisted then falls back to
+    the container marker (``tls_managed_env.effective_install_mode``), and that
+    inference deserves one line in the log: it is the only place an operator
+    would learn why their install is being treated as Compose, and the fix —
+    saying so in the deployment — is a one-liner.
+    """
+    from app.config.tls_managed_env import KNOWN_INSTALL_MODES, install_mode_was_inferred
+
+    if not install_mode_was_inferred():
+        return
+    raw = (os.environ.get("INSTALL_MODE") or "").strip()
+    said = (
+        "INSTALL_MODE is not set" if not raw
+        else f"INSTALL_MODE={raw!r} names no install mode ({', '.join(KNOWN_INSTALL_MODES)})"
+    )
+    logger.warning(
+        f"{said}, but this process is running in a Docker container, so it is "
+        "treated as a Docker (Compose) install: restarts are expected to be "
+        "supervised by Docker, and an HTTPS switch from Settings → HTTPS & "
+        "Certificate is applied from the system-directory volume. Set "
+        "INSTALL_MODE=docker in the deployment to make that explicit — the "
+        "shipped docker-compose.yml does."
+    )
+
+
 async def _watch_https_confirmation() -> None:
     """Undo a self-applied HTTPS switch that nobody ever managed to reach.
 
@@ -1043,6 +1073,7 @@ async def main(
     public_port = _resolve_public_port()
     _require_free_ports(host, public_port, port)
     _warn_if_app_url_names_the_internal_bind(public_port, port)
+    _note_inferred_install_mode()
     #    Now that the ports are ours, tell the boot service (and the
     #    uninstallers, which have always stopped this PID) which process to
     #    manage. No-op unless something is actually supervising us.
@@ -1079,6 +1110,18 @@ async def main(
             "set the same values in the deployment to make them permanent and this "
             "file retires itself."
         )
+    #    A managed Compose switch that this boot cannot read — saved by a process
+    #    that took the container for a native install, into a .env the container
+    #    environment shadows — is going nowhere, and nothing else would ever say
+    #    so. Before the counter below (it is not self-applied, so the counter
+    #    ignores it) and before the rollback record is discarded (it is what
+    #    puts that .env back).
+    try:
+        from app.config.tls_transition import revert_stranded_managed_switch
+
+        revert_stranded_managed_switch(tls is not None)
+    except Exception as e:  # noqa: BLE001 - never block boot on bookkeeping
+        logger.debug(f"[boot] stranded HTTPS switch check skipped: {e}")
     #    Either way, judge the boot a self-applied switch was counting on. The
     #    success case is handled above; this is the branch that was missing —
     #    the restart landed and HTTPS did not come up, which is indistinguishable

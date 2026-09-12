@@ -249,7 +249,14 @@ def compute_tls_facts(
 
 
 def current_tls_facts(public_port: int | None = None) -> TlsFacts:
-    """TLS facts for this running process."""
+    """TLS facts for this running process.
+
+    The install mode is the effective one, not the raw variable: a Docker
+    container that never said ``INSTALL_MODE`` is still restarted by Docker,
+    and reporting ``restart_supported`` False there is what handed its
+    administrator a Ctrl+C runbook for a terminal that does not exist.
+    """
+    from app.config.tls_managed_env import effective_install_mode
     if public_port is None:
         public_port = _public_port()
     has_pair = bool(
@@ -261,7 +268,7 @@ def current_tls_facts(public_port: int | None = None) -> TlsFacts:
         has_pair=has_pair,
         public_port=public_port,
         serving_https=boot_serving_https(),
-        install_mode=(os.environ.get("INSTALL_MODE") or "").strip().lower(),
+        install_mode=effective_install_mode(),
         supervised=env_supervised(),
     )
 

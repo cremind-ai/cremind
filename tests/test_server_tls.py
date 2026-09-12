@@ -323,6 +323,44 @@ def test_a_legacy_container_counts_as_supervised(monkeypatch, tmp_path) -> None:
         assert server._supervised_env() is True, mode
 
 
+def test_an_inferred_install_mode_is_said_at_boot(monkeypatch, tmp_path) -> None:
+    """One line, only when the container marker had to stand in for
+    INSTALL_MODE: it is the sole place an operator learns why their install is
+    treated as Compose, and the remedy is a one-liner in the deployment."""
+    from loguru import logger
+
+    from app.config import tls_managed_env as managed
+
+    monkeypatch.delenv("VNC_PASSWORD", raising=False)
+    marker = tmp_path / "dockerenv"
+    marker.write_text("", encoding="utf-8")
+    monkeypatch.setattr(managed, "_CONTAINER_MARKER", marker)
+    monkeypatch.setattr(managed, "_POD_MARKER", tmp_path / "no-serviceaccount")
+    messages: list[str] = []
+    sink = logger.add(lambda m: messages.append(str(m)), level="WARNING")
+    try:
+        monkeypatch.setenv("INSTALL_MODE", "docker")
+        server._note_inferred_install_mode()
+        assert messages == [], "an explicit mode has nothing to explain"
+        monkeypatch.delenv("INSTALL_MODE", raising=False)
+        server._note_inferred_install_mode()
+        monkeypatch.setenv("INSTALL_MODE", "podman")
+        server._note_inferred_install_mode()
+        # Outside a container an absent mode means native, and native says nothing.
+        monkeypatch.setattr(managed, "_CONTAINER_MARKER", tmp_path / "no-dockerenv")
+        monkeypatch.delenv("INSTALL_MODE", raising=False)
+        server._note_inferred_install_mode()
+    finally:
+        logger.remove(sink)
+
+    assert len(messages) == 2
+    assert "INSTALL_MODE is not set" in messages[0]
+    assert "INSTALL_MODE='podman' names no install mode" in messages[1]
+    for message in messages:
+        assert "Docker (Compose) install" in message
+        assert "INSTALL_MODE=docker" in message
+
+
 def test_a_boot_service_counts_as_a_supervisor(monkeypatch) -> None:
     """A native install with `cremind boot enable` is supervised too.
 

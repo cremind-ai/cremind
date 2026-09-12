@@ -49,6 +49,17 @@ def environment(monkeypatch, tmp_path):
     monkeypatch.delenv("CREMIND_ELECTRON_PARENT", raising=False)
     monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
     monkeypatch.delenv("CREMIND_TLS_TERMINATION", raising=False)
+    # The HTTPS path infers Docker from the container marker (or the desktop
+    # image's VNC_PASSWORD) when INSTALL_MODE says nothing, so a suite running
+    # inside a container would otherwise turn every empty-INSTALL_MODE case
+    # into a managed Compose install. Tests that want the marker set their own.
+    monkeypatch.delenv("VNC_PASSWORD", raising=False)
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._CONTAINER_MARKER", tmp_path / "no-dockerenv",
+    )
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._POD_MARKER", tmp_path / "no-serviceaccount",
+    )
     # The Kubernetes runbook now prints whatever this pod knows about itself,
     # so a suite running *inside* a cluster would otherwise assert against that
     # cluster's namespace and Deployment: the placeholder cases below would

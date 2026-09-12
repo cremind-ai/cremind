@@ -19,7 +19,8 @@ Three things make this safe to do without a capability handshake:
   same image, so a server that can honour this file is by definition the server
   that will come back. Nothing has to negotiate with an older entrypoint.
 * **It is loaded only where the container environment is genuinely immutable**
-  (``INSTALL_MODE=docker``). A native install's ``.env`` keeps being the
+  (``INSTALL_MODE=docker``, or a Docker container that never said — see
+  :func:`effective_install_mode`). A native install's ``.env`` keeps being the
   installer shim's business, and Kubernetes keeps its Helm runbook — there
   ``cremind.ssl`` moves the Service, the probes and the proxy sidecar together,
   which no pod can do to itself.
@@ -57,8 +58,77 @@ MANAGED_KEYS = (
 _LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
 
 
+#: What ``INSTALL_MODE`` may legitimately say — the keys of
+#: install/catalog.toml's ``[modes]`` and ``[mode_rules]``. A copy, like
+#: :data:`MANAGED_KEYS` and for the same reason: the catalog loader is not
+#: importable from here.
+KNOWN_INSTALL_MODES = ("docker", "kubernetes", "native", "custom")
+
+# Last-resort "are we in a container?" signals, consulted only when INSTALL_MODE
+# says nothing usable. ``_CONTAINER_MARKER`` is a copy of
+# ``app.config.runtime_env._CONTAINER_MARKER``, module-level for the same
+# reason: tests point it somewhere that does not exist rather than patching
+# Path.exists globally, because CI itself may run inside a container. The
+# service-account mount is something every pod has unless its manifest opts
+# out (``automountServiceAccountToken: false``), and ``KUBERNETES_SERVICE_HOST``
+# is injected by the kubelet into every pod regardless; a Compose container
+# has neither.
+_CONTAINER_MARKER = Path("/.dockerenv")
+_POD_MARKER = Path("/var/run/secrets/kubernetes.io/serviceaccount")
+
+
+def _in_a_pod() -> bool:
+    return bool(os.environ.get("KUBERNETES_SERVICE_HOST")) or _POD_MARKER.exists()
+
+
 def install_mode() -> str:
+    """``INSTALL_MODE`` as the deployment wrote it, normalised; empty when unset."""
     return (os.environ.get("INSTALL_MODE") or "").strip().lower()
+
+
+def effective_install_mode() -> str:
+    """``INSTALL_MODE`` when it names a mode, otherwise what the container says.
+
+    The shipped Compose template sets ``INSTALL_MODE=docker``, but the image
+    itself does not: ``docker run`` on it, a hand-written compose file, or a
+    ``.env`` that predates the key all start a container in which the variable
+    is absent. Every other reader of the mode already falls back to the
+    container marker for that case — ``runtime_env.detect_install_mode``, the
+    server's own supervised check, ``cremind boot`` — so the Developer page
+    called such an install "Docker, supervised" while the HTTPS switch, reading
+    only the variable, took it for an unsupervised native install: it wrote its
+    settings into a ``.env`` the container environment shadows and told the
+    operator to press Ctrl+C in a terminal that does not exist. This is the
+    HTTPS path's copy of that fallback, kept here because ``settings.py``
+    imports this module before ``runtime_env`` can be imported.
+
+    Mirrors ``detect_install_mode`` with one narrowing: a pod (the kubelet's
+    ``KUBERNETES_SERVICE_HOST``, or the service-account mount) is never
+    inferred to be Docker, so a hand-rolled Kubernetes manifest without the
+    chart's ``INSTALL_MODE`` keeps the behaviour it had rather than gaining a
+    self-restarting switch its Service and probes never made. An unknown value
+    (``podman``, ``compose``) counts as absent, exactly as the install catalog
+    treats it. Returns the empty string when nothing can be said, which every
+    caller reads as native.
+
+    What the inference cannot see is a restart policy: ``docker run`` with the
+    default ``--restart=no`` is inferred to be Docker all the same, and a
+    switch it applies stops the container until someone starts it again. The
+    confirmation window a self-applied switch carries therefore restarts on
+    the boot that serves HTTPS (see ``reconcile_activation_boot``), so time
+    spent stopped does not count against it.
+    """
+    mode = install_mode()
+    if mode in KNOWN_INSTALL_MODES:
+        return mode
+    if os.environ.get("VNC_PASSWORD") or _CONTAINER_MARKER.exists():
+        return "" if _in_a_pod() else "docker"
+    return ""
+
+
+def install_mode_was_inferred() -> bool:
+    """Whether :func:`effective_install_mode` had to look past ``INSTALL_MODE``."""
+    return install_mode() not in KNOWN_INSTALL_MODES and bool(effective_install_mode())
 
 
 def is_container_install() -> bool:
@@ -69,7 +139,7 @@ def is_container_install() -> bool:
     an environment change, so honouring this file would let the pod believe in
     a switch its Service and probes never made.
     """
-    return install_mode() == "docker"
+    return effective_install_mode() == "docker"
 
 
 def system_dir() -> str:

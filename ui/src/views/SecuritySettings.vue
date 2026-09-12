@@ -64,6 +64,7 @@ const {
   recoveryUrl: pivotRecoveryUrl,
 } = pivot;
 // Top-level bindings: the template only unwraps refs it can see directly.
+const backgroundTransition = httpsTransitionState.transition;
 const backgroundReason = httpsTransitionState.reason;
 const backgroundReadiness = httpsTransitionState.readiness;
 const backgroundRecoveryUrl = httpsTransitionState.recoveryUrl;
@@ -281,11 +282,17 @@ async function load(quiet = false) {
   }
 }
 
-/** "Check now": wake whichever wait is running, and re-read this page. */
+/** "Check now": wake whichever wait is running, and re-read this page.
+ *
+ *  Re-read in manual mode too: the server is up (it is waiting for the
+ *  operator), so the read is safe, and it is the only way this pane notices a
+ *  switch the server has since called off when the profile stream is not
+ *  connected. Not mid-restart — that read fails while the listener is away and
+ *  the failure would replace the spinner with an error card. */
 async function retryRecovery() {
   pivot.retryNow();
   retryHttpsTransition();
-  if (pivotPhase.value !== 'idle' && pivotPhase.value !== 'failed') return;
+  if (!['idle', 'failed', 'manual'].includes(pivotPhase.value)) return;
   refreshing.value = true;
   try {
     await load(true);
@@ -293,6 +300,34 @@ async function retryRecovery() {
     refreshing.value = false;
   }
 }
+
+// The server can move a switch on without this page asking: a boot that could
+// not apply the saved settings calls it off, the deadline passes and it puts
+// itself back, another tab cancels it. The app-level coordinator hears about
+// that over the profile stream, but this page renders only what it last read
+// itself — so a tab left on the runbook or the spinner kept promising a
+// restart that had already been called off, which is exactly the "page did not
+// change status" a Docker administrator reported. Re-read when the announced
+// switch is no longer the one on screen, and stop probing an address the server
+// no longer intends to answer at.
+//
+// Only `cancelled` interrupts a running pivot: `active` while the pivot is
+// carrying this tab across means the pivot is about to redirect it, and a
+// status read over plaintext at that moment would only put a recovery card in
+// front of a navigation already under way.
+watch(backgroundTransition, (announced) => {
+  const shown = runtime.value?.transition;
+  if (!announced || !shown || working.value) return;
+  if (announced.id === shown.id && announced.phase === shown.phase) return;
+  if (!['quiescing', 'activating'].includes(shown.phase)) return;
+  const pivotRunning = !['idle', 'failed', 'manual'].includes(pivotPhase.value);
+  if (announced.phase === 'cancelled') {
+    pivot.cancelManualProbe();
+  } else if (!['active', 'prepared'].includes(announced.phase) || pivotRunning) {
+    return;
+  }
+  void load(true);
+});
 
 async function prepare() {
   working.value = true;

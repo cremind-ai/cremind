@@ -24,9 +24,19 @@ from app.config.tls_mode import (
 
 
 @pytest.fixture(autouse=True)
-def _no_ambient_supervisor(monkeypatch):
-    """A dev box running under a boot service must not skew these answers."""
+def _no_ambient_supervisor(monkeypatch, tmp_path):
+    """A dev box running under a boot service must not skew these answers —
+    nor a suite running inside a container, now that ``current_tls_facts``
+    reads the container marker when INSTALL_MODE says nothing."""
     monkeypatch.delenv("CREMIND_SUPERVISED", raising=False)
+    monkeypatch.delenv("VNC_PASSWORD", raising=False)
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._CONTAINER_MARKER", tmp_path / "no-dockerenv",
+    )
+    monkeypatch.setattr(
+        "app.config.tls_managed_env._POD_MARKER", tmp_path / "no-serviceaccount",
+    )
 
 
 # ── https_origin_from_app_url ────────────────────────────────────────────
@@ -159,6 +169,32 @@ def test_current_facts_pick_up_the_unit_flag(monkeypatch):
 
     monkeypatch.setenv("CREMIND_SUPERVISED", "1")
     assert current_tls_facts(public_port=1515).restart_supported is True
+
+
+def test_current_facts_take_a_container_that_never_said_its_mode_for_docker(
+    monkeypatch, tmp_path,
+):
+    """Where the Ctrl+C runbook inside a container came from.
+
+    ``restart_supported`` read the raw variable while the Developer page read
+    the container marker, so the same install was "Docker, supervised" on one
+    page and "nothing supervises this server" on the other. Docker restarts a
+    container whatever its environment says about itself.
+    """
+    from app.config import tls_managed_env as managed
+
+    monkeypatch.setattr(BaseConfig, "SSL_MODE", MODE_AFTER_SETUP, raising=False)
+    monkeypatch.delenv("INSTALL_MODE", raising=False)
+    assert current_tls_facts(public_port=1515).restart_supported is False
+
+    marker = tmp_path / "dockerenv"
+    marker.write_text("", encoding="utf-8")
+    monkeypatch.setattr(managed, "_CONTAINER_MARKER", marker)
+    assert current_tls_facts(public_port=1515).restart_supported is True
+
+    # An explicit answer still wins over the marker.
+    monkeypatch.setenv("INSTALL_MODE", "native")
+    assert current_tls_facts(public_port=1515).restart_supported is False
 
 
 # ── the anti-drift pin ───────────────────────────────────────────────────
