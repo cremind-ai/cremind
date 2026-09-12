@@ -15,6 +15,18 @@ from app.config import settings as dynaconf_settings
 dotenv_path = os.path.join("app/../.env")
 load_dotenv(dotenv_path)
 
+# A container's environment is fixed when the container is created, so an HTTPS
+# switch has nowhere to put its settings that a restart would read. On Docker it
+# puts them in the system directory — a volume that outlives both a restart and a
+# replacement — and this applies them. It must happen here, before BaseConfig
+# binds APP_URL/CREMIND_SSL/... from os.environ in its class body, and it is the
+# one load in this process that deliberately *overrides* the environment: the
+# values it replaces are the ones baked in at container creation, which is
+# exactly what the switch is changing. A no-op everywhere else.
+from app.config.tls_managed_env import load_into_environ as _load_managed_env  # noqa: E402
+
+_MANAGED_ENV = _load_managed_env()
+
 
 def _bool(val) -> bool:
     if val is None:

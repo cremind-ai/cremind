@@ -1061,6 +1061,22 @@ async def main(
         # Storage is not up yet, so a pending credential-boundary advance is
         # deferred to the post-storage hook below rather than done here.
         mark_active()
+    #    Say so when this boot's HTTPS settings came from the volume rather than
+    #    from the container's environment. Otherwise a Compose operator reading
+    #    `docker inspect` sees CREMIND_SSL empty and APP_URL http while the
+    #    server serves HTTPS, with nothing anywhere explaining the difference.
+    from app.config.settings import _MANAGED_ENV
+    from app.config.tls_managed_env import managed_env_path
+
+    if _MANAGED_ENV:
+        logger.info(
+            "Applied HTTPS settings saved by this installation's own switch "
+            f"({', '.join(sorted(_MANAGED_ENV))}) from "
+            f"{managed_env_path(BaseConfig.CREMIND_SYSTEM_DIR)}. They override the "
+            "container environment, which is fixed when the container is created; "
+            "set the same values in the deployment to make them permanent and this "
+            "file retires itself."
+        )
     #    Either way, judge the boot a self-applied switch was counting on. The
     #    success case is handled above; this is the branch that was missing —
     #    the restart landed and HTTPS did not come up, which is indistinguishable

@@ -863,18 +863,21 @@ async def post_tls_activate(request: Request) -> JSONResponse:
             restore_prepared()
             raise
         # Native services may restart any upgrade after their canonical env is
-        # persisted. Docker/Kubernetes may self-restart only during the
-        # install-time after-setup flow, where their deployment was already
-        # rendered for TLS. A later external upgrade must recreate the container
-        # or Helm release so proxy/Service/probes move too. Electron always owns
-        # its child process in main, including the install-time after-setup
-        # switch. Decided before the durable write so the first announcement
-        # already tells tabs whether anyone is coming to finish this.
+        # persisted, and a managed Compose install now may too: its settings went
+        # into the system-directory volume, which the next boot reads, so the
+        # restart the container already performs for itself is enough and nothing
+        # has to be recreated. A Kubernetes release still may not — enabling TLS
+        # there moves the Service, the probes and the proxy sidecar together, so
+        # only a Helm upgrade can do it, and it may self-restart solely during
+        # the install-time after-setup flow where the chart already rendered for
+        # TLS. Electron always owns its child process in main, including that
+        # same install-time switch. Decided before the durable write so the first
+        # announcement already tells tabs whether anyone is coming to finish this.
         restart_requested = data.get("restart", True) is not False
         from app.config.tls_mode import current_tls_facts
         restart_facts = current_tls_facts()
         can_schedule = restart_facts.restart_supported and (
-            manager == "native"
+            manager in ("native", "managed-docker")
             or (manager == "external" and restart_facts.pending_https)
         )
         for key in ("quiesce_expected", "quiesce_acked", "quiesce_closed",

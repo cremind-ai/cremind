@@ -220,13 +220,13 @@ def test_a_boot_that_serves_https_clears_the_counter(
 def test_a_switch_waiting_for_an_operator_is_never_counted(
     client, environment, monkeypatch,
 ):
-    """A Docker or Helm switch is *supposed* to sit through restarts.
+    """A Helm switch is *supposed* to sit through restarts.
 
     It waits until the operator applies the deployment change, which may be
     tomorrow. Counting those boots would revert a switch that is proceeding
     exactly as designed — and Cremind holds no rollback record for it anyway.
     """
-    monkeypatch.setenv("INSTALL_MODE", "docker")
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
     value = prepared(client)
     assert client.post(
         "/api/tls/activate", json={"transition_id": value["id"]}, headers=auth(),
@@ -403,7 +403,7 @@ def test_a_deployment_managed_switch_still_advances_unconfirmed(
     record to apply at the deadline — and would leave every HTTP-era session
     alive for ten minutes longer than it is today.
     """
-    monkeypatch.setenv("INSTALL_MODE", "docker")
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
     value = prepared(client)
     assert client.post(
         "/api/tls/activate", json={"transition_id": value["id"]}, headers=auth(),
@@ -467,7 +467,7 @@ def test_the_watchdog_stops_as_soon_as_the_switch_is_confirmed(
 def test_the_watchdog_ignores_a_switch_that_was_never_ours(
     client, environment, monkeypatch,
 ):
-    monkeypatch.setenv("INSTALL_MODE", "docker")
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
     value = prepared(client)
     client.post("/api/tls/activate", json={"transition_id": value["id"]}, headers=auth())
     overdue = transition.load_transition()
@@ -616,7 +616,7 @@ def test_a_confirmation_stops_the_deadline_even_if_the_advance_fails(
     assert restarts == []
 
 
-def test_a_docker_install_still_serving_http_may_still_cancel(
+def test_a_deployment_managed_install_still_serving_http_may_still_cancel(
     client, environment, monkeypatch,
 ):
     """The 409 that told an operator HTTPS was serving while HTTP served them.
@@ -625,7 +625,7 @@ def test_a_docker_install_still_serving_http_may_still_cancel(
     cancel read that as proof the switch had landed — refusing the one action
     that would have given the installation back.
     """
-    monkeypatch.setenv("INSTALL_MODE", "docker")
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
     value = prepared(client)
     assert client.post(
         "/api/tls/activate", json={"transition_id": value["id"]}, headers=auth(),
@@ -646,7 +646,7 @@ def test_a_reverse_proxy_install_still_reads_app_url_as_proof(
 ):
     """Where the process holds no public bind it genuinely cannot observe the
     transport, so the configured origin is the only evidence there is."""
-    monkeypatch.setenv("INSTALL_MODE", "docker")
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
     value = prepared(client)
     client.post("/api/tls/activate", json={"transition_id": value["id"]}, headers=auth())
     stale = transition.load_transition()
