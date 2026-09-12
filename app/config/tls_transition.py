@@ -643,11 +643,42 @@ def startup_upload_recovery_window() -> bool:
 
 
 def management() -> str:
+    """Who applies this installation's HTTPS switch.
+
+    ``managed-docker`` is a Compose install Cremind can switch by itself: the
+    settings go into the system-directory volume (see
+    :mod:`app.config.tls_managed_env`) and the container restarts itself, so
+    there is no runbook and nothing for the operator to edit. It is still
+    ``external`` where the public origin is not this process's to change — no
+    public bind of its own, or an explicitly configured terminator.
+
+    Kubernetes deliberately stays ``external``: ``cremind.ssl`` moves the
+    Service, the probes and the proxy sidecar together, which is a chart change
+    no pod can make to itself (and its ServiceAccount has no RBAC to try).
+    """
+    from app.config.tls_managed_env import is_container_install
     from app.config.tls_mode import _public_port, edge_tls_termination
     mode = (os.environ.get("INSTALL_MODE") or "native").lower()
-    if mode in ("docker", "kubernetes") or _public_port() == 0 or edge_tls_termination():
+    if _public_port() == 0 or edge_tls_termination():
+        return "external"
+    if is_container_install():
+        return "managed-docker"
+    if mode in ("docker", "kubernetes"):
         return "external"
     return "electron" if os.environ.get("CREMIND_ELECTRON_PARENT") is not None else "native"
+
+
+def canonical_env_path() -> Path:
+    """Where this installation's HTTPS settings are persisted.
+
+    One definition, because :func:`persist_native` and :func:`revert_native`
+    disagreeing about it would write a switch to one file and restore the other
+    — leaving the installation on HTTPS with its rollback record spent.
+    """
+    from app.config.tls_managed_env import is_container_install, managed_env_path
+    if is_container_install():
+        return managed_env_path(BaseConfig.CREMIND_SYSTEM_DIR)
+    return Path(BaseConfig.CREMIND_SYSTEM_DIR) / ".env"
 
 
 def _native_rollback_path() -> Path:
@@ -749,7 +780,7 @@ def revert_native(transition_id: str) -> bool:
         finally:
             temporary.unlink(missing_ok=True)
 
-    restore_file(Path(BaseConfig.CREMIND_SYSTEM_DIR) / ".env", env_bytes)
+    restore_file(canonical_env_path(), env_bytes)
     restore_file(Path(BaseConfig.CREMIND_INSTALL_DIR) / "credentials.toml", creds_bytes)
     if isinstance(attrs.get("APP_URL"), str):
         BaseConfig.APP_URL = attrs["APP_URL"]
@@ -897,7 +928,7 @@ def reconcile_activation_boot(serving_https: bool) -> str | None:
 
 def persist_native(value: dict):
     """Replace all related env entries together; a failed write changes nothing."""
-    path = Path(BaseConfig.CREMIND_SYSTEM_DIR) / ".env"
+    path = canonical_env_path()
     original_bytes = path.read_bytes() if path.exists() else None
     original = original_bytes.decode("utf-8-sig") if original_bytes is not None else ""
     creds_path = Path(BaseConfig.CREMIND_INSTALL_DIR) / "credentials.toml"

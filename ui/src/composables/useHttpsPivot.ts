@@ -59,7 +59,7 @@ export interface PivotRunOptions {
   installMode?: string | null;
   /** The backend owner reported by /api/tls/status. Only an Electron-owned
    * backend may be stopped and respawned through Electron IPC. */
-  management?: 'native' | 'electron' | 'external';
+  management?: 'native' | 'electron' | 'external' | 'managed-docker';
   /** Durable state retained by a settings page resuming an activating switch. */
   transition?: TlsTransition | null;
   resumeStatus?: TlsRuntimeStatus | null;

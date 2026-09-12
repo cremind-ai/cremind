@@ -164,7 +164,10 @@ export interface TlsRuntimeStatus {
   certificate_error?: string | null;
   mode: '' | 'auto' | 'after-setup' | 'custom';
   install_mode: string;
-  management: 'native' | 'electron' | 'external';
+  /** Who applies the switch. `managed-docker` is a Compose install Cremind
+   *  switches by itself — it persists into the system-directory volume and
+   *  restarts its own container, so it gets no runbook. */
+  management: 'native' | 'electron' | 'external' | 'managed-docker';
   /** True after activation persistence; the client chooses the correct
    * supervisor (REST, Electron IPC, or deployment command). */
   restart_required?: boolean;
@@ -802,7 +805,7 @@ export interface CompleteSetupResponse {
   /** Whether the wizard may trigger that restart itself. */
   restart_supported?: boolean;
   /** Which supervisor owns the server process used by the HTTPS pivot. */
-  tls_management?: 'native' | 'electron' | 'external';
+  tls_management?: 'native' | 'electron' | 'external' | 'managed-docker';
 }
 
 export async function completeSetup(

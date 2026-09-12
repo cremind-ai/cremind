@@ -1,5 +1,5 @@
 ---
-description: "Enable HTTPS after the default HTTP installation and fix ERR_CERT_AUTHORITY_INVALID or connection is not private by trusting ca.pem for CREMIND_SSL=auto, CREMIND_SSL=true or CREMIND_SSL=after-setup. cremind tls status reports transport, certificate and deployment instructions without a token, but names the real Kubernetes namespace and release only for admin; prepare generates or validates a certificate; enable persists and activates HTTPS; cancel stops a switch before HTTPS serves, and cancel --local does it offline when the server will not start. The HTTP application keeps working until the change lands. A switch Cremind applied undoes itself when it fails: an unusable certificate or two restarts without HTTPS restore the previous settings instead of restart-looping, and HTTPS nobody reaches - untrusted CA, unpublished port, missing hostname - is reverted after ten minutes, because the credential boundary waits for a real client instead of moving when the listener starts. Mutations need an admin token; trust, export and fingerprint work locally without one to install the Cremind CA in a device trust store. Covers native, Electron, Docker and Kubernetes with session migration."
+description: "Enable HTTPS after the default HTTP installation and fix ERR_CERT_AUTHORITY_INVALID or connection is not private by trusting ca.pem for CREMIND_SSL=auto, CREMIND_SSL=true or CREMIND_SSL=after-setup. cremind tls status reports transport, certificate and deployment instructions; prepare generates or validates a certificate; enable persists and activates HTTPS; cancel stops a switch before HTTPS serves, and cancel --local does it offline when the server will not start. A Docker (Compose) install needs no runbook: Cremind saves the settings in its system-directory volume and restarts its own container, editing nothing on the host. Kubernetes still uses Helm. A switch Cremind applied undoes itself when it fails: an unusable certificate or two restarts without HTTPS restore the previous settings instead of restart-looping, and HTTPS nobody reaches - untrusted CA, unpublished port, missing hostname - is reverted after ten minutes, because the credential boundary waits for a real client instead of moving when the listener starts. Mutations need an admin token; trust, export and fingerprint work locally without one. Covers native, Electron, Docker and Kubernetes with session migration."
 ---
 
 # `cremind tls` — Enable HTTPS and trust the local certificate authority
@@ -58,8 +58,9 @@ sessions and application data in transit and enables browser secure-context APIs
    HTTP server and token epoch remain usable until that barrier completes.
    A supervised native server restarts automatically. `--no-restart` saves and
    announces the switch for a later manual restart. Electron restarts through the
-   desktop app. Docker and Kubernetes print host/Helm instructions instead of
-   changing deployment-owned configuration.
+   desktop app. A Docker (Compose) install applies the switch itself — see
+   below. Kubernetes prints Helm instructions instead of changing
+   deployment-owned configuration.
 4. Open or suspended Cremind tabs that joined the preparation retain their
    route and session when they move to HTTPS, including after the pod or
    container is replaced, as long as the Cremind CA is unchanged. An old HTTP
@@ -68,11 +69,41 @@ sessions and application data in transit and enables browser secure-context APIs
    route retained. Untrusted certificates or a disconnected port-forward leave
    retry instructions.
 
-Docker, Kubernetes and reverse-proxy installs stay on HTTP until you apply the
+Kubernetes and reverse-proxy installs stay on HTTP until you apply the
 deployment change, and that wait is safe: the HTTP application keeps serving,
 existing sessions keep working, and `cremind tls cancel` still calls the whole
 thing off. `cremind tls status` says `awaiting_operator` while that is the case.
 Nothing is invalidated until a listener genuinely answers HTTPS.
+
+## Docker: Cremind applies the switch itself
+
+A Compose install needs no runbook and no `docker compose up -d --force-recreate`.
+`cremind --profile admin tls enable --yes` (or the Settings page) saves the HTTPS
+settings into the **system-directory volume** and restarts the container, which
+is something the container already does for itself — the entrypoint exits and
+Compose's `restart: unless-stopped` brings it back. Nothing on the Docker host
+has to be edited.
+
+This is why it goes in the volume rather than the Compose `.env`: a container's
+environment is fixed when the container is *created*, so a restart re-reads
+nothing, and two of the six settings could not be delivered through that file at
+all — `CREMIND_ATLASSIAN_REDIRECT_URI` is absent from the shipped Compose
+template, and the rendered `docker-compose.yml` on the host is frozen at install
+time. Keep the system-directory volume mounted: it holds the CA, the switch and
+those settings.
+
+The file retires itself. Once the container's own environment already carries
+the same values — because you later recreated it with them set — it is deleted
+on the next boot, so it can never become an invisible override of something you
+are trying to change.
+
+Two Compose shapes are still deployment-managed and keep the old runbook, because
+their public origin is not Cremind's to change: `CREMIND_UI_PORT=0` (a reverse
+proxy in front of a loopback bind) and `CREMIND_TLS_TERMINATION=edge`.
+
+Kubernetes is **not** covered by this and still prints its Helm runbook.
+`cremind.ssl` moves the Service, the readiness probes and the proxy sidecar
+together, so it is a chart change no pod can make to itself.
 
 ## A switch that goes wrong undoes itself
 
@@ -86,9 +117,9 @@ back, and uses it without being asked:
   settings and starts on plain HTTP. A certificate *you* configured by hand
   still fails the boot loudly: there is nothing for Cremind to undo.
 - **HTTPS never comes up.** Two consecutive restarts that were meant to serve
-  HTTPS and did not restore the previous settings. A Docker or Kubernetes
-  switch is never counted this way — it is supposed to wait through restarts
-  until you apply the deployment change.
+  HTTPS and did not restore the previous settings. A Kubernetes or
+  reverse-proxy switch is never counted this way — it is supposed to wait
+  through restarts until you apply the deployment change.
 - **HTTPS comes up but nobody can reach it.** This is the common one: an
   untrusted CA, an unpublished port, or a hostname missing from the
   certificate. The credential boundary therefore does **not** move when the
@@ -260,7 +291,7 @@ recorded certificate fingerprint, waits for registered tabs and windows to
 finish uploads and save handoffs, persists managed native settings, and then
 restarts when supervision is available. `--yes` skips the trust-and-save
 confirmation. `--restart` is the default; `--no-restart` persists the change
-and prints the exact manual restart command. Docker and Kubernetes remain
+and prints the exact manual restart command. Kubernetes remains
 deployment-managed and print recreation or Helm rollout commands instead.
 
 When a supervised restart cannot be scheduled, the output prints the failure and
@@ -281,7 +312,7 @@ cremind tls cancel --local
 Cancels a transition and tells participating tabs to release their upload gates.
 It works while the switch is prepared or quiescing, and also after `enable` for
 as long as HTTPS has not actually started serving — the window in which a
-Docker, Kubernetes or reverse-proxy install waits for its deployment change, and
+Kubernetes or reverse-proxy install waits for its deployment change, and
 in which nothing has been invalidated yet. On a native or Electron install it
 also restores the `.env` and credentials that activation rewrote.
 

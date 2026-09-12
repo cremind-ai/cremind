@@ -574,7 +574,7 @@ const finishTls = ref<{
   pending: boolean;
   nextOrigin: string | null;
   restartSupported: boolean;
-  management: 'native' | 'electron' | 'external';
+  management: 'native' | 'electron' | 'external' | 'managed-docker';
 } | null>(null);
 
 const pivot = useHttpsPivot();

@@ -79,6 +79,14 @@ services:
       # exists, then a container restart into https — the first https load is
       # to an already-trusting browser, so no warning is ever shown. APP_URL
       # stays the https:// steady state either way.
+      #
+      # None of this has to be set by hand. Settings → HTTPS & Certificate (or
+      # ``cremind tls enable``) switches a Compose install to HTTPS itself: it
+      # writes the settings into the cremind-data volume below — which a
+      # restart re-reads, unlike this environment, which is fixed when the
+      # container is created — and restarts the container. Editing these values
+      # here is the way to make the change permanent across a recreate, and
+      # Cremind then retires its own copy on the next boot.
       CREMIND_SSL_CERTFILE: ${CREMIND_SSL_CERTFILE:-}
       CREMIND_SSL_KEYFILE: ${CREMIND_SSL_KEYFILE:-}
       CREMIND_SSL_KEYFILE_PASSWORD: ${CREMIND_SSL_KEYFILE_PASSWORD:-}

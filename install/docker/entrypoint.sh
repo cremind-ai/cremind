@@ -175,6 +175,19 @@ cremind serve --host "$HOST" --port "$PORT" 2>&1 \
 read -r banner_mode <<< "${CREMIND_SSL:-}"
 read -r banner_certfile <<< "${CREMIND_SSL_CERTFILE:-}"
 read -r banner_keyfile <<< "${CREMIND_SSL_KEYFILE:-}"
+# A switch made from Settings lives in the system-directory volume, not in this
+# container's environment (which is fixed at creation) — see
+# app/config/tls_managed_env.py. Without this the banner would send everyone to
+# an http:// URL that resets, on exactly the installs Cremind switched itself.
+# Parsed with sed, never sourced: this file is data, not shell.
+banner_managed_env="${CREMIND_SYSTEM_DIR:-/root/.cremind}/tls/managed-env"
+if [ -f "$banner_managed_env" ]; then
+    banner_managed_ssl="$(sed -n 's/^[[:space:]]*CREMIND_SSL[[:space:]]*=[[:space:]]*//p' \
+        "$banner_managed_env" | tail -n 1)"
+    if [ -n "$banner_managed_ssl" ]; then
+        read -r banner_mode <<< "$banner_managed_ssl"
+    fi
+fi
 banner_port="${CREMIND_UI_PORT:-1515}"
 banner_scheme=http
 if [ "$banner_port" = "0" ]; then
@@ -183,7 +196,10 @@ elif [ -n "$banner_certfile" ] && [ -n "$banner_keyfile" ]; then
     banner_scheme=https
 else
     case "${banner_mode,,}" in
-        auto)
+        # ``true`` is what an activation persists (effective_ssl_mode normalises
+        # it to auto); the banner used to know only the two spellings an
+        # installer writes, and so reported http for every switched install.
+        auto|true|1|yes)
             banner_scheme=https
             ;;
         after-setup)

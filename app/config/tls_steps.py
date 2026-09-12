@@ -643,6 +643,45 @@ def _unsupervised_native_steps(activating: bool, https_url: str) -> list[dict]:
     ]
 
 
+def _managed_docker_steps(https_url: str) -> list[dict]:
+    """A Compose install Cremind switches by itself. No commands at all.
+
+    The runbook this replaces asked the operator to edit four values in the
+    ``.env`` beside their ``docker-compose.yml`` and recreate the container.
+    Every one of those edits is something Cremind already computes exactly —
+    the HTTPS origin, both CORS origins, the certificate's hostnames, the
+    Atlassian callback — and two of them could not be delivered that way at
+    all: ``CREMIND_ATLASSIAN_REDIRECT_URI`` is absent from the shipped Compose
+    template, and the rendered ``docker-compose.yml`` on the host is frozen at
+    install time. So the settings go into the system-directory volume instead,
+    where the next boot reads them and no file on the host has to change.
+
+    What remains is worth saying, because it is what the operator would
+    otherwise wonder about: the container restarts itself, and the volume is
+    what carries the switch across it.
+    """
+    return [
+        note(
+            "Cremind applies this switch itself. It saves the HTTPS settings in the "
+            "system-directory volume and restarts its own container, so there is "
+            "nothing to edit on the Docker host and no container to recreate."
+        ),
+        note(
+            "Keep the system-directory volume mounted: it holds the certificate "
+            "authority, the switch itself and the settings the restarted container "
+            "reads. Removing it would lose all three."
+        ),
+        note(
+            f"When the container is back Cremind answers at {https_url}; tabs that "
+            "joined this switch move there on their own. If no browser reaches the "
+            "new address, Cremind restores the previous settings and returns to HTTP "
+            "by itself, so a certificate this device does not trust cannot lock you "
+            "out. If a browser warns about the certificate, trust the Cremind CA on "
+            "that device first."
+        ),
+    ]
+
+
 def deployment_steps(
     *,
     manager: str,
@@ -672,10 +711,16 @@ def deployment_steps(
     (the Ingress one only when it is not a tunnel's loopback address — see
     :func:`_ingress_steps`); the other modes only name it.
     """
+    if manager == "managed-docker":
+        return _managed_docker_steps(https_url)
     if manager == "external":
         if edge:
             return _ingress_steps(https_url, chart_version, kubernetes)
         if install_mode == "docker":
+            # Still reachable: a Compose install whose public origin is not this
+            # process's to change (no public bind of its own, or an explicitly
+            # configured terminator) is ``external``, and its operator does have
+            # to apply the change by hand.
             return _docker_steps(https_url)
         if install_mode == "kubernetes":
             return _kubernetes_steps(https_url, chart_version, kubernetes)
@@ -701,6 +746,16 @@ def certificate_repair_steps(
     ``kubernetes`` fills the pod's own names into the two ``kubectl`` lines,
     exactly as in :func:`deployment_steps`.
     """
+    if manager == "managed-docker":
+        # A restart, not a recreate: the certificate lives in the system-directory
+        # volume and nothing in the container's own environment has to change.
+        return [
+            note(
+                "Once the replacement certificate is in place, restart Cremind so "
+                "it loads it:"
+            ),
+            command(RESTART_COMMAND),
+        ]
     if install_mode == "docker":
         return [
             note(

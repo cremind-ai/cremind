@@ -62,6 +62,13 @@ def environment(monkeypatch, tmp_path):
     monkeypatch.setattr(
         runtime_env, "_SA_NAMESPACE_FILE", tmp_path / "no-such-namespace",
     )
+    # No test may spawn the real restart watchdog. It is a detached
+    # ``python -m app.system.restart --parent-pid <pid>`` that hard-kills its
+    # parent after 25s — and the parent here is pytest, so one unpatched
+    # activation takes the whole run down partway through with no failure
+    # reported. Tests that care about the restart override this with their own
+    # recorder; every other test is simply protected from scheduling one.
+    monkeypatch.setattr("app.api.system.schedule_system_restart", lambda: 4242)
     monkeypatch.setattr("app.auth.tokens.serial_matches", lambda claims: claims.get("tsr") == 3)
     # Certificate generation itself has a separate real-files test below.
     monkeypatch.setattr("app.config.tls_auto.ensure_local_tls", lambda *_args: ("cert", "key"))
@@ -483,7 +490,9 @@ def test_after_setup_container_activation_schedules_supervised_restart(
         headers=auth(),
     )
     assert result.status_code == 202
-    assert result.json()["management"] == "external"
+    assert result.json()["management"] == (
+        "managed-docker" if install_mode == "docker" else "external"
+    )
     assert result.json()["restart_scheduled"] is True
     assert result.json()["restart_required"] is False
     assert scheduled == [True]
@@ -584,7 +593,11 @@ def test_native_activation_moves_only_default_or_matching_atlassian_callbacks(
         assert any(expected in item and "Atlassian developer console" in item for item in instructions)
 
 
-@pytest.mark.parametrize("mode", ["docker", "kubernetes"])
+# Docker is deliberately absent: a Compose install is now Cremind's own to
+# switch (``managed-docker``), so it *does* persist — into the system-directory
+# volume rather than the deployment. See
+# tests/api/test_tls_managed_docker.py::test_activation_persists_into_the_volume.
+@pytest.mark.parametrize("mode", ["kubernetes"])
 def test_external_activation_never_rewrites_deployment_environment(client, environment, monkeypatch, mode):
     monkeypatch.setenv("INSTALL_MODE", mode)
     value = prepared(client)
@@ -592,15 +605,18 @@ def test_external_activation_never_rewrites_deployment_environment(client, envir
     assert result["management"] == "external" and result["instructions"]
     guidance = " ".join(result["instructions"])
     assert "Atlassian developer console" in guidance
-    assert ("CREMIND_ATLASSIAN_REDIRECT_URI" if mode == "docker"
-            else "cremind.atlassianRedirectUri") in guidance
+    assert "cremind.atlassianRedirectUri" in guidance
     assert not (environment / ".env").exists()
 
 
 @pytest.mark.parametrize(
     ("install_mode", "extra_env", "expected_commands"),
     [
-        pytest.param("docker", {}, ["docker compose up -d --force-recreate cremind"], id="docker"),
+        # A managed Compose install has notes and no commands: Cremind persists
+        # into its own volume and restarts its own container, so there is nothing
+        # for the operator to run. The recreate command survives for a Compose
+        # install that is still ``external`` — see the reverse-proxy case below.
+        pytest.param("docker", {}, [], id="managed-docker"),
         pytest.param(
             "kubernetes", {},
             [
@@ -805,7 +821,7 @@ def test_an_https_server_lists_only_certificate_repair_steps(
 ):
     """Re-running the enable runbook against a server already on HTTPS was the
     illogical part; a broken certificate needs a reload, nothing more."""
-    monkeypatch.setenv("INSTALL_MODE", "docker")
+    monkeypatch.setenv("INSTALL_MODE", "kubernetes")
     value = prepared(client)
     client.post("/api/tls/activate", json={"transition_id": value["id"]}, headers=auth())
     monkeypatch.setattr(tls_mode, "_boot_serving_https", True)
@@ -818,9 +834,9 @@ def test_an_https_server_lists_only_certificate_repair_steps(
     broken = client.get("https://testserver:80/api/tls/status").json()
 
     assert broken["certificate_error"]
-    assert [step["kind"] for step in broken["steps"]] == ["note", "command"]
+    assert [step["kind"] for step in broken["steps"]] == ["note", "command", "command"]
     assert broken["steps"][0]["text"].startswith("Once the replacement certificate")
-    assert broken["steps"][1]["text"] == "docker compose up -d --force-recreate cremind"
+    assert broken["steps"][1]["text"].startswith("kubectl --namespace")
     assert "CREMIND_SSL=auto" not in " ".join(broken["instructions"])
 
 
