@@ -188,7 +188,7 @@ hint   = "6-8 characters, from letters, digits and @ % _ + = : , . - — VNC ign
 
 [kubernetes]
 context_prompt    = "Which kubeconfig context should Cremind be installed into?"
-context_hint      = "Every helm and kubectl command runs with --kube-context set to this choice, never the ambient current-context. The current context is preselected; each row shows the API server so a look-alike cluster stands out."
+context_hint      = "Every helm and kubectl command runs with --kube-context set to this choice (and --kubeconfig, for a context from a file kubectl does not read on its own), never the ambient current-context. Every kubeconfig under ~/.kube is listed, not just kubectl's own; each row shows the API server, and its file when several are in play, so a look-alike cluster stands out."
 namespace_prompt  = "Which namespace should the Helm release go into?"
 namespace_hint    = "Created if it does not exist. Lowercase letters, digits and hyphens, up to 63 characters."
 namespace_default = "cremind"

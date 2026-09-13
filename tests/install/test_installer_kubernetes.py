@@ -38,6 +38,7 @@ MAIN_PY = REPO_ROOT / "app" / "installer" / "__main__.py"
 #: echoes it back, and sourcing is a no-op for a flag-supplied answer.
 ANSWER_KEYS = [
     ("KUBE_CONTEXT", "--kube-context", "KubeContext"),
+    ("KUBE_CONFIG_FILE", "--kubeconfig", "KubeConfig"),
     ("KUBE_NAMESPACE", "--kube-namespace", "KubeNamespace"),
     ("K8S_release_name", "--k8s-release-name", "K8sReleaseName"),
     ("K8S_app_url", "--k8s-app-url", "K8sAppUrl"),
@@ -51,7 +52,6 @@ CONTEXT_FLAGS = [
     "--has-kubectl",
     "--has-helm",
     "--kube-contexts-file",
-    "--kube-current-context",
 ]
 
 
@@ -77,11 +77,22 @@ def _sh_kubernetes_branch() -> str:
 
 
 def _sh_code_lines(text: str) -> list[str]:
-    """Lines that run something: no comments, no printed output."""
+    """Lines that run something: no comments, no printed output, and none of
+    the body of a ``cat <<EOF`` block (the printed summary spells commands
+    for the operator to copy)."""
     out = []
+    heredoc_end: str | None = None
     for raw in text.splitlines():
+        if heredoc_end is not None:
+            if raw.strip() == heredoc_end:
+                heredoc_end = None
+            continue
         line = raw.strip()
         if not line or line.startswith("#"):
+            continue
+        opened = re.search(r"<<-?\s*'?([A-Z_]+)'?", line)
+        if opened:
+            heredoc_end = opened.group(1)
             continue
         if line.split(" ", 1)[0].rstrip("(") in _SH_PRINTERS:
             continue
@@ -155,11 +166,18 @@ def test_the_mode_question_precedes_the_deployment_questions() -> None:
 
 def test_every_cluster_call_names_its_context_in_sh() -> None:
     """The whole point of the context picker. install.sh routes kubectl
-    through ``kc``/``kcn`` (which add --context) and spells --kube-context on
-    every helm call; a bare ``kubectl``/``helm`` would use whatever
-    current-context happens to be."""
+    through ``kc``/``kcn`` and helm through ``hc`` — which add --context /
+    --kube-context, plus --kubeconfig for a context from a sibling file — so
+    a bare ``kubectl``/``helm`` would use whatever current-context happens
+    to be."""
     branch = _sh_kubernetes_branch()
     assert 'kubectl --context "$KUBE_CONTEXT" --request-timeout=20s "$@"' in branch
+    assert (
+        'kubectl --kubeconfig "$KUBE_CONFIG_FILE" --context "$KUBE_CONTEXT" '
+        '--request-timeout=20s "$@"'
+    ) in branch
+    assert 'helm --kube-context "$KUBE_CONTEXT" "$@"' in branch
+    assert 'helm --kubeconfig "$KUBE_CONFIG_FILE" --kube-context "$KUBE_CONTEXT" "$@"' in branch
 
     for line in _sh_code_lines(branch):
         for tool in ("kubectl ", "helm "):
@@ -173,20 +191,27 @@ def test_every_cluster_call_names_its_context_in_sh() -> None:
                 or "helm repo add" in line
                 or "helm dependency build" in line
                 or "helm show chart" in line
-                # The assembled argv, built line by line just above.
-                or 'helm "$@"' in line
             ):
                 continue
             raise AssertionError(f"cluster call without an explicit context: {line}")
 
 
 def test_every_cluster_call_names_its_context_in_ps1() -> None:
+    """install.ps1 routes kubectl through Invoke-Kubectl and helm through
+    Invoke-HelmTarget; both prepend the context and, when set, the file."""
     branch = _ps1_kubernetes_branch()
-    assert "-ArgumentList (@('--context', $KubeContext, '--request-timeout=20s')" in branch
-    for match in re.finditer(r"'(helm|uninstall|upgrade|status)'[^\n]*", branch):
-        line = match.group(0)
-        if "'helm'" in line and "-ArgumentList" in line and "status" in line:
-            assert "--kube-context" in line or "$KubeContext" in line
+    assert "$target = @('--context', $KubeContext, '--request-timeout=20s')" in branch
+    assert "$target = @('--kube-context', $KubeContext)" in branch
+    assert branch.count("$target = @('--kubeconfig', $KubeConfig) + $target") == 2
+    # helm reaches the cluster only through the helper; every other helm
+    # invocation is registry or chart work.
+    for match in re.finditer(r"-FilePath 'helm'[^\n]*(\n[^\n]*)?", branch):
+        text = match.group(0)
+        if "$HelmArgs + $target" in text:
+            continue
+        assert re.search(r"'(show|repo|dependency|pull)'", text), text
+    # The background port-forward is a raw Start-Process, not Invoke-Kubectl.
+    assert "if ($KubeConfig) { $pfArgs = @('--kubeconfig', $KubeConfig) + $pfArgs }" in branch
 
 
 def test_the_context_picker_never_falls_back_to_current_context() -> None:
@@ -306,11 +331,11 @@ def test_the_helm_invocation_omits_the_dangerous_flags() -> None:
     # message may legitimately suggest `helm show chart ... --devel`.
     sh_branch = _sh_kubernetes_branch()
     sh_argv = sh_branch[
-        sh_branch.index("set -- upgrade --install") : sh_branch.index('if ! helm "$@"')
+        sh_branch.index("set -- upgrade --install") : sh_branch.index('if ! hc "$@"')
     ]
     ps1_branch = _ps1_kubernetes_branch()
     ps1_argv = ps1_branch[
-        ps1_branch.index("$helmArgs = ") : ps1_branch.index("$installed = Invoke-NativeCapture")
+        ps1_branch.index("$helmArgs = ") : ps1_branch.index("$installed = Invoke-HelmTarget")
     ]
     for argv in (sh_argv, ps1_argv):
         assert "upgrade" in argv and "--install" in argv
@@ -428,8 +453,10 @@ def test_no_boot_service_for_kubernetes() -> None:
 
 def test_uninstall_removes_the_release_with_an_explicit_context() -> None:
     sh, ps1 = _sh(), _ps1()
-    assert 'helm uninstall "$K8S_REL" --kube-context "$K8S_CTX"' in sh
-    assert "'uninstall', $K8sRel, '--kube-context', $K8sCtx" in ps1
+    assert 'set -- uninstall "$K8S_REL" --kube-context "$K8S_CTX"' in sh
+    assert 'set -- "$@" --kubeconfig "$K8S_CFG"' in sh
+    assert "@('uninstall', $K8sRel) + $helmTarget" in ps1
+    assert "$helmTarget    = @('--kubeconfig', $K8sCfg) + $helmTarget" in ps1
 
 
 def test_uninstall_keep_preserves_the_release_record() -> None:
@@ -448,3 +475,52 @@ def test_only_purge_deletes_cluster_volumes_and_only_our_namespace() -> None:
     # fullname (cremind-postgresql), not the Helm release name.
     assert "app.kubernetes.io/name=$_sub" in sh
     assert 'app.kubernetes.io/name=$sub' in ps1
+
+
+def test_uninstall_checks_the_recorded_api_server() -> None:
+    """A kubeconfig edited since the install must not aim the teardown at a
+    different cluster than the one the release record names."""
+    assert "but the release was installed on $K8S_SRV" in _sh()
+    assert "but the release was installed on $K8sSrv" in _ps1()
+
+
+# ── every kubeconfig under ~/.kube ────────────────────────────────────────
+
+
+def test_every_kubeconfig_under_the_kube_dir_is_probed() -> None:
+    """kubectl reads one merged config. A workstation with one file per
+    cluster next to it would otherwise be offered only the default file's
+    contexts — the bug report that added the file column."""
+    sh, ps1 = _sh(), _ps1()
+    assert 'for _kube_file in "${HOME:-}/.kube"/*; do' in sh
+    assert "kube_is_ambient" in sh and 'kube_probe_file ""' in sh
+    assert "function Add-KubeconfigRows" in ps1
+    assert "Join-Path $HOME '.kube'" in ps1
+    # The rows carry the file, and the TUI reads that column.
+    assert "name<TAB>server<TAB>default-namespace<TAB>kubeconfig<TAB>current" in sh
+    assert "kubeconfig: str" in TUI.read_text(encoding="utf-8")
+
+
+def test_a_name_shared_by_several_files_is_refused_without_the_file() -> None:
+    """Both of a user's sibling files may call their only context "default"."""
+    assert "exists in several kubeconfig files; add --kubeconfig FILE" in _sh()
+    assert "exists in several kubeconfig files; add -KubeConfig FILE" in _ps1()
+
+
+def test_the_file_travels_with_the_context() -> None:
+    """A context from a sibling file is unreachable without its file, so the
+    file is recorded with the release and named on the teardown too."""
+    sh, ps1 = _sh(), _ps1()
+    assert "printf 'KUBE_CONFIG_FILE=%s\\n' \"$KUBE_CONFIG_FILE\"" in sh
+    assert '$releaseLines.Add("KUBE_CONFIG_FILE=$KubeConfig")' in ps1
+    assert 'K8S_CFG="$(uninstall_k8s_value KUBE_CONFIG_FILE)"' in sh
+    assert "$K8sCfg       = Get-UninstallK8s 'KUBE_CONFIG_FILE'" in ps1
+
+
+def test_the_shell_never_assigns_kubeconfig_itself() -> None:
+    """KUBECONFIG is the variable kubectl reads; sourcing the TUI's answers
+    into it would redirect every later call. The installer's own variable is
+    KUBE_CONFIG_FILE."""
+    for line in _sh().splitlines():
+        assert not re.match(r"\s*(export\s+)?KUBECONFIG=", line), line
+    assert "KUBE_CONFIG_FILE" in OUTPUT_PY.read_text(encoding="utf-8")

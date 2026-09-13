@@ -168,19 +168,27 @@ service, and runs no migrations — the Setup Wizard does the first one.
 
 ### Which cluster
 
-The question the mode exists to answer. The installer enumerates your
-kubeconfig contexts and shows each one with its API server:
+The question the mode exists to answer. The installer lists every kubeconfig
+context it can find — the ones kubectl reads on its own (`$KUBECONFIG`, else
+`~/.kube/config`) **plus** those in every other file under `~/.kube`, since
+one file per cluster is a common layout — and shows each with its API server
+and, when several files are in play, the file it came from:
 
 ```
-  1) minikube — https://127.0.0.1:8443 (default)
-  2) prod-eu  — https://eks-prod.example:443 (cremind)  [current]
+  1) prod-eu — https://eks-prod.example:443 (cremind)  default kubeconfig  [current]
+  2) default — https://161.248.199.106:6443 (frp)      ~/.kube/cremind_config
+  3) default — https://103.153.69.159:6443 (default)   ~/.kube/ssp_config
 ```
 
-Whatever you pick is passed as `--kube-context` on **every** helm and kubectl
-call the installer makes. The ambient `current-context` never decides where a
-release lands, so a context you switched away from an hour ago cannot redirect
-the install. With exactly one context it is used without asking; with several,
-an unattended run **requires** `--kube-context` rather than guessing.
+Whatever you pick is passed as `--kube-context` — and, for a context from a
+sibling file, `--kubeconfig` — on **every** helm and kubectl call the installer
+makes. The ambient `current-context` never decides where a release lands, so a
+context you switched away from an hour ago cannot redirect the install. With
+exactly one context it is used without asking; with several, an unattended run
+**requires** `--kube-context` rather than guessing. Sibling files routinely
+reuse a context name (`default` above), so a name that exists in more than one
+file needs `--kubeconfig FILE` as well; `--kubeconfig` on its own restricts the
+list to that file.
 
 ### What it does
 
@@ -307,6 +315,7 @@ container-friendly defaults) for one release; new scripts should use
 | `--wizard-preset ID`                 | (custom) Override `SETUP_WIZARD_ENV`. |
 | `--mode docker\|native\|kubernetes`  | Skip the mode prompt. `--docker`, `--native` and `--kubernetes` are aliases. A mode this machine cannot run is an error. |
 | `--kube-context CTX`                 | (kubernetes) The kubeconfig context to install into, passed to every helm and kubectl call. Required unattended when more than one context exists. |
+| `--kubeconfig FILE`                  | (kubernetes) The kubeconfig file holding that context. Without it, every file under `~/.kube` is listed alongside kubectl's own config, and a `--kube-context` that exists in several files is refused until you add this. Rides every helm and kubectl call as `--kubeconfig`. |
 | `--kube-namespace NS`                | (kubernetes) Namespace for the release, created if missing. Default `cremind`. |
 | `--k8s-release-name NAME`            | (kubernetes) Helm release name. Default `cremind`. |
 | `--k8s-app-url URL`                  | (kubernetes) `cremind.appUrl`. Leave unset to let the chart derive `http(s)://localhost:1515`. |
@@ -336,6 +345,7 @@ container-friendly defaults) for one release; new scripts should use
 | `-WizardPreset ID`                  | (custom) Override `SETUP_WIZARD_ENV`. |
 | `-Mode docker\|native\|kubernetes`  | Skip the mode prompt. A mode this machine cannot run is an error. |
 | `-KubeContext CTX`                  | (kubernetes) The kubeconfig context to install into, passed to every helm and kubectl call. Required unattended when more than one context exists. |
+| `-KubeConfig FILE`                  | (kubernetes) The kubeconfig file holding that context. Without it, every file under `~\.kube` is listed alongside kubectl's own config, and a `-KubeContext` that exists in several files is refused until you add this. Rides every helm and kubectl call as `--kubeconfig`. |
 | `-KubeNamespace NS`                 | (kubernetes) Namespace for the release, created if missing. Default `cremind`. |
 | `-K8sReleaseName NAME`              | (kubernetes) Helm release name. Default `cremind`. |
 | `-K8sAppUrl URL`                    | (kubernetes) `cremind.appUrl`. Leave unset to let the chart derive `http(s)://localhost:1515`. |
@@ -463,7 +473,7 @@ first.
 
 ```bash
 kill $(cat ~/.local/share/cremind/k8s/port-forward.pid)   # close the tunnel
-helm uninstall cremind --kube-context <ctx> -n <namespace>  # stop the release
+helm uninstall cremind --kube-context <ctx> [--kubeconfig <file>] -n <namespace>  # stop the release
 ```
 
 ```powershell

@@ -41,6 +41,14 @@
     show a picker; -Unattended requires this flag whenever more than one
     context exists.
 
+.PARAMETER KubeConfig
+    (kubernetes) The kubeconfig file holding that context. Without it the
+    picker lists the contexts kubectl reads on its own ($env:KUBECONFIG, else
+    ~\.kube\config) plus those in every other file under ~\.kube, and
+    -KubeContext must name exactly one of them - sibling files often reuse a
+    name such as "default". Whatever file the context came from rides every
+    helm and kubectl call as --kubeconfig.
+
 .PARAMETER KubeNamespace
     (kubernetes) Namespace for the release, created if missing.
     Default: cremind.
@@ -214,6 +222,7 @@ param(
     # the whitelist in Invoke-InstallerTuiBootstrap; the ValidateSet above is
     # load-bearing for $Mode because that read-back assigns the variable.
     [string] $KubeContext = '',
+    [string] $KubeConfig = '',
     [string] $KubeNamespace = '',
     [string] $K8sReleaseName = '',
     [string] $K8sAppUrl = '',
@@ -668,6 +677,16 @@ if ($Uninstall) {
         $K8sNs        = Get-UninstallK8s 'KUBE_NAMESPACE'
         $K8sRel       = Get-UninstallK8s 'HELM_RELEASE'
         $K8sNsCreated = Get-UninstallK8s 'NAMESPACE_CREATED'
+        $K8sCfg       = Get-UninstallK8s 'KUBE_CONFIG_FILE'
+        $K8sSrv       = Get-UninstallK8s 'KUBE_SERVER'
+        # Aim every cluster call at the recorded file and context, exactly
+        # as the install did.
+        $kubectlTarget = @('--context', $K8sCtx)
+        $helmTarget    = @('--kube-context', $K8sCtx)
+        if ($K8sCfg) {
+            $kubectlTarget = @('--kubeconfig', $K8sCfg) + $kubectlTarget
+            $helmTarget    = @('--kubeconfig', $K8sCfg) + $helmTarget
+        }
 
         # Stop the background port-forward first - it holds a connection to
         # the pod we are about to delete.
@@ -686,18 +705,31 @@ if ($Uninstall) {
         $helmCmdU    = Get-Command helm -ErrorAction SilentlyContinue
         $ctxKnown = $false
         if ($kubectlCmdU -and $K8sCtx) {
-            $names = (Invoke-NativeCapture -FilePath $kubectlCmdU.Source -ArgumentList @('config', 'get-contexts', '-o', 'name')).Lines
+            $listArgs = @('config', 'get-contexts', '-o', 'name')
+            if ($K8sCfg) { $listArgs = @('--kubeconfig', $K8sCfg) + $listArgs }
+            $names = (Invoke-NativeCapture -FilePath $kubectlCmdU.Source -ArgumentList $listArgs).Lines
             if ($names -contains $K8sCtx) { $ctxKnown = $true }
+        }
+        # A kubeconfig edited since the install must not aim the teardown at
+        # a different cluster than the one recorded.
+        if ($ctxKnown -and $K8sSrv) {
+            $live = (Invoke-NativeCapture -FilePath $kubectlCmdU.Source -ArgumentList (
+                $kubectlTarget + @('config', 'view', '--minify', '-o', 'jsonpath={.clusters[0].cluster.server}'))).Stdout.Trim()
+            if ($live -and $live -ne $K8sSrv) {
+                Write-Host "Context '$K8sCtx' now points at $live, but the release was installed on $K8sSrv." -ForegroundColor Yellow
+                $ctxKnown = $false
+            }
         }
 
         if (-not $ctxKnown -or -not $helmCmdU) {
+            $cfgNote = if ($K8sCfg) { " --kubeconfig `"$K8sCfg`"" } else { '' }
             Write-Host "Cannot reach the cluster from here (kubectl/helm missing, or context '$K8sCtx' is gone)." -ForegroundColor Yellow
             Write-Host "Remove the release yourself with:" -ForegroundColor Yellow
-            Write-Host "  helm uninstall $K8sRel --kube-context $K8sCtx -n $K8sNs" -ForegroundColor Yellow
+            Write-Host "  helm uninstall $K8sRel --kube-context $K8sCtx$cfgNote -n $K8sNs" -ForegroundColor Yellow
         } else {
             Write-Host "Removing Helm release $K8sRel from namespace $K8sNs on context $K8sCtx..."
-            $removed = Invoke-NativeCapture -FilePath $helmCmdU.Source -ArgumentList @(
-                'uninstall', $K8sRel, '--kube-context', $K8sCtx, '--namespace', $K8sNs, '--wait')
+            $removed = Invoke-NativeCapture -FilePath $helmCmdU.Source -ArgumentList (
+                @('uninstall', $K8sRel) + $helmTarget + @('--namespace', $K8sNs, '--wait'))
             if ($removed.ExitCode -ne 0) {
                 Write-Host 'helm uninstall reported a problem; continuing.' -ForegroundColor Yellow
             }
@@ -708,23 +740,23 @@ if ($Uninstall) {
                 # (cremind-postgresql), not the Helm release name.
                 Write-Host 'Deleting cluster data volumes...'
                 foreach ($sub in @('postgresql', 'qdrant', 'chromadb')) {
-                    $found = (Invoke-NativeCapture -FilePath $kubectlCmdU.Source -ArgumentList @(
-                        '--context', $K8sCtx, '-n', $K8sNs, 'get', 'pvc',
+                    $found = (Invoke-NativeCapture -FilePath $kubectlCmdU.Source -ArgumentList (
+                        $kubectlTarget + @('-n', $K8sNs, 'get', 'pvc',
                         '-l', "app.kubernetes.io/name=$sub",
-                        '-o', 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}')).Stdout
+                        '-o', 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'))).Stdout
                     foreach ($pvc in ($found -split "`n")) {
                         $name = $pvc.Trim()
                         if (-not $name) { continue }
-                        Invoke-NativeCapture -FilePath $kubectlCmdU.Source -ArgumentList @(
-                            '--context', $K8sCtx, '-n', $K8sNs, 'delete', 'pvc', $name, '--ignore-not-found') | Out-Null
+                        Invoke-NativeCapture -FilePath $kubectlCmdU.Source -ArgumentList (
+                            $kubectlTarget + @('-n', $K8sNs, 'delete', 'pvc', $name, '--ignore-not-found')) | Out-Null
                         Write-Host "  removed pvc $name"
                     }
                 }
                 # Only a namespace this installer created is ours to delete.
                 if ($K8sNsCreated -eq '1') {
                     Write-Host "Deleting namespace $K8sNs (created by the installer)..."
-                    Invoke-NativeCapture -FilePath $kubectlCmdU.Source -ArgumentList @(
-                        '--context', $K8sCtx, 'delete', 'namespace', $K8sNs, '--ignore-not-found') | Out-Null
+                    Invoke-NativeCapture -FilePath $kubectlCmdU.Source -ArgumentList (
+                        $kubectlTarget + @('delete', 'namespace', $K8sNs, '--ignore-not-found')) | Out-Null
                 } else {
                     Write-Host "Namespace $K8sNs existed before the install; leaving it in place."
                 }
@@ -857,6 +889,14 @@ if ($Version -and $Channel -eq 'dev') {
 # Kubernetes flag shapes. Checked here, before anything reaches helm: a bad
 # namespace or release name is a template error several minutes into an
 # install otherwise.
+if ($KubeConfig) {
+    if (-not (Test-Path -LiteralPath $KubeConfig -PathType Leaf)) {
+        Write-Host "ERR Invalid -KubeConfig: not a file: $KubeConfig" -ForegroundColor Red
+        exit 2
+    }
+    # Absolute, so the path recorded for -Uninstall survives a cd.
+    $KubeConfig = (Resolve-Path -LiteralPath $KubeConfig).ProviderPath
+}
 if ($KubeNamespace -and $KubeNamespace -cnotmatch $KubeNameRe) {
     Write-Host "ERR Invalid -KubeNamespace: '$KubeNamespace' (lowercase letters, digits and hyphens, max 63 characters)" -ForegroundColor Red
     exit 2
@@ -1367,60 +1407,118 @@ if ($HasDocker) {
 # `kubectl config view -o json`, not `-o jsonpath=...`: PowerShell 5.1's
 # native-argument quoting mangles a jsonpath expression (it contains spaces,
 # braces and embedded quotes). JSON is one argument and ConvertFrom-Json does
-# the rest. `config view` reads the MERGED kubeconfig, so a KUBECONFIG naming
-# several files is handled by kubectl rather than by us.
+# the rest.
+#
+# kubectl on its own reads one merged config ($env:KUBECONFIG, else
+# ~\.kube\config). One file per cluster dropped next to it is a common layout
+# too, and those files routinely reuse a context name ("default"), so a name
+# alone cannot identify a target. Every other file under ~\.kube is therefore
+# probed on its own, and each row remembers where it came from: Kubeconfig is
+# '' for the ambient config and the file's path otherwise, and that path then
+# rides every helm and kubectl call as --kubeconfig. Current marks the ambient
+# current-context. -KubeConfig narrows all of this to the one file named.
 $HasKubectl        = $false
 $HasHelm           = $false
 $KubectlExe        = ''
 $KubeContexts      = @()
 $KubeCurrentContext = ''
 $KubeContextsFile  = ''
+$KubeFileCount     = 0
+
+# Add $File's contexts (the ambient config's when $File is '') to $Into. A
+# file that is not a kubeconfig, or has no contexts, adds nothing.
+function Add-KubeconfigRows {
+    param([string] $File, [System.Collections.Generic.List[object]] $Into)
+    $viewArgs = @('config', 'view', '-o', 'json')
+    if ($File) { $viewArgs = @('config', 'view', '--kubeconfig', $File, '-o', 'json') }
+    $viewed = Invoke-NativeCapture -FilePath $KubectlExe -ArgumentList $viewArgs
+    if ($viewed.ExitCode -ne 0 -or -not $viewed.Stdout) { return }
+    try {
+        $cfg = $viewed.Stdout | ConvertFrom-Json
+    } catch {
+        return
+    }
+    if (-not $cfg -or -not ($cfg.PSObject.Properties.Name -contains 'contexts') -or -not $cfg.contexts) { return }
+    $servers = @{}
+    if ($cfg.PSObject.Properties.Name -contains 'clusters' -and $cfg.clusters) {
+        foreach ($cluster in @($cfg.clusters)) {
+            if ($cluster.name) { $servers[$cluster.name] = [string]$cluster.cluster.server }
+        }
+    }
+    $current = ''
+    if (-not $File -and ($cfg.PSObject.Properties.Name -contains 'current-context')) {
+        $current = [string]$cfg.'current-context'
+    }
+    foreach ($ctx in @($cfg.contexts)) {
+        if (-not $ctx.name) { continue }
+        $clusterName = ''
+        if ($ctx.context.PSObject.Properties.Name -contains 'cluster') { $clusterName = [string]$ctx.context.cluster }
+        $ns = ''
+        if ($ctx.context.PSObject.Properties.Name -contains 'namespace') { $ns = [string]$ctx.context.namespace }
+        $server = ''
+        if ($clusterName -and $servers.ContainsKey($clusterName)) { $server = $servers[$clusterName] }
+        $Into.Add([pscustomobject]@{
+            Name       = [string]$ctx.name
+            Server     = $server
+            Namespace  = $ns
+            Kubeconfig = $File
+            Current    = ($current -ne '' -and [string]$ctx.name -eq $current)
+        })
+    }
+}
+
 $kubectlCmd = Get-Command kubectl -ErrorAction SilentlyContinue
 if ($kubectlCmd) {
     $KubectlExe = $kubectlCmd.Source
-    $viewed = Invoke-NativeCapture -FilePath $KubectlExe -ArgumentList @('config', 'view', '-o', 'json')
-    if ($viewed.ExitCode -eq 0 -and $viewed.Stdout) {
-        try {
-            $cfg = $viewed.Stdout | ConvertFrom-Json
-        } catch {
-            $cfg = $null
+    $rows = [System.Collections.Generic.List[object]]::new()
+    if ($KubeConfig) {
+        # -KubeConfig: that file and nothing else.
+        Add-KubeconfigRows -File $KubeConfig -Into $rows
+    } else {
+        Add-KubeconfigRows -File '' -Into $rows
+        # The files kubectl already merged, which the scan below skips.
+        $ambient = @()
+        if ($env:KUBECONFIG) {
+            foreach ($entry in ($env:KUBECONFIG -split [regex]::Escape([IO.Path]::PathSeparator))) {
+                if (-not $entry) { continue }
+                try { $ambient += [IO.Path]::GetFullPath($entry) } catch { $ambient += $entry }
+            }
+        } else {
+            $ambient += (Join-Path $HOME '.kube\config')
         }
-        if ($cfg -and $cfg.PSObject.Properties.Name -contains 'contexts' -and $cfg.contexts) {
-            $servers = @{}
-            if ($cfg.PSObject.Properties.Name -contains 'clusters' -and $cfg.clusters) {
-                foreach ($cluster in @($cfg.clusters)) {
-                    if ($cluster.name) { $servers[$cluster.name] = [string]$cluster.cluster.server }
-                }
-            }
-            $rows = [System.Collections.Generic.List[object]]::new()
-            foreach ($ctx in @($cfg.contexts)) {
-                if (-not $ctx.name) { continue }
-                $clusterName = ''
-                if ($ctx.context.PSObject.Properties.Name -contains 'cluster') { $clusterName = [string]$ctx.context.cluster }
-                $ns = ''
-                if ($ctx.context.PSObject.Properties.Name -contains 'namespace') { $ns = [string]$ctx.context.namespace }
-                $server = ''
-                if ($clusterName -and $servers.ContainsKey($clusterName)) { $server = $servers[$clusterName] }
-                $rows.Add([pscustomobject]@{ Name = [string]$ctx.name; Server = $server; Namespace = $ns })
-            }
-            $KubeContexts = @($rows)
-            if ($cfg.PSObject.Properties.Name -contains 'current-context') {
-                $KubeCurrentContext = [string]$cfg.'current-context'
+        $kubeDir = Join-Path $HOME '.kube'
+        if (Test-Path -LiteralPath $kubeDir -PathType Container) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $kubeDir -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+                # A kubeconfig is a few KB; skip anything that plainly is not one.
+                if ($f.Length -gt 1MB) { continue }
+                if ($ambient -contains $f.FullName) { continue }
+                Add-KubeconfigRows -File $f.FullName -Into $rows
             }
         }
     }
+    $KubeContexts = @($rows)
+    $KubeFileCount = @($KubeContexts | ForEach-Object { $_.Kubeconfig } | Sort-Object -Unique).Count
+    foreach ($row in $KubeContexts) {
+        if ($row.Current) { $KubeCurrentContext = $row.Name; break }
+    }
     if ($KubeContexts.Count -ge 1) {
         $HasKubectl = $true
-        # One context per line: name<TAB>server<TAB>namespace — the format the
-        # TUI's parse_kube_contexts reads.
+        # One context per line: name<TAB>server<TAB>namespace<TAB>kubeconfig<TAB>current
+        # - the format the TUI's parse_kube_contexts reads.
         $KubeContextsFile = Join-Path $CremindInstallDir '.kube-contexts'
-        $ctxText = ($KubeContexts | ForEach-Object { "$($_.Name)`t$($_.Server)`t$($_.Namespace)" }) -join "`n"
+        $ctxText = ($KubeContexts | ForEach-Object {
+            "$($_.Name)`t$($_.Server)`t$($_.Namespace)`t$($_.Kubeconfig)`t$([int]$_.Current)"
+        }) -join "`n"
         Write-Utf8NoBomFile -Path $KubeContextsFile -Content ($ctxText + "`n")
+        $filesNote = ''
+        if ($KubeFileCount -gt 1) { $filesNote = " in $KubeFileCount kubeconfig files" }
         $currentNote = ''
         if ($KubeCurrentContext) { $currentNote = ", current: $KubeCurrentContext" }
-        Write-Ok "kubectl: $($KubeContexts.Count) context(s)$currentNote"
+        Write-Ok "kubectl: $($KubeContexts.Count) context(s)$filesNote$currentNote"
+    } elseif ($KubeConfig) {
+        Write-Info "kubectl: found, but $KubeConfig has no contexts"
     } else {
-        Write-Info "kubectl: found, but the kubeconfig has no contexts"
+        Write-Info "kubectl: found, but no kubeconfig context turned up (checked kubectl's own config and ~\.kube\*)"
     }
 } else {
     Write-Info "kubectl: not detected"
@@ -1598,8 +1696,8 @@ function Invoke-InstallerTuiBootstrap {
     $tuiArgs.Add('--has-kubectl'); $tuiArgs.Add(([int][bool]$HasKubectl).ToString())
     $tuiArgs.Add('--has-helm');    $tuiArgs.Add(([int][bool]$HasHelm).ToString())
     if ($KubeContextsFile)   { $tuiArgs.Add('--kube-contexts-file');   $tuiArgs.Add($KubeContextsFile) }
-    if ($KubeCurrentContext) { $tuiArgs.Add('--kube-current-context'); $tuiArgs.Add($KubeCurrentContext) }
     if ($KubeContext)            { $tuiArgs.Add('--kube-context');               $tuiArgs.Add($KubeContext) }
+    if ($KubeConfig)             { $tuiArgs.Add('--kubeconfig');                 $tuiArgs.Add($KubeConfig) }
     if ($KubeNamespace)          { $tuiArgs.Add('--kube-namespace');             $tuiArgs.Add($KubeNamespace) }
     if ($K8sReleaseName)         { $tuiArgs.Add('--k8s-release-name');           $tuiArgs.Add($K8sReleaseName) }
     if ($K8sAppUrl)              { $tuiArgs.Add('--k8s-app-url');                $tuiArgs.Add($K8sAppUrl) }
@@ -1664,6 +1762,7 @@ function Invoke-InstallerTuiBootstrap {
                     'CUSTOM_allowed_origins' { if (-not $AllowedOrigins) { Set-Variable -Scope Script AllowedOrigins $v } }
                     'CUSTOM_wizard_preset' { if (-not $WizardPreset)   { Set-Variable -Scope Script WizardPreset $v } }
                     'KUBE_CONTEXT'         { if (-not $KubeContext)    { Set-Variable -Scope Script KubeContext $v } }
+                    'KUBE_CONFIG_FILE'     { if (-not $KubeConfig)     { Set-Variable -Scope Script KubeConfig $v } }
                     'KUBE_NAMESPACE'       { if (-not $KubeNamespace)  { Set-Variable -Scope Script KubeNamespace $v } }
                     'K8S_release_name'     { if (-not $K8sReleaseName) { Set-Variable -Scope Script K8sReleaseName $v } }
                     'K8S_app_url'          { if (-not $K8sAppUrl)      { Set-Variable -Scope Script K8sAppUrl $v } }
@@ -2036,27 +2135,57 @@ $KubeServer = ''
 if ($Mode -eq 'kubernetes') {
     Write-Step "Kubernetes target"
 
+    # A row is addressed by its position: sibling kubeconfig files reuse
+    # context names ("default"), so a name alone can be ambiguous.
+    function Format-KubeconfigLabel {
+        param([string] $Path)
+        if (-not $Path) { return 'default kubeconfig' }
+        if ($HOME -and $Path.StartsWith("$HOME\", [StringComparison]::OrdinalIgnoreCase)) {
+            return '~' + $Path.Substring($HOME.Length)
+        }
+        return $Path
+    }
     function Write-KubeContexts {
         $i = 0
         foreach ($ctx in $KubeContexts) {
             $i++
             $server = if ($ctx.Server) { $ctx.Server } else { 'server unknown' }
             $ns     = if ($ctx.Namespace) { $ctx.Namespace } else { 'default' }
-            $marker = if ($ctx.Name -eq $KubeCurrentContext) { '  [current]' } else { '' }
-            Write-Host ("  {0}) {1} - {2} ({3}){4}" -f $i, $ctx.Name, $server, $ns, $marker)
+            $where  = if ($KubeFileCount -gt 1) { '  ' + (Format-KubeconfigLabel $ctx.Kubeconfig) } else { '' }
+            $marker = if ($ctx.Current) { '  [current]' } else { '' }
+            Write-Host ("  {0}) {1} - {2} ({3}){4}{5}" -f $i, $ctx.Name, $server, $ns, $where, $marker)
         }
+    }
+    function Find-KubeContextRows {
+        # The rows called $Name; with -ByFile, only those in $File ('' = the
+        # ambient config).
+        param([string] $Name, [string] $File, [switch] $ByFile)
+        return @($KubeContexts | Where-Object { $_.Name -eq $Name -and ((-not $ByFile) -or $_.Kubeconfig -eq $File) })
     }
 
     $interactive = (-not $Unattended) -and [Environment]::UserInteractive
+    $picked = $null
     if ($KubeContext) {
-        if (-not ($KubeContexts | Where-Object { $_.Name -eq $KubeContext })) {
+        # The TUI settles the file along with the name (as does -KubeConfig,
+        # which narrowed the rows to one file); a bare -KubeContext has to
+        # name exactly one row across every file.
+        $byFile = ([bool]$KubeConfig) -or $TuiApplied
+        # @(): a function returning one row hands back the bare object, and
+        # under StrictMode a bare object has no .Count.
+        $found = @(Find-KubeContextRows -Name $KubeContext -File $KubeConfig -ByFile:$byFile)
+        if ($found.Count -eq 0) {
             Write-Err2 "Unknown kubeconfig context: $KubeContext"
             Write-Err2 "Available contexts:"
             Write-KubeContexts
             exit 2
+        } elseif ($found.Count -gt 1) {
+            Write-Err2 "Context '$KubeContext' exists in several kubeconfig files; add -KubeConfig FILE to say which:"
+            foreach ($row in $found) { Write-Err2 "  -KubeConfig '$($row.Kubeconfig)'  ($($row.Server))" }
+            exit 2
         }
+        $picked = $found[0]
     } elseif ($KubeContexts.Count -eq 1) {
-        $KubeContext = $KubeContexts[0].Name
+        $picked = $KubeContexts[0]
     } elseif (-not $interactive) {
         Write-Err2 "-KubeContext is required: the kubeconfig has $($KubeContexts.Count) contexts and"
         Write-Err2 "an unattended install must not guess which cluster to install into."
@@ -2071,26 +2200,29 @@ if ($Mode -eq 'kubernetes') {
         Write-KubeContexts
         $ctxDefaultIdx = 1
         for ($i = 0; $i -lt $KubeContexts.Count; $i++) {
-            if ($KubeContexts[$i].Name -eq $KubeCurrentContext) { $ctxDefaultIdx = $i + 1; break }
+            if ($KubeContexts[$i].Current) { $ctxDefaultIdx = $i + 1; break }
         }
-        while (-not $KubeContext) {
+        while (-not $picked) {
             $choice = Read-Host "Choice [$ctxDefaultIdx]"
             if (-not $choice) { $choice = "$ctxDefaultIdx" }
-            $picked = $KubeContexts | Where-Object { $_.Name -eq $choice } | Select-Object -First 1
-            if (-not $picked) {
-                $n = 0
-                if ([int]::TryParse($choice, [ref]$n) -and $n -ge 1 -and $n -le $KubeContexts.Count) {
-                    $picked = $KubeContexts[$n - 1]
-                }
+            $n = 0
+            if ([int]::TryParse($choice, [ref]$n)) {
+                if ($n -ge 1 -and $n -le $KubeContexts.Count) { $picked = $KubeContexts[$n - 1] }
+                else { Write-Warn2 "Pick a number from the list, or a context name." }
+            } else {
+                $named = @(Find-KubeContextRows -Name $choice)
+                if ($named.Count -eq 1) { $picked = $named[0] }
+                elseif ($named.Count -gt 1) { Write-Warn2 "'$choice' is in several files; pick its number." }
+                else { Write-Warn2 "Pick a number from the list, or a context name." }
             }
-            if ($picked) { $KubeContext = $picked.Name }
-            else { Write-Warn2 "Pick a number from the list, or a context name." }
         }
     }
-    $ctxEntry = $KubeContexts | Where-Object { $_.Name -eq $KubeContext } | Select-Object -First 1
-    if ($ctxEntry) { $KubeServer = $ctxEntry.Server }
+    $KubeContext = $picked.Name
+    $KubeServer  = $picked.Server
+    $KubeConfig  = $picked.Kubeconfig
     $serverNote = if ($KubeServer) { " ($KubeServer)" } else { '' }
-    Write-Ok "Context: $KubeContext$serverNote"
+    $fromNote   = if ($KubeConfig) { " from $KubeConfig" } else { '' }
+    Write-Ok "Context: $KubeContext$serverNote$fromNote"
 
     if (-not $KubeNamespace) {
         $nsDefault = Get-PrevK8s 'KUBE_NAMESPACE'
@@ -2202,6 +2334,7 @@ if ($Mode -eq 'kubernetes') {
         Write-Host 'About to install into:' -ForegroundColor White
         Write-Host ("  context    {0}" -f $KubeContext)
         Write-Host ("  server     {0}" -f $(if ($KubeServer) { $KubeServer } else { '(unknown)' }))
+        if ($KubeConfig) { Write-Host ("  kubeconfig {0}" -f $KubeConfig) }
         Write-Host ("  namespace  {0}" -f $KubeNamespace)
         Write-Host ("  release    {0}" -f $K8sReleaseName)
         Write-Host ''
@@ -2854,7 +2987,8 @@ function Resolve-CremindVersion {
 #
 # Installs the Cremind Helm chart into the kubeconfig context the operator
 # chose. Nothing about this install is ambient: every helm and kubectl call
-# carries --kube-context, so a stale current-context can never redirect it.
+# carries --kube-context (and --kubeconfig, for a context from a sibling
+# file), so a stale current-context can never redirect it.
 #
 # What this branch does NOT do, deliberately: write a host .env, register a
 # boot service, or run migrations. The chart owns the pod's environment
@@ -2869,15 +3003,33 @@ if ($Mode -eq 'kubernetes') {
 
     # Every kubectl call goes through these. --request-timeout keeps an
     # unreachable API server (or an exec credential plugin waiting on a
-    # browser) from looking like a frozen installer.
+    # browser) from looking like a frozen installer. The kubeconfig file is
+    # named too whenever the context came from one kubectl would not read on
+    # its own (see the probe above).
     function Invoke-Kubectl {
         param([string[]] $KubectlArgs)
-        return Invoke-NativeCapture -FilePath $KubectlExe `
-            -ArgumentList (@('--context', $KubeContext, '--request-timeout=20s') + $KubectlArgs)
+        $target = @('--context', $KubeContext, '--request-timeout=20s')
+        if ($KubeConfig) { $target = @('--kubeconfig', $KubeConfig) + $target }
+        return Invoke-NativeCapture -FilePath $KubectlExe -ArgumentList ($target + $KubectlArgs)
     }
     function Invoke-KubectlNs {
         param([string[]] $KubectlArgs)
         return Invoke-Kubectl -KubectlArgs (@('--namespace', $KubeNamespace) + $KubectlArgs)
+    }
+    # Every helm call that reaches the cluster goes through this, for the
+    # same reason.
+    function Invoke-HelmTarget {
+        param([string[]] $HelmArgs)
+        $target = @('--kube-context', $KubeContext)
+        if ($KubeConfig) { $target = @('--kubeconfig', $KubeConfig) + $target }
+        return Invoke-NativeCapture -FilePath 'helm' -ArgumentList ($HelmArgs + $target)
+    }
+    # The same targeting, spelled out for the commands printed to the operator.
+    $HelmTargetText    = "--kube-context $KubeContext"
+    $KubectlTargetText = "--context $KubeContext"
+    if ($KubeConfig) {
+        $HelmTargetText    += " --kubeconfig `"$KubeConfig`""
+        $KubectlTargetText += " --kubeconfig `"$KubeConfig`""
     }
 
     $HelmRelease = if ($K8sReleaseName) { $K8sReleaseName } else { 'cremind' }
@@ -2886,12 +3038,18 @@ if ($Mode -eq 'kubernetes') {
     # leave the previous one behind with nothing recording it, so say so.
     $prevRelease = Get-PrevK8s 'HELM_RELEASE'
     if ($prevRelease) {
-        if ((Get-PrevK8s 'KUBE_CONTEXT') -ne $KubeContext -or
+        # Same API server, same cluster - whichever file or context name
+        # reaches it this time. Names are the fallback when a server is unknown.
+        $prevServer = Get-PrevK8s 'KUBE_SERVER'
+        $sameCluster = if ($prevServer -and $KubeServer) { $prevServer -eq $KubeServer } else { (Get-PrevK8s 'KUBE_CONTEXT') -eq $KubeContext }
+        if (-not $sameCluster -or
             (Get-PrevK8s 'KUBE_NAMESPACE') -ne $KubeNamespace -or
             $prevRelease -ne $HelmRelease) {
+            $prevServerNote = if ($prevServer) { " ($prevServer)" } else { '' }
+            $serverNote = if ($KubeServer) { " ($KubeServer)" } else { '' }
             Write-Warn2 "This machine already tracks a Cremind release:"
-            Write-Warn2 "  $prevRelease in namespace $(Get-PrevK8s 'KUBE_NAMESPACE') on context $(Get-PrevK8s 'KUBE_CONTEXT')"
-            Write-Warn2 "You are about to install $HelmRelease in $KubeNamespace on $KubeContext."
+            Write-Warn2 "  $prevRelease in namespace $(Get-PrevK8s 'KUBE_NAMESPACE') on context $(Get-PrevK8s 'KUBE_CONTEXT')$prevServerNote"
+            Write-Warn2 "You are about to install $HelmRelease in $KubeNamespace on $KubeContext$serverNote."
             if ($Unattended -or -not [Environment]::UserInteractive) {
                 Write-Err2 "Refusing to orphan the tracked release. Run -Uninstall first, or pass the same target."
                 exit 2
@@ -3021,8 +3179,8 @@ if ($Mode -eq 'kubernetes') {
     # Hence: adopt what the release already uses before generating anything.
     $PgPassword = ''
     $K8sExternalPg = ",$K8sExtraSet," -like '*,postgresql.enabled=false,*'
-    $ReleaseExists = (Invoke-NativeCapture -FilePath 'helm' -ArgumentList @(
-        'status', $HelmRelease, '--kube-context', $KubeContext, '--namespace', $KubeNamespace
+    $ReleaseExists = (Invoke-HelmTarget -HelmArgs @(
+        'status', $HelmRelease, '--namespace', $KubeNamespace
     )).ExitCode -eq 0
     if (-not $K8sExternalPg) {
         if ($K8sPostgresPassword) {
@@ -3072,7 +3230,7 @@ if ($Mode -eq 'kubernetes') {
                 Write-Err2 "and its password is not recorded on this machine. A fresh install would"
                 Write-Err2 "write a new password that the retained database does not accept."
                 Write-Err2 "Either delete it:"
-                Write-Err2 "  kubectl --context $KubeContext -n $KubeNamespace delete pvc $pgPvc"
+                Write-Err2 "  kubectl $KubectlTargetText -n $KubeNamespace delete pvc $pgPvc"
                 Write-Err2 "or re-run with -K8sPostgresPassword <the old password>."
                 exit 1
             }
@@ -3184,9 +3342,8 @@ if ($Mode -eq 'kubernetes') {
     # (an exact --version already bypasses the prerelease filter).
     if ($ReleaseExists -and $Reinstall) {
         Write-Info "Removing release $HelmRelease (-Reinstall)"
-        Invoke-NativeCapture -FilePath 'helm' -ArgumentList @(
-            'uninstall', $HelmRelease, '--kube-context', $KubeContext,
-            '--namespace', $KubeNamespace, '--wait') | Out-Null
+        Invoke-HelmTarget -HelmArgs @(
+            'uninstall', $HelmRelease, '--namespace', $KubeNamespace, '--wait') | Out-Null
         $ReleaseExists = $false
     } elseif ($ReleaseExists) {
         Write-Info "Release $HelmRelease already exists - upgrading it in place."
@@ -3206,7 +3363,6 @@ if ($Mode -eq 'kubernetes') {
     $helmArgs = [System.Collections.Generic.List[string]]::new()
     $helmArgs.Add('upgrade'); $helmArgs.Add('--install')
     $helmArgs.Add($HelmRelease); $helmArgs.Add($ChartRef)
-    $helmArgs.Add('--kube-context'); $helmArgs.Add($KubeContext)
     $helmArgs.Add('--namespace'); $helmArgs.Add($KubeNamespace)
     $helmArgs.Add('--create-namespace')
     $helmArgs.Add('--history-max'); $helmArgs.Add('5')
@@ -3214,7 +3370,8 @@ if ($Mode -eq 'kubernetes') {
     if ($ChartVersion) { $helmArgs.Add('--version'); $helmArgs.Add($ChartVersion) }
     # Last, so an operator's --set overrides the installer's own values.
     if ($K8sExtraSet) { $helmArgs.Add('--set'); $helmArgs.Add($K8sExtraSet) }
-    $installed = Invoke-NativeCapture -FilePath 'helm' -ArgumentList $helmArgs.ToArray()
+    # Invoke-HelmTarget adds the cluster targeting (--kube-context, --kubeconfig).
+    $installed = Invoke-HelmTarget -HelmArgs $helmArgs.ToArray()
     if ($installed.ExitCode -ne 0) {
         Write-Err2 "helm upgrade --install failed:"
         if ($installed.Stderr) { Write-Err2 $installed.Stderr }
@@ -3222,7 +3379,7 @@ if ($Mode -eq 'kubernetes') {
         Write-Err2 ""
         Write-Err2 "Common causes: a chart value the cluster rejects (see -K8sExtraSet),"
         Write-Err2 "an unreachable image registry, or insufficient quota."
-        Write-Err2 "Inspect with: helm status $HelmRelease --kube-context $KubeContext -n $KubeNamespace"
+        Write-Err2 "Inspect with: helm status $HelmRelease $HelmTargetText -n $KubeNamespace"
         exit 1
     }
     Write-Ok "Chart installed."
@@ -3253,7 +3410,7 @@ if ($Mode -eq 'kubernetes') {
             if ($pgRollout.ExitCode -ne 0) {
                 Write-Warn2 "PostgreSQL did not become ready within 5 minutes."
                 Write-Warn2 "A Pending volume usually means the cluster has no default StorageClass:"
-                Write-Warn2 "  kubectl --context $KubeContext -n $KubeNamespace get pvc"
+                Write-Warn2 "  kubectl $KubectlTargetText -n $KubeNamespace get pvc"
             }
         }
     }
@@ -3267,7 +3424,7 @@ if ($Mode -eq 'kubernetes') {
         Write-Err2 ""
         Write-Err2 "ImagePullBackOff  -> the image tag is not published, or the registry is unreachable."
         Write-Err2 "Pending           -> the node needs 2 CPU and 2Gi free for the desktop image."
-        Write-Err2 "CrashLoopBackOff  -> kubectl --context $KubeContext -n $KubeNamespace logs deploy/$HelmFullname -c cremind"
+        Write-Err2 "CrashLoopBackOff  -> kubectl $KubectlTargetText -n $KubeNamespace logs deploy/$HelmFullname -c cremind"
         Write-Err2 ""
         Write-Err2 "The release is installed; re-running this installer upgrades it in place."
         exit 1
@@ -3283,7 +3440,7 @@ if ($Mode -eq 'kubernetes') {
     $svcPorts = (Invoke-KubectlNs -KubectlArgs @('get', 'svc', $HelmFullname, '-o', 'jsonpath={.spec.ports[*].port}')).Stdout.Trim()
     $PfPorts = @('1515:80', '1455:1455')
     if (" $svcPorts " -like '* 6080 *') { $PfPorts += '6080:6080' }
-    $PortForwardCmd = "kubectl --context $KubeContext --namespace $KubeNamespace port-forward svc/$HelmFullname $($PfPorts -join ' ')"
+    $PortForwardCmd = "kubectl $KubectlTargetText --namespace $KubeNamespace port-forward svc/$HelmFullname $($PfPorts -join ' ')"
     $K8sNovncUrl = (Invoke-KubectlNs -KubectlArgs @('get', 'configmap', "$HelmFullname-env", '-o', 'jsonpath={.data.CREMIND_NOVNC_URL}')).Stdout.Trim()
     $K8sPodAppUrl = (Invoke-KubectlNs -KubectlArgs @('get', 'configmap', "$HelmFullname-env", '-o', 'jsonpath={.data.APP_URL}')).Stdout.Trim()
 
@@ -3328,6 +3485,7 @@ if ($Mode -eq 'kubernetes') {
             Write-Info "Starting the port-forward in the background"
             $pfArgs = @('--context', $KubeContext, '--namespace', $KubeNamespace,
                         'port-forward', "svc/$HelmFullname") + $PfPorts
+            if ($KubeConfig) { $pfArgs = @('--kubeconfig', $KubeConfig) + $pfArgs }
             $pfProc = Start-Process -FilePath $KubectlExe -ArgumentList $pfArgs `
                 -RedirectStandardOutput $PfLogFile -RedirectStandardError $PfErrFile `
                 -WindowStyle Hidden -PassThru
@@ -3368,6 +3526,7 @@ if ($Mode -eq 'kubernetes') {
     $releaseLines.Add('# Cremind Kubernetes release, written by the installer.')
     $releaseLines.Add('# Read by install.sh / install.ps1; never sourced.')
     $releaseLines.Add("KUBE_CONTEXT=$KubeContext")
+    $releaseLines.Add("KUBE_CONFIG_FILE=$KubeConfig")
     $releaseLines.Add("KUBE_SERVER=$KubeServer")
     $releaseLines.Add("KUBE_NAMESPACE=$KubeNamespace")
     $releaseLines.Add("NAMESPACE_CREATED=$NamespaceCreated")
@@ -3436,6 +3595,8 @@ if ($Mode -eq 'kubernetes') {
     $credLines.Add('')
     $credLines.Add('[kubernetes]')
     $credLines.Add("context = `"$KubeContext`"")
+    # A TOML literal string: a Windows path is all backslashes.
+    $credLines.Add("kubeconfig = '$KubeConfig'")
     $credLines.Add("server = `"$KubeServer`"")
     $credLines.Add("namespace = `"$KubeNamespace`"")
     $credLines.Add("release = `"$HelmRelease`"")
@@ -3478,8 +3639,8 @@ if ($Mode -eq 'kubernetes') {
     }
     Write-Host ''
     Write-Host '  Manage the release:' -ForegroundColor White
-    Write-Host "    helm status $HelmRelease --kube-context $KubeContext -n $KubeNamespace"
-    Write-Host "    kubectl --context $KubeContext -n $KubeNamespace logs deploy/$HelmFullname -c cremind -f"
+    Write-Host "    helm status $HelmRelease $HelmTargetText -n $KubeNamespace"
+    Write-Host "    kubectl $KubectlTargetText -n $KubeNamespace logs deploy/$HelmFullname -c cremind -f"
     Write-Host '    .\install.ps1 -Uninstall'
     Write-Host ''
     Write-Host "  Credentials: $K8sCredsFile"

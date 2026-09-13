@@ -49,6 +49,10 @@ class TuiResult:
     # current value in and the TUI echoes it back, so sourcing this file can
     # never clobber an answer that came from the command line.
     kube_context: str = ""
+    # The kubeconfig file that context came from; "" for the one kubectl
+    # reads on its own. Its shell variable is KUBE_CONFIG_FILE, never
+    # KUBECONFIG: sourcing this file must not redirect kubectl itself.
+    kube_config_file: str = ""
     kube_namespace: str = ""
     k8s_release_name: str = ""
     k8s_app_url: str = ""
@@ -71,6 +75,7 @@ class TuiResult:
             "CUSTOM_allowed_origins": self.custom_allowed_origins,
             "CUSTOM_wizard_preset": self.custom_wizard_preset,
             "KUBE_CONTEXT": self.kube_context,
+            "KUBE_CONFIG_FILE": self.kube_config_file,
             "KUBE_NAMESPACE": self.kube_namespace,
             "K8S_release_name": self.k8s_release_name,
             "K8S_app_url": self.k8s_app_url,

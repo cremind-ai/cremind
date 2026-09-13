@@ -46,6 +46,15 @@
 #                               release lands. Interactive runs show a picker;
 #                               --unattended requires this flag whenever more
 #                               than one context exists.
+#   --kubeconfig FILE           (kubernetes) The kubeconfig file holding that
+#                               context. Without it the picker lists the
+#                               contexts kubectl reads on its own ($KUBECONFIG,
+#                               else ~/.kube/config) plus those in every other
+#                               file under ~/.kube, and --kube-context must
+#                               name exactly one of them — sibling files often
+#                               reuse a name such as "default". Whatever file
+#                               the context came from rides every helm and
+#                               kubectl call as --kubeconfig.
 #   --kube-namespace NS         (kubernetes) Namespace for the release,
 #                               created if missing. Default: cremind.
 #   --k8s-release-name NAME     (kubernetes) Helm release name. Default:
@@ -281,6 +290,10 @@ CUSTOM_wizard_preset=""
 # PG_PASSWORD, …) are deliberately spelled differently, the same care
 # VNC_PASSWORD_INPUT and SSL_CHOICE take above.
 KUBE_CONTEXT=""
+# The kubeconfig file the context lives in; empty for the config kubectl
+# reads on its own. NOT named KUBECONFIG: that is the variable kubectl itself
+# reads, and sourcing the TUI's answers must never redirect it.
+KUBE_CONFIG_FILE=""
 KUBE_NAMESPACE=""
 K8S_release_name=""
 K8S_app_url=""
@@ -315,6 +328,8 @@ while [ $# -gt 0 ]; do
         --kubernetes)             MODE="kubernetes"; shift ;;
         --kube-context)           KUBE_CONTEXT="$2"; shift 2 ;;
         --kube-context=*)         KUBE_CONTEXT="${1#*=}"; shift ;;
+        --kubeconfig)             KUBE_CONFIG_FILE="$2"; shift 2 ;;
+        --kubeconfig=*)           KUBE_CONFIG_FILE="${1#*=}"; shift ;;
         --kube-namespace)         KUBE_NAMESPACE="$2"; shift 2 ;;
         --kube-namespace=*)       KUBE_NAMESPACE="${1#*=}"; shift ;;
         --k8s-release-name)       K8S_release_name="$2"; shift 2 ;;
@@ -640,6 +655,18 @@ if [ "$UNINSTALL" -eq 1 ]; then
         K8S_NS="$(uninstall_k8s_value KUBE_NAMESPACE)"
         K8S_REL="$(uninstall_k8s_value HELM_RELEASE)"
         K8S_NS_CREATED="$(uninstall_k8s_value NAMESPACE_CREATED)"
+        K8S_CFG="$(uninstall_k8s_value KUBE_CONFIG_FILE)"
+        K8S_SRV="$(uninstall_k8s_value KUBE_SERVER)"
+
+        # Aim every cluster call at the recorded file and context, exactly
+        # as the install did.
+        k8s_kubectl() {
+            if [ -n "$K8S_CFG" ]; then
+                kubectl --kubeconfig "$K8S_CFG" --context "$K8S_CTX" --request-timeout=20s "$@"
+            else
+                kubectl --context "$K8S_CTX" --request-timeout=20s "$@"
+            fi
+        }
 
         # Stop the background port-forward first — it holds a connection to
         # the pod we are about to delete.
@@ -655,19 +682,38 @@ if [ "$UNINSTALL" -eq 1 ]; then
 
         k8s_ctx_known=0
         if command -v kubectl >/dev/null 2>&1 && [ -n "$K8S_CTX" ]; then
-            if kubectl config get-contexts -o name 2>/dev/null | grep -qx "$K8S_CTX"; then
+            if [ -n "$K8S_CFG" ]; then
+                _k8s_ctxs="$(kubectl --kubeconfig "$K8S_CFG" config get-contexts -o name 2>/dev/null || true)"
+            else
+                _k8s_ctxs="$(kubectl config get-contexts -o name 2>/dev/null || true)"
+            fi
+            if printf '%s\n' "$_k8s_ctxs" | grep -qx "$K8S_CTX"; then
                 k8s_ctx_known=1
             fi
+            unset _k8s_ctxs
+        fi
+        # A kubeconfig edited since the install must not aim the teardown at
+        # a different cluster than the one recorded.
+        if [ "$k8s_ctx_known" -eq 1 ] && [ -n "$K8S_SRV" ]; then
+            _k8s_live="$(k8s_kubectl config view --minify -o 'jsonpath={.clusters[0].cluster.server}' 2>/dev/null || true)"
+            if [ -n "$_k8s_live" ] && [ "$_k8s_live" != "$K8S_SRV" ]; then
+                echo "Context '$K8S_CTX' now points at $_k8s_live, but the release was installed on $K8S_SRV." >&2
+                k8s_ctx_known=0
+            fi
+            unset _k8s_live
         fi
 
         if [ "$k8s_ctx_known" -eq 0 ] || ! command -v helm >/dev/null 2>&1; then
             echo "Cannot reach the cluster from here (kubectl/helm missing, or context '$K8S_CTX' is gone)." >&2
             echo "Remove the release yourself with:" >&2
-            echo "  helm uninstall $K8S_REL --kube-context $K8S_CTX -n $K8S_NS" >&2
+            echo "  helm uninstall $K8S_REL --kube-context $K8S_CTX${K8S_CFG:+ --kubeconfig '$K8S_CFG'} -n $K8S_NS" >&2
         else
-            echo "Removing Helm release $K8S_REL from namespace $K8S_NS on context $K8S_CTX..."
-            helm uninstall "$K8S_REL" --kube-context "$K8S_CTX" \
-                --namespace "$K8S_NS" --wait >/dev/null 2>&1 \
+            echo "Removing Helm release $K8S_REL from namespace $K8S_NS on context $K8S_CTX${K8S_CFG:+ ($K8S_CFG)}..."
+            set -- uninstall "$K8S_REL" --kube-context "$K8S_CTX" --namespace "$K8S_NS" --wait
+            if [ -n "$K8S_CFG" ]; then
+                set -- "$@" --kubeconfig "$K8S_CFG"
+            fi
+            helm "$@" >/dev/null 2>&1 \
                 || echo "helm uninstall reported a problem; continuing." >&2
 
             if [ "$UNINSTALL_MODE" = "purge" ]; then
@@ -676,11 +722,11 @@ if [ "$UNINSTALL" -eq 1 ]; then
                 # (cremind-postgresql), not the Helm release name.
                 echo "Deleting cluster data volumes..."
                 for _sub in postgresql qdrant chromadb; do
-                    _pvcs="$(kubectl --context "$K8S_CTX" -n "$K8S_NS" get pvc \
+                    _pvcs="$(k8s_kubectl -n "$K8S_NS" get pvc \
                         -l "app.kubernetes.io/name=$_sub" \
                         -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
                     for _pvc in $_pvcs; do
-                        kubectl --context "$K8S_CTX" -n "$K8S_NS" delete pvc "$_pvc" \
+                        k8s_kubectl -n "$K8S_NS" delete pvc "$_pvc" \
                             --ignore-not-found >/dev/null 2>&1 || true
                         echo "  removed pvc $_pvc"
                     done
@@ -689,7 +735,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
                 # Only a namespace this installer created is ours to delete.
                 if [ "$K8S_NS_CREATED" = "1" ]; then
                     echo "Deleting namespace $K8S_NS (created by the installer)..."
-                    kubectl --context "$K8S_CTX" delete namespace "$K8S_NS" \
+                    k8s_kubectl delete namespace "$K8S_NS" \
                         --ignore-not-found >/dev/null 2>&1 || true
                 else
                     echo "Namespace $K8S_NS existed before the install; leaving it in place."
@@ -822,6 +868,17 @@ for _pair in "legacy-postgres-image:$K8S_legacy_postgres_image" \
     esac
 done
 unset _pair
+if [ -n "$KUBE_CONFIG_FILE" ]; then
+    case "$KUBE_CONFIG_FILE" in
+        "~/"*) KUBE_CONFIG_FILE="${HOME:-}/${KUBE_CONFIG_FILE#\~/}" ;;
+    esac
+    if [ ! -f "$KUBE_CONFIG_FILE" ] || [ ! -r "$KUBE_CONFIG_FILE" ]; then
+        err "Invalid --kubeconfig: not a readable file: $KUBE_CONFIG_FILE"
+        exit 2
+    fi
+    # Absolute, so the path recorded for --uninstall survives a cd.
+    KUBE_CONFIG_FILE="$(cd "$(dirname "$KUBE_CONFIG_FILE")" && pwd -P)/$(basename "$KUBE_CONFIG_FILE")"
+fi
 if [ -n "$KUBE_NAMESPACE" ] && ! printf '%s' "$KUBE_NAMESPACE" | grep -Eq "$KUBE_NAME_RE"; then
     err "Invalid --kube-namespace: '$KUBE_NAMESPACE' (lowercase letters, digits and hyphens, max 63 characters)"
     exit 2
@@ -1249,42 +1306,114 @@ fi
 # Contexts are enumerated once, into a file, because the TUI needs them and
 # so does the text-fallback picker. One line per context:
 #
-#     name<TAB>server<TAB>default-namespace
+#     name<TAB>server<TAB>default-namespace<TAB>kubeconfig<TAB>current
 #
-# Two `kubectl config view` calls, not two per context: one ranges over
-# contexts (name + cluster + namespace), one over clusters (name + server),
-# and awk joins them. `kubectl config view` reads the merged kubeconfig, so a
-# KUBECONFIG naming several files is handled by kubectl rather than by us.
+# kubectl on its own reads one merged config ($KUBECONFIG, else
+# ~/.kube/config). One file per cluster dropped next to it is a common layout
+# too, and those files routinely reuse a context name ("default"), so a name
+# alone cannot identify a target. Every other regular file under ~/.kube is
+# therefore probed on its own, and each row remembers where it came from:
+# ``kubeconfig`` is empty for the ambient config and the file's path
+# otherwise, and that path then rides every helm and kubectl call as
+# --kubeconfig. ``current`` marks the ambient current-context. --kubeconfig
+# on the command line narrows all of this to the one file named.
+#
+# Two `kubectl config view` calls per file, not two per context: one ranges
+# over contexts (name + cluster + namespace), one over clusters (name +
+# server), and awk joins them.
 HAS_KUBECTL=0
 HAS_HELM=0
 KUBE_CONTEXT_COUNT=0
+KUBE_FILE_COUNT=0
 KUBE_CURRENT_CONTEXT=""
 KUBE_CONTEXTS_FILE=""
+
+# kube_view FILE JSONPATH — `kubectl config view` over FILE, or over the
+# ambient config when FILE is empty. Silent on any failure.
+kube_view() {
+    if [ -n "$1" ]; then
+        kubectl config view --kubeconfig "$1" -o "jsonpath=$2" 2>/dev/null || true
+    else
+        kubectl config view -o "jsonpath=$2" 2>/dev/null || true
+    fi
+}
+
+# kube_probe_file FILE — append FILE's contexts (the ambient config's when
+# FILE is empty) to $KUBE_CONTEXTS_FILE. A file that is not a kubeconfig, or
+# has no contexts, adds nothing.
+kube_probe_file() {
+    local _file="$1" _current="" _ctx_rows _cluster_rows
+    _ctx_rows="$(kube_view "$_file" '{range .contexts[*]}{.name}{"\t"}{.context.cluster}{"\t"}{.context.namespace}{"\n"}{end}')"
+    [ -n "$_ctx_rows" ] || return 0
+    _cluster_rows="$(kube_view "$_file" '{range .clusters[*]}{.name}{"\t"}{.cluster.server}{"\n"}{end}')"
+    if [ -z "$_file" ]; then
+        _current="$KUBE_CURRENT_CONTEXT"
+    fi
+    printf '%s\n' "$_cluster_rows" >"$KUBE_CONTEXTS_FILE.clusters"
+    # The path and the current context reach awk through the environment:
+    # -v would interpret backslashes in them.
+    printf '%s\n' "$_ctx_rows" | KUBE_ROW_FILE="$_file" KUBE_ROW_CURRENT="$_current" \
+        awk -F'\t' -v OFS='\t' '
+            NR==FNR { if ($1 != "") srv[$1] = $2; next }
+            $1 != "" {
+                cur = (ENVIRON["KUBE_ROW_CURRENT"] != "" && $1 == ENVIRON["KUBE_ROW_CURRENT"]) ? 1 : 0
+                print $1, (($2 in srv) ? srv[$2] : ""), $3, ENVIRON["KUBE_ROW_FILE"], cur
+            }
+        ' "$KUBE_CONTEXTS_FILE.clusters" - >>"$KUBE_CONTEXTS_FILE"
+    rm -f "$KUBE_CONTEXTS_FILE.clusters"
+}
+
+# kube_is_ambient FILE — is FILE one kubectl already reads on its own?
+kube_is_ambient() {
+    local _entry _list="${KUBECONFIG:-${HOME:-}/.kube/config}"
+    local IFS=':'
+    for _entry in $_list; do
+        [ -n "$_entry" ] || continue
+        if [ "$1" -ef "$_entry" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 if command -v kubectl >/dev/null 2>&1; then
-    _ctx_rows="$(kubectl config view -o 'jsonpath={range .contexts[*]}{.name}{"\t"}{.context.cluster}{"\t"}{.context.namespace}{"\n"}{end}' 2>/dev/null || true)"
-    if [ -n "$_ctx_rows" ]; then
-        _cluster_rows="$(kubectl config view -o 'jsonpath={range .clusters[*]}{.name}{"\t"}{.cluster.server}{"\n"}{end}' 2>/dev/null || true)"
-        KUBE_CONTEXTS_FILE="$CREMIND_INSTALL_DIR/.kube-contexts"
-        (
-            umask 077
-            printf '%s\n' "$_cluster_rows" >"$KUBE_CONTEXTS_FILE.clusters"
-            printf '%s\n' "$_ctx_rows" | awk -F'\t' -v OFS='\t' '
-                NR==FNR { if ($1 != "") srv[$1] = $2; next }
-                $1 != "" { print $1, (($2 in srv) ? srv[$2] : ""), $3 }
-            ' "$KUBE_CONTEXTS_FILE.clusters" - >"$KUBE_CONTEXTS_FILE"
-        )
-        rm -f "$KUBE_CONTEXTS_FILE.clusters"
-        KUBE_CONTEXT_COUNT="$(grep -c . "$KUBE_CONTEXTS_FILE" 2>/dev/null || true)"
-        [ -n "$KUBE_CONTEXT_COUNT" ] || KUBE_CONTEXT_COUNT=0
+    KUBE_CONTEXTS_FILE="$CREMIND_INSTALL_DIR/.kube-contexts"
+    ( umask 077; : >"$KUBE_CONTEXTS_FILE" )
+    if [ -n "$KUBE_CONFIG_FILE" ]; then
+        # --kubeconfig: that file and nothing else.
+        kube_probe_file "$KUBE_CONFIG_FILE"
+    else
         # Exits 1 with "current-context is not set" when there is none; that
         # is a normal state, not an error.
         KUBE_CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
+        kube_probe_file ""
+        for _kube_file in "${HOME:-}/.kube"/*; do
+            [ -f "$_kube_file" ] && [ -r "$_kube_file" ] || continue
+            if kube_is_ambient "$_kube_file"; then
+                continue
+            fi
+            # A kubeconfig is a few KB; skip anything that plainly is not one.
+            [ "$(wc -c <"$_kube_file" | tr -d ' ')" -le 1048576 ] || continue
+            kube_probe_file "$_kube_file"
+        done
+        unset _kube_file
     fi
+    KUBE_CONTEXT_COUNT="$(grep -c . "$KUBE_CONTEXTS_FILE" 2>/dev/null || true)"
+    [ -n "$KUBE_CONTEXT_COUNT" ] || KUBE_CONTEXT_COUNT=0
+    KUBE_FILE_COUNT="$(cut -f4 "$KUBE_CONTEXTS_FILE" 2>/dev/null | sort -u | grep -c '' || true)"
+    [ -n "$KUBE_FILE_COUNT" ] || KUBE_FILE_COUNT=0
     if [ "$KUBE_CONTEXT_COUNT" -ge 1 ]; then
         HAS_KUBECTL=1
-        ok "kubectl: $KUBE_CONTEXT_COUNT context(s)${KUBE_CURRENT_CONTEXT:+, current: $KUBE_CURRENT_CONTEXT}"
+        _kube_files_note=""
+        if [ "$KUBE_FILE_COUNT" -gt 1 ]; then
+            _kube_files_note=" in $KUBE_FILE_COUNT kubeconfig files"
+        fi
+        ok "kubectl: $KUBE_CONTEXT_COUNT context(s)${_kube_files_note}${KUBE_CURRENT_CONTEXT:+, current: $KUBE_CURRENT_CONTEXT}"
+        unset _kube_files_note
+    elif [ -n "$KUBE_CONFIG_FILE" ]; then
+        info "kubectl: found, but $KUBE_CONFIG_FILE has no contexts"
     else
-        info "kubectl: found, but the kubeconfig has no contexts"
+        info "kubectl: found, but no kubeconfig context turned up (checked kubectl's own config and ~/.kube/*)"
     fi
 else
     info "kubectl: not detected"
@@ -1387,6 +1516,8 @@ read_prev_vnc_password
 K8S_DIR="$CREMIND_INSTALL_DIR/k8s"
 K8S_RELEASE_ENV="$K8S_DIR/release.env"
 PREV_K8S_KUBE_CONTEXT=""
+PREV_K8S_KUBE_CONFIG_FILE=""
+PREV_K8S_KUBE_SERVER=""
 PREV_K8S_KUBE_NAMESPACE=""
 PREV_K8S_NAMESPACE_CREATED=""
 PREV_K8S_HELM_RELEASE=""
@@ -1408,6 +1539,8 @@ read_k8s_env_value() {
 read_k8s_release_env() {
     [ -f "$K8S_RELEASE_ENV" ] || return 0
     PREV_K8S_KUBE_CONTEXT="$(read_k8s_env_value KUBE_CONTEXT)"
+    PREV_K8S_KUBE_CONFIG_FILE="$(read_k8s_env_value KUBE_CONFIG_FILE)"
+    PREV_K8S_KUBE_SERVER="$(read_k8s_env_value KUBE_SERVER)"
     PREV_K8S_KUBE_NAMESPACE="$(read_k8s_env_value KUBE_NAMESPACE)"
     PREV_K8S_NAMESPACE_CREATED="$(read_k8s_env_value NAMESPACE_CREATED)"
     PREV_K8S_HELM_RELEASE="$(read_k8s_env_value HELM_RELEASE)"
@@ -1497,7 +1630,7 @@ tui_run_bootstrap() {
             --wizard-preset "$CUSTOM_wizard_preset" \
             --electron-version "$ELECTRON_VERSION" \
             --in-container "$IN_CONTAINER" \
-            --has-docker "$HAS_DOCKER"             --has-kubectl "$HAS_KUBECTL"             --has-helm "$HAS_HELM"             --kube-contexts-file "$KUBE_CONTEXTS_FILE"             --kube-current-context "$KUBE_CURRENT_CONTEXT"             --kube-context "$KUBE_CONTEXT"             --kube-namespace "$KUBE_NAMESPACE"             --k8s-release-name "$K8S_release_name"             --k8s-app-url "$K8S_app_url"             --k8s-legacy-postgres-image "$K8S_legacy_postgres_image"             --k8s-delete-postgres-data "$K8S_delete_postgres_data"             --k8s-extra-set "$K8S_extra_set" \
+            --has-docker "$HAS_DOCKER"             --has-kubectl "$HAS_KUBECTL"             --has-helm "$HAS_HELM"             --kube-contexts-file "$KUBE_CONTEXTS_FILE"             --kube-context "$KUBE_CONTEXT"             --kubeconfig "$KUBE_CONFIG_FILE"             --kube-namespace "$KUBE_NAMESPACE"             --k8s-release-name "$K8S_release_name"             --k8s-app-url "$K8S_app_url"             --k8s-legacy-postgres-image "$K8S_legacy_postgres_image"             --k8s-delete-postgres-data "$K8S_delete_postgres_data"             --k8s-extra-set "$K8S_extra_set" \
             </dev/tty >/dev/tty || rc=$?
     else
         "$UV_BIN" run --quiet --python 3.13 \
@@ -1523,7 +1656,7 @@ tui_run_bootstrap() {
             --wizard-preset "$CUSTOM_wizard_preset" \
             --electron-version "$ELECTRON_VERSION" \
             --in-container "$IN_CONTAINER" \
-            --has-docker "$HAS_DOCKER"             --has-kubectl "$HAS_KUBECTL"             --has-helm "$HAS_HELM"             --kube-contexts-file "$KUBE_CONTEXTS_FILE"             --kube-current-context "$KUBE_CURRENT_CONTEXT"             --kube-context "$KUBE_CONTEXT"             --kube-namespace "$KUBE_NAMESPACE"             --k8s-release-name "$K8S_release_name"             --k8s-app-url "$K8S_app_url"             --k8s-legacy-postgres-image "$K8S_legacy_postgres_image"             --k8s-delete-postgres-data "$K8S_delete_postgres_data"             --k8s-extra-set "$K8S_extra_set" \
+            --has-docker "$HAS_DOCKER"             --has-kubectl "$HAS_KUBECTL"             --has-helm "$HAS_HELM"             --kube-contexts-file "$KUBE_CONTEXTS_FILE"             --kube-context "$KUBE_CONTEXT"             --kubeconfig "$KUBE_CONFIG_FILE"             --kube-namespace "$KUBE_NAMESPACE"             --k8s-release-name "$K8S_release_name"             --k8s-app-url "$K8S_app_url"             --k8s-legacy-postgres-image "$K8S_legacy_postgres_image"             --k8s-delete-postgres-data "$K8S_delete_postgres_data"             --k8s-extra-set "$K8S_extra_set" \
             </dev/tty >/dev/tty || rc=$?
     fi
 
@@ -1939,37 +2072,74 @@ fi
 if [ "$MODE" = "kubernetes" ]; then
     step "Kubernetes target"
 
-    kube_context_row() {
-        # kube_context_row NAME FIELD(2=server|3=namespace)
-        awk -F'\t' -v want="$1" -v col="$2" '$1 == want { print $col; exit }' \
+    # Rows are name<TAB>server<TAB>namespace<TAB>kubeconfig<TAB>current, and a
+    # row is addressed by its position: sibling kubeconfig files reuse
+    # context names ("default"), so a name alone can be ambiguous.
+    kube_row_field() {
+        # kube_row_field ROW COL(1=name|2=server|3=namespace|4=kubeconfig)
+        awk -F'\t' -v row="$1" -v col="$2" 'NF { n++ } n == row { print $col; exit }' \
             "$KUBE_CONTEXTS_FILE"
     }
-    kube_context_known() {
-        awk -F'\t' -v want="$1" '$1 == want { found = 1 } END { exit found ? 0 : 1 }' \
-            "$KUBE_CONTEXTS_FILE"
+    kube_rows_named() {
+        # kube_rows_named NAME [FILE] — the positions of every row called
+        # NAME; with FILE given ("" = the ambient config), only in that file.
+        KUBE_WANT_NAME="$1" KUBE_WANT_FILE="${2-}" KUBE_BY_FILE="$#" \
+            awk -F'\t' 'NF { n++ }
+                $1 == ENVIRON["KUBE_WANT_NAME"] && (ENVIRON["KUBE_BY_FILE"] != "2" || $4 == ENVIRON["KUBE_WANT_FILE"]) { print n }' \
+                "$KUBE_CONTEXTS_FILE"
     }
     print_kube_contexts() {
-        local idx=0 name server namespace marker
-        while IFS="$(printf '\t')" read -r name server namespace; do
-            [ -n "$name" ] || continue
-            idx=$((idx + 1))
-            marker=""
-            [ "$name" = "$KUBE_CURRENT_CONTEXT" ] && marker="  ${DIM}[current]${RESET}"
-            printf '  %s%d)%s %s %s— %s (%s)%s%s\n' \
-                "$BOLD" "$idx" "$RESET" "$name" \
-                "$DIM" "${server:-server unknown}" "${namespace:-default}" "$RESET" "$marker"
-        done <"$KUBE_CONTEXTS_FILE"
+        # awk rather than `read`: a tab-separated row with an empty field
+        # (the ambient rows carry no kubeconfig) collapses under IFS.
+        awk -F'\t' -v bold="$BOLD" -v dim="$DIM" -v reset="$RESET" \
+            -v files="$KUBE_FILE_COUNT" -v home="${HOME:-}" '
+            NF {
+                n++
+                server = ($2 != "") ? $2 : "server unknown"
+                ns = ($3 != "") ? $3 : "default"
+                where = ""
+                if (files > 1) {
+                    file = ($4 != "") ? $4 : "default kubeconfig"
+                    if (home != "" && index(file, home "/") == 1) file = "~" substr(file, length(home) + 1)
+                    where = "  " dim file reset
+                }
+                marker = ($5 == "1") ? "  " dim "[current]" reset : ""
+                printf "  %s%d)%s %s %s— %s (%s)%s%s%s\n", bold, n, reset, $1, dim, server, ns, reset, where, marker
+            }' "$KUBE_CONTEXTS_FILE"
     }
 
+    kube_row=""
     if [ -n "$KUBE_CONTEXT" ]; then
-        if ! kube_context_known "$KUBE_CONTEXT"; then
-            err "Unknown kubeconfig context: $KUBE_CONTEXT"
-            err "Available contexts:"
-            print_kube_contexts >&2
-            exit 2
+        # The TUI settles the file along with the name (as does --kubeconfig,
+        # which narrowed the rows to one file); a bare --kube-context has to
+        # name exactly one row across every file.
+        if [ -n "$KUBE_CONFIG_FILE" ] || [ "$TUI_APPLIED" -eq 1 ]; then
+            kube_matches="$(kube_rows_named "$KUBE_CONTEXT" "$KUBE_CONFIG_FILE")"
+        else
+            kube_matches="$(kube_rows_named "$KUBE_CONTEXT")"
         fi
+        case "$(printf '%s\n' "$kube_matches" | grep -c .)" in
+            1)
+                kube_row="$kube_matches"
+                ;;
+            0)
+                err "Unknown kubeconfig context: $KUBE_CONTEXT"
+                err "Available contexts:"
+                print_kube_contexts >&2
+                exit 2
+                ;;
+            *)
+                err "Context '$KUBE_CONTEXT' exists in several kubeconfig files; add --kubeconfig FILE to say which:"
+                for _row in $kube_matches; do
+                    err "  --kubeconfig '$(kube_row_field "$_row" 4)'  ($(kube_row_field "$_row" 2))"
+                done
+                unset _row
+                exit 2
+                ;;
+        esac
+        unset kube_matches
     elif [ "$KUBE_CONTEXT_COUNT" -eq 1 ]; then
-        KUBE_CONTEXT="$(awk -F'\t' 'NF { print $1; exit }' "$KUBE_CONTEXTS_FILE")"
+        kube_row=1
     elif [ "$UNATTENDED" -eq 1 ] || [ ! -e /dev/tty ]; then
         err "--kube-context is required: the kubeconfig has $KUBE_CONTEXT_COUNT contexts and"
         err "an unattended install must not guess which cluster to install into."
@@ -1981,25 +2151,38 @@ if [ "$MODE" = "kubernetes" ]; then
         [ -n "$K8S_CONTEXT_HINT" ] && printf '  %s%s%s\n' "$DIM" "$K8S_CONTEXT_HINT" "$RESET"
         print_kube_contexts
         # Default to the current context's position, or 1 when there is none.
-        ctx_default_idx=1
-        if [ -n "$KUBE_CURRENT_CONTEXT" ]; then
-            ctx_default_idx="$(awk -F'\t' -v want="$KUBE_CURRENT_CONTEXT" \
-                'NF { n++ } $1 == want { print n; found = 1; exit } END { if (!found) print 1 }' \
-                "$KUBE_CONTEXTS_FILE")"
-        fi
+        ctx_default_idx="$(awk -F'\t' \
+            'NF { n++ } $5 == "1" { print n; found = 1; exit } END { if (!found) print 1 }' \
+            "$KUBE_CONTEXTS_FILE")"
         while :; do
             read -r -p "Choice [$ctx_default_idx]: " choice </dev/tty || choice=""
             choice="${choice:-$ctx_default_idx}"
-            KUBE_CONTEXT="$(awk -F'\t' -v want="$choice" \
-                'NF { n++; if (n == want + 0 || $1 == want) { print $1; exit } }' \
-                "$KUBE_CONTEXTS_FILE")"
-            [ -n "$KUBE_CONTEXT" ] && break
-            warn "Pick a number from the list, or a context name."
+            case "$choice" in
+                *[!0-9]*)
+                    kube_matches="$(kube_rows_named "$choice")"
+                    case "$(printf '%s\n' "$kube_matches" | grep -c .)" in
+                        1) kube_row="$kube_matches" ;;
+                        0) warn "Pick a number from the list, or a context name." ;;
+                        *) warn "'$choice' is in several files; pick its number." ;;
+                    esac
+                    ;;
+                *)
+                    if [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le "$KUBE_CONTEXT_COUNT" ]; then
+                        kube_row="$choice"
+                    else
+                        warn "Pick a number from the list, or a context name."
+                    fi
+                    ;;
+            esac
+            [ -n "$kube_row" ] && break
         done
-        unset ctx_default_idx
+        unset ctx_default_idx choice kube_matches
     fi
-    KUBE_SERVER="$(kube_context_row "$KUBE_CONTEXT" 2)"
-    ok "Context: $KUBE_CONTEXT${KUBE_SERVER:+ ($KUBE_SERVER)}"
+    KUBE_CONTEXT="$(kube_row_field "$kube_row" 1)"
+    KUBE_SERVER="$(kube_row_field "$kube_row" 2)"
+    KUBE_CONFIG_FILE="$(kube_row_field "$kube_row" 4)"
+    unset kube_row
+    ok "Context: $KUBE_CONTEXT${KUBE_SERVER:+ ($KUBE_SERVER)}${KUBE_CONFIG_FILE:+ from $KUBE_CONFIG_FILE}"
 
     if [ -z "$KUBE_NAMESPACE" ]; then
         ns_default="${PREV_K8S_KUBE_NAMESPACE:-$K8S_NAMESPACE_DEFAULT}"
@@ -2121,6 +2304,9 @@ if [ "$MODE" = "kubernetes" ]; then
         printf '%sAbout to install into:%s\n' "$BOLD" "$RESET"
         printf '  context    %s\n' "$KUBE_CONTEXT"
         printf '  server     %s\n' "${KUBE_SERVER:-(unknown)}"
+        if [ -n "$KUBE_CONFIG_FILE" ]; then
+            printf '  kubeconfig %s\n' "$KUBE_CONFIG_FILE"
+        fi
         printf '  namespace  %s\n' "$KUBE_NAMESPACE"
         printf '  release    %s\n\n' "$K8S_release_name"
         read -r -p "Install into this cluster? [y/N]: " ans </dev/tty || ans=""
@@ -2722,7 +2908,8 @@ resolve_version() {
 #
 # Installs the Cremind Helm chart into the kubeconfig context the operator
 # chose. Nothing about this install is ambient: every helm and kubectl call
-# carries --kube-context, so a stale current-context can never redirect it.
+# carries --kube-context (and --kubeconfig, for a context from a sibling
+# file), so a stale current-context can never redirect it.
 #
 # What this branch does NOT do, deliberately: write a host .env, register a
 # boot service, or run migrations. The chart owns the pod's environment
@@ -2736,25 +2923,53 @@ if [ "$MODE" = "kubernetes" ]; then
 
     # Every kubectl call goes through this. --request-timeout keeps an
     # unreachable API server (or an exec credential plugin waiting on a
-    # browser) from looking like a frozen installer.
+    # browser) from looking like a frozen installer. The kubeconfig file is
+    # named too whenever the context came from one kubectl would not read on
+    # its own (see the probe above).
     kc() {
-        kubectl --context "$KUBE_CONTEXT" --request-timeout=20s "$@"
+        if [ -n "$KUBE_CONFIG_FILE" ]; then
+            kubectl --kubeconfig "$KUBE_CONFIG_FILE" --context "$KUBE_CONTEXT" --request-timeout=20s "$@"
+        else
+            kubectl --context "$KUBE_CONTEXT" --request-timeout=20s "$@"
+        fi
     }
     kcn() {
         kc --namespace "$KUBE_NAMESPACE" "$@"
     }
+    # Every helm call that reaches the cluster goes through this, for the
+    # same reason.
+    hc() {
+        if [ -n "$KUBE_CONFIG_FILE" ]; then
+            helm --kubeconfig "$KUBE_CONFIG_FILE" --kube-context "$KUBE_CONTEXT" "$@"
+        else
+            helm --kube-context "$KUBE_CONTEXT" "$@"
+        fi
+    }
+    # The same targeting, spelled out for the commands printed to the operator.
+    HELM_TARGET_FLAGS="--kube-context $KUBE_CONTEXT${KUBE_CONFIG_FILE:+ --kubeconfig '$KUBE_CONFIG_FILE'}"
+    KUBECTL_TARGET_FLAGS="--context $KUBE_CONTEXT${KUBE_CONFIG_FILE:+ --kubeconfig '$KUBE_CONFIG_FILE'}"
 
     HELM_RELEASE="${K8S_release_name:-cremind}"
 
     # A host tracks one release. Re-running against a different target would
     # leave the previous one behind with nothing recording it, so say so.
     if [ -f "$K8S_RELEASE_ENV" ] && [ -n "$PREV_K8S_HELM_RELEASE" ]; then
-        if [ "$PREV_K8S_KUBE_CONTEXT" != "$KUBE_CONTEXT" ] \
+        # Same API server, same cluster — whichever file or context name
+        # reaches it this time. Names are the fallback when a server is unknown.
+        k8s_same_cluster=0
+        if [ -n "$PREV_K8S_KUBE_SERVER" ] && [ -n "$KUBE_SERVER" ]; then
+            if [ "$PREV_K8S_KUBE_SERVER" = "$KUBE_SERVER" ]; then
+                k8s_same_cluster=1
+            fi
+        elif [ "$PREV_K8S_KUBE_CONTEXT" = "$KUBE_CONTEXT" ]; then
+            k8s_same_cluster=1
+        fi
+        if [ "$k8s_same_cluster" -eq 0 ] \
            || [ "$PREV_K8S_KUBE_NAMESPACE" != "$KUBE_NAMESPACE" ] \
            || [ "$PREV_K8S_HELM_RELEASE" != "$HELM_RELEASE" ]; then
             warn "This machine already tracks a Cremind release:"
-            warn "  $PREV_K8S_HELM_RELEASE in namespace $PREV_K8S_KUBE_NAMESPACE on context $PREV_K8S_KUBE_CONTEXT"
-            warn "You are about to install $HELM_RELEASE in $KUBE_NAMESPACE on $KUBE_CONTEXT."
+            warn "  $PREV_K8S_HELM_RELEASE in namespace $PREV_K8S_KUBE_NAMESPACE on context $PREV_K8S_KUBE_CONTEXT${PREV_K8S_KUBE_SERVER:+ ($PREV_K8S_KUBE_SERVER)}"
+            warn "You are about to install $HELM_RELEASE in $KUBE_NAMESPACE on $KUBE_CONTEXT${KUBE_SERVER:+ ($KUBE_SERVER)}."
             if [ "$UNATTENDED" -eq 1 ] || [ ! -e /dev/tty ]; then
                 err "Refusing to orphan the tracked release. Run --uninstall first, or pass the same target."
                 exit 2
@@ -2898,8 +3113,7 @@ if [ "$MODE" = "kubernetes" ]; then
         *,postgresql.enabled=false,*) K8S_EXTERNAL_PG=1 ;;
     esac
     RELEASE_EXISTS=0
-    if helm status "$HELM_RELEASE" --kube-context "$KUBE_CONTEXT" \
-            --namespace "$KUBE_NAMESPACE" >/dev/null 2>&1; then
+    if hc status "$HELM_RELEASE" --namespace "$KUBE_NAMESPACE" >/dev/null 2>&1; then
         RELEASE_EXISTS=1
     fi
     if [ "$K8S_EXTERNAL_PG" -eq 0 ]; then
@@ -2940,7 +3154,7 @@ if [ "$MODE" = "kubernetes" ]; then
                 err "and its password is not recorded on this machine. A fresh install would"
                 err "write a new password that the retained database does not accept."
                 err "Either delete it:"
-                err "  kubectl --context $KUBE_CONTEXT -n $KUBE_NAMESPACE delete pvc $pg_pvc"
+                err "  kubectl $KUBECTL_TARGET_FLAGS -n $KUBE_NAMESPACE delete pvc $pg_pvc"
                 err "or re-run with --k8s-postgres-password <the old password>."
                 exit 1
             fi
@@ -3053,8 +3267,7 @@ if [ "$MODE" = "kubernetes" ]; then
     # (an exact --version already bypasses the prerelease filter).
     if [ "$RELEASE_EXISTS" -eq 1 ] && [ "$REINSTALL" -eq 1 ]; then
         info "Removing release $HELM_RELEASE (--reinstall)"
-        helm uninstall "$HELM_RELEASE" --kube-context "$KUBE_CONTEXT" \
-            --namespace "$KUBE_NAMESPACE" --wait >>"$LOG_FILE" 2>&1 || true
+        hc uninstall "$HELM_RELEASE" --namespace "$KUBE_NAMESPACE" --wait >>"$LOG_FILE" 2>&1 || true
         RELEASE_EXISTS=0
     elif [ "$RELEASE_EXISTS" -eq 1 ]; then
         info "Release $HELM_RELEASE already exists — upgrading it in place."
@@ -3072,20 +3285,20 @@ if [ "$MODE" = "kubernetes" ]; then
 
     info "Installing the chart (this pulls images; give it a few minutes)"
     set -- upgrade --install "$HELM_RELEASE" "$CHART_REF" \
-        --kube-context "$KUBE_CONTEXT" \
         --namespace "$KUBE_NAMESPACE" --create-namespace \
         --history-max 5 \
         -f "$K8S_VALUES_FILE"
     [ -n "$CHART_VERSION" ] && set -- "$@" --version "$CHART_VERSION"
     # Last, so an operator's --set overrides the installer's own values.
     [ -n "$K8S_extra_set" ] && set -- "$@" --set "$K8S_extra_set"
-    if ! helm "$@" >>"$LOG_FILE" 2>&1; then
+    # hc adds the cluster targeting (--kube-context, --kubeconfig).
+    if ! hc "$@" >>"$LOG_FILE" 2>&1; then
         err "helm upgrade --install failed. The last lines of $LOG_FILE:"
         tail -n 30 "$LOG_FILE" >&2 || true
         err ""
         err "Common causes: a chart value the cluster rejects (see --k8s-extra-set),"
         err "an unreachable image registry, or insufficient quota."
-        err "Inspect with: helm status $HELM_RELEASE --kube-context $KUBE_CONTEXT -n $KUBE_NAMESPACE"
+        err "Inspect with: helm status $HELM_RELEASE $HELM_TARGET_FLAGS -n $KUBE_NAMESPACE"
         exit 1
     fi
     ok "Chart installed."
@@ -3115,7 +3328,7 @@ if [ "$MODE" = "kubernetes" ]; then
             if ! kcn rollout status "statefulset/$pg_sts" --timeout=5m 2>&1 | tee -a "$LOG_FILE"; then
                 warn "PostgreSQL did not become ready within 5 minutes."
                 warn "A Pending volume usually means the cluster has no default StorageClass:"
-                warn "  kubectl --context $KUBE_CONTEXT -n $KUBE_NAMESPACE get pvc"
+                warn "  kubectl $KUBECTL_TARGET_FLAGS -n $KUBE_NAMESPACE get pvc"
             fi
         fi
         unset pg_sts
@@ -3129,7 +3342,7 @@ if [ "$MODE" = "kubernetes" ]; then
         err ""
         err "ImagePullBackOff  → the image tag is not published, or the registry is unreachable."
         err "Pending           → the node needs 2 CPU and 2Gi free for the desktop image."
-        err "CrashLoopBackOff  → kubectl --context $KUBE_CONTEXT -n $KUBE_NAMESPACE logs deploy/$HELM_FULLNAME -c cremind"
+        err "CrashLoopBackOff  → kubectl $KUBECTL_TARGET_FLAGS -n $KUBE_NAMESPACE logs deploy/$HELM_FULLNAME -c cremind"
         err ""
         err "The release is installed; re-running this installer upgrades it in place."
         exit 1
@@ -3148,7 +3361,7 @@ if [ "$MODE" = "kubernetes" ]; then
     case " $K8S_SERVICE_PORTS " in
         *" 6080 "*) PF_PORTS="$PF_PORTS 6080:6080" ;;
     esac
-    PORT_FORWARD_CMD="kubectl --context $KUBE_CONTEXT --namespace $KUBE_NAMESPACE port-forward svc/$HELM_FULLNAME $PF_PORTS"
+    PORT_FORWARD_CMD="kubectl $KUBECTL_TARGET_FLAGS --namespace $KUBE_NAMESPACE port-forward svc/$HELM_FULLNAME $PF_PORTS"
     K8S_NOVNC_URL="$(kcn get configmap "$HELM_FULLNAME-env" \
         -o 'jsonpath={.data.CREMIND_NOVNC_URL}' 2>/dev/null || true)"
     K8S_POD_APP_URL="$(kcn get configmap "$HELM_FULLNAME-env" \
@@ -3189,8 +3402,13 @@ if [ "$MODE" = "kubernetes" ]; then
             warn "  $PORT_FORWARD_CMD"
         else
             info "Starting the port-forward in the background"
-            nohup kubectl --context "$KUBE_CONTEXT" --namespace "$KUBE_NAMESPACE" \
-                port-forward "svc/$HELM_FULLNAME" $PF_PORTS >"$PF_LOG_FILE" 2>&1 &
+            if [ -n "$KUBE_CONFIG_FILE" ]; then
+                nohup kubectl --kubeconfig "$KUBE_CONFIG_FILE" --context "$KUBE_CONTEXT" --namespace "$KUBE_NAMESPACE" \
+                    port-forward "svc/$HELM_FULLNAME" $PF_PORTS >"$PF_LOG_FILE" 2>&1 &
+            else
+                nohup kubectl --context "$KUBE_CONTEXT" --namespace "$KUBE_NAMESPACE" \
+                    port-forward "svc/$HELM_FULLNAME" $PF_PORTS >"$PF_LOG_FILE" 2>&1 &
+            fi
             echo $! >"$PF_PID_FILE"
             disown 2>/dev/null || true
             PF_RUNNING=1
@@ -3239,6 +3457,7 @@ if [ "$MODE" = "kubernetes" ]; then
             printf '# Cremind Kubernetes release, written by the installer.\n'
             printf '# Read by install.sh / install.ps1; never sourced.\n'
             printf 'KUBE_CONTEXT=%s\n' "$KUBE_CONTEXT"
+            printf 'KUBE_CONFIG_FILE=%s\n' "$KUBE_CONFIG_FILE"
             printf 'KUBE_SERVER=%s\n' "$KUBE_SERVER"
             printf 'KUBE_NAMESPACE=%s\n' "$KUBE_NAMESPACE"
             printf 'NAMESPACE_CREATED=%s\n' "$NAMESPACE_CREATED"
@@ -3304,6 +3523,7 @@ if [ "$MODE" = "kubernetes" ]; then
             fi
             printf '[kubernetes]\n'
             printf 'context = "%s"\n' "$KUBE_CONTEXT"
+            printf "kubeconfig = '%s'\n" "$KUBE_CONFIG_FILE"
             printf 'server = "%s"\n' "$KUBE_SERVER"
             printf 'namespace = "%s"\n' "$KUBE_NAMESPACE"
             printf 'release = "%s"\n' "$HELM_RELEASE"
@@ -3361,8 +3581,8 @@ EOF
     cat <<EOF
 
   ${BOLD}Manage the release:${RESET}
-    helm status $HELM_RELEASE --kube-context $KUBE_CONTEXT -n $KUBE_NAMESPACE
-    kubectl --context $KUBE_CONTEXT -n $KUBE_NAMESPACE logs deploy/$HELM_FULLNAME -c cremind -f
+    helm status $HELM_RELEASE $HELM_TARGET_FLAGS -n $KUBE_NAMESPACE
+    kubectl $KUBECTL_TARGET_FLAGS -n $KUBE_NAMESPACE logs deploy/$HELM_FULLNAME -c cremind -f
     bash ${BASH_SOURCE[0]:-install.sh} --uninstall
 
   ${BOLD}Credentials:${RESET} $K8S_CREDENTIALS_FILE

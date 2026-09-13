@@ -95,6 +95,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # value short-circuits its screen); the capability/context flags are
     # context only and are never written back.
     p.add_argument("--kube-context", default="", dest="kube_context")
+    p.add_argument("--kubeconfig", default="", dest="kube_config_file")
     p.add_argument("--kube-namespace", default="", dest="kube_namespace")
     p.add_argument("--k8s-release-name", default="", dest="k8s_release_name")
     p.add_argument("--k8s-app-url", default="", dest="k8s_app_url")
@@ -126,12 +127,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--kube-contexts-file",
         default="",
-        help="File of kubeconfig contexts, one per line: name<TAB>server<TAB>namespace.",
-    )
-    p.add_argument(
-        "--kube-current-context",
-        default="",
-        help="The kubeconfig's current-context, preselected in the picker.",
+        help="File of kubeconfig contexts, one per line: "
+             "name<TAB>server<TAB>namespace<TAB>kubeconfig<TAB>current.",
     )
     return p
 
@@ -176,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
         custom_allowed_origins=args.custom_allowed_origins,
         custom_wizard_preset=args.custom_wizard_preset,
         kube_context=args.kube_context,
+        kube_config_file=args.kube_config_file,
         kube_namespace=args.kube_namespace,
         k8s_release_name=args.k8s_release_name,
         k8s_app_url=args.k8s_app_url,
@@ -193,7 +191,6 @@ def main(argv: list[str] | None = None) -> int:
             has_kubectl=args.has_kubectl == "1",
             has_helm=args.has_helm == "1",
             kube_contexts=_read_kube_contexts(args.kube_contexts_file),
-            kube_current_context=args.kube_current_context,
             electron_version=args.electron_version,
             vnc_password_preset=args.vnc_password_set == "1",
             ssl_inherited=args.ssl_inherited == "1",

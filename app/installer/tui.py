@@ -657,42 +657,74 @@ def screen_mode(state: TuiResult, ctx: "Context") -> ScreenResult:
 # ── kubernetes mode ──────────────────────────────────────────────────────
 #
 # The context list cannot be a catalog `choices` array: it is probed at run
-# time. install.sh / install.ps1 enumerate `kubectl config view` before
-# launching the TUI and hand the result over as a file, one context per line:
+# time. install.sh / install.ps1 enumerate the kubeconfigs before launching
+# the TUI and hand the result over as a file, one context per line:
 #
-#     name<TAB>server<TAB>default-namespace
+#     name<TAB>server<TAB>default-namespace<TAB>kubeconfig<TAB>current
 #
-# Empty fields are allowed (a context may declare no namespace, and a cluster
-# entry may be missing), so only the name is required.
+# ``kubeconfig`` is empty for the config kubectl reads on its own
+# ($KUBECONFIG, else ~/.kube/config) and the file's path for a sibling file
+# the shell found under ~/.kube. Those files routinely reuse a context name
+# ("default"), so a row is identified by (kubeconfig, name), never by the
+# name alone. ``current`` is 1 on the ambient current-context. Only the name
+# is required — a three-column line still parses.
 
 
 class KubeContext(NamedTuple):
     name: str
-    server: str
-    namespace: str
+    server: str = ""
+    namespace: str = ""
+    kubeconfig: str = ""
+    current: bool = False
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """What identifies a target: sibling files may reuse a context name."""
+        return (self.kubeconfig, self.name)
 
 
 def parse_kube_contexts(text: str) -> tuple[KubeContext, ...]:
     """Parse the shell's contexts file. Blank and duplicate rows are dropped."""
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     out: list[KubeContext] = []
     for raw in (text or "").splitlines():
         line = raw.rstrip("\r")
         if not line.strip():
             continue
-        parts = line.split("\t")
-        name = parts[0].strip()
-        if not name or name in seen:
+        parts = [part.strip() for part in line.split("\t")]
+        parts += [""] * (5 - len(parts))
+        name, server, namespace, kubeconfig, current = parts[:5]
+        if not name or (kubeconfig, name) in seen:
             continue
-        seen.add(name)
+        seen.add((kubeconfig, name))
         out.append(
             KubeContext(
                 name=name,
-                server=parts[1].strip() if len(parts) > 1 else "",
-                namespace=parts[2].strip() if len(parts) > 2 else "",
+                server=server,
+                namespace=namespace,
+                kubeconfig=kubeconfig,
+                current=current == "1",
             )
         )
     return tuple(out)
+
+
+def kubeconfig_label(path: str, home: str | None = None) -> str:
+    """A kubeconfig path as the operator would type it: ``~`` for home.
+
+    ``home`` exists for tests; the real one is :meth:`Path.home`.
+    """
+    if not path:
+        return "default kubeconfig"
+    root = home if home is not None else str(Path.home())
+    if (
+        root
+        and len(path) > len(root)
+        and path.startswith(root)
+        and path[len(root)] in "/\\"
+    ):
+        return "~" + path[len(root):]
+    return path
 
 
 # An RFC 1123 label, which is what Kubernetes accepts for a namespace and
@@ -738,17 +770,33 @@ def validate_helm_release_name(value: str) -> str | None:
 def screen_kube_context(state: TuiResult, ctx: "Context") -> ScreenResult:
     """Pick the cluster. The whole point of the mode's safety story.
 
-    Whatever is chosen here is passed as ``--kube-context`` on every helm and
-    kubectl call the installer makes, so the ambient current-context never
-    decides where a release lands. Each row carries the API server because
-    two contexts can look alike by name and point at different clusters — or
-    at the same one.
+    Whatever is chosen here is passed as ``--kube-context`` — and, for a
+    context from a sibling kubeconfig file, ``--kubeconfig`` — on every helm
+    and kubectl call the installer makes, so the ambient current-context
+    never decides where a release lands. Each row carries the API server
+    because two contexts can look alike by name and point at different
+    clusters — or at the same one — and names its file when more than one
+    file is in play, because sibling files reuse context names.
     """
     if state.mode != "kubernetes":
         return state, "skip"
+
+    rows = list(ctx.kube_contexts)
+    if state.kube_config_file:
+        # --kubeconfig narrowed the shell's probe to that file; mirror it.
+        narrowed = [k for k in rows if k.kubeconfig == state.kube_config_file]
+        rows = narrowed or rows
     if state.kube_context:
-        return state, "skip"
-    if not ctx.kube_contexts:
+        matches = [k for k in rows if k.name == state.kube_context]
+        if state.kube_config_file or len(matches) <= 1:
+            # Settled — or unknown, which the shell rejects with the full
+            # list. Record the file the name resolved to and move on.
+            if matches:
+                state = replace(state, kube_config_file=matches[0].kubeconfig)
+            return state, "skip"
+        # The name exists in several files: ask which, and only that.
+        rows = matches
+    if not rows:
         _message(
             title="No kubeconfig contexts",
             text=(
@@ -762,29 +810,50 @@ def screen_kube_context(state: TuiResult, ctx: "Context") -> ScreenResult:
         return state, ("back" if ctx.can_go_back else "cancel")
 
     kp = ctx.catalog.kubernetes
-    text = kp.context_prompt
+    if state.kube_context:
+        text = (
+            f"'{state.kube_context}' exists in {len(rows)} kubeconfig files. "
+            "Which one did you mean?"
+        )
+    else:
+        text = kp.context_prompt
     if kp.context_hint:
         text += f"\n\n{kp.context_hint}"
 
+    # Values are positions in the full list: a name is not unique, and the
+    # ambient rows share the empty kubeconfig.
+    several_files = len({k.kubeconfig for k in ctx.kube_contexts}) > 1
     values: list[tuple[str, str]] = []
-    for kube in ctx.kube_contexts:
+    default = ""
+    for index, kube in enumerate(ctx.kube_contexts):
+        if kube not in rows:
+            continue
         server = kube.server or "(server unknown)"
         namespace = kube.namespace or "default"
         row = f"{kube.name} — {server} ({namespace})"
-        if kube.name == ctx.kube_current_context:
+        if several_files:
+            row += f"  ·  {kubeconfig_label(kube.kubeconfig)}"
+        if kube.current:
             row += "  [current]"
-        values.append((kube.name, row))
+            default = str(index)
+        values.append((str(index), row))
+    if not default:
+        default = values[0][0]
 
     value, action = _radio(
         title="Cremind · Kubernetes context",
         text=text,
         values=values,
-        default=ctx.kube_current_context or ctx.kube_contexts[0].name,
+        default=default,
         allow_back=ctx.can_go_back,
     )
     if action != "advance":
         return state, action
-    return replace(state, kube_context=value or ""), "advance"
+    chosen = ctx.kube_contexts[int(value)] if value else rows[0]
+    return (
+        replace(state, kube_context=chosen.name, kube_config_file=chosen.kubeconfig),
+        "advance",
+    )
 
 
 def screen_kube_namespace(state: TuiResult, ctx: "Context") -> ScreenResult:
@@ -1084,13 +1153,23 @@ def screen_confirm(state: TuiResult, ctx: "Context") -> ScreenResult:
         rows.append(("Deployment", state.deployment))
     rows.append(("Mode", state.mode))
     if state.mode == "kubernetes":
-        server = next(
+        picked = next(
+            (
+                k
+                for k in ctx.kube_contexts
+                if k.name == state.kube_context
+                and k.kubeconfig == state.kube_config_file
+            ),
+            None,
+        )
+        server = picked.server if picked else next(
             (k.server for k in ctx.kube_contexts if k.name == state.kube_context),
             "",
         )
-        rows.append(
-            ("Context", f"{state.kube_context} — {server}" if server else state.kube_context)
-        )
+        label = f"{state.kube_context} — {server}" if server else state.kube_context
+        if state.kube_config_file:
+            label += f" ({kubeconfig_label(state.kube_config_file)})"
+        rows.append(("Context", label))
         rows.append(("Namespace", state.kube_namespace))
         rows.append(("Release", state.k8s_release_name or "cremind"))
     rows.append(
@@ -1165,7 +1244,6 @@ class Context:
     # Probed by the shell before the TUI launches; empty when kubectl found
     # nothing or is not installed.
     kube_contexts: tuple[KubeContext, ...] = ()
-    kube_current_context: str = ""
     version_mode: str = "latest"
     # "" until screen_k8s_advanced runs; then "recommended" or "customize".
     k8s_advanced: str = ""
@@ -1230,7 +1308,6 @@ def run(
     has_kubectl: bool = False,
     has_helm: bool = False,
     kube_contexts: tuple[KubeContext, ...] = (),
-    kube_current_context: str = "",
     vnc_password_preset: bool = False,
     ssl_inherited: bool = False,
     native_env: str = "",
@@ -1253,7 +1330,6 @@ def run(
         has_kubectl=has_kubectl,
         has_helm=has_helm,
         kube_contexts=tuple(kube_contexts),
-        kube_current_context=kube_current_context,
         vnc_password_preset=vnc_password_preset,
         ssl_inherited=ssl_inherited,
         native_env=native_env,
@@ -1288,4 +1364,4 @@ def run(
     return state
 
 
-__all__ = ["Context", "KubeContext", "parse_kube_contexts", "run"]
+__all__ = ["Context", "KubeContext", "kubeconfig_label", "parse_kube_contexts", "run"]

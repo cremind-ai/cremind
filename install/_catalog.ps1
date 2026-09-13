@@ -1,6 +1,6 @@
 # AUTO-GENERATED from install/catalog.toml. Do not edit by hand.
 # Regenerate with: python install/scripts/build_catalog.py
-# Source SHA-256:  38ee43526a42ade7e82271dbd714e48eb47fca76f18e654f076c903ef190f19b
+# Source SHA-256:  918c3655f0cf44a166d84e0964d05463ea9d0d2de58f3d5bce1c0b736879f81a
 
 $script:CatalogSchema = 1
 
@@ -114,7 +114,7 @@ $script:VncPasswordPrompt = [ordered]@{
 # ── Kubernetes prompts ──
 $script:Kubernetes = [ordered]@{
     ContextPrompt    = 'Which kubeconfig context should Cremind be installed into?'
-    ContextHint      = 'Every helm and kubectl command runs with --kube-context set to this choice, never the ambient current-context. The current context is preselected; each row shows the API server so a look-alike cluster stands out.'
+    ContextHint      = 'Every helm and kubectl command runs with --kube-context set to this choice (and --kubeconfig, for a context from a file kubectl does not read on its own), never the ambient current-context. Every kubeconfig under ~/.kube is listed, not just kubectl''s own; each row shows the API server, and its file when several are in play, so a look-alike cluster stands out.'
     NamespacePrompt  = 'Which namespace should the Helm release go into?'
     NamespaceHint    = 'Created if it does not exist. Lowercase letters, digits and hyphens, up to 63 characters.'
     NamespaceDefault = 'cremind'

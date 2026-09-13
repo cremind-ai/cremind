@@ -435,17 +435,43 @@ def test_screen_mode_auto_selects_the_only_available_mode(
 def test_parse_kube_contexts() -> None:
     parsed = tui.parse_kube_contexts(
         "a\thttps://a:6443\tns1\n\nb\thttps://b\n\na\thttps://dupe\tx\n"
+        # Sibling files reuse a name: both rows survive, told apart by file.
+        "default\thttps://c:6443\tfrp\t/home/me/.kube/c\t0\n"
+        "default\thttps://d:6443\t\t/home/me/.kube/d\t0\n"
+        "cur\thttps://e:6443\t\t\t1\n"
     )
     assert parsed == (
         tui.KubeContext("a", "https://a:6443", "ns1"),
         tui.KubeContext("b", "https://b", ""),
+        tui.KubeContext("default", "https://c:6443", "frp", "/home/me/.kube/c"),
+        tui.KubeContext("default", "https://d:6443", "", "/home/me/.kube/d"),
+        tui.KubeContext("cur", "https://e:6443", "", "", True),
     )
+    assert parsed[0].key == ("", "a")
+    assert parsed[2].key == ("/home/me/.kube/c", "default")
     assert tui.parse_kube_contexts("") == ()
+
+
+def test_kubeconfig_label_shortens_home() -> None:
+    assert tui.kubeconfig_label("") == "default kubeconfig"
+    assert tui.kubeconfig_label("/home/me/.kube/x", home="/home/me") == "~/.kube/x"
+    assert tui.kubeconfig_label(r"C:\Users\me\.kube\x", home=r"C:\Users\me") == r"~\.kube\x"
+    # A sibling directory that merely starts with the home path is not home.
+    assert tui.kubeconfig_label("/home/meow/.kube/x", home="/home/me") == "/home/meow/.kube/x"
 
 
 _CONTEXTS = (
     tui.KubeContext("ctx-a", "https://a.example:6443", "default"),
     tui.KubeContext("ctx-b", "https://b.example:6443", "team"),
+)
+
+# The user's layout that motivated the file column: kubectl's own config plus
+# two sibling files that both call their only context "default".
+_MULTI_FILE_CONTEXTS = (
+    tui.KubeContext("buddy", "https://buddy.example:443", "", "", True),
+    tui.KubeContext("default", "https://161.0.0.1:6443", "frp", "/home/me/.kube/cremind_config"),
+    tui.KubeContext("default", "https://103.0.0.1:6443", "", "/home/me/.kube/ssp_config"),
+    tui.KubeContext("staging", "https://103.0.0.1:6443", "stg", "/home/me/.kube/ssp_config"),
 )
 
 
@@ -467,6 +493,75 @@ def test_screen_kube_context_short_circuits_when_set(
     )
     assert action == "skip"
     assert new_state.kube_context == "ctx-b"
+    assert new_state.kube_config_file == ""
+
+
+def test_a_unique_context_flag_resolves_its_file(
+    loaded_catalog: catalog.Catalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--kube-context staging names a sibling file's context: the shell needs
+    that file on every call, so the skip records it."""
+    monkeypatch.setattr(tui, "_radio", lambda **_k: pytest.fail("opened a dialog"))
+    state = TuiResult(mode="kubernetes", kube_context="staging")
+    new_state, action = tui.screen_kube_context(
+        state, _ctx(loaded_catalog, kube_contexts=_MULTI_FILE_CONTEXTS)
+    )
+    assert action == "skip"
+    assert new_state.kube_config_file == "/home/me/.kube/ssp_config"
+    # An unknown name is left for the shell to reject with the full list.
+    state = TuiResult(mode="kubernetes", kube_context="nope")
+    new_state, action = tui.screen_kube_context(
+        state, _ctx(loaded_catalog, kube_contexts=_MULTI_FILE_CONTEXTS)
+    )
+    assert action == "skip"
+    assert new_state.kube_config_file == ""
+
+
+def test_an_ambiguous_context_flag_asks_which_file(
+    loaded_catalog: catalog.Catalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both sibling files call their context "default"; the name alone must
+    not quietly pick one of them."""
+    seen: dict[str, object] = {}
+
+    def fake_radio(**kwargs: object) -> tuple[str, str]:
+        seen.update(kwargs)
+        return "2", "advance"
+
+    monkeypatch.setattr(tui, "_radio", fake_radio)
+    state = TuiResult(mode="kubernetes", kube_context="default")
+    new_state, action = tui.screen_kube_context(
+        state, _ctx(loaded_catalog, kube_contexts=_MULTI_FILE_CONTEXTS)
+    )
+    assert action == "advance"
+    assert new_state.kube_context == "default"
+    assert new_state.kube_config_file == "/home/me/.kube/ssp_config"
+    assert "'default' exists in 2 kubeconfig files" in str(seen["text"])
+    labels = [label for _value, label in seen["values"]]
+    assert len(labels) == 2
+    assert all(label.startswith("default — ") for label in labels)
+    assert "/home/me/.kube/cremind_config" in labels[0]
+    assert "/home/me/.kube/ssp_config" in labels[1]
+
+
+def test_a_kubeconfig_flag_restricts_the_picker_to_that_file(
+    loaded_catalog: catalog.Catalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_radio(**kwargs: object) -> tuple[str, str]:
+        seen.update(kwargs)
+        return "3", "advance"
+
+    monkeypatch.setattr(tui, "_radio", fake_radio)
+    state = TuiResult(mode="kubernetes", kube_config_file="/home/me/.kube/ssp_config")
+    new_state, action = tui.screen_kube_context(
+        state, _ctx(loaded_catalog, kube_contexts=_MULTI_FILE_CONTEXTS)
+    )
+    assert action == "advance"
+    assert [value for value, _label in seen["values"]] == ["2", "3"]
+    assert new_state.kube_context == "staging"
+    assert new_state.kube_config_file == "/home/me/.kube/ssp_config"
 
 
 def test_screen_kube_context_preselects_the_current_one(
@@ -477,20 +572,43 @@ def test_screen_kube_context_preselects_the_current_one(
 
     def fake_radio(**kwargs: object) -> tuple[str, str]:
         seen.update(kwargs)
-        return "ctx-b", "advance"
+        return "1", "advance"
 
     monkeypatch.setattr(tui, "_radio", fake_radio)
-    ctx = _ctx(
-        loaded_catalog, kube_contexts=_CONTEXTS, kube_current_context="ctx-b"
-    )
+    contexts = (_CONTEXTS[0], _CONTEXTS[1]._replace(current=True))
+    ctx = _ctx(loaded_catalog, kube_contexts=contexts)
     new_state, action = tui.screen_kube_context(TuiResult(mode="kubernetes"), ctx)
     assert action == "advance"
     assert new_state.kube_context == "ctx-b"
-    assert seen["default"] == "ctx-b"
-    rows = dict(seen["values"])
-    assert "https://a.example:6443" in rows["ctx-a"]
-    assert "(default)" in rows["ctx-a"]
-    assert rows["ctx-b"].endswith("[current]")
+    assert new_state.kube_config_file == ""
+    assert seen["default"] == "1"
+    labels = [label for _value, label in seen["values"]]
+    assert "https://a.example:6443" in labels[0]
+    assert "(default)" in labels[0]
+    assert labels[1].endswith("[current]")
+    # One file in play: no file column to clutter the rows.
+    assert "kubeconfig" not in labels[0]
+
+
+def test_rows_name_their_file_when_several_are_in_play(
+    loaded_catalog: catalog.Catalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_radio(**kwargs: object) -> tuple[str, str]:
+        seen.update(kwargs)
+        return "0", "advance"
+
+    monkeypatch.setattr(tui, "_radio", fake_radio)
+    ctx = _ctx(loaded_catalog, kube_contexts=_MULTI_FILE_CONTEXTS)
+    new_state, action = tui.screen_kube_context(TuiResult(mode="kubernetes"), ctx)
+    assert action == "advance"
+    assert new_state.kube_context == "buddy"
+    assert new_state.kube_config_file == ""
+    assert seen["default"] == "0"  # the ambient current-context
+    labels = [label for _value, label in seen["values"]]
+    assert "default kubeconfig" in labels[0] and labels[0].endswith("[current]")
+    assert "/home/me/.kube/cremind_config" in labels[1]
 
 
 def test_screen_kube_context_with_no_contexts(
@@ -796,6 +914,33 @@ def test_confirm_rows_for_kubernetes(
     assert "Deployment" not in text
 
 
+def test_screen_confirm_names_the_kubeconfig_file(
+    loaded_catalog: catalog.Catalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two files call their context "default": the summary must show the
+    server and file of the one actually chosen."""
+    seen: dict[str, object] = {}
+
+    def fake_choice(**kwargs: object) -> tuple[None, str]:
+        seen.update(kwargs)
+        return None, "advance"
+
+    monkeypatch.setattr(tui, "_choice", fake_choice)
+    state = TuiResult(
+        channel="test",
+        mode="kubernetes",
+        kube_context="default",
+        kube_config_file="/home/me/.kube/ssp_config",
+        kube_namespace="cremind",
+        desktop="1",
+    )
+    tui.screen_confirm(state, _ctx(loaded_catalog, kube_contexts=_MULTI_FILE_CONTEXTS))
+    text = str(seen["text"])
+    assert "https://103.0.0.1:6443" in text
+    assert "https://161.0.0.1:6443" not in text
+    assert "/home/me/.kube/ssp_config" in text
+
+
 def test_screen_desktop_skips_when_not_docker(loaded_catalog: catalog.Catalog) -> None:
     state = TuiResult(mode="native")
     new_state, action = tui.screen_desktop(state, _ctx(loaded_catalog))
@@ -955,7 +1100,6 @@ def test_run_kubernetes_with_all_values_prepopulated(
             has_kubectl=True,
             has_helm=True,
             kube_contexts=_CONTEXTS,
-            kube_current_context="ctx-a",
             electron_version="",
         )
     finally:
@@ -1241,13 +1385,14 @@ def test_main_plumbs_the_kubernetes_flags(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(installer_main.tui, "run", fake_run)
     contexts = tmp_path / "contexts"
-    contexts.write_text("ctx-a\thttps://a:6443\tdefault\n", encoding="utf-8")
+    contexts.write_text("ctx-a\thttps://a:6443\tdefault\t\t1\n", encoding="utf-8")
     out = tmp_path / "tui.out"
     rc = installer_main.main(
         [
             "--output", str(out), "--catalog", str(CATALOG_PATH),
             "--mode", "kubernetes",
             "--kube-context", "ctx-a",
+            "--kubeconfig", "/home/me/.kube/other",
             "--kube-namespace", "lee-cremind",
             "--k8s-release-name", "rel",
             "--k8s-app-url", "https://cremind.example.com",
@@ -1257,13 +1402,13 @@ def test_main_plumbs_the_kubernetes_flags(tmp_path, monkeypatch) -> None:
             "--has-kubectl", "1",
             "--has-helm", "1",
             "--kube-contexts-file", str(contexts),
-            "--kube-current-context", "ctx-a",
         ]
     )
     assert rc == 0
     initial: TuiResult = seen["initial"]  # type: ignore[assignment]
     assert initial.mode == "kubernetes"
     assert initial.kube_context == "ctx-a"
+    assert initial.kube_config_file == "/home/me/.kube/other"
     assert initial.kube_namespace == "lee-cremind"
     assert initial.k8s_release_name == "rel"
     assert initial.k8s_app_url == "https://cremind.example.com"
@@ -1271,8 +1416,10 @@ def test_main_plumbs_the_kubernetes_flags(tmp_path, monkeypatch) -> None:
     assert initial.k8s_delete_postgres_data == "yes"
     assert initial.k8s_extra_set == "a=b"
     assert seen["has_kubectl"] is True and seen["has_helm"] is True
-    assert seen["kube_contexts"] == (tui.KubeContext("ctx-a", "https://a:6443", "default"),)
-    assert seen["kube_current_context"] == "ctx-a"
+    assert seen["kube_contexts"] == (
+        tui.KubeContext("ctx-a", "https://a:6443", "default", "", True),
+    )
+    assert "kube_current_context" not in seen
 
 
 def test_main_tolerates_a_missing_contexts_file(tmp_path, monkeypatch) -> None:
@@ -1300,3 +1447,18 @@ def test_main_exits_2_on_an_unwritable_answer(tmp_path, monkeypatch) -> None:
     rc = installer_main.main(["--output", str(out), "--catalog", str(CATALOG_PATH)])
     assert rc == 2
     assert not out.exists()
+
+
+def test_the_kubeconfig_path_round_trips_quoted(tmp_path) -> None:
+    """A Windows path is all backslashes, which are outside the unquoted-safe
+    set, so it travels shell-quoted — under a key that is NOT the KUBECONFIG
+    variable kubectl itself reads."""
+    from app.installer import output as installer_output
+
+    out = tmp_path / "tui.out"
+    installer_output.write(
+        TuiResult(kube_config_file=r"C:\Users\me\.kube\ssp_config"), out
+    )
+    text = out.read_text(encoding="utf-8")
+    assert "KUBE_CONFIG_FILE='C:\\Users\\me\\.kube\\ssp_config'" in text
+    assert "\nKUBECONFIG=" not in text
