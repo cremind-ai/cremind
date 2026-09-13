@@ -31,9 +31,15 @@ carries.
 from __future__ import annotations
 
 import ipaddress
-import re
 import shlex
 from urllib.parse import urlsplit
+
+#: The PEP 440 → chart SemVer2 translation, owned by ``app/upgrade/channel.py``
+#: (stdlib-only, so the install scripts can run it standalone). Re-exported
+#: here because ``app/api/tls.py`` and the runbook tests import it from this
+#: module, and because ``running_chart_version`` below is its only in-server
+#: caller.
+from app.upgrade.channel import pep440_to_semver  # noqa: F401
 
 
 #: Where the chart is published. ``helm push`` in ``release-rc.yml`` and
@@ -113,29 +119,6 @@ def command(text: str) -> dict:
 def flatten(steps: list[dict]) -> list[str]:
     """The legacy flat ``instructions`` list older clients still read."""
     return [step["text"] for step in steps]
-
-
-_PEP440_RC = re.compile(r"^(\d+\.\d+\.\d+(?:\.\d+)?)rc(\d+)(?:\.dev(\d+))?$")
-
-
-def pep440_to_semver(version: str) -> str:
-    """This build's version as the chart's SemVer2 spelling.
-
-    ``0.0.17rc9.dev4`` → ``0.0.17-rc.9.dev.4``; a stable version is already
-    SemVer2 and passes through. Helm rejects the PEP 440 form outright, so the
-    two spellings of one release cannot be used interchangeably.
-
-    Deliberately duplicated from ``scripts/sync_ui_version.py``, which the
-    release workflow uses to stamp the chart: ``scripts/`` is not packaged into
-    the wheel (``pyproject.toml`` ships ``packages = ["app"]``), so a running
-    server cannot import it. ``tests/config/test_tls_steps.py`` pins the two
-    implementations equal.
-    """
-    match = _PEP440_RC.match(version)
-    if not match:
-        return version
-    base, rc, dev = match.group(1), match.group(2), match.group(3)
-    return f"{base}-rc.{rc}.dev.{dev}" if dev is not None else f"{base}-rc.{rc}"
 
 
 def running_chart_version() -> str:

@@ -2,9 +2,11 @@
 
 Cremind ships from a single git tag: the Python wheel goes to PyPI, the
 Electron installers (Windows / macOS / Linux) attach to a GitHub Release,
-and two Docker image flavors push to Docker Hub — `cremind/cremind-desktop`
-(XFCE + VNC) and `cremind/cremind` (headless basic image). All artifacts
-carry the same version number.
+two Docker image flavors push to Docker Hub — `cremind/cremind-desktop`
+(XFCE + VNC) and `cremind/cremind` (headless basic image) — and the Helm
+chart pushes to the same registry as an OCI artifact. All artifacts carry
+the same version, in one of two spellings: see
+[Tag conventions](#tag-conventions).
 
 Releases are coordinated by two roles:
 
@@ -203,7 +205,7 @@ Approve button.
 
 ### 8. Watch the prod workflow publish
 
-After approval the workflow runs seven jobs:
+After approval the workflow runs eight jobs:
 
 1. **`verify`** — the four mechanical gate checks (next section).
 2. **`approve`** — the human-validation gate (just completed).
@@ -220,7 +222,12 @@ After approval the workflow runs seven jobs:
    `CREMIND_PIP_SPEC=cremind==0.0.2` and pushes
    `cremind/cremind-desktop:0.0.2` + `:latest` (desktop) and
    `cremind/cremind:0.0.2` + `:latest` (basic) to Docker Hub.
-7. **`publish`** — promotes the draft from hidden to public, **only
+7. **`helm`** (Ubuntu) — waits for `docker`, lints and packages
+   `helm/cremind` with `--version <SemVer2> --app-version <PEP 440>`, and
+   pushes it to `oci://registry-1.docker.io/cremind`. See the tag table
+   below for the version shapes, and the note there about the tag this
+   shares with the basic image.
+8. **`publish`** — promotes the draft from hidden to public, **only
    after** all of the above succeed. Half-finished releases never reach
    users.
 
@@ -435,10 +442,30 @@ RC tags carry the **PEP 440 canonical form** verbatim with a leading
 Both image flavors (`cremind-desktop` and `cremind`) share the Docker tag
 in each row.
 
-| Tag pattern        | PEP 440          | npm / installer       | Docker tag (both repos)               | PyPI     | Channel      |
-|--------------------|------------------|-----------------------|---------------------------------------|----------|--------------|
-| `v0.0.2rc1.dev1`   | `0.0.2rc1.dev1`  | `0.0.2-rc.1.dev.1`    | `{desktop,basic}:0.0.2rc1.dev1`        | TestPyPI | `test`       |
-| `v0.0.2`           | `0.0.2`          | `0.0.2`               | `{desktop,basic}:0.0.2` + `:latest`    | PyPI     | `production` |
+| Tag pattern        | PEP 440          | npm / installer       | Docker tag (both repos)               | Helm chart version | PyPI     | Channel      |
+|--------------------|------------------|-----------------------|---------------------------------------|--------------------|----------|--------------|
+| `v0.0.2rc1.dev1`   | `0.0.2rc1.dev1`  | `0.0.2-rc.1.dev.1`    | `{desktop,basic}:0.0.2rc1.dev1`        | `0.0.2-rc.1.dev.1` | TestPyPI | `test`       |
+| `v0.0.2`           | `0.0.2`          | `0.0.2`               | `{desktop,basic}:0.0.2` + `:latest`    | `0.0.2`            | PyPI     | `production` |
+
+The **chart version is SemVer2**, like the npm one and by the same function
+(`app/upgrade/channel.py`'s `pep440_to_semver`, which
+`scripts/sync_ui_version.py` and the installer's
+`channel.py chart-version` both call). The chart's `appVersion` stays the
+PEP 440 form, so one release is `0.0.2rc1.dev1` as an image and
+`0.0.2-rc.1.dev.1` as a chart. Helm rejects the PEP 440 spelling outright:
+the two are never interchangeable.
+
+> **The production chart and the basic image share a Docker Hub tag.**
+> `helm push` targets `oci://registry-1.docker.io/cremind`, so a chart lands
+> at `cremind/cremind:<chart version>` — which for a production release is the
+> same `repo:tag` the basic image just used, and the `helm` job runs after
+> `docker`. So `cremind/cremind:0.0.2` on Docker Hub holds a **chart**, not an
+> image, and a Kubernetes install of the basic flavor cannot pull it. RC
+> versions do not collide (`0.0.2-rc.1.dev.1` vs `0.0.2rc1.dev1`), and
+> `cremind/cremind-desktop` is image-only and unaffected. The installer's
+> kubernetes mode refuses `--channel production --no-desktop` for this reason.
+> Fixing it properly means pushing charts to their own repository, which
+> changes `CHART_REFERENCE` and every published runbook that quotes it.
 
 Within a version's slate:
 - `rc<N>` indexes the PR (`rc1` for the first PR, `rc2` for the
@@ -457,8 +484,9 @@ refuses to publish them and the in-app updater ignores GitHub
 prereleases whose tag fails this regex. The npm/installer column is
 the SemVer form `scripts/sync_ui_version.py` derives from the PEP 440
 version internally (npm and electron-builder reject the PEP 440
-no-separator form as a prerelease identifier); the SemVer string
-never appears on GitHub, PyPI, or Docker Hub.
+no-separator form as a prerelease identifier); the SemVer string never
+appears on GitHub or PyPI, and on Docker Hub only as the Helm chart's
+version, not as an image tag.
 
 ### Version source
 

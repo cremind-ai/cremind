@@ -51,6 +51,17 @@ survives the app restarting underneath it.
 
 ## Install
 
+**Or let the installer drive it.** `install.sh --mode kubernetes` /
+`install.ps1 -Mode kubernetes` does everything below and a few things that are
+easy to get wrong by hand: it asks **which kubeconfig context** to install
+into and passes `--kube-context` on every call, pins
+`postgresql.auth.password` so an uninstall/reinstall cycle can reuse a
+retained volume, defaults the bundled PostgreSQL to the `bitnamilegacy` image
+(see [Dependency availability](#bundled-dependencies)), waits for the rollout,
+and opens the port-forward and the Setup Wizard. It needs `kubectl` and
+`helm` 3.8+ on PATH. See
+[install/README.md](../../install/README.md#kubernetes-mode).
+
 ```bash
 # Dependencies (PostgreSQL + optional vector DBs) must be fetched first.
 helm dependency build ./helm/cremind
@@ -577,15 +588,18 @@ embeddings.
 >    image) into `charts/` so resolution and pulls are self-contained.
 
 > **Reinstalling? Delete the Postgres data PVC first.** The bundled PostgreSQL
-> is a StatefulSet, so its data volume (`data-<release>-postgresql-0`) is
+> is a StatefulSet, so its data volume (`data-cremind-postgresql-0`) is
 > **retained** across `helm uninstall` — but a fresh `helm install` generates a
 > **new** random password into the Secret. PostgreSQL only applies a password on
 > *first* init, so the reused volume keeps the *old* password and setup fails
 > with `password authentication failed for user "cremind"`. Before reinstalling,
 > either delete the stale PVC for a clean database
-> (`kubectl -n <ns> delete pvc data-<release>-postgresql-0`) or pin a stable
+> (`kubectl -n <ns> delete pvc data-cremind-postgresql-0`) or pin a stable
 > password you reuse every time (`--set postgresql.auth.password=…`). The same
 > applies to managed/external PostgreSQL: the wizard password must match the DB.
+> The installer's kubernetes mode pins that password for you and records it,
+> so its re-installs reuse a retained volume without any of this; it also
+> refuses to install over a volume whose password it never saw.
 > To instead have `helm uninstall` delete this volume automatically (so a
 > reinstall always starts clean), see [Uninstalling and removing data](#uninstalling-and-removing-data).
 
@@ -684,7 +698,7 @@ would *miss* them. Handle each one:
   ```
   (Also documented under `postgresql:` in `values.yaml` — set it there instead
   if you prefer a values file.) `helm uninstall` then removes
-  `data-<release>-postgresql-0` along with everything else. Requires the
+  `data-cremind-postgresql-0` along with everything else. Requires the
   `StatefulSetAutoDeletePVC` feature — GA in k8s 1.32, beta on-by-default since
   1.27.
 - **ChromaDB** (if enabled) — already deletes its PVC on uninstall by default

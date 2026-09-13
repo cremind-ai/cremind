@@ -44,6 +44,17 @@ class TuiResult:
     custom_public_url: str = ""
     custom_allowed_origins: str = ""
     custom_wizard_preset: str = ""
+    # Kubernetes mode. Every one of these is round-tripped through a shell
+    # flag (--kube-context, --k8s-release-name, …): the shell passes its
+    # current value in and the TUI echoes it back, so sourcing this file can
+    # never clobber an answer that came from the command line.
+    kube_context: str = ""
+    kube_namespace: str = ""
+    k8s_release_name: str = ""
+    k8s_app_url: str = ""
+    k8s_legacy_postgres_image: str = ""
+    k8s_delete_postgres_data: str = ""
+    k8s_extra_set: str = ""
 
     def as_env_dict(self) -> dict[str, str]:
         return {
@@ -59,6 +70,13 @@ class TuiResult:
             "CUSTOM_public_url": self.custom_public_url,
             "CUSTOM_allowed_origins": self.custom_allowed_origins,
             "CUSTOM_wizard_preset": self.custom_wizard_preset,
+            "KUBE_CONTEXT": self.kube_context,
+            "KUBE_NAMESPACE": self.kube_namespace,
+            "K8S_release_name": self.k8s_release_name,
+            "K8S_app_url": self.k8s_app_url,
+            "K8S_legacy_postgres_image": self.k8s_legacy_postgres_image,
+            "K8S_delete_postgres_data": self.k8s_delete_postgres_data,
+            "K8S_extra_set": self.k8s_extra_set,
         }
 
 
@@ -69,6 +87,15 @@ _SAFE = set(
 
 
 def _sh_quote(value: str) -> str:
+    # A newline would break the format outright: install.ps1 parses the file
+    # line by line (dropping the tail of a multi-line value) and install.sh
+    # greps it for the cancel sentinel before sourcing, so a pasted value
+    # containing "CREMIND_TUI_CANCELLED=1" on its own line would abort the
+    # install. No screen can produce one — prompt_toolkit's TextArea is
+    # single-line — but a forwarded flag value can, so refuse it here rather
+    # than writing a file the shell will misread.
+    if "\n" in value or "\r" in value:
+        raise ValueError(f"installer answers must be single-line: {value!r}")
     if value == "" or all(c in _SAFE for c in value):
         return value
     return "'" + value.replace("'", "'\\''") + "'"

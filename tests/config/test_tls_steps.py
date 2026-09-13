@@ -274,31 +274,29 @@ def test_the_chart_version_is_the_semver_spelling_of_this_build():
     assert running_chart_version() == pep440_to_semver(__version__)
 
 
-@pytest.mark.parametrize(
-    ("pep440", "semver"),
-    [
-        ("0.0.17rc9.dev4", "0.0.17-rc.9.dev.4"),
-        ("0.0.17rc9", "0.0.17-rc.9"),
-        ("0.0.2.1rc1.dev1", "0.0.2.1-rc.1.dev.1"),
-        ("0.0.16", "0.0.16"),          # a stable version is already SemVer2
-        ("0.0.17.dev1", "0.0.17.dev1"),  # not an RC shape: passed through
-    ],
-)
-def test_pep440_to_semver_matches_the_release_workflows_translation(pep440, semver):
-    """Helm rejects the PEP 440 spelling, so a drift here would print a chart
-    version that does not resolve. The release workflow stamps the chart with
-    scripts/sync_ui_version.py, which the wheel cannot import — hence the copy."""
+def test_every_translator_is_the_channel_module_function():
+    """One implementation, three callers.
+
+    Helm rejects the PEP 440 spelling, so a drift between the runbook's chart
+    version, the chart the release workflow stamps, and the version the
+    kubernetes install mode passes to ``helm --version`` would print a
+    reference that does not resolve. They are the same function object, not
+    three copies that agree today. The value table lives in
+    tests/upgrade/test_channel.py, next to the implementation.
+    """
     import sys
     from pathlib import Path
 
+    from app.upgrade import channel
+
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
     try:
-        from sync_ui_version import pep440_to_semver as canonical
+        import sync_ui_version
     finally:
         sys.path.pop(0)
 
-    assert pep440_to_semver(pep440) == semver
-    assert canonical(pep440) == pep440_to_semver(pep440)
+    assert pep440_to_semver is channel.pep440_to_semver
+    assert sync_ui_version.pep440_to_semver is channel.pep440_to_semver
 
 
 def test_docker_names_the_installers_own_compose_folder():

@@ -31,6 +31,11 @@ This module is the single owner of:
   - PEP 440 rc-version ordering, since stdlib has no parser for it
     and we don't want to take a runtime dep on ``packaging`` just for
     the upgrader.
+  - the translation from that PEP 440 version to the Helm chart's SemVer2
+    spelling (``0.0.17rc13.dev1`` → ``0.0.17-rc.13.dev.1``) —
+    :func:`pep440_to_semver`. ``app/config/tls_steps.py`` and
+    ``scripts/sync_ui_version.py`` import it from here, and the kubernetes
+    install mode reaches it through the ``chart-version`` CLI below.
   - the channel-shape rules (``matches_channel`` / ``matches_electron_line``
     / ``validate`` / ``filter_same_line``) the install scripts and the
     SetupWizard use to decide "is this version allowed for (channel,
@@ -40,8 +45,8 @@ This module is the single owner of:
 Keeping these here means manifest.py, runner.py, and the install
 scripts don't grow tag / version-format knowledge. The install scripts
 run this file *standalone* via its ``__main__`` CLI (``resolve`` /
-``validate``) during bootstrap — before the cremind wheel is installed —
-so this module must stay import-light (stdlib only).
+``validate`` / ``chart-version``) during bootstrap — before the cremind
+wheel is installed — so this module must stay import-light (stdlib only).
 """
 
 from __future__ import annotations
@@ -139,6 +144,44 @@ def parse_pep440(version: str) -> tuple[int, int, int, int, int, int, int, str]:
 def is_newer(latest: str, current: str) -> bool:
     """``True`` iff ``latest`` is strictly newer than ``current`` under PEP 440."""
     return parse_pep440(latest) > parse_pep440(current)
+
+
+# ── Chart version (SemVer2) ─────────────────────────────────────────────────
+# The Helm chart carries the same release under a different spelling: the
+# release workflows package it with ``--version <SemVer2> --app-version <PEP
+# 440>``, so one release is ``0.0.17rc13.dev1`` as a wheel/image tag and
+# ``0.0.17-rc.13.dev.1`` as a chart version. Helm rejects the PEP 440 form
+# outright, so the two are never interchangeable. This module owns the
+# translation because it is the one file the install scripts already fetch and
+# run standalone during bootstrap — the kubernetes install mode needs a chart
+# version before any cremind wheel exists.
+
+#: The two shapes the chart pipeline publishes: ``X.Y.Z[.W]`` and
+#: ``X.Y.Z[.W]rcN[.devM]``. Anything else never reaches ``helm package``.
+_CHART_VERSION_SOURCE = re.compile(
+    r"^(\d+\.\d+\.\d+(?:\.\d+)?)(?:rc(\d+)(?:\.dev(\d+))?)?$"
+)
+
+
+def pep440_to_semver(version: str) -> str:
+    """Translate a PEP 440 release version to the chart's SemVer2 spelling.
+
+    ``0.0.17rc13.dev1`` → ``0.0.17-rc.13.dev.1``; ``0.0.17rc2`` →
+    ``0.0.17-rc.2``; a final ``0.0.17`` is already SemVer2 and passes through.
+
+    Anything else — ``X.Y.Z.devM``, a ``.postN``, a ``+local`` suffix, a leading
+    ``v``, or an already-translated SemVer string — is returned **verbatim**:
+    Helm, not this function, is the authority on what a chart version is, and
+    the release pipeline never produces those shapes. Callers that need a
+    guarantee use the ``chart-version`` CLI below, which refuses them.
+    """
+    match = _CHART_VERSION_SOURCE.match(version or "")
+    if not match:
+        return version
+    base, rc, dev = match.group(1), match.group(2), match.group(3)
+    if rc is None:
+        return base
+    return f"{base}-rc.{rc}.dev.{dev}" if dev is not None else f"{base}-rc.{rc}"
 
 
 # ── Channel-shape rules ─────────────────────────────────────────────────────
@@ -260,7 +303,7 @@ def filter_same_line(
 
 # ── Standalone CLI ──────────────────────────────────────────────────────────
 # The install scripts fetch this single file and run it with the system
-# python3 during bootstrap (before the cremind wheel exists). Two subcommands:
+# python3 during bootstrap (before the cremind wheel exists). Three subcommands:
 #
 #   resolve   — read a PyPI / Test PyPI *simple index* HTML on stdin and print
 #               the newest matching cremind wheel URL (or version). Replaces the
@@ -268,6 +311,11 @@ def filter_same_line(
 #               which couldn't order the ``rcN.devM`` form correctly.
 #   validate  — exit 0 (and echo the version) when a version string is valid
 #               for a channel, else exit 2 with a message on stderr.
+#   chart-version — print the Helm chart's SemVer2 spelling of a PEP 440
+#               version, or exit 2 when the version is not a shape the chart
+#               pipeline publishes. The kubernetes install mode needs the chart
+#               version for ``helm install --version``, and neither bash nor
+#               PowerShell should own that regex.
 
 # Matches an absolute cremind wheel href in a simple-index listing, capturing the
 # URL (up to ``.whl``, dropping any ``#sha256=…`` fragment) and the version.
@@ -327,7 +375,24 @@ def _cli(argv: list[str] | None = None) -> int:
     pv.add_argument("--version", required=True)
     pv.add_argument("--electron-version", default=None)
 
+    pc = sub.add_parser(
+        "chart-version",
+        help="print the Helm chart's SemVer2 spelling of a PEP 440 version",
+    )
+    pc.add_argument("--version", required=True)
+
     args = parser.parse_args(argv)
+
+    if args.cmd == "chart-version":
+        if not _CHART_VERSION_SOURCE.match(args.version or ""):
+            print(
+                f"Not a version the chart pipeline publishes: {args.version!r} "
+                f"(expected X.Y.Z[.W] or X.Y.Z[.W]rcN[.devM]).",
+                file=sys.stderr,
+            )
+            return 2
+        print(pep440_to_semver(args.version))
+        return 0
 
     if args.cmd == "validate":
         ok, err = validate(
@@ -364,6 +429,7 @@ __all__ = [
     "matches_channel",
     "matches_electron_line",
     "parse_pep440",
+    "pep440_to_semver",
     "tag_to_pep440",
     "validate",
 ]

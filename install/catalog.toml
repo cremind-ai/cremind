@@ -115,14 +115,28 @@ hint        = "Simpler, but the agent shares your desktop and home directory."
 requires    = []
 order       = 20
 
-# NOTE: there is deliberately NO [modes.kubernetes] entry. Kubernetes is not a
-# host install method a user picks via curl/PowerShell (the installers — TUI,
-# install.sh, install.ps1 — list every [modes.*] as a selectable option, so a
-# `kubernetes` mode here would wrongly appear on a laptop and force Postgres-only
-# on a desktop install). Instead it is a *rule-only* install mode: the Helm chart
-# sets INSTALL_MODE=kubernetes on the pod, and get_active_install_mode() accepts
-# any mode defined in [mode_rules] even without a [modes] entry, so the rule below
-# still constrains the Setup Wizard. See app/config/install_catalog.py.
+[modes.kubernetes]
+label       = "Kubernetes"
+description = "Helm release in an existing cluster (in-cluster Postgres, optional VNC desktop)"
+hint        = "Installs the cremind Helm chart into a kubeconfig context you pick. Needs kubectl and helm on PATH; you reach Cremind through a kubectl port-forward at http://localhost:1515."
+requires    = ["kubectl", "helm"]
+order       = 30
+
+# `requires` is a visibility gate, not documentation. Every front-end
+# (install.sh, install.ps1, the installer TUI, the Electron installer stage)
+# probes the capabilities it knows — `docker` (daemon reachable), `kubectl`
+# (on PATH with at least one kubeconfig context), `helm` (helm 3 on PATH) —
+# and only OFFERS a mode whose requirements are all met. A front-end that
+# cannot probe a capability treats it as unmet, which is why the Electron
+# installer (docker only) never lists Kubernetes. When exactly one mode
+# survives it is selected without a prompt; `native` declares no requirements
+# so that fallback always exists. The recommendation is the first surviving
+# mode by `order` — there is no hardcoded "Docker by default" anywhere.
+#
+# Kubernetes is therefore invisible on a laptop without kubectl+helm. Note it
+# is *also* a rule-only mode for the pod: the Helm chart sets
+# INSTALL_MODE=kubernetes there, and [mode_rules.kubernetes] below constrains
+# the Setup Wizard regardless of how the release was installed.
 
 
 # ── Docker desktop UI sub-question ─────────────────────────────────────────
@@ -160,6 +174,60 @@ prompt = "Choose a password for the VNC Desktop"
 hint   = "6-8 characters, from letters, digits and @ % _ + = : , . - — VNC ignores anything past the 8th character. You will sign in with it at http://<host>:6080/vnc.html. Leave empty when re-installing to keep the current password."
 
 
+# ── Kubernetes prompts ─────────────────────────────────────────────────────
+# Asked only when the install mode is kubernetes, in this order: context,
+# namespace, (desktop / VNC password / HTTPS — shared with the Docker mode),
+# then an "advanced options" gate that either applies every default below or
+# walks the advanced_fields one by one. The TUI writes each answer as
+# K8S_<key>; the shells expose the same values via --k8s-<key> / -K8s<Key>
+# flags. release_name deliberately has a non-empty default: a non-empty
+# K8S_release_name is how the shells know the gate has already been answered.
+#
+# The context question has no `choices` here because its options are probed at
+# run time (kubectl config get-contexts), not declared in this file.
+
+[kubernetes]
+context_prompt    = "Which kubeconfig context should Cremind be installed into?"
+context_hint      = "Every helm and kubectl command runs with --kube-context set to this choice, never the ambient current-context. The current context is preselected; each row shows the API server so a look-alike cluster stands out."
+namespace_prompt  = "Which namespace should the Helm release go into?"
+namespace_hint    = "Created if it does not exist. Lowercase letters, digits and hyphens, up to 63 characters."
+namespace_default = "cremind"
+advanced_prompt   = "Use the recommended Helm options, or customize them?"
+advanced_hint     = "Recommended: release name cremind, app URL derived from the port-forward, the legacy Bitnami Postgres image, Postgres data kept on uninstall, no extra --set values."
+
+[[kubernetes.advanced_fields]]
+key     = "release_name"                  # → the helm release name
+prompt  = "What should the Helm release be called?"
+hint    = "Shown by helm list. Objects are named after it (a name containing cremind is used as-is, otherwise -cremind is appended). Lowercase letters, digits and hyphens, up to 53 characters."
+default = "cremind"
+
+[[kubernetes.advanced_fields]]
+key     = "app_url"                       # → cremind.appUrl
+prompt  = "What URL will you use to open Cremind in a browser?"
+hint    = "Leave blank to let the chart derive it from the port-forward (http://localhost:1515, or https:// when HTTPS is on). Set it only when an ingress or load balancer serves Cremind at another address."
+default = ""
+
+[[kubernetes.advanced_fields]]
+key     = "legacy_postgres_image"         # → postgresql.image.registry/repository
+prompt  = "Use the legacy Bitnami Postgres image (docker.io/bitnamilegacy/postgresql)?"
+hint    = "Bitnami moved its free images to the bitnamilegacy namespace, so the chart's default Postgres image no longer resolves on Docker Hub. Answer no only if your cluster mirrors the current Bitnami catalog."
+choices = ["yes", "no"]
+default = "yes"
+
+[[kubernetes.advanced_fields]]
+key     = "delete_postgres_data"          # → postgresql.primary.persistentVolumeClaimRetentionPolicy
+prompt  = "Delete the Postgres volume when the release is uninstalled?"
+hint    = "no keeps the data-cremind-postgresql-0 claim after helm uninstall (the chart default) so a reinstall picks the data back up; yes sets the retention policy to Delete."
+choices = ["yes", "no"]
+default = "no"
+
+[[kubernetes.advanced_fields]]
+key     = "extra_set"                     # → appended verbatim as one trailing --set
+prompt  = "Any extra --set values for helm?"
+hint    = "The value of one helm --set, e.g. ingress.enabled=true,ingress.host=cremind.example.com. Applied last, so it overrides the installer's own values. Leave blank for none."
+default = ""
+
+
 # ── Mode rules ───────────────────────────────────────────────────────────
 # Per-install-mode visibility rules for each backing service's
 # deployment_mode picker (Postgres / Qdrant / Chroma). The Setup Wizard's
@@ -190,8 +258,7 @@ default_service_mode  = "external"
 allowed_service_modes = ["docker", "native", "external"]
 default_service_mode  = "external"
 
-# Kubernetes (rule-only mode — see the note above [modes]; no [modes.kubernetes]
-# entry on purpose). Every backing service (Postgres / Qdrant / Chroma) must be a
+# Kubernetes. Every backing service (Postgres / Qdrant / Chroma) must be a
 # shared in-cluster service reached over its service DNS — never pod-local.
 # Restricting to External-only drops Docker (no docker socket in a pod) and,
 # critically, Chroma's Native mode (an in-process *persistent* local file that

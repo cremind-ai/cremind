@@ -31,6 +31,49 @@
 #                               --unattended, this flag wins, else the
 #                               previous install's password is kept, else one
 #                               is generated and printed at the end.
+#   --mode docker|native|kubernetes
+#                               Skip the mode prompt. ``--docker``,
+#                               ``--native`` and ``--kubernetes`` are aliases.
+#                               A mode is only offered (and only accepted)
+#                               when this machine has what it needs: docker
+#                               needs a reachable daemon, kubernetes needs
+#                               kubectl with at least one kubeconfig context
+#                               plus helm 3, native needs nothing.
+#   --kube-context CTX          (kubernetes) The kubeconfig context to install
+#                               into. Passed as --kube-context to every helm
+#                               and kubectl call, so the ambient
+#                               current-context never decides where the
+#                               release lands. Interactive runs show a picker;
+#                               --unattended requires this flag whenever more
+#                               than one context exists.
+#   --kube-namespace NS         (kubernetes) Namespace for the release,
+#                               created if missing. Default: cremind.
+#   --k8s-release-name NAME     (kubernetes) Helm release name. Default:
+#                               cremind.
+#   --k8s-app-url URL           (kubernetes) cremind.appUrl. Leave unset to
+#                               let the chart derive http(s)://localhost:1515
+#                               from the port-forward.
+#   --k8s-legacy-postgres-image yes|no
+#                               (kubernetes) Point the bundled PostgreSQL at
+#                               docker.io/bitnamilegacy/postgresql. Default:
+#                               yes — Bitnami froze its free images there, so
+#                               the chart default no longer pulls.
+#   --k8s-delete-postgres-data yes|no
+#                               (kubernetes) Delete the Postgres volume when
+#                               the release is uninstalled. Default: no.
+#   --k8s-extra-set K=V,K2=V2   (kubernetes) The value of one extra helm
+#                               --set, applied last so it overrides the
+#                               installer's own values.
+#   --k8s-postgres-password PW  (kubernetes) Adopt a retained Postgres volume
+#                               whose password this installer never saw,
+#                               instead of deleting it.
+#   --helm-chart REF            (kubernetes) Chart to install: an OCI
+#                               reference, a .tgz, or a directory. Default:
+#                               oci://registry-1.docker.io/cremind/cremind
+#                               (the local helm/cremind on --channel dev).
+#   --no-port-forward           (kubernetes) Don't start the background
+#                               kubectl port-forward after install; just
+#                               print the command.
 #   --listen-host HOST          (custom deployment) Override HOST in .env.
 #   --public-url URL            (custom deployment) Override APP_URL in .env.
 #   --allowed-origins LIST      (custom deployment) Override CORS_ALLOWED_ORIGINS.
@@ -62,7 +105,11 @@
 #   --no-launch                 Skip opening the setup wizard at the end.
 #   --unattended                Use defaults; never prompt. Implies --no-launch
 #                               unless deployment+host are also provided.
-#   --reinstall                 Wipe any existing $CREMIND_SYSTEM_DIR/venv before installing.
+#   --reinstall                 Wipe any existing $CREMIND_SYSTEM_DIR/venv
+#                               before installing. For kubernetes, uninstall
+#                               the Helm release first and install it fresh
+#                               (the pinned Postgres password is reused, so a
+#                               retained data volume stays usable).
 #   --auto-install-python       Auto-install isolated Python 3.13 if missing
 #                               (default: prompt; --unattended installs silently).
 #   --no-auto-install-python    Never auto-install; print manual hints and exit.
@@ -95,10 +142,16 @@
 #                               CREMIND_SYSTEM_DIR / CREMIND_INSTALL_DIR.
 #   --keep                      (with --uninstall) Remove binaries + install
 #                               scratch; preserve .env, bootstrap.toml,
-#                               storage/, tokens/, profile dirs.
+#                               storage/, tokens/, profile dirs. For a
+#                               kubernetes install, uninstalls the Helm
+#                               release but keeps the Postgres volume and the
+#                               record of its password.
 #   --purge                     (with --uninstall) Wipe both System Dir and
 #                               Install Dir. For docker installs, also runs
-#                               ``docker compose down -v`` to drop volumes.
+#                               ``docker compose down -v`` to drop volumes;
+#                               for kubernetes installs, deletes the bundled
+#                               PostgreSQL/vector-store volumes and the
+#                               namespace if the installer created it.
 #   --help                      Show this message.
 #
 # Service selection (database, vector store, …) is no longer made here —
@@ -152,7 +205,7 @@ fi
 
 DEPLOYMENT=""
 APP_HOST=""
-MODE=""           # docker | native (default: prompt if Docker available)
+MODE=""           # docker | native | kubernetes (default: prompt)
 # Docker mode only: include the VNC Desktop UI? "" = ask (default yes);
 # "1" = desktop image (cremind/cremind-desktop); "0" = basic headless image
 # (cremind/cremind). Ignored for native installs.
@@ -221,6 +274,33 @@ CUSTOM_listen_host=""
 CUSTOM_public_url=""
 CUSTOM_allowed_origins=""
 CUSTOM_wizard_preset=""
+# Kubernetes mode. Every one of these is a TUI output key too, and the TUI's
+# output file is sourced — so each must be forwarded into the TUI (see
+# tui_run_bootstrap) and each name must be one the TUI actually writes. The
+# shell's own kubernetes variables (KUBE_SERVER, HELM_RELEASE, CHART_REF,
+# PG_PASSWORD, …) are deliberately spelled differently, the same care
+# VNC_PASSWORD_INPUT and SSL_CHOICE take above.
+KUBE_CONTEXT=""
+KUBE_NAMESPACE=""
+K8S_release_name=""
+K8S_app_url=""
+K8S_legacy_postgres_image=""
+K8S_delete_postgres_data=""
+K8S_extra_set=""
+# Flag-only kubernetes options (never asked, never in the TUI).
+K8S_POSTGRES_PASSWORD=""
+HELM_CHART=""
+NO_PORT_FORWARD=0
+# The RFC 1123 label Kubernetes wants for a namespace and Helm for a release
+# name. Mirrored verbatim in install.ps1 and app/installer/tui.py.
+KUBE_NAME_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+# --version as the operator typed it. The dev-channel guard below blanks
+# VERSION_SPEC (an editable install ignores it), but a dev *kubernetes*
+# install still needs a published image tag for the pod, so keep a copy.
+VERSION_SPEC_RAW=""
+# 1 once the TUI's answers were applied. The text-mode kubernetes flow adds
+# its own final confirmation; the TUI already has a confirm screen.
+TUI_APPLIED=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -232,6 +312,26 @@ while [ $# -gt 0 ]; do
         --mode=*)                 MODE="${1#*=}"; shift ;;
         --docker)                 MODE="docker"; shift ;;
         --native)                 MODE="native"; shift ;;
+        --kubernetes)             MODE="kubernetes"; shift ;;
+        --kube-context)           KUBE_CONTEXT="$2"; shift 2 ;;
+        --kube-context=*)         KUBE_CONTEXT="${1#*=}"; shift ;;
+        --kube-namespace)         KUBE_NAMESPACE="$2"; shift 2 ;;
+        --kube-namespace=*)       KUBE_NAMESPACE="${1#*=}"; shift ;;
+        --k8s-release-name)       K8S_release_name="$2"; shift 2 ;;
+        --k8s-release-name=*)     K8S_release_name="${1#*=}"; shift ;;
+        --k8s-app-url)            K8S_app_url="$2"; shift 2 ;;
+        --k8s-app-url=*)          K8S_app_url="${1#*=}"; shift ;;
+        --k8s-legacy-postgres-image)   K8S_legacy_postgres_image="$2"; shift 2 ;;
+        --k8s-legacy-postgres-image=*) K8S_legacy_postgres_image="${1#*=}"; shift ;;
+        --k8s-delete-postgres-data)    K8S_delete_postgres_data="$2"; shift 2 ;;
+        --k8s-delete-postgres-data=*)  K8S_delete_postgres_data="${1#*=}"; shift ;;
+        --k8s-extra-set)          K8S_extra_set="$2"; shift 2 ;;
+        --k8s-extra-set=*)        K8S_extra_set="${1#*=}"; shift ;;
+        --k8s-postgres-password)  K8S_POSTGRES_PASSWORD="$2"; shift 2 ;;
+        --k8s-postgres-password=*) K8S_POSTGRES_PASSWORD="${1#*=}"; shift ;;
+        --helm-chart)             HELM_CHART="$2"; shift 2 ;;
+        --helm-chart=*)           HELM_CHART="${1#*=}"; shift ;;
+        --no-port-forward)        NO_PORT_FORWARD=1; shift ;;
         --desktop)                DESKTOP_UI=1; shift ;;
         --no-desktop)             DESKTOP_UI=0; shift ;;
         --vnc-password)           VNC_PASSWORD_INPUT="$2"; shift 2 ;;
@@ -316,12 +416,26 @@ if [ "$UNINSTALL" -eq 1 ]; then
         exit 0
     fi
 
+    # A Helm release is tracked independently of the host install kind: the
+    # same machine can hold a docker or native install AND have installed a
+    # release into a cluster. So this is a separate flag, not a KIND value,
+    # and its teardown runs whenever the marker is present.
+    UNINSTALL_K8S_ENV="$UNINSTALL_INSTALL_DIR/k8s/release.env"
+    K8S_PRESENT=0
+    [ -f "$UNINSTALL_K8S_ENV" ] && K8S_PRESENT=1
+    uninstall_k8s_value() {
+        [ -f "$UNINSTALL_K8S_ENV" ] || return 0
+        sed -n "s/^$1=//p" "$UNINSTALL_K8S_ENV" | head -n 1
+    }
+
     # Detect install kind from on-disk markers.
     KIND=""
     if [ -f "$UNINSTALL_INSTALL_DIR/docker/docker-compose.yml" ]; then
         KIND=docker
     elif [ -d "$UNINSTALL_SYSTEM_DIR/venv" ]; then
         KIND=native
+    elif [ "$K8S_PRESENT" -eq 1 ]; then
+        KIND=kubernetes
     elif [ -d "$UNINSTALL_INSTALL_DIR" ]; then
         # Install Dir exists but no compose file and no venv — partial install
         # (script crashed mid-run, or already partly uninstalled). Treat as
@@ -329,7 +443,8 @@ if [ "$UNINSTALL" -eq 1 ]; then
         KIND=native
     else
         echo "Unrecognized install layout." >&2
-        echo "Expected $UNINSTALL_SYSTEM_DIR/venv (native) or $UNINSTALL_INSTALL_DIR/docker/docker-compose.yml (docker)." >&2
+        echo "Expected $UNINSTALL_SYSTEM_DIR/venv (native), $UNINSTALL_INSTALL_DIR/docker/docker-compose.yml (docker)," >&2
+        echo "or $UNINSTALL_K8S_ENV (kubernetes)." >&2
         exit 1
     fi
 
@@ -337,12 +452,25 @@ if [ "$UNINSTALL" -eq 1 ]; then
     if [ -z "$UNINSTALL_MODE" ]; then
         printf 'Uninstall Cremind (%s):\n' "$KIND"
         printf '  System Dir:  %s\n' "$UNINSTALL_SYSTEM_DIR"
-        printf '  Install Dir: %s\n\n' "$UNINSTALL_INSTALL_DIR"
+        printf '  Install Dir: %s\n' "$UNINSTALL_INSTALL_DIR"
+        if [ "$K8S_PRESENT" -eq 1 ]; then
+            printf '  Helm release: %s in namespace %s on context %s\n' \
+                "$(uninstall_k8s_value HELM_RELEASE)" \
+                "$(uninstall_k8s_value KUBE_NAMESPACE)" \
+                "$(uninstall_k8s_value KUBE_CONTEXT)"
+        fi
+        printf '\n'
         printf '  [k] Keep data    — remove the binaries + install scratch; preserve System Dir contents\n'
         printf '                     (.env, bootstrap.toml, storage/, tokens/, profile dirs)\n'
+        if [ "$K8S_PRESENT" -eq 1 ]; then
+            printf '                     The Helm release is removed; the PostgreSQL volume and the\n'
+            printf '                     record of its password are kept so a reinstall can reuse it.\n'
+        fi
         printf '  [p] Purge all    — delete everything Cremind installed'
         if [ "$KIND" = "docker" ]; then
             printf ' (incl. Docker volumes)'
+        elif [ "$K8S_PRESENT" -eq 1 ]; then
+            printf ' (incl. the cluster volumes)'
         fi
         printf '\n'
         printf '  [c] Cancel\n\n> '
@@ -500,6 +628,79 @@ if [ "$UNINSTALL" -eq 1 ]; then
         fi
     fi
 
+    # ── Helm release teardown ────────────────────────────────────────────
+    #
+    # Runs whenever a release is tracked, regardless of KIND: a machine can
+    # hold a docker or native install and still be the one that installed
+    # into the cluster. helm uninstall removes the chart's own PVCs
+    # (system/venv/work); the StatefulSet subcharts' data volumes are created
+    # by their controllers, so nothing removes them unless --purge does.
+    if [ "$K8S_PRESENT" -eq 1 ]; then
+        K8S_CTX="$(uninstall_k8s_value KUBE_CONTEXT)"
+        K8S_NS="$(uninstall_k8s_value KUBE_NAMESPACE)"
+        K8S_REL="$(uninstall_k8s_value HELM_RELEASE)"
+        K8S_NS_CREATED="$(uninstall_k8s_value NAMESPACE_CREATED)"
+
+        # Stop the background port-forward first — it holds a connection to
+        # the pod we are about to delete.
+        if [ -f "$UNINSTALL_INSTALL_DIR/k8s/port-forward.pid" ]; then
+            pf_pid="$(cat "$UNINSTALL_INSTALL_DIR/k8s/port-forward.pid" 2>/dev/null || true)"
+            if [ -n "$pf_pid" ] && kill -0 "$pf_pid" 2>/dev/null; then
+                case "$(ps -o comm= -p "$pf_pid" 2>/dev/null || true)" in
+                    *kubectl*) kill "$pf_pid" 2>/dev/null || true ;;
+                esac
+            fi
+            unset pf_pid
+        fi
+
+        k8s_ctx_known=0
+        if command -v kubectl >/dev/null 2>&1 && [ -n "$K8S_CTX" ]; then
+            if kubectl config get-contexts -o name 2>/dev/null | grep -qx "$K8S_CTX"; then
+                k8s_ctx_known=1
+            fi
+        fi
+
+        if [ "$k8s_ctx_known" -eq 0 ] || ! command -v helm >/dev/null 2>&1; then
+            echo "Cannot reach the cluster from here (kubectl/helm missing, or context '$K8S_CTX' is gone)." >&2
+            echo "Remove the release yourself with:" >&2
+            echo "  helm uninstall $K8S_REL --kube-context $K8S_CTX -n $K8S_NS" >&2
+        else
+            echo "Removing Helm release $K8S_REL from namespace $K8S_NS on context $K8S_CTX..."
+            helm uninstall "$K8S_REL" --kube-context "$K8S_CTX" \
+                --namespace "$K8S_NS" --wait >/dev/null 2>&1 \
+                || echo "helm uninstall reported a problem; continuing." >&2
+
+            if [ "$UNINSTALL_MODE" = "purge" ]; then
+                # The bundled StatefulSets' data volumes. Found by label
+                # because their names follow the subchart's pinned fullname
+                # (cremind-postgresql), not the Helm release name.
+                echo "Deleting cluster data volumes..."
+                for _sub in postgresql qdrant chromadb; do
+                    _pvcs="$(kubectl --context "$K8S_CTX" -n "$K8S_NS" get pvc \
+                        -l "app.kubernetes.io/name=$_sub" \
+                        -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+                    for _pvc in $_pvcs; do
+                        kubectl --context "$K8S_CTX" -n "$K8S_NS" delete pvc "$_pvc" \
+                            --ignore-not-found >/dev/null 2>&1 || true
+                        echo "  removed pvc $_pvc"
+                    done
+                done
+                unset _sub _pvcs _pvc
+                # Only a namespace this installer created is ours to delete.
+                if [ "$K8S_NS_CREATED" = "1" ]; then
+                    echo "Deleting namespace $K8S_NS (created by the installer)..."
+                    kubectl --context "$K8S_CTX" delete namespace "$K8S_NS" \
+                        --ignore-not-found >/dev/null 2>&1 || true
+                else
+                    echo "Namespace $K8S_NS existed before the install; leaving it in place."
+                fi
+            else
+                echo "Kept the PostgreSQL volume. A reinstall reuses it with the recorded password."
+            fi
+        fi
+        unset k8s_ctx_known
+    fi
+
     # Remove PATH-marker blocks from shell rc files. The install script writes
     # a `# >>> cremind installer >>>` / `# <<< cremind installer <<<` marker pair
     # around the PATH export. sed -i.bak then rm -f .bak works on both GNU
@@ -550,8 +751,24 @@ if [ "$UNINSTALL" -eq 1 ]; then
             "$UNINSTALL_SYSTEM_DIR/venv" \
             "$UNINSTALL_SYSTEM_DIR/bin" \
             "$UNINSTALL_SYSTEM_DIR/server.pid"
+        # The Install Dir is otherwise all scratch, but the kept cluster
+        # volume is only usable with the password recorded here — wiping it
+        # would leave a database nobody can open.
+        K8S_KEEP_TMP=""
+        if [ "$K8S_PRESENT" -eq 1 ] && [ -f "$UNINSTALL_K8S_ENV" ]; then
+            K8S_KEEP_TMP="$(mktemp 2>/dev/null || true)"
+            [ -n "$K8S_KEEP_TMP" ] && cp "$UNINSTALL_K8S_ENV" "$K8S_KEEP_TMP"
+        fi
         # Wipe the Install Dir wholesale — it's all install scratch.
         [ -d "$UNINSTALL_INSTALL_DIR" ] && rm -rf "$UNINSTALL_INSTALL_DIR" && echo "Removed install scratch at $UNINSTALL_INSTALL_DIR."
+        if [ -n "$K8S_KEEP_TMP" ] && [ -f "$K8S_KEEP_TMP" ]; then
+            mkdir -p "$UNINSTALL_INSTALL_DIR/k8s"
+            chmod 700 "$UNINSTALL_INSTALL_DIR/k8s" 2>/dev/null || true
+            cp "$K8S_KEEP_TMP" "$UNINSTALL_K8S_ENV"
+            chmod 600 "$UNINSTALL_K8S_ENV" 2>/dev/null || true
+            rm -f "$K8S_KEEP_TMP"
+            echo "Kept $UNINSTALL_K8S_ENV so the retained PostgreSQL volume stays usable."
+        fi
         echo "Kept data in $UNINSTALL_SYSTEM_DIR (.env, bootstrap.toml, storage/, tokens/, profile dirs)."
     fi
 
@@ -593,6 +810,45 @@ if [ -n "$VNC_PASSWORD_INPUT" ] \
     exit 2
 fi
 
+# Kubernetes flag shapes. Checked here, before anything reaches helm: a bad
+# namespace or release name is a template error several minutes into an
+# install otherwise, and a yes/no field silently taking "true" would quietly
+# flip a default.
+for _pair in "legacy-postgres-image:$K8S_legacy_postgres_image" \
+             "delete-postgres-data:$K8S_delete_postgres_data"; do
+    case "${_pair#*:}" in
+        ""|yes|no) ;;
+        *) err "Invalid --k8s-${_pair%%:*}: ${_pair#*:} (must be yes or no)"; exit 2 ;;
+    esac
+done
+unset _pair
+if [ -n "$KUBE_NAMESPACE" ] && ! printf '%s' "$KUBE_NAMESPACE" | grep -Eq "$KUBE_NAME_RE"; then
+    err "Invalid --kube-namespace: '$KUBE_NAMESPACE' (lowercase letters, digits and hyphens, max 63 characters)"
+    exit 2
+fi
+if [ -n "$K8S_release_name" ]; then
+    if ! printf '%s' "$K8S_release_name" | grep -Eq "$KUBE_NAME_RE"; then
+        err "Invalid --k8s-release-name: '$K8S_release_name' (lowercase letters, digits and hyphens)"
+        exit 2
+    fi
+    if [ "${#K8S_release_name}" -gt 53 ]; then
+        err "Invalid --k8s-release-name: Helm allows at most 53 characters."
+        exit 2
+    fi
+fi
+if [ -n "$K8S_app_url" ] \
+   && ! printf '%s' "$K8S_app_url" | grep -Eq '^https?://[^/[:space:]]+'; then
+    err "Invalid --k8s-app-url: '$K8S_app_url' (expected http://host[:port] or https://host[:port])"
+    exit 2
+fi
+# --k8s-extra-set is the VALUE of one helm --set, not a fragment of argv.
+case "$K8S_extra_set" in
+    -*)
+        err "Invalid --k8s-extra-set: pass key=value[,key=value], without the --set itself."
+        exit 2
+        ;;
+esac
+
 if [ "$CHANNEL" = "dev" ]; then
     if [ -z "$REPO_ROOT" ] || [ ! -f "$REPO_ROOT/pyproject.toml" ]; then
         err "--channel dev requires running install.sh from a checkout (not piped via curl)."
@@ -612,8 +868,13 @@ fi
 # The error message is the one the Cremind desktop app surfaces in its
 # install log, so it carries the user-visible context (which Electron
 # build is rejecting the spec).
+# Keep the operator's raw --version before the dev-channel guard blanks it:
+# a dev *kubernetes* install still runs a published image in the pod, so the
+# kubernetes branch pins image.tag from this copy. (MODE is not known yet —
+# the TUI may still choose it — so the blanking below stays unconditional.)
+VERSION_SPEC_RAW="$VERSION_SPEC"
 if [ -n "$VERSION_SPEC" ] && [ "$CHANNEL" = "dev" ]; then
-    warn "--version is ignored on dev channel (editable install)."
+    warn "--version is ignored on dev channel (editable install; a kubernetes install still uses it as the pod's image tag)."
     VERSION_SPEC=""
 fi
 if [ -n "$VERSION_SPEC" ]; then
@@ -666,7 +927,9 @@ if [ -f /.dockerenv ] || [ -f /run/.containerenv ] \
     IN_CONTAINER=1
 fi
 
-if [ "$UNATTENDED" -eq 1 ] && [ -z "$DEPLOYMENT" ]; then
+# Kubernetes has no host to bind — the chart sets HOST and APP_URL on the pod
+# — so it never gets a deployment, not even an unattended default.
+if [ "$UNATTENDED" -eq 1 ] && [ -z "$DEPLOYMENT" ] && [ "$MODE" != "kubernetes" ]; then
     if [ "$IN_CONTAINER" -eq 1 ]; then
         DEPLOYMENT="custom"
         : "${CUSTOM_listen_host:=0.0.0.0}"
@@ -976,6 +1239,118 @@ else
     info "Docker: not detected (or not running)"
 fi
 
+# ── kubernetes capabilities ───────────────────────────────────────────────
+#
+# kubectl and helm are what the ``kubernetes`` install mode needs, and the
+# catalog's ``requires`` turns their presence into whether the mode is even
+# offered (see the mode block below). Probing kubectl means more than "is it
+# on PATH": a kubeconfig with no contexts gives us nothing to install into.
+#
+# Contexts are enumerated once, into a file, because the TUI needs them and
+# so does the text-fallback picker. One line per context:
+#
+#     name<TAB>server<TAB>default-namespace
+#
+# Two `kubectl config view` calls, not two per context: one ranges over
+# contexts (name + cluster + namespace), one over clusters (name + server),
+# and awk joins them. `kubectl config view` reads the merged kubeconfig, so a
+# KUBECONFIG naming several files is handled by kubectl rather than by us.
+HAS_KUBECTL=0
+HAS_HELM=0
+KUBE_CONTEXT_COUNT=0
+KUBE_CURRENT_CONTEXT=""
+KUBE_CONTEXTS_FILE=""
+if command -v kubectl >/dev/null 2>&1; then
+    _ctx_rows="$(kubectl config view -o 'jsonpath={range .contexts[*]}{.name}{"\t"}{.context.cluster}{"\t"}{.context.namespace}{"\n"}{end}' 2>/dev/null || true)"
+    if [ -n "$_ctx_rows" ]; then
+        _cluster_rows="$(kubectl config view -o 'jsonpath={range .clusters[*]}{.name}{"\t"}{.cluster.server}{"\n"}{end}' 2>/dev/null || true)"
+        KUBE_CONTEXTS_FILE="$CREMIND_INSTALL_DIR/.kube-contexts"
+        (
+            umask 077
+            printf '%s\n' "$_cluster_rows" >"$KUBE_CONTEXTS_FILE.clusters"
+            printf '%s\n' "$_ctx_rows" | awk -F'\t' -v OFS='\t' '
+                NR==FNR { if ($1 != "") srv[$1] = $2; next }
+                $1 != "" { print $1, (($2 in srv) ? srv[$2] : ""), $3 }
+            ' "$KUBE_CONTEXTS_FILE.clusters" - >"$KUBE_CONTEXTS_FILE"
+        )
+        rm -f "$KUBE_CONTEXTS_FILE.clusters"
+        KUBE_CONTEXT_COUNT="$(grep -c . "$KUBE_CONTEXTS_FILE" 2>/dev/null || true)"
+        [ -n "$KUBE_CONTEXT_COUNT" ] || KUBE_CONTEXT_COUNT=0
+        # Exits 1 with "current-context is not set" when there is none; that
+        # is a normal state, not an error.
+        KUBE_CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
+    fi
+    if [ "$KUBE_CONTEXT_COUNT" -ge 1 ]; then
+        HAS_KUBECTL=1
+        ok "kubectl: $KUBE_CONTEXT_COUNT context(s)${KUBE_CURRENT_CONTEXT:+, current: $KUBE_CURRENT_CONTEXT}"
+    else
+        info "kubectl: found, but the kubeconfig has no contexts"
+    fi
+else
+    info "kubectl: not detected"
+fi
+if command -v helm >/dev/null 2>&1; then
+    # helm 3.8 is where OCI chart references stopped being experimental, and
+    # the chart is published only as an OCI artifact.
+    _helm_version="$(helm version --short 2>/dev/null || true)"
+    case "$_helm_version" in
+        v3.[89].*|v3.[1-9][0-9].*|v[4-9].*)
+            HAS_HELM=1
+            ok "helm: ${_helm_version}"
+            ;;
+        v3.*)
+            info "helm: ${_helm_version} — 3.8 or newer is required for OCI charts"
+            ;;
+        *)
+            info "helm: found, but its version could not be read"
+            ;;
+    esac
+    unset _helm_version
+else
+    info "helm: not detected"
+fi
+
+# ── mode availability ─────────────────────────────────────────────────────
+#
+# The catalog's per-mode ``requires`` decides what this machine may be
+# offered. Implemented here over MODE_REQUIRES_<id> from _catalog.sh; the
+# TUI (Catalog.available_modes) and the Electron stage apply the same rule
+# over the same data. An unknown capability id counts as unmet, so a typo in
+# catalog.toml hides a mode instead of advertising a broken one.
+capability_present() {
+    case "$1" in
+        docker)  [ "$HAS_DOCKER" -eq 1 ] ;;
+        kubectl) [ "$HAS_KUBECTL" -eq 1 ] ;;
+        helm)    [ "$HAS_HELM" -eq 1 ] ;;
+        *)       return 1 ;;
+    esac
+}
+
+mode_available() {
+    local _req_var="MODE_REQUIRES_$1" _req
+    for _req in $(eval "printf %s \"\${${_req_var}-}\""); do
+        capability_present "$_req" || return 1
+    done
+    return 0
+}
+
+# Why a mode is not on the list, in the operator's words.
+capability_label() {
+    case "$1" in
+        docker)  printf 'a running Docker daemon' ;;
+        kubectl) printf 'kubectl with a kubeconfig context' ;;
+        helm)    printf 'helm 3.8+' ;;
+        *)       printf '%s' "$1" ;;
+    esac
+}
+
+AVAILABLE_MODE_IDS=""
+for m_id in $MODE_IDS; do
+    if mode_available "$m_id"; then
+        AVAILABLE_MODE_IDS="${AVAILABLE_MODE_IDS:+$AVAILABLE_MODE_IDS }$m_id"
+    fi
+done
+
 # ── TUI bootstrap ─────────────────────────────────────────────────────────
 
 # Run the prompt_toolkit-based installer to gather channel, version,
@@ -1001,6 +1376,52 @@ read_prev_vnc_password() {
 }
 
 read_prev_vnc_password
+
+# ── previous kubernetes release ───────────────────────────────────────────
+#
+# A kubernetes install records what it did in k8s/release.env so a re-run can
+# offer the same answers and an uninstall knows what to tear down. Read —
+# never sourced: the file holds two secrets and arbitrary --set text, and
+# sourcing it would let either become shell code. Values land in PREV_K8S_*,
+# which nothing else in this script writes.
+K8S_DIR="$CREMIND_INSTALL_DIR/k8s"
+K8S_RELEASE_ENV="$K8S_DIR/release.env"
+PREV_K8S_KUBE_CONTEXT=""
+PREV_K8S_KUBE_NAMESPACE=""
+PREV_K8S_NAMESPACE_CREATED=""
+PREV_K8S_HELM_RELEASE=""
+PREV_K8S_DESKTOP_UI=""
+PREV_K8S_VNC_PASSWORD=""
+PREV_K8S_PG_PASSWORD=""
+PREV_K8S_release_name=""
+PREV_K8S_app_url=""
+PREV_K8S_legacy_postgres_image=""
+PREV_K8S_delete_postgres_data=""
+PREV_K8S_extra_set=""
+
+read_k8s_env_value() {
+    # read_k8s_env_value KEY → the value, or empty. First match wins.
+    [ -f "$K8S_RELEASE_ENV" ] || return 0
+    sed -n "s/^$1=//p" "$K8S_RELEASE_ENV" | head -n 1
+}
+
+read_k8s_release_env() {
+    [ -f "$K8S_RELEASE_ENV" ] || return 0
+    PREV_K8S_KUBE_CONTEXT="$(read_k8s_env_value KUBE_CONTEXT)"
+    PREV_K8S_KUBE_NAMESPACE="$(read_k8s_env_value KUBE_NAMESPACE)"
+    PREV_K8S_NAMESPACE_CREATED="$(read_k8s_env_value NAMESPACE_CREATED)"
+    PREV_K8S_HELM_RELEASE="$(read_k8s_env_value HELM_RELEASE)"
+    PREV_K8S_DESKTOP_UI="$(read_k8s_env_value DESKTOP_UI)"
+    PREV_K8S_VNC_PASSWORD="$(read_k8s_env_value VNC_PASSWORD)"
+    PREV_K8S_PG_PASSWORD="$(read_k8s_env_value PG_PASSWORD)"
+    PREV_K8S_release_name="$(read_k8s_env_value K8S_release_name)"
+    PREV_K8S_app_url="$(read_k8s_env_value K8S_app_url)"
+    PREV_K8S_legacy_postgres_image="$(read_k8s_env_value K8S_legacy_postgres_image)"
+    PREV_K8S_delete_postgres_data="$(read_k8s_env_value K8S_delete_postgres_data)"
+    PREV_K8S_extra_set="$(read_k8s_env_value K8S_extra_set)"
+}
+
+read_k8s_release_env
 
 tui_run_bootstrap() {
     [ "$UNATTENDED" -eq 1 ] && return 0
@@ -1038,8 +1459,12 @@ tui_run_bootstrap() {
     fi
 
     # Tells the TUI an empty password answer means "keep the existing one".
+    # Either previous install counts — the mode is not settled yet, and the
+    # text prompt re-points PREV_VNC_PASSWORD once it is.
     local vnc_pw_preset=0
-    [ -n "$PREV_VNC_PASSWORD" ] && vnc_pw_preset=1
+    if [ -n "$PREV_VNC_PASSWORD" ] || [ -n "$PREV_K8S_VNC_PASSWORD" ]; then
+        vnc_pw_preset=1
+    fi
 
     local ssl_inherited=0
     if [ -n "${CREMIND_SSL:-}" ] || [ -n "${CREMIND_SSL_CERTFILE:-}" ] || [ -n "${CREMIND_SSL_KEYFILE:-}" ]; then ssl_inherited=1; fi
@@ -1072,7 +1497,7 @@ tui_run_bootstrap() {
             --wizard-preset "$CUSTOM_wizard_preset" \
             --electron-version "$ELECTRON_VERSION" \
             --in-container "$IN_CONTAINER" \
-            --has-docker "$HAS_DOCKER" \
+            --has-docker "$HAS_DOCKER"             --has-kubectl "$HAS_KUBECTL"             --has-helm "$HAS_HELM"             --kube-contexts-file "$KUBE_CONTEXTS_FILE"             --kube-current-context "$KUBE_CURRENT_CONTEXT"             --kube-context "$KUBE_CONTEXT"             --kube-namespace "$KUBE_NAMESPACE"             --k8s-release-name "$K8S_release_name"             --k8s-app-url "$K8S_app_url"             --k8s-legacy-postgres-image "$K8S_legacy_postgres_image"             --k8s-delete-postgres-data "$K8S_delete_postgres_data"             --k8s-extra-set "$K8S_extra_set" \
             </dev/tty >/dev/tty || rc=$?
     else
         "$UV_BIN" run --quiet --python 3.13 \
@@ -1098,7 +1523,7 @@ tui_run_bootstrap() {
             --wizard-preset "$CUSTOM_wizard_preset" \
             --electron-version "$ELECTRON_VERSION" \
             --in-container "$IN_CONTAINER" \
-            --has-docker "$HAS_DOCKER" \
+            --has-docker "$HAS_DOCKER"             --has-kubectl "$HAS_KUBECTL"             --has-helm "$HAS_HELM"             --kube-contexts-file "$KUBE_CONTEXTS_FILE"             --kube-current-context "$KUBE_CURRENT_CONTEXT"             --kube-context "$KUBE_CONTEXT"             --kube-namespace "$KUBE_NAMESPACE"             --k8s-release-name "$K8S_release_name"             --k8s-app-url "$K8S_app_url"             --k8s-legacy-postgres-image "$K8S_legacy_postgres_image"             --k8s-delete-postgres-data "$K8S_delete_postgres_data"             --k8s-extra-set "$K8S_extra_set" \
             </dev/tty >/dev/tty || rc=$?
     fi
 
@@ -1114,6 +1539,7 @@ tui_run_bootstrap() {
     if [ "$rc" -eq 0 ]; then
         # shellcheck disable=SC1090
         . "$tui_out"
+        TUI_APPLIED=1
         ok "TUI selections applied."
     elif [ "$rc" -eq 1 ]; then
         err "Installer cancelled."
@@ -1125,7 +1551,122 @@ tui_run_bootstrap() {
 
 tui_run_bootstrap
 
+# ── mode (how Cremind is installed) ───────────────────────────────────────
+#
+# Asked before the deployment questions because it decides whether they are
+# asked at all: a kubernetes install has no host to bind and no .env to
+# render — the chart owns both on the pod.
+#
+# Only modes this machine can actually run are offered (AVAILABLE_MODE_IDS,
+# computed from the catalog's ``requires`` above). When one survives there is
+# nothing to ask, which is what happens on a plain laptop with no Docker.
+
+# Guard against ``--mode <unknown>`` and against a mode whose requirements
+# this machine does not meet. Both used to fall through: an unknown --mode
+# silently took the native branch.
+if [ -n "$MODE" ]; then
+    MODE_KNOWN=0
+    for m_id in $MODE_IDS; do
+        [ "$m_id" = "$MODE" ] && MODE_KNOWN=1
+    done
+    if [ "$MODE_KNOWN" -ne 1 ]; then
+        err "Unknown mode: $MODE (must be one of: $MODE_IDS)"
+        exit 2
+    fi
+    if ! mode_available "$MODE"; then
+        err "$MODE mode was requested, but this machine is missing what it needs:"
+        req_var="MODE_REQUIRES_$MODE"
+        for req in $(eval "printf %s \"\${${req_var}-}\""); do
+            capability_present "$req" || err "  - $(capability_label "$req")"
+        done
+        case "$MODE" in
+            kubernetes)
+                err "Install kubectl and helm 3.8+, and make sure 'kubectl config get-contexts' lists at least one context."
+                ;;
+            docker)
+                err "Start Docker Desktop / the docker daemon and re-run."
+                ;;
+        esac
+        exit 1
+    fi
+fi
+
+if [ -z "$MODE" ]; then
+    mode_count=0
+    for m_id in $AVAILABLE_MODE_IDS; do
+        mode_count=$((mode_count + 1))
+    done
+    if [ "$mode_count" -le 1 ] || [ "$UNATTENDED" -eq 1 ]; then
+        # Catalog order is the recommendation, so the first available mode is
+        # the pick. Unattended never lands on kubernetes: it sorts after
+        # native, which is always available — an unattended kubernetes install
+        # is opted into with --mode kubernetes.
+        MODE="${AVAILABLE_MODE_IDS%% *}"
+        : "${MODE:=native}"
+    else
+        echo
+        printf '%sHow do you want to run Cremind?%s\n' "$BOLD" "$RESET"
+        idx=0
+        for m_id in $AVAILABLE_MODE_IDS; do
+            idx=$((idx + 1))
+            label_var="MODE_LABEL_$m_id"; label="${!label_var}"
+            desc_var="MODE_DESC_$m_id";   desc="${!desc_var}"
+            hint_var="MODE_HINT_$m_id";   hint="${!hint_var}"
+            printf '  %s%d)%s %s%s%s — %s\n' \
+                "$BOLD" "$idx" "$RESET" "$BOLD" "$label" "$RESET" "$desc"
+            [ -n "$hint" ] && printf '                  %s%s%s\n' "$DIM" "$hint" "$RESET"
+        done
+        # Name what is missing rather than silently shortening the list.
+        for m_id in $MODE_IDS; do
+            mode_available "$m_id" && continue
+            label_var="MODE_LABEL_$m_id"; label="${!label_var}"
+            req_var="MODE_REQUIRES_$m_id"
+            missing=""
+            for req in $(eval "printf %s \"\${${req_var}-}\""); do
+                capability_present "$req" && continue
+                missing="${missing:+$missing, }$(capability_label "$req")"
+            done
+            printf '  %s(not offered: %s — needs %s)%s\n' "$DIM" "$label" "$missing" "$RESET"
+        done
+        while :; do
+            read -r -p "Choice [1]: " choice </dev/tty || choice=""
+            choice="${choice:-1}"
+            MODE=""
+            idx=0
+            for m_id in $AVAILABLE_MODE_IDS; do
+                idx=$((idx + 1))
+                if [ "$choice" = "$idx" ] || [ "$choice" = "$m_id" ]; then
+                    MODE="$m_id"; break
+                fi
+            done
+            [ -n "$MODE" ] && break
+            warn "Pick a number 1-$idx or a mode id."
+        done
+    fi
+fi
+ok "Mode: $MODE"
+
+# The desktop app drives this script for a local install; it has no helm
+# branch, no context picker, and computes the post-install URL itself.
+if [ "$MODE" = "kubernetes" ] && [ "${CREMIND_INSTALLER_FRONTEND:-}" = "electron" ]; then
+    err "Kubernetes installs are not supported from the desktop app."
+    err "Run install.sh --mode kubernetes in a terminal instead."
+    exit 2
+fi
+
 # ── deployment type ───────────────────────────────────────────────────────
+
+if [ "$MODE" = "kubernetes" ]; then
+    # The chart sets HOST, APP_URL and CORS on the pod; there is nothing here
+    # to answer. Warn rather than silently dropping a flag the operator typed.
+    if [ -n "$DEPLOYMENT" ] || [ -n "$APP_HOST" ]; then
+        warn "--deployment / --host do not apply to a kubernetes install; the chart sets them on the pod."
+        DEPLOYMENT=""
+        APP_HOST=""
+    fi
+fi
+
+if [ "$MODE" != "kubernetes" ]; then
 
 step "Deployment"
 
@@ -1255,54 +1796,7 @@ if [ "$DEPLOYMENT" = "custom" ]; then
     fi
 fi
 
-# ── mode (docker vs native) ──────────────────────────────────────────────
-
-# Default: docker if available, native otherwise. We sandbox the agent in
-# a desktop container by default — the user opts out explicitly if they
-# want a native install. Both labels + descriptions come from the
-# catalog ($MODE_IDS / MODE_LABEL_<id> / MODE_DESC_<id>).
-if [ -z "$MODE" ]; then
-    if [ "$HAS_DOCKER" -eq 1 ]; then
-        if [ "$UNATTENDED" -eq 1 ]; then
-            MODE="docker"
-        else
-            echo
-            printf '%sHow do you want to run Cremind?%s\n' "$BOLD" "$RESET"
-            idx=0
-            for m_id in $MODE_IDS; do
-                idx=$((idx + 1))
-                label_var="MODE_LABEL_$m_id"; label="${!label_var}"
-                desc_var="MODE_DESC_$m_id";   desc="${!desc_var}"
-                hint_var="MODE_HINT_$m_id";   hint="${!hint_var}"
-                printf '  %s%d)%s %s%s%s — %s\n' \
-                    "$BOLD" "$idx" "$RESET" "$BOLD" "$label" "$RESET" "$desc"
-                [ -n "$hint" ] && printf '                  %s%s%s\n' "$DIM" "$hint" "$RESET"
-            done
-            while :; do
-                read -r -p "Choice [1]: " choice </dev/tty || choice=""
-                choice="${choice:-1}"
-                MODE=""
-                idx=0
-                for m_id in $MODE_IDS; do
-                    idx=$((idx + 1))
-                    if [ "$choice" = "$idx" ] || [ "$choice" = "$m_id" ]; then
-                        MODE="$m_id"; break
-                    fi
-                done
-                [ -n "$MODE" ] && break
-                warn "Pick a number 1-$idx or a mode id."
-            done
-        fi
-    else
-        MODE="native"
-    fi
-fi
-ok "Mode: $MODE"
-
-if [ "$MODE" = "docker" ] && [ "$HAS_DOCKER" -eq 0 ]; then
-    err "Docker mode requested but Docker is not available."
-    exit 1
-fi
+fi  # end: deployment questions (skipped for kubernetes)
 
 # ── desktop UI (docker mode only) ─────────────────────────────────────────
 #
@@ -1311,14 +1805,25 @@ fi
 # (cremind/cremind). Default is desktop everywhere, including --unattended.
 # A re-install reads the previous choice from the existing docker/.env
 # (CREMIND_IMAGE) so an unattended re-run preserves the flavor.
-if [ "$MODE" = "docker" ] && [ -z "$DESKTOP_UI" ]; then
+#
+# Kubernetes picks the same two images through the chart's desktop.enabled,
+# with one extra rule: on the production channel the basic image is not
+# installable at all (see the refusal below), so it is not offered.
+if [ "$MODE" = "kubernetes" ] && [ "$CHANNEL" = "production" ] && [ -z "$DESKTOP_UI" ]; then
+    DESKTOP_UI=1
+fi
+if { [ "$MODE" = "docker" ] || [ "$MODE" = "kubernetes" ]; } && [ -z "$DESKTOP_UI" ]; then
     # Sticky default from a prior install: cremind/cremind → basic (0),
     # anything else / no prior install → desktop (1).
     desktop_default=1
-    prev_env="$CREMIND_INSTALL_DIR/docker/.env"
-    if [ -f "$prev_env" ]; then
-        prev_image="$(sed -n 's/^CREMIND_IMAGE=//p' "$prev_env" | head -n 1)"
-        [ "$prev_image" = "cremind/cremind" ] && desktop_default=0
+    if [ "$MODE" = "kubernetes" ]; then
+        [ "$PREV_K8S_DESKTOP_UI" = "0" ] && desktop_default=0
+    else
+        prev_env="$CREMIND_INSTALL_DIR/docker/.env"
+        if [ -f "$prev_env" ]; then
+            prev_image="$(sed -n 's/^CREMIND_IMAGE=//p' "$prev_env" | head -n 1)"
+            [ "$prev_image" = "cremind/cremind" ] && desktop_default=0
+        fi
     fi
 
     if [ "$UNATTENDED" -eq 1 ]; then
@@ -1345,7 +1850,22 @@ if [ "$MODE" = "docker" ] && [ -z "$DESKTOP_UI" ]; then
         done
     fi
 fi
-if [ "$MODE" = "docker" ]; then
+# The production chart and the production basic image are published to the
+# SAME Docker Hub tag — `helm push` writes cremind/cremind:X.Y.Z after the
+# image job has pushed an image there, so that tag holds a Helm chart. A
+# headless production install would ask Kubernetes to run the chart artifact
+# as a container image and fail on the pull. Release candidates do not
+# collide (chart 0.0.17-rc.13.dev.1 vs image 0.0.17rc13.dev1), so the test
+# channel is fine. Refused here rather than leaving a pod in ImagePullBackOff.
+if [ "$MODE" = "kubernetes" ] && [ "$CHANNEL" = "production" ] && [ "$DESKTOP_UI" = "0" ]; then
+    err "A production Kubernetes install cannot use the basic (headless) image."
+    err "On the production channel, cremind/cremind:<version> on Docker Hub is the Helm"
+    err "chart artifact, not a container image, so the pod could never pull it."
+    err "Use the desktop image (drop --no-desktop), or --channel test for a headless install."
+    exit 2
+fi
+
+if [ "$MODE" = "docker" ] || [ "$MODE" = "kubernetes" ]; then
     if [ "$DESKTOP_UI" = "0" ]; then
         ok "Desktop UI: no (basic headless image)"
     else
@@ -1353,13 +1873,17 @@ if [ "$MODE" = "docker" ]; then
     fi
 fi
 
-# ── VNC password (docker + desktop only) ──────────────────────────────────
+# ── VNC password (container modes + desktop only) ─────────────────────────
 #
 # Asked here when the TUI didn't (--no-tui, no /dev/tty, TUI failure) and no
 # --vnc-password was passed. Unattended installs deliberately fall through
-# without asking: the docker branch below still resolves a password from the
+# without asking: the install branch below still resolves a password from the
 # previous install or generates one, so a scripted install never blocks.
-if [ "$MODE" = "docker" ] && [ "$DESKTOP_UI" != "0" ] \
+if [ "$MODE" = "kubernetes" ]; then
+    # The relevant "previous install" is the Helm release, not docker/.env.
+    PREV_VNC_PASSWORD="$PREV_K8S_VNC_PASSWORD"
+fi
+if { [ "$MODE" = "docker" ] || [ "$MODE" = "kubernetes" ]; } && [ "$DESKTOP_UI" != "0" ] \
    && [ -z "$VNC_PASSWORD_INPUT" ] && [ "$UNATTENDED" -eq 0 ] && [ -e /dev/tty ]; then
     echo
     printf '%s%s%s\n' "$BOLD" "$VNC_PASSWORD_PROMPT" "$RESET"
@@ -1400,6 +1924,212 @@ if [ "$MODE" = "docker" ] && [ "$DESKTOP_UI" != "0" ] \
         warn "No VNC password entered; generating one and printing it at the end."
     fi
     unset vnc_pw vnc_pw2 vnc_tries
+fi
+
+# ── kubernetes questions ──────────────────────────────────────────────────
+#
+# The fallback for everything the TUI would have asked: which cluster, which
+# namespace, and the Helm options. Reached with --no-tui, without a /dev/tty,
+# when the TUI failed to launch, and in --unattended (where nothing is asked
+# and the flags/defaults stand).
+#
+# The context question is the one that cannot be defaulted away. Installing
+# into the wrong cluster is not recoverable by re-running, so an unattended
+# run with several contexts is an error, not a guess.
+if [ "$MODE" = "kubernetes" ]; then
+    step "Kubernetes target"
+
+    kube_context_row() {
+        # kube_context_row NAME FIELD(2=server|3=namespace)
+        awk -F'\t' -v want="$1" -v col="$2" '$1 == want { print $col; exit }' \
+            "$KUBE_CONTEXTS_FILE"
+    }
+    kube_context_known() {
+        awk -F'\t' -v want="$1" '$1 == want { found = 1 } END { exit found ? 0 : 1 }' \
+            "$KUBE_CONTEXTS_FILE"
+    }
+    print_kube_contexts() {
+        local idx=0 name server namespace marker
+        while IFS="$(printf '\t')" read -r name server namespace; do
+            [ -n "$name" ] || continue
+            idx=$((idx + 1))
+            marker=""
+            [ "$name" = "$KUBE_CURRENT_CONTEXT" ] && marker="  ${DIM}[current]${RESET}"
+            printf '  %s%d)%s %s %s— %s (%s)%s%s\n' \
+                "$BOLD" "$idx" "$RESET" "$name" \
+                "$DIM" "${server:-server unknown}" "${namespace:-default}" "$RESET" "$marker"
+        done <"$KUBE_CONTEXTS_FILE"
+    }
+
+    if [ -n "$KUBE_CONTEXT" ]; then
+        if ! kube_context_known "$KUBE_CONTEXT"; then
+            err "Unknown kubeconfig context: $KUBE_CONTEXT"
+            err "Available contexts:"
+            print_kube_contexts >&2
+            exit 2
+        fi
+    elif [ "$KUBE_CONTEXT_COUNT" -eq 1 ]; then
+        KUBE_CONTEXT="$(awk -F'\t' 'NF { print $1; exit }' "$KUBE_CONTEXTS_FILE")"
+    elif [ "$UNATTENDED" -eq 1 ] || [ ! -e /dev/tty ]; then
+        err "--kube-context is required: the kubeconfig has $KUBE_CONTEXT_COUNT contexts and"
+        err "an unattended install must not guess which cluster to install into."
+        print_kube_contexts >&2
+        exit 2
+    else
+        echo
+        printf '%s%s%s\n' "$BOLD" "$K8S_CONTEXT_PROMPT" "$RESET"
+        [ -n "$K8S_CONTEXT_HINT" ] && printf '  %s%s%s\n' "$DIM" "$K8S_CONTEXT_HINT" "$RESET"
+        print_kube_contexts
+        # Default to the current context's position, or 1 when there is none.
+        ctx_default_idx=1
+        if [ -n "$KUBE_CURRENT_CONTEXT" ]; then
+            ctx_default_idx="$(awk -F'\t' -v want="$KUBE_CURRENT_CONTEXT" \
+                'NF { n++ } $1 == want { print n; found = 1; exit } END { if (!found) print 1 }' \
+                "$KUBE_CONTEXTS_FILE")"
+        fi
+        while :; do
+            read -r -p "Choice [$ctx_default_idx]: " choice </dev/tty || choice=""
+            choice="${choice:-$ctx_default_idx}"
+            KUBE_CONTEXT="$(awk -F'\t' -v want="$choice" \
+                'NF { n++; if (n == want + 0 || $1 == want) { print $1; exit } }' \
+                "$KUBE_CONTEXTS_FILE")"
+            [ -n "$KUBE_CONTEXT" ] && break
+            warn "Pick a number from the list, or a context name."
+        done
+        unset ctx_default_idx
+    fi
+    KUBE_SERVER="$(kube_context_row "$KUBE_CONTEXT" 2)"
+    ok "Context: $KUBE_CONTEXT${KUBE_SERVER:+ ($KUBE_SERVER)}"
+
+    if [ -z "$KUBE_NAMESPACE" ]; then
+        ns_default="${PREV_K8S_KUBE_NAMESPACE:-$K8S_NAMESPACE_DEFAULT}"
+        : "${ns_default:=cremind}"
+        if [ "$UNATTENDED" -eq 1 ] || [ ! -e /dev/tty ]; then
+            KUBE_NAMESPACE="$ns_default"
+        else
+            echo
+            printf '%s%s%s\n' "$BOLD" "$K8S_NAMESPACE_PROMPT" "$RESET"
+            [ -n "$K8S_NAMESPACE_HINT" ] && printf '  %s%s%s\n' "$DIM" "$K8S_NAMESPACE_HINT" "$RESET"
+            while :; do
+                read -r -p "  [$ns_default]: " answer </dev/tty || answer=""
+                answer="${answer:-$ns_default}"
+                if printf '%s' "$answer" | grep -Eq "$KUBE_NAME_RE"; then
+                    KUBE_NAMESPACE="$answer"; break
+                fi
+                warn "Use lowercase letters, digits and hyphens, max 63 characters."
+            done
+        fi
+        unset ns_default answer
+    fi
+    ok "Namespace: $KUBE_NAMESPACE"
+
+    # Helm options. A populated release name is the "already answered" signal
+    # — from the TUI, a flag, or the previous release — here and in the TUI's
+    # screen_k8s_advanced. It works because release_name is the one advanced
+    # field with a non-empty default: app_url and extra_set are legitimately
+    # blank, so emptiness alone cannot mean "not asked yet".
+    k8s_any_answered=0
+    for field in $K8S_FIELD_IDS; do
+        var_name="K8S_$field"
+        [ -n "${!var_name}" ] && k8s_any_answered=1
+    done
+    k8s_customize=0
+    if [ -n "$K8S_release_name" ]; then
+        k8s_customize=0
+    elif [ "$k8s_any_answered" -eq 1 ]; then
+        # A flag answered part of it, so the operator is customizing: ask the
+        # rest, release name included.
+        k8s_customize=1
+    elif [ "$UNATTENDED" -eq 0 ] && [ -e /dev/tty ]; then
+        echo
+        printf '%s%s%s\n' "$BOLD" "$K8S_ADVANCED_PROMPT" "$RESET"
+        [ -n "$K8S_ADVANCED_HINT" ] && printf '  %s%s%s\n' "$DIM" "$K8S_ADVANCED_HINT" "$RESET"
+        while :; do
+            read -r -p "Customize the Helm options? [y/N]: " ans </dev/tty || ans=""
+            case "$ans" in
+                ""|[Nn]|[Nn][Oo])  k8s_customize=0; break ;;
+                [Yy]|[Yy][Ee][Ss]) k8s_customize=1; break ;;
+                *) warn "Please answer yes or no." ;;
+            esac
+        done
+        unset ans
+    fi
+
+    for field in $K8S_FIELD_IDS; do
+        var_name="K8S_$field"
+        current="${!var_name}"
+        if [ -n "$current" ]; then
+            ok "$field: $current"
+            continue
+        fi
+        prev_var="PREV_K8S_$field"
+        default="${!prev_var}"
+        if [ -z "$default" ]; then
+            default_var="K8S_FIELD_DEFAULT_$field"; default="${!default_var}"
+        fi
+        if [ "$k8s_customize" -eq 0 ]; then
+            eval "K8S_$field=\"\$default\""
+            continue
+        fi
+        prompt_var="K8S_FIELD_PROMPT_$field";   prompt="${!prompt_var}"
+        hint_var="K8S_FIELD_HINT_$field";       hint="${!hint_var}"
+        choices_var="K8S_FIELD_CHOICES_$field"; choices="${!choices_var}"
+        echo
+        printf '%s%s%s\n' "$BOLD" "$prompt" "$RESET"
+        printf '%s%s%s\n' "$DIM" "$hint" "$RESET"
+        [ -n "$choices" ] && printf '%sChoices: %s%s\n' "$DIM" "$choices" "$RESET"
+        while :; do
+            read -r -p "  [$default]: " answer </dev/tty || answer=""
+            answer="${answer:-$default}"
+            if [ -n "$choices" ]; then
+                ok_choice=0
+                for c in $choices; do
+                    [ "$c" = "$answer" ] && ok_choice=1
+                done
+                if [ "$ok_choice" -ne 1 ]; then
+                    warn "Pick one of: $choices"
+                    continue
+                fi
+            fi
+            case "$field" in
+                release_name)
+                    if ! printf '%s' "$answer" | grep -Eq "$KUBE_NAME_RE" || [ "${#answer}" -gt 53 ]; then
+                        warn "Use lowercase letters, digits and hyphens, max 53 characters."
+                        continue
+                    fi
+                    ;;
+                app_url)
+                    if [ -n "$answer" ] \
+                       && ! printf '%s' "$answer" | grep -Eq '^https?://[^/[:space:]]+'; then
+                        warn "Start the URL with http:// or https://, or leave it blank."
+                        continue
+                    fi
+                    ;;
+            esac
+            eval "K8S_$field=\"\$answer\""
+            break
+        done
+    done
+    unset k8s_any_answered k8s_customize field var_name current default default_var \
+          prev_var prompt_var hint_var choices_var prompt hint choices answer ok_choice c
+    : "${K8S_release_name:=cremind}"
+
+    # The TUI has a confirm screen; the text path does not, and this is the
+    # question worth confirming — the cluster.
+    if [ "$TUI_APPLIED" -eq 0 ] && [ "$UNATTENDED" -eq 0 ] && [ -e /dev/tty ]; then
+        echo
+        printf '%sAbout to install into:%s\n' "$BOLD" "$RESET"
+        printf '  context    %s\n' "$KUBE_CONTEXT"
+        printf '  server     %s\n' "${KUBE_SERVER:-(unknown)}"
+        printf '  namespace  %s\n' "$KUBE_NAMESPACE"
+        printf '  release    %s\n\n' "$K8S_release_name"
+        read -r -p "Install into this cluster? [y/N]: " ans </dev/tty || ans=""
+        case "$ans" in
+            [Yy]|[Yy][Ee][Ss]) ;;
+            *) err "Cancelled."; exit 1 ;;
+        esac
+        unset ans
+    fi
 fi
 
 # ── https scheme ──────────────────────────────────────────────────────────
@@ -1569,6 +2299,10 @@ cremind_health_ok() {
 #      Electron uses the same choices and precedence as browser installs.
 if [ "$MODE" = "docker" ]; then
     PREVIOUS_SSL_ENV="$CREMIND_INSTALL_DIR/docker/.env"
+elif [ "$MODE" = "kubernetes" ]; then
+    # The Helm release's own record. It stores the key as CREMIND_SSL exactly
+    # so the machinery below works unchanged.
+    PREVIOUS_SSL_ENV="$K8S_RELEASE_ENV"
 else
     PREVIOUS_SSL_ENV="$ENV_FILE"
 fi
@@ -1686,6 +2420,11 @@ elif [ "$MODE" = "docker" ]; then
         warn "--boot-service ignored: docker restarts the container for you."
     fi
     BOOT_SERVICE=0
+elif [ "$MODE" = "kubernetes" ]; then
+    if [ "$BOOT_EXPLICIT" = "1" ] && [ "$BOOT_SERVICE" = "1" ]; then
+        warn "--boot-service ignored: kubelet restarts the pod for you."
+    fi
+    BOOT_SERVICE=0
 elif [ "$BOOT_EXPLICIT" = "1" ]; then
     :
 elif [ -f "$ENV_FILE" ] && grep -qE '^[[:space:]]*CREMIND_BOOT_SERVICE[[:space:]]*=[[:space:]]*disabled' "$ENV_FILE" 2>/dev/null; then
@@ -1769,6 +2508,102 @@ upsert_env_key() {
     else
         printf '%s=%s\n' "$key" "$value" >> "$file"
     fi
+}
+
+# ── host-side CA trust ─────────────────────────────────────
+#
+# The CA lives inside the container (Docker) or the pod (Kubernetes), where
+# nothing can reach the HOST's trust store - but this script runs on the host,
+# so it can. This is the containerised counterpart of the wizard's one-click
+# trust (which the server can only offer on native installs): download /ca.pem
+# from the running server and offer to install it system-wide. Declining is
+# fine - the wizard's "Secure this install" step shows the manual command, and
+# every OTHER device needs that path anyway.
+#
+# Both listener phases serve /ca.pem: under after-setup it is plain http, and a
+# finished install answers https - which curl accepts exactly when this host
+# already trusts the CA from a previous run (and then the already-trusted check
+# below skips the prompt). A host that never trusted it gets a failed download
+# and a pointer, not a failed install.
+#
+# Usage: offer_host_ca_trust <ca-url>. Callers decide WHETHER to offer (TLS on,
+# interactive, not Electron); this decides how.
+offer_host_ca_trust() {
+    local ca_url="$1"
+    CA_TMP="$(mktemp "${TMPDIR:-/tmp}/cremind-ca.XXXXXX" 2>/dev/null || true)"
+    CA_FETCHED=0
+    if [ -n "$CA_TMP" ]; then
+        if curl -fsS --max-time 10 -o "$CA_TMP" "$ca_url" 2>/dev/null \
+            && grep -q "BEGIN CERTIFICATE" "$CA_TMP" 2>/dev/null; then
+            CA_FETCHED=1
+        else
+            # No local CA (operator certificate pair → /ca.pem 404s, and
+            # there is genuinely nothing of ours to trust) or an untrusted
+            # https listener — either way the wizard step has it covered.
+            info "Skipping host CA trust (could not fetch the CA from $ca_url)."
+        fi
+    fi
+    if [ "$CA_FETCHED" -eq 1 ]; then
+        CA_SUDO=""
+        if [ "$(id -u)" -ne 0 ]; then CA_SUDO="sudo"; fi
+        CA_ALREADY=0
+        CA_ANCHOR=""
+        CA_TRUST_CMD=""
+        case "$(uname -s)" in
+            Darwin)
+                # CN presence in the System keychain is the best cheap
+                # check macOS offers; the add below sets trustRoot anyway.
+                if security find-certificate -c "Cremind Local CA" -Z /Library/Keychains/System.keychain >/dev/null 2>&1; then
+                    CA_ALREADY=1
+                fi
+                CA_TRUST_CMD="$CA_SUDO security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain $CA_TMP"
+                ;;
+            *)
+                if [ -d /usr/local/share/ca-certificates ]; then
+                    CA_ANCHOR="/usr/local/share/ca-certificates/cremind-local-ca.crt"
+                    CA_TRUST_CMD="$CA_SUDO cp $CA_TMP $CA_ANCHOR && $CA_SUDO update-ca-certificates"
+                elif [ -d /etc/pki/ca-trust/source/anchors ]; then
+                    CA_ANCHOR="/etc/pki/ca-trust/source/anchors/cremind-local-ca.crt"
+                    CA_TRUST_CMD="$CA_SUDO cp $CA_TMP $CA_ANCHOR && $CA_SUDO update-ca-trust extract"
+                fi
+                if [ -n "$CA_ANCHOR" ] && [ -f "$CA_ANCHOR" ] && cmp -s "$CA_TMP" "$CA_ANCHOR"; then
+                    CA_ALREADY=1
+                fi
+                ;;
+        esac
+        if [ "$CA_ALREADY" -eq 1 ]; then
+            ok "This machine already trusts the Cremind local CA."
+        elif [ -z "$CA_TRUST_CMD" ]; then
+            info "No known trust store on this system — the Setup Wizard's 'Secure this install' step shows the options."
+        else
+            echo ""
+            echo "Cremind will serve HTTPS with a certificate signed by its own local CA."
+            echo "Trusting that CA now removes the browser warning on this machine; every"
+            echo "other device gets the same walkthrough in the Setup Wizard."
+            if command -v openssl >/dev/null 2>&1; then
+                CA_FP="$(openssl x509 -in "$CA_TMP" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//' || true)"
+                if [ -n "$CA_FP" ]; then echo "  SHA-256 : $CA_FP"; fi
+            fi
+            if [ -n "$CA_SUDO" ]; then
+                echo "  (needs sudo — you may be asked for your password)"
+            fi
+            trust_ans=""
+            read -r -p "Trust it system-wide now? [Y/n]: " trust_ans </dev/tty || trust_ans=""
+            case "$trust_ans" in
+                [nN]*)
+                    info "Skipped. The Setup Wizard's 'Secure this install' step covers it."
+                    ;;
+                *)
+                    if sh -c "$CA_TRUST_CMD"; then
+                        ok "Trusted the Cremind local CA."
+                    else
+                        warn "CA not trusted — the Setup Wizard's 'Secure this install' step shows the manual command."
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+    if [ -n "$CA_TMP" ]; then rm -f "$CA_TMP"; fi
 }
 
 # ── docker install ────────────────────────────────────────────────────────
@@ -1882,6 +2717,660 @@ resolve_version() {
             ;;
     esac
 }
+
+# ── kubernetes install ────────────────────────────────────────────────────
+#
+# Installs the Cremind Helm chart into the kubeconfig context the operator
+# chose. Nothing about this install is ambient: every helm and kubectl call
+# carries --kube-context, so a stale current-context can never redirect it.
+#
+# What this branch does NOT do, deliberately: write a host .env, register a
+# boot service, or run migrations. The chart owns the pod's environment
+# (INSTALL_MODE=kubernetes, SETUP_WIZARD_ENV=kubernetes, APP_URL), kubelet
+# supervises the pod, and the Setup Wizard runs the first migration.
+if [ "$MODE" = "kubernetes" ]; then
+    step "Kubernetes install"
+
+    mkdir -p "$K8S_DIR"
+    chmod 700 "$K8S_DIR" 2>/dev/null || true
+
+    # Every kubectl call goes through this. --request-timeout keeps an
+    # unreachable API server (or an exec credential plugin waiting on a
+    # browser) from looking like a frozen installer.
+    kc() {
+        kubectl --context "$KUBE_CONTEXT" --request-timeout=20s "$@"
+    }
+    kcn() {
+        kc --namespace "$KUBE_NAMESPACE" "$@"
+    }
+
+    HELM_RELEASE="${K8S_release_name:-cremind}"
+
+    # A host tracks one release. Re-running against a different target would
+    # leave the previous one behind with nothing recording it, so say so.
+    if [ -f "$K8S_RELEASE_ENV" ] && [ -n "$PREV_K8S_HELM_RELEASE" ]; then
+        if [ "$PREV_K8S_KUBE_CONTEXT" != "$KUBE_CONTEXT" ] \
+           || [ "$PREV_K8S_KUBE_NAMESPACE" != "$KUBE_NAMESPACE" ] \
+           || [ "$PREV_K8S_HELM_RELEASE" != "$HELM_RELEASE" ]; then
+            warn "This machine already tracks a Cremind release:"
+            warn "  $PREV_K8S_HELM_RELEASE in namespace $PREV_K8S_KUBE_NAMESPACE on context $PREV_K8S_KUBE_CONTEXT"
+            warn "You are about to install $HELM_RELEASE in $KUBE_NAMESPACE on $KUBE_CONTEXT."
+            if [ "$UNATTENDED" -eq 1 ] || [ ! -e /dev/tty ]; then
+                err "Refusing to orphan the tracked release. Run --uninstall first, or pass the same target."
+                exit 2
+            fi
+            printf '\nThe previous release will keep running, untracked by this installer.\n'
+            read -r -p "Continue anyway? [y/N]: " ans </dev/tty || ans=""
+            case "$ans" in
+                [Yy]|[Yy][Ee][Ss]) ;;
+                *) err "Cancelled."; exit 1 ;;
+            esac
+            unset ans
+        fi
+    fi
+
+    info "Target: context $KUBE_CONTEXT${KUBE_SERVER:+ ($KUBE_SERVER)}, namespace $KUBE_NAMESPACE, release $HELM_RELEASE"
+
+    # Pre-flight: can we actually reach this cluster? Better here than three
+    # minutes into a helm install.
+    if ! kc cluster-info >>"$LOG_FILE" 2>&1; then
+        err "Cannot reach the cluster for context '$KUBE_CONTEXT'${KUBE_SERVER:+ ($KUBE_SERVER)}."
+        err "Check your kubeconfig and VPN, then re-run. Details: $LOG_FILE"
+        exit 1
+    fi
+    ok "Cluster reachable."
+
+    # ── version + chart reference ─────────────────────────────────────────
+    #
+    # The image tag is a PEP 440 version (0.0.17rc13.dev1); the chart version
+    # is its SemVer2 spelling (0.0.17-rc.13.dev.1). One release, two
+    # spellings, and Helm rejects the PEP 440 form — so the translation runs
+    # through app/upgrade/channel.py, the same file that already owns every
+    # other version rule here.
+    #
+    # dev is the odd one: there is no published dev chart, so it installs the
+    # checkout's chart against the newest test-channel IMAGE. (The pod then
+    # reports the test channel in-app, because the chart derives the channel
+    # from the image tag.)
+    if [ "$CHANNEL" = "dev" ]; then
+        if [ -n "$VERSION_SPEC_RAW" ]; then
+            CREMIND_VERSION="$VERSION_SPEC_RAW"
+        else
+            info "Resolving the newest published image for the local chart"
+            k8s_index="$(curl -fsSL https://test.pypi.org/simple/cremind/)" || {
+                err "Failed to fetch https://test.pypi.org/simple/cremind/"
+                exit 1
+            }
+            CREMIND_VERSION="$(printf '%s' "$k8s_index" | resolve_cremind_wheel test version)"
+            unset k8s_index
+            if [ -z "$CREMIND_VERSION" ]; then
+                err "No published cremind image found to run the local chart against."
+                err "Pass --version <X.Y.ZrcN.devM> to pick one."
+                exit 1
+            fi
+            ok "Image tag: $CREMIND_VERSION"
+        fi
+    else
+        CREMIND_VERSION="$(resolve_version)"
+    fi
+
+    CHART_VERSION=""
+    CHART_IS_LOCAL=0
+    if [ -n "$HELM_CHART" ]; then
+        CHART_REF="$HELM_CHART"
+        [ -d "$CHART_REF" ] && CHART_IS_LOCAL=1
+    elif [ "$CHANNEL" = "dev" ]; then
+        CHART_REF="$REPO_ROOT/helm/cremind"
+        CHART_IS_LOCAL=1
+        if [ ! -f "$CHART_REF/Chart.yaml" ]; then
+            err "--channel dev needs the chart at $CHART_REF, which is missing."
+            exit 1
+        fi
+    else
+        CHART_REF="oci://registry-1.docker.io/cremind/cremind"
+    fi
+
+    case "$CHART_REF" in
+        oci://*)
+            # A production X.Y.Z is already SemVer2; only the RC form needs
+            # translating, which is the only case that needs python here.
+            if [ "$CHANNEL" = "production" ]; then
+                CHART_VERSION="$CREMIND_VERSION"
+            else
+                CHART_VERSION="$("${PYTHON:-python3}" "$(ensure_resolver)" chart-version --version "$CREMIND_VERSION")" || {
+                    err "Could not derive a chart version from '$CREMIND_VERSION'."
+                    exit 1
+                }
+            fi
+            info "Chart: $CHART_REF --version $CHART_VERSION"
+            # Fail here, with a useful message, rather than inside helm.
+            if ! helm show chart "$CHART_REF" --version "$CHART_VERSION" >>"$LOG_FILE" 2>&1; then
+                err "Chart $CHART_VERSION is not published at $CHART_REF."
+                err "Release-candidate charts appear a few minutes after the tag; check 'helm show chart $CHART_REF --devel'."
+                exit 1
+            fi
+            ;;
+        *)
+            info "Chart: $CHART_REF (local)"
+            ;;
+    esac
+
+    if [ "$CHART_IS_LOCAL" -eq 1 ]; then
+        # A checkout's chart has unresolved subchart dependencies and a
+        # placeholder appVersion, so the image tag must be pinned explicitly.
+        info "Building chart dependencies"
+        helm repo add --force-update qdrant https://qdrant.github.io/qdrant-helm >>"$LOG_FILE" 2>&1 || true
+        helm repo add --force-update chromadb https://amikos-tech.github.io/chromadb-chart/ >>"$LOG_FILE" 2>&1 || true
+        if ! helm dependency build "$CHART_REF" >>"$LOG_FILE" 2>&1; then
+            err "helm dependency build failed for $CHART_REF. Details: $LOG_FILE"
+            exit 1
+        fi
+    fi
+
+    # ── values the installer owns ─────────────────────────────────────────
+    #
+    # Rendered into a values file rather than a wall of --set arguments. Same
+    # manifests either way, but: helm's --set parser treats commas as
+    # separators (and the VNC charset contains one), the two secrets stay off
+    # the process list and out of install.log, and the operator gets a file
+    # they can keep using with plain `helm upgrade -f`.
+    K8S_VALUES_FILE="$K8S_DIR/values.yaml"
+
+    # yaml_scalar <value> → a double-quoted YAML scalar, escaped.
+    yaml_scalar() {
+        printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    }
+
+    # ── Postgres password ─────────────────────────────────────────────────
+    #
+    # Pinned rather than left to the subchart's generator, because the
+    # generated one lives only in a Secret: uninstall + reinstall regenerates
+    # it while the retained data volume keeps the OLD password, and setup then
+    # fails with "password authentication failed for user cremind".
+    #
+    # Pinning has its own trap in the other direction: the Bitnami helper
+    # honours a provided password, so pinning a FRESH one onto an existing
+    # release rewrites the Secret and locks the app out of its own database.
+    # Hence: adopt what the release already uses before generating anything.
+    PG_PASSWORD=""
+    K8S_EXTERNAL_PG=0
+    case ",$K8S_extra_set," in
+        *,postgresql.enabled=false,*) K8S_EXTERNAL_PG=1 ;;
+    esac
+    RELEASE_EXISTS=0
+    if helm status "$HELM_RELEASE" --kube-context "$KUBE_CONTEXT" \
+            --namespace "$KUBE_NAMESPACE" >/dev/null 2>&1; then
+        RELEASE_EXISTS=1
+    fi
+    if [ "$K8S_EXTERNAL_PG" -eq 0 ]; then
+        PG_SECRET_NAME="$(kcn get secret \
+            -l app.kubernetes.io/name=postgresql,app.kubernetes.io/instance="$HELM_RELEASE" \
+            -o 'jsonpath={.items[0].metadata.name}' 2>/dev/null || true)"
+        [ -n "$PG_SECRET_NAME" ] || PG_SECRET_NAME="cremind-postgresql"
+        if [ -n "$K8S_POSTGRES_PASSWORD" ]; then
+            PG_PASSWORD="$K8S_POSTGRES_PASSWORD"
+            info "Using the Postgres password from --k8s-postgres-password."
+        elif [ -n "$PREV_K8S_PG_PASSWORD" ]; then
+            PG_PASSWORD="$PREV_K8S_PG_PASSWORD"
+        elif [ "$RELEASE_EXISTS" -eq 1 ]; then
+            # Release we did not install (or release.env was lost): adopt the
+            # live Secret so the running database keeps working.
+            pg_b64="$(kcn get secret "$PG_SECRET_NAME" \
+                -o 'jsonpath={.data.password}' 2>/dev/null || true)"
+            if [ -n "$pg_b64" ]; then
+                PG_PASSWORD="$(printf '%s' "$pg_b64" | base64 -d 2>/dev/null || true)"
+                [ -n "$PG_PASSWORD" ] && info "Adopted the existing PostgreSQL password from the release."
+            fi
+            unset pg_b64
+            if [ -z "$PG_PASSWORD" ]; then
+                err "Release $HELM_RELEASE exists but its PostgreSQL password could not be read."
+                err "Pass --k8s-postgres-password <password>, or uninstall and start clean."
+                exit 1
+            fi
+        else
+            # No release. A leftover data volume from a previous one still has
+            # its own password, and nothing here can guess it.
+            pg_pvc="$(kcn get pvc \
+                -l app.kubernetes.io/name=postgresql,app.kubernetes.io/instance="$HELM_RELEASE" \
+                -o 'jsonpath={.items[0].metadata.name}' 2>/dev/null || true)"
+            [ -n "$pg_pvc" ] || pg_pvc="$(kcn get pvc data-cremind-postgresql-0 \
+                --ignore-not-found -o 'jsonpath={.metadata.name}' 2>/dev/null || true)"
+            if [ -n "$pg_pvc" ]; then
+                err "A PostgreSQL data volume ($pg_pvc) survives from an earlier release,"
+                err "and its password is not recorded on this machine. A fresh install would"
+                err "write a new password that the retained database does not accept."
+                err "Either delete it:"
+                err "  kubectl --context $KUBE_CONTEXT -n $KUBE_NAMESPACE delete pvc $pg_pvc"
+                err "or re-run with --k8s-postgres-password <the old password>."
+                exit 1
+            fi
+            unset pg_pvc
+            PG_PASSWORD="$(gen_secret)"
+        fi
+    fi
+
+    # ── VNC password ──────────────────────────────────────────────────────
+    VNC_PASSWORD=""
+    if [ "$DESKTOP_UI" != "0" ]; then
+        VNC_PASSWORD="${VNC_PASSWORD_INPUT:-${PREV_K8S_VNC_PASSWORD:-}}"
+        if [ -z "$VNC_PASSWORD" ]; then
+            VNC_PASSWORD="$(gen_secret | cut -c1-8)"
+            VNC_GENERATED=1
+        fi
+    fi
+
+    # ── app URL ───────────────────────────────────────────────────────────
+    #
+    # Left unset unless the operator named one: the chart derives
+    # http://localhost:1515 (or https:// under cremind.ssl) by itself, which
+    # is exactly right for the port-forward — and an explicit http:// value is
+    # what makes a later --ssl re-run fail the chart's own validation.
+    K8S_APP_URL="$K8S_app_url"
+    if [ -n "$K8S_APP_URL" ] && [ -n "$SSL_MODE" ]; then
+        case "$K8S_APP_URL" in
+            http://*)
+                err "--k8s-app-url is http:// but --ssl $SSL_MODE serves HTTPS."
+                err "Use https://, or leave it blank so the chart derives it."
+                exit 2
+                ;;
+        esac
+    fi
+
+    # Combinations the chart refuses to render. Checking them here turns a
+    # Go template error into a sentence.
+    case ",$K8S_extra_set," in
+        *,ingress.enabled=true,*)
+            if [ -n "$SSL_MODE" ]; then
+                err "ingress.enabled and --ssl are mutually exclusive: an ingress controller"
+                err "speaks plain HTTP to the pod and cannot re-encrypt to Cremind's private CA."
+                err "Terminate TLS at the ingress instead, and drop --ssl."
+                exit 2
+            fi
+            K8S_INGRESS=1
+            ;;
+    esac
+    case "$K8S_extra_set" in
+        *CREMIND_DB_PROVIDER*)
+            err "CREMIND_DB_PROVIDER must not be set on Kubernetes: it would skip the Setup Wizard."
+            exit 2
+            ;;
+    esac
+    case "$K8S_extra_set" in
+        *replicaCount=*)
+            case "$K8S_extra_set" in
+                *replicaCount=1*) ;;
+                *)
+                    err "Cremind runs as exactly one pod; the chart rejects any other replicaCount."
+                    exit 2
+                    ;;
+            esac
+            ;;
+    esac
+
+    info "Writing $K8S_VALUES_FILE"
+    (
+        umask 077
+        {
+            printf '# Generated by the Cremind installer. Regenerated on every run.\n'
+            printf '# Safe to reuse by hand: helm upgrade --install %s %s -f %s\n' \
+                "$HELM_RELEASE" "$CHART_REF" "$K8S_VALUES_FILE"
+            if [ "$DESKTOP_UI" = "0" ]; then
+                printf 'desktop:\n  enabled: false\n'
+            else
+                printf 'desktop:\n  enabled: true\n'
+            fi
+            printf 'cremind:\n'
+            printf '  ssl: %s\n' "$(yaml_scalar "${SSL_MODE:-none}")"
+            [ -n "$K8S_APP_URL" ] && printf '  appUrl: %s\n' "$(yaml_scalar "$K8S_APP_URL")"
+            [ -n "$VNC_PASSWORD" ] && printf '  vncPassword: %s\n' "$(yaml_scalar "$VNC_PASSWORD")"
+            if [ "$CHART_IS_LOCAL" -eq 1 ]; then
+                # A checkout's Chart.yaml carries a placeholder appVersion, so
+                # the image tag would render as :0.0.0 without this.
+                printf 'image:\n  tag: %s\n' "$(yaml_scalar "$CREMIND_VERSION")"
+            fi
+            if [ "$K8S_EXTERNAL_PG" -eq 0 ]; then
+                printf 'postgresql:\n'
+                printf '  auth:\n    password: %s\n' "$(yaml_scalar "$PG_PASSWORD")"
+                if [ "$K8S_legacy_postgres_image" != "no" ]; then
+                    # Bitnami froze its free images into the bitnamilegacy
+                    # namespace, so the chart's default no longer pulls.
+                    printf '  image:\n    registry: docker.io\n    repository: bitnamilegacy/postgresql\n'
+                fi
+                if [ "$K8S_delete_postgres_data" = "yes" ]; then
+                    printf '  primary:\n    persistentVolumeClaimRetentionPolicy:\n'
+                    printf '      enabled: true\n      whenDeleted: Delete\n'
+                fi
+            fi
+        } >"$K8S_VALUES_FILE"
+    )
+
+    # ── install ───────────────────────────────────────────────────────────
+    #
+    # No --wait (it hides a Pending Postgres volume behind a generic timeout),
+    # no --atomic (a rollback on a slow first image pull would delete the
+    # chart-owned PVCs), no --reuse-values (every value is re-sent from the
+    # values file above, so nothing silently carries over), and no --devel
+    # (an exact --version already bypasses the prerelease filter).
+    if [ "$RELEASE_EXISTS" -eq 1 ] && [ "$REINSTALL" -eq 1 ]; then
+        info "Removing release $HELM_RELEASE (--reinstall)"
+        helm uninstall "$HELM_RELEASE" --kube-context "$KUBE_CONTEXT" \
+            --namespace "$KUBE_NAMESPACE" --wait >>"$LOG_FILE" 2>&1 || true
+        RELEASE_EXISTS=0
+    elif [ "$RELEASE_EXISTS" -eq 1 ]; then
+        info "Release $HELM_RELEASE already exists — upgrading it in place."
+    fi
+
+    # Did the namespace exist before us? Only what we created may be deleted
+    # again by --uninstall --purge.
+    NAMESPACE_CREATED=0
+    if [ -z "$(kc get namespace "$KUBE_NAMESPACE" --ignore-not-found -o name 2>/dev/null || true)" ]; then
+        NAMESPACE_CREATED=1
+    elif [ "$PREV_K8S_NAMESPACE_CREATED" = "1" ] \
+         && [ "$PREV_K8S_KUBE_NAMESPACE" = "$KUBE_NAMESPACE" ]; then
+        NAMESPACE_CREATED=1
+    fi
+
+    info "Installing the chart (this pulls images; give it a few minutes)"
+    set -- upgrade --install "$HELM_RELEASE" "$CHART_REF" \
+        --kube-context "$KUBE_CONTEXT" \
+        --namespace "$KUBE_NAMESPACE" --create-namespace \
+        --history-max 5 \
+        -f "$K8S_VALUES_FILE"
+    [ -n "$CHART_VERSION" ] && set -- "$@" --version "$CHART_VERSION"
+    # Last, so an operator's --set overrides the installer's own values.
+    [ -n "$K8S_extra_set" ] && set -- "$@" --set "$K8S_extra_set"
+    if ! helm "$@" >>"$LOG_FILE" 2>&1; then
+        err "helm upgrade --install failed. The last lines of $LOG_FILE:"
+        tail -n 30 "$LOG_FILE" >&2 || true
+        err ""
+        err "Common causes: a chart value the cluster rejects (see --k8s-extra-set),"
+        err "an unreachable image registry, or insufficient quota."
+        err "Inspect with: helm status $HELM_RELEASE --kube-context $KUBE_CONTEXT -n $KUBE_NAMESPACE"
+        exit 1
+    fi
+    ok "Chart installed."
+
+    # ── names ─────────────────────────────────────────────────────────────
+    #
+    # Ask the cluster rather than recomputing the chart's fullname rule: an
+    # operator's nameOverride/fullnameOverride in --k8s-extra-set would
+    # otherwise silently break the rollout wait and the port-forward.
+    HELM_FULLNAME="$(kcn get deploy \
+        -l app.kubernetes.io/instance="$HELM_RELEASE" \
+        -o 'jsonpath={.items[0].metadata.name}' 2>/dev/null || true)"
+    if [ -z "$HELM_FULLNAME" ]; then
+        case "$HELM_RELEASE" in
+            *cremind*) HELM_FULLNAME="$HELM_RELEASE" ;;
+            *)         HELM_FULLNAME="$HELM_RELEASE-cremind" ;;
+        esac
+    fi
+
+    # ── wait for the rollout ──────────────────────────────────────────────
+    if [ "$K8S_EXTERNAL_PG" -eq 0 ]; then
+        pg_sts="$(kcn get statefulset \
+            -l app.kubernetes.io/name=postgresql,app.kubernetes.io/instance="$HELM_RELEASE" \
+            -o 'jsonpath={.items[0].metadata.name}' 2>/dev/null || true)"
+        if [ -n "$pg_sts" ]; then
+            info "Waiting for PostgreSQL"
+            if ! kcn rollout status "statefulset/$pg_sts" --timeout=5m 2>&1 | tee -a "$LOG_FILE"; then
+                warn "PostgreSQL did not become ready within 5 minutes."
+                warn "A Pending volume usually means the cluster has no default StorageClass:"
+                warn "  kubectl --context $KUBE_CONTEXT -n $KUBE_NAMESPACE get pvc"
+            fi
+        fi
+        unset pg_sts
+    fi
+
+    info "Waiting for the Cremind pod"
+    if ! kcn rollout status "deployment/$HELM_FULLNAME" \
+            --timeout="${CREMIND_K8S_ROLLOUT_TIMEOUT:-10m}" 2>&1 | tee -a "$LOG_FILE"; then
+        err "The Cremind pod did not become ready in time. Current state:"
+        kcn get pods -l app.kubernetes.io/instance="$HELM_RELEASE" >&2 || true
+        err ""
+        err "ImagePullBackOff  → the image tag is not published, or the registry is unreachable."
+        err "Pending           → the node needs 2 CPU and 2Gi free for the desktop image."
+        err "CrashLoopBackOff  → kubectl --context $KUBE_CONTEXT -n $KUBE_NAMESPACE logs deploy/$HELM_FULLNAME -c cremind"
+        err ""
+        err "The release is installed; re-running this installer upgrades it in place."
+        exit 1
+    fi
+    ok "Cremind is running."
+
+    # ── how it is reached ─────────────────────────────────────────────────
+    #
+    # 1515 is the app, 1455 the transient Codex OAuth callback, 6080 noVNC —
+    # the last only when the desktop image runs without the L7 proxy, which is
+    # what happens under cremind.ssl. Read the Service rather than re-deriving
+    # the rule.
+    K8S_SERVICE_PORTS="$(kcn get svc "$HELM_FULLNAME" \
+        -o 'jsonpath={.spec.ports[*].port}' 2>/dev/null || true)"
+    PF_PORTS="1515:80 1455:1455"
+    case " $K8S_SERVICE_PORTS " in
+        *" 6080 "*) PF_PORTS="$PF_PORTS 6080:6080" ;;
+    esac
+    PORT_FORWARD_CMD="kubectl --context $KUBE_CONTEXT --namespace $KUBE_NAMESPACE port-forward svc/$HELM_FULLNAME $PF_PORTS"
+    K8S_NOVNC_URL="$(kcn get configmap "$HELM_FULLNAME-env" \
+        -o 'jsonpath={.data.CREMIND_NOVNC_URL}' 2>/dev/null || true)"
+    K8S_POD_APP_URL="$(kcn get configmap "$HELM_FULLNAME-env" \
+        -o 'jsonpath={.data.APP_URL}' 2>/dev/null || true)"
+
+    # ── port-forward ──────────────────────────────────────────────────────
+    #
+    # Started in the background so the wizard is reachable the moment this
+    # script ends. An ingress install has a real address and needs none.
+    PF_PID_FILE="$K8S_DIR/port-forward.pid"
+    PF_LOG_FILE="$K8S_DIR/port-forward.log"
+    PF_RUNNING=0
+    if [ "${K8S_INGRESS:-0}" -eq 1 ]; then
+        info "Ingress configured — skipping the port-forward."
+    elif [ "$NO_PORT_FORWARD" -eq 1 ]; then
+        info "Skipping the port-forward (--no-port-forward)."
+    else
+        # A forward we started earlier is ours to replace; anything else on
+        # 1515 is not, and a second Cremind on this host is a real possibility.
+        if [ -f "$PF_PID_FILE" ]; then
+            old_pf="$(cat "$PF_PID_FILE" 2>/dev/null || true)"
+            if [ -n "$old_pf" ] && kill -0 "$old_pf" 2>/dev/null; then
+                case "$(ps -o comm= -p "$old_pf" 2>/dev/null || true)" in
+                    *kubectl*) kill "$old_pf" 2>/dev/null || true; sleep 1 ;;
+                esac
+            fi
+            rm -f "$PF_PID_FILE"
+            unset old_pf
+        fi
+        port_in_use=0
+        if (exec 3<>/dev/tcp/127.0.0.1/1515) 2>/dev/null; then
+            port_in_use=1
+            exec 3>&- 2>/dev/null || true
+        fi
+        if [ "$port_in_use" -eq 1 ]; then
+            warn "Port 1515 on this machine is already in use, so the port-forward was not started."
+            warn "Stop whatever is listening and run:"
+            warn "  $PORT_FORWARD_CMD"
+        else
+            info "Starting the port-forward in the background"
+            nohup kubectl --context "$KUBE_CONTEXT" --namespace "$KUBE_NAMESPACE" \
+                port-forward "svc/$HELM_FULLNAME" $PF_PORTS >"$PF_LOG_FILE" 2>&1 &
+            echo $! >"$PF_PID_FILE"
+            disown 2>/dev/null || true
+            PF_RUNNING=1
+            sleep 2
+        fi
+        unset port_in_use
+    fi
+
+    # ── health ────────────────────────────────────────────────────────────
+    BOOT_SCHEME="$(cremind_boot_scheme)"
+    if [ "$PF_RUNNING" -eq 1 ]; then
+        info "Waiting for Cremind to answer on localhost:1515"
+        k8s_health_ok=0
+        i=0
+        while [ "$i" -lt 60 ]; do
+            if cremind_health_ok "${BOOT_SCHEME}://localhost:1515/health"; then
+                k8s_health_ok=1
+                break
+            fi
+            i=$((i + 1))
+            sleep 2
+        done
+        if [ "$k8s_health_ok" -eq 1 ]; then
+            ok "Cremind is reachable at ${BOOT_SCHEME}://localhost:1515"
+        else
+            warn "Cremind did not answer through the port-forward within 2 minutes."
+            warn "Check it with: $PORT_FORWARD_CMD"
+        fi
+        unset i
+    fi
+
+    # ── CA trust ──────────────────────────────────────────────────────────
+    if [ "$PF_RUNNING" -eq 1 ] && [ "${k8s_health_ok:-0}" -eq 1 ] \
+       && [ "$URL_SCHEME" = "https" ] && [ "$UNATTENDED" -eq 0 ] \
+       && [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ]; then
+        offer_host_ca_trust "${BOOT_SCHEME}://localhost:1515/ca.pem"
+    fi
+
+    # ── state ─────────────────────────────────────────────────────────────
+    #
+    # What a re-run and an uninstall need. Read with sed, never sourced: it
+    # carries two secrets and free-form --set text.
+    (
+        umask 077
+        {
+            printf '# Cremind Kubernetes release, written by the installer.\n'
+            printf '# Read by install.sh / install.ps1; never sourced.\n'
+            printf 'KUBE_CONTEXT=%s\n' "$KUBE_CONTEXT"
+            printf 'KUBE_SERVER=%s\n' "$KUBE_SERVER"
+            printf 'KUBE_NAMESPACE=%s\n' "$KUBE_NAMESPACE"
+            printf 'NAMESPACE_CREATED=%s\n' "$NAMESPACE_CREATED"
+            printf 'HELM_RELEASE=%s\n' "$HELM_RELEASE"
+            printf 'HELM_FULLNAME=%s\n' "$HELM_FULLNAME"
+            printf 'CHART_REF=%s\n' "$CHART_REF"
+            printf 'CHART_VERSION=%s\n' "$CHART_VERSION"
+            printf 'CREMIND_VERSION=%s\n' "$CREMIND_VERSION"
+            printf 'CREMIND_UPGRADE_CHANNEL=%s\n' "$CHANNEL"
+            printf 'DESKTOP_UI=%s\n' "${DESKTOP_UI:-1}"
+            printf 'VNC_PASSWORD=%s\n' "$VNC_PASSWORD"
+            printf 'PG_PASSWORD=%s\n' "$PG_PASSWORD"
+            # Named CREMIND_SSL so the previous-choice machinery above reads
+            # this file with no special case.
+            printf 'CREMIND_SSL=%s\n' "$SSL_MODE"
+            printf 'APP_URL=%s\n' "${K8S_POD_APP_URL:-$K8S_APP_URL}"
+            printf 'PORT_FORWARD_PORTS=%s\n' "$PF_PORTS"
+            printf 'K8S_release_name=%s\n' "$K8S_release_name"
+            printf 'K8S_app_url=%s\n' "$K8S_app_url"
+            printf 'K8S_legacy_postgres_image=%s\n' "$K8S_legacy_postgres_image"
+            printf 'K8S_delete_postgres_data=%s\n' "$K8S_delete_postgres_data"
+            printf 'K8S_extra_set=%s\n' "$K8S_extra_set"
+        } >"$K8S_RELEASE_ENV"
+    )
+
+    # credentials.toml — the single "how do I connect to X again?" file, same
+    # schema app/config/credentials_file.py writes.
+    K8S_CREDENTIALS_FILE="$CREMIND_INSTALL_DIR/credentials.toml"
+    (
+        umask 077
+        {
+            printf '# Cremind service credentials and connection info.\n'
+            printf '# Auto-generated by the installer.\n\n'
+            printf 'generated_at = "%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf 'install_mode = "kubernetes"\n'
+            printf 'cremind_version = "%s"\n' "$CREMIND_VERSION"
+            printf 'system_dir = "%s"\n' "$CREMIND_SYSTEM_DIR"
+            printf 'install_dir = "%s"\n\n' "$CREMIND_INSTALL_DIR"
+            printf '[app]\n'
+            printf 'api_url = "%s://localhost:1515"\n' "$URL_SCHEME"
+            printf 'spa_url = "%s://localhost:1515"\n' "$URL_SCHEME"
+            printf 'api_port = 1112\n'
+            printf 'spa_port = 1515\n'
+            printf 'cors_allowed_origins = ""\n'
+            printf 'setup_wizard_env = "kubernetes"\n\n'
+            if [ "$DESKTOP_UI" != "0" ]; then
+                printf '[desktop]\n'
+                printf 'novnc_url = "%s"\n' "${K8S_NOVNC_URL:-http://localhost:1515/vnc/vnc.html}"
+                printf 'novnc_port = 6080\n'
+                printf 'vnc_port = 5900\n'
+                printf 'vnc_password = "%s"\n' "$VNC_PASSWORD"
+                printf 'resolution = "1280x720"\n\n'
+            fi
+            if [ "$K8S_EXTERNAL_PG" -eq 0 ]; then
+                printf '[postgres]\n'
+                printf 'deployment_mode = "external"\n'
+                printf 'host = "cremind-postgresql"\n'
+                printf 'port = 5432\n'
+                printf 'database = "cremind"\n'
+                printf 'user = "cremind"\n'
+                printf 'password = "%s"\n' "$PG_PASSWORD"
+                printf 'sslmode = "prefer"\n\n'
+            fi
+            printf '[kubernetes]\n'
+            printf 'context = "%s"\n' "$KUBE_CONTEXT"
+            printf 'server = "%s"\n' "$KUBE_SERVER"
+            printf 'namespace = "%s"\n' "$KUBE_NAMESPACE"
+            printf 'release = "%s"\n' "$HELM_RELEASE"
+            printf 'workload = "%s"\n' "$HELM_FULLNAME"
+            printf 'port_forward = "%s"\n' "$PORT_FORWARD_CMD"
+        } >"$K8S_CREDENTIALS_FILE"
+    )
+
+    # ── handoff ───────────────────────────────────────────────────────────
+    K8S_WIZARD_URL="${BOOT_SCHEME}://localhost:1515/#/setup"
+    if [ "${K8S_INGRESS:-0}" -eq 1 ] && [ -n "$K8S_POD_APP_URL" ]; then
+        K8S_WIZARD_URL="${K8S_POD_APP_URL%/}/#/setup"
+    fi
+
+    if [ "$NO_LAUNCH" -eq 0 ] && [ "$PF_RUNNING" -eq 1 ] && [ "${k8s_health_ok:-0}" -eq 1 ]; then
+        if command -v xdg-open >/dev/null 2>&1; then
+            xdg-open "$K8S_WIZARD_URL" >/dev/null 2>&1 || true
+        elif command -v open >/dev/null 2>&1; then
+            open "$K8S_WIZARD_URL" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    step "Setup wizard"
+    cat <<EOF
+
+  ${BOLD}Open:${RESET} $K8S_WIZARD_URL
+
+  In the Database step, leave the password blank and click Next — the chart
+  wires the PostgreSQL credentials into the pod for you.
+
+EOF
+    if [ "$DESKTOP_UI" != "0" ]; then
+        cat <<EOF
+  ${BOLD}Agent desktop:${RESET} ${K8S_NOVNC_URL:-http://localhost:1515/vnc/vnc.html}
+  ${BOLD}VNC password:${RESET}  $VNC_PASSWORD
+EOF
+        if [ "${VNC_GENERATED:-0}" -eq 1 ]; then
+            printf '  %s(generated for this install; it is also in %s)%s\n' \
+                "$DIM" "$K8S_CREDENTIALS_FILE" "$RESET"
+        fi
+        echo
+    fi
+    cat <<EOF
+  ${BOLD}Port-forward:${RESET}
+    $PORT_FORWARD_CMD
+EOF
+    if [ "$PF_RUNNING" -eq 1 ]; then
+        cat <<EOF
+  ${DIM}Running in the background (pid $(cat "$PF_PID_FILE" 2>/dev/null || echo '?')).${RESET}
+  ${DIM}Stop it with: kill \$(cat $PF_PID_FILE)${RESET}
+  ${DIM}It ends when this terminal's session does; re-run the command above to
+  reconnect, or wrap it in a loop so it heals itself.${RESET}
+EOF
+    fi
+    cat <<EOF
+
+  ${BOLD}Manage the release:${RESET}
+    helm status $HELM_RELEASE --kube-context $KUBE_CONTEXT -n $KUBE_NAMESPACE
+    kubectl --context $KUBE_CONTEXT -n $KUBE_NAMESPACE logs deploy/$HELM_FULLNAME -c cremind -f
+    bash ${BASH_SOURCE[0]:-install.sh} --uninstall
+
+  ${BOLD}Credentials:${RESET} $K8S_CREDENTIALS_FILE
+
+EOF
+    ok "Done."
+    exit 0
+fi
 
 if [ "$MODE" = "docker" ]; then
     step "Docker install"
@@ -2183,97 +3672,11 @@ EOF
         SSL_DEFERRED=1
     fi
 
-    # ── host-side CA trust ────────────────────────────────────────────────
-    # The CA lives inside the container, where nothing can reach the HOST's
-    # trust store — but this script runs on the host, so it can. This is the
-    # Docker counterpart of the wizard's one-click trust (which the server
-    # can only offer on native installs): download /ca.pem from the running
-    # container and offer to install it system-wide. Declining is fine — the
-    # wizard's "Secure this install" step shows the manual command, and every
-    # OTHER device needs that path anyway.
-    #
-    # Both listener phases serve /ca.pem: under after-setup it is plain http,
-    # and a finished install answers https — which curl accepts exactly when
-    # this host already trusts the CA from a previous run (and then the
-    # already-trusted check below skips the prompt). A host that never
-    # trusted it gets a failed download and a pointer, not a failed install.
     if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ] && [ "$UNATTENDED" -eq 0 ] \
         && [ "$URL_SCHEME" = "https" ]; then
-        CA_TMP="$(mktemp "${TMPDIR:-/tmp}/cremind-ca.XXXXXX" 2>/dev/null || true)"
-        CA_FETCHED=0
-        if [ -n "$CA_TMP" ]; then
-            if curl -fsS --max-time 10 -o "$CA_TMP" "${BOOT_SCHEME}://${HEALTH_HOST}:1515/ca.pem" 2>/dev/null \
-                && grep -q "BEGIN CERTIFICATE" "$CA_TMP" 2>/dev/null; then
-                CA_FETCHED=1
-            else
-                # No local CA (operator certificate pair → /ca.pem 404s, and
-                # there is genuinely nothing of ours to trust) or an untrusted
-                # https listener — either way the wizard step has it covered.
-                info "Skipping host CA trust (could not fetch the CA from the container)."
-            fi
-        fi
-        if [ "$CA_FETCHED" -eq 1 ]; then
-            CA_SUDO=""
-            if [ "$(id -u)" -ne 0 ]; then CA_SUDO="sudo"; fi
-            CA_ALREADY=0
-            CA_ANCHOR=""
-            CA_TRUST_CMD=""
-            case "$(uname -s)" in
-                Darwin)
-                    # CN presence in the System keychain is the best cheap
-                    # check macOS offers; the add below sets trustRoot anyway.
-                    if security find-certificate -c "Cremind Local CA" -Z /Library/Keychains/System.keychain >/dev/null 2>&1; then
-                        CA_ALREADY=1
-                    fi
-                    CA_TRUST_CMD="$CA_SUDO security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain $CA_TMP"
-                    ;;
-                *)
-                    if [ -d /usr/local/share/ca-certificates ]; then
-                        CA_ANCHOR="/usr/local/share/ca-certificates/cremind-local-ca.crt"
-                        CA_TRUST_CMD="$CA_SUDO cp $CA_TMP $CA_ANCHOR && $CA_SUDO update-ca-certificates"
-                    elif [ -d /etc/pki/ca-trust/source/anchors ]; then
-                        CA_ANCHOR="/etc/pki/ca-trust/source/anchors/cremind-local-ca.crt"
-                        CA_TRUST_CMD="$CA_SUDO cp $CA_TMP $CA_ANCHOR && $CA_SUDO update-ca-trust extract"
-                    fi
-                    if [ -n "$CA_ANCHOR" ] && [ -f "$CA_ANCHOR" ] && cmp -s "$CA_TMP" "$CA_ANCHOR"; then
-                        CA_ALREADY=1
-                    fi
-                    ;;
-            esac
-            if [ "$CA_ALREADY" -eq 1 ]; then
-                ok "This machine already trusts the Cremind local CA."
-            elif [ -z "$CA_TRUST_CMD" ]; then
-                info "No known trust store on this system — the Setup Wizard's 'Secure this install' step shows the options."
-            else
-                echo ""
-                echo "Cremind will serve HTTPS with a certificate signed by its own local CA."
-                echo "Trusting that CA now removes the browser warning on this machine; every"
-                echo "other device gets the same walkthrough in the Setup Wizard."
-                if command -v openssl >/dev/null 2>&1; then
-                    CA_FP="$(openssl x509 -in "$CA_TMP" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//' || true)"
-                    if [ -n "$CA_FP" ]; then echo "  SHA-256 : $CA_FP"; fi
-                fi
-                if [ -n "$CA_SUDO" ]; then
-                    echo "  (needs sudo — you may be asked for your password)"
-                fi
-                trust_ans=""
-                read -r -p "Trust it system-wide now? [Y/n]: " trust_ans </dev/tty || trust_ans=""
-                case "$trust_ans" in
-                    [nN]*)
-                        info "Skipped. The Setup Wizard's 'Secure this install' step covers it."
-                        ;;
-                    *)
-                        if sh -c "$CA_TRUST_CMD"; then
-                            ok "Trusted the Cremind local CA."
-                        else
-                            warn "CA not trusted — the Setup Wizard's 'Secure this install' step shows the manual command."
-                        fi
-                        ;;
-                esac
-            fi
-        fi
-        if [ -n "$CA_TMP" ]; then rm -f "$CA_TMP"; fi
+        offer_host_ca_trust "${BOOT_SCHEME}://${HEALTH_HOST}:1515/ca.pem"
     fi
+
 
     # The Electron app drives navigation to the wizard inside its own
     # window — printing a "Wizard URL: http://localhost:1515/#/setup"

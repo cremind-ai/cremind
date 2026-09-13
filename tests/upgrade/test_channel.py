@@ -180,6 +180,67 @@ def test_cli_validate_accepts_dev_on_test_rejects_on_prod() -> None:
     assert channel._cli(["validate", "--channel", "production", "--version", "0.2.9rc1.dev2"]) == 2
 
 
+# ── chart version (SemVer2) ───────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("pep440", "semver"),
+    [
+        ("0.0.17rc9.dev4", "0.0.17-rc.9.dev.4"),
+        ("0.0.17rc9", "0.0.17-rc.9"),
+        ("0.0.2.1rc1.dev1", "0.0.2.1-rc.1.dev.1"),  # four-segment hotfix line
+        ("0.0.16", "0.0.16"),                       # a final is already SemVer2
+        ("0.0.17.dev1", "0.0.17.dev1"),             # not a published shape: verbatim
+    ],
+)
+def test_pep440_to_semver_table(pep440: str, semver: str) -> None:
+    assert channel.pep440_to_semver(pep440) == semver
+
+
+def test_cli_chart_version_prints_semver(capsys: Any) -> None:
+    assert channel._cli(["chart-version", "--version", "0.0.17rc13.dev1"]) == 0
+    assert capsys.readouterr().out.strip() == "0.0.17-rc.13.dev.1"
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "0.0.17.dev1",            # dev without an rc: never published
+        "v0.0.17rc1.dev1",        # a git tag, not a version
+        "0.0.17+devforced",       # the dev-channel synth
+        "0.0.17-rc.13.dev.1",     # already SemVer2 — refuse to translate twice
+        "",
+    ],
+)
+def test_cli_chart_version_rejects_unpublishable_shapes(
+    version: str, capsys: Any
+) -> None:
+    assert channel._cli(["chart-version", "--version", version]) == 2
+    assert "chart pipeline" in capsys.readouterr().err
+
+
+def test_cli_chart_version_runs_standalone(tmp_path: Any) -> None:
+    """The kubernetes install mode runs this the same standalone way."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(Path(channel.__file__)),
+            "chart-version",
+            "--version",
+            "0.0.17rc16.dev6",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,  # not inside the repo, so ``app`` isn't importable
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "0.0.17-rc.16.dev.6"
+
+
 def test_cli_resolve_runs_standalone(tmp_path: Any) -> None:
     """The installers run channel.py as a standalone file (no package on the
     path). Exercise that exact invocation so a stray intra-package import
