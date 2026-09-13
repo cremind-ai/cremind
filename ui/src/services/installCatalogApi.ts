@@ -135,14 +135,63 @@ export function renderServiceModeDescription(
 }
 
 /**
- * Capabilities probed by the installer/Electron-bridge — used by
- * ``recommendInstallMode`` to decide which modes are usable in the
- * current environment. Add new capability flags here as new
- * ``modes.<id>.requires`` strings appear in the catalog.
+ * Capabilities probed by the installer/Electron-bridge — used to decide
+ * which modes this environment can offer. A field left ``undefined`` means
+ * *this front-end does not probe that capability at all*, which is different
+ * from probing it and finding it missing: see ``isInstallModeProbed``.
+ * Add new flags here as new ``modes.<id>.requires`` strings appear.
  */
 export interface InstallEnvCapabilities {
   /** ``docker info`` succeeded — Docker daemon is reachable. */
   hasDocker: boolean;
+  /** kubectl on PATH with at least one kubeconfig context. */
+  hasKubectl?: boolean;
+  /** helm 3 on PATH. */
+  hasHelm?: boolean;
+}
+
+/** ``modes.<id>.requires`` string → the capability field that answers it. */
+const CAPABILITY_KEYS: Record<string, keyof InstallEnvCapabilities> = {
+  docker: 'hasDocker',
+  kubectl: 'hasKubectl',
+  helm: 'hasHelm',
+};
+
+/**
+ * Whether this environment knows enough to *show* a mode at all.
+ *
+ * True when every requirement maps to a capability this front-end probes,
+ * whatever the answer was. That is the visibility rule, and it is
+ * deliberately weaker than ``isInstallModeAvailable``: Docker stays on the
+ * list (disabled, with an explanation) when the daemon is down, while
+ * Kubernetes — whose kubectl/helm requirements the Electron bridge does not
+ * probe at all — never appears there. Use the installer scripts or the
+ * terminal TUI for a Kubernetes install.
+ */
+export function isInstallModeProbed(
+  entry: InstallModeEntry,
+  caps: InstallEnvCapabilities,
+): boolean {
+  return (entry.requires ?? []).every((req) => {
+    const key = CAPABILITY_KEYS[req];
+    return key !== undefined && caps[key] !== undefined;
+  });
+}
+
+/**
+ * Whether this environment can actually run a mode: every requirement is a
+ * capability that was probed *and* found. An unknown requirement string is
+ * conservatively unsatisfied, so a typo in catalog.toml never advertises an
+ * unsupported mode.
+ */
+export function isInstallModeAvailable(
+  entry: InstallModeEntry,
+  caps: InstallEnvCapabilities,
+): boolean {
+  return (entry.requires ?? []).every((req) => {
+    const key = CAPABILITY_KEYS[req];
+    return key !== undefined && caps[key] === true;
+  });
 }
 
 /**
@@ -150,9 +199,8 @@ export interface InstallEnvCapabilities {
  * ``modes`` table in ``order`` ascending and returns the first mode
  * whose ``requires`` capabilities are all satisfied. Returns ``null``
  * when no mode qualifies (which today never happens: ``native``
- * declares no requirements). The same algorithm is used by install.sh
- * and install.ps1, where it falls out implicitly from "Choice [1] =
- * first MODE_ID = lowest order in the generated _catalog.sh / .ps1".
+ * declares no requirements). install.sh, install.ps1 and the terminal TUI
+ * apply the same rule over the catalog's ``requires``.
  */
 export function recommendInstallMode(
   catalog: InstallCatalog | null | undefined,
@@ -163,15 +211,7 @@ export function recommendInstallMode(
     (a, b) => (a[1].order ?? 999) - (b[1].order ?? 999),
   );
   for (const [id, entry] of modes) {
-    const requires = entry.requires ?? [];
-    const satisfied = requires.every((req) => {
-      if (req === 'docker') return caps.hasDocker;
-      // Unknown requirement → conservatively treat as unsatisfied so a
-      // typo in catalog.toml doesn't silently advertise an unsupported
-      // mode. Add new branches above as new capabilities appear.
-      return false;
-    });
-    if (satisfied) return id;
+    if (isInstallModeAvailable(entry, caps)) return id;
   }
   return null;
 }

@@ -75,6 +75,16 @@
       "hint": "Simpler, but the agent shares your desktop and home directory.",
       "requires": [],
       "order": 20
+    },
+    "kubernetes": {
+      "label": "Kubernetes",
+      "description": "Helm release in an existing cluster (in-cluster Postgres, optional VNC desktop)",
+      "hint": "Installs the cremind Helm chart into a kubeconfig context you pick. Needs kubectl and helm on PATH; you reach Cremind through a kubectl port-forward at http://localhost:1515.",
+      "requires": [
+        "kubectl",
+        "helm"
+      ],
+      "order": 30
     }
   },
   "docker_desktop": {
@@ -85,6 +95,55 @@
   "vnc_password": {
     "prompt": "Choose a password for the VNC Desktop",
     "hint": "6-8 characters, from letters, digits and @ % _ + = : , . - \u2014 VNC ignores anything past the 8th character. You will sign in with it at http://<host>:6080/vnc.html. Leave empty when re-installing to keep the current password."
+  },
+  "kubernetes": {
+    "context_prompt": "Which kubeconfig context should Cremind be installed into?",
+    "context_hint": "Every helm and kubectl command runs with --kube-context set to this choice (and --kubeconfig, for a context from a file kubectl does not read on its own), never the ambient current-context. Every kubeconfig under ~/.kube is listed, not just kubectl's own; each row shows the API server, and its file when several are in play, so a look-alike cluster stands out.",
+    "namespace_prompt": "Which namespace should the Helm release go into?",
+    "namespace_hint": "Created if it does not exist. Lowercase letters, digits and hyphens, up to 63 characters.",
+    "namespace_default": "cremind",
+    "advanced_prompt": "Use the recommended Helm options, or customize them?",
+    "advanced_hint": "Recommended: release name cremind, app URL derived from the port-forward, the legacy Bitnami Postgres image, Postgres data kept on uninstall, no extra --set values.",
+    "advanced_fields": [
+      {
+        "key": "release_name",
+        "prompt": "What should the Helm release be called?",
+        "hint": "Shown by helm list. Objects are named after it (a name containing cremind is used as-is, otherwise -cremind is appended). Lowercase letters, digits and hyphens, up to 53 characters.",
+        "default": "cremind"
+      },
+      {
+        "key": "app_url",
+        "prompt": "What URL will you use to open Cremind in a browser?",
+        "hint": "Leave blank to let the chart derive it from the port-forward (http://localhost:1515, or https:// when HTTPS is on). Set it only when an ingress or load balancer serves Cremind at another address.",
+        "default": ""
+      },
+      {
+        "key": "legacy_postgres_image",
+        "prompt": "Use the legacy Bitnami Postgres image (docker.io/bitnamilegacy/postgresql)?",
+        "hint": "Bitnami moved its free images to the bitnamilegacy namespace, so the chart's default Postgres image no longer resolves on Docker Hub. Answer no only if your cluster mirrors the current Bitnami catalog.",
+        "choices": [
+          "yes",
+          "no"
+        ],
+        "default": "yes"
+      },
+      {
+        "key": "delete_postgres_data",
+        "prompt": "Delete the Postgres volume when the release is uninstalled?",
+        "hint": "no keeps the data-cremind-postgresql-0 claim after helm uninstall (the chart default) so a reinstall picks the data back up; yes sets the retention policy to Delete.",
+        "choices": [
+          "yes",
+          "no"
+        ],
+        "default": "no"
+      },
+      {
+        "key": "extra_set",
+        "prompt": "Any extra --set values for helm?",
+        "hint": "The value of one helm --set, e.g. ingress.enabled=true,ingress.host=cremind.example.com. Applied last, so it overrides the installer's own values. Leave blank for none.",
+        "default": ""
+      }
+    ]
   },
   "mode_rules": {
     "docker": {
@@ -131,7 +190,7 @@
     }
   },
   "_meta": {
-    "sha256": "b2e69882e9556a0d5d79c3076bf5b048a768f6838559e0cea624f2809b6b2617",
+    "sha256": "918c3655f0cf44a166d84e0964d05463ea9d0d2de58f3d5bce1c0b736879f81a",
     "schema_version": 1
   }
 }

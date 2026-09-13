@@ -166,9 +166,25 @@ def test_unattended_installs_never_prompt() -> None:
 
 
 def test_the_prompt_is_only_asked_when_there_is_a_desktop_to_protect() -> None:
-    """The basic image ships no VNC server; asking there would be noise."""
-    assert '[ "$MODE" = "docker" ] && [ "$DESKTOP_UI" != "0" ]' in _sh()
-    assert "$Mode -eq 'docker' -and $DesktopUi -ne '0'" in _ps1()
+    """The basic image ships no VNC server; asking there would be noise.
+
+    Both container modes qualify: Docker runs that image locally, Kubernetes
+    runs the same one in a pod.
+    """
+    assert (
+        '{ [ "$MODE" = "docker" ] || [ "$MODE" = "kubernetes" ]; } '
+        '&& [ "$DESKTOP_UI" != "0" ]'
+    ) in _sh()
+    assert (
+        "($Mode -eq 'docker' -or $Mode -eq 'kubernetes') -and $DesktopUi -ne '0'"
+    ) in _ps1()
+
+
+def test_kubernetes_reads_its_own_previous_password() -> None:
+    """On a kubernetes re-run the "previous install" is the Helm release, not
+    docker/.env — otherwise every re-run silently rotates the password."""
+    assert 'PREV_VNC_PASSWORD="$PREV_K8S_VNC_PASSWORD"' in _sh()
+    assert "$PrevVncPassword = Get-PrevK8s 'VNC_PASSWORD'" in _ps1()
 
 
 def test_the_retry_loop_is_bounded_in_both_scripts() -> None:

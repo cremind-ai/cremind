@@ -28,7 +28,7 @@ from __future__ import annotations
 import datetime as _dt
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Literal, NamedTuple
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import get_app
@@ -441,6 +441,10 @@ def screen_version_picker(state: TuiResult, ctx: "Context") -> ScreenResult:
 
 
 def screen_deployment(state: TuiResult, ctx: "Context") -> ScreenResult:
+    # Kubernetes has no host to bind: the chart sets HOST/APP_URL on the pod
+    # and the browser reaches it through a port-forward or an ingress.
+    if state.mode == "kubernetes":
+        return state, "skip"
     if state.deployment:
         return state, "skip"
     default = "custom" if ctx.in_container else "local"
@@ -468,6 +472,8 @@ def screen_deployment(state: TuiResult, ctx: "Context") -> ScreenResult:
 
 
 def screen_server_host(state: TuiResult, ctx: "Context") -> ScreenResult:
+    if state.mode == "kubernetes":
+        return state, "skip"
     if state.deployment != "server":
         return state, "skip"
     if state.app_host:
@@ -494,7 +500,11 @@ def screen_server_host(state: TuiResult, ctx: "Context") -> ScreenResult:
 
 
 def _custom_field_screen(
-    field_def: CustomField, current: str, *, allow_back: bool
+    field_def: CustomField,
+    current: str,
+    *,
+    allow_back: bool,
+    validator: Callable[[str], str | None] | None = None,
 ) -> tuple[str | None, Action]:
     if field_def.choices:
         return _radio(
@@ -514,19 +524,26 @@ def _custom_field_screen(
         title=f"Cremind · {field_def.key}",
         text=f"{field_def.prompt}\n\n{field_def.hint}",
         default=current or field_def.default,
-        validator=_validate,
+        validator=validator or _validate,
         allow_back=allow_back,
     )
 
 
-def screen_custom_fields(state: TuiResult, ctx: "Context") -> ScreenResult:
-    if state.deployment != "custom":
-        return state, "skip"
-    deployment = ctx.catalog.deployment("custom")
-    if deployment is None:
-        return state, "skip"
+def _fields_loop(
+    state: TuiResult,
+    ctx: "Context",
+    fields: tuple[CustomField, ...],
+    *,
+    slot_prefix: str,
+    validator_for: Callable[[str, TuiResult], Callable[[str], str | None] | None]
+    | None = None,
+) -> ScreenResult:
+    """Walk ``fields`` one screen at a time, writing ``<slot_prefix><key>``.
 
-    fields = deployment.advanced_fields
+    Shared by the ``custom`` deployment's advanced fields and the kubernetes
+    Helm options — same catalog shape, same per-field Back. A field whose slot
+    is already populated (by a flag) is stepped over silently.
+    """
     new_state = state
     # Per-field history so Back walks fields one at a time; only Back on the
     # first *prompted* field bubbles out to the driver.
@@ -535,13 +552,16 @@ def screen_custom_fields(state: TuiResult, ctx: "Context") -> ScreenResult:
     i = 0
     while i < len(fields):
         field_def = fields[i]
-        slot = f"custom_{field_def.key}"
+        slot = f"{slot_prefix}{field_def.key}"
         if getattr(new_state, slot, ""):
             i += 1
             continue  # pre-populated by flag
         allow_back = bool(field_stack) or ctx.can_go_back
         before = new_state
-        value, action = _custom_field_screen(field_def, "", allow_back=allow_back)
+        validator = validator_for(field_def.key, new_state) if validator_for else None
+        value, action = _custom_field_screen(
+            field_def, "", allow_back=allow_back, validator=validator
+        )
         if action == "cancel":
             return new_state, "cancel"
         if action == "back":
@@ -556,22 +576,77 @@ def screen_custom_fields(state: TuiResult, ctx: "Context") -> ScreenResult:
     return (new_state, "advance") if prompted else (new_state, "skip")
 
 
+def screen_custom_fields(state: TuiResult, ctx: "Context") -> ScreenResult:
+    if state.mode == "kubernetes":
+        return state, "skip"
+    if state.deployment != "custom":
+        return state, "skip"
+    deployment = ctx.catalog.deployment("custom")
+    if deployment is None:
+        return state, "skip"
+    return _fields_loop(
+        state, ctx, deployment.advanced_fields, slot_prefix="custom_"
+    )
+
+
+# Modes that run Cremind in a container image, i.e. the ones the desktop-UI
+# and VNC-password questions apply to. Docker runs that image locally;
+# Kubernetes runs the same image in a pod.
+_CONTAINER_MODES = ("docker", "kubernetes")
+
+# What a missing capability is called when the mode screen explains why a
+# mode is not on the list. Keys are the `requires` ids from catalog.toml.
+CAPABILITY_LABELS = {
+    "docker": "Docker",
+    "kubectl": "kubectl with a kubeconfig context",
+    "helm": "helm 3",
+}
+
+
 def screen_mode(state: TuiResult, ctx: "Context") -> ScreenResult:
+    """Offer the install methods this machine can actually run.
+
+    The catalog's ``requires`` is the gate (see ``Catalog.available_modes``):
+    a mode is listed only when every capability it names was probed and found.
+    When exactly one survives there is nothing to ask, so it is selected with
+    a ``skip`` — which is also what happens on a plain laptop with no Docker,
+    where ``native`` is the only mode left.
+    """
     if state.mode:
         return state, "skip"
-    if not ctx.has_docker:
-        # Docker not available — default to native without asking.
+
+    available = ctx.catalog.available_modes(ctx.capabilities)
+    if not available:
+        # Defensive: `native` requires nothing, so this only happens with a
+        # catalog that dropped it. Falling back keeps the installer usable.
         return replace(state, mode="native"), "skip"
+    if len(available) == 1:
+        return replace(state, mode=available[0].id), "skip"
 
     values: list[tuple[str, str]] = []
-    for mode in ctx.catalog.modes:
+    for mode in available:
         badge = f" [{mode.badge}]" if mode.badge else ""
         values.append((mode.id, f"{mode.label}{badge} — {mode.description}"))
+
+    text = "How do you want to run Cremind?"
+    hidden = [m for m in ctx.catalog.modes if m not in available]
+    if hidden:
+        parts = []
+        for mode in hidden:
+            missing = [
+                CAPABILITY_LABELS.get(r, r)
+                for r in mode.requires
+                if r not in ctx.capabilities
+            ]
+            parts.append(f"{mode.label} (needs {', '.join(missing)})")
+        text += "\n\nNot offered here: " + "; ".join(parts)
+
     value, action = _radio(
         title="Cremind · Mode",
-        text="How do you want to run Cremind?",
+        text=text,
         values=values,
-        default=state.mode or "docker",
+        # Catalog order is the recommendation: the first available mode wins.
+        default=available[0].id,
         allow_back=ctx.can_go_back,
     )
     if action != "advance":
@@ -579,13 +654,347 @@ def screen_mode(state: TuiResult, ctx: "Context") -> ScreenResult:
     return replace(state, mode=value or ""), "advance"
 
 
+# ── kubernetes mode ──────────────────────────────────────────────────────
+#
+# The context list cannot be a catalog `choices` array: it is probed at run
+# time. install.sh / install.ps1 enumerate the kubeconfigs before launching
+# the TUI and hand the result over as a file, one context per line:
+#
+#     name<TAB>server<TAB>default-namespace<TAB>kubeconfig<TAB>current
+#
+# ``kubeconfig`` is empty for the config kubectl reads on its own
+# ($KUBECONFIG, else ~/.kube/config) and the file's path for a sibling file
+# the shell found under ~/.kube. Those files routinely reuse a context name
+# ("default"), so a row is identified by (kubeconfig, name), never by the
+# name alone. ``current`` is 1 on the ambient current-context. Only the name
+# is required — a three-column line still parses.
+
+
+class KubeContext(NamedTuple):
+    name: str
+    server: str = ""
+    namespace: str = ""
+    kubeconfig: str = ""
+    current: bool = False
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """What identifies a target: sibling files may reuse a context name."""
+        return (self.kubeconfig, self.name)
+
+
+def parse_kube_contexts(text: str) -> tuple[KubeContext, ...]:
+    """Parse the shell's contexts file. Blank and duplicate rows are dropped."""
+    seen: set[tuple[str, str]] = set()
+    out: list[KubeContext] = []
+    for raw in (text or "").splitlines():
+        line = raw.rstrip("\r")
+        if not line.strip():
+            continue
+        parts = [part.strip() for part in line.split("\t")]
+        parts += [""] * (5 - len(parts))
+        name, server, namespace, kubeconfig, current = parts[:5]
+        if not name or (kubeconfig, name) in seen:
+            continue
+        seen.add((kubeconfig, name))
+        out.append(
+            KubeContext(
+                name=name,
+                server=server,
+                namespace=namespace,
+                kubeconfig=kubeconfig,
+                current=current == "1",
+            )
+        )
+    return tuple(out)
+
+
+def kubeconfig_label(path: str, home: str | None = None) -> str:
+    """A kubeconfig path as the operator would type it: ``~`` for home.
+
+    ``home`` exists for tests; the real one is :meth:`Path.home`.
+    """
+    if not path:
+        return "default kubeconfig"
+    root = home if home is not None else str(Path.home())
+    if (
+        root
+        and len(path) > len(root)
+        and path.startswith(root)
+        and path[len(root)] in "/\\"
+    ):
+        return "~" + path[len(root):]
+    return path
+
+
+# An RFC 1123 label, which is what Kubernetes accepts for a namespace and
+# Helm for a release name. install.sh and install.ps1 carry the same regex
+# literally so a flag is rejected the same way an answer here is.
+KUBE_NAME_PATTERN = r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+KUBE_NAME_ERROR = (
+    "Use lowercase letters, digits and hyphens, starting and ending with a "
+    "letter or digit."
+)
+#: Helm's own cap on a release name, stricter than the 63 of a DNS label.
+HELM_RELEASE_NAME_MAX = 53
+
+
+def validate_kube_namespace(value: str) -> str | None:
+    """Return an error for a rejected namespace, or ``None`` if valid."""
+    import re
+
+    text = (value or "").strip()
+    if not text:
+        return "A namespace is required."
+    if len(text) > 63:
+        return "A namespace can be at most 63 characters."
+    if not re.match(KUBE_NAME_PATTERN, text):
+        return KUBE_NAME_ERROR
+    return None
+
+
+def validate_helm_release_name(value: str) -> str | None:
+    """Return an error for a rejected Helm release name, or ``None``."""
+    import re
+
+    text = (value or "").strip()
+    if not text:
+        return "A release name is required."
+    if len(text) > HELM_RELEASE_NAME_MAX:
+        return f"Helm allows at most {HELM_RELEASE_NAME_MAX} characters."
+    if not re.match(KUBE_NAME_PATTERN, text):
+        return KUBE_NAME_ERROR
+    return None
+
+
+def screen_kube_context(state: TuiResult, ctx: "Context") -> ScreenResult:
+    """Pick the cluster. The whole point of the mode's safety story.
+
+    Whatever is chosen here is passed as ``--kube-context`` — and, for a
+    context from a sibling kubeconfig file, ``--kubeconfig`` — on every helm
+    and kubectl call the installer makes, so the ambient current-context
+    never decides where a release lands. Each row carries the API server
+    because two contexts can look alike by name and point at different
+    clusters — or at the same one — and names its file when more than one
+    file is in play, because sibling files reuse context names.
+    """
+    if state.mode != "kubernetes":
+        return state, "skip"
+
+    rows = list(ctx.kube_contexts)
+    if state.kube_config_file:
+        # --kubeconfig narrowed the shell's probe to that file; mirror it.
+        narrowed = [k for k in rows if k.kubeconfig == state.kube_config_file]
+        rows = narrowed or rows
+    if state.kube_context:
+        matches = [k for k in rows if k.name == state.kube_context]
+        if state.kube_config_file or len(matches) <= 1:
+            # Settled — or unknown, which the shell rejects with the full
+            # list. Record the file the name resolved to and move on.
+            if matches:
+                state = replace(state, kube_config_file=matches[0].kubeconfig)
+            return state, "skip"
+        # The name exists in several files: ask which, and only that.
+        rows = matches
+    if not rows:
+        _message(
+            title="No kubeconfig contexts",
+            text=(
+                "kubectl reported no contexts, so there is no cluster to "
+                "install into.\n\nCreate one (kubectl config set-context …) "
+                "or re-run with --kube-context."
+            ),
+        )
+        # Nothing to answer here: go back to the previous question if there
+        # was one, otherwise there is no way forward at all.
+        return state, ("back" if ctx.can_go_back else "cancel")
+
+    kp = ctx.catalog.kubernetes
+    if state.kube_context:
+        text = (
+            f"'{state.kube_context}' exists in {len(rows)} kubeconfig files. "
+            "Which one did you mean?"
+        )
+    else:
+        text = kp.context_prompt
+    if kp.context_hint:
+        text += f"\n\n{kp.context_hint}"
+
+    # Values are positions in the full list: a name is not unique, and the
+    # ambient rows share the empty kubeconfig.
+    several_files = len({k.kubeconfig for k in ctx.kube_contexts}) > 1
+    values: list[tuple[str, str]] = []
+    default = ""
+    for index, kube in enumerate(ctx.kube_contexts):
+        if kube not in rows:
+            continue
+        server = kube.server or "(server unknown)"
+        namespace = kube.namespace or "default"
+        row = f"{kube.name} — {server} ({namespace})"
+        if several_files:
+            row += f"  ·  {kubeconfig_label(kube.kubeconfig)}"
+        if kube.current:
+            row += "  [current]"
+            default = str(index)
+        values.append((str(index), row))
+    if not default:
+        default = values[0][0]
+
+    value, action = _radio(
+        title="Cremind · Kubernetes context",
+        text=text,
+        values=values,
+        default=default,
+        allow_back=ctx.can_go_back,
+    )
+    if action != "advance":
+        return state, action
+    chosen = ctx.kube_contexts[int(value)] if value else rows[0]
+    return (
+        replace(state, kube_context=chosen.name, kube_config_file=chosen.kubeconfig),
+        "advance",
+    )
+
+
+def screen_kube_namespace(state: TuiResult, ctx: "Context") -> ScreenResult:
+    if state.mode != "kubernetes":
+        return state, "skip"
+    if state.kube_namespace:
+        return state, "skip"
+
+    kp = ctx.catalog.kubernetes
+    text = kp.namespace_prompt
+    if kp.namespace_hint:
+        text += f"\n\n{kp.namespace_hint}"
+    value, action = _text(
+        title="Cremind · Namespace",
+        text=text,
+        default=kp.namespace_default,
+        validator=validate_kube_namespace,
+        allow_back=ctx.can_go_back,
+    )
+    if action != "advance":
+        return state, action
+    return replace(state, kube_namespace=(value or "").strip()), "advance"
+
+
+def _k8s_validator(
+    key: str, state: TuiResult
+) -> Callable[[str], str | None] | None:
+    """The per-field validator for the kubernetes advanced fields.
+
+    ``app_url`` is checked against the HTTPS answer because the chart refuses
+    to render ``cremind.ssl`` together with an ``http://`` app URL — and by
+    the time helm says so the TUI is long gone.
+    """
+    if key == "release_name":
+        return validate_helm_release_name
+
+    if key == "app_url":
+
+        def _validate_app_url(value: str) -> str | None:
+            text = (value or "").strip()
+            if not text:
+                return None  # blank = let the chart derive it
+            if not (text.startswith("http://") or text.startswith("https://")):
+                return "Start the URL with http:// or https://, or leave it blank."
+            if state.ssl_choice in ("auto", "after-setup") and text.startswith(
+                "http://"
+            ):
+                return (
+                    "HTTPS is enabled for this install, so the URL must be "
+                    "https:// — or leave it blank and the chart derives it."
+                )
+            return None
+
+        return _validate_app_url
+
+    return None
+
+
+def screen_k8s_advanced(state: TuiResult, ctx: "Context") -> ScreenResult:
+    """Ask once whether the Helm options need customizing at all.
+
+    Answering "recommended" fills every advanced slot with its catalog
+    default, which makes the field loop below a no-op.
+
+    A populated release name is the "already answered" signal, here and in
+    both install scripts. It works because ``release_name`` is the one
+    advanced field with a non-empty default — ``app_url`` and ``extra_set``
+    are legitimately blank, so emptiness alone cannot mean "not asked yet".
+    """
+    if state.mode != "kubernetes":
+        return state, "skip"
+    fields = ctx.catalog.kubernetes.advanced_fields
+    if not fields:
+        return state, "skip"
+    if state.k8s_release_name:
+        # Answered already — by a flag, or by the shell replaying the
+        # previous release. The field loop has nothing left to fill either.
+        ctx.k8s_advanced = "recommended"
+        return state, "skip"
+    if any(getattr(state, f"k8s_{f.key}", "") for f in fields):
+        # A flag answered part of this, so the operator is customizing: the
+        # field loop asks the rest, release name included.
+        ctx.k8s_advanced = "customize"
+        return state, "skip"
+
+    kp = ctx.catalog.kubernetes
+    text = kp.advanced_prompt
+    if kp.advanced_hint:
+        text += f"\n\n{kp.advanced_hint}"
+    value, action = _radio(
+        title="Cremind · Helm options",
+        text=text,
+        values=[
+            ("recommended", "Use the recommended options"),
+            (
+                "customize",
+                "Customize — release name, app URL, Postgres image, data "
+                "retention, extra --set",
+            ),
+        ],
+        default="recommended",
+        allow_back=ctx.can_go_back,
+    )
+    if action != "advance":
+        return state, action
+    ctx.k8s_advanced = value or "recommended"
+    if ctx.k8s_advanced == "recommended":
+        return (
+            replace(state, **{f"k8s_{f.key}": f.default for f in fields}),
+            "advance",
+        )
+    return state, "advance"
+
+
+def screen_k8s_fields(state: TuiResult, ctx: "Context") -> ScreenResult:
+    if state.mode != "kubernetes":
+        return state, "skip"
+    if ctx.k8s_advanced == "recommended":
+        return state, "skip"
+    fields = ctx.catalog.kubernetes.advanced_fields
+    if not fields:
+        return state, "skip"
+    return _fields_loop(
+        state, ctx, fields, slot_prefix="k8s_", validator_for=_k8s_validator
+    )
+
+
 def screen_desktop(state: TuiResult, ctx: "Context") -> ScreenResult:
-    # Only relevant for Docker installs — the desktop UI is a container image
-    # flavor. Native installs share the host desktop and skip this.
-    if state.mode != "docker":
+    # Only relevant where Cremind runs from a container image — Docker locally,
+    # Kubernetes in a pod. Native installs share the host desktop and skip this.
+    if state.mode not in _CONTAINER_MODES:
         return state, "skip"
     if state.desktop:
         return state, "skip"
+    if state.mode == "kubernetes" and state.channel == "production":
+        # Not a choice on this channel: the production chart and the basic
+        # image are published to the same Docker Hub tag, so a headless
+        # Kubernetes install would pull the chart artifact as its image. The
+        # install scripts refuse that combination outright (it can also arrive
+        # by flag); here there is simply nothing to ask.
+        return replace(state, desktop="1"), "skip"
 
     dd = ctx.catalog.docker_desktop
     text = dd.prompt
@@ -610,9 +1019,15 @@ def screen_ssl(state: TuiResult, ctx: "Context") -> ScreenResult:
     """Offer HTTPS on fresh installs; preserve flags and existing settings."""
     if state.ssl_choice:
         return state, "skip"
-    previous_env = ctx.docker_env if state.mode == "docker" else ctx.native_env
-    if ctx.ssl_inherited or (previous_env and Path(previous_env).is_file()):
-        return replace(state, ssl_choice="keep"), "skip"
+    # Kubernetes never "keeps": TLS is a chart value on the pod, not a host
+    # .env, so neither an inherited CREMIND_SSL in this shell nor a previous
+    # Docker/native install says anything about it. A re-install carries the
+    # previous answer forward through --ssl, which short-circuits this screen
+    # above — one owner of the release's state, the install script.
+    if state.mode != "kubernetes":
+        previous_env = ctx.docker_env if state.mode == "docker" else ctx.native_env
+        if ctx.ssl_inherited or (previous_env and Path(previous_env).is_file()):
+            return replace(state, ssl_choice="keep"), "skip"
     value, action = _radio(
         title="Cremind · HTTPS",
         text=(
@@ -676,7 +1091,7 @@ def screen_vnc_password(state: TuiResult, ctx: "Context") -> ScreenResult:
     already decided. Skipped whenever there is nothing to protect (native
     install, desktop declined) or the value arrived by flag.
     """
-    if state.mode != "docker":
+    if state.mode not in _CONTAINER_MODES:
         return state, "skip"
     if state.desktop == "0":
         return state, "skip"
@@ -733,24 +1148,68 @@ def screen_confirm(state: TuiResult, ctx: "Context") -> ScreenResult:
     rows = [
         ("Channel", state.channel or "production"),
         ("Version", version_label),
-        ("Deployment", state.deployment),
-        ("Mode", state.mode),
+    ]
+    if state.mode != "kubernetes":
+        rows.append(("Deployment", state.deployment))
+    rows.append(("Mode", state.mode))
+    if state.mode == "kubernetes":
+        picked = next(
+            (
+                k
+                for k in ctx.kube_contexts
+                if k.name == state.kube_context
+                and k.kubeconfig == state.kube_config_file
+            ),
+            None,
+        )
+        server = picked.server if picked else next(
+            (k.server for k in ctx.kube_contexts if k.name == state.kube_context),
+            "",
+        )
+        label = f"{state.kube_context} — {server}" if server else state.kube_context
+        if state.kube_config_file:
+            label += f" ({kubeconfig_label(state.kube_config_file)})"
+        rows.append(("Context", label))
+        rows.append(("Namespace", state.kube_namespace))
+        rows.append(("Release", state.k8s_release_name or "cremind"))
+    rows.append(
         ("HTTPS (SSL)", {
             "after-setup": "enabled after certificate trust in setup",
             "auto": "enabled from first boot",
             "keep": "keep existing transport settings",
-        }.get(state.ssl_choice, "off (HTTP)")),
-    ]
-    if state.mode == "docker":
-        rows.append(("Desktop UI", "yes" if state.desktop != "0" else "no (basic image)"))
+        }.get(state.ssl_choice, "off (HTTP)"))
+    )
+    if state.mode in _CONTAINER_MODES:
+        if state.mode == "kubernetes" and state.channel == "production":
+            desktop_label = "yes (required on the production channel)"
+        else:
+            desktop_label = "yes" if state.desktop != "0" else "no (basic image)"
+        rows.append(("Desktop UI", desktop_label))
         if state.desktop != "0":
             rows.append((
                 "VNC password",
                 "********" if state.vnc_password else "(keep existing)",
             ))
-    if state.deployment == "server" and state.app_host:
+    if state.mode == "kubernetes":
+        rows.append(
+            ("App URL", state.k8s_app_url or "(auto: http(s)://localhost:1515)")
+        )
+        rows.append((
+            "Postgres image",
+            "chart default"
+            if state.k8s_legacy_postgres_image == "no"
+            else "docker.io/bitnamilegacy/postgresql",
+        ))
+        rows.append((
+            "Postgres data",
+            "deleted on uninstall"
+            if state.k8s_delete_postgres_data == "yes"
+            else "kept on uninstall",
+        ))
+        rows.append(("Extra --set", state.k8s_extra_set or "(none)"))
+    if state.mode != "kubernetes" and state.deployment == "server" and state.app_host:
         rows.append(("Host", state.app_host))
-    if state.deployment == "custom":
+    if state.mode != "kubernetes" and state.deployment == "custom":
         rows.append(("Listen host", state.custom_listen_host or "(catalog default)"))
         rows.append(("Public URL", state.custom_public_url or "(catalog default)"))
         rows.append(("Allowed origins", state.custom_allowed_origins or "(public URL + localhost)"))
@@ -780,7 +1239,14 @@ class Context:
     in_container: bool
     has_docker: bool
     electron_version: str
+    has_kubectl: bool = False
+    has_helm: bool = False
+    # Probed by the shell before the TUI launches; empty when kubectl found
+    # nothing or is not installed.
+    kube_contexts: tuple[KubeContext, ...] = ()
     version_mode: str = "latest"
+    # "" until screen_k8s_advanced runs; then "recommended" or "customize".
+    k8s_advanced: str = ""
     # True when a previous install already has a VNC password on disk, which
     # makes an empty entry mean "keep that one" instead of being rejected.
     vnc_password_preset: bool = False
@@ -791,19 +1257,43 @@ class Context:
     # *prompted* screen to return to. Screens forward it as ``allow_back``.
     can_go_back: bool = False
 
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """The ``requires`` ids this environment probed and found.
 
-# Order matters: each screen advances or rewinds the cursor.
+        A capability the front-end cannot probe is simply absent, which makes
+        any mode requiring it unavailable — the same rule every front-end
+        applies (see the comment under ``[modes]`` in install/catalog.toml).
+        """
+        found = set()
+        if self.has_docker:
+            found.add("docker")
+        if self.has_kubectl:
+            found.add("kubectl")
+        if self.has_helm:
+            found.add("helm")
+        return frozenset(found)
+
+
+# Order matters: each screen advances or rewinds the cursor. The mode comes
+# before the deployment questions because it decides whether they are asked at
+# all — a kubernetes install has no host to bind. The kubernetes Helm options
+# come after HTTPS so the app-URL check knows which scheme was chosen.
 _SCREENS: list[Callable[[TuiResult, Context], ScreenResult]] = [
     screen_channel,
     screen_version_mode,
     screen_version_picker,
+    screen_mode,
+    screen_kube_context,
+    screen_kube_namespace,
     screen_deployment,
     screen_server_host,
     screen_custom_fields,
-    screen_mode,
     screen_desktop,
     screen_vnc_password,
     screen_ssl,
+    screen_k8s_advanced,
+    screen_k8s_fields,
     screen_confirm,
 ]
 
@@ -815,6 +1305,9 @@ def run(
     in_container: bool,
     has_docker: bool,
     electron_version: str,
+    has_kubectl: bool = False,
+    has_helm: bool = False,
+    kube_contexts: tuple[KubeContext, ...] = (),
     vnc_password_preset: bool = False,
     ssl_inherited: bool = False,
     native_env: str = "",
@@ -834,6 +1327,9 @@ def run(
         in_container=in_container,
         has_docker=has_docker,
         electron_version=electron_version,
+        has_kubectl=has_kubectl,
+        has_helm=has_helm,
+        kube_contexts=tuple(kube_contexts),
         vnc_password_preset=vnc_password_preset,
         ssl_inherited=ssl_inherited,
         native_env=native_env,
@@ -868,4 +1364,4 @@ def run(
     return state
 
 
-__all__ = ["Context", "run"]
+__all__ = ["Context", "KubeContext", "kubeconfig_label", "parse_kube_contexts", "run"]

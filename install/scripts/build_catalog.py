@@ -166,6 +166,31 @@ def render_bash(catalog: dict[str, Any], digest: str) -> str:
     add("VNC_PASSWORD_HINT=" + _bash_quote(vp.get("hint", "")))
     add("")
 
+    # Kubernetes prompts (asked only when mode == kubernetes). The advanced
+    # fields mirror the custom-deployment ones above: same shape, same naming
+    # convention, so install.sh reuses the very same prompt loop with a
+    # different prefix. K8S_FIELD_* (definitions) never collides with the
+    # K8S_<key> answer variables the shells and the TUI exchange.
+    k8s = catalog.get("kubernetes", {}) or {}
+    k8s_fields = k8s.get("advanced_fields", []) or []
+    add("# ── Kubernetes prompts ──")
+    add("K8S_CONTEXT_PROMPT=" + _bash_quote(k8s.get("context_prompt", "")))
+    add("K8S_CONTEXT_HINT=" + _bash_quote(k8s.get("context_hint", "")))
+    add("K8S_NAMESPACE_PROMPT=" + _bash_quote(k8s.get("namespace_prompt", "")))
+    add("K8S_NAMESPACE_HINT=" + _bash_quote(k8s.get("namespace_hint", "")))
+    add("K8S_NAMESPACE_DEFAULT=" + _bash_quote(k8s.get("namespace_default", "cremind")))
+    add("K8S_ADVANCED_PROMPT=" + _bash_quote(k8s.get("advanced_prompt", "")))
+    add("K8S_ADVANCED_HINT=" + _bash_quote(k8s.get("advanced_hint", "")))
+    add("K8S_FIELD_IDS=" + _bash_quote(" ".join(f["key"] for f in k8s_fields)))
+    for field in k8s_fields:
+        key = field["key"]
+        add(_bash_var_name("K8S_FIELD_PROMPT", key) + "=" + _bash_quote(field.get("prompt", "")))
+        add(_bash_var_name("K8S_FIELD_HINT", key) + "=" + _bash_quote(field.get("hint", "")))
+        add(_bash_var_name("K8S_FIELD_DEFAULT", key) + "=" + _bash_quote(field.get("default", "")))
+        choices = field.get("choices") or []
+        add(_bash_var_name("K8S_FIELD_CHOICES", key) + "=" + _bash_quote(" ".join(choices)))
+    add("")
+
     # Mode rules
     rules = catalog.get("mode_rules", {})
     add("# ── Mode rules ──")
@@ -288,6 +313,39 @@ def render_powershell(catalog: dict[str, Any], digest: str) -> str:
     add("$script:VncPasswordPrompt = [ordered]@{")
     add(f"    Prompt = {_ps_quote(vp.get('prompt', ''))}")
     add(f"    Hint   = {_ps_quote(vp.get('hint', ''))}")
+    add("}")
+    add("")
+
+    # Kubernetes prompts (asked only when mode == kubernetes). One hashtable
+    # with an ordered AdvancedFields array rather than the Ids/Fields pair the
+    # custom deployment uses: install.ps1 iterates it directly. Choices is
+    # always emitted (even empty) so Set-StrictMode never sees a missing
+    # property.
+    k8s = catalog.get("kubernetes", {}) or {}
+    k8s_fields = k8s.get("advanced_fields", []) or []
+    add("# ── Kubernetes prompts ──")
+    add("$script:Kubernetes = [ordered]@{")
+    add(f"    ContextPrompt    = {_ps_quote(k8s.get('context_prompt', ''))}")
+    add(f"    ContextHint      = {_ps_quote(k8s.get('context_hint', ''))}")
+    add(f"    NamespacePrompt  = {_ps_quote(k8s.get('namespace_prompt', ''))}")
+    add(f"    NamespaceHint    = {_ps_quote(k8s.get('namespace_hint', ''))}")
+    add(f"    NamespaceDefault = {_ps_quote(k8s.get('namespace_default', 'cremind'))}")
+    add(f"    AdvancedPrompt   = {_ps_quote(k8s.get('advanced_prompt', ''))}")
+    add(f"    AdvancedHint     = {_ps_quote(k8s.get('advanced_hint', ''))}")
+    add("    AdvancedFields   = @(")
+    for field in k8s_fields:
+        choices = field.get("choices") or []
+        add("        [ordered]@{")
+        add(f"            Key     = {_ps_quote(field['key'])}")
+        add(f"            Prompt  = {_ps_quote(field.get('prompt', ''))}")
+        add(f"            Hint    = {_ps_quote(field.get('hint', ''))}")
+        add(f"            Default = {_ps_quote(field.get('default', ''))}")
+        if choices:
+            add(f"            Choices = @({', '.join(_ps_quote(c) for c in choices)})")
+        else:
+            add("            Choices = @()")
+        add("        }")
+    add("    )")
     add("}")
     add("")
 

@@ -1,6 +1,6 @@
 # AUTO-GENERATED from install/catalog.toml. Do not edit by hand.
 # Regenerate with: python install/scripts/build_catalog.py
-# Source SHA-256:  b2e69882e9556a0d5d79c3076bf5b048a768f6838559e0cea624f2809b6b2617
+# Source SHA-256:  918c3655f0cf44a166d84e0964d05463ea9d0d2de58f3d5bce1c0b736879f81a
 
 $script:CatalogSchema = 1
 
@@ -70,7 +70,7 @@ $script:CustomFields = [ordered]@{
 }
 
 # ── Install modes ──
-$script:ModeIds = @('docker', 'native')
+$script:ModeIds = @('docker', 'native', 'kubernetes')
 $script:Modes = [ordered]@{
     'docker' = [ordered]@{
         Label       = 'Docker'
@@ -88,6 +88,14 @@ $script:Modes = [ordered]@{
         Requires    = @()
         Order       = 20
     }
+    'kubernetes' = [ordered]@{
+        Label       = 'Kubernetes'
+        Description = 'Helm release in an existing cluster (in-cluster Postgres, optional VNC desktop)'
+        Hint        = 'Installs the cremind Helm chart into a kubeconfig context you pick. Needs kubectl and helm on PATH; you reach Cremind through a kubectl port-forward at http://localhost:1515.'
+        Badge       = ''
+        Requires    = @('kubectl', 'helm')
+        Order       = 30
+    }
 }
 
 # ── Docker desktop UI ──
@@ -101,6 +109,54 @@ $script:DockerDesktop = [ordered]@{
 $script:VncPasswordPrompt = [ordered]@{
     Prompt = 'Choose a password for the VNC Desktop'
     Hint   = '6-8 characters, from letters, digits and @ % _ + = : , . - — VNC ignores anything past the 8th character. You will sign in with it at http://<host>:6080/vnc.html. Leave empty when re-installing to keep the current password.'
+}
+
+# ── Kubernetes prompts ──
+$script:Kubernetes = [ordered]@{
+    ContextPrompt    = 'Which kubeconfig context should Cremind be installed into?'
+    ContextHint      = 'Every helm and kubectl command runs with --kube-context set to this choice (and --kubeconfig, for a context from a file kubectl does not read on its own), never the ambient current-context. Every kubeconfig under ~/.kube is listed, not just kubectl''s own; each row shows the API server, and its file when several are in play, so a look-alike cluster stands out.'
+    NamespacePrompt  = 'Which namespace should the Helm release go into?'
+    NamespaceHint    = 'Created if it does not exist. Lowercase letters, digits and hyphens, up to 63 characters.'
+    NamespaceDefault = 'cremind'
+    AdvancedPrompt   = 'Use the recommended Helm options, or customize them?'
+    AdvancedHint     = 'Recommended: release name cremind, app URL derived from the port-forward, the legacy Bitnami Postgres image, Postgres data kept on uninstall, no extra --set values.'
+    AdvancedFields   = @(
+        [ordered]@{
+            Key     = 'release_name'
+            Prompt  = 'What should the Helm release be called?'
+            Hint    = 'Shown by helm list. Objects are named after it (a name containing cremind is used as-is, otherwise -cremind is appended). Lowercase letters, digits and hyphens, up to 53 characters.'
+            Default = 'cremind'
+            Choices = @()
+        }
+        [ordered]@{
+            Key     = 'app_url'
+            Prompt  = 'What URL will you use to open Cremind in a browser?'
+            Hint    = 'Leave blank to let the chart derive it from the port-forward (http://localhost:1515, or https:// when HTTPS is on). Set it only when an ingress or load balancer serves Cremind at another address.'
+            Default = ''
+            Choices = @()
+        }
+        [ordered]@{
+            Key     = 'legacy_postgres_image'
+            Prompt  = 'Use the legacy Bitnami Postgres image (docker.io/bitnamilegacy/postgresql)?'
+            Hint    = 'Bitnami moved its free images to the bitnamilegacy namespace, so the chart''s default Postgres image no longer resolves on Docker Hub. Answer no only if your cluster mirrors the current Bitnami catalog.'
+            Default = 'yes'
+            Choices = @('yes', 'no')
+        }
+        [ordered]@{
+            Key     = 'delete_postgres_data'
+            Prompt  = 'Delete the Postgres volume when the release is uninstalled?'
+            Hint    = 'no keeps the data-cremind-postgresql-0 claim after helm uninstall (the chart default) so a reinstall picks the data back up; yes sets the retention policy to Delete.'
+            Default = 'no'
+            Choices = @('yes', 'no')
+        }
+        [ordered]@{
+            Key     = 'extra_set'
+            Prompt  = 'Any extra --set values for helm?'
+            Hint    = 'The value of one helm --set, e.g. ingress.enabled=true,ingress.host=cremind.example.com. Applied last, so it overrides the installer''s own values. Leave blank for none.'
+            Default = ''
+            Choices = @()
+        }
+    )
 }
 
 # ── Mode rules ──

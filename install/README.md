@@ -43,14 +43,26 @@ your installation. For Kubernetes, use the [Helm HTTPS instructions](../helm/cre
 `cremind.ssl=true` selects the same trust-first setup flow, while `auto`
 enables HTTPS immediately. The chart defaults to HTTP.
 
-## Two install modes
+## Three install modes
 
-The scripts detect Docker and ask which mode you want:
+The scripts probe what this machine can run and offer only those modes:
 
 | Mode | What you get | When to pick it |
 |---|---|---|
 | **docker** *(recommended)* | The agent runs inside a sandboxed container. A sub-question asks whether to include the VNC Desktop UI: **yes** (default) pulls `cremind/cremind-desktop` so the agent has an XFCE desktop you can observe at `http://<host>:6080/vnc.html`; **no** (`--no-desktop`) pulls the smaller headless `cremind/cremind`. Either way the Setup Wizard activates Postgres, Qdrant, or ChromaDB as sibling containers on demand. | Anytime Docker is available — the agent is isolated from your host, and per-service deployment choices are made later in the wizard. |
 | **native** | A Python venv at `~/.cremind/venv` with `cremind` and SQLite. The agent shares your desktop and home directory. | Docker isn't available, or you want a minimal install without containers. |
+| **kubernetes** | The [Helm chart](../helm/cremind/README.md) installed into a kubeconfig context **you pick**, with the bundled PostgreSQL. The installer waits for the rollout, opens a `kubectl port-forward`, and hands you the Setup Wizard at `http://localhost:1515`. See [Kubernetes mode](#kubernetes-mode). | You already run a cluster. Needs `kubectl` with at least one kubeconfig context and `helm` 3.8+. |
+
+A mode is offered only when the machine meets its requirements (`requires` in
+[`catalog.toml`](catalog.toml)): docker needs a reachable daemon, kubernetes
+needs kubectl and helm, native needs nothing. When exactly one mode qualifies
+it is selected without asking, and the list names what is missing for the
+rest. `--mode` / `-Mode` for a mode this machine cannot run is an error, not a
+silent fallback.
+
+The desktop app's installer stage offers docker and native only: it probes
+Docker and Python, not kubectl and helm, so a Kubernetes install runs from
+`install.sh` / `install.ps1` in a terminal.
 
 The installer no longer asks which database or vector store to use —
 those choices are now per-service, made in the Setup Wizard. Each
@@ -148,7 +160,132 @@ docker compose down -v             # stop and delete all data
    hands the CA to your OS trust store itself (`POST /api/tls/trust`) —
    no download, no terminal. The OS still asks for its own confirmation.
 
-Both modes are idempotent: re-running upgrades in place and keeps your
+## Kubernetes mode
+
+Installs the Cremind Helm chart into a cluster you already run. The chart owns
+the pod's configuration, so this mode writes no host `.env`, registers no boot
+service, and runs no migrations — the Setup Wizard does the first one.
+
+### Which cluster
+
+The question the mode exists to answer. The installer lists every kubeconfig
+context it can find — the ones kubectl reads on its own (`$KUBECONFIG`, else
+`~/.kube/config`) **plus** those in every other file under `~/.kube`, since
+one file per cluster is a common layout — and shows each with its API server
+and, when several files are in play, the file it came from:
+
+```
+  1) prod-eu — https://eks-prod.example:443 (cremind)  default kubeconfig  [current]
+  2) default — https://161.248.199.106:6443 (frp)      ~/.kube/cremind_config
+  3) default — https://103.153.69.159:6443 (default)   ~/.kube/ssp_config
+```
+
+Whatever you pick is passed as `--kube-context` — and, for a context from a
+sibling file, `--kubeconfig` — on **every** helm and kubectl call the installer
+makes. The ambient `current-context` never decides where a release lands, so a
+context you switched away from an hour ago cannot redirect the install. With
+exactly one context it is used without asking; with several, an unattended run
+**requires** `--kube-context` rather than guessing. Sibling files routinely
+reuse a context name (`default` above), so a name that exists in more than one
+file needs `--kubeconfig FILE` as well; `--kubeconfig` on its own restricts the
+list to that file.
+
+### What it does
+
+1. Probe `kubectl` (needs ≥ 1 context) and `helm` (needs 3.8+ for OCI charts).
+2. Ask for the context, the namespace (default `cremind`, created if missing),
+   the desktop image and its VNC password, HTTPS, and — behind one
+   "customize?" question — the Helm options below.
+3. Reach the cluster once (`kubectl cluster-info`) before anything is changed.
+4. Resolve the version: the image tag is PEP 440 (`0.0.17rc13.dev1`), the
+   chart version is its SemVer2 spelling (`0.0.17-rc.13.dev.1`). Both come
+   from one release; `app/upgrade/channel.py chart-version` translates.
+5. Write `~/.local/share/cremind/k8s/values.yaml` and run
+   `helm upgrade --install` with it. Secrets ride the file rather than the
+   command line, and the file is yours to reuse by hand afterwards.
+6. Wait for PostgreSQL, then for the Cremind pod (`kubectl rollout status`).
+7. Start a background `kubectl port-forward`, wait for `/health`, offer to
+   trust the local CA when HTTPS is on, and open the Setup Wizard.
+8. Record the release in `k8s/release.env` and write `credentials.toml`.
+
+The manual `port-forward` command, the wizard URL, the noVNC URL and the VNC
+password are printed either way.
+
+### The values it sends
+
+| Answer | Chart value | Default |
+|---|---|---|
+| desktop UI | `desktop.enabled` | `true` |
+| VNC password | `cremind.vncPassword` | kept from the previous release, else generated |
+| `--ssl` | `cremind.ssl` | `none` |
+| `--k8s-app-url` | `cremind.appUrl` | **unset** — the chart derives `http(s)://localhost:1515` |
+| `--k8s-legacy-postgres-image` | `postgresql.image.registry` + `.repository` | `yes` → `docker.io/bitnamilegacy/postgresql` |
+| `--k8s-delete-postgres-data` | `postgresql.primary.persistentVolumeClaimRetentionPolicy` | `no` (the chart keeps the volume) |
+| *(always)* | `postgresql.auth.password` | pinned, see below |
+| `--k8s-extra-set` | appended as one trailing `--set` | — |
+
+`--k8s-extra-set` is applied **last**, so it overrides anything above it.
+
+Two defaults are worth knowing. The **legacy Bitnami image** is on because
+Bitnami froze its free images into the `bitnamilegacy` namespace and the
+chart's own default no longer pulls. The **app URL is deliberately not sent**:
+the chart derives exactly the value a port-forward needs, and an explicit
+`http://` value is what makes a later `--ssl` run fail the chart's own
+validation.
+
+### The Postgres password
+
+The installer pins `postgresql.auth.password` instead of letting the subchart
+generate one, and records it in `k8s/release.env`. Without that pin, an
+uninstall-and-reinstall generates a new password while the retained data
+volume keeps the old one, and setup fails with `password authentication failed
+for user "cremind"` long after the cause.
+
+Two consequences:
+
+- Installing over a release the installer did not create **adopts** the live
+  Secret's password rather than overwriting it.
+- A retained volume from an earlier release whose password this machine never
+  saw is a hard error, with the `kubectl delete pvc` line and the
+  `--k8s-postgres-password` escape hatch both printed.
+
+### Re-running and uninstalling
+
+Re-running upgrades the release in place and re-sends every value, so nothing
+silently carries over. The Postgres and VNC passwords are reused. Pointing a
+re-run at a different context, namespace or release name asks first, and
+refuses outright when unattended — the previously tracked release would
+otherwise keep running with nothing recording where it is.
+
+`--reinstall` uninstalls the release and installs it again (the pinned
+password keeps a retained volume usable).
+
+`--uninstall --keep` removes the Helm release and keeps both the PostgreSQL
+volume and `k8s/release.env`, so a later install picks the data back up.
+`--uninstall --purge` additionally deletes the bundled PostgreSQL / Qdrant /
+ChromaDB volumes and — only if the installer created it — the namespace.
+
+The chart's own PVCs (`system`, `venv`, `work`) are removed by
+`helm uninstall` itself, in both modes; only the StatefulSet subcharts' data
+volumes survive it.
+
+### The production channel needs the desktop image
+
+`--channel production --no-desktop` is refused. On the production channel the
+Helm chart is pushed to `cremind/cremind:<version>` on Docker Hub, the same
+tag the basic image uses, and the chart lands there second — so a headless
+production install would ask Kubernetes to run a chart artifact as a container
+image. Release candidates do not collide, so `--channel test --no-desktop`
+works.
+
+On `--channel dev` the local `helm/cremind` chart is installed (after
+`helm dependency build`) against the newest published **test** image, because
+no dev image or dev chart exists. The pod therefore reports the *test* channel
+on its Updates page.
+
+---
+
+All three modes are idempotent: re-running upgrades in place and keeps your
 existing config + database. Use `--reinstall` (sh) or `-Reinstall` (ps1)
 to wipe and start fresh.
 
@@ -176,7 +313,18 @@ container-friendly defaults) for one release; new scripts should use
 | `--public-url URL`                   | (custom) Override `APP_URL`. |
 | `--allowed-origins LIST`             | (custom) Override `CORS_ALLOWED_ORIGINS`. |
 | `--wizard-preset ID`                 | (custom) Override `SETUP_WIZARD_ENV`. |
-| `--mode docker\|native`              | Skip the mode prompt. `--docker` and `--native` are aliases. |
+| `--mode docker\|native\|kubernetes`  | Skip the mode prompt. `--docker`, `--native` and `--kubernetes` are aliases. A mode this machine cannot run is an error. |
+| `--kube-context CTX`                 | (kubernetes) The kubeconfig context to install into, passed to every helm and kubectl call. Required unattended when more than one context exists. |
+| `--kubeconfig FILE`                  | (kubernetes) The kubeconfig file holding that context. Without it, every file under `~/.kube` is listed alongside kubectl's own config, and a `--kube-context` that exists in several files is refused until you add this. Rides every helm and kubectl call as `--kubeconfig`. |
+| `--kube-namespace NS`                | (kubernetes) Namespace for the release, created if missing. Default `cremind`. |
+| `--k8s-release-name NAME`            | (kubernetes) Helm release name. Default `cremind`. |
+| `--k8s-app-url URL`                  | (kubernetes) `cremind.appUrl`. Leave unset to let the chart derive `http(s)://localhost:1515`. |
+| `--k8s-legacy-postgres-image yes\|no` | (kubernetes) Use `docker.io/bitnamilegacy/postgresql`. Default `yes`. |
+| `--k8s-delete-postgres-data yes\|no` | (kubernetes) Delete the Postgres volume on uninstall. Default `no`. |
+| `--k8s-extra-set K=V,K2=V2`          | (kubernetes) The value of one extra helm `--set`, applied last. |
+| `--k8s-postgres-password PW`         | (kubernetes) Adopt a retained Postgres volume whose password this installer never saw. |
+| `--helm-chart REF`                   | (kubernetes) Chart to install: an OCI reference, a `.tgz`, or a directory. |
+| `--no-port-forward`                  | (kubernetes) Don't start the background port-forward; just print the command. |
 | `--desktop` / `--no-desktop`         | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `--unattended`; a re-install keeps the previous choice. `--no-desktop` pulls the headless `cremind/cremind`. |
 | `--vnc-password PW`                  | (docker + desktop) Password for the VNC Desktop. 6–8 chars from `[A-Za-z0-9@%_+=:,.-]`. Interactive installs ask for it (twice) instead; unattended runs fall back to the previous install's password, else a generated one. An invalid value is a hard error in every mode. |
 | `--ssl none\|auto\|after-setup`      | TLS on the public origin. Default `none` (HTTP). Select Enable HTTPS or pass `after-setup` for certificate trust during the wizard followed by HTTPS. `auto` is HTTPS from boot one. A re-install preserves its previous choice unless this flag is supplied. Works with native, Docker, custom, and Electron installs. |
@@ -195,7 +343,18 @@ container-friendly defaults) for one release; new scripts should use
 | `-PublicUrl URL`                    | (custom) Override `APP_URL`. |
 | `-AllowedOrigins LIST`              | (custom) Override `CORS_ALLOWED_ORIGINS`. |
 | `-WizardPreset ID`                  | (custom) Override `SETUP_WIZARD_ENV`. |
-| `-Mode docker\|native`              | Skip the mode prompt. |
+| `-Mode docker\|native\|kubernetes`  | Skip the mode prompt. A mode this machine cannot run is an error. |
+| `-KubeContext CTX`                  | (kubernetes) The kubeconfig context to install into, passed to every helm and kubectl call. Required unattended when more than one context exists. |
+| `-KubeConfig FILE`                  | (kubernetes) The kubeconfig file holding that context. Without it, every file under `~\.kube` is listed alongside kubectl's own config, and a `-KubeContext` that exists in several files is refused until you add this. Rides every helm and kubectl call as `--kubeconfig`. |
+| `-KubeNamespace NS`                 | (kubernetes) Namespace for the release, created if missing. Default `cremind`. |
+| `-K8sReleaseName NAME`              | (kubernetes) Helm release name. Default `cremind`. |
+| `-K8sAppUrl URL`                    | (kubernetes) `cremind.appUrl`. Leave unset to let the chart derive `http(s)://localhost:1515`. |
+| `-K8sLegacyPostgresImage yes\|no`   | (kubernetes) Use `docker.io/bitnamilegacy/postgresql`. Default `yes`. |
+| `-K8sDeletePostgresData yes\|no`    | (kubernetes) Delete the Postgres volume on uninstall. Default `no`. |
+| `-K8sExtraSet K=V,K2=V2`            | (kubernetes) The value of one extra helm `--set`, applied last. |
+| `-K8sPostgresPassword PW`           | (kubernetes) Adopt a retained Postgres volume whose password this installer never saw. |
+| `-HelmChart REF`                    | (kubernetes) Chart to install: an OCI reference, a `.tgz`, or a directory. |
+| `-NoPortForward`                    | (kubernetes) Don't start the background port-forward; just print the command. |
 | `-Desktop` / `-NoDesktop`           | (docker) Include or skip the VNC Desktop UI. Default: desktop, incl. `-Unattended`; a re-install keeps the previous choice. `-NoDesktop` pulls the headless `cremind/cremind`. |
 | `-VncPassword PW`                   | (docker + desktop) Password for the VNC Desktop. 6–8 chars from `[A-Za-z0-9@%_+=:,.-]`. Interactive installs ask for it (twice) instead; unattended runs fall back to the previous install's password, else a generated one. An invalid value is a hard error in every mode. |
 | `-Ssl none\|auto\|after-setup`      | TLS on the public origin. Default `none` (HTTP). Select Enable HTTPS or pass `after-setup` for certificate trust during the wizard followed by HTTPS. `auto` is HTTPS from boot one. A re-install preserves its previous choice unless this flag is supplied. Works with native, Docker, custom, and Electron installs. |
@@ -251,6 +410,20 @@ the wizard, not by the installer, so they survive re-runs as well.
 | `~/.cremind/server.pid`                | PID of the server, written by the server itself when a boot service supervises it. |
 | `~/.cremind/server.log`                | `cremind serve` stdout/stderr. |
 
+### Kubernetes mode
+
+Nothing is written to the System Dir: the pod owns its own state, on the
+chart's PVCs.
+
+| Path | Purpose |
+|---|---|
+| `<install dir>/k8s/release.env`      | Which context/namespace/release this machine installed, and the pinned Postgres + VNC passwords. Read line by line, never sourced. Mode 600. |
+| `<install dir>/k8s/values.yaml`      | The values handed to helm. Regenerated every run; reusable by hand with `helm upgrade -f`. Mode 600. |
+| `<install dir>/k8s/port-forward.pid` | The background `kubectl port-forward`. Stop it with `kill $(cat …)`. |
+| `<install dir>/k8s/port-forward.log` | That process's output. |
+| `<install dir>/credentials.toml`     | Connection info + passwords, `install_mode = "kubernetes"`. |
+| `<install dir>/install.log`          | helm and kubectl output. |
+
 Plus, when a boot service is registered — all owned by `cremind boot`, and
 removed by `cremind boot disable` or by uninstalling:
 
@@ -295,6 +468,22 @@ cremind boot disable
 `cremind boot status` reports whether the service is registered, running, and
 surviving logout. Uninstalling removes it too — you do not need to disable it
 first.
+
+**Kubernetes:** the port-forward is a local process; the release is not.
+
+```bash
+kill $(cat ~/.local/share/cremind/k8s/port-forward.pid)   # close the tunnel
+helm uninstall cremind --kube-context <ctx> [--kubeconfig <file>] -n <namespace>  # stop the release
+```
+
+```powershell
+Stop-Process -Id (Get-Content $env:LOCALAPPDATA\Cremind\k8s\port-forward.pid)
+```
+
+Reopen the tunnel with the command the installer printed (it is also in
+`credentials.toml`). Prefer `--uninstall` over a bare `helm uninstall`: it
+stops the forward, applies the keep/purge volume rules, and clears the local
+record.
 
 **Native (fallback, `--no-boot-service` or where no service could be
 registered):** the server runs only until you log out or stop it explicitly.

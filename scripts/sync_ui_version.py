@@ -8,7 +8,10 @@ PEP 440 rc versions (e.g. ``0.2.1rc12`` or ``0.2.1rc12.dev3``) are
 translated to the SemVer pre-release form (``0.2.1-rc.12`` /
 ``0.2.1-rc.12.dev.3``) on the way in. electron-builder and npm validate
 strictly against SemVer and reject the PEP 440 no-separator form;
-stable releases pass through unchanged.
+stable releases pass through unchanged. That translation is
+``app.upgrade.channel.pep440_to_semver`` — the same function that stamps
+the Helm chart version in release-rc.yml and that the kubernetes install
+mode calls through ``channel.py chart-version``.
 
 Wired into ui/package.json as prebuild/preweb:build/predev hooks so it
 runs automatically before any UI build. Also safe to invoke manually:
@@ -29,7 +32,14 @@ BACKEND_VERSION_FILE = REPO_ROOT / "app" / "__version__.py"
 UI_PACKAGE_JSON = REPO_ROOT / "ui" / "package.json"
 
 VERSION_RE = re.compile(r'^__version__\s*=\s*"([^"]+)"', re.MULTILINE)
-PEP440_RC_RE = re.compile(r"^(\d+\.\d+\.\d+(?:\.\d+)?)rc(\d+)(?:\.dev(\d+))?$")
+
+# The PEP 440 → SemVer2 translation lives in app/upgrade/channel.py: it is
+# stdlib-only (the install scripts run that file standalone during bootstrap)
+# and it is what stamps the Helm chart version too, so there is exactly one
+# implementation. Re-exported under this module's own name because
+# release-rc.yml imports ``pep440_to_semver`` from here.
+sys.path.insert(0, str(REPO_ROOT))
+from app.upgrade.channel import pep440_to_semver  # noqa: E402
 
 
 def read_backend_version() -> str:
@@ -38,16 +48,6 @@ def read_backend_version() -> str:
     if not match:
         raise SystemExit(f"Could not find __version__ in {BACKEND_VERSION_FILE}")
     return match.group(1)
-
-
-def pep440_to_semver(version: str) -> str:
-    m = PEP440_RC_RE.match(version)
-    if not m:
-        return version
-    base, rc, dev = m.group(1), m.group(2), m.group(3)
-    if dev is not None:
-        return f"{base}-rc.{rc}.dev.{dev}"
-    return f"{base}-rc.{rc}"
 
 
 def main() -> int:

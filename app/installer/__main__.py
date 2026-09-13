@@ -90,7 +90,64 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["0", "1"],
         help="1 if Docker is detected and usable.",
     )
+
+    # Kubernetes mode. The value flags mirror TuiResult slots (a non-empty
+    # value short-circuits its screen); the capability/context flags are
+    # context only and are never written back.
+    p.add_argument("--kube-context", default="", dest="kube_context")
+    p.add_argument("--kubeconfig", default="", dest="kube_config_file")
+    p.add_argument("--kube-namespace", default="", dest="kube_namespace")
+    p.add_argument("--k8s-release-name", default="", dest="k8s_release_name")
+    p.add_argument("--k8s-app-url", default="", dest="k8s_app_url")
+    p.add_argument(
+        "--k8s-legacy-postgres-image",
+        default="",
+        choices=["", "yes", "no"],
+        dest="k8s_legacy_postgres_image",
+    )
+    p.add_argument(
+        "--k8s-delete-postgres-data",
+        default="",
+        choices=["", "yes", "no"],
+        dest="k8s_delete_postgres_data",
+    )
+    p.add_argument("--k8s-extra-set", default="", dest="k8s_extra_set")
+    p.add_argument(
+        "--has-kubectl",
+        default="0",
+        choices=["0", "1"],
+        help="1 if kubectl is on PATH with at least one kubeconfig context.",
+    )
+    p.add_argument(
+        "--has-helm",
+        default="0",
+        choices=["0", "1"],
+        help="1 if helm 3 is on PATH.",
+    )
+    p.add_argument(
+        "--kube-contexts-file",
+        default="",
+        help="File of kubeconfig contexts, one per line: "
+             "name<TAB>server<TAB>namespace<TAB>kubeconfig<TAB>current.",
+    )
     return p
+
+
+def _read_kube_contexts(path: str) -> tuple[tui.KubeContext, ...]:
+    """Parse the contexts file the shell wrote, tolerating its absence.
+
+    A missing or unreadable file is not fatal: the context screen shows its
+    own "no contexts" message, and the shell refuses a kubernetes install
+    without contexts long before this point.
+    """
+    if not path:
+        return ()
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"installer: could not read {path}: {exc}", file=sys.stderr)
+        return ()
+    return tui.parse_kube_contexts(text)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -115,6 +172,14 @@ def main(argv: list[str] | None = None) -> int:
         custom_public_url=args.custom_public_url,
         custom_allowed_origins=args.custom_allowed_origins,
         custom_wizard_preset=args.custom_wizard_preset,
+        kube_context=args.kube_context,
+        kube_config_file=args.kube_config_file,
+        kube_namespace=args.kube_namespace,
+        k8s_release_name=args.k8s_release_name,
+        k8s_app_url=args.k8s_app_url,
+        k8s_legacy_postgres_image=args.k8s_legacy_postgres_image,
+        k8s_delete_postgres_data=args.k8s_delete_postgres_data,
+        k8s_extra_set=args.k8s_extra_set,
     )
 
     try:
@@ -123,6 +188,9 @@ def main(argv: list[str] | None = None) -> int:
             initial=initial,
             in_container=args.in_container == "1",
             has_docker=args.has_docker == "1",
+            has_kubectl=args.has_kubectl == "1",
+            has_helm=args.has_helm == "1",
+            kube_contexts=_read_kube_contexts(args.kube_contexts_file),
             electron_version=args.electron_version,
             vnc_password_preset=args.vnc_password_set == "1",
             ssl_inherited=args.ssl_inherited == "1",
@@ -140,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         write(result, args.output)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         print(f"installer: failed to write output {args.output}: {exc}", file=sys.stderr)
         return 2
 

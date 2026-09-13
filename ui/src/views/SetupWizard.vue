@@ -51,6 +51,7 @@ import {
 import {
   fetchInstallCatalog,
   getBundledInstallCatalog,
+  isInstallModeProbed,
   recommendInstallMode,
   type InstallCatalog,
   type DeploymentAdvancedField,
@@ -207,9 +208,16 @@ const installCatalogDeploymentEntries = computed(() => {
 const installCatalogModeEntries = computed(() => {
   const cat = installCatalog.value;
   if (!cat) return [] as Array<[string, InstallCatalog['modes'][string]]>;
-  return Object.entries(cat.modes).sort(
-    (a, b) => (a[1].order ?? 999) - (b[1].order ?? 999),
-  );
+  // Only modes whose requirements this bridge can answer. It probes Docker
+  // and Python, not kubectl/helm, so Kubernetes is not offered here — that
+  // install runs from install.sh / install.ps1, which drive helm directly
+  // and ask which kubeconfig context to use. Docker still shows (disabled,
+  // with a reason) when the daemon is down, because hasDocker is probed.
+  return Object.entries(cat.modes)
+    .filter(([, entry]) =>
+      isInstallModeProbed(entry, { hasDocker: installEnv.value?.hasDocker ?? false }),
+    )
+    .sort((a, b) => (a[1].order ?? 999) - (b[1].order ?? 999));
 });
 
 const installCatalogCustomFields = computed<DeploymentAdvancedField[]>(() => {

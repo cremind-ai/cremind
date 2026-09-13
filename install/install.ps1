@@ -28,6 +28,65 @@
 .PARAMETER AppHost
     Public IP/domain for server deployments.
 
+.PARAMETER Mode
+    'docker', 'native' or 'kubernetes'. Skips the mode prompt. A mode is only
+    offered (and only accepted) when this machine has what it needs: docker
+    needs a reachable daemon, kubernetes needs kubectl with at least one
+    kubeconfig context plus helm 3.8+, native needs nothing.
+
+.PARAMETER KubeContext
+    (kubernetes) The kubeconfig context to install into. Passed as
+    --kube-context to every helm and kubectl call, so the ambient
+    current-context never decides where the release lands. Interactive runs
+    show a picker; -Unattended requires this flag whenever more than one
+    context exists.
+
+.PARAMETER KubeConfig
+    (kubernetes) The kubeconfig file holding that context. Without it the
+    picker lists the contexts kubectl reads on its own ($env:KUBECONFIG, else
+    ~\.kube\config) plus those in every other file under ~\.kube, and
+    -KubeContext must name exactly one of them - sibling files often reuse a
+    name such as "default". Whatever file the context came from rides every
+    helm and kubectl call as --kubeconfig.
+
+.PARAMETER KubeNamespace
+    (kubernetes) Namespace for the release, created if missing.
+    Default: cremind.
+
+.PARAMETER K8sReleaseName
+    (kubernetes) Helm release name. Default: cremind.
+
+.PARAMETER K8sAppUrl
+    (kubernetes) cremind.appUrl. Leave unset to let the chart derive
+    http(s)://localhost:1515 from the port-forward.
+
+.PARAMETER K8sLegacyPostgresImage
+    (kubernetes) 'yes' or 'no'. Point the bundled PostgreSQL at
+    docker.io/bitnamilegacy/postgresql. Default: yes — Bitnami froze its free
+    images there, so the chart default no longer pulls.
+
+.PARAMETER K8sDeletePostgresData
+    (kubernetes) 'yes' or 'no'. Delete the Postgres volume when the release is
+    uninstalled. Default: no.
+
+.PARAMETER K8sExtraSet
+    (kubernetes) The value of one extra helm --set, e.g.
+    'ingress.enabled=true,ingress.host=cremind.example.com'. Applied last, so
+    it overrides the installer's own values.
+
+.PARAMETER K8sPostgresPassword
+    (kubernetes) Adopt a retained Postgres volume whose password this
+    installer never saw, instead of deleting it.
+
+.PARAMETER HelmChart
+    (kubernetes) Chart to install: an OCI reference, a .tgz, or a directory.
+    Default: oci://registry-1.docker.io/cremind/cremind (the local
+    helm\cremind on -Channel dev).
+
+.PARAMETER NoPortForward
+    (kubernetes) Don't start the background kubectl port-forward after
+    install; just print the command.
+
 .PARAMETER ListenHost
     (custom deployment) Override HOST in .env.
 
@@ -158,7 +217,22 @@ param(
     [string] $PublicUrl = '',
     [string] $AllowedOrigins = '',
     [string] $WizardPreset = '',
-    [ValidateSet('','docker','native')] [string] $Mode = '',
+    [ValidateSet('','docker','native','kubernetes')] [string] $Mode = '',
+    # Kubernetes mode. Each of these is also a TUI output key, read back by
+    # the whitelist in Invoke-InstallerTuiBootstrap; the ValidateSet above is
+    # load-bearing for $Mode because that read-back assigns the variable.
+    [string] $KubeContext = '',
+    [string] $KubeConfig = '',
+    [string] $KubeNamespace = '',
+    [string] $K8sReleaseName = '',
+    [string] $K8sAppUrl = '',
+    [ValidateSet('','yes','no')] [string] $K8sLegacyPostgresImage = '',
+    [ValidateSet('','yes','no')] [string] $K8sDeletePostgresData = '',
+    [string] $K8sExtraSet = '',
+    # Flag-only kubernetes options (never asked, never in the TUI).
+    [string] $K8sPostgresPassword = '',
+    [string] $HelmChart = '',
+    [switch] $NoPortForward,
     # TLS on the public origin. '' = not specified (fresh installs default to
     # plain HTTP; a re-install carries the previous choice forward). See
     # the ── ssl mode ── section below for the full precedence chain.
@@ -201,6 +275,91 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# The RFC 1123 label Kubernetes wants for a namespace and Helm for a release
+# name. Mirrored verbatim in install.sh and app/installer/tui.py.
+$KubeNameRe = '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+
+# Run a native command and return its stdout + exit code without letting its
+# stderr take the script down.
+#
+# Windows PowerShell 5.1 turns every redirected stderr line into a
+# NativeCommandError record, and under $ErrorActionPreference = 'Stop' the
+# first one terminates — on a command that SUCCEEDED. kubectl and helm write
+# perfectly routine notices there (deprecated kubeconfig fields, "release not
+# found"), so the redirect has to run under 'Continue' and the error records
+# have to be unwrapped by hand.
+#
+# Defined here, above the uninstall flow, because that flow needs it too.
+function Invoke-NativeCapture {
+    param(
+        [Parameter(Mandatory)][string] $FilePath,
+        [string[]] $ArgumentList = @()
+    )
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = [System.Collections.Generic.List[string]]::new()
+        $errLines = [System.Collections.Generic.List[string]]::new()
+        $raw = & $FilePath @ArgumentList 2>&1
+        $code = $LASTEXITCODE
+        foreach ($item in @($raw)) {
+            if ($item -is [System.Management.Automation.ErrorRecord]) {
+                $errLines.Add([string]$item.Exception.Message)
+            } else {
+                $out.Add([string]$item)
+            }
+        }
+        $logVar = Get-Variable -Name LogFile -Scope Script -ErrorAction SilentlyContinue
+        if ($logVar -and $logVar.Value -and $errLines.Count -gt 0) {
+            $errLines | Out-File -FilePath $logVar.Value -Encoding utf8 -Append
+        }
+        return [pscustomobject]@{
+            ExitCode = $code
+            Stdout   = ($out -join "`n")
+            Lines    = $out.ToArray()
+            Stderr   = ($errLines -join "`n")
+        }
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+}
+
+# Defined here, above the uninstall flow, because that flow needs it too
+# (it rewrites the kubernetes release record it just preserved).
+# Write a file as UTF-8 with no BOM, LF line endings and exactly one trailing
+# newline — the bytes install.sh's heredocs produce.
+#
+# ``Set-Content -Encoding utf8`` under Windows PowerShell 5.1 prepends EF BB BF,
+# and the ``toml`` parser the backend reads bootstrap.toml and credentials.toml
+# with does not skip it: the BOM glues onto the leading ``#`` of the first
+# comment and the file fails as "invalid character in key name". That takes down
+# ``cremind db upgrade``, ``cremind db current`` and every later ``cremind
+# serve`` — a boot loop out of a file the installer itself wrote. .NET's
+# UTF8Encoding($false) emits the content and nothing else.
+#
+# Line endings are normalised because a here-string carries whatever this script
+# was delivered with: LF from ``iwr | iex`` against raw GitHub, CRLF from a
+# Windows checkout (.gitattributes marks it eol=crlf). Both installers should
+# write the same file.
+#
+# Deliberately scoped to TOML. The .env files keep ``Set-Content -Encoding
+# utf8``: this script's own .env round-trips are built around reading them back
+# the same way (PS 5.1 decodes a BOM-less file as cp1252 and would mangle the
+# em-dashes in the template comments), the ``cremind`` shim's findstr already
+# skips a BOM, and python-dotenv tolerates one.
+function Write-Utf8NoBomFile {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string] $Content
+    )
+    $text = $Content -replace "`r`n", "`n"
+    if (-not $text.EndsWith("`n")) { $text += "`n" }
+    # .NET resolves a relative path against the process working directory, not
+    # PowerShell's current location; ask the provider for the real one.
+    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    [System.IO.File]::WriteAllText($full, $text, [System.Text.UTF8Encoding]::new($false))
+}
 
 # ── -Uninstall flow ───────────────────────────────────────────────────────
 # Inline uninstaller. Runs before banner / catalog / TUI setup so the
@@ -257,6 +416,26 @@ if ($Uninstall) {
         exit 0
     }
 
+    # A Helm release is tracked independently of the host install kind: the
+    # same machine can hold a docker or native install AND have installed a
+    # release into a cluster. So this is a separate flag, not a $Kind value,
+    # and its teardown runs whenever the marker is present.
+    $UninstallK8sEnv = Join-Path $UninstallInstallDir 'k8s\release.env'
+    $K8sPresent = Test-Path -LiteralPath $UninstallK8sEnv
+    $UninstallK8s = @{}
+    if ($K8sPresent) {
+        foreach ($line in (Get-Content -LiteralPath $UninstallK8sEnv -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+            if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
+                if (-not $UninstallK8s.ContainsKey($Matches[1])) { $UninstallK8s[$Matches[1]] = $Matches[2] }
+            }
+        }
+    }
+    function Get-UninstallK8s {
+        param([string] $Key)
+        if ($UninstallK8s.ContainsKey($Key)) { return [string]$UninstallK8s[$Key] }
+        return ''
+    }
+
     # Detect kind from on-disk markers.
     $ComposeFile = Join-Path $UninstallInstallDir 'docker\docker-compose.yml'
     $UninstallVenvDir = Join-Path $UninstallSystemDir 'venv'
@@ -264,13 +443,16 @@ if ($Uninstall) {
         $Kind = 'docker'
     } elseif (Test-Path -LiteralPath $UninstallVenvDir) {
         $Kind = 'native'
+    } elseif ($K8sPresent) {
+        $Kind = 'kubernetes'
     } elseif ($installExists) {
         # Install Dir present but no markers - partial install. Default to
         # native so the residual scratch gets cleaned up.
         $Kind = 'native'
     } else {
         Write-Host "Unrecognized install layout." -ForegroundColor Red
-        Write-Host "Expected $UninstallSystemDir\venv (native) or $UninstallInstallDir\docker\docker-compose.yml (docker)." -ForegroundColor Red
+        Write-Host "Expected $UninstallSystemDir\venv (native), $UninstallInstallDir\docker\docker-compose.yml (docker)," -ForegroundColor Red
+        Write-Host "or $UninstallK8sEnv (kubernetes)." -ForegroundColor Red
         exit 1
     }
 
@@ -284,10 +466,19 @@ if ($Uninstall) {
         Write-Host "Uninstall Cremind ($Kind):"
         Write-Host "  System Dir:  $UninstallSystemDir"
         Write-Host "  Install Dir: $UninstallInstallDir"
+        if ($K8sPresent) {
+            Write-Host "  Helm release: $(Get-UninstallK8s 'HELM_RELEASE') in namespace $(Get-UninstallK8s 'KUBE_NAMESPACE') on context $(Get-UninstallK8s 'KUBE_CONTEXT')"
+        }
         Write-Host ''
         Write-Host '  [k] Keep data    - remove the binaries + install scratch; preserve System Dir contents'
         Write-Host '                     (.env, bootstrap.toml, storage\, tokens\, profile dirs)'
-        $purgeExtra = if ($Kind -eq 'docker') { ' (incl. Docker volumes)' } else { '' }
+        if ($K8sPresent) {
+            Write-Host '                     The Helm release is removed; the PostgreSQL volume and the'
+            Write-Host '                     record of its password are kept so a reinstall can reuse it.'
+        }
+        $purgeExtra = if ($Kind -eq 'docker') { ' (incl. Docker volumes)' }
+                      elseif ($K8sPresent) { ' (incl. the cluster volumes)' }
+                      else { '' }
         Write-Host "  [p] Purge all    - delete everything Cremind installed$purgeExtra"
         Write-Host '  [c] Cancel'
         Write-Host ''
@@ -474,6 +665,107 @@ if ($Uninstall) {
         }
     }
 
+    # ── Helm release teardown ────────────────────────────────────────────
+    #
+    # Runs whenever a release is tracked, regardless of $Kind: a machine can
+    # hold a docker or native install and still be the one that installed
+    # into the cluster. helm uninstall removes the chart's own PVCs
+    # (system/venv/work); the StatefulSet subcharts' data volumes are created
+    # by their controllers, so nothing removes them unless -Purge does.
+    if ($K8sPresent) {
+        $K8sCtx       = Get-UninstallK8s 'KUBE_CONTEXT'
+        $K8sNs        = Get-UninstallK8s 'KUBE_NAMESPACE'
+        $K8sRel       = Get-UninstallK8s 'HELM_RELEASE'
+        $K8sNsCreated = Get-UninstallK8s 'NAMESPACE_CREATED'
+        $K8sCfg       = Get-UninstallK8s 'KUBE_CONFIG_FILE'
+        $K8sSrv       = Get-UninstallK8s 'KUBE_SERVER'
+        # Aim every cluster call at the recorded file and context, exactly
+        # as the install did.
+        $kubectlTarget = @('--context', $K8sCtx)
+        $helmTarget    = @('--kube-context', $K8sCtx)
+        if ($K8sCfg) {
+            $kubectlTarget = @('--kubeconfig', $K8sCfg) + $kubectlTarget
+            $helmTarget    = @('--kubeconfig', $K8sCfg) + $helmTarget
+        }
+
+        # Stop the background port-forward first - it holds a connection to
+        # the pod we are about to delete.
+        $PfPidPath = Join-Path $UninstallInstallDir 'k8s\port-forward.pid'
+        if (Test-Path -LiteralPath $PfPidPath) {
+            $pfPid = (Get-Content -LiteralPath $PfPidPath -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if ($pfPid) {
+                $pfProc = Get-Process -Id ([int]$pfPid) -ErrorAction SilentlyContinue
+                if ($pfProc -and $pfProc.ProcessName -eq 'kubectl') {
+                    Stop-Process -Id ([int]$pfPid) -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        $kubectlCmdU = Get-Command kubectl -ErrorAction SilentlyContinue
+        $helmCmdU    = Get-Command helm -ErrorAction SilentlyContinue
+        $ctxKnown = $false
+        if ($kubectlCmdU -and $K8sCtx) {
+            $listArgs = @('config', 'get-contexts', '-o', 'name')
+            if ($K8sCfg) { $listArgs = @('--kubeconfig', $K8sCfg) + $listArgs }
+            $names = (Invoke-NativeCapture -FilePath $kubectlCmdU.Source -ArgumentList $listArgs).Lines
+            if ($names -contains $K8sCtx) { $ctxKnown = $true }
+        }
+        # A kubeconfig edited since the install must not aim the teardown at
+        # a different cluster than the one recorded.
+        if ($ctxKnown -and $K8sSrv) {
+            $live = (Invoke-NativeCapture -FilePath $kubectlCmdU.Source -ArgumentList (
+                $kubectlTarget + @('config', 'view', '--minify', '-o', 'jsonpath={.clusters[0].cluster.server}'))).Stdout.Trim()
+            if ($live -and $live -ne $K8sSrv) {
+                Write-Host "Context '$K8sCtx' now points at $live, but the release was installed on $K8sSrv." -ForegroundColor Yellow
+                $ctxKnown = $false
+            }
+        }
+
+        if (-not $ctxKnown -or -not $helmCmdU) {
+            $cfgNote = if ($K8sCfg) { " --kubeconfig `"$K8sCfg`"" } else { '' }
+            Write-Host "Cannot reach the cluster from here (kubectl/helm missing, or context '$K8sCtx' is gone)." -ForegroundColor Yellow
+            Write-Host "Remove the release yourself with:" -ForegroundColor Yellow
+            Write-Host "  helm uninstall $K8sRel --kube-context $K8sCtx$cfgNote -n $K8sNs" -ForegroundColor Yellow
+        } else {
+            Write-Host "Removing Helm release $K8sRel from namespace $K8sNs on context $K8sCtx..."
+            $removed = Invoke-NativeCapture -FilePath $helmCmdU.Source -ArgumentList (
+                @('uninstall', $K8sRel) + $helmTarget + @('--namespace', $K8sNs, '--wait'))
+            if ($removed.ExitCode -ne 0) {
+                Write-Host 'helm uninstall reported a problem; continuing.' -ForegroundColor Yellow
+            }
+
+            if ($UninstallMode -eq 'purge') {
+                # The bundled StatefulSets' data volumes. Found by label
+                # because their names follow the subchart's pinned fullname
+                # (cremind-postgresql), not the Helm release name.
+                Write-Host 'Deleting cluster data volumes...'
+                foreach ($sub in @('postgresql', 'qdrant', 'chromadb')) {
+                    $found = (Invoke-NativeCapture -FilePath $kubectlCmdU.Source -ArgumentList (
+                        $kubectlTarget + @('-n', $K8sNs, 'get', 'pvc',
+                        '-l', "app.kubernetes.io/name=$sub",
+                        '-o', 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'))).Stdout
+                    foreach ($pvc in ($found -split "`n")) {
+                        $name = $pvc.Trim()
+                        if (-not $name) { continue }
+                        Invoke-NativeCapture -FilePath $kubectlCmdU.Source -ArgumentList (
+                            $kubectlTarget + @('-n', $K8sNs, 'delete', 'pvc', $name, '--ignore-not-found')) | Out-Null
+                        Write-Host "  removed pvc $name"
+                    }
+                }
+                # Only a namespace this installer created is ours to delete.
+                if ($K8sNsCreated -eq '1') {
+                    Write-Host "Deleting namespace $K8sNs (created by the installer)..."
+                    Invoke-NativeCapture -FilePath $kubectlCmdU.Source -ArgumentList (
+                        $kubectlTarget + @('delete', 'namespace', $K8sNs, '--ignore-not-found')) | Out-Null
+                } else {
+                    Write-Host "Namespace $K8sNs existed before the install; leaving it in place."
+                }
+            } else {
+                Write-Host 'Kept the PostgreSQL volume. A reinstall reuses it with the recorded password.'
+            }
+        }
+    }
+
     # Remove the bin entry from User-scope PATH. We match $BinDir exactly
     # to avoid clobbering unrelated PATH entries.
     $UninstallBinDir = Join-Path $UninstallSystemDir 'bin'
@@ -530,10 +822,23 @@ if ($Uninstall) {
                 Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
+        # The Install Dir is otherwise all scratch, but the kept cluster
+        # volume is only usable with the password recorded here - wiping it
+        # would leave a database nobody can open.
+        $K8sKeepText = $null
+        if ($K8sPresent -and (Test-Path -LiteralPath $UninstallK8sEnv)) {
+            $K8sKeepText = Get-Content -LiteralPath $UninstallK8sEnv -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        }
         # Wipe the Install Dir wholesale - it's all install scratch.
         if (Test-Path -LiteralPath $UninstallInstallDir) {
             Remove-Item -LiteralPath $UninstallInstallDir -Recurse -Force -ErrorAction SilentlyContinue
             Write-Host "Removed install scratch at $UninstallInstallDir."
+        }
+        if ($K8sKeepText) {
+            $keepDir = Split-Path -Parent $UninstallK8sEnv
+            New-Item -ItemType Directory -Path $keepDir -Force | Out-Null
+            Write-Utf8NoBomFile -Path $UninstallK8sEnv -Content $K8sKeepText
+            Write-Host "Kept $UninstallK8sEnv so the retained PostgreSQL volume stays usable."
         }
         Write-Host "Kept data in $UninstallSystemDir (.env, bootstrap.toml, storage\, tokens\, profile dirs)."
     }
@@ -572,9 +877,48 @@ if ($Channel -eq 'dev') {
 #
 # The error messages are the strings the Cremind desktop app surfaces in
 # its install log; they name the Electron build that's rejecting the spec.
+# Keep the operator's raw -Version before the dev-channel guard blanks it: a
+# dev *kubernetes* install still runs a published image in the pod, so the
+# kubernetes branch pins image.tag from this copy. ($Mode is not known yet -
+# the TUI may still choose it - so the blanking below stays unconditional.)
+$VersionRaw = $Version
 if ($Version -and $Channel -eq 'dev') {
-    Write-Host "!!! -Version is ignored on dev channel (editable install)." -ForegroundColor Yellow
+    Write-Host "!!! -Version is ignored on dev channel (editable install; a kubernetes install still uses it as the pod's image tag)." -ForegroundColor Yellow
     $Version = ''
+}
+# Kubernetes flag shapes. Checked here, before anything reaches helm: a bad
+# namespace or release name is a template error several minutes into an
+# install otherwise.
+if ($KubeConfig) {
+    if (-not (Test-Path -LiteralPath $KubeConfig -PathType Leaf)) {
+        Write-Host "ERR Invalid -KubeConfig: not a file: $KubeConfig" -ForegroundColor Red
+        exit 2
+    }
+    # Absolute, so the path recorded for -Uninstall survives a cd.
+    $KubeConfig = (Resolve-Path -LiteralPath $KubeConfig).ProviderPath
+}
+if ($KubeNamespace -and $KubeNamespace -cnotmatch $KubeNameRe) {
+    Write-Host "ERR Invalid -KubeNamespace: '$KubeNamespace' (lowercase letters, digits and hyphens, max 63 characters)" -ForegroundColor Red
+    exit 2
+}
+if ($K8sReleaseName) {
+    if ($K8sReleaseName -cnotmatch $KubeNameRe) {
+        Write-Host "ERR Invalid -K8sReleaseName: '$K8sReleaseName' (lowercase letters, digits and hyphens)" -ForegroundColor Red
+        exit 2
+    }
+    if ($K8sReleaseName.Length -gt 53) {
+        Write-Host "ERR Invalid -K8sReleaseName: Helm allows at most 53 characters." -ForegroundColor Red
+        exit 2
+    }
+}
+if ($K8sAppUrl -and $K8sAppUrl -notmatch '^https?://[^/\s]+') {
+    Write-Host "ERR Invalid -K8sAppUrl: '$K8sAppUrl' (expected http://host[:port] or https://host[:port])" -ForegroundColor Red
+    exit 2
+}
+# -K8sExtraSet is the VALUE of one helm --set, not a fragment of argv.
+if ($K8sExtraSet -and $K8sExtraSet.StartsWith('-')) {
+    Write-Host "ERR Invalid -K8sExtraSet: pass key=value[,key=value], without the --set itself." -ForegroundColor Red
+    exit 2
 }
 if ($Version) {
     switch ($Channel) {
@@ -660,7 +1004,9 @@ function Invoke-NativeLogged {
 
 # ── unattended sanity check ──────────────────────────────────────────────
 
-if ($Unattended -and -not $Deployment) { $Deployment = 'local' }
+# Kubernetes has no host to bind - the chart sets HOST and APP_URL on the pod
+# - so it never gets a deployment, not even an unattended default.
+if ($Unattended -and -not $Deployment -and $Mode -ne 'kubernetes') { $Deployment = 'local' }
 if ($Unattended -and $Deployment -eq 'server' -and -not $AppHost) {
     Write-Err2 "-Unattended with -Deployment server requires -AppHost"
     exit 2
@@ -799,39 +1145,6 @@ function Get-TemplateContent {
     return (Invoke-WebRequest -UseBasicParsing -Uri "$script:TemplateBase/$Name").Content
 }
 
-# Write a file as UTF-8 with no BOM, LF line endings and exactly one trailing
-# newline — the bytes install.sh's heredocs produce.
-#
-# ``Set-Content -Encoding utf8`` under Windows PowerShell 5.1 prepends EF BB BF,
-# and the ``toml`` parser the backend reads bootstrap.toml and credentials.toml
-# with does not skip it: the BOM glues onto the leading ``#`` of the first
-# comment and the file fails as "invalid character in key name". That takes down
-# ``cremind db upgrade``, ``cremind db current`` and every later ``cremind
-# serve`` — a boot loop out of a file the installer itself wrote. .NET's
-# UTF8Encoding($false) emits the content and nothing else.
-#
-# Line endings are normalised because a here-string carries whatever this script
-# was delivered with: LF from ``iwr | iex`` against raw GitHub, CRLF from a
-# Windows checkout (.gitattributes marks it eol=crlf). Both installers should
-# write the same file.
-#
-# Deliberately scoped to TOML. The .env files keep ``Set-Content -Encoding
-# utf8``: this script's own .env round-trips are built around reading them back
-# the same way (PS 5.1 decodes a BOM-less file as cp1252 and would mangle the
-# em-dashes in the template comments), the ``cremind`` shim's findstr already
-# skips a BOM, and python-dotenv tolerates one.
-function Write-Utf8NoBomFile {
-    param(
-        [Parameter(Mandatory)][string] $Path,
-        [Parameter(Mandatory)][AllowEmptyString()][string] $Content
-    )
-    $text = $Content -replace "`r`n", "`n"
-    if (-not $text.EndsWith("`n")) { $text += "`n" }
-    # .NET resolves a relative path against the process working directory, not
-    # PowerShell's current location; ask the provider for the real one.
-    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
-    [System.IO.File]::WriteAllText($full, $text, [System.Text.UTF8Encoding]::new($false))
-}
 
 # ── catalog ───────────────────────────────────────────────────────────────
 #
@@ -1084,6 +1397,210 @@ if ($HasDocker) {
     Write-Info "Docker: not detected (or not running)"
 }
 
+# ── kubernetes capabilities ───────────────────────────────────────────────
+#
+# kubectl and helm are what the ``kubernetes`` install mode needs, and the
+# catalog's ``requires`` turns their presence into whether the mode is even
+# offered. Probing kubectl means more than "is it on PATH": a kubeconfig with
+# no contexts gives us nothing to install into.
+#
+# `kubectl config view -o json`, not `-o jsonpath=...`: PowerShell 5.1's
+# native-argument quoting mangles a jsonpath expression (it contains spaces,
+# braces and embedded quotes). JSON is one argument and ConvertFrom-Json does
+# the rest.
+#
+# kubectl on its own reads one merged config ($env:KUBECONFIG, else
+# ~\.kube\config). One file per cluster dropped next to it is a common layout
+# too, and those files routinely reuse a context name ("default"), so a name
+# alone cannot identify a target. Every other file under ~\.kube is therefore
+# probed on its own, and each row remembers where it came from: Kubeconfig is
+# '' for the ambient config and the file's path otherwise, and that path then
+# rides every helm and kubectl call as --kubeconfig. Current marks the ambient
+# current-context. -KubeConfig narrows all of this to the one file named.
+$HasKubectl        = $false
+$HasHelm           = $false
+$KubectlExe        = ''
+$KubeContexts      = @()
+$KubeCurrentContext = ''
+$KubeContextsFile  = ''
+$KubeFileCount     = 0
+
+# Add $File's contexts (the ambient config's when $File is '') to $Into. A
+# file that is not a kubeconfig, or has no contexts, adds nothing.
+function Add-KubeconfigRows {
+    param([string] $File, [System.Collections.Generic.List[object]] $Into)
+    $viewArgs = @('config', 'view', '-o', 'json')
+    if ($File) { $viewArgs = @('config', 'view', '--kubeconfig', $File, '-o', 'json') }
+    $viewed = Invoke-NativeCapture -FilePath $KubectlExe -ArgumentList $viewArgs
+    if ($viewed.ExitCode -ne 0 -or -not $viewed.Stdout) { return }
+    try {
+        $cfg = $viewed.Stdout | ConvertFrom-Json
+    } catch {
+        return
+    }
+    if (-not $cfg -or -not ($cfg.PSObject.Properties.Name -contains 'contexts') -or -not $cfg.contexts) { return }
+    $servers = @{}
+    if ($cfg.PSObject.Properties.Name -contains 'clusters' -and $cfg.clusters) {
+        foreach ($cluster in @($cfg.clusters)) {
+            if ($cluster.name) { $servers[$cluster.name] = [string]$cluster.cluster.server }
+        }
+    }
+    $current = ''
+    if (-not $File -and ($cfg.PSObject.Properties.Name -contains 'current-context')) {
+        $current = [string]$cfg.'current-context'
+    }
+    foreach ($ctx in @($cfg.contexts)) {
+        if (-not $ctx.name) { continue }
+        $clusterName = ''
+        if ($ctx.context.PSObject.Properties.Name -contains 'cluster') { $clusterName = [string]$ctx.context.cluster }
+        $ns = ''
+        if ($ctx.context.PSObject.Properties.Name -contains 'namespace') { $ns = [string]$ctx.context.namespace }
+        $server = ''
+        if ($clusterName -and $servers.ContainsKey($clusterName)) { $server = $servers[$clusterName] }
+        $Into.Add([pscustomobject]@{
+            Name       = [string]$ctx.name
+            Server     = $server
+            Namespace  = $ns
+            Kubeconfig = $File
+            Current    = ($current -ne '' -and [string]$ctx.name -eq $current)
+        })
+    }
+}
+
+$kubectlCmd = Get-Command kubectl -ErrorAction SilentlyContinue
+if ($kubectlCmd) {
+    $KubectlExe = $kubectlCmd.Source
+    $rows = [System.Collections.Generic.List[object]]::new()
+    if ($KubeConfig) {
+        # -KubeConfig: that file and nothing else.
+        Add-KubeconfigRows -File $KubeConfig -Into $rows
+    } else {
+        Add-KubeconfigRows -File '' -Into $rows
+        # The files kubectl already merged, which the scan below skips.
+        $ambient = @()
+        if ($env:KUBECONFIG) {
+            foreach ($entry in ($env:KUBECONFIG -split [regex]::Escape([IO.Path]::PathSeparator))) {
+                if (-not $entry) { continue }
+                try { $ambient += [IO.Path]::GetFullPath($entry) } catch { $ambient += $entry }
+            }
+        } else {
+            $ambient += (Join-Path $HOME '.kube\config')
+        }
+        $kubeDir = Join-Path $HOME '.kube'
+        if (Test-Path -LiteralPath $kubeDir -PathType Container) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $kubeDir -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+                # A kubeconfig is a few KB; skip anything that plainly is not one.
+                if ($f.Length -gt 1MB) { continue }
+                if ($ambient -contains $f.FullName) { continue }
+                Add-KubeconfigRows -File $f.FullName -Into $rows
+            }
+        }
+    }
+    $KubeContexts = @($rows)
+    $KubeFileCount = @($KubeContexts | ForEach-Object { $_.Kubeconfig } | Sort-Object -Unique).Count
+    foreach ($row in $KubeContexts) {
+        if ($row.Current) { $KubeCurrentContext = $row.Name; break }
+    }
+    if ($KubeContexts.Count -ge 1) {
+        $HasKubectl = $true
+        # One context per line: name<TAB>server<TAB>namespace<TAB>kubeconfig<TAB>current
+        # - the format the TUI's parse_kube_contexts reads.
+        $KubeContextsFile = Join-Path $CremindInstallDir '.kube-contexts'
+        $ctxText = ($KubeContexts | ForEach-Object {
+            "$($_.Name)`t$($_.Server)`t$($_.Namespace)`t$($_.Kubeconfig)`t$([int]$_.Current)"
+        }) -join "`n"
+        Write-Utf8NoBomFile -Path $KubeContextsFile -Content ($ctxText + "`n")
+        $filesNote = ''
+        if ($KubeFileCount -gt 1) { $filesNote = " in $KubeFileCount kubeconfig files" }
+        $currentNote = ''
+        if ($KubeCurrentContext) { $currentNote = ", current: $KubeCurrentContext" }
+        Write-Ok "kubectl: $($KubeContexts.Count) context(s)$filesNote$currentNote"
+    } elseif ($KubeConfig) {
+        Write-Info "kubectl: found, but $KubeConfig has no contexts"
+    } else {
+        Write-Info "kubectl: found, but no kubeconfig context turned up (checked kubectl's own config and ~\.kube\*)"
+    }
+} else {
+    Write-Info "kubectl: not detected"
+}
+if (Get-Command helm -ErrorAction SilentlyContinue) {
+    # helm 3.8 is where OCI chart references stopped being experimental, and
+    # the chart is published only as an OCI artifact.
+    $helmVer = (Invoke-NativeCapture -FilePath 'helm' -ArgumentList @('version', '--short')).Stdout.Trim()
+    if ($helmVer -match '^v(\d+)\.(\d+)\.') {
+        $helmMajor = [int]$Matches[1]
+        $helmMinor = [int]$Matches[2]
+        if ($helmMajor -gt 3 -or ($helmMajor -eq 3 -and $helmMinor -ge 8)) {
+            $HasHelm = $true
+            Write-Ok "helm: $helmVer"
+        } else {
+            Write-Info "helm: $helmVer - 3.8 or newer is required for OCI charts"
+        }
+    } else {
+        Write-Info "helm: found, but its version could not be read"
+    }
+} else {
+    Write-Info "helm: not detected"
+}
+
+# ── mode availability ─────────────────────────────────────────────────────
+#
+# The catalog's per-mode ``requires`` decides what this machine may be
+# offered. install.sh and the TUI apply the same rule over the same data. An
+# unknown capability id counts as unmet, so a typo in catalog.toml hides a
+# mode instead of advertising a broken one.
+function Test-CremindCapability {
+    param([string] $Name)
+    switch ($Name) {
+        'docker'  { return $HasDocker }
+        'kubectl' { return $HasKubectl }
+        'helm'    { return $HasHelm }
+        default   { return $false }
+    }
+}
+
+function Get-CapabilityLabel {
+    param([string] $Name)
+    switch ($Name) {
+        'docker'  { return 'a running Docker daemon' }
+        'kubectl' { return 'kubectl with a kubeconfig context' }
+        'helm'    { return 'helm 3.8+' }
+        default   { return $Name }
+    }
+}
+
+function Test-ModeAvailable {
+    param([string] $Id)
+    if (-not $script:Modes.Contains($Id)) { return $false }
+    foreach ($req in @($script:Modes[$Id].Requires)) {
+        if (-not (Test-CremindCapability $req)) { return $false }
+    }
+    return $true
+}
+
+$AvailableModeIds = @($script:ModeIds | Where-Object { Test-ModeAvailable $_ })
+
+# ── previous kubernetes release ───────────────────────────────────────────
+#
+# A kubernetes install records what it did in k8s\release.env so a re-run can
+# offer the same answers and an uninstall knows what to tear down. Read -
+# never dot-sourced: the file holds two secrets and arbitrary --set text.
+$K8sDir        = Join-Path $CremindInstallDir 'k8s'
+$K8sReleaseEnv = Join-Path $K8sDir 'release.env'
+$PrevK8s = @{}
+if (Test-Path -LiteralPath $K8sReleaseEnv) {
+    foreach ($line in (Get-Content -LiteralPath $K8sReleaseEnv -Encoding UTF8)) {
+        if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
+            if (-not $PrevK8s.ContainsKey($Matches[1])) { $PrevK8s[$Matches[1]] = $Matches[2] }
+        }
+    }
+}
+function Get-PrevK8s {
+    param([string] $Key)
+    if ($PrevK8s.ContainsKey($Key)) { return [string]$PrevK8s[$Key] }
+    return ''
+}
+
 # Read the VNC password a previous install left behind, so both the TUI and
 # the fallback prompt can offer "leave empty to keep the current one". Done
 # once here because the TUI needs it before it renders, and the docker branch
@@ -1170,7 +1687,23 @@ function Invoke-InstallerTuiBootstrap {
     # Always sent (never empty): tells the TUI whether an empty password
     # answer may mean "keep the existing one".
     $tuiArgs.Add('--vnc-password-set')
-    $tuiArgs.Add($(if ($PrevVncPassword) { '1' } else { '0' }))
+    # Either previous install counts - the mode is not settled yet, and the
+    # text prompt re-points $PrevVncPassword once it is.
+    $tuiArgs.Add($(if ($PrevVncPassword -or (Get-PrevK8s 'VNC_PASSWORD')) { '1' } else { '0' }))
+    # Kubernetes: capabilities and the probed context list are context-only
+    # (the TUI never writes them back); the value flags round-trip, so a flag
+    # the operator passed is echoed back instead of being cleared.
+    $tuiArgs.Add('--has-kubectl'); $tuiArgs.Add(([int][bool]$HasKubectl).ToString())
+    $tuiArgs.Add('--has-helm');    $tuiArgs.Add(([int][bool]$HasHelm).ToString())
+    if ($KubeContextsFile)   { $tuiArgs.Add('--kube-contexts-file');   $tuiArgs.Add($KubeContextsFile) }
+    if ($KubeContext)            { $tuiArgs.Add('--kube-context');               $tuiArgs.Add($KubeContext) }
+    if ($KubeConfig)             { $tuiArgs.Add('--kubeconfig');                 $tuiArgs.Add($KubeConfig) }
+    if ($KubeNamespace)          { $tuiArgs.Add('--kube-namespace');             $tuiArgs.Add($KubeNamespace) }
+    if ($K8sReleaseName)         { $tuiArgs.Add('--k8s-release-name');           $tuiArgs.Add($K8sReleaseName) }
+    if ($K8sAppUrl)              { $tuiArgs.Add('--k8s-app-url');                $tuiArgs.Add($K8sAppUrl) }
+    if ($K8sLegacyPostgresImage) { $tuiArgs.Add('--k8s-legacy-postgres-image');  $tuiArgs.Add($K8sLegacyPostgresImage) }
+    if ($K8sDeletePostgresData)  { $tuiArgs.Add('--k8s-delete-postgres-data');   $tuiArgs.Add($K8sDeletePostgresData) }
+    if ($K8sExtraSet)            { $tuiArgs.Add('--k8s-extra-set');              $tuiArgs.Add($K8sExtraSet) }
     if ($Version)         { $tuiArgs.Add('--version');          $tuiArgs.Add($Version) }
     if ($AppHost)         { $tuiArgs.Add('--host');             $tuiArgs.Add($AppHost) }
     if ($ListenHost)      { $tuiArgs.Add('--listen-host');      $tuiArgs.Add($ListenHost) }
@@ -1228,17 +1761,130 @@ function Invoke-InstallerTuiBootstrap {
                     'CUSTOM_public_url'    { if (-not $PublicUrl)      { Set-Variable -Scope Script PublicUrl $v } }
                     'CUSTOM_allowed_origins' { if (-not $AllowedOrigins) { Set-Variable -Scope Script AllowedOrigins $v } }
                     'CUSTOM_wizard_preset' { if (-not $WizardPreset)   { Set-Variable -Scope Script WizardPreset $v } }
+                    'KUBE_CONTEXT'         { if (-not $KubeContext)    { Set-Variable -Scope Script KubeContext $v } }
+                    'KUBE_CONFIG_FILE'     { if (-not $KubeConfig)     { Set-Variable -Scope Script KubeConfig $v } }
+                    'KUBE_NAMESPACE'       { if (-not $KubeNamespace)  { Set-Variable -Scope Script KubeNamespace $v } }
+                    'K8S_release_name'     { if (-not $K8sReleaseName) { Set-Variable -Scope Script K8sReleaseName $v } }
+                    'K8S_app_url'          { if (-not $K8sAppUrl)      { Set-Variable -Scope Script K8sAppUrl $v } }
+                    'K8S_legacy_postgres_image' { if (-not $K8sLegacyPostgresImage -and $v -in @('yes', 'no')) { Set-Variable -Scope Script K8sLegacyPostgresImage $v } }
+                    'K8S_delete_postgres_data'  { if (-not $K8sDeletePostgresData -and $v -in @('yes', 'no')) { Set-Variable -Scope Script K8sDeletePostgresData $v } }
+                    'K8S_extra_set'        { if (-not $K8sExtraSet)    { Set-Variable -Scope Script K8sExtraSet $v } }
                 }
             }
         }
         Remove-Item -LiteralPath $tuiOut -Force -ErrorAction SilentlyContinue
+        $script:TuiApplied = $true
         Write-Ok "TUI selections applied."
     }
 }
 
+# 1 once the TUI's answers were applied. The text-mode kubernetes flow adds
+# its own final confirmation; the TUI already has a confirm screen.
+# Pre-declared for StrictMode, which faults on reading an unassigned variable.
+$TuiApplied = $false
 Invoke-InstallerTuiBootstrap
 
+# ── mode (how Cremind is installed) ───────────────────────────────────────
+#
+# Asked before the deployment questions because it decides whether they are
+# asked at all: a kubernetes install has no host to bind and no .env to
+# render - the chart owns both on the pod.
+#
+# Only modes this machine can actually run are offered ($AvailableModeIds,
+# computed from the catalog's ``requires`` above). When one survives there is
+# nothing to ask, which is what happens on a plain laptop with no Docker.
+
+# Guard against a mode whose requirements this machine does not meet. (An
+# unknown -Mode is already impossible: the parameter's ValidateSet rejects it
+# at binding time.)
+if ($Mode) {
+    if ($script:ModeIds -notcontains $Mode) {
+        Write-Err2 "Unknown mode: $Mode (must be one of: $($script:ModeIds -join ', '))"
+        exit 2
+    }
+    if (-not (Test-ModeAvailable $Mode)) {
+        Write-Err2 "$Mode mode was requested, but this machine is missing what it needs:"
+        foreach ($req in @($script:Modes[$Mode].Requires)) {
+            if (-not (Test-CremindCapability $req)) {
+                Write-Err2 "  - $(Get-CapabilityLabel $req)"
+            }
+        }
+        if ($Mode -eq 'kubernetes') {
+            Write-Err2 "Install kubectl and helm 3.8+, and make sure 'kubectl config get-contexts' lists at least one context."
+        } elseif ($Mode -eq 'docker') {
+            Write-Err2 "Start Docker Desktop and re-run."
+        }
+        exit 1
+    }
+}
+
+if (-not $Mode) {
+    if ($AvailableModeIds.Count -le 1 -or $Unattended) {
+        # Catalog order is the recommendation, so the first available mode is
+        # the pick. Unattended never lands on kubernetes: it sorts after
+        # native, which is always available - an unattended kubernetes install
+        # is opted into with -Mode kubernetes.
+        if ($AvailableModeIds.Count -ge 1) {
+            $Mode = $AvailableModeIds[0]
+        } else {
+            $Mode = 'native'
+        }
+    } else {
+        Write-Host ''
+        Write-Host 'How do you want to run Cremind?' -ForegroundColor White
+        $idx = 0
+        foreach ($mId in $AvailableModeIds) {
+            $idx++
+            $entry = $script:Modes[$mId]
+            Write-Host ("  {0}) {1} - {2}" -f $idx, $entry.Label, $entry.Description)
+            if ($entry.Hint) { Write-Host ("      {0}" -f $entry.Hint) -ForegroundColor DarkGray }
+        }
+        # Name what is missing rather than silently shortening the list.
+        foreach ($mId in $script:ModeIds) {
+            if (Test-ModeAvailable $mId) { continue }
+            $missing = @()
+            foreach ($req in @($script:Modes[$mId].Requires)) {
+                if (-not (Test-CremindCapability $req)) { $missing += (Get-CapabilityLabel $req) }
+            }
+            Write-Host ("  (not offered: {0} - needs {1})" -f $script:Modes[$mId].Label, ($missing -join ', ')) -ForegroundColor DarkGray
+        }
+        while ($true) {
+            $choice = Read-Host "Choice [1]"
+            if (-not $choice) { $choice = '1' }
+            $picked = ''
+            $idx = 0
+            foreach ($mId in $AvailableModeIds) {
+                $idx++
+                if ($choice -eq "$idx" -or $choice -eq $mId) { $picked = $mId; break }
+            }
+            if ($picked) { $Mode = $picked; break }
+            Write-Warn2 "Pick a number 1-$idx or a mode id."
+        }
+    }
+}
+Write-Ok "Mode: $Mode"
+
+# The desktop app drives this script for a local install; it has no helm
+# branch, no context picker, and computes the post-install URL itself.
+if ($Mode -eq 'kubernetes' -and $env:CREMIND_INSTALLER_FRONTEND -eq 'electron') {
+    Write-Err2 "Kubernetes installs are not supported from the desktop app."
+    Write-Err2 "Run install.ps1 -Mode kubernetes in a terminal instead."
+    exit 2
+}
+
 # ── deployment type ───────────────────────────────────────────────────────
+
+if ($Mode -eq 'kubernetes') {
+    # The chart sets HOST, APP_URL and CORS on the pod; there is nothing here
+    # to answer. Warn rather than silently dropping a flag the operator typed.
+    if ($Deployment -or $AppHost) {
+        Write-Warn2 "-Deployment / -AppHost do not apply to a kubernetes install; the chart sets them on the pod."
+        $Deployment = ''
+        $AppHost = ''
+    }
+}
+
+if ($Mode -ne 'kubernetes') {
 
 Write-Step "Deployment"
 
@@ -1346,53 +1992,7 @@ if ($Deployment -eq 'custom') {
     }
 }
 
-# ── mode (docker vs native) ──────────────────────────────────────────────
-
-# Default: docker if available, native otherwise. Labels and descriptions
-# come from the catalog ($script:ModeIds / $script:Modes) so the install
-# scripts and the Setup Wizard show identical text.
-if (-not $Mode) {
-    if ($HasDocker) {
-        if ($Unattended) {
-            $Mode = 'docker'
-        } else {
-            Write-Host ""
-            Write-Host "How do you want to run Cremind?" -ForegroundColor White
-            $idx = 0
-            foreach ($id in $script:ModeIds) {
-                $idx++
-                $entry = $script:Modes[$id]
-                Write-Host ("  {0}) {1,-8} - {2}" -f $idx, $entry.Label, $entry.Description)
-                if ($entry.Hint) {
-                    Write-Host ("               $($entry.Hint)") -ForegroundColor DarkGray
-                }
-            }
-            while (-not $Mode) {
-                $choice = Read-Host "Choice [1]"
-                if (-not $choice) { $choice = '1' }
-                $i = 0
-                foreach ($id in $script:ModeIds) {
-                    $i++
-                    if ($choice -eq "$i" -or $choice -eq $id) {
-                        $Mode = $id
-                        break
-                    }
-                }
-                if (-not $Mode) {
-                    Write-Warn2 "Pick a number 1-$($script:ModeIds.Count) or a mode id."
-                }
-            }
-        }
-    } else {
-        $Mode = 'native'
-    }
-}
-Write-Ok "Mode: $Mode"
-
-if ($Mode -eq 'docker' -and -not $HasDocker) {
-    Write-Err2 "Docker mode requested but Docker is not available."
-    exit 1
-}
+}  # end: deployment questions (skipped for kubernetes)
 
 # ── desktop UI (docker mode only) ─────────────────────────────────────────
 #
@@ -1401,13 +2001,24 @@ if ($Mode -eq 'docker' -and -not $HasDocker) {
 # (cremind/cremind). Default is desktop everywhere, including -Unattended.
 # A re-install reads the previous choice from the existing docker\.env
 # (CREMIND_IMAGE) so an unattended re-run preserves the flavor.
-if ($Mode -eq 'docker' -and -not $DesktopUi) {
+#
+# Kubernetes picks the same two images through the chart's desktop.enabled,
+# with one extra rule: on the production channel the basic image is not
+# installable at all (see the refusal below), so it is not offered.
+if ($Mode -eq 'kubernetes' -and $Channel -eq 'production' -and -not $DesktopUi) {
+    $DesktopUi = '1'
+}
+if (($Mode -eq 'docker' -or $Mode -eq 'kubernetes') -and -not $DesktopUi) {
     $desktopDefault = '1'
-    $prevEnv = Join-Path (Join-Path $CremindInstallDir 'docker') '.env'
-    if (Test-Path -LiteralPath $prevEnv) {
-        $prevImageLine = Get-Content -LiteralPath $prevEnv | Where-Object { $_ -like 'CREMIND_IMAGE=*' } | Select-Object -First 1
-        if ($prevImageLine -and ($prevImageLine -replace '^CREMIND_IMAGE=', '').Trim() -eq 'cremind/cremind') {
-            $desktopDefault = '0'
+    if ($Mode -eq 'kubernetes') {
+        if ((Get-PrevK8s 'DESKTOP_UI') -eq '0') { $desktopDefault = '0' }
+    } else {
+        $prevEnv = Join-Path (Join-Path $CremindInstallDir 'docker') '.env'
+        if (Test-Path -LiteralPath $prevEnv) {
+            $prevImageLine = Get-Content -LiteralPath $prevEnv | Where-Object { $_ -like 'CREMIND_IMAGE=*' } | Select-Object -First 1
+            if ($prevImageLine -and ($prevImageLine -replace '^CREMIND_IMAGE=', '').Trim() -eq 'cremind/cremind') {
+                $desktopDefault = '0'
+            }
         }
     }
 
@@ -1434,7 +2045,22 @@ if ($Mode -eq 'docker' -and -not $DesktopUi) {
         }
     }
 }
-if ($Mode -eq 'docker') {
+# The production chart and the production basic image are published to the
+# SAME Docker Hub tag - `helm push` writes cremind/cremind:X.Y.Z after the
+# image job has pushed an image there, so that tag holds a Helm chart. A
+# headless production install would ask Kubernetes to run the chart artifact
+# as a container image and fail on the pull. Release candidates do not collide
+# (chart 0.0.17-rc.13.dev.1 vs image 0.0.17rc13.dev1), so the test channel is
+# fine. Refused here rather than leaving a pod in ImagePullBackOff.
+if ($Mode -eq 'kubernetes' -and $Channel -eq 'production' -and $DesktopUi -eq '0') {
+    Write-Err2 "A production Kubernetes install cannot use the basic (headless) image."
+    Write-Err2 "On the production channel, cremind/cremind:<version> on Docker Hub is the Helm"
+    Write-Err2 "chart artifact, not a container image, so the pod could never pull it."
+    Write-Err2 "Use the desktop image (drop -NoDesktop), or -Channel test for a headless install."
+    exit 2
+}
+
+if ($Mode -eq 'docker' -or $Mode -eq 'kubernetes') {
     if ($DesktopUi -eq '0') {
         Write-Ok "Desktop UI: no (basic headless image)"
     } else {
@@ -1442,16 +2068,20 @@ if ($Mode -eq 'docker') {
     }
 }
 
-# ── VNC password (docker + desktop only) ──────────────────────────────────
+# ── VNC password (container modes + desktop only) ─────────────────────────
 #
 # Asked here when the TUI didn't (-NoTui, TUI failure) and no -VncPassword was
 # passed. Unattended installs deliberately fall through without asking: the
-# docker branch below still resolves a password from the previous install or
+# install branch below still resolves a password from the previous install or
 # generates one, so a scripted install never blocks.
 #
 # Read-Host -AsSecureString, not -MaskInput: the latter is PowerShell 7.1+,
 # and the Electron installer spawns Windows PowerShell 5.1.
-if ($Mode -eq 'docker' -and $DesktopUi -ne '0' -and -not $VncPassword -and -not $Unattended) {
+if ($Mode -eq 'kubernetes') {
+    # The relevant "previous install" is the Helm release, not docker\.env.
+    $PrevVncPassword = Get-PrevK8s 'VNC_PASSWORD'
+}
+if (($Mode -eq 'docker' -or $Mode -eq 'kubernetes') -and $DesktopUi -ne '0' -and -not $VncPassword -and -not $Unattended) {
     Write-Host ""
     Write-Host $script:VncPasswordPrompt.Prompt -ForegroundColor White
     if ($script:VncPasswordPrompt.Hint) {
@@ -1488,6 +2118,231 @@ if ($Mode -eq 'docker' -and $DesktopUi -ne '0' -and -not $VncPassword -and -not 
     }
     if (-not $VncPassword -and -not $PrevVncPassword) {
         Write-Warn2 "No VNC password entered; generating one and printing it at the end."
+    }
+}
+
+# ── kubernetes questions ──────────────────────────────────────────────────
+#
+# The fallback for everything the TUI would have asked: which cluster, which
+# namespace, and the Helm options. Reached with -NoTui, in a non-interactive
+# host, when the TUI failed to launch, and in -Unattended (where nothing is
+# asked and the flags/defaults stand).
+#
+# The context question is the one that cannot be defaulted away. Installing
+# into the wrong cluster is not recoverable by re-running, so an unattended
+# run with several contexts is an error, not a guess.
+$KubeServer = ''
+if ($Mode -eq 'kubernetes') {
+    Write-Step "Kubernetes target"
+
+    # A row is addressed by its position: sibling kubeconfig files reuse
+    # context names ("default"), so a name alone can be ambiguous.
+    function Format-KubeconfigLabel {
+        param([string] $Path)
+        if (-not $Path) { return 'default kubeconfig' }
+        if ($HOME -and $Path.StartsWith("$HOME\", [StringComparison]::OrdinalIgnoreCase)) {
+            return '~' + $Path.Substring($HOME.Length)
+        }
+        return $Path
+    }
+    function Write-KubeContexts {
+        $i = 0
+        foreach ($ctx in $KubeContexts) {
+            $i++
+            $server = if ($ctx.Server) { $ctx.Server } else { 'server unknown' }
+            $ns     = if ($ctx.Namespace) { $ctx.Namespace } else { 'default' }
+            $where  = if ($KubeFileCount -gt 1) { '  ' + (Format-KubeconfigLabel $ctx.Kubeconfig) } else { '' }
+            $marker = if ($ctx.Current) { '  [current]' } else { '' }
+            Write-Host ("  {0}) {1} - {2} ({3}){4}{5}" -f $i, $ctx.Name, $server, $ns, $where, $marker)
+        }
+    }
+    function Find-KubeContextRows {
+        # The rows called $Name; with -ByFile, only those in $File ('' = the
+        # ambient config).
+        param([string] $Name, [string] $File, [switch] $ByFile)
+        return @($KubeContexts | Where-Object { $_.Name -eq $Name -and ((-not $ByFile) -or $_.Kubeconfig -eq $File) })
+    }
+
+    $interactive = (-not $Unattended) -and [Environment]::UserInteractive
+    $picked = $null
+    if ($KubeContext) {
+        # The TUI settles the file along with the name (as does -KubeConfig,
+        # which narrowed the rows to one file); a bare -KubeContext has to
+        # name exactly one row across every file.
+        $byFile = ([bool]$KubeConfig) -or $TuiApplied
+        # @(): a function returning one row hands back the bare object, and
+        # under StrictMode a bare object has no .Count.
+        $found = @(Find-KubeContextRows -Name $KubeContext -File $KubeConfig -ByFile:$byFile)
+        if ($found.Count -eq 0) {
+            Write-Err2 "Unknown kubeconfig context: $KubeContext"
+            Write-Err2 "Available contexts:"
+            Write-KubeContexts
+            exit 2
+        } elseif ($found.Count -gt 1) {
+            Write-Err2 "Context '$KubeContext' exists in several kubeconfig files; add -KubeConfig FILE to say which:"
+            foreach ($row in $found) { Write-Err2 "  -KubeConfig '$($row.Kubeconfig)'  ($($row.Server))" }
+            exit 2
+        }
+        $picked = $found[0]
+    } elseif ($KubeContexts.Count -eq 1) {
+        $picked = $KubeContexts[0]
+    } elseif (-not $interactive) {
+        Write-Err2 "-KubeContext is required: the kubeconfig has $($KubeContexts.Count) contexts and"
+        Write-Err2 "an unattended install must not guess which cluster to install into."
+        Write-KubeContexts
+        exit 2
+    } else {
+        Write-Host ''
+        Write-Host $script:Kubernetes.ContextPrompt -ForegroundColor White
+        if ($script:Kubernetes.ContextHint) {
+            Write-Host ("  $($script:Kubernetes.ContextHint)") -ForegroundColor DarkGray
+        }
+        Write-KubeContexts
+        $ctxDefaultIdx = 1
+        for ($i = 0; $i -lt $KubeContexts.Count; $i++) {
+            if ($KubeContexts[$i].Current) { $ctxDefaultIdx = $i + 1; break }
+        }
+        while (-not $picked) {
+            $choice = Read-Host "Choice [$ctxDefaultIdx]"
+            if (-not $choice) { $choice = "$ctxDefaultIdx" }
+            $n = 0
+            if ([int]::TryParse($choice, [ref]$n)) {
+                if ($n -ge 1 -and $n -le $KubeContexts.Count) { $picked = $KubeContexts[$n - 1] }
+                else { Write-Warn2 "Pick a number from the list, or a context name." }
+            } else {
+                $named = @(Find-KubeContextRows -Name $choice)
+                if ($named.Count -eq 1) { $picked = $named[0] }
+                elseif ($named.Count -gt 1) { Write-Warn2 "'$choice' is in several files; pick its number." }
+                else { Write-Warn2 "Pick a number from the list, or a context name." }
+            }
+        }
+    }
+    $KubeContext = $picked.Name
+    $KubeServer  = $picked.Server
+    $KubeConfig  = $picked.Kubeconfig
+    $serverNote = if ($KubeServer) { " ($KubeServer)" } else { '' }
+    $fromNote   = if ($KubeConfig) { " from $KubeConfig" } else { '' }
+    Write-Ok "Context: $KubeContext$serverNote$fromNote"
+
+    if (-not $KubeNamespace) {
+        $nsDefault = Get-PrevK8s 'KUBE_NAMESPACE'
+        if (-not $nsDefault) { $nsDefault = $script:Kubernetes.NamespaceDefault }
+        if (-not $nsDefault) { $nsDefault = 'cremind' }
+        if (-not $interactive) {
+            $KubeNamespace = $nsDefault
+        } else {
+            Write-Host ''
+            Write-Host $script:Kubernetes.NamespacePrompt -ForegroundColor White
+            if ($script:Kubernetes.NamespaceHint) {
+                Write-Host ("  $($script:Kubernetes.NamespaceHint)") -ForegroundColor DarkGray
+            }
+            while (-not $KubeNamespace) {
+                $answer = Read-Host "  [$nsDefault]"
+                if (-not $answer) { $answer = $nsDefault }
+                if ($answer -cmatch $KubeNameRe) { $KubeNamespace = $answer }
+                else { Write-Warn2 "Use lowercase letters, digits and hyphens, max 63 characters." }
+            }
+        }
+    }
+    Write-Ok "Namespace: $KubeNamespace"
+
+    # Helm options. The gate is skipped when a flag already answered part of
+    # it (then only the unanswered fields are asked) and in -Unattended.
+    $K8sValues = @{
+        'release_name'          = $K8sReleaseName
+        'app_url'               = $K8sAppUrl
+        'legacy_postgres_image' = $K8sLegacyPostgresImage
+        'delete_postgres_data'  = $K8sDeletePostgresData
+        'extra_set'             = $K8sExtraSet
+    }
+    # A populated release name is the "already answered" signal - from the
+    # TUI, a flag, or the previous release - here and in the TUI's
+    # screen_k8s_advanced. It works because release_name is the one advanced
+    # field with a non-empty default: app_url and extra_set are legitimately
+    # blank, so emptiness alone cannot mean "not asked yet".
+    $k8sAnyAnswered = $false
+    foreach ($v in $K8sValues.Values) { if ($v) { $k8sAnyAnswered = $true } }
+    $k8sCustomize = $false
+    if ($K8sReleaseName) {
+        $k8sCustomize = $false
+    } elseif ($k8sAnyAnswered) {
+        # A flag answered part of it, so the operator is customizing: ask the
+        # rest, release name included.
+        $k8sCustomize = $true
+    } elseif ($interactive) {
+        Write-Host ''
+        Write-Host $script:Kubernetes.AdvancedPrompt -ForegroundColor White
+        if ($script:Kubernetes.AdvancedHint) {
+            Write-Host ("  $($script:Kubernetes.AdvancedHint)") -ForegroundColor DarkGray
+        }
+        while ($true) {
+            $ans = Read-Host "Customize the Helm options? [y/N]"
+            if (-not $ans -or $ans -match '^(n|no)$') { $k8sCustomize = $false; break }
+            if ($ans -match '^(y|yes)$') { $k8sCustomize = $true; break }
+            Write-Warn2 "Please answer yes or no."
+        }
+    }
+
+    foreach ($field in $script:Kubernetes.AdvancedFields) {
+        $key = $field.Key
+        if ($K8sValues[$key]) {
+            Write-Ok "$key`: $($K8sValues[$key])"
+            continue
+        }
+        $default = Get-PrevK8s ("K8S_" + $key)
+        if (-not $default) { $default = $field.Default }
+        if (-not $k8sCustomize) {
+            $K8sValues[$key] = $default
+            continue
+        }
+        Write-Host ''
+        Write-Host $field.Prompt -ForegroundColor White
+        Write-Host $field.Hint   -ForegroundColor DarkGray
+        if ($field.Choices.Count -gt 0) {
+            Write-Host ("Choices: " + ($field.Choices -join ', ')) -ForegroundColor DarkGray
+        }
+        while ($true) {
+            $answer = Read-Host "  [$default]"
+            if (-not $answer) { $answer = $default }
+            if ($field.Choices.Count -gt 0 -and -not ($field.Choices -contains $answer)) {
+                Write-Warn2 "Pick one of: $($field.Choices -join ', ')"
+                continue
+            }
+            if ($key -eq 'release_name' -and (($answer -cnotmatch $KubeNameRe) -or $answer.Length -gt 53)) {
+                Write-Warn2 "Use lowercase letters, digits and hyphens, max 53 characters."
+                continue
+            }
+            if ($key -eq 'app_url' -and $answer -and $answer -notmatch '^https?://[^/\s]+') {
+                Write-Warn2 "Start the URL with http:// or https://, or leave it blank."
+                continue
+            }
+            $K8sValues[$key] = $answer
+            break
+        }
+    }
+    $K8sReleaseName         = $K8sValues['release_name']
+    $K8sAppUrl              = $K8sValues['app_url']
+    $K8sLegacyPostgresImage = $K8sValues['legacy_postgres_image']
+    $K8sDeletePostgresData  = $K8sValues['delete_postgres_data']
+    $K8sExtraSet            = $K8sValues['extra_set']
+    if (-not $K8sReleaseName) { $K8sReleaseName = 'cremind' }
+
+    # The TUI has a confirm screen; the text path does not, and this is the
+    # question worth confirming - the cluster.
+    if (-not $TuiApplied -and $interactive) {
+        Write-Host ''
+        Write-Host 'About to install into:' -ForegroundColor White
+        Write-Host ("  context    {0}" -f $KubeContext)
+        Write-Host ("  server     {0}" -f $(if ($KubeServer) { $KubeServer } else { '(unknown)' }))
+        if ($KubeConfig) { Write-Host ("  kubeconfig {0}" -f $KubeConfig) }
+        Write-Host ("  namespace  {0}" -f $KubeNamespace)
+        Write-Host ("  release    {0}" -f $K8sReleaseName)
+        Write-Host ''
+        $ans = Read-Host "Install into this cluster? [y/N]"
+        if ($ans -notmatch '^(y|yes)$') {
+            Write-Err2 "Cancelled."
+            exit 1
+        }
     }
 }
 
@@ -1785,6 +2640,10 @@ function Set-CremindEnvSslMode {
 #      Electron uses the same choices and precedence as browser installs.
 $PreviousSslEnv = if ($Mode -eq 'docker') {
     Join-Path (Join-Path $CremindInstallDir 'docker') '.env'
+} elseif ($Mode -eq 'kubernetes') {
+    # The Helm release's own record. It stores the key as CREMIND_SSL exactly
+    # so the machinery below works unchanged.
+    $K8sReleaseEnv
 } else {
     $EnvFile
 }
@@ -1903,6 +2762,11 @@ if ($env:CREMIND_INSTALLER_FRONTEND -eq 'electron') {
         Write-Warn2 "-BootService ignored: docker restarts the container for you."
     }
     $BootServiceOn = $false
+} elseif ($Mode -eq 'kubernetes') {
+    if ($BootService) {
+        Write-Warn2 "-BootService ignored: kubelet restarts the pod for you."
+    }
+    $BootServiceOn = $false
 } elseif ($BootExplicit) {
     $BootServiceOn = [bool]$BootService
 } else {
@@ -1942,6 +2806,73 @@ $UrlScheme = Get-CremindScheme
 if ($Deployment -eq 'custom' -and $UrlScheme -eq 'https') {
     $CustomValues['public_url']      = $CustomValues['public_url']      -replace 'http://', 'https://'
     $CustomValues['allowed_origins'] = $CustomValues['allowed_origins'] -replace 'http://', 'https://'
+}
+
+# ── host-side CA trust ─────────────────────────────────────
+#
+# The CA lives inside the container (Docker) or the pod (Kubernetes), where
+# nothing can reach the HOST's trust store - but this script runs on the host,
+# so it can. This is the containerised counterpart of the wizard's one-click
+# trust (which the server can only offer on native installs): download
+# /ca.pem from the running server and offer to add it to the current user's
+# Trusted Root store. Declining is fine - the wizard's "Secure this install"
+# step shows the manual command, and every OTHER device needs that path
+# anyway.
+#
+# Both listener phases serve /ca.pem: under after-setup it is plain http, and
+# a finished install answers https - which Invoke-WebRequest accepts via
+# Schannel exactly when this host already trusts the CA from a previous run
+# (and then the thumbprint check below skips the prompt). A host that never
+# trusted it gets a failed download and a pointer, not a failed install.
+#
+# Callers decide WHETHER to offer (TLS on, interactive, not Electron); this
+# decides how.
+function Invoke-HostCaTrust {
+    param([Parameter(Mandatory)][string] $CaUrl)
+    $CaTmp = Join-Path $env:TEMP 'cremind-local-ca.pem'
+    $CaCert = $null
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri $CaUrl -OutFile $CaTmp -TimeoutSec 10 | Out-Null
+        $CaCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CaTmp)
+    } catch {
+        # No local CA (operator certificate pair → /ca.pem 404s, and there
+        # is genuinely nothing of ours to trust) or an untrusted https
+        # listener — either way the wizard step has it covered.
+        Write-Info "Skipping host CA trust ($($_.Exception.Message.Trim()))."
+    }
+    if ($CaCert) {
+        $CaStore = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
+        $CaStore.Open('ReadWrite')
+        try {
+            $found = $CaStore.Certificates.Find('FindByThumbprint', $CaCert.Thumbprint, $false)
+            if ($found.Count -gt 0) {
+                Write-Ok "This machine already trusts the Cremind local CA."
+            } else {
+                $CaSha256 = [System.BitConverter]::ToString(
+                    [System.Security.Cryptography.SHA256]::Create().ComputeHash($CaCert.RawData)
+                ) -replace '-', ':'
+                Write-Host ""
+                Write-Host "Cremind will serve HTTPS with a certificate signed by its own local CA."
+                Write-Host "Trusting that CA now removes the browser warning on this machine; every"
+                Write-Host "other device gets the same walkthrough in the Setup Wizard."
+                Write-Host "  Subject : $($CaCert.Subject)"
+                Write-Host "  SHA-256 : $CaSha256"
+                $TrustAnswer = Read-Host "Add it to the current user's Trusted Root store? Windows asks you to confirm. [Y/n]"
+                if ($TrustAnswer -notmatch '^[nN]') {
+                    try {
+                        $CaStore.Add($CaCert)
+                        Write-Ok "Trusted the Cremind local CA for the current user."
+                    } catch {
+                        # Includes the user clicking No on the Windows dialog.
+                        Write-Warn2 "CA not trusted ($($_.Exception.Message.Trim())). The Setup Wizard's 'Secure this install' step shows the manual command."
+                    }
+                } else {
+                    Write-Info "Skipped. The Setup Wizard's 'Secure this install' step covers it."
+                }
+            }
+        } finally { $CaStore.Dispose() }
+    }
+    Remove-Item $CaTmp -ErrorAction SilentlyContinue
 }
 
 # ── docker install ────────────────────────────────────────────────────────
@@ -2050,6 +2981,672 @@ function Resolve-CremindVersion {
     }
     Write-Err2 "Unknown channel: $Channel"
     exit 1
+}
+
+# ── kubernetes install ────────────────────────────────────────────────────
+#
+# Installs the Cremind Helm chart into the kubeconfig context the operator
+# chose. Nothing about this install is ambient: every helm and kubectl call
+# carries --kube-context (and --kubeconfig, for a context from a sibling
+# file), so a stale current-context can never redirect it.
+#
+# What this branch does NOT do, deliberately: write a host .env, register a
+# boot service, or run migrations. The chart owns the pod's environment
+# (INSTALL_MODE=kubernetes, SETUP_WIZARD_ENV=kubernetes, APP_URL), kubelet
+# supervises the pod, and the Setup Wizard runs the first migration.
+if ($Mode -eq 'kubernetes') {
+    Write-Step "Kubernetes install"
+
+    if (-not (Test-Path -LiteralPath $K8sDir)) {
+        New-Item -ItemType Directory -Path $K8sDir -Force | Out-Null
+    }
+
+    # Every kubectl call goes through these. --request-timeout keeps an
+    # unreachable API server (or an exec credential plugin waiting on a
+    # browser) from looking like a frozen installer. The kubeconfig file is
+    # named too whenever the context came from one kubectl would not read on
+    # its own (see the probe above).
+    function Invoke-Kubectl {
+        param([string[]] $KubectlArgs)
+        $target = @('--context', $KubeContext, '--request-timeout=20s')
+        if ($KubeConfig) { $target = @('--kubeconfig', $KubeConfig) + $target }
+        return Invoke-NativeCapture -FilePath $KubectlExe -ArgumentList ($target + $KubectlArgs)
+    }
+    function Invoke-KubectlNs {
+        param([string[]] $KubectlArgs)
+        return Invoke-Kubectl -KubectlArgs (@('--namespace', $KubeNamespace) + $KubectlArgs)
+    }
+    # Every helm call that reaches the cluster goes through this, for the
+    # same reason.
+    function Invoke-HelmTarget {
+        param([string[]] $HelmArgs)
+        $target = @('--kube-context', $KubeContext)
+        if ($KubeConfig) { $target = @('--kubeconfig', $KubeConfig) + $target }
+        return Invoke-NativeCapture -FilePath 'helm' -ArgumentList ($HelmArgs + $target)
+    }
+    # The same targeting, spelled out for the commands printed to the operator.
+    $HelmTargetText    = "--kube-context $KubeContext"
+    $KubectlTargetText = "--context $KubeContext"
+    if ($KubeConfig) {
+        $HelmTargetText    += " --kubeconfig `"$KubeConfig`""
+        $KubectlTargetText += " --kubeconfig `"$KubeConfig`""
+    }
+
+    $HelmRelease = if ($K8sReleaseName) { $K8sReleaseName } else { 'cremind' }
+
+    # A host tracks one release. Re-running against a different target would
+    # leave the previous one behind with nothing recording it, so say so.
+    $prevRelease = Get-PrevK8s 'HELM_RELEASE'
+    if ($prevRelease) {
+        # Same API server, same cluster - whichever file or context name
+        # reaches it this time. Names are the fallback when a server is unknown.
+        $prevServer = Get-PrevK8s 'KUBE_SERVER'
+        $sameCluster = if ($prevServer -and $KubeServer) { $prevServer -eq $KubeServer } else { (Get-PrevK8s 'KUBE_CONTEXT') -eq $KubeContext }
+        if (-not $sameCluster -or
+            (Get-PrevK8s 'KUBE_NAMESPACE') -ne $KubeNamespace -or
+            $prevRelease -ne $HelmRelease) {
+            $prevServerNote = if ($prevServer) { " ($prevServer)" } else { '' }
+            $serverNote = if ($KubeServer) { " ($KubeServer)" } else { '' }
+            Write-Warn2 "This machine already tracks a Cremind release:"
+            Write-Warn2 "  $prevRelease in namespace $(Get-PrevK8s 'KUBE_NAMESPACE') on context $(Get-PrevK8s 'KUBE_CONTEXT')$prevServerNote"
+            Write-Warn2 "You are about to install $HelmRelease in $KubeNamespace on $KubeContext$serverNote."
+            if ($Unattended -or -not [Environment]::UserInteractive) {
+                Write-Err2 "Refusing to orphan the tracked release. Run -Uninstall first, or pass the same target."
+                exit 2
+            }
+            Write-Host ''
+            Write-Host 'The previous release will keep running, untracked by this installer.'
+            $ans = Read-Host "Continue anyway? [y/N]"
+            if ($ans -notmatch '^(y|yes)$') { Write-Err2 "Cancelled."; exit 1 }
+        }
+    }
+
+    $serverNote = if ($KubeServer) { " ($KubeServer)" } else { '' }
+    Write-Info "Target: context $KubeContext$serverNote, namespace $KubeNamespace, release $HelmRelease"
+
+    # Pre-flight: can we actually reach this cluster? Better here than three
+    # minutes into a helm install.
+    if ((Invoke-Kubectl -KubectlArgs @('cluster-info')).ExitCode -ne 0) {
+        Write-Err2 "Cannot reach the cluster for context '$KubeContext'$serverNote."
+        Write-Err2 "Check your kubeconfig and VPN, then re-run. Details: $LogFile"
+        exit 1
+    }
+    Write-Ok "Cluster reachable."
+
+    # ── version + chart reference ─────────────────────────────────────────
+    #
+    # The image tag is a PEP 440 version (0.0.17rc13.dev1); the chart version
+    # is its SemVer2 spelling (0.0.17-rc.13.dev.1). One release, two
+    # spellings, and Helm rejects the PEP 440 form - so the translation runs
+    # through app/upgrade/channel.py, the same file that already owns every
+    # other version rule here.
+    #
+    # dev is the odd one: there is no published dev chart, so it installs the
+    # checkout's chart against the newest test-channel IMAGE. (The pod then
+    # reports the test channel in-app, because the chart derives the channel
+    # from the image tag.)
+    if ($Channel -eq 'dev') {
+        if ($VersionRaw) {
+            $CremindVer = $VersionRaw
+        } else {
+            Write-Info "Resolving the newest published image for the local chart"
+            try {
+                $k8sIndex = (Invoke-WebRequest -UseBasicParsing -Uri 'https://test.pypi.org/simple/cremind/').Content
+            } catch {
+                Write-Err2 "Failed to fetch https://test.pypi.org/simple/cremind/ : $_"
+                exit 1
+            }
+            $CremindVer = Resolve-CremindWheel -IndexBody $k8sIndex -ResolveChannel 'test' -Emit 'version'
+            if (-not $CremindVer) {
+                Write-Err2 "No published cremind image found to run the local chart against."
+                Write-Err2 "Pass -Version <X.Y.ZrcN.devM> to pick one."
+                exit 1
+            }
+            Write-Ok "Image tag: $CremindVer"
+        }
+    } else {
+        $CremindVer = Resolve-CremindVersion
+    }
+
+    $ChartVersion = ''
+    $ChartIsLocal = $false
+    if ($HelmChart) {
+        $ChartRef = $HelmChart
+        if (Test-Path -LiteralPath $ChartRef -PathType Container) { $ChartIsLocal = $true }
+    } elseif ($Channel -eq 'dev') {
+        $ChartRef = Join-Path $RepoRoot 'helm\cremind'
+        $ChartIsLocal = $true
+        if (-not (Test-Path -LiteralPath (Join-Path $ChartRef 'Chart.yaml'))) {
+            Write-Err2 "-Channel dev needs the chart at $ChartRef, which is missing."
+            exit 1
+        }
+    } else {
+        $ChartRef = 'oci://registry-1.docker.io/cremind/cremind'
+    }
+
+    if ($ChartRef.StartsWith('oci://')) {
+        # A production X.Y.Z is already SemVer2; only the RC form needs
+        # translating, which is the only case that needs python here.
+        if ($Channel -eq 'production') {
+            $ChartVersion = $CremindVer
+        } else {
+            $resolverPy = Get-ResolverPython
+            $resolver = Get-CremindResolver
+            $chartOut = Invoke-NativeCapture -FilePath $resolverPy `
+                -ArgumentList @($resolver, 'chart-version', '--version', $CremindVer)
+            if ($chartOut.ExitCode -ne 0 -or -not $chartOut.Stdout.Trim()) {
+                Write-Err2 "Could not derive a chart version from '$CremindVer'."
+                exit 1
+            }
+            $ChartVersion = $chartOut.Stdout.Trim()
+        }
+        Write-Info "Chart: $ChartRef --version $ChartVersion"
+        # Fail here, with a useful message, rather than inside helm.
+        $shown = Invoke-NativeCapture -FilePath 'helm' `
+            -ArgumentList @('show', 'chart', $ChartRef, '--version', $ChartVersion)
+        if ($shown.ExitCode -ne 0) {
+            Write-Err2 "Chart $ChartVersion is not published at $ChartRef."
+            Write-Err2 "Release-candidate charts appear a few minutes after the tag; check 'helm show chart $ChartRef --devel'."
+            exit 1
+        }
+    } else {
+        Write-Info "Chart: $ChartRef (local)"
+    }
+
+    if ($ChartIsLocal) {
+        # A checkout's chart has unresolved subchart dependencies and a
+        # placeholder appVersion, so the image tag must be pinned explicitly.
+        Write-Info "Building chart dependencies"
+        Invoke-NativeCapture -FilePath 'helm' -ArgumentList @('repo', 'add', '--force-update', 'qdrant', 'https://qdrant.github.io/qdrant-helm') | Out-Null
+        Invoke-NativeCapture -FilePath 'helm' -ArgumentList @('repo', 'add', '--force-update', 'chromadb', 'https://amikos-tech.github.io/chromadb-chart/') | Out-Null
+        $dep = Invoke-NativeCapture -FilePath 'helm' -ArgumentList @('dependency', 'build', $ChartRef)
+        if ($dep.ExitCode -ne 0) {
+            Write-Err2 "helm dependency build failed for $ChartRef. Details: $LogFile"
+            exit 1
+        }
+    }
+
+    # ── Postgres password ─────────────────────────────────────────────────
+    #
+    # Pinned rather than left to the subchart's generator, because the
+    # generated one lives only in a Secret: uninstall + reinstall regenerates
+    # it while the retained data volume keeps the OLD password, and setup then
+    # fails with "password authentication failed for user cremind".
+    #
+    # Pinning has its own trap in the other direction: the Bitnami helper
+    # honours a provided password, so pinning a FRESH one onto an existing
+    # release rewrites the Secret and locks the app out of its own database.
+    # Hence: adopt what the release already uses before generating anything.
+    $PgPassword = ''
+    $K8sExternalPg = ",$K8sExtraSet," -like '*,postgresql.enabled=false,*'
+    $ReleaseExists = (Invoke-HelmTarget -HelmArgs @(
+        'status', $HelmRelease, '--namespace', $KubeNamespace
+    )).ExitCode -eq 0
+    if (-not $K8sExternalPg) {
+        if ($K8sPostgresPassword) {
+            $PgPassword = $K8sPostgresPassword
+            Write-Info "Using the Postgres password from -K8sPostgresPassword."
+        } elseif (Get-PrevK8s 'PG_PASSWORD') {
+            $PgPassword = Get-PrevK8s 'PG_PASSWORD'
+        } elseif ($ReleaseExists) {
+            # Release we did not install (or release.env was lost): adopt the
+            # live Secret so the running database keeps working.
+            $secretName = (Invoke-KubectlNs -KubectlArgs @(
+                'get', 'secret',
+                '-l', "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=$HelmRelease",
+                '-o', 'jsonpath={.items[0].metadata.name}'
+            )).Stdout.Trim()
+            if (-not $secretName) { $secretName = 'cremind-postgresql' }
+            $pgB64 = (Invoke-KubectlNs -KubectlArgs @(
+                'get', 'secret', $secretName, '-o', 'jsonpath={.data.password}'
+            )).Stdout.Trim()
+            if ($pgB64) {
+                try {
+                    $PgPassword = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($pgB64))
+                    Write-Info "Adopted the existing PostgreSQL password from the release."
+                } catch { $PgPassword = '' }
+            }
+            if (-not $PgPassword) {
+                Write-Err2 "Release $HelmRelease exists but its PostgreSQL password could not be read."
+                Write-Err2 "Pass -K8sPostgresPassword <password>, or uninstall and start clean."
+                exit 1
+            }
+        } else {
+            # No release. A leftover data volume from a previous one still has
+            # its own password, and nothing here can guess it.
+            $pgPvc = (Invoke-KubectlNs -KubectlArgs @(
+                'get', 'pvc',
+                '-l', "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=$HelmRelease",
+                '-o', 'jsonpath={.items[0].metadata.name}'
+            )).Stdout.Trim()
+            if (-not $pgPvc) {
+                $pgPvc = (Invoke-KubectlNs -KubectlArgs @(
+                    'get', 'pvc', 'data-cremind-postgresql-0', '--ignore-not-found',
+                    '-o', 'jsonpath={.metadata.name}'
+                )).Stdout.Trim()
+            }
+            if ($pgPvc) {
+                Write-Err2 "A PostgreSQL data volume ($pgPvc) survives from an earlier release,"
+                Write-Err2 "and its password is not recorded on this machine. A fresh install would"
+                Write-Err2 "write a new password that the retained database does not accept."
+                Write-Err2 "Either delete it:"
+                Write-Err2 "  kubectl $KubectlTargetText -n $KubeNamespace delete pvc $pgPvc"
+                Write-Err2 "or re-run with -K8sPostgresPassword <the old password>."
+                exit 1
+            }
+            $PgPassword = New-Secret
+        }
+    }
+
+    # ── VNC password ──────────────────────────────────────────────────────
+    $VncPwd = ''
+    $VncGenerated = $false
+    if ($DesktopUi -ne '0') {
+        $VncPwd = if ($VncPassword) { $VncPassword }
+                  elseif (Get-PrevK8s 'VNC_PASSWORD') { Get-PrevK8s 'VNC_PASSWORD' }
+                  else { '' }
+        if (-not $VncPwd) {
+            $VncPwd = (New-Secret).Substring(0, 8)
+            $VncGenerated = $true
+        }
+    }
+
+    # ── app URL ───────────────────────────────────────────────────────────
+    #
+    # Left unset unless the operator named one: the chart derives
+    # http://localhost:1515 (or https:// under cremind.ssl) by itself, which
+    # is exactly right for the port-forward - and an explicit http:// value is
+    # what makes a later -Ssl re-run fail the chart's own validation.
+    if ($K8sAppUrl -and $SslMode -and $K8sAppUrl.StartsWith('http://')) {
+        Write-Err2 "-K8sAppUrl is http:// but -Ssl $SslMode serves HTTPS."
+        Write-Err2 "Use https://, or leave it blank so the chart derives it."
+        exit 2
+    }
+
+    # Combinations the chart refuses to render. Checking them here turns a
+    # Go template error into a sentence.
+    $K8sIngress = $false
+    if ((",$K8sExtraSet," -like '*,ingress.enabled=true,*')) {
+        if ($SslMode) {
+            Write-Err2 "ingress.enabled and -Ssl are mutually exclusive: an ingress controller"
+            Write-Err2 "speaks plain HTTP to the pod and cannot re-encrypt to Cremind's private CA."
+            Write-Err2 "Terminate TLS at the ingress instead, and drop -Ssl."
+            exit 2
+        }
+        $K8sIngress = $true
+    }
+    if ($K8sExtraSet -like '*CREMIND_DB_PROVIDER*') {
+        Write-Err2 "CREMIND_DB_PROVIDER must not be set on Kubernetes: it would skip the Setup Wizard."
+        exit 2
+    }
+    if ($K8sExtraSet -match 'replicaCount=(\d+)' -and $Matches[1] -ne '1') {
+        Write-Err2 "Cremind runs as exactly one pod; the chart rejects any other replicaCount."
+        exit 2
+    }
+
+    # ── values the installer owns ─────────────────────────────────────────
+    #
+    # Rendered into a values file rather than a wall of --set arguments. Same
+    # manifests either way, but: helm's --set parser treats commas as
+    # separators (and the VNC charset contains one), the two secrets stay off
+    # the process list and out of install.log, and the operator gets a file
+    # they can keep using with plain `helm upgrade -f`.
+    $K8sValuesFile = Join-Path $K8sDir 'values.yaml'
+    function ConvertTo-YamlScalar {
+        param([string] $Value)
+        return '"' + ($Value -replace '\\', '\\\\' -replace '"', '\"') + '"'
+    }
+
+    $valuesLines = [System.Collections.Generic.List[string]]::new()
+    $valuesLines.Add('# Generated by the Cremind installer. Regenerated on every run.')
+    $valuesLines.Add("# Safe to reuse by hand: helm upgrade --install $HelmRelease $ChartRef -f $K8sValuesFile")
+    $valuesLines.Add('desktop:')
+    $valuesLines.Add($(if ($DesktopUi -eq '0') { '  enabled: false' } else { '  enabled: true' }))
+    $valuesLines.Add('cremind:')
+    $valuesLines.Add("  ssl: $(ConvertTo-YamlScalar $(if ($SslMode) { $SslMode } else { 'none' }))")
+    if ($K8sAppUrl) { $valuesLines.Add("  appUrl: $(ConvertTo-YamlScalar $K8sAppUrl)") }
+    if ($VncPwd)    { $valuesLines.Add("  vncPassword: $(ConvertTo-YamlScalar $VncPwd)") }
+    if ($ChartIsLocal) {
+        # A checkout's Chart.yaml carries a placeholder appVersion, so the
+        # image tag would render as :0.0.0 without this.
+        $valuesLines.Add('image:')
+        $valuesLines.Add("  tag: $(ConvertTo-YamlScalar $CremindVer)")
+    }
+    if (-not $K8sExternalPg) {
+        $valuesLines.Add('postgresql:')
+        $valuesLines.Add('  auth:')
+        $valuesLines.Add("    password: $(ConvertTo-YamlScalar $PgPassword)")
+        if ($K8sLegacyPostgresImage -ne 'no') {
+            # Bitnami froze its free images into the bitnamilegacy namespace,
+            # so the chart's default no longer pulls.
+            $valuesLines.Add('  image:')
+            $valuesLines.Add('    registry: docker.io')
+            $valuesLines.Add('    repository: bitnamilegacy/postgresql')
+        }
+        if ($K8sDeletePostgresData -eq 'yes') {
+            $valuesLines.Add('  primary:')
+            $valuesLines.Add('    persistentVolumeClaimRetentionPolicy:')
+            $valuesLines.Add('      enabled: true')
+            $valuesLines.Add('      whenDeleted: Delete')
+        }
+    }
+    Write-Info "Writing $K8sValuesFile"
+    Write-Utf8NoBomFile -Path $K8sValuesFile -Content (($valuesLines -join "`n") + "`n")
+
+    # ── install ───────────────────────────────────────────────────────────
+    #
+    # No --wait (it hides a Pending Postgres volume behind a generic timeout),
+    # no --atomic (a rollback on a slow first image pull would delete the
+    # chart-owned PVCs), no --reuse-values (every value is re-sent from the
+    # values file above, so nothing silently carries over), and no --devel
+    # (an exact --version already bypasses the prerelease filter).
+    if ($ReleaseExists -and $Reinstall) {
+        Write-Info "Removing release $HelmRelease (-Reinstall)"
+        Invoke-HelmTarget -HelmArgs @(
+            'uninstall', $HelmRelease, '--namespace', $KubeNamespace, '--wait') | Out-Null
+        $ReleaseExists = $false
+    } elseif ($ReleaseExists) {
+        Write-Info "Release $HelmRelease already exists - upgrading it in place."
+    }
+
+    # Did the namespace exist before us? Only what we created may be deleted
+    # again by -Uninstall -Purge.
+    $NamespaceCreated = '0'
+    $nsSeen = (Invoke-Kubectl -KubectlArgs @('get', 'namespace', $KubeNamespace, '--ignore-not-found', '-o', 'name')).Stdout.Trim()
+    if (-not $nsSeen) {
+        $NamespaceCreated = '1'
+    } elseif ((Get-PrevK8s 'NAMESPACE_CREATED') -eq '1' -and (Get-PrevK8s 'KUBE_NAMESPACE') -eq $KubeNamespace) {
+        $NamespaceCreated = '1'
+    }
+
+    Write-Info "Installing the chart (this pulls images; give it a few minutes)"
+    $helmArgs = [System.Collections.Generic.List[string]]::new()
+    $helmArgs.Add('upgrade'); $helmArgs.Add('--install')
+    $helmArgs.Add($HelmRelease); $helmArgs.Add($ChartRef)
+    $helmArgs.Add('--namespace'); $helmArgs.Add($KubeNamespace)
+    $helmArgs.Add('--create-namespace')
+    $helmArgs.Add('--history-max'); $helmArgs.Add('5')
+    $helmArgs.Add('-f'); $helmArgs.Add($K8sValuesFile)
+    if ($ChartVersion) { $helmArgs.Add('--version'); $helmArgs.Add($ChartVersion) }
+    # Last, so an operator's --set overrides the installer's own values.
+    if ($K8sExtraSet) { $helmArgs.Add('--set'); $helmArgs.Add($K8sExtraSet) }
+    # Invoke-HelmTarget adds the cluster targeting (--kube-context, --kubeconfig).
+    $installed = Invoke-HelmTarget -HelmArgs $helmArgs.ToArray()
+    if ($installed.ExitCode -ne 0) {
+        Write-Err2 "helm upgrade --install failed:"
+        if ($installed.Stderr) { Write-Err2 $installed.Stderr }
+        if ($installed.Stdout) { Write-Err2 $installed.Stdout }
+        Write-Err2 ""
+        Write-Err2 "Common causes: a chart value the cluster rejects (see -K8sExtraSet),"
+        Write-Err2 "an unreachable image registry, or insufficient quota."
+        Write-Err2 "Inspect with: helm status $HelmRelease $HelmTargetText -n $KubeNamespace"
+        exit 1
+    }
+    Write-Ok "Chart installed."
+
+    # ── names ─────────────────────────────────────────────────────────────
+    #
+    # Ask the cluster rather than recomputing the chart's fullname rule: an
+    # operator's nameOverride/fullnameOverride in -K8sExtraSet would otherwise
+    # silently break the rollout wait and the port-forward.
+    $HelmFullname = (Invoke-KubectlNs -KubectlArgs @(
+        'get', 'deploy', '-l', "app.kubernetes.io/instance=$HelmRelease",
+        '-o', 'jsonpath={.items[0].metadata.name}'
+    )).Stdout.Trim()
+    if (-not $HelmFullname) {
+        $HelmFullname = if ($HelmRelease -like '*cremind*') { $HelmRelease } else { "$HelmRelease-cremind" }
+    }
+
+    # ── wait for the rollout ──────────────────────────────────────────────
+    if (-not $K8sExternalPg) {
+        $pgSts = (Invoke-KubectlNs -KubectlArgs @(
+            'get', 'statefulset',
+            '-l', "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=$HelmRelease",
+            '-o', 'jsonpath={.items[0].metadata.name}'
+        )).Stdout.Trim()
+        if ($pgSts) {
+            Write-Info "Waiting for PostgreSQL"
+            $pgRollout = Invoke-KubectlNs -KubectlArgs @('rollout', 'status', "statefulset/$pgSts", '--timeout=5m')
+            if ($pgRollout.ExitCode -ne 0) {
+                Write-Warn2 "PostgreSQL did not become ready within 5 minutes."
+                Write-Warn2 "A Pending volume usually means the cluster has no default StorageClass:"
+                Write-Warn2 "  kubectl $KubectlTargetText -n $KubeNamespace get pvc"
+            }
+        }
+    }
+
+    Write-Info "Waiting for the Cremind pod"
+    $rolloutTimeout = if ($env:CREMIND_K8S_ROLLOUT_TIMEOUT) { $env:CREMIND_K8S_ROLLOUT_TIMEOUT } else { '10m' }
+    $appRollout = Invoke-KubectlNs -KubectlArgs @('rollout', 'status', "deployment/$HelmFullname", "--timeout=$rolloutTimeout")
+    if ($appRollout.ExitCode -ne 0) {
+        Write-Err2 "The Cremind pod did not become ready in time. Current state:"
+        Write-Host (Invoke-KubectlNs -KubectlArgs @('get', 'pods', '-l', "app.kubernetes.io/instance=$HelmRelease")).Stdout
+        Write-Err2 ""
+        Write-Err2 "ImagePullBackOff  -> the image tag is not published, or the registry is unreachable."
+        Write-Err2 "Pending           -> the node needs 2 CPU and 2Gi free for the desktop image."
+        Write-Err2 "CrashLoopBackOff  -> kubectl $KubectlTargetText -n $KubeNamespace logs deploy/$HelmFullname -c cremind"
+        Write-Err2 ""
+        Write-Err2 "The release is installed; re-running this installer upgrades it in place."
+        exit 1
+    }
+    Write-Ok "Cremind is running."
+
+    # ── how it is reached ─────────────────────────────────────────────────
+    #
+    # 1515 is the app, 1455 the transient Codex OAuth callback, 6080 noVNC -
+    # the last only when the desktop image runs without the L7 proxy, which is
+    # what happens under cremind.ssl. Read the Service rather than re-deriving
+    # the rule.
+    $svcPorts = (Invoke-KubectlNs -KubectlArgs @('get', 'svc', $HelmFullname, '-o', 'jsonpath={.spec.ports[*].port}')).Stdout.Trim()
+    $PfPorts = @('1515:80', '1455:1455')
+    if (" $svcPorts " -like '* 6080 *') { $PfPorts += '6080:6080' }
+    $PortForwardCmd = "kubectl $KubectlTargetText --namespace $KubeNamespace port-forward svc/$HelmFullname $($PfPorts -join ' ')"
+    $K8sNovncUrl = (Invoke-KubectlNs -KubectlArgs @('get', 'configmap', "$HelmFullname-env", '-o', 'jsonpath={.data.CREMIND_NOVNC_URL}')).Stdout.Trim()
+    $K8sPodAppUrl = (Invoke-KubectlNs -KubectlArgs @('get', 'configmap', "$HelmFullname-env", '-o', 'jsonpath={.data.APP_URL}')).Stdout.Trim()
+
+    # ── port-forward ──────────────────────────────────────────────────────
+    #
+    # Started in the background so the wizard is reachable the moment this
+    # script ends. An ingress install has a real address and needs none.
+    $PfPidFile = Join-Path $K8sDir 'port-forward.pid'
+    $PfLogFile = Join-Path $K8sDir 'port-forward.log'
+    $PfErrFile = Join-Path $K8sDir 'port-forward.err.log'
+    $PfRunning = $false
+    if ($K8sIngress) {
+        Write-Info "Ingress configured - skipping the port-forward."
+    } elseif ($NoPortForward) {
+        Write-Info "Skipping the port-forward (-NoPortForward)."
+    } else {
+        # A forward we started earlier is ours to replace; anything else on
+        # 1515 is not, and a second Cremind on this host is a real possibility.
+        if (Test-Path -LiteralPath $PfPidFile) {
+            $oldPf = (Get-Content -LiteralPath $PfPidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if ($oldPf) {
+                $oldProc = Get-Process -Id ([int]$oldPf) -ErrorAction SilentlyContinue
+                if ($oldProc -and $oldProc.ProcessName -eq 'kubectl') {
+                    Stop-Process -Id ([int]$oldPf) -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 1
+                }
+            }
+            Remove-Item -LiteralPath $PfPidFile -Force -ErrorAction SilentlyContinue
+        }
+        $portInUse = $false
+        try {
+            $probe = [System.Net.Sockets.TcpClient]::new()
+            $probe.Connect('127.0.0.1', 1515)
+            $portInUse = $true
+            $probe.Close()
+        } catch { $portInUse = $false }
+        if ($portInUse) {
+            Write-Warn2 "Port 1515 on this machine is already in use, so the port-forward was not started."
+            Write-Warn2 "Stop whatever is listening and run:"
+            Write-Warn2 "  $PortForwardCmd"
+        } else {
+            Write-Info "Starting the port-forward in the background"
+            $pfArgs = @('--context', $KubeContext, '--namespace', $KubeNamespace,
+                        'port-forward', "svc/$HelmFullname") + $PfPorts
+            if ($KubeConfig) { $pfArgs = @('--kubeconfig', $KubeConfig) + $pfArgs }
+            $pfProc = Start-Process -FilePath $KubectlExe -ArgumentList $pfArgs `
+                -RedirectStandardOutput $PfLogFile -RedirectStandardError $PfErrFile `
+                -WindowStyle Hidden -PassThru
+            Set-Content -LiteralPath $PfPidFile -Value $pfProc.Id -Encoding ascii
+            $PfRunning = $true
+            Start-Sleep -Seconds 2
+        }
+    }
+
+    # ── health ────────────────────────────────────────────────────────────
+    $BootScheme = Get-CremindBootScheme
+    $K8sHealthOk = $false
+    if ($PfRunning) {
+        Write-Info "Waiting for Cremind to answer on localhost:1515"
+        for ($i = 0; $i -lt 60; $i++) {
+            if (Test-CremindHealth -Url "${BootScheme}://localhost:1515/health") { $K8sHealthOk = $true; break }
+            Start-Sleep -Seconds 2
+        }
+        if ($K8sHealthOk) {
+            Write-Ok "Cremind is reachable at ${BootScheme}://localhost:1515"
+        } else {
+            Write-Warn2 "Cremind did not answer through the port-forward within 2 minutes."
+            Write-Warn2 "Check it with: $PortForwardCmd"
+        }
+    }
+
+    # ── CA trust ──────────────────────────────────────────────────────────
+    if ($PfRunning -and $K8sHealthOk -and $UrlScheme -eq 'https' -and -not $Unattended `
+        -and $env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
+        Invoke-HostCaTrust -CaUrl "${BootScheme}://localhost:1515/ca.pem"
+    }
+
+    # ── state ─────────────────────────────────────────────────────────────
+    #
+    # What a re-run and an uninstall need. Read line by line, never
+    # dot-sourced: it carries two secrets and free-form --set text.
+    $releaseLines = [System.Collections.Generic.List[string]]::new()
+    $releaseLines.Add('# Cremind Kubernetes release, written by the installer.')
+    $releaseLines.Add('# Read by install.sh / install.ps1; never sourced.')
+    $releaseLines.Add("KUBE_CONTEXT=$KubeContext")
+    $releaseLines.Add("KUBE_CONFIG_FILE=$KubeConfig")
+    $releaseLines.Add("KUBE_SERVER=$KubeServer")
+    $releaseLines.Add("KUBE_NAMESPACE=$KubeNamespace")
+    $releaseLines.Add("NAMESPACE_CREATED=$NamespaceCreated")
+    $releaseLines.Add("HELM_RELEASE=$HelmRelease")
+    $releaseLines.Add("HELM_FULLNAME=$HelmFullname")
+    $releaseLines.Add("CHART_REF=$ChartRef")
+    $releaseLines.Add("CHART_VERSION=$ChartVersion")
+    $releaseLines.Add("CREMIND_VERSION=$CremindVer")
+    $releaseLines.Add("CREMIND_UPGRADE_CHANNEL=$Channel")
+    $releaseLines.Add("DESKTOP_UI=$(if ($DesktopUi) { $DesktopUi } else { '1' })")
+    $releaseLines.Add("VNC_PASSWORD=$VncPwd")
+    $releaseLines.Add("PG_PASSWORD=$PgPassword")
+    # Named CREMIND_SSL so the previous-choice machinery above reads this file
+    # with no special case.
+    $releaseLines.Add("CREMIND_SSL=$SslMode")
+    $releaseLines.Add("APP_URL=$(if ($K8sPodAppUrl) { $K8sPodAppUrl } else { $K8sAppUrl })")
+    $releaseLines.Add("PORT_FORWARD_PORTS=$($PfPorts -join ' ')")
+    $releaseLines.Add("K8S_release_name=$K8sReleaseName")
+    $releaseLines.Add("K8S_app_url=$K8sAppUrl")
+    $releaseLines.Add("K8S_legacy_postgres_image=$K8sLegacyPostgresImage")
+    $releaseLines.Add("K8S_delete_postgres_data=$K8sDeletePostgresData")
+    $releaseLines.Add("K8S_extra_set=$K8sExtraSet")
+    Write-Utf8NoBomFile -Path $K8sReleaseEnv -Content (($releaseLines -join "`n") + "`n")
+
+    # credentials.toml - the single "how do I connect to X again?" file, same
+    # schema app/config/credentials_file.py writes.
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $novnc = if ($K8sNovncUrl) { $K8sNovncUrl } else { 'http://localhost:1515/vnc/vnc.html' }
+    $credLines = [System.Collections.Generic.List[string]]::new()
+    $credLines.Add('# Cremind service credentials and connection info.')
+    $credLines.Add('# Auto-generated by the installer.')
+    $credLines.Add('')
+    $credLines.Add("generated_at = `"$stamp`"")
+    $credLines.Add('install_mode = "kubernetes"')
+    $credLines.Add("cremind_version = `"$CremindVer`"")
+    $credLines.Add("system_dir = `"$($CremindSystemDir -replace '\\', '\\')`"")
+    $credLines.Add("install_dir = `"$($CremindInstallDir -replace '\\', '\\')`"")
+    $credLines.Add('')
+    $credLines.Add('[app]')
+    $credLines.Add("api_url = `"${UrlScheme}://localhost:1515`"")
+    $credLines.Add("spa_url = `"${UrlScheme}://localhost:1515`"")
+    $credLines.Add('api_port = 1112')
+    $credLines.Add('spa_port = 1515')
+    $credLines.Add('cors_allowed_origins = ""')
+    $credLines.Add('setup_wizard_env = "kubernetes"')
+    if ($DesktopUi -ne '0') {
+        $credLines.Add('')
+        $credLines.Add('[desktop]')
+        $credLines.Add("novnc_url = `"$novnc`"")
+        $credLines.Add('novnc_port = 6080')
+        $credLines.Add('vnc_port = 5900')
+        $credLines.Add("vnc_password = `"$VncPwd`"")
+        $credLines.Add('resolution = "1280x720"')
+    }
+    if (-not $K8sExternalPg) {
+        $credLines.Add('')
+        $credLines.Add('[postgres]')
+        $credLines.Add('deployment_mode = "external"')
+        $credLines.Add('host = "cremind-postgresql"')
+        $credLines.Add('port = 5432')
+        $credLines.Add('database = "cremind"')
+        $credLines.Add('user = "cremind"')
+        $credLines.Add("password = `"$PgPassword`"")
+        $credLines.Add('sslmode = "prefer"')
+    }
+    $credLines.Add('')
+    $credLines.Add('[kubernetes]')
+    $credLines.Add("context = `"$KubeContext`"")
+    # A TOML literal string: a Windows path is all backslashes.
+    $credLines.Add("kubeconfig = '$KubeConfig'")
+    $credLines.Add("server = `"$KubeServer`"")
+    $credLines.Add("namespace = `"$KubeNamespace`"")
+    $credLines.Add("release = `"$HelmRelease`"")
+    $credLines.Add("workload = `"$HelmFullname`"")
+    $credLines.Add("port_forward = `"$PortForwardCmd`"")
+    $K8sCredsFile = Join-Path $CremindInstallDir 'credentials.toml'
+    Write-Utf8NoBomFile -Path $K8sCredsFile -Content (($credLines -join "`n") + "`n")
+
+    # ── handoff ───────────────────────────────────────────────────────────
+    $K8sWizardUrl = "${BootScheme}://localhost:1515/#/setup"
+    if ($K8sIngress -and $K8sPodAppUrl) {
+        $K8sWizardUrl = ($K8sPodAppUrl.TrimEnd('/')) + '/#/setup'
+    }
+
+    if (-not $NoLaunch -and $PfRunning -and $K8sHealthOk) {
+        try { Start-Process $K8sWizardUrl | Out-Null } catch {}
+    }
+
+    Write-Step "Setup wizard"
+    Write-Host ''
+    Write-Host "  Open: $K8sWizardUrl" -ForegroundColor White
+    Write-Host ''
+    Write-Host '  In the Database step, leave the password blank and click Next - the chart'
+    Write-Host '  wires the PostgreSQL credentials into the pod for you.'
+    Write-Host ''
+    if ($DesktopUi -ne '0') {
+        Write-Host "  Agent desktop: $novnc"
+        Write-Host "  VNC password:  $VncPwd"
+        if ($VncGenerated) {
+            Write-Host "  (generated for this install; it is also in $K8sCredsFile)" -ForegroundColor DarkGray
+        }
+        Write-Host ''
+    }
+    Write-Host '  Port-forward:' -ForegroundColor White
+    Write-Host "    $PortForwardCmd"
+    if ($PfRunning) {
+        Write-Host "  Running in the background (pid $(Get-Content -LiteralPath $PfPidFile))." -ForegroundColor DarkGray
+        Write-Host "  Stop it with: Stop-Process -Id (Get-Content '$PfPidFile')" -ForegroundColor DarkGray
+        Write-Host '  It ends when this session does; re-run the command above to reconnect.' -ForegroundColor DarkGray
+    }
+    Write-Host ''
+    Write-Host '  Manage the release:' -ForegroundColor White
+    Write-Host "    helm status $HelmRelease $HelmTargetText -n $KubeNamespace"
+    Write-Host "    kubectl $KubectlTargetText -n $KubeNamespace logs deploy/$HelmFullname -c cremind -f"
+    Write-Host '    .\install.ps1 -Uninstall'
+    Write-Host ''
+    Write-Host "  Credentials: $K8sCredsFile"
+    Write-Host ''
+    Write-Ok "Done."
+    exit 0
 }
 
 if ($Mode -eq 'docker') {
@@ -2384,50 +3981,7 @@ not a missing image. Things that help:
     # A host that never trusted it gets a failed download and a pointer, not
     # a failed install.
     if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron' -and -not $Unattended -and $UrlScheme -eq 'https') {
-        $CaTmp = Join-Path $env:TEMP 'cremind-local-ca.pem'
-        $CaCert = $null
-        try {
-            Invoke-WebRequest -UseBasicParsing -Uri "${BootScheme}://${HealthHost}:1515/ca.pem" -OutFile $CaTmp -TimeoutSec 10 | Out-Null
-            $CaCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CaTmp)
-        } catch {
-            # No local CA (operator certificate pair → /ca.pem 404s, and there
-            # is genuinely nothing of ours to trust) or an untrusted https
-            # listener — either way the wizard step has it covered.
-            Write-Info "Skipping host CA trust ($($_.Exception.Message.Trim()))."
-        }
-        if ($CaCert) {
-            $CaStore = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
-            $CaStore.Open('ReadWrite')
-            try {
-                $found = $CaStore.Certificates.Find('FindByThumbprint', $CaCert.Thumbprint, $false)
-                if ($found.Count -gt 0) {
-                    Write-Ok "This machine already trusts the Cremind local CA."
-                } else {
-                    $CaSha256 = [System.BitConverter]::ToString(
-                        [System.Security.Cryptography.SHA256]::Create().ComputeHash($CaCert.RawData)
-                    ) -replace '-', ':'
-                    Write-Host ""
-                    Write-Host "Cremind will serve HTTPS with a certificate signed by its own local CA."
-                    Write-Host "Trusting that CA now removes the browser warning on this machine; every"
-                    Write-Host "other device gets the same walkthrough in the Setup Wizard."
-                    Write-Host "  Subject : $($CaCert.Subject)"
-                    Write-Host "  SHA-256 : $CaSha256"
-                    $TrustAnswer = Read-Host "Add it to the current user's Trusted Root store? Windows asks you to confirm. [Y/n]"
-                    if ($TrustAnswer -notmatch '^[nN]') {
-                        try {
-                            $CaStore.Add($CaCert)
-                            Write-Ok "Trusted the Cremind local CA for the current user."
-                        } catch {
-                            # Includes the user clicking No on the Windows dialog.
-                            Write-Warn2 "CA not trusted ($($_.Exception.Message.Trim())). The Setup Wizard's 'Secure this install' step shows the manual command."
-                        }
-                    } else {
-                        Write-Info "Skipped. The Setup Wizard's 'Secure this install' step covers it."
-                    }
-                }
-            } finally { $CaStore.Dispose() }
-        }
-        Remove-Item $CaTmp -ErrorAction SilentlyContinue
+        Invoke-HostCaTrust -CaUrl "${BootScheme}://${HealthHost}:1515/ca.pem"
     }
 
     # Suppress the human-handoff block when the Electron app is driving —

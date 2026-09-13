@@ -422,7 +422,7 @@ postgresql:
     # password / postgresPassword: leave unset to auto-generate into the secret.
   architecture: standalone
   # Data-volume lifecycle on `helm uninstall`. PostgreSQL is a StatefulSet, so
-  # its data PVC (`data-<release>-postgresql-0`) is created by the controller —
+  # its data PVC (`data-cremind-postgresql-0`) is created by the controller —
   # NOT Helm — and by default SURVIVES uninstall. That is the safe default: a
   # stray `helm uninstall` never destroys the database (see README
   # "Reinstalling?" and "Uninstalling and removing data"). To make uninstall

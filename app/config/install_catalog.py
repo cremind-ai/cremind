@@ -119,8 +119,96 @@ _DEFAULT_CATALOG: dict[str, Any] = {
             "label": "Native",
             "description": "Python venv at ~/.cremind/venv with embedded storage",
             "hint": "Simpler, but the agent shares your desktop and home directory.",
+            "requires": [],
             "order": 20,
         },
+        "kubernetes": {
+            "label": "Kubernetes",
+            "description": (
+                "Helm release in an existing cluster (in-cluster Postgres, "
+                "optional VNC desktop)"
+            ),
+            "hint": (
+                "Installs the cremind Helm chart into a kubeconfig context you "
+                "pick. Needs kubectl and helm on PATH."
+            ),
+            "requires": ["kubectl", "helm"],
+            "order": 30,
+        },
+    },
+    # Only asked when the install mode is kubernetes. Keys mirror
+    # install/catalog.toml's [kubernetes] table.
+    "kubernetes": {
+        "context_prompt": "Which kubeconfig context should Cremind be installed into?",
+        "context_hint": (
+            "Every helm and kubectl command runs with --kube-context set to this "
+            "choice, never the ambient current-context."
+        ),
+        "namespace_prompt": "Which namespace should the Helm release go into?",
+        "namespace_hint": (
+            "Created if it does not exist. Lowercase letters, digits and hyphens, "
+            "up to 63 characters."
+        ),
+        "namespace_default": "cremind",
+        "advanced_prompt": "Use the recommended Helm options, or customize them?",
+        "advanced_hint": (
+            "Recommended: release name cremind, app URL derived from the "
+            "port-forward, the legacy Bitnami Postgres image, Postgres data kept "
+            "on uninstall, no extra --set values."
+        ),
+        "advanced_fields": [
+            {
+                "key": "release_name",
+                "prompt": "What should the Helm release be called?",
+                "hint": (
+                    "Shown by helm list. Lowercase letters, digits and hyphens, "
+                    "up to 53 characters."
+                ),
+                "default": "cremind",
+            },
+            {
+                "key": "app_url",
+                "prompt": "What URL will you use to open Cremind in a browser?",
+                "hint": (
+                    "Leave blank to let the chart derive it from the port-forward "
+                    "(http://localhost:1515, or https:// when HTTPS is on)."
+                ),
+                "default": "",
+            },
+            {
+                "key": "legacy_postgres_image",
+                "prompt": (
+                    "Use the legacy Bitnami Postgres image "
+                    "(docker.io/bitnamilegacy/postgresql)?"
+                ),
+                "hint": (
+                    "Bitnami moved its free images to the bitnamilegacy namespace, "
+                    "so the chart's default Postgres image no longer resolves."
+                ),
+                "choices": ["yes", "no"],
+                "default": "yes",
+            },
+            {
+                "key": "delete_postgres_data",
+                "prompt": "Delete the Postgres volume when the release is uninstalled?",
+                "hint": (
+                    "no keeps the data-cremind-postgresql-0 claim after helm "
+                    "uninstall (the chart default); yes sets the retention policy "
+                    "to Delete."
+                ),
+                "choices": ["yes", "no"],
+                "default": "no",
+            },
+            {
+                "key": "extra_set",
+                "prompt": "Any extra --set values for helm?",
+                "hint": (
+                    "The value of one helm --set. Applied last, so it overrides "
+                    "the installer's own values."
+                ),
+                "default": "",
+            },
+        ],
     },
     "mode_rules": {
         "docker": {
@@ -135,9 +223,10 @@ _DEFAULT_CATALOG: dict[str, Any] = {
             "allowed_service_modes": ["docker", "native", "external"],
             "default_service_mode": "external",
         },
-        # Rule-only mode (no matching [modes] entry — set by the Helm chart via
-        # INSTALL_MODE, never user-selectable). External-only so the wizard can't
-        # pick pod-local storage. Mirrors install/catalog.toml.
+        # Also set by the Helm chart via INSTALL_MODE on the pod, whether the
+        # release came from the installer's kubernetes mode or a hand-typed
+        # helm install. External-only so the wizard can't pick pod-local
+        # storage. Mirrors install/catalog.toml.
         "kubernetes": {
             "allowed_service_modes": ["external"],
             "default_service_mode": "external",

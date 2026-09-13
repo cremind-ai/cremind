@@ -87,17 +87,85 @@ def test_active_install_mode_is_case_insensitive(monkeypatch: pytest.MonkeyPatch
 # ── Kubernetes mode ──────────────────────────────────────────────────────
 
 
-def test_kubernetes_is_a_rule_only_mode() -> None:
-    """Kubernetes must define a mode-rule (so the chart's INSTALL_MODE=kubernetes
-    constrains the wizard) but must NOT appear under [modes] — the host
-    installers list every [modes] entry as a selectable option, and offering
-    "Kubernetes" on a laptop would wrongly force Postgres-only on a desktop
-    install."""
+def test_kubernetes_mode_is_capability_gated() -> None:
+    """Kubernetes is a selectable install mode, but only where it can run.
+
+    It appears under [modes] so the install scripts and the TUI can offer it,
+    and under [mode_rules] so the chart's INSTALL_MODE=kubernetes still
+    constrains the wizard on the pod. What keeps it off a laptop is
+    ``requires``: every front-end lists a mode only when it probed and found
+    each named capability. ``native`` requires nothing, so some mode is always
+    available.
+    """
     cat = install_catalog.load_install_catalog(force_reload=True)
     assert "kubernetes" in cat["mode_rules"]
-    assert "kubernetes" not in cat["modes"], "kubernetes must not be host-selectable"
-    # Host-selectable modes stay exactly docker + native.
-    assert set(cat["modes"]) == {"docker", "native"}
+    assert "kubernetes" in cat["modes"]
+    assert set(cat["modes"]) == {"docker", "native", "kubernetes"}
+    assert cat["modes"]["kubernetes"]["requires"] == ["kubectl", "helm"]
+    assert cat["modes"]["native"].get("requires", []) == []
+    # Order is the recommendation: kubernetes must never outrank Docker.
+    assert cat["modes"]["kubernetes"]["order"] > cat["modes"]["docker"]["order"]
+    # No badge — "recommended" belongs to exactly one mode.
+    assert not cat["modes"]["kubernetes"].get("badge")
+
+
+def test_kubernetes_prompts_are_present() -> None:
+    """The kubernetes-only questions the installers and the TUI render."""
+    cat = install_catalog.load_install_catalog(force_reload=True)
+    k8s = cat["kubernetes"]
+    assert k8s["namespace_default"] == "cremind"
+    assert k8s["context_prompt"] and k8s["context_hint"]
+    fields = k8s["advanced_fields"]
+    assert [f["key"] for f in fields] == [
+        "release_name",
+        "app_url",
+        "legacy_postgres_image",
+        "delete_postgres_data",
+        "extra_set",
+    ]
+    for field in fields:
+        assert field["prompt"]
+        assert field["hint"]
+    by_key = {f["key"]: f for f in fields}
+    assert by_key["legacy_postgres_image"]["choices"] == ["yes", "no"]
+    assert by_key["legacy_postgres_image"]["default"] == "yes"
+    assert by_key["delete_postgres_data"]["default"] == "no"
+    # The shells use a non-empty release name as "advanced was answered".
+    assert by_key["release_name"]["default"] == "cremind"
+
+
+def test_default_catalog_mirrors_the_toml_skeleton() -> None:
+    """The hardcoded fallback must not drift from the shipped TOML.
+
+    ``_DEFAULT_CATALOG`` is hand-maintained and only used when the TOML cannot
+    be parsed — which is exactly when a silent disagreement would be hardest
+    to notice. Compare the structure, not the prose.
+    """
+    import tomllib
+
+    toml_cat = tomllib.loads(
+        install_catalog._CATALOG_FILE.read_text(encoding="utf-8")
+    )
+    fallback = install_catalog._DEFAULT_CATALOG
+
+    # Two tables the fallback has always left out: they carry only prompt text
+    # for the Docker sub-questions, and the dataclasses that read them supply
+    # their own defaults. Everything else must be mirrored, so a new top-level
+    # table cannot be added to the TOML without deciding about the fallback.
+    known_omissions = {"docker_desktop", "vnc_password"}
+    assert set(toml_cat) - set(fallback) == known_omissions
+    assert set(fallback) <= set(toml_cat)
+    assert set(fallback["modes"]) == set(toml_cat["modes"])
+    for mode_id, body in toml_cat["modes"].items():
+        assert fallback["modes"][mode_id].get("requires", []) == body.get(
+            "requires", []
+        ), mode_id
+        assert fallback["modes"][mode_id]["order"] == body["order"], mode_id
+    assert fallback["mode_rules"] == toml_cat["mode_rules"]
+    assert set(fallback["deployments"]) == set(toml_cat["deployments"])
+    assert [f["key"] for f in fallback["kubernetes"]["advanced_fields"]] == [
+        f["key"] for f in toml_cat["kubernetes"]["advanced_fields"]
+    ]
 
 
 def test_active_install_mode_kubernetes(monkeypatch: pytest.MonkeyPatch) -> None:

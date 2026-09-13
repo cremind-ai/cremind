@@ -82,3 +82,55 @@ def test_bash_quote_rejects_newlines() -> None:
     mod = _load_module()
     with pytest.raises(ValueError):
         mod._bash_quote("line1\nline2")
+
+
+# ── kubernetes block ──────────────────────────────────────────────────────
+
+
+def test_bash_include_renders_the_kubernetes_block() -> None:
+    """install.sh reads these variable names directly."""
+    mod = _load_module()
+    _digest, bash_text, _ps, _json, _toml, _ui = mod.build()
+
+    assert 'MODE_IDS="docker native kubernetes"' in bash_text
+    # The requirements are the visibility gate, so the shell has to see them.
+    assert 'MODE_REQUIRES_kubernetes="kubectl helm"' in bash_text
+    assert 'MODE_REQUIRES_native=""' in bash_text
+
+    assert 'K8S_NAMESPACE_DEFAULT="cremind"' in bash_text
+    assert "K8S_CONTEXT_PROMPT=" in bash_text
+    assert "K8S_ADVANCED_PROMPT=" in bash_text
+    assert (
+        'K8S_FIELD_IDS="release_name app_url legacy_postgres_image '
+        'delete_postgres_data extra_set"'
+    ) in bash_text
+    assert 'K8S_FIELD_DEFAULT_release_name="cremind"' in bash_text
+    assert 'K8S_FIELD_CHOICES_legacy_postgres_image="yes no"' in bash_text
+    assert 'K8S_FIELD_DEFAULT_delete_postgres_data="no"' in bash_text
+    # Free-text fields still emit an (empty) choices variable, so the shell's
+    # indirect lookup never reads an unset name under `set -u`.
+    assert 'K8S_FIELD_CHOICES_app_url=""' in bash_text
+
+
+def test_powershell_include_renders_the_kubernetes_block() -> None:
+    mod = _load_module()
+    _digest, _bash, ps_text, _json, _toml, _ui = mod.build()
+
+    assert "$script:ModeIds = @('docker', 'native', 'kubernetes')" in ps_text
+    assert "Requires    = @('kubectl', 'helm')" in ps_text
+    assert "$script:Kubernetes = [ordered]@{" in ps_text
+    assert "NamespaceDefault = 'cremind'" in ps_text
+    assert "AdvancedFields   = @(" in ps_text
+    assert "Key     = 'release_name'" in ps_text
+    assert "Choices = @('yes', 'no')" in ps_text
+    # Emitted even when empty: Set-StrictMode faults on a missing property.
+    assert "Choices = @()" in ps_text
+
+
+def test_renderers_tolerate_a_catalog_without_kubernetes() -> None:
+    """The generator must not require the table it renders."""
+    mod = _load_module()
+    bash_text = mod.render_bash({}, "deadbeef")
+    ps_text = mod.render_powershell({}, "deadbeef")
+    assert 'K8S_FIELD_IDS=""' in bash_text
+    assert "AdvancedFields   = @(" in ps_text
