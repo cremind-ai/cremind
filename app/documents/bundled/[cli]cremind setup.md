@@ -138,12 +138,28 @@ from **stdin**. `--json` and `--json-file` are mutually exclusive.
       "llm_provider": "anthropic",
       "llm_model": "claude-..."
     }
-  }
+  },
+  "user_config": { "memory.enabled": "true" },
+  "channel_configs": [
+    { "channel_type": "telegram", "mode": "bot", "enabled": true,
+      "config": { "bot_token": "..." } }
+  ],
+  "adopt_existing": false
 }
 ```
 
 The first profile must be named `admin`. A `profile` field is required
 either inside the JSON or via `--profile`.
+
+Three keys are easy to miss because the wizard collects them on their own steps:
+`user_config` holds per-profile settings validated against the config schema
+(an unknown key is skipped with a log line, not an error), `channel_configs` is
+a list of the same payloads `POST /api/channels` takes (a channel that fails is
+reported in `channel_errors` and does not fail the setup), and
+`adopt_existing: true` applies the payload to a profile that **already exists**
+instead of answering `409`. Adoption is admin-only, never accepted for `admin`
+itself, and mints a new token at the profile's current serial — tokens issued to
+it earlier stay valid.
 
 **`model_group.high` is what makes the profile usable.** It names the single
 model everything resolves to (`provider/model-id`); the optional `low`,
@@ -347,9 +363,10 @@ subcommands require admin auth. Make sure `CREMIND_TOKEN` belongs to an
 admin profile (`cremind me` to confirm).
 
 **`setup complete` reports `setup already complete`** — The server has
-been bootstrapped before. Either use `cremind profile create` for new
-profiles (with an existing admin token), or run `cremind setup reconfigure`
-first to allow the wizard to run again.
+been bootstrapped before. For additional profiles use `cremind profile wizard
+start <name>` (with an admin token), which walks the same steps the web wizard
+does; or run `cremind setup reconfigure` first to allow first-run setup to run
+again.
 
 **`reset-orphaned` rejected** — The recovery path only fires when the
 database is genuinely orphaned (`setup_complete=true` but no profiles).

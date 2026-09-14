@@ -2,11 +2,15 @@
 
 Three things this doc got wrong and must not lose again.
 
-First, the Developer page's configuration-file re-download shipped with no
-documentation at all. The whole point of that card is recovering a file the
-Setup Wizard hands over exactly once, so a user who lost it asks
-``documentation_search`` for it — and only the frontmatter ``description`` is
-embedded, so the retrieval intent has to live there, not just in the body.
+First, the configuration-file re-download shipped with no documentation at all.
+The whole point of that card is recovering a file the Setup Wizard hands over
+exactly once, so a user who lost it asks ``documentation_search`` for it — and
+only the frontmatter ``description`` is embedded, so the retrieval intent has to
+live there, not just in the body. The card now lives on the **Profile** page
+rather than the admin-only Developer page (the export is per-profile and its
+endpoint is scoped to the caller's own token), and ``cremind config export``
+produces the same file from the terminal — so the doc has to name both, and the
+two-scope rule that replaced "admin-only".
 
 Second, ``--json`` is a *root* flag on the `cremind` app, not an option on any
 `cremind config` subcommand: ``cremind config schema --json`` exits with
@@ -166,24 +170,56 @@ def test_the_description_carries_the_config_file_recovery_intent():
         "re-download",
         "lost my setup file",
         "recover my token",
-        "developer",
+        # Where the card lives, and the command that does the same thing.
+        "profiles",
+        "cremind config export",
     ):
         assert keyword in description, f"description never mentions {keyword!r}"
+    assert "developer" not in description, (
+        "the card moved off the Developer page — the description must not send "
+        "a user who lost their file to a page that no longer has it"
+    )
 
 
-def test_the_body_documents_what_the_developer_card_actually_ships():
+def test_the_body_documents_what_the_profile_card_actually_ships():
     text = _doc_text()
-    assert "Sidebar → Developer → Configuration File" in text, (
+    assert "Sidebar → Settings → Profiles → Configuration File" in text, (
         "the doc must name the exact path to the card"
+    )
+    assert "Sidebar → Developer → Configuration File" not in text, (
+        "the old Developer path is stale — the card moved"
     )
     assert "cremind-<profile>-config." in text, "the filename shape is missing"
     for label in ("Markdown (.md)", "JSON (.json)", "Env file (.env)"):
         assert label in text, f"format option {label!r} is not documented"
-    assert "admin-only" in text, "the admin-only gate is not documented"
-    assert "plain text" in text, "the JWT/passwords warning is missing"
-    # No CLI command produces the file, so the doc has to point at the pieces.
-    for command in ("cremind auth show", "cremind server environment"):
+    # Replaces the old "admin-only" pin: every profile may download its own
+    # file, and what differs is what is IN it.
+    assert "full file" in text and "reduced" in text, (
+        "the doc must say the admin profile gets the full file and everyone "
+        "else a reduced one"
+    )
+    assert "plain text" in text, "the JWT warning is missing"
+    assert "--format" in text and "--out" in text, (
+        "`cremind config export`'s flags are not documented"
+    )
+    assert "There is no CLI command that produces the whole file" not in text, (
+        "`cremind config export` produces it now"
+    )
+    # The whole file, and the pieces for a narrower question.
+    for command in ("cremind config export", "cremind auth show", "cremind server environment"):
         assert command in text, f"CLI equivalent {command!r} is not mentioned"
+
+
+def test_every_config_subcommand_has_a_section():
+    """A new leaf without a section is a command the agent cannot discover."""
+    from app.cli.commands.config import config_app
+
+    text = _doc_text()
+    for command in config_app.registered_commands:
+        name = command.name or (command.callback.__name__ if command.callback else "")
+        assert f"### `cremind config {name}`" in text, (
+            f"`cremind config {name}` has no '### `cremind config {name}`' section"
+        )
 
 
 def test_no_example_puts_json_after_a_config_subcommand():

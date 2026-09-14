@@ -26,6 +26,7 @@ import { storeToRefs } from 'pinia';
 import {
   completeSetup,
   checkSetupStatus,
+  fetchConfigExport,
   fetchServiceCapabilities,
   fetchInstallSecrets,
   type ServiceCapabilitiesResponse,
@@ -33,12 +34,7 @@ import {
   type TlsRuntimeStatus,
 } from '../services/configApi';
 import { tunnelCommand } from '../services/httpsReadiness';
-import {
-  assembleConfigSnapshot,
-  downloadConfigExport,
-  type ConfigExportSnapshot,
-  type ExportFormat,
-} from '../utils/configExport';
+import { downloadTextFile, type ExportFormat } from '../utils/configExport';
 import {
   openSetupProgressStream,
   type SetupLogEntry,
@@ -441,7 +437,6 @@ const isFirstSetup = ref(true);
 // the session to the new profile's own token.
 const adminToken = computed(() => settingsStore.getTokenForProfile('admin'));
 const generatedToken = ref('');
-const tokenExpiresAt = ref<string>('');
 // True once the user has triggered at least one config download on the
 // final step. ``handleFinish`` (Start Using Cremind) refuses to proceed
 // until this is set — the export bundles the only copy of the JWT plus
@@ -449,52 +444,6 @@ const tokenExpiresAt = ref<string>('');
 const configSaved = ref(false);
 const installSecrets = ref<InstallSecrets | null>(null);
 const checkingStatus = ref(true);
-
-// Web users (test/production docker installs opened in a browser) never
-// walk through the Electron-only Deployment/Mode steps, so ``installMode``
-// and ``installDeployment`` stay at their declared defaults ('native' /
-// 'local'). Sync them from the backend's authoritative install-secrets
-// response so the downloadable config export reflects the real
-// deployment instead of the unmutated form defaults.
-function reconcileInstallStateFromSecrets(secrets: InstallSecrets | null) {
-  if (!secrets || !secrets.available) return;
-  // Kubernetes folds into 'docker' here on purpose: these two refs answer
-  // "container or host process?" and "which installer questions apply?", and
-  // ``installMode`` is also posted to the Electron installer bridge, which has
-  // no Helm branch. The chart is named in the exported file instead — see
-  // ``exportDeployment``. Written out rather than left to fall through to
-  // ``secrets.deployment`` (which happens to say "docker" too) so the fold is
-  // a decision the next reader can see rather than a coincidence.
-  if (secrets.install_mode === 'kubernetes') {
-    installMode.value = 'docker';
-    return;
-  }
-  const mode = (secrets.install_mode === 'docker' || secrets.install_mode === 'native')
-    ? secrets.install_mode
-    : secrets.deployment;
-  if (mode === 'docker' || mode === 'native') installMode.value = mode;
-  // Only sync the deployment type when the ref is still its untouched
-  // default — protects the Electron installer-stage selection from being
-  // overwritten when it picked 'custom' or 'server'.
-  const env = secrets.setup_wizard_env;
-  if (
-    installDeployment.value === 'local'
-    && (env === 'local' || env === 'server' || env === 'custom')
-  ) {
-    installDeployment.value = env;
-  }
-}
-
-// What the exported config file calls this deployment. Only the export widens
-// to 'kubernetes': ``installDeployment`` stays local/server/custom because the
-// Electron installer bridge consumes it verbatim, but a file that said "local"
-// for a Helm install would describe the wrong thing to the one reader who has
-// lost the cluster.
-const exportDeployment = computed<ConfigExportSnapshot['deployment']['type']>(
-  () => (installSecrets.value?.install_mode === 'kubernetes'
-    ? 'kubernetes'
-    : installDeployment.value),
-);
 
 // The chart states the namespace and Service, so the reconnect line can be the
 // real command instead of "the same one you ran". Empty on an older chart that
@@ -1211,7 +1160,6 @@ async function handleCompleteSetup() {
 
     const result = await completeSetup(settingsStore.agentUrl, config as any, adminToken.value);
     generatedToken.value = result.token;
-    tokenExpiresAt.value = result.expires_at || '';
     restartRequired.value = Boolean(result.restart_required);
     createdChannels.value = result.channels || [];
     channelErrors.value = result.channel_errors || [];
@@ -1229,16 +1177,12 @@ async function handleCompleteSetup() {
         ?? 'native',
     };
 
-    // Fire-and-forget: the downloadable config bundle wants Docker
-    // install-time secrets (VNC password, docker-generated PG creds)
-    // that don't live in wizard state. A failure here just means the
-    // export omits the Docker section — never block setup completion
-    // on it.
+    // Fire-and-forget: the HTTPS-pivot panes name the Kubernetes Service and
+    // print the `kubectl port-forward` line that reconnects to it, and only
+    // install-secrets knows them. The configuration file no longer needs this
+    // (the server renders it), so a failure here costs one hint on one pane.
     fetchInstallSecrets(settingsStore.agentUrl, generatedToken.value)
-      .then((secrets) => {
-        installSecrets.value = secrets;
-        reconcileInstallStateFromSecrets(secrets);
-      })
+      .then((secrets) => { installSecrets.value = secrets; })
       .catch(() => { installSecrets.value = null; });
 
     // Activate the token immediately so the in-wizard pairing dialog
@@ -1386,53 +1330,47 @@ const embeddingBlocking = computed(() => {
 
 const embeddingFailed = computed(() => embeddingStatus.value === 'failed');
 
-function buildConfigSnapshot(): ConfigExportSnapshot {
-  return assembleConfigSnapshot({
-    profile: profileName.value,
-    token: generatedToken.value,
-    tokenExpiresAt: tokenExpiresAt.value,
-    agentUrl: exportAgentUrl.value,
-    agentUrlPendingHttps: Boolean(finishTls.value?.pending),
-    generatedAt: new Date().toISOString(),
-    installDeployment: exportDeployment.value,
-    installMode: installMode.value,
-    installCustomValues: installCustomValues.value,
-    installSecrets: installSecrets.value,
-    serverConfig: serverConfig.value,
-    embeddingConfig: embeddingConfig.value,
-    channels: createdChannels.value.map((ch) => ({
-      type: String((ch as any).channel_type ?? ''),
-      mode: String((ch as any).mode ?? ''),
-      id: String((ch as any).id ?? ''),
-    })),
-  });
-}
-
 async function downloadConfigFile(format: ExportFormat) {
   if (!generatedToken.value) {
     ElMessage.warning('Setup is not complete yet.');
     return;
   }
-  // handleCompleteSetup kicks off the install-secrets fetch fire-and-forget
-  // as a pre-warmer. If the user clicks Download before that resolves,
-  // installSecrets.value is still null — wait for the fetch here so the
-  // exported file contains VNC password and Docker-provisioned Postgres
-  // credentials instead of silently omitting them.
-  if (!installSecrets.value) {
+  // Rendered by the server against the token just minted, so the file names
+  // this profile and carries exactly the sections it is allowed to see.
+  // Under ``after-setup`` TLS the whole wizard runs on plain HTTP and the
+  // server is about to restart into HTTPS, so the file has to name the origin
+  // that answers *afterwards* — that is what these two parameters are for.
+  const pending = Boolean(finishTls.value?.pending);
+  try {
+    const { text, mime } = await fetchConfigExport(
+      settingsStore.agentUrl, generatedToken.value, format,
+      { agentUrl: pending ? exportAgentUrl.value : undefined, pendingHttps: pending },
+    );
+    downloadTextFile(`cremind-${profileName.value}-config.${format}`, text, mime);
+    // Recovering credentials, paths, and the JWT token without the export
+    // is painful, so we gate "Start Using Cremind" on this flag — the user
+    // must trigger at least one download before they can leave the wizard.
+    configSaved.value = true;
+  } catch (e) {
+    // The download is a network call now, and on the after-setup path the
+    // server may already be restarting. Never trap the user inside the wizard
+    // with the only copy of their JWT in a Vue ref: offer the way out, and say
+    // where the server keeps the token.
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to export configuration');
     try {
-      installSecrets.value = await fetchInstallSecrets(
-        settingsStore.agentUrl, generatedToken.value,
+      await ElMessageBox.confirm(
+        'The configuration file could not be downloaded. Your token is shown above '
+        + `and the server keeps a copy at <system dir>/tokens/${profileName.value}.token. `
+        + 'Continue without the file?',
+        'Download failed',
+        { confirmButtonText: 'Continue anyway', cancelButtonText: 'Try again', type: 'warning' },
       );
-      reconcileInstallStateFromSecrets(installSecrets.value);
+      configSaved.value = true;
     } catch {
-      installSecrets.value = null;
+      /* "Try again" — leave the gate closed. */
     }
   }
-  downloadConfigExport(format, buildConfigSnapshot(), profileName.value);
-  // Recovering credentials, paths, and the JWT token without the export
-  // is painful, so we gate "Start Using Cremind" on this flag — the user
-  // must trigger at least one download before they can leave the wizard.
-  configSaved.value = true;
+
 }
 </script>
 

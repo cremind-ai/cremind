@@ -180,7 +180,7 @@ async def get_system_environment(request: Request) -> JSONResponse:
     if denied is not None:
         return denied
 
-    from app.config.settings import BaseConfig
+    from app.config.runtime_env import deployment_custom_fields
     from app.config.timezone import resolve_tz_name
 
     return JSONResponse({
@@ -188,15 +188,9 @@ async def get_system_environment(request: Request) -> JSONResponse:
         "effective_timezone": resolve_tz_name(
             getattr(request.user, "username", "") or None
         ),
-        "deployment_custom_fields": {
-            "listen_host": BaseConfig.HOST,
-            "public_url": BaseConfig.APP_URL,
-            # The raw env string, not BaseConfig's parsed list: the export
-            # writes this back into a .env file verbatim, and the parsed form
-            # defaults to ``["*"]`` where the operator wrote nothing at all.
-            "allowed_origins": os.environ.get("CORS_ALLOWED_ORIGINS", ""),
-            "wizard_preset": os.environ.get("SETUP_WIZARD_ENV", ""),
-        },
+        # Shared with the config export (app/config/config_export.py) so the
+        # two never describe the same install differently.
+        "deployment_custom_fields": deployment_custom_fields(),
     })
 
 

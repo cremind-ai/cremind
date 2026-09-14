@@ -995,6 +995,51 @@ export async function fetchInstallSecrets(
   }
 }
 
+export type ConfigExportFormat = 'md' | 'json' | 'env';
+
+export interface ConfigExportFile {
+  text: string;
+  /** The response's own Content-Type, charset stripped. */
+  mime: string;
+}
+
+/** GET /api/config/export — this profile's configuration file, rendered by the
+ *  server.
+ *
+ *  Scoped to the bearer token: the ``admin`` profile gets every section, any
+ *  other profile gets its own identity without the install-wide database,
+ *  vector-store, desktop and Kubernetes detail.
+ *
+ *  ``opts.agentUrl`` / ``opts.pendingHttps`` name the address the file should
+ *  carry, for the Setup Wizard mid-HTTPS-pivot: the whole wizard runs on plain
+ *  HTTP and the origin in the file has to be the one that answers afterwards.
+ *
+ *  The filename is the CALLER's job. ``Content-Disposition`` is not a
+ *  CORS-exposed header (the server sets no ``expose_headers``), so in the
+ *  split-origin dev setup the SPA cannot read the name the server chose;
+ *  ``Content-Type`` is safelisted and can be. Both producers write
+ *  ``cremind-<profile>-config.<ext>``, which is what the server sends too. */
+export async function fetchConfigExport(
+  agentUrl: string,
+  token: string,
+  format: ConfigExportFormat,
+  opts: { agentUrl?: string; pendingHttps?: boolean } = {},
+): Promise<ConfigExportFile> {
+  const base = resolveBaseUrl(agentUrl);
+  const params = new URLSearchParams({ format });
+  if (opts.agentUrl) params.set('agent_url', opts.agentUrl);
+  if (opts.pendingHttps) params.set('pending_https', '1');
+  const res = await fetch(`${base}/api/config/export?${params.toString()}`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to export configuration: ${res.statusText}`);
+  }
+  const mime = (res.headers.get('content-type') ?? 'text/plain').split(';')[0].trim();
+  return { text: await res.text(), mime: mime || 'text/plain' };
+}
+
 export type EmbeddingStatus =
   | 'disabled'
   | 'initializing'
@@ -1126,35 +1171,6 @@ export async function reconfigure(
     headers: authHeaders(token),
   });
   if (!res.ok) throw new Error(`Failed to reconfigure: ${res.statusText}`);
-  return res.json();
-}
-
-// ── Server Config ──
-
-export async function getServerConfig(
-  agentUrl: string,
-  token: string
-): Promise<{ config: Record<string, string> }> {
-  const base = resolveBaseUrl(agentUrl);
-  const res = await fetch(`${base}/api/config/server`, {
-    headers: authHeaders(token),
-  });
-  if (!res.ok) throw new Error(`Failed to get server config: ${res.statusText}`);
-  return res.json();
-}
-
-export async function updateServerConfig(
-  agentUrl: string,
-  token: string,
-  config: Record<string, string>
-): Promise<{ success: boolean }> {
-  const base = resolveBaseUrl(agentUrl);
-  const res = await fetch(`${base}/api/config/server`, {
-    method: 'PUT',
-    headers: authHeaders(token),
-    body: JSON.stringify({ config }),
-  });
-  if (!res.ok) throw new Error(`Failed to update server config: ${res.statusText}`);
   return res.json();
 }
 

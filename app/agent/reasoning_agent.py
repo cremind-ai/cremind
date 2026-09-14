@@ -1248,6 +1248,11 @@ _PLAN_READONLY_CLI_GROUPS: Dict[str, frozenset] = {
     "profile agent-name": frozenset({"get"}),
     "profile instructions": frozenset({"get"}),
     "profile persona": frozenset({"get"}),
+    # ``status`` reads one local draft file (and /api/me to check who is
+    # asking). Its siblings all write: ``start``/``set``/``skip`` edit the
+    # draft, ``cancel`` deletes it, and ``finish`` creates a profile and mints
+    # a token — the very thing plan mode promises not to do while planning.
+    "profile wizard": frozenset({"status"}),
     "setup server-config": frozenset({"get"}),
 }
 

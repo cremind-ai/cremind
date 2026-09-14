@@ -235,6 +235,11 @@ _ALLOWED_CREMIND_COMMANDS = [
     "cremind calendar schedule list",
     "cremind channels groups list",
     "cremind proc autostart list",
+    # The one wizard leaf that only reads: it prints a draft's progress and the
+    # questions the next step asks, which is exactly what a planner needs to
+    # see before proposing how to finish one.
+    "cremind profile wizard status javis",
+    "cremind profile wizard status javis --step llm",
     "cremind profile persona get",
     "cremind setup server-config get",
     "cremind agents config get",
@@ -267,6 +272,18 @@ _BLOCKED_CREMIND_COMMANDS = [
     # A real nested group whose verb is not read-only.
     "cremind group members list",
     "cremind calendar google list",
+    # Every wizard leaf but `status` writes: the draft, or the profile itself.
+    "cremind profile wizard start javis",
+    "cremind profile wizard start javis --adopt",
+    "cremind profile wizard set javis llm provider=anthropic",
+    "cremind profile wizard skip javis tools",
+    "cremind profile wizard finish javis",
+    "cremind profile wizard cancel javis",
+    # `config export` writes a file that embeds a live JWT. `export` is not a
+    # read-only verb, and `--out` is a rejected option, so it is blocked twice
+    # over — pinned here because both halves are easy to undo by accident.
+    "cremind config export",
+    "cremind config export --out x",
     # An unknown flag's VALUE must not be mistaken for the command word — this
     # is `cremind tools delete abc` wearing a read-only verb as camouflage.
     "cremind tools --opt list delete abc",

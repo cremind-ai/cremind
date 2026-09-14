@@ -298,9 +298,10 @@ this release is — `CREMIND_K8S_NAMESPACE`, `CREMIND_K8S_RELEASE`,
 that one name) and `CREMIND_K8S_SERVICE_PORT`, all in the env ConfigMap — so
 **Settings > Security** prints this runbook with your real names already filled
 in, and with `cremind.appUrl` set to the HTTPS form of the address your browser
-is using, port included. The exported config file (Setup Wizard, or
-**Developer > Configuration File** afterwards) carries the names together with
-the `kubectl port-forward` command to reconnect. A chart older than these keys
+is using, port included. The **admin** profile's exported config file (Setup
+Wizard, or **Settings > Profiles > Configuration File** afterwards) carries the
+names together with the `kubectl port-forward` command to reconnect; every other
+profile's export is reduced and leaves the cluster detail out. A chart older than these keys
 still works: the pod reads its namespace off the service-account mount and
 infers the workload from its pod name, marks the answer as inferred, and leaves
 `<release>` for you to fill in after `helm list --all-namespaces`.

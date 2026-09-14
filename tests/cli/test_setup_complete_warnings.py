@@ -85,7 +85,9 @@ def _invoke(runner: CliRunner, monkeypatch, args: list[str], response: dict):
             return False
 
     import app.cli.client._base as base
-    monkeypatch.setattr(base, "Client", lambda _cfg: _FakeClient())
+    # ``**kw`` because one caller now passes ``timeout=None`` (the setup POST
+    # can pip-install features for minutes before it answers).
+    monkeypatch.setattr(base, "Client", lambda _cfg, **_kw: _FakeClient())
     assert setup_cmd is not None  # imported for the side effect of registration
 
     monkeypatch.setattr(sys, "argv", ["cremind", *args])
@@ -115,3 +117,69 @@ def test_a_clean_setup_prints_no_warning_line(runner, monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert "Warning:" not in result.output
+
+
+# ── the rest of the response ──────────────────────────────────────────────
+#
+# ``SetupResponse`` used to parse four fields and drop everything else, which
+# meant a headless caller could not learn that a channel had failed to
+# register, that a feature needed a restart, or that the server was about to
+# switch to HTTPS. The wizard's ``finish`` acts on all three.
+
+
+def test_the_whole_response_is_parsed_not_just_the_token() -> None:
+    resp = SetupResponse.from_dict({
+        "success": True,
+        "token": "t",
+        "expires_at": "2026-10-14T09:12:33Z",
+        "profile": "bobo",
+        "embedding_enabled": True,
+        "channels": [{"id": "ch_1", "channel_type": "telegram", "mode": "bot"}],
+        "channel_errors": [{"channel_type": "slack", "error": "bad token"}],
+        "restart_required": True,
+        "installed_features": ["embedding.me5"],
+        "failed_features": ["browser"],
+        "tls_pending": True,
+        "next_origin": "https://localhost:1515",
+        "restart_supported": True,
+        "tls_management": "native",
+    })
+    assert resp.channels[0]["id"] == "ch_1"
+    assert resp.channel_errors[0]["channel_type"] == "slack"
+    assert resp.restart_required is True
+    assert resp.installed_features == ("embedding.me5",)
+    assert resp.failed_features == ("browser",)
+    assert resp.tls_pending is True
+    assert resp.next_origin == "https://localhost:1515"
+
+
+def test_an_older_server_that_omits_the_new_fields_still_parses() -> None:
+    """Defaults, not KeyErrors: the CLI has to keep working against a server
+    that predates any of this."""
+    resp = SetupResponse.from_dict({"success": True, "token": "t", "profile": "bobo"})
+    assert resp.channels == ()
+    assert resp.restart_required is False
+    assert resp.next_origin == ""
+
+
+@pytest.mark.parametrize("malformed", [None, "nope", 7, [1, "two"]])
+def test_malformed_lists_degrade_to_empty_rather_than_crashing(malformed) -> None:
+    resp = SetupResponse.from_dict({
+        "success": True, "token": "t", "channels": malformed, "installed_features": malformed,
+    })
+    assert isinstance(resp.channels, tuple)
+    assert isinstance(resp.installed_features, tuple)
+
+
+def test_json_mode_now_carries_every_field(runner, monkeypatch) -> None:
+    """A superset of what it printed before, so nothing reading the old keys
+    breaks."""
+    response = {**_RESPONSE, "restart_required": True, "next_origin": "https://x"}
+    result = _invoke(runner, monkeypatch, ["--json", "setup", "complete"], response)
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["token"] == _RESPONSE["token"]
+    assert payload["warnings"] == [_WARNING]
+    assert payload["restart_required"] is True
+    assert payload["next_origin"] == "https://x"

@@ -1,5 +1,5 @@
 ---
-description: "Inspect, override, and reset **per-profile agent settings** with `cremind config schema`, `get`, `set`, and `reset`: the system timezone schedules fire in, whether the agent asks for approval before messaging channel clients (`channels.confirm_before_send`; override per client with `cremind channels set-confirm`), the reasoning-agent loop (max steps, retries, temperature, max tokens, prompt caching, reasoning-trace replay), conversation compaction, tool-result truncation, and long-term memory. Distinct from `cremind llm` (models and providers) and `cremind tools` (per-tool config). Also the home of the Setup Wizard's configuration file — re-download my config, lost my setup file, recover my token, agent URL, database and VNC details — from **Sidebar → Developer → Configuration File** as `cremind-<profile>-config.md`, `.json` or `.env`; on Kubernetes it also records the namespace, Helm release and Service, and the `kubectl port-forward` command that reconnects to the install."
+description: "Inspect, override, and reset **per-profile agent settings** with `cremind config schema`, `get`, `set`, and `reset`: the system timezone schedules fire in, whether the agent asks for approval before messaging channel clients (`channels.confirm_before_send`; override per client with `cremind channels set-confirm`), the reasoning-agent loop (max steps, retries, temperature, max tokens, prompt caching, reasoning-trace replay), conversation compaction, tool-result truncation, and long-term memory. Distinct from `cremind llm` (models and providers) and `cremind tools` (per-tool config). Also the home of the Setup Wizard's configuration file — re-download my config, lost my setup file, recover my token, agent URL, database and VNC details — from **Sidebar → Settings → Profiles → Configuration File**, or with `cremind config export`, as `cremind-<profile>-config.md`, `.json` or `.env`. Any profile may download its own; the admin profile's file also carries the database, vector-store, VNC and Kubernetes details, including the `kubectl port-forward` command that reconnects to the install."
 ---
 
 # `cremind config` — Per-Profile Settings Reference
@@ -77,7 +77,7 @@ release, the Deployment and Service, the Service port, and the port-forward
 command that reconnects to the install from your own machine. The
 wizard offers it exactly once; if you lost it, download it again from:
 
-> **Sidebar → Developer → Configuration File**
+> **Sidebar → Settings → Profiles → Configuration File**
 
 Pick a **Format** — `Markdown (.md)` (the default: secrets grouped under a
 "Sensitive" callout, with ready-to-paste connection strings), `JSON (.json)`,
@@ -86,10 +86,15 @@ or `Env file (.env)` — then click **Download**. The browser saves it as
 are read back off the running server, so the file describes the install as it
 is *now*, not as it was at setup.
 
-**It contains your JWT token and passwords in plain text** — store it somewhere
-safe and do not share it. Both the Developer page and the endpoints behind the
-card are **admin-only**: a non-admin profile is redirected away from the page,
-and a non-admin token gets a permission error instead of a file.
+**It contains your JWT token in plain text** — store it somewhere safe and do
+not share it. Every profile may download **its own** file; what is in it depends
+on who asks. The `admin` profile gets the **full file**. Every other profile gets
+a **reduced** one: its own token and expiry, the agent URL and the link to sign
+in with, where the token is kept on the server, the working and system
+directories, the deployment type and mode, whether vector embedding is on, and
+its own channels — without the database, vector-store, VNC and Kubernetes
+sections, which describe the server rather than the profile (and carry
+install-wide passwords).
 
 The Kubernetes section is only as complete as the chart that installed the pod.
 An older chart states none of the names, so the file says the identity was read
@@ -98,11 +103,12 @@ with `helm list --all-namespaces` — the Helm release is the one name nothing i
 a pod records. Upgrading the chart fills it in (see `cremind server environment`
 and its `kubernetes.source` row).
 
-There is no CLI command that produces the whole file, but every part of it is
-readable from the terminal:
+`cremind config export` writes the same file from the terminal — see its
+section below. The individual pieces are still readable on their own:
 
 ```bash
-cremind auth show           # the JWT token for this host's profile
+cremind config export       # the whole file, as the browser would download it
+cremind auth show           # just the JWT token for this host's profile
 cremind server environment  # deployment, install mode, VNC, release channel,
                             # and on Kubernetes the namespace / release /
                             # Deployment / port-forward command
@@ -122,7 +128,7 @@ cremind --json config get
 
 ## Subcommands
 
-`cremind config` has four subcommands. Each is documented below with its
+`cremind config` has five subcommands. Each is documented below with its
 purpose, syntax, and worked examples.
 
 ### `cremind config schema`
@@ -266,6 +272,47 @@ profile. The next read returns the key's declared default.
 
 ```bash
 cremind config reset agent.max_steps
+```
+
+### `cremind config export`
+
+**Purpose.** Download this profile's configuration file — the one the Setup
+Wizard hands over on its last step — rendered by the server.
+
+**Syntax.**
+
+```bash
+cremind config export [--format md|json|env] [--out <path>] [--agent-url <url>]
+cremind --json config export
+```
+
+**Flags.**
+
+| Flag             | Type   | Default | Meaning                                                                 |
+|------------------|--------|---------|-------------------------------------------------------------------------|
+| `--format`, `-f` | string | `md`    | `md` (the default), `json`, or `env`.                                   |
+| `--out`, `-o`    | string | `""`    | A file, a directory, or `-` for stdout. Default: the server's filename in the current directory. |
+| `--agent-url`    | string | `""`    | The address the file should name, when `APP_URL` is not what a browser reaches. |
+| `--pending-https`| bool   | `false` | Mark that address as the HTTPS origin that answers after a restart.     |
+
+**Behavior.** Writes `cremind-<profile>-config.<ext>` with mode `0600` (the file
+embeds a live JWT) and prints its path, the format, the size, and the scope —
+`full` for `admin`, `profile` for everyone else. With `--json`, the same fields
+as one object. The warning about the token in plain text goes to stderr.
+
+**Handing it to a user from chat.** The path this prints is under the acting
+profile's own directory, which the `system_file` tool may read: call its
+`read_file` on that path and the chat renders a Download chip. A Markdown link
+to the path will not open — file links carry no authorization header.
+
+**Example.**
+
+```bash
+$ cremind config export --format md
+path    /home/li/cremind-li-config.md
+format  md
+bytes   1843
+scope   profile
 ```
 
 ## Available config keys

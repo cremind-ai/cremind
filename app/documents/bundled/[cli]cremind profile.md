@@ -1,5 +1,5 @@
 ---
-description: "Create (make, add, register), list, inspect, and delete Cremind **profiles**, and **choose which profile the CLI acts as without setting `CREMIND_TOKEN`** — an interactive type-to-filter pick on first use, the root `--profile` flag, or `cremind profile use`, remembered per terminal. Reads and edits a profile's **persona** (who the agent is), its **standing instructions** (directives followed in every conversation) and its **agent name**. Subcommands: `use`, `which`, `clear`, `create`, `list`, `get`, `delete`, `persona get/set`, `instructions get/set`, `agent-name get/set`; there is **no rename** (create a new profile, copy these across, delete the old one). Each profile isolates its own conversations, tools and agents. Creating is **admin-only**; deleting is **self-only**, except that **admin** may delete any other profile and can never itself be deleted. `--profile` only picks an identity when no `CREMIND_TOKEN` / `--token` is set, so inside `exec_shell` pass the other profile's token with `--token` instead."
+description: "List, inspect and delete Cremind **profiles**, and **choose which profile the CLI acts as without setting `CREMIND_TOKEN`** — an interactive type-to-filter pick on first use, the root `--profile` flag, or `cremind profile use`, remembered per terminal. Reads and edits a profile's **persona** (who the agent is), its **standing instructions** (directives followed in every conversation) and its **agent name**. Subcommands: `use`, `which`, `clear`, `create`, `list`, `get`, `delete`, `persona get/set`, `instructions get/set`, `agent-name get/set`; there is **no rename**. To set up a NEW profile properly — with an LLM model, tools, channels and a login token — use `cremind profile wizard start`; plain `create` only registers an empty shell that cannot answer anything and has no token. Creating is **admin-only**; deleting is **self-only**, except that **admin** may delete any other profile and can never itself be deleted. `--profile` only picks an identity when no `CREMIND_TOKEN` / `--token` is set, so inside `exec_shell` pass the other profile's token with `--token` instead."
 ---
 
 # `cremind profile` — Profile Management & Selection
@@ -23,8 +23,13 @@ use`. An explicit `CREMIND_TOKEN` in the environment (as injected into
 cannot change who you are acting as. See *Acting as another profile*
 below for what does.
 
-The command groups together five concerns:
+The command groups together six concerns:
 
+- **Profile setup** — `wizard start/status/set/skip/finish/cancel`. The
+  step-by-step way to create a profile that actually works: an LLM model,
+  tools, memory, channels, a login token and a configuration file. Documented
+  on its own in `[cli]cremind profile wizard`; the rest of this page assumes
+  the profile already exists.
 - **Profile selection** — `use`, `which`, `clear`, plus the root
   `--profile` flag. Chooses which profile subsequent commands act as, per
   terminal.
@@ -381,6 +386,18 @@ gets the same 403 whatever name it passes.
 wizard completes for that profile, or you mint one on the server host with
 `cremind auth regenerate --local --profile <name> --yes`. Until then
 nothing can act *as* the new profile.
+
+**It also makes no model, no tools and no channels**, so the profile answers
+nothing on any surface. For a profile someone can actually use, run the wizard
+instead — or run it afterwards over the shell this command left behind:
+
+```bash
+cremind profile wizard start <profile name>            # create and set up
+cremind profile wizard start <profile name> --adopt    # set up one that exists
+```
+
+See `[cli]cremind profile wizard`. The command prints the same reminder on
+stderr, leaving stdout as just the name so it stays pipe-friendly.
 
 **Example.**
 

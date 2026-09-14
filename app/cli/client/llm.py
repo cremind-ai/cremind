@@ -24,8 +24,20 @@ async def list_llm_providers(client: Client) -> list[dict[str, Any]]:
 async def get_provider_models(
     client: Client,
     provider: str,
+    auth_method: str | None = None,
 ) -> dict[str, Any]:
-    out = await client.get_json(f"/api/llm/providers/{quote(provider, safe='')}/models")
+    """GET /api/llm/providers/{p}/models — the models this provider offers.
+
+    ``auth_method`` asks for the catalogue of the sign-in method being
+    *configured* rather than the one this profile already has stored. They
+    differ for providers whose model list depends on the credential (a
+    subscription login sees a different set from an API key), which matters
+    when validating a model the caller has not saved yet.
+    """
+    params = {"auth_method": auth_method} if auth_method else None
+    out = await client.get_json(
+        f"/api/llm/providers/{quote(provider, safe='')}/models", params=params,
+    )
     return out if isinstance(out, dict) else {}
 
 

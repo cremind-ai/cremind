@@ -131,13 +131,11 @@ def setup_complete(
     resp = asyncio.run(_run())
 
     if mode.json:
-        print_json({
-            "success": resp.success,
-            "token": resp.token,
-            "expires_at": resp.expires_at,
-            "profile": resp.profile,
-            "warnings": [dict(w) for w in resp.warnings],
-        })
+        # The whole response, not the four fields this command used to pick:
+        # channels, channel_errors, restart_required and the TLS hand-off are
+        # all things a headless caller has to act on, and a superset breaks
+        # nobody who was reading the original keys.
+        print_json(resp.to_dict())
     else:
         print_kv([
             ("profile", resp.profile),

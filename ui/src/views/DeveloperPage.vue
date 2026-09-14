@@ -13,7 +13,6 @@ import { useServerRestart } from '../composables/useServerRestart';
 import { downloadTextFile } from '../utils/configExport';
 import EnvironmentCard from '../components/developer/EnvironmentCard.vue';
 import DesktopCard from '../components/developer/DesktopCard.vue';
-import ConfigExportCard from '../components/developer/ConfigExportCard.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -389,7 +388,9 @@ watch(autoScroll, (on) => {
          other deployments a single environment read. -->
     <DesktopCard />
 
-    <ConfigExportCard />
+    <!-- The Configuration File card lives on Settings → Profiles now: the
+         export is per-profile and its endpoint is scoped to the caller's own
+         token, so every profile can download its own. -->
 
     <ElCard class="restart-card" shadow="never">
       <template #header>

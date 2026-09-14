@@ -48,14 +48,15 @@ async function copyValue(text: string, key: string) {
     <div v-else class="token-section">
       <ElAlert type="success" :closable="false" show-icon class="token-alert">
         <template #title>Setup Complete!</template>
-        Download your configuration below. The token inside is also saved at
-        <code>~/.cremind/tokens/{{ profileName }}.token</code><button
+        Download your configuration below. The token inside is also saved on the
+        server, under its system directory at
+        <code>tokens/{{ profileName }}.token</code><button
           type="button"
           class="copy-icon-btn"
           :class="{ copied: isCopied('path-alert') }"
           :title="isCopied('path-alert') ? 'Copied!' : 'Copy path'"
-          @click="copyValue(`~/.cremind/tokens/${profileName}.token`, 'path-alert')"
-        ><Icon :icon="isCopied('path-alert') ? 'mdi:check' : 'mdi:content-copy'" /></button> on the server.
+          @click="copyValue(`tokens/${profileName}.token`, 'path-alert')"
+        ><Icon :icon="isCopied('path-alert') ? 'mdi:check' : 'mdi:content-copy'" /></button> — the downloaded file names the full path.
       </ElAlert>
 
       <ElAlert
@@ -102,16 +103,18 @@ async function copyValue(text: string, key: string) {
       </div>
 
       <div class="info-box">
-        The export bundles your token, project paths, database and vector-store
-        parameters, embedding settings, channels, and the VNC password when
-        running under Docker. If you lose the token later, recover it from
-        <code>~/.cremind/tokens/{{ profileName }}.token</code><button
+        The export bundles your token, the link to sign in with, the project
+        paths, the deployment and your channels. The <code>admin</code>
+        profile's file also carries the database and vector-store parameters,
+        embedding settings, and the VNC password when running under Docker. If
+        you lose the token later, recover it from
+        <code>tokens/{{ profileName }}.token</code><button
           type="button"
           class="copy-icon-btn"
           :class="{ copied: isCopied('path-infobox') }"
           :title="isCopied('path-infobox') ? 'Copied!' : 'Copy path'"
-          @click="copyValue(`~/.cremind/tokens/${profileName}.token`, 'path-infobox')"
-        ><Icon :icon="isCopied('path-infobox') ? 'mdi:check' : 'mdi:content-copy'" /></button> on the server.
+          @click="copyValue(`tokens/${profileName}.token`, 'path-infobox')"
+        ><Icon :icon="isCopied('path-infobox') ? 'mdi:check' : 'mdi:content-copy'" /></button> under the server's system directory.
       </div>
     </div>
   </div>

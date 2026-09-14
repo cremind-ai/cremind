@@ -6,6 +6,7 @@ Mirrors `cli/cmd/config.go`. Subcommands:
   config get [<group.key>]  Show all values, or a single key
   config set <key> <value>  Set a config key for the active profile
   config reset <key>        Revert a config key to its default
+  config export             Download this profile's configuration file
 """
 
 from __future__ import annotations
@@ -173,6 +174,115 @@ def config_reset(
             await reset_user_config_key(client, key)
 
     asyncio.run(_run())
+
+
+# ── export ─────────────────────────────────────────────────────────────────
+
+@config_app.command("export")
+@graceful_errors
+def config_export(
+    ctx: typer.Context,
+    fmt: str = typer.Option(
+        "md", "--format", "-f", help="File format: md | json | env.",
+    ),
+    out: Optional[str] = typer.Option(
+        None,
+        "--out",
+        "-o",
+        help=(
+            "Where to write it: a file, a directory, or '-' for stdout. "
+            "Default: the server's filename in the current directory."
+        ),
+    ),
+    agent_url: Optional[str] = typer.Option(
+        None,
+        "--agent-url",
+        help=(
+            "The address the file should name, when this server's APP_URL is "
+            "not the one a browser uses (a split-origin dev box, a tunnel)."
+        ),
+    ),
+    pending_https: bool = typer.Option(
+        False,
+        "--pending-https",
+        help="Mark the agent URL as the HTTPS origin that answers after a restart.",
+    ),
+) -> None:
+    """Download this profile's configuration file.
+
+    The file the Setup Wizard hands over on its last step, re-rendered from the
+    running server: the JWT token and its expiry, the agent URL and the login
+    link, where the token is kept on the server, the project paths, the
+    deployment, whether embedding is on, and this profile's channels. Run as
+    ``admin`` it also carries the database, vector-store, VNC and Kubernetes
+    details, which describe the install rather than the profile.
+    """
+    import asyncio
+    import os
+    from pathlib import Path
+
+    from app.cli.client._base import Client
+    from app.cli.client.config import export_config
+    from app.cli.config import Config
+    from app.cli.output import OutputMode, print_json, print_kv
+
+    cfg: Config = ctx.obj["cfg"]
+    mode: OutputMode = ctx.obj["mode"]
+    cfg.require_token()
+
+    fmt = fmt.strip().lower()
+    if fmt not in ("md", "json", "env"):
+        typer.echo(f"unknown --format {fmt!r}: use md, json or env", err=True)
+        raise typer.Exit(code=2)
+
+    async def _run():
+        async with Client(cfg) as client:
+            return await export_config(
+                client, fmt, agent_url=agent_url, pending_https=pending_https,
+            )
+
+    export = asyncio.run(_run())
+
+    if out == "-":
+        sys.stdout.buffer.write(export.content)
+        sys.stdout.buffer.flush()
+        return
+
+    target = Path.cwd() / export.filename if out is None else Path(out)
+    if target.is_dir():
+        target = target / export.filename
+    # 0600: the file embeds a live JWT, so it gets the same treatment as the
+    # token file itself (app/auth/tokens.py). A no-op on Windows, as there.
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, export.content)
+    finally:
+        os.close(fd)
+
+    resolved = str(target.resolve()).replace(os.sep, "/")
+    if mode.json:
+        print_json({
+            "path": resolved,
+            "filename": export.filename,
+            "format": fmt,
+            "bytes": len(export.content),
+            "scope": export.scope,
+        })
+    else:
+        print_kv([
+            ("path", resolved),
+            ("format", fmt),
+            ("bytes", str(len(export.content))),
+            ("scope", export.scope),
+        ])
+    sys.stderr.write(
+        "Contains your JWT token in plain text — keep it private.\n"
+    )
+    if export.scope == "profile":
+        sys.stderr.write(
+            "Reduced per-profile file: the database, vector-store, desktop and "
+            "Kubernetes sections are only in the admin profile's export.\n"
+        )
 
 
 def _coerce_config_value(s: str) -> Any:

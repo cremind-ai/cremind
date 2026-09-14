@@ -975,6 +975,32 @@ def describe_runtime_environment() -> dict:
     return described
 
 
+def deployment_custom_fields() -> dict[str, str]:
+    """The four advanced fields the installer asks for on a ``custom`` deployment.
+
+    Mirrors ``install/catalog.toml`` so the configuration file can re-render the
+    Setup Wizard's answers long after setup, when the wizard's own state is
+    gone. Shared by ``/api/system/environment`` and the config export so the
+    two can never describe the same install differently.
+
+    Every value is read live: ``APP_URL`` is reassigned by an HTTPS switch, and
+    the two environment variables are what the installer wrote, not a parsed
+    form of them — the export writes them straight back into a ``.env``.
+    """
+    import os
+
+    from app.config.settings import BaseConfig
+
+    return {
+        "listen_host": BaseConfig.HOST,
+        "public_url": BaseConfig.APP_URL,
+        # The raw env string, not BaseConfig's parsed list: the parsed form
+        # defaults to ``["*"]`` where the operator wrote nothing at all.
+        "allowed_origins": os.environ.get("CORS_ALLOWED_ORIGINS", ""),
+        "wizard_preset": os.environ.get("SETUP_WIZARD_ENV", ""),
+    }
+
+
 def _clear_description_caches() -> None:
     """Reset every cache the description is assembled from, not just its own.
 

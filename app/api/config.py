@@ -11,7 +11,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from app.api._auth import require_admin
+from app.api._auth import is_admin, require_admin, require_auth
 from app.config.bootstrap import write_bootstrap
 from app.config.settings import (
     BaseConfig,
@@ -838,6 +838,12 @@ def get_config_routes(state: BootedState) -> list[Route]:
         - server_config: dict of server settings (first setup only)
         - llm_config: dict of LLM settings
         - tool_configs: dict of {tool_name: {key: value}}
+        - user_config: dict of per-profile settings (e.g. {"memory.enabled": "true"})
+        - channel_configs: list of channel payloads (same shape as POST /api/channels)
+        - adopt_existing: bool — apply the payload to a profile that already
+          exists instead of answering 409. Non-first setup only, never for
+          ``admin``; a new token is minted at the profile's current serial, so
+          tokens issued to it earlier stay valid.
         """
         # In deferred-storage mode (no ``bootstrap.toml`` yet), this is a
         # first-setup by definition — there is no DB to ask. Once storage
@@ -874,6 +880,34 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 status_code=400,
             )
 
+        # ── Adoption ─────────────────────────────────────────────────────
+        # Apply this payload to a profile that already exists, instead of the
+        # 409 below. It is how a profile created bare — ``POST /api/profiles`` /
+        # ``cremind profile create``, which mints no token and configures
+        # nothing — gets an LLM, tools, channels and a token without being
+        # deleted and recreated. Meaningless on first setup, where the 409 is
+        # unreachable anyway.
+        raw_adopt = body.get("adopt_existing")
+        adopt_existing = (not is_first_setup) and (
+            raw_adopt is True or str(raw_adopt or "").strip().lower() in ("true", "1")
+        )
+        # Never ``admin``. This endpoint is reachable from the admin agent's own
+        # shell (exec_shell injects its token), so a prompt-injected payload
+        # could otherwise re-run setup over the administering profile: rewrite
+        # its LLM and tool config and mint a fresh token into
+        # ``tokens/admin.token``. Re-running first-run setup is what Settings →
+        # Reconfigure is for, and it is a deliberate, human action.
+        if adopt_existing and profile_name == "admin":
+            return JSONResponse(
+                {
+                    "error": (
+                        "The admin profile cannot be adopted. Re-run its setup from "
+                        "Settings → Profiles → Reconfigure (or `cremind setup reconfigure`)."
+                    )
+                },
+                status_code=400,
+            )
+
         # Non-fatal problems with a setup that otherwise succeeded, returned to
         # the caller so a headless client can act on what the wizard's live log
         # shows a human. Kept as a list of coded entries rather than another
@@ -881,12 +915,31 @@ def get_config_routes(state: BootedState) -> list[Route]:
         # went that way and the response is crowded enough.
         setup_warnings: list[dict[str, str]] = []
 
+        # Advisory only — the authoritative check runs against the resolved
+        # storage handles further down, once the deferred boot has had its
+        # chance. Asking early matters because the feature pip-install below can
+        # run for minutes: without this, a plain "profile already exists" answer
+        # would arrive after all of it.
+        adopted = False
+        if not is_first_setup and state.storage_ready and state.conversation_storage is not None:
+            exists_now = await state.conversation_storage.profile_exists(profile_name)
+            if exists_now and not adopt_existing:
+                return JSONResponse(
+                    {"error": f"Profile '{profile_name}' already exists"},
+                    status_code=409,
+                )
+            adopted = exists_now
+
         _emit_setup(
             "start",
             (
                 f"Starting setup for profile {profile_name!r}…"
                 if is_first_setup
-                else f"Creating profile {profile_name!r}…"
+                else (
+                    f"Configuring existing profile {profile_name!r}…"
+                    if adopted
+                    else f"Creating profile {profile_name!r}…"
+                )
             ),
         )
 
@@ -1093,16 +1146,44 @@ def get_config_routes(state: BootedState) -> list[Route]:
         registry = state.registry
         on_first_setup = state.on_first_setup
 
-        # For subsequent profiles, check the profile doesn't already exist
+        # For subsequent profiles, check the profile doesn't already exist —
+        # unless the caller asked to adopt it (see the flag above).
         if not is_first_setup:
-            if await conversation_storage.profile_exists(profile_name):
+            adopted = await conversation_storage.profile_exists(profile_name)
+            if adopted and not adopt_existing:
                 return JSONResponse(
                     {"error": f"Profile '{profile_name}' already exists"},
                     status_code=409,
                 )
 
-        # Create the profile first (needed for FK constraints on llm_config / tool_configs)
-        _emit_setup("profile", f"Creating profile {profile_name!r}…")
+        # Create the profile first (needed for FK constraints on llm_config /
+        # tool_configs). Adoption relies on every step from here being
+        # idempotent, and each one is: the create below is guarded,
+        # ``ensure_persona_file`` returns early on an existing file,
+        # ``initialize_profile_skills`` is the same sync that runs on every
+        # boot, and ``on_profile_created`` skips tool rows that already exist.
+        #
+        # What adoption is NOT is a revocation. The token below is minted at the
+        # profile's CURRENT serial, so tokens issued to it earlier keep working;
+        # only ``tokens/<profile>.token`` is overwritten with the new one.
+        # Rotating (and thereby invalidating the old ones) stays an explicit
+        # ``cremind auth regenerate``.
+        if adopted:
+            _emit_setup(
+                "profile",
+                f"Adopting existing profile {profile_name!r} (tokens issued earlier stay valid)…",
+                level="warning",
+            )
+            setup_warnings.append({
+                "code": "adopted_existing",
+                "message": (
+                    f"Profile '{profile_name}' already existed; this configuration was "
+                    "applied on top of it and a new token was minted. Tokens issued to "
+                    "it earlier remain valid."
+                ),
+            })
+        else:
+            _emit_setup("profile", f"Creating profile {profile_name!r}…")
         if not await conversation_storage.profile_exists(profile_name):
             await conversation_storage.create_profile(profile_name)
 
@@ -1511,9 +1592,9 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 # Settings.
                 "failed_features": failed_features,
                 # Non-fatal problems with a setup that still succeeded, each
-                # ``{code, message}``. Today the only code is
-                # ``no_main_model``; clients should render whatever arrives
-                # rather than switching on the codes they know.
+                # ``{code, message}``. Today the codes are ``no_main_model``
+                # and ``adopted_existing``; clients should render whatever
+                # arrives rather than switching on the codes they know.
                 "warnings": setup_warnings,
                 # HTTPS hand-off (CREMIND_SSL=after-setup). Deliberately not
                 # folded into ``restart_required`` above — that one means
@@ -1777,14 +1858,29 @@ def get_config_routes(state: BootedState) -> list[Route]:
         return JSONResponse({"channels": load_all_channel_catalogs()})
 
     async def handle_get_server_config(request: Request) -> JSONResponse:
-        """Get server configuration (non-secret values). Requires auth."""
+        """Get server configuration (non-secret values). Admin only.
+
+        The gate is new, and the docstring claiming it predates it: these two
+        handlers were the only ones in this module with no check at all, because
+        the JWT middleware populates ``request.user`` without rejecting anyone.
+        What they return — vector-store hosts, Chroma paths, the working
+        directory — is deployment detail, the same rationale
+        ``/api/system/environment`` gives for its own admin gate. The per-profile
+        settings every profile may read live on ``/api/config/user``.
+        """
+        denied = require_admin(request)
+        if denied is not None:
+            return denied
         if gate := _require_storage():
             return gate
         config = state.config_storage.get_all("server_config", include_secrets=False)
         return JSONResponse({"config": config})
 
     async def handle_update_server_config(request: Request) -> JSONResponse:
-        """Update server configuration. Requires auth (admin only)."""
+        """Update server configuration. Admin only."""
+        denied = require_admin(request)
+        if denied is not None:
+            return denied
         if gate := _require_storage():
             return gate
         try:
@@ -1832,163 +1928,194 @@ def get_config_routes(state: BootedState) -> list[Route]:
 
         ``deployment`` answers "container or host process", not "which
         orchestrator": a Kubernetes pod reports ``docker`` here on purpose.
-        The Setup Wizard's ``installMode`` ref and
-        ``ui/src/utils/configExport.ts`` both branch on that value to decide
-        whether the exported config file has a container shape at all, and
-        widening it to a third word would silently drop the container block on
-        every pod. ``install_mode`` beside it still says ``kubernetes``, which
-        is what a caller asking about the orchestrator must read.
+        ``app/config/config_export.py`` branches on that value to decide whether
+        the exported config file has a container shape at all, and widening it
+        to a third word would silently drop the container block on every pod.
+        ``install_mode`` beside it still says ``kubernetes``, which is what a
+        caller asking about the orchestrator must read.
 
         The ``kubernetes`` and ``vnc`` blocks are the same ones
-        ``/api/system/environment`` publishes, repeated here because the Setup
-        Wizard never calls that endpoint - it runs before an admin token
-        exists, reads install-secrets once and writes the whole config file
-        from it. One shape, two doors.
+        ``/api/system/environment`` publishes. The body lives in
+        ``app.config.config_export.gather_install_secrets`` because the
+        configuration-file renderer needs exactly this dict, and two copies of
+        a three-source priority chain would drift.
         """
-        import os
-
-        from app.config import runtime_env
-        from app.config.bootstrap import read_bootstrap
-        from app.config.credentials_file import parse_docker_env
+        from app.config.config_export import gather_install_secrets
 
         denied = require_admin(request)
         if denied is not None:
             return denied
 
-        compose_env_file = os.environ.get("CREMIND_COMPOSE_ENV_FILE", "").strip()
-        compose_env_path = Path(compose_env_file) if compose_env_file else None
-        docker_env_host = Path(BaseConfig.CREMIND_INSTALL_DIR) / "docker" / ".env"
-        bootstrap_path = Path(BaseConfig.CREMIND_SYSTEM_DIR) / "bootstrap.toml"
+        try:
+            return JSONResponse(gather_install_secrets())
+        except OSError as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
 
-        # File-based fallback for keys not promoted to container env vars.
-        # Pick the first source that exists; both parsers return {} for
-        # missing files, so a non-existent path is safe.
-        file_parsed: dict[str, str] = {}
-        for candidate in (compose_env_path, docker_env_host):
-            if candidate is not None and candidate.exists():
-                try:
-                    file_parsed = parse_docker_env(candidate)
-                except OSError as e:
-                    return JSONResponse(
-                        {"error": f"Failed to read docker env file {candidate}: {e}"},
-                        status_code=500,
-                    )
-                break
+    async def handle_config_export(request: Request):
+        """Render this profile's configuration file. Any authenticated profile.
 
-        def _runtime(key: str) -> str | None:
-            """Priority chain for any docker-runtime KEY: env var → file."""
-            val = os.environ.get(key, "").strip()
-            if val:
-                return val
-            val = file_parsed.get(key, "").strip()
-            if val:
-                # parse_docker_env already drops __PLACEHOLDER__ values.
-                return val
-            return None
+        The file the Setup Wizard hands over on its last step, rebuilt from the
+        running server: token, expiry, agent URL, the login link, where the
+        token is kept, the project directories, the deployment shape, whether
+        embedding is on, and the caller's own channels. For ``admin`` it also
+        carries the install-wide sections — database, vector store, the VNC
+        password on a desktop container install, and the Kubernetes identity
+        with the ``kubectl port-forward`` line that reconnects to it.
 
-        def _runtime_int(key: str, default: int) -> int:
-            raw = _runtime(key)
-            try:
-                return int(raw) if raw is not None else default
-            except (TypeError, ValueError):
-                return default
+        Scoped to the bearer token, never to a ``?profile=``: the file embeds a
+        live JWT, and the only one this handler can legitimately hand out is the
+        one it was called with.
 
-        # The mode this process really runs under, falling back to whatever the
-        # compose ``.env`` on the host says when nothing here can tell (the
-        # Electron app calls this endpoint from outside the container). Reading
-        # the variable alone reported a container whose environment claimed
-        # ``INSTALL_MODE=native`` as a native install, in the one payload the
-        # Developer page's config export and the wizard's mode seed are built
-        # from. See ``app.config.tls_managed_env.resolve_install_mode``.
-        from app.config.tls_managed_env import effective_install_mode
+        ``?agent_url=`` overrides the address the file names, and
+        ``?pending_https=1`` marks it as the origin that starts answering after
+        a restart. Both exist for callers that know better than this process
+        does: the Setup Wizard mid-HTTPS-pivot, and the CLI on a split-origin
+        dev box where ``APP_URL`` names a port the browser never sees.
+        """
+        import time
+        from urllib.parse import urlsplit
 
-        install_mode = effective_install_mode() or (_runtime("INSTALL_MODE") or "").lower()
-        vnc_password = _runtime("VNC_PASSWORD")
-        # ``kubernetes`` belongs in here beside ``docker``. It used to be
-        # missing, and the only Kubernetes signal left was VNC_PASSWORD - which
-        # the chart writes only when ``desktop.enabled`` is true. So a pod
-        # running the basic image reported ``deployment: native`` with
-        # app_url, install_mode, the ports and every other container field
-        # ``None``, while INSTALL_MODE=kubernetes sat right there in its own
-        # environment and the wizard's config export came out empty.
-        is_container = (
-            install_mode in ("docker", "kubernetes")
-            or compose_env_path is not None
-            or docker_env_host.exists()
-            or bool(vnc_password)
+        from starlette.responses import Response
+
+        from app.auth import verify_token
+        from app.config.config_export import (
+            EXPORT_FORMATS,
+            EXPORT_MIME,
+            ConfigSnapshotSources,
+            assemble_config_snapshot,
+            export_filename,
+            gather_install_secrets,
+            render,
+        )
+        from app.config.runtime_env import (
+            deployment_custom_fields,
+            describe_runtime_environment,
+        )
+        from app.config.settings import get_user_working_directory
+        from app.config.tls_mode import (
+            current_tls_facts,
+            https_origin_from_app_url,
+            public_app_url,
         )
 
-        if not is_container and not bootstrap_path.exists():
-            return JSONResponse({"deployment": "native", "available": False})
+        # Auth before storage: a caller with no token must hear 401, not learn
+        # from a 503 that this server exists but hasn't been set up.
+        denied = require_auth(request)
+        if denied is not None:
+            return denied
+        if gate := _require_storage():
+            return gate
 
-        bootstrap = read_bootstrap()
-        pg_bootstrap = bootstrap.get("postgres") or {}
-        has_postgres = bootstrap.get("db_provider") == "postgres"
+        fmt = (request.query_params.get("format") or "md").strip().lower()
+        if fmt not in EXPORT_FORMATS:
+            return JSONResponse(
+                {"error": f"Unknown format {fmt!r}. Use one of: {', '.join(EXPORT_FORMATS)}"},
+                status_code=400,
+            )
 
-        def _pg(field: str, env_key: str):
-            """Prefer bootstrap.toml for Postgres; fall back to docker env."""
-            if has_postgres:
-                val = pg_bootstrap.get(field)
-                if val not in (None, ""):
-                    return val
-            return file_parsed.get(env_key) or None
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse({"error": "Invalid authorization header"}, status_code=401)
+        claims = verify_token(auth_header.split("Bearer ", 1)[1])
+        if claims is None:
+            return JSONResponse({"error": "Invalid token"}, status_code=401)
+        token = auth_header.split("Bearer ", 1)[1]
+        profile = getattr(request.user, "username", "") or str(claims.get("profile") or "")
+        exp = claims.get("exp")
+        token_expires_at = (
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(exp)))
+            if isinstance(exp, (int, float)) else ""
+        )
 
-        deployment = "docker" if is_container else "native"
+        # ── which address the file names ──
+        requested_url = (request.query_params.get("agent_url") or "").strip()
+        pending_https = (request.query_params.get("pending_https") or "").strip().lower() in (
+            "1", "true", "yes",
+        )
+        tls = current_tls_facts()
+        if requested_url:
+            split = urlsplit(requested_url)
+            if split.scheme not in ("http", "https") or not split.hostname:
+                return JSONResponse(
+                    {"error": "agent_url must be an absolute http(s) URL"}, status_code=400,
+                )
+            agent_url = requested_url.rstrip("/")
+        elif tls.pending_https:
+            # Same rule as the setup response's ``next_origin``: the Host header
+            # is the address this client actually reached, which survives a
+            # port-forward that a configured APP_URL would get wrong.
+            host = request.headers.get("host", "")
+            agent_url = f"https://{host}" if host else https_origin_from_app_url(BaseConfig.APP_URL)
+            pending_https = True
+        else:
+            agent_url = public_app_url(fallback=request.headers.get("origin", ""))
 
-        return JSONResponse(
-            {
-                # "container" or "host process" - a Kubernetes pod says
-                # ``docker`` here; see the docstring.
-                "deployment": deployment,
-                "available": True,
-                # Container runtime block: populated only when we detect a
-                # container runtime. Values are None on native installs.
-                "vnc_password": vnc_password,
-                "app_url": _runtime("APP_URL") if is_container else None,
-                "resolution": _runtime("RESOLUTION") if is_container else None,
-                "install_mode": install_mode or None,
-                "cors_allowed_origins": _runtime("CORS_ALLOWED_ORIGINS") if is_container else None,
-                "setup_wizard_env": _runtime("SETUP_WIZARD_ENV") if is_container else None,
-                "api_port": _runtime_int("API_PORT", 1112) if is_container else None,
-                "spa_port": _runtime_int("SPA_PORT", 1515) if is_container else None,
-                "novnc_port": _runtime_int("NOVNC_PORT", 6080) if is_container else None,
-                "vnc_port": _runtime_int("VNC_PORT", 5900) if is_container else None,
-                # Where noVNC actually answers, when the deployment knows and
-                # the client cannot work it out. On Kubernetes that depends on
-                # whether the nginx sidecar is fronting it (/vnc/ on the app
-                # origin) or bypassed because the app terminates TLS itself
-                # (its own Service port) — a distinction invisible from the
-                # browser, so the chart states it.
-                "novnc_url": _runtime("CREMIND_NOVNC_URL"),
-                # Which namespace, Helm release and Deployment/Service this pod
-                # is, so the exported config file can carry the ``kubectl
-                # port-forward`` line that reconnects to it. ``None`` off
-                # Kubernetes - and asked for with an explicit mode rather than
-                # letting the function re-detect, because ``install_mode`` here
-                # is the one this handler resolved from its own three sources.
-                "kubernetes": (
-                    runtime_env.kubernetes_identity("kubernetes")
-                    if install_mode == "kubernetes"
-                    else None
-                ),
-                # How the VNC desktop is reached (and what it takes to get
-                # there). The full descriptor, not the public subset the
-                # unauthenticated tray endpoint gets: this response is
-                # admin-only and already carries the VNC password.
-                "vnc": runtime_env.describe_runtime_environment()["vnc"],
-                # Postgres block — populated from bootstrap.toml when the user
-                # picked Postgres in the wizard. ``db_provider`` states which
-                # backend was chosen even when it is SQLite, because the
-                # post-setup config re-download has no other way to name it.
-                "db_provider": bootstrap.get("db_provider"),
-                "pg_host": _pg("host", "") if has_postgres else None,
-                "pg_port": int(pg_bootstrap["port"]) if has_postgres and pg_bootstrap.get("port") else None,
-                "pg_user": _pg("user", "PG_USER"),
-                "pg_password": _pg("password", "PG_PASSWORD"),
-                "pg_database": _pg("database", "PG_DATABASE"),
-                "pg_sslmode": _pg("sslmode", "") if has_postgres else None,
-                "pg_deployment_mode": (pg_bootstrap.get("deployment_mode") if has_postgres else None) or None,
-            }
+        full = is_admin(request)
+        environment = describe_runtime_environment()
+        install_secrets = None
+        custom_values: dict[str, str] = {}
+        db_provider = "sqlite"
+        if full:
+            try:
+                install_secrets = gather_install_secrets()
+            except OSError as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+            custom_values = deployment_custom_fields()
+            from app.config.bootstrap import read_bootstrap
+
+            db_provider = str(read_bootstrap().get("db_provider") or "sqlite")
+
+        from app.lib.embedding_lifecycle import read_embedding_config
+
+        embedding_config = read_embedding_config(state.config_storage)
+
+        rows = await state.conversation_storage.list_channels(profile)
+        channels = [
+            {"type": r.get("channel_type"), "mode": r.get("mode"), "id": r.get("id")}
+            for r in rows
+            # The implicit ``main`` channel is an internal row, hidden by
+            # GET /api/channels for the same reason.
+            if r.get("channel_type") != "main"
+        ]
+
+        # Forward slashes, resolved — the same normalisation ``GET /api/me``
+        # applies. A path the file tells someone to look at should not be half
+        # one separator and half the other just because it was joined here.
+        def _path(value: str) -> str:
+            return os.path.realpath(value).replace(os.sep, "/")
+
+        content = render(fmt, assemble_config_snapshot(ConfigSnapshotSources(
+            profile=profile,
+            token=token,
+            token_expires_at=token_expires_at,
+            agent_url=agent_url,
+            agent_url_pending_https=pending_https,
+            generated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            install_deployment=str(environment.get("deployment") or "local"),
+            install_mode=str(environment.get("install_mode") or "native"),
+            install_custom_values=custom_values,
+            install_secrets=install_secrets,
+            db_provider=db_provider,
+            user_working_dir=_path(get_user_working_directory()),
+            system_dir=_path(BaseConfig.CREMIND_SYSTEM_DIR),
+            sqlite_db_path=_path(BaseConfig.SQLITE_DB_PATH),
+            embedding_config=embedding_config,
+            channels=channels,
+            full=full,
+        )))
+
+        return Response(
+            content,
+            media_type=EXPORT_MIME[fmt],
+            headers={
+                "Content-Disposition": f'attachment; filename="{export_filename(profile, fmt)}"',
+                # It holds a live JWT: never let a proxy keep a copy.
+                "Cache-Control": "no-store",
+                # Lets a client say "reduced file" without parsing the body.
+                # Not readable cross-origin (no CORS expose_headers), which is
+                # why neither the SPA nor the CLI depends on it for correctness.
+                "X-Cremind-Export-Scope": "full" if full else "profile",
+            },
         )
 
     return [
@@ -2005,6 +2132,7 @@ def get_config_routes(state: BootedState) -> list[Route]:
         Route("/api/config/server", handle_get_server_config, methods=["GET"]),
         Route("/api/config/server", handle_update_server_config, methods=["PUT"]),
         Route("/api/config/install-secrets", handle_install_secrets, methods=["GET"]),
+        Route("/api/config/export", handle_config_export, methods=["GET"]),
         Route("/api/config/embedding", handle_get_embedding_config, methods=["GET"]),
         Route("/api/config/embedding", handle_put_embedding_config, methods=["PUT"]),
         Route("/api/config/reconfigure", handle_reconfigure, methods=["POST"]),

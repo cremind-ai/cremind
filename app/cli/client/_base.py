@@ -38,16 +38,21 @@ class Client:
     * `_http` — 60s timeout, used for every request/response round-trip.
     * `_stream_http` — no timeout, used for SSE (`stream`) and any other
       long-lived response body. Cancellation flows via the asyncio task.
+
+    `timeout` overrides the first of those. `None` means "wait indefinitely",
+    which one caller needs: `POST /api/config/setup` pip-installs whatever
+    optional features the payload implies *inside the request*, so a profile
+    whose tools need packages can take minutes to create.
     """
 
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, *, timeout: Optional[float] = 60.0) -> None:
         self._cfg = cfg
         headers: dict[str, str] = {}
         if cfg.token:
             headers["Authorization"] = f"Bearer {cfg.token}"
         self._http = httpx.AsyncClient(
             base_url=cfg.server,
-            timeout=60.0,
+            timeout=timeout,
             headers=headers,
         )
         self._stream_http = httpx.AsyncClient(
@@ -123,6 +128,24 @@ class Client:
         if not resp.content:
             return None
         return resp.json()
+
+    async def get_bytes(
+        self,
+        path: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+    ) -> tuple[bytes, dict[str, str]]:
+        """GET returning `(body, lowercased headers)`.
+
+        Distinct from `download`, which streams into a sink and hides the
+        response headers: for a rendered file the server states the filename in
+        `Content-Disposition`, so the caller has to see them. Reads the whole
+        body into memory, which is right for a config file of a few KB and
+        wrong for anything large — that is what `download` is for.
+        """
+        resp = await self._http.get(path, params=params)
+        self._check_response(resp)
+        return resp.content, {k.lower(): v for k, v in resp.headers.items()}
 
     async def get_json_status(
         self,

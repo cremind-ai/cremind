@@ -11,6 +11,7 @@ from typing import Optional
 import typer
 
 from app.cli.commands._helpers import graceful_errors
+from app.cli.commands.profile_wizard import wizard_app
 
 
 profile_app = typer.Typer(
@@ -36,6 +37,9 @@ agent_name_app = typer.Typer(
 profile_app.add_typer(persona_app, name="persona")
 profile_app.add_typer(instructions_app, name="instructions")
 profile_app.add_typer(agent_name_app, name="agent-name")
+# Its own module: the wizard carries a draft store, a step grammar and catalog
+# validation, where everything else here is one call per command.
+profile_app.add_typer(wizard_app, name="wizard")
 
 
 @profile_app.command("list")
@@ -181,6 +185,15 @@ def profile_create(
 
     asyncio.run(_run())
     sys.stdout.write(f"{name}\n")
+    # stdout stays pipe-clean (the name alone); the advice goes to stderr.
+    # What this command makes is a shell: no LLM, no tools, no channels and no
+    # token, so nothing can act as it and it answers nothing. Most callers
+    # asking for "a new profile" want the wizard instead.
+    sys.stderr.write(
+        f"Created a bare profile: '{name}' has no LLM, tools, memory or channels, "
+        "and no token yet.\n"
+        f"Set it up and mint its token: cremind profile wizard start {name} --adopt\n"
+    )
 
 
 @profile_app.command("delete")

@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router';
 import { ElInput, ElButton, ElMessage, ElTable, ElTableColumn, ElPopconfirm, ElAlert, ElDialog, ElCheckbox, ElCheckboxGroup } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
+import ConfigExportCard from '../components/profile/ConfigExportCard.vue';
 import { listProfiles, deleteProfile, reconfigure, getPersona, updatePersona, getInstructions, updateInstructions, getAgentName, setAgentName } from '../services/configApi';
 import { cleanProfileData, CLEAN_GROUPS, type CleanScope } from '../services/cleanApi';
 
@@ -331,6 +332,21 @@ function goBack() { router.push(`/${props.profile}/settings`); }
         <ElButton type="primary" :loading="savingInstructions" @click="saveInstructions" style="margin-top: 12px;">
           <Icon icon="mdi:content-save" style="margin-right: 6px;" /> Save
         </ElButton>
+      </div>
+
+      <!-- Configuration File — the signed-in profile's own file. The JWT inside
+           it is the token this browser holds, so it is gated on isOwnProfile
+           exactly like the Danger Zone below: viewing someone else's profile
+           page must not hand you a file containing your own credentials under
+           their name. -->
+      <div class="section">
+        <h2 class="section-title">
+          <Icon icon="mdi:file-key-outline" class="section-icon" /> Configuration File
+        </h2>
+        <div v-if="!isOwnProfile" class="loading-state">
+          Sign in as “{{ props.profile }}” to download this profile's configuration file.
+        </div>
+        <ConfigExportCard v-else />
       </div>
 
       <!-- Create Profile — admin only. This form never calls POST /api/profiles:

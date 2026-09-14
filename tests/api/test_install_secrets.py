@@ -482,7 +482,8 @@ def test_kubernetes_basic_image_is_a_container_install(
 
     assert body["available"] is True
     # "container or host process" — a pod answers ``docker`` on purpose; the
-    # wizard's installMode ref and configExport.ts branch on that word.
+    # configuration-file renderer (app/config/config_export.py) branches on
+    # that word to decide whether the file has a container shape at all.
     assert body["deployment"] == "docker"
     assert body["install_mode"] == "kubernetes"
     assert body["app_url"] == "https://cremind.example"

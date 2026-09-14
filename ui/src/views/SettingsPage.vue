@@ -57,7 +57,7 @@ const allCards: SettingsCard[] = [
   },
   {
     title: 'Profiles',
-    description: 'Manage user profiles and reconfigure the system',
+    description: 'Manage user profiles, reconfigure the system, and download your configuration file',
     icon: 'mdi:account-group',
     route: 'profiles',
   },

@@ -49,7 +49,47 @@ from app.utils.working_directory import (
 # because there is one store per profile, they are created on demand, and the
 # same names appear both per profile and at the shared root -- there is no list
 # of live paths to enumerate, so the name is the rule.
-_CREDENTIAL_DIR_NAMES = frozenset({"coding-cli", "codex-home"})
+_CREDENTIAL_DIR_NAMES = frozenset({"coding-cli", "codex-home", "cli-wizards"})
+
+# Directory names directly under a profile's own directory that only that
+# profile may reach through these routes: ``<system dir>/<profile>/<name>/...``.
+#
+# Same reasoning as the credential stores above, one step milder. ``exports``
+# holds the configuration file ``cremind config export`` writes, which embeds
+# that profile's live JWT — so the name rule alone would be wrong (its owner
+# *must* be able to download it; that is the whole point of the Download chip in
+# chat) and no rule at all would be worse (the path is fully predictable, and
+# every authenticated profile could fetch it).
+#
+# Deliberately narrow. Widening this to the whole ``<system dir>/<profile>/``
+# subtree is the boundary the sandbox arguably should have had all along, but a
+# group-chat room renders every member agent's file tree from that subtree, so
+# that change needs its own audit rather than riding along here.
+_PRIVATE_PROFILE_DIR_NAMES = frozenset({"exports"})
+
+
+def _is_other_profiles_private_path(target: str, profile: str | None) -> bool:
+    """Is ``target`` inside some *other* profile's private directory?
+
+    ``profile`` is the authenticated caller. ``None`` means "no caller known",
+    which denies every private path: a route that forgets to pass one fails
+    closed rather than serving another profile's export.
+
+    Admin is not exempt. Its own exports live in its own slice, so the exemption
+    would buy nothing and would hand the one profile most likely to be
+    prompt-injected a reader for everyone else's tokens.
+    """
+    base = os.path.realpath(BaseConfig.CREMIND_SYSTEM_DIR)
+    try:
+        relative = os.path.relpath(os.path.realpath(target), base)
+    except ValueError:
+        return False  # different drive on Windows: not under the System Directory
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        return False
+    segments = relative.replace("\\", "/").split("/")
+    if len(segments) < 2 or segments[1] not in _PRIVATE_PROFILE_DIR_NAMES:
+        return False
+    return segments[0] != (profile or "")
 
 
 def _shared_credential_homes() -> tuple[str, ...]:
@@ -233,10 +273,15 @@ def _allowed_bases_for_conversation(context_key: str | None) -> list[str]:
     return bases
 
 
-def _is_inside_allowed(target: str, context_key: str | None = None) -> bool:
+def _is_inside_allowed(
+    target: str, context_key: str | None = None, profile: str | None = None,
+) -> bool:
     # Checked before the bases, and never widened by a conversation override:
-    # a credential store is off limits however the caller arrived at it.
+    # a credential store is off limits however the caller arrived at it, and so
+    # is another profile's private directory.
     if _is_credential_path(target):
+        return False
+    if _is_other_profiles_private_path(target, profile):
         return False
     for base in _allowed_bases_for_conversation(context_key):
         if target == base or target.startswith(base + os.sep):
@@ -291,7 +336,7 @@ async def _conversation_scope(
     return row_id, conv.get("context_id") or row_id, None
 
 
-def _safe_resolve(relative_path: str) -> str | None:
+def _safe_resolve(relative_path: str, profile: str | None = None) -> str | None:
     """Resolve a relative path inside CREMIND_SYSTEM_DIR.
 
     Returns the absolute path if safe, or None if traversal is detected.
@@ -303,8 +348,10 @@ def _safe_resolve(relative_path: str) -> str | None:
     # The ``{path:path}`` route reaches this without going through
     # _is_inside_allowed, and it does not filter dotfiles either, so a request
     # for ``<profile>/coding-cli/claude/.credentials.json`` would otherwise be
-    # served verbatim.
+    # served verbatim. Same for another profile's ``exports``.
     if _is_credential_path(target):
+        return None
+    if _is_other_profiles_private_path(target, profile):
         return None
     return target
 
@@ -313,6 +360,11 @@ def _require_auth(request: Request):
     if not getattr(request.user, "is_authenticated", False):
         return JSONResponse({"error": "Unauthenticated"}, status_code=401)
     return None
+
+
+def _profile_of(request: Request) -> str:
+    """The authenticated caller's profile, for the private-directory rule."""
+    return getattr(request.user, "username", "") or ""
 
 
 async def _serve_file(request: Request):
@@ -324,7 +376,7 @@ async def _serve_file(request: Request):
         return JSONResponse({"error": "No path specified"}, status_code=400)
 
     logger.debug(f"File request: relative_path={relative_path}, CREMIND_SYSTEM_DIR={BaseConfig.CREMIND_SYSTEM_DIR}")
-    target = _safe_resolve(relative_path)
+    target = _safe_resolve(relative_path, _profile_of(request))
     if target is None:
         return JSONResponse({"error": "Access denied"}, status_code=403)
 
@@ -358,7 +410,7 @@ async def _serve_file_by_path(request: Request):
         return denied
 
     target = os.path.realpath(abs_path)
-    if not _is_inside_allowed(target, context_key):
+    if not _is_inside_allowed(target, context_key, _profile_of(request)):
         logger.debug(
             f"File access denied: target={target}, "
             f"allowed_bases={_allowed_bases_for_conversation(context_key)}"
@@ -420,7 +472,7 @@ async def _list_directory(request: Request):
         return denied
 
     target = os.path.realpath(abs_path)
-    if not _is_inside_allowed(target, context_key):
+    if not _is_inside_allowed(target, context_key, _profile_of(request)):
         return JSONResponse({"error": "Access denied"}, status_code=403)
     if not os.path.isdir(target):
         return JSONResponse({"error": "Not a directory"}, status_code=404)
@@ -507,7 +559,7 @@ async def _watch_directory(request: Request):
     if denied is not None:
         return denied
     target = os.path.realpath(abs_path)
-    if not _is_inside_allowed(target, context_key):
+    if not _is_inside_allowed(target, context_key, _profile_of(request)):
         return JSONResponse({"error": "Access denied"}, status_code=403)
     if not os.path.isdir(target):
         return JSONResponse({"error": "Not a directory"}, status_code=404)
@@ -618,7 +670,9 @@ async def _watch_directory(request: Request):
     )
 
 
-def _resolve_safe(abs_path: str, context_key: str | None) -> str | None:
+def _resolve_safe(
+    abs_path: str, context_key: str | None, profile: str | None = None,
+) -> str | None:
     """Realpath-resolve and verify ``abs_path`` is within the allowlist.
 
     Returns the resolved absolute path on success, or ``None`` if the path is
@@ -628,7 +682,7 @@ def _resolve_safe(abs_path: str, context_key: str | None) -> str | None:
     if not abs_path:
         return None
     target = os.path.realpath(abs_path)
-    if not _is_inside_allowed(target, context_key):
+    if not _is_inside_allowed(target, context_key, profile):
         return None
     return target
 
@@ -725,7 +779,7 @@ async def _upload_files(request: Request):
     if denied is not None:
         return denied
 
-    resolved = _resolve_safe(target_dir, context_key)
+    resolved = _resolve_safe(target_dir, context_key, _profile_of(request))
     if resolved is None:
         return JSONResponse({"error": "Access denied"}, status_code=403)
     if not os.path.isdir(resolved):
@@ -821,7 +875,7 @@ async def _delete_entry(request: Request):
     if denied is not None:
         return denied
 
-    resolved = _resolve_safe(path, context_key)
+    resolved = _resolve_safe(path, context_key, _profile_of(request))
     if resolved is None:
         return JSONResponse({"error": "Access denied"}, status_code=403)
     if _is_allowed_base(resolved):
@@ -867,7 +921,7 @@ async def _move_entry(request: Request):
     _row_id, context_key, denied = await _conversation_scope(request, cid, write=True)
     if denied is not None:
         return denied
-    src_resolved = _resolve_safe(src, context_key)
+    src_resolved = _resolve_safe(src, context_key, _profile_of(request))
     if src_resolved is None:
         return JSONResponse({"error": "Access denied (src)"}, status_code=403)
     if _is_allowed_base(src_resolved):
@@ -889,7 +943,7 @@ async def _move_entry(request: Request):
     dest_parent = os.path.dirname(dest)
     if not dest_parent:
         return JSONResponse({"error": "dest must include a parent directory"}, status_code=400)
-    dest_parent_resolved = _resolve_safe(dest_parent, context_key)
+    dest_parent_resolved = _resolve_safe(dest_parent, context_key, _profile_of(request))
     if dest_parent_resolved is None:
         return JSONResponse({"error": "Access denied (dest)"}, status_code=403)
     if not os.path.isdir(dest_parent_resolved):
@@ -943,7 +997,7 @@ async def _mkdir(request: Request):
     parent = os.path.dirname(path)
     if not parent:
         return JSONResponse({"error": "path must include a parent"}, status_code=400)
-    parent_resolved = _resolve_safe(parent, context_key)
+    parent_resolved = _resolve_safe(parent, context_key, _profile_of(request))
     if parent_resolved is None:
         return JSONResponse({"error": "Access denied"}, status_code=403)
     if not os.path.isdir(parent_resolved):
@@ -1054,6 +1108,13 @@ def get_file_routes() -> list[Route]:
     later inherits the sandbox from ``_resolve_safe``/``_is_inside_allowed``
     *without* anyone having to think about credentials -- unless it resolves a
     path some other way, in which case it silently inherits neither.
+
+    The same two functions carry the private-directory rule
+    (``_is_other_profiles_private_path``), which needs the caller's profile and
+    therefore a ``_profile_of(request)`` argument at every call site. Omitting
+    it fails closed -- every private path is denied -- so a forgotten argument
+    shows up as a 403 in a test rather than as another profile's export on the
+    wire.
 
     ``GET  /list``
         ``_is_inside_allowed`` on the directory, plus the per-entry filter that
