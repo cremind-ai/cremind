@@ -13,6 +13,7 @@ around every test by an autouse fixture.
 from __future__ import annotations
 
 import asyncio
+import enum
 import sys
 import types
 from dataclasses import dataclass, field
@@ -954,7 +955,336 @@ def test_feature_and_pip_spec():
     assert feat.extras == ("codex",)
     assert feat.probes == ("openai_codex",)
     assert feat.requires_restart is False
+    # 0.154 is the first SDK whose bundled binary can decode ChatGPT's live
+    # model catalog; below it the account's list silently falls back to the
+    # models built into the binary.
+    assert feat.requirements == ("openai-codex>=0.154.0,<0.155",)
     assert pip_spec(["codex"]).startswith("cremind[codex]==")
+
+
+# ── reasoning effort levels: read from the SDK, never a list of our own ───────
+class _OpenEffortBase(str, enum.Enum):
+    """The 0.154 SDK's ``_missing_``: any other non-empty string is accepted."""
+
+    @classmethod
+    def _missing_(cls, value):
+        if not isinstance(value, str) or not value:
+            return None
+        member = str.__new__(cls, value)
+        member._name_ = value
+        member._value_ = value
+        return member
+
+
+def _effort_enum(*levels, open_ended=False):
+    """A ``ReasoningEffort``-shaped str enum declaring ``levels`` in order:
+    closed like 0.1.0b3's, or ``open_ended`` like 0.154's."""
+    names = {level: level for level in levels}
+    if open_ended:
+        return _OpenEffortBase("ReasoningEffort", names)
+    return enum.Enum("ReasoningEffort", names, type=str)
+
+
+def test_sdk_effort_enum_from_a_top_level_attribute():
+    from app.tools.builtin import codex_runner as r
+
+    enum_cls = _effort_enum("low", "high")
+    sdk = types.ModuleType("fake_codex_top")
+    sdk.ReasoningEffort = enum_cls
+    assert r._sdk_effort_enum(sdk) is enum_cls
+
+
+def test_sdk_effort_enum_from_the_generated_module(monkeypatch):
+    """0.154 defines the enum in ``generated.v2_all`` without re-exporting it."""
+    from app.tools.builtin import codex_runner as r
+
+    enum_cls = _effort_enum("low", "medium", "high")
+    sdk = types.ModuleType("fake_codex_pkg")
+    sdk.__path__ = []  # a package, as the real SDK is
+    generated = types.ModuleType("fake_codex_pkg.generated.v2_all")
+    generated.ReasoningEffort = enum_cls
+    monkeypatch.setitem(sys.modules, "fake_codex_pkg", sdk)
+    monkeypatch.setitem(sys.modules, "fake_codex_pkg.generated.v2_all", generated)
+    assert r._sdk_effort_enum(sdk) is enum_cls
+
+
+def test_sdk_effort_enum_absent(monkeypatch):
+    """No attribute, no generated module, or no SDK at all -> None, never a raise.
+
+    A plain stand-in module named ``openai_codex`` must also stay enum-less when
+    the REAL SDK's ``generated.v2_all`` is already sitting in ``sys.modules``:
+    ``import_module`` would hand that over without looking at the parent."""
+    from app.tools.builtin import codex_runner as r
+
+    assert r._sdk_effort_enum(None) is None
+
+    missing_pkg = types.ModuleType("fake_codex_nogen")
+    missing_pkg.__path__ = []
+    monkeypatch.setitem(sys.modules, "fake_codex_nogen", missing_pkg)
+    assert r._sdk_effort_enum(missing_pkg) is None
+
+    fake = types.ModuleType("openai_codex")
+    cached = types.ModuleType("openai_codex.generated.v2_all")
+    cached.ReasoningEffort = _effort_enum("low")
+    monkeypatch.setitem(sys.modules, "openai_codex", fake)
+    monkeypatch.setitem(sys.modules, "openai_codex.generated.v2_all", cached)
+    assert r._sdk_effort_enum(fake) is None
+
+    not_an_enum = types.ModuleType("fake_codex_str")
+    not_an_enum.ReasoningEffort = "low"
+    assert r._sdk_effort_enum(not_an_enum) is None
+
+
+def test_sdk_reasoning_efforts_keeps_the_enum_order():
+    from app.tools.builtin import codex_runner as r
+
+    sdk = types.ModuleType("fake_codex_order")
+    sdk.ReasoningEffort = _effort_enum("none", "low", "medium", "high", "xhigh", open_ended=True)
+    # A member minted by ``_missing_`` is not a declared level and never lists.
+    sdk.ReasoningEffort("persistent")
+    assert r.sdk_reasoning_efforts(sdk) == ["none", "low", "medium", "high", "xhigh"]
+    assert r.sdk_reasoning_efforts(types.ModuleType("fake_codex_empty")) == []
+    assert r.sdk_reasoning_efforts(None) == []
+
+
+def test_sdk_reasoning_efforts_match_the_installed_sdk():
+    """Against the REAL openai_codex, whatever version is installed: the list is
+    exactly its enum, in its order - nothing added, dropped or reordered."""
+    import importlib
+
+    from app.tools.builtin import codex_runner as r
+
+    generated = pytest.importorskip("openai_codex.generated.v2_all")
+    sdk = importlib.import_module("openai_codex")
+    expected = [e.value for e in generated.ReasoningEffort]
+    assert expected  # the installed SDK declares levels at all
+    assert r._sdk_effort_enum(sdk) is generated.ReasoningEffort
+    assert r.sdk_reasoning_efforts(sdk) == expected
+
+
+def test_coerce_effort_with_a_closed_enum_drops_an_unknown_level():
+    """An SDK that refuses a level is not handed it: the model's default runs."""
+    from app.tools.builtin import codex_runner as r
+
+    sdk = types.ModuleType("fake_codex_closed")
+    sdk.ReasoningEffort = _effort_enum("none", "low", "medium", "high", "xhigh")
+    assert r._coerce_effort(sdk, " XHIGH ") == "xhigh"
+    assert r._coerce_effort(sdk, "ultra") is None
+    assert r._coerce_effort(sdk, "") is None
+    assert r._coerce_effort(sdk, None) is None
+
+
+def test_coerce_effort_with_an_open_enum_accepts_any_token():
+    """0.154's enum accepts any non-empty string, so a level from a catalog newer
+    than Cremind still reaches Codex - the app-server is the judge."""
+    from app.tools.builtin import codex_runner as r
+
+    sdk = types.ModuleType("fake_codex_open")
+    sdk.ReasoningEffort = _effort_enum("low", "high", open_ended=True)
+    assert r._coerce_effort(sdk, "high") == "high"
+    assert r._coerce_effort(sdk, "Persistent") == "persistent"
+    assert r._coerce_effort(sdk, "   ") is None
+
+
+def test_coerce_effort_without_an_enum_passes_the_value_through():
+    from app.tools.builtin import codex_runner as r
+
+    sdk = types.ModuleType("fake_codex_noenum")
+    assert r._coerce_effort(sdk, " Ultra ") == "ultra"
+    assert r._coerce_effort(None, "max") == "max"
+    assert r._coerce_effort(sdk, "") is None
+
+
+def test_build_turn_kwargs_passes_the_sdk_judged_effort(monkeypatch):
+    from app.tools.builtin import codex_runner as r
+
+    mod = install_fake_sdk(monkeypatch, _one_turn())
+    assert r.build_turn_kwargs(mod, variables={r.Var.REASONING_EFFORT: "MAX"}) == {"effort": "max"}
+    # Empty = the model's default: the kwarg is left out altogether.
+    assert r.build_turn_kwargs(mod, variables={r.Var.REASONING_EFFORT: ""}) == {}
+
+    mod.ReasoningEffort = _effort_enum("low", "high")
+    assert r.build_turn_kwargs(mod, variables={r.Var.REASONING_EFFORT: "max"}) == {}
+
+
+def test_reasoning_effort_is_a_strict_dropdown():
+    """Effort is the only Codex variable that forbids free typing: a model id
+    or a future sandbox may legitimately be absent from the list, but the effort
+    list IS what the account's models declare, so a level outside it is a typo
+    or one no model here takes."""
+    from app.tools.builtin import codex_runner as r
+    from app.tools.builtin.codex import TOOL_CONFIG
+
+    fields = TOOL_CONFIG["required_config"]
+    effort = fields[r.Var.REASONING_EFFORT]
+    assert effort["dynamic_options"] is True
+    assert effort["options_only"] is True
+    assert effort["default"] == ""
+    assert "options_only" not in fields[r.Var.MODEL]
+    assert "options_only" not in fields[r.Var.SANDBOX]
+
+
+def test_reasoning_effort_description_and_doc_point_at_the_live_list():
+    """The levels differ per account and per model, so neither the variable
+    description (what Settings and `cremind tools get` show) nor the bundled
+    ``[tool]codex.md`` row (what documentation_search answers "which efforts can
+    Codex use?" from) may carry a fixed set - both send the reader to the live
+    list instead. A copied-in list would be wrong for somebody's account."""
+    import re
+    from pathlib import Path
+
+    from app.tools.builtin import codex_runner as r
+    from app.tools.builtin.codex import TOOL_CONFIG
+
+    desc = TOOL_CONFIG["required_config"][r.Var.REASONING_EFFORT]["description"]
+    doc = (
+        Path(__file__).resolve().parents[2]
+        / "app" / "documents" / "bundled" / "[tool]codex.md"
+    ).read_text(encoding="utf-8")
+    rows = [line for line in doc.splitlines() if line.startswith("| `CODEX_REASONING_EFFORT`")]
+    assert rows, "[tool]codex.md has no CODEX_REASONING_EFFORT row"
+
+    for text in (desc, rows[0]):
+        assert "cremind tools options codex" in text
+        assert "account's models" in text
+        assert "SDK" in text  # the fallback is named
+
+    # With the real SDK installed, prove neither text enumerates its levels.
+    # Whole words only: "high" must not count on the strength of "xhigh".
+    try:
+        from openai_codex.generated.v2_all import ReasoningEffort
+    except Exception:  # noqa: BLE001 - the SDK is an optional feature
+        return
+    for text in (desc, rows[0]):
+        named = [
+            e.value for e in ReasoningEffort
+            if re.search(rf"(?<![\w-]){re.escape(e.value)}(?![\w-])", text)
+        ]
+        assert len(named) < 3, f"looks like a hardcoded effort list: {named}"
+
+
+# ── restart pending after an in-place update ──────────────────────────────────
+def _restart_pending(monkeypatch, pending: bool = True):
+    """Speak for a server whose codex feature was (or was not) just updated.
+
+    Patched on the installer module because that is where the runner looks it
+    up, lazily, on every ``load_sdk`` call."""
+    import app.features.installer as installer
+
+    monkeypatch.setattr(
+        installer, "restart_pending", lambda key: pending and key == "codex", raising=False,
+    )
+
+
+def test_load_sdk_refuses_while_a_restart_is_pending(monkeypatch):
+    """The old SDK still loaded in memory must not drive the new binary pip
+    just put on disk - so an importable SDK is refused until the restart."""
+    from app.tools.builtin import codex_runner as r
+
+    install_fake_sdk(monkeypatch, _one_turn())
+    _restart_pending(monkeypatch)
+    assert r.load_sdk() == (None, r.RESTART_PENDING_MESSAGE)
+
+    _restart_pending(monkeypatch, pending=False)
+    sdk, err = r.load_sdk()
+    assert sdk is sys.modules["openai_codex"]
+    assert err is None
+
+
+def test_load_sdk_fails_open_when_the_restart_check_breaks(monkeypatch):
+    """A check that could not run is no evidence of an update: Codex keeps
+    working rather than being taken away by a broken lookup."""
+    import app.features.installer as installer
+    from app.tools.builtin import codex_runner as r
+
+    def _boom(key):
+        raise RuntimeError("installer state unavailable")
+
+    install_fake_sdk(monkeypatch, _one_turn())
+    monkeypatch.setattr(installer, "restart_pending", _boom, raising=False)
+    sdk, err = r.load_sdk()
+    assert sdk is sys.modules["openai_codex"]
+    assert err is None
+
+
+def test_listings_report_the_restart_not_an_install(monkeypatch):
+    """"Install it" is the wrong advice for an SDK that was just updated, so
+    the Settings dropdowns carry the restart message verbatim."""
+    from app.tools.builtin import codex_runner as r
+
+    install_fake_sdk(monkeypatch, _one_turn())
+    _restart_pending(monkeypatch)
+
+    models = asyncio.run(_real_list_models({r.Var.API_KEY: "sk-x"}, "admin"))
+    assert models["models"] == []
+    assert models["error"] == r.RESTART_PENDING_MESSAGE
+
+    modes = r.list_sandbox_modes()
+    assert modes["modes"] == []
+    assert modes["error"] == r.RESTART_PENDING_MESSAGE
+
+
+def test_run_leaf_reports_restart_required(monkeypatch, tmp_path):
+    from app.tools.builtin import codex_runner as r
+
+    install_fake_sdk(monkeypatch, _one_turn())
+    _restart_pending(monkeypatch)
+    res = asyncio.run(
+        _run_tool(prompt="do a thing", working_directory=str(tmp_path), _variables={})
+    )
+    sc = res.structured_content
+    assert sc["error"] == "RestartRequired"
+    assert sc["feature_key"] == "codex"
+    assert sc["message"] == r.RESTART_PENDING_MESSAGE
+    # Not the missing-dependency walk-through: the feature is already updated.
+    assert "pip install" not in str(sc)
+
+
+def test_status_leaf_reports_restart_pending(monkeypatch):
+    from app.tools.builtin import codex_runner as r
+
+    install_fake_sdk(monkeypatch, _one_turn())
+    _restart_pending(monkeypatch)
+    sc = asyncio.run(_status_tool(_profile="default", _variables={})).structured_content
+    assert sc["available"] is False
+    # The update is on disk; it is only not loadable yet.
+    assert sc["sdk_installed"] is True
+    assert sc["restart_pending"] is True
+    assert sc["message"] == r.RESTART_PENDING_MESSAGE
+
+
+# ── busy_count (the installer's Windows file-lock guard) ──────────────────────
+def test_busy_count_counts_only_running_tasks(monkeypatch, tmp_path):
+    from app.tools.builtin import codex_runner as r
+
+    monkeypatch.setattr(r, "_RUN_GRACE_SECONDS", 0.1)
+
+    async def produce(handle):
+        yield _note("thread/started", thread=SimpleNamespace(id="thread-busy"))
+        await handle.gate.wait()
+        yield _note("turn/completed", turn=Turn(
+            status="completed", duration_ms=1,
+            items=[Item(type="agentMessage", text="done", phase="final_answer")],
+        ))
+
+    install_fake_sdk(monkeypatch, produce, thread_id="thread-busy")
+
+    async def body():
+        assert r.busy_count() == 0
+        run_res = await _run_tool(
+            prompt="long job", working_directory=str(tmp_path),
+            _context_id="conv-busy", _profile="default", _variables={},
+        )
+        assert run_res.structured_content["status"] == "running"
+        assert r.busy_count() == 1
+        task = r.get_task(run_res.structured_content["task_id"])
+        task.turn_handle.gate.set()
+        assert await r.wait_for_task(task, 5)
+        # Finished tasks stay in the registry for an hour; they hold no binary.
+        assert r.get_task(task.task_id) is task
+        assert r.busy_count() == 0
+
+    asyncio.run(body())
 
 
 def test_default_disabled_and_feature_gated():

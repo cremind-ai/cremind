@@ -116,7 +116,7 @@ backend's SPA listener won out; revisit the prereq above.
 | `ui/src/**` (Vue, TS, CSS) | Vite HMR — instant in the browser. |
 | `ui/vite.config*.ts`, `ui/package.json` | Restart Terminal B (`Ctrl+C`, then `npm run web:dev`). |
 | `app/**` (Python) | Restart Terminal A (`Ctrl+C`, then `uv run cremind serve`). No `--reload` flag on `cremind serve` today — see "Auto-restart on Python edits" below if you want one. |
-| `pyproject.toml` deps | `uv sync --all-extras`, then restart Terminal A. |
+| `pyproject.toml` deps | `uv sync --all-extras`, then restart Terminal A. Beware plain `uv sync`: it is an *exact* sync, so it uninstalls every extra the app installed at runtime (`cremind features install …`, the Settings Install/Update buttons). Use `uv sync --inexact` to keep them, or name the extras (`--extra codex`). `--all-extras` also installs the newest pins, so it skips the feature-update flow — don't use it when you are testing that flow. |
 | `app/__version__.py` | The pre-commit hook syncs `ui/package.json` automatically. Manual: `python scripts/sync_ui_version.py`. |
 
 ### Auto-restart on Python edits (optional)

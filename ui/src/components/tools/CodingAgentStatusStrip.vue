@@ -25,8 +25,11 @@ const props = defineProps<{
   probe?: Record<string, unknown> | null;
   probing?: boolean;
   signingOut?: boolean;
-  /** Whether the viewer may sign out the shared server login (admin only —
-   *  it is the fallback every other profile inherits). */
+  /** Whether the viewer is the admin profile. Signing out the shared server
+   *  login is admin-only (it is the fallback every other profile inherits),
+   *  and so is installing or updating the agent's packages: they go into the
+   *  one venv every profile runs from, and the install endpoint refuses
+   *  anyone else after setup. */
   isAdmin?: boolean;
 }>();
 
@@ -34,6 +37,9 @@ const emit = defineEmits<{
   /** Install the agent's pip extra. The page owns the streaming install
    *  dialog every other built-in tool uses. */
   install: [agent: CodingAgentStatus];
+  /** Bring an installed-but-outdated SDK into the pinned range. Same dialog as
+   *  install, in its update mode. */
+  update: [agent: CodingAgentStatus];
   'sign-in': [agent: CodingAgentStatus];
   check: [agent: CodingAgentStatus];
   'sign-out': [agent: CodingAgentStatus];
@@ -125,6 +131,42 @@ const signOutLabel = computed(() =>
 );
 
 /**
+ * What the installed packages are worth, not merely whether they import.
+ *
+ * An SDK can import and still be the wrong one: Codex's SDK bundles its CLI
+ * binary, and a binary too old to decode the account's live model catalog
+ * quietly lists the models built into it instead — which reads as a working
+ * install with a wrong dropdown. Restart outranks update: once the update has landed, the
+ * only thing left to do is load it. Both fields are absent on a backend that
+ * predates version checks, which leaves the old Installed / Not installed.
+ */
+const installTag = computed<{ label: string; type: 'success' | 'warning' | 'info'; tooltip: string }>(() => {
+  const agent = props.agent;
+  if (!agent.sdk_installed) return { label: 'Not installed', type: 'info', tooltip: '' };
+  if (agent.restart_pending) return { label: 'Restart required', type: 'warning', tooltip: '' };
+  if (agent.sdk_outdated) {
+    const installed = agent.sdk_version ? `Installed ${agent.sdk_version}` : 'Installed version unknown';
+    const tooltip = agent.sdk_required ? `${installed}; requires ${agent.sdk_required}` : installed;
+    return { label: 'Update required', type: 'warning', tooltip };
+  }
+  return { label: 'Installed', type: 'success', tooltip: '' };
+});
+
+/** Offered only while there is something to update and nothing to load yet:
+ *  after an update the venv is already current, and a second run would just
+ *  repeat pip for the same restart. */
+const showUpdate = computed(() =>
+  props.agent.sdk_installed && Boolean(props.agent.sdk_outdated) && !props.agent.restart_pending,
+);
+
+/** Why Install / Update is unavailable to this viewer, or '' when it is not.
+ *  The button stays visible so a member still learns the agent needs one —
+ *  it just cannot be the one to run it. */
+const packageBlockedReason = computed(() =>
+  props.isAdmin ? '' : 'Only the admin profile can install or update server packages',
+);
+
+/**
  * Set when this server cannot execute the agent's CLI at all — the binary is
  * present and correct but built for a CPU level this host does not provide, so
  * every invocation of it hangs instead of answering. It outranks every other
@@ -180,9 +222,15 @@ const probeDetail = computed(() =>
 <template>
   <div class="agent-strip">
     <div class="agent-chips">
-      <ElTag :type="agent.sdk_installed ? 'success' : 'info'" size="small" effect="plain">
-        {{ agent.sdk_installed ? 'Installed' : 'Not installed' }}
-      </ElTag>
+      <ElTooltip
+        :disabled="!installTag.tooltip"
+        :content="installTag.tooltip"
+        placement="top"
+      >
+        <ElTag :type="installTag.type" size="small" effect="plain">
+          {{ installTag.label }}
+        </ElTag>
+      </ElTooltip>
       <ElTag :type="agent.enabled ? 'success' : 'info'" size="small" effect="plain">
         {{ agent.enabled ? 'Enabled' : 'Off' }}
       </ElTag>
@@ -222,14 +270,45 @@ const probeDetail = computed(() =>
     <p v-else class="agent-message">{{ agent.message }}</p>
 
     <div class="agent-actions">
-      <ElButton
+      <ElTooltip
         v-if="!agent.sdk_installed"
-        type="primary"
-        size="small"
-        @click="emit('install', agent)"
+        :disabled="!packageBlockedReason"
+        :content="packageBlockedReason"
+        placement="top"
       >
-        <Icon icon="mdi:download" />&nbsp;Install
-      </ElButton>
+        <span class="agent-action-wrap">
+          <ElButton
+            type="primary"
+            size="small"
+            :disabled="Boolean(packageBlockedReason)"
+            @click="emit('install', agent)"
+          >
+            <Icon icon="mdi:download" />&nbsp;Install
+          </ElButton>
+        </span>
+      </ElTooltip>
+
+      <ElTooltip
+        v-if="showUpdate"
+        :disabled="!packageBlockedReason"
+        :content="packageBlockedReason"
+        placement="top"
+      >
+        <!-- Primary, like Install, rather than warning: this project redeclares
+             only the base `--el-color-warning`, so a warning button's hover and
+             disabled shades would stay Element Plus's light ones in the dark
+             theme. The warning is already carried by the status tag. -->
+        <span class="agent-action-wrap">
+          <ElButton
+            type="primary"
+            size="small"
+            :disabled="Boolean(packageBlockedReason)"
+            @click="emit('update', agent)"
+          >
+            <Icon icon="mdi:update" />&nbsp;Update
+          </ElButton>
+        </span>
+      </ElTooltip>
 
       <ElTooltip
         :disabled="!signInBlockedReason"

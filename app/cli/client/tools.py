@@ -121,7 +121,9 @@ async def get_coding_agents(client: Client) -> list[dict[str, Any]]:
     """Return one row per coding delegate (Claude Code, Codex).
 
     Each row carries `tool_id`, `display_name`, `sdk_installed`, `enabled`,
-    `credential_source`, `sign_in` and a human `message`. Served from
+    `credential_source`, `sign_in` and a human `message`, plus — from a server
+    with version checks — `sdk_outdated`, `sdk_version`, `sdk_required` and
+    `restart_pending`. Served from
     `/api/coding-agents`, which is per-profile — the credential and enabled
     state are this profile's, not the server's.
     """

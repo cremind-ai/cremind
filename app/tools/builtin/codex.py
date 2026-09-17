@@ -72,7 +72,7 @@ TOOL_CONFIG: ToolConfig = {
         Var.MODEL: {
             "description": (
                 "Codex model for coding tasks — pick from the account's live model "
-                "list or type a model id (e.g. 'gpt-5.1-codex'). Empty = Codex's "
+                "list or type a model id (e.g. 'gpt-5.5'). Empty = Codex's "
                 "default model."
             ),
             "type": "string",
@@ -95,12 +95,21 @@ TOOL_CONFIG: ToolConfig = {
         },
         Var.REASONING_EFFORT: {
             "description": (
-                "Reasoning effort for coding tasks (none, minimal, low, medium, "
-                "high, xhigh). Empty = the model's default. Higher effort is slower "
-                "and costs more tokens."
+                "Reasoning effort for coding tasks — pick a level from the list "
+                "(`cremind tools options codex`). The levels come from the "
+                "signed-in account's models: each model supports its own subset, "
+                "and the list marks a level only some models support; when the "
+                "models can't be listed it falls back to the installed Codex "
+                "SDK's levels. Empty = the model's default. Higher effort is "
+                "slower and costs more tokens."
             ),
             "type": "string",
             "default": "",
+            "dynamic_options": True,
+            # Strict: the list is what the account's models declare, so a typed
+            # level outside it is a typo or a level no model here takes -
+            # either way not something Settings should let through unchecked.
+            "options_only": True,
         },
         Var.API_KEY: {
             "description": (
@@ -151,13 +160,20 @@ async def get_variable_options(
     ``cremind tools options``). Module-level hook discovered by
     :func:`app.tools.builtin.get_builtin_variable_options_hook`.
 
-    Returns ``{Var.MODEL: {...}, Var.SANDBOX: {...}}`` where each value is
-    ``{"options": [{"id", "label"}...], "error": str|None, "source": str|None}``:
+    Returns ``{Var.MODEL: {...}, Var.SANDBOX: {...}, Var.REASONING_EFFORT: {...}}``
+    where each value is ``{"options": [{"id", "label"}...], "error": str|None,
+    "source": str|None}``:
 
     - ``Var.MODEL`` — the account's models (from the Codex SDK's ``models()`` via
       the same credential chain the coding task uses).
     - ``Var.SANDBOX`` — the installed Codex SDK's ``Sandbox`` enum (introspected
       locally; ``refresh`` is a no-op for it).
+    - ``Var.REASONING_EFFORT`` — the levels the account's models support,
+      derived from the SAME listing by :func:`runner.effort_options` (one
+      app-server spawn serves both fields, and ``refresh`` refreshes both).
+      When no model declares an effort it falls back to the installed SDK's
+      ``ReasoningEffort`` levels; with neither, ``options`` is empty and
+      ``error`` says why.
 
     Never raises.
     """
@@ -168,6 +184,9 @@ async def get_variable_options(
     ]
 
     modes = runner.list_sandbox_modes()
+    # A None SDK is fine: effort_options reports why there is nothing to list.
+    sdk, _err = runner.load_sdk()
+    efforts = runner.effort_options(sdk, listing)
     return {
         Var.MODEL: {
             "options": options,
@@ -181,6 +200,11 @@ async def get_variable_options(
             ],
             "error": modes.get("error"),
             "source": modes.get("source"),
+        },
+        Var.REASONING_EFFORT: {
+            "options": efforts["options"],
+            "error": efforts["error"],
+            "source": efforts["source"],
         },
     }
 
@@ -199,6 +223,27 @@ def _final_result(task) -> BuiltInToolResult:
 
 
 def _missing_sdk(detail: str) -> BuiltInToolResult:
+    """The result for an SDK :func:`load_sdk` could not hand back.
+
+    Two different situations arrive here and need two different fixes: an SDK
+    that is not installed (install the feature) and one that was just updated
+    in place (restart the server - installing again changes nothing). The
+    latter is recognised by the runner's exact message and reported as a
+    ``RestartRequired`` observation instead of the missing-dependency one, so
+    the agent does not walk the user through a pip install they already did.
+    """
+    if detail == runner.RESTART_PENDING_MESSAGE:
+        return BuiltInToolResult(structured_content={
+            "error": "RestartRequired",
+            "tool": "codex",
+            "feature_key": _FEATURE_KEY,
+            "message": runner.RESTART_PENDING_MESSAGE,
+            "remediation": (
+                "Tell the user the Cremind server must be restarted before Codex "
+                "can run again (an admin runs `cremind server restart`). Do not "
+                "reinstall the codex feature - it is already up to date."
+            ),
+        })
     return missing_dependency_result(
         tool="codex",
         feature_key=_FEATURE_KEY,
@@ -493,6 +538,16 @@ class CodexStatusTool(BuiltInTool):
 
     async def run(self, arguments: Dict[str, Any]) -> BuiltInToolResult:
         sdk, err = load_sdk()
+        if sdk is None and err == runner.RESTART_PENDING_MESSAGE:
+            # Installed - the update is on disk - but not loadable until the
+            # server restarts, so neither "not installed" nor "ready" is true.
+            return BuiltInToolResult(structured_content={
+                "available": False,
+                "sdk_installed": True,
+                "restart_pending": True,
+                "message": runner.RESTART_PENDING_MESSAGE,
+                "detail": "",
+            })
         if sdk is None:
             return BuiltInToolResult(structured_content={
                 "available": False,

@@ -135,6 +135,7 @@ class Var:
 
     MODEL = "CLAUDE_CODE_MODEL"
     PERMISSION_MODE = "CLAUDE_CODE_PERMISSION_MODE"
+    EFFORT = "CLAUDE_CODE_EFFORT"
     MAX_TURNS = "CLAUDE_CODE_MAX_TURNS"
     MAX_BUDGET_USD = "CLAUDE_CODE_MAX_BUDGET_USD"
     API_KEY = "CLAUDE_CODE_API_KEY"
@@ -148,6 +149,7 @@ class Var:
 VAR_DEFAULTS: Dict[str, Any] = {
     Var.MODEL: "",
     Var.PERMISSION_MODE: "bypassPermissions",
+    Var.EFFORT: "",
     Var.MAX_TURNS: 0,
     Var.MAX_BUDGET_USD: 0,
     Var.API_KEY: "",
@@ -305,14 +307,37 @@ def build_options(
     on_stderr,
 ):
     """Build a ``ClaudeAgentOptions``, dropping fields an older SDK lacks."""
+    # None (unset, or a level this SDK does not list) leaves the field out, so
+    # the CLI runs at its own default rather than at a level we guessed.
+    effort, ultracode = _resolve_effort(sdk, variables.get(Var.EFFORT))
+    allowed_tools = _csv(variables.get(Var.ALLOWED_TOOLS))
+    settings: Optional[str] = None
+    if ultracode:
+        # Picking "ultracode" is the user's explicit consent to dynamic workflows
+        # for this session, so the flag settings also turn workflows ON (they
+        # default off on the Pro plan). Flag settings load regardless of
+        # ``setting_sources``, but they only switch things on: a
+        # ``disableWorkflows`` setting, CLAUDE_CODE_DISABLE_WORKFLOWS or an org
+        # policy still wins, as does a CLAUDE_CODE_EFFORT_LEVEL other than xhigh
+        # in the server env - the run then simply works at the resolved effort.
+        # An SDK without the ``settings`` field has it dropped by
+        # :func:`_construct_options` and the run still gets xhigh.
+        settings = json.dumps(_ULTRACODE_SETTINGS)
+        # The Workflow tool's permission check asks. An allowlist that does not
+        # name it would leave the orchestration ultracode promises unreachable,
+        # so it is added; the denylist is left alone - an explicit deny wins.
+        if allowed_tools is not None and _WORKFLOW_TOOL not in allowed_tools:
+            allowed_tools.append(_WORKFLOW_TOOL)
     kwargs: Dict[str, Any] = {
         "cwd": cwd,
         "permission_mode": variables.get(Var.PERMISSION_MODE) or "bypassPermissions",
         "model": (model or variables.get(Var.MODEL) or None),
+        "effort": effort,
+        "settings": settings,
         "resume": session_id or None,
         "max_turns": _as_int(variables.get(Var.MAX_TURNS)) or None,
         "max_budget_usd": _as_float(variables.get(Var.MAX_BUDGET_USD)) or None,
-        "allowed_tools": _csv(variables.get(Var.ALLOWED_TOOLS)),
+        "allowed_tools": allowed_tools,
         "disallowed_tools": _csv(variables.get(Var.DISALLOWED_TOOLS)),
         "cli_path": (variables.get(Var.CLI_PATH) or None),
         # Merge over the inherited process env so the CLI keeps PATH/node/etc.
@@ -822,6 +847,179 @@ def list_permission_modes() -> Dict[str, Any]:
             "source": "claude_agent_sdk",
         }
     return {"modes": modes, "source": "claude_agent_sdk", "error": None}
+
+
+# --- Effort-level listing ----------------------------------------------------
+#
+# The same arrangement as the permission modes above, for the same reason: the
+# SDK owns the set. ``ClaudeAgentOptions.effort`` arrived in SDK 0.1.36 with
+# low/medium/high/max, ``xhigh`` joined in 0.2.x, and the ``EffortLevel`` Literal
+# became a package-root export in 0.2.82 - so every SDK the ``>=0.2.0`` pin
+# allows has the field, but not every one exports the alias, and reading the
+# list from whichever shape is present is what keeps a level added next release
+# from needing a Cremind change. The SDK hands the value to the CLI verbatim as
+# ``--effort <level>``. In-process introspection only; ``refresh`` is a no-op.
+
+_EFFORT_LABELS: Dict[str, str] = {
+    "low": "low (minimal thinking, fastest)",
+    "medium": "medium (moderate thinking)",
+    "high": "high (deep reasoning; Claude Code's default)",
+    "xhigh": "xhigh (extended depth; xhigh-capable models, else high)",
+    "max": "max (maximum effort)",
+}
+
+# Ultracode is the one choice Cremind declares itself. It is not an effort level
+# - the SDK's ``EffortLevel`` Literal and the CLI's ``--effort`` enum stop at
+# ``max`` - but a Claude Code *setting*: the ``ultracode`` settings key, which on
+# a session running at xhigh effort (with workflows allowed) makes Claude
+# orchestrate dynamic workflows. The SDK's types do not model it, so it cannot
+# be read off the SDK the way the levels are. It is offered in the same dropdown
+# because that is where the Claude Code editor extensions put it (as the notch
+# after ``max``), and it is detected here by the one thing the SDK does tell us:
+# whether it accepts ``xhigh``, the effort ultracode runs at. An SDK without it
+# cannot express the choice at all, so the choice is not shown there. A CLI too
+# old to know the key ignores it and simply runs at xhigh.
+ULTRACODE = "ultracode"
+_ULTRACODE_EFFORT = "xhigh"
+_ULTRACODE_LABEL = (
+    "ultracode (xhigh effort + dynamic workflow orchestration; xhigh-capable "
+    "models, workflows enabled)"
+)
+# Handed to the CLI as ``--settings <json>``. ``enableWorkflows`` is part of the
+# recipe because workflows are off by default on the Pro plan.
+_ULTRACODE_SETTINGS: Dict[str, Any] = {"ultracode": True, "enableWorkflows": True}
+_WORKFLOW_TOOL = "Workflow"
+
+
+def _str_literal_members(hint: Any) -> List[str]:
+    """The ``str`` members of a ``Literal``, looking one level into a union.
+
+    ``Optional[Literal[...]]`` is how the options field is typed today, and the
+    SDK's subagent definition already types the same alias as
+    ``EffortLevel | int | None``, so a union that also admits a number is a shape
+    the options field could plausibly take next. Only string members are ids a
+    dropdown can offer; ``int`` and ``None`` are skipped rather than failing the
+    whole list. Order is preserved (it is the SDK's, lowest effort first).
+    """
+    import typing as _t
+
+    members: List[str] = []
+    for candidate in (hint, *_t.get_args(hint)):
+        if _t.get_origin(candidate) is not _t.Literal:
+            continue
+        for arg in _t.get_args(candidate):
+            if isinstance(arg, str) and arg not in members:
+                members.append(arg)
+    return members
+
+
+def _effort_level_ids(sdk) -> List[str]:
+    """Extract the effort levels the installed SDK accepts.
+
+    Tries the exported ``EffortLevel`` alias first, then the
+    ``ClaudeAgentOptions.effort`` type hint (an SDK older than 0.2.82 names the
+    levels only there). Returns ``[]`` if neither shape is present. Never raises.
+    """
+    import typing as _t
+
+    levels = _str_literal_members(getattr(sdk, "EffortLevel", None))
+    if levels:
+        return levels
+    try:
+        hint = _t.get_type_hints(sdk.ClaudeAgentOptions).get("effort")
+    except Exception:  # noqa: BLE001 — forward refs on some SDK versions
+        logger.debug("claude_code: effort hint resolution failed", exc_info=True)
+        return []
+    return _str_literal_members(hint)
+
+
+def list_effort_levels() -> Dict[str, Any]:
+    """List the effort levels the installed Claude Agent SDK accepts.
+
+    Never raises. The envelope mirrors :func:`list_permission_modes`:
+    ``{"levels": [...], "source": "claude_agent_sdk"|None, "error": str|None}``,
+    and an empty list means the same thing there as here - the write-check
+    cannot validate, so it accepts the value.
+    """
+    sdk, err = load_sdk()
+    if sdk is None:
+        return {
+            "levels": [],
+            "error": (
+                "claude_agent_sdk is not installed — install it with "
+                "`cremind features install claude_code`. " + (err or "")
+            ).strip(),
+            "source": None,
+        }
+    levels = _effort_level_ids(sdk)
+    if not levels:
+        return {
+            "levels": [],
+            "error": "Installed claude_agent_sdk does not expose effort levels.",
+            "source": "claude_agent_sdk",
+        }
+    return {"levels": levels, "source": "claude_agent_sdk", "error": None}
+
+
+def effort_choices(levels: List[str]) -> List[Dict[str, str]]:
+    """The ``CLAUDE_CODE_EFFORT`` dropdown for an SDK that lists ``levels``.
+
+    The SDK's levels in the SDK's order (a level this build has no label for is
+    shown as itself), then :data:`ULTRACODE` LAST when ``xhigh`` is among them -
+    see the note above :data:`ULTRACODE`. The options hook returns exactly this
+    list, and the ``set-var`` write-check validates against the hook, so what the
+    dropdown offers and what a write accepts cannot drift apart. An SDK that one
+    day lists ``ultracode`` itself is not given a second entry.
+    """
+    choices = [{"id": level, "label": _EFFORT_LABELS.get(level, level)} for level in levels]
+    if _ULTRACODE_EFFORT in levels and ULTRACODE not in levels:
+        choices.append({"id": ULTRACODE, "label": _ULTRACODE_LABEL})
+    return choices
+
+
+def _resolve_effort(sdk, value: Any) -> Tuple[Optional[str], bool]:
+    """``(effort, ultracode)`` for a run: the ``effort`` it starts with (None for
+    Claude Code's own default) and whether to switch ultracode on.
+
+    The Settings dropdown only offers :func:`effort_choices`, but a value can
+    still be stale: ``set-var --force`` skips the check, and an SDK downgrade can
+    remove a level that was valid when it was saved. Such a value is dropped
+    rather than forwarded, because the SDK passes it straight through as
+    ``--effort`` and a coding task is a poor place to discover the CLI does not
+    know it - running at the default is the smaller surprise. When this SDK lists
+    no levels there is nothing to check against, so the value goes through as
+    typed and the SDK decides (on an SDK without the field at all,
+    :func:`_construct_options` drops it).
+
+    :data:`ULTRACODE` (any case) is not forwarded as a level: it resolves to
+    ``xhigh`` plus the ultracode flag, which :func:`build_options` turns into the
+    settings that enable it. It needs an SDK that accepts ``xhigh``, or one that
+    lists nothing to check against; on an SDK whose list lacks ``xhigh`` it is
+    dropped like any other unlisted value. A level the SDK itself lists is always
+    forwarded verbatim, first, so an SDK that ever models ``ultracode`` owns it.
+    """
+    effort = str(value or "").strip()
+    if not effort:
+        return None, False
+    levels = _effort_level_ids(sdk)
+    if levels and effort in levels:
+        return effort, False
+    if effort.lower() == ULTRACODE:
+        if not levels or _ULTRACODE_EFFORT in levels:
+            return _ULTRACODE_EFFORT, True
+        logger.debug(
+            f"claude_code: ignoring effort {effort!r}; ultracode runs at "
+            f"{_ULTRACODE_EFFORT!r}, which the installed SDK does not accept "
+            f"({levels})"
+        )
+        return None, False
+    if levels:
+        logger.debug(
+            f"claude_code: ignoring effort {effort!r}; the installed SDK accepts "
+            f"{levels}"
+        )
+        return None, False
+    return effort, False
 
 
 # --- The `claude` CLI itself: sign in, sign out, and ask who is signed in -----

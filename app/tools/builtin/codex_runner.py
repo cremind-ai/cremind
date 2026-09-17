@@ -38,7 +38,9 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import enum
 import hashlib
+import importlib
 import inspect
 import os
 import shutil
@@ -69,7 +71,12 @@ _WAIT_MARGIN_SECONDS = 15.0
 _FINISHED_TASK_TTL_SECONDS = 3600.0
 _DEFAULT_MAX_CONCURRENT = 2
 
-_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+# What every SDK-loading path says once the codex feature has been upgraded in
+# place and the server has not restarted yet. Named once because the leaves,
+# the listings, the sign-in and the Coding Agents card all have to say the same
+# thing - and because callers compare against it to tell "restart" apart from
+# "not installed", which call for different fixes.
+RESTART_PENDING_MESSAGE = "Codex was updated on this server; restart Cremind to load the new version."
 
 _DELEGATION_APPEND = (
     "You are being driven programmatically by another AI assistant on behalf of "
@@ -197,13 +204,55 @@ def _as_int(value: Any) -> int:
 
 
 def load_sdk():
-    """Lazily import ``openai_codex``. Returns ``(module, error_str)``."""
+    """Lazily import ``openai_codex``. Returns ``(module, error_str)``.
+
+    Refuses with :data:`RESTART_PENDING_MESSAGE` once the ``codex`` feature has
+    been upgraded in this process's lifetime. pip replaces the SDK *and* the
+    bundled ``codex`` binary on disk, but the old SDK stays loaded in memory -
+    so without this gate the old Python client would drive the new binary, and
+    a protocol mismatch between the two fails in ways nobody could diagnose
+    from the error. Refusing until the restart is the one honest answer.
+    """
+    if _restart_pending():
+        return None, RESTART_PENDING_MESSAGE
     try:
         import openai_codex
 
         return openai_codex, None
     except ImportError as exc:
         return None, str(exc)
+
+
+def _restart_pending() -> bool:
+    """Has the installer upgraded ``codex`` since this server started?
+
+    Imported lazily, like the SDK: the installer pulls in the upgrade plumbing,
+    and this module is imported at tool registration, where none of that is
+    needed. Fails OPEN - a check that could not run must not take a working
+    Codex away.
+    """
+    try:
+        from app.features.installer import restart_pending
+
+        return bool(restart_pending("codex"))
+    except Exception:  # noqa: BLE001
+        logger.debug("codex: the restart-pending check failed", exc_info=True)
+        return False
+
+
+def _sdk_unavailable_error(err: Optional[str]) -> str:
+    """The ``error`` a listing reports when :func:`load_sdk` returned no module.
+
+    A pending restart is passed through verbatim, because "install it" is the
+    wrong advice for an SDK that was just updated: installing again changes
+    nothing, restarting fixes it.
+    """
+    if err == RESTART_PENDING_MESSAGE:
+        return RESTART_PENDING_MESSAGE
+    return (
+        "openai_codex is not installed — install it with "
+        "`cremind features install codex`. " + (err or "")
+    ).strip()
 
 
 # ── SDK-item duck-typing helpers ───────────────────────────────────────────────
@@ -490,7 +539,10 @@ async def logout(variables: dict, profile: str, *, scope: str = "profile") -> Di
 
     sdk, err = load_sdk()
     if sdk is None:
-        problems.append(f"the Codex SDK is not installed ({err})")
+        problems.append(
+            err if err == RESTART_PENDING_MESSAGE
+            else f"the Codex SDK is not installed ({err})"
+        )
     else:
         auth = CodexAuth(env_overrides={"CODEX_HOME": str(home)}, scope=scope)
 
@@ -631,9 +683,37 @@ def resolve_sandbox(sdk, variables: dict) -> Tuple[str, Optional[str]]:
     return effective, note
 
 
-def _coerce_effort(value: Any) -> Optional[str]:
+def _coerce_effort(sdk, value: Any) -> Optional[str]:
+    """``CODEX_REASONING_EFFORT`` as the turn's ``effort``; None = the model's
+    default.
+
+    Judged by the installed SDK, never by a list of Cremind's own: the value is
+    passed on (as a string) when the SDK's ``ReasoningEffort`` enum constructs
+    it. On 0.154 that is any non-empty token - the enum's ``_missing_`` accepts
+    it and the app-server decides - so a level from a catalog newer than this
+    code still reaches Codex. An older SDK's closed enum refuses a level it does
+    not know, and the value is dropped rather than handed to an SDK that has
+    already said no. With no enum to ask at all, it passes through for the same
+    reason as on 0.154: the app-server is the one that knows.
+
+    Typos are caught before they get here, where there IS a list to check
+    against: ``set-var`` validates against the account's live levels and the
+    Settings field is a strict dropdown.
+    """
     effort = str(value or "").strip().lower()
-    return effort if effort in _REASONING_EFFORTS else None
+    if not effort:
+        return None
+    enum_cls = _sdk_effort_enum(sdk)
+    if enum_cls is None:
+        return effort
+    try:
+        return _enum_value(enum_cls(effort)) or None
+    except (ValueError, TypeError):
+        logger.debug(
+            f"codex: dropping CODEX_REASONING_EFFORT '{effort}' - the installed "
+            "SDK does not accept it, so the model's default applies"
+        )
+        return None
 
 
 def build_thread_kwargs(
@@ -653,7 +733,7 @@ def build_thread_kwargs(
 
 
 def build_turn_kwargs(sdk, *, variables: dict) -> Dict[str, Any]:
-    kwargs = {"effort": _coerce_effort(variables.get(Var.REASONING_EFFORT))}
+    kwargs = {"effort": _coerce_effort(sdk, variables.get(Var.REASONING_EFFORT))}
     return _filter_kwargs(sdk.AsyncThread.turn, kwargs)
 
 
@@ -679,6 +759,12 @@ _MODELS_CACHE_TTL = 300.0  # seconds
 _MODELS_TIMEOUT = 15.0  # cap the app-server spawn + models() call
 # credential fingerprint -> (fetched_at, models). Errors are never cached.
 _models_cache: Dict[str, Tuple[float, List[dict]]] = {}
+# credential fingerprint -> how many times its cached list has been forgotten.
+# A listing takes a snapshot before it spawns the app-server and only writes
+# the cache if the number has not moved: a fetch that started before a sign-in
+# and finished after :func:`_forget_models_cache` would otherwise put the
+# previous account's list straight back, for the rest of the five minutes.
+_models_generation: Dict[str, int] = {}
 
 
 def _cache_key(auth: CodexAuth) -> str:
@@ -705,8 +791,42 @@ def _forget_models_cache(home: str) -> None:
     Called after a sign-in or a sign-out: the listing is cached per credential
     for five minutes, so without this the card would keep offering the previous
     account's models (or a signed-out home's) for the rest of the window.
+
+    Bumps the key's generation as well, so a listing already in flight for this
+    home cannot write its now-stale answer back (see ``_models_generation``).
     """
-    _models_cache.pop(_cache_key(CodexAuth(env_overrides={"CODEX_HOME": home})), None)
+    key = _cache_key(CodexAuth(env_overrides={"CODEX_HOME": home}))
+    _models_cache.pop(key, None)
+    _models_generation[key] = _models_generation.get(key, 0) + 1
+
+
+def _model_row(model: Any) -> Dict[str, Any]:
+    """One SDK ``Model`` as the plain row :func:`list_models` returns and caches.
+
+    ``supported_efforts`` keeps the catalog's order and its per-level
+    description (the text the dropdown label is built from), with a level the
+    catalog repeats kept once. ``default_effort`` is the level Codex uses for
+    this model when ``CODEX_REASONING_EFFORT`` is empty. Both are empty on a
+    model - or an SDK - that declares no efforts.
+    """
+    model_id = getattr(model, "id", None)
+    efforts: List[Dict[str, str]] = []
+    seen: set = set()
+    for option in getattr(model, "supported_reasoning_efforts", None) or []:
+        level = _enum_value(getattr(option, "reasoning_effort", None))
+        if not level or level in seen:
+            continue
+        seen.add(level)
+        efforts.append({
+            "id": level,
+            "description": str(getattr(option, "description", "") or "").strip(),
+        })
+    return {
+        "id": model_id,
+        "display_name": getattr(model, "display_name", None) or model_id,
+        "supported_efforts": efforts,
+        "default_effort": _enum_value(getattr(model, "default_reasoning_effort", None)) or None,
+    }
 
 
 async def list_models(
@@ -714,25 +834,25 @@ async def list_models(
 ) -> Dict[str, Any]:
     """List the Codex models available to the resolved account. Never raises.
 
-    Returns ``{"models": [{"id", "display_name"}...], "source": label, "cached":
-    bool}`` on success, or ``{"models": [], "error": "<detail>", "source":
-    label|None}`` when the SDK is missing, no credential is available, or the
-    query fails. Uses the SDK's ``codex.models()`` (spawns a short-lived
-    app-server), cached 300s per credential fingerprint.
+    Returns ``{"models": [row...], "source": label, "cached": bool}`` on
+    success, or ``{"models": [], "error": "<detail>", "source": label|None}``
+    when the SDK is missing, no credential is available, or the query fails.
+    Uses the SDK's ``codex.models()`` (spawns a short-lived app-server), cached
+    300s per credential fingerprint.
+
+    A row is ``{"id", "display_name", "supported_efforts": [{"id",
+    "description"}...], "default_effort": str|None}`` (see :func:`_model_row`).
+    The effort fields ride the same cached rows because they are the same
+    catalog: :func:`effort_options` builds the effort dropdown from them
+    without a second app-server spawn.
     """
     sdk, err = load_sdk()
     if sdk is None:
-        return {
-            "models": [],
-            "error": (
-                "openai_codex is not installed — install it with "
-                "`cremind features install codex`. " + (err or "")
-            ).strip(),
-            "source": None,
-        }
+        return {"models": [], "error": _sdk_unavailable_error(err), "source": None}
 
     auth = resolve_auth(variables, profile)
     key = _cache_key(auth)
+    generation = _models_generation.get(key, 0)
     if not force_refresh:
         entry = _models_cache.get(key)
         if entry is not None:
@@ -768,11 +888,14 @@ async def list_models(
         return {"models": [], "error": detail, "source": auth.source}
 
     models = [
-        {"id": getattr(m, "id", None), "display_name": getattr(m, "display_name", None) or getattr(m, "id", None)}
+        _model_row(m)
         for m in rows
         if getattr(m, "id", None) and not getattr(m, "hidden", False)
     ]
-    _models_cache[key] = (time.monotonic(), models)
+    # Still the right answer to THIS call, but no longer to the next one if the
+    # home was signed in or out while the app-server was answering.
+    if _models_generation.get(key, 0) == generation:
+        _models_cache[key] = (time.monotonic(), models)
     return {"models": models, "source": auth.source, "cached": False}
 
 
@@ -873,14 +996,7 @@ def list_sandbox_modes() -> Dict[str, Any]:
     """
     sdk, err = load_sdk()
     if sdk is None:
-        return {
-            "modes": [],
-            "error": (
-                "openai_codex is not installed — install it with "
-                "`cremind features install codex`. " + (err or "")
-            ).strip(),
-            "source": None,
-        }
+        return {"modes": [], "error": _sdk_unavailable_error(err), "source": None}
     sandbox_cls = getattr(sdk, "Sandbox", None)
     try:
         modes = [m.value for m in sandbox_cls] if sandbox_cls is not None else []
@@ -893,6 +1009,151 @@ def list_sandbox_modes() -> Dict[str, Any]:
             "source": "openai_codex",
         }
     return {"modes": modes, "source": "openai_codex", "error": None}
+
+
+# ── reasoning-effort listing ───────────────────────────────────────────────────
+#
+# Nothing in this module names a level. Which efforts a model takes is a fact
+# about the ACCOUNT's model catalog: with a ChatGPT login each model row carries
+# its own ``supported_reasoning_efforts``, and two accounts - or two models on
+# one account - genuinely disagree. So the dropdown is built from the rows
+# :func:`list_models` already fetched. A list of our own was wrong in both
+# directions at once: it offered levels a model refuses, and it hid any level a
+# newer catalog added until someone edited the code.
+#
+# The installed SDK's ``ReasoningEffort`` enum is the fallback for when the
+# catalog says nothing (signed out, offline, models that declare no efforts).
+# It is the vocabulary of the SDK that will carry the value, so it can never be
+# staler than the binary receiving it.
+
+_EFFORT_PARTIAL_SUFFIX = " (some models only)"
+_NO_SDK_EFFORTS_ERROR = "The installed openai_codex does not expose reasoning effort levels."
+
+
+def _sdk_effort_enum(sdk) -> Optional[type]:
+    """The installed SDK's ``ReasoningEffort`` enum class, or None. Never raises.
+
+    Looked up on the package first, then in ``<sdk>.generated.v2_all``, where
+    0.154 (and the 0.1.0b3 beta before it) define it without re-exporting it.
+
+    The submodule is only imported for a real package (one with a
+    ``__path__``). ``import_module`` answers from ``sys.modules`` before it
+    ever consults the parent, so a stand-in module named ``openai_codex`` - the
+    shape every test fake has - would otherwise be handed the REAL SDK's enum
+    whenever something earlier in the process imported the real one, and a
+    fake built without an enum would quietly grow one.
+    """
+    if sdk is None:
+        return None
+    candidate = getattr(sdk, "ReasoningEffort", None)
+    name = getattr(sdk, "__name__", None)
+    if candidate is None and name and getattr(sdk, "__path__", None) is not None:
+        try:
+            generated = importlib.import_module(f"{name}.generated.v2_all")
+            candidate = getattr(generated, "ReasoningEffort", None)
+        except Exception:  # noqa: BLE001 - no generated module = no enum
+            logger.debug("codex: the SDK has no generated ReasoningEffort enum", exc_info=True)
+            candidate = None
+    if isinstance(candidate, type) and issubclass(candidate, enum.Enum):
+        return candidate
+    return None
+
+
+def sdk_reasoning_efforts(sdk) -> List[str]:
+    """The levels the installed SDK's ``ReasoningEffort`` enum declares, in its
+    declaration order (shallowest first on every SDK so far), or ``[]`` when
+    it exposes none. Never raises.
+
+    Declared members only. The 0.154 enum's ``_missing_`` mints a member for any
+    other non-empty string, but such a member never joins the iteration - which
+    is right: nobody listed it.
+    """
+    enum_cls = _sdk_effort_enum(sdk)
+    if enum_cls is None:
+        return []
+    try:
+        levels = [_enum_value(member) for member in enum_cls]
+    except Exception:  # noqa: BLE001
+        logger.debug("codex: iterating the SDK's ReasoningEffort enum failed", exc_info=True)
+        return []
+    return [level for level in dict.fromkeys(levels) if level]
+
+
+def effort_options(sdk, listing: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The ``CODEX_REASONING_EFFORT`` dropdown for one :func:`list_models`
+    result. Pure (no I/O beyond the SDK introspection) and never raises.
+
+    Returns ``{"options": [{"id", "label"}...], "source": str|None, "error":
+    str|None}``, from the first of these that has anything to say:
+
+    - ``source="account_models"`` - the union of the listed models'
+      ``supported_efforts``. Levels the SDK enum knows are ranked by it, so the
+      list reads shallowest to deepest however the catalog orders its rows;
+      levels it does not know follow, in the order the catalog first named
+      them, so a catalog newer than the SDK is still offered, just not ranked.
+      A label is ``"<id> — <description>"`` from the first model that describes
+      the level (the bare id when none does), and ends in ``(some models
+      only)`` when a model that declares efforts leaves the level out: the
+      variable is one value for every model, so a pick that will not reach
+      them all has to say so.
+    - ``source="openai_codex"`` - no model declared an effort (the listing
+      failed, or the catalog carries none): the SDK enum's levels as bare ids.
+      ``error`` stays None because the dropdown is still usable.
+    - ``source=None`` - neither has any: no options, and ``error`` explains
+      why, preferring the listing's own error (which already distinguishes a
+      missing SDK, a pending restart and a missing credential).
+    """
+    listing = listing if isinstance(listing, dict) else {}
+    known = sdk_reasoning_efforts(sdk)
+
+    order: List[str] = []  # first-seen order across the catalog
+    descriptions: Dict[str, str] = {}
+    supporters: Dict[str, int] = {}
+    declaring = 0
+    for model in listing.get("models") or []:
+        if not isinstance(model, dict):
+            continue
+        levels: List[str] = []
+        for option in model.get("supported_efforts") or []:
+            if not isinstance(option, dict):
+                continue
+            level = str(option.get("id") or "").strip()
+            if not level or level in levels:
+                continue
+            levels.append(level)
+            if level not in supporters:
+                order.append(level)
+                supporters[level] = 0
+            supporters[level] += 1
+            description = str(option.get("description") or "").strip()
+            if description and level not in descriptions:
+                descriptions[level] = description
+        if levels:
+            declaring += 1
+
+    if order:
+        rank = {level: index for index, level in enumerate(known)}
+        ranked = sorted((level for level in order if level in rank), key=rank.__getitem__)
+        ordered = ranked + [level for level in order if level not in rank]
+        options = []
+        for level in ordered:
+            label = f"{level} — {descriptions[level]}" if level in descriptions else level
+            if supporters[level] < declaring:
+                label += _EFFORT_PARTIAL_SUFFIX
+            options.append({"id": level, "label": label})
+        return {"options": options, "source": "account_models", "error": None}
+
+    if known:
+        return {
+            "options": [{"id": level, "label": level} for level in known],
+            "source": "openai_codex",
+            "error": None,
+        }
+
+    error = listing.get("error")
+    if not error:
+        error = _sdk_unavailable_error(None) if sdk is None else _NO_SDK_EFFORTS_ERROR
+    return {"options": [], "source": None, "error": error}
 
 
 # The Codex account kinds the SDK models, spelled the way Cremind spells them
@@ -1004,6 +1265,20 @@ def known_task_ids() -> List[str]:
     return list(_task_registry.keys())
 
 
+def busy_count() -> int:
+    """How many Codex tasks are still running, across every profile.
+
+    A count and nothing more, because its other caller is the feature installer:
+    on Windows a running ``codex`` binary holds its own executable open, so pip
+    cannot replace it mid-task, and the installer refuses the upgrade while
+    this is non-zero. That refusal is shown to whoever clicked Update, so it
+    must not carry another profile's task ids or prompts - a number is all it
+    needs. The registry is snapshotted first because the installer may ask
+    from a worker thread while the event loop is adding a task.
+    """
+    return sum(1 for task in tuple(_task_registry.values()) if not task.done.is_set())
+
+
 def _cleanup_stale_tasks() -> None:
     now = time.monotonic()
     stale = [
@@ -1039,7 +1314,7 @@ async def start_task(
         )
 
     max_concurrent = _as_int(variables.get(Var.MAX_CONCURRENT_TASKS)) or _DEFAULT_MAX_CONCURRENT
-    running = sum(1 for t in _task_registry.values() if not t.done.is_set())
+    running = busy_count()
     if running >= max_concurrent:
         raise CodexConcurrencyError(
             "TooManyTasks",
@@ -1049,7 +1324,12 @@ async def start_task(
 
     sdk, err = load_sdk()
     if sdk is None:  # pragma: no cover — leaf pre-checks this; defensive.
-        raise RuntimeError(f"openai_codex not importable: {err}")
+        # The restart message travels bare so the leaf can recognise it: an
+        # upgrade finishing between the leaf's check and this one is rare,
+        # but "install it" would be the wrong advice when it happens.
+        raise RuntimeError(
+            err if err == RESTART_PENDING_MESSAGE else f"openai_codex not importable: {err}"
+        )
 
     effective_sandbox, sandbox_note = resolve_sandbox(sdk, variables)
     task = CodexTask(

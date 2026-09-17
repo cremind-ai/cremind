@@ -212,6 +212,74 @@ def test_listing_prints_the_remedy_for_a_blocked_host(
     assert result.output.count("Proxmox") == 1
 
 
+def _installed_cells(output: str) -> dict[str, str]:
+    """AGENT -> INSTALLED cell, read from the rendered table rows."""
+    cells: dict[str, str] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in ("claude_code", "codex"):
+            cells[parts[0]] = parts[1]
+    return cells
+
+
+@pytest.mark.parametrize(
+    "fields,expected",
+    [
+        ({"sdk_installed": True, "sdk_outdated": False, "restart_pending": False}, "yes"),
+        ({"sdk_installed": True, "sdk_outdated": True, "restart_pending": False}, "outdated"),
+        # Updated but not restarted: still outdated as far as the running
+        # process is concerned, but the step left is the restart.
+        ({"sdk_installed": True, "sdk_outdated": True, "restart_pending": True}, "restart"),
+        ({"sdk_installed": True, "sdk_outdated": False, "restart_pending": True}, "restart"),
+        # Not installed says so first: there is nothing to update or restart.
+        ({"sdk_installed": False, "sdk_outdated": False, "restart_pending": True}, "no"),
+    ],
+)
+def test_installed_cell_reports_an_outdated_or_restart_pending_sdk(
+    monkeypatch: pytest.MonkeyPatch, fields: dict, expected: str,
+) -> None:
+    """Importable is not usable: an SDK an older Cremind installed still
+    imports, and an old Codex SDK silently lists built-in models instead of the
+    account's. The table is where a user looking at "why is my model list
+    wrong" lands, so the cell has to say it."""
+    from app.cli.main import app
+
+    codex = {
+        **_AGENTS[1],
+        **fields,
+        "sdk_version": "0.1.0b3",
+        "sdk_required": "openai-codex>=0.154.0,<0.155",
+    }
+    _patch_listing(monkeypatch, agents=[_AGENTS[0], codex])
+    result = CliRunner().invoke(app, ["--token", "t", "tools", "coding-agents"])
+    assert result.exit_code == 0, result.output
+    assert _installed_cells(result.stdout) == {"claude_code": "yes", "codex": expected}
+
+
+def test_installed_cell_on_an_older_server_is_plain_yes_or_no(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that predates version checks sends no ``sdk_outdated`` or
+    ``restart_pending``; a missing key must read as "nothing known to be
+    wrong", never as outdated."""
+    from app.cli.main import app
+
+    old_rows = [
+        {k: v for k, v in agent.items()
+         if k not in ("sdk_outdated", "sdk_version", "sdk_required", "restart_pending")}
+        for agent in (_AGENTS[0], {**_AGENTS[1], "sdk_installed": True})
+    ]
+    _patch_listing(monkeypatch, agents=old_rows)
+    result = CliRunner().invoke(app, ["--token", "t", "tools", "coding-agents"])
+    assert result.exit_code == 0, result.output
+    assert _installed_cells(result.stdout) == {"claude_code": "yes", "codex": "yes"}
+
+    _patch_listing(monkeypatch, agents=[_AGENTS[0], _AGENTS[1]])
+    result = CliRunner().invoke(app, ["--token", "t", "tools", "coding-agents"])
+    assert result.exit_code == 0, result.output
+    assert _installed_cells(result.stdout)["codex"] == "no"
+
+
 def test_listing_json_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.cli.main import app
 

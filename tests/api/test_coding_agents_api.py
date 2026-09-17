@@ -31,7 +31,11 @@ both read:
   and reported FIRST - the listing's sentence, a 409 from ``login-terminal``
   with nothing spawned, and ``cli_blocked`` in the ``/cli`` payload so the shell
   door refuses too. On such a host "install it" / "sign in" / "switch it on"
-  are all still true and all beside the point.
+  are all still true and all beside the point;
+- an SDK that imports but sits outside the feature's pinned range is
+  ``sdk_outdated`` with both versions named, and an update that already landed
+  is ``restart_pending`` - the listing's sentence says restart before update,
+  and both after "not installed", because neither applies to an absent SDK.
 
 Isolation is by environment: ``CLAUDE_CONFIG_DIR`` / ``CODEX_HOME`` point at
 empty temp directories and ``BaseConfig.CREMIND_SYSTEM_DIR`` at ``tmp_path``, so
@@ -124,6 +128,53 @@ def _no_cli_binaries(monkeypatch):
         monkeypatch.setattr(runner, "find_cli", lambda variables=None: None)
         monkeypatch.setattr(runner, "cli_binary_source", lambda variables=None: None)
         monkeypatch.setattr(runner, "host_blocker", lambda variables=None: None)
+
+
+@pytest.fixture(autouse=True)
+def _sdk_versions_current(monkeypatch):
+    """Every SDK inside its pinned range, and no update waiting for a restart.
+
+    The version check reads the installed distributions' metadata, so without
+    this the listing's sentence would depend on which venv runs the suite - a
+    dev box that still has the pre-0.154 codex wheel would turn every codex
+    row's message into "update required". Tests about that state say so with
+    :func:`_versions`."""
+    import app.features.installer as installer
+    import app.features.manifest as manifest
+
+    monkeypatch.setattr(
+        manifest, "version_report",
+        lambda key: {"outdated": False, "required": [], "installed_versions": {}},
+        raising=False,
+    )
+    monkeypatch.setattr(installer, "restart_pending", lambda key: False, raising=False)
+
+
+def _versions(
+    monkeypatch,
+    *,
+    outdated: tuple[str, ...] = (),
+    restart_pending: tuple[str, ...] = (),
+) -> None:
+    """Speak for a server where the named features are outdated / updated and
+    waiting for a restart. Codex is described with its real requirement and
+    the pre-0.154 wheel the dev venvs still carry."""
+    import app.features.installer as installer
+    import app.features.manifest as manifest
+
+    def _report(key):
+        if key != "codex":
+            return {"outdated": False, "required": [], "installed_versions": {}}
+        return {
+            "outdated": key in outdated,
+            "required": ["openai-codex>=0.154.0,<0.155"],
+            "installed_versions": {"openai-codex": "0.1.0b3"},
+        }
+
+    monkeypatch.setattr(manifest, "version_report", _report, raising=False)
+    monkeypatch.setattr(
+        installer, "restart_pending", lambda key: key in restart_pending, raising=False,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -530,6 +581,108 @@ def test_a_blocked_host_also_leads_the_not_installed_sentence(
     row = _by_id(_agents(tmp_path))["claude_code"]
     assert row["message"] == blocker["message"]
     assert "not installed" not in row["message"]
+
+
+def test_rows_report_a_current_sdk_by_default(tmp_path: Path, sdk_present) -> None:
+    """The healthy shape, pinned: every row carries the four update fields, and
+    a row with nothing to update says so rather than leaving them out."""
+    for row in _agents(tmp_path):
+        assert row["sdk_outdated"] is False
+        assert row["restart_pending"] is False
+        assert "sdk_version" in row and "sdk_required" in row
+        assert "Update the" not in row["message"]
+        assert "Restart the Cremind server" not in row["message"]
+
+
+def test_an_outdated_sdk_is_reported_with_both_versions(
+    tmp_path: Path, monkeypatch, sdk_present,
+) -> None:
+    """An SDK below the pinned range still imports, so ``sdk_installed`` alone
+    reads as healthy - and the account's model list quietly falls back to the
+    one built into the old binary. The row has to name both versions and the
+    fix, ahead of the credential sentence it would otherwise show."""
+    _versions(monkeypatch, outdated=("codex",))
+    _sign_in_codex(_profile_codex_home(tmp_path))
+    agents = _by_id(_agents(tmp_path))
+
+    row = agents["codex"]
+    assert row["sdk_installed"] is True
+    assert row["sdk_outdated"] is True
+    assert row["sdk_version"] == "0.1.0b3"
+    assert row["sdk_required"] == "openai-codex>=0.154.0,<0.155"
+    assert row["restart_pending"] is False
+    assert row["message"] == (
+        "Codex is installed, but its SDK (openai-codex 0.1.0b3) is outside the "
+        "range this Cremind needs (openai-codex>=0.154.0,<0.155), so Codex cannot "
+        "read the account's live model list and falls back to one built into the "
+        "old binary. Update the 'codex' feature (admin), then restart the server."
+    )
+    # Still reported honestly underneath: the update decides what to SAY.
+    assert row["credential_source"] == "profile_codex_login"
+
+    # Per delegate: Claude Code declares no requirement and is untouched.
+    assert agents["claude_code"]["sdk_outdated"] is False
+    assert agents["claude_code"]["sdk_version"] is None
+    assert agents["claude_code"]["sdk_required"] is None
+
+
+def test_a_pending_restart_beats_the_update_sentence(
+    tmp_path: Path, monkeypatch, sdk_present,
+) -> None:
+    """Once the update has landed, updating again changes nothing: the old SDK
+    still loaded in the server process is what is in the way."""
+    _versions(monkeypatch, outdated=("codex",), restart_pending=("codex",))
+    row = _by_id(_agents(tmp_path))["codex"]
+    assert row["restart_pending"] is True
+    assert row["message"] == (
+        "Codex was updated on this server. Restart the Cremind server to load the "
+        "new version."
+    )
+
+
+def test_not_installed_still_leads_an_outdated_or_restarting_row(
+    tmp_path: Path, monkeypatch, sdk_absent,
+) -> None:
+    """``outdated`` is only ever claimed for an SDK that is there: a row saying
+    "not installed" and "update required" at once would contradict itself."""
+    _versions(monkeypatch, outdated=("codex",), restart_pending=("codex",))
+    row = _by_id(_agents(tmp_path))["codex"]
+    assert row["sdk_installed"] is False
+    assert row["sdk_outdated"] is False
+    assert "not installed" in row["message"]
+    assert "Restart" not in row["message"]
+
+
+def test_a_blocked_host_still_leads_an_outdated_row(
+    tmp_path: Path, monkeypatch, sdk_present,
+) -> None:
+    """Updating the SDK would not help a host that cannot run the binary."""
+    _versions(monkeypatch, outdated=("codex",))
+    blocker = _block_host(monkeypatch, codex_runner)
+    row = _by_id(_agents(tmp_path))["codex"]
+    assert row["sdk_outdated"] is True
+    assert row["message"] == blocker["message"]
+
+
+def test_a_failing_version_check_never_breaks_the_listing(
+    tmp_path: Path, monkeypatch, sdk_present,
+) -> None:
+    """Both checks fail open: a check that could not run is no evidence that
+    anything needs updating, and the card must still render."""
+    import app.features.installer as installer
+    import app.features.manifest as manifest
+
+    def _boom(key):
+        raise RuntimeError("metadata unreadable")
+
+    monkeypatch.setattr(manifest, "version_report", _boom, raising=False)
+    monkeypatch.setattr(installer, "restart_pending", _boom, raising=False)
+    agents = _agents(tmp_path)
+    for row in agents:
+        assert row["sdk_outdated"] is False
+        assert row["restart_pending"] is False
+        assert row["sdk_version"] is None
+        assert row["message"]
 
 
 def test_list_unauthenticated_401(tmp_path: Path) -> None:

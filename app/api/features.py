@@ -45,9 +45,14 @@ async def get_features(request: Request) -> JSONResponse:
     """Snapshot of every feature's install state.
 
     Returns ``{ feature_id: { installed, requires_restart_after_install,
-    extras } }``. Unauthenticated until setup is complete so the wizard
-    can render its "this will install …" hints before the admin token
-    exists.
+    extras, outdated, required, installed_versions, restart_pending } }``
+    (see :func:`app.features.installer.feature_status`). ``outdated`` means
+    the feature imports but sits below the version range this Cremind
+    needs; ``restart_pending`` means it was updated in place and the server
+    has not restarted since. Unauthenticated until setup is complete so the
+    wizard can render its "this will install …" hints before the admin
+    token exists. The version fields are package names and versions only:
+    no secrets, and nothing profile-scoped.
     """
     state = get_state()
     setup_complete = state.storage_ready and state.config_storage.is_setup_complete()
@@ -67,6 +72,11 @@ async def post_install_features(request: Request) -> Any:
     Each pip stdout line is emitted as ``event: log``. When the install
     finishes, a final ``event: done`` carries the :class:`InstallResult`
     as JSON. Errors emit ``event: error`` with the failure message.
+
+    A listed feature that is installed but outdated is updated rather than
+    skipped; it comes back under ``upgraded`` (never also under
+    ``installed``) with ``restart_required`` set, because the old version
+    stays loaded until the server restarts.
     """
     state = get_state()
     setup_complete = state.storage_ready and state.config_storage.is_setup_complete()
@@ -153,6 +163,9 @@ def _result_payload(result: InstallResult) -> dict:
         "failed": result.failed,
         "already_present": result.already_present,
         "error": result.error,
+        # Features that were installed but outdated and are now updated.
+        # Clients that predate the field simply don't show the update.
+        "upgraded": result.upgraded,
     }
 
 

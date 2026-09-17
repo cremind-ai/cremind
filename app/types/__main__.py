@@ -171,6 +171,16 @@ class RequiredConfigField(TypedDict, total=False):
     # and offline use still work. Use this (not ``enum``) when the valid set is
     # discovered at runtime rather than fixed in the schema.
     dynamic_options: bool
+    # Only meaningful alongside ``dynamic_options``. When True the Settings form
+    # renders a STRICT dropdown — the user picks from the live list or clears
+    # back to the default (empty), but cannot type a value the list doesn't
+    # offer. For variables whose valid set is closed and fully known to the
+    # runner (e.g. reasoning-effort levels), where a typed value outside the
+    # list would be silently dropped at run time. When the live list comes back
+    # empty the form still falls back to a text input, so an unresolvable list
+    # never locks the field. Server-side validation is unchanged: ``--force`` /
+    # ``allow_unknown`` still write an unlisted value.
+    options_only: bool
 
 
 class OAuthConfig(TypedDict, total=False):

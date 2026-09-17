@@ -177,8 +177,9 @@ async def start(profile: str, variables: dict) -> CodexLoginSession:
     """Begin a device-code sign-in for ``profile`` and return it once the code
     is known (or the attempt has already failed).
 
-    Raises ``RuntimeError`` when the Codex SDK is not installed - there is
-    nothing to spawn and the API turns that into a 409. Every other failure
+    Raises ``RuntimeError`` when the Codex SDK is not installed, or was updated
+    and awaits a server restart - there is nothing to spawn either way and the
+    API turns that into a 409. Every other failure
     lands on the session as ``status="error"`` with a ``detail``, because by
     then there IS a session and the card has somewhere to show the reason.
 
@@ -190,6 +191,11 @@ async def start(profile: str, variables: dict) -> CodexLoginSession:
     _reap()
     sdk, err = runner.load_sdk()
     if sdk is None:
+        # A pending restart goes out verbatim: the SDK IS installed, just not
+        # loadable until the server restarts, and "install it" would send the
+        # user to a fix that changes nothing.
+        if err == runner.RESTART_PENDING_MESSAGE:
+            raise RuntimeError(err)
         raise RuntimeError(
             "openai_codex is not installed - install it with "
             f"`cremind features install codex`. {err or ''}".strip()
@@ -361,6 +367,23 @@ def get(login_id: str) -> Optional[CodexLoginSession]:
     return _by_login_id.get(login_id)
 
 
+def active_count() -> int:
+    """How many sign-ins are still live (not in a terminal status), across
+    every profile.
+
+    Asked by the feature installer, not by the API: each live sign-in holds a
+    ``codex app-server`` child, and on Windows a running binary cannot be
+    replaced, so an upgrade refuses while this is non-zero. A count only - the
+    refusal is shown to whoever clicked Update and must not name another
+    profile's session. Snapshotted first because the installer may ask from a
+    worker thread while the event loop is registering a session.
+    """
+    return sum(
+        1 for session in tuple(_by_login_id.values())
+        if session.status not in _TERMINAL_STATUSES
+    )
+
+
 async def cancel(login_id: str) -> bool:
     """Cancel one session by id. True when there was a live one to cancel."""
     session = _by_login_id.get(login_id)
@@ -410,6 +433,7 @@ def _reset_for_tests() -> None:
 
 __all__ = [
     "CodexLoginSession",
+    "active_count",
     "cancel",
     "cancel_for_profile",
     "close_all",

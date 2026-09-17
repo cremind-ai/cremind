@@ -1609,9 +1609,14 @@ export interface ToolConfigField {
   enum?: string[];
   default?: unknown;
   /** When true, a live option list is available from
-   *  ``getToolVariableOptions`` (GET /api/tools/{id}/variable-options). Advisory:
-   *  values are not validated against it, so the field stays free-form. */
+   *  ``getToolVariableOptions`` (GET /api/tools/{id}/variable-options). Advisory
+   *  for the UI: its saves pass ``allow_unknown``, so the field stays free-form
+   *  unless ``options_only`` is also set. */
   dynamic_options?: boolean;
+  /** With `dynamic_options`: render a strict dropdown (pick from the live list
+   *  or clear to the default — no free typing). Falls back to a text input when
+   *  the live list is empty. */
+  options_only?: boolean;
 }
 
 export interface ToolStatus {
@@ -1949,6 +1954,12 @@ export interface FeatureInstallEvent {
   // Present on the final ``event: done`` frame.
   restart_required?: boolean;
   installed?: string[];
+  /** Features that were already importable but outside the version range
+   *  this Cremind pins, and were brought into range by this install. The
+   *  running process still holds the old modules, so a restart is due even
+   *  when the feature would load live on a first install. Absent on a
+   *  backend that predates version-aware installs. */
+  upgraded?: string[];
   failed?: string[];
   already_present?: string[];
   error?: string | null;
@@ -1958,6 +1969,8 @@ export interface StreamFeaturesInstallResult {
   ok: boolean;
   restart_required: boolean;
   installed: string[];
+  /** See ``FeatureInstallEvent.upgraded``; empty on an older backend. */
+  upgraded: string[];
   failed: string[];
   error: string | null;
 }
@@ -2028,12 +2041,13 @@ export async function streamFeaturesInstall(
   }
 
   if (!lastDone) {
-    return { ok: false, restart_required: false, installed: [], failed: features, error: 'install stream ended without a done event' };
+    return { ok: false, restart_required: false, installed: [], upgraded: [], failed: features, error: 'install stream ended without a done event' };
   }
   return {
     ok: lastDone.ok && !(lastDone.failed && lastDone.failed.length),
     restart_required: !!lastDone.restart_required,
     installed: lastDone.installed ?? [],
+    upgraded: lastDone.upgraded ?? [],
     failed: lastDone.failed ?? [],
     error: (lastDone.error as string | null | undefined) ?? null,
   };
@@ -2190,6 +2204,24 @@ export interface CodingAgentStatus {
   feature_key: string;
   extras: string[];
   sdk_installed: boolean;
+  /** The SDK imports, but its installed version is outside the range this
+   *  Cremind pins — e.g. an ``openai-codex`` whose bundled binary cannot read
+   *  the account's live model catalog and silently lists built-in models
+   *  instead. Only ever true alongside ``sdk_installed``. Optional, like the
+   *  three fields after it: a backend that predates version checks omits
+   *  them, and the card then renders exactly as it did before. */
+  sdk_outdated?: boolean;
+  /** The installed version of the feature's first pinned distribution
+   *  (``0.1.0b3``). Null when the feature pins nothing or the version is
+   *  unknown. */
+  sdk_version?: string | null;
+  /** The pinned requirement(s) verbatim (``openai-codex>=0.154.0,<0.155``).
+   *  Null when the feature pins nothing. */
+  sdk_required?: string | null;
+  /** The feature was updated on this server, but the running process still
+   *  holds the old modules until the server restarts. System-wide, like the
+   *  venv it describes. */
+  restart_pending?: boolean;
   requires_restart_after_install: boolean;
   enabled: boolean;
   /** Non-secret label of where the credential comes from

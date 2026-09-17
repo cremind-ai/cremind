@@ -24,6 +24,7 @@ import {
   registerSkillLongRunningApp, DuplicateAutostartError,
 } from '../services/processApi';
 import { openSettingsStateStream, type SettingsStateStreamHandle } from '../services/settingsStateStream';
+import { useServerRestart } from '../composables/useServerRestart';
 
 import type { JsonSchema } from '../services/agentApi';
 import { getAuthUrl, unlinkAgent, reconnectAgent } from '../services/agentApi';
@@ -55,7 +56,7 @@ interface UnifiedItem {
   kind: 'builtin' | 'skill' | 'mcp-remote';
 
   toolName: string | null;  // tool_id used by /api/tools/{tool_id} endpoints
-  toolConfigFields: Record<string, { description: string; type: string; secret: boolean; configured: boolean; required?: boolean; enum?: string[]; default?: unknown; dynamic_options?: boolean }>;
+  toolConfigFields: Record<string, { description: string; type: string; secret: boolean; configured: boolean; required?: boolean; enum?: string[]; default?: unknown; dynamic_options?: boolean; options_only?: boolean }>;
   toolConfigValues: Record<string, string>;
   toolConfigured: boolean;
 
@@ -115,6 +116,10 @@ interface UnifiedItem {
   dynamicOptionsLoading: boolean;
   /** Whether the option lists have been fetched yet (lazy-load guard). */
   dynamicOptionsLoaded: boolean;
+  /** Transient: bumped by every option fetch, so a slow answer that a newer
+   *  fetch has superseded (a pre-sign-in listing landing after the post-sign-in
+   *  refresh) is dropped instead of overwriting the fresher list. */
+  dynamicOptionsSeq: number;
 }
 
 // ── Data ──
@@ -185,6 +190,16 @@ const featureInstallBusy = ref(false);
 const featureInstallLog = ref<string[]>([]);
 const featureInstallRestartRequired = ref(false);
 const featureInstallError = ref<string | null>(null);
+// The same dialog also updates a feature that imports but sits outside the
+// version range this Cremind pins (a coding agent's "Update required"). The
+// install endpoint is the same call either way; what differs is the copy, and
+// that an update never retries an enable (the tool was working all along) but
+// ends on a restart instead, because the running process keeps the old modules.
+const featureInstallMode = ref<'install' | 'update'>('install');
+const featureInstallVersions = ref<{ installed: string | null; required: string | null } | null>(null);
+const serverRestart = useServerRestart();
+/** Restarting the server is admin-only, like installing into its venv. */
+const isAdminProfile = computed(() => props.profile === 'admin');
 
 // Listen for auth completion from the OAuth callback tab
 function handleAuthMessage(event: MessageEvent) {
@@ -225,6 +240,10 @@ function closeLiveSettingsStream() {
 onMounted(async () => {
   window.addEventListener('message', handleAuthMessage);
   openLiveSettingsStream();
+  // Resolve install_mode early so the install dialog's Restart button knows
+  // whether to route through the Electron IPC bridge or POST
+  // /api/system/restart — the same wiring EmbeddingSettings.vue uses.
+  if (isAdminProfile.value) void serverRestart.loadInstallMode();
   // Its own endpoint, its own error surface: a coding-agents failure must not
   // keep the tool list from rendering, so it is not awaited with the rest.
   void loadCodingAgents();
@@ -331,6 +350,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       dynamicOptions: {},
       dynamicOptionsLoading: false,
       dynamicOptionsLoaded: false,
+      dynamicOptionsSeq: 0,
     });
   }
 
@@ -377,6 +397,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       dynamicOptions: {},
       dynamicOptionsLoading: false,
       dynamicOptionsLoaded: false,
+      dynamicOptionsSeq: 0,
     });
   }
 
@@ -467,7 +488,13 @@ function toggleExpand(item: UnifiedItem) {
   if (item.expanded && !item.leavesLoaded && (item.kind === 'builtin' || item.kind === 'mcp-remote')) {
     void loadLeaves(item);
   }
-  if (item.expanded && !item.dynamicOptionsLoaded && item.kind === 'builtin' && hasDynamicOptions(item)) {
+  // A load already in flight is left to finish: `dynamicOptionsLoaded` is also
+  // false while a post-sign-in refresh runs, and a second, non-refresh fetch
+  // started by re-expanding would supersede it with a possibly cached list.
+  if (
+    item.expanded && !item.dynamicOptionsLoaded && !item.dynamicOptionsLoading
+    && item.kind === 'builtin' && hasDynamicOptions(item)
+  ) {
     void loadDynamicOptions(item);
   }
 }
@@ -494,18 +521,30 @@ function hasDynamicOptions(item: UnifiedItem): boolean {
 }
 
 /** Lazy-load live option lists (e.g. Claude Code's model list). Failures leave
- *  the field as a plain text input, so we swallow errors silently. */
-async function loadDynamicOptions(item: UnifiedItem) {
+ *  the field as a plain text input, so we swallow errors silently.
+ *
+ *  `refresh` asks the server to bypass its own cache — what a sign-in or
+ *  sign-out needs, since the list is the account's and the account just
+ *  changed. The stale list is cleared first so the select shows a loading
+ *  state rather than the previous account's models while the new ones come
+ *  in. Only the newest fetch may write: an older one resolving late would put
+ *  the list it was started for back on screen. */
+async function loadDynamicOptions(item: UnifiedItem, refresh = false) {
   const toolId = item.toolName ?? item.name;
+  const seq = ++item.dynamicOptionsSeq;
   item.dynamicOptionsLoading = true;
+  if (refresh) item.dynamicOptions = {};
   try {
-    const res = await getToolVariableOptions(settingsStore.agentUrl, settingsStore.authToken, toolId);
+    const res = await getToolVariableOptions(
+      settingsStore.agentUrl, settingsStore.authToken, toolId, refresh,
+    );
+    if (seq !== item.dynamicOptionsSeq) return;
     item.dynamicOptions = res.variables ?? {};
     item.dynamicOptionsLoaded = true;
   } catch {
     // Keep dynamicOptions empty -> the form renders a text input instead.
   } finally {
-    item.dynamicOptionsLoading = false;
+    if (seq === item.dynamicOptionsSeq) item.dynamicOptionsLoading = false;
   }
 }
 
@@ -541,9 +580,16 @@ async function setAllLeaves(item: UnifiedItem, enabled: boolean) {
   }
 }
 
-function openFeatureInstallDialog(item: UnifiedItem, detail: FeatureNotInstalledDetail) {
+function openFeatureInstallDialog(
+  item: UnifiedItem,
+  detail: FeatureNotInstalledDetail,
+  mode: 'install' | 'update' = 'install',
+  versions?: { installed: string | null; required: string | null },
+) {
   featureInstallDetail.value = detail;
   featureInstallPendingItem.value = item;
+  featureInstallMode.value = mode;
+  featureInstallVersions.value = versions ?? null;
   featureInstallLog.value = [];
   featureInstallRestartRequired.value = false;
   featureInstallError.value = null;
@@ -555,15 +601,30 @@ function closeFeatureInstallDialog() {
   featureInstallOpen.value = false;
   featureInstallDetail.value = null;
   featureInstallPendingItem.value = null;
+  featureInstallMode.value = 'install';
+  featureInstallVersions.value = null;
   featureInstallLog.value = [];
   featureInstallRestartRequired.value = false;
   featureInstallError.value = null;
+}
+
+/** Restart from the dialog's "Restart now". The page is either about to be
+ *  reloaded by a supervisor or about to lose its connection; if it survives
+ *  and the new process answers, the dialog's "restart required" is no longer
+ *  true and every row on the page predates the restart, so both go. */
+async function restartFromFeatureDialog() {
+  await serverRestart.restart();
+  if (serverRestart.phase.value === 'reconnected') {
+    closeFeatureInstallDialog();
+    await reloadAll();
+  }
 }
 
 async function confirmFeatureInstall() {
   const detail = featureInstallDetail.value;
   const item = featureInstallPendingItem.value;
   if (!detail || !item || featureInstallBusy.value) return;
+  const updating = featureInstallMode.value === 'update';
   featureInstallBusy.value = true;
   featureInstallError.value = null;
   featureInstallLog.value = [];
@@ -584,7 +645,32 @@ async function confirmFeatureInstall() {
     );
     if (!result.ok || result.failed.length) {
       featureInstallError.value =
-        result.error || `Install failed for: ${result.failed.join(', ')}`;
+        result.error || `${updating ? 'Update' : 'Install'} failed for: ${result.failed.join(', ')}`;
+      featureInstallBusy.value = false;
+      return;
+    }
+    if (updating) {
+      // No enable retry: the tool imported before the update and still does.
+      // What changed is the venv under a process that has the old modules
+      // loaded, so the only follow-up is a restart — and the row itself, which
+      // now reports "Restart required" instead of "Update required".
+      featureInstallRestartRequired.value = result.restart_required;
+      ElMessage.success(
+        result.restart_required
+          ? `Updated '${detail.feature_key}' — restart the server to load the new version.`
+          : `'${detail.feature_key}' is already up to date.`,
+      );
+      await loadCodingAgents();
+      if (!result.restart_required) {
+        // Nothing needed updating by the time the request landed: another
+        // admin got there first, or the page was stale. The refreshed row
+        // still knows whether that earlier update is waiting on a restart, and
+        // if so the dialog keeps offering one; otherwise it has nothing left.
+        const toolId = item.toolName ?? item.name;
+        const pending = codingAgents.value.find(a => a.tool_id === toolId)?.restart_pending;
+        if (pending) featureInstallRestartRequired.value = true;
+        else closeFeatureInstallDialog();
+      }
       featureInstallBusy.value = false;
       return;
     }
@@ -672,6 +758,12 @@ function codingAgentStatusTag(row: { agent: CodingAgentStatus; item: UnifiedItem
   if (row.standIn || !row.agent.sdk_installed) {
     return { label: 'Not installed', type: 'info' as const };
   }
+  // Both outrank "Active": an agent whose SDK is outdated still runs, but not
+  // as configured (Codex lists the models built into its old binary instead
+  // of the account's), and one waiting on a restart is refused outright.
+  // Restart first — once the update has landed, loading it is all that's left.
+  if (row.agent.restart_pending) return { label: 'Restart required', type: 'warning' as const };
+  if (row.agent.sdk_outdated) return { label: 'Update required', type: 'warning' as const };
   return getBuiltinStatusTag(row.item);
 }
 
@@ -704,6 +796,25 @@ function handleCodingAgentInstall(agent: CodingAgentStatus) {
   });
 }
 
+/** Bring an installed-but-outdated SDK into the pinned range. Same dialog and
+ *  endpoint as Install — the installer tells a missing feature from an
+ *  outdated one itself — opened in its update mode so the copy names both
+ *  versions and the restart that has to follow. */
+function handleCodingAgentUpdate(agent: CodingAgentStatus) {
+  openFeatureInstallDialog(
+    itemForCodingAgent(agent),
+    {
+      tool_id: agent.tool_id,
+      feature_key: agent.feature_key,
+      extras: agent.extras,
+      requires_restart_after_install: agent.requires_restart_after_install,
+      message: agent.message,
+    },
+    'update',
+    { installed: agent.sdk_version ?? null, required: agent.sdk_required ?? null },
+  );
+}
+
 async function handleCodingAgentToggle(agent: CodingAgentStatus, enabled: boolean) {
   // Switching on something that was never installed is a request to install it,
   // not an error to report: the toggle would only 409 its way into the same
@@ -728,10 +839,35 @@ function openSignIn(agent: CodingAgentStatus) {
   }
 }
 
+/**
+ * Refetch a delegate's live option lists after its login changed.
+ *
+ * The model list is the signed-in account's — a ChatGPT sign-in swaps the
+ * binary's built-in models for the account's own — but the card only fetched it
+ * on its first expand, so the pre-sign-in list stayed on screen until a page
+ * reload. The item is looked up here, at call time, rather than taken from the
+ * row: the row may hold the stand-in built before the feature was installed,
+ * which is not in `items` and whose flags nothing renders. A collapsed card is
+ * only marked stale; its next expand fetches.
+ */
+function refreshCodingAgentOptions(agent: CodingAgentStatus) {
+  const item = items.value.find(
+    i => i.kind === 'builtin' && (i.toolName ?? i.name) === agent.tool_id,
+  );
+  if (!item) return;
+  item.dynamicOptionsLoaded = false;
+  if (item.expanded && hasDynamicOptions(item)) {
+    void loadDynamicOptions(item, true);
+  }
+}
+
 /** A login just landed (or just ended): the cached probe answer predates it, so
- *  re-check with `fresh` and refetch the credential chain. */
+ *  re-check with `fresh` and refetch the credential chain. The option refetch
+ *  goes first and is not awaited — listing models can take as long as the
+ *  probe, and neither needs the other's answer. */
 async function afterSignInChange(agent: CodingAgentStatus | null) {
   if (!agent) return;
+  refreshCodingAgentOptions(agent);
   await checkSignIn(agent, true);
   await loadCodingAgents();
 }
@@ -1096,8 +1232,9 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
                   :probe="codingProbeResults[row.agent.tool_id] ?? null"
                   :probing="codingProbing[row.agent.tool_id]"
                   :signing-out="codingSigningOut[row.agent.tool_id]"
-                  :is-admin="props.profile === 'admin'"
+                  :is-admin="isAdminProfile"
                   @install="handleCodingAgentInstall"
+                  @update="handleCodingAgentUpdate"
                   @sign-in="openSignIn"
                   @check="checkSignIn($event, true)"
                   @sign-out="signOut"
@@ -1511,28 +1648,54 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
     <!-- Feature install dialog (toggled by toggleItemEnabled when the
          backend returns 409 FeatureNotInstalled). Streams pip output
          from /api/features/install over SSE and retries the enable
-         toggle once the install completes. -->
+         toggle once the install completes. In update mode (a coding
+         agent's "Update required") it runs the same install to bring an
+         outdated SDK into range, skips the enable retry, and ends on a
+         restart. -->
     <ElDialog
       v-model="featureInstallOpen"
-      :title="featureInstallDetail ? `Install '${featureInstallDetail.feature_key}' feature?` : 'Install feature'"
+      :title="featureInstallDetail
+        ? `${featureInstallMode === 'update' ? 'Update' : 'Install'} '${featureInstallDetail.feature_key}' feature?`
+        : (featureInstallMode === 'update' ? 'Update feature' : 'Install feature')"
       width="560px"
-      :close-on-click-modal="!featureInstallBusy"
-      :close-on-press-escape="!featureInstallBusy"
-      :show-close="!featureInstallBusy"
+      :close-on-click-modal="!featureInstallBusy && !serverRestart.isBusy.value"
+      :close-on-press-escape="!featureInstallBusy && !serverRestart.isBusy.value"
+      :show-close="!featureInstallBusy && !serverRestart.isBusy.value"
     >
       <div v-if="featureInstallDetail" class="feature-install-body">
-        <p>
-          Enabling
-          <strong>{{ featureInstallPendingItem?.displayName ?? featureInstallDetail.tool_id }}</strong>
-          requires installing the
-          <code>{{ featureInstallDetail.feature_key }}</code>
-          optional dependency group
-          (<code>cremind[{{ featureInstallDetail.extras.join(',') }}]</code>).
-        </p>
-        <p v-if="featureInstallDetail.requires_restart_after_install" class="feature-install-warn">
-          A server restart will be required after the install completes
-          before the new feature can load.
-        </p>
+        <template v-if="featureInstallMode === 'update'">
+          <p>
+            <strong>{{ featureInstallPendingItem?.displayName ?? featureInstallDetail.tool_id }}</strong>
+            is installed, but its SDK is outside the version range this
+            Cremind needs. Updating reinstalls the
+            <code>{{ featureInstallDetail.feature_key }}</code>
+            optional dependency group on this server.
+          </p>
+          <dl v-if="featureInstallVersions" class="feature-install-versions">
+            <dt>Installed</dt>
+            <dd><code>{{ featureInstallVersions.installed ?? 'unknown' }}</code></dd>
+            <dt>Required</dt>
+            <dd><code>{{ featureInstallVersions.required ?? 'unknown' }}</code></dd>
+          </dl>
+          <p class="feature-install-warn">
+            The running server keeps the old version loaded, so a server
+            restart is needed after the update before it takes effect.
+          </p>
+        </template>
+        <template v-else>
+          <p>
+            Enabling
+            <strong>{{ featureInstallPendingItem?.displayName ?? featureInstallDetail.tool_id }}</strong>
+            requires installing the
+            <code>{{ featureInstallDetail.feature_key }}</code>
+            optional dependency group
+            (<code>cremind[{{ featureInstallDetail.extras.join(',') }}]</code>).
+          </p>
+          <p v-if="featureInstallDetail.requires_restart_after_install" class="feature-install-warn">
+            A server restart will be required after the install completes
+            before the new feature can load.
+          </p>
+        </template>
 
         <div v-if="featureInstallLog.length" class="feature-install-log">
           <div v-for="(line, i) in featureInstallLog" :key="i">{{ line }}</div>
@@ -1546,8 +1709,20 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
           v-if="featureInstallRestartRequired"
           class="feature-install-restart"
         >
-          Install complete. Restart the Cremind server to load the new
-          feature.
+          <template v-if="featureInstallMode === 'update'">
+            Update complete. Restart the Cremind server to load the new
+            version.
+          </template>
+          <template v-else>
+            Install complete. Restart the Cremind server to load the new
+            feature.
+          </template>
+        </p>
+        <p
+          v-if="featureInstallRestartRequired && serverRestart.error.value"
+          class="feature-install-error"
+        >
+          Restart failed: {{ serverRestart.error.value }}
         </p>
       </div>
       <template #footer>
@@ -1564,15 +1739,35 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
           :loading="featureInstallBusy"
           @click="confirmFeatureInstall"
         >
-          {{ featureInstallError ? 'Retry install' : 'Install' }}
+          <template v-if="featureInstallMode === 'update'">
+            {{ featureInstallError ? 'Retry update' : 'Update' }}
+          </template>
+          <template v-else>
+            {{ featureInstallError ? 'Retry install' : 'Install' }}
+          </template>
         </ElButton>
-        <ElButton
-          v-if="featureInstallRestartRequired"
-          type="primary"
-          @click="closeFeatureInstallDialog"
-        >
-          Close
-        </ElButton>
+        <template v-if="featureInstallRestartRequired">
+          <ElButton
+            :type="isAdminProfile ? 'default' : 'primary'"
+            :disabled="serverRestart.isBusy.value"
+            @click="closeFeatureInstallDialog"
+          >
+            Close
+          </ElButton>
+          <!-- Admin-only: restarting stops the server for every profile.
+               Wired exactly as EmbeddingSettings.vue's install dialog. -->
+          <ElButton
+            v-if="isAdminProfile"
+            type="primary"
+            autofocus
+            :loading="serverRestart.isBusy.value"
+            :disabled="serverRestart.isBusy.value"
+            @click="restartFromFeatureDialog"
+          >
+            <Icon icon="mdi:restart" style="margin-right: 4px" />
+            Restart now
+          </ElButton>
+        </template>
       </template>
     </ElDialog>
 
@@ -1610,6 +1805,16 @@ async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
   padding: 1px 4px; border-radius: 3px;
 }
 .feature-install-warn { color: var(--el-color-warning); }
+/* Installed vs required, side by side, so the gap the update closes is
+   readable at a glance rather than buried in a sentence. */
+.feature-install-versions {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  margin: 8px 0;
+}
+.feature-install-versions dt { color: var(--text-secondary); }
+.feature-install-versions dd { margin: 0; word-break: break-all; }
 .feature-install-error { color: var(--el-color-danger); }
 .feature-install-restart {
   color: var(--el-color-success);

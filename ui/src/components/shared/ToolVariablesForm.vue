@@ -2,7 +2,7 @@
 import { ElForm, ElFormItem, ElInput, ElInputNumber, ElSelect, ElOption, ElSwitch, ElTag } from 'element-plus';
 
 const props = withDefaults(defineProps<{
-  fields: Record<string, { description: string; type: string; secret: boolean; configured: boolean; required?: boolean; enum?: string[]; default?: unknown; dynamic_options?: boolean }>;
+  fields: Record<string, { description: string; type: string; secret: boolean; configured: boolean; required?: boolean; enum?: string[]; default?: unknown; dynamic_options?: boolean; options_only?: boolean }>;
   values: Record<string, string>;
   title?: string;
   // Live option lists for `dynamic_options` fields, keyed by variable name.
@@ -29,10 +29,12 @@ function optionsFor(key: string): { id: string; label?: string }[] {
 
 // Placeholder for a `dynamic_options` combobox. A field with a concrete default
 // (e.g. permission mode → "bypassPermissions") shows it; a field whose default
-// is empty (e.g. model → Claude Code's own default) shows generic guidance.
-function dynamicPlaceholder(field: { default?: unknown }): string {
+// is empty (e.g. model → Claude Code's own default) shows generic guidance —
+// without "or type one" for an `options_only` field, which can't be typed into.
+function dynamicPlaceholder(field: { default?: unknown; options_only?: boolean }): string {
   const def = field.default;
-  return def != null && def !== '' ? `Default: ${def}` : 'Default (pick or type one)';
+  if (def != null && def !== '') return `Default: ${def}`;
+  return field.options_only ? 'Default (pick one)' : 'Default (pick or type one)';
 }
 </script>
 
@@ -62,12 +64,16 @@ function dynamicPlaceholder(field: { default?: unknown }): string {
         >
           <ElOption v-for="opt in field.enum" :key="opt" :label="opt" :value="opt" />
         </ElSelect>
+        <!-- A live-list field is a combobox (pick or type a custom value), or —
+             with `options_only` — a strict dropdown whose only escape is Clear
+             (back to the default). An empty list that isn't loading falls
+             through to the text input below, so the field is never locked. -->
         <ElSelect
           v-else-if="field.dynamic_options && (optionsFor(key as string).length > 0 || dynamicLoading)"
           :model-value="values[key] || ''"
           @update:model-value="updateValue(key as string, $event ?? '')"
-          filterable
-          allow-create
+          :filterable="!field.options_only"
+          :allow-create="!field.options_only"
           default-first-option
           clearable
           :loading="dynamicLoading"

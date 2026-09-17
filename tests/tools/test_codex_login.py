@@ -372,6 +372,51 @@ def test_start_without_the_sdk_raises(monkeypatch):
     asyncio.run(body())
 
 
+def test_start_after_an_update_asks_for_a_restart_not_an_install(monkeypatch):
+    """The SDK is installed - pip just updated it - but the old one is still
+    loaded, so the sign-in refuses with the restart message the 409 carries."""
+    import app.features.installer as installer
+
+    _install_login_sdk(monkeypatch, handle=FakeDeviceCodeHandle())
+    monkeypatch.setattr(
+        installer, "restart_pending", lambda key: key == "codex", raising=False,
+    )
+
+    async def body():
+        with pytest.raises(RuntimeError) as excinfo:
+            await login.start("lee", {})
+        assert str(excinfo.value) == runner.RESTART_PENDING_MESSAGE
+
+    asyncio.run(body())
+    assert login.active_count() == 0
+
+
+def test_active_count_counts_live_sign_ins_across_profiles(monkeypatch):
+    """What the feature installer asks before replacing the codex binary on
+    Windows: every live sign-in holds an app-server child open."""
+    handles = [FakeDeviceCodeHandle(), FakeDeviceCodeHandle()]
+    mod = _install_login_sdk(monkeypatch, handle=None)
+
+    async def _next_handle(self):
+        return handles.pop(0)
+
+    mod.AsyncCodex.login_chatgpt_device_code = _next_handle
+
+    async def body():
+        assert login.active_count() == 0
+        lee = await login.start("lee", {})
+        sam = await login.start("sam", {})
+        assert login.active_count() == 2
+        await login.cancel(lee.login_id)
+        # A finished session stays readable for the UI, but holds no child.
+        assert login.get(lee.login_id) is lee
+        assert login.active_count() == 1
+        await login.cancel(sam.login_id)
+        assert login.active_count() == 0
+
+    asyncio.run(body())
+
+
 def test_get_on_an_unknown_id_is_none():
     """The signal the API turns into "sign-in interrupted, start again":
     sessions live in this process only, held open by a child process."""

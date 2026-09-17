@@ -33,6 +33,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -538,13 +539,20 @@ def _have_pip() -> bool:
 
 
 def _pip_install(
-    spec: str,
+    spec: str | Sequence[str],
     callback: ProgressCallback | None,
     *,
     channel: Channel,
     upgrade: bool = True,
 ) -> None:
     """Run ``pip install [--upgrade] <spec>`` against the current interpreter.
+
+    ``spec`` is one requirement string (what the upgrade path passes) or a
+    sequence of them, each appended as its own argv entry — never joined into
+    one string, which pip would read as a single malformed requirement. The
+    feature installer passes a list when an outdated feature's version range
+    has to ride next to the ``cremind[...]`` spec (see
+    :func:`app.features.manifest.pip_requirements`).
 
     Uses ``sys.executable -m pip`` when pip is available in this venv;
     otherwise falls back to ``uv pip install --python <sys.executable>``
@@ -622,7 +630,10 @@ def _pip_install(
                 extra_index_url,
             ]
 
-    cmd.append(spec)
+    if isinstance(spec, str):
+        cmd.append(spec)
+    else:
+        cmd.extend(spec)
     _run(cmd, callback, env=env)
 
 

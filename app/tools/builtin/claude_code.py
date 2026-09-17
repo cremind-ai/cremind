@@ -96,6 +96,25 @@ TOOL_CONFIG: ToolConfig = {
             "default": "bypassPermissions",
             "dynamic_options": True,
         },
+        Var.EFFORT: {
+            "description": (
+                "Claude Code effort level — how much thinking Claude puts into each "
+                "step; pick from the installed Claude Agent SDK's list (`cremind tools "
+                "options claude_code`). Empty = Claude Code's default (high). 'xhigh' "
+                "needs an xhigh-capable model (Opus 4.7+, Sonnet 5, Fable 5) and falls "
+                "back to 'high' on others; higher "
+                "effort is slower and uses more tokens. 'ultracode' (last in the list) "
+                "is xhigh plus dynamic workflow orchestration: it needs an "
+                "xhigh-capable model and workflows allowed, and any other level runs "
+                "without it."
+            ),
+            "type": "string",
+            "default": "",
+            "dynamic_options": True,
+            # A strict dropdown: the SDK's list is the whole set, and a typo here
+            # would otherwise be dropped silently at run time.
+            "options_only": True,
+        },
         Var.MAX_TURNS: {
             "description": "Maximum agent turns per task. 0 = unlimited.",
             "type": "number",
@@ -176,13 +195,17 @@ async def get_variable_options(
     ``cremind tools options``). Module-level hook discovered by
     :func:`app.tools.builtin.get_builtin_variable_options_hook`.
 
-    Returns ``{Var.MODEL: {...}, Var.PERMISSION_MODE: {...}}`` where each value is
+    Returns ``{Var.MODEL: {...}, Var.PERMISSION_MODE: {...}, Var.EFFORT: {...}}``
+    where each value is
     ``{"options": [{"id", "label"}...], "error": str|None, "source": str|None}``:
 
     - ``Var.MODEL`` — the account's models (from the Anthropic ``/v1/models`` API
       via the same credential chain the coding task uses) plus the CLI aliases.
     - ``Var.PERMISSION_MODE`` — the installed Claude Agent SDK's ``PermissionMode``
       Literal (introspected locally; ``refresh`` is a no-op for it).
+    - ``Var.EFFORT`` — the installed SDK's ``EffortLevel`` Literal, in the SDK's
+      order (lowest first), introspected the same way, plus ``ultracode`` last
+      when the SDK accepts ``xhigh`` (:func:`runner.effort_choices`).
 
     Never raises.
     """
@@ -197,6 +220,7 @@ async def get_variable_options(
         ]
 
     modes = runner.list_permission_modes()
+    efforts = runner.list_effort_levels()
     return {
         Var.MODEL: {
             "options": options,
@@ -210,6 +234,11 @@ async def get_variable_options(
             ],
             "error": modes.get("error"),
             "source": modes.get("source"),
+        },
+        Var.EFFORT: {
+            "options": runner.effort_choices(efforts.get("levels", [])),
+            "error": efforts.get("error"),
+            "source": efforts.get("source"),
         },
     }
 

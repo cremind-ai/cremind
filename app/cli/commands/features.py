@@ -6,6 +6,13 @@ backends, some LLM SDKs) out of the slim `pip install cremind` as optional
 the live pip output over SSE — the same flow the Setup Wizard and Settings page
 use. Features whose `requires_restart_after_install` is set only activate after
 `cremind server restart`.
+
+"Installed" only means importable. A feature can be importable and still too
+old — a runtime venv is never resynced, so a Cremind upgrade that raises a
+feature's version range leaves the old package in place (Codex's SDK is the
+case that forced this: an old one cannot read the account's live model list).
+`list` flags such a feature under UPDATE, and `install` updates it; the process
+still has the old package loaded, so an update always needs a restart.
 """
 
 from __future__ import annotations
@@ -29,7 +36,13 @@ features_app = typer.Typer(
 @features_app.command("list")
 @graceful_errors
 def features_list(ctx: typer.Context) -> None:
-    """List every optional feature and its install state."""
+    """List every optional feature and its install state.
+
+    UPDATE is `required` when an installed feature's packages are outside the
+    version range this Cremind needs, and `restart` once it has been updated
+    but the server still runs the old code. A server that predates version
+    checks sends neither field, which reads as `-`.
+    """
     import asyncio
 
     from app.cli.client._base import Client
@@ -51,7 +64,8 @@ def features_list(ctx: typer.Context) -> None:
         print_json(feats)
         return
 
-    table = Table(mode, "FEATURE", "INSTALLED", "RESTART_AFTER", "EXTRAS")
+    table = Table(mode, "FEATURE", "INSTALLED", "UPDATE", "RESTART_AFTER", "EXTRAS")
+    notes: list[str] = []
     for fid in sorted(feats):
         info = feats[fid] if isinstance(feats[fid], dict) else {}
         extras = info.get("extras")
@@ -59,10 +73,50 @@ def features_list(ctx: typer.Context) -> None:
         table.add_row(
             fid,
             "true" if info.get("installed") else "false",
+            _update_cell(info),
             "true" if info.get("requires_restart_after_install") else "false",
             extras_str,
         )
+        # Once the update has run, the only step left is the restart the cell
+        # already names; repeating "run install" would send the user round the
+        # loop again.
+        if info.get("outdated") is True and info.get("restart_pending") is not True:
+            notes.append(_outdated_note(fid, info))
     table.render()
+    for note in notes:
+        sys.stderr.write(note + "\n")
+
+
+def _update_cell(info: dict[str, Any]) -> str:
+    """Render one feature's UPDATE cell: `restart`, `required` or `-`.
+
+    `restart` wins over `required`: the feature is still outdated as far as the
+    running process is concerned (the old package is loaded), but installing it
+    again would change nothing — only the restart does.
+    """
+    if info.get("restart_pending") is True:
+        return "restart"
+    if info.get("outdated") is True:
+        return "required"
+    return "-"
+
+
+def _outdated_note(fid: str, info: dict[str, Any]) -> str:
+    """The stderr line naming what is installed, what is needed, and the fix."""
+    versions = info.get("installed_versions")
+    have = (
+        ", ".join(f"{dist} {ver or 'unknown'}" for dist, ver in versions.items())
+        if isinstance(versions, dict) and versions else "an older version"
+    )
+    required = info.get("required")
+    needs = (
+        ", ".join(str(r) for r in required)
+        if isinstance(required, list) and required else "a newer version"
+    )
+    return (
+        f"({fid}: {have} installed, needs {needs} - run "
+        f"`cremind features install {fid}`, then `cremind server restart`)"
+    )
 
 
 @features_app.command("install")
@@ -75,9 +129,10 @@ def features_install(
 ) -> None:
     """Install one or more features, streaming the pip output live.
 
-    Exits non-zero if any feature fails. A feature marked
-    requires_restart_after_install only takes effect after
-    `cremind server restart`.
+    Also updates a feature that is installed but outdated (UPDATE `required`
+    in `features list`); an update only takes effect after
+    `cremind server restart`, as does a feature marked
+    requires_restart_after_install. Exits non-zero if any feature fails.
     """
     import asyncio
 
@@ -146,10 +201,15 @@ def _render_done(data: dict[str, Any]) -> None:
         return ", ".join(str(x) for x in val) if isinstance(val, list) else ""
 
     installed = _names("installed")
+    # Features that were installed but outdated and are now updated (never also
+    # under `installed`). An older server's frame has no `upgraded` at all.
+    upgraded = _names("upgraded")
     already = _names("already_present")
     failed = _names("failed")
     if installed:
         sys.stdout.write("installed: " + installed + "\n")
+    if upgraded:
+        sys.stdout.write("updated: " + upgraded + "\n")
     if already:
         sys.stdout.write("already present: " + already + "\n")
     if failed:

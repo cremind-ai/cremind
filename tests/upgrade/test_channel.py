@@ -818,6 +818,38 @@ def test_pip_install_prod_argv(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["env"]["PIP_CACHE_DIR"].endswith("pip-cache")
 
 
+@pytest.mark.parametrize("have_pip", [True, False])
+def test_pip_install_list_spec_is_separate_argv_entries(
+    monkeypatch: pytest.MonkeyPatch, have_pip: bool,
+) -> None:
+    """The feature installer passes ``[cremind spec, version range]`` to update
+    an outdated feature. Joined into one argv entry, pip would read it as a
+    single malformed requirement."""
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd, callback, *, ignore_failure=False, prefer=None, env=None):
+        captured["cmd"] = cmd
+
+    monkeypatch.setattr(runner, "_run", fake_run)
+    monkeypatch.setattr(runner, "_have_pip", lambda: have_pip)
+    monkeypatch.setattr(runner.shutil, "which", lambda _name: "/usr/bin/uv")
+    from app.config.settings import BaseConfig
+
+    monkeypatch.setattr(BaseConfig, "CREMIND_SYSTEM_DIR", "/tmp/cremind-test")
+
+    runner._pip_install(
+        ["cremind[codex]==0.1.5", "openai-codex>=0.154.0,<0.155"],
+        None,
+        channel="production",
+        upgrade=False,
+    )
+
+    cmd = captured["cmd"]
+    assert cmd[-2:] == ["cremind[codex]==0.1.5", "openai-codex>=0.154.0,<0.155"]
+    assert "--upgrade" not in cmd
+    assert all(isinstance(part, str) for part in cmd)
+
+
 def test_pip_install_test_argv(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
 

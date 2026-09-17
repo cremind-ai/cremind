@@ -116,6 +116,15 @@ _AGENTS: tuple[dict, ...] = (
             "cli_login": "codex login --device-auth",
             "cli_logout": "codex logout",
         },
+        # What an SDK outside the feature's pinned range actually costs the
+        # user, for the listing's sentence. Per agent because it is a fact about
+        # this delegate: the wheel pins the codex binary, and a binary older
+        # than 0.154 cannot decode ChatGPT's live model catalog, so it quietly
+        # offers the models built into it instead.
+        "sdk_outdated_effect": (
+            "Codex cannot read the account's live model list and falls back to "
+            "one built into the old binary"
+        ),
     },
 )
 
@@ -307,6 +316,7 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
 
             enabled = enabled_by_id.get(tool_id, False)
             source = info.get("source")
+            update = _sdk_update_state(feature_key, sdk_installed=sdk_installed)
             agents.append({
                 "tool_id": tool_id,
                 "display_name": spec["display_name"],
@@ -316,6 +326,14 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
                 "requires_restart_after_install": (
                     bool(feature.requires_restart) if feature is not None else False
                 ),
+                # Whether the installed SDK is inside the range this Cremind
+                # pins, and whether an update already landed and waits for a
+                # restart. System facts, the same for every profile, and no
+                # secrets - versions and requirement strings.
+                "sdk_outdated": update["sdk_outdated"],
+                "sdk_version": update["sdk_version"],
+                "sdk_required": update["sdk_required"],
+                "restart_pending": update["restart_pending"],
                 "enabled": enabled,
                 "credential_source": source,
                 "credential_scope": info.get("scope"),
@@ -337,6 +355,11 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
                     scope=info.get("scope"),
                     cli_available=cli_available,
                     cli_blocked=cli_blocked,
+                    sdk_outdated=update["sdk_outdated"],
+                    sdk_dist=update["sdk_dist"],
+                    sdk_version=update["sdk_version"],
+                    sdk_required=update["sdk_required"],
+                    restart_pending=update["restart_pending"],
                 ),
             })
         return JSONResponse({"agents": agents})
@@ -447,8 +470,9 @@ def get_coding_agents_routes(state: BootedState) -> list[Route]:
             )
             session = await codex_login.start(profile, variables)
         except RuntimeError as exc:
-            # The SDK is missing. Same shape as the feature gate above, because
-            # to the user it is the same problem.
+            # The SDK is missing, or was updated and waits for a restart. Same
+            # shape as the feature gate above, because to the user it is the
+            # same problem - nothing can run yet - and ``error`` names the fix.
             return JSONResponse({"tool_id": "codex", "error": str(exc)}, status_code=409)
         except Exception as exc:  # noqa: BLE001 - a sign-in never 500s
             logger.exception("coding-agents: starting the Codex device login failed")
@@ -1066,6 +1090,63 @@ def _status_leaf(tool_id: str):
     return CodexStatusTool()
 
 
+def _sdk_update_state(feature_key: str, *, sdk_installed: bool) -> dict[str, Any]:
+    """Whether one delegate's installed SDK needs an update. Never raises.
+
+    Returns the row's ``sdk_outdated`` / ``sdk_version`` / ``sdk_required`` /
+    ``restart_pending``, plus ``sdk_dist`` (the distribution ``sdk_version``
+    belongs to), which only the summary sentence uses.
+
+    ``sdk_installed`` answers "does it import?", which an SDK too old to work
+    passes: the codex wheel below 0.154 imports fine and still cannot read the
+    account's live model list. So the version is a separate fact, asked of the
+    manifest rather than re-derived here, and reported only for an installed
+    SDK - "outdated" on a row that is not installed would contradict it.
+
+    Both checks fail OPEN - not outdated, no restart pending - because a status
+    listing must never fail, and because a check that could not run is no
+    evidence that anything is wrong.
+    """
+    outdated = False
+    required: list[str] = []
+    versions: dict[str, Any] = {}
+    try:
+        from app.features.manifest import version_report
+
+        report = version_report(feature_key)
+        outdated = bool(report.get("outdated"))
+        required = [str(r) for r in (report.get("required") or ())]
+        versions = dict(report.get("installed_versions") or {})
+    except Exception:  # noqa: BLE001 - status must never fail on a version check
+        logger.debug(
+            f"coding-agents: the version check failed for '{feature_key}'", exc_info=True,
+        )
+
+    pending = False
+    try:
+        from app.features.installer import restart_pending
+
+        pending = bool(restart_pending(feature_key))
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            f"coding-agents: the restart-pending check failed for '{feature_key}'",
+            exc_info=True,
+        )
+
+    # ``installed_versions`` is keyed by distribution in requirement order, so
+    # its first entry is the first requirement's - the SDK the sentence names.
+    dist, version = None, None
+    if required:
+        dist, version = next(iter(versions.items()), (None, None))
+    return {
+        "sdk_outdated": bool(sdk_installed and outdated),
+        "sdk_dist": dist,
+        "sdk_version": version,
+        "sdk_required": ", ".join(required) or None,
+        "restart_pending": pending,
+    }
+
+
 def _summary(
     spec: dict,
     *,
@@ -1075,10 +1156,15 @@ def _summary(
     scope: str | None,
     cli_available: bool,
     cli_blocked: dict | None = None,
+    sdk_outdated: bool = False,
+    sdk_dist: str | None = None,
+    sdk_version: str | None = None,
+    sdk_required: str | None = None,
+    restart_pending: bool = False,
 ) -> str:
     """One sentence naming the single next thing standing between the profile
     and a working delegate - a host that cannot run its CLI at all, or else
-    install, sign in, or switch the tool on."""
+    install, restart after an update, update, sign in, or switch the tool on."""
     name = spec["display_name"]
     login = spec["sign_in"]["cli_login"]
     # Ahead of all three, because on a host that cannot run the binary all three
@@ -1096,6 +1182,27 @@ def _summary(
         return (
             f"{name} is not installed on this server. Install the "
             f"'{spec['feature_key']}' feature to add it - no shell access needed."
+        )
+    # Both ahead of the credential sentences, because neither a sign-in nor the
+    # toggle helps while the SDK in memory is the wrong one. Restart first: once
+    # an update has landed, the version on disk is fine and updating again would
+    # change nothing - the old SDK still loaded in this process is the problem.
+    if restart_pending:
+        return (
+            f"{name} was updated on this server. Restart the Cremind server to "
+            f"load the new version."
+        )
+    if sdk_outdated:
+        installed = " ".join(part for part in (sdk_dist, sdk_version) if part)
+        effect = str(spec.get("sdk_outdated_effect") or "").strip()
+        return (
+            f"{name} is installed, but its SDK"
+            + (f" ({installed})" if installed else "")
+            + " is outside the range this Cremind needs"
+            + (f" ({sdk_required})" if sdk_required else "")
+            + (f", so {effect}" if effect else "")
+            + f". Update the '{spec['feature_key']}' feature (admin), then restart "
+            f"the server."
         )
     if source is None:
         if not cli_available:

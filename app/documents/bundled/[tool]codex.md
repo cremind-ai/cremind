@@ -1,5 +1,5 @@
 ---
-description: "The Codex built-in tool (codex, disabled by default): delegate coding tasks to OpenAI's Codex CLI through the OpenAI Codex SDK; it runs headless and never pauses for approval. Covers its Tool Variables — model (live list via `cremind tools options codex`), sandbox (read-only, workspace-write, full-access), reasoning effort, OpenAI API key, codex binary path, config overrides, max concurrent tasks; installing it without shell access (`cremind features install codex`, or Settings → Tools & Skills → Coding Agents); signing in and out (Sign in with ChatGPT device code, `codex login --device-auth`, `cremind tools coding-agents login/logout codex`), the per-profile CODEX_HOME versus the shared login and the credential order (the old bridge to the ChatGPT LLM login was removed); troubleshooting a run that changed nothing because CODEX_SANDBOX is read-only (`cremind tools set-var codex CODEX_SANDBOX=full-access`), and a session_id that no longer resumes. Distinct from `cremind tools` and from the Claude Code tool."
+description: "The Codex built-in tool (codex, disabled by default): delegate coding tasks to OpenAI's Codex CLI through the OpenAI Codex SDK; it runs headless and never pauses for approval. Covers its Tool Variables — model (live list via `cremind tools options codex`), sandbox (read-only, workspace-write, full-access), reasoning effort, OpenAI API key, codex binary path, config overrides, max concurrent tasks; installing it without shell access (`cremind features install codex`, or Settings → Tools & Skills → Coding Agents); signing in and out (Sign in with ChatGPT device code, `codex login --device-auth`, `cremind tools coding-agents login/logout codex`), the per-profile CODEX_HOME versus the shared login and the credential order (the old bridge to the ChatGPT LLM login was removed); troubleshooting a run that changed nothing because CODEX_SANDBOX is read-only (`cremind tools set-var codex CODEX_SANDBOX=full-access`), a session_id that no longer resumes, and a model list stuck on built-in models (outdated SDK: update the codex feature, restart). Distinct from `cremind tools` and from the Claude Code tool."
 ---
 
 # Codex Tool
@@ -247,6 +247,14 @@ server environment. Settings → LLM Providers → OpenAI does **not** feed this
 tool any more; a profile that used to authenticate through the removed ChatGPT
 bridge has to sign in to Codex once.
 
+**The model list shows only gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex /
+gpt-5.2, even after signing in.** Those are the models built into an outdated
+Codex SDK, which cannot read the account's live list and silently falls back.
+`cremind tools coding-agents` shows `INSTALLED outdated`. An admin runs
+`cremind features install codex` (or **Update** on the Codex card), then
+`cremind server restart`; until the restart Codex refuses to run. Then
+`cremind tools options codex --refresh`.
+
 ## Choosing a model
 
 The `CODEX_MODEL` variable selects which Codex model coding tasks run on. Like
@@ -270,7 +278,7 @@ Three equivalent ways, all profile-scoped:
   ```bash
   cremind tools options codex            # the account's live model list
   cremind tools options codex --refresh  # bypass the 5-minute cache
-  cremind tools set-var codex CODEX_MODEL=gpt-5.1-codex
+  cremind tools set-var codex CODEX_MODEL=gpt-5.5
   ```
 
   Setting an id that isn't in the list is rejected with the valid ids; pass
@@ -295,9 +303,9 @@ Every variable is optional; the table gives its exact name and default.
 
 | Variable | Type | Default | Meaning |
 |----------|------|---------|---------|
-| `CODEX_MODEL` | string (dynamic list) | `""` | Codex model for coding tasks — pick from the account's live model list (see *Choosing a model*) or type an id (e.g. `gpt-5.1-codex`). Empty = Codex's default model. |
+| `CODEX_MODEL` | string (dynamic list) | `""` | Codex model for coding tasks — pick from the account's live model list (see *Choosing a model*) or type an id (e.g. `gpt-5.5`). Empty = Codex's default model. |
 | `CODEX_SANDBOX` | string (dynamic list) | `full-access` | Filesystem sandbox; see the sandbox modes above. List the live values with `cremind tools options codex`. |
-| `CODEX_REASONING_EFFORT` | string | `""` | Reasoning effort per task (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`). Empty = the model's default. Higher effort is slower and costs more tokens. |
+| `CODEX_REASONING_EFFORT` | string (dynamic list) | `""` | Reasoning effort per task. There is no fixed set: the levels come live from the signed-in account's models, each model supports its own subset, and a level only some of them take is labelled `(some models only)` — so the list differs per account and per model. When the models can't be listed it falls back to the installed Codex SDK's levels. In Settings it is a dropdown (pick a level, or clear it for the default — no typing); list the levels with `cremind tools options codex` and copy an exact id (don't guess one), then `cremind tools set-var codex CODEX_REASONING_EFFORT=<id>`. Empty = the model's default. Higher effort is slower and costs more tokens. |
 | `CODEX_API_KEY` | string (secret) | `""` | OpenAI API key for Codex. Empty = fall back to `CODEX_API_KEY` / `OPENAI_API_KEY` in the server environment, then this profile's own `codex login`, then the server's shared login. Never the profile's OpenAI LLM-provider credentials — see *Credentials*. A key set here is installed into a Cremind-managed `CODEX_HOME`, never your own `~/.codex`. |
 | `CODEX_BIN` | string | `""` | Absolute path to an external codex binary. Empty = the SDK's bundled binary. |
 | `CODEX_CONFIG_OVERRIDES` | string | `""` | Comma-separated Codex `--config` overrides (e.g. `model_reasoning_effort=high, sandbox_mode=workspace-write`). Empty = none. |
@@ -310,11 +318,12 @@ To view the live schema and the current per-profile values:
 
 ```bash
 cremind --json tools get codex      # schema + current values (no static mode list)
-cremind tools options codex         # the live model AND sandbox-mode lists
+cremind tools options codex         # the live model, sandbox-mode AND effort lists
 ```
 
-`CODEX_SANDBOX` and `CODEX_MODEL` are dynamic-list variables, so their allowed
-values come from `cremind tools options` rather than a static `enum` in the
-`tools get` schema.
+`CODEX_SANDBOX`, `CODEX_MODEL` and `CODEX_REASONING_EFFORT` are dynamic-list
+variables, so their allowed values come from `cremind tools options` rather than
+a static `enum` in the `tools get` schema — and when a list resolves, `set-var`
+rejects a value outside it unless you pass `--force`.
 
 See `cremind tools` for the full tool-configuration CLI reference.

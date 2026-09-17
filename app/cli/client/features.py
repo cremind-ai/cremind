@@ -1,9 +1,11 @@
 """Optional-feature endpoints — `/api/features` and `/api/features/install`.
 
 `GET /api/features` returns a **map** keyed by feature id
-(`{installed, requires_restart_after_install, extras}`). `POST
-/api/features/install` streams pip output as *named* SSE frames
-(`event: log|done|error`) — consumed via `Client.stream_post`.
+(`{installed, requires_restart_after_install, extras, outdated, required,
+installed_versions, restart_pending}` — the last four are absent on a server
+that predates version checks). `POST /api/features/install` streams pip output
+as *named* SSE frames (`event: log|done|error`) — consumed via
+`Client.stream_post`; its `done` frame lists updated features under `upgraded`.
 """
 
 from __future__ import annotations

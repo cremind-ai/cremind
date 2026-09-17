@@ -1,5 +1,5 @@
 ---
-description: "Configure the tools the Cremind agent can call, with the `cremind tools` CLI: enable or disable a tool, `set-var` its Tool Variables (env-style key=value — API keys, limits, modes), list the live `options` of a dynamic variable (e.g. the Claude models the signed-in account may use), get or set its JSON Tool Arguments, and toggle a grouped tool's sub-tools (\"leaves\") with `leaves`/`set-leaf`. `coding-agents` answers whether Claude Code or Codex is installed and signed in and which credential each resolves to, installs the CLI without shell access, signs a delegate in or out (`login claude_code`, `logout codex`, `--shared` for the server-wide login that profiles without their own inherit), and reports `cli_blocked` when the Claude Code CLI cannot run on this server's CPU (a qemu64 guest without ssse3/sse4_1/sse4_2/popcnt — fix the hypervisor CPU model). The agent configures tools itself by running these commands in its shell. Distinct from each tool's own `[tool] …` reference and from `cremind agents` (MCP/A2A servers)."
+description: "Configure the tools the Cremind agent can call, with the `cremind tools` CLI: enable or disable a tool, `set-var` its Tool Variables (env-style key=value — API keys, limits, modes), list the live `options` of a dynamic variable (e.g. the Claude models the signed-in account may use), get or set its JSON Tool Arguments, and toggle a grouped tool's sub-tools (\"leaves\") with `leaves`/`set-leaf`. `coding-agents` answers whether Claude Code or Codex is installed and signed in and which credential each resolves to, reports an outdated SDK (INSTALLED outdated/restart — e.g. a Codex model list stuck on built-in models), installs the CLI without shell access, signs a delegate in or out (`login claude_code`, `logout codex`, `--shared` for the server-wide login that profiles without their own inherit), and reports `cli_blocked` when the Claude Code CLI cannot run on this server's CPU (a qemu64 guest without ssse3/sse4_1/sse4_2/popcnt — fix the hypervisor CPU model). The agent configures tools itself by running these commands in its shell. Distinct from each tool's own `[tool] …` reference and from `cremind agents` (MCP/A2A servers)."
 ---
 
 # `cremind tools` — Tool & Skill Configuration
@@ -55,7 +55,9 @@ The page shows one card per tool with its type, an enabled toggle, and a
 configuration panel. The panel renders the tool's **Tool Variables** (the same
 key/values as `cremind tools set-var`) — for example, Claude Code's *Permission
 mode* dropdown, and its *Model* dropdown, which is populated live from the
-account's available models (the same list as `cremind tools options`). Tool
+account's available models (the same list as `cremind tools options`). The
+effort variables of Claude Code and Codex are strict dropdowns: pick a listed
+level or clear the field for the default — no free typing. Tool
 **Arguments** are managed from the CLI / API
 (`cremind tools set-args` / `get-args`), not from the built-in tool cards. Skill
 rows additionally expose a **Register long-running app** action that maps to
@@ -65,7 +67,8 @@ A **Coding Agents** *section* sits at the top of the same page — its own secti
 above *Built-in Tools*, which no longer lists Claude Code or Codex — and is the
 UI counterpart of `cremind tools coding-agents`. Each agent gets a card showing
 its installed / enabled / credential state (and whether the credential is this
-profile's own login or the shared server one), installs a missing SDK in place,
+profile's own login or the shared server one), installs a missing SDK in place
+(or, for an admin, updates an outdated one),
 runs the same sign-in probe behind **Check sign-in**, and does the sign-in
 itself: **Sign in** opens a device code for Codex, or a built-in terminal
 running `claude auth login` for Claude Code — whose dialog also takes a pasted
@@ -97,8 +100,8 @@ get its full variable list, allowed values, defaults, and CLI recipes:
 
 | Tool | `tool_id` | Reference doc | Notable variables |
 |------|-----------|---------------|-------------------|
-| Claude Code | `claude_code` | *Claude Code Tool* | `CLAUDE_CODE_PERMISSION_MODE` and `CLAUDE_CODE_MODEL` (both dynamic lists via `options`), budget, API key |
-| Codex | `codex` | *Codex Tool* | `CODEX_SANDBOX` and `CODEX_MODEL` (both dynamic lists via `options`), reasoning effort, API key |
+| Claude Code | `claude_code` | *Claude Code Tool* | `CLAUDE_CODE_PERMISSION_MODE`, `CLAUDE_CODE_MODEL` and `CLAUDE_CODE_EFFORT` (dynamic lists via `options`), budget, API key |
+| Codex | `codex` | *Codex Tool* | `CODEX_SANDBOX`, `CODEX_MODEL` and `CODEX_REASONING_EFFORT` (dynamic lists via `options`), API key |
 | Shell Executor | `exec_shell` | *Shell Executor Tool* | large-output mode, timeouts, RTK; `os` argument |
 | System File | `system_file` | *System File Tool* | read/list/search/grep caps |
 | Browser | `browser` | *Browser Tool* | headless, channel (enum), CDP URL |
@@ -293,13 +296,16 @@ For built-in tools whose variables declare a static `enum` (such as the
 Browser tool's `channel` or Web Search's `provider`), the server validates the
 value and rejects anything outside the allowed set with HTTP 400 — so a typo
 fails loudly instead of silently persisting. A variable with a **dynamic**
-option list (Claude Code's `CLAUDE_CODE_MODEL` and `CLAUDE_CODE_PERMISSION_MODE`,
-whose values come from `cremind tools options`) is validated the same way
-**when the list can be fetched**: an unrecognized value is rejected with the
-valid values listed (model aliases like `opus`/`sonnet` always pass). Pass
+option list (Claude Code's `CLAUDE_CODE_MODEL`, `CLAUDE_CODE_PERMISSION_MODE` and
+`CLAUDE_CODE_EFFORT`; Codex's `CODEX_MODEL`, `CODEX_SANDBOX` and
+`CODEX_REASONING_EFFORT` — values from `cremind tools options`) is validated the
+same way **when the list can be fetched**: an unrecognized value is rejected with
+the valid values listed (model aliases like `opus`/`sonnet` always pass). Pass
 `--force` to set a custom or unverified value anyway; if the list can't be
-fetched (no credential / offline for models, SDK not installed for modes) any
-value is accepted. See the per-tool reference docs (below) for each tool's
+fetched (no credential / offline for models, SDK not installed for modes and
+effort levels) any value is accepted. Codex's effort levels come from the
+signed-in account's models (each model has its own subset), falling back to the
+installed SDK's levels. See the per-tool reference docs (below) for each tool's
 variables and their allowed values.
 
 ### `cremind tools options`
@@ -308,7 +314,10 @@ variables and their allowed values.
 values fetched at request time rather than baked into a static `enum`. The
 primary use is Claude Code: it prints the Claude models available to the account
 the tool's credential resolves to (`CLAUDE_CODE_MODEL`) and the permission modes
-the installed Claude Agent SDK accepts (`CLAUDE_CODE_PERMISSION_MODE`).
+and effort levels the installed Claude Agent SDK accepts
+(`CLAUDE_CODE_PERMISSION_MODE`, `CLAUDE_CODE_EFFORT`). Codex lists its models,
+sandbox modes and the reasoning-effort levels its account's models support
+(`CODEX_REASONING_EFFORT`) the same way.
 
 **Syntax.**
 
@@ -349,6 +358,7 @@ CLAUDE_CODE_MODEL              sonnet               sonnet (alias)
 CLAUDE_CODE_PERMISSION_MODE    bypassPermissions    bypassPermissions (fully autonomous)
 CLAUDE_CODE_PERMISSION_MODE    acceptEdits          acceptEdits (auto-approve file edits)
 CLAUDE_CODE_PERMISSION_MODE    plan                 plan (read-only planning, no changes)
+CLAUDE_CODE_EFFORT             max                  max (maximum effort)
 
 # Pick one and apply it
 $ cremind tools set-var claude_code CLAUDE_CODE_MODEL=claude-sonnet-4-5
@@ -389,7 +399,7 @@ gets a row, because that is exactly the case worth reporting:
 | Column       | Meaning                                                                                     |
 |--------------|-----------------------------------------------------------------------------------------------|
 | `AGENT`      | `claude_code` or `codex` (the `tool_id`).                                                    |
-| `INSTALLED`  | `yes` if the SDK (and its bundled CLI binary) is importable on the server.                   |
+| `INSTALLED`  | `yes` if the SDK (and its bundled CLI binary) is importable on the server; `no` if not; `outdated` if it is older than this Cremind needs; `restart` if it was updated but the server still runs the old copy. |
 | `ENABLED`    | `yes` if the tool is switched on **for the active profile**.                                 |
 | `CREDENTIAL` | The resolved credential source, or `none`. See **Coding-agent credential sources** below.                              |
 | `LOGGED_IN`  | `-` without `--probe` (not checked); otherwise `yes` / `no` / `unknown`.                      |
@@ -397,9 +407,10 @@ gets a row, because that is exactly the case worth reporting:
 A one-line human summary per agent — naming the single next step — is written to
 stderr under the table, so it stays out of a piped table but is still visible.
 With `--json`, returns the raw agent objects (including `feature_key`, `extras`,
-`requires_restart_after_install`, `sign_in`, `credential_scope`, `cli_home`,
-`account_hint`, `cli_available`, `cli_blocked`, and, with `--probe`, the full
-probe payload under `probe`).
+`requires_restart_after_install`, `sdk_outdated`, `sdk_version` (installed SDK
+version), `sdk_required` (the range this Cremind needs), `restart_pending`,
+`sign_in`, `credential_scope`, `cli_home`, `account_hint`, `cli_available`,
+`cli_blocked`, and, with `--probe`, the full probe payload under `probe`).
 
 `LOGGED_IN unknown` is **not** "logged out": the check ran but could not decide
 — a timeout, the CLI binary was not found, or the server's CPU cannot run that
@@ -415,6 +426,13 @@ the active profile's answer, never the server's.
 `cremind features install claude_code` (or `codex`) — that pulls the SDK wheel,
 CLI binary included, with no restart needed. Then `cremind tools enable
 claude_code` to switch it on for the profile.
+
+**Updating an outdated agent.** `INSTALLED outdated` means an older Cremind
+installed the SDK and nothing has updated it since. For Codex the visible
+symptom is a model list stuck on the built-in models instead of the account's.
+An admin runs `cremind features install codex` (or **Update** on the card),
+then `cremind server restart`. Until the restart the cell reads `restart`, and
+Codex refuses to run rather than drive the new binary with the old SDK.
 
 **Examples.**
 

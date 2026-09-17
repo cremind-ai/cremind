@@ -9,8 +9,11 @@ Drives the route endpoints directly with a fake Request, backed by a real
 - argument values round-trip through ``ToolConfigManager`` (incl. non-string
   JSON), and bad keys / enum values / bodies are rejected;
 - ``…/variables`` rejects a value outside a field's live ``dynamic_options``
-  list (e.g. an invalid Claude Code model or permission mode) when the list
-  resolves, unless ``allow_unknown`` is set, instead of silently persisting.
+  list (e.g. an invalid Claude Code model or permission mode, or a Codex
+  reasoning effort) when the list resolves, unless ``allow_unknown`` is set,
+  instead of silently persisting;
+- the tool listing hands a field's ``options_only`` flag to the Settings form
+  verbatim, since that flag is what turns its combobox into a strict dropdown.
 """
 
 from __future__ import annotations
@@ -407,6 +410,171 @@ def test_set_variable_model_allow_unknown_persists(tmp_path: Path, monkeypatch) 
     assert resp.status_code == 200
     vars_ = reg.config.get_variables("claude_code", "admin", include_secrets=True)
     assert vars_["CLAUDE_CODE_MODEL"] == "my-custom-model"
+
+
+# ── variables dynamic-option validation: Codex reasoning effort ─────────────
+# Unlike the Claude Code cases above, this runs the REAL codex hook, so the
+# effort list is derived for real from the account's model rows. Only the
+# listing itself is stubbed (it would spawn the codex app-server) - with two
+# models that support different levels, as a ChatGPT catalog does - and the SDK
+# is hidden so neither the sandbox listing nor the effort fallback can reach an
+# installed one.
+
+_CODEX_ACCOUNT_MODELS = [
+    {
+        "id": "gpt-a", "display_name": "GPT A", "default_effort": "medium",
+        "supported_efforts": [
+            {"id": "low", "description": "Fast"},
+            {"id": "medium", "description": ""},
+            {"id": "high", "description": "Deeper"},
+        ],
+    },
+    {
+        "id": "gpt-b", "display_name": "GPT B", "default_effort": "high",
+        "supported_efforts": [
+            {"id": "high", "description": ""},
+            {"id": "ultra", "description": "Deepest"},
+        ],
+    },
+]
+
+
+def _codex_registry(tmp_path: Path, monkeypatch, models=None) -> ToolRegistry:
+    import sys
+
+    import app.tools.builtin.codex_runner as codex_runner
+
+    rows = _CODEX_ACCOUNT_MODELS if models is None else models
+
+    async def _models(variables, profile, *, force_refresh=False):
+        if not rows:
+            return {"models": [], "error": "no creds", "source": None}
+        return {"models": rows, "source": "profile_codex_login", "cached": False}
+
+    monkeypatch.setattr(codex_runner, "list_models", _models)
+    monkeypatch.setitem(sys.modules, "openai_codex", None)
+    reg = _make_registry(tmp_path)
+    codex = BuiltInToolGroup(
+        config_name="codex", display_name="Codex",
+        description="cx", functions=[_FakeLeaf()], llm=object(),
+    )
+    reg.register_builtin(codex, source="codex")
+    return reg
+
+
+def test_set_variable_codex_effort_rejects_unlisted(tmp_path: Path, monkeypatch) -> None:
+    reg = _codex_registry(tmp_path, monkeypatch)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "codex"},
+        body={"variables": {"CODEX_REASONING_EFFORT": "extreme"}},
+    )))
+    assert resp.status_code == 400
+    body = _body(resp)
+    assert body["key"] == "CODEX_REASONING_EFFORT"
+    # Exactly the levels this account's models declare - no more, no fewer.
+    assert set(body["allowed"]) == {"low", "medium", "high", "ultra"}
+    # Nothing persisted on rejection.
+    assert reg.config.get_variables("codex", "admin") == {}
+
+
+def test_set_variable_codex_effort_rejects_a_level_the_account_lacks(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A level real SDKs know is still refused when no model on THIS account
+    supports it: the list is the account's, not a generic one."""
+    reg = _codex_registry(tmp_path, monkeypatch)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "codex"},
+        body={"variables": {"CODEX_REASONING_EFFORT": "xhigh"}},
+    )))
+    assert resp.status_code == 400
+    assert "xhigh" not in _body(resp)["allowed"]
+
+
+def test_set_variable_codex_effort_unresolvable_list_accepts(tmp_path: Path, monkeypatch) -> None:
+    """No catalog and no SDK to fall back on: the list is unavailable, so any
+    value persists (the same graceful rule as every other dynamic list)."""
+    reg = _codex_registry(tmp_path, monkeypatch, models=[])
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "codex"},
+        body={"variables": {"CODEX_REASONING_EFFORT": "persistent"}},
+    )))
+    assert resp.status_code == 200
+    vars_ = reg.config.get_variables("codex", "admin", include_secrets=True)
+    assert vars_["CODEX_REASONING_EFFORT"] == "persistent"
+
+
+def test_set_variable_codex_effort_accepts_listed(tmp_path: Path, monkeypatch) -> None:
+    reg = _codex_registry(tmp_path, monkeypatch)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "codex"},
+        body={"variables": {"CODEX_REASONING_EFFORT": "ultra"}},
+    )))
+    assert resp.status_code == 200
+    vars_ = reg.config.get_variables("codex", "admin", include_secrets=True)
+    assert vars_["CODEX_REASONING_EFFORT"] == "ultra"
+
+
+def test_set_variable_codex_effort_allow_unknown_persists(tmp_path: Path, monkeypatch) -> None:
+    """``--force`` still writes an unlisted level: ``options_only`` restricts the
+    Settings form, not the API."""
+    reg = _codex_registry(tmp_path, monkeypatch)
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "codex"},
+        body={
+            "variables": {"CODEX_REASONING_EFFORT": "extreme"},
+            "allow_unknown": True,
+        },
+    )))
+    assert resp.status_code == 200
+    vars_ = reg.config.get_variables("codex", "admin", include_secrets=True)
+    assert vars_["CODEX_REASONING_EFFORT"] == "extreme"
+
+
+def test_set_variable_codex_effort_clear_skips_validation(tmp_path: Path, monkeypatch) -> None:
+    """Clearing the dropdown sends "" (back to the model's default), which must
+    never be judged against the list."""
+    reg = _codex_registry(tmp_path, monkeypatch)
+    reg.config.set_variable("codex", "admin", "CODEX_REASONING_EFFORT", "high")
+    state = SimpleNamespace(registry=reg)
+    handler = _handler(state, "/api/tools/{tool_id}/variables", "PUT")
+    resp = asyncio.run(handler(_req(
+        path_params={"tool_id": "codex"},
+        body={"variables": {"CODEX_REASONING_EFFORT": ""}},
+    )))
+    assert resp.status_code == 200
+    vars_ = reg.config.get_variables("codex", "admin", include_secrets=True)
+    assert vars_["CODEX_REASONING_EFFORT"] == ""
+
+
+# ── tool listing: field flags reach the Settings form ───────────────────────
+
+def test_tool_listing_exposes_options_only(tmp_path: Path, monkeypatch) -> None:
+    """The form reads ``required_fields`` straight off the listing, so a strict
+    dropdown depends on ``options_only`` surviving the trip — and on it staying
+    off the fields that must remain free-form comboboxes."""
+    reg = _codex_registry(tmp_path, monkeypatch)
+    state = SimpleNamespace(registry=reg, config_storage=None)
+    handler = _handler(state, "/api/tools", "GET")
+    resp = asyncio.run(handler(_req()))
+    assert resp.status_code == 200
+    rows = {row["tool_id"]: row for row in _body(resp)["tools"]}
+    fields = rows["codex"]["required_fields"]
+    effort = fields["CODEX_REASONING_EFFORT"]
+    assert effort["dynamic_options"] is True
+    assert effort["options_only"] is True
+    assert "options_only" not in fields["CODEX_MODEL"]
+    assert "options_only" not in fields["CODEX_SANDBOX"]
 
 
 # ── masked-secret round-trip guard ──────────────────────────────────────────

@@ -21,11 +21,31 @@ Each :class:`Feature` declares:
   install followed by ``importlib.invalidate_caches()`` is importable
   in-process on the next connect — same rationale as ``claude_code`` /
   ``codex`` below.
+- ``requirements``: verbatim PEP 508 strings, copied from the extras group,
+  for the packages whose *version* matters and not just their presence
+  (``tests/features/test_feature_requirements_drift.py`` keeps the copy in
+  step with ``pyproject.toml``). A probe only proves a package imports, and
+  the installer skips anything that imports, so a runtime venv that got the
+  SDK under an older pin would keep it forever — nothing ever re-syncs a
+  runtime venv. These strings let :func:`is_outdated` flag that install as
+  "update required", and :func:`pip_requirements` hands them to pip
+  verbatim so the update actually lands.
+
+"Installed" and "outdated" are deliberately separate questions.
+:func:`is_installed` stays probe-only, and every gate that blocks a tool
+from working at all (tool enable, the Setup Wizard, channel connect) keeps
+asking it: an outdated SDK still runs, so it must not suddenly read as
+missing. Only the installer and the status surfaces ask
+:func:`is_outdated`, and a version check that cannot be made (no dist
+metadata, an unparseable version, ``packaging`` unavailable) fails open to
+"not outdated" rather than nagging about an update nobody can verify.
 """
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
+import re
 from dataclasses import dataclass, field
 
 from app.upgrade.channel import Channel
@@ -38,6 +58,22 @@ class Feature:
     probes: tuple[str, ...]
     post_install: tuple[str, ...] = field(default_factory=tuple)
     requires_restart: bool = False
+    requirements: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VersionCheck:
+    """One :attr:`Feature.requirements` entry checked against the live venv.
+
+    ``installed`` is the bare installed version (``"0.1.0b3"``), or ``None``
+    when the distribution has no metadata here. ``satisfied`` is ``True``
+    whenever the check could not be made — see the module docstring.
+    """
+
+    requirement: str
+    dist: str
+    installed: str | None
+    satisfied: bool
 
 
 FEATURES: dict[str, Feature] = {
@@ -94,12 +130,18 @@ FEATURES: dict[str, Feature] = {
     # (incl. win_amd64), so there is no post_install download, and the codex tool
     # imports openai_codex lazily inside run() (never at module load) — so, with
     # the installer's importlib.invalidate_caches() after pip, a runtime install
-    # is importable in-process on the next call with no restart.
+    # is importable in-process on the next call with no restart. That holds for
+    # a FIRST install only: updating an SDK this process already imported leaves
+    # the old module in memory, so the installer marks an update restart-pending
+    # on its own. ``requirements`` mirrors the ``codex`` extra — 0.154 is the
+    # first SDK + binary pair that can decode ChatGPT's live model catalog, so an
+    # older install is reported as "update required".
     "codex": Feature(
         key="codex",
         extras=("codex",),
         probes=("openai_codex",),
         requires_restart=False,
+        requirements=("openai-codex>=0.154.0,<0.155",),
     ),
 
     # ── Document ingestion + tabular processing ─────────────────────────────
@@ -291,3 +333,167 @@ def pip_spec(feature_keys: list[str], channel: Channel = "production") -> str:
     if not groups:
         return f"cremind=={__version__}"
     return f"cremind[{','.join(groups)}]=={__version__}"
+
+
+# ── version checks ──────────────────────────────────────────────────────────
+
+# The distribution name a PEP 508 string starts with. Only consulted when
+# ``packaging`` can't parse the string (or can't be imported), so the report
+# still names the package it could not check.
+_DIST_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def _require_feature(feature_key: str) -> Feature:
+    feature = FEATURES.get(feature_key)
+    if feature is None:
+        raise KeyError(f"Unknown feature: {feature_key!r}")
+    return feature
+
+
+def _installed_version(dist: str) -> str | None:
+    """Installed version of ``dist`` from its metadata, or ``None``.
+
+    Called through the ``importlib.metadata`` module attribute (not a bound
+    import) so tests can patch ``importlib.metadata.version``. Any failure
+    reads as "no metadata": a half-written dist-info must not break
+    ``GET /api/features``.
+    """
+    try:
+        return importlib.metadata.version(dist)
+    except Exception:  # noqa: BLE001 — PackageNotFoundError, corrupt metadata
+        return None
+
+
+def _check_requirement(requirement: str) -> VersionCheck:
+    match = _DIST_NAME_RE.match(requirement)
+    fallback_dist = match.group(1) if match else requirement.strip()
+    try:
+        from packaging.requirements import InvalidRequirement, Requirement
+        from packaging.version import InvalidVersion, Version
+    except ImportError:
+        # Core depends on ``packaging``, but a hand-assembled venv may still
+        # lack it; without a parser there is nothing to compare, so fail open.
+        return VersionCheck(requirement, fallback_dist, _installed_version(fallback_dist), True)
+
+    try:
+        req = Requirement(requirement)
+    except InvalidRequirement:
+        return VersionCheck(requirement, fallback_dist, _installed_version(fallback_dist), True)
+
+    installed = _installed_version(req.name)
+    if installed is None:
+        return VersionCheck(requirement, req.name, None, True)
+    try:
+        # A requirement whose marker excludes this platform doesn't apply here.
+        if req.marker is not None and not req.marker.evaluate():
+            return VersionCheck(requirement, req.name, installed, True)
+    except Exception:  # noqa: BLE001 — undefined marker variables: can't judge, fail open
+        return VersionCheck(requirement, req.name, installed, True)
+    try:
+        # ``prereleases=True``: an installed pre-release must be judged by the
+        # range alone. By default a range that names no pre-release rejects
+        # every one, so a beta that sits inside the range would be reported
+        # outdated and "updated" on every install.
+        satisfied = req.specifier.contains(Version(installed), prereleases=True)
+    except InvalidVersion:
+        satisfied = True
+    return VersionCheck(requirement, req.name, installed, satisfied)
+
+
+def version_checks(feature_key: str) -> list[VersionCheck]:
+    """Check each :attr:`Feature.requirements` entry against the live venv.
+
+    Returns one :class:`VersionCheck` per requirement, in declaration order
+    (an empty list for a feature that declares none). Raises ``KeyError`` for
+    an unknown feature. This reads dist metadata only — it says nothing about
+    whether the feature imports; :func:`is_outdated` combines the two.
+    """
+    feature = _require_feature(feature_key)
+    return [_check_requirement(req) for req in feature.requirements]
+
+
+def is_outdated(feature_key: str) -> bool:
+    """Return True if ``feature_key`` is installed but below its required range.
+
+    A feature that isn't installed is *missing*, not outdated — installing it
+    already brings the right version. The probe only runs once a requirement
+    is actually unsatisfied, so the common case (no requirements, or all
+    satisfied) never touches ``find_spec``.
+    """
+    checks = version_checks(feature_key)
+    if all(check.satisfied for check in checks):
+        return False
+    return is_installed(feature_key)
+
+
+def outdated_features(feature_keys: list[str]) -> list[str]:
+    """Return the subset of ``feature_keys`` that :func:`is_outdated` flags.
+
+    Order-preserving + de-duplicating, and raises ``KeyError`` on an unknown
+    key, exactly like :func:`missing_features`.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for key in feature_keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        if key not in FEATURES:
+            raise KeyError(f"Unknown feature: {key!r}")
+        if is_outdated(key):
+            out.append(key)
+    return out
+
+
+def version_report(feature_key: str) -> dict:
+    """Version facts for one feature, as the status endpoints publish them.
+
+    ``{"outdated": bool, "required": [<PEP 508 string>, ...],
+    "installed_versions": {<dist>: <version or None>}}``. System facts only —
+    package names and versions, nothing profile-scoped.
+    """
+    feature = _require_feature(feature_key)
+    checks = version_checks(feature_key)
+    outdated = any(not check.satisfied for check in checks) and is_installed(feature_key)
+    return {
+        "outdated": outdated,
+        "required": list(feature.requirements),
+        "installed_versions": {check.dist: check.installed for check in checks},
+    }
+
+
+def pip_requirements(feature_keys: list[str], channel: Channel = "production") -> list[str]:
+    """Every argument ``pip install`` needs to install or update ``feature_keys``.
+
+    Production and test: :func:`pip_spec` for all the keys, followed by each
+    feature's :attr:`Feature.requirements` (de-duplicated). The cremind pin
+    alone would already make pip upgrade a dependency that falls outside the
+    range in cremind's metadata, but naming the range outright means the
+    update never hinges on which cremind metadata pip happens to read, and
+    the streamed ``pip install`` line shows exactly what is being updated.
+
+    Dev: features that declare requirements are left OUT of the
+    ``cremind[...]`` spec and installed through their requirement strings
+    alone. The editable cremind's installed metadata is only as fresh as the
+    last ``uv sync`` (a dev venv can still record an older version with the
+    old pin), so pairing ``cremind[codex]`` with the new range asks pip for
+    two contradictory ranges — unresolvable, or "resolved" by fetching a PyPI
+    cremind over the checkout. ``pip_spec([], "dev")`` is plain ``cremind``,
+    which the editable install already satisfies.
+    """
+    for key in feature_keys:
+        _require_feature(key)
+
+    requirements: list[str] = []
+    seen: set[str] = set()
+    for key in feature_keys:
+        for req in FEATURES[key].requirements:
+            if req not in seen:
+                seen.add(req)
+                requirements.append(req)
+
+    if channel == "dev":
+        spec = pip_spec([k for k in feature_keys if not FEATURES[k].requirements], channel="dev")
+    else:
+        spec = pip_spec(feature_keys, channel=channel)
+    return [spec, *requirements]

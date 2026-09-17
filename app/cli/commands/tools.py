@@ -328,8 +328,10 @@ def tools_options(
     """List live option values for a tool's dynamic variables.
 
     For ``claude_code`` this lists the Claude models available to the logged-in
-    account (``CLAUDE_CODE_MODEL``) and the permission modes the installed Claude
-    Agent SDK accepts (``CLAUDE_CODE_PERMISSION_MODE``). When the list resolves,
+    account (``CLAUDE_CODE_MODEL``) and the permission modes and effort levels the
+    installed Claude Agent SDK accepts (``CLAUDE_CODE_PERMISSION_MODE``,
+    ``CLAUDE_CODE_EFFORT``); for ``codex``, its models, sandbox modes and
+    reasoning-effort levels (``CODEX_REASONING_EFFORT``). When the list resolves,
     ``set-var`` rejects a value that isn't in it (pass ``--force`` to override);
     if it can't be fetched, any value is accepted. Pipe with ``set-var`` to
     apply, e.g. ``cremind tools set-var claude_code CLAUDE_CODE_MODEL=<id>``.
@@ -451,7 +453,9 @@ def tools_coding_agents(
     coding work: the SDK (which bundles the CLI binary) is installed, the tool
     is enabled for this profile, and a credential resolves. Without `--probe`
     the LOGGED_IN column is `-` — the credential is only read from config, not
-    exercised.
+    exercised. INSTALLED is `outdated` when the SDK is older than this Cremind
+    needs (update it with `cremind features install <agent>`) and `restart`
+    once it has been updated but the server has not been restarted.
 
     `login` and `logout` (below) sign this profile in and out of the delegate's
     own CLI.
@@ -502,7 +506,7 @@ def tools_coding_agents(
     for row in agents:
         table.add_row(
             string_field(row, "tool_id"),
-            bool_field(row, "sdk_installed", False),
+            _installed_cell(row),
             bool_field(row, "enabled", False),
             string_field(row, "credential_source") or "none",
             _logged_in_cell(row.get("probe") if probe else None),
@@ -525,6 +529,25 @@ def tools_coding_agents(
         )
         if remedy:
             sys.stderr.write(f"{remedy}\n")
+
+
+def _installed_cell(row: dict[str, Any]) -> str:
+    """Render one agent's INSTALLED cell: `no` / `restart` / `outdated` / `yes`.
+
+    Importable is not the same as usable: an SDK left behind by an older
+    Cremind still imports, but Codex's old one cannot read the account's live
+    model list and quietly offers a built-in one instead. `outdated` says the
+    feature needs updating; `restart` says it has been updated and the server
+    still runs the old copy. An older server sends neither field, and a missing
+    field must read as "nothing known to be wrong" — plain `yes` / `no`.
+    """
+    if row.get("sdk_installed") is not True:
+        return "no"
+    if row.get("restart_pending") is True:
+        return "restart"
+    if row.get("sdk_outdated") is True:
+        return "outdated"
+    return "yes"
 
 
 def _logged_in_cell(probe: Optional[dict]) -> str:

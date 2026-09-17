@@ -1,5 +1,5 @@
 ---
-description: "The Claude Code built-in tool (claude_code, disabled by default): delegate coding tasks to Anthropic's Claude Code CLI via the Claude Agent SDK. Tool Variables: model (live list via `cremind tools options claude_code`), permission mode (bypassPermissions, acceptEdits, default, plan, dontAsk, auto), max turns, max budget USD, API key, long-lived OAuth token, CLI path, allowed/disallowed tools, max concurrent tasks; installing it without shell access (`cremind features install claude_code`, or Settings → Tools & Skills → Coding Agents); signing in and out (the Sign in dialog runs `claude auth login`; headless servers use `claude setup-token` + CLAUDE_CODE_OAUTH_TOKEN; `cremind tools coding-agents login/logout claude_code`), per-profile vs shared login and the credential order; troubleshooting a run blocked by a read-only permission mode (plan/default/dontAsk — set CLAUDE_CODE_PERMISSION_MODE=bypassPermissions), a resumed session with no output, and a CLI hanging at 100% CPU on a qemu64 virtual CPU (cli_blocked; fix the hypervisor CPU model). Distinct from `cremind tools` and the Codex tool."
+description: "The Claude Code built-in tool (claude_code, disabled by default): delegate coding tasks to Anthropic's Claude Code CLI via the Claude Agent SDK. Tool Variables: model (live list via `cremind tools options claude_code`), permission mode (bypassPermissions, acceptEdits, default, plan, dontAsk, auto), effort level (low, medium, high, xhigh, max, ultracode), max turns, max budget USD, API key, long-lived OAuth token, CLI path, allowed/disallowed tools, max concurrent tasks; installing it without shell access (`cremind features install claude_code`, or Settings → Tools & Skills → Coding Agents); signing in and out (the Sign in dialog runs `claude auth login`; headless servers use `claude setup-token` + CLAUDE_CODE_OAUTH_TOKEN; `cremind tools coding-agents login/logout claude_code`), per-profile vs shared login and the credential order; troubleshooting a run blocked by a read-only permission mode (plan/default/dontAsk — set CLAUDE_CODE_PERMISSION_MODE=bypassPermissions), a resumed session with no output, and a CLI hanging at 100% CPU on a qemu64 virtual CPU (cli_blocked; fix the hypervisor CPU model). Distinct from `cremind tools` and the Codex tool."
 ---
 
 # Claude Code Tool
@@ -326,6 +326,37 @@ If no Anthropic credential is available, the list comes back empty with an
 `error` note and the model stays a free-form text field (no rejection). A change
 takes effect on the next Claude Code task.
 
+## Choosing an effort level
+
+`CLAUDE_CODE_EFFORT` sets how much thinking Claude puts into each step. Its
+levels come from the installed Claude Agent SDK — today `low`, `medium`, `high`,
+`xhigh`, `max` — so the Settings field is a dropdown of exactly that list (clear
+it to return to the default). Empty = Claude Code's default (`high`). `xhigh`
+needs an xhigh-capable model (Opus 4.7+, Sonnet 5, Fable 5) and falls back to
+`high` on others; higher effort is slower and uses more tokens.
+
+The last choice, `ultracode`, is not an effort level but a Claude Code setting
+(the "Ultracode" notch of the editor extensions): the task runs at `xhigh` and
+Claude also orchestrates dynamic workflows, so it can fan out into many
+subagents and use far more tokens. It is offered only when the SDK accepts
+`xhigh`. It needs an xhigh-capable model, workflows not disabled by a setting or
+org policy, and a permission mode that does not pause (`bypassPermissions` or
+`auto`) or an allowlist naming `Workflow` (Cremind adds it to a set
+`CLAUDE_CODE_ALLOWED_TOOLS`). Missing any of these, the task silently runs
+without ultracode; choosing any other level turns it off. Enabling it also makes
+the CLI record a launch-effort flag in this profile's Claude Code config.
+
+```bash
+cremind tools options claude_code                         # lists the effort levels too
+cremind tools set-var claude_code CLAUDE_CODE_EFFORT=max
+cremind tools set-var claude_code CLAUDE_CODE_EFFORT=ultracode
+```
+
+A level outside the installed SDK's list is rejected with the valid ones (with
+no SDK installed there is no list, so any value is accepted). One forced in with
+`--force` is ignored at run time (the task runs at the default). A change takes
+effect on the next task.
+
 ## All Tool Variables
 
 Every variable is optional; the table gives its exact name and default.
@@ -334,6 +365,7 @@ Every variable is optional; the table gives its exact name and default.
 |----------|------|---------|---------|
 | `CLAUDE_CODE_MODEL` | string | `""` | Claude model for coding tasks — pick from the account's live model list (see *Choosing a model*) or type an id/alias (e.g. `claude-sonnet-4-5`, `opus`). Empty = Claude Code's default model. |
 | `CLAUDE_CODE_PERMISSION_MODE` | string (dynamic list) | `bypassPermissions` | See the permission modes above; list the live values with `cremind tools options claude_code`. |
+| `CLAUDE_CODE_EFFORT` | string (dynamic list, dropdown only) | `""` | Effort level from the SDK's list (`low` … `max`), or `ultracode` (`xhigh` + dynamic workflows) when the SDK accepts `xhigh`; see *Choosing an effort level*. Empty = Claude Code's default (`high`). |
 | `CLAUDE_CODE_MAX_TURNS` | number | `0` | Maximum agent turns per task. `0` = unlimited. |
 | `CLAUDE_CODE_MAX_BUDGET_USD` | number | `0` | Maximum API spend (USD) per task. `0` = unlimited. |
 | `CLAUDE_CODE_API_KEY` | string (secret) | `""` | Anthropic API key for Claude Code. Empty = fall back to `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` in the server environment, then this profile's own `claude auth login`, then the server's shared login. A `CLAUDE_CODE_OAUTH_TOKEN` Tool Variable wins over this key. Never the profile's Anthropic LLM-provider credentials — see *Credentials*. |
@@ -350,11 +382,11 @@ To view the live schema and the current per-profile values:
 
 ```bash
 cremind --json tools get claude_code      # schema + current values (no static mode list)
-cremind tools options claude_code         # the live model AND permission-mode lists
+cremind tools options claude_code         # the live model, permission-mode and effort lists
 ```
 
-`CLAUDE_CODE_PERMISSION_MODE` and `CLAUDE_CODE_MODEL` are dynamic-list variables,
-so their allowed values come from `cremind tools options` rather than a static
-`enum` in the `tools get` schema.
+`CLAUDE_CODE_PERMISSION_MODE`, `CLAUDE_CODE_MODEL` and `CLAUDE_CODE_EFFORT` are
+dynamic-list variables, so their allowed values come from `cremind tools options`
+rather than a static `enum` in the `tools get` schema.
 
 See `cremind tools` for the full tool-configuration CLI reference.
