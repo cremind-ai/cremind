@@ -1,9 +1,11 @@
 """Server configuration and setup API endpoints."""
 
+import asyncio
 import json
 import os
 import re
 import secrets
+import threading
 import time
 from pathlib import Path
 
@@ -44,6 +46,37 @@ _BOOTSTRAP_ONLY_KEYS = {"db_provider", "postgres", "system_dir"}
 
 # Profile name validation: lowercase, numbers, underscore, hyphen only
 PROFILE_NAME_PATTERN = re.compile(r"^[a-z0-9_-]+$")
+
+
+# Profiles with a ``POST /api/config/setup`` in flight right now.
+#
+# Setup used to hold the event loop for its whole duration, which serialised
+# these calls by accident; now that the blocking spans run on worker threads a
+# second POST really can interleave with the first. That matters twice over:
+# the handler's "profile already exists" check happens long before the writes,
+# so two calls for the same name would race each other's config and each mint a
+# token; and ``SetupProgressBus`` is process-global with no run key (see its
+# docstring: "Only one setup runs at a time"), so two wizards would interleave
+# log lines into each other's panels. A plain guard keeps both invariants true.
+#
+# A ``threading.Lock`` rather than an asyncio one because it is also read from
+# the worker threads' error paths, and it is only ever held for a set lookup.
+_setup_in_flight: set[str] = set()
+_setup_in_flight_lock = threading.Lock()
+
+
+def _claim_setup_slot(profile: str) -> bool:
+    """Reserve the setup slot for ``profile``. False if one is already running."""
+    with _setup_in_flight_lock:
+        if profile in _setup_in_flight:
+            return False
+        _setup_in_flight.add(profile)
+        return True
+
+
+def _release_setup_slot(profile: str) -> None:
+    with _setup_in_flight_lock:
+        _setup_in_flight.discard(profile)
 
 
 def _emit_setup(step: str, message: str, level: str = "info") -> None:
@@ -820,6 +853,46 @@ def get_config_routes(state: BootedState) -> list[Route]:
         return None
 
     async def handle_setup(request: Request) -> JSONResponse:
+        """One-at-a-time gate in front of :func:`_handle_setup`.
+
+        A setup run takes tens of seconds and is not safe to interleave with
+        another run for the same profile — see ``_claim_setup_slot``. The most
+        likely second caller is the user's own retry after a dropped
+        connection, so answer it with something the wizard can act on rather
+        than letting the two races play out.
+
+        ``Request.json()`` caches its parse, so reading the body here costs the
+        inner handler nothing.
+        """
+        try:
+            probe = await request.json()
+        except Exception:  # noqa: BLE001 — the inner handler owns the 400
+            probe = None
+        profile_probe = ""
+        if isinstance(probe, dict):
+            raw = probe.get("profile")
+            profile_probe = raw.strip() if isinstance(raw, str) else ""
+
+        if not profile_probe:
+            return await _handle_setup(request)
+
+        if not _claim_setup_slot(profile_probe):
+            return JSONResponse(
+                {
+                    "error": (
+                        f"Setup for profile '{profile_probe}' is already running. "
+                        "Watch the setup log for progress rather than starting it again."
+                    ),
+                    "code": "setup_in_progress",
+                },
+                status_code=409,
+            )
+        try:
+            return await _handle_setup(request)
+        finally:
+            _release_setup_slot(profile_probe)
+
+    async def _handle_setup(request: Request) -> JSONResponse:
         """Complete setup for a profile.
 
         First profile (admin): unauthenticated — this is the bootstrap
@@ -967,7 +1040,10 @@ def get_config_routes(state: BootedState) -> list[Route]:
             from app.features.manifest import missing_features as _missing
 
             try:
-                missing = _missing(required_features)
+                # ``missing_features`` probes each feature with
+                # ``importlib.util.find_spec``, which hits the filesystem —
+                # off the loop with the install it gates.
+                missing = await asyncio.to_thread(_missing, required_features)
             except KeyError as e:
                 return JSONResponse(
                     {"error": f"Unknown feature in payload: {e}"},
@@ -983,18 +1059,27 @@ def get_config_routes(state: BootedState) -> list[Route]:
                     f"Installing optional features: {', '.join(missing)}…",
                 )
 
-                # Synchronous install — the UI either streamed progress
-                # via /api/features/install before submitting, or it's
-                # showing a spinner while we wait. Either way the call
-                # is idempotent and safe to repeat. Re-publish each pip
-                # event into the setup-progress bus so the wizard sees
-                # incremental log lines instead of a single multi-minute
-                # silence.
+                # The install is idempotent and safe to repeat — the UI either
+                # streamed progress via /api/features/install before
+                # submitting, or it's showing a spinner while we wait. Each
+                # pip event is republished onto the setup-progress bus so the
+                # wizard sees incremental log lines rather than a single
+                # multi-minute silence.
+                #
+                # It runs on a worker thread because it shells out to pip and
+                # reads the subprocess line by line: on the loop it would
+                # starve every other request for the duration, which under
+                # HTTP/2 (one connection per origin) drops the browser's whole
+                # session, not just this request. ``/api/features/install``
+                # threads the same call for the same reason. The bus publishes
+                # via ``call_soon_threadsafe``, so emitting from here is safe.
                 def _forward_install_event(evt) -> None:
                     level = "error" if not evt.ok else "info"
                     _emit_setup("features", evt.message, level=level)
 
-                result = installer.install_features(missing, _forward_install_event)
+                result = await asyncio.to_thread(
+                    installer.install_features, missing, _forward_install_event,
+                )
                 installed_features = result.installed
                 failed_features = result.failed
                 if result.failed:
@@ -1198,19 +1283,20 @@ def get_config_routes(state: BootedState) -> list[Route]:
         # profiles otherwise having no skills until the next server restart.
         # First-setup (admin) skill seeding still runs via ``on_first_setup``.
         if not is_first_setup and registry is not None:
-            import asyncio
-
             from app.skills import initialize_profile_skills
 
             _emit_setup("skills", f"Setting up skills for {profile_name!r}…")
             try:
+                # ``loop=`` must be the live server loop, not a worker's: it is
+                # handed to the skills watcher, which publishes into it for the
+                # profile's lifetime. Keep this call on the loop.
                 await initialize_profile_skills(
                     profile_name, registry, loop=asyncio.get_running_loop(),
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception(f"Skill init failed for new profile '{profile_name}': {exc}")
             try:
-                inserted = registry.on_profile_created(profile_name)
+                inserted = await asyncio.to_thread(registry.on_profile_created, profile_name)
                 logger.info(
                     f"Backfilled {inserted} profile_tools row(s) for new profile '{profile_name}'"
                 )
@@ -1221,38 +1307,53 @@ def get_config_routes(state: BootedState) -> list[Route]:
         if is_first_setup:
             _emit_setup("server_config", "Saving server configuration…")
             server_config = body.get("server_config", {})
-            for key, value in server_config.items():
-                # The DB-provider keys live in bootstrap.toml, never in the
-                # server_config table — they were applied above.
-                if key in _BOOTSTRAP_ONLY_KEYS:
-                    continue
-                is_secret = key in ("jwt_secret",)
-                config_storage.set("server_config", key, str(value), is_secret=is_secret)
 
-            # Ensure the User Working Directory is recorded with a sensible
-            # default so all built-in tools have a writable active path on
-            # first run, even if the wizard payload didn't include it.
-            user_working_dir = server_config.get("user_working_dir")
-            if not user_working_dir:
-                user_working_dir = DEFAULT_USER_WORKING_DIR
-                config_storage.set("server_config", "user_working_dir", user_working_dir)
-            expanded_uwd = (
-                os.path.expanduser(user_working_dir) if user_working_dir.startswith("~") else user_working_dir
-            )
-            try:
-                os.makedirs(expanded_uwd, exist_ok=True)
-            except OSError as exc:
-                logger.warning(f"Could not create user working directory {expanded_uwd!r}: {exc}")
+            def _write_server_config() -> None:
+                """Persist the wizard's server_config keys.
 
-            # Generate JWT secret if not provided
-            jwt_secret = config_storage.get("server_config", "jwt_secret")
-            if not jwt_secret and not BaseConfig.get_jwt_secret():
-                jwt_secret = secrets.token_urlsafe(32)
-                config_storage.set("server_config", "jwt_secret", jwt_secret, is_secret=True)
+                One blocking DB round-trip per key, so it runs on a worker
+                thread — see the note on ``_write_profile_config`` below.
+                """
+                for key, value in server_config.items():
+                    # The DB-provider keys live in bootstrap.toml, never in the
+                    # server_config table — they were applied above.
+                    if key in _BOOTSTRAP_ONLY_KEYS:
+                        continue
+                    is_secret = key in ("jwt_secret",)
+                    config_storage.set("server_config", key, str(value), is_secret=is_secret)
+
+                # Ensure the User Working Directory is recorded with a sensible
+                # default so all built-in tools have a writable active path on
+                # first run, even if the wizard payload didn't include it.
+                user_working_dir = server_config.get("user_working_dir")
+                if not user_working_dir:
+                    user_working_dir = DEFAULT_USER_WORKING_DIR
+                    config_storage.set("server_config", "user_working_dir", user_working_dir)
+                expanded_uwd = (
+                    os.path.expanduser(user_working_dir)
+                    if user_working_dir.startswith("~")
+                    else user_working_dir
+                )
+                try:
+                    os.makedirs(expanded_uwd, exist_ok=True)
+                except OSError as exc:
+                    logger.warning(f"Could not create user working directory {expanded_uwd!r}: {exc}")
+
+                # Generate JWT secret if not provided
+                if not config_storage.get("server_config", "jwt_secret") and not BaseConfig.get_jwt_secret():
+                    config_storage.set(
+                        "server_config", "jwt_secret", secrets.token_urlsafe(32), is_secret=True,
+                    )
+
+            await asyncio.to_thread(_write_server_config)
 
             # Vector embedding configuration. Stored in server_config because
             # the model loads once into the Cremind process and is shared
             # across all profiles. Only persisted on first setup.
+            #
+            # Stays on the loop: both branches below answer with a 400, and a
+            # ``return JSONResponse`` inside a ``to_thread`` closure would be
+            # discarded and fall through to a success response.
             from app.lib.embedding_lifecycle import persist_embedding_config
 
             try:
@@ -1269,75 +1370,100 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 )
                 return JSONResponse({"error": str(e)}, status_code=400)
 
-            config_storage.mark_setup_complete()
-
         # Save LLM and tool configs for ALL profiles (including first setup)
         # (must happen before on_first_setup so tool enabled states are persisted)
-        _emit_setup("llm_config", "Saving LLM provider settings…")
-        # Defense in depth: the wizard has no way to finish a browser OAuth
-        # sign-in, so an OAuth ``auth_method`` arriving without tokens would
-        # strand the new profile on a backend it can't reach. Drop it here
-        # rather than trusting the frontend not to send it.
+        #
+        # Defense in depth on the LLM payload: the wizard has no way to finish a
+        # browser OAuth sign-in, so an OAuth ``auth_method`` arriving without
+        # tokens would strand the new profile on a backend it can't reach. Drop
+        # it here rather than trusting the frontend not to send it.
         llm_config = _drop_unusable_oauth_auth_methods(body.get("llm_config", {}))
-        for key, value in llm_config.items():
-            is_secret = (
-                "api_key" in key
-                or "service_account" in key
-                or "setup_token" in key
-                or "oauth_token" in key
-                or "bearer_token" in key
-            )
-            # auth_method selections are not secrets
-            if key.endswith(".auth_method") or key == "auth_method":
-                is_secret = False
-            config_storage.set("llm_config", key, str(value), is_secret=is_secret, profile=profile_name)
-
-        # A profile with no main model is agent-dead: every turn raises
-        # SetupRequiredError, and the channel paths that fail closed (the group
-        # relevance judge) then swallow it — the profile simply never answers,
-        # anywhere, with nothing user-visible to explain why. Setup is NOT
-        # rejected over it, because configuring the model later is legitimate
-        # (``cremind setup complete`` bootstraps headlessly, restores replay a
-        # DB dump), but it is called out loudly enough that nobody has to
-        # discover it from a traceback three days later.
-        setup_warnings.extend(_no_main_model_warning(config_storage, llm_config, profile_name))
-
-        # Per-profile general settings from the wizard (Settings → Config keys),
-        # e.g. the Memory opt-in (``{"memory.enabled": "true"}``). Validated
-        # against CONFIG_SCHEMA and coerced/stringified the same way the
-        # /api/config/user PUT endpoint does, so an invalid key is ignored
-        # rather than corrupting the user_config table.
         user_config = body.get("user_config") or {}
-        if isinstance(user_config, dict) and user_config:
-            from app.config.config_schema import lookup as _lookup_config
-
-            _emit_setup("user_config", "Saving profile preferences…")
-            for key, raw in user_config.items():
-                try:
-                    _, _, field = _lookup_config(key)
-                    value = field.coerce(raw)
-                    field.validate(value)
-                except (KeyError, ValueError) as exc:
-                    logger.warning(f"setup: skipping invalid user_config {key!r}: {exc}")
-                    continue
-                stored = "true" if value is True else ("false" if value is False else str(value))
-                config_storage.set("user_config", key, stored, profile=profile_name)
-
-        # Tool config payload from the wizard. The frontend bundles four
-        # different settings into a single ``tool_configs[tool_id]`` dict using
-        # reserved key prefixes:
-        #   - ``_enabled``         -> per-profile enabled state (profile_tools)
-        #   - ``_arg.<name>``      -> tool argument
-        #   - everything else      -> tool variable (env-style secret/value)
-        # Route each to the right storage; otherwise these settings would be
-        # silently dropped into the variables table and never honored.
         tool_configs = body.get("tool_configs", {})
-        if registry is not None and tool_configs:
-            _emit_setup(
-                "tool_configs",
-                f"Saving configuration for {len(tool_configs)} tool(s)…",
-            )
-        if registry is not None:
+        agent_configs = body.get("agent_configs", {})
+
+        def _write_profile_config() -> list[dict[str, str]]:
+            """Persist this profile's llm / user / tool / agent config.
+
+            Every write in here is one blocking DB round-trip, and a wizard
+            payload covers ~30 built-in tools with several keys each — hundreds
+            of sequential round-trips. On the event loop that starved the whole
+            server for ~52s, and because the TLS listener speaks HTTP/2 (one
+            connection per origin) the browser dropped its entire session
+            rather than just this request. So: one worker thread for the lot.
+
+            Emits progress as it goes — the bus publishes via
+            ``call_soon_threadsafe``, so it is safe to call from here.
+
+            Returns the non-fatal warnings for the caller to merge; it must not
+            build responses, because a ``return JSONResponse`` in here would be
+            discarded and fall through to a success response.
+            """
+            warnings: list[dict[str, str]] = []
+
+            _emit_setup("llm_config", "Saving LLM provider settings…")
+            for key, value in llm_config.items():
+                is_secret = (
+                    "api_key" in key
+                    or "service_account" in key
+                    or "setup_token" in key
+                    or "oauth_token" in key
+                    or "bearer_token" in key
+                )
+                # auth_method selections are not secrets
+                if key.endswith(".auth_method") or key == "auth_method":
+                    is_secret = False
+                config_storage.set(
+                    "llm_config", key, str(value), is_secret=is_secret, profile=profile_name,
+                )
+
+            # A profile with no main model is agent-dead: every turn raises
+            # SetupRequiredError, and the channel paths that fail closed (the group
+            # relevance judge) then swallow it — the profile simply never answers,
+            # anywhere, with nothing user-visible to explain why. Setup is NOT
+            # rejected over it, because configuring the model later is legitimate
+            # (``cremind setup complete`` bootstraps headlessly, restores replay a
+            # DB dump), but it is called out loudly enough that nobody has to
+            # discover it from a traceback three days later.
+            warnings.extend(_no_main_model_warning(config_storage, llm_config, profile_name))
+
+            # Per-profile general settings from the wizard (Settings → Config keys),
+            # e.g. the Memory opt-in (``{"memory.enabled": "true"}``). Validated
+            # against CONFIG_SCHEMA and coerced/stringified the same way the
+            # /api/config/user PUT endpoint does, so an invalid key is ignored
+            # rather than corrupting the user_config table.
+            if isinstance(user_config, dict) and user_config:
+                from app.config.config_schema import lookup as _lookup_config
+
+                _emit_setup("user_config", "Saving profile preferences…")
+                for key, raw in user_config.items():
+                    try:
+                        _, _, field = _lookup_config(key)
+                        value = field.coerce(raw)
+                        field.validate(value)
+                    except (KeyError, ValueError) as exc:
+                        logger.warning(f"setup: skipping invalid user_config {key!r}: {exc}")
+                        continue
+                    stored = "true" if value is True else ("false" if value is False else str(value))
+                    config_storage.set("user_config", key, stored, profile=profile_name)
+
+            # Tool config payload from the wizard. The frontend bundles four
+            # different settings into a single ``tool_configs[tool_id]`` dict using
+            # reserved key prefixes:
+            #   - ``_enabled``         -> per-profile enabled state (profile_tools)
+            #   - ``_arg.<name>``      -> tool argument
+            #   - everything else      -> tool variable (env-style secret/value)
+            # Route each to the right storage; otherwise these settings would be
+            # silently dropped into the variables table and never honored.
+            if registry is None:
+                return warnings
+
+            if tool_configs:
+                _emit_setup(
+                    "tool_configs",
+                    f"Saving configuration for {len(tool_configs)} tool(s)…",
+                )
+
             from app.tools.base import ToolType
             from app.tools.ids import slugify
 
@@ -1375,6 +1501,10 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 # unregistered id.
                 if registry.get(tool_id) is None:
                     continue
+                # One line per tool: this loop is the long pole of the whole
+                # request, and a silent multi-second gap is what made the
+                # original failure look like a hang.
+                _emit_setup("tool_configs", f"Configuring {tool_id}…")
                 arg_values: dict[str, object] = {}
                 for key, value in configs.items():
                     if key == "_enabled":
@@ -1405,20 +1535,22 @@ def get_config_routes(state: BootedState) -> list[Route]:
                 if arg_values:
                     registry.config.set_arguments(tool_id, profile_name, arg_values)
 
-        # Per-built-in-tool description overrides land in the meta scope of the tool_configs table.
-        agent_configs = body.get("agent_configs", {})
-        if registry is not None and agent_configs:
-            from app.tools.ids import slugify
+            # Per-built-in-tool description overrides land in the meta scope of
+            # the tool_configs table.
+            if agent_configs:
+                for tool_key, config in agent_configs.items():
+                    tool_id = tool_key if registry.get(tool_key) else slugify(tool_key)
+                    if "description" in config and config["description"]:
+                        registry.config.set_meta(
+                            tool_id,
+                            profile_name,
+                            "description",
+                            config["description"],
+                        )
 
-            for tool_key, config in agent_configs.items():
-                tool_id = tool_key if registry.get(tool_key) else slugify(tool_key)
-                if "description" in config and config["description"]:
-                    registry.config.set_meta(
-                        tool_id,
-                        profile_name,
-                        "description",
-                        config["description"],
-                    )
+            return warnings
+
+        setup_warnings.extend(await asyncio.to_thread(_write_profile_config))
 
         # Channels declared during the setup wizard. Validation + creation
         # mirror POST /api/channels but happen pre-token because the setup
@@ -1488,6 +1620,21 @@ def get_config_routes(state: BootedState) -> list[Route]:
         token_file = write_token_file(profile_name, token)
         logger.info(f"Token saved to {token_file}")
 
+        # Close the bootstrap window only now, with a usable admin credential
+        # already on disk.
+        #
+        # This used to run ~200 lines earlier, right after the embedding config
+        # was persisted. Anything that killed the process in between — a pod
+        # restart, an OOM kill, an unhandled exception — left ``setup_complete``
+        # true, the admin profile created, and no token anywhere: every retry of
+        # this endpoint then took the non-first-setup branch and demanded an
+        # admin JWT that did not exist (401 forever), while
+        # ``reset-orphaned-setup`` refused because a visible profile existed.
+        # The only way out was a DB wipe. Ordering it after ``write_token_file``
+        # turns that dead end into a plain retry.
+        if is_first_setup:
+            config_storage.mark_setup_complete()
+
         # Bind built-in tool LLMs, (re)sync skills, and reconcile documents for
         # the just-configured profile. Runs for EVERY profile (not just first
         # setup) so a wizard-created profile is fully wired without a server
@@ -1508,20 +1655,24 @@ def get_config_routes(state: BootedState) -> list[Route]:
         if is_first_setup and registry is not None and tool_configs:
             from app.tools.ids import slugify
 
-            for tool_key, configs in tool_configs.items():
-                if not isinstance(configs, dict) or "_enabled" not in configs:
-                    continue
-                skill_id = f"{profile_name}__{slugify(tool_key)}"
-                if registry.get(skill_id) is None:
-                    continue
-                try:
-                    registry.set_profile_tool_enabled(
-                        profile_name,
-                        skill_id,
-                        str(configs["_enabled"]).lower() == "true",
-                    )
-                except (KeyError, ValueError) as e:
-                    logger.warning(f"setup: skipping skill _enabled for {skill_id!r}: {e}")
+            def _apply_seeded_skill_states() -> None:
+                """One blocking DB write per skill — off the loop, as above."""
+                for tool_key, configs in tool_configs.items():
+                    if not isinstance(configs, dict) or "_enabled" not in configs:
+                        continue
+                    skill_id = f"{profile_name}__{slugify(tool_key)}"
+                    if registry.get(skill_id) is None:
+                        continue
+                    try:
+                        registry.set_profile_tool_enabled(
+                            profile_name,
+                            skill_id,
+                            str(configs["_enabled"]).lower() == "true",
+                        )
+                    except (KeyError, ValueError) as e:
+                        logger.warning(f"setup: skipping skill _enabled for {skill_id!r}: {e}")
+
+            await asyncio.to_thread(_apply_seeded_skill_states)
 
         # If first setup just turned Vector Embedding on, kick off model
         # load + rebuild in the background so the agent becomes usable

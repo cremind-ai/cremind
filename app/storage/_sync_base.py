@@ -7,7 +7,9 @@ helpers live here so each module doesn't reinvent them:
 - :class:`SyncStorageBase` — base class that resolves the active engine on
   demand. Subclasses call ``self._engine`` to get a `sqlalchemy.Engine`.
 - :func:`dialect_upsert` — picks the right ``insert()`` constructor (SQLite
-  vs PostgreSQL) and renders an ``ON CONFLICT DO UPDATE`` statement.
+  vs PostgreSQL) and renders an ``ON CONFLICT DO UPDATE`` statement. The
+  reflected table it needs is cached per engine; see
+  :func:`clear_reflection_cache` for when that is dropped.
 
 Why route the sync path through SQLAlchemy Core rather than the raw DB-API:
 
@@ -22,9 +24,10 @@ Why route the sync path through SQLAlchemy Core rather than the raw DB-API:
 
 from __future__ import annotations
 
+import weakref
 from typing import Any
 
-from sqlalchemy import Engine, Table
+from sqlalchemy import Engine, MetaData, Table
 
 from app.databases import DatabaseProvider, get_database_provider
 
@@ -49,6 +52,51 @@ class SyncStorageBase:
         return self.provider.sync_engine()
 
 
+# Reflected ``Table`` objects, keyed by the engine that produced them.
+#
+# Reflection is expensive — ``autoload_with`` issues a fistful of catalog
+# queries per call — and every config write goes through ``dialect_upsert``,
+# so re-reflecting per key turned a profile-creation request into ~70s of
+# blocking round-trips. The reflected table only depends on (engine, name),
+# so cache it.
+#
+# Keyed on the ``Engine`` object rather than the table name alone because the
+# Setup Wizard hot-swaps providers mid-process (``set_database_provider`` ->
+# ``invalidate_storage_singletons`` -> new provider): a name-keyed cache would
+# hand SQLite-shaped tables to a Postgres engine. Weak keys let an abandoned
+# engine's entry die with it.
+_TABLE_CACHE: "weakref.WeakKeyDictionary[Engine, dict[str, Table]]" = weakref.WeakKeyDictionary()
+
+
+def clear_reflection_cache() -> None:
+    """Forget every cached ``Table``.
+
+    Called from :func:`app.storage.invalidate_storage_singletons`. A cached
+    table that predates a migration would render an ``INSERT`` missing the
+    new column — silent data loss — so the cache is dropped whenever the
+    storage layer is rebuilt rather than trusting boot ordering.
+    """
+    _TABLE_CACHE.clear()
+
+
+def _reflected_table(engine: Engine, table_name: str) -> Table:
+    """Reflect ``table_name`` off ``engine``, memoised per engine.
+
+    A reflected table is only ever read here, so sharing one across threads
+    is safe; two threads racing to reflect the same name simply produce
+    equivalent objects and the loser's copy is discarded.
+    """
+    tables = _TABLE_CACHE.get(engine)
+    if tables is None:
+        tables = {}
+        _TABLE_CACHE[engine] = tables
+    table = tables.get(table_name)
+    if table is None:
+        table = Table(table_name, MetaData(), autoload_with=engine)
+        tables[table_name] = table
+    return table
+
+
 def dialect_upsert(
     engine: Engine,
     table_name: str,
@@ -70,8 +118,7 @@ def dialect_upsert(
     else:
         raise NotImplementedError(f"Upsert not implemented for dialect {dialect_name!r}")
 
-    from sqlalchemy import MetaData
-    table = Table(table_name, MetaData(), autoload_with=engine)
+    table = _reflected_table(engine, table_name)
     stmt = _insert(table).values(**values)
     update_dict = {field: getattr(stmt.excluded, field) for field in update_fields}
     return stmt.on_conflict_do_update(index_elements=conflict_keys, set_=update_dict)

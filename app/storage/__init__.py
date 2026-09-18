@@ -109,6 +109,13 @@ def invalidate_storage_singletons() -> None:
     _memory_instance = None
     _usage_instance = None
 
+    # Reflected tables are memoised per engine in ``_sync_base``. The weak
+    # keying already drops entries for an abandoned engine, but clear them
+    # eagerly: a table cached before a migration ran would render an INSERT
+    # that silently omits the new column.
+    from app.storage._sync_base import clear_reflection_cache
+    clear_reflection_cache()
+
     # Reach into the storage modules that hold their own singletons to drop
     # them too — otherwise they'd hold engines pointing at the old DB.
     from app.storage.tool_storage import _reset_tool_storage_singleton

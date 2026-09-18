@@ -31,6 +31,7 @@ import {
   fetchInstallSecrets,
   type ServiceCapabilitiesResponse,
   type InstallSecrets,
+  type SetupError,
   type TlsRuntimeStatus,
 } from '../services/configApi';
 import { matchesCaTrustHint, resolveTrustEvidence } from '../services/caTrustHint';
@@ -446,6 +447,14 @@ const generatedToken = ref('');
 const configSaved = ref(false);
 const installSecrets = ref<InstallSecrets | null>(null);
 const checkingStatus = ref(true);
+// Whether the profile we are about to create was confirmed absent when the
+// wizard mounted. It gates the adopt-on-recovery path below: without it a
+// dropped connection could offer to apply this payload on top of a profile
+// that already belonged to someone else. ``runPostInstallSetupChecks``
+// redirects to /login/<profile> when it exists, so reaching the Complete step
+// already implies this — recording it explicitly keeps the recovery path from
+// depending on that redirect staying in place.
+const profileWasAbsentAtMount = ref(false);
 
 // The chart states the namespace and Service, so the reconnect line can be the
 // real command instead of "the same one you ran". Empty on an older chart that
@@ -903,6 +912,9 @@ async function runPostInstallSetupChecks() {
       router.replace(`/login/${props.profile}`);
       return;
     }
+    // Past both redirects: this profile does not exist yet, so if it appears
+    // while our own submit is in flight, we are the ones who created it.
+    profileWasAbsentAtMount.value = true;
 
     if (isFirstSetup.value) {
       try {
@@ -1148,6 +1160,108 @@ function retryInstallerRun() {
   void startInstallerRun();
 }
 
+/**
+ * Whether `e` is a fetch that never got a response.
+ *
+ * `completeSetup` throws `new Error(data.error)` for anything the server
+ * answered, and lets the raw `TypeError: Failed to fetch` through when the
+ * connection itself failed. Only the latter leaves the outcome unknown.
+ */
+function isTransportFailure(e: unknown): boolean {
+  return e instanceof TypeError;
+}
+
+/**
+ * Recover the result of a setup whose response we lost in transit.
+ *
+ * Polls the (unauthenticated, cheap) setup-status endpoint until the profile
+ * appears, then offers to re-issue the same payload with `adopt_existing`,
+ * which re-applies it on top and mints a token at the profile's *current*
+ * serial — so any token issued to it earlier stays valid.
+ *
+ * Returns null if we could not establish that the server finished, or if the
+ * user declined; the caller then surfaces the original error.
+ *
+ * Four things must hold before adoption is even offered, so this can never
+ * silently take over a profile the user did not just create: the profile was
+ * absent when the wizard mounted, the failure was this session's own POST
+ * failing at the transport layer, the profile appeared *across* that POST, and
+ * a human confirms. The backend independently refuses to adopt `admin`.
+ */
+async function recoverLostSetupResponse(
+  config: Record<string, unknown>,
+): Promise<Awaited<ReturnType<typeof completeSetup>> | null> {
+  if (!profileWasAbsentAtMount.value) return null;
+
+  setupLog.value = [
+    ...setupLog.value,
+    {
+      step: 'recover',
+      message: 'Connection lost. Checking whether the server finished anyway…',
+      level: 'warning',
+      ts: Date.now() / 1000,
+    },
+  ];
+
+  // ~2 minutes of backoff: long enough to outlast a feature install that was
+  // still running when the connection dropped.
+  const delays = [1000, 2000, 3000, 5000, 5000, 10000, 10000, 15000, 15000, 20000, 20000, 20000];
+  let exists = false;
+  for (const delay of delays) {
+    await new Promise((r) => setTimeout(r, delay));
+    try {
+      const status = await checkSetupStatus(settingsStore.agentUrl, profileName.value);
+      if (status.profile_exists) { exists = true; break; }
+    } catch {
+      // Server still unreachable — keep waiting.
+    }
+  }
+  if (!exists) return null;
+
+  try {
+    await ElMessageBox.confirm(
+      `The connection dropped, but the server has created "${profileName.value}". `
+      + 'Finish setting it up and issue its access token? Your settings are re-applied '
+      + 'on top, and any token issued to this profile earlier stays valid.',
+      'Finish the interrupted setup',
+      {
+        confirmButtonText: `Finish "${profileName.value}"`,
+        cancelButtonText: 'Cancel',
+        type: 'warning',
+      },
+    );
+  } catch {
+    return null;
+  }
+
+  // The profile row appears early in the run, so the original request may still
+  // be going on the server — in which case the per-profile guard answers 409
+  // `setup_in_progress`. That is "wait", not "fail": keep asking until it
+  // finishes. Any other error is the server's real answer and must surface.
+  for (const delay of delays) {
+    try {
+      return await completeSetup(
+        settingsStore.agentUrl,
+        { ...config, adopt_existing: true } as any,
+        adminToken.value,
+      );
+    } catch (e) {
+      if ((e as SetupError)?.code !== 'setup_in_progress') throw e;
+      setupLog.value = [
+        ...setupLog.value,
+        {
+          step: 'recover',
+          message: 'The original setup is still running on the server — waiting for it to finish…',
+          level: 'info',
+          ts: Date.now() / 1000,
+        },
+      ];
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  return null;
+}
+
 async function handleCompleteSetup() {
   // The LLM step's own gate is the one users meet; this catches the case
   // where the step list changes and 'llm' stops being something you walk
@@ -1162,10 +1276,30 @@ async function handleCompleteSetup() {
   // Subscribe to the per-phase progress stream BEFORE firing the POST so
   // we don't miss the first few events (feature install / db validation
   // happen within milliseconds of the request hitting the handler).
+  // The admin token is required for every profile after the first — the
+  // backend opens this stream only during the first-run bootstrap window.
+  // An empty token here is correct for first setup and only there.
   setupProgressHandle = openSetupProgressStream(
     settingsStore.agentUrl,
+    adminToken.value,
     (entry) => {
       setupLog.value = [...setupLog.value, entry];
+    },
+    (err) => {
+      // Never swallow this. The panel going quiet used to be indistinguishable
+      // from the server hanging, which is how a 401 here stayed invisible.
+      console.warn('[setupProgressStream]', err);
+      setupLog.value = [
+        ...setupLog.value,
+        {
+          step: 'progress',
+          message:
+            'Live progress is unavailable — setup is still running. '
+            + (err instanceof Error ? err.message : String(err)),
+          level: 'warning',
+          ts: Date.now() / 1000,
+        },
+      ];
     },
   );
 
@@ -1191,7 +1325,24 @@ async function handleCompleteSetup() {
       config.channel_configs = channelConfigs.value;
     }
 
-    const result = await completeSetup(settingsStore.agentUrl, config as any, adminToken.value);
+    let result: Awaited<ReturnType<typeof completeSetup>>;
+    try {
+      result = await completeSetup(settingsStore.agentUrl, config as any, adminToken.value);
+    } catch (e) {
+      // A setup run takes tens of seconds and the server finishes it whether or
+      // not we are still listening — Starlette does not cancel a handler when
+      // the client goes away. So a *transport* failure tells us nothing about
+      // the outcome, and the profile may well have been created, with its token
+      // already on disk. Retrying blind would only earn a 409.
+      //
+      // Only a transport failure arms recovery: if the server answered with a
+      // status, its answer is authoritative and must surface as-is.
+      const recovered = isTransportFailure(e)
+        ? await recoverLostSetupResponse(config)
+        : null;
+      if (!recovered) throw e;
+      result = recovered;
+    }
     generatedToken.value = result.token;
     restartRequired.value = Boolean(result.restart_required);
     createdChannels.value = result.channels || [];

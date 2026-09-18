@@ -176,6 +176,16 @@ copy/paste it. With `--json`, the full response object — including the
 `warnings` array of `{code, message}` entries — is emitted to stdout instead.
 The only code today is `no_main_model`.
 
+**One run per profile at a time.** A second `complete` for a profile whose
+setup is still running is refused with `409` and
+`"code": "setup_in_progress"` — distinct from the `409` for a name that is
+simply taken. It means "wait", not "this failed": the first run is still
+going and will finish on its own. The server completes a run whether or not
+the client is still connected, so if a `complete` dies on a broken pipe, do
+not assume nothing happened — check `cremind setup status --profile <name>`
+before retrying, and use `adopt_existing` to finish a profile that was
+created but never got its token.
+
 **Examples.**
 
 ```bash

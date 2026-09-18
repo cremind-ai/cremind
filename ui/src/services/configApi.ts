@@ -851,9 +851,21 @@ export async function completeSetup(
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || `Setup failed: ${res.statusText}`);
+    const err: SetupError = new Error(data.error || `Setup failed: ${res.statusText}`);
+    // The server distinguishes "this name is taken" from "a run for this name
+    // is still going"; both are 409, and the recovery path has to tell them
+    // apart. Carried on the error so callers need not re-parse the message.
+    err.status = res.status;
+    if (typeof data.code === 'string') err.code = data.code;
+    throw err;
   }
   return res.json();
+}
+
+/** An error from a setup call that the server answered, with its own code. */
+export interface SetupError extends Error {
+  status?: number;
+  code?: string;
 }
 
 /** Ask the server to restart itself (admin-gated; returns 202 Accepted).

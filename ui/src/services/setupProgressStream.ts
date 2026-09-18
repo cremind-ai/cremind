@@ -7,9 +7,15 @@
  * Each ``log`` frame's payload is ``{ step, message, level, ts }``.
  *
  * Connection is short-lived: opened just before posting Complete Setup,
- * closed when the post returns (or on error). EventSource can't send
- * Authorization headers, but the stream is intentionally unauthenticated
- * during the bootstrap window.
+ * closed when the post returns (or on error).
+ *
+ * Auth mirrors the backend gate in ``app/api/setup_stream.py``: the stream is
+ * open during the first-run bootstrap window (no JWT can exist yet), and
+ * admin-only once setup is complete. So every profile created *after* the
+ * first needs the admin token — without it the stream 401s and the wizard's
+ * live-log panel silently stays empty for the whole run. That is why this uses
+ * fetch + ReadableStream rather than `EventSource`, which cannot send an
+ * Authorization header.
  */
 
 export interface SetupLogEntry {
@@ -32,6 +38,8 @@ function resolveBaseUrl(agentUrl: string): string {
 
 export function openSetupProgressStream(
   agentUrl: string,
+  /** Admin JWT. Empty during first-run setup, where the stream is open. */
+  authToken: string,
   onLog: (entry: SetupLogEntry) => void,
   onError?: (err: unknown) => void,
 ): SetupProgressStreamHandle {
@@ -42,8 +50,10 @@ export function openSetupProgressStream(
     try {
       const base = resolveBaseUrl(agentUrl);
       const url = `${base}/api/config/setup/stream`;
+      const headers: Record<string, string> = { Accept: 'text/event-stream' };
+      if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
       const res = await fetch(url, {
-        headers: { Accept: 'text/event-stream' },
+        headers,
         signal: controller.signal,
       });
       if (!res.ok || !res.body) {

@@ -417,7 +417,12 @@ async def initialize_profile_skills(
 
     Returns the watcher handle (``None`` if the directory could not be set up).
     """
-    newly_added_dirs = sync_builtin_skills_into_profile(profile)
+    # Seeding copies the whole shipped skill tree and scanning walks it back,
+    # parsing every SKILL.md. Both are pure filesystem work with no loop
+    # interaction, and both are on the critical path of creating a profile —
+    # seconds of a blocked event loop each, during which the server answers
+    # nothing. Hand them to a worker thread.
+    newly_added_dirs = await asyncio.to_thread(sync_builtin_skills_into_profile, profile)
     skills_dir = profile_skills_dir(profile)
     if not skills_dir.is_dir():
         logger.warning(f"Skills dir not ready for '{profile}': {skills_dir}")
@@ -426,7 +431,7 @@ async def initialize_profile_skills(
     await _retire_listener_autostarts(profile)
     _repoint_orphaned_event_subscriptions(profile)
 
-    skills = scan_skills(skills_dir)
+    skills = await asyncio.to_thread(scan_skills, skills_dir)
     _notify_first_add_long_running(profile, skills, newly_added_dirs)
     await registry.sync_skills(
         profile=profile,

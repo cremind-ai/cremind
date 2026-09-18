@@ -327,6 +327,18 @@ with `--agent-url <the address you actually open>`.
 Read the rest with `exec_shell_output`, or `cremind --json profile wizard status
 <name>` once it is done.
 
+**`setup_in_progress`** — a `finish` for this profile is still running. Wait
+for it rather than re-running; the second call is refused precisely so the two
+do not race each other's config and mint two tokens.
+
+**`finish` died on a broken connection** — the server completes a run whether
+or not the client is still attached, so the profile may well have been created
+and its token written. Check with `cremind profile list` (or `cremind setup
+status --profile <name>`) before doing anything else: if it is there, re-run
+`start <name> --adopt` and `finish` to pick up the token, rather than deleting
+it and starting over. Adoption mints at the profile's current serial, so any
+token issued to it earlier keeps working.
+
 **The profile cannot answer anything** — the LLM step was skipped, or no main
 model was chosen. Set one under Settings → LLM Providers, or with
 `cremind --token "$(cremind auth show --profile <name>)" llm model-groups set`.
