@@ -22,6 +22,7 @@ import test, { after, before } from 'node:test'
 import { createSSRApp, h } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 import { createServer } from 'vite'
+import vue from '@vitejs/plugin-vue'
 
 // CaTrustPanel sniffs the platform at setup to re-order its command list.
 // Node's own `navigator` has no `platform`, which is fine (the detection
@@ -39,6 +40,12 @@ let resolveTrustEvidence
 before(async () => {
   vite = await createServer({
     root: new URL('..', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'),
+    // Never the repo's own vite.config.ts: that one builds the Electron app
+    // and would drag vite-plugin-electron into a unit test. Everything these
+    // components import is explicit (element-plus, @iconify/vue, relative
+    // paths), so the vue plugin alone is the whole toolchain they need.
+    configFile: false,
+    plugins: [vue()],
     server: { middlewareMode: true },
     appType: 'custom',
     logLevel: 'error',
