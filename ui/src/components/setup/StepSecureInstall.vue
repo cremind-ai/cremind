@@ -18,7 +18,7 @@ import { ElAlert, ElCheckbox, ElMessage } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useCopyToClipboard } from '../../composables/useCopyToClipboard';
 import CaTrustPanel from '../shared/CaTrustPanel.vue';
-import type { TlsStatus } from '../../services/configApi';
+import type { TlsStatus, TrustEvidence } from '../../services/configApi';
 
 const props = defineProps<{
   agentUrl: string;
@@ -27,8 +27,18 @@ const props = defineProps<{
    *  drops the user's `kubectl port-forward`, and forewarning that here is
    *  what keeps it a non-event instead of a "connection lost" scare. */
   installMode?: string | null;
+  /** Why this device is already covered, decided by the wizard (which owns
+   *  the Next gate) so that this step's first render is already correct.
+   *  Deliberately separate from ``confirmed``: evidence satisfies the step on
+   *  its own, but it must never write the user's own tick — a capabilities
+   *  refresh that re-derived evidence could otherwise untick a box they
+   *  ticked and re-block a step they had passed. */
+  evidence?: TrustEvidence | null;
 }>();
 const confirmed = defineModel<boolean>('confirmed', { default: false });
+/** A trust request made inside the panel succeeded — passed up to the wizard,
+ *  which folds it back into ``evidence``. */
+const justTrusted = defineModel<boolean>('justTrusted', { default: false });
 
 const { copy, isCopied } = useCopyToClipboard();
 async function copyValue(text: string, key: string) {
@@ -53,23 +63,35 @@ const isKubernetes = computed(
       single certificate warning.
     </p>
 
-    <ElAlert type="info" :closable="false" show-icon class="skip-alert">
+    <!-- Only when nothing vouches for this device yet. With evidence in hand
+         the panel below states why in one success alert; demanding the work a
+         second time here is exactly the redundancy this step had. -->
+    <ElAlert v-if="!evidence" type="info" :closable="false" show-icon class="skip-alert">
       <template #title>Trust is required before activation</template>
       Verify the SHA-256 fingerprint, then trust this exact CA on the device
       running this browser. Repeat the trust instructions on every other device
       that connects to this private Cremind certificate.
     </ElAlert>
+    <p v-else class="step-description ready-line">
+      This device is ready for the switch — you can continue. Every other device
+      that connects to this Cremind still needs the trust steps below.
+    </p>
 
     <!-- No auth token: the wizard runs inside the pre-setup bootstrap window,
          where no JWT exists and the backend skips its admin gate. -->
     <CaTrustPanel
+      v-model:just-trusted="justTrusted"
       variant="wizard"
       :agent-url="agentUrl"
       :tls="tls"
       :install-mode="installMode"
+      :evidence="evidence"
     />
 
-    <ElCheckbox v-model="confirmed" class="trust-confirm">
+    <!-- Self-attestation, and the only way past this step when nothing else
+         can vouch for the device. Evidence replaces it rather than ticking
+         it, so a refetch can never revoke a decision the user already made. -->
+    <ElCheckbox v-if="!evidence" v-model="confirmed" class="trust-confirm">
       I verified the fingerprint and trusted this exact CA on this device.
     </ElCheckbox>
 
@@ -117,6 +139,7 @@ const isKubernetes = computed(
 .step-description { color: var(--text-secondary); font-size: 0.875rem; margin: 0 0 20px 0; line-height: 1.5; }
 .step-description strong { color: var(--text-primary); }
 .skip-alert { margin-bottom: 24px; }
+.ready-line { margin-bottom: 24px; }
 .trust-confirm { margin: 18px 0; }
 
 .copy-icon-btn {

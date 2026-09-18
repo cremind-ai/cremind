@@ -60,8 +60,11 @@ export type DeploymentMode = 'docker' | 'native' | 'external';
 // environment itself.
 export interface TlsStatus {
   /** ``CREMIND_SSL``: '' (plain HTTP), 'auto' (HTTPS from boot one), or
-   *  'after-setup' (HTTP until the wizard finishes, then HTTPS). */
-  mode: '' | 'auto' | 'after-setup';
+   *  'after-setup' (HTTP until the wizard finishes, then HTTPS) — plus
+   *  'custom', which the backend substitutes whenever an operator supplied a
+   *  certificate pair (``_tls_capabilities`` in app/api/features.py). There is
+   *  no local CA to trust in that case. */
+  mode: '' | 'auto' | 'after-setup' | 'custom';
   /** Whether the process answering right now bound TLS. */
   serving_https: boolean;
   /** Whether it will bind TLS on its next boot. See the note above. */
@@ -98,6 +101,17 @@ export interface TlsLocalTrust {
   /** Why ``supported`` is false, in showable words. */
   reason: string | null;
 }
+
+/** Why the UI believes THIS device already trusts the local CA, strongest
+ *  first: the server looked in the store and found it; we just put it there;
+ *  the installer that opened this page reported writing the host store; or the
+ *  Electron desktop app verifies the chain itself and never consults the OS.
+ *
+ *  ``null`` means no evidence — and then, and only then, the wizard asks the
+ *  human. None of these proves every *browser* on the device trusts the CA
+ *  (Firefox keeps its own store), which is why the manual commands are only
+ *  ever collapsed behind a toggle, never removed. */
+export type TrustEvidence = 'already' | 'just-trusted' | 'installer' | 'electron';
 
 export interface TrustLocalCaResult {
   trusted: boolean;

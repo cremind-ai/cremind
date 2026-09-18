@@ -21,6 +21,7 @@ import {
   type TlsStatus,
   type TlsTransition,
 } from '../services/configApi';
+import { resolveTrustEvidence } from '../services/caTrustHint';
 import {
   handleHttpsTransition,
   httpsTransitionState,
@@ -125,15 +126,36 @@ const usesLocalCertificate = computed(() => Boolean(
   certificateKind.value === 'local'
   || (!transition.value?.certificate_kind && transition.value?.ca_sha256),
 ));
+// Evidence from the panel (the server found the CA in this machine's store, or
+// the one-click trust just succeeded) satisfies the confirmation on its own —
+// the user should not have to re-attest work that demonstrably happened. Kept
+// as a separate ref from their own tick so a refetch can never revoke it.
+const trustJustTrusted = ref(false);
+// Only ever about the local CA: an uploaded or edge certificate has to be
+// verified by the operator whatever some earlier local CA's state was. No
+// installer hint here either — Settings is reached long after any install,
+// from any device, so an installer's word about some other machine's trust
+// store means nothing. Electron is left out for the same reason it is not in
+// the wizard's Settings equivalent: this page is admin-only and routinely
+// opened from a browser that is not the desktop app.
+const trustEvidence = computed(() => (usesLocalCertificate.value
+  ? resolveTrustEvidence({
+    justTrusted: trustJustTrusted.value,
+    serverSaysTrusted: tls.value?.local_trust?.already_trusted,
+  })
+  : null));
+const trustSatisfied = computed(
+  () => trustEvidence.value !== null || trustConfirmed.value,
+);
 const canActivate = computed(() =>
-  isPrepared.value && trustConfirmed.value && migrationReady.value && !working.value,
+  isPrepared.value && trustSatisfied.value && migrationReady.value && !working.value,
 );
 /** Why the activate button is not pressable, in the user's terms. A disabled
  *  button that explains nothing is indistinguishable from a broken one — which
  *  is exactly how an unfinished upload in another tab used to read. */
 const activateBlockedBy = computed(() => {
   if (working.value) return null;
-  if (!trustConfirmed.value) {
+  if (!trustSatisfied.value) {
     return usesLocalCertificate.value
       ? 'Confirm above that you trusted this CA on this device.'
       : 'Confirm above that you verified this certificate on this device.';
@@ -267,10 +289,10 @@ async function load(quiet = false) {
     const caps: ServiceCapabilitiesResponse | null = capsResult.status === 'fulfilled'
       ? capsResult.value : null;
     runtime.value = status;
-    if (caps) {
-      tls.value = caps.tls ?? null;
-      trustConfirmed.value = Boolean(caps.tls?.local_trust?.already_trusted);
-    }
+    // No seeding of ``trustConfirmed`` from ``already_trusted`` any more: the
+    // panel derives that reactively and publishes it as evidence, so this
+    // write could only ever stomp a tick the user had just made.
+    if (caps) tls.value = caps.tls ?? null;
     installMode.value = caps?.install_mode ?? status.install_mode ?? installMode.value;
     if (status.transition && ['prepared', 'quiescing'].includes(status.transition.phase)) {
       await handleHttpsTransition(status.transition, settingsStore.agentUrl, settingsStore.authToken);
@@ -346,7 +368,6 @@ async function prepare() {
     const caps = await fetchServiceCapabilities(settingsStore.agentUrl, settingsStore.authToken);
     tls.value = caps.tls ?? null;
     installMode.value = caps.install_mode ?? runtime.value.install_mode ?? null;
-    trustConfirmed.value = Boolean(caps.tls?.local_trust?.already_trusted);
     ElMessage.success(
       runtime.value.transition?.certificate_kind === 'external'
         ? 'HTTPS handoff prepared. Verify the edge certificate before activation.'
@@ -601,13 +622,19 @@ onMounted(() => { void load(); });
             </p>
             <CaTrustPanel
               v-if="usesLocalCertificate"
+              v-model:just-trusted="trustJustTrusted"
               :agent-url="settingsStore.agentUrl"
               :tls="tls"
               :install-mode="installMode"
               :auth-token="settingsStore.authToken"
+              :evidence="trustEvidence"
               variant="settings"
             />
-            <ElCheckbox v-model="trustConfirmed" class="trust-confirm">
+            <ElCheckbox
+              v-if="!trustEvidence"
+              v-model="trustConfirmed"
+              class="trust-confirm"
+            >
               {{ usesLocalCertificate
                 ? 'I trusted this exact CA on this device.'
                 : certificateKind === 'custom'

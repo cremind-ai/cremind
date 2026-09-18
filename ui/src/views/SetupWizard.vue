@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue';
-import { useRouter } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import {
   ElSteps, ElStep, ElButton, ElMessage, ElMessageBox,
   ElForm, ElFormItem, ElInput, ElRadio, ElRadioGroup, ElAlert, ElTag,
@@ -33,6 +33,7 @@ import {
   type InstallSecrets,
   type TlsRuntimeStatus,
 } from '../services/configApi';
+import { matchesCaTrustHint, resolveTrustEvidence } from '../services/caTrustHint';
 import { tunnelCommand } from '../services/httpsReadiness';
 import { downloadTextFile, type ExportFormat } from '../utils/configExport';
 import {
@@ -68,6 +69,7 @@ const props = defineProps<{
 }>();
 
 const router = useRouter();
+const route = useRoute();
 const settingsStore = useSettingsStore();
 const configStore = useConfigStore();
 const chatStore = useChatStore();
@@ -520,7 +522,38 @@ const serviceCapabilities = ref<ServiceCapabilitiesResponse | null>(null);
 // through main-process IPC.
 const tlsStatus = computed(() => serviceCapabilities.value?.tls ?? null);
 const tlsPending = computed(() => Boolean(tlsStatus.value?.pending_https));
+// The user's own attestation, and the evidence the Secure step gathered on its
+// own — kept apart on purpose. Either satisfies the step, but evidence never
+// writes ``secureTrustConfirmed``: a capabilities refetch that re-derived
+// evidence would otherwise be able to untick a box the user had ticked and
+// re-block a step they had already passed.
 const secureTrustConfirmed = ref(false);
+/** A trust request made on the Secure step succeeded. */
+const secureJustTrusted = ref(false);
+
+/** A container install's installer trusted this exact CA on the host and said
+ *  so on the URL it opened (``#/setup?ca_trusted=…``). The digest has to match
+ *  what this server is serving, so a stale link or a regenerated CA vouches
+ *  for nothing. Left in the address bar deliberately: it is not a credential,
+ *  and scrubbing it would re-block the step on a mid-wizard reload. */
+const installerTrustedThisCa = computed(
+  () => matchesCaTrustHint(route.query.ca_trusted, tlsStatus.value?.ca_sha256),
+);
+
+// Decided here, where the Next gate lives, and handed down to the step — not
+// discovered by the panel and reported back, which would arrive a render late
+// and flash "trust is required" on a step that is already satisfied.
+const secureTrustEvidence = computed(() => resolveTrustEvidence({
+  justTrusted: secureJustTrusted.value,
+  serverSaysTrusted: tlsStatus.value?.local_trust?.already_trusted,
+  installerTrusted: installerTrustedThisCa.value,
+  isElectron: isElectron.value,
+  installMode: serviceCapabilities.value?.install_mode ?? null,
+  tlsMode: tlsStatus.value?.mode ?? null,
+}));
+const secureTrustSatisfied = computed(
+  () => secureTrustEvidence.value !== null || secureTrustConfirmed.value,
+);
 
 // Snapshot of the TLS hand-off fields from the setup response, captured in
 // ``handleCompleteSetup`` and consumed by ``handleFinish``. Kept separate
@@ -1058,7 +1091,7 @@ async function handleNext() {
     return;
   }
 
-  if (key === 'secure' && !secureTrustConfirmed.value) {
+  if (key === 'secure' && !secureTrustSatisfied.value) {
     ElMessage.error('Trust the exact certificate authority on this device and confirm it before continuing.');
     return;
   }
@@ -1921,9 +1954,11 @@ async function downloadConfigFile(format: ExportFormat) {
         <StepSecureInstall
           v-else-if="currentStepKey === 'secure'"
           v-model:confirmed="secureTrustConfirmed"
+          v-model:just-trusted="secureJustTrusted"
           :agent-url="settingsStore.agentUrl"
           :tls="tlsStatus"
           :install-mode="serviceCapabilities?.install_mode ?? null"
+          :evidence="secureTrustEvidence"
         />
         <StepProfileCreate
           v-else-if="currentStepKey === 'complete'"
@@ -2115,10 +2150,10 @@ async function downloadConfigFile(format: ExportFormat) {
             v-if="!isLastStep"
             type="primary"
             :disabled="(currentStepKey === 'llm' && !canAdvanceFromLLM)
-              || (currentStepKey === 'secure' && !secureTrustConfirmed)"
+              || (currentStepKey === 'secure' && !secureTrustSatisfied)"
             :title="currentStepKey === 'llm' && !canAdvanceFromLLM
               ? 'Choose a Model first — the assistant needs one to answer.'
-              : currentStepKey === 'secure' && !secureTrustConfirmed
+              : currentStepKey === 'secure' && !secureTrustSatisfied
                 ? 'Trust and confirm the exact CA before activating HTTPS.' : ''"
             @click="handleNext"
           >

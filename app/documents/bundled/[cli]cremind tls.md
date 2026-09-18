@@ -26,8 +26,17 @@ the CA there, and only then does it restart into HTTPS — to a browser that
 already trusts the chain. On a **native** install the wizard's "Secure this
 install" step does it in one click ("Trust it on this device" — the server and
 the browser share the machine, so the server hands the CA to the OS itself),
-and a **Docker** install's host is offered the same thing by the installer
-right after the container starts. Skipping that step is not permanent — the
+and the step then counts itself done, with nothing further to confirm. On
+**Docker** and **Kubernetes** the server sits inside the container and can only
+read the container's trust store, so the installer offers to write the host's
+store instead, right after the container or pod answers; accept it and the
+installer tells the wizard which CA it trusted, so that step arrives already
+satisfied too. In the **Electron desktop app** there is nothing to do at all —
+the app verifies Cremind's certificate itself and never shows a warning; trust
+the CA on the device only if you also want to open Cremind in a normal browser
+there. Everywhere else — another device, an ingress address, or after declining
+the installer's offer — the wizard asks, and these commands are how you answer
+it by hand. Skipping that step is not permanent — the
 admin profile can come back to it any time under **Settings → HTTPS &
 Certificate**, which offers the same one-click trust, the same fingerprint,
 and the same CA download. These commands are how you do the same thing by

@@ -553,3 +553,124 @@ def test_host_ca_trust_skips_when_already_trusted() -> None:
     # Linux compares the shipped anchor; macOS asks the keychain.
     assert re.search(r"host-side CA trust[\s\S]{0,5000}cmp -s", sh)
     assert re.search(r"host-side CA trust[\s\S]{0,5000}find-certificate", sh)
+
+
+# ── the installer → Setup Wizard trust hand-off ───────────────────────────
+#
+# A container install's server can only ever read the CONTAINER's trust store
+# (``_trust_environment_error`` in app/api/tls.py refuses docker/kubernetes
+# outright, which forces ``local_trust.already_trusted`` to null). So when the
+# block above writes the HOST's store, the installer is the only witness — and
+# without these guards it threw that fact away, leaving the wizard to demand
+# the same work again by hand. It now says so on the wizard URL it opens.
+#
+# What must not rot: the hand-off is emitted ONLY from evidence that names the
+# exact certificate, and never from a URL meant for another device.
+
+
+def _sh_trust_helper(sh: str) -> str:
+    """Just ``offer_host_ca_trust``'s body. Slicing the whole script instead
+    would hit the uninstall block's own ``Darwin)`` case first."""
+    start = sh.index("offer_host_ca_trust() {")
+    return sh[start:sh.index("ca_trust_hint_url() {", start)]
+
+
+def _between(text: str, start: str, end: str) -> str:
+    at = text.index(start)
+    return text[at:text.index(end, at)]
+
+
+def test_host_ca_trust_declares_its_output_before_the_block() -> None:
+    """``set -u`` / ``Set-StrictMode`` make an unset read fatal, and the whole
+    block is skipped in most install modes — so the variable has to exist
+    before anything reads it."""
+    ps1, sh = _ps1(), _sh()
+    assert sh.index('HOST_CA_TRUST_FP=""') < sh.index("host-side CA trust")
+    assert ps1.index("$script:HostCaTrustFingerprint = ''") < ps1.index("host-side CA trust")
+
+
+def test_host_ca_trust_hint_only_on_fingerprint_exact_evidence() -> None:
+    """The hint names a CA, so it may only come from evidence that identified
+    that exact CA: install.ps1's thumbprint lookup, install.sh's byte-for-byte
+    anchor comparison, or a trust command that just succeeded.
+
+    install.sh's macOS branch matches by COMMON NAME. After a CA regeneration
+    it reports "already trusts" for the OLD CA while the fingerprint would name
+    the NEW one — a hint that matches the server exactly and is a lie. It must
+    stay out of this.
+    """
+    ps1, helper = _ps1(), _sh_trust_helper(_sh())
+
+    darwin = _between(helper, "            Darwin)", "            *)")
+    assert "find-certificate" in darwin, "wrong slice — the macOS branch moved"
+    assert "HOST_CA_VERIFIED=1" not in darwin
+
+    linux = _between(helper, "                if [ -d /usr/local", "        esac")
+    assert "cmp -s" in linux, "wrong slice — the Linux anchor comparison moved"
+    assert "HOST_CA_VERIFIED=1" in linux
+
+    # Declining stays silent; only the branch that ran the command speaks.
+    declined = _between(helper, "                [nN]*)", ";;")
+    assert "Skipped. The Setup Wizard" in declined, "wrong slice — the decline branch moved"
+    assert "HOST_CA_VERIFIED=1" not in declined
+    granted = _between(helper, 'if sh -c "$CA_TRUST_CMD"; then', "else")
+    assert "HOST_CA_VERIFIED=1" in granted
+    failed = _between(helper, 'warn "CA not trusted', "fi")
+    assert "HOST_CA_VERIFIED=1" not in failed
+    assert re.search(
+        r"\$CaStore\.Add\(\$CaCert\)\s*\n\s*#[\s\S]{0,200}?\$script:HostCaTrustFingerprint = \$CaHintFp",
+        ps1,
+    ), "install.ps1 must publish only after Add() returned"
+    ps1_catch = ps1[ps1.index("Includes the user clicking No"):]
+    assert "$script:HostCaTrustFingerprint" not in ps1_catch[:600]
+
+
+def test_container_wizard_urls_carry_the_trust_hint() -> None:
+    """Docker and Kubernetes are exactly the two modes that call the trust
+    block, and the two whose server cannot check the host store itself."""
+    ps1, sh = _ps1(), _sh()
+    assert 'K8S_WIZARD_URL="$(ca_trust_hint_url "${BOOT_SCHEME}://localhost:1515/#/setup")"' in sh
+    assert 'Get-CremindWizardTrustHintUrl "${BootScheme}://localhost:1515/#/setup"' in ps1
+    # Docker hands off only for a loopback host — a `custom` deployment's URL
+    # is meant for somebody else's browser.
+    assert re.search(r"localhost\|127\.0\.0\.1[\s\S]{0,120}ca_trust_hint_url", sh)
+    assert re.search(
+        r"@\('localhost', '127\.0\.0\.1'[\s\S]{0,200}Get-CremindWizardTrustHintUrl \$WizardUrl",
+        ps1,
+    )
+    # The query rides INSIDE the hash: the UI router is createWebHashHistory,
+    # so anything before the '#' never reaches route.query.
+    assert "'%s?ca_trusted=%s' \"$1\" \"$HOST_CA_TRUST_FP\"" in sh
+    assert '"${Url}?ca_trusted=$($script:HostCaTrustFingerprint)"' in ps1
+
+
+def test_ingress_and_native_wizard_urls_are_never_hinted() -> None:
+    """An ingress serves a different chain than the port-forward we trusted,
+    and native never runs the trust block at all (the server's own one-click
+    covers it). Native also strips a '/#/setup' suffix, which a query would
+    silently defeat."""
+    ps1, sh = _ps1(), _sh()
+    assert 'K8S_WIZARD_URL="${K8S_POD_APP_URL%/}/#/setup"' in sh
+    assert "$K8sWizardUrl = ($K8sPodAppUrl.TrimEnd('/')) + '/#/setup'" in ps1
+    native_sh = sh[sh.index('WIZARD_URL="${BOOT_SCHEME}://$APP_HOST:1515/#/setup"'):]
+    assert "ca_trust_hint_url" not in native_sh
+    assert "${WIZARD_URL%/#/setup}" in native_sh
+    native_ps1 = ps1[ps1.index('$WizardUrl = "${BootScheme}://${AppHost}:1515/#/setup"'):]
+    assert "Get-CremindWizardTrustHintUrl" not in native_ps1
+
+
+def test_trust_block_proximity_budget_has_headroom() -> None:
+    """The guards above are distance-bounded regexes over the raw script. When
+    the budget runs out they fail as ``assert None`` somewhere else entirely,
+    so measure it here and fail with the number instead."""
+    sh, ps1 = _sh(), _ps1()
+    anchor = sh.index("host-side CA trust")
+    spent = sh.index('read -r -p "Trust it', anchor) - anchor
+    assert spent < 4500, (
+        f"install.sh: {spent} chars between the 'host-side CA trust' anchor and the "
+        f"prompt, over the 4500 budget in test_host_ca_trust_is_offered_not_forced. "
+        f"Move additions after the prompt, or raise both bounds together."
+    )
+    ps1_anchor = ps1.index("host-side CA trust")
+    ps1_spent = ps1.index("Read-Host", ps1_anchor) - ps1_anchor
+    assert ps1_spent < 4000, f"install.ps1: {ps1_spent} chars, over the 4000 budget"

@@ -2696,6 +2696,12 @@ upsert_env_key() {
     fi
 }
 
+# The CA this host's trust store now really holds, lowercase hex, empty when
+# nothing verifiable happened. Declared out here because ``set -u`` makes an
+# unset read fatal and the block below is skipped in most install modes.
+# ``ca_trust_hint_url`` turns it into the wizard hand-off.
+HOST_CA_TRUST_FP=""
+
 # ── host-side CA trust ─────────────────────────────────────
 #
 # The CA lives inside the container (Docker) or the pod (Kubernetes), where
@@ -2716,6 +2722,7 @@ upsert_env_key() {
 # interactive, not Electron); this decides how.
 offer_host_ca_trust() {
     local ca_url="$1"
+    HOST_CA_VERIFIED=0
     CA_TMP="$(mktemp "${TMPDIR:-/tmp}/cremind-ca.XXXXXX" 2>/dev/null || true)"
     CA_FETCHED=0
     if [ -n "$CA_TMP" ]; then
@@ -2739,6 +2746,7 @@ offer_host_ca_trust() {
             Darwin)
                 # CN presence in the System keychain is the best cheap
                 # check macOS offers; the add below sets trustRoot anyway.
+                # Deliberately NOT evidence: see HOST_CA_VERIFIED below.
                 if security find-certificate -c "Cremind Local CA" -Z /Library/Keychains/System.keychain >/dev/null 2>&1; then
                     CA_ALREADY=1
                 fi
@@ -2754,6 +2762,7 @@ offer_host_ca_trust() {
                 fi
                 if [ -n "$CA_ANCHOR" ] && [ -f "$CA_ANCHOR" ] && cmp -s "$CA_TMP" "$CA_ANCHOR"; then
                     CA_ALREADY=1
+                    HOST_CA_VERIFIED=1
                 fi
                 ;;
         esac
@@ -2781,6 +2790,7 @@ offer_host_ca_trust() {
                     ;;
                 *)
                     if sh -c "$CA_TRUST_CMD"; then
+                        HOST_CA_VERIFIED=1
                         ok "Trusted the Cremind local CA."
                     else
                         warn "CA not trusted — the Setup Wizard's 'Secure this install' step shows the manual command."
@@ -2789,7 +2799,32 @@ offer_host_ca_trust() {
             esac
         fi
     fi
+    # Publish the hand-off, but ONLY from evidence that is exact about WHICH
+    # certificate this host trusts: the byte-for-byte anchor comparison above,
+    # or a trust command that just succeeded on this very file. The macOS
+    # check is excluded on purpose - it matches by common name, so after a CA
+    # regeneration it reports "already trusts" for the OLD CA while this
+    # fingerprint names the NEW one, producing a hint that matches the server
+    # exactly and is a straight lie. No openssl, no hint; the wizard simply
+    # asks, which is what it did before this existed.
+    if [ "${HOST_CA_VERIFIED:-0}" -eq 1 ] && [ -n "$CA_TMP" ] && command -v openssl >/dev/null 2>&1; then
+        HOST_CA_TRUST_FP="$(openssl x509 -in "$CA_TMP" -noout -fingerprint -sha256 2>/dev/null \
+            | sed 's/^.*=//' | tr -d ':' | tr 'A-Z' 'a-z' || true)"
+    fi
     if [ -n "$CA_TMP" ]; then rm -f "$CA_TMP"; fi
+}
+
+# Carry "this host trusts that exact CA" to the Setup Wizard, which otherwise
+# has no way to learn it: the server is in the container and can only read the
+# container's store. The query goes INSIDE the hash - the UI router is
+# createWebHashHistory, so `#/setup?ca_trusted=...` is what reaches route.query.
+# Usage: ca_trust_hint_url <wizard-url>
+ca_trust_hint_url() {
+    if [ -z "${HOST_CA_TRUST_FP:-}" ]; then
+        printf '%s' "$1"
+    else
+        printf '%s?ca_trusted=%s' "$1" "$HOST_CA_TRUST_FP"
+    fi
 }
 
 # ── docker install ────────────────────────────────────────────────────────
@@ -3533,8 +3568,11 @@ if [ "$MODE" = "kubernetes" ]; then
     )
 
     # ── handoff ───────────────────────────────────────────────────────────
-    K8S_WIZARD_URL="${BOOT_SCHEME}://localhost:1515/#/setup"
+    K8S_WIZARD_URL="$(ca_trust_hint_url "${BOOT_SCHEME}://localhost:1515/#/setup")"
     if [ "${K8S_INGRESS:-0}" -eq 1 ] && [ -n "$K8S_POD_APP_URL" ]; then
+        # No hand-off under an ingress: the trust we just offered was for the
+        # CA behind the port-forward, and an ingress serves a different chain
+        # entirely. Let the wizard ask, as it does for any other device.
         K8S_WIZARD_URL="${K8S_POD_APP_URL%/}/#/setup"
     fi
 
@@ -3907,6 +3945,13 @@ EOF
     # $BOOT_SCHEME — under after-setup an https link here would simply not
     # open. It becomes https on its own once the wizard restarts the server.
     WIZARD_URL="${BOOT_SCHEME}://${HEALTH_HOST}:1515/#/setup"
+    # Hand the trust off only for a loopback address, i.e. the very machine
+    # whose store we just wrote. $HEALTH_HOST is localhost everywhere except a
+    # `custom` deployment, where this URL is meant for somebody else's browser.
+    case "$HEALTH_HOST" in
+        localhost|127.0.0.1|::1|"[::1]")
+            WIZARD_URL="$(ca_trust_hint_url "$WIZARD_URL")" ;;
+    esac
     if [ "${CREMIND_INSTALLER_FRONTEND:-}" != "electron" ]; then
         step "Setup wizard"
 

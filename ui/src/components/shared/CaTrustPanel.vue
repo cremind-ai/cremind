@@ -23,7 +23,7 @@ import { ElAlert, ElMessage } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useCopyToClipboard } from '../../composables/useCopyToClipboard';
 import { trustLocalCa } from '../../services/configApi';
-import type { TlsStatus } from '../../services/configApi';
+import type { TlsStatus, TrustEvidence } from '../../services/configApi';
 
 const props = withDefaults(defineProps<{
   agentUrl: string;
@@ -34,12 +34,23 @@ const props = withDefaults(defineProps<{
    *  pre-setup bootstrap window is unauthenticated and the backend skips
    *  its admin gate there); required once setup is complete. */
   authToken?: string;
+  /** Why this device is already covered, or null to ask the user. Decided by
+   *  whoever owns the gate (``resolveTrustEvidence``) and handed down, not
+   *  worked out here: this is a child, so anything discovered during its own
+   *  setup would reach the parent one render too late — long enough to flash
+   *  a "trust is required" alert on a step that is already satisfied. */
+  evidence?: TrustEvidence | null;
   variant?: 'wizard' | 'settings';
 }>(), {
   installMode: null,
   authToken: '',
+  evidence: null,
   variant: 'wizard',
 });
+
+/** The one thing only this component can know: a trust request it just made
+ *  succeeded. Flows up so the gate can re-derive its evidence. */
+const justTrusted = defineModel<boolean>('justTrusted', { default: false });
 
 const { copy, isCopied } = useCopyToClipboard();
 async function copyValue(text: string, key: string) {
@@ -54,8 +65,11 @@ const caUrl = computed(() => `${props.agentUrl}/ca.pem`);
 const fingerprint = computed(() => props.tls?.ca_sha256 ?? null);
 const httpsUrl = computed(() => props.tls?.https_url ?? null);
 const isSettings = computed(() => props.variant === 'settings');
-const isDocker = computed(
-  () => (props.installMode ?? '').toLowerCase() === 'docker',
+// Docker AND Kubernetes: in both the server is inside the container and the
+// trust store that matters is the host's, so the installer is the one that
+// could have done this. Kubernetes used to fall through this copy entirely.
+const isContainer = computed(
+  () => ['docker', 'kubernetes'].includes((props.installMode ?? '').toLowerCase()),
 );
 
 // ── one-click trust ──
@@ -67,20 +81,22 @@ const autoSupported = computed(
 );
 // Why the server refuses to do it itself (a container, or a browser on another
 // machine). Shown only in Settings: the wizard reaches the same users through
-// its Docker note, while a Settings visitor arrives with no such context.
+// its container note, while a Settings visitor arrives with no such context.
 const unsupportedReason = computed(() => (
   isSettings.value && localTrust.value && !localTrust.value.supported
     ? localTrust.value.reason
     : null
 ));
 
-type TrustState = 'idle' | 'working' | 'done' | 'already' | 'failed';
-const trustState = ref<TrustState>(
-  localTrust.value?.already_trusted === true ? 'already' : 'idle',
-);
+type TrustState = 'idle' | 'working' | 'failed';
+// Only the in-flight request. Success is not stored here: it is reported
+// upward and comes back as ``evidence``, so the panel and the gate can never
+// disagree about whether this device is covered.
+const trustState = ref<TrustState>('idle');
 const trustError = ref<string | null>(null);
+const currentEvidence = computed(() => props.evidence ?? null);
 const trustDone = computed(
-  () => trustState.value === 'done' || trustState.value === 'already',
+  () => currentEvidence.value === 'already' || currentEvidence.value === 'just-trusted',
 );
 
 // Forewarn about the OS-side prompt: the request blocks on it, and on
@@ -107,7 +123,11 @@ async function runAutoTrust() {
       props.agentUrl, fingerprint.value, props.authToken,
     );
     if (result.trusted) {
-      trustState.value = result.already_trusted ? 'already' : 'done';
+      // Both outcomes mean the store holds it now; the gate decides which
+      // wording that earns. ``already_trusted`` here is the server's
+      // short-circuit, not a different result.
+      trustState.value = 'idle';
+      justTrusted.value = true;
     } else {
       trustState.value = 'failed';
       trustError.value = result.error ?? 'The server could not install the certificate.';
@@ -118,10 +138,15 @@ async function runAutoTrust() {
   }
 }
 
-// Manual instructions: the only path when one-click is unavailable; a
-// collapsed fallback when it is.
+// Manual instructions: the only path when one-click is unavailable AND
+// nothing vouches for this device; a collapsed fallback otherwise. Evidence
+// matters here because a container install has no one-click button at all —
+// without this, an install whose CA the installer already trusted still
+// opened on a wall of commands the user had no reason to run.
 const showManual = ref(false);
-const manualVisible = computed(() => !autoSupported.value || showManual.value);
+const manualVisible = computed(
+  () => (!autoSupported.value && !currentEvidence.value) || showManual.value,
+);
 
 // Per-OS trust commands. These mirror ``_platform_commands`` in
 // app/cli/commands/tls.py — the CLI decides the same thing at runtime for the
@@ -197,6 +222,35 @@ const orderedTargets = computed(() => {
 
 <template>
   <div class="ca-trust-panel">
+    <!-- ── evidence the work is already done ──
+         Only the two kinds the one-click panel below cannot report itself:
+         a container install's host trust (the installer is the only witness)
+         and the desktop app verifying the chain in-process. -->
+    <ElAlert
+      v-if="currentEvidence === 'installer'"
+      type="success"
+      :closable="false"
+      show-icon
+      class="evidence-alert"
+    >
+      <template #title>Trusted during installation</template>
+      The installer trusted this certificate authority on this machine, and it
+      matches the one this server is serving — there is nothing to do here.
+      Other devices still need the steps below.
+    </ElAlert>
+    <ElAlert
+      v-else-if="currentEvidence === 'electron'"
+      type="success"
+      :closable="false"
+      show-icon
+      class="evidence-alert"
+    >
+      <template #title>The desktop app trusts this certificate</template>
+      Cremind verifies its own certificate inside this app, so it never shows a
+      warning here. Trust it on the device as well only if you also want to open
+      Cremind in a normal browser on this machine.
+    </ElAlert>
+
     <!-- ── one click, when the server can do it itself ── -->
     <div v-if="autoSupported" class="section auto-trust">
       <h4 class="section-title">Trust it on this device</h4>
@@ -222,7 +276,7 @@ const orderedTargets = computed(() => {
       </p>
 
       <ElAlert
-        v-if="trustState === 'already'"
+        v-if="currentEvidence === 'already'"
         type="success"
         :closable="false"
         show-icon
@@ -232,7 +286,7 @@ const orderedTargets = computed(() => {
         is nothing to do here.
       </ElAlert>
       <ElAlert
-        v-else-if="trustState === 'done'"
+        v-else-if="currentEvidence === 'just-trusted'"
         type="success"
         :closable="false"
         show-icon
@@ -279,26 +333,29 @@ const orderedTargets = computed(() => {
     </div>
 
     <button
-      v-if="autoSupported"
+      v-if="autoSupported || currentEvidence"
       type="button"
       class="manual-toggle"
       @click="showManual = !showManual"
     >
       <Icon :icon="showManual ? 'mdi:chevron-down' : 'mdi:chevron-right'" />
-      {{ trustDone
+      {{ trustDone || currentEvidence
         ? 'Trusting another device? Do it manually there'
         : 'Prefer to do it manually?' }}
     </button>
 
     <template v-if="manualVisible">
       <!-- Why there is no button: the server itself said so. Settings-only —
-           in the wizard the Docker note below covers the same ground. -->
+           in the wizard the container note below covers the same ground. -->
       <div v-if="unsupportedReason" class="info-box">
         <strong>This device has to be trusted manually.</strong>
         {{ unsupportedReason }}
       </div>
 
-      <div v-if="isDocker" class="info-box">
+      <!-- Only when nothing already vouches for this device: with evidence in
+           hand the alert at the top says so outright instead of asking the
+           user to remember what they answered during the install. -->
+      <div v-if="isContainer && !currentEvidence" class="info-box">
         <strong>Installed with the Cremind installer on this machine?</strong>
         It offered to trust this certificate during installation — if you
         accepted there, this is already done.
@@ -444,6 +501,7 @@ const orderedTargets = computed(() => {
 .trust-btn .spin { animation: trust-spin 1s linear infinite; }
 @keyframes trust-spin { to { transform: rotate(360deg); } }
 .trust-error { margin-top: 12px; }
+.evidence-alert { margin-bottom: 20px; }
 
 .manual-toggle {
   display: inline-flex;

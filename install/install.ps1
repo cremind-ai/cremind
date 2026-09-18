@@ -2808,6 +2808,12 @@ if ($Deployment -eq 'custom' -and $UrlScheme -eq 'https') {
     $CustomValues['allowed_origins'] = $CustomValues['allowed_origins'] -replace 'http://', 'https://'
 }
 
+# The CA this host's trust store now really holds, lowercase hex, empty when
+# nothing verifiable happened. Declared out here because Set-StrictMode makes
+# reading an undefined variable fatal and the block below is skipped in most
+# install modes. Get-CremindWizardTrustHintUrl turns it into the hand-off.
+$script:HostCaTrustFingerprint = ''
+
 # ── host-side CA trust ─────────────────────────────────────
 #
 # The CA lives inside the container (Docker) or the pod (Kubernetes), where
@@ -2844,13 +2850,18 @@ function Invoke-HostCaTrust {
         $CaStore = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
         $CaStore.Open('ReadWrite')
         try {
+            $CaSha256 = [System.BitConverter]::ToString(
+                [System.Security.Cryptography.SHA256]::Create().ComputeHash($CaCert.RawData)
+            ) -replace '-', ':'
+            # Lowercase, colon-free: what the wizard's hand-off carries.
+            $CaHintFp = ($CaSha256 -replace ':', '').ToLowerInvariant()
             $found = $CaStore.Certificates.Find('FindByThumbprint', $CaCert.Thumbprint, $false)
             if ($found.Count -gt 0) {
+                # Thumbprint-exact, so this really is the CA the server serves -
+                # unlike install.sh's macOS check, which matches a common name.
+                $script:HostCaTrustFingerprint = $CaHintFp
                 Write-Ok "This machine already trusts the Cremind local CA."
             } else {
-                $CaSha256 = [System.BitConverter]::ToString(
-                    [System.Security.Cryptography.SHA256]::Create().ComputeHash($CaCert.RawData)
-                ) -replace '-', ':'
                 Write-Host ""
                 Write-Host "Cremind will serve HTTPS with a certificate signed by its own local CA."
                 Write-Host "Trusting that CA now removes the browser warning on this machine; every"
@@ -2861,6 +2872,9 @@ function Invoke-HostCaTrust {
                 if ($TrustAnswer -notmatch '^[nN]') {
                     try {
                         $CaStore.Add($CaCert)
+                        # Only after Add() returned: the catch below is also
+                        # where the user clicking No on the Windows dialog lands.
+                        $script:HostCaTrustFingerprint = $CaHintFp
                         Write-Ok "Trusted the Cremind local CA for the current user."
                     } catch {
                         # Includes the user clicking No on the Windows dialog.
@@ -2873,6 +2887,16 @@ function Invoke-HostCaTrust {
         } finally { $CaStore.Dispose() }
     }
     Remove-Item $CaTmp -ErrorAction SilentlyContinue
+}
+
+# Carry "this host trusts that exact CA" to the Setup Wizard, which otherwise
+# has no way to learn it: the server is in the container and can only read the
+# container's store. The query goes INSIDE the hash - the UI router is
+# createWebHashHistory, so `#/setup?ca_trusted=...` is what reaches route.query.
+function Get-CremindWizardTrustHintUrl {
+    param([Parameter(Mandatory)][string] $Url)
+    if (-not $script:HostCaTrustFingerprint) { return $Url }
+    return "${Url}?ca_trusted=$($script:HostCaTrustFingerprint)"
 }
 
 # ── docker install ────────────────────────────────────────────────────────
@@ -3606,8 +3630,11 @@ if ($Mode -eq 'kubernetes') {
     Write-Utf8NoBomFile -Path $K8sCredsFile -Content (($credLines -join "`n") + "`n")
 
     # ── handoff ───────────────────────────────────────────────────────────
-    $K8sWizardUrl = "${BootScheme}://localhost:1515/#/setup"
+    $K8sWizardUrl = Get-CremindWizardTrustHintUrl "${BootScheme}://localhost:1515/#/setup"
     if ($K8sIngress -and $K8sPodAppUrl) {
+        # No hand-off under an ingress: the trust we just offered was for the
+        # CA behind the port-forward, and an ingress serves a different chain
+        # entirely. Let the wizard ask, as it does for any other device.
         $K8sWizardUrl = ($K8sPodAppUrl.TrimEnd('/')) + '/#/setup'
     }
 
@@ -3991,6 +4018,12 @@ not a missing image. Things that help:
     # $BootScheme — under after-setup an https link here would simply not
     # open. It becomes https on its own once the wizard restarts the server.
     $WizardUrl = "${BootScheme}://${HealthHost}:1515/#/setup"
+    # Hand the trust off only for a loopback address, i.e. the very machine
+    # whose store we just wrote. $HealthHost is localhost everywhere except a
+    # `custom` deployment, where this URL is meant for somebody else's browser.
+    if (@('localhost', '127.0.0.1', '::1', '[::1]') -contains $HealthHost) {
+        $WizardUrl = Get-CremindWizardTrustHintUrl $WizardUrl
+    }
     if ($env:CREMIND_INSTALLER_FRONTEND -ne 'electron') {
         Write-Step "Setup wizard"
 
