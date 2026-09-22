@@ -127,11 +127,16 @@ def format_event(event: Event, theme: Theme) -> Optional[RenderedLine]:
         tool_input = data.get("Tool_Input")
         model_label = str(data.get("Model_Label") or "")
         token_usage = data.get("Token_Usage") if isinstance(data.get("Token_Usage"), dict) else {}
+        # How far into the turn this step landed (``Elapsed_Ms``, stamped by the
+        # stream runner). Absent on runs from before it shipped.
+        elapsed = format_elapsed_ms(data.get("Elapsed_Ms"))
         body_parts: list[str] = []
         if tool:
             head = "<> Tool: " + tool
             if model_label:
                 head += f"  [{model_label}]"
+            if elapsed:
+                head += f"  +{elapsed}"
             body_parts.append(t.style(t.thinking, head))
         ai = _format_action_input(tool_input)
         if ai:
@@ -214,7 +219,19 @@ def format_event(event: Event, theme: Theme) -> Optional[RenderedLine]:
         return RenderedLine("todos", head + ("\n" + "\n".join(body_lines) if body_lines else ""))
 
     if event.type == "complete":
-        return RenderedLine("info", t.style(t.dim, "* run complete"))
+        latency = data.get("latency") if isinstance(data.get("latency"), dict) else {}
+        timings = [
+            f"{label} {value}"
+            for label, value in (
+                ("first token", format_elapsed_ms(latency.get("first_token_ms"))),
+                ("total", format_elapsed_ms(latency.get("total_ms"))),
+            )
+            if value
+        ]
+        line = "* run complete"
+        if timings:
+            line += "  (" + ", ".join(timings) + ")"
+        return RenderedLine("info", t.style(t.dim, line))
 
     if event.type == "error":
         msg = str(data.get("message") or data.get("error") or "error")
@@ -240,6 +257,21 @@ def _trigger_label(content: str) -> str:
         if line.startswith("Trigger:"):
             return line[len("Trigger:"):].strip()
     return ""
+
+
+def format_elapsed_ms(value: Any) -> str:
+    """``1240`` -> ``"1.2s"``, ``820`` -> ``"820ms"``; ``""`` when unusable.
+
+    The same thresholds the web UI's latency labels use, so a step reads the
+    same in the terminal as it does in a bubble.
+    """
+    try:
+        ms = int(value)
+    except (TypeError, ValueError):
+        return ""
+    if ms < 0:
+        return ""
+    return f"{ms}ms" if ms < 1000 else f"{ms / 1000:.1f}s"
 
 
 def _summarize_token_usage(usage: dict[str, Any]) -> tuple[int, str]:

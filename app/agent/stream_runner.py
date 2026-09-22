@@ -30,6 +30,7 @@ import asyncio
 import mimetypes
 import os
 import re
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -418,6 +419,7 @@ async def run_agent_to_bus(
     trigger_event: Dict[str, Any] | None = None,
     event_run_id: str | None = None,
     event_run: bool = False,
+    queued_at: float | None = None,
 ) -> None:
     """Run the reasoning agent for one conversation, publishing chunks to the bus.
 
@@ -427,10 +429,31 @@ async def run_agent_to_bus(
     to SQLite, and clears the bus's ring buffer so a fresh subscriber doesn't
     re-render persisted history.
 
+    ``queued_at`` is a :func:`time.monotonic` stamp from the moment the request
+    reached the server, so the turn's latency includes the wait in the
+    per-conversation queue — which is time the user spends watching a spinner
+    like any other. Callers that have no such moment to report (events,
+    channels, group fanout) leave it out, and the clock starts here instead.
+
     Idempotent re: bus state: both ``start_run`` and ``end_run`` are safe to
     call when no subscriber is connected.
     """
     bus = get_event_stream_bus()
+
+    # Turn clock. Every latency this run reports — per step, first token, total
+    # — is milliseconds from this instant, measured on the server so the numbers
+    # survive into the persisted row and read the same after a reload as they
+    # did live. Monotonic: a clock adjustment mid-turn must not produce a
+    # negative elapsed.
+    turn_started_at = queued_at if queued_at is not None else time.monotonic()
+
+    def elapsed_ms() -> int:
+        return max(0, int((time.monotonic() - turn_started_at) * 1000))
+
+    # First tool call and first visible token, ms from the turn clock. Both stay
+    # None for a turn that produced neither (an error before the model spoke).
+    first_step_ms: Optional[int] = None
+    first_token_ms: Optional[int] = None
 
     # Mark the run active on the bus before we publish anything. Late
     # subscribers (e.g. a tab opened after the user typed) get the replay.
@@ -770,12 +793,23 @@ async def run_agent_to_bus(
                 if ctype == ChatCompletionTypeEnum.CONTENT:
                     data = chunk.get("data")
                     if data:
+                        if first_token_ms is None:
+                            first_token_ms = elapsed_ms()
                         final_text_parts.append(data)
                         await bus.publish(conversation_id, "text", {"token": data})
 
                 elif ctype == ChatCompletionTypeEnum.THINKING_ARTIFACT:
                     thinking_data = chunk.get("data", {}) or {}
-                    await bus.publish(conversation_id, "thinking", thinking_data)
+                    step_elapsed = elapsed_ms()
+                    if first_step_ms is None:
+                        first_step_ms = step_elapsed
+                    # Copied, not mutated in place: ``thinking_data`` belongs to
+                    # the agent's chunk and is not ours to add keys to.
+                    await bus.publish(
+                        conversation_id,
+                        "thinking",
+                        {**thinking_data, "Elapsed_Ms": step_elapsed},
+                    )
                     collected_thinking_steps.append({
                         "step": thinking_data.get("Step"),
                         "call_id": thinking_data.get("Call_Id"),
@@ -783,6 +817,9 @@ async def run_agent_to_bus(
                         "tool_input": thinking_data.get("Tool_Input", ""),
                         "model_label": thinking_data.get("Model_Label"),
                         "token_usage": thinking_data.get("Token_Usage"),
+                        # Elapsed from the turn clock, so a reload can rebuild the
+                        # same per-step timings the live timeline showed.
+                        "elapsed_ms": step_elapsed,
                     })
 
                 elif ctype == ChatCompletionTypeEnum.RESULT_ARTIFACT:
@@ -914,6 +951,10 @@ async def run_agent_to_bus(
                 ):
                     data = chunk.get("data")
                     if data:
+                        # A provider that does not stream says everything here, so
+                        # this is its first token too.
+                        if first_token_ms is None:
+                            first_token_ms = elapsed_ms()
                         final_text_parts.append(data)
                         await bus.publish(conversation_id, "text", {"token": data})
                     total_input_tokens = chunk.get("input_tokens") or total_input_tokens
@@ -975,6 +1016,15 @@ async def run_agent_to_bus(
             except Exception:  # noqa: BLE001
                 logger.exception("stream_runner: failed to publish error event")
 
+        # 3b. Stop the turn clock. Taken here rather than after persistence so
+        #     "total" is the agent's work, not our bookkeeping — and so a
+        #     cancelled or errored turn still reports how long it ran for.
+        turn_latency = {
+            "first_step_ms": first_step_ms,
+            "first_token_ms": first_token_ms,
+            "total_ms": elapsed_ms(),
+        }
+
         # 4. Token usage — what the agent loop reported this turn.
         if total_input_tokens or total_output_tokens:
             await bus.publish(conversation_id, "token_usage", {
@@ -1024,6 +1074,13 @@ async def run_agent_to_bus(
                 "provider": reasoning_rec.get("provider"),
                 "model": reasoning_rec.get("model"),
             }
+
+        # How long the turn took, stamped on the row so the bubble can say it
+        # again after a reload instead of only while the stream was open.
+        agent_message_metadata = {
+            **(agent_message_metadata or {}),
+            "latency": turn_latency,
+        }
 
         # Plan mode: stamp the turn's plan state onto the message metadata so a
         # reload / restart can restore the pending question form, the plan
@@ -1357,6 +1414,9 @@ async def run_agent_to_bus(
             "assistant_id": assistant_msg_id,
             "errored": errored,
             "cancelled": cancelled,
+            # The same numbers just persisted, so a client that watched the turn
+            # live settles on the values a reload would give it.
+            "latency": turn_latency,
             "followup_queued": task_result_inbox.has_unconsumed_user_messages(
                 conversation_id
             ),

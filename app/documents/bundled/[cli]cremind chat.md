@@ -31,6 +31,13 @@ out …)` sub-line under the step's tool. This mirrors the per-step token
 badge in the web UI's Thinking Process panel; the running per-turn total
 still appears in the status bar (see `cremind usage` for cost rollups).
 
+Steps are timed as well: a `+4.3s` marker on the step's tool line says how far
+into the turn it landed, and the `* run complete` line closes the turn with
+`(first token …, total …)`. All of it is measured on the server, from the
+moment the message reached it, so the numbers include the wait in the queue and
+match what the web UI's bubble shows for the same turn. Turns that ran before
+this shipped carry no timings and render exactly as they did before.
+
 This is the right command when you want to *talk to* the agent. For
 scripted, one-shot interactions (pipe answer to a file, gate it on
 exit code, etc.) reach for [`cremind conv send`](%5Bcli%5Dopa%20conv.md)
