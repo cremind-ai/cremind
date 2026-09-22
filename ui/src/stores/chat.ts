@@ -33,6 +33,7 @@ import {
 import { useTodoPanelsStore, livePanelKey } from './todoPanels';
 import { normalizeTodos, allTodosCompleted } from '../utils/todos';
 import { splitMidTurnSegments } from '../utils/midTurnSplit';
+import { backfillLegacyTotals } from '../utils/latencyLabels';
 import {
   attachResultToSteps,
   terminalAttachmentFromFrame,
@@ -253,6 +254,10 @@ export interface ThinkingStep {
   toolInput: string;
   result?: ObservationPart[];
   receivedAt?: number;
+  // Milliseconds from the start of the turn to this step, as the server timed
+  // it. Unlike ``receivedAt`` this is persisted, so the timeline shows the same
+  // elapsed labels after a reload. Undefined for steps from older runs.
+  elapsedMs?: number;
   modelLabel?: string | null;
   tokenUsage?: StepTokenUsage | null;
 }
@@ -272,12 +277,53 @@ export interface TokenUsage {
   totalTokens: number;
 }
 
+/**
+ * How long a turn took, from two sources that answer slightly different
+ * questions.
+ *
+ * The ``*Ms`` fields are the server's own measurement, from the moment the
+ * request reached it to each milestone. They arrive on the ``complete`` frame
+ * and are persisted on the row, so they are what a reloaded conversation shows
+ * and what a live one settles on once the turn ends.
+ *
+ * The ``*At`` fields are wall-clock stamps taken in this tab while the turn
+ * streams, so a bubble can report progress before ``complete`` lands.
+ * ``requestSentAt`` is the moment ``sendMessage`` fired — NOT the moment the
+ * first frame arrived, which is what made "First token: 0ms": the bubble was
+ * created by that very frame, so the baseline and the milestone were the same
+ * instant. A turn this tab did not start (an automation, a channel message)
+ * has no send to measure from and leaves it undefined.
+ */
 export interface LatencyInfo {
-  requestSentAt: number;
+  firstStepMs?: number;
+  firstTokenMs?: number;
+  totalMs?: number;
+  // Turn length inferred from the two row timestamps, for turns that ran before
+  // the server timed itself. Rendered with a `~` so it is never mistaken for a
+  // measurement (see backfillLegacyTotals).
+  totalMsApprox?: number;
+  requestSentAt?: number;
   firstEventAt?: number;
   firstStepAt?: number;
   firstTokenAt?: number;
   completedAt?: number;
+}
+
+/** The ``latency`` blob as the server sends/persists it (snake_case). */
+export function latencyFromServer(raw: any): LatencyInfo | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const num = (v: any): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined;
+  const info: LatencyInfo = {
+    firstStepMs: num(raw.first_step_ms),
+    firstTokenMs: num(raw.first_token_ms),
+    totalMs: num(raw.total_ms),
+  };
+  return info.firstStepMs !== undefined
+    || info.firstTokenMs !== undefined
+    || info.totalMs !== undefined
+    ? info
+    : undefined;
 }
 
 export interface ConversationRuntime {
@@ -289,6 +335,11 @@ export interface ConversationRuntime {
   // ID of the assistant ChatMessage currently being filled in by the
   // SSE stream. `undefined` between runs.
   streamingAssistantId?: string;
+  // When this tab last POSTed a message here, adopted as the latency baseline
+  // by the assistant bubble the run opens. Cleared at the end of the turn so
+  // the next one cannot inherit it — a run nobody here started must measure
+  // from its first frame, not from a send minutes ago.
+  requestSentAt?: number;
 }
 
 export interface CompactionSuggestion {
@@ -725,7 +776,13 @@ export const useChatStore = defineStore('chat', {
       const wasStreaming = runtime.isStreaming;
       runtime.isStreaming = true;
       runtime.isSummarizing = false;
-      if (!wasStreaming) runtime.startedAt = Date.now();
+      if (!wasStreaming) {
+        runtime.startedAt = Date.now();
+        // Baseline for this turn's latency labels. Only a send that STARTS a
+        // turn sets it: a mid-turn message is folded into the run already
+        // going, whose bubble measures from the send that opened it.
+        runtime.requestSentAt = runtime.startedAt;
+      }
 
       // Make sure we're subscribed to events for this conversation BEFORE
       // the POST returns; otherwise we could miss the first few events
@@ -773,6 +830,7 @@ export const useChatStore = defineStore('chat', {
         // send must not kill the turn that is still running and streaming.
         if (!wasStreaming) {
           runtime.isStreaming = false;
+          runtime.requestSentAt = undefined;
           this.untrackConversation(cid, 'streaming');
         }
         // Surface the failure inside the bucket so the user knows what
@@ -804,6 +862,7 @@ export const useChatStore = defineStore('chat', {
       const taskId = runtime.currentTaskId;
       runtime.isStreaming = false;
       runtime.isSummarizing = false;
+      runtime.requestSentAt = undefined;
       const last = bucket?.[bucket.length - 1];
       if (last?.role === 'assistant') {
         last.isStreaming = false;
@@ -1300,7 +1359,7 @@ export const useChatStore = defineStore('chat', {
         // mid-run, before its DataPart is persisted.
         if (!this.messagesByConversation[id]) {
           this.messagesByConversation[id] =
-            splitMidTurnSegments(messages, this.mapBackendMessage);
+            backfillLegacyTotals(splitMidTurnSegments(messages, this.mapBackendMessage));
           // Restore any parked Plan-mode state (question form / plan approval /
           // todo panel) from message metadata — SSE replay can't (the ring is
           // dropped on `complete`).
@@ -1345,7 +1404,7 @@ export const useChatStore = defineStore('chat', {
         // before its DataPart is persisted. Keep the live bucket.
         if (!this.messagesByConversation[id]) {
           this.messagesByConversation[id] =
-            splitMidTurnSegments(messages, this.mapBackendMessage);
+            backfillLegacyTotals(splitMidTurnSegments(messages, this.mapBackendMessage));
           this.restorePlanModeState(id, messages);
           this.restoreAgentActivityState(id, messages);
         }
@@ -1406,7 +1465,14 @@ export const useChatStore = defineStore('chat', {
           isStreaming: true,
           thinkingSteps: [],
           artifacts: [],
-          latency: { requestSentAt: Date.now() },
+          // ``requestSentAt`` is the send this run answers, when this tab made
+          // it. Without one (an automation, a channel message, another tab's
+          // send) the bubble has no baseline of its own and waits for the
+          // server's numbers on ``complete``.
+          latency: {
+            requestSentAt: runtime.requestSentAt,
+            firstEventAt: Date.now(),
+          },
         };
         bucket.push(msg);
         runtime.streamingAssistantId = msg.id;
@@ -1840,6 +1906,11 @@ export const useChatStore = defineStore('chat', {
           if (message) {
             message.isStreaming = false;
             if (message.latency) message.latency.completedAt = Date.now();
+            // Settle on the server's measurement of the turn. Until now the
+            // bubble has been showing this tab's own stamps; from here it shows
+            // exactly what a reload of this conversation will show.
+            const served = latencyFromServer(data.latency);
+            if (served) message.latency = { ...(message.latency || {}), ...served };
             // Deliberately do NOT mutate message.id to data.assistant_id:
             // ChatWindow uses :key="message.id" for v-for, so changing it
             // here forces Vue to unmount and remount the bubble — the user
@@ -1863,6 +1934,7 @@ export const useChatStore = defineStore('chat', {
           runtime.isStreaming = followupQueued;
           runtime.isSummarizing = false;
           runtime.streamingAssistantId = undefined;
+          runtime.requestSentAt = undefined;
           scratch.currentTextPart = '';
           // This run drove a todo list: stamp the snapshot onto the assistant
           // bubble so a per-turn chip appears immediately (no reload needed).
@@ -1951,6 +2023,7 @@ export const useChatStore = defineStore('chat', {
           runtime.isStreaming = false;
           runtime.isSummarizing = false;
           runtime.streamingAssistantId = undefined;
+          runtime.requestSentAt = undefined;
           scratch.currentTextPart = '';
           this.untrackConversation(conversationId, 'streaming');
           // Surface a top-level notification. Setup-required errors include
@@ -2116,6 +2189,12 @@ export const useChatStore = defineStore('chat', {
           : undefined,
         planTodos,
         planStage,
+        // How long the turn took, as the server timed it. This is the only
+        // reason a reloaded bubble can still report its latency — the live
+        // stamps live in this tab's memory and are gone.
+        latency: msg.role === 'agent'
+          ? latencyFromServer((msg.metadata as any)?.latency)
+          : undefined,
       };
     },
 

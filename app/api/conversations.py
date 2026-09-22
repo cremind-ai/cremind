@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 from typing import Any, Dict
 
 from starlette.requests import Request
@@ -420,6 +421,9 @@ def get_conversation_routes(
         receive the live tail; multiple subscribers (tabs) all receive the
         same events, and disconnecting/reconnecting mid-run is safe.
         """
+        # Start of the turn's latency clock — before auth, history hydration and
+        # the queue, all of which the user waits through.
+        received_at = time.monotonic()
         unauth = _require_auth(request)
         if unauth is not None:
             return unauth
@@ -635,6 +639,7 @@ def get_conversation_routes(
             event_run_id=event_run_id,
             event_run=is_event_run,
             publish_notification=is_event_run,
+            queued_at=received_at,
         )
 
         # Hidden event-run conversations never appear in the conversation list,

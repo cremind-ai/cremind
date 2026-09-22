@@ -13,6 +13,7 @@ import { Icon } from '@iconify/vue';
 import { ElMessage } from 'element-plus';
 import type { StepTokenUsage, ThinkingStep } from '../stores/chat';
 import { formatTokens } from '../utils/usageFormat';
+import { stepElapsedLabel } from '../utils/latencyLabels';
 import { useSettingsStore } from '../stores/settings';
 
 const props = withDefaults(
@@ -26,9 +27,9 @@ const props = withDefaults(
     // without a signature change.
     conversationId?: string | null;
     title?: string;
-    // Start of the turn, used as the baseline for the first step's elapsed
-    // label. Without it that one step shows no timing (the rest are measured
-    // against the step before them).
+    // Start of the turn in this tab's clock. Only a fallback baseline for the
+    // first step's elapsed label, used for steps that carry no server-stamped
+    // ``elapsedMs``; leaving it out costs that one label and nothing else.
     requestSentAt?: number;
   }>(),
   { title: 'Thinking Process' },
@@ -57,29 +58,19 @@ const thinkingGroups = computed(() => {
   return groups;
 });
 
-// Format milliseconds to human-readable string
-const formatLatencyMs = (ms: number): string => {
-  if (ms < 1000) {
-    return `${ms}ms`;
-  }
-  return `${(ms / 1000).toFixed(1)}s`;
-};
-
-// Latency for a grouped step (relative to the previous group / request start).
-const groupLatency = (group: any, gIdx: number): string => {
-  const tool = group.tools?.[0];
-  if (!tool?.receivedAt) return '';
-  let ms: number;
-  if (gIdx === 0) {
-    if (!props.requestSentAt) return '';
-    ms = tool.receivedAt - props.requestSentAt;
-  } else {
-    const prev = thinkingGroups.value[gIdx - 1]?.tools?.[0];
-    if (!prev?.receivedAt) return '';
-    ms = tool.receivedAt - prev.receivedAt;
-  }
-  return ms > 0 ? ` · ${formatLatencyMs(ms)}` : '';
-};
+/**
+ * How long the turn spent getting to a grouped step — from the step before it,
+ * or from the start of the turn for the first one. See utils/latencyLabels.
+ *
+ * (In a segment of a turn a mid-turn message split, the first label is time
+ * since the START of the turn, not since the split — the timeline measures the
+ * turn, and a segment is a slice of one.)
+ */
+const groupLatency = (group: any, gIdx: number): string => stepElapsedLabel(
+  group.tools?.[0],
+  gIdx > 0 ? thinkingGroups.value[gIdx - 1]?.tools?.[0] : undefined,
+  props.requestSentAt,
+);
 
 // Extract text-only observation parts for display in code block
 const formatObservationText = (parts: any[]): string => {

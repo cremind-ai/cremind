@@ -7,6 +7,7 @@ import { createChatMarked } from '../utils/markdown';
 import vLinkBlank from '../directives/v-link-blank';
 import { Icon } from '@iconify/vue';
 import { copyTextToClipboard } from '../utils/clipboard';
+import { latencySummary } from '../utils/latencyLabels';
 import { chatModeMeta } from '../constants/chatModes';
 import { useSettingsStore } from '../stores/settings';
 import { useTerminalPanelStore } from '../stores/terminalPanel';
@@ -88,43 +89,16 @@ const parsedContent = computed(() => {
   return marked.parse(props.message.content) as string;
 });
 
-// Format latency information for display
-const latencyDisplay = computed(() => {
-  if (!props.message.latency || !props.message.latency.requestSentAt) return null;
-  
-  const latency = props.message.latency;
-  const parts: string[] = [];
-  
-  if (latency.firstEventAt) {
-    const ms = latency.firstEventAt - latency.requestSentAt;
-    parts.push(`First event: ${formatLatencyMs(ms)}`);
-  }
-  
-  if (latency.firstStepAt) {
-    const ms = latency.firstStepAt - latency.requestSentAt;
-    parts.push(`First step: ${formatLatencyMs(ms)}`);
-  }
-  
-  if (latency.firstTokenAt) {
-    const ms = latency.firstTokenAt - latency.requestSentAt;
-    parts.push(`First token: ${formatLatencyMs(ms)}`);
-  }
-  
-  if (latency.completedAt) {
-    const ms = latency.completedAt - latency.requestSentAt;
-    parts.push(`Total: ${formatLatencyMs(ms)}`);
-  }
-  
-  return parts.length > 0 ? parts.join(' | ') : null;
-});
+// "First step: 5.6s | First token: 12.7s | Total: 13.2s" — see utils/latencyLabels.
+const latency = computed(() => latencySummary(props.message.latency));
 
-// Format milliseconds to human-readable string
-const formatLatencyMs = (ms: number): string => {
-  if (ms < 1000) {
-    return `${ms}ms`;
-  }
-  return `${(ms / 1000).toFixed(1)}s`;
-};
+// Spelled out on hover, because "~" alone doesn't say what is approximate.
+const latencyTitle = computed(() =>
+  latency.value?.approximate
+    ? 'Approximate — this turn ran before Cremind recorded its own timings, '
+      + 'so the total is the gap between the two stored messages.'
+    : 'Time from sending the message to each milestone of the reply.',
+);
 
 // Build full URL for a file URI (absolute path or legacy /api/files/ path)
 const resolveFileUrl = (uri: string): string => {
@@ -362,8 +336,8 @@ watch(
       <MessageUsageChip v-if="message.tokenUsage" :message="message" :conversation-id="conversationId" />
 
       <!-- Latency information -->
-      <div v-if="latencyDisplay && !isUser" class="latency-info">
-        {{ latencyDisplay }}
+      <div v-if="latency && !isUser" class="latency-info" :title="latencyTitle">
+        {{ latency.text }}
       </div>
 
       <!-- Collapsible Thinking Process Timeline -->

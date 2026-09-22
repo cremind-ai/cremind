@@ -42,6 +42,9 @@ export interface MessageRecord {
     // Legacy fields (older persisted messages) read for back-compat.
     observation?: { kind: string; text?: string; data?: Record<string, any>; file?: any }[];
     model_label?: string | null;
+    // Milliseconds from the start of the turn to this step, measured server-side
+    // (absent on messages persisted before step timings shipped).
+    elapsed_ms?: number | null;
     // Reasoning-call token counts for this step (absent on messages persisted
     // before per-step tokens shipped).
     token_usage?: {

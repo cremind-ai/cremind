@@ -44,6 +44,10 @@ export function mapStepTokenUsage(raw: any): StepTokenUsage | null {
  *
  * ``receivedAt`` is stamped here and read back by the caller for the turn's
  * first-step latency, so the step and the latency mark the same instant.
+ *
+ * ``Elapsed_Ms`` is the server's own measurement of where this step fell in the
+ * turn. It is what the timeline prefers, because it is also what gets persisted
+ * — the same step reads the same after a reload as it did live.
  */
 export function thinkingStepFromFrame(data: any): ThinkingStep {
   return {
@@ -52,6 +56,7 @@ export function thinkingStepFromFrame(data: any): ThinkingStep {
     tool: data.Tool || '',
     toolInput: data.Tool_Input || '',
     receivedAt: Date.now(),
+    elapsedMs: typeof data.Elapsed_Ms === 'number' ? data.Elapsed_Ms : undefined,
     modelLabel: data.Model_Label || null,
     tokenUsage: mapStepTokenUsage(data.Token_Usage),
   };
@@ -169,6 +174,10 @@ export function thinkingStepsFromRecord(
     tool: (s as any).tool ?? '',
     toolInput: (s as any).tool_input ?? '',
     result: ((s as any).result ?? s.observation) as ObservationPart[] | undefined,
+    // The live stream's ``receivedAt`` has no counterpart on a stored row, so
+    // this is the only timing a reloaded timeline has. Absent on rows written
+    // before the runner started stamping it.
+    elapsedMs: typeof (s as any).elapsed_ms === 'number' ? (s as any).elapsed_ms : undefined,
     modelLabel: s.model_label || null,
     tokenUsage: mapStepTokenUsage((s as any).token_usage),
   }));

@@ -68,6 +68,7 @@ async def _worker(conversation_id: str) -> None:
                     update_title_from_query=item.get("update_title_from_query", True),
                     event_run_id=item.get("event_run_id"),
                     event_run=item.get("event_run", False),
+                    queued_at=item.get("queued_at"),
                 )
         except asyncio.CancelledError:
             # Intentional teardown (discard_queue) — exit cleanly.
@@ -121,6 +122,7 @@ async def enqueue_user_message(
     event_run_id: Optional[str] = None,
     event_run: bool = False,
     publish_notification: bool = False,
+    queued_at: Optional[float] = None,
 ) -> None:
     """Add a user-typed message to the conversation's queue.
 
@@ -144,6 +146,11 @@ async def enqueue_user_message(
     injection and then had to run as its own turn after all. The runner treats it
     as this turn's user message so compaction excludes it from the history tail
     instead of feeding it twice (see :mod:`app.events.user_message_delivery`).
+
+    ``queued_at`` is a :func:`time.monotonic` stamp from the moment the request
+    arrived. The runner starts its latency clock there rather than at run start,
+    so a message that waited behind another turn reports the wait the user
+    actually sat through. Omitted, the clock starts when the run does.
     """
     queue = _ensure_worker(conversation_id)
     await queue.put({
@@ -166,6 +173,7 @@ async def enqueue_user_message(
         "event_run_id": event_run_id,
         "event_run": event_run,
         "publish_notification": publish_notification,
+        "queued_at": queued_at,
     })
 
 
