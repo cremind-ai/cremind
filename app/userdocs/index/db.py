@@ -37,7 +37,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
 from app.userdocs.index import schema as sch
-from app.userdocs.types import Chunk, ChunkDiff, ManifestRow, OldChunk
+from app.userdocs.types import ChunkDiff, ManifestRow, OldChunk
 from app.utils.logger import logger
 
 # Crockford base32 minus i, l, o, u: no characters a reader can confuse, and
@@ -1916,7 +1916,8 @@ class IndexDB:
             "SELECT "
             "COALESCE(SUM(CASE WHEN status NOT IN ('missing', 'tombstone') THEN 1 ELSE 0 END), 0), "
             "COALESCE(SUM(CASE WHEN status IN ('dirty', 'deferred') THEN 1 ELSE 0 END), 0), "
-            "COALESCE(SUM(CASE WHEN kind = 'image' AND caption_state IN ('awaiting_vision', 'over_cap') "
+            "COALESCE(SUM(CASE WHEN kind = 'image' AND caption_state IN "
+            "  ('awaiting_vision', 'awaiting_consent', 'over_cap') "
             "  AND status NOT IN ('missing', 'tombstone') THEN 1 ELSE 0 END), 0), "
             "COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) "
             "FROM files"

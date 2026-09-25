@@ -142,7 +142,9 @@ def _photo_bytes() -> bytes | None:
     exif.get_ifd(0x8769)[0x9003] = "2026:09:20 10:00:00"
     buf = BytesIO()
     img.save(buf, format="JPEG", exif=exif, quality=90)
-    return buf.getvalue()
+    # A flat test image compresses to a few KB; real photos are far above the
+    # 20 KB floor under which images are skipped as icons.
+    return buf.getvalue() + b"\0" * 30_000
 
 
 NOW = time.time()

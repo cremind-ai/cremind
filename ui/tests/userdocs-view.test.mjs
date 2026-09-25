@@ -13,7 +13,7 @@ import { load } from './harness.mjs'
 
 const {
   stateBanner, reasonLabel, formatBytes, formatEta, formatCount, formatDuration, effectLabel,
-  chipTooltip, stageLabel, statusLabel,
+  chipTooltip, stageLabel, statusLabel, visionStatus, visionQuota, captionStateLabel,
 } = await load('src/utils/userdocsView.ts')
 
 function snap(overrides = {}) {
@@ -379,4 +379,67 @@ test('chip tooltip: what needs attention', () => {
   )
   assert.equal(chipTooltip(snap({ state: 'idle', stages: { error: 3 } })), '3 documents could not be indexed')
   assert.equal(chipTooltip(null), '')
+})
+
+// ── image descriptions ──────────────────────────────────────────────────────
+// Descriptions come only from the Specialized Vision Model: a missing model is
+// a setup step (never "using your main model"), and permission names one model.
+
+const VISION_OK = {
+  ready: true, provider: 'openai', model: 'gpt-4o', reason: null, consent: true,
+  consent_for: { at: 1, provider: 'openai', model: 'gpt-4o' },
+  quota: { day: '2026-09-25', used: 37, ocr_pages: 2, cap: 1000 },
+}
+
+test('vision status: every reason a model is unusable sends the user to LLM Providers', () => {
+  for (const reason of ['vision_disabled', 'vision_model_unset', 'vision_model_auth_incompatible',
+    'vision_model_not_capable', 'vision_model_error']) {
+    const s = visionStatus({ ready: false, reason })
+    assert.equal(s.action, 'open_llm', reason)
+    assert.equal(s.tone, 'warning', reason)
+    assert.match(s.detail, /found by name, folder, date and camera/, reason)
+    assert.doesNotMatch(`${s.title} ${s.detail}`, /main model/i, reason)
+  }
+  assert.equal(visionStatus(null).action, 'open_llm')
+})
+
+test('vision status: consent names the model, and asks again when it changed', () => {
+  const ask = visionStatus({ ...VISION_OK, ready: false, reason: 'no_consent', consent: false, consent_for: null })
+  assert.equal(ask.action, 'consent')
+  assert.match(ask.detail, /openai\/gpt-4o/)
+  assert.match(ask.detail, /Nothing is sent until you allow it/)
+
+  const changed = visionStatus({
+    ...VISION_OK, ready: false, reason: 'no_consent', consent: false,
+    consent_for: { at: 1, provider: 'anthropic', model: 'claude-sonnet-5' },
+  })
+  assert.equal(changed.action, 'consent')
+  assert.match(changed.title, /changed/)
+  assert.match(changed.detail, /You had allowed anthropic\/claude-sonnet-5/)
+})
+
+test('vision status: ready, and turned off', () => {
+  const ok = visionStatus(VISION_OK)
+  assert.equal(ok.tone, 'success')
+  assert.equal(ok.action, null)
+  assert.match(ok.detail, /openai\/gpt-4o/)
+  const off = visionStatus({ ...VISION_OK, ready: false, reason: 'vision_model_unset' }, false)
+  assert.equal(off.action, null)
+  assert.match(off.title, /off/)
+})
+
+test('vision quota: used of cap, full at the cap, and a zero cap sends nothing', () => {
+  assert.deepEqual(visionQuota({ used: 37, cap: 1000 }), { label: '37 of 1,000 today', fraction: 0.037 })
+  assert.equal(visionQuota({ used: 1200, cap: 1000 }).fraction, 1)
+  assert.match(visionQuota({ used: 0, cap: 0 }).label, /no images are sent/)
+  assert.equal(visionQuota(null), null)
+})
+
+test('caption state labels', () => {
+  assert.match(captionStateLabel('awaiting_consent'), /your OK/)
+  assert.match(captionStateLabel('over_cap'), /limit/)
+  assert.match(captionStateLabel('awaiting_vision'), /no vision model/)
+  assert.equal(captionStateLabel('done'), null)
+  assert.equal(captionStateLabel(null), null)
+  assert.match(reasonLabel('awaiting_consent'), /your OK/)
 })

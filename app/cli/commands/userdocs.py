@@ -748,6 +748,152 @@ def userdocs_cite(
         sys.stdout.write("  text: " + " ".join(str(item["snippet"]).split()) + "\n")
 
 
+# ── image captions ─────────────────────────────────────────────────────────
+
+
+@userdocs_app.command("caption")
+@graceful_errors
+def userdocs_caption(
+    ctx: typer.Context,
+    enable: Optional[bool] = typer.Option(
+        None, "--enable/--disable", help="Caption photos and scanned pages with the vision model.",
+    ),
+    daily_cap: Optional[int] = typer.Option(
+        None, "--daily-cap", help="Images captioned per day for this profile (default: the admin's).",
+    ),
+    min_px: Optional[int] = typer.Option(None, "--min-px", help="Skip images smaller than this (shorter side)."),
+    min_kb: Optional[int] = typer.Option(None, "--min-kb", help="Skip image files smaller than this."),
+    consent_vision: bool = typer.Option(
+        False, "--consent-vision",
+        help="Agree to send your images to the Specialized Vision Model shown by `settings`.",
+    ),
+    revoke_consent: bool = typer.Option(False, "--revoke-consent", help="Stop sending images to the vision model."),
+) -> None:
+    """Configure image captions and consent to the vision model (Settings → LLM Providers)."""
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.userdocs import get_settings
+    from app.cli.config import Config
+
+    cfg: Config = ctx.obj["cfg"]
+    cfg.require_token()
+    caption: dict[str, Any] = {}
+    if enable is not None:
+        caption["enabled"] = enable
+    if daily_cap is not None:
+        caption["daily_cap"] = daily_cap
+    if min_px is not None:
+        caption["min_px"] = min_px
+    if min_kb is not None:
+        caption["min_kb"] = min_kb
+    if caption:
+        _put_settings(ctx, {"kind": "local", "options": {"caption": caption}}, yes=False)
+    if consent_vision and revoke_consent:
+        typer.echo("--consent-vision and --revoke-consent are mutually exclusive", err=True)
+        raise typer.Exit(code=1)
+    if consent_vision or revoke_consent:
+        async def _shown() -> dict[str, Any]:
+            async with Client(cfg) as client:
+                return await get_settings(client)
+
+        vision = (asyncio.run(_shown()).get("vision") or {})
+        model = f"{vision.get('provider')}/{vision.get('model')}" if vision.get("model") else None
+        if consent_vision:
+            if not model:
+                typer.echo("No Specialized Vision Model is configured (Settings → LLM Providers).", err=True)
+                raise typer.Exit(code=1)
+            sys.stderr.write(f"Images and scanned pages will be sent to {model}.\n")
+            _control(ctx, "consent_vision", model=model)
+        else:
+            _control(ctx, "revoke_vision_consent")
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await get_settings(client)
+
+    out = asyncio.run(_run())
+    _print(ctx, {
+        "caption": ((out.get("local") or {}).get("options") or {}).get("caption"),
+        "vision": out.get("vision"),
+    })
+
+
+def _split_list(values: Optional[list[str]]) -> Optional[list[str]]:
+    """Repeated flags and comma-separated values both work: ``--name A --name
+    "B, C"`` is ``[A, B, C]``. ``--name ""`` clears the list."""
+    if values is None:
+        return None
+    out: list[str] = []
+    for v in values:
+        out += [p.strip() for p in str(v).split(",") if p.strip()]
+    return out
+
+
+def _local_option(ctx: typer.Context, key: str) -> Any:
+    import asyncio
+
+    from app.cli.client._base import Client
+    from app.cli.client.userdocs import get_settings
+    from app.cli.config import Config
+
+    cfg: Config = ctx.obj["cfg"]
+
+    async def _run() -> dict[str, Any]:
+        async with Client(cfg) as client:
+            return await get_settings(client)
+
+    return (((asyncio.run(_run()).get("local") or {}).get("options")) or {}).get(key)
+
+
+@userdocs_app.command("identity")
+@graceful_errors
+def userdocs_identity(
+    ctx: typer.Context,
+    name: Optional[list[str]] = typer.Option(
+        None, "--name", help="A name you write as (document author). Repeat or comma-separate; replaces the list.",
+    ),
+    email: Optional[list[str]] = typer.Option(
+        None, "--email", help="An email address of yours. Repeat or comma-separate; replaces the list.",
+    ),
+    camera: Optional[list[str]] = typer.Option(
+        None, "--camera", help="A camera or phone you shoot with (EXIF make/model). Replaces the list.",
+    ),
+) -> None:
+    """Who "me" is, for "documents I wrote" and "photos I took"."""
+    ctx.obj["cfg"].require_token()
+    identity: dict[str, Any] = {}
+    for key, values in (("author_names", name), ("emails", email), ("camera_devices", camera)):
+        parsed = _split_list(values)
+        if parsed is not None:
+            identity[key] = parsed
+    if identity:
+        _put_settings(ctx, {"kind": "local", "options": {"identity": identity}}, yes=False)
+    _print(ctx, {"identity": _local_option(ctx, "identity")})
+
+
+@userdocs_app.command("allow-in")
+@graceful_errors
+def userdocs_allow_in(
+    ctx: typer.Context,
+    web_cli: Optional[bool] = typer.Option(
+        None, "--web-cli/--no-web-cli", help="The web app, the CLI and your automations (default on).",
+    ),
+    channels: Optional[bool] = typer.Option(
+        None, "--channels/--no-channels", help="Messaging channels such as Telegram or Zalo (default off).",
+    ),
+    rooms: Optional[bool] = typer.Option(
+        None, "--rooms/--no-rooms", help="Group rooms, where other people read the answers (default off).",
+    ),
+) -> None:
+    """Where the agent may use your documents."""
+    ctx.obj["cfg"].require_token()
+    allow = {k: v for k, v in (("web_cli", web_cli), ("channels", channels), ("rooms", rooms)) if v is not None}
+    if allow:
+        _put_settings(ctx, {"kind": "local", "options": {"allow_in": allow}}, yes=False)
+    _print(ctx, {"allow_in": _local_option(ctx, "allow_in")})
+
+
 # ── excludes ───────────────────────────────────────────────────────────────
 
 

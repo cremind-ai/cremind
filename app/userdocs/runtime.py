@@ -948,11 +948,28 @@ class ProfileRuntime:
                     status, reason = "awaiting_extractor", (doc_meta.get("missing") or "extractor")
                 else:
                     status, reason, error = "error", result.reason or "corrupt", doc_meta.get("error")
-                if kind == t.KIND_IMAGE:
-                    # Captions come from the Specialized Vision Model, which a
-                    # later stage adds; until then an image is found by its
-                    # name, folder, date and camera.
-                    caption_state = caption_state if caption_state == "done" else "awaiting_vision"
+                if result.ocr_pages and status == "indexed":
+                    ocr_chunks, pending, ocr_state = self._ocr_pages(result.ocr_pages, start_ordinal=len(body))
+                    body += ocr_chunks
+                    if pending:
+                        doc_meta["ocr_pending_pages"] = pending
+                        caption_state = ocr_state
+                    else:
+                        doc_meta.pop("ocr_pending_pages", None)
+                        caption_state = "done" if ocr_chunks else caption_state
+
+        newly_captioned = False
+        if kind == t.KIND_IMAGE and status == "indexed" and caption_state != "done":
+            # An image is found by its name, folder, date and camera from the
+            # moment it is indexed; the caption adds what it *shows*, when the
+            # Specialized Vision Model, consent and today's quota allow.
+            self.progress.file_stage(fid, "caption")
+            caption_state, caption_chunk = self._caption_image(
+                rel=rel, sha=sha, abs_path=fs_path(abs_path), image=image, exif=exif, size=int(st.st_size),
+            )
+            if caption_chunk is not None:
+                body = [c for c in body if c.ctype != t.CTYPE_CAPTION] + [caption_chunk]
+                newly_captioned = True
 
         taken_ts = ts_from_iso((exif or {}).get("taken_at"))
         created_ts = ts_from_iso(doc_meta.get("created"))
@@ -1001,6 +1018,8 @@ class ProfileRuntime:
         if status == "error":
             return "failed", f"{name}: could not be read ({reason})", reason
         if content_unchanged:
+            if newly_captioned:
+                return "captioned", f"{name}: caption added", None
             if not diff.add:
                 return "unchanged", f"{name} is unchanged", None
             return "moved", f"{name}: location or details updated", None
@@ -1009,6 +1028,163 @@ class ProfileRuntime:
                 return "metadata_only", f"{name} indexed by name and details only ({reason})", reason
             return "added", f"{name} indexed ({total} chunks)", None
         return "updated", f"{name} — {len(diff.add)} of {total} chunks re-embedded", None
+
+    # ── vision: captions and scanned pages ─────────────────────────────────
+
+    def vision_gate(self) -> tuple[Any, str | None]:
+        """(resolution, blocking state) — the state is None when a vision call
+        may be made right now (model chosen, consent recorded for it)."""
+        from app.userdocs.vision import resolver
+
+        res = resolver.resolve_dedicated_vision(self.profile)
+        if not res.ok:
+            return res, "awaiting_vision"
+        opts = uds.normalize_options(self.settings.get("options"))
+        if not resolver.consent_matches(opts, res):
+            return res, "awaiting_consent"
+        return res, None
+
+    def caption_cap(self) -> int:
+        from app.userdocs.vision import captioner
+
+        return captioner.daily_cap(uds.normalize_options(self.settings.get("options")))
+
+    def _caption_image(
+        self, *, rel: str, sha: str | None, abs_path: str, image: dict[str, Any] | None,
+        exif: dict[str, Any] | None, size: int,
+    ) -> tuple[str, t.Chunk | None]:
+        from app.storage.userdocs_storage import get_userdocs_storage
+        from app.userdocs.chunking import make_caption_chunk
+        from app.userdocs.vision import captioner, resolver
+
+        storage = get_userdocs_storage()
+        if sha:
+            cached = storage.get_caption(self.profile, sha)
+            if cached and cached.get("caption_text"):
+                return "done", make_caption_chunk(cached["caption_text"])
+        opts = uds.normalize_options(self.settings.get("options"))
+        width, height = captioner.image_dims(image, exif)
+        ok, why = captioner.eligible(width=width, height=height, size_bytes=size, rel_path=rel, options=opts)
+        if not ok:
+            return why or "skipped_small", None
+        res, blocked = self.vision_gate()
+        if blocked:
+            return blocked, None
+        day = captioner.local_day(self.profile)
+        if not storage.reserve_vision(self.profile, day, self.caption_cap()):
+            return "over_cap", None
+        try:
+            jpeg = captioner.prepare_jpeg(path=abs_path)
+            llm = resolver.build_vision_llm(self.profile, res)
+            out = captioner.run_vision(llm, self.profile, jpeg, mode="image", exif=exif)
+        except Exception as exc:  # noqa: BLE001 — a failed call must not eat the quota
+            storage.refund_vision(self.profile, day)
+            logger.warning(f"[userdocs] {self.profile}: captioning {rel} failed: {exc}")
+            return "failed", None
+        if not out.text.strip():
+            return "failed", None
+        storage.add_vision_tokens(self.profile, day, out.tokens_in + out.tokens_out)
+        if sha:
+            storage.put_caption(
+                self.profile, sha, variant="image", caption_text=out.text, caption_json=out.data,
+                provider=out.provider, model=out.model, prompt_version=captioner.PROMPT_VERSION,
+                tokens_in=out.tokens_in, tokens_out=out.tokens_out,
+            )
+        return "done", make_caption_chunk(out.text)
+
+    def _ocr_pages(
+        self, pages: list[dict[str, Any]], *, start_ordinal: int,
+    ) -> tuple[list[t.Chunk], list[int], str | None]:
+        """Transcribe scanned PDF pages with the vision model. Returns (chunks,
+        page numbers still waiting, why they wait)."""
+        import base64
+
+        from app.storage.userdocs_storage import get_userdocs_storage
+        from app.userdocs.chunking import make_ocr_chunks
+        from app.userdocs.vision import captioner, resolver
+
+        storage = get_userdocs_storage()
+        chunks: list[t.Chunk] = []
+        pending: list[int] = []
+        state: str | None = None
+        res, blocked = self.vision_gate()
+        llm = None
+        day = captioner.local_day(self.profile)
+        for page in sorted(pages, key=lambda p: int(p.get("page") or 0)):
+            num = int(page.get("page") or 0)
+            key = str(page.get("sha256") or "")
+            cached = storage.get_caption(self.profile, key) if key else None
+            text = cached.get("caption_text") if cached else None
+            if text is None:
+                if blocked:
+                    pending.append(num)
+                    state = blocked
+                    continue
+                if not storage.reserve_vision(self.profile, day, self.caption_cap(), ocr=True):
+                    pending.append(num)
+                    state = "over_cap"
+                    continue
+                try:
+                    png = base64.b64decode(page.get("png_b64") or "")
+                    jpeg = captioner.prepare_jpeg(data=png, max_side=captioner.OCR_MAX_SIDE)
+                    llm = llm or resolver.build_vision_llm(self.profile, res)
+                    out = captioner.run_vision(llm, self.profile, jpeg, mode="ocr")
+                except Exception as exc:  # noqa: BLE001
+                    storage.refund_vision(self.profile, day, ocr=True)
+                    logger.warning(f"[userdocs] {self.profile}: OCR of page {num} failed: {exc}")
+                    pending.append(num)
+                    state = "failed"
+                    continue
+                text = out.text
+                storage.add_vision_tokens(self.profile, day, out.tokens_in + out.tokens_out)
+                if key:
+                    storage.put_caption(self.profile, key, variant="ocr", caption_text=text, provider=out.provider,
+                                        model=out.model, prompt_version=captioner.PROMPT_VERSION,
+                                        tokens_in=out.tokens_in, tokens_out=out.tokens_out)
+            if text and text.strip():
+                made = make_ocr_chunks(num, text, start_ordinal + len(chunks))
+                chunks += made
+        return chunks, pending, state
+
+    def requeue_waiting_vision(self) -> int:
+        """Re-queue images (and scanned PDFs) that are waiting for a vision
+        model, consent or tomorrow's quota, once what they wait for is there.
+        Called by the service's housekeeping; cheap when nothing waits."""
+        from app.storage.userdocs_storage import get_userdocs_storage
+        from app.userdocs.vision import captioner
+
+        if self.db is None or not self.active or self.paused_user:
+            return 0
+        opts = uds.normalize_options(self.settings.get("options"))
+        if not (opts.get("caption") or {}).get("enabled", True):
+            self.progress.set_vision(ready=False, reason="captions_off", waiting=0)
+            return 0
+        # Images indexed while descriptions were off wait too, once they are on.
+        waiting = self.db.read_sql(
+            "SELECT id, kind FROM files WHERE source = ? AND caption_state IN "
+            "('awaiting_vision', 'awaiting_consent', 'over_cap', 'captions_off') "
+            "AND status = 'indexed' ORDER BY COALESCE(taken_at, mtime) DESC LIMIT 5000",
+            (SOURCE,),
+        )
+        _res, blocked = self.vision_gate()
+        usage = get_userdocs_storage().vision_usage(self.profile, captioner.local_day(self.profile))
+        cap = self.caption_cap()
+        self.progress.set_vision(
+            ready=blocked is None, reason=blocked, waiting=len(waiting),
+            quota={"used": usage["captions"], "cap": cap},
+        )
+        if not waiting or blocked:
+            return 0
+        room = max(0, cap - int(usage["captions"]))
+        if room <= 0:
+            return 0
+        ids = [int(r["id"]) for r in waiting[:room]]
+        for r in waiting[:room]:
+            if r.get("kind") != t.KIND_IMAGE:
+                # Scanned pages need their page images again: re-extract.
+                self.db.update_file(int(r["id"]), extractor_version=None)
+        self.db.mark_dirty(ids, priority=P_UPGRADE + 1)
+        return len(ids)
 
     # ── removal ────────────────────────────────────────────────────────────
 

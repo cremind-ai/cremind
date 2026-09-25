@@ -181,7 +181,38 @@ def _settings_view(profile: str, admin: bool) -> Dict[str, Any]:
             "max_file_mb": policy.max_file_mb,
         },
         "drive_link": _drive_view(profile),
+        "vision": _vision_view(profile, storage),
     }
+
+
+def _vision_view(profile: str, storage) -> Dict[str, Any]:
+    """Whether images can be captioned for this profile, and why not.
+
+    ``reason`` is one of vision_disabled / vision_model_unset /
+    vision_model_auth_incompatible / vision_model_not_capable (fix in
+    Settings → LLM Providers → Specialized Vision Model) or ``no_consent``
+    (the user has not agreed to send images to this provider yet)."""
+    try:
+        from app.userdocs.vision import captioner, resolver
+
+        res = resolver.resolve_dedicated_vision(profile)
+        row = storage.get_source(profile, uds.SOURCE_LOCAL) or {}
+        opts = uds.normalize_options(row.get("options"))
+        consent = resolver.consent_matches(opts, res)
+        cap = captioner.daily_cap(opts)
+        day = captioner.local_day(profile)
+        used = storage.vision_usage(profile, day)
+        return {
+            "ready": bool(res.ok and consent),
+            "provider": res.provider, "model": res.model,
+            "reason": res.reason if not res.ok else (None if consent else "no_consent"),
+            "consent": consent,
+            "consent_for": opts.get("caption_consent"),
+            "quota": {"day": day, "used": used["captions"], "ocr_pages": used["ocr_pages"], "cap": cap},
+        }
+    except Exception as exc:  # noqa: BLE001 — a settings page must render regardless
+        logger.debug(f"[userdocs] vision view failed for {profile}: {exc}")
+        return {"ready": False, "reason": "vision_model_error"}
 
 
 class _BadRequest(Exception):
@@ -250,7 +281,12 @@ def _build_patch(
         patch["excludes"] = uds.normalize_excludes(body.get("excludes"))
 
     if "options" in body:
-        patch["options"] = uds.normalize_options(body.get("options"), base=cur.get("options"))
+        raw_opts = body.get("options")
+        if isinstance(raw_opts, dict):
+            # Consent is recorded only by the consent_vision action, which
+            # checks it names the model the user was shown.
+            raw_opts = {k: v for k, v in raw_opts.items() if k != "caption_consent"}
+        patch["options"] = uds.normalize_options(raw_opts, base=cur.get("options"))
 
     if body.get("confirm_first_sync"):
         import time as _time
@@ -537,7 +573,7 @@ def get_userdocs_routes() -> List[Route]:
         action = str(body.get("action") or "")
         # Only the known parameters travel on: anything else in the body
         # (a "profile", say) is dropped, never a way to aim at another profile.
-        params = {k: body[k] for k in ("targets", "reextract", "confirm") if k in body}
+        params = {k: body[k] for k in ("targets", "reextract", "confirm", "model") if k in body}
         return await _engine_call(
             lambda svc: svc.control(_profile(request), action, **params), status=202,
         )

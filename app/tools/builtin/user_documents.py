@@ -227,7 +227,9 @@ class UserDocumentsSearchTool(BuiltInTool):
                 "description": "Objects a photo should show, e.g. [{\"label\": \"dog\", \"count\": 2}]. Soft.",
             },
             "verify_images": {"type": "boolean",
-                              "description": "Re-check the top photos with the vision model (when available)."},
+                              "description": "Look again at the top 6 photos with the vision model and re-rank "
+                                             "by what it sees (uses the daily image quota). For specific "
+                                             "counts or scenes."},
             "page": {"type": "integer", "minimum": 1, "description": "Page of results (default 1)."},
         },
         "required": ["query"],

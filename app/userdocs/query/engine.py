@@ -379,9 +379,6 @@ class QueryEngine:
         page = max(1, int(page or 1))
         terms = analyze(query)
         notes = status_notes(self.snapshot)
-        if verify_images:
-            notes.append("verify_images is not available yet: it needs image captions from the "
-                         "Specialized Vision Model.")
         limit = min(400, max(60, top_k * page * 8))
 
         relaxed: list[str] = []
@@ -396,6 +393,9 @@ class QueryEngine:
         notes += scope.notes
 
         groups: list[Group] = run["groups"]
+        if verify_images:
+            notes += self._verify_images(groups, image_objects or [], terms.raw)
+            groups.sort(key=lambda g: -g.score)
         total = len(groups)
         start = (page - 1) * top_k
         shown = groups[start:start + top_k]
@@ -560,6 +560,86 @@ class QueryEngine:
             out.append(Group(kind="file", key=("f", int(r["id"])), file=r, folder=None, score=hit.score,
                              passages=[hit]))
         return out
+
+    VERIFY_MAX = 6
+
+    def _verify_images(self, groups: list[Group], objects: list[dict[str, Any]], query: str) -> list[str]:
+        """Look again at the top image results with the Specialized Vision
+        Model (never the main model), and re-rank by what it actually sees.
+
+        A caption can miscount ("two puppies" vs three); when the user asked
+        for something specific this checks the few images that matter. It
+        needs the same consent and daily quota as captioning, and says so —
+        in the result — when it cannot run."""
+        from app.storage.userdocs_storage import get_userdocs_storage
+        from app.userdocs import settings as uds
+        from app.userdocs.discovery.hashing import fs_path
+        from app.userdocs.vision import captioner, resolver
+
+        targets = [g for g in groups[: self.VERIFY_MAX * 3]
+                   if g.file and g.file.get("kind") == t.KIND_IMAGE][: self.VERIFY_MAX]
+        if not targets:
+            return []
+        if not self.root:
+            return ["Image check skipped: the indexed folder is not available."]
+        res = resolver.resolve_dedicated_vision(self.profile)
+        if not res.ok:
+            return [f"Image check unavailable ({res.reason}); ranking uses captions only."]
+        storage = get_userdocs_storage()
+        opts = uds.normalize_options((storage.get_source(self.profile, uds.SOURCE_LOCAL) or {}).get("options"))
+        if not resolver.consent_matches(opts, res):
+            return ["Image check unavailable: sending images to the vision model has not been allowed."]
+        cap = captioner.daily_cap(opts)
+        day = captioner.local_day(self.profile)
+        wanted: dict[str, Any] = {}
+        for o in objects[:5]:
+            label = fold(str(o.get("label") or ""))
+            if label:
+                wanted[_OBJECT_SYNONYMS.get(label, label)] = o.get("count")
+        labels = list(wanted)
+        root = uds.real_path(self.root)
+        llm = None
+        checked = 0
+        for g in targets:
+            # Only a file that really sits under the indexed folder is sent: a
+            # symlink swapped in since indexing must not leak another image.
+            path = uds.real_path(os.path.join(root, *str(g.file["rel_path"]).split("/")))
+            if not uds.is_inside(path, root) or not os.path.isfile(fs_path(path)):
+                continue
+            if not storage.reserve_vision(self.profile, day, cap):
+                return [f"Image check stopped after {checked}: today's image quota is used up."]
+            try:
+                jpeg = captioner.prepare_jpeg(path=fs_path(path))
+                llm = llm or resolver.build_vision_llm(self.profile, res)
+                verdict = captioner.run_verify(llm, self.profile, jpeg, labels=labels, query=query)
+            except Exception as exc:  # noqa: BLE001 — a failed check leaves the ranking as it was
+                storage.refund_vision(self.profile, day)
+                logger.info(f"[userdocs] {self.profile}: image check failed for fid "
+                            f"{g.file.get('cite_id')}: {exc}")
+                continue
+            checked += 1
+            factor = 1.0
+            why: list[str] = []
+            seen_by = {_OBJECT_SYNONYMS.get(fold(k), fold(k)): v for k, v in verdict["counts"].items()}
+            for label, count in wanted.items():
+                seen = seen_by.get(label, seen_by.get(label + "s"))
+                if seen is None or count is None:
+                    continue
+                if int(seen) == int(count):
+                    factor *= 1.6
+                    why.append(f"checked: {seen} {label}")
+                else:
+                    factor *= 0.5
+                    why.append(f"checked: {seen} {label}, not {count}")
+            if verdict["matches"] is False:
+                factor *= 0.6
+                why.append("checked: does not match the description")
+            elif verdict["matches"] is True:
+                factor *= 1.2
+            g.score *= factor
+            if why and g.passages:
+                g.passages[0].reasons.extend(why)
+        return [f"{checked} image(s) re-checked with the vision model."] if checked else []
 
     def _image_object_factor(self, file_row: dict[str, Any], objects: list[dict[str, Any]]) -> tuple[float, list[str]]:
         """Soft check of ``image_objects`` against the image's caption: +50%

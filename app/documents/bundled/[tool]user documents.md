@@ -71,9 +71,15 @@ typed without accents still matches accented text.
   the query (Vietnamese ↔ English) and reranks the best 30 with the `low`
   model group.
 - `image_objects` — objects a photo should show, e.g. `[{"label": "dog",
-  "count": 2}]`; a soft preference, used once photos have captions.
-- `verify_images` — re-check the top photos with the vision model (reported
-  as unavailable until image captioning ships).
+  "count": 2}]`; a soft preference, matched against each photo's caption.
+- `verify_images` — look again at the top 6 photos with the Specialized
+  Vision Model (never the main model) and re-rank by what it counts; each
+  check uses one image from the daily caption quota. When the vision model
+  is off or not consented to, the result says so and ranks by captions only.
+
+Photos that are not captioned yet (no vision model, no consent, or over the
+daily cap) are still found by name, folder, date and camera; the result
+header counts them.
 
 If a date window finds no keyword match, it is widened to ±3 days, then ±14
 days, then dropped, and the result says which step matched.

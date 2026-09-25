@@ -47,7 +47,8 @@ const tagType = (t: string) =>
     : t === 'event_gate' ? 'info' : 'warning';
 
 // Friendlier badge text for source types whose raw key reads awkwardly.
-const sourceTypeLabel = (t: string) => (t === 'event_gate' ? 'event filter' : t);
+const sourceTypeLabel = (t: string) =>
+  (t === 'event_gate' ? 'event filter' : t === 'userdocs' ? 'my documents' : t);
 
 // Requests are sortable from the column headers (When / Model / Tokens / Est.
 // cost), defaulting to newest-first — which also fixes the unordered rows the

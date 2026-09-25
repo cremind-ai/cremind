@@ -105,6 +105,8 @@ const REASON_LABELS: Record<string, string> = {
   heic_unsupported: 'HEIC photos are not supported on this server yet',
   internal_error: 'Unexpected error while indexing',
   awaiting_vision: 'Waiting for a vision model to describe it',
+  awaiting_consent: 'Waiting for your OK to send it to the vision model',
+  over_cap: "Waiting — today's image limit is reached",
   // A deferred file waits for the storage level it was deferred at to clear.
   budget: 'Waiting — the storage budget is full',
   disk_low: 'Waiting — disk space is low',
@@ -611,6 +613,101 @@ export function stateBanner(
         "The sync status couldn't be read just now. It refreshes on its own.",
       );
   }
+}
+
+// ── image descriptions (the Specialized Vision Model) ─────────────────────
+
+/** A file row's image-description state, for the file table; null when
+ *  there is nothing to say (described, not an image, or an icon-sized image
+ *  that is never sent). */
+export function captionStateLabel(state: string | null | undefined): string | null {
+  switch (state) {
+    case 'awaiting_vision': return 'No description yet — no vision model is set up';
+    case 'awaiting_consent': return 'No description yet — waiting for your OK';
+    case 'over_cap': return "No description yet — today's image limit is reached";
+    case 'failed': return 'The vision model could not describe it — Retry all tries again';
+    case 'captions_off': return 'No description — image descriptions are off';
+    default: return null;
+  }
+}
+
+export type VisionAction = 'open_llm' | 'consent' | null;
+
+export interface VisionStatus {
+  tone: BannerTone;
+  title: string;
+  detail: string;
+  action: VisionAction;
+}
+
+const VISION_SETUP: Record<string, string> = {
+  vision_disabled: 'Image understanding is turned off in LLM Providers.',
+  vision_model_unset: 'No Specialized Vision Model is chosen in LLM Providers.',
+  vision_model_auth_incompatible:
+    "The chosen vision model can't be used with how its provider is signed in — pick another in LLM Providers.",
+  vision_model_not_capable: "The chosen vision model can't read images — pick another in LLM Providers.",
+  vision_model_error: "The vision model settings couldn't be read.",
+};
+
+/**
+ * Whether photos and scanned pages can be described right now, and what to
+ * do if not. Descriptions come only from the Specialized Vision Model — the
+ * main model is never used — so a missing model is a setup step, not a
+ * fallback.
+ */
+export function visionStatus(
+  vision: UserDocsSettings['vision'] | null | undefined,
+  captionsEnabled = true,
+): VisionStatus {
+  if (!captionsEnabled) {
+    return {
+      tone: 'info',
+      title: 'Image descriptions are off',
+      detail: 'Photos are found by name, folder, date and camera only.',
+      action: null,
+    };
+  }
+  const model = vision?.provider && vision?.model ? `${vision.provider}/${vision.model}` : null;
+  if (!vision || (vision.reason && vision.reason !== 'no_consent')) {
+    return {
+      tone: 'warning',
+      title: 'No vision model to describe images',
+      detail: `${VISION_SETUP[vision?.reason ?? ''] ?? VISION_SETUP.vision_model_unset} `
+        + 'Until then photos are found by name, folder, date and camera.',
+      action: 'open_llm',
+    };
+  }
+  if (!vision.consent) {
+    const old = vision.consent_for;
+    const changed = old && model && `${old.provider}/${old.model}` !== model;
+    return {
+      tone: 'info',
+      title: changed ? 'The vision model changed — allow it again?' : 'Allow describing your images?',
+      detail: `Photos and scanned pages will be sent to ${model ?? 'your vision model'} to describe what they `
+        + 'show. Nothing is sent until you allow it.'
+        + (changed ? ` You had allowed ${old!.provider}/${old!.model}.` : ''),
+      action: 'consent',
+    };
+  }
+  return {
+    tone: 'success',
+    title: 'Describing images',
+    detail: `Photos and scanned pages are described by ${model}.`,
+    action: null,
+  };
+}
+
+/** "37 of 1,000 today" with a fill fraction (0–1), or null without a quota. */
+export function visionQuota(
+  quota: { used: number; ocr_pages?: number; cap: number } | null | undefined,
+): { label: string; fraction: number } | null {
+  if (!quota) return null;
+  const used = (quota.used ?? 0);
+  const cap = Math.max(0, quota.cap ?? 0);
+  // A cap of 0 sends nothing (the server reserves `used < cap`).
+  return cap > 0
+    ? { label: `${formatCount(used)} of ${formatCount(cap)} today`, fraction: Math.min(1, used / cap) }
+    : { label: 'Daily limit is 0 — no images are sent', fraction: 1 };
 }
 
 /** The NavRail chip's tooltip, e.g. "Indexing documents 3,120/12,840 · 12 failed". */

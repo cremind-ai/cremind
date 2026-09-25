@@ -32,6 +32,7 @@ from typing import Any
 
 from app.userdocs import settings as uds
 from app.userdocs import state as uds_state
+from app.userdocs import types as t
 from app.userdocs.errors import EngineError, NotEnabled, NotFound, UnknownAction
 from app.userdocs.runtime import P_BULK, P_INTERACTIVE, P_UPGRADE, SOURCE, ProfileRuntime
 from app.utils.logger import logger
@@ -242,6 +243,11 @@ class UserDocsService:
                 for rt in runtimes:
                     try:
                         rt.purge_tombstones(now)
+                        # Images waiting for a vision model, consent or a new
+                        # day's quota get captioned as soon as that arrives —
+                        # the LLM settings publish nothing this engine hears,
+                        # so it looks once a minute.
+                        rt.requeue_waiting_vision()
                         rt.refresh_totals()
                     except Exception:  # noqa: BLE001
                         logger.exception(f"[userdocs] {rt.profile}: housekeeping failed")
@@ -377,7 +383,6 @@ class UserDocsService:
             return self._pool
 
     def extract(self, req: Any, *, size: int) -> Any:
-        from app.userdocs import types as t
         from app.userdocs.extract.pool import ExtractorPool
 
         if size > self.max_file_bytes():
@@ -606,6 +611,8 @@ class UserDocsService:
         elif action == "reject_deletions":
             self._require(profile)
             rt.reject_deletions()
+        elif action in ("consent_vision", "revoke_vision_consent"):
+            self._vision_consent(profile, grant=action == "consent_vision", shown=kw.get("model"))
         elif action == "confirm_root_change":
             hold = rt.hold or {}
             if hold.get("reason") != "pending_root_change":
@@ -618,6 +625,46 @@ class UserDocsService:
             raise UnknownAction(f"Unknown action {action!r}.")
         self.wake()
         return {"accepted": True, "snapshot": uds_state.build_snapshot(profile)}
+
+    def _vision_consent(self, profile: str, *, grant: bool, shown: Any) -> None:
+        """Record (or withdraw) consent to send this profile's images and
+        scanned pages to its Specialized Vision Model.
+
+        Consent is recorded for the model that resolves *now*, server-side, and
+        only if it is the one the user was shown (``shown`` = "provider/model"):
+        agreeing to one provider is never agreement to another, and a model
+        switched between opening the dialog and clicking must not slip in."""
+        from app.storage.userdocs_storage import get_userdocs_storage
+        from app.userdocs.vision import resolver
+
+        storage = get_userdocs_storage()
+        row = storage.get_source(profile, SOURCE) or {}
+        opts = uds.normalize_options(row.get("options"))
+        if grant:
+            res = resolver.resolve_dedicated_vision(profile)
+            if not res.ok:
+                raise EngineError(
+                    "Choose a Specialized Vision Model in Settings → LLM Providers first.",
+                    code="VisionNotConfigured", reason=res.reason,
+                )
+            current = f"{res.provider}/{res.model}"
+            if str(shown or "") != current:
+                raise EngineError(
+                    f"The vision model changed to {current}; review it and confirm again.",
+                    code="VisionModelChanged", model=current,
+                )
+            opts["caption_consent"] = {"provider": res.provider, "model": res.model, "at": time.time() * 1000}
+        else:
+            opts["caption_consent"] = None
+        storage.upsert_source(profile, SOURCE, options=opts)
+        rt = self.runtime(profile)
+        if rt is not None and rt.db is not None:
+            rt.db.add_activity(
+                "consent",
+                "Allowed sending images to the vision model." if grant else "Stopped sending images to the vision model.",
+                source=SOURCE,
+            )
+        uds_state.notify_settings_changed(profile, SOURCE)
 
     def _resolve_targets(self, rt: ProfileRuntime, targets: list[str]) -> list[int]:
         db = rt.ensure_db()
@@ -658,6 +705,15 @@ class UserDocsService:
         else:
             ids = [int(r["id"]) for r in db.list_files(status="error", limit=100_000)]
             ids += [int(r["id"]) for r in db.list_files(status="awaiting_extractor", limit=100_000)]
+            # Indexed files whose image description or page OCR failed (a
+            # provider error, say): the vision call is tried again.
+            for r in db.read_sql(
+                "SELECT id, kind FROM files WHERE source = ? AND status = 'indexed' AND caption_state = 'failed'",
+                (SOURCE,),
+            ):
+                ids.append(int(r["id"]))
+                if r.get("kind") != t.KIND_IMAGE:
+                    db.update_file(int(r["id"]), extractor_version=None)  # page images come from extraction
         for fid in ids:
             db.update_file(fid, attempts=0, next_attempt_at=None)
         if ids:

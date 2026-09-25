@@ -1,5 +1,5 @@
 ---
-description: "Search the user's OWN files with User Document Search via `cremind userdocs`: turn indexing on or off for this profile (`enable`, `disable --delete-index`), choose the indexed folder (`set-root`, default the working directory), manage exclude rules (`excludes list|add|remove`), follow sync progress live (`status --follow`), and, as admin, allow the feature and set storage budgets (`admin get|set --allow`). Needs Vector Embedding. Not for Cremind's own documentation (that is documentation_search)."
+description: "Search the user's OWN files with User Document Search via `cremind userdocs`: turn indexing on or off for this profile (`enable`, `disable --delete-index`), choose the indexed folder (`set-root`, default the working directory), manage exclude rules (`excludes list|add|remove`), follow sync progress live (`status --follow`), describe photos and scanned PDFs with the Specialized Vision Model (`caption --consent-vision`, daily cap), say who \"me\" is for \"docs I wrote\" / \"photos I took\" (`identity`), choose where the agent may use them (`allow-in` web/CLI, channels, rooms), and, as admin, allow the feature and set storage budgets (`admin get|set --allow`). Needs Vector Embedding. Not for Cremind's own documentation (that is documentation_search)."
 ---
 
 # `cremind userdocs` — User Document Search
@@ -165,6 +165,76 @@ re-reads every file) — rarely needed. When many files vanish at once (an
 unplugged drive, a renamed folder) nothing is deleted: they are hidden from
 search until you run `deletions confirm` (remove them) or `deletions reject`
 (keep them; they are re-checked on every scan for 14 days).
+
+### `cremind userdocs caption`
+
+**Purpose.** Captions make photos findable by what they show ("two puppies in
+a park") and scanned PDF pages readable. They come **only** from the
+Specialized Vision Model chosen in **Settings → LLM Providers** — never the
+main model — and only after you consent to sending images to it.
+
+```bash
+cremind userdocs caption [--enable|--disable] [--daily-cap N] [--min-px N] [--min-kb N]
+                         [--consent-vision | --revoke-consent]
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--enable/--disable` | Caption images at all (default on). |
+| `--daily-cap` | Images + scanned pages per day for this profile (default: the admin's, 1000). |
+| `--min-px` / `--min-kb` | Skip icons and tiny images (defaults 256 px, 20 KB). |
+| `--consent-vision` | Agree to send images to the vision model `settings` shows. Consent is per model: switching the model asks again. |
+| `--revoke-consent` | Stop sending images; existing captions stay. |
+
+Until then images are indexed by name, folder, date and camera (EXIF), shown
+as `awaiting_vision` / `awaiting_consent`; over the daily cap they are
+`over_cap` and captioned on the following days, newest first. A search with
+`verify_images` (see **`cremind userdocs search`**) re-checks its top photos
+with the same model and uses the same daily cap.
+
+**Errors.** `VisionNotConfigured` — no usable Specialized Vision Model; choose
+one in Settings → LLM Providers. `VisionModelChanged` — the model changed after
+`settings` was read; run `settings` again, check the model, and repeat.
+
+### `cremind userdocs identity`
+
+**Purpose.** Say who "me" is, so "the report I wrote" and "photos I took"
+rank your own files first. A match is a boost, never a filter: files with no
+author or no EXIF are still found.
+
+```bash
+cremind userdocs identity [--name NAME]... [--email EMAIL]... [--camera DEVICE]...
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--name` | A name you write as (the author recorded in Word, PDF, … files). |
+| `--email` | An email address of yours. |
+| `--camera` | A camera or phone you shoot with, as its EXIF make/model shows it (e.g. `iPhone 14`). |
+
+Each flag repeats or takes comma-separated values, and **replaces** that list;
+`--name ""` clears it. Without flags, prints the current identity.
+
+```bash
+cremind userdocs identity --name "Ann Nguyen, Nguyễn Thị An" --camera "iPhone 14"
+```
+
+### `cremind userdocs allow-in`
+
+**Purpose.** Choose where the agent may use your documents. Takes effect from
+the next message.
+
+```bash
+cremind userdocs allow-in [--web-cli/--no-web-cli] [--channels/--no-channels] [--rooms/--no-rooms]
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--web-cli` | on | The web app, the CLI and your own automations. |
+| `--channels` | off | Messaging channels (Telegram, Zalo, …) — whoever the channel answers could ask about your files. |
+| `--rooms` | off | Group rooms — everyone in the room reads the answers; the sources list there leaves out paths and links. |
+
+Without flags, prints the current setting.
 
 ### Inspecting the index
 

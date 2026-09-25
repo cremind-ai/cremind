@@ -239,8 +239,13 @@ def _file_line(n: int, row: dict[str, Any], issued: _Issued, leaf: str, tz: _dt.
         camera = " ".join(str(exif.get(k)) for k in ("make", "model") if exif.get(k))
         if camera:
             bits.append(_clean(camera))
-        if row.get("caption_state") in ("awaiting_vision", "over_cap"):
+        state = row.get("caption_state")
+        if state in ("awaiting_vision", "awaiting_consent", "over_cap", "failed"):
             bits.append("no caption yet (found by name, date and camera)")
+        elif state == "captions_off":
+            bits.append("no caption (image descriptions are off)")
+        elif state == "skipped_small":
+            bits.append("no caption (too small: icon or thumbnail)")
     if row.get("status") in ("metadata_only", "awaiting_extractor", "error"):
         bits.append(f"content not indexed ({row.get('status_reason') or row.get('status')})")
     bits += extra

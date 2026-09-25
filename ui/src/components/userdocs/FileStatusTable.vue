@@ -20,6 +20,7 @@ import {
 } from '../../services/userdocsApi';
 import {
   STATUS_ORDER,
+  captionStateLabel,
   formatBytes,
   formatCount,
   reasonLabel,
@@ -183,6 +184,9 @@ defineExpose({ showStatus, reload: () => load(true) });
             <span>{{ statusLabel(row.status) }}</span>
           </div>
           <div v-if="row.status_reason" class="cell-reason">{{ reasonLabel(row.status_reason) }}</div>
+          <div v-else-if="captionStateLabel(row.caption_state)" class="cell-reason">
+            {{ captionStateLabel(row.caption_state) }}
+          </div>
         </template>
       </ElTableColumn>
       <ElTableColumn label="Size" width="90" align="right">

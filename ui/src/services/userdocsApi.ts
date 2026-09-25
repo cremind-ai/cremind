@@ -256,11 +256,48 @@ export interface UserDocsDriveLink {
   access_model?: string | null;
 }
 
+/** Why images can't be sent to a vision model right now. The first four are
+ *  fixed in Settings → LLM Providers → Specialized Vision Model. */
+export type UserDocsVisionReason =
+  | 'vision_disabled'
+  | 'vision_model_unset'
+  | 'vision_model_auth_incompatible'
+  | 'vision_model_not_capable'
+  | 'vision_model_error'
+  | 'no_consent';
+
+/** The profile's Specialized Vision Model as captioning sees it. Captions
+ *  never fall back to the main model: no vision model means no captions. */
+export interface UserDocsVisionView {
+  /** A model is set and this profile consented to it. */
+  ready: boolean;
+  provider?: string | null;
+  model?: string | null;
+  reason: UserDocsVisionReason | null;
+  consent?: boolean;
+  /** What the recorded consent names — may be an older model. */
+  consent_for?: { at: number | null; provider: string; model: string } | null;
+  quota?: { day: string; used: number; ocr_pages: number; cap: number };
+}
+
 export interface UserDocsSettings {
   local: UserDocsSource;
   drive: UserDocsSource;
   policy_view: UserDocsPolicyView;
   drive_link: UserDocsDriveLink;
+  vision?: UserDocsVisionView;
+}
+
+/** Options a settings PUT may change; each group merges key by key on the
+ *  server. Vision consent is not here: only the `consent_vision` control
+ *  action records it (and the server ignores it in a PUT). */
+export interface UserDocsOptionsPatch {
+  caption?: Partial<UserDocsOptions['caption']>;
+  identity?: Partial<UserDocsOptions['identity']>;
+  allow_in?: Partial<UserDocsOptions['allow_in']>;
+  observer?: UserDocsOptions['observer'];
+  reconcile_interval_min?: number;
+  include_folders?: string[];
 }
 
 /** The fields a settings PUT may carry; only those present are changed. */
@@ -270,7 +307,7 @@ export interface UserDocsSettingsPatch {
   root_mode?: RootMode;
   root_path?: string | null;
   excludes?: ExcludeRule[];
-  options?: Partial<UserDocsOptions>;
+  options?: UserDocsOptionsPatch;
   /** Only valid while turning the source off. */
   delete_index?: boolean;
 }
@@ -359,7 +396,9 @@ export type UserDocsControlAction =
   | 'rebuild'
   | 'confirm_deletions'
   | 'reject_deletions'
-  | 'confirm_root_change';
+  | 'confirm_root_change'
+  | 'consent_vision'
+  | 'revoke_vision_consent';
 
 export interface UserDocsControlRequest {
   action: UserDocsControlAction;
@@ -367,6 +406,9 @@ export interface UserDocsControlRequest {
   targets?: string[];
   /** rebuild: also re-read every file, not just re-embed the stored text. */
   reextract?: boolean;
+  /** consent_vision: the "provider/model" the user was shown. The server
+   *  refuses (VisionModelChanged) if the model has changed since. */
+  model?: string;
 }
 
 export interface UserDocsControlResult {

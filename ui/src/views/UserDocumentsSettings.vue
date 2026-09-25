@@ -44,6 +44,7 @@ import {
   type UserDocsControlAction,
   type UserDocsControlRequest,
   type UserDocsControlResult,
+  type UserDocsOptions,
   type UserDocsSettings,
   type UserDocsSettingsPatch,
   type UserDocsSettingsSaved,
@@ -59,6 +60,9 @@ import FileStatusTable from '../components/userdocs/FileStatusTable.vue';
 import FirstSyncEstimateDialog from '../components/userdocs/FirstSyncEstimateDialog.vue';
 import ConfirmPlanDialog from '../components/userdocs/ConfirmPlanDialog.vue';
 import DeletionsConfirmDialog from '../components/userdocs/DeletionsConfirmDialog.vue';
+import CaptioningSection from '../components/userdocs/CaptioningSection.vue';
+import IdentitySection from '../components/userdocs/IdentitySection.vue';
+import ChannelAccessSection from '../components/userdocs/ChannelAccessSection.vue';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -78,6 +82,7 @@ const asOf = ref<number | null>(null);
 const acting = ref(false);
 const savingRoot = ref(false);
 const savingExcludes = ref(false);
+const savingOptions = ref(false);
 const togglingEnabled = ref(false);
 
 const snapshot = computed(() => store.snapshot);
@@ -100,6 +105,12 @@ const pausedByUser = computed(() =>
 
 const captionCap = computed(() =>
   local.value?.options.caption.daily_cap ?? policy.value?.vision_daily_cap_default ?? null);
+
+/** Images waiting for a description, from the live snapshot. */
+const visionWaiting = computed(() => {
+  const w = (snapshot.value?.vision as { waiting?: number } | undefined)?.waiting;
+  return typeof w === 'number' ? w : null;
+});
 
 // ── loading ───────────────────────────────────────────────────────────────
 
@@ -177,6 +188,11 @@ function describeError(e: unknown): string {
         return 'Vector Embedding is off, so document search cannot be turned on right now.';
       case 'NotEnabled':
         return 'Turn document search on first.';
+      case 'VisionModelChanged':
+      case 'VisionNotConfigured':
+        // Show the model as it is now before asking again.
+        void loadSettings();
+        return e.message;
       default:
         return e.message;
     }
@@ -340,6 +356,60 @@ async function onSaveExcludes(rules: ExcludeRule[]) {
   } finally {
     savingExcludes.value = false;
   }
+}
+
+// Captions, identity and channel access are plain option saves: none of them
+// removes indexed content, so none needs a confirmation.
+async function saveOptions(options: UserDocsSettingsPatch['options'], done: string) {
+  savingOptions.value = true;
+  try {
+    if (await saveLocal({ options }, 'Save?', 'Save')) ElMessage.success(done);
+  } finally {
+    savingOptions.value = false;
+  }
+}
+
+function onSaveCaption(patch: Partial<UserDocsOptions['caption']>) {
+  const msg = patch.enabled === undefined
+    ? 'Limits saved.'
+    : patch.enabled ? 'Image descriptions are on.' : 'Image descriptions are off. Existing descriptions stay searchable.';
+  void saveOptions({ caption: patch }, msg);
+}
+
+function onSaveIdentity(identity: UserDocsOptions['identity']) {
+  void saveOptions({ identity }, 'Saved.');
+}
+
+function onSaveAllowIn(patch: Partial<UserDocsOptions['allow_in']>) {
+  void saveOptions({ allow_in: patch }, 'Saved. It applies from the next message.');
+}
+
+async function onConsentVision(model: string) {
+  try {
+    await ElMessageBox.confirm(
+      `Your photos and scanned pages will be sent to ${model} to describe what they show. Descriptions `
+        + 'are stored in your index; a copy of the same image is never sent twice. You can stop at any time.',
+      'Allow describing your images?',
+      { confirmButtonText: `Allow ${model}`, cancelButtonText: 'Cancel' },
+    );
+  } catch {
+    return;
+  }
+  if (await control('consent_vision', { model })) {
+    ElMessage.success('Allowed. Waiting images are being described.');
+    await loadSettings();
+  }
+}
+
+async function onRevokeVision() {
+  if (await control('revoke_vision_consent')) {
+    ElMessage.success('Stopped. Existing descriptions stay searchable.');
+    await loadSettings();
+  }
+}
+
+function goToLlmSettings() {
+  void router.push({ name: 'llm-settings', params: { profile: props.profile } });
 }
 
 // ── engine actions ────────────────────────────────────────────────────────
@@ -682,6 +752,44 @@ function goBack() {
               :saving="savingExcludes"
               :disabled="savingExcludes"
               @save="onSaveExcludes"
+            />
+          </section>
+
+          <!-- Photos and scans: the Specialized Vision Model -->
+          <section class="ud-card">
+            <h2>Photos and scanned pages</h2>
+            <CaptioningSection
+              :caption="local.options.caption"
+              :vision="settings.vision"
+              :default-cap="policy.vision_daily_cap_default"
+              :waiting="visionWaiting"
+              :saving="savingOptions"
+              :busy="acting"
+              @save="onSaveCaption"
+              @consent="onConsentVision"
+              @revoke="onRevokeVision"
+              @open-llm="goToLlmSettings"
+            />
+          </section>
+
+          <!-- Who "me" is -->
+          <section class="ud-card">
+            <h2>You</h2>
+            <p class="ud-muted">So "the report I wrote" and "photos I took" find your own files first.</p>
+            <IdentitySection
+              :identity="local.options.identity"
+              :saving="savingOptions"
+              @save="onSaveIdentity"
+            />
+          </section>
+
+          <!-- Where the agent may use it -->
+          <section class="ud-card">
+            <h2>Where the agent may use your documents</h2>
+            <ChannelAccessSection
+              :allow-in="local.options.allow_in"
+              :saving="savingOptions"
+              @save="onSaveAllowIn"
             />
           </section>
 
