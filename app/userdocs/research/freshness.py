@@ -19,12 +19,17 @@ draft is still wrong, so before a job reads anything:
    files are being indexed, up to a limit, and checks them once more: a file
    saved again while it was being indexed goes round again.
 
+Google Drive files have no disk to compare with: Drive's change feed is what
+says a file changed. So discovery also asks Drive for a sync (unless the
+job's scopes are limited to the local folder) and waits for it; the files it
+queues are then moved up and waited for like local ones.
+
 A file that is still not indexed when the wait ends is never read from its
 old text. It was queued, so when the caller resolves the scope again it shows
 up in the coverage table as "not indexed yet", and the job asks the user
-whether to go on without it (or to continue the job later). When sync is not
-running at all (paused, on hold, suspended) nothing is waited for, and the
-notes say why.
+whether to go on without it (or to continue the job later). When a source's
+sync is not running at all (paused, on hold, suspended) nothing of it is
+waited for, and the notes say why.
 """
 
 from __future__ import annotations
@@ -34,13 +39,17 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from app.userdocs import settings as uds
 from app.userdocs.research.context import ResearchContext
+from app.userdocs.research.types import MODE_COMPILE
 
 POLL_S = 0.5
 # A full scan in polling mode (it walks the whole folder).
 SCAN_WAIT_S = 180.0
 # Changes the native watcher is still settling (a file being written).
 WATCH_SETTLE_S = 10.0
+# A Drive sync: usually one page of the change feed.
+DRIVE_WAIT_S = 120.0
 # Queued files being indexed: the overall cap, and how long the queue may go
 # without finishing or working on any of them before the job stops waiting.
 INDEX_WAIT_S = 600.0
@@ -51,11 +60,11 @@ ROUNDS = 2
 RESERVE_S = 120.0
 
 _BLOCKED = {
-    "paused": "sync is paused",
-    "hold": "sync is on hold",
-    "suspended": "sync is suspended",
-    "disabled": "sync is off",
-    "awaiting_confirmation": "sync is waiting for a confirmation",
+    "paused": "is paused",
+    "hold": "is on hold",
+    "suspended": "is suspended",
+    "disabled": "is off",
+    "awaiting_confirmation": "is waiting for a confirmation",
 }
 
 
@@ -71,9 +80,24 @@ def _runtime(ctx: ResearchContext) -> Any:
     return getattr(ctx.engine, "runtime", None)
 
 
-def _blocked(state: tuple[str, str | None]) -> str:
-    what = _BLOCKED.get(state[0], "sync is not running")
+def _subject(source: str) -> str:
+    return "Google Drive sync" if source == uds.SOURCE_DRIVE else "sync"
+
+
+def _blocked(state: tuple[str, str | None], subject: str = "sync") -> str:
+    what = f"{subject} {_BLOCKED.get(state[0], 'is not running')}"
     return f"{what} ({state[1]})" if state[1] else what
+
+
+def _wants(ctx: ResearchContext, source: str) -> bool:
+    """Whether the job's scopes can hold files of ``source``. No scope means
+    every indexed file, and an analyze job without a reference scope searches
+    the whole index."""
+    scopes = [ctx.spec.scope] if ctx.spec.mode == MODE_COMPILE else [ctx.spec.scope, ctx.spec.reference_scope]
+    for scope in scopes:
+        if not scope or str(scope.get("source") or "all").lower() in ("all", source):
+            return True
+    return False
 
 
 async def _wait(ctx: ResearchContext, done: Callable[[], bool], limit: float) -> bool:
@@ -89,11 +113,23 @@ async def _wait(ctx: ResearchContext, done: Callable[[], bool], limit: float) ->
 
 
 async def settle_discovery(ctx: ResearchContext) -> list[str]:
-    """Make sure the index knows about every file in the folder, new ones
-    included; returns notes for the dossier (empty when all went well)."""
+    """Make sure the index knows about every file in the folder and in
+    Drive, new ones included; returns notes for the dossier (empty when all
+    went well)."""
     rt = _runtime(ctx)
     if rt is None:
         return []
+    notes: list[str] = []
+    local_on = getattr(rt, "local_on", None)
+    if (local_on is None or await ctx.io(local_on)) and _wants(ctx, uds.SOURCE_LOCAL):
+        notes += await _settle_local(ctx, rt)
+    drive = getattr(rt, "drive", None)
+    if drive is not None and drive.enabled and _wants(ctx, uds.SOURCE_DRIVE):
+        notes += await _settle_drive(ctx, drive)
+    return notes
+
+
+async def _settle_local(ctx: ResearchContext, rt: Any) -> list[str]:
     if await ctx.io(rt.finds_new_files_by_scan):
         blocker = await ctx.io(rt.scan_blocker)
         if blocker is not None:
@@ -117,15 +153,40 @@ async def settle_discovery(ctx: ResearchContext) -> list[str]:
     return []
 
 
-def _files(n: int) -> tuple[str, str, str, str]:
-    """``("1 file", "it", "was", "is")`` or ``("3 files", "they", "were", "are")``."""
-    return (f"{n} file", "it", "was", "is") if n == 1 else (f"{n} files", "they", "were", "are")
+async def _settle_drive(ctx: ResearchContext, drive: Any) -> list[str]:
+    stale = "Drive files added or edited since the last sync may be missing or outdated."
+    subject = _subject(uds.SOURCE_DRIVE)
+    blocker = await ctx.io(drive.sync_blocker)
+    if blocker is not None:
+        return [f"Google Drive was not checked for changes because {_blocked(blocker, subject)}: {stale}"]
+    sid = ctx.step("Checking Google Drive for changes")
+    ticket = await ctx.io(drive.sync_ticket, "research")
+    await _wait(ctx, lambda: drive.sync_done(ticket) or drive.sync_blocker() is not None, DRIVE_WAIT_S)
+    if not await ctx.io(drive.sync_done, ticket):
+        blocker = await ctx.io(drive.sync_blocker)
+        ctx.done_step(sid, ok=False, suffix=" — stopped" if blocker else " — did not finish in time")
+        if blocker is not None:
+            return [f"The Google Drive check stopped because {_blocked(blocker, subject)}: {stale}"]
+        return [f"The Google Drive check did not finish in time: {stale}"]
+    # It ran, but may have ended in a hold (Drive unreachable, access revoked).
+    blocker = await ctx.io(drive.work_blocker)
+    ctx.done_step(sid, ok=blocker is None)
+    if blocker is not None:
+        return [f"Google Drive could not be checked for changes ({_blocked(blocker, subject)}): {stale}"]
+    return []
 
 
-async def _wait_indexed(ctx: ResearchContext, rt: Any, ids: list[int]) -> list[int]:
+def _files(n: int, source: str = uds.SOURCE_LOCAL) -> tuple[str, str, str, str]:
+    """``("1 file", "it", "was", "is")`` or ``("3 files", "they", "were", "are")``
+    (``Google Drive file(s)`` for Drive)."""
+    noun = "Google Drive file" if source == uds.SOURCE_DRIVE else "file"
+    return (f"1 {noun}", "it", "was", "is") if n == 1 else (f"{n} {noun}s", "they", "were", "are")
+
+
+async def _wait_indexed(ctx: ResearchContext, rt: Any, ids: list[int], sources: set[str]) -> list[int]:
     """Wait while ``ids`` are being indexed; return the ones still queued
     when the wait ends (all done, over the limit, no progress for STALL_S,
-    or sync stopped)."""
+    or the sync of one of ``sources`` stopped)."""
     db = ctx.engine.db
     total = len(ids)
     pending = list(ids)
@@ -142,8 +203,11 @@ async def _wait_indexed(ctx: ResearchContext, rt: Any, ids: list[int]) -> list[i
         if len(left) < len(pending) or await ctx.io(rt.indexing_any, left):
             last_move = now
         pending = left
-        if now >= end or now - last_move >= STALL_S or await ctx.io(rt.sync_blocker) is not None:
+        if now >= end or now - last_move >= STALL_S:
             return pending
+        for source in sources:
+            if await ctx.io(rt.sync_blocker, source) is not None:
+                return pending
         await asyncio.sleep(POLL_S)
 
 
@@ -155,19 +219,28 @@ async def refresh_files(ctx: ResearchContext, rows: list[dict[str, Any]]) -> Ref
     if rt is None or not rows:
         return out
     for _ in range(ROUNDS):
+        source_of = {int(r["id"]): r.get("source") or uds.SOURCE_LOCAL for r in rows}
         changed, queued = await ctx.io(rt.queue_if_changed, rows)
         ids = list(dict.fromkeys(changed + queued))
         if not ids:
             break
         out.changed = True
-        blocker = await ctx.io(rt.sync_blocker)
-        if blocker is not None:
-            n, it, was, is_ = _files(len(ids))
-            out.notes.append(f"{n} in scope changed since {it} {was} last indexed, but {_blocked(blocker)}, "
-                             f"so {it} {is_} listed as not indexed yet.")
+        by_source: dict[str, list[int]] = {}
+        for i in ids:
+            by_source.setdefault(source_of.get(i, uds.SOURCE_LOCAL), []).append(i)
+        waiting: list[int] = []
+        for source, group in by_source.items():
+            blocker = await ctx.io(rt.sync_blocker, source)
+            if blocker is None:
+                waiting += group
+                continue
+            n, it, was, is_ = _files(len(group), source)
+            out.notes.append(f"{n} in scope changed since {it} {was} last indexed, but "
+                             f"{_blocked(blocker, _subject(source))}, so {it} {is_} listed as not indexed yet.")
+        if not waiting:
             break
-        sid = ctx.step(f"Re-indexing {_files(len(ids))[0]} changed since the last sync")
-        left = await _wait_indexed(ctx, rt, ids)
+        sid = ctx.step(f"Re-indexing {_files(len(waiting))[0]} changed since the last sync")
+        left = await _wait_indexed(ctx, rt, waiting, {source_of.get(i, uds.SOURCE_LOCAL) for i in waiting})
         if left:
             ctx.done_step(sid, ok=False, suffix=f" — {len(left)} not finished")
             n, it, was, is_ = _files(len(left))
@@ -177,7 +250,7 @@ async def refresh_files(ctx: ResearchContext, rows: list[dict[str, Any]]) -> Ref
         ctx.done_step(sid)
         # Once more over what was re-indexed: a file saved again while it was
         # being indexed was indexed at its older content.
-        rows = list((await ctx.io(ctx.engine.db.files_by_ids, ids)).values())
+        rows = list((await ctx.io(ctx.engine.db.files_by_ids, waiting)).values())
     return out
 
 

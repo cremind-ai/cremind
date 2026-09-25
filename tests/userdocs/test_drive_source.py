@@ -1298,3 +1298,34 @@ def test_delete_source_kind_removes_one_profiles_drive_citations(tmp_path, monke
         assert [r["source_kind"] for r in env.cit.rows_for_cite_ids("alice", ["aaaaaaaa", "bbbbbbbb"])] == ["local"]
     finally:
         close(env)
+
+
+# ── research: a sync on request, and why Drive files would wait ─────────────
+
+
+def test_a_sync_ticket_is_answered_only_by_a_sync_started_after_it(env):
+    # Research asks Drive for its latest changes before reading: the answer
+    # must come from a sync that read the change feed after the question.
+    w = _synced(env)
+    ticket = w.src.sync_ticket("research")
+    assert not w.src.sync_done(ticket)
+    w.fake.edit("a", b"Alpha one.\n\nAlpha four.")
+    w.sync()
+    assert w.src.sync_done(ticket)
+    assert w.rows()["a"]["status"] == "dirty", "the change the sync found is queued"
+    assert w.src.sync_blocker() is None and w.src.work_blocker() is None
+
+
+def test_research_blockers_follow_holds_and_the_user_pause(env):
+    w = _synced(env)
+    w.fake.down("unreachable")
+    w.sync()
+    # A held Drive still runs a requested sync (its probe), but its queued
+    # files are not indexed until the hold clears.
+    assert w.src.sync_blocker() is None
+    assert w.src.work_blocker() == ("hold", "drive_unreachable")
+    w.fake.up()
+    w.sync()
+    assert w.src.work_blocker() is None
+    w.rt.paused_user = True
+    assert w.src.sync_blocker() == ("paused", "user") and w.src.work_blocker() == ("paused", "user")

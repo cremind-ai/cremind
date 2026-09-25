@@ -68,8 +68,8 @@ class FakeRuntime:
     def scan_blocker(self):
         return self.blocker
 
-    def sync_blocker(self):
-        return self.blocker
+    def sync_blocker(self, source="local"):
+        return self.blockers.get(source, self.blocker) if hasattr(self, "blockers") else self.blocker
 
     def scan_ticket(self, reason):
         self.tickets.append(reason)
@@ -237,6 +237,101 @@ def test_waits_leave_the_job_its_reading_time():
     assert "not re-indexed in time" in out.notes[0]
 
 
+# ── Google Drive ─────────────────────────────────────────────────────────────
+
+
+class FakeDriveSource:
+    enabled = True
+
+    def __init__(self, *, blocker=None, after=None, sync_after=1):
+        self.blocker = blocker          # sync_blocker(): a requested sync would not run
+        self.after = after              # work_blocker() once the sync ran (e.g. it ended in a hold)
+        self.sync_after = sync_after
+        self.tickets: list[str] = []
+
+    def sync_ticket(self, reason):
+        self.tickets.append(reason)
+        return 1
+
+    def sync_done(self, ticket):
+        self.sync_after -= 1
+        return self.sync_after < 0
+
+    def sync_blocker(self):
+        return self.blocker
+
+    def work_blocker(self):
+        return self.after
+
+
+def _drive_rt(*, local_on=True, **drive_kw) -> FakeRuntime:
+    rt = FakeRuntime(FakeDB({}), poll=True)
+    rt.local_on = lambda: local_on
+    rt.drive = FakeDriveSource(**drive_kw)
+    return rt
+
+
+def test_drive_is_asked_for_its_changes_and_a_drive_only_profile_is_not_scanned():
+    rt = _drive_rt(local_on=False, sync_after=3)
+    ctx = _ctx(rt)
+    assert asyncio.run(F.settle_discovery(ctx)) == []
+    assert rt.tickets == [] and rt.drive.tickets == ["research"]
+    assert _steps(ctx) == [("Checking Google Drive for changes", "done")]
+
+
+def test_a_local_only_scope_leaves_drive_alone_and_a_drive_only_one_the_folder():
+    rt = _drive_rt()
+    ctx = _ctx(rt)
+    ctx.spec.scope = {"folder": ["MKT-report"], "source": "local"}
+    asyncio.run(F.settle_discovery(ctx))
+    assert rt.tickets == ["research"] and rt.drive.tickets == []
+
+    rt = _drive_rt()
+    ctx = _ctx(rt)
+    ctx.spec.scope = {"source": "drive"}
+    asyncio.run(F.settle_discovery(ctx))
+    assert rt.tickets == [] and rt.drive.tickets == ["research"]
+
+
+def test_an_analyze_job_without_a_reference_scope_checks_both():
+    rt = _drive_rt()
+    ctx = _ctx(rt)
+    ctx.spec.mode, ctx.spec.scope, ctx.spec.reference_scope = "analyze", {"source": "local"}, None
+    asyncio.run(F.settle_discovery(ctx))
+    assert rt.tickets == ["research"] and rt.drive.tickets == ["research"]
+
+
+def test_a_drive_sync_that_ends_in_a_hold_is_reported():
+    rt = _drive_rt(local_on=False, after=("hold", "drive_unreachable"))
+    ctx = _ctx(rt)
+    notes = asyncio.run(F.settle_discovery(ctx))
+    assert notes == ["Google Drive could not be checked for changes (Google Drive sync is on hold "
+                     "(drive_unreachable)): Drive files added or edited since the last sync may be missing "
+                     "or outdated."]
+    assert _steps(ctx) == [("Checking Google Drive for changes", "failed")]
+
+
+def test_no_drive_sync_is_asked_for_while_drive_waits_for_a_decision():
+    rt = _drive_rt(local_on=False, blocker=("awaiting_confirmation", "mass_delete"))
+    notes = asyncio.run(F.settle_discovery(_ctx(rt)))
+    assert rt.drive.tickets == []
+    assert "Google Drive sync is waiting for a confirmation (mass_delete)" in notes[0]
+
+
+def test_each_source_is_waited_for_only_while_its_sync_runs():
+    db = FakeDB({1: "indexed", 2: "dirty"})
+    rt = FakeRuntime(db, changes=[[1]])
+    rt.blockers = {"local": None, "drive": ("hold", "drive_unreachable")}
+    rows = [{"id": 1, "status": "indexed", "source": "local"}, {"id": 2, "status": "dirty", "source": "drive"}]
+    ctx = _ctx(rt)
+    out = asyncio.run(F.refresh_files(ctx, rows))
+    assert db.statuses == {1: "indexed", 2: "dirty"}, "the local file was waited for; the held Drive one was not"
+    assert out.changed and out.notes == [
+        "1 Google Drive file in scope changed since it was last indexed, but Google Drive sync is on hold "
+        "(drive_unreachable), so it is listed as not indexed yet."]
+    assert _steps(ctx)[0] == ("Re-indexing 1 file changed since the last sync", "done")
+
+
 # ── the engine's side ────────────────────────────────────────────────────────
 
 
@@ -277,6 +372,23 @@ def _runtime(ix: Index, root: Path) -> ProfileRuntime:
     rt = ProfileRuntime(SimpleNamespace(wake=lambda: None), "alice", "u1")
     rt.db, rt.root = ix.db, str(root)
     return rt
+
+
+def test_queued_drive_files_are_moved_up_even_with_no_local_folder(tmp_path):
+    # Drive's change feed queued it; research only moves it up. With Drive
+    # alone on, there is no folder to compare local rows with.
+    (tmp_path / "idx").mkdir()
+    ix = Index(tmp_path / "idx")
+    drive_row = ix.db.insert_file("drive", "Drive/plan.md", "k-plan", name="plan.md", name_folded="plan.md",
+                                  ext=".md", status="dirty", priority=P_BULK)
+    local = ix.add("notes.md", _md("N", "n"))
+    rt = _runtime(ix, tmp_path)
+    rt.root = None
+    changed, waiting = rt.queue_if_changed([ix.db.get_file(drive_row["id"]), local])
+    assert changed == [] and waiting == [drive_row["id"]]
+    assert ix.db.get_file(drive_row["id"])["priority"] == P_INTERACTIVE
+    assert ix.db.get_file(local["id"])["status"] == "indexed"
+    ix.db.close()
 
 
 def test_queue_if_changed_queues_only_what_differs_on_disk(tmp_path):

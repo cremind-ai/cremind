@@ -18,8 +18,9 @@ started here belongs to no conversation.
 
 A job reads the text the index holds, so it first brings the index up to
 date: it checks the folder for new files (a scan, when the folder is
-polled), compares every file in scope with the disk, and re-indexes the
-changed ones before reading. A changed file that could not be re-indexed in
+polled), asks Google Drive for its latest changes when Drive is indexed,
+compares every local file in scope with the disk, and re-indexes the changed
+ones before reading. A changed file that could not be re-indexed in
 time, or while sync is paused, is never read from its old text: it shows as
 `not_indexed_yet` and the job asks before going on without it.
 

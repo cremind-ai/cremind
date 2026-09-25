@@ -378,6 +378,9 @@ class DriveSource:
         self._purging = False
 
         self._syncing = False
+        # Syncs started / finished so far: what a sync ticket is checked against.
+        self._syncs_started = 0
+        self._syncs_finished = 0
         self._sync_requested: str | None = None
         self._full_requested = False
         self._next_poll_at = 0.0
@@ -504,6 +507,38 @@ class DriveSource:
                 self._full_requested = True
         self._wake()
 
+    # ── freshness: research asks for Drive's latest changes before reading ──
+
+    def sync_ticket(self, reason: str) -> int:
+        """Ask for a sync; :meth:`sync_done` says when it has run. A sync
+        already under way when asked does not count: it may have read the
+        change feed before the change the caller is after."""
+        with self._lock:
+            ticket = self._syncs_started + 1
+            self._sync_requested = self._sync_requested or reason
+        self._wake()
+        return ticket
+
+    def sync_done(self, ticket: int) -> bool:
+        with self._lock:
+            return self._syncs_finished >= ticket
+
+    def sync_blocker(self) -> tuple[str, str | None] | None:
+        """``(state, reason)`` when a requested sync would not run now
+        (:meth:`sync_due`'s test for one); None when it would. A held Drive
+        still runs one: that is its probe."""
+        with self._lock:
+            if self._enabled and not (self._purging or self._confirmation or self._closed.is_set()
+                                      or self._paused()):
+                return None
+            return self._effective()
+
+    def work_blocker(self) -> tuple[str, str | None] | None:
+        """``(state, reason)`` when queued Drive files are not being indexed
+        now (:meth:`work_allowed` is false); None while they are."""
+        with self._lock:
+            return None if self.work_allowed() else self._effective()
+
     # ── scheduling ─────────────────────────────────────────────────────────
 
     def sync_due(self, now: float) -> bool:
@@ -540,6 +575,7 @@ class DriveSource:
             self.request_sync("queued", full=full)
             return
         stop: threading.Event | None = None
+        seq = 0
         try:
             self._sync_owner = threading.get_ident()
             with self._lock:
@@ -549,6 +585,8 @@ class DriveSource:
                 self._sync_requested = None
                 full = full or self._full_requested
                 self._syncing = True
+                self._syncs_started += 1
+                seq = self._syncs_started
             self._publish()
             client, stop = self._get_client()
             self._sync_client = client
@@ -569,6 +607,7 @@ class DriveSource:
             self._sync_client = None
             with self._lock:
                 self._syncing = False
+                self._syncs_finished = max(self._syncs_finished, seq)
             self._sync_owner = None
             self._sync_lock.release()
             self.refresh_counts()

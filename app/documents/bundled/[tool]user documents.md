@@ -117,8 +117,9 @@ and every quote it keeps is checked against the source text — a quote the
 model got wrong (a swapped word, a dropped "not") is dropped and counted.
 
 A job reads the text the index holds, so it first brings the index up to
-date: it checks the folder for new files (a scan, in polling mode), compares
-every file in scope with the disk, and re-indexes the changed ones before
+date: it checks the folder for new files (a scan, in polling mode), asks
+Google Drive for its latest changes when Drive is indexed, compares every
+local file in scope with the disk, and re-indexes the changed ones before
 reading. A file that could not be re-indexed in time (or while sync is
 paused) is never read from its old text: it is listed as "still being
 indexed", and the job asks whether to go on without it.

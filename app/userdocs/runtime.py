@@ -663,11 +663,16 @@ class ProfileRuntime:
             busy = bool(self._pending_changed or self._pending_removed or self._draining)
         return not busy and (watcher is None or watcher.pending_count() == 0)
 
-    def sync_blocker(self) -> tuple[str, str | None] | None:
-        """``(state, reason)`` as the UI shows it when queued files are not
-        being indexed now (sync paused, the folder held, the first sync not
-        confirmed yet); None while the queue is worked — the same test the
-        service's workers use to pick this profile."""
+    def sync_blocker(self, source: str = SOURCE) -> tuple[str, str | None] | None:
+        """``(state, reason)`` as the UI shows it when queued files of
+        ``source`` are not being indexed now (sync paused, the folder or
+        Drive held, the first sync not confirmed yet); None while that queue
+        is worked — the same test the service's workers use
+        (``UserDocsService._work_sources``)."""
+        if source == uds.SOURCE_DRIVE:
+            if self.db is None:
+                return self.effective_state()
+            return self.drive.work_blocker()
         with self.lock:
             runs = (
                 self.active and self.db is not None and not self.paused_user and not self.hold
@@ -694,22 +699,27 @@ class ProfileRuntime:
         or that are gone (processing turns a vanished file into a tombstone);
         they are queued at P_INTERACTIVE. ``queued`` were already waiting and
         are moved up to it without being queued again, so one being indexed
-        right now does not start over. Rows of other sources are left alone.
+        right now does not start over.
+
+        Drive files cannot be compared with anything local: Drive's change
+        feed is what queues them (a sync, which the caller asks for first).
+        Here they are only moved up when already queued.
         """
         from app.userdocs.discovery.hashing import changed_on_disk
 
         db, root = self.db, self.root
-        if db is None or root is None:
+        if db is None:
             return [], []
         changed: list[int] = []
         queued: list[int] = []
         for r in rows:
-            if r.get("source") != SOURCE:
+            source, status = r.get("source"), r.get("status")
+            if source not in (SOURCE, uds.SOURCE_DRIVE):
                 continue
-            status = r.get("status")
             if status == "dirty":
                 queued.append(int(r["id"]))
-            elif status not in ("tombstone", "missing") and changed_on_disk(root, r):
+            elif (source == SOURCE and root is not None and status not in ("tombstone", "missing")
+                  and changed_on_disk(root, r)):
                 changed.append(int(r["id"]))
         if changed:
             db.mark_dirty(changed, priority=P_INTERACTIVE)
