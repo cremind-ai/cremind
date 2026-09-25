@@ -48,8 +48,9 @@ from app.utils.working_directory import (
 # outright rather than trying to work out who is asking. Kept as a name set
 # because there is one store per profile, they are created on demand, and the
 # same names appear both per profile and at the shared root -- there is no list
-# of live paths to enumerate, so the name is the rule.
-_CREDENTIAL_DIR_NAMES = frozenset({"coding-cli", "codex-home", "cli-wizards"})
+# of live paths to enumerate, so the name is the rule. The set itself lives in
+# :mod:`app.utils.credential_paths` so User Document Search can share it.
+from app.utils.credential_paths import CREDENTIAL_DIR_NAMES as _CREDENTIAL_DIR_NAMES  # noqa: E402
 
 # Directory names directly under a profile's own directory that only that
 # profile may reach through these routes: ``<system dir>/<profile>/<name>/...``.

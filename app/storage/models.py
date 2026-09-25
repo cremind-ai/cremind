@@ -39,6 +39,15 @@ Tables
 - channel_group_members : who is in such a group, from the platform's roster or
                         from having posted (FK channel group CASCADE).
                         UNIQUE(group_id, member_id)
+- userdoc_sources     : User Document Search settings per profile and source
+                        (local folder / Google Drive). UNIQUE(profile, kind)
+                        (FK profile CASCADE). The index itself is a separate
+                        per-profile SQLite file, see app/userdocs/index
+- userdoc_captions    : vision-model captions keyed by image sha256, so a
+                        rebuilt index never pays for a caption twice
+                        (FK profile CASCADE)
+- userdoc_vision_usage : per-profile, per-local-day captioning counters behind
+                        the daily cap (FK profile CASCADE)
 """
 
 import uuid
@@ -973,3 +982,111 @@ class ChannelGroupMemberModel(Base):
     __table_args__ = (
         UniqueConstraint("group_id", "member_id", name="uq_channel_group_members"),
     )
+
+
+# ── User Document Search ───────────────────────────────────────────────────
+#
+# Only the small, durable half of the feature lives in the main database. The
+# bulk of it — the file manifest, chunk text, the full-text index, runtime sync
+# state — is a per-profile SQLite file under
+# ``<SYSTEM_DIR>/storage/userdocs/<profile uuid>/`` owned by
+# :mod:`app.userdocs.index`. That split is deliberate: the index is derived
+# data that can run to gigabytes, and anything in the main database is copied
+# by every backup and by every upgrade's pre-flight snapshot.
+
+
+class UserDocSourceModel(Base):
+    """One indexed source of one profile: its local folder, or its Google Drive.
+
+    Settings only. Where the sync *is* (state, the Drive changes cursor,
+    counters) is kept in the profile's index file next to the data it
+    describes, so restoring a backup can never pair a restored cursor with an
+    index that no longer exists — a Drive source would otherwise skip every
+    file that did not change after the snapshot.
+
+    ``root_path`` is the resolved absolute folder even when ``root_mode`` is
+    ``inherit``: the working directory it inherits is server-wide, and storing
+    what it resolved to is how a later change to it is noticed rather than
+    silently re-pointing every profile's index at another folder.
+    """
+
+    __tablename__ = "userdoc_sources"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # local | drive
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false(),
+    )
+    # inherit | custom (local sources only)
+    root_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="inherit", server_default=text("'inherit'"),
+    )
+    root_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Normalized by ``app.userdocs.settings.normalize_excludes``:
+    #   [{"pattern": str, "type": "glob"|"dir"|"ext", "mode": "skip"|"metadata_only"}]
+    excludes: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    # Normalized by ``app.userdocs.settings.normalize_options`` — caption,
+    # caption_consent, identity, allow_in, observer, reconcile_interval_min,
+    # include_folders.
+    options: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    first_sync_confirmed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("profile", "kind", name="uq_userdoc_sources_profile_kind"),
+    )
+
+
+class UserDocCaptionModel(Base):
+    """What the vision model said about one image (or one scanned page).
+
+    Content-addressed by the bytes' sha256, so a copy of a photo is never sent
+    to the vision provider twice. Kept in the main database rather than the
+    index file on purpose: a caption costs money, and an index rebuilt after a
+    restore, a model change or a corrupted file should get it back for free.
+    """
+
+    __tablename__ = "userdoc_captions"
+
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), primary_key=True,
+    )
+    sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # image | ocr
+    variant: Mapped[str] = mapped_column(String(8), nullable=False)
+    caption_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    caption_text: Mapped[str] = mapped_column(Text, nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    prompt_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1"),
+    )
+    tokens_in: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    tokens_out: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class UserDocVisionUsageModel(Base):
+    """How much captioning a profile has spent today, for the daily cap.
+
+    ``day`` is the local date in the profile's own timezone, so the cap resets
+    at the user's midnight rather than UTC's. The cap is enforced with one
+    conditional ``UPDATE … WHERE captions < :cap`` so two workers can never
+    both take the last slot.
+    """
+
+    __tablename__ = "userdoc_vision_usage"
+
+    profile: Mapped[str] = mapped_column(
+        String(128), ForeignKey("profiles.name", ondelete="CASCADE"), primary_key=True,
+    )
+    day: Mapped[str] = mapped_column(String(10), primary_key=True)
+    captions: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    ocr_pages: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))

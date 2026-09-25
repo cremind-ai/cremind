@@ -28,6 +28,7 @@ from app.api.auth import get_auth_routes
 from app.api.tokens import get_token_routes
 from app.api.usage import get_usage_routes
 from app.api.user_config import get_user_config_routes
+from app.api.userdocs import get_userdocs_routes
 
 
 def get_api_routes(
@@ -89,6 +90,7 @@ def get_api_routes(
     routes.extend(get_file_watcher_routes())
     routes.extend(get_calendar_routes(conversation_storage))
     routes.extend(get_drive_routes())
+    routes.extend(get_userdocs_routes())
     routes.extend(get_google_routes())
     routes.extend(get_admin_stream_routes())
     routes.extend(get_settings_stream_routes())
